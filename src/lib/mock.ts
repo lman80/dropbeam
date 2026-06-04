@@ -6,6 +6,7 @@ import type {
   FolderStatus,
   Friend,
   HistoryEntry,
+  HistoryItem,
   Pair,
   PairUpdate,
   Settings,
@@ -91,14 +92,23 @@ let pairs: Pair[] = [
     role: 'a',
     peerName: 'Alex',
     secret: 'mock',
-    folder: '/Users/you/Desktop/Beam to Alex',
+    folder: '/Users/you/Desktop/Project (shared with Alex)',
     twoWay: true,
-    autoDelete: true,
+    mirror: true,
+    autoDelete: false,
     deleteMode: 'trash',
     createdAt: Date.now() - 3 * 86400_000,
   },
 ]
 let pairCounter = 1
+
+const folderHistory: Record<string, HistoryItem[]> = {
+  p1: [
+    { id: 'fh1', relPath: 'src/old-logo.svg', size: 24_000, reason: 'deleted', timestampMs: Date.now() - 36 * 60_000 },
+    { id: 'fh2', relPath: 'notes.md', size: 4_200, reason: 'replaced', timestampMs: Date.now() - 5 * 3600_000 },
+    { id: 'fh3', relPath: 'drafts/v1.fig', size: 1_840_000, reason: 'deleted', timestampMs: Date.now() - 2 * 86400_000 },
+  ],
+}
 
 let friends: Friend[] = [
   { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true },
@@ -242,6 +252,7 @@ export const mockApi = {
     folder: string,
     twoWay: boolean,
     peerName?: string,
+    mirror?: boolean,
   ): Promise<{ pair: Pair; invite: string }> => {
     const id = `p${++pairCounter}`
     const pair: Pair = {
@@ -250,7 +261,8 @@ export const mockApi = {
       peerName: peerName?.trim() || '',
       secret: 'mock',
       folder,
-      twoWay,
+      twoWay: twoWay || !!mirror,
+      mirror: !!mirror,
       autoDelete: false,
       deleteMode: 'trash',
       createdAt: Date.now(),
@@ -277,6 +289,7 @@ export const mockApi = {
       secret: 'mock',
       folder,
       twoWay: true,
+      mirror: false,
       autoDelete: false,
       deleteMode: 'trash',
       createdAt: Date.now(),
@@ -288,6 +301,13 @@ export const mockApi = {
   updatePair: async (u: PairUpdate): Promise<Pair> => {
     const p = pairs.find((x) => x.id === u.id)!
     if (u.twoWay != null) p.twoWay = u.twoWay
+    if (u.mirror != null) {
+      p.mirror = u.mirror
+      if (u.mirror) {
+        p.twoWay = true
+        p.autoDelete = false
+      }
+    }
     if (u.autoDelete != null) p.autoDelete = u.autoDelete
     if (u.deleteMode) p.deleteMode = u.deleteMode
     if (u.peerName) p.peerName = u.peerName
@@ -297,6 +317,14 @@ export const mockApi = {
     pairs = pairs.filter((p) => p.id !== id)
   },
   pairInvite: async (id: string): Promise<string> => `dropbeam1:MOCK${id}invitecodewouldgohere0000`,
+  listFolderHistory: async (pairId: string): Promise<HistoryItem[]> =>
+    [...(folderHistory[pairId] ?? [])].sort((a, b) => b.timestampMs - a.timestampMs),
+  restoreFolderItem: async (pairId: string, itemId: string): Promise<void> => {
+    folderHistory[pairId] = (folderHistory[pairId] ?? []).filter((i) => i.id !== itemId)
+  },
+  forgetFolderItem: async (pairId: string, itemId: string): Promise<void> => {
+    folderHistory[pairId] = (folderHistory[pairId] ?? []).filter((i) => i.id !== itemId)
+  },
   getFolderStatuses: async (): Promise<FolderStatus[]> =>
     pairs.map((p) =>
       p.id === 'p1'

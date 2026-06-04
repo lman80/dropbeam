@@ -1,23 +1,33 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
   ArrowLeftRight,
   ArrowRight,
   Check,
+  Clock,
   Copy,
   FolderOpen,
   FolderSync,
+  History,
   Plus,
   QrCode,
+  RotateCcw,
   Settings2,
+  Trash2,
   Unlink,
   X,
 } from 'lucide-react'
-import { api, type FolderStatus, type Pair } from '../lib/api'
+import {
+  api,
+  onFolderHistoryChanged,
+  type FolderStatus,
+  type HistoryItem,
+  type Pair,
+} from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState, ProgressBar, Spinner } from '../components/bits'
-import { formatBytes, formatEta, formatSpeed } from '../lib/format'
+import { formatBytes, formatEta, formatRelativeTime, formatSpeed } from '../lib/format'
 import { PairingModal } from '../components/PairingModal'
 import { avatarGradient, initials } from '../lib/avatar'
 
@@ -134,6 +144,7 @@ function FolderCard({
   const [open, setOpen] = useState(false)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [loadingInvite, setLoadingInvite] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
 
   const info = statusInfo(pair, status)
   const folderName = pair.folder.split('/').pop() || pair.folder
@@ -178,13 +189,19 @@ function FolderCard({
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{ fontWeight: 700, fontSize: 14.5 }}>{peer}</span>
-            <span
-              className="chip"
-              style={{ background: 'var(--surface-2)', color: 'var(--text-muted)' }}
-            >
-              {pair.twoWay ? <ArrowLeftRight size={11} /> : <ArrowRight size={11} />}
-              {pair.twoWay ? 'Two-way' : 'One-way'}
-            </span>
+            {pair.mirror ? (
+              <span className="chip" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>
+                <FolderSync size={11} /> Total sync
+              </span>
+            ) : (
+              <span
+                className="chip"
+                style={{ background: 'var(--surface-2)', color: 'var(--text-muted)' }}
+              >
+                {pair.twoWay ? <ArrowLeftRight size={11} /> : <ArrowRight size={11} />}
+                {pair.twoWay ? 'Two-way' : 'One-way'}
+              </span>
+            )}
             {pair.autoDelete && (
               <span className="chip" style={{ background: 'var(--amber-soft)', color: 'var(--amber)' }}>
                 Auto-delete
@@ -301,24 +318,37 @@ function FolderCard({
           >
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 14, paddingTop: 6 }}>
               <SettingRow
-                title="Two-way sync"
-                desc="Receive the peer's files too, not just send."
+                title="Total sync (source of truth)"
+                desc="Adds, edits, and deletes all sync both ways — like a shared drive. Deleted and replaced files are kept in History so nothing is lost."
               >
                 <button
-                  className={`toggle${pair.twoWay ? ' on' : ''}`}
-                  onClick={() => updatePair({ id: pair.id, twoWay: !pair.twoWay })}
+                  className={`toggle${pair.mirror ? ' on' : ''}`}
+                  onClick={() => updatePair({ id: pair.id, mirror: !pair.mirror })}
                 />
               </SettingRow>
-              <SettingRow
-                title="Delete after delivery"
-                desc="Remove the local copy once the peer confirms receipt — a self-emptying outbox."
-              >
-                <button
-                  className={`toggle${pair.autoDelete ? ' on' : ''}`}
-                  onClick={() => updatePair({ id: pair.id, autoDelete: !pair.autoDelete })}
-                />
-              </SettingRow>
-              {pair.autoDelete && (
+              {!pair.mirror && (
+                <SettingRow
+                  title="Two-way sync"
+                  desc="Receive the peer's files too, not just send."
+                >
+                  <button
+                    className={`toggle${pair.twoWay ? ' on' : ''}`}
+                    onClick={() => updatePair({ id: pair.id, twoWay: !pair.twoWay })}
+                  />
+                </SettingRow>
+              )}
+              {!pair.mirror && (
+                <SettingRow
+                  title="Delete after delivery"
+                  desc="Remove the local copy once the peer confirms receipt — a self-emptying outbox."
+                >
+                  <button
+                    className={`toggle${pair.autoDelete ? ' on' : ''}`}
+                    onClick={() => updatePair({ id: pair.id, autoDelete: !pair.autoDelete })}
+                  />
+                </SettingRow>
+              )}
+              {!pair.mirror && pair.autoDelete && (
                 <SettingRow title="When deleting" desc="Trash is recoverable; permanent is not.">
                   <div className="seg">
                     {(['trash', 'permanent'] as const).map((m) => (
@@ -343,6 +373,15 @@ function FolderCard({
                   paddingBottom: 2,
                 }}
               >
+                {pair.mirror && (
+                  <button
+                    className="btn btn-ghost"
+                    style={{ marginRight: 'auto' }}
+                    onClick={() => setHistoryOpen(true)}
+                  >
+                    <History size={14} /> History
+                  </button>
+                )}
                 {pair.role === 'a' && (
                   <button className="btn btn-ghost" onClick={showInvite} disabled={loadingInvite}>
                     <QrCode size={14} /> Show invite
@@ -367,7 +406,149 @@ function FolderCard({
           </motion.div>
         )}
       </AnimatePresence>
+
+      {historyOpen && (
+        <HistoryModal pair={pair} onClose={() => setHistoryOpen(false)} />
+      )}
     </motion.div>
+  )
+}
+
+function HistoryModal({ pair, onClose }: { pair: Pair; onClose: () => void }) {
+  const toast = useStore((s) => s.toast)
+  const [items, setItems] = useState<HistoryItem[] | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    try {
+      setItems(await api.listFolderHistory(pair.id))
+    } catch (e) {
+      toast('error', String(e))
+      setItems([])
+    }
+  }, [pair.id, toast])
+
+  useEffect(() => {
+    let alive = true
+    // load() is async — setState runs after the await, not during the effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load()
+    const un = onFolderHistoryChanged((pid) => {
+      if (alive && pid === pair.id) void load()
+    })
+    return () => {
+      alive = false
+      un.then((f) => f())
+    }
+  }, [pair.id, load])
+
+  const restore = async (item: HistoryItem) => {
+    setBusy(item.id)
+    try {
+      await api.restoreFolderItem(pair.id, item.id)
+      toast('success', `Restored ${item.relPath.split('/').pop()}`)
+      await load()
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const forget = async (item: HistoryItem) => {
+    setBusy(item.id)
+    try {
+      await api.forgetFolderItem(pair.id, item.id)
+      await load()
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(8, 9, 14, 0.5)',
+        backdropFilter: 'blur(4px)',
+        display: 'grid',
+        placeItems: 'center',
+        zIndex: 200,
+        padding: 20,
+      }}
+    >
+      <motion.div
+        initial={{ opacity: 0, scale: 0.96 }}
+        animate={{ opacity: 1, scale: 1 }}
+        onClick={(e) => e.stopPropagation()}
+        className="card"
+        style={{ width: 520, maxWidth: '100%', maxHeight: '80vh', padding: 22, borderRadius: 20, display: 'flex', flexDirection: 'column' }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <div style={{ fontWeight: 750, fontSize: 16 }}>Folder history</div>
+          <button className="icon-btn" onClick={onClose}>
+            <X size={17} />
+          </button>
+        </div>
+        <p style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.5 }}>
+          Deleted and replaced files are kept here. Restore one and it comes back in the folder —
+          and re-syncs to {pair.peerName || 'everyone'}.
+        </p>
+
+        <div style={{ overflowY: 'auto', marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {items === null ? (
+            <div style={{ display: 'grid', placeItems: 'center', padding: 30 }}>
+              <Spinner size={20} />
+            </div>
+          ) : items.length === 0 ? (
+            <EmptyState icon={<Clock size={22} />} title="Nothing in history yet" hint="When a file is deleted or replaced in this folder, the old copy shows up here so you can get it back." />
+          ) : (
+            items.map((item) => (
+              <div
+                key={item.id}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 12,
+                  padding: '10px 12px',
+                  background: 'var(--surface-2)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 12,
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {item.relPath}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginTop: 2 }}>
+                    {item.reason === 'replaced' ? 'Replaced' : 'Deleted'} ·{' '}
+                    {formatRelativeTime(item.timestampMs)} · {formatBytes(item.size)}
+                  </div>
+                </div>
+                <button
+                  className="btn btn-primary"
+                  style={{ padding: '6px 12px' }}
+                  onClick={() => restore(item)}
+                  disabled={busy === item.id}
+                >
+                  {busy === item.id ? <Spinner size={13} /> : <RotateCcw size={14} />} Restore
+                </button>
+                <button
+                  className="icon-btn"
+                  title="Forget permanently"
+                  onClick={() => forget(item)}
+                  disabled={busy === item.id}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </motion.div>
+    </div>
   )
 }
 

@@ -54,6 +54,9 @@ struct Invite {
     /// matching friend record (never a one-sided, non-working one).
     #[serde(default)]
     frn: bool,
+    /// Total-sync / mirror mode — both sides must agree, so it rides the invite.
+    #[serde(default)]
+    mir: bool,
 }
 
 /// Create a new pair (this device is A). Returns the pair + a shareable invite.
@@ -65,6 +68,7 @@ pub fn create(
     my_name: String,
     two_way: bool,
     peer_name: String,
+    mirror: bool,
 ) -> Result<(Pair, String), String> {
     validate_folder(&folder)?;
     let _guard = LOCK.lock().unwrap();
@@ -77,6 +81,8 @@ pub fn create(
     let secret = random_secret();
     let peer_label = peer_name.trim().to_string();
     let auto_friend = !peer_label.is_empty();
+    // Mirror is inherently two-way.
+    let two_way = two_way || mirror;
     let pair = Pair {
         id: id.clone(),
         role: PairRole::A,
@@ -84,6 +90,7 @@ pub fn create(
         secret: secret.clone(),
         folder,
         two_way,
+        mirror,
         auto_delete: false,
         delete_mode: DeleteMode::Trash,
         created_at: now_ms(),
@@ -96,6 +103,7 @@ pub fn create(
         name: my_name,
         tw: two_way,
         frn: auto_friend,
+        mir: mirror,
     };
     let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
     let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
@@ -141,7 +149,8 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
         },
         secret: invite.secret,
         folder,
-        two_way: invite.tw,
+        two_way: invite.tw || invite.mir,
+        mirror: invite.mir,
         auto_delete: false,
         delete_mode: DeleteMode::Trash,
         created_at: now_ms(),
@@ -162,6 +171,7 @@ pub fn update(
     auto_delete: Option<bool>,
     delete_mode: Option<DeleteMode>,
     peer_name: Option<String>,
+    mirror: Option<bool>,
 ) -> Result<Pair, String> {
     let _guard = LOCK.lock().unwrap();
     let mut pairs = load(config_dir);
@@ -171,6 +181,13 @@ pub fn update(
         .ok_or("Pair not found.")?;
     if let Some(v) = two_way {
         pair.two_way = v;
+    }
+    if let Some(v) = mirror {
+        pair.mirror = v;
+        if v {
+            pair.two_way = true; // mirror is inherently two-way
+            pair.auto_delete = false; // and mutually exclusive with auto-delete
+        }
     }
     if let Some(v) = auto_delete {
         pair.auto_delete = v;
@@ -199,6 +216,7 @@ pub fn invite_for(pair: &Pair, my_name: &str) -> String {
         tw: pair.two_way,
         // Re-offer the friend link iff this pair was created with a named peer.
         frn: !pair.peer_name.trim().is_empty(),
+        mir: pair.mirror,
     };
     let json = serde_json::to_string(&invite).unwrap_or_default();
     format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
@@ -279,11 +297,11 @@ fn derive_code(secret: &str, channel: &str) -> String {
 }
 
 pub fn runs_sender(p: &Pair) -> bool {
-    p.two_way || p.role == PairRole::A
+    p.mirror || p.two_way || p.role == PairRole::A
 }
 
 pub fn runs_listener(p: &Pair) -> bool {
-    p.two_way || p.role == PairRole::B
+    p.mirror || p.two_way || p.role == PairRole::B
 }
 
 fn random_secret() -> String {
@@ -328,6 +346,7 @@ mod tests {
             secret: "deadbeefcafebabe".into(),
             folder: "/tmp".into(),
             two_way: true,
+            mirror: false,
             auto_delete: false,
             delete_mode: DeleteMode::Trash,
             created_at: 0,

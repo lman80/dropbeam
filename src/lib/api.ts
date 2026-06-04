@@ -79,9 +79,19 @@ export interface Pair {
   secret: string
   folder: string
   twoWay: boolean
+  mirror: boolean
   autoDelete: boolean
   deleteMode: DeleteMode
   createdAt: number
+}
+
+/** A restorable deleted/overwritten file in a mirror folder's history. */
+export interface HistoryItem {
+  id: string
+  relPath: string
+  size: number
+  reason: string
+  timestampMs: number
 }
 
 /** A named peer you can send to directly — no code, no QR. */
@@ -114,6 +124,7 @@ export interface FolderStatus {
 export interface PairUpdate {
   id: string
   twoWay?: boolean
+  mirror?: boolean
   autoDelete?: boolean
   deleteMode?: DeleteMode
   peerName?: string
@@ -134,8 +145,8 @@ const realApi = {
   getDefaultDownloadDir: () => invoke<string>('get_default_download_dir'),
   // Shared Drop Folders. Tauri v2 maps camelCase JS keys → snake_case Rust params,
   // so the keys here MUST be camelCase (e.g. twoWay, not two_way).
-  createPair: (folder: string, twoWay: boolean, peerName?: string) =>
-    invoke<{ pair: Pair; invite: string }>('create_pair', { folder, twoWay, peerName }),
+  createPair: (folder: string, twoWay: boolean, peerName?: string, mirror?: boolean) =>
+    invoke<{ pair: Pair; invite: string }>('create_pair', { folder, twoWay, peerName, mirror }),
   acceptPair: (invite: string, folder: string) =>
     invoke<Pair>('accept_pair', { invite, folder }),
   listPairs: () => invoke<Pair[]>('list_pairs'),
@@ -143,6 +154,7 @@ const realApi = {
     invoke<Pair>('update_pair', {
       id: u.id,
       twoWay: u.twoWay,
+      mirror: u.mirror,
       autoDelete: u.autoDelete,
       deleteMode: u.deleteMode,
       peerName: u.peerName,
@@ -150,6 +162,12 @@ const realApi = {
   removePair: (id: string) => invoke<void>('remove_pair', { id }),
   pairInvite: (id: string) => invoke<string>('pair_invite', { id }),
   getFolderStatuses: () => invoke<FolderStatus[]>('get_folder_statuses'),
+  listFolderHistory: (pairId: string) =>
+    invoke<HistoryItem[]>('list_folder_history', { pairId }),
+  restoreFolderItem: (pairId: string, itemId: string) =>
+    invoke<void>('restore_folder_item', { pairId, itemId }),
+  forgetFolderItem: (pairId: string, itemId: string) =>
+    invoke<void>('forget_folder_item', { pairId, itemId }),
   // Friends — named peers you send to directly.
   createFriend: (friendName: string) =>
     invoke<{ friend: Friend; invite: string }>('create_friend', { friendName }),
@@ -177,6 +195,11 @@ export function onFolderStatus(cb: (s: FolderStatus) => void): Promise<UnlistenF
 export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('pairs://changed', () => cb())
   return listen('pairs://changed', () => cb())
+}
+
+export function onFolderHistoryChanged(cb: (pairId: string) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('folder-history://changed', (p) => cb(p as string))
+  return listen<string>('folder-history://changed', (e) => cb(e.payload))
 }
 
 export function onTransferUpdate(cb: (u: TransferUpdate) => void): Promise<UnlistenFn> {

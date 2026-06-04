@@ -187,10 +187,29 @@ pub struct Pair {
     pub folder: String,
     /// Sync both directions (vs. one-way: A sends, B receives).
     pub two_way: bool,
+    /// Total-sync / mirror: a shared source of truth. Implies two-way, and
+    /// additionally propagates deletes and replaces edited files (instead of
+    /// keeping a duplicate). Deleted/overwritten files go to the folder's history
+    /// so nothing is ever lost.
+    #[serde(default)]
+    pub mirror: bool,
     /// Delete the local copy after delivery is confirmed.
     pub auto_delete: bool,
     pub delete_mode: DeleteMode,
     pub created_at: u64,
+}
+
+/// One restorable entry in a folder's history (a deleted or overwritten file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryItem {
+    pub id: String,
+    /// Path relative to the shared folder (what it was before it left).
+    pub rel_path: String,
+    pub size: u64,
+    /// "deleted" or "replaced".
+    pub reason: String,
+    pub timestamp_ms: u64,
 }
 
 /// A friend — a named peer you can send files to directly, no code needed.

@@ -5,9 +5,11 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use crate::models::{DeleteMode, FolderStatus, Friend, HistoryEntry, Pair, Settings, TransferUpdate};
+use crate::models::{
+    DeleteMode, FolderStatus, Friend, HistoryEntry, HistoryItem, Pair, Settings, TransferUpdate,
+};
 use crate::sync::SyncManager;
-use crate::{croc, friends, history, pairing, settings, AppState};
+use crate::{croc, folder_history, friends, history, pairing, settings, AppState};
 
 #[tauri::command]
 pub fn send_files(
@@ -176,10 +178,17 @@ pub fn create_pair(
     folder: String,
     two_way: bool,
     peer_name: Option<String>,
+    mirror: Option<bool>,
 ) -> Result<CreatePairResult, String> {
     let name = state.settings.lock().unwrap().display_name.clone();
-    let (pair, invite) =
-        pairing::create(&state.config_dir, folder, name, two_way, peer_name.unwrap_or_default())?;
+    let (pair, invite) = pairing::create(
+        &state.config_dir,
+        folder,
+        name,
+        two_way,
+        peer_name.unwrap_or_default(),
+        mirror.unwrap_or(false),
+    )?;
     sync.reconcile();
     Ok(CreatePairResult { pair, invite })
 }
@@ -210,6 +219,7 @@ pub fn update_pair(
     auto_delete: Option<bool>,
     delete_mode: Option<DeleteMode>,
     peer_name: Option<String>,
+    mirror: Option<bool>,
 ) -> Result<Pair, String> {
     let pair = pairing::update(
         &state.config_dir,
@@ -218,6 +228,7 @@ pub fn update_pair(
         auto_delete,
         delete_mode,
         peer_name,
+        mirror,
     )?;
     sync.reconcile();
     Ok(pair)
@@ -340,6 +351,49 @@ pub fn friend_invite(state: State<'_, Arc<AppState>>, id: String) -> Result<Stri
     let my_name = state.settings.lock().unwrap().display_name.clone();
     let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
     Ok(friends::invite_for(&friend, &my_name))
+}
+
+// ---------------------------------------------------------------------------
+// Shared folder history (total-sync / mirror folders)
+// ---------------------------------------------------------------------------
+
+fn folder_for(state: &Arc<AppState>, pair_id: &str) -> Option<String> {
+    pairing::load(&state.config_dir)
+        .into_iter()
+        .find(|p| p.id == pair_id)
+        .map(|p| p.folder)
+}
+
+#[tauri::command]
+pub fn list_folder_history(state: State<'_, Arc<AppState>>, pair_id: String) -> Vec<HistoryItem> {
+    match folder_for(state.inner(), &pair_id) {
+        Some(folder) => {
+            let mut items = folder_history::load(&folder);
+            items.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+            items
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Restore a deleted/overwritten file back into the folder. In a mirror folder
+/// it then re-syncs to the peer automatically.
+#[tauri::command]
+pub fn restore_folder_item(
+    state: State<'_, Arc<AppState>>,
+    pair_id: String,
+    item_id: String,
+) -> Result<(), String> {
+    let folder = folder_for(state.inner(), &pair_id).ok_or("Folder not found.")?;
+    folder_history::restore(&folder, &item_id)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn forget_folder_item(state: State<'_, Arc<AppState>>, pair_id: String, item_id: String) {
+    if let Some(folder) = folder_for(state.inner(), &pair_id) {
+        folder_history::forget(&folder, &item_id);
+    }
 }
 
 /// Send files straight to a friend — no code, no QR. Their inbox listener is

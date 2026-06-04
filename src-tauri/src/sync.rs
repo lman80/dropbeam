@@ -91,6 +91,19 @@ impl Default for StatusSnapshot {
     }
 }
 
+/// A removal to propagate to the mirror peer.
+#[derive(Clone)]
+struct DeleteEvent {
+    rel: String,
+    ts: u64,
+}
+
+/// A filesystem change observed by the watcher.
+enum FsEvent {
+    Upsert(PathBuf),
+    Remove(PathBuf),
+}
+
 impl SyncManager {
     pub fn new(app: AppHandle, config_dir: PathBuf) -> Arc<Self> {
         Arc::new(SyncManager {
@@ -319,7 +332,10 @@ impl SyncManager {
                         let dest = friend_download_dir(&settings);
                         let _ = std::fs::create_dir_all(&dest);
                         let throwaway = Arc::new(Mutex::new(HashSet::new()));
-                        let moved = move_staged_into_folder(&staging, &dest, &throwaway);
+                        let throwaway_sd = Arc::new(Mutex::new(HashMap::new()));
+                        // Friend inboxes are never mirrors — keep collision-safe naming.
+                        let moved =
+                            move_staged_into_folder(&staging, &dest, &throwaway, false, &throwaway_sd);
                         if !moved.is_empty() {
                             let names: Vec<String> =
                                 moved.iter().map(|f| file_name_of(f)).collect();
@@ -458,19 +474,32 @@ impl SyncManager {
 
         let mut watcher = None;
 
+        // Total-sync (mirror) state: delete events queued for the peer, a loop
+        // guard for files WE removed (so applying a remote delete or an overwrite
+        // never echoes back), and a wake to flush deletes to the peer promptly.
+        let pending_deletes: Arc<Mutex<Vec<DeleteEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let self_deleted: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let control_wake = Arc::new(Notify::new());
+
         if pairing::runs_sender(&pair) {
             // Filesystem watcher → candidate channel.
-            let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+            let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<FsEvent>();
             let folder = pair.folder.clone();
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    if matches!(
-                        event.kind,
-                        notify::EventKind::Create(_) | notify::EventKind::Modify(_)
-                    ) {
-                        for path in event.paths {
-                            let _ = evt_tx.send(path);
+                    use notify::EventKind;
+                    match event.kind {
+                        EventKind::Create(_) | EventKind::Modify(_) => {
+                            for path in event.paths {
+                                let _ = evt_tx.send(FsEvent::Upsert(path));
+                            }
                         }
+                        EventKind::Remove(_) => {
+                            for path in event.paths {
+                                let _ = evt_tx.send(FsEvent::Remove(path));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }) {
@@ -487,7 +516,8 @@ impl SyncManager {
                 Err(e) => log::warn!("watcher init failed: {e}"),
             }
 
-            // Collector: debounce + size-stability → enqueue.
+            // Collector: debounce + size-stability → enqueue (and, in mirror mode,
+            // turn removals into delete events for the peer).
             self.clone().spawn_collector(
                 evt_rx,
                 config.clone(),
@@ -495,6 +525,9 @@ impl SyncManager {
                 wake.clone(),
                 queue.clone(),
                 inbound.clone(),
+                pending_deletes.clone(),
+                self_deleted.clone(),
+                control_wake.clone(),
             );
 
             // Sender worker.
@@ -519,23 +552,28 @@ impl SyncManager {
                 stop_notify.clone(),
                 inbound.clone(),
                 status.clone(),
+                self_deleted.clone(),
             );
         }
 
-        // Control channel (presence + identity) runs for BOTH peers on every pair,
-        // independent of file-sync direction — that's how the creator learns the
-        // accepter exists + their name (fixing the stuck "waiting" state).
+        // Control channel (presence + identity + mirror delete events) runs for
+        // BOTH peers on every pair, independent of file-sync direction — that's
+        // how the creator learns the accepter exists + their name (fixing the
+        // stuck "waiting" state) and how deletes reach the other side.
         self.clone().spawn_control_sender(
             config.clone(),
             stopped.clone(),
             stop_notify.clone(),
             status.clone(),
+            pending_deletes.clone(),
+            control_wake.clone(),
         );
         self.clone().spawn_control_listener(
             config.clone(),
             stopped.clone(),
             stop_notify.clone(),
             status.clone(),
+            self_deleted.clone(),
         );
 
         let handle = PairHandle {
@@ -555,55 +593,116 @@ impl SyncManager {
 
     fn spawn_collector(
         self: Arc<Self>,
-        mut evt_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
+        mut evt_rx: tokio::sync::mpsc::UnboundedReceiver<FsEvent>,
         config: Arc<Mutex<Pair>>,
         stopped: Arc<AtomicBool>,
         wake: Arc<Notify>,
         queue: Arc<Mutex<VecDeque<String>>>,
         inbound: Arc<Mutex<HashSet<String>>>,
+        pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
+        self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
+        control_wake: Arc<Notify>,
     ) {
         let debounce: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         tauri::async_runtime::spawn(async move {
-            while let Some(path) = evt_rx.recv().await {
+            while let Some(evt) = evt_rx.recv().await {
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }
-                let folder = config.lock().unwrap().folder.clone();
-                let p = path.to_string_lossy().to_string();
-                if !is_sendable_candidate(&p, &folder, &inbound) {
-                    continue;
-                }
-                let gen = {
-                    let mut d = debounce.lock().unwrap();
-                    let g = d.entry(p.clone()).or_insert(0);
-                    *g += 1;
-                    *g
-                };
-                let debounce2 = debounce.clone();
-                let queue2 = queue.clone();
-                let wake2 = wake.clone();
-                let inbound2 = inbound.clone();
-                let stopped2 = stopped.clone();
-                let folder2 = folder.clone();
-                tauri::async_runtime::spawn(async move {
-                    // Wait for quiet, then confirm write-completion via size stability.
-                    if !wait_until_stable(&p, &debounce2, gen, &stopped2).await {
-                        return;
-                    }
-                    if stopped2.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    if !is_sendable_candidate(&p, &folder2, &inbound2) {
-                        return;
-                    }
-                    {
-                        let mut q = queue2.lock().unwrap();
-                        if !q.iter().any(|x| x == &p) {
-                            q.push_back(p.clone());
+                match evt {
+                    FsEvent::Upsert(path) => {
+                        let folder = config.lock().unwrap().folder.clone();
+                        let p = path.to_string_lossy().to_string();
+                        if !is_sendable_candidate(&p, &folder, &inbound) {
+                            continue;
                         }
+                        let gen = {
+                            let mut d = debounce.lock().unwrap();
+                            let g = d.entry(p.clone()).or_insert(0);
+                            *g += 1;
+                            *g
+                        };
+                        let debounce2 = debounce.clone();
+                        let queue2 = queue.clone();
+                        let wake2 = wake.clone();
+                        let inbound2 = inbound.clone();
+                        let stopped2 = stopped.clone();
+                        let folder2 = folder.clone();
+                        tauri::async_runtime::spawn(async move {
+                            // Wait for quiet, then confirm write-completion via size stability.
+                            if !wait_until_stable(&p, &debounce2, gen, &stopped2).await {
+                                return;
+                            }
+                            if stopped2.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            if !is_sendable_candidate(&p, &folder2, &inbound2) {
+                                return;
+                            }
+                            {
+                                let mut q = queue2.lock().unwrap();
+                                if !q.iter().any(|x| x == &p) {
+                                    q.push_back(p.clone());
+                                }
+                            }
+                            wake2.notify_one();
+                        });
                     }
-                    wake2.notify_one();
-                });
+                    FsEvent::Remove(path) => {
+                        // Deletes only propagate in mirror (total-sync) mode.
+                        let (folder, mirror) = {
+                            let p = config.lock().unwrap();
+                            (p.folder.clone(), p.mirror)
+                        };
+                        if !mirror {
+                            continue;
+                        }
+                        let abs = path.to_string_lossy().to_string();
+                        let Some(rel) = rel_path_of(&abs, &folder) else {
+                            continue;
+                        };
+                        if rel.is_empty() || rel.split('/').any(|c| c.starts_with('.')) {
+                            continue;
+                        }
+                        // Loop guard: did WE just remove this (applying a remote
+                        // delete or replacing an edited file)? Then don't echo it.
+                        {
+                            let mut sd = self_deleted.lock().unwrap();
+                            prune_self_deleted(&mut sd);
+                            if sd.remove(&rel).is_some() {
+                                continue;
+                            }
+                        }
+                        let pd = pending_deletes.clone();
+                        let cw = control_wake.clone();
+                        let stopped2 = stopped.clone();
+                        let abs2 = abs.clone();
+                        let rel2 = rel.clone();
+                        let self_deleted2 = self_deleted.clone();
+                        tauri::async_runtime::spawn(async move {
+                            // Debounce: an editor's atomic save is unlink+rename, so
+                            // if the file is back shortly it wasn't really deleted.
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            if stopped2.load(Ordering::SeqCst) || Path::new(&abs2).exists() {
+                                return;
+                            }
+                            {
+                                let mut sd = self_deleted2.lock().unwrap();
+                                prune_self_deleted(&mut sd);
+                                if sd.remove(&rel2).is_some() {
+                                    return;
+                                }
+                            }
+                            {
+                                let mut p = pd.lock().unwrap();
+                                if !p.iter().any(|d| d.rel == rel2) {
+                                    p.push(DeleteEvent { rel: rel2.clone(), ts: now_ms() });
+                                }
+                            }
+                            cw.notify_one();
+                        });
+                    }
+                }
             }
         });
     }
@@ -743,6 +842,7 @@ impl SyncManager {
         stop_notify: Arc<Notify>,
         inbound: Arc<Mutex<HashSet<String>>>,
         status: Arc<Mutex<StatusSnapshot>>,
+        self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
@@ -799,8 +899,17 @@ impl SyncManager {
                 match outcome {
                     ReceiveOutcome::Received => {
                         idle_streak = 0;
-                        let folder = config.lock().unwrap().folder.clone();
-                        let moved = move_staged_into_folder(&staging, &folder, &inbound);
+                        let (folder, mirror) = {
+                            let p = config.lock().unwrap();
+                            (p.folder.clone(), p.mirror)
+                        };
+                        let moved = move_staged_into_folder(
+                            &staging,
+                            &folder,
+                            &inbound,
+                            mirror,
+                            &self_deleted,
+                        );
                         if !moved.is_empty() {
                             let snapshot = inbound.lock().unwrap().clone();
                             manager.persist_manifest(&pair_id, &snapshot);
@@ -830,14 +939,17 @@ impl SyncManager {
         });
     }
 
-    /// Periodically beam a tiny hello {name} to the peer on the control channel.
-    /// Delivery means their control listener is up → they're online.
+    /// Beam our hello {name, deletes[]} to the peer on the control channel.
+    /// Delivery means their control listener is up → they're online, and any
+    /// deletes in the payload have been received (so we can clear them).
     fn spawn_control_sender(
         self: Arc<Self>,
         config: Arc<Mutex<Pair>>,
         stopped: Arc<AtomicBool>,
         stop_notify: Arc<Notify>,
         status: Arc<Mutex<StatusSnapshot>>,
+        pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
+        control_wake: Arc<Notify>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
@@ -862,31 +974,52 @@ impl SyncManager {
                 } else {
                     settings.display_name.clone()
                 };
-                let payload = serde_json::json!({ "v": 1, "name": my_name, "ts": now_ms() });
+                let dels: Vec<DeleteEvent> = pending_deletes.lock().unwrap().clone();
+                let dels_json: Vec<serde_json::Value> = dels
+                    .iter()
+                    .map(|d| serde_json::json!({ "rel": d.rel, "ts": d.ts }))
+                    .collect();
+                let payload = serde_json::json!({
+                    "v": 1, "name": my_name, "ts": now_ms(), "deletes": dels_json,
+                });
                 let _ = std::fs::write(&ctrl_file, payload.to_string());
                 let code = pairing::control_outbound_code(&pair);
-                let outcome = run_croc_send(
-                    &settings,
-                    &code,
-                    &ctrl_path,
-                    &stopped,
-                    &stop_notify,
-                    |_m| {},
-                )
-                .await;
+                let outcome =
+                    run_croc_send(&settings, &code, &ctrl_path, &stopped, &stop_notify, |_m| {})
+                        .await;
                 match outcome {
                     SendOutcome::Delivered => {
                         set_peer_online(&status, true);
                         manager.emit_status(&pair_id);
-                        // Refresh presence periodically.
-                        if wait_fixed(&stop_notify, &stopped, 30_000).await {
+                        // Delivered == the peer received (and will apply) these
+                        // deletes, so drop exactly the ones we just sent.
+                        if !dels.is_empty() {
+                            let sent: HashSet<String> =
+                                dels.iter().map(|d| format!("{}|{}", d.rel, d.ts)).collect();
+                            pending_deletes
+                                .lock()
+                                .unwrap()
+                                .retain(|d| !sent.contains(&format!("{}|{}", d.rel, d.ts)));
+                        }
+                        // Refresh presence periodically, but flush a new delete at once.
+                        tokio::select! {
+                            _ = control_wake.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                            _ = stop_notify.notified() => break,
+                        }
+                        if stopped.load(Ordering::SeqCst) {
                             break;
                         }
                     }
                     SendOutcome::Offline => {
                         set_peer_online(&status, false);
                         manager.emit_status(&pair_id);
-                        if wait_backoff(&stop_notify, &stopped, 3).await {
+                        tokio::select! {
+                            _ = control_wake.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_secs(8)) => {}
+                            _ = stop_notify.notified() => break,
+                        }
+                        if stopped.load(Ordering::SeqCst) {
                             break;
                         }
                     }
@@ -902,20 +1035,22 @@ impl SyncManager {
         });
     }
 
-    /// Listen for the peer's hello → learn their name, mark them online, and link
-    /// them as a friend (folder partners are always friends).
+    /// Listen for the peer's control message → learn their name, mark them online,
+    /// link them as a friend, and apply any deletes (in mirror mode).
     fn spawn_control_listener(
         self: Arc<Self>,
         config: Arc<Mutex<Pair>>,
         stopped: Arc<AtomicBool>,
         stop_notify: Arc<Notify>,
         status: Arc<Mutex<StatusSnapshot>>,
+        self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
         tauri::async_runtime::spawn(async move {
             let staging = manager.config_dir.join(format!(".ctrl-in-{pair_id}"));
             let mut idle_streak: u32 = 0;
+            let mut seen_deletes: HashSet<String> = HashSet::new();
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
@@ -939,7 +1074,11 @@ impl SyncManager {
                 match outcome {
                     ReceiveOutcome::Received => {
                         idle_streak = 0;
-                        // Read the staging dir directly — the hello arrives as a
+                        let (folder, mirror) = {
+                            let p = config.lock().unwrap();
+                            (p.folder.clone(), p.mirror)
+                        };
+                        // Read the staging dir directly — the message arrives as a
                         // dotfile, which list_files_rec would skip.
                         if let Ok(entries) = std::fs::read_dir(&staging) {
                             for e in entries.flatten() {
@@ -947,22 +1086,47 @@ impl SyncManager {
                                 if !p.is_file() {
                                     continue;
                                 }
-                                if let Ok(txt) = std::fs::read_to_string(&p) {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                        if let Some(name) =
-                                            v.get("name").and_then(|n| n.as_str()).map(|s| s.trim())
-                                        {
-                                            if !name.is_empty() {
-                                                manager.on_peer_hello(
-                                                    &pair_id, &config, name, &status,
-                                                );
+                                let Ok(txt) = std::fs::read_to_string(&p) else {
+                                    continue;
+                                };
+                                let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+                                    continue;
+                                };
+                                if let Some(name) =
+                                    v.get("name").and_then(|n| n.as_str()).map(|s| s.trim())
+                                {
+                                    if !name.is_empty() {
+                                        manager.on_peer_hello(&pair_id, &config, name, &status);
+                                    }
+                                }
+                                if mirror {
+                                    if let Some(dels) = v.get("deletes").and_then(|d| d.as_array()) {
+                                        let mut applied_any = false;
+                                        for d in dels {
+                                            let rel = d.get("rel").and_then(|r| r.as_str());
+                                            let ts = d.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+                                            let Some(rel) = rel else { continue };
+                                            let key = format!("{rel}|{ts}");
+                                            if seen_deletes.contains(&key) {
+                                                continue;
                                             }
+                                            seen_deletes.insert(key);
+                                            if apply_remote_delete(&folder, rel, &self_deleted) {
+                                                applied_any = true;
+                                            }
+                                        }
+                                        if applied_any {
+                                            let _ = manager.app.emit("folder-history://changed", &pair_id);
                                         }
                                     }
                                 }
                             }
                         }
                         clear_dir(&staging);
+                        // Keep the dedupe set from growing without bound.
+                        if seen_deletes.len() > 2000 {
+                            seen_deletes.clear();
+                        }
                     }
                     ReceiveOutcome::Stopped => break,
                     ReceiveOutcome::Error => {
@@ -1503,19 +1667,44 @@ fn move_staged_into_folder(
     staging: &Path,
     folder: &str,
     inbound: &Arc<Mutex<HashSet<String>>>,
+    mirror: bool,
+    self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
 ) -> Vec<String> {
     let folder_str = folder;
-    let folder = Path::new(folder);
+    let folder_path = Path::new(folder);
     let mut moved = Vec::new();
     for src in list_files_rec(staging) {
         let Ok(rel) = src.strip_prefix(staging) else {
             continue;
         };
-        let mut dest = folder.join(rel);
-        if let Some(parent) = dest.parent() {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let dest_path = folder_path.join(rel);
+        if let Some(parent) = dest_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        dest = unique_dest(dest);
+        // Mirror = source of truth: REPLACE an edited file (archiving the old
+        // copy to history) instead of keeping a "file (1)" duplicate. Guard the
+        // resulting Remove event so it isn't echoed back as a delete.
+        let dest = if mirror {
+            if dest_path.is_file() {
+                self_deleted
+                    .lock()
+                    .unwrap()
+                    .insert(rel_str.clone(), Instant::now());
+                crate::folder_history::archive(
+                    folder_str,
+                    &dest_path.to_string_lossy(),
+                    &rel_str,
+                    "replaced",
+                );
+                if dest_path.exists() {
+                    let _ = std::fs::remove_file(&dest_path);
+                }
+            }
+            dest_path
+        } else {
+            unique_dest(dest_path)
+        };
         let dest_str = dest.to_string_lossy().to_string();
         let ok = if std::fs::rename(&src, &dest).is_ok() {
             true
@@ -1535,6 +1724,61 @@ fn move_staged_into_folder(
         }
     }
     moved
+}
+
+/// Compute a file's path relative to the folder (forward-slashed, so the same
+/// key is used on both peers). Works even when the file is already gone.
+fn rel_path_of(abs: &str, folder: &str) -> Option<String> {
+    let p = Path::new(abs);
+    let norm = |r: &Path| r.to_string_lossy().replace('\\', "/");
+    if let Ok(rel) = p.strip_prefix(folder) {
+        return Some(norm(rel));
+    }
+    if let Ok(canon_folder) = std::fs::canonicalize(folder) {
+        if let Ok(rel) = p.strip_prefix(&canon_folder) {
+            return Some(norm(rel));
+        }
+    }
+    None
+}
+
+/// Drop loop-guard entries older than the debounce window.
+fn prune_self_deleted(map: &mut HashMap<String, Instant>) {
+    let now = Instant::now();
+    map.retain(|_, t| now.duration_since(*t) < Duration::from_secs(30));
+}
+
+/// Apply a delete the peer made (mirror mode): move the file to history (so it's
+/// recoverable) and mark it self-deleted so our watcher doesn't echo it back.
+/// Returns true if a file was archived to history.
+fn apply_remote_delete(
+    folder: &str,
+    rel: &str,
+    self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
+) -> bool {
+    let rel_norm = rel.replace('\\', "/");
+    // Never let a peer reach outside the folder.
+    if rel_norm.is_empty() || rel_norm.starts_with('/') || rel_norm.split('/').any(|c| c == "..") {
+        return false;
+    }
+    let dest = Path::new(folder).join(&rel_norm);
+    if dest.is_file() {
+        self_deleted
+            .lock()
+            .unwrap()
+            .insert(rel_norm.clone(), Instant::now());
+        // archive MOVES the file out; if it fails, the file stays (no data loss).
+        crate::folder_history::archive(folder, &dest.to_string_lossy(), &rel_norm, "deleted")
+    } else if dest.is_dir() {
+        self_deleted
+            .lock()
+            .unwrap()
+            .insert(rel_norm.clone(), Instant::now());
+        let _ = std::fs::remove_dir(&dest); // only succeeds if already empty
+        false
+    } else {
+        false
+    }
 }
 
 fn unique_dest(dest: PathBuf) -> PathBuf {
@@ -1686,11 +1930,8 @@ fn friend_download_dir(settings: &Settings) -> String {
 
 fn structural_sig(p: &Pair) -> String {
     format!(
-        "{}|{:?}|{}|{}",
-        p.folder,
-        p.role,
-        p.secret,
-        p.two_way
+        "{}|{:?}|{}|{}|{}",
+        p.folder, p.role, p.secret, p.two_way, p.mirror
     )
 }
 
@@ -1754,5 +1995,89 @@ mod tests {
             parse_accept_prompt("Accept 'Q3 Report.pdf' (2.3 MB)? (Y/n)").unwrap();
         assert_eq!(names, vec!["Q3 Report.pdf".to_string()]);
         assert_eq!(total, 2_300_000);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "dropbeam-test-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rel_path_of_strips_folder() {
+        assert_eq!(
+            rel_path_of("/a/b/c/d.txt", "/a/b").as_deref(),
+            Some("c/d.txt")
+        );
+        assert_eq!(rel_path_of("/a/b/x.txt", "/a/b").as_deref(), Some("x.txt"));
+        assert_eq!(rel_path_of("/x/y.txt", "/a/b"), None);
+    }
+
+    #[test]
+    fn mirror_delete_archives_to_history_and_restores() {
+        let folder = temp_dir("del");
+        let folder_s = folder.to_string_lossy().to_string();
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("sub/x.txt"), b"hello world").unwrap();
+
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let archived = apply_remote_delete(&folder_s, "sub/x.txt", &sd);
+        assert!(archived, "a file should have been archived");
+        assert!(!folder.join("sub/x.txt").exists(), "original is gone");
+        assert!(
+            sd.lock().unwrap().contains_key("sub/x.txt"),
+            "loop guard recorded"
+        );
+
+        let hist = crate::folder_history::load(&folder_s);
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].rel_path, "sub/x.txt");
+        assert_eq!(hist[0].reason, "deleted");
+
+        let restored = crate::folder_history::restore(&folder_s, &hist[0].id).unwrap();
+        assert!(Path::new(&restored).exists(), "restored file exists");
+        assert_eq!(std::fs::read(&restored).unwrap(), b"hello world");
+        assert!(
+            crate::folder_history::load(&folder_s).is_empty(),
+            "history entry consumed on restore"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn mirror_delete_rejects_escape_paths() {
+        let folder = temp_dir("trav");
+        let folder_s = folder.to_string_lossy().to_string();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        assert!(!apply_remote_delete(&folder_s, "../escape.txt", &sd));
+        assert!(!apply_remote_delete(&folder_s, "/etc/passwd", &sd));
+        assert!(!apply_remote_delete(&folder_s, "a/../../b.txt", &sd));
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn history_is_a_dotdir_so_it_never_syncs() {
+        // The history dir must start with '.' so is_sendable_candidate skips it.
+        let folder = temp_dir("hist");
+        let folder_s = folder.to_string_lossy().to_string();
+        std::fs::write(folder.join("a.txt"), b"x").unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        apply_remote_delete(&folder_s, "a.txt", &sd);
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        for f in list_files_rec(&folder) {
+            let p = f.to_string_lossy().to_string();
+            assert!(
+                !is_sendable_candidate(&p, &folder_s, &inbound),
+                "history file must not be sendable: {p}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&folder);
     }
 }

@@ -1,5 +1,6 @@
 mod commands;
 mod croc;
+mod folder_history;
 mod friends;
 mod history;
 mod models;
@@ -120,6 +121,9 @@ pub fn run() {
             commands::remove_pair,
             commands::pair_invite,
             commands::get_folder_statuses,
+            commands::list_folder_history,
+            commands::restore_folder_item,
+            commands::forget_folder_item,
             commands::create_friend,
             commands::accept_friend,
             commands::list_friends,

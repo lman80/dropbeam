@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
-import { ArrowLeftRight, ArrowRight, Check, Copy, FolderOpen, X } from 'lucide-react'
+import { ArrowLeftRight, ArrowRight, Check, Copy, FolderOpen, FolderSync, X } from 'lucide-react'
 import { api } from '../lib/api'
 import { useStore } from '../store'
 import { Spinner } from './bits'
@@ -17,7 +17,7 @@ export function PairingModal({
   const reloadFriends = useStore((s) => s.reloadFriends)
   const toast = useStore((s) => s.toast)
   const [folder, setFolder] = useState('')
-  const [twoWay, setTwoWay] = useState(true)
+  const [syncMode, setSyncMode] = useState<'mirror' | 'twoway' | 'oneway'>('twoway')
   const [peerName, setPeerName] = useState('')
   const [inviteInput, setInviteInput] = useState('')
   const [createdInvite, setCreatedInvite] = useState<string | null>(null)
@@ -36,7 +36,12 @@ export function PairingModal({
     }
     setBusy(true)
     try {
-      const res = await api.createPair(folder, twoWay, peerName.trim() || undefined)
+      const res = await api.createPair(
+        folder,
+        syncMode !== 'oneway',
+        peerName.trim() || undefined,
+        syncMode === 'mirror',
+      )
       setCreatedInvite(res.invite)
       reloadPairs()
       if (peerName.trim()) reloadFriends()
@@ -236,22 +241,29 @@ export function PairingModal({
               {mode === 'create' && (
                 <div style={{ marginTop: 16 }}>
                   <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
-                    Direction
+                    Sync mode
                   </label>
-                  <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
                     <DirOption
-                      active={twoWay}
-                      onClick={() => setTwoWay(true)}
-                      icon={<ArrowLeftRight size={16} />}
-                      title="Two-way"
-                      desc="Both folders stay in sync"
+                      active={syncMode === 'mirror'}
+                      onClick={() => setSyncMode('mirror')}
+                      icon={<FolderSync size={16} />}
+                      title="Total sync"
+                      desc="A shared source of truth — adds, edits, and deletes all sync both ways. Deleted files are kept in history so nothing is lost."
                     />
                     <DirOption
-                      active={!twoWay}
-                      onClick={() => setTwoWay(false)}
+                      active={syncMode === 'twoway'}
+                      onClick={() => setSyncMode('twoway')}
+                      icon={<ArrowLeftRight size={16} />}
+                      title="Two-way"
+                      desc="New and changed files sync both ways. Deletes don't propagate."
+                    />
+                    <DirOption
+                      active={syncMode === 'oneway'}
+                      onClick={() => setSyncMode('oneway')}
                       icon={<ArrowRight size={16} />}
                       title="One-way"
-                      desc="This folder sends only"
+                      desc="This folder only sends — the other side just receives."
                     />
                   </div>
                 </div>
