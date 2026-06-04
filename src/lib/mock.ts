@@ -2,7 +2,15 @@
 // plain browser, for UI preview/development). In the real packaged app the Tauri
 // APIs are present and this module is never used, so it can't affect production.
 
-import type { FolderStatus, HistoryEntry, Pair, PairUpdate, Settings, TransferUpdate } from './api'
+import type {
+  FolderStatus,
+  Friend,
+  HistoryEntry,
+  Pair,
+  PairUpdate,
+  Settings,
+  TransferUpdate,
+} from './api'
 
 type Cb = (payload: unknown) => void
 const buses: Record<string, Set<Cb>> = {}
@@ -89,6 +97,12 @@ let pairs: Pair[] = [
 ]
 let pairCounter = 1
 
+let friends: Friend[] = [
+  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000 },
+  { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: Date.now() - 2 * 86400_000 },
+]
+let friendCounter = 2
+
 function base(id: string, direction: 'send' | 'receive', names: string[]): TransferUpdate {
   return {
     id,
@@ -106,6 +120,7 @@ function base(id: string, direction: 'send' | 'receive', names: string[]): Trans
     peer: null,
     error: null,
     outDir: direction === 'receive' ? settings.downloadDir : null,
+    friendName: null,
   }
 }
 
@@ -199,12 +214,16 @@ export const mockApi = {
   openPath: async (_path: string): Promise<void> => {},
   getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
 
-  createPair: async (folder: string, twoWay: boolean): Promise<{ pair: Pair; invite: string }> => {
+  createPair: async (
+    folder: string,
+    twoWay: boolean,
+    peerName?: string,
+  ): Promise<{ pair: Pair; invite: string }> => {
     const id = `p${++pairCounter}`
     const pair: Pair = {
       id,
       role: 'a',
-      peerName: '',
+      peerName: peerName?.trim() || '',
       secret: 'mock',
       folder,
       twoWay,
@@ -213,6 +232,15 @@ export const mockApi = {
       createdAt: Date.now(),
     }
     pairs.push(pair)
+    if (peerName?.trim()) {
+      friends.push({
+        id: `f${++friendCounter}`,
+        role: 'a',
+        name: peerName.trim(),
+        secret: 'mock',
+        createdAt: Date.now(),
+      })
+    }
     return { pair, invite: `dropbeam1:MOCK${id}invitecodewouldgohere0000` }
   },
   acceptPair: async (_invite: string, folder: string): Promise<Pair> => {
@@ -272,4 +300,58 @@ export const mockApi = {
             detail: null,
           },
     ),
+
+  createFriend: async (friendName: string): Promise<{ friend: Friend; invite: string }> => {
+    const id = `f${++friendCounter}`
+    const friend: Friend = {
+      id,
+      role: 'a',
+      name: friendName.trim() || 'New friend',
+      secret: 'mock',
+      createdAt: Date.now(),
+    }
+    friends.push(friend)
+    return { friend, invite: `dropbeamf1:MOCK${id}friendinvitewouldgohere0000` }
+  },
+  acceptFriend: async (_invite: string): Promise<Friend> => {
+    const id = `f${++friendCounter}`
+    const friend: Friend = {
+      id,
+      role: 'b',
+      name: 'Jordan',
+      secret: 'mock',
+      createdAt: Date.now(),
+    }
+    friends.push(friend)
+    return friend
+  },
+  listFriends: async (): Promise<Friend[]> => [...friends],
+  renameFriend: async (id: string, name: string): Promise<void> => {
+    const f = friends.find((x) => x.id === id)
+    if (f && name.trim()) f.name = name.trim()
+  },
+  removeFriend: async (id: string): Promise<void> => {
+    friends = friends.filter((f) => f.id !== id)
+  },
+  friendInvite: async (id: string): Promise<string> =>
+    `dropbeamf1:MOCK${id}friendinvitewouldgohere0000`,
+  sendToFriend: async (id: string, paths: string[]): Promise<TransferUpdate> => {
+    const friend = friends.find((f) => f.id === id)
+    const tid = `m${++counter}`
+    const names = paths.map((p) => p.split('/').pop() || p)
+    const t = base(tid, 'send', names)
+    t.friendName = friend?.name ?? 'Friend'
+    setTimeout(() => {
+      t.state = 'connecting'
+      t.friendName = friend?.name ?? 'Friend'
+      emit('transfer://update', { ...t })
+      setTimeout(() => {
+        t.friendName = friend?.name ?? 'Friend'
+        simulate(t, 88_000_000)
+      }, 1200)
+    }, 250)
+    const initial = base(tid, 'send', names)
+    initial.friendName = friend?.name ?? 'Friend'
+    return initial
+  },
 }

@@ -37,6 +37,8 @@ export interface TransferUpdate {
   peer: string | null
   error: string | null
   outDir: string | null
+  /** Set when sending straight to a friend — shows "Sending to {name}", no code. */
+  friendName: string | null
 }
 
 export interface HistoryEntry {
@@ -80,6 +82,15 @@ export interface Pair {
   createdAt: number
 }
 
+/** A named peer you can send to directly — no code, no QR. */
+export interface Friend {
+  id: string
+  role: PairRole
+  name: string
+  secret: string
+  createdAt: number
+}
+
 export type FolderState = 'idle' | 'sending' | 'receiving' | 'waiting' | 'error'
 
 export interface FolderStatus {
@@ -118,8 +129,8 @@ const realApi = {
   getDefaultDownloadDir: () => invoke<string>('get_default_download_dir'),
   // Shared Drop Folders. Tauri v2 maps camelCase JS keys → snake_case Rust params,
   // so the keys here MUST be camelCase (e.g. twoWay, not two_way).
-  createPair: (folder: string, twoWay: boolean) =>
-    invoke<{ pair: Pair; invite: string }>('create_pair', { folder, twoWay }),
+  createPair: (folder: string, twoWay: boolean, peerName?: string) =>
+    invoke<{ pair: Pair; invite: string }>('create_pair', { folder, twoWay, peerName }),
   acceptPair: (invite: string, folder: string) =>
     invoke<Pair>('accept_pair', { invite, folder }),
   listPairs: () => invoke<Pair[]>('list_pairs'),
@@ -134,6 +145,17 @@ const realApi = {
   removePair: (id: string) => invoke<void>('remove_pair', { id }),
   pairInvite: (id: string) => invoke<string>('pair_invite', { id }),
   getFolderStatuses: () => invoke<FolderStatus[]>('get_folder_statuses'),
+  // Friends — named peers you send to directly.
+  createFriend: (friendName: string) =>
+    invoke<{ friend: Friend; invite: string }>('create_friend', { friendName }),
+  acceptFriend: (invite: string) => invoke<Friend>('accept_friend', { invite }),
+  listFriends: () => invoke<Friend[]>('list_friends'),
+  renameFriend: (id: string, name: string) =>
+    invoke<void>('rename_friend', { id, name }),
+  removeFriend: (id: string) => invoke<void>('remove_friend', { id }),
+  friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
+  sendToFriend: (id: string, paths: string[]) =>
+    invoke<TransferUpdate>('send_to_friend', { id, paths }),
 }
 
 export const api: typeof realApi = HAS_TAURI ? realApi : (mockApi as typeof realApi)

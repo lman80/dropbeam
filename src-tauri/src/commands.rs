@@ -5,9 +5,9 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use crate::models::{DeleteMode, FolderStatus, HistoryEntry, Pair, Settings, TransferUpdate};
+use crate::models::{DeleteMode, FolderStatus, Friend, HistoryEntry, Pair, Settings, TransferUpdate};
 use crate::sync::SyncManager;
-use crate::{croc, history, pairing, settings, AppState};
+use crate::{croc, friends, history, pairing, settings, AppState};
 
 #[tauri::command]
 pub fn send_files(
@@ -24,7 +24,7 @@ pub fn send_files(
             return Err(format!("File not found: {p}"));
         }
     }
-    Ok(croc::start_send(app, state.inner().clone(), paths, None))
+    Ok(croc::start_send(app, state.inner().clone(), paths, None, None))
 }
 
 #[tauri::command]
@@ -175,9 +175,11 @@ pub fn create_pair(
     sync: State<'_, Arc<SyncManager>>,
     folder: String,
     two_way: bool,
+    peer_name: Option<String>,
 ) -> Result<CreatePairResult, String> {
     let name = state.settings.lock().unwrap().display_name.clone();
-    let (pair, invite) = pairing::create(&state.config_dir, folder, name, two_way)?;
+    let (pair, invite) =
+        pairing::create(&state.config_dir, folder, name, two_way, peer_name.unwrap_or_default())?;
     sync.reconcile();
     Ok(CreatePairResult { pair, invite })
 }
@@ -243,4 +245,106 @@ pub fn pair_invite(state: State<'_, Arc<AppState>>, id: String) -> Result<String
 #[tauri::command]
 pub fn get_folder_statuses(sync: State<'_, Arc<SyncManager>>) -> Vec<FolderStatus> {
     sync.statuses()
+}
+
+// ---------------------------------------------------------------------------
+// Friends — named peers you send to directly, no per-transfer code.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateFriendResult {
+    pub friend: Friend,
+    pub invite: String,
+}
+
+/// Create a friend invite (this device is A). `friendName` is your label for them;
+/// the invite carries your own display name so they see who added them.
+#[tauri::command]
+pub fn create_friend(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    friend_name: String,
+) -> Result<CreateFriendResult, String> {
+    let my_name = state.settings.lock().unwrap().display_name.clone();
+    let (friend, invite) = friends::create(&state.config_dir, my_name, friend_name)?;
+    sync.reconcile_friends();
+    Ok(CreateFriendResult { friend, invite })
+}
+
+/// Accept a friend invite (this device is B). You're named after the inviter.
+#[tauri::command]
+pub fn accept_friend(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    invite: String,
+) -> Result<Friend, String> {
+    let friend = friends::accept(&state.config_dir, &invite)?;
+    sync.reconcile_friends();
+    Ok(friend)
+}
+
+#[tauri::command]
+pub fn list_friends(state: State<'_, Arc<AppState>>) -> Vec<Friend> {
+    friends::load(&state.config_dir)
+}
+
+#[tauri::command]
+pub fn rename_friend(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    friends::rename(&state.config_dir, &id, name)?;
+    sync.reconcile_friends();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_friend(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    id: String,
+) -> Result<(), String> {
+    friends::remove(&state.config_dir, &id)?;
+    sync.reconcile_friends();
+    Ok(())
+}
+
+/// Rebuild a friend's invite so the inviter can show it again.
+#[tauri::command]
+pub fn friend_invite(state: State<'_, Arc<AppState>>, id: String) -> Result<String, String> {
+    let my_name = state.settings.lock().unwrap().display_name.clone();
+    let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
+    Ok(friends::invite_for(&friend, &my_name))
+}
+
+/// Send files straight to a friend — no code, no QR. Their inbox listener is
+/// already waiting on the derived channel, so it just arrives.
+#[tauri::command]
+pub fn send_to_friend(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    paths: Vec<String>,
+) -> Result<TransferUpdate, String> {
+    let paths: Vec<String> = paths.into_iter().filter(|p| !p.trim().is_empty()).collect();
+    if paths.is_empty() {
+        return Err("No files selected.".into());
+    }
+    for p in &paths {
+        if !std::path::Path::new(p).exists() {
+            return Err(format!("File not found: {p}"));
+        }
+    }
+    let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
+    let code = friends::friend_inbox_code(&friend);
+    Ok(croc::start_send(
+        app,
+        state.inner().clone(),
+        paths,
+        Some(code),
+        Some(friend.name),
+    ))
 }

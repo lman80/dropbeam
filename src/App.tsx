@@ -11,6 +11,7 @@ import { SendView } from './views/SendView'
 import { HistoryView } from './views/HistoryView'
 import { SettingsView } from './views/SettingsView'
 import { FoldersView } from './views/FoldersView'
+import { FriendsView } from './views/FriendsView'
 
 export default function App() {
   const ready = useStore((s) => s.ready)
@@ -65,6 +66,7 @@ export default function App() {
             style={{ minHeight: '100%' }}
           >
             {view === 'send' && <SendView />}
+            {view === 'friends' && <FriendsView />}
             {view === 'folders' && <FoldersView />}
             {view === 'history' && <HistoryView />}
             {view === 'settings' && <SettingsView />}

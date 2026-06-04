@@ -5,6 +5,7 @@ import {
   onHistoryChanged,
   onTransferUpdate,
   type FolderStatus,
+  type Friend,
   type HistoryEntry,
   type Pair,
   type PairUpdate,
@@ -20,7 +21,7 @@ interface UpdateState {
   progress: number
 }
 
-export type View = 'send' | 'folders' | 'history' | 'settings'
+export type View = 'send' | 'friends' | 'folders' | 'history' | 'settings'
 
 export interface Toast {
   id: string
@@ -37,6 +38,7 @@ interface AppStore {
   dragHovering: boolean
   history: HistoryEntry[]
   pairs: Pair[]
+  friends: Friend[]
   folderStatuses: Record<string, FolderStatus>
   toasts: Toast[]
   defaultDownloadDir: string
@@ -59,6 +61,12 @@ interface AppStore {
   reloadPairs: () => Promise<void>
   updatePair: (u: PairUpdate) => Promise<void>
   removePair: (id: string) => Promise<void>
+  reloadFriends: () => Promise<void>
+  sendToFriend: (id: string, paths: string[]) => Promise<void>
+  createFriend: (name: string) => Promise<string>
+  acceptFriend: (invite: string) => Promise<void>
+  renameFriend: (id: string, name: string) => Promise<void>
+  removeFriend: (id: string) => Promise<void>
   toast: (kind: Toast['kind'], message: string) => void
   dismissToast: (id: string) => void
 }
@@ -76,6 +84,7 @@ export const useStore = create<AppStore>((set, get) => ({
   dragHovering: false,
   history: [],
   pairs: [],
+  friends: [],
   folderStatuses: {},
   toasts: [],
   defaultDownloadDir: '',
@@ -84,17 +93,18 @@ export const useStore = create<AppStore>((set, get) => ({
   checkingUpdate: false,
 
   init: async () => {
-    const [settings, history, pairs, statuses, defaultDownloadDir] = await Promise.all([
+    const [settings, history, pairs, friends, statuses, defaultDownloadDir] = await Promise.all([
       api.getSettings(),
       api.getHistory(),
       api.listPairs().catch(() => []),
+      api.listFriends().catch(() => []),
       api.getFolderStatuses().catch(() => []),
       api.getDefaultDownloadDir().catch(() => ''),
     ])
     get().applyTheme(settings.theme)
     const folderStatuses: Record<string, FolderStatus> = {}
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
-    set({ settings, history, pairs, folderStatuses, defaultDownloadDir, ready: true })
+    set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })
 
     // Re-apply theme when the OS appearance changes (only matters for "system").
     window
@@ -246,6 +256,53 @@ export const useStore = create<AppStore>((set, get) => ({
     try {
       await api.removePair(id)
       await get().reloadPairs()
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  reloadFriends: async () => {
+    const friends = await api.listFriends().catch(() => [])
+    set({ friends })
+  },
+
+  sendToFriend: async (id, paths) => {
+    paths = paths.filter(Boolean)
+    if (!paths.length) return
+    set({ view: 'send' })
+    try {
+      const u = await api.sendToFriend(id, paths)
+      get().upsertTransfer(u)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  createFriend: async (name) => {
+    const res = await api.createFriend(name)
+    await get().reloadFriends()
+    return res.invite
+  },
+
+  acceptFriend: async (invite) => {
+    const friend = await api.acceptFriend(invite)
+    await get().reloadFriends()
+    get().toast('success', `You're now friends with ${friend.name}`)
+  },
+
+  renameFriend: async (id, name) => {
+    try {
+      await api.renameFriend(id, name)
+      await get().reloadFriends()
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  removeFriend: async (id) => {
+    try {
+      await api.removeFriend(id)
+      await get().reloadFriends()
     } catch (e) {
       get().toast('error', String(e))
     }

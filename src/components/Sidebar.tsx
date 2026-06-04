@@ -1,10 +1,11 @@
-import { FolderSync, History, Send, Settings } from 'lucide-react'
+import { FolderSync, History, Send, Settings, Users } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { isActive } from '../lib/api'
 import { useStore, type View } from '../store'
 
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
+  { id: 'friends', label: 'Friends', icon: Users },
   { id: 'folders', label: 'Shared Folders', icon: FolderSync },
   { id: 'history', label: 'History', icon: History },
   { id: 'settings', label: 'Settings', icon: Settings },

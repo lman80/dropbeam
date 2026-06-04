@@ -26,3 +26,6 @@ dist-ssr
 # signing keys — NEVER commit
 *.key
 *.key.pub
+
+# local Claude Code tooling (launch configs, etc.)
+.claude/

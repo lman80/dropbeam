@@ -134,10 +134,12 @@ pub fn start_send(
     state: Arc<AppState>,
     paths: Vec<String>,
     code: Option<String>,
+    friend_name: Option<String>,
 ) -> TransferUpdate {
     let names: Vec<String> = paths.iter().map(|p| file_name_of(p)).collect();
     let id = uuid::Uuid::new_v4().to_string();
-    let update = TransferUpdate::new(id, Direction::Send, names);
+    let mut update = TransferUpdate::new(id, Direction::Send, names);
+    update.friend_name = friend_name;
     let job = Job::Send { paths, code };
     let snapshot = update.clone();
     tauri::async_runtime::spawn(run_transfer(app, state, update, job));

@@ -28,8 +28,16 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
   const [copied, setCopied] = useState(false)
 
   const active = isActive(t.state)
+  // A friend send has no code to show — it rides a pre-shared channel.
   const isSendWaiting =
-    t.direction === 'send' && (t.state === 'waitingForPeer' || t.state === 'starting') && !!t.code
+    t.direction === 'send' &&
+    (t.state === 'waitingForPeer' || t.state === 'starting') &&
+    !!t.code &&
+    !t.friendName
+  const isFriendPending =
+    t.direction === 'send' &&
+    !!t.friendName &&
+    (t.state === 'starting' || t.state === 'waitingForPeer' || t.state === 'connecting')
 
   const copyCode = async () => {
     if (!t.code) return
@@ -211,9 +219,8 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
         </div>
       )}
 
-      {/* connecting (receive or post-handshake) */}
-      {(t.state === 'connecting' ||
-        (t.state === 'starting' && !isSendWaiting)) && (
+      {/* friend send: no code, just a calm "beaming to {name}" */}
+      {isFriendPending && (
         <div
           style={{
             display: 'flex',
@@ -225,9 +232,27 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
           }}
         >
           <Spinner size={15} />
-          {t.direction === 'receive' ? 'Connecting to sender…' : 'Connecting…'}
+          Beaming to {t.friendName}…
         </div>
       )}
+
+      {/* connecting (receive or post-handshake) */}
+      {!isFriendPending &&
+        (t.state === 'connecting' || (t.state === 'starting' && !isSendWaiting)) && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 9,
+              marginTop: 14,
+              fontSize: 13,
+              color: 'var(--text-muted)',
+            }}
+          >
+            <Spinner size={15} />
+            {t.direction === 'receive' ? 'Connecting to sender…' : 'Connecting…'}
+          </div>
+        )}
 
       {/* completed */}
       {t.state === 'completed' && (
@@ -286,17 +311,18 @@ function stateColor(t: TransferUpdate): string {
 }
 
 function statusLabel(t: TransferUpdate): string {
+  const to = t.friendName ? ` to ${t.friendName}` : ''
   switch (t.state) {
     case 'starting':
-      return 'Starting…'
+      return t.friendName ? `Beaming${to}…` : 'Starting…'
     case 'waitingForPeer':
-      return 'Ready to send'
+      return t.friendName ? `Beaming${to}…` : 'Ready to send'
     case 'connecting':
-      return 'Connecting…'
+      return t.friendName ? `Beaming${to}…` : 'Connecting…'
     case 'transferring':
-      return t.direction === 'send' ? 'Sending' : 'Receiving'
+      return t.direction === 'send' ? `Sending${to}` : 'Receiving'
     case 'completed':
-      return t.direction === 'send' ? 'Sent' : 'Received'
+      return t.direction === 'send' ? `Sent${to}` : 'Received'
     case 'failed':
       return 'Failed'
     case 'canceled':

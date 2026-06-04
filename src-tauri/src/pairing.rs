@@ -18,6 +18,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::friends;
 use crate::models::{DeleteMode, Pair, PairRole};
 use crate::settings::write_atomic;
 
@@ -48,14 +49,22 @@ struct Invite {
     secret: String,
     name: String,
     tw: bool,
+    /// Whether accepting this invite should also link the two as friends. Set
+    /// only when the creator named the peer, so both sides end up with a
+    /// matching friend record (never a one-sided, non-working one).
+    #[serde(default)]
+    frn: bool,
 }
 
 /// Create a new pair (this device is A). Returns the pair + a shareable invite.
+/// `peer_name` is the creator's optional label for the friend; when present,
+/// both sides auto-link as friends on accept.
 pub fn create(
     config_dir: &Path,
     folder: String,
     my_name: String,
     two_way: bool,
+    peer_name: String,
 ) -> Result<(Pair, String), String> {
     validate_folder(&folder)?;
     let _guard = LOCK.lock().unwrap();
@@ -66,10 +75,12 @@ pub fn create(
 
     let id = uuid::Uuid::new_v4().to_string();
     let secret = random_secret();
+    let peer_label = peer_name.trim().to_string();
+    let auto_friend = !peer_label.is_empty();
     let pair = Pair {
         id: id.clone(),
         role: PairRole::A,
-        peer_name: String::new(),
+        peer_name: peer_label.clone(),
         secret: secret.clone(),
         folder,
         two_way,
@@ -84,12 +95,17 @@ pub fn create(
         secret,
         name: my_name,
         tw: two_way,
+        frn: auto_friend,
     };
     let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
     let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
 
     pairs.push(pair.clone());
     save(config_dir, &pairs)?;
+    // Creator (role A) labels the peer, so we can register the friend right away.
+    if auto_friend {
+        friends::upsert_from_pairing(config_dir, &peer_label, &pair.secret, PairRole::A);
+    }
     Ok((pair, encoded))
 }
 
@@ -115,6 +131,7 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
         return Err("That folder is already a Shared Drop Folder.".into());
     }
 
+    let auto_friend = invite.frn;
     let pair = Pair {
         id: invite.id,
         role: PairRole::B,
@@ -132,6 +149,11 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
     };
     pairs.push(pair.clone());
     save(config_dir, &pairs)?;
+    // Mirror the creator: if they linked us as a friend, link them back (role B),
+    // named after the inviter. Both sides derive the same friend channels.
+    if auto_friend {
+        friends::upsert_from_pairing(config_dir, &pair.peer_name, &pair.secret, PairRole::B);
+    }
     Ok(pair)
 }
 
@@ -177,6 +199,8 @@ pub fn invite_for(pair: &Pair, my_name: &str) -> String {
         secret: pair.secret.clone(),
         name: my_name.to_string(),
         tw: pair.two_way,
+        // Re-offer the friend link iff this pair was created with a named peer.
+        frn: !pair.peer_name.trim().is_empty(),
     };
     let json = serde_json::to_string(&invite).unwrap_or_default();
     format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))

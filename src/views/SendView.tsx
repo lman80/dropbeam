@@ -1,20 +1,25 @@
 import { useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ArrowDownToLine, Inbox, Send } from 'lucide-react'
+import { ArrowDownToLine, Inbox, Send, UserPlus } from 'lucide-react'
 import { api, isActive } from '../lib/api'
 import { useStore } from '../store'
 import { DropZone } from '../components/DropZone'
 import { TransferCard } from '../components/TransferCard'
-import { EmptyState } from '../components/bits'
+import { EmptyState, Spinner } from '../components/bits'
+import { avatarGradient, initials } from '../lib/avatar'
 
 export function SendView() {
   const [mode, setMode] = useState<'send' | 'receive'>('send')
   const [code, setCode] = useState('')
+  const [pickingFor, setPickingFor] = useState<string | null>(null)
   const transfers = useStore((s) => s.transfers)
   const order = useStore((s) => s.order)
   const dragHovering = useStore((s) => s.dragHovering)
   const sendPaths = useStore((s) => s.sendPaths)
   const receiveCode = useStore((s) => s.receiveCode)
+  const friends = useStore((s) => s.friends)
+  const sendToFriend = useStore((s) => s.sendToFriend)
+  const setView = useStore((s) => s.setView)
 
   const list = useMemo(
     () => order.map((id) => transfers[id]).filter(Boolean).reverse(),
@@ -27,6 +32,16 @@ export function SendView() {
   const onPick = async () => {
     const paths = await api.pickFiles()
     if (paths.length) sendPaths(paths)
+  }
+
+  const beamToFriend = async (id: string) => {
+    setPickingFor(id)
+    try {
+      const paths = await api.pickFiles()
+      if (paths.length) await sendToFriend(id, paths)
+    } finally {
+      setPickingFor(null)
+    }
   }
 
   const submitReceive = (e: React.FormEvent) => {
@@ -91,6 +106,76 @@ export function SendView() {
           )}
         </motion.div>
       </AnimatePresence>
+
+      {mode === 'send' && (
+        <div style={{ marginTop: 18 }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              marginBottom: 10,
+            }}
+          >
+            <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+            <span style={{ fontSize: 11.5, color: 'var(--text-faint)', fontWeight: 600 }}>
+              {friends.length ? 'OR BEAM TO A FRIEND' : 'FRIENDS'}
+            </span>
+            <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+          </div>
+
+          {friends.length ? (
+            <div style={{ display: 'flex', gap: 9, flexWrap: 'wrap', justifyContent: 'center' }}>
+              {friends.map((f) => (
+                <button
+                  key={f.id}
+                  className="card"
+                  onClick={() => beamToFriend(f.id)}
+                  disabled={pickingFor !== null}
+                  title={`Send files to ${f.name}`}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 9,
+                    padding: '7px 13px 7px 8px',
+                    borderRadius: 999,
+                    cursor: 'pointer',
+                    opacity: pickingFor && pickingFor !== f.id ? 0.5 : 1,
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 28,
+                      height: 28,
+                      borderRadius: 999,
+                      display: 'grid',
+                      placeItems: 'center',
+                      color: 'white',
+                      fontWeight: 700,
+                      fontSize: 11,
+                      background: avatarGradient(f.id),
+                      flexShrink: 0,
+                    }}
+                  >
+                    {pickingFor === f.id ? <Spinner size={13} /> : initials(f.name)}
+                  </span>
+                  <span style={{ fontSize: 13.5, fontWeight: 600 }}>{f.name}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div style={{ textAlign: 'center' }}>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setView('friends')}
+                style={{ fontSize: 12.5 }}
+              >
+                <UserPlus size={14} /> Add a friend to send without codes
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 12 }}>
         <AnimatePresence initial={false}>

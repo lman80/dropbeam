@@ -1,5 +1,6 @@
 mod commands;
 mod croc;
+mod friends;
 mod history;
 mod models;
 mod pairing;
@@ -115,6 +116,13 @@ pub fn run() {
             commands::remove_pair,
             commands::pair_invite,
             commands::get_folder_statuses,
+            commands::create_friend,
+            commands::accept_friend,
+            commands::list_friends,
+            commands::rename_friend,
+            commands::remove_friend,
+            commands::friend_invite,
+            commands::send_to_friend,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DropBeam");

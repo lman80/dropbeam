@@ -61,6 +61,8 @@ pub struct TransferUpdate {
     pub error: Option<String>,
     /// For receives, the directory files are landing in.
     pub out_dir: Option<String>,
+    /// Set when sending directly to a friend (shows "Sending to {name}", no code).
+    pub friend_name: Option<String>,
 }
 
 impl TransferUpdate {
@@ -82,6 +84,7 @@ impl TransferUpdate {
             peer: None,
             error: None,
             out_dir: None,
+            friend_name: None,
         }
     }
 }
@@ -180,6 +183,19 @@ pub struct Pair {
     /// Delete the local copy after delivery is confirmed.
     pub auto_delete: bool,
     pub delete_mode: DeleteMode,
+    pub created_at: u64,
+}
+
+/// A friend — a named peer you can send files to directly, no code needed.
+/// Backed by the same shared-secret/derived-channel model as a pair. Each friend
+/// runs a small inbox listener so files sent to you arrive automatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Friend {
+    pub id: String,
+    pub role: PairRole,
+    pub name: String,
+    pub secret: String,
     pub created_at: u64,
 }
 

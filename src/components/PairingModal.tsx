@@ -14,9 +14,11 @@ export function PairingModal({
   onClose: () => void
 }) {
   const reloadPairs = useStore((s) => s.reloadPairs)
+  const reloadFriends = useStore((s) => s.reloadFriends)
   const toast = useStore((s) => s.toast)
   const [folder, setFolder] = useState('')
   const [twoWay, setTwoWay] = useState(true)
+  const [peerName, setPeerName] = useState('')
   const [inviteInput, setInviteInput] = useState('')
   const [createdInvite, setCreatedInvite] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -34,9 +36,10 @@ export function PairingModal({
     }
     setBusy(true)
     try {
-      const res = await api.createPair(folder, twoWay)
+      const res = await api.createPair(folder, twoWay, peerName.trim() || undefined)
       setCreatedInvite(res.invite)
       reloadPairs()
+      if (peerName.trim()) reloadFriends()
     } catch (e) {
       toast('error', String(e))
     } finally {
@@ -208,6 +211,25 @@ export function PairingModal({
                     value={inviteInput}
                     onChange={(e) => setInviteInput(e.target.value)}
                   />
+                </div>
+              )}
+
+              {mode === 'create' && (
+                <div style={{ marginTop: 16 }}>
+                  <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+                    Their name <span style={{ color: 'var(--text-faint)', fontWeight: 500 }}>(optional)</span>
+                  </label>
+                  <input
+                    className="input"
+                    style={{ marginTop: 6 }}
+                    placeholder="e.g. Alex"
+                    value={peerName}
+                    onChange={(e) => setPeerName(e.target.value)}
+                  />
+                  <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginTop: 6, lineHeight: 1.45 }}>
+                    Add a name and you'll be linked as friends automatically — then you can beam files
+                    to each other without sharing a code again.
+                  </div>
                 </div>
               )}
 

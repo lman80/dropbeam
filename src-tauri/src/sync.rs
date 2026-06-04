@@ -22,18 +22,25 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 
 use crate::croc::croc_binary_path;
-use crate::models::{DeleteMode, FolderState, FolderStatus, Pair, Settings};
-use crate::{pairing, AppState};
+use crate::models::{DeleteMode, FolderState, FolderStatus, Friend, Pair, Settings};
+use crate::{friends, pairing, AppState};
 
 const STAGING_DIR: &str = ".dropbeam-incoming";
 const CONNECT_TIMEOUT_SECS: u64 = 75;
 const MAX_BACKOFF_SECS: u64 = 30;
 
-/// Manages all active Shared Drop Folders.
+/// Manages all active Shared Drop Folders and friend inbox listeners.
 pub struct SyncManager {
     app: AppHandle,
     config_dir: PathBuf,
     handles: Mutex<HashMap<String, PairHandle>>,
+    friend_handles: Mutex<HashMap<String, FriendHandle>>,
+}
+
+struct FriendHandle {
+    sig: String,
+    stopped: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
 }
 
 struct PairHandle {
@@ -82,6 +89,7 @@ impl SyncManager {
             app,
             config_dir,
             handles: Mutex::new(HashMap::new()),
+            friend_handles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -125,6 +133,8 @@ impl SyncManager {
                 None => self.start_pair(pair),
             }
         }
+
+        self.reconcile_friends();
     }
 
     fn stop_pair(&self, id: &str) {
@@ -140,6 +150,177 @@ impl SyncManager {
         let ids: Vec<String> = self.handles.lock().unwrap().keys().cloned().collect();
         for id in ids {
             self.stop_pair(&id);
+        }
+        let fids: Vec<String> = self.friend_handles.lock().unwrap().keys().cloned().collect();
+        for id in fids {
+            self.stop_friend(&id);
+        }
+    }
+
+    /// Bring friend inbox listeners in line with what's persisted on disk.
+    pub fn reconcile_friends(self: &Arc<Self>) {
+        let desired = friends::load(&self.config_dir);
+        let desired_ids: HashSet<String> = desired.iter().map(|f| f.id.clone()).collect();
+
+        let removed: Vec<String> = {
+            let h = self.friend_handles.lock().unwrap();
+            h.keys()
+                .filter(|id| !desired_ids.contains(*id))
+                .cloned()
+                .collect()
+        };
+        for id in removed {
+            self.stop_friend(&id);
+        }
+
+        for friend in desired {
+            let sig = friend_sig(&friend);
+            let existing = self
+                .friend_handles
+                .lock()
+                .unwrap()
+                .get(&friend.id)
+                .map(|h| h.sig.clone());
+            match existing {
+                Some(s) if s == sig => {}
+                Some(_) => {
+                    self.stop_friend(&friend.id);
+                    self.start_friend_listener(friend);
+                }
+                None => self.start_friend_listener(friend),
+            }
+        }
+    }
+
+    fn stop_friend(&self, id: &str) {
+        if let Some(h) = self.friend_handles.lock().unwrap().remove(id) {
+            h.stopped.store(true, Ordering::SeqCst);
+            h.stop_notify.notify_waiters();
+        }
+    }
+
+    /// A persistent listener on this friend's inbox channel — files they send you
+    /// land in Downloads automatically. No watched folder, no sender.
+    fn start_friend_listener(self: &Arc<Self>, friend: Friend) {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop_notify = Arc::new(Notify::new());
+        let sig = friend_sig(&friend);
+        let friend_id = friend.id.clone();
+
+        let manager = self.clone();
+        let stopped_t = stopped.clone();
+        let stop_t = stop_notify.clone();
+        tauri::async_runtime::spawn(async move {
+            let staging = manager
+                .config_dir
+                .join(format!(".friend-inbox-{}", friend.id));
+            let mut idle_streak: u32 = 0;
+            loop {
+                if stopped_t.load(Ordering::SeqCst) {
+                    break;
+                }
+                let _ = std::fs::create_dir_all(&staging);
+                clear_dir(&staging);
+
+                let settings = manager
+                    .app
+                    .try_state::<Arc<AppState>>()
+                    .map(|st| st.settings.lock().unwrap().clone())
+                    .unwrap_or_default();
+                let code = friends::my_inbox_code(&friend);
+
+                let outcome = run_croc_receive(
+                    &settings,
+                    &code,
+                    &staging,
+                    &stopped_t,
+                    &stop_t,
+                    move |_m| {},
+                )
+                .await;
+
+                match outcome {
+                    ReceiveOutcome::Received => {
+                        idle_streak = 0;
+                        let dest = friend_download_dir(&settings);
+                        let _ = std::fs::create_dir_all(&dest);
+                        let throwaway = Arc::new(Mutex::new(HashSet::new()));
+                        let moved = move_staged_into_folder(&staging, &dest, &throwaway);
+                        if !moved.is_empty() {
+                            manager.note_friend_received(&friend, &dest, &moved);
+                        }
+                    }
+                    ReceiveOutcome::Stopped => break,
+                    ReceiveOutcome::Error => {
+                        idle_streak = idle_streak.saturating_add(1);
+                        let gap = match idle_streak {
+                            1 => 1200,
+                            2 => 3000,
+                            _ => 8000,
+                        };
+                        if wait_fixed(&stop_t, &stopped_t, gap).await {
+                            break;
+                        }
+                    }
+                }
+            }
+            clear_dir(&staging);
+        });
+
+        self.friend_handles.lock().unwrap().insert(
+            friend_id,
+            FriendHandle {
+                sig,
+                stopped,
+                stop_notify,
+            },
+        );
+    }
+
+    fn note_friend_received(&self, friend: &Friend, dest: &str, files: &[String]) {
+        use crate::history;
+        use crate::models::{Direction, HistoryEntry, Locality, TransferState};
+        let names: Vec<String> = files.iter().map(|f| file_name_of(f)).collect();
+        let total: u64 = files
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok().map(|m| m.len()))
+            .sum();
+        history::append(
+            &self.config_dir,
+            HistoryEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                direction: Direction::Receive,
+                file_names: names.clone(),
+                bytes_total: total,
+                peer: Some(friend.name.clone()),
+                locality: Locality::Unknown,
+                code: None,
+                state: TransferState::Completed,
+                timestamp_ms: now_ms(),
+                error: None,
+                out_dir: Some(dest.to_string()),
+            },
+        );
+        let _ = self.app.emit("history://changed", ());
+        let notify_on = self
+            .app
+            .try_state::<Arc<AppState>>()
+            .map(|s| s.settings.lock().unwrap().notify_on_complete)
+            .unwrap_or(true);
+        if notify_on {
+            use tauri_plugin_notification::NotificationExt;
+            let body = if names.len() == 1 {
+                format!("{} sent you {}", friend.name, names[0])
+            } else {
+                format!("{} sent you {} files", friend.name, names.len())
+            };
+            let _ = self
+                .app
+                .notification()
+                .builder()
+                .title("DropBeam")
+                .body(body)
+                .show();
         }
     }
 
@@ -1057,6 +1238,20 @@ fn save_manifest(config_dir: &Path, pair_id: &str, set: &HashSet<String>) {
     if let Ok(txt) = serde_json::to_string(set) {
         let _ = std::fs::write(manifest_path(config_dir, pair_id), txt);
     }
+}
+
+fn friend_sig(f: &Friend) -> String {
+    format!("{}|{:?}|{}", f.id, f.role, f.secret)
+}
+
+fn friend_download_dir(settings: &Settings) -> String {
+    let d = settings.download_dir.trim();
+    if !d.is_empty() {
+        return d.to_string();
+    }
+    std::env::var("HOME")
+        .map(|h| format!("{h}/Downloads"))
+        .unwrap_or_else(|_| ".".to_string())
 }
 
 fn structural_sig(p: &Pair) -> String {
