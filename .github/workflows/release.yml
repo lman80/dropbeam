@@ -1,0 +1,73 @@
+name: Release
+
+# Push a version tag (e.g. v0.1.1) to build installers for macOS + Windows,
+# sign them for the in-app updater, and publish a GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest # universal: Apple Silicon + Intel in one .dmg
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - platform: windows-latest # Windows x64 (.exe / .msi)
+            args: ""
+            rust-targets: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Ensure bundled croc is executable (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: chmod +x src-tauri/binaries/croc-*-apple-darwin
+
+      - name: Build, sign, and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "DropBeam ${{ github.ref_name }}"
+          releaseBody: |
+            ## Download DropBeam
+
+            - **macOS** (Apple Silicon & Intel): grab the **`.dmg`**, open it, drag DropBeam to Applications.
+            - **Windows**: grab the **`.exe`** installer and run it.
+
+            First open on macOS: right‑click the app → **Open** → **Open** (it's unsigned). On Windows: **More info → Run anyway**.
+
+            DropBeam checks for updates automatically — future versions install themselves from inside the app.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
