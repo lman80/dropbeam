@@ -11,11 +11,18 @@ Grab the latest installer from the **[Releases page](https://github.com/lman80/d
 - **macOS** (Apple Silicon & Intel) → download the **`.dmg`**, open it, drag **DropBeam** to Applications.
 - **Windows** → download the **`.exe`** installer and run it.
 
-> **First launch only** — the app isn't signed with a paid developer certificate, so the OS shows a one‑time warning:
-> - **macOS:** right‑click DropBeam → **Open** → **Open**.
-> - **Windows:** click **More info → Run anyway**.
+> **First launch only** — the app isn't signed with a paid developer certificate, so the OS blocks it once.
 >
-> After that it opens normally, and **updates install themselves** from inside the app (Settings → Check for updates) — no re‑downloading.
+> **macOS (Sequoia 15 / macOS 26 and newer):**
+> 1. Double‑click **DropBeam** → you'll see *"Apple could not verify…"* → click **Done**.
+> 2. Open  menu → **System Settings → Privacy & Security**, scroll to **Security**.
+> 3. Click **Open Anyway** next to the DropBeam message → authenticate → **Open Anyway** again.
+>
+> (On macOS 14 and older, you can instead just **right‑click the app → Open → Open**. Or, in Terminal: `xattr -dr com.apple.quarantine /Applications/DropBeam.app`.)
+>
+> **Windows:** on the SmartScreen prompt, click **More info → Run anyway**.
+>
+> It opens normally after that, and **updates install themselves** from inside the app — no re‑downloading.
 
 Two modes:
 

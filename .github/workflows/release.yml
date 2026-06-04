@@ -65,9 +65,11 @@ jobs:
             - **macOS** (Apple Silicon & Intel): grab the **`.dmg`**, open it, drag DropBeam to Applications.
             - **Windows**: grab the **`.exe`** installer and run it.
 
-            First open on macOS: right‑click the app → **Open** → **Open** (it's unsigned). On Windows: **More info → Run anyway**.
+            **First launch (the app is unsigned, so the OS blocks it once):**
+            - **macOS (newest):** double‑click → "Apple could not verify…" → **Done**. Then **System Settings → Privacy & Security → Open Anyway** (authenticate, Open Anyway again). *(Older macOS: right‑click → Open.)*
+            - **Windows:** SmartScreen → **More info → Run anyway**.
 
-            DropBeam checks for updates automatically — future versions install themselves from inside the app.
+            After that it opens normally and **updates install themselves** from inside the app — no re‑downloading.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
