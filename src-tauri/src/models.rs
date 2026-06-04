@@ -204,6 +204,10 @@ pub struct FolderStatus {
     pub queued: usize,
     pub sending_file: Option<String>,
     pub percent: f64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub speed_bps: f64,
+    pub eta_seconds: Option<f64>,
     pub detail: Option<String>,
 }
 

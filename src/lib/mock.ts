@@ -249,12 +249,27 @@ export const mockApi = {
       p.id === 'p1'
         ? {
             pairId: p.id,
-            state: 'waiting' as const,
-            queued: 2,
+            state: 'sending' as const,
+            queued: 1,
+            sendingFile: 'beach-sunset.jpg',
+            percent: 62,
+            bytesDone: 77_000_000,
+            bytesTotal: 124_000_000,
+            speedBps: 41_000_000,
+            etaSeconds: 1.1,
+            detail: null,
+          }
+        : {
+            pairId: p.id,
+            state: 'idle' as const,
+            queued: 0,
             sendingFile: null,
             percent: 0,
-            detail: 'Waiting for Alex to come online',
-          }
-        : { pairId: p.id, state: 'idle' as const, queued: 0, sendingFile: null, percent: 0, detail: null },
+            bytesDone: 0,
+            bytesTotal: 0,
+            speedBps: 0,
+            etaSeconds: null,
+            detail: null,
+          },
     ),
 }

@@ -16,7 +16,8 @@ import {
 } from 'lucide-react'
 import { api, type FolderStatus, type Pair } from '../lib/api'
 import { useStore } from '../store'
-import { EmptyState, Spinner } from '../components/bits'
+import { EmptyState, ProgressBar, Spinner } from '../components/bits'
+import { formatBytes, formatEta, formatSpeed } from '../lib/format'
 import { PairingModal } from '../components/PairingModal'
 
 export function FoldersView() {
@@ -93,10 +94,10 @@ function statusInfo(pair: Pair, status?: FolderStatus): { color: string; label: 
     case 'sending':
       return {
         color: 'var(--accent)',
-        label: `Sending ${status?.sendingFile ?? ''} · ${Math.round(status?.percent ?? 0)}%`,
+        label: status?.sendingFile ? `Sending ${status.sendingFile}` : 'Sending…',
       }
     case 'receiving':
-      return { color: 'var(--accent)', label: `Receiving… ${Math.round(status?.percent ?? 0)}%` }
+      return { color: 'var(--accent)', label: 'Receiving…' }
     case 'waiting':
       return {
         color: 'var(--amber)',
@@ -232,6 +233,45 @@ function FolderCard({
           </button>
         )}
       </div>
+
+      {/* Live transfer progress while sending or receiving */}
+      {(status?.state === 'sending' || status?.state === 'receiving') && (
+        <motion.div
+          initial={{ opacity: 0, height: 0 }}
+          animate={{ opacity: 1, height: 'auto' }}
+          style={{ marginTop: 12, overflow: 'hidden' }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'baseline',
+              marginBottom: 6,
+            }}
+          >
+            <span style={{ fontSize: 15, fontWeight: 750 }} className="gradient-text">
+              {Math.round(status.percent)}%
+            </span>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              {formatBytes(status.bytesDone)}
+              {status.bytesTotal > 0 ? ` / ${formatBytes(status.bytesTotal)}` : ''}
+            </span>
+          </div>
+          <ProgressBar percent={status.percent} />
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              fontSize: 11.5,
+              color: 'var(--text-faint)',
+              marginTop: 6,
+            }}
+          >
+            <span>{formatSpeed(status.speedBps)}</span>
+            <span>{formatEta(status.etaSeconds)} left</span>
+          </div>
+        </motion.div>
+      )}
 
       <AnimatePresence initial={false}>
         {open && (

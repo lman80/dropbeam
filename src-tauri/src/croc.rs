@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use tauri::{AppHandle, Emitter};
@@ -80,7 +80,15 @@ pub fn croc_binary_path() -> PathBuf {
     PathBuf::from(exe_name)
 }
 
-fn build_command(bin: &Path, settings: &Settings, job: &Job) -> Command {
+/// Build the croc command for one attempt. `override_send_code` lets retries reuse
+/// the code croc generated on the first attempt, so the code shown to the user
+/// stays valid across re-parks.
+fn build_run_command(
+    bin: &Path,
+    settings: &Settings,
+    job: &Job,
+    override_send_code: Option<&str>,
+) -> Command {
     let mut cmd = Command::new(bin);
     // Don't let croc misread our piped stdin as content to send.
     cmd.arg("--ignore-stdin");
@@ -95,10 +103,11 @@ fn build_command(bin: &Path, settings: &Settings, job: &Job) -> Command {
 
     match job {
         Job::Send { paths, code } => {
-            if let Some(c) = code {
+            // Prefer the captured/reused code, else the job's fixed code, else let
+            // croc generate one on this (first) attempt.
+            if let Some(c) = override_send_code.or(code.as_deref()) {
                 cmd.env("CROC_SECRET", c);
             }
-            // Don't hijack the user's clipboard with the code.
             cmd.arg("--disable-clipboard");
             cmd.arg("send");
             for p in paths {
@@ -107,7 +116,6 @@ fn build_command(bin: &Path, settings: &Settings, job: &Job) -> Command {
         }
         Job::Receive { code, out_dir } => {
             cmd.env("CROC_SECRET", code);
-            // Auto-accept, never prompt to overwrite/resume, write to out_dir.
             cmd.arg("--yes").arg("--overwrite").arg("--out").arg(out_dir);
         }
     }
@@ -115,8 +123,6 @@ fn build_command(bin: &Path, settings: &Settings, job: &Job) -> Command {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Avoid leaking ANSI we then have to strip where we can, but croc colors
-    // by default; we strip ANSI in the parser regardless.
     cmd.env("NO_COLOR", "1");
     cmd
 }
@@ -155,29 +161,100 @@ pub fn start_receive(
     snapshot
 }
 
+const SEND_RETRY_BUDGET_SECS: u64 = 600;
+const RECEIVE_RETRY_BUDGET_SECS: u64 = 120;
+const RETRY_DELAY_MS: u64 = 1000;
+
+enum RunOutcome {
+    Completed,
+    Canceled,
+    Failed { permanent: bool, error: String },
+}
+
 async fn run_transfer(app: AppHandle, state: Arc<AppState>, mut update: TransferUpdate, job: Job) {
     let settings = { state.settings.lock().unwrap().clone() };
     let bin = croc_binary_path();
-    let mut cmd = build_command(&bin, &settings, &job);
 
-    // Register a cancellation handle for this transfer.
+    // One cancellation handle for the whole transfer (it spans retries).
     let cancel = Arc::new(Notify::new());
     state
         .transfers
         .lock()
         .unwrap()
         .insert(update.id.clone(), cancel.clone());
-
     emit_update(&app, &update);
 
+    // croc's receiver only waits ~2s for a sender, and a handshake can race, so a
+    // single attempt is fragile. Retry both directions: the sender re-parks (reusing
+    // its code) and the receiver keeps reaching for the parked sender, until success,
+    // a real error (wrong code), cancel, or the time budget runs out.
+    let budget = match update.direction {
+        Direction::Send => Duration::from_secs(SEND_RETRY_BUDGET_SECS),
+        Direction::Receive => Duration::from_secs(RECEIVE_RETRY_BUDGET_SECS),
+    };
+    let deadline = Instant::now() + budget;
+
+    loop {
+        // Reuse the code croc generated on the first send attempt.
+        let send_code = if matches!(job, Job::Send { .. }) {
+            update.code.clone()
+        } else {
+            None
+        };
+        let cmd = build_run_command(&bin, &settings, &job, send_code.as_deref());
+
+        match run_once(&app, &mut update, cmd, &cancel).await {
+            RunOutcome::Completed => {
+                update.state = TransferState::Completed;
+                update.percent = 100.0;
+                if update.bytes_total > 0 {
+                    update.bytes_done = update.bytes_total;
+                }
+                update.error = None;
+                break;
+            }
+            RunOutcome::Canceled => {
+                update.state = TransferState::Canceled;
+                break;
+            }
+            RunOutcome::Failed { permanent, error } => {
+                if permanent || Instant::now() >= deadline {
+                    update.state = TransferState::Failed;
+                    update.error = Some(if permanent {
+                        error
+                    } else {
+                        friendly_timeout(update.direction)
+                    });
+                    break;
+                }
+                reset_for_retry(&mut update);
+                emit_update(&app, &update);
+                if wait_retry(&cancel).await {
+                    update.state = TransferState::Canceled;
+                    break;
+                }
+            }
+        }
+    }
+
+    emit_update(&app, &update);
+    finalize(&app, &state, &settings, &update);
+}
+
+/// Run croc once, streaming progress into `update`. Returns the attempt's outcome.
+async fn run_once(
+    app: &AppHandle,
+    update: &mut TransferUpdate,
+    mut cmd: Command,
+    cancel: &Arc<Notify>,
+) -> RunOutcome {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            update.state = TransferState::Failed;
-            update.error = Some(format!("Could not start the transfer engine: {e}"));
-            emit_update(&app, &update);
-            finalize(&app, &state, &settings, &update);
-            return;
+            return RunOutcome::Failed {
+                permanent: true,
+                error: format!("Could not start the transfer engine: {e}"),
+            }
         }
     };
 
@@ -198,53 +275,98 @@ async fn run_transfer(app: AppHandle, state: Arc<AppState>, mut update: Transfer
     let (tx, mut rx) = mpsc::channel::<ParsedLine>(128);
     let reader = tauri::async_runtime::spawn(read_stderr(stderr, tx));
 
+    let mut canceled = false;
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(parsed) => {
-                    apply(&mut update, parsed);
-                    emit_update(&app, &update);
+                    apply(update, parsed);
+                    emit_update(app, update);
                 }
-                None => break, // stderr closed → process is exiting
+                None => break,
             },
             _ = cancel.notified() => {
                 let _ = child.start_kill();
-                update.state = TransferState::Canceled;
+                canceled = true;
                 break;
             }
         }
     }
 
-    // Unblock the reader if we broke out early (cancel), then reap.
     drop(rx);
     let _ = reader.await;
     let status = child.wait().await;
 
-    if update.state != TransferState::Canceled {
-        match status {
-            Ok(s) if s.success() => {
-                update.state = TransferState::Completed;
-                update.percent = 100.0;
-                if update.bytes_total > 0 {
-                    update.bytes_done = update.bytes_total;
-                }
-                update.error = None;
-            }
-            Ok(s) => {
-                update.state = TransferState::Failed;
-                if update.error.is_none() {
-                    update.error = Some(friendly_exit_error(s.code()));
-                }
-            }
-            Err(e) => {
-                update.state = TransferState::Failed;
-                update.error = Some(format!("Transfer engine error: {e}"));
+    if canceled {
+        return RunOutcome::Canceled;
+    }
+    match status {
+        Ok(s) if s.success() => RunOutcome::Completed,
+        Ok(_) => {
+            let err = update.error.clone().unwrap_or_default();
+            RunOutcome::Failed {
+                permanent: is_permanent_error(&err),
+                error: if err.is_empty() {
+                    friendly_exit_error(None)
+                } else {
+                    err
+                },
             }
         }
+        Err(e) => RunOutcome::Failed {
+            permanent: false,
+            error: format!("Transfer engine error: {e}"),
+        },
     }
+}
 
-    emit_update(&app, &update);
-    finalize(&app, &state, &settings, &update);
+/// Errors that won't fix themselves on retry — fail fast on these.
+fn is_permanent_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("wrong code")
+        || e.contains("too short")
+        || e.contains("could not be found")
+        || e.contains("no such file")
+        || e.contains("declined")
+}
+
+fn reset_for_retry(u: &mut TransferUpdate) {
+    u.percent = 0.0;
+    u.bytes_done = 0;
+    u.speed_bps = 0.0;
+    u.eta_seconds = None;
+    u.error = None;
+    u.state = match u.direction {
+        Direction::Send => {
+            if u.code.is_some() {
+                TransferState::WaitingForPeer
+            } else {
+                TransferState::Starting
+            }
+        }
+        Direction::Receive => TransferState::Connecting,
+    };
+}
+
+async fn wait_retry(cancel: &Arc<Notify>) -> bool {
+    // Jitter the delay so two retrying peers don't phase-lock and keep missing.
+    use rand::Rng;
+    let ms = RETRY_DELAY_MS + rand::thread_rng().gen_range(0..RETRY_DELAY_MS);
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(ms)) => false,
+        _ = cancel.notified() => true,
+    }
+}
+
+fn friendly_timeout(dir: Direction) -> String {
+    match dir {
+        Direction::Receive => {
+            "Couldn't connect. Double-check the code, and make sure the other person has their Send screen open.".into()
+        }
+        Direction::Send => {
+            "No one received the files in time — the code may have expired. Try sending again.".into()
+        }
+    }
 }
 
 fn finalize(app: &AppHandle, state: &Arc<AppState>, settings: &Settings, update: &TransferUpdate) {
@@ -484,6 +606,41 @@ fn parse_segment(raw: &[u8]) -> Option<ParsedLine> {
 
 fn strip_ansi(s: &str) -> String {
     RE_ANSI.replace_all(s, "").into_owned()
+}
+
+/// Full progress metrics from a croc progress line — reused by the folder sync UI.
+pub(crate) struct ProgressMetrics {
+    pub percent: f64,
+    pub done: u64,
+    pub total: u64,
+    pub speed_bps: Option<f64>,
+    pub eta: Option<f64>,
+}
+
+pub(crate) fn parse_progress_metrics(line: &str) -> Option<ProgressMetrics> {
+    let s = strip_ansi(line);
+    let c = RE_PROGRESS.captures(s.trim())?;
+    let pct: f64 = c.name("pct")?.as_str().parse().ok()?;
+    let total_unit = c.name("unit")?.as_str();
+    let done_unit = c
+        .name("dunit")
+        .map(|m| m.as_str())
+        .filter(|u| !u.is_empty())
+        .unwrap_or(total_unit);
+    let done = parse_bytes(c.name("done")?.as_str(), done_unit);
+    let total = parse_bytes(c.name("total")?.as_str(), total_unit);
+    let speed = match (c.name("spd"), c.name("spdunit")) {
+        (Some(v), Some(u)) => Some(parse_bytes(v.as_str(), u.as_str()) as f64),
+        _ => None,
+    };
+    let eta = c.name("eta").and_then(|m| parse_go_duration(m.as_str()));
+    Some(ProgressMetrics {
+        percent: pct.clamp(0.0, 100.0),
+        done,
+        total,
+        speed_bps: speed,
+        eta,
+    })
 }
 
 /// Convert a croc human-readable byte value to raw bytes (decimal: kB=1000).

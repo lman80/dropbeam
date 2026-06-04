@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use regex::Regex;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -55,6 +54,10 @@ struct StatusSnapshot {
     state: FolderState,
     sending_file: Option<String>,
     percent: f64,
+    bytes_done: u64,
+    bytes_total: u64,
+    speed_bps: f64,
+    eta_seconds: Option<f64>,
     detail: Option<String>,
 }
 
@@ -64,6 +67,10 @@ impl Default for StatusSnapshot {
             state: FolderState::Idle,
             sending_file: None,
             percent: 0.0,
+            bytes_done: 0,
+            bytes_total: 0,
+            speed_bps: 0.0,
+            eta_seconds: None,
             detail: None,
         }
     }
@@ -150,6 +157,10 @@ impl SyncManager {
                     queued,
                     sending_file: s.sending_file,
                     percent: s.percent,
+                    bytes_done: s.bytes_done,
+                    bytes_total: s.bytes_total,
+                    speed_bps: s.speed_bps,
+                    eta_seconds: s.eta_seconds,
                     detail: s.detail,
                 }
             })
@@ -367,10 +378,18 @@ impl SyncManager {
                     &file,
                     &stopped,
                     &stop_notify,
-                    move |pct| {
+                    move |m| {
                         if let Ok(mut s) = status_cb.lock() {
-                            s.percent = pct;
                             s.state = FolderState::Sending;
+                            s.percent = m.percent;
+                            s.bytes_done = m.done;
+                            if m.total > 0 {
+                                s.bytes_total = m.total;
+                            }
+                            if let Some(spd) = m.speed_bps {
+                                s.speed_bps = spd;
+                            }
+                            s.eta_seconds = m.eta;
                         }
                         manager_cb.emit_status(&pair_id_cb);
                     },
@@ -463,11 +482,19 @@ impl SyncManager {
                     &staging,
                     &stopped,
                     &stop_notify,
-                    move |pct| {
+                    move |m| {
                         if let Ok(mut s) = status_cb.lock() {
-                            s.percent = pct;
                             s.state = FolderState::Receiving;
                             s.sending_file = None;
+                            s.percent = m.percent;
+                            s.bytes_done = m.done;
+                            if m.total > 0 {
+                                s.bytes_total = m.total;
+                            }
+                            if let Some(spd) = m.speed_bps {
+                                s.speed_bps = spd;
+                            }
+                            s.eta_seconds = m.eta;
                         }
                         manager_cb.emit_status(&pair_id_cb);
                     },
@@ -570,6 +597,10 @@ impl SyncManager {
             queued,
             sending_file: s.sending_file,
             percent: s.percent,
+            bytes_done: s.bytes_done,
+            bytes_total: s.bytes_total,
+            speed_bps: s.speed_bps,
+            eta_seconds: s.eta_seconds,
             detail: s.detail,
         };
         let _ = self.app.emit("folder://status", status);
@@ -593,9 +624,6 @@ enum ReceiveOutcome {
     Error,
 }
 
-static RE_PCT: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"(\d+)%\s+\|").unwrap());
-
 fn apply_relay(cmd: &mut Command, settings: &Settings) {
     if !settings.custom_relay.trim().is_empty() {
         cmd.arg("--relay").arg(settings.custom_relay.trim());
@@ -611,7 +639,7 @@ async fn run_croc_send(
     file: &str,
     stopped: &Arc<AtomicBool>,
     stop_notify: &Arc<Notify>,
-    on_percent: impl Fn(f64) + Send + 'static,
+    on_progress: impl Fn(crate::croc::ProgressMetrics) + Send + 'static,
 ) -> SendOutcome {
     let bin = croc_binary_path();
     let mut cmd = Command::new(&bin);
@@ -642,9 +670,11 @@ async fn run_croc_send(
                     Ok(n) => {
                         for &b in &buf[..n] {
                             if b == b'\r' || b == b'\n' {
-                                if let Some(pct) = parse_pct(&line) {
+                                if let Some(m) =
+                                    crate::croc::parse_progress_metrics(&String::from_utf8_lossy(&line))
+                                {
                                     connected = true;
-                                    on_percent(pct);
+                                    on_progress(m);
                                 }
                                 line.clear();
                             } else {
@@ -684,7 +714,7 @@ async fn run_croc_receive(
     out_dir: &Path,
     stopped: &Arc<AtomicBool>,
     stop_notify: &Arc<Notify>,
-    on_percent: impl Fn(f64) + Send + 'static,
+    on_progress: impl Fn(crate::croc::ProgressMetrics) + Send + 'static,
 ) -> ReceiveOutcome {
     let bin = croc_binary_path();
     let mut cmd = Command::new(&bin);
@@ -714,8 +744,10 @@ async fn run_croc_receive(
                     Ok(n) => {
                         for &b in &buf[..n] {
                             if b == b'\r' || b == b'\n' {
-                                if let Some(pct) = parse_pct(&line) {
-                                    on_percent(pct);
+                                if let Some(m) =
+                                    crate::croc::parse_progress_metrics(&String::from_utf8_lossy(&line))
+                                {
+                                    on_progress(m);
                                 }
                                 line.clear();
                             } else {
@@ -746,12 +778,6 @@ async fn run_croc_receive(
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-fn parse_pct(raw: &[u8]) -> Option<f64> {
-    let s = String::from_utf8_lossy(raw);
-    let caps = RE_PCT.captures(s.trim())?;
-    caps.get(1)?.as_str().parse::<f64>().ok()
-}
 
 async fn sleep_until(deadline: Instant) {
     let now = Instant::now();
@@ -968,6 +994,12 @@ fn set_status(
         s.sending_file = sending_file;
         s.percent = percent;
         s.detail = detail;
+        // A status transition (start/idle/waiting) clears stale progress metrics;
+        // the live on_progress callback refills them during a transfer.
+        s.bytes_done = 0;
+        s.bytes_total = 0;
+        s.speed_bps = 0.0;
+        s.eta_seconds = None;
     }
 }
 

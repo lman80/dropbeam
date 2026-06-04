@@ -88,6 +88,10 @@ export interface FolderStatus {
   queued: number
   sendingFile: string | null
   percent: number
+  bytesDone: number
+  bytesTotal: number
+  speedBps: number
+  etaSeconds: number | null
   detail: string | null
 }
 
