@@ -330,6 +330,9 @@ fn is_permanent_error(err: &str) -> bool {
         || e.contains("could not be found")
         || e.contains("no such file")
         || e.contains("declined")
+        // Receiver chose to decline a manual-accept offer — don't keep re-offering.
+        || e.contains("refused")
+        || e.contains("rejected")
 }
 
 fn reset_for_retry(u: &mut TransferUpdate) {
@@ -646,7 +649,7 @@ pub(crate) fn parse_progress_metrics(line: &str) -> Option<ProgressMetrics> {
 }
 
 /// Convert a croc human-readable byte value to raw bytes (decimal: kB=1000).
-fn parse_bytes(value: &str, unit: &str) -> u64 {
+pub(crate) fn parse_bytes(value: &str, unit: &str) -> u64 {
     let v: f64 = value.parse().unwrap_or(0.0);
     let mult = match unit.chars().next().map(|c| c.to_ascii_lowercase()) {
         Some('k') => 1e3,

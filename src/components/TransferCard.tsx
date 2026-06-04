@@ -24,10 +24,12 @@ function title(t: TransferUpdate): string {
 
 export function TransferCard({ t }: { t: TransferUpdate }) {
   const removeTransfer = useStore((s) => s.removeTransfer)
+  const respondToOffer = useStore((s) => s.respondToOffer)
   const toast = useStore((s) => s.toast)
   const [copied, setCopied] = useState(false)
 
   const active = isActive(t.state)
+  const isOffer = t.state === 'waitingForAccept'
   // A friend send has no code to show — it rides a pre-shared channel.
   const isSendWaiting =
     t.direction === 'send' &&
@@ -104,12 +106,47 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
         </div>
         <button
           className="icon-btn"
-          title={active ? 'Cancel' : 'Dismiss'}
-          onClick={() => (active ? api.cancelTransfer(t.id) : removeTransfer(t.id))}
+          title={isOffer ? 'Decline' : active ? 'Cancel' : 'Dismiss'}
+          onClick={() =>
+            isOffer
+              ? respondToOffer(t.id, false)
+              : active
+                ? api.cancelTransfer(t.id)
+                : removeTransfer(t.id)
+          }
         >
           <X size={16} />
         </button>
       </div>
+
+      {/* manual-accept offer from a friend */}
+      {isOffer && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+            <b style={{ color: 'var(--text)' }}>{t.friendName ?? 'Someone'}</b> wants to send you{' '}
+            <b style={{ color: 'var(--text)' }}>
+              {t.fileNames.length ? t.fileNames[0] : 'files'}
+            </b>
+            {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
+          </div>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button
+              className="btn btn-primary"
+              style={{ flex: 1 }}
+              onClick={() => respondToOffer(t.id, true)}
+            >
+              <Check size={16} /> Accept
+            </button>
+            <button
+              className="btn btn-ghost"
+              style={{ flex: 1 }}
+              onClick={() => respondToOffer(t.id, false)}
+            >
+              <X size={16} /> Decline
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* send waiting: code + QR */}
       {isSendWaiting && (
@@ -311,21 +348,24 @@ function stateColor(t: TransferUpdate): string {
 }
 
 function statusLabel(t: TransferUpdate): string {
-  const to = t.friendName ? ` to ${t.friendName}` : ''
+  const fn = t.friendName
+  const send = t.direction === 'send'
   switch (t.state) {
     case 'starting':
-      return t.friendName ? `Beaming${to}…` : 'Starting…'
+      return send && fn ? `Beaming to ${fn}…` : 'Starting…'
     case 'waitingForPeer':
-      return t.friendName ? `Beaming${to}…` : 'Ready to send'
+      return send && fn ? `Beaming to ${fn}…` : 'Ready to send'
     case 'connecting':
-      return t.friendName ? `Beaming${to}…` : 'Connecting…'
+      return fn ? (send ? `Beaming to ${fn}…` : `Receiving from ${fn}…`) : 'Connecting…'
+    case 'waitingForAccept':
+      return fn ? `${fn} wants to send files` : 'Incoming files'
     case 'transferring':
-      return t.direction === 'send' ? `Sending${to}` : 'Receiving'
+      return send ? (fn ? `Sending to ${fn}` : 'Sending') : fn ? `Receiving from ${fn}` : 'Receiving'
     case 'completed':
-      return t.direction === 'send' ? `Sent${to}` : 'Received'
+      return send ? (fn ? `Sent to ${fn}` : 'Sent') : fn ? `Received from ${fn}` : 'Received'
     case 'failed':
       return 'Failed'
     case 'canceled':
-      return 'Canceled'
+      return !send && fn ? 'Declined' : 'Canceled'
   }
 }

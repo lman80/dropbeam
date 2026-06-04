@@ -25,6 +25,9 @@ pub struct AppState {
     pub settings: Mutex<Settings>,
     /// Cancellation handles for in-flight transfers, keyed by transfer id.
     pub transfers: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Pending manual-accept offers: a friend transfer awaiting the user's
+    /// accept/decline, keyed by transfer id. `respond_to_offer` resolves these.
+    pub offers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     /// Set when the user really wants to quit (vs. close-to-tray).
     pub force_quit: AtomicBool,
 }
@@ -68,6 +71,7 @@ pub fn run() {
                 config_dir: config_dir.clone(),
                 settings: Mutex::new(loaded),
                 transfers: Mutex::new(HashMap::new()),
+                offers: Mutex::new(HashMap::new()),
                 force_quit: AtomicBool::new(false),
             }));
 
@@ -121,6 +125,8 @@ pub fn run() {
             commands::list_friends,
             commands::rename_friend,
             commands::remove_friend,
+            commands::set_friend_auto_accept,
+            commands::respond_to_offer,
             commands::friend_invite,
             commands::send_to_friend,
         ])

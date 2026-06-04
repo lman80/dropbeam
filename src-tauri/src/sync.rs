@@ -13,16 +13,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Notify;
 
-use crate::croc::croc_binary_path;
-use crate::models::{DeleteMode, FolderState, FolderStatus, Friend, Pair, Settings};
+use crate::croc::{croc_binary_path, ProgressMetrics};
+use crate::models::{
+    DeleteMode, Direction, FolderState, FolderStatus, Friend, Locality, Pair, Settings,
+    TransferState, TransferUpdate,
+};
 use crate::{friends, pairing, AppState};
 
 const STAGING_DIR: &str = ".dropbeam-incoming";
@@ -199,8 +203,12 @@ impl SyncManager {
         }
     }
 
-    /// A persistent listener on this friend's inbox channel — files they send you
-    /// land in Downloads automatically. No watched folder, no sender.
+    /// A persistent listener on this friend's inbox channel.
+    ///
+    /// Auto-accept friends: files arrive and land in Downloads automatically.
+    /// Manual friends: each incoming file first surfaces an Accept/Decline offer.
+    /// Either way we emit `transfer://update` so the receive shows live on the
+    /// Send & Receive page with the same progress the sender sees.
     fn start_friend_listener(self: &Arc<Self>, friend: Friend) {
         let stopped = Arc::new(AtomicBool::new(false));
         let stop_notify = Arc::new(Notify::new());
@@ -229,15 +237,77 @@ impl SyncManager {
                     .unwrap_or_default();
                 let code = friends::my_inbox_code(&friend);
 
-                let outcome = run_croc_receive(
-                    &settings,
-                    &code,
-                    &staging,
-                    &stopped_t,
-                    &stop_t,
-                    move |_m| {},
-                )
-                .await;
+                // One id for this receive attempt, shared by offer/progress/complete
+                // so the UI updates a single card rather than spawning new ones.
+                let tid = uuid::Uuid::new_v4().to_string();
+                let started = Arc::new(AtomicBool::new(false));
+                let names_cell = Arc::new(Mutex::new(Vec::<String>::new()));
+
+                let on_progress = {
+                    let app = manager.app.clone();
+                    let tid = tid.clone();
+                    let fname = friend.name.clone();
+                    let started = started.clone();
+                    let names_cell = names_cell.clone();
+                    move |m: ProgressMetrics| {
+                        started.store(true, Ordering::SeqCst);
+                        let names = names_cell.lock().unwrap().clone();
+                        let mut u = recv_update(&tid, &fname, TransferState::Transferring, &names);
+                        u.percent = m.percent;
+                        u.bytes_done = m.done;
+                        if m.total > 0 {
+                            u.bytes_total = m.total;
+                        }
+                        if let Some(s) = m.speed_bps {
+                            u.speed_bps = s;
+                        }
+                        u.eta_seconds = m.eta;
+                        let _ = app.emit("transfer://update", &u);
+                    }
+                };
+
+                let outcome = if friend.auto_accept {
+                    run_croc_receive(&settings, &code, &staging, &stopped_t, &stop_t, on_progress)
+                        .await
+                } else {
+                    let on_offer = {
+                        let app = manager.app.clone();
+                        let tid = tid.clone();
+                        let fname = friend.name.clone();
+                        let names_cell = names_cell.clone();
+                        move |names: Vec<String>, total: u64| {
+                            *names_cell.lock().unwrap() = names.clone();
+                            let app = app.clone();
+                            let tid = tid.clone();
+                            let fname = fname.clone();
+                            async move {
+                                let mut u =
+                                    recv_update(&tid, &fname, TransferState::WaitingForAccept, &names);
+                                u.bytes_total = total;
+                                let _ = app.emit("transfer://update", &u);
+
+                                let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                                if let Some(st) = app.try_state::<Arc<AppState>>() {
+                                    st.offers.lock().unwrap().insert(tid.clone(), tx);
+                                }
+                                let accept = rx.await.unwrap_or(false);
+                                if let Some(st) = app.try_state::<Arc<AppState>>() {
+                                    st.offers.lock().unwrap().remove(&tid);
+                                }
+                                if !accept {
+                                    let u =
+                                        recv_update(&tid, &fname, TransferState::Canceled, &names);
+                                    let _ = app.emit("transfer://update", &u);
+                                }
+                                accept
+                            }
+                        }
+                    };
+                    run_croc_receive_interactive(
+                        &settings, &code, &staging, &stopped_t, &stop_t, on_offer, on_progress,
+                    )
+                    .await
+                };
 
                 match outcome {
                     ReceiveOutcome::Received => {
@@ -247,11 +317,33 @@ impl SyncManager {
                         let throwaway = Arc::new(Mutex::new(HashSet::new()));
                         let moved = move_staged_into_folder(&staging, &dest, &throwaway);
                         if !moved.is_empty() {
+                            let names: Vec<String> =
+                                moved.iter().map(|f| file_name_of(f)).collect();
+                            let total: u64 = moved
+                                .iter()
+                                .filter_map(|f| std::fs::metadata(f).ok().map(|m| m.len()))
+                                .sum();
+                            let mut u =
+                                recv_update(&tid, &friend.name, TransferState::Completed, &names);
+                            u.bytes_total = total;
+                            u.bytes_done = total;
+                            u.percent = 100.0;
+                            u.out_dir = Some(dest.clone());
+                            let _ = manager.app.emit("transfer://update", &u);
                             manager.note_friend_received(&friend, &dest, &moved);
                         }
                     }
                     ReceiveOutcome::Stopped => break,
                     ReceiveOutcome::Error => {
+                        // Only surface a failure if a transfer had actually started;
+                        // an idle poll with no sender is normal and silent.
+                        if started.load(Ordering::SeqCst) {
+                            let names = names_cell.lock().unwrap().clone();
+                            let mut u =
+                                recv_update(&tid, &friend.name, TransferState::Failed, &names);
+                            u.error = Some("The transfer didn't finish.".into());
+                            let _ = manager.app.emit("transfer://update", &u);
+                        }
                         idle_streak = idle_streak.saturating_add(1);
                         let gap = match idle_streak {
                             1 => 1200,
@@ -956,6 +1048,134 @@ async fn run_croc_receive(
     }
 }
 
+/// Build a receive-side TransferUpdate tagged with the friend's name so the UI
+/// shows "from {name}". Callers fill in progress/size fields as needed.
+fn recv_update(id: &str, friend_name: &str, state: TransferState, names: &[String]) -> TransferUpdate {
+    let mut u = TransferUpdate::new(id.to_string(), Direction::Receive, names.to_vec());
+    u.state = state;
+    u.friend_name = Some(friend_name.to_string());
+    u.peer = Some(friend_name.to_string());
+    u.locality = Locality::Unknown;
+    u
+}
+
+// croc's accept prompt, e.g. "Accept 'photo.jpg' (1.2 MB)? (Y/n)" or
+// "Accept 3 files (10.5 MB)? (Y/n)". Written WITHOUT a trailing newline.
+static RE_ACCEPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Accept\s+(?:'(?P<name>[^']*)'|(?P<count>\d+)\s+files?)\s+\((?P<size>[^)]+)\)\s*\?")
+        .unwrap()
+});
+
+fn parse_accept_prompt(s: &str) -> Option<(Vec<String>, u64)> {
+    let c = RE_ACCEPT.captures(s)?;
+    let names = if let Some(n) = c.name("name") {
+        vec![n.as_str().to_string()]
+    } else {
+        let count = c.name("count").map(|m| m.as_str()).unwrap_or("0");
+        vec![format!("{count} files")]
+    };
+    let size = c.name("size").map(|m| m.as_str().trim()).unwrap_or("");
+    let mut it = size.split_whitespace();
+    let val = it.next().unwrap_or("0");
+    let unit = it.next().unwrap_or("");
+    Some((names, crate::croc::parse_bytes(val, unit)))
+}
+
+/// Like `run_croc_receive`, but for a manual-accept friend: croc runs without
+/// `--yes`, so it pauses at an Accept prompt (indefinitely, while stdin stays
+/// open). We surface the offer via `on_offer` (which resolves to the user's
+/// accept/decline), write the answer to croc's stdin, then stream progress.
+async fn run_croc_receive_interactive<F, Fut>(
+    settings: &Settings,
+    code: &str,
+    out_dir: &Path,
+    stopped: &Arc<AtomicBool>,
+    stop_notify: &Arc<Notify>,
+    on_offer: F,
+    on_progress: impl Fn(ProgressMetrics) + Send + 'static,
+) -> ReceiveOutcome
+where
+    F: FnOnce(Vec<String>, u64) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let bin = croc_binary_path();
+    let mut cmd = Command::new(&bin);
+    cmd.env("CROC_SECRET", code).env("NO_COLOR", "1");
+    cmd.arg("--overwrite"); // deliberately NO --yes / --ignore-stdin
+    apply_relay(&mut cmd, settings);
+    cmd.arg("--out").arg(out_dir);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return ReceiveOutcome::Error,
+    };
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let mut buf = [0u8; 4096];
+    let mut line: Vec<u8> = Vec::new();
+    let mut on_offer = Some(on_offer);
+
+    loop {
+        tokio::select! {
+            n = stderr.read(&mut buf) => {
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        for &b in &buf[..n] {
+                            if b == b'\r' || b == b'\n' {
+                                if let Some(m) = crate::croc::parse_progress_metrics(
+                                    &String::from_utf8_lossy(&line),
+                                ) {
+                                    on_progress(m);
+                                }
+                                line.clear();
+                            } else {
+                                line.push(b);
+                            }
+                        }
+                        // The accept prompt carries no newline, so test the partial line.
+                        if on_offer.is_some() {
+                            let partial = String::from_utf8_lossy(&line);
+                            if let Some((names, total)) = parse_accept_prompt(&partial) {
+                                let cb = on_offer.take().unwrap();
+                                let accept = tokio::select! {
+                                    a = cb(names, total) => a,
+                                    _ = stop_notify.notified() => {
+                                        let _ = child.start_kill();
+                                        let _ = child.wait().await;
+                                        return ReceiveOutcome::Stopped;
+                                    }
+                                };
+                                let answer: &[u8] = if accept { b"y\n" } else { b"n\n" };
+                                let _ = stdin.write_all(answer).await;
+                                let _ = stdin.flush().await;
+                                line.clear();
+                            }
+                        }
+                    }
+                }
+            }
+            _ = stop_notify.notified() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return ReceiveOutcome::Stopped;
+            }
+        }
+    }
+
+    if stopped.load(Ordering::SeqCst) {
+        let _ = child.wait().await;
+        return ReceiveOutcome::Stopped;
+    }
+    match child.wait().await {
+        Ok(s) if s.success() => ReceiveOutcome::Received,
+        _ => ReceiveOutcome::Error,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1241,7 +1461,8 @@ fn save_manifest(config_dir: &Path, pair_id: &str, set: &HashSet<String>) {
 }
 
 fn friend_sig(f: &Friend) -> String {
-    format!("{}|{:?}|{}", f.id, f.role, f.secret)
+    // auto_accept is included so flipping it restarts the listener in the new mode.
+    format!("{}|{:?}|{}|{}", f.id, f.role, f.secret, f.auto_accept)
 }
 
 fn friend_download_dir(settings: &Settings) -> String {
@@ -1291,4 +1512,38 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_single_file_accept_prompt() {
+        // Exact format croc v10.4.4 emits (captured from a real transfer).
+        let (names, total) = parse_accept_prompt("Accept 'dbtest-src.txt' (15 B)? (Y/n) ").unwrap();
+        assert_eq!(names, vec!["dbtest-src.txt".to_string()]);
+        assert_eq!(total, 15);
+    }
+
+    #[test]
+    fn parses_multi_file_accept_prompt() {
+        let (names, total) = parse_accept_prompt("Accept 3 files (10.5 MB)? (Y/n)").unwrap();
+        assert_eq!(names, vec!["3 files".to_string()]);
+        assert_eq!(total, 10_500_000);
+    }
+
+    #[test]
+    fn ignores_non_prompt_lines() {
+        assert!(parse_accept_prompt("securing channel...").is_none());
+        assert!(parse_accept_prompt(" file 45% |##| (4/10 MB, 5 MB/s) [1s:2s]").is_none());
+    }
+
+    #[test]
+    fn parses_prompt_with_spaces_in_name() {
+        let (names, total) =
+            parse_accept_prompt("Accept 'Q3 Report.pdf' (2.3 MB)? (Y/n)").unwrap();
+        assert_eq!(names, vec!["Q3 Report.pdf".to_string()]);
+        assert_eq!(total, 2_300_000);
+    }
 }

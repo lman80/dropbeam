@@ -312,6 +312,28 @@ pub fn remove_friend(
     Ok(())
 }
 
+/// Toggle whether a friend's files arrive automatically (true) or require the
+/// user to accept each one (false). Restarts that friend's listener.
+#[tauri::command]
+pub fn set_friend_auto_accept(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    id: String,
+    auto_accept: bool,
+) -> Result<(), String> {
+    friends::set_auto_accept(&state.config_dir, &id, auto_accept)?;
+    sync.reconcile_friends();
+    Ok(())
+}
+
+/// Answer a pending manual-accept offer (the user tapped Accept or Decline).
+#[tauri::command]
+pub fn respond_to_offer(state: State<'_, Arc<AppState>>, id: String, accept: bool) {
+    if let Some(tx) = state.offers.lock().unwrap().remove(&id) {
+        let _ = tx.send(accept);
+    }
+}
+
 /// Rebuild a friend's invite so the inviter can show it again.
 #[tauri::command]
 pub fn friend_invite(state: State<'_, Arc<AppState>>, id: String) -> Result<String, String> {

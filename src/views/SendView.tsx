@@ -28,6 +28,8 @@ export function SendView() {
   const sends = list.filter((t) => t.direction === 'send')
   const receives = list.filter((t) => t.direction === 'receive')
   const shown = mode === 'send' ? sends : receives
+  const activeSends = sends.filter((t) => isActive(t.state)).length
+  const activeReceives = receives.filter((t) => isActive(t.state)).length
 
   const onPick = async () => {
     const paths = await api.pickFiles()
@@ -63,9 +65,11 @@ export function SendView() {
         <div className="seg">
           <button className={mode === 'send' ? 'active' : ''} onClick={() => setMode('send')}>
             <Send size={15} /> Send
+            {activeSends > 0 && <SegBadge n={activeSends} />}
           </button>
           <button className={mode === 'receive' ? 'active' : ''} onClick={() => setMode('receive')}>
             <ArrowDownToLine size={15} /> Receive
+            {activeReceives > 0 && <SegBadge n={activeReceives} />}
           </button>
         </div>
       </div>
@@ -191,7 +195,7 @@ export function SendView() {
             hint={
               mode === 'send'
                 ? 'Drag in a file or click the area above. You’ll get a code to share — works on your network or anywhere over the internet.'
-                : 'Paste a code from someone sending you files and they’ll arrive in your downloads.'
+                : 'Paste a code from someone sending you files — or just wait. Files from friends arrive here automatically and land in your downloads.'
             }
           />
         )}
@@ -201,5 +205,24 @@ export function SendView() {
         <div style={{ height: 8 }} />
       )}
     </div>
+  )
+}
+
+function SegBadge({ n }: { n: number }) {
+  return (
+    <span
+      className="chip"
+      style={{
+        background: 'var(--accent)',
+        color: 'white',
+        minWidth: 18,
+        justifyContent: 'center',
+        padding: '1px 5px',
+        marginLeft: 6,
+        fontSize: 11,
+      }}
+    >
+      {n}
+    </span>
   )
 }

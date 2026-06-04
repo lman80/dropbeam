@@ -20,6 +20,9 @@ pub enum TransferState {
     WaitingForPeer,
     /// Peer found, securing channel.
     Connecting,
+    /// A friend with manual-accept is offering files; waiting for the user to
+    /// accept or decline before any bytes move.
+    WaitingForAccept,
     /// Bytes are moving.
     Transferring,
     /// Finished successfully (sender: receiver confirmed full receipt).
@@ -128,6 +131,9 @@ pub struct Settings {
     pub custom_relay_pass: String,
     /// Show a native notification when a transfer completes.
     pub notify_on_complete: bool,
+    /// Play short sounds on send/receive events.
+    #[serde(default = "default_true")]
+    pub play_sounds: bool,
 }
 
 impl Default for Settings {
@@ -142,6 +148,7 @@ impl Default for Settings {
             custom_relay: String::new(),
             custom_relay_pass: String::new(),
             notify_on_complete: true,
+            play_sounds: true,
         }
     }
 }
@@ -197,6 +204,15 @@ pub struct Friend {
     pub name: String,
     pub secret: String,
     pub created_at: u64,
+    /// When true, files this friend sends arrive automatically. When false, each
+    /// incoming file waits for the user to accept or decline. Defaults to true so
+    /// existing friends (and the common case) keep the frictionless behavior.
+    #[serde(default = "default_true")]
+    pub auto_accept: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Live sync status for a Shared Drop Folder, emitted on `folder://status`.

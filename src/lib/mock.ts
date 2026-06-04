@@ -36,6 +36,7 @@ let settings: Settings = {
   customRelay: '',
   customRelayPass: '',
   notifyOnComplete: true,
+  playSounds: true,
 }
 
 const history: HistoryEntry[] = [
@@ -81,6 +82,8 @@ const history: HistoryEntry[] = [
 ]
 
 let counter = 0
+// Pending manual-accept offers awaiting respondToOffer (mock only).
+const pendingOffers: Record<string, TransferUpdate> = {}
 
 let pairs: Pair[] = [
   {
@@ -98,8 +101,8 @@ let pairs: Pair[] = [
 let pairCounter = 1
 
 let friends: Friend[] = [
-  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000 },
-  { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: Date.now() - 2 * 86400_000 },
+  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true },
+  { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: Date.now() - 2 * 86400_000, autoAccept: false },
 ]
 let friendCounter = 2
 
@@ -166,6 +169,27 @@ function simulate(t: TransferUpdate, total: number) {
     t.etaSeconds = (100 - pct) / 11
     emit('transfer://update', { ...t })
   }, 550)
+}
+
+// Dev helper to preview incoming transfers: window.__mockIncoming(true) for a
+// manual-accept offer, false for an auto receive that streams progress.
+function mockIncoming(manual: boolean) {
+  const id = `r${++counter}`
+  const t = base(id, 'receive', manual ? ['Q3 Report.pdf'] : [])
+  t.friendName = 'Alex'
+  t.bytesTotal = 18_400_000
+  if (manual) {
+    t.state = 'waitingForAccept'
+    pendingOffers[id] = t
+    emit('transfer://update', { ...t })
+  } else {
+    t.state = 'connecting'
+    emit('transfer://update', { ...t })
+    setTimeout(() => simulate(t, 64_000_000), 900)
+  }
+}
+if (typeof window !== 'undefined') {
+  ;(window as unknown as { __mockIncoming?: (m: boolean) => void }).__mockIncoming = mockIncoming
 }
 
 export const mockApi = {
@@ -239,6 +263,7 @@ export const mockApi = {
         name: peerName.trim(),
         secret: 'mock',
         createdAt: Date.now(),
+        autoAccept: true,
       })
     }
     return { pair, invite: `dropbeam1:MOCK${id}invitecodewouldgohere0000` }
@@ -309,6 +334,7 @@ export const mockApi = {
       name: friendName.trim() || 'New friend',
       secret: 'mock',
       createdAt: Date.now(),
+      autoAccept: true,
     }
     friends.push(friend)
     return { friend, invite: `dropbeamf1:MOCK${id}friendinvitewouldgohere0000` }
@@ -321,6 +347,7 @@ export const mockApi = {
       name: 'Jordan',
       secret: 'mock',
       createdAt: Date.now(),
+      autoAccept: true,
     }
     friends.push(friend)
     return friend
@@ -332,6 +359,21 @@ export const mockApi = {
   },
   removeFriend: async (id: string): Promise<void> => {
     friends = friends.filter((f) => f.id !== id)
+  },
+  setFriendAutoAccept: async (id: string, autoAccept: boolean): Promise<void> => {
+    const f = friends.find((x) => x.id === id)
+    if (f) f.autoAccept = autoAccept
+  },
+  respondToOffer: async (id: string, accept: boolean): Promise<void> => {
+    const t = pendingOffers[id]
+    if (!t) return
+    delete pendingOffers[id]
+    if (!accept) {
+      t.state = 'canceled'
+      emit('transfer://update', { ...t })
+      return
+    }
+    simulate(t, t.bytesTotal || 64_000_000)
   },
   friendInvite: async (id: string): Promise<string> =>
     `dropbeamf1:MOCK${id}friendinvitewouldgohere0000`,

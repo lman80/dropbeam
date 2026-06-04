@@ -141,6 +141,10 @@ export function SettingsView() {
         <Row title="Notify when transfers finish">
           <Toggle on={settings.notifyOnComplete} onChange={(v) => save({ notifyOnComplete: v })} />
         </Row>
+        {SEP}
+        <Row title="Play sounds" desc="Soft cues when you send, receive, or get a file offer.">
+          <Toggle on={settings.playSounds} onChange={(v) => save({ playSounds: v })} />
+        </Row>
       </Card>
 
       <SectionTitle>Updates</SectionTitle>

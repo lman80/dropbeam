@@ -13,6 +13,7 @@ import {
   type TransferUpdate,
 } from './lib/api'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
+import { playIncoming, playOffer, playReceived, playSent } from './lib/sounds'
 
 interface UpdateState {
   version: string
@@ -67,6 +68,8 @@ interface AppStore {
   acceptFriend: (invite: string) => Promise<void>
   renameFriend: (id: string, name: string) => Promise<void>
   removeFriend: (id: string) => Promise<void>
+  setFriendAutoAccept: (id: string, autoAccept: boolean) => Promise<void>
+  respondToOffer: (id: string, accept: boolean) => Promise<void>
   toast: (kind: Toast['kind'], message: string) => void
   dismissToast: (id: string) => void
 }
@@ -215,6 +218,19 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   upsertTransfer: (u) => {
+    const prev = get().transfers[u.id]
+    // Sounds fire on meaningful state changes only (not on every progress tick).
+    if ((get().settings?.playSounds ?? true) && (!prev || prev.state !== u.state)) {
+      if (u.state === 'completed') {
+        if (u.direction === 'send') playSent()
+        else playReceived()
+      } else if (u.state === 'waitingForAccept') {
+        playOffer()
+      } else if (u.direction === 'receive' && !prev && u.state !== 'failed' && u.state !== 'canceled') {
+        // First time we see an incoming transfer (auto-accept) — a soft cue.
+        playIncoming()
+      }
+    }
     set((s) => ({
       transfers: { ...s.transfers, [u.id]: u },
       order: s.order.includes(u.id) ? s.order : [...s.order, u.id],
@@ -303,6 +319,36 @@ export const useStore = create<AppStore>((set, get) => ({
     try {
       await api.removeFriend(id)
       await get().reloadFriends()
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  setFriendAutoAccept: async (id, autoAccept) => {
+    // Optimistic flip so the toggle feels instant.
+    set((s) => ({
+      friends: s.friends.map((f) => (f.id === id ? { ...f, autoAccept } : f)),
+    }))
+    try {
+      await api.setFriendAutoAccept(id, autoAccept)
+      await get().reloadFriends()
+    } catch (e) {
+      get().toast('error', String(e))
+      await get().reloadFriends()
+    }
+  },
+
+  respondToOffer: async (id, accept) => {
+    // Reflect the choice immediately; the backend then drives the real states.
+    const t = get().transfers[id]
+    if (t) {
+      get().upsertTransfer({
+        ...t,
+        state: accept ? 'connecting' : 'canceled',
+      })
+    }
+    try {
+      await api.respondToOffer(id, accept)
     } catch (e) {
       get().toast('error', String(e))
     }

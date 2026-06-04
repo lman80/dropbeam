@@ -15,6 +15,7 @@ export type TransferState =
   | 'starting'
   | 'waitingForPeer'
   | 'connecting'
+  | 'waitingForAccept'
   | 'transferring'
   | 'completed'
   | 'failed'
@@ -65,6 +66,7 @@ export interface Settings {
   customRelay: string
   customRelayPass: string
   notifyOnComplete: boolean
+  playSounds: boolean
 }
 
 export type PairRole = 'a' | 'b'
@@ -89,6 +91,7 @@ export interface Friend {
   name: string
   secret: string
   createdAt: number
+  autoAccept: boolean
 }
 
 export type FolderState = 'idle' | 'sending' | 'receiving' | 'waiting' | 'error'
@@ -153,6 +156,10 @@ const realApi = {
   renameFriend: (id: string, name: string) =>
     invoke<void>('rename_friend', { id, name }),
   removeFriend: (id: string) => invoke<void>('remove_friend', { id }),
+  setFriendAutoAccept: (id: string, autoAccept: boolean) =>
+    invoke<void>('set_friend_auto_accept', { id, autoAccept }),
+  respondToOffer: (id: string, accept: boolean) =>
+    invoke<void>('respond_to_offer', { id, accept }),
   friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
   sendToFriend: (id: string, paths: string[]) =>
     invoke<TransferUpdate>('send_to_friend', { id, paths }),
@@ -201,6 +208,7 @@ export function isActive(state: TransferState): boolean {
     state === 'starting' ||
     state === 'waitingForPeer' ||
     state === 'connecting' ||
+    state === 'waitingForAccept' ||
     state === 'transferring'
   )
 }

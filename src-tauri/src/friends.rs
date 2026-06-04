@@ -62,6 +62,7 @@ pub fn create(
         name: clean_name(&friend_name, "New friend"),
         secret: secret.clone(),
         created_at: now_ms(),
+        auto_accept: true,
     };
     let invite = Invite {
         v: 1,
@@ -101,6 +102,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         name: clean_name(&invite.name, "Friend"),
         secret: invite.secret,
         created_at: now_ms(),
+        auto_accept: true,
     };
     friends.push(friend.clone());
     save(config_dir, &friends)?;
@@ -138,6 +140,7 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         name: name.to_string(),
         secret: derive_friend_secret(pair_secret),
         created_at: now_ms(),
+        auto_accept: true,
     });
     let _ = save(config_dir, &friends);
 }
@@ -149,6 +152,15 @@ pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
         if !name.trim().is_empty() {
             f.name = name.trim().to_string();
         }
+    }
+    save(config_dir, &friends)
+}
+
+pub fn set_auto_accept(config_dir: &Path, id: &str, auto_accept: bool) -> Result<(), String> {
+    let _guard = LOCK.lock().unwrap();
+    let mut friends = load(config_dir);
+    if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
+        f.auto_accept = auto_accept;
     }
     save(config_dir, &friends)
 }
@@ -231,6 +243,7 @@ mod tests {
             name: "n".into(),
             secret: "sharedsecret123".into(),
             created_at: 0,
+            auto_accept: true,
         }
     }
 

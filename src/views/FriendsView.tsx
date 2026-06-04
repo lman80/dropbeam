@@ -77,6 +77,7 @@ function FriendCard({ friend }: { friend: Friend }) {
   const sendToFriend = useStore((s) => s.sendToFriend)
   const removeFriend = useStore((s) => s.removeFriend)
   const renameFriend = useStore((s) => s.renameFriend)
+  const setFriendAutoAccept = useStore((s) => s.setFriendAutoAccept)
   const toast = useStore((s) => s.toast)
   const [busy, setBusy] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
@@ -187,11 +188,34 @@ function FriendCard({ friend }: { friend: Friend }) {
       <div
         style={{
           display: 'flex',
-          gap: 8,
-          justifyContent: 'flex-end',
+          alignItems: 'center',
+          gap: 12,
           marginTop: 12,
           paddingTop: 12,
           borderTop: '1px solid var(--border)',
+        }}
+      >
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13.5, fontWeight: 600 }}>Auto-accept files</div>
+          <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.4 }}>
+            {friend.autoAccept
+              ? 'Files arrive and save automatically'
+              : "You'll approve each incoming file first"}
+          </div>
+        </div>
+        <button
+          className={`toggle${friend.autoAccept ? ' on' : ''}`}
+          title={friend.autoAccept ? 'Auto-accept on' : 'Manual approval'}
+          onClick={() => setFriendAutoAccept(friend.id, !friend.autoAccept)}
+        />
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          gap: 8,
+          justifyContent: 'flex-end',
+          marginTop: 12,
         }}
       >
         <button className="btn btn-ghost" onClick={showInvite} disabled={loadingInvite}>
