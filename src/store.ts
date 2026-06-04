@@ -128,8 +128,12 @@ export const useStore = create<AppStore>((set, get) => ({
     onPairsChanged(() => get().reloadPairs())
 
     appVersion().then((v) => set({ appVer: v }))
-    // Quietly check for an update on launch; it surfaces in Settings if found.
-    get().checkForUpdates(false)
+    // Only the main window owns the update check (the popover/HUD share state but
+    // shouldn't each trigger their own launch check).
+    const isOverlay =
+      typeof document !== 'undefined' &&
+      document.documentElement.classList.contains('overlay-window')
+    if (!isOverlay) get().checkForUpdates(false)
   },
 
   checkForUpdates: async (manual) => {

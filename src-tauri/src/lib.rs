@@ -11,9 +11,14 @@ mod sync;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
+
+/// When the popover last hid itself on blur — so a tray click that *caused* that
+/// blur doesn't immediately re-open it (clicking the icon should toggle).
+static LAST_POPOVER_HIDE: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
 
@@ -84,8 +89,8 @@ pub fn run() {
             build_tray(app.handle())?;
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
                 let app = window.app_handle();
                 let force = app
                     .try_state::<Arc<AppState>>()
@@ -100,6 +105,12 @@ pub fn run() {
                     api.prevent_close();
                 }
             }
+            // The menu-bar popover dismisses itself when it loses focus.
+            tauri::WindowEvent::Focused(false) if window.label() == "popover" => {
+                *LAST_POPOVER_HIDE.lock().unwrap() = Some(Instant::now());
+                let _ = window.hide();
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             commands::send_files,
@@ -113,6 +124,8 @@ pub fn run() {
             commands::pick_directory,
             commands::reveal_path,
             commands::open_path,
+            commands::open_main_window,
+            commands::hide_popover,
             commands::get_default_download_dir,
             commands::create_pair,
             commands::accept_pair,
@@ -169,10 +182,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
+                position,
                 ..
             } = event
             {
-                show_main_window(tray.app_handle());
+                toggle_popover(tray.app_handle(), position);
             }
         });
 
@@ -190,6 +204,37 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// Toggle the menu-bar popover, anchoring it just below the clicked tray icon.
+fn toggle_popover(app: &AppHandle, cursor: tauri::PhysicalPosition<f64>) {
+    let Some(w) = app.get_webview_window("popover") else {
+        return;
+    };
+    if w.is_visible().unwrap_or(false) {
+        *LAST_POPOVER_HIDE.lock().unwrap() = Some(Instant::now());
+        let _ = w.hide();
+        return;
+    }
+    // If a blur from THIS same click just hid it, treat the click as a dismiss.
+    let just_hid = LAST_POPOVER_HIDE
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed() < Duration::from_millis(250))
+        .unwrap_or(false);
+    if just_hid {
+        return;
+    }
+    // Cursor is physical; convert to logical so layout math matches window size.
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let cx = cursor.x / scale;
+    let cy = cursor.y / scale;
+    let pop_w = 380.0;
+    let x = (cx - pop_w / 2.0).max(8.0);
+    let y = cy + 8.0; // just under the menu bar
+    let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+    let _ = w.show();
+    let _ = w.set_focus();
 }
 
 fn quit_app(app: &AppHandle) {

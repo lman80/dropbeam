@@ -142,6 +142,28 @@ pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Bring the main window forward (from the menu-bar popover or the HUD) and
+/// tuck the popover away.
+#[tauri::command]
+pub fn open_main_window(app: AppHandle) {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.unminimize();
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    if let Some(pop) = app.get_webview_window("popover") {
+        let _ = pop.hide();
+    }
+}
+
+/// Hide the menu-bar popover (its own close affordance).
+#[tauri::command]
+pub fn hide_popover(app: AppHandle) {
+    if let Some(pop) = app.get_webview_window("popover") {
+        let _ = pop.hide();
+    }
+}
+
 #[tauri::command]
 pub fn get_default_download_dir(app: AppHandle) -> String {
     app.path()

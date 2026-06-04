@@ -345,3 +345,178 @@ textarea,
 .row-hover:hover {
   background: var(--surface-2);
 }
+
+/* ===================================================================== */
+/* Overlay windows: the menu-bar popover and the floating transfer HUD.  */
+/* These windows are transparent, so the body must not paint a backdrop. */
+/* ===================================================================== */
+html.overlay-window,
+html.overlay-window body,
+html.overlay-window #root {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+/* ---- Menu-bar popover ---- */
+.popover-root {
+  height: 100%;
+  padding: 8px;
+  box-sizing: border-box;
+}
+.popover-panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 10px 10px 14px;
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
+}
+.popover-head .icon-btn {
+  -webkit-app-region: no-drag;
+}
+.popover-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.popover-section-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-top: 2px;
+}
+.popover-friend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px 5px 5px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+.popover-friend:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+.popover-friend:disabled {
+  opacity: 0.55;
+}
+.popover-friend-av {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 10px;
+  flex-shrink: 0;
+}
+.popover-xfer {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 9px 11px;
+}
+.popover-code {
+  display: block;
+  margin-top: 7px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-all;
+}
+.popover-progress {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+  margin-top: 8px;
+}
+.popover-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ---- Floating transfer HUD (Dynamic Island style) ---- */
+.hud-root {
+  height: 100%;
+  display: grid;
+  place-items: start center;
+  padding: 0;
+}
+.hud-pill {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 320px;
+  max-width: 320px;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 18px;
+  background: rgba(14, 15, 22, 0.92);
+  color: #fff;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  cursor: pointer;
+  text-align: left;
+}
+.hud-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+.hud-icon.done {
+  background: linear-gradient(135deg, #16a34a, #22c55e);
+}
+.hud-title {
+  display: block;
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hud-sub {
+  display: block;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hud-ring {
+  flex-shrink: 0;
+  min-width: 34px;
+  text-align: right;
+  font-size: 13px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.92);
+}
