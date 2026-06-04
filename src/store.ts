@@ -3,6 +3,7 @@ import {
   api,
   onFolderStatus,
   onHistoryChanged,
+  onPairsChanged,
   onTransferUpdate,
   type FolderStatus,
   type Friend,
@@ -122,6 +123,9 @@ export const useStore = create<AppStore>((set, get) => ({
     onFolderStatus((s) =>
       set((st) => ({ folderStatuses: { ...st.folderStatuses, [s.pairId]: s } })),
     )
+    // The control channel can learn the peer's name after the fact — reload pairs
+    // so the folder shows who's in it (and clears the stale "waiting" state).
+    onPairsChanged(() => get().reloadPairs())
 
     appVersion().then((v) => set({ appVer: v }))
     // Quietly check for an update on launch; it surfaces in Settings if found.

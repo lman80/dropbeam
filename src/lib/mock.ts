@@ -311,6 +311,8 @@ export const mockApi = {
             speedBps: 41_000_000,
             etaSeconds: 1.1,
             detail: null,
+            peerOnline: true,
+            peerName: p.peerName || null,
           }
         : {
             pairId: p.id,
@@ -323,6 +325,8 @@ export const mockApi = {
             speedBps: 0,
             etaSeconds: null,
             detail: null,
+            peerOnline: !!p.peerName,
+            peerName: p.peerName || null,
           },
     ),
 

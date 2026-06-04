@@ -70,6 +70,8 @@ struct StatusSnapshot {
     speed_bps: f64,
     eta_seconds: Option<f64>,
     detail: Option<String>,
+    peer_online: bool,
+    peer_name: Option<String>,
 }
 
 impl Default for StatusSnapshot {
@@ -83,6 +85,8 @@ impl Default for StatusSnapshot {
             speed_bps: 0.0,
             eta_seconds: None,
             detail: None,
+            peer_online: false,
+            peer_name: None,
         }
     }
 }
@@ -435,6 +439,8 @@ impl SyncManager {
                     speed_bps: s.speed_bps,
                     eta_seconds: s.eta_seconds,
                     detail: s.detail,
+                    peer_online: s.peer_online,
+                    peer_name: s.peer_name,
                 }
             })
             .collect()
@@ -515,6 +521,22 @@ impl SyncManager {
                 status.clone(),
             );
         }
+
+        // Control channel (presence + identity) runs for BOTH peers on every pair,
+        // independent of file-sync direction — that's how the creator learns the
+        // accepter exists + their name (fixing the stuck "waiting" state).
+        self.clone().spawn_control_sender(
+            config.clone(),
+            stopped.clone(),
+            stop_notify.clone(),
+            status.clone(),
+        );
+        self.clone().spawn_control_listener(
+            config.clone(),
+            stopped.clone(),
+            stop_notify.clone(),
+            status.clone(),
+        );
 
         let handle = PairHandle {
             sig,
@@ -808,6 +830,185 @@ impl SyncManager {
         });
     }
 
+    /// Periodically beam a tiny hello {name} to the peer on the control channel.
+    /// Delivery means their control listener is up → they're online.
+    fn spawn_control_sender(
+        self: Arc<Self>,
+        config: Arc<Mutex<Pair>>,
+        stopped: Arc<AtomicBool>,
+        stop_notify: Arc<Notify>,
+        status: Arc<Mutex<StatusSnapshot>>,
+    ) {
+        let manager = self.clone();
+        let pair_id = config.lock().unwrap().id.clone();
+        tauri::async_runtime::spawn(async move {
+            let ctrl_file = manager.config_dir.join(format!(".ctrl-out-{pair_id}.json"));
+            let ctrl_path = ctrl_file.to_string_lossy().to_string();
+            loop {
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                let (pair, settings) = {
+                    let p = config.lock().unwrap().clone();
+                    let s = manager
+                        .app
+                        .try_state::<Arc<AppState>>()
+                        .map(|st| st.settings.lock().unwrap().clone())
+                        .unwrap_or_default();
+                    (p, s)
+                };
+                let my_name = if settings.display_name.trim().is_empty() {
+                    "DropBeam user".to_string()
+                } else {
+                    settings.display_name.clone()
+                };
+                let payload = serde_json::json!({ "v": 1, "name": my_name, "ts": now_ms() });
+                let _ = std::fs::write(&ctrl_file, payload.to_string());
+                let code = pairing::control_outbound_code(&pair);
+                let outcome = run_croc_send(
+                    &settings,
+                    &code,
+                    &ctrl_path,
+                    &stopped,
+                    &stop_notify,
+                    |_m| {},
+                )
+                .await;
+                match outcome {
+                    SendOutcome::Delivered => {
+                        set_peer_online(&status, true);
+                        manager.emit_status(&pair_id);
+                        // Refresh presence periodically.
+                        if wait_fixed(&stop_notify, &stopped, 30_000).await {
+                            break;
+                        }
+                    }
+                    SendOutcome::Offline => {
+                        set_peer_online(&status, false);
+                        manager.emit_status(&pair_id);
+                        if wait_backoff(&stop_notify, &stopped, 3).await {
+                            break;
+                        }
+                    }
+                    SendOutcome::Failed(_) => {
+                        if wait_fixed(&stop_notify, &stopped, 3000).await {
+                            break;
+                        }
+                    }
+                    SendOutcome::Stopped => break,
+                }
+            }
+            let _ = std::fs::remove_file(&ctrl_file);
+        });
+    }
+
+    /// Listen for the peer's hello → learn their name, mark them online, and link
+    /// them as a friend (folder partners are always friends).
+    fn spawn_control_listener(
+        self: Arc<Self>,
+        config: Arc<Mutex<Pair>>,
+        stopped: Arc<AtomicBool>,
+        stop_notify: Arc<Notify>,
+        status: Arc<Mutex<StatusSnapshot>>,
+    ) {
+        let manager = self.clone();
+        let pair_id = config.lock().unwrap().id.clone();
+        tauri::async_runtime::spawn(async move {
+            let staging = manager.config_dir.join(format!(".ctrl-in-{pair_id}"));
+            let mut idle_streak: u32 = 0;
+            loop {
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                let _ = std::fs::create_dir_all(&staging);
+                clear_dir(&staging);
+
+                let (pair, settings) = {
+                    let p = config.lock().unwrap().clone();
+                    let s = manager
+                        .app
+                        .try_state::<Arc<AppState>>()
+                        .map(|st| st.settings.lock().unwrap().clone())
+                        .unwrap_or_default();
+                    (p, s)
+                };
+                let code = pairing::control_inbound_code(&pair);
+                let outcome =
+                    run_croc_receive(&settings, &code, &staging, &stopped, &stop_notify, |_m| {})
+                        .await;
+                match outcome {
+                    ReceiveOutcome::Received => {
+                        idle_streak = 0;
+                        // Read the staging dir directly — the hello arrives as a
+                        // dotfile, which list_files_rec would skip.
+                        if let Ok(entries) = std::fs::read_dir(&staging) {
+                            for e in entries.flatten() {
+                                let p = e.path();
+                                if !p.is_file() {
+                                    continue;
+                                }
+                                if let Ok(txt) = std::fs::read_to_string(&p) {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                        if let Some(name) =
+                                            v.get("name").and_then(|n| n.as_str()).map(|s| s.trim())
+                                        {
+                                            if !name.is_empty() {
+                                                manager.on_peer_hello(
+                                                    &pair_id, &config, name, &status,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        clear_dir(&staging);
+                    }
+                    ReceiveOutcome::Stopped => break,
+                    ReceiveOutcome::Error => {
+                        // Presence/identity isn't latency-critical — poll gently to
+                        // keep background croc churn low.
+                        idle_streak = idle_streak.saturating_add(1);
+                        let gap = match idle_streak {
+                            1 => 2000,
+                            2 => 7000,
+                            _ => 15000,
+                        };
+                        if wait_fixed(&stop_notify, &stopped, gap).await {
+                            break;
+                        }
+                    }
+                }
+            }
+            clear_dir(&staging);
+        });
+    }
+
+    fn on_peer_hello(
+        self: &Arc<Self>,
+        pair_id: &str,
+        config: &Arc<Mutex<Pair>>,
+        name: &str,
+        status: &Arc<Mutex<StatusSnapshot>>,
+    ) {
+        if let Ok(mut s) = status.lock() {
+            s.peer_online = true;
+            s.peer_name = Some(name.to_string());
+        }
+        let changed = pairing::set_peer_name(&self.config_dir, pair_id, name);
+        if changed {
+            let (secret, role) = {
+                let mut p = config.lock().unwrap();
+                p.peer_name = name.to_string();
+                (p.secret.clone(), p.role)
+            };
+            friends::upsert_from_pairing(&self.config_dir, name, &secret, role);
+            self.reconcile_friends();
+            let _ = self.app.emit("pairs://changed", ());
+        }
+        self.emit_status(pair_id);
+    }
+
     fn persist_manifest(&self, pair_id: &str, set: &HashSet<String>) {
         save_manifest(&self.config_dir, pair_id, set);
     }
@@ -875,6 +1076,8 @@ impl SyncManager {
             speed_bps: s.speed_bps,
             eta_seconds: s.eta_seconds,
             detail: s.detail,
+            peer_online: s.peer_online,
+            peer_name: s.peer_name,
         };
         let _ = self.app.emit("folder://status", status);
     }
@@ -1401,6 +1604,12 @@ fn set_status(
         s.bytes_total = 0;
         s.speed_bps = 0.0;
         s.eta_seconds = None;
+    }
+}
+
+fn set_peer_online(status: &Arc<Mutex<StatusSnapshot>>, online: bool) {
+    if let Ok(mut s) = status.lock() {
+        s.peer_online = online;
     }
 }
 

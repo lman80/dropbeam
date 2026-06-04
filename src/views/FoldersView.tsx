@@ -19,6 +19,7 @@ import { useStore } from '../store'
 import { EmptyState, ProgressBar, Spinner } from '../components/bits'
 import { formatBytes, formatEta, formatSpeed } from '../lib/format'
 import { PairingModal } from '../components/PairingModal'
+import { avatarGradient, initials } from '../lib/avatar'
 
 export function FoldersView() {
   const pairs = useStore((s) => s.pairs)
@@ -86,7 +87,9 @@ export function FoldersView() {
 }
 
 function statusInfo(pair: Pair, status?: FolderStatus): { color: string; label: string } {
-  if (pair.role === 'a' && !pair.peerName) {
+  const peer = pair.peerName || 'your friend'
+  // Only truly "waiting" if the creator has never been reached by anyone yet.
+  if (pair.role === 'a' && !pair.peerName && !status?.peerOnline) {
     return { color: 'var(--amber)', label: 'Waiting for someone to accept the invite' }
   }
   const st = status?.state ?? 'idle'
@@ -108,6 +111,9 @@ function statusInfo(pair: Pair, status?: FolderStatus): { color: string; label: 
     case 'error':
       return { color: 'var(--red)', label: status?.detail ?? 'Something went wrong' }
     default:
+      if (status && !status.peerOnline && pair.peerName) {
+        return { color: 'var(--text-faint)', label: `${peer} is offline — will sync when they're back` }
+      }
       return { color: 'var(--green)', label: 'In sync' }
   }
 }
@@ -124,6 +130,7 @@ function FolderCard({
   const updatePair = useStore((s) => s.updatePair)
   const removePair = useStore((s) => s.removePair)
   const toast = useStore((s) => s.toast)
+  const myName = useStore((s) => s.settings?.displayName || 'You')
   const [open, setOpen] = useState(false)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [loadingInvite, setLoadingInvite] = useState(false)
@@ -232,6 +239,16 @@ function FolderCard({
             {loadingInvite ? <Spinner size={13} /> : <QrCode size={13} />} Show invite
           </button>
         )}
+      </div>
+
+      {/* Members — who's in this folder (you + your paired friend) */}
+      <div style={{ display: 'flex', gap: 8, marginTop: 11, flexWrap: 'wrap' }}>
+        <Member name={myName} you online />
+        <Member
+          name={pair.peerName || 'Waiting to join…'}
+          online={status?.peerOnline ?? false}
+          pending={!pair.peerName}
+        />
       </div>
 
       {/* Live transfer progress while sending or receiving */}
@@ -351,6 +368,72 @@ function FolderCard({
         )}
       </AnimatePresence>
     </motion.div>
+  )
+}
+
+function Member({
+  name,
+  online,
+  you,
+  pending,
+}: {
+  name: string
+  online: boolean
+  you?: boolean
+  pending?: boolean
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 7,
+        padding: '4px 11px 4px 5px',
+        background: 'var(--surface-2)',
+        borderRadius: 999,
+        border: '1px solid var(--border)',
+      }}
+      title={you ? 'You' : online ? `${name} · online` : `${name} · offline`}
+    >
+      <span
+        style={{
+          position: 'relative',
+          width: 24,
+          height: 24,
+          borderRadius: 999,
+          display: 'grid',
+          placeItems: 'center',
+          color: 'white',
+          fontWeight: 700,
+          fontSize: 10,
+          flexShrink: 0,
+          background: you
+            ? 'linear-gradient(135deg, var(--accent), var(--accent-2))'
+            : pending
+              ? 'var(--text-faint)'
+              : avatarGradient(name),
+        }}
+      >
+        {pending ? '?' : initials(name)}
+        {!you && !pending && (
+          <span
+            style={{
+              position: 'absolute',
+              right: -1,
+              bottom: -1,
+              width: 9,
+              height: 9,
+              borderRadius: 999,
+              background: online ? 'var(--green)' : 'var(--text-faint)',
+              border: '2px solid var(--surface)',
+            }}
+          />
+        )}
+      </span>
+      <span style={{ fontSize: 12.5, fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
+        {you ? `${name} (you)` : name}
+      </span>
+    </div>
   )
 }
 

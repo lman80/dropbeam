@@ -107,6 +107,8 @@ export interface FolderStatus {
   speedBps: number
   etaSeconds: number | null
   detail: string | null
+  peerOnline: boolean
+  peerName: string | null
 }
 
 export interface PairUpdate {
@@ -170,6 +172,11 @@ export const api: typeof realApi = HAS_TAURI ? realApi : (mockApi as typeof real
 export function onFolderStatus(cb: (s: FolderStatus) => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('folder://status', (p) => cb(p as FolderStatus))
   return listen<FolderStatus>('folder://status', (e) => cb(e.payload))
+}
+
+export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('pairs://changed', () => cb())
+  return listen('pairs://changed', () => cb())
 }
 
 export function onTransferUpdate(cb: (u: TransferUpdate) => void): Promise<UnlistenFn> {

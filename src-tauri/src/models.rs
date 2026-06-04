@@ -241,5 +241,12 @@ pub struct FolderStatus {
     pub speed_bps: f64,
     pub eta_seconds: Option<f64>,
     pub detail: Option<String>,
+    /// Whether the paired peer is currently reachable (their control channel
+    /// answered recently). Drives the online/offline dot + clears the stale
+    /// "waiting for someone to accept" state once we've actually heard from them.
+    pub peer_online: bool,
+    /// The peer's display name, learned over the control channel (the creator
+    /// side has no name until the accepter says hello).
+    pub peer_name: Option<String>,
 }
 

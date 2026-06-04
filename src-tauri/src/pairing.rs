@@ -131,7 +131,6 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
         return Err("That folder is already a Shared Drop Folder.".into());
     }
 
-    let auto_friend = invite.frn;
     let pair = Pair {
         id: invite.id,
         role: PairRole::B,
@@ -149,11 +148,10 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
     };
     pairs.push(pair.clone());
     save(config_dir, &pairs)?;
-    // Mirror the creator: if they linked us as a friend, link them back (role B),
-    // named after the inviter. Both sides derive the same friend channels.
-    if auto_friend {
-        friends::upsert_from_pairing(config_dir, &pair.peer_name, &pair.secret, PairRole::B);
-    }
+    // Folder partners are always friends — that's how you see who's in a folder
+    // and beam to them by name. We know the inviter's name from the invite; they
+    // learn ours over the control channel's hello.
+    friends::upsert_from_pairing(config_dir, &pair.peer_name, &pair.secret, PairRole::B);
     Ok(pair)
 }
 
@@ -229,6 +227,47 @@ pub fn inbound_code(pair: &Pair) -> String {
         PairRole::B => "a2b",
     };
     derive_code(&pair.secret, channel)
+}
+
+/// Control channel (presence/identity/sync events) this side SENDS on. Separate
+/// from the file channels so a tiny hello never collides with a file transfer.
+pub fn control_outbound_code(pair: &Pair) -> String {
+    let channel = match pair.role {
+        PairRole::A => "ctrl-a2b",
+        PairRole::B => "ctrl-b2a",
+    };
+    derive_code(&pair.secret, channel)
+}
+
+/// Control channel this side RECEIVES on.
+pub fn control_inbound_code(pair: &Pair) -> String {
+    let channel = match pair.role {
+        PairRole::A => "ctrl-b2a",
+        PairRole::B => "ctrl-a2b",
+    };
+    derive_code(&pair.secret, channel)
+}
+
+/// Persist a peer name learned over the control channel. Returns true if it
+/// actually changed (so the caller can refresh the UI + auto-friend once).
+pub fn set_peer_name(config_dir: &Path, id: &str, name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let mut changed = false;
+    if let Some(p) = pairs.iter_mut().find(|p| p.id == id) {
+        if p.peer_name != name {
+            p.peer_name = name.to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &pairs);
+    }
+    changed
 }
 
 fn derive_code(secret: &str, channel: &str) -> String {
