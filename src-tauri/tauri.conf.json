@@ -1,0 +1,64 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "DropBeam",
+  "mainBinaryName": "DropBeam",
+  "version": "0.1.0",
+  "identifier": "com.dropbeam.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "DropBeam",
+        "width": 980,
+        "height": 700,
+        "minWidth": 760,
+        "minHeight": 560,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": "all",
+    "category": "public.app-category.utilities",
+    "shortDescription": "Seamless peer-to-peer file transfer",
+    "longDescription": "DropBeam sends files directly between computers — on your local network or across the internet — with end-to-end encryption. Includes Shared Drop Folders that auto-beam files to a paired friend.",
+    "externalBin": ["binaries/croc"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxMjA5QjkyRjQwQUY5QzMKUldURCtRcjBrcHNnSVFNeGVyZHlDd3o0MTlVSjcwRi81bzZXcDN4dy9NUEFjbXN0OUMxTmRLQjAK",
+      "endpoints": [
+        "https://github.com/lman80/dropbeam/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

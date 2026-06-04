@@ -1,0 +1,262 @@
+import { create } from 'zustand'
+import {
+  api,
+  onFolderStatus,
+  onHistoryChanged,
+  onTransferUpdate,
+  type FolderStatus,
+  type HistoryEntry,
+  type Pair,
+  type PairUpdate,
+  type Settings,
+  type TransferUpdate,
+} from './lib/api'
+import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
+
+interface UpdateState {
+  version: string
+  notes: string
+  installing: boolean
+  progress: number
+}
+
+export type View = 'send' | 'folders' | 'history' | 'settings'
+
+export interface Toast {
+  id: string
+  kind: 'info' | 'success' | 'error'
+  message: string
+}
+
+interface AppStore {
+  ready: boolean
+  view: View
+  settings: Settings | null
+  transfers: Record<string, TransferUpdate>
+  order: string[]
+  dragHovering: boolean
+  history: HistoryEntry[]
+  pairs: Pair[]
+  folderStatuses: Record<string, FolderStatus>
+  toasts: Toast[]
+  defaultDownloadDir: string
+  appVer: string
+  update: UpdateState | null
+  checkingUpdate: boolean
+
+  init: () => Promise<void>
+  checkForUpdates: (manual: boolean) => Promise<void>
+  installUpdate: () => Promise<void>
+  setView: (v: View) => void
+  setDragHovering: (v: boolean) => void
+  applyTheme: (theme: Settings['theme']) => void
+  saveSettings: (patch: Partial<Settings>) => Promise<void>
+  sendPaths: (paths: string[]) => Promise<void>
+  receiveCode: (code: string) => Promise<void>
+  upsertTransfer: (u: TransferUpdate) => void
+  removeTransfer: (id: string) => void
+  reloadHistory: () => Promise<void>
+  reloadPairs: () => Promise<void>
+  updatePair: (u: PairUpdate) => Promise<void>
+  removePair: (id: string) => Promise<void>
+  toast: (kind: Toast['kind'], message: string) => void
+  dismissToast: (id: string) => void
+}
+
+// Guard against Tauri's occasional double-fire of a single OS file drop.
+let lastDropSig = ''
+let lastDropAt = 0
+
+export const useStore = create<AppStore>((set, get) => ({
+  ready: false,
+  view: 'send',
+  settings: null,
+  transfers: {},
+  order: [],
+  dragHovering: false,
+  history: [],
+  pairs: [],
+  folderStatuses: {},
+  toasts: [],
+  defaultDownloadDir: '',
+  appVer: '',
+  update: null,
+  checkingUpdate: false,
+
+  init: async () => {
+    const [settings, history, pairs, statuses, defaultDownloadDir] = await Promise.all([
+      api.getSettings(),
+      api.getHistory(),
+      api.listPairs().catch(() => []),
+      api.getFolderStatuses().catch(() => []),
+      api.getDefaultDownloadDir().catch(() => ''),
+    ])
+    get().applyTheme(settings.theme)
+    const folderStatuses: Record<string, FolderStatus> = {}
+    statuses.forEach((s) => (folderStatuses[s.pairId] = s))
+    set({ settings, history, pairs, folderStatuses, defaultDownloadDir, ready: true })
+
+    // Re-apply theme when the OS appearance changes (only matters for "system").
+    window
+      .matchMedia('(prefers-color-scheme: dark)')
+      .addEventListener('change', () => {
+        const s = get().settings
+        if (s && s.theme === 'system') get().applyTheme('system')
+      })
+
+    onTransferUpdate((u) => get().upsertTransfer(u))
+    onHistoryChanged(() => get().reloadHistory())
+    onFolderStatus((s) =>
+      set((st) => ({ folderStatuses: { ...st.folderStatuses, [s.pairId]: s } })),
+    )
+
+    appVersion().then((v) => set({ appVer: v }))
+    // Quietly check for an update on launch; it surfaces in Settings if found.
+    get().checkForUpdates(false)
+  },
+
+  checkForUpdates: async (manual) => {
+    if (get().checkingUpdate) return
+    set({ checkingUpdate: true })
+    try {
+      const info = await checkUpdate()
+      if (info) {
+        set({ update: { version: info.version, notes: info.notes, installing: false, progress: 0 } })
+        if (manual) get().toast('info', `Update available: v${info.version}`)
+      } else if (manual) {
+        get().toast('success', "You're on the latest version")
+      }
+    } catch (e) {
+      if (manual) get().toast('error', `Couldn't check for updates: ${e}`)
+    } finally {
+      set({ checkingUpdate: false })
+    }
+  },
+
+  installUpdate: async () => {
+    const u = get().update
+    if (!u) return
+    set({ update: { ...u, installing: true, progress: 0 } })
+    try {
+      await runInstall((pct) => {
+        const cur = get().update
+        if (cur) set({ update: { ...cur, progress: pct } })
+      })
+      // The app relaunches inside runInstall on success.
+    } catch (e) {
+      get().toast('error', `Update failed: ${e}`)
+      const cur = get().update
+      if (cur) set({ update: { ...cur, installing: false } })
+    }
+  },
+
+  setView: (view) => set({ view }),
+
+  setDragHovering: (dragHovering) => set({ dragHovering }),
+
+  sendPaths: async (paths) => {
+    paths = paths.filter(Boolean)
+    if (!paths.length) return
+    // De-dupe a double-fired drop of the same paths within 800ms.
+    const sig = paths.join('|')
+    const now = Date.now()
+    if (sig === lastDropSig && now - lastDropAt < 800) return
+    lastDropSig = sig
+    lastDropAt = now
+    set({ view: 'send' })
+    try {
+      const u = await api.sendFiles(paths)
+      get().upsertTransfer(u)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  receiveCode: async (code) => {
+    code = code.trim()
+    if (!code) return
+    try {
+      const u = await api.receiveFiles(code)
+      get().upsertTransfer(u)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  applyTheme: (theme) => {
+    const root = document.documentElement
+    const sysDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+    const dark = theme === 'dark' || (theme === 'system' && sysDark)
+    root.classList.toggle('dark', dark)
+  },
+
+  saveSettings: async (patch) => {
+    const current = get().settings
+    if (!current) return
+    const next = { ...current, ...patch }
+    set({ settings: next })
+    if (patch.theme) get().applyTheme(patch.theme)
+    try {
+      const saved = await api.updateSettings(next)
+      set({ settings: saved })
+    } catch (e) {
+      get().toast('error', `Couldn't save settings: ${e}`)
+    }
+  },
+
+  upsertTransfer: (u) => {
+    set((s) => ({
+      transfers: { ...s.transfers, [u.id]: u },
+      order: s.order.includes(u.id) ? s.order : [...s.order, u.id],
+    }))
+  },
+
+  removeTransfer: (id) =>
+    set((s) => {
+      const next = { ...s.transfers }
+      delete next[id]
+      return { transfers: next, order: s.order.filter((x) => x !== id) }
+    }),
+
+  reloadHistory: async () => {
+    const history = await api.getHistory()
+    set({ history })
+  },
+
+  reloadPairs: async () => {
+    const [pairs, statuses] = await Promise.all([
+      api.listPairs(),
+      api.getFolderStatuses().catch(() => []),
+    ])
+    const folderStatuses: Record<string, FolderStatus> = {}
+    statuses.forEach((s) => (folderStatuses[s.pairId] = s))
+    set({ pairs, folderStatuses })
+  },
+
+  updatePair: async (u) => {
+    try {
+      await api.updatePair(u)
+      await get().reloadPairs()
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  removePair: async (id) => {
+    try {
+      await api.removePair(id)
+      await get().reloadPairs()
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  toast: (kind, message) => {
+    const id = crypto.randomUUID()
+    set((s) => ({ toasts: [...s.toasts, { id, kind, message }] }))
+    setTimeout(() => get().dismissToast(id), kind === 'error' ? 6000 : 3500)
+  },
+
+  dismissToast: (id) =>
+    set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+}))

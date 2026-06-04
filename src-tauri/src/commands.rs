@@ -1,0 +1,246 @@
+//! Tauri commands invoked from the React frontend.
+
+use std::sync::Arc;
+
+use serde::Serialize;
+use tauri::{AppHandle, Manager, State};
+
+use crate::models::{DeleteMode, FolderStatus, HistoryEntry, Pair, Settings, TransferUpdate};
+use crate::sync::SyncManager;
+use crate::{croc, history, pairing, settings, AppState};
+
+#[tauri::command]
+pub fn send_files(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    paths: Vec<String>,
+) -> Result<TransferUpdate, String> {
+    let paths: Vec<String> = paths.into_iter().filter(|p| !p.trim().is_empty()).collect();
+    if paths.is_empty() {
+        return Err("No files selected.".into());
+    }
+    for p in &paths {
+        if !std::path::Path::new(p).exists() {
+            return Err(format!("File not found: {p}"));
+        }
+    }
+    Ok(croc::start_send(app, state.inner().clone(), paths, None))
+}
+
+#[tauri::command]
+pub fn receive_files(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    code: String,
+) -> Result<TransferUpdate, String> {
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        return Err("Enter a code to receive.".into());
+    }
+    let configured = { state.settings.lock().unwrap().download_dir.clone() };
+    let out = if configured.trim().is_empty() {
+        app.path()
+            .download_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .map_err(|e| format!("No download folder available: {e}"))?
+    } else {
+        configured
+    };
+    std::fs::create_dir_all(&out).map_err(|e| format!("Can't write to download folder: {e}"))?;
+    Ok(croc::start_receive(app, state.inner().clone(), code, out))
+}
+
+#[tauri::command]
+pub fn cancel_transfer(state: State<'_, Arc<AppState>>, id: String) {
+    if let Some(notify) = state.transfers.lock().unwrap().get(&id) {
+        notify.notify_one();
+    }
+}
+
+#[tauri::command]
+pub fn get_settings(state: State<'_, Arc<AppState>>) -> Settings {
+    state.settings.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn update_settings(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    settings: Settings,
+) -> Result<Settings, String> {
+    apply_autostart(&app, settings.launch_at_login);
+    {
+        let mut guard = state.settings.lock().unwrap();
+        *guard = settings.clone();
+    }
+    settings::save(&state.config_dir, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+pub fn get_history(state: State<'_, Arc<AppState>>) -> Vec<HistoryEntry> {
+    history::load(&state.config_dir)
+}
+
+#[tauri::command]
+pub fn clear_history(state: State<'_, Arc<AppState>>) {
+    history::clear(&state.config_dir);
+}
+
+/// Native multi-file picker (the "+" / choose-files affordance).
+///
+/// IMPORTANT: this is `async` on purpose. A sync command runs on the main UI
+/// thread, and a *blocking* file dialog would then deadlock that thread (the
+/// panel appears but the whole app freezes). Running async + the non-blocking
+/// callback lets the dialog live on the main loop while we await off-thread.
+#[tauri::command]
+pub async fn pick_files(app: AppHandle) -> Vec<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_files(move |paths| {
+        let _ = tx.send(paths);
+    });
+    match rx.await {
+        Ok(Some(list)) => list
+            .into_iter()
+            .filter_map(|p| p.into_path().ok())
+            .map(|pb| pb.to_string_lossy().to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Native folder picker (download folder, shared folder selection).
+#[tauri::command]
+pub async fn pick_directory(app: AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |path| {
+        let _ = tx.send(path);
+    });
+    match rx.await {
+        Ok(Some(p)) => p.into_path().ok().map(|pb| pb.to_string_lossy().to_string()),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_default_download_dir(app: AppHandle) -> String {
+    app.path()
+        .download_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn apply_autostart(app: &AppHandle, enable: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let _ = if enable {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Shared Drop Folders
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePairResult {
+    pub pair: Pair,
+    pub invite: String,
+}
+
+#[tauri::command]
+pub fn create_pair(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    folder: String,
+    two_way: bool,
+) -> Result<CreatePairResult, String> {
+    let name = state.settings.lock().unwrap().display_name.clone();
+    let (pair, invite) = pairing::create(&state.config_dir, folder, name, two_way)?;
+    sync.reconcile();
+    Ok(CreatePairResult { pair, invite })
+}
+
+#[tauri::command]
+pub fn accept_pair(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    invite: String,
+    folder: String,
+) -> Result<Pair, String> {
+    let pair = pairing::accept(&state.config_dir, &invite, folder)?;
+    sync.reconcile();
+    Ok(pair)
+}
+
+#[tauri::command]
+pub fn list_pairs(state: State<'_, Arc<AppState>>) -> Vec<Pair> {
+    pairing::load(&state.config_dir)
+}
+
+#[tauri::command]
+pub fn update_pair(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    id: String,
+    two_way: Option<bool>,
+    auto_delete: Option<bool>,
+    delete_mode: Option<DeleteMode>,
+    peer_name: Option<String>,
+) -> Result<Pair, String> {
+    let pair = pairing::update(
+        &state.config_dir,
+        &id,
+        two_way,
+        auto_delete,
+        delete_mode,
+        peer_name,
+    )?;
+    sync.reconcile();
+    Ok(pair)
+}
+
+#[tauri::command]
+pub fn remove_pair(
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    id: String,
+) -> Result<(), String> {
+    pairing::remove(&state.config_dir, &id)?;
+    sync.reconcile();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn pair_invite(state: State<'_, Arc<AppState>>, id: String) -> Result<String, String> {
+    let name = state.settings.lock().unwrap().display_name.clone();
+    let pairs = pairing::load(&state.config_dir);
+    let pair = pairs.iter().find(|p| p.id == id).ok_or("Pair not found.")?;
+    Ok(pairing::invite_for(pair, &name))
+}
+
+#[tauri::command]
+pub fn get_folder_statuses(sync: State<'_, Arc<SyncManager>>) -> Vec<FolderStatus> {
+    sync.statuses()
+}

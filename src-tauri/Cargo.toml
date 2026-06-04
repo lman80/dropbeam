@@ -1,0 +1,53 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "DropBeam — seamless peer-to-peer file transfer"
+authors = ["DropBeam"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.2", features = ["tray-icon", "image-png"] }
+tauri-plugin-log = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+tokio = { version = "1", features = ["process", "io-util", "rt-multi-thread", "macros", "sync", "time", "fs"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+whoami = "1"
+regex = "1"
+notify = "6"
+trash = "5"
+base64 = "0.22"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+
+# Keep the dev build small on a tight disk: no debug symbols (saves several GB in target/).
+[profile.dev]
+debug = 0
+strip = true
+
+# Small release binary for the shipped .dmg/.msi (thin LTO keeps build time sane).
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 16
+strip = true

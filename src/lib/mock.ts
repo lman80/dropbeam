@@ -1,0 +1,260 @@
+// Dev-only mock backend. Activates ONLY when the app runs outside Tauri (i.e. a
+// plain browser, for UI preview/development). In the real packaged app the Tauri
+// APIs are present and this module is never used, so it can't affect production.
+
+import type { FolderStatus, HistoryEntry, Pair, PairUpdate, Settings, TransferUpdate } from './api'
+
+type Cb = (payload: unknown) => void
+const buses: Record<string, Set<Cb>> = {}
+
+function emit(event: string, payload: unknown) {
+  buses[event]?.forEach((cb) => cb(payload))
+}
+
+export function mockListen(event: string, cb: Cb): Promise<() => void> {
+  ;(buses[event] ??= new Set()).add(cb)
+  return Promise.resolve(() => {
+    buses[event]?.delete(cb)
+  })
+}
+
+let settings: Settings = {
+  downloadDir: '/Users/you/Downloads',
+  displayName: "Ashton's MacBook Pro",
+  theme: 'system',
+  minimizeToTray: true,
+  launchAtLogin: false,
+  preferDirectP2p: true,
+  customRelay: '',
+  customRelayPass: '',
+  notifyOnComplete: true,
+}
+
+const history: HistoryEntry[] = [
+  {
+    id: 'h1',
+    direction: 'receive',
+    fileNames: ['Vacation Photos.zip'],
+    bytesTotal: 248_000_000,
+    peer: '192.168.1.40:5',
+    locality: 'local',
+    code: null,
+    state: 'completed',
+    timestampMs: Date.now() - 42 * 60_000,
+    error: null,
+    outDir: '/Users/you/Downloads',
+  },
+  {
+    id: 'h2',
+    direction: 'send',
+    fileNames: ['budget-2026.xlsx'],
+    bytesTotal: 84_000,
+    peer: '70.2.1.9:5',
+    locality: 'internet',
+    code: null,
+    state: 'completed',
+    timestampMs: Date.now() - 8 * 3600_000,
+    error: null,
+    outDir: null,
+  },
+  {
+    id: 'h3',
+    direction: 'send',
+    fileNames: ['demo-reel.mov', 'notes.txt'],
+    bytesTotal: 1_240_000_000,
+    peer: null,
+    locality: 'unknown',
+    code: null,
+    state: 'failed',
+    timestampMs: Date.now() - 26 * 3600_000,
+    error: 'The other side went offline before the transfer finished.',
+    outDir: null,
+  },
+]
+
+let counter = 0
+
+let pairs: Pair[] = [
+  {
+    id: 'p1',
+    role: 'a',
+    peerName: 'Alex',
+    secret: 'mock',
+    folder: '/Users/you/Desktop/Beam to Alex',
+    twoWay: true,
+    autoDelete: true,
+    deleteMode: 'trash',
+    createdAt: Date.now() - 3 * 86400_000,
+  },
+]
+let pairCounter = 1
+
+function base(id: string, direction: 'send' | 'receive', names: string[]): TransferUpdate {
+  return {
+    id,
+    direction,
+    state: 'starting',
+    code: null,
+    fileNames: names,
+    fileCount: names.length,
+    percent: 0,
+    bytesDone: 0,
+    bytesTotal: 0,
+    speedBps: 0,
+    etaSeconds: null,
+    locality: 'unknown',
+    peer: null,
+    error: null,
+    outDir: direction === 'receive' ? settings.downloadDir : null,
+  }
+}
+
+function simulate(t: TransferUpdate, total: number) {
+  t.bytesTotal = total
+  t.peer = '192.168.1.55:51022'
+  t.locality = 'local'
+  let pct = 0
+  const iv = setInterval(() => {
+    pct += 6 + Math.random() * 9
+    if (pct >= 100) {
+      t.state = 'transferring'
+      t.percent = 100
+      t.bytesDone = total
+      t.speedBps = 44_000_000
+      t.etaSeconds = 0
+      emit('transfer://update', { ...t })
+      clearInterval(iv)
+      setTimeout(() => {
+        t.state = 'completed'
+        emit('transfer://update', { ...t })
+        history.unshift({
+          id: t.id,
+          direction: t.direction,
+          fileNames: t.fileNames,
+          bytesTotal: total,
+          peer: t.peer,
+          locality: t.locality,
+          code: t.code,
+          state: 'completed',
+          timestampMs: Date.now(),
+          error: null,
+          outDir: t.outDir,
+        })
+        emit('history://changed', null)
+      }, 600)
+      return
+    }
+    t.state = 'transferring'
+    t.percent = pct
+    t.bytesDone = Math.round((total * pct) / 100)
+    t.speedBps = 36_000_000 + Math.random() * 16_000_000
+    t.etaSeconds = (100 - pct) / 11
+    emit('transfer://update', { ...t })
+  }, 550)
+}
+
+export const mockApi = {
+  sendFiles: async (paths: string[]): Promise<TransferUpdate> => {
+    const id = `m${++counter}`
+    const names = paths.map((p) => p.split('/').pop() || p)
+    const t = base(id, 'send', names)
+    setTimeout(() => {
+      t.state = 'waitingForPeer'
+      t.code = `${4000 + Math.floor(Math.random() * 5000)}-mizar-cobalt`
+      emit('transfer://update', { ...t })
+      setTimeout(() => simulate(t, 124_000_000), 3200)
+    }, 250)
+    return base(id, 'send', names)
+  },
+  receiveFiles: async (_code: string): Promise<TransferUpdate> => {
+    const id = `m${++counter}`
+    const t = base(id, 'receive', [])
+    setTimeout(() => {
+      t.state = 'connecting'
+      emit('transfer://update', { ...t })
+      setTimeout(() => {
+        t.fileNames = ['project-export.bin']
+        t.fileCount = 1
+        simulate(t, 64_000_000)
+      }, 1400)
+    }, 300)
+    return base(id, 'receive', [])
+  },
+  cancelTransfer: async (_id: string): Promise<void> => {},
+  getSettings: async (): Promise<Settings> => settings,
+  updateSettings: async (s: Settings): Promise<Settings> => {
+    settings = s
+    return s
+  },
+  getHistory: async (): Promise<HistoryEntry[]> => [...history],
+  clearHistory: async (): Promise<void> => {
+    history.length = 0
+  },
+  pickFiles: async (): Promise<string[]> => [
+    '/Users/you/Desktop/Q3 Presentation.key',
+    '/Users/you/Desktop/cover-photo.png',
+  ],
+  pickDirectory: async (): Promise<string | null> => '/Users/you/Desktop/Beam to Alex',
+  revealPath: async (_path: string): Promise<void> => {},
+  openPath: async (_path: string): Promise<void> => {},
+  getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
+
+  createPair: async (folder: string, twoWay: boolean): Promise<{ pair: Pair; invite: string }> => {
+    const id = `p${++pairCounter}`
+    const pair: Pair = {
+      id,
+      role: 'a',
+      peerName: '',
+      secret: 'mock',
+      folder,
+      twoWay,
+      autoDelete: false,
+      deleteMode: 'trash',
+      createdAt: Date.now(),
+    }
+    pairs.push(pair)
+    return { pair, invite: `dropbeam1:MOCK${id}invitecodewouldgohere0000` }
+  },
+  acceptPair: async (_invite: string, folder: string): Promise<Pair> => {
+    const id = `p${++pairCounter}`
+    const pair: Pair = {
+      id,
+      role: 'b',
+      peerName: 'Sam',
+      secret: 'mock',
+      folder,
+      twoWay: true,
+      autoDelete: false,
+      deleteMode: 'trash',
+      createdAt: Date.now(),
+    }
+    pairs.push(pair)
+    return pair
+  },
+  listPairs: async (): Promise<Pair[]> => [...pairs],
+  updatePair: async (u: PairUpdate): Promise<Pair> => {
+    const p = pairs.find((x) => x.id === u.id)!
+    if (u.twoWay != null) p.twoWay = u.twoWay
+    if (u.autoDelete != null) p.autoDelete = u.autoDelete
+    if (u.deleteMode) p.deleteMode = u.deleteMode
+    if (u.peerName) p.peerName = u.peerName
+    return { ...p }
+  },
+  removePair: async (id: string): Promise<void> => {
+    pairs = pairs.filter((p) => p.id !== id)
+  },
+  pairInvite: async (id: string): Promise<string> => `dropbeam1:MOCK${id}invitecodewouldgohere0000`,
+  getFolderStatuses: async (): Promise<FolderStatus[]> =>
+    pairs.map((p) =>
+      p.id === 'p1'
+        ? {
+            pairId: p.id,
+            state: 'waiting' as const,
+            queued: 2,
+            sendingFile: null,
+            percent: 0,
+            detail: 'Waiting for Alex to come online',
+          }
+        : { pairId: p.id, state: 'idle' as const, queued: 0, sendingFile: null, percent: 0, detail: null },
+    ),
+}
