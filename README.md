@@ -4,6 +4,19 @@ A polished, cross‑platform desktop app for sending files directly between
 computers — on your local network or anywhere over the internet — with
 end‑to‑end encryption. Built on [croc](https://github.com/schollz/croc).
 
+## ⬇️ Download
+
+Grab the latest installer from the **[Releases page](https://github.com/lman80/dropbeam/releases/latest)**:
+
+- **macOS** (Apple Silicon & Intel) → download the **`.dmg`**, open it, drag **DropBeam** to Applications.
+- **Windows** → download the **`.exe`** installer and run it.
+
+> **First launch only** — the app isn't signed with a paid developer certificate, so the OS shows a one‑time warning:
+> - **macOS:** right‑click DropBeam → **Open** → **Open**.
+> - **Windows:** click **More info → Run anyway**.
+>
+> After that it opens normally, and **updates install themselves** from inside the app (Settings → Check for updates) — no re‑downloading.
+
 Two modes:
 
 - **Quick Send** — drag a file in, get a short code, the other side enters it. Works
