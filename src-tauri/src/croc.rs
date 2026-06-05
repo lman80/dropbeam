@@ -205,7 +205,7 @@ async fn run_transfer(app: AppHandle, state: Arc<AppState>, mut update: Transfer
         };
         let cmd = build_run_command(&bin, &settings, &job, send_code.as_deref());
 
-        match run_once(&app, &mut update, cmd, &cancel).await {
+        match run_once(&app, &mut update, cmd, &cancel, deadline).await {
             RunOutcome::Completed => {
                 update.state = TransferState::Completed;
                 update.percent = 100.0;
@@ -249,6 +249,7 @@ async fn run_once(
     update: &mut TransferUpdate,
     mut cmd: Command,
     cancel: &Arc<Notify>,
+    deadline: Instant,
 ) -> RunOutcome {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -278,11 +279,23 @@ async fn run_once(
     let reader = tauri::async_runtime::spawn(read_stderr(stderr, tx));
 
     let mut canceled = false;
+    // A waiting `croc send` parks on the relay at ~12% CPU until the peer shows
+    // up. Once a real connection forms (Connecting/Transferring) we let it run to
+    // completion; until then we honor the overall budget so an abandoned send
+    // can't busy-burn the CPU forever.
+    let mut connected = false;
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(parsed) => {
                     apply(update, parsed);
+                    if matches!(
+                        update.state,
+                        TransferState::Connecting | TransferState::Transferring
+                    ) {
+                        connected = true;
+                    }
                     emit_update(app, update);
                 }
                 None => break,
@@ -291,6 +304,14 @@ async fn run_once(
                 let _ = child.start_kill();
                 canceled = true;
                 break;
+            }
+            _ = tokio::time::sleep(remaining), if !connected => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return RunOutcome::Failed {
+                    permanent: false,
+                    error: friendly_timeout(update.direction),
+                };
             }
         }
     }

@@ -31,6 +31,11 @@ use crate::{friends, pairing, AppState};
 
 const STAGING_DIR: &str = ".dropbeam-incoming";
 const CONNECT_TIMEOUT_SECS: u64 = 75;
+/// The presence/control beacon parks only briefly — a parked `croc send` costs
+/// ~12% CPU, so we never hold one open just to gossip a hello. Chosen a touch
+/// longer than the control listener's idle gap so a beacon reliably overlaps one
+/// of the listener's poll windows (guaranteed rendezvous in one round).
+const CONTROL_CONNECT_TIMEOUT_SECS: u64 = 25;
 const MAX_BACKOFF_SECS: u64 = 30;
 
 /// Manages all active Shared Drop Folders and friend inbox listeners.
@@ -365,11 +370,7 @@ impl SyncManager {
                             let _ = manager.app.emit("transfer://update", &u);
                         }
                         idle_streak = idle_streak.saturating_add(1);
-                        let gap = match idle_streak {
-                            1 => 1200,
-                            2 => 3000,
-                            _ => 8000,
-                        };
+                        let gap = poll_gap(idle_streak, 60_000);
                         if wait_fixed(&stop_t, &stopped_t, gap).await {
                             break;
                         }
@@ -763,6 +764,12 @@ impl SyncManager {
                 set_status(&status, FolderState::Sending, Some(name.clone()), 0.0, None);
                 manager.emit_status(&pair_id);
 
+                // A parked `croc send` busy-burns ~12% CPU. If the peer looks
+                // offline, park only briefly (still self-correcting if that guess
+                // is stale, since the next attempt re-parks); park long when online.
+                let peer_online = status.lock().map(|s| s.peer_online).unwrap_or(true);
+                let connect = if peer_online { CONNECT_TIMEOUT_SECS } else { 25 };
+
                 let status_cb = status.clone();
                 let pair_id_cb = pair_id.clone();
                 let manager_cb = manager.clone();
@@ -772,6 +779,7 @@ impl SyncManager {
                     &file,
                     &stopped,
                     &stop_notify,
+                    connect,
                     move |m| {
                         if let Ok(mut s) = status_cb.lock() {
                             s.state = FolderState::Sending;
@@ -924,11 +932,7 @@ impl SyncManager {
                         // Usually just "no sender waiting right now". Re-poll with an
                         // adaptive gap — quick at first, easing off to limit chatter.
                         idle_streak = idle_streak.saturating_add(1);
-                        let gap = match idle_streak {
-                            1 => 1000,
-                            2 => 2500,
-                            _ => 5000,
-                        };
+                        let gap = poll_gap(idle_streak, 60_000);
                         if wait_fixed(&stop_notify, &stopped, gap).await {
                             break;
                         }
@@ -956,6 +960,7 @@ impl SyncManager {
         tauri::async_runtime::spawn(async move {
             let ctrl_file = manager.config_dir.join(format!(".ctrl-out-{pair_id}.json"));
             let ctrl_path = ctrl_file.to_string_lossy().to_string();
+            let mut offline_streak: u32 = 0;
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
@@ -984,11 +989,21 @@ impl SyncManager {
                 });
                 let _ = std::fs::write(&ctrl_file, payload.to_string());
                 let code = pairing::control_outbound_code(&pair);
-                let outcome =
-                    run_croc_send(&settings, &code, &ctrl_path, &stopped, &stop_notify, |_m| {})
-                        .await;
+                // Short park: a beacon that misses the peer's poll this round just
+                // retries later — far cheaper than holding a 12%-CPU parked send.
+                let outcome = run_croc_send(
+                    &settings,
+                    &code,
+                    &ctrl_path,
+                    &stopped,
+                    &stop_notify,
+                    CONTROL_CONNECT_TIMEOUT_SECS,
+                    |_m| {},
+                )
+                .await;
                 match outcome {
                     SendOutcome::Delivered => {
+                        offline_streak = 0;
                         set_peer_online(&status, true);
                         manager.emit_status(&pair_id);
                         // Delivered == the peer received (and will apply) these
@@ -1001,10 +1016,11 @@ impl SyncManager {
                                 .unwrap()
                                 .retain(|d| !sent.contains(&format!("{}|{}", d.rel, d.ts)));
                         }
-                        // Refresh presence periodically, but flush a new delete at once.
+                        // Re-beacon presence only occasionally (a new delete still
+                        // flushes instantly via control_wake) — keeps croc churn low.
                         tokio::select! {
                             _ = control_wake.notified() => {}
-                            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                            _ = tokio::time::sleep(Duration::from_secs(300)) => {}
                             _ = stop_notify.notified() => break,
                         }
                         if stopped.load(Ordering::SeqCst) {
@@ -1014,9 +1030,24 @@ impl SyncManager {
                     SendOutcome::Offline => {
                         set_peer_online(&status, false);
                         manager.emit_status(&pair_id);
+                        offline_streak = offline_streak.saturating_add(1);
+                        // The peer isn't answering. Back off hard so a perpetually
+                        // offline folder barely costs anything — but if a delete is
+                        // pending, keep trying briskly so mirrors converge, and a new
+                        // delete (control_wake) always retries at once.
+                        let have_deletes = !pending_deletes.lock().unwrap().is_empty();
+                        let wait = if have_deletes {
+                            25
+                        } else {
+                            match offline_streak {
+                                1 => 60,
+                                2 => 120,
+                                _ => 300,
+                            }
+                        };
                         tokio::select! {
                             _ = control_wake.notified() => {}
-                            _ = tokio::time::sleep(Duration::from_secs(8)) => {}
+                            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
                             _ = stop_notify.notified() => break,
                         }
                         if stopped.load(Ordering::SeqCst) {
@@ -1130,14 +1161,10 @@ impl SyncManager {
                     }
                     ReceiveOutcome::Stopped => break,
                     ReceiveOutcome::Error => {
-                        // Presence/identity isn't latency-critical — poll gently to
-                        // keep background croc churn low.
+                        // Poll often enough to catch the peer's short-park beacon
+                        // (gap < beacon park), but receives are cheap (~4% for ~4s).
                         idle_streak = idle_streak.saturating_add(1);
-                        let gap = match idle_streak {
-                            1 => 2000,
-                            2 => 7000,
-                            _ => 15000,
-                        };
+                        let gap = poll_gap(idle_streak, 22_000);
                         if wait_fixed(&stop_notify, &stopped, gap).await {
                             break;
                         }
@@ -1279,6 +1306,7 @@ async fn run_croc_send(
     file: &str,
     stopped: &Arc<AtomicBool>,
     stop_notify: &Arc<Notify>,
+    connect_timeout_secs: u64,
     on_progress: impl Fn(crate::croc::ProgressMetrics) + Send + 'static,
 ) -> SendOutcome {
     let bin = croc_binary_path();
@@ -1297,7 +1325,9 @@ async fn run_croc_send(
     };
     let mut stderr = child.stderr.take().expect("stderr piped");
 
-    let connect_deadline = Instant::now() + Duration::from_secs(CONNECT_TIMEOUT_SECS);
+    // A parked `croc send` busy-polls the relay at ~12% CPU, so the caller bounds
+    // how long we're willing to wait for the receiver before giving up.
+    let connect_deadline = Instant::now() + Duration::from_secs(connect_timeout_secs);
     let mut connected = false;
     let mut buf = [0u8; 4096];
     let mut line: Vec<u8> = Vec::new();
@@ -1855,6 +1885,24 @@ fn set_peer_online(status: &Arc<Mutex<StatusSnapshot>>, online: bool) {
     if let Ok(mut s) = status.lock() {
         s.peer_online = online;
     }
+}
+
+/// Adaptive idle poll gap (ms). croc can't park waiting for a sender — it gives
+/// up after a few seconds — so a listener has to re-spawn croc to keep checking.
+/// We poll quickly right after activity (to drain a burst of files), then ease
+/// off to a calm steady state so an idle folder/friend doesn't spawn croc every
+/// few seconds and cook the CPU. `streak` resets to 0 on every receive.
+fn poll_gap(streak: u32, cap_ms: u64) -> u64 {
+    let g: u64 = match streak {
+        0 | 1 => 1_500,
+        2 => 3_000,
+        3 => 6_000,
+        4 => 12_000,
+        5 => 25_000,
+        6 => 45_000,
+        _ => 90_000,
+    };
+    g.min(cap_ms)
 }
 
 async fn wait_backoff(stop_notify: &Arc<Notify>, stopped: &Arc<AtomicBool>, attempt: u32) -> bool {
