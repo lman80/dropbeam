@@ -211,10 +211,9 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{stem}-dup{ext}"))
 }
 
-/// Send a set of files to an already-connected peer over a fresh stream.
-/// `on_progress(done, total)` fires as bytes go out. Returns bytes sent.
-pub async fn send_files<F: Fn(u64, u64)>(
-    conn: &Connection,
+/// Core: write `[header][file bytes…]` to an already-open send stream.
+async fn write_files<F: Fn(u64, u64)>(
+    send: &mut SendStream,
     paths: &[PathBuf],
     on_progress: F,
 ) -> Result<u64> {
@@ -228,7 +227,6 @@ pub async fn send_files<F: Fn(u64, u64)>(
         items.push((p.clone(), name, meta.len()));
     }
     let total: u64 = items.iter().map(|i| i.2).sum();
-    let (mut send, mut recv) = conn.open_bi().await?;
     let header = serde_json::json!({
         "kind": "files",
         "items": items
@@ -237,7 +235,7 @@ pub async fn send_files<F: Fn(u64, u64)>(
             .collect::<Vec<_>>(),
         "total": total,
     });
-    write_frame(&mut send, &header).await?;
+    write_frame(send, &header).await?;
 
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
@@ -253,21 +251,16 @@ pub async fn send_files<F: Fn(u64, u64)>(
             on_progress(sent, total);
         }
     }
-    send.finish()?;
-    // Wait for the receiver's ack so "Sent" means "safely written on their disk".
-    let _ = recv.read_to_end(16).await;
     Ok(sent)
 }
 
-/// Receive a file set on `conn`'s next incoming stream, writing into `dest_dir`.
-/// Returns the paths written. `on_progress(done, total)` fires as bytes arrive.
-pub async fn recv_files<F: Fn(u64, u64)>(
-    conn: &Connection,
+/// Core: read `[header][file bytes…]` from a recv stream into `dest_dir`.
+async fn read_files<F: Fn(u64, u64)>(
+    recv: &mut RecvStream,
     dest_dir: &Path,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
-    let (mut send, mut recv) = conn.accept_bi().await?;
-    let header = read_frame(&mut recv).await?;
+    let header = read_frame(recv).await?;
     anyhow::ensure!(header["kind"] == "files", "unexpected stream kind");
     let items = header["items"].as_array().cloned().unwrap_or_default();
     let total = header["total"].as_u64().unwrap_or(0);
@@ -303,9 +296,91 @@ pub async fn recv_files<F: Fn(u64, u64)>(
         f.flush().await?;
         out.push(dest);
     }
+    Ok(out)
+}
+
+/// PUSH: send files to an already-connected peer over a fresh stream (used by
+/// Friends/Folders where we initiate). Waits for the receiver's ack.
+pub async fn send_files<F: Fn(u64, u64)>(
+    conn: &Connection,
+    paths: &[PathBuf],
+    on_progress: F,
+) -> Result<u64> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let sent = write_files(&mut send, paths, on_progress).await?;
+    send.finish()?;
+    let _ = recv.read_to_end(16).await;
+    Ok(sent)
+}
+
+/// PUSH receive: accept the peer's next stream and write its files to `dest_dir`.
+pub async fn recv_files<F: Fn(u64, u64)>(
+    conn: &Connection,
+    dest_dir: &Path,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let out = read_files(&mut recv, dest_dir, on_progress).await?;
     let _ = send.write_all(b"ok").await;
     let _ = send.finish();
     Ok(out)
+}
+
+// ── Quick Send (pull model) ──────────────────────────────────────────────────
+//
+// The sender publishes a *ticket* (its EndpointAddr + a one-time token). The
+// receiver dials the ticket and asks for the files, the sender pushes them. This
+// is the croc "share a code, they pull" flow, but direct + encrypted over iroh.
+
+/// Encode a shareable ticket: where to reach us + a one-time token.
+pub fn make_ticket(ep: &Endpoint, token: &str) -> Result<String> {
+    use base64::Engine as _;
+    let addr = ep.addr();
+    let v = serde_json::json!({ "addr": addr, "token": token });
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v)?))
+}
+
+fn parse_ticket(s: &str) -> Result<(iroh::EndpointAddr, String)> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s.trim())
+        .context("ticket is not valid base64")?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).context("ticket is not valid")?;
+    let addr: iroh::EndpointAddr =
+        serde_json::from_value(v.get("addr").cloned().unwrap_or_default())
+            .context("ticket has no address")?;
+    let token = v
+        .get("token")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok((addr, token))
+}
+
+/// Receiver side: dial a ticket, request its files, write them to `dest_dir`.
+pub async fn pull_files<F: Fn(u64, u64)>(
+    client: &Endpoint,
+    ticket: &str,
+    dest_dir: &Path,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
+    let (addr, token) = parse_ticket(ticket)?;
+    let conn = client.connect(addr, ALPN).await.context("dial ticket")?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token })).await?;
+    let out = read_files(&mut recv, dest_dir, on_progress).await?;
+    Ok(out)
+}
+
+/// Sender side: a pull request arrived on `send`/`recv`; push `paths`.
+pub async fn serve_pull<F: Fn(u64, u64)>(
+    send: &mut SendStream,
+    paths: &[PathBuf],
+    on_progress: F,
+) -> Result<u64> {
+    let sent = write_files(send, paths, on_progress).await?;
+    send.finish()?;
+    Ok(sent)
 }
 
 #[cfg(test)]
@@ -365,5 +440,50 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest);
         println!("iroh file transfer OK: {} bytes verified", sent);
+    }
+
+    // Quick Send pull flow: sender publishes a ticket, receiver dials it and
+    // pulls. Ignored (network); run with --ignored.
+    #[tokio::test]
+    #[ignore]
+    async fn quick_send_pull_over_iroh() {
+        let pid = std::process::id();
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        server.online().await;
+        let token = "tok-abc-123".to_string();
+        let ticket = make_ticket(&server, &token).unwrap();
+        assert!(ticket.len() > 20, "ticket should be a real blob");
+
+        let src = std::env::temp_dir().join(format!("dropbeam-pull-src-{pid}.bin"));
+        let data = vec![0x5Au8; 4 * 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+        let staged = vec![src.clone()];
+
+        let srv = server.clone();
+        let token_c = token.clone();
+        let serve = tokio::spawn(async move {
+            let incoming = srv.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let req = read_frame(&mut recv).await.unwrap();
+            assert_eq!(req["kind"], "pull");
+            assert_eq!(req["token"], token_c);
+            serve_pull(&mut send, &staged, |_, _| {}).await.unwrap();
+        });
+
+        let client = Endpoint::bind(presets::N0).await.unwrap();
+        let dest = std::env::temp_dir().join(format!("dropbeam-pull-rx-{pid}"));
+        let got = pull_files(&client, &ticket, &dest, |_, _| {}).await.unwrap();
+        serve.await.unwrap();
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(std::fs::read(&got[0]).unwrap(), data);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+        println!("iroh Quick Send (pull) OK: ticket {} chars", ticket.len());
     }
 }
