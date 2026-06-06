@@ -447,6 +447,90 @@ async fn serve_stream(
             write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
             send.finish()?;
         }
+        Some("folder-hello") => {
+            // A folder accepter is handing us their iroh id for our shared pair,
+            // so we (the creator) can also push this folder directly over iroh.
+            let pair_id = req.get("pair_id").and_then(|v| v.as_str()).unwrap_or("");
+            let their_id = req.get("endpoint_id").and_then(|v| v.as_str()).unwrap_or("");
+            if !pair_id.is_empty() && !their_id.is_empty() {
+                if let Some(app) = state.app.get() {
+                    if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+                        if crate::pairing::set_endpoint_id(
+                            &st.config_dir,
+                            pair_id,
+                            their_id.to_string(),
+                        ) {
+                            // Refresh the running folder workers so the sender
+                            // picks up the new key and the UI updates.
+                            if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
+                                sm.inner().clone().reconcile();
+                            }
+                            let _ = app.emit("pairs://changed", ());
+                        }
+                    }
+                }
+            }
+            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            send.finish()?;
+        }
+        Some("folder-files") => {
+            // The folder peer pushed files straight to us. Receive into a private
+            // staging dir, then hand them to the SyncManager to land in the shared
+            // folder with the exact same loop-protection / mirror / history rules
+            // the croc receive path uses.
+            let pair_id = req
+                .get("pair_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let Some(app) = state.app.get().cloned() else {
+                let never = AtomicBool::new(false);
+                let _ = read_folder_body(recv, &req, &std::env::temp_dir(), &never, |_, _| {}).await;
+                return Ok(());
+            };
+            let sm = app
+                .try_state::<Arc<crate::sync::SyncManager>>()
+                .map(|s| s.inner().clone());
+            let config_dir = app
+                .try_state::<Arc<crate::AppState>>()
+                .map(|st| st.config_dir.clone())
+                .unwrap_or_else(std::env::temp_dir);
+            let Some(sm) = sm else {
+                anyhow::bail!("sync manager not ready");
+            };
+            if !sm.has_pair(&pair_id) {
+                anyhow::bail!("push for unknown folder pair {pair_id}");
+            }
+            let staging = config_dir.join(format!(".iroh-folder-{pair_id}"));
+            let _ = std::fs::remove_dir_all(&staging);
+            let total = req["total"].as_u64().unwrap_or(0);
+            let cancel = AtomicBool::new(false);
+            let loc = conn_locality(conn);
+            let last = AtomicU64::new(0);
+            let cb = |done: u64, _t: u64| {
+                // Throttle to ~1% steps so the folder status bar updates smoothly
+                // without flooding the UI with events.
+                let permille = if total > 0 { done * 1000 / total } else { 0 };
+                if done < total && permille <= last.load(Ordering::Relaxed) {
+                    return;
+                }
+                last.store(permille, Ordering::Relaxed);
+                sm.note_folder_receiving(&pair_id, done, total, loc);
+            };
+            let result = read_folder_body(recv, &req, &staging, &cancel, cb).await;
+            match result {
+                Ok(_) => {
+                    sm.ingest_iroh_folder_files(&pair_id, &staging);
+                    let _ = std::fs::remove_dir_all(&staging);
+                    let _ = send.write_all(b"ok").await;
+                    let _ = send.finish();
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    anyhow::bail!("folder receive failed: {e}");
+                }
+            }
+        }
         other => anyhow::bail!("unknown stream kind: {other:?}"),
     }
     Ok(())
@@ -729,6 +813,200 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
     });
 }
 
+/// Folder analogue of `say_hello`: after accepting a Shared Drop Folder invite,
+/// dial the creator (whose EndpointId rode the invite) and hand them our id for
+/// this pair — so the creator → us direction also pushes directly over iroh.
+pub fn say_hello_folder(
+    state: Arc<IrohState>,
+    pair_id: String,
+    inviter_endpoint_id: String,
+    my_name: String,
+) {
+    let Some(ep) = state.get().cloned() else {
+        return;
+    };
+    let Ok(parsed) = inviter_endpoint_id.parse::<iroh::EndpointId>() else {
+        return;
+    };
+    let my_id = ep.id().to_string();
+    let addr = iroh::EndpointAddr::from(parsed);
+    tauri::async_runtime::spawn(async move {
+        let hello = serde_json::json!({
+            "kind": "folder-hello", "pair_id": pair_id, "endpoint_id": my_id, "name": my_name,
+        });
+        if let Ok(Ok(conn)) =
+            tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
+        {
+            if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                let _ = write_frame(&mut send, &hello).await;
+                let _ = send.finish();
+                let _ = recv.read_to_end(64).await;
+            }
+        }
+    });
+}
+
+/// Push folder files to a paired peer over iroh (dial-by-key). Preserves each
+/// file's path relative to `root` so subfolders survive. Returns the connection
+/// locality on success. Any `Err` means "fall back to croc" to the caller — so a
+/// peer on an old build or one that's offline never breaks folder sync.
+pub async fn send_folder_file<F: Fn(u64, u64)>(
+    ep: &Endpoint,
+    endpoint_id: &str,
+    pair_id: &str,
+    root: &str,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<crate::models::Locality> {
+    let parsed: iroh::EndpointId = endpoint_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid folder peer endpoint id"))?;
+    let addr = iroh::EndpointAddr::from(parsed);
+    let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
+        .await
+        .map_err(|_| anyhow::anyhow!("folder peer unreachable over iroh"))?
+        .context("dial folder peer")?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_folder_files(&mut send, pair_id, root, paths, cancel, on_progress).await?;
+    send.finish()?;
+    // Require the receiver's "ok" so "delivered" means the bytes actually landed
+    // in their folder (not just that we finished writing to the socket).
+    let ack = recv.read_to_end(16).await.unwrap_or_default();
+    anyhow::ensure!(ack == b"ok", "folder peer did not confirm receipt");
+    Ok(conn_locality(&conn))
+}
+
+/// Folder PUSH writer: like `write_files`, but tags the stream with `pair_id` and
+/// sends each file's path RELATIVE to the folder root (so `sub/a.txt` lands in
+/// `sub/a.txt`, not the folder root).
+async fn write_folder_files<F: Fn(u64, u64)>(
+    send: &mut SendStream,
+    pair_id: &str,
+    root: &str,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<u64> {
+    let mut items = Vec::new();
+    for p in paths {
+        let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
+        items.push((p.clone(), folder_rel(p, root), meta.len()));
+    }
+    let total: u64 = items.iter().map(|i| i.2).sum();
+    let header = serde_json::json!({
+        "kind": "folder-files",
+        "pair_id": pair_id,
+        "items": items
+            .iter()
+            .map(|(_, n, s)| serde_json::json!({ "name": n, "size": s }))
+            .collect::<Vec<_>>(),
+        "total": total,
+    });
+    write_frame(send, &header).await?;
+
+    let mut sent = 0u64;
+    let mut buf = vec![0u8; CHUNK];
+    for (path, _, _) in &items {
+        let mut f = tokio::fs::File::open(path).await?;
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                anyhow::bail!("canceled");
+            }
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            send.write_all(&buf[..n]).await?;
+            sent += n as u64;
+            on_progress(sent, total);
+        }
+    }
+    Ok(sent)
+}
+
+/// Folder receive: like `read_body`, but PRESERVES each item's relative subpath
+/// (sanitized — never an absolute path or a `..` escape) so subfolders are
+/// recreated under `dest_dir`.
+async fn read_folder_body<F: Fn(u64, u64)>(
+    recv: &mut RecvStream,
+    header: &serde_json::Value,
+    dest_dir: &Path,
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
+    anyhow::ensure!(header["kind"] == "folder-files", "unexpected stream kind");
+    let items = header["items"].as_array().cloned().unwrap_or_default();
+    let total = header["total"].as_u64().unwrap_or(0);
+    std::fs::create_dir_all(dest_dir)?;
+
+    let mut got = 0u64;
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; CHUNK];
+    for item in &items {
+        let raw = item["name"].as_str().unwrap_or("file");
+        let rel = sanitize_rel(raw);
+        let size = item["size"].as_u64().unwrap_or(0);
+        let dest = dest_dir.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = tokio::fs::File::create(&dest).await?;
+        let mut remaining = size;
+        while remaining > 0 {
+            if cancel.load(Ordering::SeqCst) {
+                anyhow::bail!("canceled");
+            }
+            let want = remaining.min(buf.len() as u64) as usize;
+            match recv.read(&mut buf[..want]).await? {
+                Some(n) if n > 0 => {
+                    f.write_all(&buf[..n]).await?;
+                    remaining -= n as u64;
+                    got += n as u64;
+                    on_progress(got, total);
+                }
+                _ => anyhow::bail!("stream ended before {} finished", dest.display()),
+            }
+        }
+        f.flush().await?;
+        out.push(dest);
+    }
+    Ok(out)
+}
+
+/// A file's path relative to the folder root, forward-slashed; falls back to the
+/// bare file name if it isn't under `root`.
+fn folder_rel(path: &Path, root: &str) -> String {
+    let norm = |r: &Path| r.to_string_lossy().replace('\\', "/");
+    if let Ok(rel) = path.strip_prefix(root) {
+        return norm(rel);
+    }
+    if let Ok(canon) = std::fs::canonicalize(root) {
+        if let Ok(rel) = path.strip_prefix(&canon) {
+            return norm(rel);
+        }
+    }
+    path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string())
+}
+
+/// Sanitize a peer-supplied relative path: drop empties, `.` and `..`, and any
+/// drive/root prefix, so a malicious peer can't write outside the staging dir.
+fn sanitize_rel(raw: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in raw.replace('\\', "/").split('/') {
+        if comp.is_empty() || comp == "." || comp == ".." || comp.contains(':') {
+            continue;
+        }
+        out.push(comp);
+    }
+    if out.as_os_str().is_empty() {
+        out.push("file");
+    }
+    out
+}
+
 // ── File-transfer protocol (raw QUIC bi-stream) ──────────────────────────────
 //
 // Wire format on one bidirectional stream:
@@ -998,6 +1276,30 @@ mod tests {
         // Same key the second time — identity persisted, not regenerated.
         assert_eq!(a.public(), b.public());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_rel_blocks_path_escapes() {
+        use std::path::Path;
+        // Subfolders are preserved…
+        assert_eq!(sanitize_rel("sub/dir/a.txt"), Path::new("sub/dir/a.txt"));
+        assert_eq!(sanitize_rel("a.txt"), Path::new("a.txt"));
+        // …but traversal, absolute, and drive paths can never escape staging.
+        assert_eq!(sanitize_rel("../../etc/passwd"), Path::new("etc/passwd"));
+        assert_eq!(sanitize_rel("/etc/passwd"), Path::new("etc/passwd"));
+        assert_eq!(sanitize_rel("..\\..\\Windows\\x"), Path::new("Windows/x"));
+        assert_eq!(sanitize_rel("C:\\secret"), Path::new("secret"));
+        // Degenerate input still yields a safe, non-empty name.
+        assert_eq!(sanitize_rel(""), Path::new("file"));
+        assert_eq!(sanitize_rel("../.."), Path::new("file"));
+    }
+
+    #[test]
+    fn folder_rel_is_relative_and_forward_slashed() {
+        use std::path::Path;
+        assert_eq!(folder_rel(Path::new("/data/share/sub/a.txt"), "/data/share"), "sub/a.txt");
+        // A path outside the root degrades to the bare file name (never absolute).
+        assert_eq!(folder_rel(Path::new("/somewhere/else/b.txt"), "/data/share"), "b.txt");
     }
 
     // Real end-to-end file transfer over iroh. Ignored by default because it

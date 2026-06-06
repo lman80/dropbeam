@@ -57,6 +57,11 @@ struct Invite {
     /// Total-sync / mirror mode — both sides must agree, so it rides the invite.
     #[serde(default)]
     mir: bool,
+    /// The inviter's iroh EndpointId, so the accepter can sync this folder
+    /// directly over iroh (dial-by-key) instead of the croc relay. The accepter
+    /// hands back their own id via a "folder-hello" right after accepting.
+    #[serde(default)]
+    eid: Option<String>,
 }
 
 /// Create a new pair (this device is A). Returns the pair + a shareable invite.
@@ -69,6 +74,7 @@ pub fn create(
     two_way: bool,
     peer_name: String,
     mirror: bool,
+    my_endpoint_id: Option<String>,
 ) -> Result<(Pair, String), String> {
     validate_folder(&folder)?;
     let _guard = LOCK.lock().unwrap();
@@ -94,6 +100,8 @@ pub fn create(
         auto_delete: false,
         delete_mode: DeleteMode::Trash,
         created_at: now_ms(),
+        // The accepter's id arrives later via their folder-hello.
+        endpoint_id: None,
     };
 
     let invite = Invite {
@@ -104,6 +112,7 @@ pub fn create(
         tw: two_way,
         frn: auto_friend,
         mir: mirror,
+        eid: my_endpoint_id,
     };
     let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
     let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
@@ -154,6 +163,8 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
         auto_delete: false,
         delete_mode: DeleteMode::Trash,
         created_at: now_ms(),
+        // Learned straight from the invite — lets us sync directly over iroh.
+        endpoint_id: invite.eid.clone(),
     };
     pairs.push(pair.clone());
     save(config_dir, &pairs)?;
@@ -162,6 +173,25 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
     // learn ours over the control channel's hello.
     friends::upsert_from_pairing(config_dir, &pair.peer_name, &pair.secret, PairRole::B);
     Ok(pair)
+}
+
+/// Record (or update) a pair peer's iroh EndpointId — called when the accepter's
+/// "folder-hello" reaches the creator, so the creator can also push directly over
+/// iroh. Returns true if a pair was found and changed.
+pub fn set_endpoint_id(config_dir: &Path, pair_id: &str, endpoint_id: String) -> bool {
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let mut changed = false;
+    for p in pairs.iter_mut() {
+        if p.id == pair_id && p.endpoint_id.as_deref() != Some(endpoint_id.as_str()) {
+            p.endpoint_id = Some(endpoint_id.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &pairs);
+    }
+    changed
 }
 
 pub fn update(
@@ -207,7 +237,7 @@ pub fn update(
 
 /// Rebuild the shareable invite for an existing pair (so the creator can show
 /// it again). Only meaningful for the inviter (role A).
-pub fn invite_for(pair: &Pair, my_name: &str) -> String {
+pub fn invite_for(pair: &Pair, my_name: &str, my_endpoint_id: Option<String>) -> String {
     let invite = Invite {
         v: 1,
         id: pair.id.clone(),
@@ -217,6 +247,7 @@ pub fn invite_for(pair: &Pair, my_name: &str) -> String {
         // Re-offer the friend link iff this pair was created with a named peer.
         frn: !pair.peer_name.trim().is_empty(),
         mir: pair.mirror,
+        eid: my_endpoint_id,
     };
     let json = serde_json::to_string(&invite).unwrap_or_default();
     format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
@@ -350,6 +381,7 @@ mod tests {
             auto_delete: false,
             delete_mode: DeleteMode::Trash,
             created_at: 0,
+            endpoint_id: None,
         }
     }
 

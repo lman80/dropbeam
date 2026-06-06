@@ -218,12 +218,15 @@ pub struct CreatePairResult {
 pub fn create_pair(
     state: State<'_, Arc<AppState>>,
     sync: State<'_, Arc<SyncManager>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     folder: String,
     two_way: bool,
     peer_name: Option<String>,
     mirror: Option<bool>,
 ) -> Result<CreatePairResult, String> {
     let name = state.settings.lock().unwrap().display_name.clone();
+    // Carry our iroh device key in the invite so the folder syncs directly.
+    let my_id = iroh.get().map(|ep| ep.id().to_string());
     let (pair, invite) = pairing::create(
         &state.config_dir,
         folder,
@@ -231,6 +234,7 @@ pub fn create_pair(
         two_way,
         peer_name.unwrap_or_default(),
         mirror.unwrap_or(false),
+        my_id,
     )?;
     sync.reconcile();
     Ok(CreatePairResult { pair, invite })
@@ -240,10 +244,22 @@ pub fn create_pair(
 pub fn accept_pair(
     state: State<'_, Arc<AppState>>,
     sync: State<'_, Arc<SyncManager>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     invite: String,
     folder: String,
 ) -> Result<Pair, String> {
     let pair = pairing::accept(&state.config_dir, &invite, folder)?;
+    // Dial the creator back to hand them our iroh id (the invite gave us theirs),
+    // so both directions of this folder can push directly over iroh.
+    if let Some(inviter_eid) = pair.endpoint_id.clone() {
+        let my_name = state.settings.lock().unwrap().display_name.clone();
+        crate::iroh_net::say_hello_folder(
+            iroh.inner().clone(),
+            pair.id.clone(),
+            inviter_eid,
+            my_name,
+        );
+    }
     sync.reconcile();
     Ok(pair)
 }
@@ -289,11 +305,16 @@ pub fn remove_pair(
 }
 
 #[tauri::command]
-pub fn pair_invite(state: State<'_, Arc<AppState>>, id: String) -> Result<String, String> {
+pub fn pair_invite(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    id: String,
+) -> Result<String, String> {
     let name = state.settings.lock().unwrap().display_name.clone();
+    let my_id = iroh.get().map(|ep| ep.id().to_string());
     let pairs = pairing::load(&state.config_dir);
     let pair = pairs.iter().find(|p| p.id == id).ok_or("Pair not found.")?;
-    Ok(pairing::invite_for(pair, &name))
+    Ok(pairing::invite_for(pair, &name, my_id))
 }
 
 #[tauri::command]

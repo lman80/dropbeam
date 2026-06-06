@@ -99,6 +99,7 @@ let pairs: Pair[] = [
     autoDelete: false,
     deleteMode: 'trash',
     createdAt: Date.now() - 3 * 86400_000,
+    endpointId: null,
   },
 ]
 let pairCounter = 1
@@ -294,6 +295,7 @@ export const mockApi = {
       autoDelete: false,
       deleteMode: 'trash',
       createdAt: Date.now(),
+      endpointId: null,
     }
     pairs.push(pair)
     if (peerName?.trim()) {
@@ -322,6 +324,7 @@ export const mockApi = {
       autoDelete: false,
       deleteMode: 'trash',
       createdAt: Date.now(),
+      endpointId: null,
     }
     pairs.push(pair)
     return pair

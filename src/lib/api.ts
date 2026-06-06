@@ -85,6 +85,8 @@ export interface Pair {
   autoDelete: boolean
   deleteMode: DeleteMode
   createdAt: number
+  /** The folder peer's iroh device key, for direct sync. Null until exchanged. */
+  endpointId: string | null
 }
 
 /** A restorable deleted/overwritten file in a mirror folder's history. */

@@ -134,9 +134,9 @@ pub struct Settings {
     /// Play short sounds on send/receive events.
     #[serde(default = "default_true")]
     pub play_sounds: bool,
-    /// Opt in to the new direct peer-to-peer engine (iroh) for Quick Send. When
-    /// on, the app starts a P2P listener; off by default while it's in beta.
-    #[serde(default)]
+    /// Use the direct peer-to-peer engine (iroh) — the default transport. On by
+    /// default; can be turned off to fall back to the relay engine (croc).
+    #[serde(default = "default_true")]
     pub direct_mode: bool,
 }
 
@@ -153,7 +153,7 @@ impl Default for Settings {
             custom_relay_pass: String::new(),
             notify_on_complete: true,
             play_sounds: true,
-            direct_mode: false,
+            direct_mode: true,
         }
     }
 }
@@ -202,6 +202,11 @@ pub struct Pair {
     pub auto_delete: bool,
     pub delete_mode: DeleteMode,
     pub created_at: u64,
+    /// The folder peer's iroh EndpointId, learned at pairing — so folder syncs
+    /// go directly over iroh (dial-by-key) instead of croc. None if paired before
+    /// this or not yet exchanged.
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
 }
 
 /// One restorable entry in a folder's history (a deleted or overwritten file).

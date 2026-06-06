@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,9 @@ struct PairHandle {
     queue: Arc<Mutex<VecDeque<String>>>,
     inbound: Arc<Mutex<HashSet<String>>>,
     status: Arc<Mutex<StatusSnapshot>>,
+    /// Loop-guard for files we just wrote/removed ourselves (shared with the
+    /// listener + collector so an iroh receive lands without echoing back).
+    self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
 
@@ -593,6 +596,7 @@ impl SyncManager {
             queue,
             inbound,
             status,
+            self_deleted,
             _watcher: watcher,
         };
         self.handles.lock().unwrap().insert(pair.id.clone(), handle);
@@ -776,36 +780,53 @@ impl SyncManager {
                 let peer_online = status.lock().map(|s| s.peer_online).unwrap_or(true);
                 let connect = if peer_online { CONNECT_TIMEOUT_SECS } else { 25 };
 
-                let status_cb = status.clone();
-                let pair_id_cb = pair_id.clone();
-                let manager_cb = manager.clone();
-                let result = run_croc_send(
-                    &settings,
-                    &code,
-                    &file,
-                    &stopped,
-                    &stop_notify,
-                    connect,
-                    move |m| {
-                        if let Ok(mut s) = status_cb.lock() {
-                            s.state = FolderState::Sending;
-                            s.percent = m.percent;
-                            s.bytes_done = m.done;
-                            if m.total > 0 {
-                                s.bytes_total = m.total;
+                // Direct engine first: when the peer is reachable and we know their
+                // iroh key, push straight over iroh (fast, often LAN-direct). Any
+                // failure — offline, dial error, peer on an older build — returns
+                // None and we fall through to the croc relay, so folder sync never
+                // regresses.
+                let iroh_loc = if peer_online {
+                    manager
+                        .try_iroh_folder_send(&pair, &settings, &file, &status, &stopped)
+                        .await
+                } else {
+                    None
+                };
+
+                let result = if iroh_loc.is_some() {
+                    SendOutcome::Delivered
+                } else {
+                    let status_cb = status.clone();
+                    let pair_id_cb = pair_id.clone();
+                    let manager_cb = manager.clone();
+                    run_croc_send(
+                        &settings,
+                        &code,
+                        &file,
+                        &stopped,
+                        &stop_notify,
+                        connect,
+                        move |m| {
+                            if let Ok(mut s) = status_cb.lock() {
+                                s.state = FolderState::Sending;
+                                s.percent = m.percent;
+                                s.bytes_done = m.done;
+                                if m.total > 0 {
+                                    s.bytes_total = m.total;
+                                }
+                                if let Some(spd) = m.speed_bps {
+                                    s.speed_bps = spd;
+                                }
+                                s.eta_seconds = m.eta;
+                                if !matches!(m.locality, Locality::Unknown) {
+                                    s.locality = m.locality;
+                                }
                             }
-                            if let Some(spd) = m.speed_bps {
-                                s.speed_bps = spd;
-                            }
-                            s.eta_seconds = m.eta;
-                            if !matches!(m.locality, Locality::Unknown) {
-                                s.locality = m.locality;
-                            }
-                        }
-                        manager_cb.emit_status(&pair_id_cb);
-                    },
-                )
-                .await;
+                            manager_cb.emit_status(&pair_id_cb);
+                        },
+                    )
+                    .await
+                };
 
                 match result {
                     SendOutcome::Delivered => {
@@ -1256,6 +1277,142 @@ impl SyncManager {
                 format!("{} files arrived in {}", names.len(), folder_name(&pair.folder))
             };
             let _ = self.app.notification().builder().title("DropBeam").body(body).show();
+        }
+    }
+
+    // ── iroh direct folder sync (Phase 4) ────────────────────────────────────
+
+    /// The live iroh endpoint, if Direct mode is up. Used to dial folder peers.
+    fn iroh_endpoint(&self) -> Option<iroh::Endpoint> {
+        self.app
+            .try_state::<Arc<crate::iroh_net::IrohState>>()
+            .and_then(|st| st.get().cloned())
+    }
+
+    /// Whether we're actively managing this folder pair (a running handle exists).
+    /// The iroh accept loop checks this before landing a pushed folder file.
+    pub fn has_pair(&self, pair_id: &str) -> bool {
+        self.handles.lock().unwrap().contains_key(pair_id)
+    }
+
+    /// Live progress for an in-flight iroh folder RECEIVE — drives the same status
+    /// bar (and Local/Internet badge) the croc receive path uses.
+    pub fn note_folder_receiving(&self, pair_id: &str, done: u64, total: u64, locality: Locality) {
+        if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
+            if let Ok(mut s) = h.status.lock() {
+                s.state = FolderState::Receiving;
+                s.sending_file = None;
+                s.bytes_done = done;
+                if total > 0 {
+                    s.bytes_total = total;
+                    s.percent = done as f64 / total as f64 * 100.0;
+                }
+                if !matches!(locality, Locality::Unknown) {
+                    s.locality = locality;
+                }
+            }
+        }
+        self.emit_status(pair_id);
+    }
+
+    /// Land iroh-received folder files: move them from the private staging dir into
+    /// the shared folder using the EXACT same loop-protection / mirror / history
+    /// rules as the croc path (shared `inbound` + `self_deleted` guards), then
+    /// update the manifest, record history, and reset status to Idle.
+    pub fn ingest_iroh_folder_files(&self, pair_id: &str, staging: &Path) -> Vec<String> {
+        let (config, inbound, self_deleted) = {
+            let handles = self.handles.lock().unwrap();
+            let Some(h) = handles.get(pair_id) else {
+                return Vec::new();
+            };
+            (h.config.clone(), h.inbound.clone(), h.self_deleted.clone())
+        };
+        let (folder, mirror) = {
+            let p = config.lock().unwrap();
+            (p.folder.clone(), p.mirror)
+        };
+        let moved = move_staged_into_folder(staging, &folder, &inbound, mirror, &self_deleted);
+        if !moved.is_empty() {
+            let snapshot = inbound.lock().unwrap().clone();
+            self.persist_manifest(pair_id, &snapshot);
+            let pair = config.lock().unwrap().clone();
+            self.note_received(&pair, &moved);
+        }
+        if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
+            if let Ok(mut s) = h.status.lock() {
+                s.state = FolderState::Idle;
+                s.percent = 0.0;
+                s.sending_file = None;
+            }
+        }
+        self.emit_status(pair_id);
+        moved
+    }
+
+    /// Try to push one folder file directly over iroh. Returns `Some(locality)` on
+    /// confirmed delivery, or `None` when the direct path is unavailable or fails
+    /// — in which case the caller falls back to the croc relay, so folders keep
+    /// working even if the peer is offline or on an older build.
+    async fn try_iroh_folder_send(
+        self: &Arc<Self>,
+        pair: &Pair,
+        settings: &Settings,
+        file: &str,
+        status: &Arc<Mutex<StatusSnapshot>>,
+        stopped: &Arc<AtomicBool>,
+    ) -> Option<Locality> {
+        if !settings.direct_mode {
+            return None;
+        }
+        let eid = pair.endpoint_id.clone()?;
+        let ep = self.iroh_endpoint()?;
+        let paths = vec![PathBuf::from(file)];
+        let cb = {
+            let mgr = self.clone();
+            let status = status.clone();
+            let pair_id = pair.id.clone();
+            let last = Arc::new(AtomicU64::new(0));
+            move |done: u64, total: u64| {
+                // Throttle to ~1% steps so we don't flood the UI per chunk.
+                let permille = if total > 0 { done * 1000 / total } else { 0 };
+                if done < total && permille <= last.load(Ordering::Relaxed) {
+                    return;
+                }
+                last.store(permille, Ordering::Relaxed);
+                if let Ok(mut s) = status.lock() {
+                    s.state = FolderState::Sending;
+                    s.bytes_done = done;
+                    if total > 0 {
+                        s.bytes_total = total;
+                        s.percent = done as f64 / total as f64 * 100.0;
+                    }
+                }
+                mgr.emit_status(&pair_id);
+            }
+        };
+        match crate::iroh_net::send_folder_file(
+            &ep,
+            &eid,
+            &pair.id,
+            &pair.folder,
+            &paths,
+            &**stopped,
+            cb,
+        )
+        .await
+        {
+            Ok(loc) => {
+                if let Ok(mut s) = status.lock() {
+                    if !matches!(loc, Locality::Unknown) {
+                        s.locality = loc;
+                    }
+                }
+                Some(loc)
+            }
+            Err(e) => {
+                log::debug!("iroh folder send failed (falling back to croc): {e}");
+                None
+            }
         }
     }
 
