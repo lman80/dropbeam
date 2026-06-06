@@ -45,16 +45,36 @@ export function Popover() {
     return q ? friends.filter((f) => f.name.toLowerCase().includes(q)) : friends
   }, [friends, query])
 
-  // Which friend row is under this (physical-pixel) drag position?
+  // Which friend row is under this drag position? Tauri reports physical pixels,
+  // but to be robust across displays/versions we try the position both as-is and
+  // divided by the device pixel ratio, and fall back to the nearest row in the
+  // contacts column — so a drop that lands a little off still sends.
   const friendIdAtPoint = (pos: { x: number; y: number }): string | null => {
     const dpr = window.devicePixelRatio || 1
-    const x = pos.x / dpr
-    const y = pos.y / dpr
-    for (const f of filtered) {
-      const el = rowRefs.current[f.id]
-      if (!el) continue
-      const r = el.getBoundingClientRect()
-      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return f.id
+    const candidates = [
+      { x: pos.x / dpr, y: pos.y / dpr },
+      { x: pos.x, y: pos.y },
+    ]
+    for (const c of candidates) {
+      for (const f of filtered) {
+        const el = rowRefs.current[f.id]
+        if (!el) continue
+        const r = el.getBoundingClientRect()
+        if (c.x >= r.left && c.x <= r.right && c.y >= r.top && c.y <= r.bottom) return f.id
+      }
+    }
+    // Near-miss: pick the closest row whose horizontal band the drop is within.
+    for (const c of candidates) {
+      let best: { id: string; dist: number } | null = null
+      for (const f of filtered) {
+        const el = rowRefs.current[f.id]
+        if (!el) continue
+        const r = el.getBoundingClientRect()
+        if (c.x < r.left - 24 || c.x > r.right + 24) continue
+        const dist = Math.abs(c.y - (r.top + r.bottom) / 2)
+        if (!best || dist < best.dist) best = { id: f.id, dist }
+      }
+      if (best && best.dist < 64) return best.id
     }
     return null
   }
@@ -74,7 +94,12 @@ export function Popover() {
           const id = friendIdAtPoint(p.position)
           setDragActive(false)
           setDragHoverId(null)
-          if (id && p.paths?.length) void sendToFriend(id, p.paths)
+          if (id && p.paths?.length) {
+            void sendToFriend(id, p.paths)
+            // Blip-style: close the menu once the send is on its way (the HUD
+            // shows progress). Small delay so the row's "sending" state is seen.
+            setTimeout(() => hideSelf(), 450)
+          }
         } else {
           setDragActive(false)
           setDragHoverId(null)

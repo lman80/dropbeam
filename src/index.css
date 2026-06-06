@@ -378,9 +378,13 @@ html.overlay-window #root {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 16px;
+  /* Blip-style frosted, faintly-blue glass. The window is transparent, so the
+     backdrop blur frosts the desktop behind it. */
+  background: color-mix(in srgb, var(--accent) 9%, color-mix(in srgb, var(--surface) 86%, transparent));
+  backdrop-filter: blur(34px) saturate(180%);
+  -webkit-backdrop-filter: blur(34px) saturate(180%);
+  border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border));
+  border-radius: 18px;
   box-shadow: var(--shadow-lg);
   overflow: hidden;
 }
@@ -437,8 +441,8 @@ html.overlay-window #root {
   width: 100%;
   box-sizing: border-box;
   border-radius: 999px;
-  border: 1.5px solid var(--border);
-  background: var(--surface-2);
+  border: 1.5px solid color-mix(in srgb, var(--accent) 14%, var(--border));
+  background: color-mix(in srgb, var(--surface-2) 65%, transparent);
   padding: 7px 12px 7px 32px;
   font-size: 13px;
   color: var(--text);
