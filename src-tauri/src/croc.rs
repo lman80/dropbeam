@@ -745,12 +745,28 @@ fn classify_ip(s: &str) -> Locality {
         || host.starts_with("fe80")
         || host.starts_with("fc")
         || host.starts_with("fd")
-        || is_172_private(&host);
+        || is_172_private(&host)
+        // 100.64.0.0/10 (CGNAT) is what Tailscale hands out — a transfer to such
+        // an address is a direct overlay link, NOT the slow public relay, so it
+        // belongs on the "direct" side of the badge.
+        || is_100_64_cgnat(&host);
     if private {
         Locality::Local
     } else {
         Locality::Internet
     }
+}
+
+/// True for the 100.64.0.0/10 carrier-grade-NAT / Tailscale range.
+fn is_100_64_cgnat(host: &str) -> bool {
+    if let Some(rest) = host.strip_prefix("100.") {
+        if let Some(second) = rest.split('.').next() {
+            if let Ok(n) = second.parse::<u32>() {
+                return (64..=127).contains(&n);
+            }
+        }
+    }
+    false
 }
 
 fn is_172_private(host: &str) -> bool {
@@ -858,6 +874,26 @@ mod tests {
         assert_eq!(classify_ip("172.16.5.4:5"), Locality::Local);
         assert_eq!(classify_ip("172.32.5.4:5"), Locality::Internet);
         assert_eq!(classify_ip("192.168.0.19:56167"), Locality::Local);
+        // Tailscale / CGNAT 100.64.0.0/10 is a direct overlay link, not the relay.
+        assert_eq!(classify_ip("100.64.0.1:5"), Locality::Local);
+        assert_eq!(classify_ip("100.115.92.3:41641"), Locality::Local);
+        assert_eq!(classify_ip("100.127.255.254:5"), Locality::Local);
+        // ...but 100.x outside 64–127 is ordinary public space.
+        assert_eq!(classify_ip("100.63.0.1:5"), Locality::Internet);
+        assert_eq!(classify_ip("100.128.0.1:5"), Locality::Internet);
+    }
+
+    #[test]
+    fn peer_locality_parses_standalone_line() {
+        assert_eq!(
+            parse_peer_locality("Sending (->192.168.0.19:65088)"),
+            Some(Locality::Local)
+        );
+        assert_eq!(
+            parse_peer_locality("Receiving (<-8.8.8.8:9009)"),
+            Some(Locality::Internet)
+        );
+        assert_eq!(parse_peer_locality("sample.bin  85% (45/52 MB)"), None);
     }
 
     #[test]

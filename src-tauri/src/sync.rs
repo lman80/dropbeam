@@ -32,10 +32,13 @@ use crate::{friends, pairing, AppState};
 const STAGING_DIR: &str = ".dropbeam-incoming";
 const CONNECT_TIMEOUT_SECS: u64 = 75;
 /// The presence/control beacon parks only briefly — a parked `croc send` costs
-/// ~12% CPU, so we never hold one open just to gossip a hello. Chosen a touch
-/// longer than the control listener's idle gap so a beacon reliably overlaps one
-/// of the listener's poll windows (guaranteed rendezvous in one round).
-const CONTROL_CONNECT_TIMEOUT_SECS: u64 = 25;
+/// ~12% CPU, so we never hold one open just to gossip a hello. Kept ~2× the
+/// control listener's idle gap (6s) so a beacon reliably spans one of the
+/// listener's poll windows (single-round rendezvous) while staying short enough
+/// that the parked-send CPU cost is negligible. This also bounds how fast a
+/// delete reaches the peer: the sender flushes immediately on a delete, and the
+/// listener catches it within its idle gap — so deletes land in a few seconds.
+const CONTROL_CONNECT_TIMEOUT_SECS: u64 = 15;
 const MAX_BACKOFF_SECS: u64 = 30;
 
 /// Manages all active Shared Drop Folders and friend inbox listeners.
@@ -103,12 +106,6 @@ impl Default for StatusSnapshot {
 struct DeleteEvent {
     rel: String,
     ts: u64,
-}
-
-/// A filesystem change observed by the watcher.
-enum FsEvent {
-    Upsert(PathBuf),
-    Remove(PathBuf),
 }
 
 impl SyncManager {
@@ -493,24 +490,24 @@ impl SyncManager {
         let control_wake = Arc::new(Notify::new());
 
         if pairing::runs_sender(&pair) {
-            // Filesystem watcher → candidate channel.
-            let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<FsEvent>();
+            // Filesystem watcher → candidate channel. We deliberately do NOT trust
+            // the event *kind* to tell adds from deletes: macOS reports a
+            // "Move to Trash" as a rename, not a Remove, so kind-based routing
+            // silently dropped trashed-file deletes. Instead we forward every
+            // touched path and let the collector classify by whether the file
+            // still exists after a short settle.
+            let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
             let folder = pair.folder.clone();
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
                     use notify::EventKind;
-                    match event.kind {
-                        EventKind::Create(_) | EventKind::Modify(_) => {
-                            for path in event.paths {
-                                let _ = evt_tx.send(FsEvent::Upsert(path));
-                            }
+                    if matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) {
+                        for path in event.paths {
+                            let _ = evt_tx.send(path);
                         }
-                        EventKind::Remove(_) => {
-                            for path in event.paths {
-                                let _ = evt_tx.send(FsEvent::Remove(path));
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }) {
@@ -604,7 +601,7 @@ impl SyncManager {
 
     fn spawn_collector(
         self: Arc<Self>,
-        mut evt_rx: tokio::sync::mpsc::UnboundedReceiver<FsEvent>,
+        mut evt_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
         config: Arc<Mutex<Pair>>,
         stopped: Arc<AtomicBool>,
         wake: Arc<Notify>,
@@ -616,104 +613,103 @@ impl SyncManager {
     ) {
         let debounce: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         tauri::async_runtime::spawn(async move {
-            while let Some(evt) = evt_rx.recv().await {
+            while let Some(path) = evt_rx.recv().await {
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }
-                match evt {
-                    FsEvent::Upsert(path) => {
-                        let folder = config.lock().unwrap().folder.clone();
-                        let p = path.to_string_lossy().to_string();
-                        if !is_sendable_candidate(&p, &folder, &inbound) {
-                            continue;
+                let (folder, mirror) = {
+                    let c = config.lock().unwrap();
+                    (c.folder.clone(), c.mirror)
+                };
+                let p = path.to_string_lossy().to_string();
+                // One generation counter per path collapses bursts (and lets a
+                // newer event supersede an in-flight handler for the same path).
+                let gen = {
+                    let mut d = debounce.lock().unwrap();
+                    let g = d.entry(p.clone()).or_insert(0);
+                    *g += 1;
+                    *g
+                };
+                let debounce2 = debounce.clone();
+                let queue2 = queue.clone();
+                let wake2 = wake.clone();
+                let inbound2 = inbound.clone();
+                let stopped2 = stopped.clone();
+                let folder2 = folder.clone();
+                let pd = pending_deletes.clone();
+                let cw = control_wake.clone();
+                let self_deleted2 = self_deleted.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Classify by EXISTENCE, not by the OS event kind. A file that
+                    // is present is an add/change; one that's gone is a delete —
+                    // works no matter how macOS labels a trash/move/rename.
+                    if Path::new(&p).is_file() {
+                        // ── ADD / CHANGE ──────────────────────────────────────
+                        if !is_sendable_candidate(&p, &folder2, &inbound2) {
+                            return;
                         }
-                        let gen = {
-                            let mut d = debounce.lock().unwrap();
-                            let g = d.entry(p.clone()).or_insert(0);
-                            *g += 1;
-                            *g
-                        };
-                        let debounce2 = debounce.clone();
-                        let queue2 = queue.clone();
-                        let wake2 = wake.clone();
-                        let inbound2 = inbound.clone();
-                        let stopped2 = stopped.clone();
-                        let folder2 = folder.clone();
-                        tauri::async_runtime::spawn(async move {
-                            // Wait for quiet, then confirm write-completion via size stability.
-                            if !wait_until_stable(&p, &debounce2, gen, &stopped2).await {
-                                return;
-                            }
-                            if stopped2.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            if !is_sendable_candidate(&p, &folder2, &inbound2) {
-                                return;
-                            }
-                            {
-                                let mut q = queue2.lock().unwrap();
-                                if !q.iter().any(|x| x == &p) {
-                                    q.push_back(p.clone());
-                                }
-                            }
-                            wake2.notify_one();
-                        });
-                    }
-                    FsEvent::Remove(path) => {
-                        // Deletes only propagate in mirror (total-sync) mode.
-                        let (folder, mirror) = {
-                            let p = config.lock().unwrap();
-                            (p.folder.clone(), p.mirror)
-                        };
-                        if !mirror {
-                            continue;
+                        // Wait for quiet + confirm write-completion via size stability.
+                        if !wait_until_stable(&p, &debounce2, gen, &stopped2).await {
+                            return;
                         }
-                        let abs = path.to_string_lossy().to_string();
-                        let Some(rel) = rel_path_of(&abs, &folder) else {
-                            continue;
+                        if stopped2.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if !is_sendable_candidate(&p, &folder2, &inbound2) {
+                            return;
+                        }
+                        {
+                            let mut q = queue2.lock().unwrap();
+                            if !q.iter().any(|x| x == &p) {
+                                q.push_back(p.clone());
+                            }
+                        }
+                        wake2.notify_one();
+                    } else if mirror {
+                        // ── DELETE (total-sync only) ──────────────────────────
+                        let Some(rel) = rel_path_of(&p, &folder2) else {
+                            return;
                         };
                         if rel.is_empty() || rel.split('/').any(|c| c.starts_with('.')) {
-                            continue;
+                            return;
                         }
-                        // Loop guard: did WE just remove this (applying a remote
-                        // delete or replacing an edited file)? Then don't echo it.
+                        // Loop guard: skip files WE removed (applying a remote
+                        // delete, or replacing one we just received/overwrote).
                         {
-                            let mut sd = self_deleted.lock().unwrap();
+                            let mut sd = self_deleted2.lock().unwrap();
                             prune_self_deleted(&mut sd);
                             if sd.remove(&rel).is_some() {
-                                continue;
-                            }
-                        }
-                        let pd = pending_deletes.clone();
-                        let cw = control_wake.clone();
-                        let stopped2 = stopped.clone();
-                        let abs2 = abs.clone();
-                        let rel2 = rel.clone();
-                        let self_deleted2 = self_deleted.clone();
-                        tauri::async_runtime::spawn(async move {
-                            // Debounce: an editor's atomic save is unlink+rename, so
-                            // if the file is back shortly it wasn't really deleted.
-                            tokio::time::sleep(Duration::from_millis(1500)).await;
-                            if stopped2.load(Ordering::SeqCst) || Path::new(&abs2).exists() {
                                 return;
                             }
-                            {
-                                let mut sd = self_deleted2.lock().unwrap();
-                                prune_self_deleted(&mut sd);
-                                if sd.remove(&rel2).is_some() {
-                                    return;
-                                }
+                        }
+                        // An editor's atomic save is unlink+rename; wait briefly and
+                        // re-check. If the file came back, it was a save (its own
+                        // create event re-sends it) — not a real delete.
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        if stopped2.load(Ordering::SeqCst) || Path::new(&p).is_file() {
+                            return;
+                        }
+                        // A newer event for this path superseded us (e.g. recreated
+                        // then handled elsewhere).
+                        if debounce2.lock().unwrap().get(&p).copied() != Some(gen) {
+                            return;
+                        }
+                        {
+                            let mut sd = self_deleted2.lock().unwrap();
+                            prune_self_deleted(&mut sd);
+                            if sd.remove(&rel).is_some() {
+                                return;
                             }
-                            {
-                                let mut p = pd.lock().unwrap();
-                                if !p.iter().any(|d| d.rel == rel2) {
-                                    p.push(DeleteEvent { rel: rel2.clone(), ts: now_ms() });
-                                }
+                        }
+                        {
+                            let mut pend = pd.lock().unwrap();
+                            if !pend.iter().any(|d| d.rel == rel) {
+                                pend.push(DeleteEvent { rel: rel.clone(), ts: now_ms() });
                             }
-                            cw.notify_one();
-                        });
+                        }
+                        cw.notify_one();
                     }
-                }
+                });
             }
         });
     }
@@ -1178,9 +1174,11 @@ impl SyncManager {
                     ReceiveOutcome::Stopped => break,
                     ReceiveOutcome::Error => {
                         // Poll often enough to catch the peer's short-park beacon
-                        // (gap < beacon park), but receives are cheap (~4% for ~4s).
+                        // (gap < beacon park) AND to land deletes quickly — this
+                        // gap is the dominant delete-propagation latency, so keep
+                        // it small (a control receive is cheap, ~4% for ~4s).
                         idle_streak = idle_streak.saturating_add(1);
-                        let gap = poll_gap(idle_streak, 22_000);
+                        let gap = poll_gap(idle_streak, 6_000);
                         if wait_fixed(&stop_notify, &stopped, gap).await {
                             break;
                         }
