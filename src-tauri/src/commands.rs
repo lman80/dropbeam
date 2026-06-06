@@ -53,9 +53,24 @@ pub fn receive_files(
 }
 
 #[tauri::command]
-pub fn cancel_transfer(state: State<'_, Arc<AppState>>, id: String) {
-    if let Some(notify) = state.transfers.lock().unwrap().get(&id) {
-        notify.notify_one();
+pub fn cancel_transfer(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    id: String,
+) {
+    use crate::iroh_net::CancelKind;
+    match iroh.cancel(&id) {
+        // A staged send isn't running a loop, so report Canceled here.
+        CancelKind::Staged => crate::iroh_net::emit_canceled_send(&app, &id),
+        // An in-flight iroh transfer reports Canceled from its own loop.
+        CancelKind::Active => {}
+        // Not an iroh transfer — cancel the croc one.
+        CancelKind::Unknown => {
+            if let Some(notify) = state.transfers.lock().unwrap().get(&id) {
+                notify.notify_one();
+            }
+        }
     }
 }
 

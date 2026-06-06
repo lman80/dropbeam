@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -37,6 +37,7 @@ struct PendingSend {
     paths: Vec<PathBuf>,
     names: Vec<String>,
     total: u64,
+    cancel: Arc<AtomicBool>,
 }
 
 /// Shared iroh state, managed by Tauri as `Arc<IrohState>`. The boot task fills
@@ -48,6 +49,34 @@ pub struct IrohState {
     pub app: OnceCell<AppHandle>,
     /// Quick Sends awaiting a puller, keyed by the ticket's one-time token.
     pending: Mutex<HashMap<String, PendingSend>>,
+    /// Cancellation flags for in-flight transfers, keyed by transfer id.
+    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl IrohState {
+    /// Signal cancellation for a transfer id. Drops a still-staged send so it
+    /// can't be pulled, and flips the in-flight flag for a running transfer.
+    pub fn cancel(&self, id: &str) -> CancelKind {
+        let was_staged = {
+            let mut p = self.pending.lock().unwrap();
+            let before = p.len();
+            p.retain(|_, ps| ps.transfer_id != id);
+            before != p.len()
+        };
+        let active = if let Some(flag) = self.cancels.lock().unwrap().get(id) {
+            flag.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        };
+        if was_staged {
+            CancelKind::Staged
+        } else if active {
+            CancelKind::Active
+        } else {
+            CancelKind::Unknown
+        }
+    }
 }
 
 impl IrohState {
@@ -121,6 +150,27 @@ fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
     emit(app, &u);
 }
 
+fn emit_canceled(app: &AppHandle, id: &str, dir: Direction) {
+    let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
+    u.state = TransferState::Canceled;
+    emit(app, &u);
+}
+
+/// Tell the UI a staged (not-yet-pulled) send was canceled.
+pub fn emit_canceled_send(app: &AppHandle, id: &str) {
+    emit_canceled(app, id, Direction::Send);
+}
+
+/// What `IrohState::cancel` found for an id.
+pub enum CancelKind {
+    /// A still-staged send (removed; the UI should show Canceled).
+    Staged,
+    /// An in-flight transfer (its loop will report Canceled itself).
+    Active,
+    /// Not an iroh transfer (caller falls back to the croc path).
+    Unknown,
+}
+
 /// Is this connection going DIRECT (peer-to-peer, fast) or via the RELAY (slow
 /// fallback)? Surfaced as the Local/Internet badge so a slow transfer is
 /// explainable. Cheap + synchronous — reads the currently selected path.
@@ -177,9 +227,17 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
 /// (n0) relays + discovery for now; Phase 5 swaps in self-hosted infrastructure.
 pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     let secret = load_or_create_secret(config_dir);
+    // Raise the per-stream flow-control window well above the 1.25 MB default
+    // (which caps throughput at ~100 Mbit/s on a 100ms link) so high-latency
+    // internet transfers aren't window-limited. Doesn't help a lossy LAN link.
+    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
+    tcfg = tcfg.stream_receive_window((16u32 * 1024 * 1024).into());
+    tcfg = tcfg.send_window(32 * 1024 * 1024);
+
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
+        .transport_config(tcfg.build())
         .bind()
         .await
         .context("bind iroh endpoint")?;
@@ -268,7 +326,7 @@ async fn serve_stream(
                         p.names.clone(),
                         conn.clone(),
                     );
-                    match serve_pull(send, &p.paths, cb).await {
+                    match serve_pull(send, &p.paths, &p.cancel, cb).await {
                         Ok(_) => emit_completed(
                             &app,
                             &p.transfer_id,
@@ -278,13 +336,17 @@ async fn serve_stream(
                             conn_locality(conn),
                             None,
                         ),
+                        Err(e) if e.to_string().contains("canceled") => {
+                            emit_canceled(&app, &p.transfer_id, Direction::Send)
+                        }
                         Err(e) => emit_failed(&app, &p.transfer_id, Direction::Send, &e.to_string()),
                     }
                 }
                 None => {
-                    serve_pull(send, &p.paths, |_, _| {}).await?;
+                    serve_pull(send, &p.paths, &p.cancel, |_, _| {}).await?;
                 }
             }
+            state.cancels.lock().unwrap().remove(&p.transfer_id);
         }
         other => anyhow::bail!("unknown stream kind: {other:?}"),
     }
@@ -359,6 +421,12 @@ pub fn start_send(
     let id = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
     let ticket = make_ticket(&ep, &token).map_err(|e| e.to_string())?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .cancels
+        .lock()
+        .unwrap()
+        .insert(id.clone(), cancel.clone());
     state.pending.lock().unwrap().insert(
         token,
         PendingSend {
@@ -366,6 +434,7 @@ pub fn start_send(
             paths: pathbufs,
             names: names.clone(),
             total,
+            cancel,
         },
     );
     let mut update = TransferUpdate::new(id, Direction::Send, names);
@@ -389,6 +458,13 @@ pub fn start_receive(
         .cloned()
         .ok_or("Direct mode is still starting up — try again in a moment.")?;
     let id = uuid::Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .cancels
+        .lock()
+        .unwrap()
+        .insert(id.clone(), cancel.clone());
+    let cleanup = state.clone();
     let mut update = TransferUpdate::new(id.clone(), Direction::Receive, Vec::new());
     update.state = TransferState::Connecting;
     update.out_dir = Some(out_dir.clone());
@@ -410,7 +486,7 @@ pub fn start_receive(
                 Vec::new(),
                 conn.clone(),
             );
-            let paths = read_files(&mut recv, &dest, cb).await?;
+            let paths = read_files(&mut recv, &dest, &cancel, cb).await?;
             let loc = conn_locality(&conn);
             Ok((paths, loc))
         }
@@ -431,8 +507,12 @@ pub fn start_receive(
                     .sum();
                 emit_completed(&app, &id, Direction::Receive, names, total, loc, Some(out_dir));
             }
+            Err(e) if e.to_string().contains("canceled") => {
+                emit_canceled(&app, &id, Direction::Receive)
+            }
             Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
         }
+        cleanup.cancels.lock().unwrap().remove(&id);
     });
     Ok(snapshot)
 }
@@ -493,6 +573,7 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 async fn write_files<F: Fn(u64, u64)>(
     send: &mut SendStream,
     paths: &[PathBuf],
+    cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<u64> {
     let mut items = Vec::new();
@@ -520,6 +601,9 @@ async fn write_files<F: Fn(u64, u64)>(
     for (path, _, _) in &items {
         let mut f = tokio::fs::File::open(path).await?;
         loop {
+            if cancel.load(Ordering::SeqCst) {
+                anyhow::bail!("canceled");
+            }
             let n = f.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -536,6 +620,7 @@ async fn write_files<F: Fn(u64, u64)>(
 async fn read_files<F: Fn(u64, u64)>(
     recv: &mut RecvStream,
     dest_dir: &Path,
+    cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let header = read_frame(recv).await?;
@@ -560,6 +645,9 @@ async fn read_files<F: Fn(u64, u64)>(
         let mut f = tokio::fs::File::create(&dest).await?;
         let mut remaining = size;
         while remaining > 0 {
+            if cancel.load(Ordering::SeqCst) {
+                anyhow::bail!("canceled");
+            }
             let want = remaining.min(buf.len() as u64) as usize;
             match recv.read(&mut buf[..want]).await? {
                 Some(n) if n > 0 => {
@@ -582,10 +670,11 @@ async fn read_files<F: Fn(u64, u64)>(
 pub async fn send_files<F: Fn(u64, u64)>(
     conn: &Connection,
     paths: &[PathBuf],
+    cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<u64> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    let sent = write_files(&mut send, paths, on_progress).await?;
+    let sent = write_files(&mut send, paths, cancel, on_progress).await?;
     send.finish()?;
     let _ = recv.read_to_end(16).await;
     Ok(sent)
@@ -595,10 +684,11 @@ pub async fn send_files<F: Fn(u64, u64)>(
 pub async fn recv_files<F: Fn(u64, u64)>(
     conn: &Connection,
     dest_dir: &Path,
+    cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let (mut send, mut recv) = conn.accept_bi().await?;
-    let out = read_files(&mut recv, dest_dir, on_progress).await?;
+    let out = read_files(&mut recv, dest_dir, cancel, on_progress).await?;
     let _ = send.write_all(b"ok").await;
     let _ = send.finish();
     Ok(out)
@@ -645,13 +735,14 @@ pub async fn pull_files<F: Fn(u64, u64)>(
     client: &Endpoint,
     ticket: &str,
     dest_dir: &Path,
+    cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let (addr, token) = parse_ticket(ticket)?;
     let conn = client.connect(addr, ALPN).await.context("dial ticket")?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token })).await?;
-    let out = read_files(&mut recv, dest_dir, on_progress).await?;
+    let out = read_files(&mut recv, dest_dir, cancel, on_progress).await?;
     Ok(out)
 }
 
@@ -659,9 +750,10 @@ pub async fn pull_files<F: Fn(u64, u64)>(
 pub async fn serve_pull<F: Fn(u64, u64)>(
     send: &mut SendStream,
     paths: &[PathBuf],
+    cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<u64> {
-    let sent = write_files(send, paths, on_progress).await?;
+    let sent = write_files(send, paths, cancel, on_progress).await?;
     send.finish()?;
     Ok(sent)
 }
@@ -702,7 +794,9 @@ mod tests {
         let handle = tokio::spawn(async move {
             let incoming = srv.accept().await.unwrap();
             let conn = incoming.await.unwrap();
-            recv_files(&conn, &dest_c, |_, _| {}).await.unwrap()
+            recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {})
+                .await
+                .unwrap()
         });
 
         let src = std::env::temp_dir().join(format!("dropbeam-iroh-src-{pid}.bin"));
@@ -711,7 +805,9 @@ mod tests {
 
         let client = Endpoint::bind(presets::N0).await.unwrap();
         let conn = client.connect(addr, ALPN).await.unwrap();
-        let sent = send_files(&conn, &[src.clone()], |_, _| {}).await.unwrap();
+        let sent = send_files(&conn, &[src.clone()], &AtomicBool::new(false), |_, _| {})
+            .await
+            .unwrap();
         assert_eq!(sent, data.len() as u64);
 
         let received = handle.await.unwrap();
@@ -755,12 +851,16 @@ mod tests {
             let req = read_frame(&mut recv).await.unwrap();
             assert_eq!(req["kind"], "pull");
             assert_eq!(req["token"], token_c);
-            serve_pull(&mut send, &staged, |_, _| {}).await.unwrap();
+            serve_pull(&mut send, &staged, &AtomicBool::new(false), |_, _| {})
+                .await
+                .unwrap();
         });
 
         let client = Endpoint::bind(presets::N0).await.unwrap();
         let dest = std::env::temp_dir().join(format!("dropbeam-pull-rx-{pid}"));
-        let got = pull_files(&client, &ticket, &dest, |_, _| {}).await.unwrap();
+        let got = pull_files(&client, &ticket, &dest, &AtomicBool::new(false), |_, _| {})
+            .await
+            .unwrap();
         serve.await.unwrap();
 
         assert_eq!(got.len(), 1);
@@ -796,6 +896,7 @@ mod tests {
                 paths: vec![src.clone()],
                 names: vec!["f.bin".into()],
                 total: data.len() as u64,
+                cancel: Arc::new(AtomicBool::new(false)),
             },
         );
         let ticket = make_ticket(&server, &token).unwrap();
@@ -807,7 +908,9 @@ mod tests {
 
         let client = Endpoint::bind(presets::N0).await.unwrap();
         let dest = std::env::temp_dir().join(format!("dropbeam-al-rx-{pid}"));
-        let got = pull_files(&client, &ticket, &dest, |_, _| {}).await.unwrap();
+        let got = pull_files(&client, &ticket, &dest, &AtomicBool::new(false), |_, _| {})
+            .await
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(std::fs::read(&got[0]).unwrap(), data);
         // The pending entry was consumed by the serve.
