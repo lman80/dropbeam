@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.5.4"
+version = "0.5.5"
 description = "DropBeam — seamless peer-to-peer file transfer"
 authors = ["DropBeam"]
 license = ""
@@ -41,7 +41,7 @@ tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 # Next-gen transport (Phase 1+): direct P2P with NAT hole-punching, replacing
 # croc's relay-only model. Raw QUIC streams — no iroh-blobs (not yet 1.0).
-iroh = "0.98"
+iroh = { version = "0.98", features = ["address-lookup-mdns"] }
 anyhow = "1"
 
 # Windows only: iroh's `wmi` dep (via netwatch) declares windows + windows-core

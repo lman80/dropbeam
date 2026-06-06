@@ -63,7 +63,13 @@ fn emit(app: &AppHandle, u: &TransferUpdate) {
 
 /// A throttled progress callback that emits `Transferring` updates (with live
 /// speed) for a transfer id — shared by the send (serve) and receive (pull) sides.
-fn progress_cb(app: AppHandle, id: String, dir: Direction, names: Vec<String>) -> impl Fn(u64, u64) {
+fn progress_cb(
+    app: AppHandle,
+    id: String,
+    dir: Direction,
+    names: Vec<String>,
+    conn: Connection,
+) -> impl Fn(u64, u64) {
     let start = Instant::now();
     let ticks = AtomicU64::new(0);
     move |done: u64, total: u64| {
@@ -83,16 +89,27 @@ fn progress_cb(app: AppHandle, id: String, dir: Direction, names: Vec<String>) -
             0.0
         };
         u.speed_bps = done as f64 / secs;
+        u.locality = conn_locality(&conn); // live Direct/Relay badge
         emit(&app, &u);
     }
 }
 
-fn emit_completed(app: &AppHandle, id: &str, dir: Direction, names: Vec<String>, total: u64, out_dir: Option<String>) {
+#[allow(clippy::too_many_arguments)]
+fn emit_completed(
+    app: &AppHandle,
+    id: &str,
+    dir: Direction,
+    names: Vec<String>,
+    total: u64,
+    locality: crate::models::Locality,
+    out_dir: Option<String>,
+) {
     let mut u = TransferUpdate::new(id.to_string(), dir, names);
     u.state = TransferState::Completed;
     u.bytes_done = total;
     u.bytes_total = total;
     u.percent = 100.0;
+    u.locality = locality;
     u.out_dir = out_dir;
     emit(app, &u);
 }
@@ -102,6 +119,27 @@ fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
     u.state = TransferState::Failed;
     u.error = Some(err.to_string());
     emit(app, &u);
+}
+
+/// Is this connection going DIRECT (peer-to-peer, fast) or via the RELAY (slow
+/// fallback)? Surfaced as the Local/Internet badge so a slow transfer is
+/// explainable. Cheap + synchronous — reads the currently selected path.
+/// (The selected path can upgrade relay→direct mid-transfer, so we re-read it
+/// on every progress tick for a live badge.)
+fn conn_locality(conn: &Connection) -> crate::models::Locality {
+    use crate::models::Locality;
+    use iroh::Watcher as _; // brings `.get()` into scope for the path watcher
+    let mut watcher = conn.paths();
+    let paths = watcher.get();
+    let relayed = paths
+        .iter()
+        .find(|p| p.is_selected())
+        .map(|p| p.is_relay());
+    match relayed {
+        Some(true) => Locality::Internet, // relayed = the slow path
+        Some(false) => Locality::Local,   // direct peer-to-peer
+        None => Locality::Unknown,
+    }
 }
 
 /// Load the device's secret key from disk, or generate + persist a fresh one.
@@ -145,6 +183,24 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
         .bind()
         .await
         .context("bind iroh endpoint")?;
+
+    // Local-network (mDNS) discovery: lets two machines on the same Wi-Fi/LAN
+    // find each other's local addresses and connect DIRECTLY, instead of bouncing
+    // through the relay. Best-effort — a failure here just means we fall back to
+    // the default relay+DNS discovery.
+    {
+        use iroh::address_lookup::MdnsAddressLookup;
+        match MdnsAddressLookup::builder().build(ep.id()) {
+            Ok(mdns) => match ep.address_lookup() {
+                Ok(al) => {
+                    al.add(mdns);
+                    log::info!("iroh: local-network (mDNS) discovery enabled");
+                }
+                Err(e) => log::warn!("iroh: address_lookup() unavailable: {e}"),
+            },
+            Err(e) => log::warn!("iroh: mDNS discovery unavailable: {e}"),
+        }
+    }
     Ok(ep)
 }
 
@@ -170,8 +226,9 @@ async fn handle_conn(conn: Connection, state: Arc<IrohState>) {
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let st = state.clone();
+                let c = conn.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = serve_stream(&mut send, &mut recv, &st).await {
+                    if let Err(e) = serve_stream(&c, &mut send, &mut recv, &st).await {
                         log::debug!("iroh stream error: {e:#}");
                     }
                 });
@@ -186,7 +243,12 @@ async fn handle_conn(conn: Connection, state: Arc<IrohState>) {
 
 /// Handle one incoming stream by its header `kind`:
 ///   "ping" → reply "pong" (self-test); "pull" → serve a staged Quick Send.
-async fn serve_stream(send: &mut SendStream, recv: &mut RecvStream, state: &IrohState) -> Result<()> {
+async fn serve_stream(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    state: &IrohState,
+) -> Result<()> {
     let req = read_frame(recv).await?;
     match req.get("kind").and_then(|k| k.as_str()) {
         Some("ping") => {
@@ -199,9 +261,23 @@ async fn serve_stream(send: &mut SendStream, recv: &mut RecvStream, state: &Iroh
             let p = pending.ok_or_else(|| anyhow::anyhow!("no pending send for token"))?;
             match state.app.get().cloned() {
                 Some(app) => {
-                    let cb = progress_cb(app.clone(), p.transfer_id.clone(), Direction::Send, p.names.clone());
+                    let cb = progress_cb(
+                        app.clone(),
+                        p.transfer_id.clone(),
+                        Direction::Send,
+                        p.names.clone(),
+                        conn.clone(),
+                    );
                     match serve_pull(send, &p.paths, cb).await {
-                        Ok(_) => emit_completed(&app, &p.transfer_id, Direction::Send, p.names, p.total, None),
+                        Ok(_) => emit_completed(
+                            &app,
+                            &p.transfer_id,
+                            Direction::Send,
+                            p.names,
+                            p.total,
+                            conn_locality(conn),
+                            None,
+                        ),
                         Err(e) => emit_failed(&app, &p.transfer_id, Direction::Send, &e.to_string()),
                     }
                 }
@@ -320,9 +396,27 @@ pub fn start_receive(
     let snapshot = update.clone();
     tauri::async_runtime::spawn(async move {
         let dest = PathBuf::from(&out_dir);
-        let cb = progress_cb(app.clone(), id.clone(), Direction::Receive, Vec::new());
-        match pull_files(&ep, &ticket, &dest, cb).await {
-            Ok(paths) => {
+        // Inline the dial+pull so we own the Connection — that lets the progress
+        // ticks read the live Direct/Relay path for the badge.
+        let outcome: Result<(Vec<PathBuf>, crate::models::Locality)> = async {
+            let (addr, token) = parse_ticket(&ticket)?;
+            let conn = ep.connect(addr, ALPN).await.context("dial ticket")?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token })).await?;
+            let cb = progress_cb(
+                app.clone(),
+                id.clone(),
+                Direction::Receive,
+                Vec::new(),
+                conn.clone(),
+            );
+            let paths = read_files(&mut recv, &dest, cb).await?;
+            let loc = conn_locality(&conn);
+            Ok((paths, loc))
+        }
+        .await;
+        match outcome {
+            Ok((paths, loc)) => {
                 let names: Vec<String> = paths
                     .iter()
                     .map(|p| {
@@ -335,7 +429,7 @@ pub fn start_receive(
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
                     .sum();
-                emit_completed(&app, &id, Direction::Receive, names, total, Some(out_dir));
+                emit_completed(&app, &id, Direction::Receive, names, total, loc, Some(out_dir));
             }
             Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
         }
