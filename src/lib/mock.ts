@@ -112,8 +112,8 @@ const folderHistory: Record<string, HistoryItem[]> = {
 }
 
 let friends: Friend[] = [
-  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true },
-  { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: Date.now() - 2 * 86400_000, autoAccept: false },
+  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true, endpointId: null },
+  { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: Date.now() - 2 * 86400_000, autoAccept: false, endpointId: null },
 ]
 let friendCounter = 2
 
@@ -304,6 +304,7 @@ export const mockApi = {
         secret: 'mock',
         createdAt: Date.now(),
         autoAccept: true,
+        endpointId: null,
       })
     }
     return { pair, invite: `dropbeam1:MOCK${id}invitecodewouldgohere0000` }
@@ -397,6 +398,7 @@ export const mockApi = {
       secret: 'mock',
       createdAt: Date.now(),
       autoAccept: true,
+      endpointId: null,
     }
     friends.push(friend)
     return { friend, invite: `dropbeamf1:MOCK${id}friendinvitewouldgohere0000` }
@@ -410,6 +412,7 @@ export const mockApi = {
       secret: 'mock',
       createdAt: Date.now(),
       autoAccept: true,
+      endpointId: null,
     }
     friends.push(friend)
     return friend

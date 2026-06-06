@@ -318,10 +318,12 @@ pub struct CreateFriendResult {
 pub fn create_friend(
     state: State<'_, Arc<AppState>>,
     sync: State<'_, Arc<SyncManager>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     friend_name: String,
 ) -> Result<CreateFriendResult, String> {
     let my_name = state.settings.lock().unwrap().display_name.clone();
-    let (friend, invite) = friends::create(&state.config_dir, my_name, friend_name)?;
+    let my_id = iroh.get().map(|ep| ep.id().to_string());
+    let (friend, invite) = friends::create(&state.config_dir, my_name, friend_name, my_id)?;
     sync.reconcile_friends();
     Ok(CreateFriendResult { friend, invite })
 }
@@ -402,10 +404,15 @@ pub async fn ping_friend(state: State<'_, Arc<AppState>>, id: String) -> Result<
 
 /// Rebuild a friend's invite so the inviter can show it again.
 #[tauri::command]
-pub fn friend_invite(state: State<'_, Arc<AppState>>, id: String) -> Result<String, String> {
+pub fn friend_invite(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    id: String,
+) -> Result<String, String> {
     let my_name = state.settings.lock().unwrap().display_name.clone();
     let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
-    Ok(friends::invite_for(&friend, &my_name))
+    let my_id = iroh.get().map(|ep| ep.id().to_string());
+    Ok(friends::invite_for(&friend, &my_name, my_id))
 }
 
 // ---------------------------------------------------------------------------

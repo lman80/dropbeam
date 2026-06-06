@@ -45,13 +45,18 @@ struct Invite {
     secret: String,
     /// The inviter's own name, so the accepter sees who added them.
     name: String,
+    /// The inviter's iroh EndpointId, so the accepter can reach them directly.
+    #[serde(default)]
+    endpoint_id: Option<String>,
 }
 
 /// Create a friend invite (this device is A). `friend_name` is your label for them.
+/// `my_endpoint_id` is our iroh id, embedded so the accepter can send to us directly.
 pub fn create(
     config_dir: &Path,
     my_name: String,
     friend_name: String,
+    my_endpoint_id: Option<String>,
 ) -> Result<(Friend, String), String> {
     let _guard = LOCK.lock().unwrap();
     let id = uuid::Uuid::new_v4().to_string();
@@ -63,12 +68,14 @@ pub fn create(
         secret: secret.clone(),
         created_at: now_ms(),
         auto_accept: true,
+        endpoint_id: None, // learned when they accept + say hello
     };
     let invite = Invite {
         v: 1,
         id,
         secret,
         name: my_name,
+        endpoint_id: my_endpoint_id,
     };
     let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
     let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
@@ -103,6 +110,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         secret: invite.secret,
         created_at: now_ms(),
         auto_accept: true,
+        endpoint_id: invite.endpoint_id, // the inviter's id, for direct sends
     };
     friends.push(friend.clone());
     save(config_dir, &friends)?;
@@ -110,12 +118,13 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
 }
 
 /// Rebuild a friend's invite (so the inviter can show it again).
-pub fn invite_for(friend: &Friend, my_name: &str) -> String {
+pub fn invite_for(friend: &Friend, my_name: &str, my_endpoint_id: Option<String>) -> String {
     let invite = Invite {
         v: 1,
         id: friend.id.clone(),
         secret: friend.secret.clone(),
         name: my_name.to_string(),
+        endpoint_id: my_endpoint_id,
     };
     let json = serde_json::to_string(&invite).unwrap_or_default();
     format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
@@ -141,8 +150,27 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         secret: derive_friend_secret(pair_secret),
         created_at: now_ms(),
         auto_accept: true,
+        endpoint_id: None,
     });
     let _ = save(config_dir, &friends);
+}
+
+/// Record a friend's iroh EndpointId (learned when they say hello after pairing).
+/// Returns true if a friend was updated.
+pub fn set_endpoint_id(config_dir: &Path, id: &str, endpoint_id: String) -> bool {
+    let _guard = LOCK.lock().unwrap();
+    let mut friends = load(config_dir);
+    let mut changed = false;
+    if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
+        if f.endpoint_id.as_deref() != Some(endpoint_id.as_str()) {
+            f.endpoint_id = Some(endpoint_id);
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &friends);
+    }
+    changed
 }
 
 pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
@@ -244,6 +272,7 @@ mod tests {
             secret: "sharedsecret123".into(),
             created_at: 0,
             auto_accept: true,
+            endpoint_id: None,
         }
     }
 

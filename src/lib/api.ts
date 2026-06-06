@@ -104,6 +104,8 @@ export interface Friend {
   secret: string
   createdAt: number
   autoAccept: boolean
+  /** The friend's iroh device id, learned at pairing — enables direct sends. */
+  endpointId: string | null
 }
 
 export type FolderState = 'idle' | 'sending' | 'receiving' | 'waiting' | 'error'

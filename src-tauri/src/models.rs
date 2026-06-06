@@ -233,6 +233,11 @@ pub struct Friend {
     /// existing friends (and the common case) keep the frictionless behavior.
     #[serde(default = "default_true")]
     pub auto_accept: bool,
+    /// The friend's iroh EndpointId (their stable device key), learned during
+    /// pairing. When present + Direct mode is on, we send to them directly over
+    /// iroh (dial-by-key) instead of croc. None for friends paired before this.
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
 }
 
 fn default_true() -> bool {
