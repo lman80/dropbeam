@@ -44,6 +44,15 @@ tauri-plugin-process = "2.3.1"
 iroh = "0.98"
 anyhow = "1"
 
+# Windows only: iroh's `wmi` dep (via netwatch) declares windows + windows-core
+# with a wide range and the resolver split it into windows 0.62 / windows-core
+# 0.61 (the latter unified with Tauri's tao), which doesn't compile. Pinning the
+# API surface to 0.62 here gives wmi a consistent 0.62 pair. (tao keeps its own
+# 0.61 — the two coexist fine.)
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = "0.62"
+
 # Keep the dev build small on a tight disk: no debug symbols (saves several GB in target/).
 [profile.dev]
 debug = 0
