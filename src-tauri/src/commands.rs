@@ -458,3 +458,27 @@ pub fn send_to_friend(
         Some(friend.name),
     ))
 }
+
+// ── iroh transport (Phase 1: foundation / diagnostics) ───────────────────────
+
+/// Our stable iroh node id (None during the brief startup window). Lets the UI
+/// show "your device id" and confirms the new transport is up.
+#[tauri::command]
+pub async fn iroh_node_id(
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+) -> Result<Option<String>, String> {
+    Ok(iroh.get().map(|ep| ep.id().to_string()))
+}
+
+/// Prove the iroh transport works inside the running app (loopback round-trip
+/// over a real QUIC stream). Surfaced in Settings as a diagnostic.
+#[tauri::command]
+pub async fn iroh_selftest(
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+) -> Result<String, String> {
+    let ep = iroh
+        .get()
+        .cloned()
+        .ok_or("iroh transport is still starting up")?;
+    crate::iroh_net::self_test(&ep).await.map_err(|e| e.to_string())
+}

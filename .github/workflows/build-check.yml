@@ -1,0 +1,45 @@
+name: build-check
+
+# Compile-checks the Rust backend (incl. the new iroh transport) on macOS AND
+# Windows for every push to main — so cross-platform build breaks (e.g. a
+# Windows-only dependency issue) surface immediately, without cutting a release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      # generate_context! embeds the built frontend, so dist must exist.
+      - name: Build frontend
+        run: npm run build
+
+      - name: Cargo check (lib + tests)
+        run: cargo check --manifest-path src-tauri/Cargo.toml --lib --tests

@@ -3,6 +3,7 @@ mod croc;
 mod folder_history;
 mod friends;
 mod history;
+mod iroh_net;
 mod models;
 mod pairing;
 mod settings;
@@ -81,6 +82,18 @@ pub fn run() {
                 force_quit: AtomicBool::new(false),
             }));
 
+            // Bring up the iroh transport in the background (Phase 1: foundation
+            // only — croc still carries every transfer, so a failure here is
+            // non-fatal). Fills the endpoint once bound. Gated to dev builds for
+            // now so shipped releases don't start a P2P listener (and trigger a
+            // firewall prompt) before iroh actually powers a user-facing flow;
+            // a later phase exposes it via an opt-in Settings toggle.
+            let iroh_state = Arc::new(iroh_net::IrohState::default());
+            if cfg!(debug_assertions) {
+                iroh_net::spawn(config_dir.clone(), iroh_state.clone());
+            }
+            app.manage(iroh_state);
+
             // Start the Shared Drop Folder sync service.
             let sync = sync::SyncManager::new(app.handle().clone(), config_dir);
             sync.reconcile();
@@ -147,6 +160,8 @@ pub fn run() {
             commands::ping_friend,
             commands::friend_invite,
             commands::send_to_friend,
+            commands::iroh_node_id,
+            commands::iroh_selftest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DropBeam");

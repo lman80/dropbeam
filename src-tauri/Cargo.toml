@@ -39,6 +39,10 @@ trash = "5"
 base64 = "0.22"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
+# Next-gen transport (Phase 1+): direct P2P with NAT hole-punching, replacing
+# croc's relay-only model. Raw QUIC streams — no iroh-blobs (not yet 1.0).
+iroh = "0.98"
+anyhow = "1"
 
 # Keep the dev build small on a tight disk: no debug symbols (saves several GB in target/).
 [profile.dev]
