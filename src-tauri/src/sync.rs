@@ -77,6 +77,7 @@ struct StatusSnapshot {
     detail: Option<String>,
     peer_online: bool,
     peer_name: Option<String>,
+    locality: Locality,
 }
 
 impl Default for StatusSnapshot {
@@ -92,6 +93,7 @@ impl Default for StatusSnapshot {
             detail: None,
             peer_online: false,
             peer_name: None,
+            locality: Locality::Unknown,
         }
     }
 }
@@ -465,6 +467,7 @@ impl SyncManager {
                     detail: s.detail,
                     peer_online: s.peer_online,
                     peer_name: s.peer_name,
+                    locality: s.locality,
                 }
             })
             .collect()
@@ -799,6 +802,9 @@ impl SyncManager {
                                 s.speed_bps = spd;
                             }
                             s.eta_seconds = m.eta;
+                            if !matches!(m.locality, Locality::Unknown) {
+                                s.locality = m.locality;
+                            }
                         }
                         manager_cb.emit_status(&pair_id_cb);
                     },
@@ -905,6 +911,9 @@ impl SyncManager {
                                 s.speed_bps = spd;
                             }
                             s.eta_seconds = m.eta;
+                            if !matches!(m.locality, Locality::Unknown) {
+                                s.locality = m.locality;
+                            }
                         }
                         manager_cb.emit_status(&pair_id_cb);
                     },
@@ -1276,6 +1285,7 @@ impl SyncManager {
             detail: s.detail,
             peer_online: s.peer_online,
             peer_name: s.peer_name,
+            locality: s.locality,
         };
         let _ = self.app.emit("folder://status", status);
     }
@@ -1338,6 +1348,7 @@ async fn run_croc_send(
     let mut connected = false;
     let mut buf = [0u8; 4096];
     let mut line: Vec<u8> = Vec::new();
+    let mut cur_loc = Locality::Unknown;
 
     loop {
         tokio::select! {
@@ -1347,10 +1358,14 @@ async fn run_croc_send(
                     Ok(n) => {
                         for &b in &buf[..n] {
                             if b == b'\r' || b == b'\n' {
-                                if let Some(m) =
-                                    crate::croc::parse_progress_metrics(&String::from_utf8_lossy(&line))
+                                let seg = String::from_utf8_lossy(&line);
+                                if let Some(loc) = crate::croc::parse_peer_locality(&seg) {
+                                    cur_loc = loc;
+                                } else if let Some(mut m) =
+                                    crate::croc::parse_progress_metrics(&seg)
                                 {
                                     connected = true;
+                                    m.locality = cur_loc;
                                     on_progress(m);
                                 }
                                 line.clear();
@@ -1412,6 +1427,7 @@ async fn run_croc_receive(
     let mut stderr = child.stderr.take().expect("stderr piped");
     let mut buf = [0u8; 4096];
     let mut line: Vec<u8> = Vec::new();
+    let mut cur_loc = Locality::Unknown;
 
     loop {
         tokio::select! {
@@ -1421,9 +1437,13 @@ async fn run_croc_receive(
                     Ok(n) => {
                         for &b in &buf[..n] {
                             if b == b'\r' || b == b'\n' {
-                                if let Some(m) =
-                                    crate::croc::parse_progress_metrics(&String::from_utf8_lossy(&line))
+                                let seg = String::from_utf8_lossy(&line);
+                                if let Some(loc) = crate::croc::parse_peer_locality(&seg) {
+                                    cur_loc = loc;
+                                } else if let Some(mut m) =
+                                    crate::croc::parse_progress_metrics(&seg)
                                 {
+                                    m.locality = cur_loc;
                                     on_progress(m);
                                 }
                                 line.clear();
@@ -1894,6 +1914,7 @@ fn set_status(
         s.bytes_total = 0;
         s.speed_bps = 0.0;
         s.eta_seconds = None;
+        s.locality = Locality::Unknown;
     }
 }
 

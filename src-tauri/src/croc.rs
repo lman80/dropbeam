@@ -641,6 +641,16 @@ pub(crate) struct ProgressMetrics {
     pub total: u64,
     pub speed_bps: Option<f64>,
     pub eta: Option<f64>,
+    /// Filled in by the caller from the most recent peer line (Local vs Internet).
+    pub locality: Locality,
+}
+
+/// Classify a standalone peer line ("Sending (->192.168.0.19:5)") as a local or
+/// internet connection — lets folder transfers show the same badge Quick Send does.
+pub(crate) fn parse_peer_locality(line: &str) -> Option<Locality> {
+    let s = strip_ansi(line);
+    let c = RE_PEER.captures(s.trim())?;
+    Some(classify_ip(c.get(1)?.as_str().trim()))
 }
 
 pub(crate) fn parse_progress_metrics(line: &str) -> Option<ProgressMetrics> {
@@ -666,6 +676,7 @@ pub(crate) fn parse_progress_metrics(line: &str) -> Option<ProgressMetrics> {
         total,
         speed_bps: speed,
         eta,
+        locality: Locality::Unknown,
     })
 }
 

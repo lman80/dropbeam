@@ -267,5 +267,8 @@ pub struct FolderStatus {
     /// The peer's display name, learned over the control channel (the creator
     /// side has no name until the accepter says hello).
     pub peer_name: Option<String>,
+    /// Whether the active transfer is going over the LAN or the internet relay —
+    /// the same signal Quick Send shows, so folder speed is explainable.
+    pub locality: Locality,
 }
 

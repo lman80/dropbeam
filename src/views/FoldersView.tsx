@@ -26,7 +26,7 @@ import {
   type Pair,
 } from '../lib/api'
 import { useStore } from '../store'
-import { EmptyState, ProgressBar, Spinner } from '../components/bits'
+import { EmptyState, LocalityBadge, ProgressBar, Spinner } from '../components/bits'
 import { formatBytes, formatEta, formatRelativeTime, formatSpeed } from '../lib/format'
 import { PairingModal } from '../components/PairingModal'
 import { avatarGradient, initials } from '../lib/avatar'
@@ -283,9 +283,12 @@ function FolderCard({
               marginBottom: 6,
             }}
           >
-            <span style={{ fontSize: 15, fontWeight: 750 }} className="gradient-text">
-              {Math.round(status.percent)}%
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 15, fontWeight: 750 }} className="gradient-text">
+                {Math.round(status.percent)}%
+              </span>
+              <LocalityBadge locality={status.locality} />
+            </div>
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
               {formatBytes(status.bytesDone)}
               {status.bytesTotal > 0 ? ` / ${formatBytes(status.bytesTotal)}` : ''}

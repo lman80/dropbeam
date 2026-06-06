@@ -119,6 +119,7 @@ export interface FolderStatus {
   detail: string | null
   peerOnline: boolean
   peerName: string | null
+  locality: Locality
 }
 
 export interface PairUpdate {

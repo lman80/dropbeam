@@ -341,6 +341,7 @@ export const mockApi = {
             detail: null,
             peerOnline: true,
             peerName: p.peerName || null,
+            locality: 'local' as const,
           }
         : {
             pairId: p.id,
@@ -355,6 +356,7 @@ export const mockApi = {
             detail: null,
             peerOnline: !!p.peerName,
             peerName: p.peerName || null,
+            locality: 'unknown' as const,
           },
     ),
 
