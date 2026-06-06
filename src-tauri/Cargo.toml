@@ -53,6 +53,15 @@ anyhow = "1"
 windows-core = "0.62"
 windows = "0.62"
 
+# macOS only: native menu-bar drag-to-open. We attach a file-drag-accepting
+# overlay to the status-item button so dragging a file over the icon springs the
+# popover open (Tauri keeps its tray's NSStatusItem private, so we go native).
+# Pinned to the same objc2 stack Tauri/tray-icon already use.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+
 # Keep the dev build small on a tight disk: no debug symbols (saves several GB in target/).
 [profile.dev]
 debug = 0

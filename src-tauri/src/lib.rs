@@ -8,6 +8,8 @@ mod models;
 mod pairing;
 mod settings;
 mod sync;
+#[cfg(target_os = "macos")]
+mod tray_drag;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -101,6 +103,29 @@ pub fn run() {
             app.manage(sync);
 
             build_tray(app.handle())?;
+
+            // Native macOS: let a file dragged over the menu-bar icon spring the
+            // popover open (Blip-style). The status item appears a beat after the
+            // tray is built, so retry on the main thread until the button exists.
+            // Best-effort — if it never attaches, the tray still works normally.
+            #[cfg(target_os = "macos")]
+            {
+                let h = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    for delay_ms in [250u64, 500, 1000, 2000, 3500] {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        let h2 = h.clone();
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let posted = h.run_on_main_thread(move || {
+                            let _ = tx.send(tray_drag::install(&h2));
+                        });
+                        if posted.is_ok() && rx.await.unwrap_or(false) {
+                            log::info!("tray drag-to-open attached");
+                            break;
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .on_window_event(|window, event| match event {
