@@ -161,11 +161,11 @@ export function SettingsView() {
         </Row>
       </Card>
 
-      <SectionTitle>Experimental</SectionTitle>
+      <SectionTitle>Connection</SectionTitle>
       <Card>
         <Row
-          title="Direct mode (beta)"
-          desc="Send Quick Send files over the new peer-to-peer engine — straight to the other computer instead of through a relay, so internet transfers are much faster. Both people need this on. Turning it on starts a direct connection (your firewall may ask once to allow DropBeam)."
+          title="Direct mode"
+          desc="On by default — Quick Send, friends, and shared folders go straight to the other computer (peer-to-peer, end-to-end encrypted), so transfers are as fast as your network allows. Turn it off only to fall back to the older relay engine if a direct connection won't form on a restrictive network. Your firewall may ask once to allow DropBeam."
         >
           <Toggle on={settings.directMode} onChange={(v) => save({ directMode: v })} />
         </Row>
