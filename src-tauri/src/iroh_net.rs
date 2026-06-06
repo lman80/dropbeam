@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
@@ -660,7 +660,14 @@ pub fn send_to_friend(
     let snapshot = update.clone();
     tauri::async_runtime::spawn(async move {
         let outcome: Result<crate::models::Locality> = async {
-            let conn = ep.connect(addr, ALPN).await.context("dial friend")?;
+            // Bounded so an offline/unreachable friend FAILS clearly instead of
+            // hanging forever (the exact thing that was wrong with the old path).
+            let conn = tokio::time::timeout(Duration::from_secs(30), ep.connect(addr, ALPN))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("Couldn't reach this friend — are they online with Direct mode on?")
+                })?
+                .context("dial friend")?;
             let cb = progress_cb(
                 app.clone(),
                 id.clone(),
@@ -710,7 +717,9 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
         let hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": friend_id, "endpoint_id": my_id, "name": my_name,
         });
-        if let Ok(conn) = ep.connect(addr, ALPN).await {
+        if let Ok(Ok(conn)) =
+            tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
+        {
             if let Ok((mut send, mut recv)) = conn.open_bi().await {
                 let _ = write_frame(&mut send, &hello).await;
                 let _ = send.finish();
