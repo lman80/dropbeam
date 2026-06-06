@@ -741,9 +741,19 @@ impl SyncManager {
                 let Some(file) = next else {
                     set_status(&status, FolderState::Idle, None, 0.0, None);
                     manager.emit_status(&pair_id);
+                    // While idle, periodically re-scan for any local file that never
+                    // reached the peer — an initial send that got interrupted, or
+                    // files that already existed when the folder was paired. Re-queuing
+                    // them is how a total-sync folder reliably converges to the SAME
+                    // set of files on both computers (seed_existing skips anything
+                    // already delivered or queued, so this is cheap + idempotent).
                     tokio::select! {
                         _ = wake.notified() => {}
                         _ = stop_notify.notified() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(45)) => {
+                            let folder = config.lock().unwrap().folder.clone();
+                            seed_existing(&folder, &inbound, &queue, &wake);
+                        }
                     }
                     continue;
                 };

@@ -257,7 +257,7 @@ fn toggle_popover(app: &AppHandle, cursor: tauri::PhysicalPosition<f64>) {
     let scale = w.scale_factor().unwrap_or(1.0);
     let cx = cursor.x / scale;
     let cy = cursor.y / scale;
-    let pop_w = 380.0;
+    let pop_w = 300.0;
     let x = (cx - pop_w / 2.0).max(8.0);
     let y = cy + 8.0; // just under the menu bar
     let _ = w.set_position(tauri::LogicalPosition::new(x, y));

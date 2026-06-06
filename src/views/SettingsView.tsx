@@ -88,7 +88,9 @@ export function SettingsView() {
 
   return (
     <div style={{ maxWidth: 620, margin: '0 auto', padding: '8px 28px 40px' }}>
-      <h1 style={{ fontSize: 20, fontWeight: 750, margin: '0 0 16px' }}>Settings</h1>
+      <h1 className="titlebar-drag" style={{ fontSize: 20, fontWeight: 750, margin: '0 0 16px' }}>
+        Settings
+      </h1>
 
       <SectionTitle>Profile</SectionTitle>
       <Card>

@@ -205,6 +205,17 @@ textarea,
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
+/* Anything interactive inside a drag region must stay clickable — so a header
+   row can drag the window while its buttons/inputs still work. */
+.titlebar-drag button,
+.titlebar-drag input,
+.titlebar-drag select,
+.titlebar-drag textarea,
+.titlebar-drag a,
+.titlebar-drag [role='button'] {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
 
 @keyframes beam-pulse {
   0%, 100% { opacity: 0.55; transform: scale(1); }
@@ -360,7 +371,7 @@ html.overlay-window #root {
 /* ---- Menu-bar popover ---- */
 .popover-root {
   height: 100%;
-  padding: 8px;
+  padding: 6px;
   box-sizing: border-box;
 }
 .popover-panel {
@@ -377,7 +388,7 @@ html.overlay-window #root {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 9px 8px 9px 8px;
+  padding: 7px 8px;
   border-bottom: 1px solid var(--border);
   -webkit-app-region: drag;
 }
@@ -413,12 +424,12 @@ html.overlay-window #root {
 /* Search field (Blip-style) */
 .pop-search-wrap {
   position: relative;
-  padding: 10px 12px 4px;
+  padding: 8px 10px 3px;
 }
 .pop-search-icon {
   position: absolute;
-  left: 24px;
-  top: 21px;
+  left: 21px;
+  top: 17px;
   color: var(--text-faint);
   pointer-events: none;
 }
@@ -428,8 +439,8 @@ html.overlay-window #root {
   border-radius: 999px;
   border: 1.5px solid var(--border);
   background: var(--surface-2);
-  padding: 9px 14px 9px 36px;
-  font-size: 13.5px;
+  padding: 7px 12px 7px 32px;
+  font-size: 13px;
   color: var(--text);
   outline: none;
   transition: border-color 0.14s ease, box-shadow 0.14s ease;
@@ -451,11 +462,11 @@ html.overlay-window #root {
 .pop-contact {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: 9px;
   width: 100%;
-  padding: 7px 8px;
+  padding: 5px 7px;
   border: none;
-  border-radius: 12px;
+  border-radius: 10px;
   background: transparent;
   text-align: left;
   cursor: pointer;
@@ -473,25 +484,25 @@ html.overlay-window #root {
 }
 .pop-contact-av {
   position: relative;
-  width: 40px;
-  height: 40px;
+  width: 32px;
+  height: 32px;
   border-radius: 999px;
   display: grid;
   place-items: center;
   color: #fff;
   font-weight: 700;
-  font-size: 14px;
+  font-size: 12.5px;
   flex-shrink: 0;
 }
 .pop-online-dot {
   position: absolute;
   right: -1px;
   bottom: -1px;
-  width: 12px;
-  height: 12px;
+  width: 10px;
+  height: 10px;
   border-radius: 999px;
   background: var(--green);
-  border: 2.5px solid var(--surface);
+  border: 2px solid var(--surface);
 }
 .pop-contact-text {
   display: flex;
@@ -500,7 +511,7 @@ html.overlay-window #root {
   flex: 1;
 }
 .pop-contact-name {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 650;
   color: var(--text);
   white-space: nowrap;

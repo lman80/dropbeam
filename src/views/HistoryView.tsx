@@ -31,6 +31,7 @@ export function HistoryView() {
   return (
     <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
       <div
+        className="titlebar-drag"
         style={{
           display: 'flex',
           alignItems: 'center',
