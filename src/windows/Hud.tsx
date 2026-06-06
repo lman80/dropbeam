@@ -128,8 +128,9 @@ function usePositionOnce() {
         const originX = mon.position.x / scale
         const originY = mon.position.y / scale
         const hudW = 340
-        const x = originX + Math.max(0, (screenW - hudW) / 2)
-        const y = originY + 12
+        // Tuck it under the menu-bar tray icon, in the top-right corner.
+        const x = originX + Math.max(8, screenW - hudW - 14)
+        const y = originY + 8
         await getCurrentWindow().setPosition(new LogicalPosition(x, y))
       } catch {
         /* positioning is best-effort */

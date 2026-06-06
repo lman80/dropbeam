@@ -5,6 +5,7 @@ import {
   Check,
   Copy,
   Pencil,
+  Radar,
   Send,
   Trash2,
   UserPlus,
@@ -15,6 +16,7 @@ import { api, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState, Spinner } from '../components/bits'
 import { avatarGradient, initials } from '../lib/avatar'
+import { friendOnlineState } from '../lib/presence'
 
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
@@ -78,6 +80,9 @@ function FriendCard({ friend }: { friend: Friend }) {
   const removeFriend = useStore((s) => s.removeFriend)
   const renameFriend = useStore((s) => s.renameFriend)
   const setFriendAutoAccept = useStore((s) => s.setFriendAutoAccept)
+  const pingFriend = useStore((s) => s.pingFriend)
+  const friendSeen = useStore((s) => s.friendSeen)
+  const folderStatuses = useStore((s) => s.folderStatuses)
   const toast = useStore((s) => s.toast)
   const [busy, setBusy] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
@@ -85,6 +90,25 @@ function FriendCard({ friend }: { friend: Friend }) {
   const [name, setName] = useState(friend.name)
   const [invite, setInvite] = useState<string | null>(null)
   const [loadingInvite, setLoadingInvite] = useState(false)
+  const [pinging, setPinging] = useState(false)
+  const [pingedOffline, setPingedOffline] = useState(false)
+
+  const online = friendOnlineState(friend.name, friendSeen, folderStatuses)
+
+  const check = async () => {
+    setPinging(true)
+    setPingedOffline(false)
+    try {
+      const ok = await pingFriend(friend.id)
+      if (ok) toast('success', `${friend.name} is online`)
+      else {
+        setPingedOffline(true)
+        toast('info', `${friend.name} didn’t respond — they may be offline`)
+      }
+    } finally {
+      setPinging(false)
+    }
+  }
 
   const send = async () => {
     setBusy(true)
@@ -127,21 +151,35 @@ function FriendCard({ friend }: { friend: Friend }) {
       style={{ padding: 16, overflow: 'hidden' }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <div
-          style={{
-            width: 44,
-            height: 44,
-            borderRadius: 14,
-            display: 'grid',
-            placeItems: 'center',
-            flexShrink: 0,
-            color: 'white',
-            fontWeight: 700,
-            fontSize: 15,
-            background: avatarGradient(friend.id),
-          }}
-        >
-          {initials(friend.name)}
+        <div style={{ position: 'relative', flexShrink: 0 }}>
+          <div
+            style={{
+              width: 44,
+              height: 44,
+              borderRadius: 14,
+              display: 'grid',
+              placeItems: 'center',
+              color: 'white',
+              fontWeight: 700,
+              fontSize: 15,
+              background: avatarGradient(friend.id),
+            }}
+          >
+            {initials(friend.name)}
+          </div>
+          <span
+            title={online ? 'Online' : 'Status unknown'}
+            style={{
+              position: 'absolute',
+              right: -2,
+              bottom: -2,
+              width: 13,
+              height: 13,
+              borderRadius: 999,
+              background: online ? 'var(--green)' : 'var(--text-faint)',
+              border: '2.5px solid var(--surface)',
+            }}
+          />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           {editing ? (
@@ -176,8 +214,37 @@ function FriendCard({ friend }: { friend: Friend }) {
               </button>
             </div>
           )}
-          <div style={{ fontSize: 12, color: 'var(--text-faint)', marginTop: 2 }}>
-            Send files instantly — no code needed
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 7,
+              fontSize: 12,
+              marginTop: 3,
+              color: online ? 'var(--green)' : 'var(--text-faint)',
+            }}
+          >
+            <span>{online ? 'Online' : pingedOffline ? 'No response' : 'Status unknown'}</span>
+            <span style={{ color: 'var(--border-strong)' }}>·</span>
+            <button
+              onClick={check}
+              disabled={pinging}
+              style={{
+                background: 'none',
+                border: 'none',
+                padding: 0,
+                cursor: 'pointer',
+                color: 'var(--accent)',
+                fontSize: 12,
+                fontWeight: 600,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+              }}
+            >
+              {pinging ? <Spinner size={11} /> : <Radar size={12} />}
+              {pinging ? 'Checking…' : 'Check'}
+            </button>
           </div>
         </div>
         <button className="btn btn-primary" onClick={send} disabled={busy}>

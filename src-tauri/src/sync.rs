@@ -356,6 +356,13 @@ impl SyncManager {
                             u.out_dir = Some(dest.clone());
                             let _ = manager.app.emit("transfer://update", &u);
                             manager.note_friend_received(&friend, &dest, &moved);
+                        } else if started.load(Ordering::SeqCst) {
+                            // Only a throwaway marker (a ping) arrived — clear the
+                            // momentary card the progress callback flashed. The UI
+                            // drops canceled, file-less transfers.
+                            let u =
+                                recv_update(&tid, &friend.name, TransferState::Canceled, &[]);
+                            let _ = manager.app.emit("transfer://update", &u);
                         }
                     }
                     ReceiveOutcome::Stopped => break,
@@ -1537,13 +1544,22 @@ where
                         if on_offer.is_some() {
                             let partial = String::from_utf8_lossy(&line);
                             if let Some((names, total)) = parse_accept_prompt(&partial) {
-                                let cb = on_offer.take().unwrap();
-                                let accept = tokio::select! {
-                                    a = cb(names, total) => a,
-                                    _ = stop_notify.notified() => {
-                                        let _ = child.start_kill();
-                                        let _ = child.wait().await;
-                                        return ReceiveOutcome::Stopped;
+                                // A ping probe is a throwaway marker — accept it
+                                // silently so a "check if online" never prompts.
+                                let is_ping =
+                                    names.iter().any(|n| n.starts_with(".dropbeam-ping"));
+                                let accept = if is_ping {
+                                    on_offer = None;
+                                    true
+                                } else {
+                                    let cb = on_offer.take().unwrap();
+                                    tokio::select! {
+                                        a = cb(names, total) => a,
+                                        _ = stop_notify.notified() => {
+                                            let _ = child.start_kill();
+                                            let _ = child.wait().await;
+                                            return ReceiveOutcome::Stopped;
+                                        }
                                     }
                                 };
                                 let answer: &[u8] = if accept { b"y\n" } else { b"n\n" };
@@ -1885,6 +1901,30 @@ fn set_peer_online(status: &Arc<Mutex<StatusSnapshot>>, online: bool) {
     if let Ok(mut s) = status.lock() {
         s.peer_online = online;
     }
+}
+
+/// One-off "are you online?" probe: beam a tiny throwaway marker on a friend's
+/// channel and report whether it was delivered (their inbox listener caught it).
+/// The marker is a `.dropbeam-ping-*` dotfile, which the receiver auto-discards.
+pub(crate) async fn ping_send(settings: &Settings, code: &str, config_dir: &Path) -> bool {
+    let marker = config_dir.join(format!(".dropbeam-ping-{}", uuid::Uuid::new_v4()));
+    if std::fs::write(&marker, b"ping").is_err() {
+        return false;
+    }
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(Notify::new());
+    let outcome = run_croc_send(
+        settings,
+        code,
+        &marker.to_string_lossy(),
+        &stopped,
+        &stop,
+        70, // generous enough to catch even a deep-idle inbox poll
+        |_m| {},
+    )
+    .await;
+    let _ = std::fs::remove_file(&marker);
+    matches!(outcome, SendOutcome::Delivered)
 }
 
 /// Adaptive idle poll gap (ms). croc can't park waiting for a sender — it gives

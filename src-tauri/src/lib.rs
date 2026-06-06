@@ -144,6 +144,7 @@ pub fn run() {
             commands::remove_friend,
             commands::set_friend_auto_accept,
             commands::respond_to_offer,
+            commands::ping_friend,
             commands::friend_invite,
             commands::send_to_friend,
         ])
@@ -190,8 +191,17 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         });
 
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone()).icon_as_template(true);
+    // A dedicated monochrome beam glyph (template) for the menu bar — templating
+    // the full app icon just yields a solid square silhouette.
+    match tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png")) {
+        Ok(icon) => {
+            builder = builder.icon(icon).icon_as_template(true);
+        }
+        Err(_) => {
+            if let Some(icon) = app.default_window_icon() {
+                builder = builder.icon(icon.clone()).icon_as_template(true);
+            }
+        }
     }
 
     builder.build(app)?;

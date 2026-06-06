@@ -42,6 +42,10 @@ interface AppStore {
   pairs: Pair[]
   friends: Friend[]
   folderStatuses: Record<string, FolderStatus>
+  /** Files picked/dropped that are awaiting a "send to whom?" choice. */
+  pendingSend: string[] | null
+  /** Last time (ms) a friend was seen online, keyed by lowercased name. */
+  friendSeen: Record<string, number>
   toasts: Toast[]
   defaultDownloadDir: string
   appVer: string
@@ -53,6 +57,8 @@ interface AppStore {
   installUpdate: () => Promise<void>
   setView: (v: View) => void
   setDragHovering: (v: boolean) => void
+  setPendingSend: (paths: string[] | null) => void
+  markFriendSeen: (name: string) => void
   applyTheme: (theme: Settings['theme']) => void
   saveSettings: (patch: Partial<Settings>) => Promise<void>
   sendPaths: (paths: string[]) => Promise<void>
@@ -71,6 +77,7 @@ interface AppStore {
   removeFriend: (id: string) => Promise<void>
   setFriendAutoAccept: (id: string, autoAccept: boolean) => Promise<void>
   respondToOffer: (id: string, accept: boolean) => Promise<void>
+  pingFriend: (id: string) => Promise<boolean>
   toast: (kind: Toast['kind'], message: string) => void
   dismissToast: (id: string) => void
 }
@@ -90,6 +97,8 @@ export const useStore = create<AppStore>((set, get) => ({
   pairs: [],
   friends: [],
   folderStatuses: {},
+  pendingSend: null,
+  friendSeen: {},
   toasts: [],
   defaultDownloadDir: '',
   appVer: '',
@@ -175,6 +184,13 @@ export const useStore = create<AppStore>((set, get) => ({
 
   setDragHovering: (dragHovering) => set({ dragHovering }),
 
+  setPendingSend: (pendingSend) => set({ view: 'send', pendingSend }),
+
+  markFriendSeen: (name) => {
+    const key = name.trim().toLowerCase()
+    if (key) set((s) => ({ friendSeen: { ...s.friendSeen, [key]: Date.now() } }))
+  },
+
   sendPaths: async (paths) => {
     paths = paths.filter(Boolean)
     if (!paths.length) return
@@ -227,6 +243,17 @@ export const useStore = create<AppStore>((set, get) => ({
 
   upsertTransfer: (u) => {
     const prev = get().transfers[u.id]
+    // A friend transfer that actually connected means they were online just now.
+    if (
+      u.friendName &&
+      (u.state === 'connecting' || u.state === 'transferring' || u.state === 'completed')
+    ) {
+      const key = u.friendName.trim().toLowerCase()
+      const last = get().friendSeen[key] ?? 0
+      if (Date.now() - last > 5000) {
+        set((s) => ({ friendSeen: { ...s.friendSeen, [key]: Date.now() } }))
+      }
+    }
     // Sounds fire on meaningful state changes only (not on every progress tick).
     if ((get().settings?.playSounds ?? true) && (!prev || prev.state !== u.state)) {
       if (u.state === 'completed') {
@@ -343,6 +370,19 @@ export const useStore = create<AppStore>((set, get) => ({
     } catch (e) {
       get().toast('error', String(e))
       await get().reloadFriends()
+    }
+  },
+
+  pingFriend: async (id) => {
+    try {
+      const online = await api.pingFriend(id)
+      if (online) {
+        const f = get().friends.find((x) => x.id === id)
+        if (f) get().markFriendSeen(f.name)
+      }
+      return online
+    } catch {
+      return false
     }
   },
 

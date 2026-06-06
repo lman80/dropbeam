@@ -367,6 +367,18 @@ pub fn respond_to_offer(state: State<'_, Arc<AppState>>, id: String, accept: boo
     }
 }
 
+/// Actively check whether a friend is online: beam them a tiny throwaway marker
+/// and report whether it was delivered (their app caught it). Can take up to ~70s
+/// if their app is idle; returns false if they don't answer in that window.
+#[tauri::command]
+pub async fn ping_friend(state: State<'_, Arc<AppState>>, id: String) -> Result<bool, String> {
+    let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
+    let code = friends::friend_inbox_code(&friend);
+    let settings = { state.settings.lock().unwrap().clone() };
+    let config_dir = state.config_dir.clone();
+    Ok(crate::sync::ping_send(&settings, &code, &config_dir).await)
+}
+
 /// Rebuild a friend's invite so the inviter can show it again.
 #[tauri::command]
 pub fn friend_invite(state: State<'_, Arc<AppState>>, id: String) -> Result<String, String> {

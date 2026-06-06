@@ -8,6 +8,7 @@ import { Sidebar } from './components/Sidebar'
 import { Toasts } from './components/Toasts'
 import { BeamLogo } from './components/bits'
 import { SendView } from './views/SendView'
+import { SendToChooser } from './components/SendToChooser'
 import { HistoryView } from './views/HistoryView'
 import { SettingsView } from './views/SettingsView'
 import { FoldersView } from './views/FoldersView'
@@ -17,7 +18,7 @@ export default function App() {
   const ready = useStore((s) => s.ready)
   const view = useStore((s) => s.view)
   const init = useStore((s) => s.init)
-  const sendPaths = useStore((s) => s.sendPaths)
+  const setPendingSend = useStore((s) => s.setPendingSend)
   const setDragHovering = useStore((s) => s.setDragHovering)
 
   useEffect(() => {
@@ -28,7 +29,7 @@ export default function App() {
     let un: UnlistenFn | undefined
     let active = true
     onFileDrop(
-      (paths) => sendPaths(paths),
+      (paths) => setPendingSend(paths),
       (h) => setDragHovering(h),
     ).then((f) => {
       if (active) un = f
@@ -38,7 +39,7 @@ export default function App() {
       active = false
       un?.()
     }
-  }, [sendPaths, setDragHovering])
+  }, [setPendingSend, setDragHovering])
 
   if (!ready) {
     return (
@@ -73,6 +74,7 @@ export default function App() {
           </motion.div>
         </main>
       </div>
+      <SendToChooser />
       <Toasts />
     </div>
   )

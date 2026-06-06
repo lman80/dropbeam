@@ -396,6 +396,12 @@ export const mockApi = {
     const f = friends.find((x) => x.id === id)
     if (f) f.autoAccept = autoAccept
   },
+  pingFriend: async (id: string): Promise<boolean> => {
+    await new Promise((r) => setTimeout(r, 1200))
+    // Alex is "online" in the mock; others aren't.
+    const f = friends.find((x) => x.id === id)
+    return f?.name === 'Alex'
+  },
   respondToOffer: async (id: string, accept: boolean): Promise<void> => {
     const t = pendingOffers[id]
     if (!t) return

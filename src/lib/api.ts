@@ -176,6 +176,7 @@ const realApi = {
   renameFriend: (id: string, name: string) =>
     invoke<void>('rename_friend', { id, name }),
   removeFriend: (id: string) => invoke<void>('remove_friend', { id }),
+  pingFriend: (id: string) => invoke<boolean>('ping_friend', { id }),
   setFriendAutoAccept: (id: string, autoAccept: boolean) =>
     invoke<void>('set_friend_auto_accept', { id, autoAccept }),
   respondToOffer: (id: string, accept: boolean) =>

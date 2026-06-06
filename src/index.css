@@ -462,8 +462,8 @@ html.overlay-window #root {
 .hud-root {
   height: 100%;
   display: grid;
-  place-items: start center;
-  padding: 0;
+  place-items: start end;
+  padding: 2px 4px 0 0;
 }
 .hud-pill {
   display: flex;
@@ -519,4 +519,21 @@ html.overlay-window #root {
   font-weight: 750;
   font-variant-numeric: tabular-nums;
   color: rgba(255, 255, 255, 0.92);
+}
+
+/* Recipient chooser rows (the "send to whom?" sheet) */
+.chooser-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 11px;
+  border: none;
+  background: transparent;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.13s ease;
+}
+.chooser-row:hover {
+  background: var(--surface-2);
 }
