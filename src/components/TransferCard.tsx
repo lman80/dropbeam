@@ -161,7 +161,9 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
         >
           <div style={{ flex: 1, minWidth: 220 }}>
             <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 7 }}>
-              On the other device, open DropBeam → Receive and enter:
+              {(t.code?.length ?? 0) > 40
+                ? 'On the other device → Receive: scan the QR, or paste this Direct ticket:'
+                : 'On the other device, open DropBeam → Receive and enter:'}
             </div>
             <div
               style={{
@@ -179,7 +181,10 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
                 style={{
                   flex: 1,
                   fontFamily: 'var(--font-mono)',
-                  fontSize: 18,
+                  fontSize: (t.code?.length ?? 0) > 40 ? 10.5 : 18,
+                  lineHeight: (t.code?.length ?? 0) > 40 ? 1.45 : undefined,
+                  maxHeight: (t.code?.length ?? 0) > 40 ? 58 : undefined,
+                  overflowY: (t.code?.length ?? 0) > 40 ? 'auto' : undefined,
                   fontWeight: 600,
                   letterSpacing: '0.02em',
                   color: 'var(--text)',

@@ -68,6 +68,7 @@ pub fn get_settings(state: State<'_, Arc<AppState>>) -> Settings {
 pub fn update_settings(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     settings: Settings,
 ) -> Result<Settings, String> {
     apply_autostart(&app, settings.launch_at_login);
@@ -76,6 +77,11 @@ pub fn update_settings(
         *guard = settings.clone();
     }
     settings::save(&state.config_dir, &settings)?;
+    // Turning Direct mode on starts the P2P engine right away (no restart). The
+    // `app` OnceCell is set the first time we spawn, so this won't double-start.
+    if settings.direct_mode && iroh.app.get().is_none() {
+        crate::iroh_net::spawn(state.config_dir.clone(), iroh.inner().clone(), app.clone());
+    }
     Ok(settings)
 }
 
@@ -481,4 +487,49 @@ pub async fn iroh_selftest(
         .cloned()
         .ok_or("iroh transport is still starting up")?;
     crate::iroh_net::self_test(&ep).await.map_err(|e| e.to_string())
+}
+
+/// Quick Send over the iroh direct engine: stage files, return a ticket-bearing
+/// update. The receiver pulls with `iroh_receive`.
+#[tauri::command]
+pub fn iroh_send(
+    app: AppHandle,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    paths: Vec<String>,
+) -> Result<TransferUpdate, String> {
+    let paths: Vec<String> = paths.into_iter().filter(|p| !p.trim().is_empty()).collect();
+    if paths.is_empty() {
+        return Err("No files selected.".into());
+    }
+    for p in &paths {
+        if !std::path::Path::new(p).exists() {
+            return Err(format!("File not found: {p}"));
+        }
+    }
+    crate::iroh_net::start_send(app, iroh.inner().clone(), paths)
+}
+
+/// Receive a Direct Quick Send by pasting its ticket.
+#[tauri::command]
+pub fn iroh_receive(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    ticket: String,
+) -> Result<TransferUpdate, String> {
+    let ticket = ticket.trim().to_string();
+    if ticket.is_empty() {
+        return Err("Paste a Direct ticket to receive.".into());
+    }
+    let configured = { state.settings.lock().unwrap().download_dir.clone() };
+    let out = if configured.trim().is_empty() {
+        app.path()
+            .download_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .map_err(|e| format!("No download folder available: {e}"))?
+    } else {
+        configured
+    };
+    std::fs::create_dir_all(&out).map_err(|e| format!("Can't write to download folder: {e}"))?;
+    crate::iroh_net::start_receive(app, iroh.inner().clone(), ticket, out)
 }

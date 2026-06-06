@@ -38,6 +38,7 @@ let settings: Settings = {
   customRelayPass: '',
   notifyOnComplete: true,
   playSounds: true,
+  directMode: false,
 }
 
 const history: HistoryEntry[] = [
@@ -229,6 +230,33 @@ export const mockApi = {
     }, 300)
     return base(id, 'receive', [])
   },
+  irohSend: async (paths: string[]): Promise<TransferUpdate> => {
+    const id = `m${++counter}`
+    const names = paths.map((p) => p.split('/').pop() || p)
+    const t = base(id, 'send', names)
+    setTimeout(() => {
+      t.state = 'waitingForPeer'
+      t.code = 'direct1aBcDeFgH2jKlMnPqRsTuVwXyZ3456789aBcDeFgHjKmNpQ'
+      emit('transfer://update', { ...t })
+      setTimeout(() => simulate(t, 540_000_000), 2600)
+    }, 250)
+    return base(id, 'send', names)
+  },
+  irohReceive: async (_ticket: string): Promise<TransferUpdate> => {
+    const id = `m${++counter}`
+    const t = base(id, 'receive', [])
+    setTimeout(() => {
+      t.state = 'connecting'
+      emit('transfer://update', { ...t })
+      setTimeout(() => {
+        t.fileNames = ['project-export.bin']
+        t.fileCount = 1
+        simulate(t, 540_000_000)
+      }, 900)
+    }, 300)
+    return base(id, 'receive', [])
+  },
+  irohSelftest: async (): Promise<string> => 'ok · node a1b2c3…f7e8',
   cancelTransfer: async (_id: string): Promise<void> => {},
   getSettings: async (): Promise<Settings> => settings,
   updateSettings: async (s: Settings): Promise<Settings> => {

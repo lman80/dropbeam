@@ -67,6 +67,8 @@ export interface Settings {
   customRelayPass: string
   notifyOnComplete: boolean
   playSounds: boolean
+  /** Opt in to the new direct P2P engine (iroh) for Quick Send. */
+  directMode: boolean
 }
 
 export type PairRole = 'a' | 'b'
@@ -134,6 +136,10 @@ export interface PairUpdate {
 const realApi = {
   sendFiles: (paths: string[]) => invoke<TransferUpdate>('send_files', { paths }),
   receiveFiles: (code: string) => invoke<TransferUpdate>('receive_files', { code }),
+  // Direct engine (iroh) Quick Send — same UI, P2P transport.
+  irohSend: (paths: string[]) => invoke<TransferUpdate>('iroh_send', { paths }),
+  irohReceive: (ticket: string) => invoke<TransferUpdate>('iroh_receive', { ticket }),
+  irohSelftest: () => invoke<string>('iroh_selftest'),
   cancelTransfer: (id: string) => invoke<void>('cancel_transfer', { id }),
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (settings: Settings) => invoke<Settings>('update_settings', { settings }),

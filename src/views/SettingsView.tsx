@@ -66,10 +66,24 @@ export function SettingsView() {
   const checkForUpdates = useStore((s) => s.checkForUpdates)
   const installUpdate = useStore((s) => s.installUpdate)
   const [advanced, setAdvanced] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<string | null>(null)
 
   const changeDir = async () => {
     const d = await api.pickDirectory()
     if (d) save({ downloadDir: d })
+  }
+
+  const runDirectTest = async () => {
+    setTesting(true)
+    setTestResult(null)
+    try {
+      setTestResult(await api.irohSelftest())
+    } catch (e) {
+      setTestResult(`Not ready yet — ${String(e)}`)
+    } finally {
+      setTesting(false)
+    }
   }
 
   return (
@@ -145,6 +159,29 @@ export function SettingsView() {
         <Row title="Play sounds" desc="Soft cues when you send, receive, or get a file offer.">
           <Toggle on={settings.playSounds} onChange={(v) => save({ playSounds: v })} />
         </Row>
+      </Card>
+
+      <SectionTitle>Experimental</SectionTitle>
+      <Card>
+        <Row
+          title="Direct mode (beta)"
+          desc="Send Quick Send files over the new peer-to-peer engine — straight to the other computer instead of through a relay, so internet transfers are much faster. Both people need this on. Turning it on starts a direct connection (your firewall may ask once to allow DropBeam)."
+        >
+          <Toggle on={settings.directMode} onChange={(v) => save({ directMode: v })} />
+        </Row>
+        {settings.directMode && (
+          <>
+            {SEP}
+            <Row
+              title="Test direct connection"
+              desc={testResult || 'Confirm the direct engine is running on this computer.'}
+            >
+              <button className="btn btn-ghost" onClick={runDirectTest} disabled={testing}>
+                {testing ? <Spinner size={14} /> : <RefreshCw size={15} />} Test
+              </button>
+            </Row>
+          </>
+        )}
       </Card>
 
       <SectionTitle>Updates</SectionTitle>

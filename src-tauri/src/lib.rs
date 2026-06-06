@@ -73,6 +73,7 @@ pub fn run() {
                 .unwrap_or_default();
             let default_name = default_display_name();
             let loaded = settings::load(&config_dir, &default_download, &default_name);
+            let direct_mode = loaded.direct_mode;
 
             app.manage(Arc::new(AppState {
                 config_dir: config_dir.clone(),
@@ -89,8 +90,8 @@ pub fn run() {
             // firewall prompt) before iroh actually powers a user-facing flow;
             // a later phase exposes it via an opt-in Settings toggle.
             let iroh_state = Arc::new(iroh_net::IrohState::default());
-            if cfg!(debug_assertions) {
-                iroh_net::spawn(config_dir.clone(), iroh_state.clone());
+            if direct_mode || cfg!(debug_assertions) {
+                iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
             }
             app.manage(iroh_state);
 
@@ -162,6 +163,8 @@ pub fn run() {
             commands::send_to_friend,
             commands::iroh_node_id,
             commands::iroh_selftest,
+            commands::iroh_send,
+            commands::iroh_receive,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DropBeam");

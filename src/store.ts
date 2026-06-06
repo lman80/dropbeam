@@ -202,7 +202,10 @@ export const useStore = create<AppStore>((set, get) => ({
     lastDropAt = now
     set({ view: 'send' })
     try {
-      const u = await api.sendFiles(paths)
+      // Direct mode routes Quick Send over the iroh P2P engine; same UI.
+      const u = get().settings?.directMode
+        ? await api.irohSend(paths)
+        : await api.sendFiles(paths)
       get().upsertTransfer(u)
     } catch (e) {
       get().toast('error', String(e))
@@ -213,7 +216,9 @@ export const useStore = create<AppStore>((set, get) => ({
     code = code.trim()
     if (!code) return
     try {
-      const u = await api.receiveFiles(code)
+      // A Direct ticket is long (starts with "direct"); route it over iroh.
+      const direct = get().settings?.directMode || code.startsWith('direct')
+      const u = direct ? await api.irohReceive(code) : await api.receiveFiles(code)
       get().upsertTransfer(u)
     } catch (e) {
       get().toast('error', String(e))

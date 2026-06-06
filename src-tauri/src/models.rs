@@ -134,6 +134,10 @@ pub struct Settings {
     /// Play short sounds on send/receive events.
     #[serde(default = "default_true")]
     pub play_sounds: bool,
+    /// Opt in to the new direct peer-to-peer engine (iroh) for Quick Send. When
+    /// on, the app starts a P2P listener; off by default while it's in beta.
+    #[serde(default)]
+    pub direct_mode: bool,
 }
 
 impl Default for Settings {
@@ -149,6 +153,7 @@ impl Default for Settings {
             custom_relay_pass: String::new(),
             notify_on_complete: true,
             play_sounds: true,
+            direct_mode: false,
         }
     }
 }

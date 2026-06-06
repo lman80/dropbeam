@@ -13,23 +13,41 @@
 //! Later phases add the real protocols (Quick Send, Friends, Shared Folders) as
 //! additional ALPN-tagged stream handlers on this same endpoint.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
+use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
+
+use crate::models::{Direction, TransferState, TransferUpdate};
 
 /// Application-layer protocol id. Bumped if the wire format changes.
 pub const ALPN: &[u8] = b"dropbeam/1";
 
-/// Shared, lazily-initialised iroh endpoint, managed by Tauri as `Arc<IrohState>`.
-/// The boot task fills `endpoint` once the node is up; commands await it.
+/// A Quick Send staged on this node, waiting for a receiver to pull it.
+struct PendingSend {
+    transfer_id: String,
+    paths: Vec<PathBuf>,
+    names: Vec<String>,
+    total: u64,
+}
+
+/// Shared iroh state, managed by Tauri as `Arc<IrohState>`. The boot task fills
+/// `endpoint` once the node is up; commands and the accept loop read from here.
 #[derive(Default)]
 pub struct IrohState {
     pub endpoint: OnceCell<Endpoint>,
+    /// Set at startup so the accept loop can emit `transfer://update` events.
+    pub app: OnceCell<AppHandle>,
+    /// Quick Sends awaiting a puller, keyed by the ticket's one-time token.
+    pending: Mutex<HashMap<String, PendingSend>>,
 }
 
 impl IrohState {
@@ -37,6 +55,53 @@ impl IrohState {
     pub fn get(&self) -> Option<&Endpoint> {
         self.endpoint.get()
     }
+}
+
+fn emit(app: &AppHandle, u: &TransferUpdate) {
+    let _ = app.emit("transfer://update", u);
+}
+
+/// A throttled progress callback that emits `Transferring` updates (with live
+/// speed) for a transfer id — shared by the send (serve) and receive (pull) sides.
+fn progress_cb(app: AppHandle, id: String, dir: Direction, names: Vec<String>) -> impl Fn(u64, u64) {
+    let start = Instant::now();
+    let ticks = AtomicU64::new(0);
+    move |done: u64, total: u64| {
+        let last = total > 0 && done >= total;
+        // Emit ~every 16 chunks (a few MB) plus always the final tick.
+        if ticks.fetch_add(1, Ordering::Relaxed) % 16 != 0 && !last {
+            return;
+        }
+        let secs = start.elapsed().as_secs_f64().max(0.001);
+        let mut u = TransferUpdate::new(id.clone(), dir, names.clone());
+        u.state = TransferState::Transferring;
+        u.bytes_done = done;
+        u.bytes_total = total;
+        u.percent = if total > 0 {
+            (done as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        u.speed_bps = done as f64 / secs;
+        emit(&app, &u);
+    }
+}
+
+fn emit_completed(app: &AppHandle, id: &str, dir: Direction, names: Vec<String>, total: u64, out_dir: Option<String>) {
+    let mut u = TransferUpdate::new(id.to_string(), dir, names);
+    u.state = TransferState::Completed;
+    u.bytes_done = total;
+    u.bytes_total = total;
+    u.percent = 100.0;
+    u.out_dir = out_dir;
+    emit(app, &u);
+}
+
+fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
+    let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
+    u.state = TransferState::Failed;
+    u.error = Some(err.to_string());
+    emit(app, &u);
 }
 
 /// Load the device's secret key from disk, or generate + persist a fresh one.
@@ -86,29 +151,28 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
 /// Accept incoming connections forever, dispatching each to the protocol handler.
 /// Runs for the life of the app. Errors on a single connection are logged, never
 /// fatal.
-pub async fn accept_loop(ep: Endpoint) {
+pub async fn accept_loop(ep: Endpoint, state: Arc<IrohState>) {
     while let Some(incoming) = ep.accept().await {
+        let st = state.clone();
         tauri::async_runtime::spawn(async move {
             match incoming.await {
-                Ok(conn) => handle_conn(conn).await,
+                Ok(conn) => handle_conn(conn, st).await,
                 Err(e) => log::debug!("iroh: incoming connection failed: {e}"),
             }
         });
     }
 }
 
-/// Per-connection handler. Phase 1 speaks one trivial protocol — echo — so the
-/// self-test can prove a round trip. Later phases branch on a stream header.
-async fn handle_conn(conn: Connection) {
+/// Per-connection handler: each incoming stream is dispatched by its first frame.
+async fn handle_conn(conn: Connection, state: Arc<IrohState>) {
     let who = conn.remote_id();
     loop {
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
+                let st = state.clone();
                 tauri::async_runtime::spawn(async move {
-                    // Echo up to 64 KiB (self-test payloads are tiny).
-                    if let Ok(data) = recv.read_to_end(64 * 1024).await {
-                        let _ = send.write_all(&data).await;
-                        let _ = send.finish();
+                    if let Err(e) = serve_stream(&mut send, &mut recv, &st).await {
+                        log::debug!("iroh stream error: {e:#}");
                     }
                 });
             }
@@ -118,6 +182,37 @@ async fn handle_conn(conn: Connection) {
             }
         }
     }
+}
+
+/// Handle one incoming stream by its header `kind`:
+///   "ping" → reply "pong" (self-test); "pull" → serve a staged Quick Send.
+async fn serve_stream(send: &mut SendStream, recv: &mut RecvStream, state: &IrohState) -> Result<()> {
+    let req = read_frame(recv).await?;
+    match req.get("kind").and_then(|k| k.as_str()) {
+        Some("ping") => {
+            write_frame(send, &serde_json::json!({ "kind": "pong" })).await?;
+            send.finish()?;
+        }
+        Some("pull") => {
+            let token = req.get("token").and_then(|t| t.as_str()).unwrap_or("");
+            let pending = state.pending.lock().unwrap().remove(token);
+            let p = pending.ok_or_else(|| anyhow::anyhow!("no pending send for token"))?;
+            match state.app.get().cloned() {
+                Some(app) => {
+                    let cb = progress_cb(app.clone(), p.transfer_id.clone(), Direction::Send, p.names.clone());
+                    match serve_pull(send, &p.paths, cb).await {
+                        Ok(_) => emit_completed(&app, &p.transfer_id, Direction::Send, p.names, p.total, None),
+                        Err(e) => emit_failed(&app, &p.transfer_id, Direction::Send, &e.to_string()),
+                    }
+                }
+                None => {
+                    serve_pull(send, &p.paths, |_, _| {}).await?;
+                }
+            }
+        }
+        other => anyhow::bail!("unknown stream kind: {other:?}"),
+    }
+    Ok(())
 }
 
 /// Prove iroh works inside the running app: spin up a throwaway client endpoint,
@@ -131,32 +226,121 @@ pub async fn self_test(main: &Endpoint) -> Result<String> {
         .context("bind self-test client")?;
     let conn = client.connect(addr, ALPN).await.context("dial self")?;
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
-    send.write_all(b"dropbeam-ping").await?;
+    write_frame(&mut send, &serde_json::json!({ "kind": "ping" })).await?;
     send.finish()?;
-    let echoed = recv.read_to_end(64).await.context("read echo")?;
-    let ok = echoed == b"dropbeam-ping";
+    let resp = read_frame(&mut recv).await.context("read pong")?;
+    let ok = resp.get("kind").and_then(|k| k.as_str()) == Some("pong");
     let id = main.id().to_string();
     client.close().await;
     if ok {
         Ok(format!("ok · node {}…{}", &id[..6], &id[id.len() - 4..]))
     } else {
-        anyhow::bail!("echo mismatch: got {:?}", String::from_utf8_lossy(&echoed))
+        anyhow::bail!("unexpected self-test response: {resp}")
     }
 }
 
 /// Spawn the endpoint at app startup and keep accepting connections. Fills
 /// `state.endpoint` once bound. Safe to fail — croc remains the live transport.
-pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>) {
+pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHandle) {
+    let _ = state.app.set(app);
     tauri::async_runtime::spawn(async move {
         match start(&config_dir).await {
             Ok(ep) => {
                 log::info!("iroh endpoint up: {}", ep.id());
                 let _ = state.endpoint.set(ep.clone());
-                accept_loop(ep).await;
+                accept_loop(ep, state).await;
             }
             Err(e) => log::warn!("iroh endpoint failed to start: {e:#}"),
         }
     });
+}
+
+/// Stage a Quick Send: register the files under a one-time token and return a
+/// ticket-bearing update (state WaitingForPeer, `code` = ticket). The accept loop
+/// serves the pull and emits the rest of the lifecycle for this transfer id.
+pub fn start_send(
+    app: AppHandle,
+    state: Arc<IrohState>,
+    paths: Vec<String>,
+) -> Result<TransferUpdate, String> {
+    let ep = state
+        .get()
+        .cloned()
+        .ok_or("Direct mode is still starting up — try again in a moment.")?;
+    let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let names: Vec<String> = pathbufs
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let total: u64 = pathbufs
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    let id = uuid::Uuid::new_v4().to_string();
+    let token = uuid::Uuid::new_v4().to_string();
+    let ticket = make_ticket(&ep, &token).map_err(|e| e.to_string())?;
+    state.pending.lock().unwrap().insert(
+        token,
+        PendingSend {
+            transfer_id: id.clone(),
+            paths: pathbufs,
+            names: names.clone(),
+            total,
+        },
+    );
+    let mut update = TransferUpdate::new(id, Direction::Send, names);
+    update.state = TransferState::WaitingForPeer;
+    update.code = Some(ticket);
+    update.bytes_total = total;
+    emit(&app, &update);
+    Ok(update)
+}
+
+/// Start an iroh receive: dial the ticket and pull files into `out_dir`, emitting
+/// progress/complete/fail for the new transfer id.
+pub fn start_receive(
+    app: AppHandle,
+    state: Arc<IrohState>,
+    ticket: String,
+    out_dir: String,
+) -> Result<TransferUpdate, String> {
+    let ep = state
+        .get()
+        .cloned()
+        .ok_or("Direct mode is still starting up — try again in a moment.")?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut update = TransferUpdate::new(id.clone(), Direction::Receive, Vec::new());
+    update.state = TransferState::Connecting;
+    update.out_dir = Some(out_dir.clone());
+    emit(&app, &update);
+    let snapshot = update.clone();
+    tauri::async_runtime::spawn(async move {
+        let dest = PathBuf::from(&out_dir);
+        let cb = progress_cb(app.clone(), id.clone(), Direction::Receive, Vec::new());
+        match pull_files(&ep, &ticket, &dest, cb).await {
+            Ok(paths) => {
+                let names: Vec<String> = paths
+                    .iter()
+                    .map(|p| {
+                        p.file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let total: u64 = paths
+                    .iter()
+                    .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                    .sum();
+                emit_completed(&app, &id, Direction::Receive, names, total, Some(out_dir));
+            }
+            Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
+        }
+    });
+    Ok(snapshot)
 }
 
 // ── File-transfer protocol (raw QUIC bi-stream) ──────────────────────────────
@@ -333,17 +517,22 @@ pub async fn recv_files<F: Fn(u64, u64)>(
 // is the croc "share a code, they pull" flow, but direct + encrypted over iroh.
 
 /// Encode a shareable ticket: where to reach us + a one-time token.
+pub const TICKET_PREFIX: &str = "direct";
+
 pub fn make_ticket(ep: &Endpoint, token: &str) -> Result<String> {
     use base64::Engine as _;
     let addr = ep.addr();
     let v = serde_json::json!({ "addr": addr, "token": token });
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v)?))
+    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v)?);
+    Ok(format!("{TICKET_PREFIX}{body}"))
 }
 
 fn parse_ticket(s: &str) -> Result<(iroh::EndpointAddr, String)> {
     use base64::Engine as _;
+    let s = s.trim();
+    let body = s.strip_prefix(TICKET_PREFIX).unwrap_or(s);
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s.trim())
+        .decode(body)
         .context("ticket is not valid base64")?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).context("ticket is not valid")?;
     let addr: iroh::EndpointAddr =
@@ -485,5 +674,52 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest);
         println!("iroh Quick Send (pull) OK: ticket {} chars", ticket.len());
+    }
+
+    // End-to-end through the REAL accept loop: register a pending send, run
+    // accept_loop, and pull it like the live receive command would.
+    #[tokio::test]
+    #[ignore]
+    async fn accept_loop_serves_a_quick_send() {
+        let pid = std::process::id();
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        server.online().await;
+        let state = Arc::new(IrohState::default());
+        let _ = state.endpoint.set(server.clone());
+
+        let src = std::env::temp_dir().join(format!("dropbeam-al-src-{pid}.bin"));
+        let data = vec![0x33u8; 3 * 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+        let token = "tok-accept-loop".to_string();
+        state.pending.lock().unwrap().insert(
+            token.clone(),
+            PendingSend {
+                transfer_id: "t1".into(),
+                paths: vec![src.clone()],
+                names: vec!["f.bin".into()],
+                total: data.len() as u64,
+            },
+        );
+        let ticket = make_ticket(&server, &token).unwrap();
+
+        // Run the production accept loop in the background.
+        let srv = server.clone();
+        let st = state.clone();
+        tokio::spawn(async move { accept_loop(srv, st).await });
+
+        let client = Endpoint::bind(presets::N0).await.unwrap();
+        let dest = std::env::temp_dir().join(format!("dropbeam-al-rx-{pid}"));
+        let got = pull_files(&client, &ticket, &dest, |_, _| {}).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(std::fs::read(&got[0]).unwrap(), data);
+        // The pending entry was consumed by the serve.
+        assert!(state.pending.lock().unwrap().is_empty());
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+        println!("iroh accept-loop Quick Send OK");
     }
 }
