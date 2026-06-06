@@ -333,10 +333,17 @@ pub fn create_friend(
 pub fn accept_friend(
     state: State<'_, Arc<AppState>>,
     sync: State<'_, Arc<SyncManager>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     invite: String,
 ) -> Result<Friend, String> {
     let friend = friends::accept(&state.config_dir, &invite)?;
     sync.reconcile_friends();
+    // Dial the inviter back to hand them our iroh id, so they can send to us
+    // directly too (the invite already gave us theirs).
+    if let Some(inviter_id) = friend.endpoint_id.clone() {
+        let my_name = state.settings.lock().unwrap().display_name.clone();
+        crate::iroh_net::say_hello(iroh.inner().clone(), friend.id.clone(), inviter_id, my_name);
+    }
     Ok(friend)
 }
 
@@ -464,6 +471,7 @@ pub fn forget_folder_item(state: State<'_, Arc<AppState>>, pair_id: String, item
 pub fn send_to_friend(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     id: String,
     paths: Vec<String>,
 ) -> Result<TransferUpdate, String> {
@@ -477,6 +485,14 @@ pub fn send_to_friend(
         }
     }
     let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
+    // Prefer the direct iroh engine when Direct mode is on, we know the friend's
+    // device id, and our endpoint is up. Otherwise fall back to croc.
+    let direct = state.settings.lock().unwrap().direct_mode;
+    if direct && iroh.get().is_some() {
+        if let Some(eid) = friend.endpoint_id.clone() {
+            return crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths);
+        }
+    }
     let code = friends::friend_inbox_code(&friend);
     Ok(croc::start_send(
         app,

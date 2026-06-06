@@ -22,7 +22,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
 
@@ -97,6 +97,7 @@ fn progress_cb(
     id: String,
     dir: Direction,
     names: Vec<String>,
+    friend: Option<String>,
     conn: Connection,
 ) -> impl Fn(u64, u64) {
     let start = Instant::now();
@@ -119,6 +120,7 @@ fn progress_cb(
         };
         u.speed_bps = done as f64 / secs;
         u.locality = conn_locality(&conn); // live Direct/Relay badge
+        u.friend_name = friend.clone();
         emit(&app, &u);
     }
 }
@@ -131,6 +133,7 @@ fn emit_completed(
     names: Vec<String>,
     total: u64,
     locality: crate::models::Locality,
+    friend: Option<String>,
     out_dir: Option<String>,
 ) {
     let mut u = TransferUpdate::new(id.to_string(), dir, names);
@@ -139,6 +142,7 @@ fn emit_completed(
     u.bytes_total = total;
     u.percent = 100.0;
     u.locality = locality;
+    u.friend_name = friend;
     u.out_dir = out_dir;
     emit(app, &u);
 }
@@ -324,6 +328,7 @@ async fn serve_stream(
                         p.transfer_id.clone(),
                         Direction::Send,
                         p.names.clone(),
+                        None,
                         conn.clone(),
                     );
                     match serve_pull(send, &p.paths, &p.cancel, cb).await {
@@ -334,6 +339,7 @@ async fn serve_stream(
                             p.names,
                             p.total,
                             conn_locality(conn),
+                            None,
                             None,
                         ),
                         Err(e) if e.to_string().contains("canceled") => {
@@ -347,6 +353,99 @@ async fn serve_stream(
                 }
             }
             state.cancels.lock().unwrap().remove(&p.transfer_id);
+        }
+        Some("files") => {
+            // A friend pushed files straight to us. Receive into the download
+            // folder and surface it like any other receive.
+            let Some(app) = state.app.get().cloned() else {
+                let never = AtomicBool::new(false);
+                let _ = read_body(recv, &req, &std::env::temp_dir(), &never, |_, _| {}).await;
+                return Ok(());
+            };
+            let (config_dir, configured) = app
+                .try_state::<Arc<crate::AppState>>()
+                .map(|st| {
+                    let dl = st.settings.lock().unwrap().download_dir.clone();
+                    (st.config_dir.clone(), dl)
+                })
+                .unwrap_or_else(|| (std::env::temp_dir(), String::new()));
+            let dest = if configured.trim().is_empty() {
+                app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+            } else {
+                PathBuf::from(configured)
+            };
+            // Identify the sender by matching their endpoint id to a friend.
+            let who = conn.remote_id().to_string();
+            let sender = crate::friends::load(&config_dir)
+                .into_iter()
+                .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
+                .map(|f| f.name);
+            let total = req["total"].as_u64().unwrap_or(0);
+            let id = uuid::Uuid::new_v4().to_string();
+            let cancel = Arc::new(AtomicBool::new(false));
+            state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
+            let mut u0 = TransferUpdate::new(id.clone(), Direction::Receive, Vec::new());
+            u0.state = TransferState::Transferring;
+            u0.friend_name = sender.clone();
+            emit(&app, &u0);
+            let cb = progress_cb(
+                app.clone(),
+                id.clone(),
+                Direction::Receive,
+                Vec::new(),
+                sender.clone(),
+                conn.clone(),
+            );
+            match read_body(recv, &req, &dest, &cancel, cb).await {
+                Ok(paths) => {
+                    let names: Vec<String> = paths
+                        .iter()
+                        .map(|p| {
+                            p.file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    emit_completed(
+                        &app,
+                        &id,
+                        Direction::Receive,
+                        names,
+                        total,
+                        conn_locality(conn),
+                        sender,
+                        Some(dest.to_string_lossy().to_string()),
+                    );
+                    let _ = send.write_all(b"ok").await;
+                    let _ = send.finish();
+                }
+                Err(e) if e.to_string().contains("canceled") => {
+                    emit_canceled(&app, &id, Direction::Receive)
+                }
+                Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
+            }
+            state.cancels.lock().unwrap().remove(&id);
+        }
+        Some("friend-hello") => {
+            // The accepter is telling us their iroh id for our shared friend
+            // record, so we can send to them directly later.
+            let friend_id = req.get("friend_id").and_then(|v| v.as_str()).unwrap_or("");
+            let their_id = req.get("endpoint_id").and_then(|v| v.as_str()).unwrap_or("");
+            if !friend_id.is_empty() && !their_id.is_empty() {
+                if let Some(app) = state.app.get() {
+                    if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+                        if crate::friends::set_endpoint_id(
+                            &st.config_dir,
+                            friend_id,
+                            their_id.to_string(),
+                        ) {
+                            let _ = app.emit("pairs://changed", ());
+                        }
+                    }
+                }
+            }
+            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            send.finish()?;
         }
         other => anyhow::bail!("unknown stream kind: {other:?}"),
     }
@@ -484,6 +583,7 @@ pub fn start_receive(
                 id.clone(),
                 Direction::Receive,
                 Vec::new(),
+                None,
                 conn.clone(),
             );
             let paths = read_files(&mut recv, &dest, &cancel, cb).await?;
@@ -505,7 +605,7 @@ pub fn start_receive(
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
                     .sum();
-                emit_completed(&app, &id, Direction::Receive, names, total, loc, Some(out_dir));
+                emit_completed(&app, &id, Direction::Receive, names, total, loc, None, Some(out_dir));
             }
             Err(e) if e.to_string().contains("canceled") => {
                 emit_canceled(&app, &id, Direction::Receive)
@@ -515,6 +615,109 @@ pub fn start_receive(
         cleanup.cancels.lock().unwrap().remove(&id);
     });
     Ok(snapshot)
+}
+
+/// Send files straight to a friend over iroh — dial their EndpointId (discovery
+/// resolves their current address), then push. The friend's accept loop receives
+/// it. This is the direct, no-code "send by name" path.
+pub fn send_to_friend(
+    app: AppHandle,
+    state: Arc<IrohState>,
+    friend_name: String,
+    endpoint_id: String,
+    paths: Vec<String>,
+) -> Result<TransferUpdate, String> {
+    let ep = state
+        .get()
+        .cloned()
+        .ok_or("Direct mode is still starting up — try again in a moment.")?;
+    let parsed: iroh::EndpointId = endpoint_id
+        .parse()
+        .map_err(|_| "This friend's direct address is invalid.".to_string())?;
+    let addr = iroh::EndpointAddr::from(parsed);
+    let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let names: Vec<String> = pathbufs
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let total: u64 = pathbufs
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    let id = uuid::Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
+    let cleanup = state.clone();
+    let mut update = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+    update.friend_name = Some(friend_name.clone());
+    update.state = TransferState::Connecting;
+    update.bytes_total = total;
+    emit(&app, &update);
+    let snapshot = update.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome: Result<crate::models::Locality> = async {
+            let conn = ep.connect(addr, ALPN).await.context("dial friend")?;
+            let cb = progress_cb(
+                app.clone(),
+                id.clone(),
+                Direction::Send,
+                names.clone(),
+                Some(friend_name.clone()),
+                conn.clone(),
+            );
+            send_files(&conn, &pathbufs, &cancel, cb).await?;
+            Ok(conn_locality(&conn))
+        }
+        .await;
+        match outcome {
+            Ok(loc) => emit_completed(
+                &app,
+                &id,
+                Direction::Send,
+                names,
+                total,
+                loc,
+                Some(friend_name),
+                None,
+            ),
+            Err(e) if e.to_string().contains("canceled") => {
+                emit_canceled(&app, &id, Direction::Send)
+            }
+            Err(e) => emit_failed(&app, &id, Direction::Send, &e.to_string()),
+        }
+        cleanup.cancels.lock().unwrap().remove(&id);
+    });
+    Ok(snapshot)
+}
+
+/// After accepting a friend invite, dial the inviter (whose EndpointId is in the
+/// invite) and tell them our id for the shared friend record — so the reverse
+/// direction (them → us) also works. Best-effort, fire-and-forget.
+pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: String, my_name: String) {
+    let Some(ep) = state.get().cloned() else {
+        return;
+    };
+    let Ok(parsed) = inviter_endpoint_id.parse::<iroh::EndpointId>() else {
+        return;
+    };
+    let my_id = ep.id().to_string();
+    let addr = iroh::EndpointAddr::from(parsed);
+    tauri::async_runtime::spawn(async move {
+        let hello = serde_json::json!({
+            "kind": "friend-hello", "friend_id": friend_id, "endpoint_id": my_id, "name": my_name,
+        });
+        if let Ok(conn) = ep.connect(addr, ALPN).await {
+            if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                let _ = write_frame(&mut send, &hello).await;
+                let _ = send.finish();
+                let _ = recv.read_to_end(64).await; // wait for their ok
+            }
+        }
+    });
 }
 
 // ── File-transfer protocol (raw QUIC bi-stream) ──────────────────────────────
@@ -624,6 +827,18 @@ async fn read_files<F: Fn(u64, u64)>(
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let header = read_frame(recv).await?;
+    read_body(recv, &header, dest_dir, cancel, on_progress).await
+}
+
+/// Read just the file BYTES (the header was already read — e.g. the accept loop
+/// peeked it to dispatch a friend push).
+async fn read_body<F: Fn(u64, u64)>(
+    recv: &mut RecvStream,
+    header: &serde_json::Value,
+    dest_dir: &Path,
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
     anyhow::ensure!(header["kind"] == "files", "unexpected stream kind");
     let items = header["items"].as_array().cloned().unwrap_or_default();
     let total = header["total"].as_u64().unwrap_or(0);
@@ -681,6 +896,8 @@ pub async fn send_files<F: Fn(u64, u64)>(
 }
 
 /// PUSH receive: accept the peer's next stream and write its files to `dest_dir`.
+/// (Used by tests + the upcoming folder sync.)
+#[allow(dead_code)]
 pub async fn recv_files<F: Fn(u64, u64)>(
     conn: &Connection,
     dest_dir: &Path,
@@ -731,6 +948,7 @@ fn parse_ticket(s: &str) -> Result<(iroh::EndpointAddr, String)> {
 }
 
 /// Receiver side: dial a ticket, request its files, write them to `dest_dir`.
+#[allow(dead_code)]
 pub async fn pull_files<F: Fn(u64, u64)>(
     client: &Endpoint,
     ticket: &str,
