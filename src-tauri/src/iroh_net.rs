@@ -13,12 +13,13 @@
 //! Later phases add the real protocols (Quick Send, Friends, Shared Folders) as
 //! additional ALPN-tagged stream handlers on this same endpoint.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{presets, Connection};
+use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
 
 /// Application-layer protocol id. Bumped if the wire format changes.
@@ -158,6 +159,155 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>) {
     });
 }
 
+// ── File-transfer protocol (raw QUIC bi-stream) ──────────────────────────────
+//
+// Wire format on one bidirectional stream:
+//   [u32 BE len][JSON header]            header = {kind:"files", items:[{name,size}], total}
+//   <raw bytes of file 1><file 2>…       concatenated in `items` order
+// then the receiver replies "ok" on its half once everything is safely written.
+// This is the single primitive Quick Send / Friends / Folders will all reuse.
+
+const MAX_HEADER: usize = 1 << 20; // 1 MiB — generous for a file list, abuse-safe
+const CHUNK: usize = 256 * 1024;
+
+async fn write_frame(send: &mut SendStream, v: &serde_json::Value) -> Result<()> {
+    let buf = serde_json::to_vec(v)?;
+    send.write_all(&(buf.len() as u32).to_be_bytes()).await?;
+    send.write_all(&buf).await?;
+    Ok(())
+}
+
+async fn read_frame(recv: &mut RecvStream) -> Result<serde_json::Value> {
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await?;
+    let n = u32::from_be_bytes(len) as usize;
+    anyhow::ensure!(n <= MAX_HEADER, "header too large ({n} bytes)");
+    let mut buf = vec![0u8; n];
+    recv.read_exact(&mut buf).await?;
+    Ok(serde_json::from_slice(&buf)?)
+}
+
+/// A collision-free destination path inside `dir` for an incoming `name`.
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let dest = dir.join(name);
+    if !dest.exists() {
+        return dest;
+    }
+    let p = Path::new(name);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+    let ext = p
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    for i in 1..100_000 {
+        let cand = dir.join(format!("{stem} ({i}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    dir.join(format!("{stem}-dup{ext}"))
+}
+
+/// Send a set of files to an already-connected peer over a fresh stream.
+/// `on_progress(done, total)` fires as bytes go out. Returns bytes sent.
+pub async fn send_files<F: Fn(u64, u64)>(
+    conn: &Connection,
+    paths: &[PathBuf],
+    on_progress: F,
+) -> Result<u64> {
+    let mut items = Vec::new();
+    for p in paths {
+        let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing file name for {}", p.display()))?;
+        items.push((p.clone(), name, meta.len()));
+    }
+    let total: u64 = items.iter().map(|i| i.2).sum();
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let header = serde_json::json!({
+        "kind": "files",
+        "items": items
+            .iter()
+            .map(|(_, n, s)| serde_json::json!({ "name": n, "size": s }))
+            .collect::<Vec<_>>(),
+        "total": total,
+    });
+    write_frame(&mut send, &header).await?;
+
+    let mut sent = 0u64;
+    let mut buf = vec![0u8; CHUNK];
+    for (path, _, _) in &items {
+        let mut f = tokio::fs::File::open(path).await?;
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            send.write_all(&buf[..n]).await?;
+            sent += n as u64;
+            on_progress(sent, total);
+        }
+    }
+    send.finish()?;
+    // Wait for the receiver's ack so "Sent" means "safely written on their disk".
+    let _ = recv.read_to_end(16).await;
+    Ok(sent)
+}
+
+/// Receive a file set on `conn`'s next incoming stream, writing into `dest_dir`.
+/// Returns the paths written. `on_progress(done, total)` fires as bytes arrive.
+pub async fn recv_files<F: Fn(u64, u64)>(
+    conn: &Connection,
+    dest_dir: &Path,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let header = read_frame(&mut recv).await?;
+    anyhow::ensure!(header["kind"] == "files", "unexpected stream kind");
+    let items = header["items"].as_array().cloned().unwrap_or_default();
+    let total = header["total"].as_u64().unwrap_or(0);
+    std::fs::create_dir_all(dest_dir)?;
+
+    let mut got = 0u64;
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; CHUNK];
+    for item in &items {
+        // Take only the file name — never honor an absolute/`..` path from a peer.
+        let raw = item["name"].as_str().unwrap_or("file");
+        let name = Path::new(raw)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "file".to_string());
+        let size = item["size"].as_u64().unwrap_or(0);
+        let dest = unique_path(dest_dir, &name);
+        let mut f = tokio::fs::File::create(&dest).await?;
+        let mut remaining = size;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            match recv.read(&mut buf[..want]).await? {
+                Some(n) if n > 0 => {
+                    f.write_all(&buf[..n]).await?;
+                    remaining -= n as u64;
+                    got += n as u64;
+                    on_progress(got, total);
+                }
+                _ => anyhow::bail!("stream ended before {} finished", dest.display()),
+            }
+        }
+        f.flush().await?;
+        out.push(dest);
+    }
+    let _ = send.write_all(b"ok").await;
+    let _ = send.finish();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +321,49 @@ mod tests {
         // Same key the second time — identity persisted, not regenerated.
         assert_eq!(a.public(), b.public());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Real end-to-end file transfer over iroh. Ignored by default because it
+    // touches iroh's relay/discovery network; run explicitly with:
+    //   cargo test --lib iroh_net -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn transfers_a_file_over_iroh() {
+        let pid = std::process::id();
+        let server = Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        server.online().await;
+        let addr = server.addr();
+
+        let dest = std::env::temp_dir().join(format!("dropbeam-iroh-rx-{pid}"));
+        let dest_c = dest.clone();
+        let srv = server.clone();
+        let handle = tokio::spawn(async move {
+            let incoming = srv.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            recv_files(&conn, &dest_c, |_, _| {}).await.unwrap()
+        });
+
+        let src = std::env::temp_dir().join(format!("dropbeam-iroh-src-{pid}.bin"));
+        let data = vec![0xABu8; 5 * 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+
+        let client = Endpoint::bind(presets::N0).await.unwrap();
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        let sent = send_files(&conn, &[src.clone()], |_, _| {}).await.unwrap();
+        assert_eq!(sent, data.len() as u64);
+
+        let received = handle.await.unwrap();
+        assert_eq!(received.len(), 1);
+        let got = std::fs::read(&received[0]).unwrap();
+        assert_eq!(got.len(), data.len());
+        assert_eq!(got, data, "received bytes must match what was sent");
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+        println!("iroh file transfer OK: {} bytes verified", sent);
     }
 }
