@@ -27,6 +27,48 @@ use tokio::sync::Notify;
 
 use models::Settings;
 
+/// Diagnostic: let the popover JS write a line into the Rust log file so we can
+/// trace the native drag → drop → send handoff. Temporary debugging aid.
+#[tauri::command]
+fn traydrag_debug(msg: String) {
+    log::info!("[traydrag-js] {msg}");
+}
+
+/// One friend row's on-screen rectangle (CSS px), reported by the menu JS.
+#[derive(serde::Deserialize)]
+struct JsRowRect {
+    id: String,
+    top: f64,
+    bottom: f64,
+    left: f64,
+    right: f64,
+}
+
+/// The menu reports its friend rows here (webview → Rust, works even when the
+/// menu is inactive) so the native drag-drop handler can map a drop to a person
+/// and send entirely in Rust.
+#[tauri::command]
+fn set_popover_rows(rows: Vec<JsRowRect>) {
+    #[cfg(target_os = "macos")]
+    {
+        let rows = rows
+            .into_iter()
+            .map(|r| tray_drag::RowRect {
+                id: r.id,
+                top: r.top,
+                bottom: r.bottom,
+                left: r.left,
+                right: r.right,
+            })
+            .collect();
+        tray_drag::set_rows(rows);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = rows;
+    }
+}
+
 /// Shared application state, managed by Tauri as `Arc<AppState>`.
 pub struct AppState {
     /// ~/Library/Application Support/com.dropbeam.app (or platform equivalent).
@@ -43,7 +85,7 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -52,12 +94,19 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_process::init());
+    // macOS: panel plugin so the popover can float over full-screen apps.
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+    builder
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
+                        // Quiet the noisy deps (iroh logs per-packet at INFO and
+                        // floods/rotates the log) so our own diagnostics survive.
+                        .level(log::LevelFilter::Warn)
+                        .level_for("app_lib", log::LevelFilter::Info)
                         .build(),
                 )?;
             }
@@ -110,6 +159,10 @@ pub fn run() {
             // Best-effort — if it never attaches, the tray still works normally.
             #[cfg(target_os = "macos")]
             {
+                // Make the popover a non-activating panel so it floats over
+                // full-screen apps and doesn't steal focus.
+                tray_drag::convert_popover_to_panel(app.handle());
+
                 let h = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     for delay_ms in [250u64, 500, 1000, 2000, 3500] {
@@ -190,9 +243,24 @@ pub fn run() {
             commands::iroh_selftest,
             commands::iroh_send,
             commands::iroh_receive,
+            traydrag_debug,
+            set_popover_rows,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running DropBeam");
+        .build(tauri::generate_context!())
+        .expect("error while building DropBeam")
+        .run(|_app, _event| {
+            // macOS: clicking the Dock icon (or otherwise re-opening the app) when
+            // the main window is hidden/minimized should bring it back. Without
+            // this the window "disappears" after it's been hidden to the tray.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = &_event {
+                if let Some(w) = _app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+        });
 }
 
 fn default_display_name() -> String {
@@ -286,8 +354,13 @@ fn toggle_popover(app: &AppHandle, cursor: tauri::PhysicalPosition<f64>) {
     let x = (cx - pop_w / 2.0).max(8.0);
     let y = cy + 8.0; // just under the menu bar
     let _ = w.set_position(tauri::LogicalPosition::new(x, y));
-    let _ = w.show();
-    let _ = w.set_focus();
+    #[cfg(target_os = "macos")]
+    tray_drag::show_popover_key(app);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
 }
 
 fn quit_app(app: &AppHandle) {

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import type { UnlistenFn } from '@tauri-apps/api/event'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { AnimatePresence, motion } from 'framer-motion'
 import { ArrowDownToLine, Check, Copy, Search, Send, Settings, UserPlus, X } from 'lucide-react'
 import { api, HAS_TAURI, isActive, type TransferUpdate } from '../lib/api'
@@ -78,6 +78,90 @@ export function Popover() {
     }
     return null
   }
+
+  // The native drop view reports the point already in CSS pixels (top-left),
+  // so we match directly — no dpr guessing.
+  const rowIdAtCss = (x: number, y: number): string | null => {
+    for (const f of filtered) {
+      const el = rowRefs.current[f.id]
+      if (!el) continue
+      const r = el.getBoundingClientRect()
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return f.id
+    }
+    let best: { id: string; dist: number } | null = null
+    for (const f of filtered) {
+      const el = rowRefs.current[f.id]
+      if (!el) continue
+      const r = el.getBoundingClientRect()
+      if (x < r.left - 24 || x > r.right + 24) continue
+      const dist = Math.abs(y - (r.top + r.bottom) / 2)
+      if (!best || dist < best.dist) best = { id: f.id, dist }
+    }
+    return best && best.dist < 80 ? best.id : null
+  }
+
+  // Native menu-bar drag → the popover's native drop view forwards drag moves and
+  // the final drop here (the webview itself can't get drops while inactive).
+  useEffect(() => {
+    if (!HAS_TAURI) return
+    const uns: UnlistenFn[] = []
+    let cancelled = false
+    const add = (p: Promise<UnlistenFn>) =>
+      p.then((u) => (cancelled ? u() : uns.push(u)))
+    add(
+      listen<[number, number]>('popover://native-drag', (e) => {
+        const [x, y] = e.payload
+        setDragActive(true)
+        setDragHoverId(rowIdAtCss(x, y))
+      }),
+    )
+    add(
+      listen<[string[], number, number]>('popover://native-drop', (e) => {
+        const [paths, x, y] = e.payload
+        const id = rowIdAtCss(x, y)
+        invoke('traydrag_debug', {
+          msg: `JS native-drop x=${x} y=${y} id=${id ?? 'null'} rows=${filtered.length} paths=${paths?.length ?? 0}`,
+        }).catch(() => {})
+        setDragActive(false)
+        setDragHoverId(null)
+        if (id && paths?.length) {
+          void sendToFriend(id, paths)
+          setTimeout(() => hideSelf(), 450)
+        }
+      }),
+    )
+    return () => {
+      cancelled = true
+      uns.forEach((u) => u())
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered, sendToFriend])
+
+  // Report friend-row positions to Rust so the NATIVE drop handler can map a
+  // drop to a person and send entirely in Rust (the inactive menu webview can't
+  // receive Rust→webview events, but webview→Rust invokes always work). We report
+  // on a steady cadence so a spring-opened menu always has fresh rects in Rust.
+  useEffect(() => {
+    if (!HAS_TAURI) return
+    const report = () => {
+      const rows = filtered
+        .map((f) => {
+          const el = rowRefs.current[f.id]
+          if (!el) return null
+          const r = el.getBoundingClientRect()
+          if (r.height === 0) return null
+          return { id: f.id, top: r.top, bottom: r.bottom, left: r.left, right: r.right }
+        })
+        .filter(Boolean)
+      if (rows.length) invoke('set_popover_rows', { rows }).catch(() => {})
+    }
+    const raf = requestAnimationFrame(report)
+    const iv = setInterval(report, 700)
+    return () => {
+      cancelAnimationFrame(raf)
+      clearInterval(iv)
+    }
+  }, [filtered])
 
   // Real OS file drags (Tauri) arrive here with a position — map to a friend.
   useEffect(() => {
@@ -195,20 +279,6 @@ export function Popover() {
                     onClick={() => beamToFriend(f.id)}
                     disabled={pickingFor !== null}
                     title={`Send files to ${f.name}`}
-                    // HTML5 DnD fallback (browser preview + non-OS drags)
-                    onDragOver={(e) => {
-                      e.preventDefault()
-                      setDragActive(true)
-                      setDragHoverId(f.id)
-                    }}
-                    onDragLeave={() =>
-                      setDragHoverId((cur) => (cur === f.id ? null : cur))
-                    }
-                    onDrop={(e) => {
-                      e.preventDefault()
-                      setDragActive(false)
-                      setDragHoverId(null)
-                    }}
                   >
                     <span
                       className="pop-contact-av"

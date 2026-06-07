@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.6.2"
+version = "0.7.0"
 description = "DropBeam — seamless peer-to-peer file transfer"
 authors = ["DropBeam"]
 license = ""
@@ -61,6 +61,10 @@ windows = "0.62"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
+# Converts the popover window into a non-activating NSPanel so it can appear OVER
+# full-screen apps (a plain NSWindow can't, since Big Sur) without stealing focus
+# or hiding the Dock icon. Pinned to a v2.1 commit (objc2-based, matches our stack).
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "a3122e894383aa068ec5365a42994e3ac94ba1b6" }
 
 # Keep the dev build small on a tight disk: no debug symbols (saves several GB in target/).
 [profile.dev]

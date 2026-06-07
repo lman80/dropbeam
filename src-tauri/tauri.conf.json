@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "DropBeam",
   "mainBinaryName": "DropBeam",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "identifier": "com.dropbeam.app",
   "build": {
     "frontendDist": "../dist",
@@ -31,7 +31,7 @@
         "label": "popover",
         "url": "index.html",
         "width": 300,
-        "height": 430,
+        "height": 390,
         "resizable": false,
         "decorations": false,
         "transparent": true,
@@ -39,7 +39,8 @@
         "skipTaskbar": true,
         "visible": false,
         "shadow": false,
-        "focus": false
+        "focus": false,
+        "dragDropEnabled": false
       },
       {
         "label": "hud",
