@@ -985,6 +985,30 @@ pub async fn send_folder_ctrl(
     Ok(())
 }
 
+/// Liveness check: dial a friend/peer's endpoint and round-trip a ping. Returns
+/// true only if they answered with a pong (their app is running and reachable) —
+/// the iroh replacement for the croc "ping_send" online check.
+pub async fn ping_endpoint(ep: &Endpoint, endpoint_id: &str) -> bool {
+    let Ok(parsed) = endpoint_id.parse::<iroh::EndpointId>() else {
+        return false;
+    };
+    let addr = iroh::EndpointAddr::from(parsed);
+    let fut = async {
+        let conn = ep.connect(addr, ALPN).await.ok()?;
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        write_frame(&mut send, &serde_json::json!({ "kind": "ping" }))
+            .await
+            .ok()?;
+        send.finish().ok()?;
+        let reply = read_frame(&mut recv).await.ok()?;
+        Some(reply.get("kind").and_then(|k| k.as_str()) == Some("pong"))
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(15), fut).await,
+        Ok(Some(true))
+    )
+}
+
 /// Push folder files to a paired peer over iroh (dial-by-key). Preserves each
 /// file's path relative to `root` so subfolders survive. Returns the connection
 /// locality on success. Any `Err` means "fall back to croc" to the caller — so a

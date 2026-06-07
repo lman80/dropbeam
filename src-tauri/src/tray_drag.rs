@@ -225,7 +225,6 @@ fn send_drop_to_friend(app: &AppHandle, friend_id: &str, paths: Vec<String>) {
     let Some(friend) = crate::friends::get(&state.config_dir, friend_id) else {
         return;
     };
-    let direct = state.settings.lock().map(|s| s.direct_mode).unwrap_or(true);
     log::info!("[traydrag] sending {} file(s) to friend '{}'", paths.len(), friend.name);
 
     // Immediate, reliable feedback — fired from Rust, so it shows even though the
@@ -247,8 +246,9 @@ fn send_drop_to_friend(app: &AppHandle, friend_id: &str, paths: Vec<String>) {
         let _ = app.notification().builder().title("DropBeam").body(body).show();
     }
 
-    if direct && iroh.get().is_some() {
-        if let Some(eid) = friend.endpoint_id.clone() {
+    // iroh-only: dial the friend's endpoint directly.
+    if let Some(eid) = friend.endpoint_id.clone() {
+        if iroh.get().is_some() {
             let _ = crate::iroh_net::send_to_friend(
                 app.clone(),
                 iroh.inner().clone(),
@@ -256,17 +256,8 @@ fn send_drop_to_friend(app: &AppHandle, friend_id: &str, paths: Vec<String>) {
                 eid,
                 paths,
             );
-            return;
         }
     }
-    let code = crate::friends::friend_inbox_code(&friend);
-    let _ = crate::croc::start_send(
-        app.clone(),
-        state.inner().clone(),
-        paths,
-        Some(code),
-        Some(friend.name),
-    );
 }
 
 /// What the overlay needs to do its job: forward mouse events to the real tray

@@ -209,14 +209,10 @@ impl SyncManager {
                 .unwrap()
                 .get(&friend.id)
                 .map(|h| h.sig.clone());
-            match existing {
-                Some(s) if s == sig => {}
-                Some(_) => {
-                    self.stop_friend(&friend.id);
-                    self.start_friend_listener(friend);
-                }
-                None => self.start_friend_listener(friend),
-            }
+            // iroh-only: friend pushes now arrive via the iroh accept loop's
+            // "files" handler (with manual-accept handled there), so there's no
+            // per-friend croc inbox listener to start.
+            let _ = (existing, sig, friend);
         }
     }
 
@@ -556,16 +552,8 @@ impl SyncManager {
             seed_existing(&pair.folder, &inbound, &queue, &wake);
         }
 
-        if pairing::runs_listener(&pair) {
-            self.clone().spawn_listener(
-                config.clone(),
-                stopped.clone(),
-                stop_notify.clone(),
-                inbound.clone(),
-                status.clone(),
-                self_deleted.clone(),
-            );
-        }
+        // iroh-only: folder pushes arrive via the iroh accept loop's "folder-files"
+        // handler (→ ingest_iroh_folder_files), so there's no croc receive listener.
 
         // Control channel (presence + identity + mirror delete events) runs for
         // BOTH peers on every pair, independent of file-sync direction — that's
@@ -579,13 +567,8 @@ impl SyncManager {
             pending_deletes.clone(),
             control_wake.clone(),
         );
-        self.clone().spawn_control_listener(
-            config.clone(),
-            stopped.clone(),
-            stop_notify.clone(),
-            status.clone(),
-            self_deleted.clone(),
-        );
+        // iroh-only: the peer's control payload (presence + name + mirror deletes)
+        // arrives via the iroh accept loop's "folder-ctrl" handler.
 
         let handle = PairHandle {
             sig,
@@ -778,23 +761,15 @@ impl SyncManager {
                         .unwrap_or_default();
                     (p, s)
                 };
-                let code = pairing::outbound_code(&pair);
                 let name = file_name_of(&file);
 
                 set_status(&status, FolderState::Sending, Some(name.clone()), 0.0, None);
                 manager.emit_status(&pair_id);
 
-                // A parked `croc send` busy-burns ~12% CPU. If the peer looks
-                // offline, park only briefly (still self-correcting if that guess
-                // is stale, since the next attempt re-parks); park long when online.
                 let peer_online = status.lock().map(|s| s.peer_online).unwrap_or(true);
-                let connect = if peer_online { CONNECT_TIMEOUT_SECS } else { 25 };
 
-                // Direct engine first: when the peer is reachable and we know their
-                // iroh key, push straight over iroh (fast, often LAN-direct). Any
-                // failure — offline, dial error, peer on an older build — returns
-                // None and we fall through to the croc relay, so folder sync never
-                // regresses.
+                // Direct engine: when the peer is reachable and we know their iroh
+                // key, push straight over iroh (fast, often LAN-direct).
                 let iroh_loc = if peer_online {
                     manager
                         .try_iroh_folder_send(&pair, &settings, &file, &status, &stopped)
@@ -803,39 +778,16 @@ impl SyncManager {
                     None
                 };
 
+                // iroh-only: deliver over iroh, else keep the file queued. Offline
+                // → wait for the peer (presence flips via the iroh control beacon);
+                // online but the push failed → quick retry. The file is only ever
+                // popped from the queue on confirmed delivery.
                 let result = if iroh_loc.is_some() {
                     SendOutcome::Delivered
+                } else if peer_online {
+                    SendOutcome::Failed("direct folder push failed".into())
                 } else {
-                    let status_cb = status.clone();
-                    let pair_id_cb = pair_id.clone();
-                    let manager_cb = manager.clone();
-                    run_croc_send(
-                        &settings,
-                        &code,
-                        &file,
-                        &stopped,
-                        &stop_notify,
-                        connect,
-                        move |m| {
-                            if let Ok(mut s) = status_cb.lock() {
-                                s.state = FolderState::Sending;
-                                s.percent = m.percent;
-                                s.bytes_done = m.done;
-                                if m.total > 0 {
-                                    s.bytes_total = m.total;
-                                }
-                                if let Some(spd) = m.speed_bps {
-                                    s.speed_bps = spd;
-                                }
-                                s.eta_seconds = m.eta;
-                                if !matches!(m.locality, Locality::Unknown) {
-                                    s.locality = m.locality;
-                                }
-                            }
-                            manager_cb.emit_status(&pair_id_cb);
-                        },
-                    )
-                    .await
+                    SendOutcome::Offline
                 };
 
                 match result {
@@ -1074,78 +1026,30 @@ impl SyncManager {
                     continue;
                 }
 
-                let code = pairing::control_outbound_code(&pair);
-                // Short park: a beacon that misses the peer's poll this round just
-                // retries later — far cheaper than holding a 12%-CPU parked send.
-                let outcome = run_croc_send(
-                    &settings,
-                    &code,
-                    &ctrl_path,
-                    &stopped,
-                    &stop_notify,
-                    CONTROL_CONNECT_TIMEOUT_SECS,
-                    |_m| {},
-                )
-                .await;
-                match outcome {
-                    SendOutcome::Delivered => {
-                        offline_streak = 0;
-                        set_peer_online(&status, true);
-                        manager.emit_status(&pair_id);
-                        // Delivered == the peer received (and will apply) these
-                        // deletes, so drop exactly the ones we just sent.
-                        if !dels.is_empty() {
-                            let sent: HashSet<String> =
-                                dels.iter().map(|d| format!("{}|{}", d.rel, d.ts)).collect();
-                            pending_deletes
-                                .lock()
-                                .unwrap()
-                                .retain(|d| !sent.contains(&format!("{}|{}", d.rel, d.ts)));
-                        }
-                        // Re-beacon presence only occasionally (a new delete still
-                        // flushes instantly via control_wake) — keeps croc churn low.
-                        tokio::select! {
-                            _ = control_wake.notified() => {}
-                            _ = tokio::time::sleep(Duration::from_secs(300)) => {}
-                            _ = stop_notify.notified() => break,
-                        }
-                        if stopped.load(Ordering::SeqCst) {
-                            break;
-                        }
+                // iroh couldn't reach the peer this round → treat them as offline
+                // and back off. A pending delete keeps us trying briskly so mirrors
+                // still converge; control_wake (a new delete) or the peer beaconing
+                // us flips presence back online sooner.
+                set_peer_online(&status, false);
+                manager.emit_status(&pair_id);
+                offline_streak = offline_streak.saturating_add(1);
+                let have_deletes = !pending_deletes.lock().unwrap().is_empty();
+                let wait = if have_deletes {
+                    25
+                } else {
+                    match offline_streak {
+                        1 => 60,
+                        2 => 120,
+                        _ => 300,
                     }
-                    SendOutcome::Offline => {
-                        set_peer_online(&status, false);
-                        manager.emit_status(&pair_id);
-                        offline_streak = offline_streak.saturating_add(1);
-                        // The peer isn't answering. Back off hard so a perpetually
-                        // offline folder barely costs anything — but if a delete is
-                        // pending, keep trying briskly so mirrors converge, and a new
-                        // delete (control_wake) always retries at once.
-                        let have_deletes = !pending_deletes.lock().unwrap().is_empty();
-                        let wait = if have_deletes {
-                            25
-                        } else {
-                            match offline_streak {
-                                1 => 60,
-                                2 => 120,
-                                _ => 300,
-                            }
-                        };
-                        tokio::select! {
-                            _ = control_wake.notified() => {}
-                            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
-                            _ = stop_notify.notified() => break,
-                        }
-                        if stopped.load(Ordering::SeqCst) {
-                            break;
-                        }
-                    }
-                    SendOutcome::Failed(_) => {
-                        if wait_fixed(&stop_notify, &stopped, 3000).await {
-                            break;
-                        }
-                    }
-                    SendOutcome::Stopped => break,
+                };
+                tokio::select! {
+                    _ = control_wake.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                    _ = stop_notify.notified() => break,
+                }
+                if stopped.load(Ordering::SeqCst) {
+                    break;
                 }
             }
             let _ = std::fs::remove_file(&ctrl_file);

@@ -418,16 +418,23 @@ pub fn respond_to_offer(state: State<'_, Arc<AppState>>, id: String, accept: boo
     }
 }
 
-/// Actively check whether a friend is online: beam them a tiny throwaway marker
-/// and report whether it was delivered (their app caught it). Can take up to ~70s
-/// if their app is idle; returns false if they don't answer in that window.
+/// Actively check whether a friend is online: dial their iroh endpoint and
+/// round-trip a ping, reporting whether they answered. Returns false quickly if
+/// they have no direct address yet (paired pre-Direct-mode) or don't answer.
 #[tauri::command]
-pub async fn ping_friend(state: State<'_, Arc<AppState>>, id: String) -> Result<bool, String> {
+pub async fn ping_friend(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    id: String,
+) -> Result<bool, String> {
     let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
-    let code = friends::friend_inbox_code(&friend);
-    let settings = { state.settings.lock().unwrap().clone() };
-    let config_dir = state.config_dir.clone();
-    Ok(crate::sync::ping_send(&settings, &code, &config_dir).await)
+    let Some(eid) = friend.endpoint_id.clone() else {
+        return Ok(false);
+    };
+    let Some(ep) = iroh.get().cloned() else {
+        return Ok(false);
+    };
+    Ok(crate::iroh_net::ping_endpoint(&ep, &eid).await)
 }
 
 /// Rebuild a friend's invite so the inviter can show it again.
@@ -506,22 +513,16 @@ pub fn send_to_friend(
         }
     }
     let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
-    // Prefer the direct iroh engine when Direct mode is on, we know the friend's
-    // device id, and our endpoint is up. Otherwise fall back to croc.
-    let direct = state.settings.lock().unwrap().direct_mode;
-    if direct && iroh.get().is_some() {
-        if let Some(eid) = friend.endpoint_id.clone() {
-            return crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths);
-        }
+    // iroh-only: dial the friend's endpoint directly (discovery resolves their
+    // address). A friend added before Direct mode has no endpoint id and needs a
+    // quick re-pair to be reachable.
+    let eid = friend.endpoint_id.clone().ok_or(
+        "This friend was added before Direct mode — re-pair with them to send directly.",
+    )?;
+    if iroh.get().is_none() {
+        return Err("Direct mode is still starting up — try again in a moment.".into());
     }
-    let code = friends::friend_inbox_code(&friend);
-    Ok(croc::start_send(
-        app,
-        state.inner().clone(),
-        paths,
-        Some(code),
-        Some(friend.name),
-    ))
+    crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths)
 }
 
 // ── iroh transport (Phase 1: foundation / diagnostics) ───────────────────────
