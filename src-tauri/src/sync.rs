@@ -531,26 +531,22 @@ impl SyncManager {
                 set_status(&status, FolderState::Sending, Some(name.clone()), 0.0, None);
                 manager.emit_status(&pair_id);
 
-                let peer_online = status.lock().map(|s| s.peer_online).unwrap_or(true);
+                // Always ATTEMPT the direct push (try_iroh_folder_send has its own
+                // 12s dial timeout and returns None cheaply if the peer is
+                // unreachable or we don't know their key yet). Driving the result
+                // off the actual dial — not the cached presence flag — means a
+                // queued file lands the instant the peer is reachable, instead of
+                // waiting up to the 300s beacon cadence to flip peer_online.
+                let iroh_loc = manager
+                    .try_iroh_folder_send(&pair, &settings, &file, &status, &stopped)
+                    .await;
 
-                // Direct engine: when the peer is reachable and we know their iroh
-                // key, push straight over iroh (fast, often LAN-direct).
-                let iroh_loc = if peer_online {
-                    manager
-                        .try_iroh_folder_send(&pair, &settings, &file, &status, &stopped)
-                        .await
-                } else {
-                    None
-                };
-
-                // iroh-only: deliver over iroh, else keep the file queued. Offline
-                // → wait for the peer (presence flips via the iroh control beacon);
-                // online but the push failed → quick retry. The file is only ever
-                // popped from the queue on confirmed delivery.
+                // iroh-only: deliver over iroh, else keep the file queued and back
+                // off (the peer is offline / not yet reachable). The file is only
+                // ever popped from the queue on confirmed delivery.
                 let result = if iroh_loc.is_some() {
+                    set_peer_online(&status, true);
                     SendOutcome::Delivered
-                } else if peer_online {
-                    SendOutcome::Failed("direct folder push failed".into())
                 } else {
                     SendOutcome::Offline
                 };

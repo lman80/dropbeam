@@ -140,15 +140,41 @@ fn emit_completed(
     friend: Option<String>,
     out_dir: Option<String>,
 ) {
-    let mut u = TransferUpdate::new(id.to_string(), dir, names);
+    let mut u = TransferUpdate::new(id.to_string(), dir, names.clone());
     u.state = TransferState::Completed;
     u.bytes_done = total;
     u.bytes_total = total;
     u.percent = 100.0;
     u.locality = locality;
-    u.friend_name = friend;
-    u.out_dir = out_dir;
+    u.friend_name = friend.clone();
+    u.out_dir = out_dir.clone();
     emit(app, &u);
+
+    // Persist to History so iroh transfers survive a restart. Folder receives log
+    // via note_received; this covers Quick Send + friend sends/receives.
+    if let Some(st) = app.try_state::<std::sync::Arc<crate::AppState>>() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        crate::history::append(
+            &st.config_dir,
+            crate::models::HistoryEntry {
+                id: id.to_string(),
+                direction: dir,
+                file_names: names,
+                bytes_total: total,
+                peer: friend,
+                locality,
+                code: None,
+                state: TransferState::Completed,
+                timestamp_ms: ts,
+                error: None,
+                out_dir,
+            },
+        );
+        let _ = app.emit("history://changed", ());
+    }
 }
 
 fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
@@ -415,7 +441,15 @@ async fn serve_stream(
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
                     st.offers.lock().unwrap().insert(id.clone(), tx);
                 }
-                let accept = rx.await.unwrap_or(false);
+                // Don't park forever: resolve on the user's choice, on the sender
+                // giving up (connection closed), or after a TTL — so a declined or
+                // ignored offer always cleans up instead of leaking the task and
+                // leaving the sender blocked.
+                let accept = tokio::select! {
+                    r = rx => r.unwrap_or(false),
+                    _ = conn.closed() => false,
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => false,
+                };
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
                     st.offers.lock().unwrap().remove(&id);
                 }
@@ -1341,7 +1375,14 @@ pub async fn send_files<F: Fn(u64, u64)>(
     let (mut send, mut recv) = conn.open_bi().await?;
     let sent = write_files(&mut send, paths, cancel, on_progress).await?;
     send.finish()?;
-    let _ = recv.read_to_end(16).await;
+    // Require the receiver's "ok" so we never report Completed for a transfer the
+    // peer declined or failed to write (declined pushes stop the stream, surfacing
+    // here as an error rather than a false success).
+    let ack = recv.read_to_end(16).await.unwrap_or_default();
+    anyhow::ensure!(
+        ack == b"ok",
+        "the transfer was interrupted before the recipient confirmed receipt"
+    );
     Ok(sent)
 }
 

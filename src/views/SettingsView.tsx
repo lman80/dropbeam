@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react'
-import { CheckCircle2, ChevronDown, Download, FolderOpen, RefreshCw } from 'lucide-react'
+import { CheckCircle2, Download, FolderOpen, RefreshCw } from 'lucide-react'
 import { api, type Settings } from '../lib/api'
 import { useStore } from '../store'
 import { ProgressBar, SectionTitle, Spinner } from '../components/bits'
@@ -65,7 +65,6 @@ export function SettingsView() {
   const checkingUpdate = useStore((s) => s.checkingUpdate)
   const checkForUpdates = useStore((s) => s.checkForUpdates)
   const installUpdate = useStore((s) => s.installUpdate)
-  const [advanced, setAdvanced] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
 
@@ -226,51 +225,6 @@ export function SettingsView() {
         )}
       </Card>
 
-      <button
-        className="nav-item"
-        style={{ marginBottom: 8, fontWeight: 700 }}
-        onClick={() => setAdvanced((a) => !a)}
-      >
-        <ChevronDown
-          size={16}
-          style={{ transform: advanced ? 'rotate(0)' : 'rotate(-90deg)', transition: 'transform .15s' }}
-        />
-        Advanced
-      </button>
-      {advanced && (
-        <Card>
-          <Row
-            title="Prefer direct connections"
-            desc="Send peer-to-peer when possible; use the relay only as a fallback."
-          >
-            <Toggle on={settings.preferDirectP2p} onChange={(v) => save({ preferDirectP2p: v })} />
-          </Row>
-          {SEP}
-          <Row
-            title="Custom relay"
-            desc="Leave blank to use the free public relay. Format: host:port"
-          >
-            <input
-              className="input"
-              style={{ width: 200 }}
-              placeholder="public relay"
-              value={settings.customRelay}
-              onChange={(e) => save({ customRelay: e.target.value })}
-            />
-          </Row>
-          {SEP}
-          <Row title="Relay password" desc="Only if your custom relay requires one.">
-            <input
-              className="input"
-              style={{ width: 200 }}
-              type="password"
-              placeholder="default"
-              value={settings.customRelayPass}
-              onChange={(e) => save({ customRelayPass: e.target.value })}
-            />
-          </Row>
-        </Card>
-      )}
 
       <div
         style={{
@@ -281,9 +235,9 @@ export function SettingsView() {
           lineHeight: 1.6,
         }}
       >
-        DropBeam · End-to-end encrypted transfers powered by croc
+        DropBeam · Direct, end-to-end encrypted peer-to-peer transfers
         <br />
-        No accounts · No telemetry · Your files never touch our servers
+        No accounts · No telemetry · Your files never touch a server
       </div>
     </div>
   )
