@@ -1500,6 +1500,7 @@ async fn run_croc_send(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1584,6 +1585,7 @@ async fn run_croc_receive(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1696,6 +1698,7 @@ where
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

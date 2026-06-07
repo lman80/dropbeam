@@ -100,6 +100,12 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .setup(|app| {
+            // DropBeam is single-instance: any croc already running at launch is
+            // an orphan from a previous run that crashed or was force-quit (an
+            // orphaned croc can busy-loop and peg a CPU core). Reap them before
+            // we spawn any fresh helpers, so they can never accumulate.
+            croc::reap_stray_croc();
+
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -259,6 +265,11 @@ pub fn run() {
                     let _ = w.unminimize();
                     let _ = w.set_focus();
                 }
+            }
+            // On a clean quit, take any croc helpers down with us so we never
+            // leave an orphan busy-looping a CPU core in the background.
+            if let tauri::RunEvent::Exit = &_event {
+                croc::reap_stray_croc();
             }
         });
 }

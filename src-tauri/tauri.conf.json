@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "DropBeam",
   "mainBinaryName": "DropBeam",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "identifier": "com.dropbeam.app",
   "build": {
     "frontendDist": "../dist",

@@ -80,6 +80,37 @@ pub fn croc_binary_path() -> PathBuf {
     PathBuf::from(exe_name)
 }
 
+/// Kill any stray `croc` child processes left behind by a previous DropBeam run.
+///
+/// DropBeam is single-instance, so at startup any running croc is an orphan from
+/// an instance that crashed or was force-quit. An orphaned croc whose parent pipe
+/// has broken can busy-loop and peg a CPU core (the "hot machine" symptom), and
+/// they otherwise accumulate across restarts. We reap on launch (clear old
+/// orphans before we spawn fresh ones) and again on app exit as a backstop.
+///
+/// Best-effort and synchronous. On Unix we match OUR croc binary's full path so
+/// an unrelated `croc` the user may have installed is never touched.
+pub fn reap_stray_croc() {
+    let bin = croc_binary_path();
+    let pat = bin.to_string_lossy();
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .arg("-9")
+            .arg("-f")
+            .arg(pat.as_ref())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        // taskkill filters by image name; our bundled helper is always croc.exe.
+        let _ = pat;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/IM", "croc.exe"])
+            .status();
+    }
+}
+
 /// Build the croc command for one attempt. `override_send_code` lets retries reuse
 /// the code croc generated on the first attempt, so the code shown to the user
 /// stays valid across re-parks.
@@ -124,6 +155,9 @@ fn build_run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.env("NO_COLOR", "1");
+    // If the owning task is dropped (panic, abort, app teardown) without an
+    // explicit kill, take croc down with it instead of leaking an orphan.
+    cmd.kill_on_drop(true);
     cmd
 }
 
