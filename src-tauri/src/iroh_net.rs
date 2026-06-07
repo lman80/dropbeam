@@ -30,6 +30,10 @@ use crate::models::{Direction, TransferState, TransferUpdate};
 
 /// Application-layer protocol id. Bumped if the wire format changes.
 pub const ALPN: &[u8] = b"dropbeam/1";
+/// How long a direct "send to a friend" keeps re-dialing an unreachable friend
+/// before giving up — lets a friend who's just opening their app still receive,
+/// mirroring croc's old parked-send window (without the hours-long hang).
+const FRIEND_SEND_RETRY_SECS: u64 = 90;
 
 /// A Quick Send staged on this node, waiting for a receiver to pull it.
 struct PendingSend {
@@ -786,12 +790,32 @@ pub fn send_to_friend(
         let outcome: Result<crate::models::Locality> = async {
             // Bounded so an offline/unreachable friend FAILS clearly instead of
             // hanging forever (the exact thing that was wrong with the old path).
-            let conn = tokio::time::timeout(Duration::from_secs(30), ep.connect(addr, ALPN))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("Couldn't reach this friend — are they online with Direct mode on?")
-                })?
-                .context("dial friend")?;
+            // Bounded re-dial: a friend who's briefly offline (e.g. just opening
+            // their app) still receives, mirroring croc's old parked-send window.
+            // We keep re-dialing until connected or the budget runs out; the file
+            // stays "Connecting" meanwhile, and a cancel breaks out immediately.
+            let conn = {
+                let started = std::time::Instant::now();
+                loop {
+                    if cancel.load(Ordering::SeqCst) {
+                        anyhow::bail!("canceled");
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_secs(20),
+                        ep.connect(addr.clone(), ALPN),
+                    )
+                    .await
+                    {
+                        Ok(Ok(c)) => break c,
+                        _ => {
+                            if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
+                                anyhow::bail!("Couldn't reach this friend — are they online with Direct mode on?");
+                            }
+                            tokio::time::sleep(Duration::from_secs(6)).await;
+                        }
+                    }
+                }
+            };
             let cb = progress_cb(
                 app.clone(),
                 id.clone(),
