@@ -123,7 +123,6 @@ pub fn run() {
                 .unwrap_or_default();
             let default_name = default_display_name();
             let loaded = settings::load(&config_dir, &default_download, &default_name);
-            let direct_mode = loaded.direct_mode;
 
             app.manage(Arc::new(AppState {
                 config_dir: config_dir.clone(),
@@ -133,16 +132,11 @@ pub fn run() {
                 force_quit: AtomicBool::new(false),
             }));
 
-            // Bring up the iroh transport in the background (Phase 1: foundation
-            // only — croc still carries every transfer, so a failure here is
-            // non-fatal). Fills the endpoint once bound. Gated to dev builds for
-            // now so shipped releases don't start a P2P listener (and trigger a
-            // firewall prompt) before iroh actually powers a user-facing flow;
-            // a later phase exposes it via an opt-in Settings toggle.
+            // iroh is the ONLY transport now, so always bring up the direct P2P
+            // endpoint in the background (it fills once bound). A user who'd
+            // toggled the old "Direct mode" off must still get a working app.
             let iroh_state = Arc::new(iroh_net::IrohState::default());
-            if direct_mode || cfg!(debug_assertions) {
-                iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
-            }
+            iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
             app.manage(iroh_state);
 
             // Start the Shared Drop Folder sync service.

@@ -166,24 +166,20 @@ export function SettingsView() {
       <SectionTitle>Connection</SectionTitle>
       <Card>
         <Row
-          title="Direct mode"
-          desc="On by default — Quick Send, friends, and shared folders go straight to the other computer (peer-to-peer, end-to-end encrypted), so transfers are as fast as your network allows. Turn it off only to fall back to the older relay engine if a direct connection won't form on a restrictive network. Your firewall may ask once to allow DropBeam."
+          title="Direct peer-to-peer"
+          desc="Every transfer — Quick Send, friends, and shared folders — goes straight to the other computer, end-to-end encrypted, as fast as your network allows. Your firewall may ask once to allow DropBeam."
         >
-          <Toggle on={settings.directMode} onChange={(v) => save({ directMode: v })} />
+          <span style={{ fontSize: 13, fontWeight: 650, color: 'var(--accent)' }}>On</span>
         </Row>
-        {settings.directMode && (
-          <>
-            {SEP}
-            <Row
-              title="Test direct connection"
-              desc={testResult || 'Confirm the direct engine is running on this computer.'}
-            >
-              <button className="btn btn-ghost" onClick={runDirectTest} disabled={testing}>
-                {testing ? <Spinner size={14} /> : <RefreshCw size={15} />} Test
-              </button>
-            </Row>
-          </>
-        )}
+        {SEP}
+        <Row
+          title="Test direct connection"
+          desc={testResult || 'Confirm the direct engine is running on this computer.'}
+        >
+          <button className="btn btn-ghost" onClick={runDirectTest} disabled={testing}>
+            {testing ? <Spinner size={14} /> : <RefreshCw size={15} />} Test
+          </button>
+        </Row>
       </Card>
 
       <SectionTitle>Updates</SectionTitle>

@@ -646,24 +646,17 @@ impl SyncManager {
                 });
                 let _ = std::fs::write(&ctrl_file, payload.to_string());
 
-                // Prefer iroh: dial the peer directly and hand them the control
-                // payload. Success means they're online AND received it (deletes
-                // included), so we skip croc entirely this round.
-                let iroh_ok = if settings.direct_mode {
-                    match (pair.endpoint_id.clone(), manager.iroh_endpoint()) {
-                        (Some(eid), Some(ep)) => {
-                            let del_pairs: Vec<(String, u64)> =
-                                dels.iter().map(|d| (d.rel.clone(), d.ts)).collect();
-                            crate::iroh_net::send_folder_ctrl(
-                                &ep, &eid, &pair_id, &my_name, &del_pairs,
-                            )
+                // Dial the peer directly and hand them the control payload.
+                // Success means they're online AND received it (deletes included).
+                let iroh_ok = match (pair.endpoint_id.clone(), manager.iroh_endpoint()) {
+                    (Some(eid), Some(ep)) => {
+                        let del_pairs: Vec<(String, u64)> =
+                            dels.iter().map(|d| (d.rel.clone(), d.ts)).collect();
+                        crate::iroh_net::send_folder_ctrl(&ep, &eid, &pair_id, &my_name, &del_pairs)
                             .await
                             .is_ok()
-                        }
-                        _ => false,
                     }
-                } else {
-                    false
+                    _ => false,
                 };
                 if iroh_ok {
                     offline_streak = 0;
@@ -909,14 +902,11 @@ impl SyncManager {
     async fn try_iroh_folder_send(
         self: &Arc<Self>,
         pair: &Pair,
-        settings: &Settings,
+        _settings: &Settings,
         file: &str,
         status: &Arc<Mutex<StatusSnapshot>>,
         stopped: &Arc<AtomicBool>,
     ) -> Option<Locality> {
-        if !settings.direct_mode {
-            return None;
-        }
         let eid = pair.endpoint_id.clone()?;
         let ep = self.iroh_endpoint()?;
         let paths = vec![PathBuf::from(file)];

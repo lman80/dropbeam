@@ -46,9 +46,9 @@ pub fn update_settings(
         *guard = settings.clone();
     }
     settings::save(&state.config_dir, &settings)?;
-    // Turning Direct mode on starts the P2P engine right away (no restart). The
-    // `app` OnceCell is set the first time we spawn, so this won't double-start.
-    if settings.direct_mode && iroh.app.get().is_none() {
+    // iroh always runs (it's the only transport); start it if it somehow isn't
+    // up yet. The `app` OnceCell guards against double-starting.
+    if iroh.app.get().is_none() {
         crate::iroh_net::spawn(state.config_dir.clone(), iroh.inner().clone(), app.clone());
     }
     Ok(settings)
