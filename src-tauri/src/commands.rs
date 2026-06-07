@@ -9,53 +9,11 @@ use crate::models::{
     DeleteMode, FolderStatus, Friend, HistoryEntry, HistoryItem, Pair, Settings, TransferUpdate,
 };
 use crate::sync::SyncManager;
-use crate::{croc, folder_history, friends, history, pairing, settings, AppState};
-
-#[tauri::command]
-pub fn send_files(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    paths: Vec<String>,
-) -> Result<TransferUpdate, String> {
-    let paths: Vec<String> = paths.into_iter().filter(|p| !p.trim().is_empty()).collect();
-    if paths.is_empty() {
-        return Err("No files selected.".into());
-    }
-    for p in &paths {
-        if !std::path::Path::new(p).exists() {
-            return Err(format!("File not found: {p}"));
-        }
-    }
-    Ok(croc::start_send(app, state.inner().clone(), paths, None, None))
-}
-
-#[tauri::command]
-pub fn receive_files(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    code: String,
-) -> Result<TransferUpdate, String> {
-    let code = code.trim().to_string();
-    if code.is_empty() {
-        return Err("Enter a code to receive.".into());
-    }
-    let configured = { state.settings.lock().unwrap().download_dir.clone() };
-    let out = if configured.trim().is_empty() {
-        app.path()
-            .download_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .map_err(|e| format!("No download folder available: {e}"))?
-    } else {
-        configured
-    };
-    std::fs::create_dir_all(&out).map_err(|e| format!("Can't write to download folder: {e}"))?;
-    Ok(croc::start_receive(app, state.inner().clone(), code, out))
-}
+use crate::{folder_history, friends, history, pairing, settings, AppState};
 
 #[tauri::command]
 pub fn cancel_transfer(
     app: AppHandle,
-    state: State<'_, Arc<AppState>>,
     iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     id: String,
 ) {
@@ -65,12 +23,8 @@ pub fn cancel_transfer(
         CancelKind::Staged => crate::iroh_net::emit_canceled_send(&app, &id),
         // An in-flight iroh transfer reports Canceled from its own loop.
         CancelKind::Active => {}
-        // Not an iroh transfer — cancel the croc one.
-        CancelKind::Unknown => {
-            if let Some(notify) = state.transfers.lock().unwrap().get(&id) {
-                notify.notify_one();
-            }
-        }
+        // Not a known iroh transfer — nothing to cancel.
+        CancelKind::Unknown => {}
     }
 }
 
