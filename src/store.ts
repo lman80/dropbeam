@@ -202,10 +202,9 @@ export const useStore = create<AppStore>((set, get) => ({
     lastDropAt = now
     set({ view: 'send' })
     try {
-      // Direct mode routes Quick Send over the iroh P2P engine; same UI.
-      const u = get().settings?.directMode
-        ? await api.irohSend(paths)
-        : await api.sendFiles(paths)
+      // iroh-only Quick Send: stage over the direct P2P engine; the receiver
+      // pulls with the Direct link/QR.
+      const u = await api.irohSend(paths)
       get().upsertTransfer(u)
     } catch (e) {
       get().toast('error', String(e))
@@ -216,9 +215,15 @@ export const useStore = create<AppStore>((set, get) => ({
     code = code.trim()
     if (!code) return
     try {
-      // A Direct ticket is long (starts with "direct"); route it over iroh.
-      const direct = get().settings?.directMode || code.startsWith('direct')
-      const u = direct ? await api.irohReceive(code) : await api.receiveFiles(code)
+      // iroh-only: receives use the Direct ticket from the sender's link/QR.
+      if (!code.startsWith('direct')) {
+        get().toast(
+          'error',
+          'Paste the Direct link or scan the QR to receive. (Short word-codes return once a rendezvous broker is set up — see SHORT-CODES.md.)',
+        )
+        return
+      }
+      const u = await api.irohReceive(code)
       get().upsertTransfer(u)
     } catch (e) {
       get().toast('error', String(e))
