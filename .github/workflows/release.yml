@@ -46,10 +46,6 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
-      - name: Ensure bundled croc is executable (macOS)
-        if: matrix.platform == 'macos-latest'
-        run: chmod +x src-tauri/binaries/croc-*-apple-darwin
-
       - name: Build, sign, and publish release
         uses: tauri-apps/tauri-action@v0
         env:
