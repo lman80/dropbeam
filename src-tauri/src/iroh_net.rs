@@ -380,23 +380,62 @@ async fn serve_stream(
             };
             // Identify the sender by matching their endpoint id to a friend.
             let who = conn.remote_id().to_string();
-            let sender = crate::friends::load(&config_dir)
+            let friend = crate::friends::load(&config_dir)
                 .into_iter()
-                .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
-                .map(|f| f.name);
+                .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()));
+            let sender = friend.as_ref().map(|f| f.name.clone());
+            // A friend with manual-accept on must approve before we receive. An
+            // unknown sender (no friend record) defaults to auto-accept, same as
+            // the prior behavior.
+            let auto_accept = friend.as_ref().map(|f| f.auto_accept).unwrap_or(true);
             let total = req["total"].as_u64().unwrap_or(0);
+            let names: Vec<String> = req["items"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|it| it.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
             let id = uuid::Uuid::new_v4().to_string();
             let cancel = Arc::new(AtomicBool::new(false));
             state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
-            let mut u0 = TransferUpdate::new(id.clone(), Direction::Receive, Vec::new());
+
+            // Manual accept/decline — the iroh twin of run_croc_receive_interactive.
+            // Pause before reading the body, surface the offer, and wait for the
+            // user's decision (resolved by the respond_to_offer command). On
+            // decline we drop the streams, which stops the sender's push.
+            if !auto_accept {
+                let mut wu = TransferUpdate::new(id.clone(), Direction::Receive, names.clone());
+                wu.state = TransferState::WaitingForAccept;
+                wu.friend_name = sender.clone();
+                wu.bytes_total = total;
+                emit(&app, &wu);
+                let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+                    st.offers.lock().unwrap().insert(id.clone(), tx);
+                }
+                let accept = rx.await.unwrap_or(false);
+                if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+                    st.offers.lock().unwrap().remove(&id);
+                }
+                if !accept {
+                    emit_canceled(&app, &id, Direction::Receive);
+                    state.cancels.lock().unwrap().remove(&id);
+                    return Ok(());
+                }
+            }
+
+            let mut u0 = TransferUpdate::new(id.clone(), Direction::Receive, names.clone());
             u0.state = TransferState::Transferring;
             u0.friend_name = sender.clone();
+            u0.bytes_total = total;
             emit(&app, &u0);
             let cb = progress_cb(
                 app.clone(),
                 id.clone(),
                 Direction::Receive,
-                Vec::new(),
+                names.clone(),
                 sender.clone(),
                 conn.clone(),
             );
