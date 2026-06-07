@@ -1031,6 +1031,49 @@ impl SyncManager {
                     "v": 1, "name": my_name, "ts": now_ms(), "deletes": dels_json,
                 });
                 let _ = std::fs::write(&ctrl_file, payload.to_string());
+
+                // Prefer iroh: dial the peer directly and hand them the control
+                // payload. Success means they're online AND received it (deletes
+                // included), so we skip croc entirely this round.
+                let iroh_ok = if settings.direct_mode {
+                    match (pair.endpoint_id.clone(), manager.iroh_endpoint()) {
+                        (Some(eid), Some(ep)) => {
+                            let del_pairs: Vec<(String, u64)> =
+                                dels.iter().map(|d| (d.rel.clone(), d.ts)).collect();
+                            crate::iroh_net::send_folder_ctrl(
+                                &ep, &eid, &pair_id, &my_name, &del_pairs,
+                            )
+                            .await
+                            .is_ok()
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if iroh_ok {
+                    offline_streak = 0;
+                    set_peer_online(&status, true);
+                    manager.emit_status(&pair_id);
+                    if !dels.is_empty() {
+                        let sent: HashSet<String> =
+                            dels.iter().map(|d| format!("{}|{}", d.rel, d.ts)).collect();
+                        pending_deletes
+                            .lock()
+                            .unwrap()
+                            .retain(|d| !sent.contains(&format!("{}|{}", d.rel, d.ts)));
+                    }
+                    tokio::select! {
+                        _ = control_wake.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                        _ = stop_notify.notified() => break,
+                    }
+                    if stopped.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
+
                 let code = pairing::control_outbound_code(&pair);
                 // Short park: a beacon that misses the peer's poll this round just
                 // retries later — far cheaper than holding a 12%-CPU parked send.
@@ -1243,6 +1286,51 @@ impl SyncManager {
             let _ = self.app.emit("pairs://changed", ());
         }
         self.emit_status(pair_id);
+    }
+
+    /// Apply a control payload received over iroh — the iroh equivalent of the
+    /// croc control listener. Marks the peer online, learns their name (which
+    /// also links the friend record), and in mirror mode propagates their deletes
+    /// into our folder. Called from the iroh accept loop's "folder-ctrl" handler.
+    pub fn apply_remote_control(
+        self: &Arc<Self>,
+        pair_id: &str,
+        name: &str,
+        deletes: &[(String, u64)],
+    ) {
+        let (config, status, self_deleted) = {
+            let handles = self.handles.lock().unwrap();
+            let Some(h) = handles.get(pair_id) else {
+                return; // not a folder we're actively managing
+            };
+            (h.config.clone(), h.status.clone(), h.self_deleted.clone())
+        };
+        // Presence + name (also links the friend), same as the croc path. If no
+        // name rode along, still mark them online — we just heard from them.
+        let name = name.trim();
+        if !name.is_empty() {
+            self.on_peer_hello(pair_id, &config, name, &status);
+        } else {
+            set_peer_online(&status, true);
+            self.emit_status(pair_id);
+        }
+        // Mirror-mode delete propagation (apply_remote_delete is idempotent, so a
+        // re-delivered delete is a harmless no-op).
+        let (folder, mirror) = {
+            let p = config.lock().unwrap();
+            (p.folder.clone(), p.mirror)
+        };
+        if mirror && !deletes.is_empty() {
+            let mut applied_any = false;
+            for (rel, _ts) in deletes {
+                if apply_remote_delete(&folder, rel, &self_deleted) {
+                    applied_any = true;
+                }
+            }
+            if applied_any {
+                let _ = self.app.emit("folder-history://changed", pair_id);
+            }
+        }
     }
 
     fn persist_manifest(&self, pair_id: &str, set: &HashSet<String>) {

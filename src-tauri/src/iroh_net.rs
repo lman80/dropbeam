@@ -531,6 +531,46 @@ async fn serve_stream(
                 }
             }
         }
+        Some("folder-ctrl") => {
+            // The folder peer's presence + control beacon, over iroh. Carries their
+            // display name and (mirror mode) pending deletes — the same payload the
+            // croc control channel used to deliver. Hand it to the SyncManager to
+            // apply (learn name, link friend, propagate deletes) and ack so the
+            // sender knows we're online and received it.
+            let pair_id = req
+                .get("pair_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = req
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let deletes: Vec<(String, u64)> = req
+                .get("deletes")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|d| {
+                            let rel = d.get("rel").and_then(|r| r.as_str())?.to_string();
+                            let ts = d.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+                            Some((rel, ts))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !pair_id.is_empty() {
+                if let Some(app) = state.app.get() {
+                    if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
+                        let sm = sm.inner().clone();
+                        sm.apply_remote_control(&pair_id, &name, &deletes);
+                    }
+                }
+            }
+            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            send.finish()?;
+        }
         other => anyhow::bail!("unknown stream kind: {other:?}"),
     }
     Ok(())
@@ -844,6 +884,42 @@ pub fn say_hello_folder(
             }
         }
     });
+}
+
+/// Folder presence + control over iroh: dial the paired peer and hand them our
+/// display name and any pending mirror deletes. This is the iroh replacement for
+/// the croc control beacon — `Ok(())` means the peer received it (so they're
+/// online), `Err` means "fall back to croc / mark offline" to the caller.
+pub async fn send_folder_ctrl(
+    ep: &Endpoint,
+    endpoint_id: &str,
+    pair_id: &str,
+    name: &str,
+    deletes: &[(String, u64)],
+) -> Result<()> {
+    let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
+    let addr = iroh::EndpointAddr::from(parsed);
+    let dels: Vec<serde_json::Value> = deletes
+        .iter()
+        .map(|(rel, ts)| serde_json::json!({ "rel": rel, "ts": ts }))
+        .collect();
+    let msg = serde_json::json!({
+        "kind": "folder-ctrl", "pair_id": pair_id, "name": name, "deletes": dels,
+    });
+    // Bounded dial so a perpetually-offline peer fails fast and the caller can
+    // back off, exactly like the old croc control timeout.
+    let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
+        .await
+        .map_err(|_| anyhow::anyhow!("control dial timed out"))?
+        .context("dial folder peer for control")?;
+    let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
+    write_frame(&mut send, &msg).await?;
+    send.finish()?;
+    // Best-effort ack: success is connect+write+finish; the peer applies the
+    // payload when it reads the finished stream. We wait briefly for the ok but
+    // don't fail delivery if the ack is slow.
+    let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
+    Ok(())
 }
 
 /// Push folder files to a paired peer over iroh (dial-by-key). Preserves each
