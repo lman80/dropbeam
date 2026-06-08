@@ -52,6 +52,11 @@ struct PairHandle {
     /// Loop-guard for files we just wrote/removed ourselves (shared with the
     /// listener + collector so an iroh receive lands without echoing back).
     self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Mirror deletes queued for this link's peer; the control beacon flushes
+    /// them. Stored here so a group delete can be FANNED to every other link.
+    pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
+    /// Wakes this link's control sender to flush a freshly-queued delete now.
+    control_wake: Arc<Notify>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
 
@@ -348,6 +353,8 @@ impl SyncManager {
             inbound,
             status,
             self_deleted,
+            pending_deletes,
+            control_wake,
             _watcher: watcher,
         };
         self.handles.lock().unwrap().insert(pair.id.clone(), handle);
@@ -778,15 +785,28 @@ impl SyncManager {
             let p = config.lock().unwrap();
             (p.folder.clone(), p.mirror)
         };
+        // Only trust the roster/group on a beacon whose group_id MATCHES this
+        // link's own group_id — a peer can't make us create links under some other
+        // group id (defense in depth; the eids still only ever point at this folder).
+        let my_group = config.lock().unwrap().group_id.clone();
+        let group_ok = !group_id.is_empty() && my_group.as_deref() == Some(group_id);
+
         if mirror && !deletes.is_empty() {
-            let mut applied_any = false;
-            for (rel, _ts) in deletes {
+            let mut applied: Vec<(String, u64)> = Vec::new();
+            for (rel, ts) in deletes {
                 if apply_remote_delete(&folder, rel, &self_deleted) {
-                    applied_any = true;
+                    applied.push((rel.clone(), *ts));
                 }
             }
-            if applied_any {
+            if !applied.is_empty() {
                 let _ = self.app.emit("folder-history://changed", pair_id);
+                // In a group, forward each delete WE just applied to our OTHER
+                // links, so it reaches members not directly connected to the
+                // origin (we only forward freshly-applied deletes, so a
+                // re-delivery — file already gone — doesn't ping-pong forever).
+                if group_ok {
+                    self.fan_group_deletes(pair_id, group_id, &applied);
+                }
             }
         }
 
@@ -794,30 +814,62 @@ impl SyncManager {
         // any member we don't have a link to yet (gossip — this converges the whole
         // group and self-heals if someone was offline when a person joined). A
         // classic 1:1 folder has an empty group/roster, so this is a no-op there.
-        if !group_id.is_empty() && !members.is_empty() {
-            let template = config.lock().unwrap().clone();
+        if group_ok && !members.is_empty() {
             let my_eid = self
                 .iroh_endpoint()
                 .map(|ep| ep.id().to_string())
                 .unwrap_or_default();
-            let mut added = false;
-            for (eid, mname) in members {
-                if pairing::ensure_member(
-                    &self.config_dir,
-                    group_id,
-                    &template,
-                    eid,
-                    mname,
-                    &my_eid,
-                )
-                .is_some()
-                {
-                    added = true;
+            // Without our own key we can't safely tell ourselves apart from a
+            // roster entry → skip rather than risk a self-referential link.
+            if !my_eid.is_empty() {
+                let template = config.lock().unwrap().clone();
+                let mut added = false;
+                for (eid, mname) in members {
+                    if pairing::ensure_member(
+                        &self.config_dir,
+                        group_id,
+                        &template,
+                        eid,
+                        mname,
+                        &my_eid,
+                    )
+                    .is_some()
+                    {
+                        added = true;
+                    }
+                }
+                if added {
+                    self.clone().reconcile();
+                    let _ = self.app.emit("pairs://changed", ());
                 }
             }
-            if added {
-                self.clone().reconcile();
-                let _ = self.app.emit("pairs://changed", ());
+        }
+    }
+
+    /// Forward a set of just-applied mirror deletes to every OTHER link in the
+    /// same folder group, so a delete propagates across the whole mesh (not just
+    /// the one hop from the origin). Dedups so a delete isn't queued twice.
+    fn fan_group_deletes(&self, from_pair: &str, group_id: &str, deletes: &[(String, u64)]) {
+        let other_ids: Vec<String> = pairing::members_of_group(&self.config_dir, group_id)
+            .into_iter()
+            .map(|p| p.id)
+            .filter(|id| id != from_pair)
+            .collect();
+        let handles = self.handles.lock().unwrap();
+        for id in other_ids {
+            if let Some(h) = handles.get(&id) {
+                {
+                    let mut pd = h.pending_deletes.lock().unwrap();
+                    for (rel, ts) in deletes {
+                        if !pd.iter().any(|d| d.rel == *rel && d.ts == *ts) {
+                            pd.push(DeleteEvent {
+                                rel: rel.clone(),
+                                ts: *ts,
+                            });
+                        }
+                    }
+                }
+                h.control_wake.notify_one();
             }
         }
     }
@@ -918,11 +970,11 @@ impl SyncManager {
             };
             (h.config.clone(), h.inbound.clone(), h.self_deleted.clone())
         };
-        let (folder, mirror) = {
+        let (folder, mirror, group) = {
             let p = config.lock().unwrap();
-            (p.folder.clone(), p.mirror)
+            (p.folder.clone(), p.mirror, p.group_id.is_some())
         };
-        let moved = move_staged_into_folder(staging, &folder, &inbound, mirror, &self_deleted);
+        let moved = move_staged_into_folder(staging, &folder, &inbound, mirror, group, &self_deleted);
         if !moved.is_empty() {
             let snapshot = inbound.lock().unwrap().clone();
             self.persist_manifest(pair_id, &snapshot);
@@ -1163,6 +1215,7 @@ fn move_staged_into_folder(
     folder: &str,
     inbound: &Arc<Mutex<HashSet<String>>>,
     mirror: bool,
+    group: bool,
     self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
 ) -> Vec<String> {
     let folder_str = folder;
@@ -1189,15 +1242,20 @@ fn move_staged_into_folder(
         //   • a genuinely different version → newest modified-time wins (an
         //     equal-second race is broken by content hash); the loser is archived
         //     to History so nothing is ever lost.
-        if mirror && dest_path.is_file() {
+        if mirror && dest_path.is_file() && group {
+            // GROUP folder: deterministic resolution so all members converge.
             let loc_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
             let loc_mtime = std::fs::metadata(&dest_path)
                 .ok()
                 .map(|m| meta_mtime(&m))
                 .unwrap_or(0);
-            if in_size == loc_size && in_mtime == loc_mtime {
-                // Already have this exact version — drop the staged dup, don't
-                // rewrite (so the folder watcher doesn't re-broadcast it).
+            // Truly identical (same size + mtime AND content) → no-op. The content
+            // check guards a same-second, same-size, DIFFERENT-content collision
+            // from being silently dropped.
+            if in_size == loc_size
+                && in_mtime == loc_mtime
+                && content_hash(&src) == content_hash(&dest_path)
+            {
                 let _ = std::fs::remove_file(&src);
                 if let Some(sig) = file_sig(&dest_path.to_string_lossy(), folder_str) {
                     inbound.lock().unwrap().insert(sig);
@@ -1210,8 +1268,8 @@ fn move_staged_into_folder(
                 content_hash(&src) > content_hash(&dest_path)
             };
             if !incoming_wins {
-                // Local copy is the winner — keep it, but archive the incoming
-                // (older) version to History so it isn't lost, and DON'T rewrite.
+                // Local copy is the winner — keep it, archive the (older) incoming
+                // version to History so it isn't lost, and DON'T rewrite.
                 crate::folder_history::archive(
                     folder_str,
                     &src.to_string_lossy(),
@@ -1221,8 +1279,24 @@ fn move_staged_into_folder(
                 let _ = std::fs::remove_file(&src);
                 continue;
             }
-            // Incoming wins → archive the local copy, then replace it below. Guard
-            // the resulting Remove event so it isn't echoed back as a delete.
+            // Incoming wins → archive the local copy, then replace it below.
+            self_deleted
+                .lock()
+                .unwrap()
+                .insert(rel_str.clone(), Instant::now());
+            crate::folder_history::archive(
+                folder_str,
+                &dest_path.to_string_lossy(),
+                &rel_str,
+                "replaced",
+            );
+            if dest_path.exists() {
+                let _ = std::fs::remove_file(&dest_path);
+            }
+        } else if mirror && dest_path.is_file() {
+            // Classic 1:1 mirror — UNCHANGED: the incoming file always replaces the
+            // local one (arrival-order wins), old copy archived to History. No
+            // mtime/clock dependence, so no skew regression for shipped folders.
             self_deleted
                 .lock()
                 .unwrap()
@@ -1572,7 +1646,8 @@ mod tests {
             staging,
             &folder.to_string_lossy(),
             &inbound,
-            true,
+            true, // mirror
+            true, // group → deterministic resolution
             &self_del,
         )
     }
@@ -1611,6 +1686,42 @@ mod tests {
         write_with_mtime(&staging.join("a.txt"), b"older", 1000);
         apply(&staging, &folder);
         assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"newer");
+        assert!(!staging.join("a.txt").exists());
+    }
+
+    #[test]
+    fn one_to_one_mirror_keeps_arrival_wins() {
+        // A classic 1:1 (non-group) mirror folder must be UNCHANGED: the incoming
+        // file always replaces local (arrival-wins), regardless of mtime — so the
+        // new group logic can't regress shipped 1:1 folders via clock skew.
+        let folder = temp_dir("1to1-f");
+        let staging = temp_dir("1to1-s");
+        write_with_mtime(&folder.join("a.txt"), b"local-newer", 2000);
+        write_with_mtime(&staging.join("a.txt"), b"incoming-older", 1000);
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        let self_del = Arc::new(Mutex::new(HashMap::new()));
+        move_staged_into_folder(
+            &staging,
+            &folder.to_string_lossy(),
+            &inbound,
+            true,  // mirror
+            false, // NOT a group → old arrival-wins behavior
+            &self_del,
+        );
+        assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"incoming-older");
+    }
+
+    #[test]
+    fn group_same_second_different_content_not_dropped() {
+        // Same size + same second but DIFFERENT bytes must not be silently dropped
+        // as "identical" — the content check forces a real (deterministic) resolve.
+        let folder = temp_dir("ss-f");
+        let staging = temp_dir("ss-s");
+        write_with_mtime(&folder.join("a.txt"), b"AAAAA", 1500);
+        write_with_mtime(&staging.join("a.txt"), b"BBBBB", 1500);
+        apply(&staging, &folder);
+        let content = std::fs::read(folder.join("a.txt")).unwrap();
+        assert!(content == b"AAAAA" || content == b"BBBBB");
         assert!(!staging.join("a.txt").exists());
     }
 

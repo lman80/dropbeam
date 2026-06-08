@@ -297,7 +297,11 @@ pub fn ensure_member(
         return None; // already meshed with this member
     }
     let new = Pair {
-        id: uuid::Uuid::new_v4().to_string(),
+        // CRITICAL: both ends must derive the SAME id, because the folder-files /
+        // folder-ctrl handlers authorize by matching the wire pair_id to a local
+        // pair. A random uuid here would never match the other side → the link
+        // could never exchange anything. Derive it from the group + the two keys.
+        id: derive_link_id(group_id, my_endpoint_id, endpoint_id),
         role: PairRole::B,
         peer_name: clean_name(name),
         // Deterministic so both ends of this new link derive the same channels.
@@ -325,6 +329,21 @@ fn clean_name(name: &str) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// A stable LINK id for a group mesh link, identical on both ends (so each side's
+/// `pair_id` matches the other's and folder pushes/beacons are authorized).
+fn derive_link_id(group_id: &str, a: &str, b: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = Sha256::new();
+    h.update(b"link|");
+    h.update(group_id.as_bytes());
+    h.update(b"|");
+    h.update(lo.as_bytes());
+    h.update(b"|");
+    h.update(hi.as_bytes());
+    format!("g{}", hex::encode(&h.finalize()[..16]))
 }
 
 /// A stable secret for a group link, identical on both ends (order-independent).
