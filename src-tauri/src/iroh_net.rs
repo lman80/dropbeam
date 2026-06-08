@@ -690,7 +690,10 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
     tauri::async_runtime::spawn(async move {
         match start(&config_dir).await {
             Ok(ep) => {
-                log::info!("iroh endpoint up: {}", ep.id());
+                log::info!(
+                    "iroh endpoint up — BBR congestion control, 32/64MB windows — {}",
+                    ep.id()
+                );
                 let _ = state.endpoint.set(ep.clone());
                 accept_loop(ep, state).await;
             }
