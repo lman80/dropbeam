@@ -140,6 +140,7 @@ dependencies = [
  "hex",
  "iroh",
  "log",
+ "noq-proto",
  "notify",
  "objc2",
  "objc2-app-kit",

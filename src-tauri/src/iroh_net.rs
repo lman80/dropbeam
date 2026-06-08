@@ -261,12 +261,18 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
 /// (n0) relays + discovery for now; Phase 5 swaps in self-hosted infrastructure.
 pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     let secret = load_or_create_secret(config_dir);
-    // Raise the per-stream flow-control window well above the 1.25 MB default
-    // (which caps throughput at ~100 Mbit/s on a 100ms link) so high-latency
-    // internet transfers aren't window-limited. Doesn't help a lossy LAN link.
+    // Throughput tuning. BBR congestion control replaces quinn's CUBIC default:
+    // iroh's own benchmark (n0-computer/iroh#4286) shows single-stream throughput
+    // up to ~30x higher with BBR, and it removes the "fill the 32 MB window, stall,
+    // repeat" pattern that makes big transfers start fast then crawl. The larger
+    // flow-control windows (32/64 MB) let BBR fill the link on higher-latency
+    // paths. (noq-proto is iroh's quinn fork — pinned to match iroh.)
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
-    tcfg = tcfg.stream_receive_window((16u32 * 1024 * 1024).into());
-    tcfg = tcfg.send_window(32 * 1024 * 1024);
+    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
+        noq_proto::congestion::BbrConfig::default(),
+    ));
+    tcfg = tcfg.stream_receive_window((32u32 * 1024 * 1024).into());
+    tcfg = tcfg.send_window(64 * 1024 * 1024);
 
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)
