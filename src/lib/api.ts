@@ -227,6 +227,10 @@ const realApi = {
   friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
   sendToFriend: (id: string, paths: string[]) =>
     invoke<TransferUpdate>('send_to_friend', { id, paths }),
+  /** Your permanent, reusable DropBeam code (stable device key + name). */
+  myInviteCode: () => invoke<string>('my_invite_code'),
+  /** Add a friend from their permanent code; auto-fills their name, two-way. */
+  addFriendByCode: (code: string) => invoke<Friend>('add_friend_by_code', { code }),
   // Chat (experimental) — direct messages + file shares with friends over iroh.
   getChatMessages: (friendId: string) =>
     invoke<ChatMessage[]>('get_chat_messages', { friendId }),

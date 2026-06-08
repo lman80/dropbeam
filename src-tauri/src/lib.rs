@@ -307,6 +307,8 @@ pub fn run() {
             commands::list_chats,
             commands::send_chat_message,
             commands::send_chat_file_note,
+            commands::my_invite_code,
+            commands::add_friend_by_code,
             traydrag_debug,
             frontend_log,
             take_launch_file,

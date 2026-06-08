@@ -20,6 +20,9 @@ use crate::settings::write_atomic;
 
 static LOCK: Mutex<()> = Mutex::new(());
 const INVITE_PREFIX: &str = "dropbeamf1:";
+/// Prefix for the permanent, reusable personal code (carries your stable
+/// EndpointId + name). Share it once; it works forever and across updates.
+const USER_PREFIX: &str = "dropbeam:";
 
 pub fn friends_path(config_dir: &Path) -> PathBuf {
     config_dir.join("friends.json")
@@ -171,6 +174,136 @@ pub fn set_endpoint_id(config_dir: &Path, id: &str, endpoint_id: String) -> bool
         let _ = save(config_dir, &friends);
     }
     changed
+}
+
+// ---------------------------------------------------------------------------
+// Permanent personal code + EndpointId-keyed friendships
+//
+// Croc is gone: friends are reached purely by their stable iroh EndpointId, so a
+// friend is really just {name, endpoint_id}. That key never changes across app
+// updates, which means a friendship — once established — is permanent. These
+// helpers make that explicit: a reusable code you share once, dedup-by-key so
+// re-adding never duplicates or wipes history, and name auto-exchange so neither
+// side has to type the other's name.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct UserCode {
+    v: u8,
+    /// This device's stable iroh EndpointId — the permanent address peers dial.
+    eid: String,
+    /// The owner's display name, so the other side never has to type it.
+    name: String,
+}
+
+/// A permanent, reusable personal invite: share it once and anyone can add you
+/// and reach you forever. It carries your stable EndpointId + name — no secret,
+/// because friends are reached purely by EndpointId now.
+pub fn my_code(my_name: &str, my_endpoint_id: &str) -> String {
+    let code = UserCode {
+        v: 1,
+        eid: my_endpoint_id.to_string(),
+        name: my_name.trim().to_string(),
+    };
+    let json = serde_json::to_string(&code).unwrap_or_default();
+    format!("{USER_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
+}
+
+fn decode_user_code(code: &str) -> Result<UserCode, String> {
+    let body = code
+        .trim()
+        .strip_prefix(USER_PREFIX)
+        .ok_or("That doesn't look like a DropBeam code.")?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(body.trim())
+        .map_err(|_| "That DropBeam code is malformed.".to_string())?;
+    let uc: UserCode =
+        serde_json::from_slice(&bytes).map_err(|_| "That DropBeam code is malformed.".to_string())?;
+    if uc.eid.trim().is_empty() {
+        return Err("That code is missing a device id.".into());
+    }
+    Ok(uc)
+}
+
+fn is_placeholder(name: &str) -> bool {
+    matches!(name.trim(), "" | "New friend" | "Friend")
+}
+
+/// Find a friend by their EndpointId and refresh their name, or add them new.
+/// The stable EndpointId IS the identity, so this NEVER duplicates a friend (or
+/// loses their chat history) across app updates or re-pairs. Returns the friend.
+pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> Friend {
+    let _guard = LOCK.lock().unwrap();
+    let mut friends = load(config_dir);
+    let name = name.trim();
+    if let Some(f) = friends
+        .iter_mut()
+        .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
+    {
+        // Refresh the name only if ours is still a placeholder — never clobber a
+        // name the user deliberately set.
+        if !name.is_empty() && is_placeholder(&f.name) {
+            f.name = name.to_string();
+        }
+        let out = f.clone();
+        let _ = save(config_dir, &friends);
+        return out;
+    }
+    let friend = Friend {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: PairRole::B,
+        name: clean_name(name, "Friend"),
+        secret: random_secret(),
+        created_at: now_ms(),
+        auto_accept: true,
+        endpoint_id: Some(endpoint_id.to_string()),
+    };
+    friends.push(friend.clone());
+    let _ = save(config_dir, &friends);
+    friend
+}
+
+/// Add a friend from their permanent personal code (dedup by EndpointId).
+pub fn add_by_code(config_dir: &Path, code: &str) -> Result<Friend, String> {
+    let uc = decode_user_code(code)?;
+    Ok(upsert_by_endpoint(config_dir, &uc.eid, &uc.name))
+}
+
+/// Apply an incoming friend-hello. If `friend_id` matches an existing record
+/// (classic invite flow), learn their EndpointId + name. Otherwise auto-add the
+/// sender by their EndpointId (the permanent-code reverse direction) so one code
+/// share makes the friendship two-way.
+pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: &str) {
+    if endpoint_id.trim().is_empty() {
+        return;
+    }
+    if !friend_id.is_empty() {
+        let matched = {
+            let _guard = LOCK.lock().unwrap();
+            let mut friends = load(config_dir);
+            if let Some(f) = friends.iter_mut().find(|f| f.id == friend_id) {
+                let mut changed = false;
+                if f.endpoint_id.as_deref() != Some(endpoint_id) {
+                    f.endpoint_id = Some(endpoint_id.to_string());
+                    changed = true;
+                }
+                if !name.trim().is_empty() && is_placeholder(&f.name) {
+                    f.name = name.trim().to_string();
+                    changed = true;
+                }
+                if changed {
+                    let _ = save(config_dir, &friends);
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if matched {
+            return;
+        }
+    }
+    let _ = upsert_by_endpoint(config_dir, endpoint_id, name);
 }
 
 pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {

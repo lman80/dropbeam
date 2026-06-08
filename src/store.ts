@@ -110,6 +110,7 @@ interface AppStore {
   sendToFriend: (id: string, paths: string[]) => Promise<void>
   createFriend: (name: string) => Promise<string>
   acceptFriend: (invite: string) => Promise<void>
+  addFriendByCode: (code: string) => Promise<void>
   renameFriend: (id: string, name: string) => Promise<void>
   removeFriend: (id: string) => Promise<void>
   setFriendAutoAccept: (id: string, autoAccept: boolean) => Promise<void>
@@ -537,6 +538,12 @@ export const useStore = create<AppStore>((set, get) => ({
     const friend = await api.acceptFriend(invite)
     await get().reloadFriends()
     get().toast('success', `You're now friends with ${friend.name}`)
+  },
+
+  addFriendByCode: async (code) => {
+    const friend = await api.addFriendByCode(code)
+    await get().reloadFriends()
+    get().toast('success', `Added ${friend.name}`)
   },
 
   renameFriend: async (id, name) => {

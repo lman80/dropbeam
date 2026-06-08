@@ -551,21 +551,19 @@ async fn serve_stream(
             state.cancels.lock().unwrap().remove(&id);
         }
         Some("friend-hello") => {
-            // The accepter is telling us their iroh id for our shared friend
-            // record, so we can send to them directly later.
+            // A peer is introducing themselves: learn their stable EndpointId +
+            // name. `friend_id` (if present) matches the classic invite flow;
+            // otherwise we auto-add them by EndpointId so one permanent-code share
+            // makes the friendship two-way. The connection's verified remote id is
+            // authoritative for their key (don't trust the self-reported one).
             let friend_id = req.get("friend_id").and_then(|v| v.as_str()).unwrap_or("");
-            let their_id = req.get("endpoint_id").and_then(|v| v.as_str()).unwrap_or("");
-            if !friend_id.is_empty() && !their_id.is_empty() {
-                if let Some(app) = state.app.get() {
-                    if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
-                        if crate::friends::set_endpoint_id(
-                            &st.config_dir,
-                            friend_id,
-                            their_id.to_string(),
-                        ) {
-                            let _ = app.emit("pairs://changed", ());
-                        }
-                    }
+            let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let who = conn.remote_id().to_string();
+            if let Some(app) = state.app.get() {
+                if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+                    crate::friends::apply_hello(&st.config_dir, friend_id, &who, name);
+                    let _ = app.emit("pairs://changed", ());
+                    let _ = app.emit("friends://changed", ());
                 }
             }
             write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
@@ -712,11 +710,23 @@ async fn serve_stream(
                 // key yet. Either way, remember the key for future sends.
                 let friends = crate::friends::load(&config_dir);
                 let claimed = req.get("friendId").and_then(|v| v.as_str());
+                let from_name = req.get("fromName").and_then(|v| v.as_str()).unwrap_or("");
                 let friend = friends
                     .iter()
                     .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
                     .or_else(|| claimed.and_then(|id| friends.iter().find(|f| f.id == id)))
-                    .cloned();
+                    .cloned()
+                    .or_else(|| {
+                        // Unknown sender who introduced themselves (they hold our
+                        // permanent code) → auto-add so the conversation is two-way.
+                        if from_name.is_empty() {
+                            None
+                        } else {
+                            let f = crate::friends::upsert_by_endpoint(&config_dir, &who, from_name);
+                            let _ = app.emit("friends://changed", ());
+                            Some(f)
+                        }
+                    });
                 if let Some(friend) = friend {
                     if friend.endpoint_id.as_deref() != Some(who.as_str()) {
                         crate::friends::set_endpoint_id(&config_dir, &friend.id, who.clone());
@@ -1094,6 +1104,35 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                 let _ = write_frame(&mut send, &hello).await;
                 let _ = send.finish();
                 let _ = recv.read_to_end(64).await; // wait for their ok
+            }
+        }
+    });
+}
+
+/// After adding a friend by their permanent code, introduce ourselves to them so
+/// the friendship is two-way: dial their EndpointId and hand over our id + name,
+/// which they auto-add (the reverse of `add_by_code`). Best-effort; if they're
+/// offline now, the first message/file we send carries our name too.
+pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name: String) {
+    let Some(ep) = state.get().cloned() else {
+        return;
+    };
+    let Ok(parsed) = endpoint_id.parse::<iroh::EndpointId>() else {
+        return;
+    };
+    let my_id = ep.id().to_string();
+    let addr = iroh::EndpointAddr::from(parsed);
+    tauri::async_runtime::spawn(async move {
+        let hello = serde_json::json!({
+            "kind": "friend-hello", "friend_id": "", "endpoint_id": my_id, "name": my_name,
+        });
+        if let Ok(Ok(conn)) =
+            tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
+        {
+            if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                let _ = write_frame(&mut send, &hello).await;
+                let _ = send.finish();
+                let _ = recv.read_to_end(64).await;
             }
         }
     });

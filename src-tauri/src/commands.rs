@@ -468,8 +468,9 @@ pub async fn send_chat_message(
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
     if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
+        let my_name = state.settings.lock().unwrap().display_name.clone();
         let payload = serde_json::json!({
-            "kind": "chat", "msgKind": "text", "friendId": friend_id,
+            "kind": "chat", "msgKind": "text", "friendId": friend_id, "fromName": my_name,
             "id": msg.id, "text": msg.text, "ts": msg.ts,
         });
         tauri::async_runtime::spawn(async move {
@@ -510,8 +511,9 @@ pub async fn send_chat_file_note(
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
     if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
+        let my_name = state.settings.lock().unwrap().display_name.clone();
         let payload = serde_json::json!({
-            "kind": "chat", "msgKind": "file", "friendId": friend_id,
+            "kind": "chat", "msgKind": "file", "friendId": friend_id, "fromName": my_name,
             "id": msg.id, "files": names, "bytes": bytes, "ts": msg.ts,
         });
         tauri::async_runtime::spawn(async move {
@@ -521,6 +523,46 @@ pub async fn send_chat_file_note(
         });
     }
     Ok(msg)
+}
+
+// ---------------------------------------------------------------------------
+// Friends: permanent personal code + add-by-code (no re-pairing on update)
+// ---------------------------------------------------------------------------
+
+/// Your permanent, reusable DropBeam code. Share it once (text or QR) and anyone
+/// can add you and reach you forever — it carries your stable device key + name.
+#[tauri::command]
+pub fn my_invite_code(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+) -> Result<String, String> {
+    let my_name = state.settings.lock().unwrap().display_name.clone();
+    let eid = iroh
+        .get()
+        .map(|ep| ep.id().to_string())
+        .ok_or("Direct mode is still starting up — try again in a moment.")?;
+    Ok(friends::my_code(&my_name, &eid))
+}
+
+/// Add a friend from their permanent code (dedup by device key, name auto-filled),
+/// then introduce ourselves back so the friendship is two-way from one share.
+#[tauri::command]
+pub fn add_friend_by_code(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    app: AppHandle,
+    code: String,
+) -> Result<Friend, String> {
+    let friend = friends::add_by_code(&state.config_dir, &code)?;
+    // Reverse direction: tell them who we are so they add us too.
+    if let Some(eid) = friend.endpoint_id.clone() {
+        let my_name = state.settings.lock().unwrap().display_name.clone();
+        crate::iroh_net::say_hello_to_endpoint(iroh.inner().clone(), eid, my_name);
+    }
+    sync.reconcile_friends();
+    let _ = app.emit("friends://changed", ());
+    Ok(friend)
 }
 
 // ---------------------------------------------------------------------------

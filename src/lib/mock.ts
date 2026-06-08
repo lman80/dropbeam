@@ -455,6 +455,20 @@ export const mockApi = {
   },
   friendInvite: async (id: string): Promise<string> =>
     `dropbeamf1:MOCK${id}friendinvitewouldgohere0000`,
+  myInviteCode: async (): Promise<string> => 'dropbeam:MOCKpersonalcodewouldgohere0000',
+  addFriendByCode: async (code: string): Promise<Friend> => {
+    const f: Friend = {
+      id: `f${++counter}`,
+      role: 'b',
+      name: 'New friend',
+      secret: '',
+      createdAt: Date.now(),
+      autoAccept: true,
+      endpointId: code.slice(0, 12),
+    }
+    friends.push(f)
+    return f
+  },
   sendToFriend: async (id: string, paths: string[]): Promise<TransferUpdate> => {
     const friend = friends.find((f) => f.id === id)
     const tid = `m${++counter}`

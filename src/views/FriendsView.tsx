@@ -1,10 +1,11 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
   Check,
   Copy,
   Pencil,
+  QrCode,
   Radar,
   Send,
   Trash2,
@@ -20,7 +21,7 @@ import { friendOnlineState } from '../lib/presence'
 
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
-  const [modal, setModal] = useState<'add' | 'accept' | null>(null)
+  const [modal, setModal] = useState<'mycode' | 'add' | null>(null)
 
   return (
     <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
@@ -36,8 +37,8 @@ export function FriendsView() {
       >
         <h1 style={{ fontSize: 20, fontWeight: 750, margin: 0 }}>Friends</h1>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-ghost" onClick={() => setModal('accept')}>
-            <Check size={15} /> Accept invite
+          <button className="btn btn-ghost" onClick={() => setModal('mycode')}>
+            <QrCode size={15} /> My code
           </button>
           <button className="btn btn-primary" onClick={() => setModal('add')}>
             <UserPlus size={15} /> Add friend
@@ -50,11 +51,11 @@ export function FriendsView() {
           <EmptyState
             icon={<Users size={24} />}
             title="No friends yet"
-            hint="Add a friend once and you can beam files straight to them by name — no codes, no QR. Anything they send you lands automatically in your downloads."
+            hint="Share your code with a friend (or paste theirs) once — then beam files and chat by name forever. It survives app updates, so you never have to re-add anyone."
           />
           <div style={{ display: 'flex', gap: 10, justifyContent: 'center', paddingBottom: 24 }}>
-            <button className="btn btn-ghost" onClick={() => setModal('accept')}>
-              Accept an invite
+            <button className="btn btn-ghost" onClick={() => setModal('mycode')}>
+              <QrCode size={15} /> Show my code
             </button>
             <button className="btn btn-primary" onClick={() => setModal('add')}>
               <UserPlus size={15} /> Add a friend
@@ -375,40 +376,45 @@ function InvitePanel({
   )
 }
 
-function FriendModal({ mode, onClose }: { mode: 'add' | 'accept'; onClose: () => void }) {
-  const createFriend = useStore((s) => s.createFriend)
+function FriendModal({ mode, onClose }: { mode: 'mycode' | 'add'; onClose: () => void }) {
   const acceptFriend = useStore((s) => s.acceptFriend)
+  const addFriendByCode = useStore((s) => s.addFriendByCode)
   const toast = useStore((s) => s.toast)
-  const [name, setName] = useState('')
-  const [inviteInput, setInviteInput] = useState('')
-  const [createdInvite, setCreatedInvite] = useState<string | null>(null)
+  const [codeInput, setCodeInput] = useState('')
+  const [myCode, setMyCode] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
 
-  const doAdd = async () => {
-    if (!name.trim()) {
-      toast('error', "Give your friend a name first.")
-      return
+  useEffect(() => {
+    if (mode !== 'mycode') return
+    let alive = true
+    api
+      .myInviteCode()
+      .then((c) => {
+        if (alive) setMyCode(c)
+      })
+      .catch(() => {
+        if (alive) setMyCode('')
+      })
+    return () => {
+      alive = false
     }
-    setBusy(true)
-    try {
-      const invite = await createFriend(name.trim())
-      setCreatedInvite(invite)
-    } catch (e) {
-      toast('error', String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
+  }, [mode])
 
-  const doAccept = async () => {
-    if (!inviteInput.trim()) {
-      toast('error', 'Paste the invite from your friend.')
+  const submitCode = async () => {
+    const code = codeInput.trim()
+    if (!code) {
+      toast('error', "Paste your friend's code first.")
       return
     }
     setBusy(true)
     try {
-      await acceptFriend(inviteInput.trim())
+      if (code.startsWith('dropbeamf1:')) await acceptFriend(code) // legacy invite
+      else if (code.startsWith('dropbeam:')) await addFriendByCode(code)
+      else {
+        toast('error', "That doesn't look like a DropBeam code.")
+        return
+      }
       onClose()
     } catch (e) {
       toast('error', String(e))
@@ -417,14 +423,14 @@ function FriendModal({ mode, onClose }: { mode: 'add' | 'accept'; onClose: () =>
     }
   }
 
-  const copyInvite = async () => {
-    if (!createdInvite) return
+  const copyMine = async () => {
+    if (!myCode) return
     try {
-      await navigator.clipboard.writeText(createdInvite)
+      await navigator.clipboard.writeText(myCode)
       setCopied(true)
       setTimeout(() => setCopied(false), 1600)
     } catch {
-      toast('error', 'Could not copy to clipboard')
+      toast('error', 'Could not copy')
     }
   }
 
@@ -457,104 +463,89 @@ function FriendModal({ mode, onClose }: { mode: 'add' | 'accept'; onClose: () =>
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
             <div style={{ fontSize: 17, fontWeight: 750 }}>
-              {createdInvite ? 'Share this invite' : mode === 'add' ? 'Add a friend' : 'Accept an invite'}
+              {mode === 'mycode' ? 'Your DropBeam code' : 'Add a friend'}
             </div>
             <button className="icon-btn" onClick={onClose}>
               <X size={17} />
             </button>
           </div>
 
-          {createdInvite ? (
+          {mode === 'mycode' ? (
             <div>
               <p style={{ fontSize: 13.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 0 }}>
-                Send this invite to <b>{name.trim()}</b>. They open DropBeam → <b>Friends</b> →{' '}
-                <b>Accept invite</b> and paste it. After that you can both beam files to each other by
-                name — no codes.
+                Share this with anyone so they can add you. It’s tied to this device and{' '}
+                <b>never changes</b> — share it once and you stay reachable, even across app updates.
               </p>
-              <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
-                <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
-                  <QRCodeSVG value={createdInvite} size={120} level="M" fgColor="#15161d" bgColor="#fff" />
+              {myCode === null ? (
+                <div style={{ display: 'grid', placeItems: 'center', padding: 30 }}>
+                  <Spinner size={20} />
                 </div>
-                <div style={{ flex: 1, minWidth: 200 }}>
-                  <div
-                    className="selectable"
-                    style={{
-                      fontFamily: 'var(--font-mono)',
-                      fontSize: 11.5,
-                      background: 'var(--surface-2)',
-                      border: '1px solid var(--border)',
-                      borderRadius: 11,
-                      padding: '10px 12px',
-                      wordBreak: 'break-all',
-                      maxHeight: 96,
-                      overflowY: 'auto',
-                      color: 'var(--text-muted)',
-                      lineHeight: 1.5,
-                    }}
-                  >
-                    {createdInvite}
+              ) : myCode === '' ? (
+                <div style={{ fontSize: 13, color: 'var(--text-muted)', padding: '10px 0' }}>
+                  Your code isn’t ready yet — Direct mode is still starting. Close this and try again
+                  in a moment.
+                </div>
+              ) : (
+                <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
+                  <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
+                    <QRCodeSVG value={myCode} size={120} level="M" fgColor="#15161d" bgColor="#fff" />
                   </div>
-                  <button
-                    className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`}
-                    style={{ width: '100%', marginTop: 10 }}
-                    onClick={copyInvite}
-                  >
-                    {copied ? <Check size={15} /> : <Copy size={15} />}
-                    {copied ? 'Copied to clipboard' : 'Copy invite'}
-                  </button>
+                  <div style={{ flex: 1, minWidth: 200 }}>
+                    <div
+                      className="selectable"
+                      style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 11.5,
+                        background: 'var(--surface-2)',
+                        border: '1px solid var(--border)',
+                        borderRadius: 11,
+                        padding: '10px 12px',
+                        wordBreak: 'break-all',
+                        maxHeight: 96,
+                        overflowY: 'auto',
+                        color: 'var(--text-muted)',
+                        lineHeight: 1.5,
+                      }}
+                    >
+                      {myCode}
+                    </div>
+                    <button
+                      className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`}
+                      style={{ width: '100%', marginTop: 10 }}
+                      onClick={copyMine}
+                    >
+                      {copied ? <Check size={15} /> : <Copy size={15} />}
+                      {copied ? 'Copied to clipboard' : 'Copy my code'}
+                    </button>
+                  </div>
                 </div>
-              </div>
-              <button className="btn btn-ghost" style={{ width: '100%', marginTop: 16 }} onClick={onClose}>
-                Done
-              </button>
-            </div>
-          ) : mode === 'add' ? (
-            <div>
-              <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
-                Their name
-              </label>
-              <input
-                className="input"
-                style={{ marginTop: 6 }}
-                placeholder="e.g. Alex"
-                value={name}
-                autoFocus
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && doAdd()}
-              />
-              <p style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
-                We'll create a one-time invite to send them. Once they accept, you can beam files
-                back and forth just by tapping their name.
-              </p>
-              <button
-                className="btn btn-primary"
-                style={{ width: '100%', marginTop: 12 }}
-                onClick={doAdd}
-                disabled={busy}
-              >
-                {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Create invite
-              </button>
+              )}
             </div>
           ) : (
             <div>
               <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
-                Invite from your friend
+                Your friend's code
               </label>
               <textarea
                 className="input"
                 style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
-                placeholder="Paste the dropbeamf1:… invite here"
-                value={inviteInput}
+                placeholder="Paste their dropbeam:… code here"
+                value={codeInput}
                 autoFocus
-                onChange={(e) => setInviteInput(e.target.value)}
+                onChange={(e) => setCodeInput(e.target.value)}
               />
+              <p style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
+                Ask your friend for their code (Friends → <b>My code</b>) and paste it here. Their
+                name fills in automatically, and you’ll both be connected — no need to retype names,
+                and no re-adding after updates.
+              </p>
               <button
                 className="btn btn-primary"
-                style={{ width: '100%', marginTop: 16 }}
-                onClick={doAccept}
+                style={{ width: '100%', marginTop: 12 }}
+                onClick={submitCode}
                 disabled={busy}
               >
-                {busy ? <Spinner size={15} /> : <Check size={15} />} Add friend
+                {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend
               </button>
             </div>
           )}
