@@ -53,6 +53,9 @@ import { playIncoming, playOffer, playReceived, playSent } from './lib/sounds'
 /** Leading-edge throttle (per pair+direction) so a burst of synced files cues once. */
 const folderSoundThrottle = new Map<string, number>()
 
+/** When each transfer started moving bytes, to compute a final average speed. */
+const transferStart = new Map<string, number>()
+
 interface UpdateState {
   version: string
   notes: string
@@ -74,6 +77,11 @@ interface AppStore {
   settings: Settings | null
   transfers: Record<string, TransferUpdate>
   order: string[]
+  /** Final stats per completed transfer: how long it took + average speed. */
+  transferSummaries: Record<string, { durationMs: number; avgBps: number }>
+  /** macOS: warning if the app is installed/running in a way that breaks folder
+   * permissions every launch (null = fine / non-macOS). */
+  installHint: string | null
   dragHovering: boolean
   history: HistoryEntry[]
   pairs: Pair[]
@@ -141,6 +149,8 @@ export const useStore = create<AppStore>((set, get) => ({
   settings: null,
   transfers: {},
   order: [],
+  transferSummaries: {},
+  installHint: null,
   dragHovering: false,
   history: [],
   pairs: [],
@@ -222,6 +232,14 @@ export const useStore = create<AppStore>((set, get) => ({
     // listen for live messages (from friends, and our own echoed sends).
     if (!isOverlay) {
       get().loadChats()
+      // macOS: warn if we're running translocated / from Downloads (folder perms
+      // won't stick). Null on a proper install or other platforms.
+      api
+        .macosInstallHint()
+        .then((h) => {
+          if (h) set({ installHint: h })
+        })
+        .catch(() => {})
       onChatMessage((m) => {
         get().addChatMessage(m)
         if (
@@ -388,6 +406,25 @@ export const useStore = create<AppStore>((set, get) => ({
         playIncoming()
       }
     }
+    // Time the transfer so we can show a final summary (duration + avg speed).
+    if (u.state === 'transferring' && (!prev || prev.state !== 'transferring')) {
+      transferStart.set(u.id, Date.now()) // bytes just started moving
+    } else if (!transferStart.has(u.id)) {
+      transferStart.set(u.id, Date.now()) // fallback: first time we saw it
+    }
+    if (u.state === 'completed' && u.bytesTotal > 0) {
+      const start = transferStart.get(u.id)
+      if (start) {
+        const durationMs = Math.max(1, Date.now() - start)
+        const avgBps = u.bytesTotal / (durationMs / 1000)
+        set((s) => ({
+          transferSummaries: { ...s.transferSummaries, [u.id]: { durationMs, avgBps } },
+        }))
+      }
+    }
+    if (u.state === 'completed' || u.state === 'failed' || u.state === 'canceled') {
+      transferStart.delete(u.id)
+    }
     set((s) => ({
       transfers: { ...s.transfers, [u.id]: u },
       order: s.order.includes(u.id) ? s.order : [...s.order, u.id],
@@ -501,27 +538,33 @@ export const useStore = create<AppStore>((set, get) => ({
     }
     set((s) => {
       const thread = s.chats[m.peerId] ?? []
-      if (thread.some((x) => x.id === m.id)) return s // dedup (event + return value)
-      const nextThread = [...thread, m].sort((a, b) => a.ts - b.ts)
+      const idx = thread.findIndex((x) => x.id === m.id)
+      // A repeat id is an UPDATE (e.g. a delivery-status change), not a new
+      // message — replace it in place and don't re-bump unread/count.
+      const isNew = idx < 0
+      const nextThread = isNew
+        ? [...thread, m].sort((a, b) => a.ts - b.ts)
+        : thread.map((x) => (x.id === m.id ? m : x))
       const prev = s.chatOverview.find((o) => o.peerId === m.peerId)
+      const last = nextThread[nextThread.length - 1]
       const lastText =
-        m.kind === 'file'
-          ? m.files.length === 1
-            ? `📎 ${m.files[0]}`
-            : `📎 ${m.files.length} files`
-          : m.text
+        last.kind === 'file'
+          ? last.files.length === 1
+            ? `📎 ${last.files[0]}`
+            : `📎 ${last.files.length} files`
+          : last.text
       const row: ChatOverview = {
         peerId: m.peerId,
         lastText,
-        lastTs: m.ts,
-        lastFromMe: m.fromMe,
-        count: prev ? prev.count + 1 : nextThread.length,
+        lastTs: last.ts,
+        lastFromMe: last.fromMe,
+        count: isNew ? (prev ? prev.count + 1 : nextThread.length) : (prev?.count ?? nextThread.length),
       }
       const chatOverview = [row, ...s.chatOverview.filter((o) => o.peerId !== m.peerId)].sort(
         (a, b) => b.lastTs - a.lastTs,
       )
       const chatUnread =
-        !m.fromMe && s.activeChatId !== m.peerId
+        isNew && !m.fromMe && s.activeChatId !== m.peerId
           ? { ...s.chatUnread, [m.peerId]: (s.chatUnread[m.peerId] ?? 0) + 1 }
           : s.chatUnread
       return { chats: { ...s.chats, [m.peerId]: nextThread }, chatOverview, chatUnread }

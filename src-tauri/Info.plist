@@ -2,6 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!-- Why we touch these folders, so the macOS access prompt is correct (a
+       Shared Drop Folder often lives on the Desktop). The repeated-prompt fix is
+       the stable ad-hoc signature + getting the app out of quarantine, not these
+       strings, but they make the prompt proper. -->
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+
   <!-- Finder right-click → Services → "Share with DropBeam". Tauri v2 merges
        this file into the generated Info.plist at bundle time. The app must live
        in /Applications for macOS (pbs) to index the service. -->

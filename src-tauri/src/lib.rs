@@ -212,6 +212,8 @@ pub fn run() {
             // toggled the old "Direct mode" off must still get a working app.
             let iroh_state = Arc::new(iroh_net::IrohState::default());
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
+            // Keep retrying undelivered chat messages until they land (reliable chat).
+            iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
             app.manage(iroh_state);
             log::info!("setup: iroh spawned + state managed");
 
@@ -323,6 +325,7 @@ pub fn run() {
             commands::send_chat_file_note,
             commands::my_invite_code,
             commands::add_friend_by_code,
+            commands::macos_install_hint,
             traydrag_debug,
             frontend_log,
             take_launch_file,

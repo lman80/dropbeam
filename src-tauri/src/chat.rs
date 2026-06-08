@@ -45,6 +45,11 @@ pub struct ChatMessage {
     /// preview and open it. Device-local, so it never travels in the wire frame.
     #[serde(default)]
     pub path: Option<String>,
+    /// Delivery state for messages WE sent: "sending" (queued/in-flight), "sent"
+    /// (the peer acked), or "failed" (couldn't reach them — the outbox keeps
+    /// retrying). None for received messages. Device-local; never sent on the wire.
+    #[serde(default)]
+    pub status: Option<String>,
     pub ts: u64,
 }
 
@@ -98,6 +103,33 @@ pub fn clear(config_dir: &Path, peer_id: &str) {
     if all.remove(peer_id).is_some() {
         save_all(config_dir, &all);
     }
+}
+
+/// Update a sent message's delivery status (sending → sent/failed). Returns the
+/// updated message so the caller can re-emit it to the UI.
+pub fn set_status(config_dir: &Path, peer_id: &str, msg_id: &str, status: &str) -> Option<ChatMessage> {
+    let _guard = LOCK.lock().unwrap();
+    let mut all = load_all(config_dir);
+    let thread = all.get_mut(peer_id)?;
+    let msg = thread.iter_mut().find(|m| m.id == msg_id)?;
+    msg.status = Some(status.to_string());
+    let out = msg.clone();
+    save_all(config_dir, &all);
+    Some(out)
+}
+
+/// All messages WE sent that haven't been delivered yet ("sending"/"failed"),
+/// oldest first — the outbox the retry loop flushes when a peer comes online.
+pub fn outbox(config_dir: &Path) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = load_all(config_dir)
+        .into_values()
+        .flatten()
+        .filter(|m| {
+            m.from_me && matches!(m.status.as_deref(), Some("sending") | Some("failed"))
+        })
+        .collect();
+    out.sort_by_key(|m| m.ts);
+    out
 }
 
 /// A short preview of each conversation, for the chat list.

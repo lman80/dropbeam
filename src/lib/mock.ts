@@ -469,6 +469,7 @@ export const mockApi = {
     friends.push(f)
     return f
   },
+  macosInstallHint: async (): Promise<string | null> => null,
   sendToFriend: async (id: string, paths: string[]): Promise<TransferUpdate> => {
     const friend = friends.find((f) => f.id === id)
     const tid = `m${++counter}`
@@ -513,6 +514,7 @@ export const mockApi = {
       files: [],
       bytes: 0,
       path: null,
+      status: 'sent',
       ts: Date.now(),
     }
     ;(mockChats[friendId] ??= []).push(m)
@@ -534,6 +536,7 @@ export const mockApi = {
       files: names,
       bytes,
       path: paths[0] ?? null,
+      status: 'sent',
       ts: Date.now(),
     }
     ;(mockChats[friendId] ??= []).push(m)

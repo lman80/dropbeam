@@ -1,5 +1,6 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
+import { AlertTriangle, X } from 'lucide-react'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { onFileDrop } from './lib/api'
 import { useStore } from './store'
@@ -55,9 +56,19 @@ export default function App() {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <TitleBar />
+      <InstallBanner />
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         <Sidebar />
-        <main className="scroll-area" style={{ flex: 1, minWidth: 0 }}>
+        <main
+          className="scroll-area"
+          style={{
+            flex: 1,
+            minWidth: 0,
+            // Chat fills the pane and scrolls its message list internally — don't
+            // let the whole view scroll (which dragged the composer off-screen).
+            overflowY: view === 'chat' ? 'hidden' : undefined,
+          }}
+        >
           {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
               so it never deadlocks on a view that has its own AnimatePresence. */}
           <motion.div
@@ -65,7 +76,7 @@ export default function App() {
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.18 }}
-            style={{ minHeight: '100%' }}
+            style={{ minHeight: '100%', height: view === 'chat' ? '100%' : undefined }}
           >
             {view === 'send' && <SendView />}
             {view === 'friends' && <FriendsView />}
@@ -78,6 +89,35 @@ export default function App() {
       </div>
       <SendToChooser />
       <Toasts />
+    </div>
+  )
+}
+
+/** macOS: a sticky warning when the app is running from a spot that breaks folder
+ * permissions every launch (translocation / Downloads). Dismissable per session. */
+function InstallBanner() {
+  const hint = useStore((s) => s.installHint)
+  const [dismissed, setDismissed] = useState(false)
+  if (!hint || dismissed) return null
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        padding: '8px 14px',
+        fontSize: 12.5,
+        lineHeight: 1.4,
+        background: 'var(--amber-soft)',
+        color: 'var(--amber)',
+        borderBottom: '1px solid var(--border)',
+      }}
+    >
+      <AlertTriangle size={15} style={{ flexShrink: 0 }} />
+      <span style={{ flex: 1 }}>{hint}</span>
+      <button className="icon-btn" onClick={() => setDismissed(true)} title="Dismiss">
+        <X size={15} />
+      </button>
     </div>
   )
 }

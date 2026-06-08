@@ -133,6 +133,36 @@ pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// On macOS, return a one-line warning if the app is running from a spot that
+/// makes the system forget folder permissions every launch — App Translocation
+/// (a quarantined app run from a randomized read-only path) or straight from the
+/// disk image / Downloads. The fix is always "move it to /Applications and
+/// reopen". Returns None when the app is installed properly (or on other OSes).
+#[tauri::command]
+pub fn macos_install_hint() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().ok()?;
+        let p = exe.to_string_lossy();
+        if p.contains("/AppTranslocation/") {
+            return Some(
+                "DropBeam is running from a temporary, read-only location, so macOS forgets your \
+                 folder permission every launch. Drag DropBeam into your Applications folder (by \
+                 itself), then reopen it from there."
+                    .into(),
+            );
+        }
+        if p.starts_with("/Volumes/") || p.contains("/Downloads/") {
+            return Some(
+                "DropBeam is running from the disk image or your Downloads folder. Move it into \
+                 Applications and reopen it so macOS remembers your permissions."
+                    .into(),
+            );
+        }
+    }
+    None
+}
+
 /// Bring the main window forward (from the menu-bar popover or the HUD) and
 /// tuck the popover away.
 #[tauri::command]
@@ -463,6 +493,7 @@ pub async fn send_chat_message(
         files: vec![],
         bytes: 0,
         path: None,
+        status: Some("sending".into()),
         ts: chat::now_ms(),
     };
     chat::append(&state.config_dir, &msg);
@@ -473,12 +504,23 @@ pub async fn send_chat_message(
             "kind": "chat", "msgKind": "text", "friendId": friend_id, "fromName": my_name,
             "id": msg.id, "text": msg.text, "ts": msg.ts,
         });
+        let config_dir = state.config_dir.clone();
+        let (pid, mid) = (friend_id.clone(), msg.id.clone());
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = crate::iroh_net::send_chat(&ep, &eid, payload).await {
-                log::debug!("chat send failed: {e:#}");
+            let status = match crate::iroh_net::send_chat(&ep, &eid, payload).await {
+                Ok(_) => "sent",
+                Err(e) => {
+                    log::debug!("chat send failed: {e:#}");
+                    "failed"
+                }
+            };
+            if let Some(u) = chat::set_status(&config_dir, &pid, &mid, status) {
+                let _ = app.emit("chat://message", &u);
             }
         });
     }
+    // No endpoint yet → leave it "sending"; the outbox retry flushes it once the
+    // friend is reachable (self-healing learns their key on first contact).
     Ok(msg)
 }
 
@@ -506,6 +548,7 @@ pub async fn send_chat_file_note(
         bytes,
         // Sender keeps the source path so they can preview/open what they sent.
         path: paths.into_iter().next(),
+        status: Some("sending".into()),
         ts: chat::now_ms(),
     };
     chat::append(&state.config_dir, &msg);
@@ -516,9 +559,18 @@ pub async fn send_chat_file_note(
             "kind": "chat", "msgKind": "file", "friendId": friend_id, "fromName": my_name,
             "id": msg.id, "files": names, "bytes": bytes, "ts": msg.ts,
         });
+        let config_dir = state.config_dir.clone();
+        let (pid, mid) = (friend_id.clone(), msg.id.clone());
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = crate::iroh_net::send_chat(&ep, &eid, payload).await {
-                log::debug!("chat file note send failed: {e:#}");
+            let status = match crate::iroh_net::send_chat(&ep, &eid, payload).await {
+                Ok(_) => "sent",
+                Err(e) => {
+                    log::debug!("chat file note send failed: {e:#}");
+                    "failed"
+                }
+            };
+            if let Some(u) = chat::set_status(&config_dir, &pid, &mid, status) {
+                let _ = app.emit("chat://message", &u);
             }
         });
     }

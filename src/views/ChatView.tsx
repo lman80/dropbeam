@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { motion } from 'framer-motion'
-import { FolderOpen, MessageCircle, Paperclip, Send as SendIcon, Users } from 'lucide-react'
+import {
+  Check,
+  Clock,
+  FolderOpen,
+  MessageCircle,
+  Paperclip,
+  Send as SendIcon,
+  Users,
+} from 'lucide-react'
 import { api, type ChatMessage, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState } from '../components/bits'
@@ -313,12 +321,18 @@ function Bubble({ m }: { m: ChatMessage }) {
       <div
         style={{
           fontSize: 10.5,
-          color: 'var(--text-faint)',
+          color: m.status === 'failed' ? 'var(--red)' : 'var(--text-faint)',
           marginTop: 3,
-          textAlign: mine ? 'right' : 'left',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 4,
+          justifyContent: mine ? 'flex-end' : 'flex-start',
         }}
       >
-        {formatRelativeTime(m.ts)}
+        <span>{formatRelativeTime(m.ts)}</span>
+        {mine && m.status === 'sending' && <Clock size={11} aria-label="Sending" />}
+        {mine && m.status === 'sent' && <Check size={11} aria-label="Sent" />}
+        {mine && m.status === 'failed' && <span>· not delivered, retrying…</span>}
       </div>
     </motion.div>
   )

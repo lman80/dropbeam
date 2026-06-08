@@ -26,6 +26,7 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
   const removeTransfer = useStore((s) => s.removeTransfer)
   const respondToOffer = useStore((s) => s.respondToOffer)
   const toast = useStore((s) => s.toast)
+  const summary = useStore((s) => s.transferSummaries[t.id])
   const [copied, setCopied] = useState(false)
 
   const active = isActive(t.state)
@@ -308,8 +309,15 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
           }}
         >
           <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
-            {t.direction === 'receive' ? 'Saved' : 'Delivered'}
-            {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
+            <div>
+              {t.direction === 'receive' ? 'Saved' : 'Delivered'}
+              {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
+            </div>
+            {summary && (
+              <div style={{ fontSize: 12, color: 'var(--text-faint)', marginTop: 2 }}>
+                {formatEta(summary.durationMs / 1000)} · {formatSpeed(summary.avgBps)} avg
+              </div>
+            )}
           </div>
           {t.direction === 'receive' && t.outDir && (
             <button className="btn btn-ghost" onClick={() => api.openPath(t.outDir!)}>

@@ -126,6 +126,9 @@ export interface ChatMessage {
   /** For file messages: the local path to the (first) file on THIS device —
    * sender's source or receiver's saved copy. Enables preview + open. */
   path: string | null
+  /** Delivery state for messages WE sent: 'sending' | 'sent' | 'failed'. Null for
+   * received messages. */
+  status: 'sending' | 'sent' | 'failed' | null
   ts: number
 }
 
@@ -231,6 +234,9 @@ const realApi = {
   myInviteCode: () => invoke<string>('my_invite_code'),
   /** Add a friend from their permanent code; auto-fills their name, two-way. */
   addFriendByCode: (code: string) => invoke<Friend>('add_friend_by_code', { code }),
+  /** macOS: a warning if the app is running from a spot that breaks folder
+   * permissions every launch (translocation / Downloads / DMG). Null when fine. */
+  macosInstallHint: () => invoke<string | null>('macos_install_hint'),
   // Chat (experimental) — direct messages + file shares with friends over iroh.
   getChatMessages: (friendId: string) =>
     invoke<ChatMessage[]>('get_chat_messages', { friendId }),

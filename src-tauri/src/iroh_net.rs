@@ -55,6 +55,11 @@ pub struct IrohState {
     pending: Mutex<HashMap<String, PendingSend>>,
     /// Cancellation flags for in-flight transfers, keyed by transfer id.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Live connections for in-flight transfers, keyed by transfer id. A cancel
+    /// CLOSES the connection so a send stuck on QUIC flow-control unblocks at
+    /// once — the flag alone only takes effect between chunks, which is why a
+    /// sender couldn't cancel a stalled transfer.
+    conns: Mutex<HashMap<String, Connection>>,
 }
 
 impl IrohState {
@@ -67,12 +72,17 @@ impl IrohState {
             p.retain(|_, ps| ps.transfer_id != id);
             before != p.len()
         };
-        let active = if let Some(flag) = self.cancels.lock().unwrap().get(id) {
+        let mut active = false;
+        if let Some(flag) = self.cancels.lock().unwrap().get(id) {
             flag.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
-        };
+            active = true;
+        }
+        // Tear down the connection so a write stuck on QUIC flow-control aborts
+        // immediately — this is what lets the SENDER cancel a stalled transfer.
+        if let Some(conn) = self.conns.lock().unwrap().remove(id) {
+            conn.close(0u32.into(), b"canceled");
+            active = true;
+        }
         if was_staged {
             CancelKind::Staged
         } else if active {
@@ -391,6 +401,18 @@ async fn serve_stream(
             let token = req.get("token").and_then(|t| t.as_str()).unwrap_or("");
             let pending = state.pending.lock().unwrap().remove(token);
             let p = pending.ok_or_else(|| anyhow::anyhow!("no pending send for token"))?;
+            // Register the flag + connection so the sender can cancel mid-pull
+            // (close the conn to unblock a stalled write).
+            state
+                .cancels
+                .lock()
+                .unwrap()
+                .insert(p.transfer_id.clone(), p.cancel.clone());
+            state
+                .conns
+                .lock()
+                .unwrap()
+                .insert(p.transfer_id.clone(), conn.clone());
             match state.app.get().cloned() {
                 Some(app) => {
                     let cb = progress_cb(
@@ -417,7 +439,10 @@ async fn serve_stream(
                                 None,
                             )
                         }
-                        Err(e) if e.to_string().contains("canceled") => {
+                        Err(e)
+                            if p.cancel.load(Ordering::SeqCst)
+                                || e.to_string().contains("canceled") =>
+                        {
                             emit_canceled(&app, &p.transfer_id, Direction::Send)
                         }
                         Err(e) => emit_failed(&app, &p.transfer_id, Direction::Send, &e.to_string()),
@@ -428,6 +453,7 @@ async fn serve_stream(
                 }
             }
             state.cancels.lock().unwrap().remove(&p.transfer_id);
+            state.conns.lock().unwrap().remove(&p.transfer_id);
         }
         Some("files") => {
             // A friend pushed files straight to us. Receive into the download
@@ -786,6 +812,7 @@ async fn serve_stream(
                         files,
                         bytes,
                         path,
+                        status: None,
                         ts,
                     };
                     if crate::chat::append(&config_dir, &msg) {
@@ -1054,6 +1081,7 @@ pub fn send_to_friend(
                 Some(friend_name.clone()),
                 conn.clone(),
             );
+            cleanup.conns.lock().unwrap().insert(id.clone(), conn.clone());
             let __t0 = std::time::Instant::now();
             send_files(&conn, &pathbufs, &cancel, cb).await?;
             log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
@@ -1071,12 +1099,16 @@ pub fn send_to_friend(
                 Some(friend_name),
                 None,
             ),
-            Err(e) if e.to_string().contains("canceled") => {
+            // A cancel may surface as our own "canceled" bail OR as a
+            // connection-closed error (we close the conn to unblock the write),
+            // so trust the flag too.
+            Err(e) if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") => {
                 emit_canceled(&app, &id, Direction::Send)
             }
             Err(e) => emit_failed(&app, &id, Direction::Send, &e.to_string()),
         }
         cleanup.cancels.lock().unwrap().remove(&id);
+        cleanup.conns.lock().unwrap().remove(&id);
     });
     Ok(snapshot)
 }
@@ -1224,6 +1256,85 @@ pub async fn send_chat(ep: &Endpoint, endpoint_id: &str, payload: serde_json::Va
     // stream, so we don't fail delivery just because the ok is slow.
     let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
     Ok(())
+}
+
+/// Build the wire frame for a chat message (shared by the send command + the
+/// outbox retry so they stay identical).
+fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) -> serde_json::Value {
+    if m.kind == "file" {
+        serde_json::json!({
+            "kind": "chat", "msgKind": "file", "friendId": peer_id, "fromName": my_name,
+            "id": m.id, "files": m.files, "bytes": m.bytes, "ts": m.ts,
+        })
+    } else {
+        serde_json::json!({
+            "kind": "chat", "msgKind": "text", "friendId": peer_id, "fromName": my_name,
+            "id": m.id, "text": m.text, "ts": m.ts,
+        })
+    }
+}
+
+/// Background loop that flushes the chat outbox: every few seconds it retries
+/// every undelivered message to any peer that's now reachable, oldest-first per
+/// peer (so order is preserved and one failure doesn't let later messages jump
+/// ahead). This is what makes chat reliable — a message that couldn't send keeps
+/// retrying until it lands, instead of being silently dropped.
+pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            let Some(ep) = state.get().cloned() else {
+                continue;
+            };
+            // Pull what we need without holding the State guard across awaits.
+            let (config_dir, my_name) = {
+                let Some(st) = app.try_state::<Arc<crate::AppState>>() else {
+                    continue;
+                };
+                let cd = st.config_dir.clone();
+                let name = st.settings.lock().unwrap().display_name.clone();
+                (cd, name)
+            };
+            let pending = crate::chat::outbox(&config_dir);
+            if pending.is_empty() {
+                continue;
+            }
+            let friends = crate::friends::load(&config_dir);
+            let mut by_peer: std::collections::HashMap<String, Vec<crate::chat::ChatMessage>> =
+                std::collections::HashMap::new();
+            for m in pending {
+                by_peer.entry(m.peer_id.clone()).or_default().push(m);
+            }
+            for (peer_id, msgs) in by_peer {
+                let Some(eid) = friends
+                    .iter()
+                    .find(|f| f.id == peer_id)
+                    .and_then(|f| f.endpoint_id.clone())
+                else {
+                    continue;
+                };
+                for m in msgs {
+                    let payload = chat_payload(&m, &peer_id, &my_name);
+                    match send_chat(&ep, &eid, payload).await {
+                        Ok(_) => {
+                            if let Some(u) = crate::chat::set_status(&config_dir, &peer_id, &m.id, "sent")
+                            {
+                                let _ = app.emit("chat://message", &u);
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(u) =
+                                crate::chat::set_status(&config_dir, &peer_id, &m.id, "failed")
+                            {
+                                let _ = app.emit("chat://message", &u);
+                            }
+                            break; // preserve order — stop this peer until next round
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Liveness check: dial a friend/peer's endpoint and round-trip a ping. Returns
