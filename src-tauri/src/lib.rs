@@ -4,6 +4,8 @@ mod folder_history;
 mod friends;
 mod history;
 mod iroh_net;
+#[cfg(target_os = "macos")]
+mod mac_service;
 mod models;
 mod pairing;
 mod settings;
@@ -60,6 +62,13 @@ fn file_from_args(argv: &[String]) -> Option<String> {
 #[tauri::command]
 fn take_launch_file() -> Option<String> {
     LAUNCH_FILE.lock().unwrap().take()
+}
+
+/// Stash a file path for the UI to pick up as a pending send. Used by the macOS
+/// "Share with DropBeam" Services handler (the app is already running there).
+#[cfg(target_os = "macos")]
+pub(crate) fn set_launch_file(path: String) {
+    *LAUNCH_FILE.lock().unwrap() = Some(path);
 }
 
 /// One friend row's on-screen rectangle (CSS px), reported by the menu JS.
@@ -221,6 +230,11 @@ pub fn run() {
             // Best-effort — if it never attaches, the tray still works normally.
             #[cfg(target_os = "macos")]
             {
+                // Finder right-click → Services → "Share with DropBeam". setup()
+                // runs on the main thread, which is where AppKit wants the
+                // provider registered. Best-effort.
+                mac_service::install(app.handle());
+
                 // Make the popover a non-activating panel so it floats over
                 // full-screen apps and doesn't steal focus.
                 tray_drag::convert_popover_to_panel(app.handle());

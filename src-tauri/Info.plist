@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Finder right-click → Services → "Share with DropBeam". Tauri v2 merges
+       this file into the generated Info.plist at bundle time. The app must live
+       in /Applications for macOS (pbs) to index the service. -->
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key>
+      <dict>
+        <key>default</key>
+        <string>Share with DropBeam</string>
+      </dict>
+      <key>NSMessage</key>
+      <string>shareWithDropBeam</string>
+      <key>NSPortName</key>
+      <string>DropBeam</string>
+      <key>NSSendFileTypes</key>
+      <array>
+        <string>public.item</string>
+      </array>
+      <key>NSServiceDescription</key>
+      <string>Send the selected file to a friend with DropBeam.</string>
+      <key>NSTimeout</key>
+      <string>5000</string>
+    </dict>
+  </array>
+</dict>
+</plist>
