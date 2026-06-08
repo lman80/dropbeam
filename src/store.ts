@@ -14,6 +14,34 @@ import {
   type TransferUpdate,
 } from './lib/api'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
+
+/** Used only if `get_settings` fails at startup, so the app still renders. */
+const DEFAULT_SETTINGS: Settings = {
+  downloadDir: '',
+  displayName: '',
+  theme: 'system',
+  minimizeToTray: true,
+  launchAtLogin: false,
+  preferDirectP2p: true,
+  customRelay: '',
+  customRelayPass: '',
+  notifyOnComplete: true,
+  playSounds: true,
+  directMode: true,
+}
+
+/** Resolve `p`, but never hang: fall back on error OR after `ms`, logging why. */
+async function guarded<T>(p: Promise<T>, fallback: T, label: string, ms = 9000): Promise<T> {
+  try {
+    return await Promise.race([
+      p,
+      new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`timed out after ${ms}ms`)), ms)),
+    ])
+  } catch (e) {
+    api.frontendLog(`init: ${label} failed: ${String(e)}`).catch(() => {})
+    return fallback
+  }
+}
 import { playIncoming, playOffer, playReceived, playSent } from './lib/sounds'
 
 interface UpdateState {
@@ -106,15 +134,23 @@ export const useStore = create<AppStore>((set, get) => ({
   checkingUpdate: false,
 
   init: async () => {
+    // Bulletproof startup: every call is guarded with a fallback + timeout and
+    // we ALWAYS reach ready:true, so a slow or failing backend renders the app
+    // (with defaults) rather than hanging on the loading screen forever. Any
+    // failure is logged to the app log file (frontend_log) for diagnosis.
     const [settings, history, pairs, friends, statuses, defaultDownloadDir] = await Promise.all([
-      api.getSettings(),
-      api.getHistory(),
-      api.listPairs().catch(() => []),
-      api.listFriends().catch(() => []),
-      api.getFolderStatuses().catch(() => []),
-      api.getDefaultDownloadDir().catch(() => ''),
+      guarded(api.getSettings(), DEFAULT_SETTINGS, 'getSettings'),
+      guarded(api.getHistory(), [], 'getHistory'),
+      guarded(api.listPairs(), [], 'listPairs'),
+      guarded(api.listFriends(), [], 'listFriends'),
+      guarded(api.getFolderStatuses(), [], 'getFolderStatuses'),
+      guarded(api.getDefaultDownloadDir(), '', 'getDefaultDownloadDir'),
     ])
-    get().applyTheme(settings.theme)
+    try {
+      get().applyTheme(settings.theme)
+    } catch {
+      /* theme is non-critical */
+    }
     const folderStatuses: Record<string, FolderStatus> = {}
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
     set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })

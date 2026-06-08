@@ -33,6 +33,14 @@ fn traydrag_debug(msg: String) {
     log::info!("[traydrag-js] {msg}");
 }
 
+/// Let the frontend write a line into the native app log file — so we can
+/// diagnose startup/runtime issues on machines we can't access (e.g. a tester's
+/// Windows box: the log lands in %APPDATA%\com.dropbeam.app\logs\DropBeam.log).
+#[tauri::command]
+fn frontend_log(msg: String) {
+    log::info!("[ui] {msg}");
+}
+
 /// One friend row's on-screen rectangle (CSS px), reported by the menu JS.
 #[derive(serde::Deserialize)]
 struct JsRowRect {
@@ -99,16 +107,29 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        // Quiet the noisy deps (iroh logs per-packet at INFO and
-                        // floods/rotates the log) so our own diagnostics survive.
-                        .level(log::LevelFilter::Warn)
-                        .level_for("app_lib", log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
+            // Always-on logging to a FILE so we can diagnose issues on machines we
+            // can't access (e.g. a tester's Windows box — the log lands in
+            // %APPDATA%\com.dropbeam.app\logs\DropBeam.log, or ~/Library/Logs/
+            // com.dropbeam.app/ on macOS). iroh's per-packet INFO spam stays at
+            // Warn so our own [app_lib]/[ui] breadcrumbs survive.
+            let _ = app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Warn)
+                    .level_for("app_lib", log::LevelFilter::Info)
+                    .targets([
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                            file_name: Some("DropBeam".into()),
+                        }),
+                    ])
+                    .build(),
+            );
+            // Log panics (including ones inside commands) so a crash on a remote
+            // machine leaves a trace in the file instead of a silent hang.
+            std::panic::set_hook(Box::new(|info| {
+                log::error!("PANIC: {info}");
+            }));
+            log::info!("setup: starting v{}", env!("CARGO_PKG_VERSION"));
 
             let config_dir = app
                 .path()
@@ -138,13 +159,16 @@ pub fn run() {
             let iroh_state = Arc::new(iroh_net::IrohState::default());
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
             app.manage(iroh_state);
+            log::info!("setup: iroh spawned + state managed");
 
             // Start the Shared Drop Folder sync service.
             let sync = sync::SyncManager::new(app.handle().clone(), config_dir);
             sync.reconcile();
             app.manage(sync);
+            log::info!("setup: sync reconciled");
 
             build_tray(app.handle())?;
+            log::info!("setup: tray built");
 
             // Native macOS: let a file dragged over the menu-bar icon spring the
             // popover open (Blip-style). The status item appears a beat after the
@@ -235,6 +259,7 @@ pub fn run() {
             commands::iroh_send,
             commands::iroh_receive,
             traydrag_debug,
+            frontend_log,
             set_popover_rows,
         ])
         .build(tauri::generate_context!())

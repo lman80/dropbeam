@@ -145,6 +145,8 @@ const realApi = {
   irohReceive: (ticket: string) => invoke<TransferUpdate>('iroh_receive', { ticket }),
   irohSelftest: () => invoke<string>('iroh_selftest'),
   cancelTransfer: (id: string) => invoke<void>('cancel_transfer', { id }),
+  /** Write a line into the native app log file (for diagnosing remote issues). */
+  frontendLog: (msg: string) => invoke<void>('frontend_log', { msg }),
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (settings: Settings) => invoke<Settings>('update_settings', { settings }),
   getHistory: () => invoke<HistoryEntry[]>('get_history'),

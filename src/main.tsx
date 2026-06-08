@@ -4,7 +4,7 @@ import './index.css'
 import App from './App'
 import { Popover } from './windows/Popover'
 import { Hud } from './windows/Hud'
-import { HAS_TAURI } from './lib/api'
+import { api, HAS_TAURI } from './lib/api'
 
 // Which window are we? The popover and HUD load the same bundle as the main
 // app and pick their compact UI from the Tauri window label. `?window=` lets us
@@ -39,3 +39,15 @@ if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
 
 const Root = label === 'popover' ? Popover : label === 'hud' ? Hud : App
 createRoot(document.getElementById('root')!).render(<Root />)
+
+// Capture uncaught errors into the native log file so a startup problem on a
+// machine we can't reach (e.g. a tester's Windows box) leaves a trace.
+if (HAS_TAURI) {
+  api.frontendLog(`ui: booting window=${label}`).catch(() => {})
+  window.addEventListener('error', (e) =>
+    api.frontendLog(`ui error: ${e.message} @ ${e.filename}:${e.lineno}`).catch(() => {}),
+  )
+  window.addEventListener('unhandledrejection', (e) =>
+    api.frontendLog(`ui unhandledrejection: ${String(e.reason)}`).catch(() => {}),
+  )
+}
