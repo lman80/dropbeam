@@ -759,6 +759,19 @@ html.overlay-window #root {
 .chat-input:focus {
   border-color: var(--accent);
 }
+.chat-file.clickable {
+  cursor: pointer;
+}
+.chat-img {
+  display: block;
+  max-width: 240px;
+  max-height: 200px;
+  width: auto;
+  height: auto;
+  border-radius: 9px;
+  margin-bottom: 7px;
+  object-fit: cover;
+}
 
 /* Recipient chooser rows (the "send to whom?" sheet) */
 .chooser-row {

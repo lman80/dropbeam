@@ -485,7 +485,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const t = await api.sendToFriend(friendId, paths)
       get().upsertTransfer(t)
       const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
-      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0)
+      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths)
       get().addChatMessage(m)
     } catch (e) {
       get().toast('error', String(e))

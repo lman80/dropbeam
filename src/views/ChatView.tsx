@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { motion } from 'framer-motion'
 import { FolderOpen, MessageCircle, Paperclip, Send as SendIcon, Users } from 'lucide-react'
 import { api, type ChatMessage, type Friend } from '../lib/api'
@@ -10,6 +11,11 @@ import { friendOnlineState } from '../lib/presence'
 
 /** Stable empty array so the messages selector doesn't return a fresh ref each render. */
 const EMPTY_MSGS: ChatMessage[] = []
+
+const IMG_RE = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i
+function isImageName(name: string | undefined): boolean {
+  return !!name && IMG_RE.test(name)
+}
 
 export function ChatView() {
   const friends = useStore((s) => s.friends)
@@ -265,23 +271,39 @@ function Bubble({ m }: { m: ChatMessage }) {
     >
       <div className={`chat-bubble${mine ? ' mine' : ''}`}>
         {m.kind === 'file' ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <Paperclip size={16} style={{ flexShrink: 0 }} />
-            <div style={{ minWidth: 0 }}>
-              <div
-                style={{
-                  fontWeight: 600,
-                  fontSize: 13.5,
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
+          <div
+            className={`chat-file${m.path ? ' clickable' : ''}`}
+            onClick={m.path ? () => api.openPath(m.path!).catch(() => {}) : undefined}
+            title={m.path ? 'Open' : undefined}
+          >
+            {m.path && isImageName(m.files[0]) && (
+              <img
+                src={convertFileSrc(m.path)}
+                alt={m.files[0]}
+                className="chat-img"
+                onError={(e) => {
+                  ;(e.currentTarget as HTMLImageElement).style.display = 'none'
                 }}
-              >
-                {m.files.length === 1 ? m.files[0] : `${m.files.length} files`}
+              />
+            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <Paperclip size={16} style={{ flexShrink: 0 }} />
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div
+                  style={{
+                    fontWeight: 600,
+                    fontSize: 13.5,
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {m.files.length === 1 ? m.files[0] : `${m.files.length} files`}
+                </div>
+                {m.bytes > 0 && (
+                  <div style={{ fontSize: 11.5, opacity: 0.7 }}>{formatBytes(m.bytes)}</div>
+                )}
               </div>
-              {m.bytes > 0 && (
-                <div style={{ fontSize: 11.5, opacity: 0.7 }}>{formatBytes(m.bytes)}</div>
-              )}
             </div>
           </div>
         ) : (

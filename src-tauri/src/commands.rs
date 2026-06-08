@@ -110,11 +110,26 @@ pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Open a path with the system default handler. A folder opens INTO itself (not
+/// revealed in its parent); a file launches in its default app. Resilient: if the
+/// exact path no longer exists (a received file got a unique name on a collision,
+/// or a folder moved), open the nearest folder that DOES exist instead of
+/// erroring — so the button always lands somewhere sensible. Logged for diagnosis.
 #[tauri::command]
 pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
+    let requested = std::path::PathBuf::from(&path);
+    let existed = requested.exists();
+    let mut target = requested.clone();
+    while !target.exists() {
+        match target.parent() {
+            Some(p) if p != target && !p.as_os_str().is_empty() => target = p.to_path_buf(),
+            _ => break,
+        }
+    }
+    log::info!("open_path: requested={requested:?} existed={existed} -> opening={target:?}");
     app.opener()
-        .open_path(path, None::<&str>)
+        .open_path(target.to_string_lossy().to_string(), None::<&str>)
         .map_err(|e| e.to_string())
 }
 
@@ -447,6 +462,7 @@ pub async fn send_chat_message(
         text: body,
         files: vec![],
         bytes: 0,
+        path: None,
         ts: chat::now_ms(),
     };
     chat::append(&state.config_dir, &msg);
@@ -476,6 +492,7 @@ pub async fn send_chat_file_note(
     friend_id: String,
     names: Vec<String>,
     bytes: u64,
+    paths: Vec<String>,
 ) -> Result<ChatMessage, String> {
     let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
     let msg = ChatMessage {
@@ -486,6 +503,8 @@ pub async fn send_chat_file_note(
         text: String::new(),
         files: names.clone(),
         bytes,
+        // Sender keeps the source path so they can preview/open what they sent.
+        path: paths.into_iter().next(),
         ts: chat::now_ms(),
     };
     chat::append(&state.config_dir, &msg);

@@ -226,6 +226,40 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
     }
 }
 
+/// One-line performance summary for a finished transfer, written to the always-on
+/// log. Captures the signals that tell us whether a transfer ran optimally: actual
+/// throughput, whether the connection was DIRECT (hole-punched) or RELAYED (the
+/// slow internet fallback), round-trip latency, and the peer address. The user can
+/// send a file then hand back the log so we can see exactly where the headroom is.
+fn log_transfer_perf(
+    conn: &Connection,
+    tag: &str,
+    direction: &str,
+    bytes: u64,
+    elapsed: std::time::Duration,
+) {
+    use iroh::Watcher as _;
+    let secs = elapsed.as_secs_f64();
+    let mb = bytes as f64 / 1_000_000.0;
+    let mbps = if secs > 0.0 { mb / secs } else { 0.0 };
+    let mut watcher = conn.paths();
+    let paths = watcher.get();
+    let selected = paths.iter().find(|p| p.is_selected());
+    let (path_kind, rtt, addr) = match selected {
+        Some(p) => (
+            if p.is_relay() { "RELAY/internet" } else { "DIRECT/p2p" },
+            p.rtt()
+                .map(|r| format!("{}ms", r.as_millis()))
+                .unwrap_or_else(|| "?".into()),
+            format!("{:?}", p.remote_addr()),
+        ),
+        None => ("unknown", "?".into(), "?".into()),
+    };
+    log::info!(
+        "PERF[{tag}] {direction}: {mbps:.1} MB/s ({mb:.1} MB in {secs:.2}s) · {path_kind} · rtt={rtt} · peer={addr}"
+    );
+}
+
 /// Load the device's secret key from disk, or generate + persist a fresh one.
 /// The 32-byte ed25519 seed IS the device identity — its public half is the
 /// `EndpointId` peers dial, so it must be stable across restarts.
@@ -367,17 +401,22 @@ async fn serve_stream(
                         None,
                         conn.clone(),
                     );
+                    let __t0 = std::time::Instant::now();
+                    let __total = p.total;
                     match serve_pull(send, &p.paths, &p.cancel, cb).await {
-                        Ok(_) => emit_completed(
-                            &app,
-                            &p.transfer_id,
-                            Direction::Send,
-                            p.names,
-                            p.total,
-                            conn_locality(conn),
-                            None,
-                            None,
-                        ),
+                        Ok(_) => {
+                            log_transfer_perf(conn, "quick-send", "send", __total, __t0.elapsed());
+                            emit_completed(
+                                &app,
+                                &p.transfer_id,
+                                Direction::Send,
+                                p.names,
+                                p.total,
+                                conn_locality(conn),
+                                None,
+                                None,
+                            )
+                        }
                         Err(e) if e.to_string().contains("canceled") => {
                             emit_canceled(&app, &p.transfer_id, Direction::Send)
                         }
@@ -479,8 +518,10 @@ async fn serve_stream(
                 sender.clone(),
                 conn.clone(),
             );
+            let __t0 = std::time::Instant::now();
             match read_body(recv, &req, &dest, &cancel, cb).await {
                 Ok(paths) => {
+                    log_transfer_perf(conn, "friend-recv", "recv", total, __t0.elapsed());
                     let names: Vec<String> = paths
                         .iter()
                         .map(|p| {
@@ -600,9 +641,11 @@ async fn serve_stream(
                 last.store(permille, Ordering::Relaxed);
                 sm.note_folder_receiving(&pair_id, done, total, loc);
             };
+            let __t0 = std::time::Instant::now();
             let result = read_folder_body(recv, &req, &staging, &cancel, cb).await;
             match result {
                 Ok(_) => {
+                    log_transfer_perf(conn, "folder-recv", "recv", total, __t0.elapsed());
                     sm.ingest_iroh_folder_files(&pair_id, &staging);
                     let _ = std::fs::remove_dir_all(&staging);
                     let _ = send.write_all(b"ok").await;
@@ -705,6 +748,25 @@ async fn serve_stream(
                         .get("ts")
                         .and_then(|t| t.as_u64())
                         .unwrap_or_else(crate::chat::now_ms);
+                    // Best-effort local path so the receiver can preview/open the
+                    // file once it lands: a friend's files save into the download
+                    // dir under the same name (collision-renames are the rare miss).
+                    let path = if msg_kind == "file" {
+                        files.first().map(|name| {
+                            let configured = app
+                                .try_state::<Arc<crate::AppState>>()
+                                .map(|st| st.settings.lock().unwrap().download_dir.clone())
+                                .unwrap_or_default();
+                            let dir = if configured.trim().is_empty() {
+                                app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                            } else {
+                                PathBuf::from(configured)
+                            };
+                            dir.join(name).to_string_lossy().to_string()
+                        })
+                    } else {
+                        None
+                    };
                     let msg = crate::chat::ChatMessage {
                         id,
                         peer_id: friend.id.clone(),
@@ -713,6 +775,7 @@ async fn serve_stream(
                         text,
                         files,
                         bytes,
+                        path,
                         ts,
                     };
                     if crate::chat::append(&config_dir, &msg) {
@@ -865,8 +928,14 @@ pub fn start_receive(
                 None,
                 conn.clone(),
             );
+            let __t0 = std::time::Instant::now();
             let paths = read_files(&mut recv, &dest, &cancel, cb).await?;
             let loc = conn_locality(&conn);
+            let __bytes: u64 = paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                .sum();
+            log_transfer_perf(&conn, "quick-recv", "recv", __bytes, __t0.elapsed());
             Ok((paths, loc))
         }
         .await;
@@ -975,7 +1044,9 @@ pub fn send_to_friend(
                 Some(friend_name.clone()),
                 conn.clone(),
             );
+            let __t0 = std::time::Instant::now();
             send_files(&conn, &pathbufs, &cancel, cb).await?;
+            log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
             Ok(conn_locality(&conn))
         }
         .await;
@@ -1162,12 +1233,18 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
         .map_err(|_| anyhow::anyhow!("folder peer unreachable over iroh"))?
         .context("dial folder peer")?;
     let (mut send, mut recv) = conn.open_bi().await?;
+    let __t0 = std::time::Instant::now();
     write_folder_files(&mut send, pair_id, root, paths, cancel, on_progress).await?;
     send.finish()?;
     // Require the receiver's "ok" so "delivered" means the bytes actually landed
     // in their folder (not just that we finished writing to the socket).
     let ack = recv.read_to_end(16).await.unwrap_or_default();
     anyhow::ensure!(ack == b"ok", "folder peer did not confirm receipt");
+    let __bytes: u64 = paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    log_transfer_perf(&conn, "folder-send", "send", __bytes, __t0.elapsed());
     Ok(conn_locality(&conn))
 }
 

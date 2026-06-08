@@ -40,6 +40,11 @@ pub struct ChatMessage {
     /// For file messages: total bytes (for display).
     #[serde(default)]
     pub bytes: u64,
+    /// For file messages: the local path to the (first) file ON THIS device — the
+    /// sender's source path, or the receiver's saved path. Lets the UI show a
+    /// preview and open it. Device-local, so it never travels in the wire frame.
+    #[serde(default)]
+    pub path: Option<String>,
     pub ts: u64,
 }
 

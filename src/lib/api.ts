@@ -123,6 +123,9 @@ export interface ChatMessage {
   files: string[]
   /** For file messages: total bytes. */
   bytes: number
+  /** For file messages: the local path to the (first) file on THIS device —
+   * sender's source or receiver's saved copy. Enables preview + open. */
+  path: string | null
   ts: number
 }
 
@@ -230,8 +233,8 @@ const realApi = {
   listChats: () => invoke<ChatOverview[]>('list_chats'),
   sendChatMessage: (friendId: string, text: string) =>
     invoke<ChatMessage>('send_chat_message', { friendId, text }),
-  sendChatFileNote: (friendId: string, names: string[], bytes: number) =>
-    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes }),
+  sendChatFileNote: (friendId: string, names: string[], bytes: number, paths: string[]) =>
+    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes, paths }),
 }
 
 export const api: typeof realApi = HAS_TAURI ? realApi : (mockApi as typeof realApi)

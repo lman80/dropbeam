@@ -498,6 +498,7 @@ export const mockApi = {
       text,
       files: [],
       bytes: 0,
+      path: null,
       ts: Date.now(),
     }
     ;(mockChats[friendId] ??= []).push(m)
@@ -508,6 +509,7 @@ export const mockApi = {
     friendId: string,
     names: string[],
     bytes: number,
+    paths: string[],
   ): Promise<ChatMessage> => {
     const m: ChatMessage = {
       id: `c${++counter}`,
@@ -517,6 +519,7 @@ export const mockApi = {
       text: '',
       files: names,
       bytes,
+      path: paths[0] ?? null,
       ts: Date.now(),
     }
     ;(mockChats[friendId] ??= []).push(m)
