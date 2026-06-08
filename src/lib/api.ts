@@ -208,6 +208,17 @@ export function onFolderStatus(cb: (s: FolderStatus) => void): Promise<UnlistenF
   return listen<FolderStatus>('folder://status', (e) => cb(e.payload))
 }
 
+export interface FolderSynced {
+  pairId: string
+  direction: 'send' | 'receive'
+}
+
+/** A shared-folder transfer just completed (one file delivered or received). */
+export function onFolderSynced(cb: (s: FolderSynced) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('folder-synced', (p) => cb(p as FolderSynced))
+  return listen<FolderSynced>('folder-synced', (e) => cb(e.payload))
+}
+
 export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('pairs://changed', () => cb())
   return listen('pairs://changed', () => cb())

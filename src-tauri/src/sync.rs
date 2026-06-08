@@ -570,6 +570,11 @@ impl SyncManager {
                         }
                         set_status(&status, FolderState::Idle, None, 0.0, None);
                         manager.emit_status(&pair_id);
+                        // Cue the UI to optionally play a sound + flash the HUD.
+                        let _ = manager.app.emit(
+                            "folder-synced",
+                            serde_json::json!({ "pairId": pair_id, "direction": "send" }),
+                        );
                     }
                     SendOutcome::Offline => {
                         offline_attempts = offline_attempts.saturating_add(1);
@@ -809,6 +814,10 @@ impl SyncManager {
             },
         );
         let _ = self.app.emit("history://changed", ());
+        let _ = self.app.emit(
+            "folder-synced",
+            serde_json::json!({ "pairId": pair.id, "direction": "receive" }),
+        );
         let settings_notify = self
             .app
             .try_state::<Arc<AppState>>()

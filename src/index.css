@@ -635,6 +635,24 @@ html.overlay-window #root {
   font-variant-numeric: tabular-nums;
   color: rgba(255, 255, 255, 0.92);
 }
+.hud-x {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin: -2px -4px -2px 0;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.55);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: background 0.13s ease, color 0.13s ease;
+}
+.hud-x:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
 
 /* Recipient chooser rows (the "send to whom?" sheet) */
 .chooser-row {

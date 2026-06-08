@@ -1,8 +1,8 @@
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { currentMonitor, getCurrentWindow, LogicalPosition } from '@tauri-apps/api/window'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ArrowDownToLine, Send } from 'lucide-react'
+import { ArrowDownToLine, Send, X } from 'lucide-react'
 import { HAS_TAURI, isActive } from '../lib/api'
 import { useStore } from '../store'
 
@@ -75,8 +75,20 @@ export function Hud() {
 
   usePositionOnce()
 
+  const [dismissed, setDismissed] = useState<string | null>(null)
+  // A dismissal sticks only to the activity it was made on. If a *different*
+  // item becomes current, show it at once; if everything goes quiet, clear the
+  // dismissal after a short grace so the next sync can surface again (brief gaps
+  // between files in a burst stay hidden).
+  useEffect(() => {
+    if (!dismissed) return
+    if (pill && pill.key === dismissed) return
+    const id = setTimeout(() => setDismissed(null), pill ? 0 : 6000)
+    return () => clearTimeout(id)
+  }, [pill, dismissed])
+
   // Drive the native window's visibility from whether there's anything to show.
-  const visible = !!pill
+  const visible = !!pill && pill.key !== dismissed
   useEffect(() => {
     if (!HAS_TAURI) return
     const win = getCurrentWindow()
@@ -88,7 +100,7 @@ export function Hud() {
     <div className="hud-root">
       <AnimatePresence>
         {pill && (
-          <motion.button
+          <motion.div
             key={pill.key}
             className="hud-pill"
             initial={{ opacity: 0, y: -14, scale: 0.9 }}
@@ -107,7 +119,17 @@ export function Hud() {
             <span className="hud-ring" aria-hidden>
               {Math.round(pill.percent)}
             </span>
-          </motion.button>
+            <button
+              className="hud-x"
+              title="Dismiss"
+              onClick={(e) => {
+                e.stopPropagation()
+                setDismissed(pill.key)
+              }}
+            >
+              <X size={13} />
+            </button>
+          </motion.div>
         )}
       </AnimatePresence>
     </div>

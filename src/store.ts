@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import {
   api,
   onFolderStatus,
+  onFolderSynced,
   onFriendsChanged,
   onHistoryChanged,
   onOpenFileSend,
@@ -45,6 +46,9 @@ async function guarded<T>(p: Promise<T>, fallback: T, label: string, ms = 9000):
   }
 }
 import { playIncoming, playOffer, playReceived, playSent } from './lib/sounds'
+
+/** Leading-edge throttle (per pair+direction) so a burst of synced files cues once. */
+const folderSoundThrottle = new Map<string, number>()
 
 interface UpdateState {
   version: string
@@ -157,6 +161,12 @@ export const useStore = create<AppStore>((set, get) => ({
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
     set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })
 
+    // Only the main window owns window-scoped side effects (sounds, update check).
+    // The popover/HUD webviews share this store but must not double/triple-fire.
+    const isOverlay =
+      typeof document !== 'undefined' &&
+      document.documentElement.classList.contains('overlay-window')
+
     // Re-apply theme when the OS appearance changes (only matters for "system").
     window
       .matchMedia('(prefers-color-scheme: dark)')
@@ -170,6 +180,25 @@ export const useStore = create<AppStore>((set, get) => ({
     onFolderStatus((s) =>
       set((st) => ({ folderStatuses: { ...st.folderStatuses, [s.pairId]: s } })),
     )
+    // A shared-folder file just left/arrived. Play an opt-in, per-folder cue so
+    // you can *hear* a folder syncing. Off by default (folders sync constantly);
+    // the toggle lives on each folder card and is stored in localStorage.
+    onFolderSynced((s) => {
+      if (isOverlay) return
+      let on = false
+      try {
+        on = localStorage.getItem(`folder-sound-${s.pairId}`) === 'on'
+      } catch {
+        /* localStorage unavailable — treat as off */
+      }
+      if (!on) return
+      const key = `${s.pairId}:${s.direction}`
+      const now = Date.now()
+      if (now - (folderSoundThrottle.get(key) ?? 0) < 1500) return
+      folderSoundThrottle.set(key, now)
+      if (s.direction === 'send') playSent()
+      else playReceived()
+    })
     // The control channel can learn the peer's name after the fact — reload pairs
     // so the folder shows who's in it (and clears the stale "waiting" state).
     onPairsChanged(() => get().reloadPairs())
@@ -191,9 +220,6 @@ export const useStore = create<AppStore>((set, get) => ({
     appVersion().then((v) => set({ appVer: v }))
     // Only the main window owns the update check (the popover/HUD share state but
     // shouldn't each trigger their own launch check).
-    const isOverlay =
-      typeof document !== 'undefined' &&
-      document.documentElement.classList.contains('overlay-window')
     if (!isOverlay) get().checkForUpdates(false)
   },
 

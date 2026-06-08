@@ -146,6 +146,22 @@ function FolderCard({
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [loadingInvite, setLoadingInvite] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [soundOn, setSoundOn] = useState(() => {
+    try {
+      return localStorage.getItem(`folder-sound-${pair.id}`) === 'on'
+    } catch {
+      return false
+    }
+  })
+  const toggleSound = () => {
+    const next = !soundOn
+    setSoundOn(next)
+    try {
+      localStorage.setItem(`folder-sound-${pair.id}`, next ? 'on' : 'off')
+    } catch {
+      /* localStorage unavailable — the toggle just won't persist */
+    }
+  }
 
   const info = statusInfo(pair, status)
   const folderName = pair.folder.split('/').pop() || pair.folder
@@ -321,6 +337,12 @@ function FolderCard({
             style={{ overflow: 'hidden' }}
           >
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 14, paddingTop: 6 }}>
+              <SettingRow
+                title="Play sound on sync"
+                desc="Hear a soft cue whenever a file is sent to or received from this folder. Off by default."
+              >
+                <button className={`toggle${soundOn ? ' on' : ''}`} onClick={toggleSound} />
+              </SettingRow>
               <SettingRow
                 title="Total sync (source of truth)"
                 desc="Adds, edits, and deletes all sync both ways — like a shared drive. Deleted and replaced files are kept in History so nothing is lost."
