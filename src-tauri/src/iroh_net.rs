@@ -654,6 +654,75 @@ async fn serve_stream(
             write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
             send.finish()?;
         }
+        Some("chat") => {
+            // A friend sent us a chat message. Identify them by their endpoint
+            // id, persist it to the conversation, and surface it live to the UI.
+            if let Some(app) = state.app.get().cloned() {
+                let config_dir = app
+                    .try_state::<Arc<crate::AppState>>()
+                    .map(|st| st.config_dir.clone())
+                    .unwrap_or_else(std::env::temp_dir);
+                let who = conn.remote_id().to_string();
+                // Identify the sender by their endpoint id; fall back to the
+                // friend id they carry in the frame (invite friends share an id
+                // on both sides) so chat still lands if we haven't learned their
+                // key yet. Either way, remember the key for future sends.
+                let friends = crate::friends::load(&config_dir);
+                let claimed = req.get("friendId").and_then(|v| v.as_str());
+                let friend = friends
+                    .iter()
+                    .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
+                    .or_else(|| claimed.and_then(|id| friends.iter().find(|f| f.id == id)))
+                    .cloned();
+                if let Some(friend) = friend {
+                    if friend.endpoint_id.as_deref() != Some(who.as_str()) {
+                        crate::friends::set_endpoint_id(&config_dir, &friend.id, who.clone());
+                    }
+                    let msg_kind = req
+                        .get("msgKind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("text")
+                        .to_string();
+                    let text = req
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let files: Vec<String> = req
+                        .get("files")
+                        .and_then(|f| f.as_array())
+                        .map(|arr| {
+                            arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                        })
+                        .unwrap_or_default();
+                    let bytes = req.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
+                    let id = req
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let ts = req
+                        .get("ts")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or_else(crate::chat::now_ms);
+                    let msg = crate::chat::ChatMessage {
+                        id,
+                        peer_id: friend.id.clone(),
+                        from_me: false,
+                        kind: msg_kind,
+                        text,
+                        files,
+                        bytes,
+                        ts,
+                    };
+                    if crate::chat::append(&config_dir, &msg) {
+                        let _ = app.emit("chat://message", &msg);
+                    }
+                }
+            }
+            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            send.finish()?;
+        }
         other => anyhow::bail!("unknown stream kind: {other:?}"),
     }
     Ok(())
@@ -1024,6 +1093,25 @@ pub async fn send_folder_ctrl(
     // Best-effort ack: success is connect+write+finish; the peer applies the
     // payload when it reads the finished stream. We wait briefly for the ok but
     // don't fail delivery if the ack is slow.
+    let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
+    Ok(())
+}
+
+/// Deliver a chat message to a friend over iroh (dial-by-key). `payload` is the
+/// full `{kind:"chat", ...}` frame. `Ok(())` means they received it; `Err` means
+/// they were unreachable — the message is kept locally (no store-and-forward yet).
+pub async fn send_chat(ep: &Endpoint, endpoint_id: &str, payload: serde_json::Value) -> Result<()> {
+    let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
+    let addr = iroh::EndpointAddr::from(parsed);
+    let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
+        .await
+        .map_err(|_| anyhow::anyhow!("chat dial timed out"))?
+        .context("dial friend for chat")?;
+    let (mut send, mut recv) = conn.open_bi().await.context("open chat stream")?;
+    write_frame(&mut send, &payload).await?;
+    send.finish()?;
+    // Best-effort ack; the peer applies the message when it reads the finished
+    // stream, so we don't fail delivery just because the ok is slow.
     let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
     Ok(())
 }

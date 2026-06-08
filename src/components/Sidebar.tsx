@@ -1,4 +1,4 @@
-import { FolderSync, History, Send, Settings, Users } from 'lucide-react'
+import { FolderSync, History, MessageCircle, Send, Settings, Users } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { isActive } from '../lib/api'
 import { useStore, type View } from '../store'
@@ -6,6 +6,7 @@ import { useStore, type View } from '../store'
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
   { id: 'friends', label: 'Friends', icon: Users },
+  { id: 'chat', label: 'Chat', icon: MessageCircle },
   { id: 'folders', label: 'Shared Folders', icon: FolderSync },
   { id: 'history', label: 'History', icon: History },
   { id: 'settings', label: 'Settings', icon: Settings },
@@ -24,6 +25,9 @@ export function Sidebar() {
   const name = useStore((s) => s.settings?.displayName ?? '')
   const activeCount = useStore(
     (s) => Object.values(s.transfers).filter((t) => isActive(t.state)).length,
+  )
+  const unreadCount = useStore((s) =>
+    Object.values(s.chatUnread).reduce((a, b) => a + b, 0),
   )
 
   return (
@@ -61,6 +65,20 @@ export function Sidebar() {
                 }}
               >
                 {activeCount}
+              </span>
+            )}
+            {item.id === 'chat' && unreadCount > 0 && (
+              <span
+                className="chip"
+                style={{
+                  background: 'var(--accent)',
+                  color: 'white',
+                  minWidth: 20,
+                  justifyContent: 'center',
+                  padding: '1px 6px',
+                }}
+              >
+                {unreadCount}
               </span>
             )}
           </button>

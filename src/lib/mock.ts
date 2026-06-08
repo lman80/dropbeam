@@ -3,6 +3,8 @@
 // APIs are present and this module is never used, so it can't affect production.
 
 import type {
+  ChatMessage,
+  ChatOverview,
   FolderStatus,
   Friend,
   HistoryEntry,
@@ -86,6 +88,8 @@ const history: HistoryEntry[] = [
 let counter = 0
 // Pending manual-accept offers awaiting respondToOffer (mock only).
 const pendingOffers: Record<string, TransferUpdate> = {}
+// In-memory chat threads keyed by friend id (mock only).
+const mockChats: Record<string, ChatMessage[]> = {}
 
 let pairs: Pair[] = [
   {
@@ -469,5 +473,54 @@ export const mockApi = {
     const initial = base(tid, 'send', names)
     initial.friendName = friend?.name ?? 'Friend'
     return initial
+  },
+  getChatMessages: async (friendId: string): Promise<ChatMessage[]> =>
+    [...(mockChats[friendId] ?? [])],
+  listChats: async (): Promise<ChatOverview[]> =>
+    Object.entries(mockChats)
+      .map(([peerId, msgs]) => {
+        const last = msgs[msgs.length - 1]
+        return {
+          peerId,
+          lastText: last ? (last.kind === 'file' ? '📎 File' : last.text) : '',
+          lastTs: last?.ts ?? 0,
+          lastFromMe: last?.fromMe ?? false,
+          count: msgs.length,
+        }
+      })
+      .sort((a, b) => b.lastTs - a.lastTs),
+  sendChatMessage: async (friendId: string, text: string): Promise<ChatMessage> => {
+    const m: ChatMessage = {
+      id: `c${++counter}`,
+      peerId: friendId,
+      fromMe: true,
+      kind: 'text',
+      text,
+      files: [],
+      bytes: 0,
+      ts: Date.now(),
+    }
+    ;(mockChats[friendId] ??= []).push(m)
+    emit('chat://message', m)
+    return m
+  },
+  sendChatFileNote: async (
+    friendId: string,
+    names: string[],
+    bytes: number,
+  ): Promise<ChatMessage> => {
+    const m: ChatMessage = {
+      id: `c${++counter}`,
+      peerId: friendId,
+      fromMe: true,
+      kind: 'file',
+      text: '',
+      files: names,
+      bytes,
+      ts: Date.now(),
+    }
+    ;(mockChats[friendId] ??= []).push(m)
+    emit('chat://message', m)
+    return m
   },
 }

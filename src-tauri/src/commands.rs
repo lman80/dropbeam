@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::chat::{self, ChatMessage};
 use crate::models::{
     DeleteMode, FolderStatus, Friend, HistoryEntry, HistoryItem, Pair, Settings, TransferUpdate,
 };
@@ -346,6 +347,7 @@ pub fn remove_friend(
     id: String,
 ) -> Result<(), String> {
     friends::remove(&state.config_dir, &id)?;
+    chat::clear(&state.config_dir, &id);
     sync.reconcile_friends();
     Ok(())
 }
@@ -402,6 +404,104 @@ pub fn friend_invite(
     let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
     let my_id = iroh.get().map(|ep| ep.id().to_string());
     Ok(friends::invite_for(&friend, &my_name, my_id))
+}
+
+// ---------------------------------------------------------------------------
+// Chat (experimental) — direct messages + file shares with friends over iroh
+// ---------------------------------------------------------------------------
+
+/// Every message in the conversation with a friend, oldest first.
+#[tauri::command]
+pub fn get_chat_messages(state: State<'_, Arc<AppState>>, friend_id: String) -> Vec<ChatMessage> {
+    chat::messages(&state.config_dir, &friend_id)
+}
+
+/// A preview of every conversation (last message + count), newest first.
+#[tauri::command]
+pub fn list_chats(state: State<'_, Arc<AppState>>) -> Vec<chat::ChatOverview> {
+    chat::overview(&state.config_dir)
+}
+
+/// Send a text message to a friend. Persists + surfaces it immediately, then
+/// delivers over iroh in the background (online-only — no store-and-forward yet).
+#[tauri::command]
+pub async fn send_chat_message(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    app: AppHandle,
+    friend_id: String,
+    text: String,
+) -> Result<ChatMessage, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Message is empty.".into());
+    }
+    // Bound the length so a giant paste can't blow past the frame header limit.
+    let body: String = trimmed.chars().take(4000).collect();
+    let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
+    let msg = ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        peer_id: friend_id.clone(),
+        from_me: true,
+        kind: "text".into(),
+        text: body,
+        files: vec![],
+        bytes: 0,
+        ts: chat::now_ms(),
+    };
+    chat::append(&state.config_dir, &msg);
+    let _ = app.emit("chat://message", &msg);
+    if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
+        let payload = serde_json::json!({
+            "kind": "chat", "msgKind": "text", "friendId": friend_id,
+            "id": msg.id, "text": msg.text, "ts": msg.ts,
+        });
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = crate::iroh_net::send_chat(&ep, &eid, payload).await {
+                log::debug!("chat send failed: {e:#}");
+            }
+        });
+    }
+    Ok(msg)
+}
+
+/// Record + deliver a "file" chat message. The bytes themselves ride the normal
+/// friend transfer (`send_to_friend`); this just puts a card in the thread on
+/// both sides so a shared file shows up in the conversation.
+#[tauri::command]
+pub async fn send_chat_file_note(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    app: AppHandle,
+    friend_id: String,
+    names: Vec<String>,
+    bytes: u64,
+) -> Result<ChatMessage, String> {
+    let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
+    let msg = ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        peer_id: friend_id.clone(),
+        from_me: true,
+        kind: "file".into(),
+        text: String::new(),
+        files: names.clone(),
+        bytes,
+        ts: chat::now_ms(),
+    };
+    chat::append(&state.config_dir, &msg);
+    let _ = app.emit("chat://message", &msg);
+    if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
+        let payload = serde_json::json!({
+            "kind": "chat", "msgKind": "file", "friendId": friend_id,
+            "id": msg.id, "files": names, "bytes": bytes, "ts": msg.ts,
+        });
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = crate::iroh_net::send_chat(&ep, &eid, payload).await {
+                log::debug!("chat file note send failed: {e:#}");
+            }
+        });
+    }
+    Ok(msg)
 }
 
 // ---------------------------------------------------------------------------

@@ -110,6 +110,31 @@ export interface Friend {
   endpointId: string | null
 }
 
+/** One message in a chat with a friend (experimental). */
+export interface ChatMessage {
+  id: string
+  /** The friend id this conversation belongs to. */
+  peerId: string
+  fromMe: boolean
+  /** "text" or "file". */
+  kind: 'text' | 'file'
+  text: string
+  /** For file messages: the names of the files shared. */
+  files: string[]
+  /** For file messages: total bytes. */
+  bytes: number
+  ts: number
+}
+
+/** A preview of one conversation, for the chat list. */
+export interface ChatOverview {
+  peerId: string
+  lastText: string
+  lastTs: number
+  lastFromMe: boolean
+  count: number
+}
+
 export type FolderState = 'idle' | 'sending' | 'receiving' | 'waiting' | 'error'
 
 export interface FolderStatus {
@@ -199,6 +224,14 @@ const realApi = {
   friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
   sendToFriend: (id: string, paths: string[]) =>
     invoke<TransferUpdate>('send_to_friend', { id, paths }),
+  // Chat (experimental) — direct messages + file shares with friends over iroh.
+  getChatMessages: (friendId: string) =>
+    invoke<ChatMessage[]>('get_chat_messages', { friendId }),
+  listChats: () => invoke<ChatOverview[]>('list_chats'),
+  sendChatMessage: (friendId: string, text: string) =>
+    invoke<ChatMessage>('send_chat_message', { friendId, text }),
+  sendChatFileNote: (friendId: string, names: string[], bytes: number) =>
+    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes }),
 }
 
 export const api: typeof realApi = HAS_TAURI ? realApi : (mockApi as typeof realApi)
@@ -217,6 +250,12 @@ export interface FolderSynced {
 export function onFolderSynced(cb: (s: FolderSynced) => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('folder-synced', (p) => cb(p as FolderSynced))
   return listen<FolderSynced>('folder-synced', (e) => cb(e.payload))
+}
+
+/** A chat message arrived (from a friend) or was just sent by us. */
+export function onChatMessage(cb: (m: ChatMessage) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('chat://message', (p) => cb(p as ChatMessage))
+  return listen<ChatMessage>('chat://message', (e) => cb(e.payload))
 }
 
 export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {

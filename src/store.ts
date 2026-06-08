@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import {
   api,
+  onChatMessage,
   onFolderStatus,
   onFolderSynced,
   onFriendsChanged,
@@ -8,6 +9,8 @@ import {
   onOpenFileSend,
   onPairsChanged,
   onTransferUpdate,
+  type ChatMessage,
+  type ChatOverview,
   type FolderStatus,
   type Friend,
   type HistoryEntry,
@@ -57,7 +60,7 @@ interface UpdateState {
   progress: number
 }
 
-export type View = 'send' | 'friends' | 'folders' | 'history' | 'settings'
+export type View = 'send' | 'friends' | 'folders' | 'chat' | 'history' | 'settings'
 
 export interface Toast {
   id: string
@@ -112,6 +115,17 @@ interface AppStore {
   setFriendAutoAccept: (id: string, autoAccept: boolean) => Promise<void>
   respondToOffer: (id: string, accept: boolean) => Promise<void>
   pingFriend: (id: string) => Promise<boolean>
+  // Chat (experimental) — direct messages with friends.
+  chats: Record<string, ChatMessage[]>
+  chatOverview: ChatOverview[]
+  chatUnread: Record<string, number>
+  activeChatId: string | null
+  loadChats: () => Promise<void>
+  openChat: (friendId: string) => Promise<void>
+  closeChat: () => void
+  sendChat: (friendId: string, text: string) => Promise<void>
+  shareFilesInChat: (friendId: string, paths: string[]) => Promise<void>
+  addChatMessage: (m: ChatMessage) => void
   toast: (kind: Toast['kind'], message: string) => void
   dismissToast: (id: string) => void
 }
@@ -133,6 +147,10 @@ export const useStore = create<AppStore>((set, get) => ({
   folderStatuses: {},
   pendingSend: null,
   friendSeen: {},
+  chats: {},
+  chatOverview: [],
+  chatUnread: {},
+  activeChatId: null,
   toasts: [],
   defaultDownloadDir: '',
   appVer: '',
@@ -199,6 +217,21 @@ export const useStore = create<AppStore>((set, get) => ({
       if (s.direction === 'send') playSent()
       else playReceived()
     })
+    // Chat lives in the main window only. Load the conversation previews and
+    // listen for live messages (from friends, and our own echoed sends).
+    if (!isOverlay) {
+      get().loadChats()
+      onChatMessage((m) => {
+        get().addChatMessage(m)
+        if (
+          !m.fromMe &&
+          get().activeChatId !== m.peerId &&
+          (get().settings?.playSounds ?? true)
+        ) {
+          playIncoming()
+        }
+      })
+    }
     // The control channel can learn the peer's name after the fact — reload pairs
     // so the folder shows who's in it (and clears the stale "waiting" state).
     onPairsChanged(() => get().reloadPairs())
@@ -415,6 +448,83 @@ export const useStore = create<AppStore>((set, get) => ({
     } catch (e) {
       get().toast('error', String(e))
     }
+  },
+
+  // --- Chat (experimental) ---------------------------------------------------
+  loadChats: async () => {
+    const chatOverview = await api.listChats().catch(() => [])
+    set({ chatOverview })
+  },
+
+  openChat: async (friendId) => {
+    set({ activeChatId: friendId, view: 'chat' })
+    const msgs = await api.getChatMessages(friendId).catch(() => [])
+    set((s) => ({
+      chats: { ...s.chats, [friendId]: msgs },
+      chatUnread: { ...s.chatUnread, [friendId]: 0 },
+    }))
+  },
+
+  closeChat: () => set({ activeChatId: null }),
+
+  sendChat: async (friendId, text) => {
+    const body = text.trim()
+    if (!body) return
+    try {
+      const m = await api.sendChatMessage(friendId, body)
+      get().addChatMessage(m)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  shareFilesInChat: async (friendId, paths) => {
+    paths = paths.filter(Boolean)
+    if (!paths.length) return
+    try {
+      const t = await api.sendToFriend(friendId, paths)
+      get().upsertTransfer(t)
+      const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
+      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0)
+      get().addChatMessage(m)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  addChatMessage: (m) => {
+    // An incoming message means that friend is reachable right now.
+    if (!m.fromMe) {
+      const f = get().friends.find((fr) => fr.id === m.peerId)
+      if (f) get().markFriendSeen(f.name)
+    }
+    set((s) => {
+      const thread = s.chats[m.peerId] ?? []
+      if (thread.some((x) => x.id === m.id)) return s // dedup (event + return value)
+      const nextThread = [...thread, m].sort((a, b) => a.ts - b.ts)
+      const prev = s.chatOverview.find((o) => o.peerId === m.peerId)
+      const lastText =
+        m.kind === 'file'
+          ? m.files.length === 1
+            ? `📎 ${m.files[0]}`
+            : `📎 ${m.files.length} files`
+          : m.text
+      const row: ChatOverview = {
+        peerId: m.peerId,
+        lastText,
+        lastTs: m.ts,
+        lastFromMe: m.fromMe,
+        count: prev ? prev.count + 1 : nextThread.length,
+      }
+      const chatOverview = [row, ...s.chatOverview.filter((o) => o.peerId !== m.peerId)].sort(
+        (a, b) => b.lastTs - a.lastTs,
+      )
+      const chatUnread =
+        !m.fromMe && s.activeChatId !== m.peerId
+          ? { ...s.chatUnread, [m.peerId]: (s.chatUnread[m.peerId] ?? 0) + 1 }
+          : s.chatUnread
+      return { chats: { ...s.chats, [m.peerId]: nextThread }, chatOverview, chatUnread }
+    })
   },
 
   createFriend: async (name) => {

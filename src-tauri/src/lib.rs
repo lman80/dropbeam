@@ -1,3 +1,4 @@
+mod chat;
 mod commands;
 mod folder_history;
 mod friends;
@@ -302,6 +303,10 @@ pub fn run() {
             commands::iroh_selftest,
             commands::iroh_send,
             commands::iroh_receive,
+            commands::get_chat_messages,
+            commands::list_chats,
+            commands::send_chat_message,
+            commands::send_chat_file_note,
             traydrag_debug,
             frontend_log,
             take_launch_file,

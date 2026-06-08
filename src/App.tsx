@@ -13,6 +13,7 @@ import { HistoryView } from './views/HistoryView'
 import { SettingsView } from './views/SettingsView'
 import { FoldersView } from './views/FoldersView'
 import { FriendsView } from './views/FriendsView'
+import { ChatView } from './views/ChatView'
 
 export default function App() {
   const ready = useStore((s) => s.ready)
@@ -68,6 +69,7 @@ export default function App() {
           >
             {view === 'send' && <SendView />}
             {view === 'friends' && <FriendsView />}
+            {view === 'chat' && <ChatView />}
             {view === 'folders' && <FoldersView />}
             {view === 'history' && <HistoryView />}
             {view === 'settings' && <SettingsView />}
