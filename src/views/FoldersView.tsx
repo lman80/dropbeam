@@ -16,6 +16,7 @@ import {
   Settings2,
   Trash2,
   Unlink,
+  UserPlus,
   X,
 } from 'lucide-react'
 import {
@@ -24,6 +25,7 @@ import {
   type FolderStatus,
   type HistoryItem,
   type Pair,
+  type PairUpdate,
 } from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState, LocalityBadge, ProgressBar, Spinner } from '../components/bits'
@@ -79,12 +81,15 @@ export function FoldersView() {
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <AnimatePresence initial={false}>
-            {pairs.map((pair) => (
+            {groupFolders(pairs).map((g) => (
               <FolderCard
-                key={pair.id}
-                pair={pair}
-                status={statuses[pair.id]}
-                onShowInvite={(code) => setInvite({ code, name: pair.folder.split('/').pop() || '' })}
+                key={g.key}
+                pair={g.rep}
+                members={g.members}
+                statuses={statuses}
+                onShowInvite={(code) =>
+                  setInvite({ code, name: g.rep.folder.split('/').pop() || '' })
+                }
               />
             ))}
           </AnimatePresence>
@@ -95,6 +100,19 @@ export function FoldersView() {
       {invite && <InviteModal code={invite.code} folderName={invite.name} onClose={() => setInvite(null)} />}
     </div>
   )
+}
+
+/** Collapse the pairwise links into one entry per shared folder: a 1:1 folder is
+ *  its own group; a multi-person folder gathers all its links under group_id. */
+function groupFolders(pairs: Pair[]): { key: string; rep: Pair; members: Pair[] }[] {
+  const byKey = new Map<string, Pair[]>()
+  for (const p of pairs) {
+    const key = p.groupId ?? p.id
+    const arr = byKey.get(key) ?? []
+    arr.push(p)
+    byKey.set(key, arr)
+  }
+  return [...byKey.entries()].map(([key, members]) => ({ key, rep: members[0], members }))
 }
 
 function statusInfo(pair: Pair, status?: FolderStatus): { color: string; label: string } {
@@ -131,17 +149,36 @@ function statusInfo(pair: Pair, status?: FolderStatus): { color: string; label: 
 
 function FolderCard({
   pair,
-  status,
+  members,
+  statuses,
   onShowInvite,
 }: {
   pair: Pair
-  status?: FolderStatus
+  members: Pair[]
+  statuses: Record<string, FolderStatus>
   onShowInvite: (code: string) => void
 }) {
   const updatePair = useStore((s) => s.updatePair)
   const removePair = useStore((s) => s.removePair)
   const toast = useStore((s) => s.toast)
   const myName = useStore((s) => s.settings?.displayName || 'You')
+  const status = statuses[pair.id]
+  const isGroup = members.length > 1 || !!pair.groupId
+  // Settings + unpair apply to the WHOLE folder (every member link).
+  const updateGroup = (patch: Partial<PairUpdate>) =>
+    members.forEach((m) => updatePair({ ...patch, id: m.id }))
+  const removeGroup = () => members.forEach((m) => removePair(m.id))
+  const [addingPerson, setAddingPerson] = useState(false)
+  const addPerson = async () => {
+    setAddingPerson(true)
+    try {
+      onShowInvite(await api.folderAddPerson(pair.id))
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setAddingPerson(false)
+    }
+  }
   const [open, setOpen] = useState(false)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [loadingInvite, setLoadingInvite] = useState(false)
@@ -275,14 +312,26 @@ function FolderCard({
         )}
       </div>
 
-      {/* Members — who's in this folder (you + your paired friend) */}
-      <div style={{ display: 'flex', gap: 8, marginTop: 11, flexWrap: 'wrap' }}>
+      {/* Members — everyone in this folder (you + each person you're linked to) */}
+      <div style={{ display: 'flex', gap: 8, marginTop: 11, flexWrap: 'wrap', alignItems: 'center' }}>
         <Member name={myName} you online />
-        <Member
-          name={pair.peerName || 'Waiting to join…'}
-          online={status?.peerOnline ?? false}
-          pending={!pair.peerName}
-        />
+        {members.map((m) => (
+          <Member
+            key={m.id}
+            name={m.peerName || 'Waiting to join…'}
+            online={statuses[m.id]?.peerOnline ?? false}
+            pending={!m.peerName}
+          />
+        ))}
+        <button
+          className="btn btn-ghost"
+          style={{ padding: '5px 11px', fontSize: 12.5 }}
+          onClick={addPerson}
+          disabled={addingPerson}
+          title="Invite another person to this folder"
+        >
+          {addingPerson ? <Spinner size={13} /> : <UserPlus size={13} />} Add person
+        </button>
       </div>
 
       {/* Live transfer progress while sending or receiving */}
@@ -349,7 +398,7 @@ function FolderCard({
               >
                 <button
                   className={`toggle${pair.mirror ? ' on' : ''}`}
-                  onClick={() => updatePair({ id: pair.id, mirror: !pair.mirror })}
+                  onClick={() => updateGroup({ mirror: !pair.mirror })}
                 />
               </SettingRow>
               {!pair.mirror && (
@@ -359,7 +408,7 @@ function FolderCard({
                 >
                   <button
                     className={`toggle${pair.twoWay ? ' on' : ''}`}
-                    onClick={() => updatePair({ id: pair.id, twoWay: !pair.twoWay })}
+                    onClick={() => updateGroup({ twoWay: !pair.twoWay })}
                   />
                 </SettingRow>
               )}
@@ -370,7 +419,7 @@ function FolderCard({
                 >
                   <button
                     className={`toggle${pair.autoDelete ? ' on' : ''}`}
-                    onClick={() => updatePair({ id: pair.id, autoDelete: !pair.autoDelete })}
+                    onClick={() => updateGroup({ autoDelete: !pair.autoDelete })}
                   />
                 </SettingRow>
               )}
@@ -382,7 +431,7 @@ function FolderCard({
                         key={m}
                         className={pair.deleteMode === m ? 'active' : ''}
                         style={{ textTransform: 'capitalize', padding: '5px 12px' }}
-                        onClick={() => updatePair({ id: pair.id, deleteMode: m })}
+                        onClick={() => updateGroup({ deleteMode: m })}
                       >
                         {m === 'trash' ? 'Trash' : 'Permanent'}
                       </button>
@@ -418,8 +467,8 @@ function FolderCard({
                     <button className="btn btn-ghost" onClick={() => setConfirmUnpair(false)}>
                       Cancel
                     </button>
-                    <button className="btn btn-danger" onClick={() => removePair(pair.id)}>
-                      <Unlink size={14} /> Confirm unpair
+                    <button className="btn btn-danger" onClick={removeGroup}>
+                      <Unlink size={14} /> Confirm {isGroup ? 'leave' : 'unpair'}
                     </button>
                   </>
                 ) : (

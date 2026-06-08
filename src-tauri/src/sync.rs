@@ -656,9 +656,13 @@ impl SyncManager {
                     (Some(eid), Some(ep)) => {
                         let del_pairs: Vec<(String, u64)> =
                             dels.iter().map(|d| (d.rel.clone(), d.ts)).collect();
-                        crate::iroh_net::send_folder_ctrl(&ep, &eid, &pair_id, &my_name, &del_pairs)
-                            .await
-                            .is_ok()
+                        let (group_id, roster) =
+                            build_group_roster(&manager.config_dir, &pair, &ep, &my_name);
+                        crate::iroh_net::send_folder_ctrl(
+                            &ep, &eid, &pair_id, &my_name, &del_pairs, &group_id, &roster,
+                        )
+                        .await
+                        .is_ok()
                     }
                     _ => false,
                 };
@@ -749,6 +753,8 @@ impl SyncManager {
         pair_id: &str,
         name: &str,
         deletes: &[(String, u64)],
+        group_id: &str,
+        members: &[(String, String)],
     ) {
         let (config, status, self_deleted) = {
             let handles = self.handles.lock().unwrap();
@@ -781,6 +787,37 @@ impl SyncManager {
             }
             if applied_any {
                 let _ = self.app.emit("folder-history://changed", pair_id);
+            }
+        }
+
+        // Multi-person folders: the beacon carries the group roster, so mesh with
+        // any member we don't have a link to yet (gossip — this converges the whole
+        // group and self-heals if someone was offline when a person joined). A
+        // classic 1:1 folder has an empty group/roster, so this is a no-op there.
+        if !group_id.is_empty() && !members.is_empty() {
+            let template = config.lock().unwrap().clone();
+            let my_eid = self
+                .iroh_endpoint()
+                .map(|ep| ep.id().to_string())
+                .unwrap_or_default();
+            let mut added = false;
+            for (eid, mname) in members {
+                if pairing::ensure_member(
+                    &self.config_dir,
+                    group_id,
+                    &template,
+                    eid,
+                    mname,
+                    &my_eid,
+                )
+                .is_some()
+                {
+                    added = true;
+                }
+            }
+            if added {
+                self.clone().reconcile();
+                let _ = self.app.emit("pairs://changed", ());
             }
         }
     }
@@ -1140,25 +1177,68 @@ fn move_staged_into_folder(
         if let Some(parent) = dest_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Mirror = source of truth: REPLACE an edited file (archiving the old
-        // copy to history) instead of keeping a "file (1)" duplicate. Guard the
-        // resulting Remove event so it isn't echoed back as a delete.
-        let dest = if mirror {
-            if dest_path.is_file() {
-                self_deleted
-                    .lock()
-                    .unwrap()
-                    .insert(rel_str.clone(), Instant::now());
+
+        // The incoming (staged) version's identity. mtime was already stamped to
+        // the origin's value by the receive path, so it's comparable across members.
+        let in_size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        let in_mtime = std::fs::metadata(&src).ok().map(|m| meta_mtime(&m)).unwrap_or(0);
+
+        // Mirror = shared source of truth. Resolve every incoming file
+        // DETERMINISTICALLY so all members converge to the same bytes:
+        //   • identical version already here → no-op (kills the mesh echo/storm),
+        //   • a genuinely different version → newest modified-time wins (an
+        //     equal-second race is broken by content hash); the loser is archived
+        //     to History so nothing is ever lost.
+        if mirror && dest_path.is_file() {
+            let loc_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+            let loc_mtime = std::fs::metadata(&dest_path)
+                .ok()
+                .map(|m| meta_mtime(&m))
+                .unwrap_or(0);
+            if in_size == loc_size && in_mtime == loc_mtime {
+                // Already have this exact version — drop the staged dup, don't
+                // rewrite (so the folder watcher doesn't re-broadcast it).
+                let _ = std::fs::remove_file(&src);
+                if let Some(sig) = file_sig(&dest_path.to_string_lossy(), folder_str) {
+                    inbound.lock().unwrap().insert(sig);
+                }
+                continue;
+            }
+            let incoming_wins = if in_mtime != loc_mtime {
+                in_mtime > loc_mtime
+            } else {
+                content_hash(&src) > content_hash(&dest_path)
+            };
+            if !incoming_wins {
+                // Local copy is the winner — keep it, but archive the incoming
+                // (older) version to History so it isn't lost, and DON'T rewrite.
                 crate::folder_history::archive(
                     folder_str,
-                    &dest_path.to_string_lossy(),
+                    &src.to_string_lossy(),
                     &rel_str,
                     "replaced",
                 );
-                if dest_path.exists() {
-                    let _ = std::fs::remove_file(&dest_path);
-                }
+                let _ = std::fs::remove_file(&src);
+                continue;
             }
+            // Incoming wins → archive the local copy, then replace it below. Guard
+            // the resulting Remove event so it isn't echoed back as a delete.
+            self_deleted
+                .lock()
+                .unwrap()
+                .insert(rel_str.clone(), Instant::now());
+            crate::folder_history::archive(
+                folder_str,
+                &dest_path.to_string_lossy(),
+                &rel_str,
+                "replaced",
+            );
+            if dest_path.exists() {
+                let _ = std::fs::remove_file(&dest_path);
+            }
+        }
+
+        let dest = if mirror {
             dest_path
         } else {
             unique_dest(dest_path)
@@ -1173,8 +1253,11 @@ fn move_staged_into_folder(
             false
         };
         if ok {
-            // Remember it (by signature) so a two-way watcher won't beam it back,
-            // now or after a restart.
+            // Bulletproof: stamp the origin mtime onto the landed file even if a
+            // cross-device copy reset it, so its signature matches every member.
+            stamp_mtime(&dest, in_mtime);
+            // Remember it (by signature) so a watcher won't beam it back, now or
+            // after a restart.
             if let Some(sig) = file_sig(&dest_str, folder_str) {
                 inbound.lock().unwrap().insert(sig);
             }
@@ -1182,6 +1265,38 @@ fn move_staged_into_folder(
         }
     }
     moved
+}
+
+/// A file's modified-time as whole seconds since the epoch (0 if unavailable).
+fn meta_mtime(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Stamp a file's modified-time to a specific epoch-seconds value (no-op on 0).
+fn stamp_mtime(path: &Path, secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(when);
+    }
+}
+
+/// A deterministic content hash (sha256 hex) for breaking same-second conflict
+/// ties identically on every member. Empty string on read error (sorts lowest).
+fn content_hash(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    hex::encode(h.finalize())
 }
 
 /// Compute a file's path relative to the folder (forward-slashed, so the same
@@ -1393,6 +1508,31 @@ fn peer_label(pair: &Pair) -> String {
     }
 }
 
+/// The group roster to advertise on a pair's control beacon: ourselves plus every
+/// member of the folder group we already have a link to. Empty for a 1:1 folder.
+fn build_group_roster(
+    config_dir: &Path,
+    pair: &Pair,
+    ep: &iroh::Endpoint,
+    my_name: &str,
+) -> (String, Vec<(String, String)>) {
+    let Some(gid) = pair.group_id.clone() else {
+        return (String::new(), Vec::new());
+    };
+    let mut roster: Vec<(String, String)> = vec![(ep.id().to_string(), my_name.to_string())];
+    for p in pairing::members_of_group(config_dir, &gid) {
+        if let Some(eid) = &p.endpoint_id {
+            let n = if p.peer_name.trim().is_empty() {
+                "Member".to_string()
+            } else {
+                p.peer_name.clone()
+            };
+            roster.push((eid.clone(), n));
+        }
+    }
+    (gid, roster)
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1415,6 +1555,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn write_with_mtime(path: &Path, content: &[u8], mtime: u64) {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+        stamp_mtime(path, mtime);
+    }
+
+    fn apply(staging: &Path, folder: &Path) -> Vec<String> {
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        let self_del = Arc::new(Mutex::new(HashMap::new()));
+        move_staged_into_folder(
+            staging,
+            &folder.to_string_lossy(),
+            &inbound,
+            true,
+            &self_del,
+        )
+    }
+
+    #[test]
+    fn group_apply_is_idempotent_for_identical_files() {
+        // A re-received byte-identical file (same content + preserved mtime) must
+        // be a NO-OP — this is what stops a mesh sync storm.
+        let folder = temp_dir("idem-f");
+        let staging = temp_dir("idem-s");
+        write_with_mtime(&folder.join("a.txt"), b"hello", 1000);
+        write_with_mtime(&staging.join("a.txt"), b"hello", 1000);
+        let moved = apply(&staging, &folder);
+        assert!(moved.is_empty(), "identical file should not be rewritten");
+        assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"hello");
+        assert!(!staging.join("a.txt").exists(), "staged dup consumed");
+    }
+
+    #[test]
+    fn group_conflict_newest_mtime_wins() {
+        let folder = temp_dir("win-f");
+        let staging = temp_dir("win-s");
+        write_with_mtime(&folder.join("a.txt"), b"old", 1000);
+        write_with_mtime(&staging.join("a.txt"), b"new", 2000);
+        apply(&staging, &folder);
+        assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn group_conflict_older_incoming_is_rejected() {
+        // Every member must converge to the SAME winner, so an older incoming
+        // version never clobbers a newer local one (it's archived instead).
+        let folder = temp_dir("rej-f");
+        let staging = temp_dir("rej-s");
+        write_with_mtime(&folder.join("a.txt"), b"newer", 2000);
+        write_with_mtime(&staging.join("a.txt"), b"older", 1000);
+        apply(&staging, &folder);
+        assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"newer");
+        assert!(!staging.join("a.txt").exists());
     }
 
     #[test]

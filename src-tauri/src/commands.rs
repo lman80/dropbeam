@@ -317,6 +317,25 @@ pub fn pair_invite(
     Ok(pairing::invite_for(pair, &name, my_id))
 }
 
+/// Invite ANOTHER person into an existing shared folder (making it a group of
+/// 3+). Returns a fresh invite; once they accept, the group roster meshes
+/// everyone together over the control beacon.
+#[tauri::command]
+pub fn folder_add_person(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    app: AppHandle,
+    id: String,
+) -> Result<String, String> {
+    let name = state.settings.lock().unwrap().display_name.clone();
+    let my_id = iroh.get().map(|ep| ep.id().to_string());
+    let invite = pairing::group_invite(&state.config_dir, &id, name, my_id)?;
+    sync.reconcile(); // start the new pending link so the newcomer's hello lands
+    let _ = app.emit("pairs://changed", ());
+    Ok(invite)
+}
+
 #[tauri::command]
 pub fn get_folder_statuses(sync: State<'_, Arc<SyncManager>>) -> Vec<FolderStatus> {
     sync.statuses()

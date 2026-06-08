@@ -104,6 +104,7 @@ let pairs: Pair[] = [
     deleteMode: 'trash',
     createdAt: Date.now() - 3 * 86400_000,
     endpointId: null,
+    groupId: null,
   },
 ]
 let pairCounter = 1
@@ -300,6 +301,7 @@ export const mockApi = {
       deleteMode: 'trash',
       createdAt: Date.now(),
       endpointId: null,
+      groupId: null,
     }
     pairs.push(pair)
     if (peerName?.trim()) {
@@ -329,6 +331,7 @@ export const mockApi = {
       deleteMode: 'trash',
       createdAt: Date.now(),
       endpointId: null,
+      groupId: null,
     }
     pairs.push(pair)
     return pair
@@ -353,6 +356,7 @@ export const mockApi = {
     pairs = pairs.filter((p) => p.id !== id)
   },
   pairInvite: async (id: string): Promise<string> => `dropbeam1:MOCK${id}invitecodewouldgohere0000`,
+  folderAddPerson: async (id: string): Promise<string> => `dropbeam1:MOCK${id}groupinvitewouldgohere000`,
   listFolderHistory: async (pairId: string): Promise<HistoryItem[]> =>
     [...(folderHistory[pairId] ?? [])].sort((a, b) => b.timestampMs - a.timestampMs),
   restoreFolderItem: async (pairId: string, itemId: string): Promise<void> => {

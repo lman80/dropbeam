@@ -87,6 +87,9 @@ export interface Pair {
   createdAt: number
   /** The folder peer's iroh device key, for direct sync. Null until exchanged. */
   endpointId: string | null
+  /** Multi-person folders: all pairwise links of one shared folder share this id.
+   * Null = a classic 1:1 folder. */
+  groupId: string | null
 }
 
 /** A restorable deleted/overwritten file in a mirror folder's history. */
@@ -207,6 +210,8 @@ const realApi = {
     }),
   removePair: (id: string) => invoke<void>('remove_pair', { id }),
   pairInvite: (id: string) => invoke<string>('pair_invite', { id }),
+  /** Invite another person into an existing folder (makes it a 3+ person group). */
+  folderAddPerson: (id: string) => invoke<string>('folder_add_person', { id }),
   getFolderStatuses: () => invoke<FolderStatus[]>('get_folder_statuses'),
   listFolderHistory: (pairId: string) =>
     invoke<HistoryItem[]>('list_folder_history', { pairId }),

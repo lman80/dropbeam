@@ -710,11 +710,33 @@ async fn serve_stream(
                         .collect()
                 })
                 .unwrap_or_default();
+            let group_id = req
+                .get("group_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let members: Vec<(String, String)> = req
+                .get("members")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            let eid = m.get("eid").and_then(|e| e.as_str())?.to_string();
+                            let n = m
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            Some((eid, n))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             if !pair_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
-                        sm.apply_remote_control(&pair_id, &name, &deletes);
+                        sm.apply_remote_control(&pair_id, &name, &deletes, &group_id, &members);
                     }
                 }
             }
@@ -1213,6 +1235,8 @@ pub async fn send_folder_ctrl(
     pair_id: &str,
     name: &str,
     deletes: &[(String, u64)],
+    group_id: &str,
+    members: &[(String, String)],
 ) -> Result<()> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
     let addr = iroh::EndpointAddr::from(parsed);
@@ -1220,8 +1244,15 @@ pub async fn send_folder_ctrl(
         .iter()
         .map(|(rel, ts)| serde_json::json!({ "rel": rel, "ts": ts }))
         .collect();
+    // The group roster rides the beacon so everyone meshes with everyone
+    // (multi-person folders). Empty group_id / members on a classic 1:1 folder.
+    let mem: Vec<serde_json::Value> = members
+        .iter()
+        .map(|(eid, n)| serde_json::json!({ "eid": eid, "name": n }))
+        .collect();
     let msg = serde_json::json!({
         "kind": "folder-ctrl", "pair_id": pair_id, "name": name, "deletes": dels,
+        "group_id": group_id, "members": mem,
     });
     // Bounded dial so a perpetually-offline peer fails fast and the caller can
     // back off, exactly like the old croc control timeout.
@@ -1401,6 +1432,27 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
 /// Folder PUSH writer: like `write_files`, but tags the stream with `pair_id` and
 /// sends each file's path RELATIVE to the folder root (so `sub/a.txt` lands in
 /// `sub/a.txt`, not the folder root).
+/// A file's modified-time as whole seconds since the epoch (0 if unavailable).
+fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Stamp a file's modified-time to a specific epoch-seconds value, so a synced
+/// file carries the SAME mtime on every member (stable signatures, no storm).
+fn set_mtime_secs(path: &Path, secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(when);
+    }
+}
+
 async fn write_folder_files<F: Fn(u64, u64)>(
     send: &mut SendStream,
     pair_id: &str,
@@ -1412,15 +1464,19 @@ async fn write_folder_files<F: Fn(u64, u64)>(
     let mut items = Vec::new();
     for p in paths {
         let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
-        items.push((p.clone(), folder_rel(p, root), meta.len()));
+        items.push((p.clone(), folder_rel(p, root), meta.len(), mtime_secs(&meta)));
     }
     let total: u64 = items.iter().map(|i| i.2).sum();
     let header = serde_json::json!({
         "kind": "folder-files",
         "pair_id": pair_id,
+        // `mtime` (seconds) travels with each file so EVERY member writes it with
+        // the same modified-time → the same file signature group-wide. That's what
+        // makes the loop-guard work across a mesh (no sync storm) and lets a
+        // re-received identical file be recognised as a no-op.
         "items": items
             .iter()
-            .map(|(_, n, s)| serde_json::json!({ "name": n, "size": s }))
+            .map(|(_, n, s, mt)| serde_json::json!({ "name": n, "size": s, "mtime": mt }))
             .collect::<Vec<_>>(),
         "total": total,
     });
@@ -1428,7 +1484,7 @@ async fn write_folder_files<F: Fn(u64, u64)>(
 
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
-    for (path, _, _) in &items {
+    for (path, _, _, _) in &items {
         let mut f = tokio::fs::File::open(path).await?;
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -1494,6 +1550,10 @@ async fn read_folder_body<F: Fn(u64, u64)>(
             }
         }
         f.flush().await?;
+        drop(f); // close before stamping the mtime
+        // Preserve the origin's modified-time so this file's signature matches on
+        // every member (older peers omit `mtime` → falls back to receive-time).
+        set_mtime_secs(&dest, item["mtime"].as_u64().unwrap_or(0));
         out.push(dest);
     }
     Ok(out)

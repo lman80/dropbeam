@@ -207,6 +207,13 @@ pub struct Pair {
     /// this or not yet exchanged.
     #[serde(default)]
     pub endpoint_id: Option<String>,
+    /// Multi-person folders: all the pairwise links that share ONE folder among a
+    /// group carry the same `group_id`. None = a classic 1:1 folder (every
+    /// existing folder). A group of N people is N-1 of these links per member,
+    /// all pointing at the same local `folder`; the roster propagates over the
+    /// control beacon so everyone meshes with everyone.
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 /// One restorable entry in a folder's history (a deleted or overwritten file).

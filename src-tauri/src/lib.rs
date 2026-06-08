@@ -301,6 +301,7 @@ pub fn run() {
             commands::update_pair,
             commands::remove_pair,
             commands::pair_invite,
+            commands::folder_add_person,
             commands::get_folder_statuses,
             commands::list_folder_history,
             commands::restore_folder_item,

@@ -62,6 +62,11 @@ struct Invite {
     /// hands back their own id via a "folder-hello" right after accepting.
     #[serde(default)]
     eid: Option<String>,
+    /// Multi-person folders: the group all the folder's pairwise links share. The
+    /// rest of the roster propagates over the control beacon, so the invite only
+    /// needs to carry the group id. None on a classic 1:1 invite.
+    #[serde(default)]
+    gid: Option<String>,
 }
 
 /// Create a new pair (this device is A). Returns the pair + a shareable invite.
@@ -85,6 +90,9 @@ pub fn create(
 
     let id = uuid::Uuid::new_v4().to_string();
     let secret = random_secret();
+    // Every new folder gets a group id so it can grow to 3+ people later; a 1:1
+    // folder is just a group of two (the roster reconciliation is a no-op there).
+    let group_id = uuid::Uuid::new_v4().to_string();
     let peer_label = peer_name.trim().to_string();
     let auto_friend = !peer_label.is_empty();
     // Mirror is inherently two-way.
@@ -102,6 +110,7 @@ pub fn create(
         created_at: now_ms(),
         // The accepter's id arrives later via their folder-hello.
         endpoint_id: None,
+        group_id: Some(group_id.clone()),
     };
 
     let invite = Invite {
@@ -113,6 +122,7 @@ pub fn create(
         frn: auto_friend,
         mir: mirror,
         eid: my_endpoint_id,
+        gid: Some(group_id),
     };
     let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
     let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
@@ -165,6 +175,7 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
         created_at: now_ms(),
         // Learned straight from the invite — lets us sync directly over iroh.
         endpoint_id: invite.eid.clone(),
+        group_id: invite.gid.clone(),
     };
     pairs.push(pair.clone());
     save(config_dir, &pairs)?;
@@ -248,9 +259,150 @@ pub fn invite_for(pair: &Pair, my_name: &str, my_endpoint_id: Option<String>) ->
         frn: !pair.peer_name.trim().is_empty(),
         mir: pair.mirror,
         eid: my_endpoint_id,
+        gid: pair.group_id.clone(),
     };
     let json = serde_json::to_string(&invite).unwrap_or_default();
     format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
+}
+
+/// Pairs that share a folder group (all the pairwise links of one N-person folder).
+pub fn members_of_group(config_dir: &Path, group_id: &str) -> Vec<Pair> {
+    load(config_dir)
+        .into_iter()
+        .filter(|p| p.group_id.as_deref() == Some(group_id))
+        .collect()
+}
+
+/// Ensure a pairwise link exists to `endpoint_id` within a folder group (used by
+/// the control-beacon roster reconciliation to mesh everyone with everyone).
+/// `template` is any existing pair in the group — we copy its folder + sync mode.
+/// Returns the new pair if one was created, or None if it already existed / self.
+pub fn ensure_member(
+    config_dir: &Path,
+    group_id: &str,
+    template: &Pair,
+    endpoint_id: &str,
+    name: &str,
+    my_endpoint_id: &str,
+) -> Option<Pair> {
+    if endpoint_id.is_empty() || endpoint_id == my_endpoint_id {
+        return None; // never pair with ourselves
+    }
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    if pairs
+        .iter()
+        .any(|p| p.group_id.as_deref() == Some(group_id) && p.endpoint_id.as_deref() == Some(endpoint_id))
+    {
+        return None; // already meshed with this member
+    }
+    let new = Pair {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: PairRole::B,
+        peer_name: clean_name(name),
+        // Deterministic so both ends of this new link derive the same channels.
+        secret: derive_group_secret(group_id, my_endpoint_id, endpoint_id),
+        folder: template.folder.clone(),
+        two_way: template.two_way,
+        mirror: template.mirror,
+        auto_delete: template.auto_delete,
+        delete_mode: template.delete_mode,
+        created_at: now_ms(),
+        endpoint_id: Some(endpoint_id.to_string()),
+        group_id: Some(group_id.to_string()),
+    };
+    pairs.push(new.clone());
+    let _ = save(config_dir, &pairs);
+    // Folder partners are friends, so they show up by name + you can chat them.
+    friends::upsert_from_pairing(config_dir, &new.peer_name, &new.secret, PairRole::B);
+    Some(new)
+}
+
+fn clean_name(name: &str) -> String {
+    let n = name.trim();
+    if n.is_empty() {
+        "Member".into()
+    } else {
+        n.to_string()
+    }
+}
+
+/// A stable secret for a group link, identical on both ends (order-independent).
+fn derive_group_secret(group_id: &str, a: &str, b: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = Sha256::new();
+    h.update(group_id.as_bytes());
+    h.update(b"|");
+    h.update(lo.as_bytes());
+    h.update(b"|");
+    h.update(hi.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Invite another person into an EXISTING folder's group. Creates a fresh
+/// inviter→newcomer link (sharing the folder + group), and returns an invite the
+/// newcomer accepts. A folder created before groups existed is upgraded in place:
+/// every link on that folder is stamped with a new group id. The rest of the
+/// roster reaches the newcomer over the control beacon once they're in.
+pub fn group_invite(
+    config_dir: &Path,
+    source_pair_id: &str,
+    my_name: String,
+    my_endpoint_id: Option<String>,
+) -> Result<String, String> {
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let source = pairs
+        .iter()
+        .find(|p| p.id == source_pair_id)
+        .cloned()
+        .ok_or("That shared folder no longer exists.")?;
+    // Resolve (or assign) the group id, upgrading a pre-groups folder in place.
+    let group_id = match source.group_id.clone() {
+        Some(g) => g,
+        None => {
+            let g = uuid::Uuid::new_v4().to_string();
+            for p in pairs.iter_mut() {
+                if same_path(&p.folder, &source.folder) {
+                    p.group_id = Some(g.clone());
+                }
+            }
+            g
+        }
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let secret = random_secret();
+    let new = Pair {
+        id: id.clone(),
+        role: PairRole::A,
+        peer_name: String::new(),
+        secret: secret.clone(),
+        folder: source.folder.clone(),
+        two_way: source.two_way,
+        mirror: source.mirror,
+        auto_delete: source.auto_delete,
+        delete_mode: source.delete_mode,
+        created_at: now_ms(),
+        endpoint_id: None, // arrives via the newcomer's folder-hello
+        group_id: Some(group_id.clone()),
+    };
+    let invite = Invite {
+        v: 1,
+        id,
+        secret,
+        name: my_name,
+        tw: new.two_way,
+        frn: true,
+        mir: new.mirror,
+        eid: my_endpoint_id,
+        gid: Some(group_id),
+    };
+    let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
+    let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
+    pairs.push(new);
+    save(config_dir, &pairs)?;
+    Ok(encoded)
 }
 
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
@@ -382,6 +534,7 @@ mod tests {
             delete_mode: DeleteMode::Trash,
             created_at: 0,
             endpoint_id: None,
+            group_id: None,
         }
     }
 
