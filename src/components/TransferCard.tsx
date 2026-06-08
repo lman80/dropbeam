@@ -312,8 +312,8 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
             {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
           </div>
           {t.direction === 'receive' && t.outDir && (
-            <button className="btn btn-ghost" onClick={() => api.revealPath(t.outDir!)}>
-              <FolderOpen size={15} /> Show in Finder
+            <button className="btn btn-ghost" onClick={() => api.openPath(t.outDir!)}>
+              <FolderOpen size={15} /> Open folder
             </button>
           )}
         </div>

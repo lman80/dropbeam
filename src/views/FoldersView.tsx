@@ -222,7 +222,7 @@ function FolderCard({
             {folderName}
           </div>
         </div>
-        <button className="icon-btn" title="Open folder" onClick={() => api.revealPath(pair.folder)}>
+        <button className="icon-btn" title="Open folder" onClick={() => api.openPath(pair.folder)}>
           <FolderOpen size={16} />
         </button>
         <button

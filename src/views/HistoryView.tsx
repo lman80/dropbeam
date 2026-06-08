@@ -128,8 +128,8 @@ export function HistoryView() {
                   {e.direction === 'receive' && e.outDir && ok && (
                     <button
                       className="icon-btn"
-                      title="Show in Finder"
-                      onClick={() => api.revealPath(e.outDir!)}
+                      title="Open folder"
+                      onClick={() => api.openPath(e.outDir!)}
                     >
                       <FolderOpen size={15} />
                     </button>
