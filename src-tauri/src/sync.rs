@@ -198,6 +198,9 @@ impl SyncManager {
             // per-friend croc inbox listener to start.
             let _ = (existing, sig, friend);
         }
+        // Tell every window (main + menu-bar popover) to reload its friend list,
+        // so a newly added friend appears immediately without an app restart.
+        let _ = self.app.emit("friends://changed", ());
     }
 
     fn stop_friend(&self, id: &str) {

@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.8.1"
+version = "0.8.2"
 description = "DropBeam — seamless peer-to-peer file transfer"
 authors = ["DropBeam"]
 license = ""
@@ -39,6 +39,10 @@ trash = "5"
 base64 = "0.22"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
+# Single-instance: forwards a second launch's file argument to the running app,
+# powering the Windows "Send with DropBeam" right-click menu. Used on Windows
+# only (macOS already single-instances .app bundles + uses the menu-bar drag).
+tauri-plugin-single-instance = "2"
 # Next-gen transport (Phase 1+): direct P2P with NAT hole-punching, replacing
 # croc's relay-only model. Raw QUIC streams — no iroh-blobs (not yet 1.0).
 iroh = { version = "0.98", features = ["address-lookup-mdns"] }

@@ -147,6 +147,8 @@ const realApi = {
   cancelTransfer: (id: string) => invoke<void>('cancel_transfer', { id }),
   /** Write a line into the native app log file (for diagnosing remote issues). */
   frontendLog: (msg: string) => invoke<void>('frontend_log', { msg }),
+  /** A file the app was launched to send (Windows "Send with DropBeam"). */
+  takeLaunchFile: () => invoke<string | null>('take_launch_file'),
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (settings: Settings) => invoke<Settings>('update_settings', { settings }),
   getHistory: () => invoke<HistoryEntry[]>('get_history'),
@@ -209,6 +211,17 @@ export function onFolderStatus(cb: (s: FolderStatus) => void): Promise<UnlistenF
 export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('pairs://changed', () => cb())
   return listen('pairs://changed', () => cb())
+}
+
+export function onFriendsChanged(cb: () => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('friends://changed', () => cb())
+  return listen('friends://changed', () => cb())
+}
+
+/** A second launch (Windows "Send with DropBeam") forwarded a file to send. */
+export function onOpenFileSend(cb: (path: string) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('open-file-send', () => {})
+  return listen<string>('open-file-send', (e) => cb(e.payload))
 }
 
 export function onFolderHistoryChanged(cb: (pairId: string) => void): Promise<UnlistenFn> {

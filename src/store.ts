@@ -2,7 +2,9 @@ import { create } from 'zustand'
 import {
   api,
   onFolderStatus,
+  onFriendsChanged,
   onHistoryChanged,
+  onOpenFileSend,
   onPairsChanged,
   onTransferUpdate,
   type FolderStatus,
@@ -171,6 +173,20 @@ export const useStore = create<AppStore>((set, get) => ({
     // The control channel can learn the peer's name after the fact — reload pairs
     // so the folder shows who's in it (and clears the stale "waiting" state).
     onPairsChanged(() => get().reloadPairs())
+    onFriendsChanged(() => get().reloadFriends())
+
+    // "Send with DropBeam" (Windows right-click): open the send chooser for the
+    // file the app was launched with (cold start) or that a second launch
+    // forwarded (the native side already brought the window to front).
+    api
+      .takeLaunchFile()
+      .then((f) => {
+        if (f) get().setPendingSend([f])
+      })
+      .catch(() => {})
+    onOpenFileSend((path) => {
+      if (path) get().setPendingSend([path])
+    })
 
     appVersion().then((v) => set({ appVer: v }))
     // Only the main window owns the update check (the popover/HUD share state but

@@ -1148,7 +1148,11 @@ async fn read_folder_body<F: Fn(u64, u64)>(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut f = tokio::fs::File::create(&dest).await?;
+        // Buffer disk writes: QUIC delivers data in small pieces, and one blocking
+        // write syscall per piece throttles big receives. A 1 MiB buffer batches
+        // them into far fewer, larger writes. Flushed before the file is finalized.
+        let mut f =
+            tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&dest).await?);
         let mut remaining = size;
         while remaining > 0 {
             if cancel.load(Ordering::SeqCst) {
@@ -1213,7 +1217,7 @@ fn sanitize_rel(raw: &str) -> PathBuf {
 // This is the single primitive Quick Send / Friends / Folders will all reuse.
 
 const MAX_HEADER: usize = 1 << 20; // 1 MiB — generous for a file list, abuse-safe
-const CHUNK: usize = 256 * 1024;
+const CHUNK: usize = 1024 * 1024; // 1 MiB — fewer read/write/await cycles on big files
 
 async fn write_frame(send: &mut SendStream, v: &serde_json::Value) -> Result<()> {
     let buf = serde_json::to_vec(v)?;
@@ -1341,7 +1345,11 @@ async fn read_body<F: Fn(u64, u64)>(
             .unwrap_or_else(|| "file".to_string());
         let size = item["size"].as_u64().unwrap_or(0);
         let dest = unique_path(dest_dir, &name);
-        let mut f = tokio::fs::File::create(&dest).await?;
+        // Buffer disk writes: QUIC delivers data in small pieces, and one blocking
+        // write syscall per piece throttles big receives. A 1 MiB buffer batches
+        // them into far fewer, larger writes. Flushed before the file is finalized.
+        let mut f =
+            tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&dest).await?);
         let mut remaining = size;
         while remaining > 0 {
             if cancel.load(Ordering::SeqCst) {

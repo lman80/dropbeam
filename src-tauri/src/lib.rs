@@ -21,6 +21,10 @@ use tauri::{AppHandle, Manager};
 /// When the popover last hid itself on blur — so a tray click that *caused* that
 /// blur doesn't immediately re-open it (clicking the icon should toggle).
 static LAST_POPOVER_HIDE: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+
+/// A file the app was launched to send (Windows "Send with DropBeam" right-click,
+/// or a second launch forwarded by single-instance). The UI drains it on load.
+static LAUNCH_FILE: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
 
@@ -39,6 +43,22 @@ fn traydrag_debug(msg: String) {
 #[tauri::command]
 fn frontend_log(msg: String) {
     log::info!("[ui] {msg}");
+}
+
+/// First argument (after the executable) that points to an existing file — the
+/// path the "Send with DropBeam" right-click menu passes (`DropBeam.exe "%1"`).
+fn file_from_args(argv: &[String]) -> Option<String> {
+    argv.iter()
+        .skip(1)
+        .find(|a| std::path::Path::new(a.as_str()).is_file())
+        .cloned()
+}
+
+/// The UI calls this on launch to pick up a file the app was opened to send
+/// (cold start via the Windows right-click menu). Returns it and clears it.
+#[tauri::command]
+fn take_launch_file() -> Option<String> {
+    LAUNCH_FILE.lock().unwrap().take()
 }
 
 /// One friend row's on-screen rectangle (CSS px), reported by the menu JS.
@@ -92,7 +112,25 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Single-instance MUST be the first plugin. Windows/Linux only: it forwards a
+    // second launch — e.g. the "Send with DropBeam" right-click menu, which runs
+    // DropBeam.exe with the file path — to the already-running app instead of
+    // opening a duplicate. (macOS already single-instances .app bundles and has
+    // the menu-bar drag-to-send, so it's skipped there.)
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+        if let Some(f) = file_from_args(&argv) {
+            *LAUNCH_FILE.lock().unwrap() = Some(f.clone());
+            let _ = tauri::Emitter::emit(app, "open-file-send", f);
+        }
+    }));
+    let builder = builder
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -130,6 +168,12 @@ pub fn run() {
                 log::error!("PANIC: {info}");
             }));
             log::info!("setup: starting v{}", env!("CARGO_PKG_VERSION"));
+
+            // Cold start via the "Send with DropBeam" right-click menu: stash the
+            // file path so the UI can open the send chooser for it once loaded.
+            if let Some(f) = file_from_args(&std::env::args().collect::<Vec<_>>()) {
+                *LAUNCH_FILE.lock().unwrap() = Some(f);
+            }
 
             let config_dir = app
                 .path()
@@ -260,6 +304,7 @@ pub fn run() {
             commands::iroh_receive,
             traydrag_debug,
             frontend_log,
+            take_launch_file,
             set_popover_rows,
         ])
         .build(tauri::generate_context!())
