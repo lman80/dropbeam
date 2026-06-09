@@ -534,6 +534,11 @@ export const useStore = create<AppStore>((set, get) => ({
   sendChat: async (friendId, text) => {
     const body = text.trim()
     if (!body) return
+    // The Rust side persists the message and IMMEDIATELY emits it back over
+    // `chat://message` (status 'sending'), then a background outbox auto-retries
+    // and emits 'sent'/'failed' — so the bubble paints + recovers on its own. We
+    // just trigger the send and let those echoes drive the thread (adding it
+    // optimistically here would double-render every message against that echo).
     try {
       const m = await api.sendChatMessage(friendId, body)
       get().addChatMessage(m)

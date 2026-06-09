@@ -15,7 +15,7 @@ import { useStore } from '../store'
 import { EmptyState } from '../components/bits'
 import { avatarGradient, initials } from '../lib/avatar'
 import { formatBytes, formatRelativeTime } from '../lib/format'
-import { friendOnlineState } from '../lib/presence'
+import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 
 /** Stable empty array so the messages selector doesn't return a fresh ref each render. */
 const EMPTY_MSGS: ChatMessage[] = []
@@ -167,7 +167,8 @@ function Conversation({ friendId }: { friendId: string }) {
       !!p.peerName &&
       p.peerName.trim().toLowerCase() === friend.name.trim().toLowerCase(),
   )
-  const online = friendOnlineState(friend.name, friendSeen, folderStatuses) === true
+  const presence = friendPresence(friend.name, friendSeen, folderStatuses)
+  const online = presence.status === 'online'
 
   const submit = () => {
     const body = text.trim()
@@ -200,7 +201,7 @@ function Conversation({ friendId }: { friendId: string }) {
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14.5 }}>{friend.name}</div>
           <div style={{ fontSize: 12, color: online ? 'var(--green)' : 'var(--text-faint)' }}>
-            {online ? 'Online' : 'Offline'}
+            {presenceLabel(presence)}
           </div>
         </div>
         {sharedFolder && (
