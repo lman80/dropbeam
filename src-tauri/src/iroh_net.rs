@@ -224,18 +224,46 @@ pub enum CancelKind {
 /// explainable. Cheap + synchronous — reads the currently selected path.
 /// (The selected path can upgrade relay→direct mid-transfer, so we re-read it
 /// on every progress tick for a live badge.)
+/// Is this `remote_addr` Debug string a private/link-local IP (i.e. same LAN)?
+/// `PathInfo::remote_addr()` Debug-formats as e.g. `Ip(192.168.1.5:54321)` (seen in
+/// our PERF logs). Best-effort string match; an unrecognized format degrades to
+/// "not LAN" → labeled DIRECT, which is still truthful for a non-relay path.
+fn addr_is_lan(dbg: &str) -> bool {
+    dbg.contains("Ip(10.")
+        || dbg.contains("Ip(192.168.")
+        || dbg.contains("Ip(127.")
+        || dbg.contains("Ip(169.254.") // link-local
+        || dbg.contains("Ip([fe80") // IPv6 link-local
+        || dbg.contains("Ip([::1]") // IPv6 loopback
+        || (dbg.contains("Ip(172.")
+            && dbg
+                .split("Ip(172.")
+                .nth(1)
+                .and_then(|s| s.split('.').next())
+                .and_then(|s| s.parse::<u8>().ok())
+                .map(|o| (16..=31).contains(&o)) // 172.16/12
+                .unwrap_or(false))
+}
+
+/// Which channel the live connection is using: relayed (slow), a direct LAN path,
+/// or a hole-punched DIRECT path over the internet. Read from the SELECTED QUIC
+/// path on every progress tick, so it's live + truthful.
 fn conn_locality(conn: &Connection) -> crate::models::Locality {
     use crate::models::Locality;
     use iroh::Watcher as _; // brings `.get()` into scope for the path watcher
     let mut watcher = conn.paths();
     let paths = watcher.get();
-    let relayed = paths
+    // Extract owned (is_relay, addr) up front so the borrow of `paths` ends here.
+    let selected = paths
         .iter()
         .find(|p| p.is_selected())
-        .map(|p| p.is_relay());
-    match relayed {
-        Some(true) => Locality::Internet, // relayed = the slow path
-        Some(false) => Locality::Local,   // direct peer-to-peer
+        .map(|p| (p.is_relay(), format!("{:?}", p.remote_addr())));
+    match selected {
+        Some((true, _)) => Locality::Internet, // relayed = the slow path
+        // Direct peer-to-peer — distinguish same-LAN from a hole-punched WAN path by
+        // the remote address so the badge can say "Local network" vs "Direct".
+        Some((false, addr)) if addr_is_lan(&addr) => Locality::Local,
+        Some((false, _)) => Locality::Direct,
         None => Locality::Unknown,
     }
 }

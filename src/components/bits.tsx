@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Globe, Wifi } from 'lucide-react'
+import { Cloud, Loader2, Wifi, Zap } from 'lucide-react'
 import type { Locality } from '../lib/api'
 
 export function BeamLogo({ size = 20 }: { size?: number }) {
@@ -18,20 +18,63 @@ export function BeamLogo({ size = 20 }: { size?: number }) {
   )
 }
 
+// The channel a transfer is flowing over — Direct P2P / Local network / Relay /
+// Connecting. Plain-English tooltips so beta users understand what each means and
+// roughly how fast to expect. One component, reused on every surface.
+const CHANNELS = {
+  direct: {
+    icon: Zap,
+    label: 'Direct',
+    bg: 'var(--green-soft)',
+    fg: 'var(--green)',
+    tip: 'Direct peer-to-peer — your files go straight to the other device, end-to-end encrypted, no middleman. Fastest.',
+  },
+  local: {
+    icon: Wifi,
+    label: 'Local network',
+    bg: 'var(--accent-soft)',
+    fg: 'var(--accent)',
+    tip: "Same network — sending over your local Wi-Fi/LAN. Very fast, and it never leaves your network.",
+  },
+  internet: {
+    icon: Cloud,
+    label: 'Relay',
+    bg: 'var(--amber-soft)',
+    fg: 'var(--amber)',
+    tip: "Relayed — a direct link couldn't be made (strict network), so files hop through an encrypted relay. Slower, still private.",
+  },
+  unknown: {
+    icon: Loader2,
+    label: 'Connecting',
+    bg: 'var(--surface-2)',
+    fg: 'var(--text-faint)',
+    tip: 'Finding the best route to the other device…',
+  },
+} as const
+
+export function ChannelBadge({
+  locality,
+  size = 12,
+  showConnecting = false,
+}: {
+  locality: Locality
+  size?: number
+  showConnecting?: boolean
+}) {
+  if (locality === 'unknown' && !showConnecting) return null
+  const c = CHANNELS[locality] ?? CHANNELS.unknown
+  const Icon = c.icon
+  return (
+    <span className="chip" title={c.tip} style={{ background: c.bg, color: c.fg }}>
+      <Icon size={size} className={locality === 'unknown' ? 'animate-spin-slow' : undefined} />{' '}
+      {c.label}
+    </span>
+  )
+}
+
+/** Back-compat alias — older call sites still import LocalityBadge. */
 export function LocalityBadge({ locality }: { locality: Locality }) {
-  if (locality === 'local')
-    return (
-      <span className="chip" style={{ background: 'var(--green-soft)', color: 'var(--green)' }}>
-        <Wifi size={12} /> Local network
-      </span>
-    )
-  if (locality === 'internet')
-    return (
-      <span className="chip" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>
-        <Globe size={12} /> Internet
-      </span>
-    )
-  return null
+  return <ChannelBadge locality={locality} />
 }
 
 export function ProgressBar({ percent }: { percent: number }) {

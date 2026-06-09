@@ -4,6 +4,8 @@ import { currentMonitor, getCurrentWindow, LogicalPosition } from '@tauri-apps/a
 import { AnimatePresence, motion } from 'framer-motion'
 import { ArrowDownToLine, Send, X } from 'lucide-react'
 import { HAS_TAURI, isActive } from '../lib/api'
+import type { Locality } from '../lib/api'
+import { ChannelBadge } from '../components/bits'
 import { useStore } from '../store'
 
 interface Pill {
@@ -12,6 +14,7 @@ interface Pill {
   title: string
   sub: string
   percent: number
+  locality: Locality
 }
 
 export function Hud() {
@@ -53,6 +56,7 @@ export function Hud() {
         title: name,
         sub,
         percent: t.state === 'transferring' ? t.percent : 0,
+        locality: t.locality,
       }
     }
     const folder = Object.values(folderStatuses).find(
@@ -68,6 +72,7 @@ export function Hud() {
         title: folder.sendingFile || (sending ? `Syncing to ${who}` : `Syncing from ${who}`),
         sub: `${Math.round(folder.percent)}% · ${sending ? 'to' : 'from'} ${who}`,
         percent: folder.percent,
+        locality: folder.locality,
       }
     }
     return null
@@ -116,6 +121,7 @@ export function Hud() {
               <span className="hud-title">{pill.title}</span>
               <span className="hud-sub">{pill.sub}</span>
             </span>
+            {pill.locality !== 'unknown' && <ChannelBadge locality={pill.locality} />}
             <span className="hud-ring" aria-hidden>
               {Math.round(pill.percent)}
             </span>

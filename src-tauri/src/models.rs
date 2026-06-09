@@ -33,12 +33,20 @@ pub enum TransferState {
     Canceled,
 }
 
-/// Whether the active connection is on the LAN or via the internet relay.
+/// Which channel the active connection is using — so the UI can tell the user
+/// exactly how their files are flowing (and roughly how fast to expect).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Locality {
+    /// Still figuring out the route (connecting / hole-punching).
     Unknown,
+    /// Same local network — a direct path to a private/link-local address. Fastest.
     Local,
+    /// Hole-punched DIRECT peer-to-peer over the internet, no relay. Fast + private.
+    Direct,
+    /// Relayed through a public relay (the slow fallback when no direct path forms).
+    /// Serialized "internet" for backward-compat with old clients + history; the UI
+    /// labels it "Relay".
     Internet,
 }
 

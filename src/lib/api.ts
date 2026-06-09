@@ -20,7 +20,7 @@ export type TransferState =
   | 'completed'
   | 'failed'
   | 'canceled'
-export type Locality = 'unknown' | 'local' | 'internet'
+export type Locality = 'unknown' | 'local' | 'direct' | 'internet'
 
 export interface TransferUpdate {
   id: string
