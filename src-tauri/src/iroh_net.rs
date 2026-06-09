@@ -188,6 +188,10 @@ fn emit_completed(
 }
 
 fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
+    // Log every failure so a transfer that "kept failing" on a machine we can't
+    // reach leaves a trace in DropBeam.log (was invisible — failures only emitted
+    // to the UI). Pairs with the PERF lines to explain a bad transfer.
+    log::warn!("TRANSFER-FAIL[{dir:?}] id={id}: {err}");
     let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
     u.state = TransferState::Failed;
     u.error = Some(err.to_string());
@@ -602,7 +606,38 @@ async fn serve_stream(
                 conn.clone(),
             );
             let __t0 = std::time::Instant::now();
-            match read_body(recv, &req, &dest, &cancel, cb).await {
+            // Receive in parallel when the sender advertised it for a single big
+            // file AND this is an auto-accept friend: reply {ready:true}, then pull
+            // the N uni streams and reassemble. We gate on auto-accept so the
+            // sender's short ready-timeout isn't spent waiting behind a manual
+            // accept dialog (in that case the sender has already fallen back to the
+            // classic single stream, so we must too). Everything else = classic.
+            // Clamp the advertised stream count so a buggy/malicious peer can't make
+            // us loop on accept_uni forever (honest peers cap themselves at 6).
+            let parallel_n = req["parallel"].as_u64().unwrap_or(0).min(PARALLEL_STREAMS);
+            let body = if parallel_n > 0 && names.len() == 1 && auto_accept {
+                match write_frame(send, &serde_json::json!({ "ready": true })).await {
+                    Ok(()) => {
+                        let name = names.first().cloned().unwrap_or_else(|| "file".to_string());
+                        // Peel off the first segment stream with a timeout. If none
+                        // arrives, the sender raced us into its classic fallback (its
+                        // ready-timeout fired just before our reply landed), so read
+                        // the classic body off the bi stream instead — no hang.
+                        match tokio::time::timeout(Duration::from_secs(12), conn.accept_uni()).await {
+                            Ok(Ok(first)) => {
+                                recv_file_parallel(conn, &dest, &name, total, parallel_n, first, &cancel, cb)
+                                    .await
+                                    .map(|p| vec![p])
+                            }
+                            _ => read_body(recv, &req, &dest, &cancel, cb).await,
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                read_body(recv, &req, &dest, &cancel, cb).await
+            };
+            match body {
                 Ok(paths) => {
                     log_transfer_perf(conn, "friend-recv", "recv", total, __t0.elapsed());
                     let names: Vec<String> = paths
@@ -1714,13 +1749,235 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{stem}-dup{ext}"))
 }
 
-/// Core: write `[header][file bytes…]` to an already-open send stream.
-async fn write_files<F: Fn(u64, u64)>(
-    send: &mut SendStream,
-    paths: &[PathBuf],
+/// Parallel transfer tuning. A single QUIC stream tops out around ~40% of link
+/// capacity in iroh 0.98 (n0-computer/iroh#4286), so for a large single file we fan
+/// the bytes across several unidirectional streams on the same connection and
+/// reassemble. Each stream carries one CONTIGUOUS segment, so the receiver just
+/// seeks once and writes sequentially — no fragile positioned-write juggling.
+const PARALLEL_STREAMS: u64 = 6;
+/// Don't split anything smaller than this — the negotiation + extra stream setup
+/// isn't worth it and small files already transfer instantly.
+const PARALLEL_MIN: u64 = 16 * 1024 * 1024; // 16 MiB
+
+/// How many streams to fan a transfer across: only a SINGLE file at least
+/// PARALLEL_MIN big, and never so many that a stream would carry under ~4 MiB.
+/// Returns 0 = "send the classic single-stream way".
+fn parallel_stream_count(item_count: usize, total: u64) -> u64 {
+    if item_count != 1 || total < PARALLEL_MIN {
+        return 0;
+    }
+    PARALLEL_STREAMS.min((total / (4 * 1024 * 1024)).max(1))
+}
+
+/// Drain a set of transfer workers, reporting summed progress every 150ms and
+/// honoring the cancel flag. On the first worker error, aborts the rest and
+/// surfaces that error (so a half-finished parallel transfer fails cleanly rather
+/// than silently dropping bytes). Returns each worker's value on success.
+async fn drain_with_progress<T: Send + 'static, F: Fn(u64, u64)>(
+    mut set: tokio::task::JoinSet<Result<T>>,
+    progress: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: u64,
+    cancel: &AtomicBool,
+    on_progress: &F,
+) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    let mut err: Option<anyhow::Error> = None;
+    while !set.is_empty() {
+        tokio::select! {
+            joined = set.join_next() => match joined {
+                Some(Ok(Ok(v))) => out.push(v),
+                Some(Ok(Err(e))) => { if err.is_none() { err = Some(e); } set.abort_all(); }
+                Some(Err(e)) => {
+                    if err.is_none() { err = Some(anyhow::anyhow!("transfer worker failed: {e}")); }
+                    set.abort_all();
+                }
+                None => break,
+            },
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    if err.is_none() { err = Some(anyhow::anyhow!("canceled")); }
+                    set.abort_all();
+                } else if err.is_none() {
+                    on_progress(progress.load(std::sync::atomic::Ordering::Relaxed), total);
+                }
+            }
+        }
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
+}
+
+/// SEND one file across `n` unidirectional streams. Stream i carries the contiguous
+/// segment starting at `i * ceil(total/n)`, prefixed with its 8-byte big-endian
+/// start offset. Always opens exactly `n` streams (empty trailing ones are valid)
+/// so the receiver's `n` accepts never deadlock.
+async fn send_file_parallel<F: Fn(u64, u64)>(
+    conn: &Connection,
+    path: &Path,
+    total: u64,
+    n: u64,
     cancel: &AtomicBool,
     on_progress: F,
-) -> Result<u64> {
+) -> Result<()> {
+    let seg = total.div_ceil(n.max(1));
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+    for i in 0..n {
+        let start = (i * seg).min(total);
+        let len = seg.min(total - start);
+        let conn = conn.clone();
+        let path = path.to_path_buf();
+        let progress = progress.clone();
+        set.spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut uni = conn.open_uni().await?;
+            // 16-byte frame header: start offset + segment length (big-endian). The
+            // explicit length lets the receiver write EXACTLY its region and reject
+            // an over- or under-sending peer, instead of trusting stream EOF.
+            uni.write_all(&start.to_be_bytes()).await?;
+            uni.write_all(&len.to_be_bytes()).await?;
+            if len > 0 {
+                let mut f = tokio::fs::File::open(&path).await?;
+                f.seek(std::io::SeekFrom::Start(start)).await?;
+                let mut remaining = len;
+                let mut buf = vec![0u8; CHUNK];
+                while remaining > 0 {
+                    let want = remaining.min(CHUNK as u64) as usize;
+                    let k = f.read(&mut buf[..want]).await?;
+                    if k == 0 {
+                        anyhow::bail!("file ended early while sending segment");
+                    }
+                    uni.write_all(&buf[..k]).await?;
+                    remaining -= k as u64;
+                    progress.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            uni.finish()?;
+            // Keep the stream alive until the peer has acked the segment, so the
+            // last bytes aren't dropped by an early reset when the task ends.
+            let _ = uni.stopped().await;
+            Ok(())
+        });
+    }
+    drain_with_progress(set, &progress, total, cancel, &on_progress).await?;
+    on_progress(total, total);
+    Ok(())
+}
+
+/// Spawn one worker to drain a single inbound segment stream into `tmp`. The stream
+/// begins with a 16-byte header (start offset + segment length); the worker seeks to
+/// the offset and writes EXACTLY that many bytes (bounding a misbehaving peer), then
+/// returns the segment length for the caller's completeness check.
+fn spawn_segment_reader(
+    set: &mut tokio::task::JoinSet<Result<u64>>,
+    mut uni: RecvStream,
+    tmp: PathBuf,
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    set.spawn(async move {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        let mut hdr = [0u8; 16];
+        uni.read_exact(&mut hdr).await?;
+        let offset = u64::from_be_bytes(hdr[0..8].try_into().unwrap());
+        let seg_len = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+        let mut f = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
+        f.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut remaining = seg_len;
+        let mut buf = vec![0u8; CHUNK];
+        while remaining > 0 {
+            let want = remaining.min(CHUNK as u64) as usize;
+            match uni.read(&mut buf[..want]).await? {
+                Some(k) if k > 0 => {
+                    f.write_all(&buf[..k]).await?;
+                    remaining -= k as u64;
+                    progress.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => anyhow::bail!("segment stream ended early ({remaining} bytes short)"),
+            }
+        }
+        f.flush().await?;
+        Ok(seg_len)
+    });
+}
+
+/// RECEIVE one file fanned across `n` unidirectional streams into `dest_dir`. `first`
+/// is the already-accepted stream 0 (the caller peeled it off with a timeout to
+/// detect a sender that raced into its classic fallback). Each stream self-describes
+/// its offset + length, so arrival order doesn't matter. Receives into a hidden
+/// `.part` temp and atomically renames on success — a failed transfer is removed,
+/// never left as a full-size garbage file at the real name.
+async fn recv_file_parallel<F: Fn(u64, u64)>(
+    conn: &Connection,
+    dest_dir: &Path,
+    name: &str,
+    total: u64,
+    n: u64,
+    first: RecvStream,
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(dest_dir)?;
+    let safe = Path::new(name)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "file".to_string());
+    let dest = unique_path(dest_dir, &safe);
+    let tmp = dest_dir.join(format!(".{safe}.{}.part", uuid::Uuid::new_v4()));
+    {
+        // Pre-size so each segment can seek to its offset and write in place.
+        let f = std::fs::File::create(&tmp)?;
+        f.set_len(total)?;
+    }
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut set: tokio::task::JoinSet<Result<u64>> = tokio::task::JoinSet::new();
+    spawn_segment_reader(&mut set, first, tmp.clone(), progress.clone());
+    let mut accept_err = None;
+    for _ in 1..n {
+        // The rest of the streams (the sender opened all `n` at once, so once the
+        // first arrived these follow immediately). Nothing else uses uni streams.
+        match conn.accept_uni().await {
+            Ok(uni) => spawn_segment_reader(&mut set, uni, tmp.clone(), progress.clone()),
+            Err(e) => {
+                accept_err = Some(anyhow::anyhow!("accept segment stream: {e}"));
+                break;
+            }
+        }
+    }
+    let outcome: Result<()> = if let Some(e) = accept_err {
+        set.abort_all();
+        Err(e)
+    } else {
+        match drain_with_progress(set, &progress, total, cancel, &on_progress).await {
+            Ok(counts) => {
+                let received: u64 = counts.iter().sum();
+                if received == total {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("parallel receive incomplete: {received}/{total} bytes"))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    };
+    match outcome {
+        Ok(()) => {
+            std::fs::rename(&tmp, &dest)
+                .with_context(|| format!("finalize {}", dest.display()))?;
+            on_progress(total, total);
+            Ok(dest)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Gather (path, name, size) for each file to send, plus the byte total.
+fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64)>, u64)> {
     let mut items = Vec::new();
     for p in paths {
         let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
@@ -1730,20 +1987,37 @@ async fn write_files<F: Fn(u64, u64)>(
             .ok_or_else(|| anyhow::anyhow!("missing file name for {}", p.display()))?;
         items.push((p.clone(), name, meta.len()));
     }
-    let total: u64 = items.iter().map(|i| i.2).sum();
-    let header = serde_json::json!({
+    let total = items.iter().map(|i| i.2).sum();
+    Ok((items, total))
+}
+
+/// The JSON header describing a files push. `parallel` > 0 advertises that the body
+/// will arrive split across that many uni streams (the receiver opts in by replying
+/// `{ready:true}`); an older peer simply ignores the field and reads classically.
+fn files_header(items: &[(PathBuf, String, u64)], total: u64, parallel: u64) -> serde_json::Value {
+    serde_json::json!({
         "kind": "files",
         "items": items
             .iter()
             .map(|(_, n, s)| serde_json::json!({ "name": n, "size": s }))
             .collect::<Vec<_>>(),
         "total": total,
-    });
-    write_frame(send, &header).await?;
+        "parallel": parallel,
+    })
+}
 
+/// Write file bytes sequentially down one stream — the classic single-stream body
+/// (the header must already have been written).
+async fn write_files_body<F: Fn(u64, u64)>(
+    send: &mut SendStream,
+    items: &[(PathBuf, String, u64)],
+    total: u64,
+    cancel: &AtomicBool,
+    on_progress: &F,
+) -> Result<u64> {
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
-    for (path, _, _) in &items {
+    for (path, _, _) in items {
         let mut f = tokio::fs::File::open(path).await?;
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -1759,6 +2033,20 @@ async fn write_files<F: Fn(u64, u64)>(
         }
     }
     Ok(sent)
+}
+
+/// Core: write `[header][file bytes…]` to an already-open send stream (classic
+/// single-stream). Used by Quick Send's pull; Friends use `send_files`, which can
+/// fan a big single file across parallel streams.
+async fn write_files<F: Fn(u64, u64)>(
+    send: &mut SendStream,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<u64> {
+    let (items, total) = gather_items(paths)?;
+    write_frame(send, &files_header(&items, total, 0)).await?;
+    write_files_body(send, &items, total, cancel, &on_progress).await
 }
 
 /// Core: read `[header][file bytes…]` from a recv stream into `dest_dir`.
@@ -1835,7 +2123,35 @@ pub async fn send_files<F: Fn(u64, u64)>(
     on_progress: F,
 ) -> Result<u64> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    let sent = write_files(&mut send, paths, cancel, on_progress).await?;
+    let (items, total) = gather_items(paths)?;
+    let n = parallel_stream_count(items.len(), total);
+    write_frame(&mut send, &files_header(&items, total, n)).await?;
+
+    if n > 0 {
+        // The receiver opts into a parallel (multi-stream) receive by replying
+        // {ready:true}. A peer on an older build — or one with manual-accept on —
+        // won't, so we time out and fall back to the classic single-stream body on
+        // this same stream. No hard failure during a staggered rollout.
+        // Comfortably under the receiver's 12s first-stream wait, so if {ready}
+        // arrives we both pick parallel, and if it doesn't we both pick classic.
+        let ready = match tokio::time::timeout(Duration::from_secs(6), read_frame(&mut recv)).await {
+            Ok(Ok(v)) => v.get("ready").and_then(|r| r.as_bool()).unwrap_or(false),
+            _ => false,
+        };
+        if ready {
+            send_file_parallel(conn, &items[0].0, total, n, cancel, on_progress).await?;
+            send.finish()?;
+            let ack = recv.read_to_end(16).await.unwrap_or_default();
+            anyhow::ensure!(
+                ack == b"ok",
+                "the transfer was interrupted before the recipient confirmed receipt"
+            );
+            return Ok(total);
+        }
+    }
+
+    // Classic single-stream body (the header was already written above).
+    let sent = write_files_body(&mut send, &items, total, cancel, &on_progress).await?;
     send.finish()?;
     // Require the receiver's "ok" so we never report Completed for a transfer the
     // peer declined or failed to write (declined pushes stop the stream, surfacing
@@ -1966,6 +2282,90 @@ mod tests {
         assert_eq!(folder_rel(Path::new("/data/share/sub/a.txt"), "/data/share"), "sub/a.txt");
         // A path outside the root degrades to the bare file name (never absolute).
         assert_eq!(folder_rel(Path::new("/somewhere/else/b.txt"), "/data/share"), "b.txt");
+    }
+
+    #[test]
+    fn parallel_only_for_one_large_file() {
+        // Multiple files → never parallel (classic single stream).
+        assert_eq!(parallel_stream_count(3, 500 * 1024 * 1024), 0);
+        // A single small file → classic.
+        assert_eq!(parallel_stream_count(1, 5 * 1024 * 1024), 0);
+        // A single big file → capped at PARALLEL_STREAMS.
+        assert_eq!(parallel_stream_count(1, 541 * 1024 * 1024), PARALLEL_STREAMS);
+        // Right at the threshold → at least one stream, never more than the cap.
+        let n = parallel_stream_count(1, PARALLEL_MIN);
+        assert!((1..=PARALLEL_STREAMS).contains(&n));
+    }
+
+    #[test]
+    fn parallel_segments_cover_every_byte_exactly_once() {
+        // The EXACT split the sender uses and the receiver trusts: any gap, overlap,
+        // or short-fall here would corrupt the reassembled file, so prove coverage.
+        for total in [PARALLEL_MIN, 100u64, 541 * 1024 * 1024, 17, 1, PARALLEL_MIN + 1] {
+            let n = parallel_stream_count(1, total).max(1);
+            let seg = total.div_ceil(n);
+            let mut prev_end = 0u64;
+            let mut covered = 0u64;
+            for i in 0..n {
+                let start = (i * seg).min(total);
+                let len = seg.min(total - start);
+                assert_eq!(start, prev_end, "gap/overlap before stream {i} (total={total})");
+                prev_end = start + len;
+                covered += len;
+            }
+            assert_eq!(prev_end, total, "coverage ends exactly at total={total}");
+            assert_eq!(covered, total, "segments sum to total={total}");
+        }
+    }
+
+    // The core parallel-transfer guarantee: a file fanned across N uni streams and
+    // reassembled must come out byte-for-byte identical. Ignored (touches the relay
+    // network); run with: cargo test --lib iroh_net -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn parallel_transfer_reassembles_identical_bytes() {
+        let pid = std::process::id();
+        let total: u64 = 20 * 1024 * 1024; // 20 MiB → above PARALLEL_MIN, multi-stream
+        let n = parallel_stream_count(1, total);
+        assert!(n > 1, "20 MiB should fan across multiple streams");
+
+        // Deterministic pseudo-random payload (so a swapped/duplicated segment shows).
+        let mut data = vec![0u8; total as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i as u64).wrapping_mul(2654435761) % 251) as u8;
+        }
+        let src = std::env::temp_dir().join(format!("dropbeam-par-src-{pid}.bin"));
+        std::fs::write(&src, &data).unwrap();
+
+        let server = Endpoint::builder(presets::N0).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+        server.online().await;
+        let addr = server.addr();
+        let dest_dir = std::env::temp_dir().join(format!("dropbeam-par-rx-{pid}"));
+
+        let srv = server.clone();
+        let dest_dir_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            // Peel off the first segment stream like the live receiver does.
+            let first = conn.accept_uni().await.unwrap();
+            recv_file_parallel(&conn, &dest_dir_c, "blob.bin", total, n, first, &AtomicBool::new(false), |_, _| {})
+                .await
+                .unwrap()
+        });
+
+        let client = Endpoint::bind(presets::N0).await.unwrap();
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        send_file_parallel(&conn, &src, total, n, &AtomicBool::new(false), |_, _| {})
+            .await
+            .unwrap();
+
+        let dest = recv.await.unwrap();
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(got.len() as u64, total, "received size matches");
+        assert!(got == data, "parallel-reassembled bytes must match the source exactly");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+        println!("parallel transfer OK: {total} bytes across {n} streams, byte-identical");
     }
 
     // Real end-to-end file transfer over iroh. Ignored by default because it

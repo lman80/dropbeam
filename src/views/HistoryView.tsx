@@ -128,8 +128,16 @@ export function HistoryView() {
                   {e.direction === 'receive' && e.outDir && ok && (
                     <button
                       className="icon-btn"
-                      title="Open folder"
-                      onClick={() => api.openPath(e.outDir!)}
+                      title={e.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
+                      onClick={() => {
+                        // Single file → reveal it selected; multiple → open folder.
+                        const sep = e.outDir!.includes('\\') ? '\\' : '/'
+                        if (e.fileNames.length === 1) {
+                          api.revealPath(`${e.outDir}${sep}${e.fileNames[0]}`).catch(() => {})
+                        } else {
+                          api.openPath(e.outDir!).catch(() => {})
+                        }
+                      }}
                     >
                       <FolderOpen size={15} />
                     </button>

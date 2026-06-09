@@ -17,6 +17,11 @@ export function TitleBar() {
 
   return (
     <div
+      // Tauri v2's drag works off this ATTRIBUTE, not the CSS `app-region` (which
+      // the macOS WKWebview ignores — that's why the window wouldn't drag). The
+      // inner label has pointer-events:none so a drag started over the logo/title
+      // still hits this region; the theme button stays clickable.
+      data-tauri-drag-region
       className="titlebar-drag"
       style={{
         height: 46,
@@ -28,7 +33,7 @@ export function TitleBar() {
         flexShrink: 0,
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 9, pointerEvents: 'none' }}>
         <BeamLogo size={19} />
         <span style={{ fontWeight: 750, letterSpacing: '-0.01em', fontSize: 15 }}>DropBeam</span>
       </div>

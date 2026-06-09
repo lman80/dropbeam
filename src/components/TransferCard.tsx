@@ -320,8 +320,21 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
             )}
           </div>
           {t.direction === 'receive' && t.outDir && (
-            <button className="btn btn-ghost" onClick={() => api.openPath(t.outDir!)}>
-              <FolderOpen size={15} /> Open folder
+            <button
+              className="btn btn-ghost"
+              onClick={() => {
+                // A single file → reveal it SELECTED in its folder ("Show in
+                // folder"); multiple → just open the folder. Match the folder's own
+                // path separator so it works on Windows + macOS.
+                const sep = t.outDir!.includes('\\') ? '\\' : '/'
+                if (t.fileNames.length === 1) {
+                  api.revealPath(`${t.outDir}${sep}${t.fileNames[0]}`).catch(() => {})
+                } else {
+                  api.openPath(t.outDir!).catch(() => {})
+                }
+              }}
+            >
+              <FolderOpen size={15} /> {t.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
             </button>
           )}
         </div>

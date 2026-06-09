@@ -142,6 +142,10 @@ interface AppStore {
 // Guard against Tauri's occasional double-fire of a single OS file drop.
 let lastDropSig = ''
 let lastDropAt = 0
+// Same guard for friend sends: a double-fired drop onto a friend (the chooser or
+// the menu-bar popover drag-to-send) would otherwise send the same files twice.
+let lastFriendSig = ''
+let lastFriendAt = 0
 
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
@@ -479,6 +483,13 @@ export const useStore = create<AppStore>((set, get) => ({
   sendToFriend: async (id, paths) => {
     paths = paths.filter(Boolean)
     if (!paths.length) return
+    // De-dupe a double-fired send of the same files to the same friend within
+    // ~1.5s (a doubled OS drop event would otherwise transfer everything twice).
+    const sig = `${id}|${paths.join('|')}`
+    const now = Date.now()
+    if (sig === lastFriendSig && now - lastFriendAt < 1500) return
+    lastFriendSig = sig
+    lastFriendAt = now
     set({ view: 'send' })
     try {
       const u = await api.sendToFriend(id, paths)
