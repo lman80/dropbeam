@@ -270,6 +270,41 @@ fn log_transfer_perf(
     );
 }
 
+/// Wait until the connection has selected a DIRECT (hole-punched) p2p path, or give
+/// up after `max`. THIS IS THE FIX FOR SLOW INTERNET TRANSFERS: an iroh dial
+/// succeeds instantly via the relay, then hole-punches a direct path in the
+/// background (usually a few hundred ms). A small file would otherwise be fully
+/// buffered and "sent" over the rate-limited relay before that direct path ever
+/// forms — which is exactly how a transfer ends up crawling at sub-KB/s on the
+/// receiver while the sender thinks it flew. n0's public relays are coordination
+/// only and throttle bulk data; the file body must ride a direct path.
+///
+/// Returns `true` once we're on a direct path; `false` if we time out (relay-only,
+/// e.g. a symmetric-NAT peer) — the caller then proceeds anyway (correct, just slow)
+/// rather than blocking forever. Returns immediately on a LAN where mDNS already
+/// gave us a direct path.
+async fn wait_for_direct_path(conn: &Connection, max: std::time::Duration) -> bool {
+    use iroh::Watcher as _;
+    let mut watcher = conn.paths();
+    let res = tokio::time::timeout(max, async {
+        loop {
+            if watcher
+                .get()
+                .iter()
+                .any(|p| p.is_selected() && !p.is_relay())
+            {
+                return true;
+            }
+            // Block until the path set changes; bail if the connection drops.
+            if watcher.updated().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await;
+    res.unwrap_or(false)
+}
+
 /// Load the device's secret key from disk, or generate + persist a fresh one.
 /// The 32-byte ed25519 seed IS the device identity — its public half is the
 /// `EndpointId` peers dial, so it must be stable across restarts.
@@ -423,10 +458,32 @@ async fn serve_stream(
                         None,
                         conn.clone(),
                     );
+                    // Get onto a direct p2p path before pushing bytes — otherwise a
+                    // small file finishes over the rate-limited relay before hole-
+                    // punching completes (the 0.3 KB/s bug). Falls through to relay
+                    // if a direct path never forms (symmetric NAT).
+                    if !wait_for_direct_path(conn, Duration::from_secs(8)).await {
+                        log::warn!("quick-send: no direct path after 8s — relay (slow)");
+                    }
                     let __t0 = std::time::Instant::now();
                     let __total = p.total;
                     match serve_pull(send, &p.paths, &p.cancel, cb).await {
                         Ok(_) => {
+                            // Wait for the receiver to confirm every byte landed
+                            // before reporting done. Otherwise our timer only
+                            // measures filling the local send buffer (instant) — not
+                            // real delivery — so the sender's speed/duration would
+                            // never match the receiver's. The friend + folder paths
+                            // already do this; Quick Send was the one that didn't.
+                            // Robust + lenient: a peer on an older build that never
+                            // acks resets the stream (resolves fast), and a peer that
+                            // vanishes mid-flight unblocks us via conn.closed() — so
+                            // we never hang, and we fall back to the old timing rather
+                            // than a false failure.
+                            tokio::select! {
+                                _ = recv.read_to_end(16) => {}
+                                _ = conn.closed() => {}
+                            }
                             log_transfer_perf(conn, "quick-send", "send", __total, __t0.elapsed());
                             emit_completed(
                                 &app,
@@ -989,6 +1046,11 @@ pub fn start_receive(
             );
             let __t0 = std::time::Instant::now();
             let paths = read_files(&mut recv, &dest, &cancel, cb).await?;
+            // Confirm receipt so the SENDER can measure REAL delivery time (it now
+            // waits for this before finalizing) — making both sides report identical
+            // bytes + speed instead of the sender's instant-buffer fiction.
+            let _ = send.write_all(b"ok").await;
+            let _ = send.finish();
             let loc = conn_locality(&conn);
             let __bytes: u64 = paths
                 .iter()
@@ -1104,6 +1166,11 @@ pub fn send_to_friend(
                 conn.clone(),
             );
             cleanup.conns.lock().unwrap().insert(id.clone(), conn.clone());
+            // Prefer a direct p2p path before sending — the relay is rate-limited
+            // and would crawl. Proceeds over relay if direct never forms.
+            if !wait_for_direct_path(&conn, Duration::from_secs(8)).await {
+                log::warn!("friend-send: no direct path after 8s — relay (slow)");
+            }
             let __t0 = std::time::Instant::now();
             send_files(&conn, &pathbufs, &cancel, cb).await?;
             log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
@@ -1414,6 +1481,9 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
         .map_err(|_| anyhow::anyhow!("folder peer unreachable over iroh"))?
         .context("dial folder peer")?;
     let (mut send, mut recv) = conn.open_bi().await?;
+    // Prefer a direct path for folder sync too (shorter wait since this runs in the
+    // background and LAN peers get a direct path via mDNS almost immediately).
+    let _ = wait_for_direct_path(&conn, Duration::from_secs(5)).await;
     let __t0 = std::time::Instant::now();
     write_folder_files(&mut send, pair_id, root, paths, cancel, on_progress).await?;
     send.finish()?;
