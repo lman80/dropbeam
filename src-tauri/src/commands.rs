@@ -133,6 +133,17 @@ pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Open a URL in the user's default browser — used as a manual-download fallback
+/// when the in-app updater can't reach GitHub (common when GitHub is throttled
+/// from China; the friend can grab the installer from the Releases page instead).
+#[tauri::command]
+pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// On macOS, return a one-line warning if the app is running from a spot that
 /// makes the system forget folder permissions every launch — App Translocation
 /// (a quarantined app run from a randomized read-only path) or straight from the

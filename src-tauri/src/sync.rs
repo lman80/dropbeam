@@ -432,7 +432,10 @@ impl SyncManager {
                         let Some(rel) = rel_path_of(&p, &folder2) else {
                             return;
                         };
-                        if rel.is_empty() || rel.split('/').any(|c| c.starts_with('.')) {
+                        if rel.is_empty()
+                            || rel.ends_with(".dropbeam-incoming")
+                            || rel.split('/').any(|c| c.starts_with('.'))
+                        {
                             return;
                         }
                         // Loop guard: skip files WE removed (applying a remote
@@ -940,6 +943,16 @@ impl SyncManager {
 
     /// Live progress for an in-flight iroh folder RECEIVE — drives the same status
     /// bar (and Local/Internet badge) the croc receive path uses.
+    /// On-disk path of a managed folder pair — used to drop a visible
+    /// "<name>.dropbeam-incoming" placeholder while a file is arriving.
+    pub fn folder_path(&self, pair_id: &str) -> Option<String> {
+        self.handles
+            .lock()
+            .unwrap()
+            .get(pair_id)
+            .map(|h| h.config.lock().unwrap().folder.clone())
+    }
+
     pub fn note_folder_receiving(&self, pair_id: &str, done: u64, total: u64, locality: Locality) {
         if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
             if let Ok(mut s) = h.status.lock() {
@@ -1150,7 +1163,7 @@ fn is_sendable_candidate(path: &str, folder: &str, inbound: &Arc<Mutex<HashSet<S
         }
     }
     let fname = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    if fname.ends_with(".crdownload") || fname.ends_with(".download") || fname.ends_with(".part") || fname.ends_with(".tmp") {
+    if fname.ends_with(".crdownload") || fname.ends_with(".download") || fname.ends_with(".part") || fname.ends_with(".tmp") || fname.ends_with(".dropbeam-incoming") {
         return false;
     }
     // Already sent or received (and unchanged since)? Don't (re)send it.
@@ -1174,6 +1187,13 @@ fn seed_existing(
         let mut q = queue.lock().unwrap();
         for f in files {
             let p = f.to_string_lossy().to_string();
+            // Sweep a stale "<name>.dropbeam-incoming" placeholder left by a receive
+            // that was interrupted (e.g. crash mid-transfer). It's never synced —
+            // just visible litter — so delete it on scan instead of leaving it.
+            if p.ends_with(".dropbeam-incoming") {
+                let _ = std::fs::remove_file(&f);
+                continue;
+            }
             if is_sendable_candidate(&p, folder, inbound) && !q.iter().any(|x| x == &p) {
                 q.push_back(p);
                 any = true;

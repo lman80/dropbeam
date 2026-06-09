@@ -292,6 +292,7 @@ pub fn run() {
             commands::pick_directory,
             commands::reveal_path,
             commands::open_path,
+            commands::open_url,
             commands::open_main_window,
             commands::hide_popover,
             commands::get_default_download_dir,

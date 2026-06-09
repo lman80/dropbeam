@@ -96,6 +96,8 @@ interface AppStore {
   appVer: string
   update: UpdateState | null
   checkingUpdate: boolean
+  /** Set when the last update check couldn't reach the server (offer manual DL). */
+  updateError: string | null
 
   init: () => Promise<void>
   checkForUpdates: (manual: boolean) => Promise<void>
@@ -171,6 +173,7 @@ export const useStore = create<AppStore>((set, get) => ({
   appVer: '',
   update: null,
   checkingUpdate: false,
+  updateError: null,
 
   init: async () => {
     // Bulletproof startup: every call is guarded with a fallback + timeout and
@@ -281,17 +284,29 @@ export const useStore = create<AppStore>((set, get) => ({
 
   checkForUpdates: async (manual) => {
     if (get().checkingUpdate) return
-    set({ checkingUpdate: true })
+    set({ checkingUpdate: true, updateError: null })
+    // Retry a few times: GitHub (where releases live) is often only INTERMITTENTLY
+    // reachable — e.g. throttled from China — so a first failure may succeed on a
+    // retry. On give-up we record the error so Settings can offer a manual download.
+    let lastErr: unknown = null
     try {
-      const info = await checkUpdate()
-      if (info) {
-        set({ update: { version: info.version, notes: info.notes, installing: false, progress: 0 } })
-        if (manual) get().toast('info', `Update available: v${info.version}`)
-      } else if (manual) {
-        get().toast('success', "You're on the latest version")
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const info = await checkUpdate()
+          if (info) {
+            set({ update: { version: info.version, notes: info.notes, installing: false, progress: 0 } })
+            if (manual) get().toast('info', `Update available: v${info.version}`)
+          } else if (manual) {
+            get().toast('success', "You're on the latest version")
+          }
+          return
+        } catch (e) {
+          lastErr = e
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 1500))
+        }
       }
-    } catch (e) {
-      if (manual) get().toast('error', `Couldn't check for updates: ${e}`)
+      set({ updateError: String(lastErr) })
+      if (manual) get().toast('error', "Couldn't reach the update server — download manually below")
     } finally {
       set({ checkingUpdate: false })
     }

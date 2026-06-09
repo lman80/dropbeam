@@ -280,6 +280,7 @@ export const mockApi = {
   pickDirectory: async (): Promise<string | null> => '/Users/you/Desktop/Beam to Alex',
   revealPath: async (_path: string): Promise<void> => {},
   openPath: async (_path: string): Promise<void> => {},
+  openUrl: async (_url: string): Promise<void> => {},
   getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
 
   createPair: async (

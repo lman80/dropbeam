@@ -541,11 +541,27 @@ async fn serve_stream(
             let friend = crate::friends::load(&config_dir)
                 .into_iter()
                 .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()));
-            let sender = friend.as_ref().map(|f| f.name.clone());
-            // A friend with manual-accept on must approve before we receive. An
-            // unknown sender (no friend record) defaults to auto-accept, same as
-            // the prior behavior.
-            let auto_accept = friend.as_ref().map(|f| f.auto_accept).unwrap_or(true);
+            // Auto-add an unknown sender as a friend (issue #6) — receiving a file
+            // from someone makes the relationship two-way without a separate pairing
+            // step. Needs their name, which the sender now puts in the header.
+            let from_name = req.get("fromName").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let (sender, auto_accept) = match &friend {
+                Some(f) => (Some(f.name.clone()), f.auto_accept),
+                None if !from_name.is_empty() && !who.is_empty() => {
+                    // Add them so the relationship is two-way — but DON'T grant silent
+                    // standing access. A stranger who has your link is now a named
+                    // friend whose FUTURE sends still prompt (auto_accept=false). The
+                    // current file still lands (true), matching the prior behavior for
+                    // an unknown sender.
+                    let f = crate::friends::upsert_by_endpoint(&config_dir, &who, from_name);
+                    let _ = crate::friends::set_auto_accept(&config_dir, &f.id, false);
+                    let _ = app.emit("friends://changed", ());
+                    (Some(f.name.clone()), true)
+                }
+                // A friend with manual-accept on must approve before we receive; an
+                // unknown sender with no name still defaults to auto-accept.
+                None => (None, true),
+            };
             let total = req["total"].as_u64().unwrap_or(0);
             let names: Vec<String> = req["items"]
                 .as_array()
@@ -743,6 +759,38 @@ async fn serve_stream(
             }
             let staging = config_dir.join(format!(".iroh-folder-{pair_id}"));
             let _ = std::fs::remove_dir_all(&staging);
+            // Drop visible "<name>.dropbeam-incoming" placeholders in the REAL folder
+            // so the recipient sees a file is on the way (esp. a multi-minute big
+            // transfer), then remove them once the real files land. The suffix is
+            // skipped by the watcher, so they never sync or trigger a mirror-delete.
+            let placeholders: Vec<PathBuf> = sm
+                .folder_path(&pair_id)
+                .map(|folder| {
+                    req["items"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|it| {
+                                    let raw = it.get("name").and_then(|n| n.as_str())?;
+                                    let rel = sanitize_rel(raw);
+                                    let ph = Path::new(&folder)
+                                        .join(format!("{}.dropbeam-incoming", rel.to_string_lossy()));
+                                    if let Some(parent) = ph.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    let _ = std::fs::File::create(&ph);
+                                    Some(ph)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let clear_placeholders = || {
+                for ph in &placeholders {
+                    let _ = std::fs::remove_file(ph);
+                }
+            };
             let total = req["total"].as_u64().unwrap_or(0);
             let cancel = AtomicBool::new(false);
             let loc = conn_locality(conn);
@@ -764,11 +812,13 @@ async fn serve_stream(
                     log_transfer_perf(conn, "folder-recv", "recv", total, __t0.elapsed());
                     sm.ingest_iroh_folder_files(&pair_id, &staging);
                     let _ = std::fs::remove_dir_all(&staging);
+                    clear_placeholders();
                     let _ = send.write_all(b"ok").await;
                     let _ = send.finish();
                 }
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&staging);
+                    clear_placeholders();
                     anyhow::bail!("folder receive failed: {e}");
                 }
             }
@@ -1162,6 +1212,12 @@ pub fn send_to_friend(
     update.bytes_total = total;
     emit(&app, &update);
     let snapshot = update.clone();
+    // Our own display name travels with the push so the recipient can auto-add us
+    // as a friend if they don't already have us (issue #6).
+    let my_name = app
+        .try_state::<Arc<crate::AppState>>()
+        .map(|st| st.settings.lock().unwrap().display_name.clone())
+        .unwrap_or_default();
     tauri::async_runtime::spawn(async move {
         let outcome: Result<crate::models::Locality> = async {
             // Bounded so an offline/unreachable friend FAILS clearly instead of
@@ -1207,7 +1263,7 @@ pub fn send_to_friend(
                 log::warn!("friend-send: no direct path after 8s — relay (slow)");
             }
             let __t0 = std::time::Instant::now();
-            send_files(&conn, &pathbufs, &cancel, cb).await?;
+            send_files(&conn, &pathbufs, &cancel, cb, &my_name).await?;
             log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
             Ok(conn_locality(&conn))
         }
@@ -1591,9 +1647,22 @@ async fn write_folder_files<F: Fn(u64, u64)>(
     let mut buf = vec![0u8; CHUNK];
     for (path, _, _, _) in &items {
         let mut f = tokio::fs::File::open(path).await?;
+        let mut since_check: u32 = 0;
         loop {
             if cancel.load(Ordering::SeqCst) {
                 anyhow::bail!("canceled");
+            }
+            // If the user deletes the file mid-upload, STOP — don't waste minutes
+            // pushing a 6 GB file they already removed (the delete propagates to the
+            // peer separately, so it never lands there). Checked every ~16 MiB (a
+            // bare stat), not every chunk. On macOS an unlinked file still reads via
+            // the open handle but the path is gone, so exists() catches it.
+            since_check += 1;
+            if since_check >= 16 {
+                since_check = 0;
+                if !path.exists() {
+                    anyhow::bail!("source file was removed during send");
+                }
             }
             let n = f.read(&mut buf).await?;
             if n == 0 {
@@ -1994,7 +2063,7 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64)>, u64)>
 /// The JSON header describing a files push. `parallel` > 0 advertises that the body
 /// will arrive split across that many uni streams (the receiver opts in by replying
 /// `{ready:true}`); an older peer simply ignores the field and reads classically.
-fn files_header(items: &[(PathBuf, String, u64)], total: u64, parallel: u64) -> serde_json::Value {
+fn files_header(items: &[(PathBuf, String, u64)], total: u64, parallel: u64, from_name: &str) -> serde_json::Value {
     serde_json::json!({
         "kind": "files",
         "items": items
@@ -2003,6 +2072,9 @@ fn files_header(items: &[(PathBuf, String, u64)], total: u64, parallel: u64) -> 
             .collect::<Vec<_>>(),
         "total": total,
         "parallel": parallel,
+        // The sender's display name — lets the receiver auto-add an unknown sender
+        // as a friend (issue #6). Empty for anonymous Quick Send.
+        "fromName": from_name,
     })
 }
 
@@ -2045,7 +2117,7 @@ async fn write_files<F: Fn(u64, u64)>(
     on_progress: F,
 ) -> Result<u64> {
     let (items, total) = gather_items(paths)?;
-    write_frame(send, &files_header(&items, total, 0)).await?;
+    write_frame(send, &files_header(&items, total, 0, "")).await?;
     write_files_body(send, &items, total, cancel, &on_progress).await
 }
 
@@ -2121,11 +2193,12 @@ pub async fn send_files<F: Fn(u64, u64)>(
     paths: &[PathBuf],
     cancel: &AtomicBool,
     on_progress: F,
+    my_name: &str,
 ) -> Result<u64> {
     let (mut send, mut recv) = conn.open_bi().await?;
     let (items, total) = gather_items(paths)?;
     let n = parallel_stream_count(items.len(), total);
-    write_frame(&mut send, &files_header(&items, total, n)).await?;
+    write_frame(&mut send, &files_header(&items, total, n, my_name)).await?;
 
     if n > 0 {
         // The receiver opts into a parallel (multi-stream) receive by replying
@@ -2400,7 +2473,7 @@ mod tests {
 
         let client = Endpoint::bind(presets::N0).await.unwrap();
         let conn = client.connect(addr, ALPN).await.unwrap();
-        let sent = send_files(&conn, &[src.clone()], &AtomicBool::new(false), |_, _| {})
+        let sent = send_files(&conn, &[src.clone()], &AtomicBool::new(false), |_, _| {}, "tester")
             .await
             .unwrap();
         assert_eq!(sent, data.len() as u64);

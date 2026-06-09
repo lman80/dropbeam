@@ -63,6 +63,7 @@ export function SettingsView() {
   const appVer = useStore((s) => s.appVer)
   const update = useStore((s) => s.update)
   const checkingUpdate = useStore((s) => s.checkingUpdate)
+  const updateError = useStore((s) => s.updateError)
   const checkForUpdates = useStore((s) => s.checkForUpdates)
   const installUpdate = useStore((s) => s.installUpdate)
   const [testing, setTesting] = useState(false)
@@ -220,6 +221,25 @@ export function SettingsView() {
                   <Download size={15} /> Install &amp; restart
                 </button>
               )}
+            </div>
+          </>
+        )}
+        {updateError && !update && (
+          <>
+            {SEP}
+            <div style={{ padding: '13px 4px' }}>
+              <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 9, lineHeight: 1.5 }}>
+                Couldn't reach the update server. If you're on a network that blocks
+                GitHub, download the latest installer manually:
+              </div>
+              <button
+                className="btn btn-ghost"
+                onClick={() =>
+                  api.openUrl('https://github.com/lman80/dropbeam/releases/latest').catch(() => {})
+                }
+              >
+                <Download size={15} /> Get the latest from GitHub
+              </button>
             </div>
           </>
         )}

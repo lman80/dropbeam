@@ -191,6 +191,7 @@ const realApi = {
   pickDirectory: () => invoke<string | null>('pick_directory'),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
+  openUrl: (url: string) => invoke<void>('open_url', { url }),
   getDefaultDownloadDir: () => invoke<string>('get_default_download_dir'),
   // Shared Drop Folders. Tauri v2 maps camelCase JS keys → snake_case Rust params,
   // so the keys here MUST be camelCase (e.g. twoWay, not two_way).
