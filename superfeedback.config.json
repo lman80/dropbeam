@@ -1,0 +1,9 @@
+{
+  "backendUrl": "https://superfeedback.ashton-mcp-worker.workers.dev",
+  "repo": "lman80/dropbeam",
+  "app": "DropBeam",
+  "appKey": "",
+  "version": "1.0.0",
+  "type": "bug",
+  "position": "bottom-right"
+}

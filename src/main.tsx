@@ -40,6 +40,33 @@ if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
 const Root = label === 'popover' ? Popover : label === 'hud' ? Hud : App
 createRoot(document.getElementById('root')!).render(<Root />)
 
+// SuperFeedback — a floating "Send feedback" button (main window only, not the
+// popover/HUD). It screenshots the app, takes a message, and opens a GitHub
+// Issue in DropBeam's OWN repo via the user's backend Worker. Dynamically
+// imported so it never loads in the overlay windows.
+if (label === 'main') {
+  void (async () => {
+    const { SuperFeedback } = await import('./vendor/superfeedback')
+    let appVersion: string | undefined
+    if (HAS_TAURI) {
+      try {
+        appVersion = await (await import('@tauri-apps/api/app')).getVersion()
+      } catch {
+        /* version is best-effort */
+      }
+    }
+    SuperFeedback.init({
+      backendUrl: 'https://superfeedback.ashton-mcp-worker.workers.dev',
+      repo: 'lman80/dropbeam',
+      app: 'DropBeam',
+      position: 'bottom-right',
+      appVersion,
+      // Default DOM-snapshot capture (no native plugin) — avoids a macOS
+      // Screen-Recording permission prompt; the webview IS the app UI.
+    })
+  })()
+}
+
 // Capture uncaught errors into the native log file so a startup problem on a
 // machine we can't reach (e.g. a tester's Windows box) leaves a trace.
 if (HAS_TAURI) {
