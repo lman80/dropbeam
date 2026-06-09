@@ -741,6 +741,30 @@ async fn serve_stream(
             let cancel = Arc::new(AtomicBool::new(false));
             state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
 
+            // Resume negotiation. A modern sender sets `resumable` for a single big
+            // file. If we're modern too, we IMMEDIATELY ack with {hold:true} so the
+            // sender keeps its handshake window open while a manual-accept dialog is
+            // up (or a slow path delays our {ready}). Without this the sender's 6s
+            // timeout expires and BOTH sides fall to the fragile, non-resumable
+            // classic single stream — the exact reason big files died on flaky
+            // links even between two up-to-date peers.
+            let parallel_n = req["parallel"].as_u64().unwrap_or(0).min(PARALLEL_STREAMS);
+            // Two INDEPENDENT gates for a single big file (conflating them silently
+            // dropped old-sender→new-receiver pairs to slow single-stream):
+            //  • want_parallel — the sender advertised a multi-stream layout. The
+            //    parallel/resumable RECEIVE runs whenever the sender is waiting for
+            //    our {ready}: any auto-accept (it gets {ready} instantly, old OR new
+            //    sender), or a modern sender holding the line through a dialog.
+            //  • resumable_hs — the sender understands {hold}/{declined}. Only then
+            //    may we stall it through a manual-accept dialog; sending {hold} to a
+            //    sender that doesn't speak it would desync its ack read.
+            let want_parallel = parallel_n > 0 && names.len() == 1;
+            let resumable_hs = req["resumable"].as_bool().unwrap_or(false);
+            let hold_sender = resumable_hs && want_parallel;
+            if hold_sender && !auto_accept {
+                let _ = write_frame(send, &serde_json::json!({ "hold": true })).await;
+            }
+
             // Manual accept/decline — the iroh twin of run_croc_receive_interactive.
             // Pause before reading the body, surface the offer, and wait for the
             // user's decision (resolved by the respond_to_offer command). On
@@ -768,6 +792,11 @@ async fn serve_stream(
                     st.offers.lock().unwrap().remove(&id);
                 }
                 if !accept {
+                    // Tell a waiting modern sender so it stops cleanly instead of
+                    // sitting out its (long) post-hold window.
+                    if hold_sender {
+                        let _ = write_frame(send, &serde_json::json!({ "declined": true })).await;
+                    }
                     emit_canceled(&app, &id, Direction::Receive);
                     state.cancels.lock().unwrap().remove(&id);
                     return Ok(());
@@ -788,16 +817,15 @@ async fn serve_stream(
                 conn.clone(),
             );
             let __t0 = std::time::Instant::now();
-            // Receive in parallel when the sender advertised it for a single big
-            // file AND this is an auto-accept friend: reply {ready:true}, then pull
-            // the N uni streams and reassemble. We gate on auto-accept so the
-            // sender's short ready-timeout isn't spent waiting behind a manual
-            // accept dialog (in that case the sender has already fallen back to the
-            // classic single stream, so we must too). Everything else = classic.
-            // Clamp the advertised stream count so a buggy/malicious peer can't make
-            // us loop on accept_uni forever (honest peers cap themselves at 6).
-            let parallel_n = req["parallel"].as_u64().unwrap_or(0).min(PARALLEL_STREAMS);
-            let body = if parallel_n > 0 && names.len() == 1 && auto_accept {
+            // Resumable parallel receive for a single big file: reply {ready:true},
+            // pull the N uni streams, reassemble into a hidden partial that survives
+            // an interruption. Runs whenever the sender is waiting for our {ready}:
+            // ANY auto-accept (old or new sender — it gets {ready} instantly), or a
+            // manual accept from a modern sender we already told to {hold}. A manual
+            // accept from an OLD sender (no {hold} support) already timed out into
+            // classic, so we must NOT reply {ready} there — hence the resumable_hs
+            // requirement on the manual side. Everything else = classic body.
+            let body = if want_parallel && (auto_accept || resumable_hs) {
                 let name = names.first().cloned().unwrap_or_else(|| "file".to_string());
                 // Resume identity: same sender + name + size + mtime = same bytes.
                 // If an earlier attempt left a partial for this fingerprint, we tell
@@ -1593,20 +1621,36 @@ pub fn send_to_friend(
                 if !got_direct {
                     log::warn!("friend-send: no direct path after 8s — relay (slow)");
                 }
+                // Fresh per attempt: only THIS attempt's handshake authorizes a
+                // retry AND the degradation watchdog. Shared (Arc) so the watchdog
+                // can read it live.
+                let engaged = std::sync::Arc::new(AtomicBool::new(false));
                 // Field-confirmed failure mode: a direct path collapses under
                 // sustained load, iroh fails over to the rate-limited RELAY, the
                 // transfer crawls until a stall guard kills it, and the attempt is
-                // wasted. The cure: if this transfer WAS direct and sits on relay
-                // for >8s, proactively close the connection — the retry loop
-                // reconnects (fresh hole-punch → direct again) and RESUMES. Peers
-                // that never had a direct path are exempt (relay is their best).
-                let had_direct = got_direct;
-                let watchdog = had_direct.then(|| {
+                // wasted. The cure: if this transfer sits on relay for >8s,
+                // proactively close the connection — the retry loop reconnects
+                // (fresh hole-punch → direct again) and RESUMES.
+                //
+                // CRITICAL: only do this once `engaged` is true (the receiver did
+                // the resumable handshake). A classic single-stream transfer (old
+                // receiver, or a manual-accept that missed the 6s window) CANNOT be
+                // retried — closing its connection just kills it with no safety net.
+                // (A real 2 GB send died exactly this way: watchdog fired, transfer
+                // was classic, retry was blocked, instant fail.)
+                let watchdog = got_direct.then(|| {
                     let c = conn.clone();
+                    let eng = engaged.clone();
                     tauri::async_runtime::spawn(async move {
                         let mut relay_since: Option<Instant> = None;
                         loop {
                             tokio::time::sleep(Duration::from_secs(2)).await;
+                            // Resume-capable transfers only — never force-close a
+                            // classic one (it has no retry to catch it).
+                            if !eng.load(Ordering::SeqCst) {
+                                relay_since = None;
+                                continue;
+                            }
                             let on_relay = matches!(
                                 conn_locality(&c),
                                 crate::models::Locality::Internet
@@ -1626,10 +1670,9 @@ pub fn send_to_friend(
                         }
                     })
                 });
-                // Fresh per attempt: only THIS attempt's handshake authorizes a retry.
-                let engaged = AtomicBool::new(false);
                 let __t0 = std::time::Instant::now();
                 let outcome = send_files(&conn, &pathbufs, &cancel, cb, &my_name, &engaged).await;
+                let was_engaged = engaged.load(Ordering::SeqCst);
                 if let Some(w) = watchdog {
                     w.abort();
                 }
@@ -1640,10 +1683,23 @@ pub fn send_to_friend(
                     }
                     Err(e) => {
                         let canceled = cancel.load(Ordering::SeqCst)
-                            || e.to_string().contains("canceled");
+                            || e.to_string().contains("canceled")
+                            || e.to_string().contains("declined");
+                        if !canceled && !was_engaged {
+                            // No resumable handshake = a classic single-stream send
+                            // (the receiver is on an older build, or had manual-
+                            // accept on and missed the 6s window). We can't retry
+                            // without risking a duplicate file on their end, so this
+                            // is terminal — name the likely cause in the log.
+                            log::warn!(
+                                "friend-send failed and is NOT resumable ({e:#}) — the \
+                                 receiver didn't negotiate fast-resume (update them to \
+                                 the latest version, or have them enable auto-accept)"
+                            );
+                        }
                         // With resume, attempts are cheap — a 2 GB send that loses
                         // its path every ~400 MB still completes within the budget.
-                        if !canceled && attempt < 5 && engaged.load(Ordering::SeqCst) {
+                        if !canceled && attempt < 5 && was_engaged {
                             attempt += 1;
                             log::warn!(
                                 "friend-send interrupted ({e:#}) — auto-resuming, attempt {attempt}/5"
@@ -2893,6 +2949,10 @@ fn files_header(items: &[(PathBuf, String, u64, u64)], total: u64, parallel: u64
             .collect::<Vec<_>>(),
         "total": total,
         "parallel": parallel,
+        // True iff we'll honor a {hold}/{ready} resume handshake for this send — it
+        // tells a modern receiver it may stall us (manual-accept dialog, slow path)
+        // by replying {hold} without our dropping to the non-resumable classic path.
+        "resumable": parallel > 0,
         // The sender's display name — lets the receiver auto-add an unknown sender
         // as a friend (issue #6). Empty for anonymous Quick Send.
         "fromName": from_name,
@@ -3027,16 +3087,37 @@ pub async fn send_files<F: Fn(u64, u64)>(
     write_frame(&mut send, &files_header(&items, total, n, my_name)).await?;
 
     if n > 0 {
-        // The receiver opts into a parallel (multi-stream) receive by replying
-        // {ready:true}. A peer on an older build — or one with manual-accept on —
-        // won't, so we time out and fall back to the classic single-stream body on
-        // this same stream. No hard failure during a staggered rollout.
-        // Comfortably under the receiver's 12s first-stream wait, so if {ready}
-        // arrives we both pick parallel, and if it doesn't we both pick classic.
-        let reply = match tokio::time::timeout(Duration::from_secs(6), read_frame(&mut recv)).await {
-            Ok(Ok(v)) => Some(v),
-            _ => None,
+        // Resume handshake. The receiver replies {ready:true} to take the parallel,
+        // resumable path. A modern receiver that needs a moment first (manual-accept
+        // dialog, or a slow path) sends {hold:true} so we KEEP WAITING instead of
+        // dropping to the fragile classic stream — the fix for big files dying on
+        // flaky links even between two up-to-date peers. An older receiver (or
+        // manual-accept on an old build) never replies, so we time out at 6s and
+        // both pick classic. No staggered-rollout break.
+        let mut budget = Duration::from_secs(6);
+        let reply = loop {
+            match tokio::time::timeout(budget, read_frame(&mut recv)).await {
+                Ok(Ok(v)) => {
+                    if v.get("hold").and_then(|h| h.as_bool()).unwrap_or(false) {
+                        // Receiver is modern and deciding — wait out its accept TTL
+                        // (slightly longer than the receiver's 300s so its decline
+                        // or timeout reaches us first).
+                        budget = Duration::from_secs(310);
+                        continue;
+                    }
+                    break Some(v);
+                }
+                _ => break None,
+            }
         };
+        if reply
+            .as_ref()
+            .and_then(|v| v.get("declined"))
+            .and_then(|d| d.as_bool())
+            .unwrap_or(false)
+        {
+            anyhow::bail!("the recipient declined the transfer");
+        }
         let ready = reply
             .as_ref()
             .and_then(|v| v.get("ready"))
@@ -3482,6 +3563,87 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest_dir);
         println!("parallel transfer OK: {total} bytes across {n} streams, byte-identical");
+    }
+
+    // THE MANUAL-ACCEPT RESUME GUARANTEE (regression: big files going classic +
+    // unretryable when the receiver wasn't auto-accept). The sender's full
+    // send_files negotiation must: advertise `resumable`, honor a {hold} ack by
+    // waiting PAST its 6s window, then engage the parallel/resume path on {ready}
+    // and complete byte-identical. Ignored (touches the relay network).
+    #[tokio::test]
+    #[ignore]
+    async fn hold_handshake_engages_parallel_after_a_delayed_accept() {
+        let pid = std::process::id();
+        let total: u64 = 20 * 1024 * 1024; // 20 MiB → above PARALLEL_MIN
+        let mut data = vec![0u8; total as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i as u64).wrapping_mul(2654435761) % 251) as u8;
+        }
+        let src = std::env::temp_dir().join(format!("dropbeam-hold-src-{pid}.bin"));
+        std::fs::write(&src, &data).unwrap();
+        let dest_dir = std::env::temp_dir().join(format!("dropbeam-hold-rx-{pid}"));
+
+        let server = Endpoint::builder(presets::N0).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+        server.online().await;
+        let addr = server.addr();
+
+        // Receiver that simulates a SLOW MANUAL ACCEPT: {hold} now, {ready} after a
+        // pause LONGER than the sender's old 6s timeout — proving the sender waits.
+        let srv = server.clone();
+        let dest_dir_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let (mut bsend, mut brecv) = conn.accept_bi().await.unwrap();
+            let header = read_frame(&mut brecv).await.unwrap();
+            assert_eq!(header["resumable"].as_bool(), Some(true), "sender must advertise resumable");
+            let n = header["parallel"].as_u64().unwrap();
+            assert!(n > 1, "20 MiB should advertise multiple streams");
+            // Modern receiver: hold the sender's window open…
+            write_frame(&mut bsend, &serde_json::json!({ "hold": true })).await.unwrap();
+            // …simulate the human taking 8s to click Accept (past the 6s window)…
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            // …then accept: reply {ready} and run the real resumable receive.
+            write_frame(&mut bsend, &serde_json::json!({ "ready": true, "resume": { "have": [] } }))
+                .await
+                .unwrap();
+            let first = conn.accept_uni().await.unwrap();
+            let fp = transfer_fingerprint(&conn.remote_id().to_string(), "blob.bin", total, 0);
+            let (part, cov) = prepare_partial(&dest_dir_c, &fp, total).unwrap();
+            let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp).1, fp };
+            let dest = recv_file_resumable(
+                &conn,
+                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into()),
+                total, part, Some(rc), cov, first, &AtomicBool::new(false), |_, _| {},
+            )
+            .await
+            .unwrap();
+            // Raw b"ok" (NOT a framed JSON value) — exactly what the live receiver
+            // sends and what the sender's `read_to_end(..).ends_with(b"ok")` expects.
+            bsend.write_all(b"ok").await.unwrap();
+            let _ = bsend.finish();
+            // Wait for the sender to consume the ack before we drop `conn` — without
+            // this the test tears the connection down mid-flight and the ack is lost
+            // (production keeps conns alive in handle_conn, so it's a test-only race).
+            let _ = bsend.stopped().await;
+            dest
+        });
+
+        let client = Endpoint::bind(presets::N0).await.unwrap();
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        let engaged = AtomicBool::new(false);
+        let t0 = std::time::Instant::now();
+        send_files(&conn, &[src.clone()], &AtomicBool::new(false), |_, _| {}, "tester", &engaged)
+            .await
+            .unwrap();
+        assert!(engaged.load(Ordering::SeqCst), "sender must engage parallel/resume after {{hold}}→{{ready}}");
+        assert!(t0.elapsed() >= Duration::from_secs(7), "sender must have WAITED past its 6s window for the delayed accept");
+
+        let dest = recv.await.unwrap();
+        let got = std::fs::read(&dest).unwrap();
+        assert!(got == data, "hold-handshake transfer must be byte-identical");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+        println!("hold-handshake OK: sender waited {}s for a manual accept, then resumed-parallel byte-identical", t0.elapsed().as_secs());
     }
 
     // THE RESUME GUARANTEE: a receiver that already has part of the file (an
