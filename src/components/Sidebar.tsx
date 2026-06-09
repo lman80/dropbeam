@@ -1,7 +1,16 @@
-import { FolderSync, History, MessageCircle, Send, Settings, Users } from 'lucide-react'
+import {
+  FolderSync,
+  History,
+  MessageCircle,
+  MessageSquarePlus,
+  Send,
+  Settings,
+  Users,
+} from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { isActive } from '../lib/api'
 import { useStore, type View } from '../store'
+import { SuperFeedback } from '../vendor/superfeedback'
 
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
@@ -84,6 +93,12 @@ export function Sidebar() {
           </button>
         )
       })}
+
+      {/* Opens the SuperFeedback panel (no floating button — it overlapped Send). */}
+      <button className="nav-item" onClick={() => SuperFeedback.open()}>
+        <MessageSquarePlus size={18} strokeWidth={2.1} />
+        <span style={{ flex: 1 }}>Feedback</span>
+      </button>
 
       <div style={{ flex: 1 }} />
 

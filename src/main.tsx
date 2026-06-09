@@ -5,6 +5,7 @@ import App from './App'
 import { Popover } from './windows/Popover'
 import { Hud } from './windows/Hud'
 import { api, HAS_TAURI } from './lib/api'
+import { SuperFeedback } from './vendor/superfeedback'
 
 // Which window are we? The popover and HUD load the same bundle as the main
 // app and pick their compact UI from the Tauri window label. `?window=` lets us
@@ -46,7 +47,6 @@ createRoot(document.getElementById('root')!).render(<Root />)
 // imported so it never loads in the overlay windows.
 if (label === 'main') {
   void (async () => {
-    const { SuperFeedback } = await import('./vendor/superfeedback')
     let appVersion: string | undefined
     if (HAS_TAURI) {
       try {
@@ -59,7 +59,9 @@ if (label === 'main') {
       backendUrl: 'https://superfeedback.ashton-mcp-worker.workers.dev',
       repo: 'lman80/dropbeam',
       app: 'DropBeam',
-      position: 'bottom-right',
+      // No floating button (it overlapped the Send control). We open the
+      // centered panel from a "Feedback" item in the left sidebar instead.
+      trigger: 'none',
       appVersion,
       // Default DOM-snapshot capture (no native plugin) — avoids a macOS
       // Screen-Recording permission prompt; the webview IS the app UI.
