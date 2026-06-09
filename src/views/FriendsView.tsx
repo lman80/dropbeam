@@ -4,6 +4,7 @@ import { QRCodeSVG } from 'qrcode.react'
 import {
   Check,
   Copy,
+  MessageCircle,
   Pencil,
   QrCode,
   Radar,
@@ -15,9 +16,9 @@ import {
 } from 'lucide-react'
 import { api, type Friend } from '../lib/api'
 import { useStore } from '../store'
-import { EmptyState, Spinner } from '../components/bits'
+import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
 import { avatarGradient, initials } from '../lib/avatar'
-import { friendOnlineState } from '../lib/presence'
+import { friendPresence, presenceLabel } from '../lib/presence'
 
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
@@ -83,6 +84,7 @@ function FriendCard({ friend }: { friend: Friend }) {
   const renameFriend = useStore((s) => s.renameFriend)
   const setFriendAutoAccept = useStore((s) => s.setFriendAutoAccept)
   const pingFriend = useStore((s) => s.pingFriend)
+  const openChat = useStore((s) => s.openChat)
   const friendSeen = useStore((s) => s.friendSeen)
   const folderStatuses = useStore((s) => s.folderStatuses)
   const toast = useStore((s) => s.toast)
@@ -95,7 +97,12 @@ function FriendCard({ friend }: { friend: Friend }) {
   const [pinging, setPinging] = useState(false)
   const [pingedOffline, setPingedOffline] = useState(false)
 
-  const online = friendOnlineState(friend.name, friendSeen, folderStatuses)
+  const presence = friendPresence(friend.name, friendSeen, folderStatuses)
+  const isOnline = presence.status === 'online'
+  // The live channel to this friend, if we share an active folder connection.
+  const channel = Object.values(folderStatuses).find(
+    (s) => s.peerName?.trim().toLowerCase() === friend.name.trim().toLowerCase(),
+  )?.locality
 
   const check = async () => {
     setPinging(true)
@@ -170,7 +177,7 @@ function FriendCard({ friend }: { friend: Friend }) {
             {initials(friend.name)}
           </div>
           <span
-            title={online ? 'Online' : 'Status unknown'}
+            title={presenceLabel(presence)}
             style={{
               position: 'absolute',
               right: -2,
@@ -178,7 +185,7 @@ function FriendCard({ friend }: { friend: Friend }) {
               width: 13,
               height: 13,
               borderRadius: 999,
-              background: online ? 'var(--green)' : 'var(--text-faint)',
+              background: isOnline ? 'var(--green)' : 'var(--text-faint)',
               border: '2.5px solid var(--surface)',
             }}
           />
@@ -223,10 +230,12 @@ function FriendCard({ friend }: { friend: Friend }) {
               gap: 7,
               fontSize: 12,
               marginTop: 3,
-              color: online ? 'var(--green)' : 'var(--text-faint)',
+              flexWrap: 'wrap',
+              color: isOnline ? 'var(--green)' : 'var(--text-faint)',
             }}
           >
-            <span>{online ? 'Online' : pingedOffline ? 'No response' : 'Status unknown'}</span>
+            <span>{pingedOffline ? 'No response' : presenceLabel(presence)}</span>
+            {channel && channel !== 'unknown' && <ChannelBadge locality={channel} size={11} />}
             <span style={{ color: 'var(--border-strong)' }}>·</span>
             <button
               onClick={check}
@@ -249,6 +258,14 @@ function FriendCard({ friend }: { friend: Friend }) {
             </button>
           </div>
         </div>
+        <button
+          className="icon-btn"
+          title={`Message ${friend.name}`}
+          onClick={() => openChat(friend.id)}
+          style={{ flexShrink: 0, width: 38, height: 38 }}
+        >
+          <MessageCircle size={18} />
+        </button>
         <button className="btn btn-primary" onClick={send} disabled={busy}>
           {busy ? <Spinner size={14} /> : <Send size={15} />} Send files
         </button>
