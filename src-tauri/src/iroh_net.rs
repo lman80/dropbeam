@@ -60,6 +60,10 @@ pub struct IrohState {
     /// once — the flag alone only takes effect between chunks, which is why a
     /// sender couldn't cancel a stalled transfer.
     conns: Mutex<HashMap<String, Connection>>,
+    /// Fingerprints of resumable partial files currently being written, so two
+    /// concurrent receives of the same file never share one partial (the loser
+    /// falls back to a throwaway, non-resumable temp).
+    partials: Mutex<std::collections::HashSet<String>>,
 }
 
 impl IrohState {
@@ -660,24 +664,91 @@ async fn serve_stream(
             // us loop on accept_uni forever (honest peers cap themselves at 6).
             let parallel_n = req["parallel"].as_u64().unwrap_or(0).min(PARALLEL_STREAMS);
             let body = if parallel_n > 0 && names.len() == 1 && auto_accept {
-                match write_frame(send, &serde_json::json!({ "ready": true })).await {
-                    Ok(()) => {
-                        let name = names.first().cloned().unwrap_or_else(|| "file".to_string());
-                        // Peel off the first segment stream with a timeout. If none
-                        // arrives, the sender raced us into its classic fallback (its
-                        // ready-timeout fired just before our reply landed), so read
-                        // the classic body off the bi stream instead — no hang.
-                        match tokio::time::timeout(Duration::from_secs(12), conn.accept_uni()).await {
-                            Ok(Ok(first)) => {
-                                recv_file_parallel(conn, &dest, &name, total, parallel_n, first, &cancel, cb)
-                                    .await
-                                    .map(|p| vec![p])
+                let name = names.first().cloned().unwrap_or_else(|| "file".to_string());
+                // Resume identity: same sender + name + size + mtime = same bytes.
+                // If an earlier attempt left a partial for this fingerprint, we tell
+                // the sender which ranges we already have and it sends only the rest.
+                let item0 = &req["items"][0];
+                let fp = transfer_fingerprint(
+                    &who,
+                    &name,
+                    item0["size"].as_u64().unwrap_or(total),
+                    item0["mtime"].as_u64().unwrap_or(0),
+                );
+                // One resumable partial per fingerprint at a time; a concurrent
+                // duplicate of the same file gets a throwaway temp instead.
+                let resumable = state.partials.lock().unwrap().insert(fp.clone());
+                let prep: Result<(PathBuf, Coverage)> = if resumable {
+                    prepare_partial(&dest, &fp, total)
+                } else {
+                    (|| {
+                        std::fs::create_dir_all(&dest)?;
+                        let p = dest.join(format!(
+                            ".dropbeam-partial-tmp-{}.part",
+                            uuid::Uuid::new_v4()
+                        ));
+                        std::fs::File::create(&p)?.set_len(total)?;
+                        Ok((p, Coverage::default()))
+                    })()
+                };
+                let res = match prep {
+                    Ok((part, cov)) => {
+                        // The `resume` key (even with empty `have`) tells the sender
+                        // we're coverage-aware — it may send any stream layout.
+                        let ready =
+                            serde_json::json!({ "ready": true, "resume": { "have": cov.ranges } });
+                        match write_frame(send, &ready).await {
+                            Ok(()) => {
+                                // Peel off the first segment stream with a timeout. If
+                                // none arrives, the sender raced us into its classic
+                                // fallback (its ready-timeout fired just before our
+                                // reply landed) — read the classic body instead. The
+                                // resumable partial is KEPT (it may hold an earlier
+                                // attempt's progress); only a throwaway is deleted.
+                                match tokio::time::timeout(
+                                    Duration::from_secs(12),
+                                    conn.accept_uni(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(first)) => {
+                                        let rc = resumable.then(|| ResumeCtx {
+                                            side: partial_paths(&dest, &fp).1,
+                                            fp: fp.clone(),
+                                        });
+                                        recv_file_resumable(
+                                            conn, &dest, &name, total, part, rc, cov, first,
+                                            &cancel, cb,
+                                        )
+                                        .await
+                                        .map(|p| vec![p])
+                                    }
+                                    _ => {
+                                        if !resumable {
+                                            let _ = std::fs::remove_file(&part);
+                                        }
+                                        let r = read_body(recv, &req, &dest, &cancel, cb).await;
+                                        // The file arrived classically — a kept
+                                        // partial would only make a LATER send of
+                                        // the same file resume into a duplicate
+                                        // "name (1)" copy. Drop it.
+                                        if r.is_ok() && resumable {
+                                            let _ = std::fs::remove_file(&part);
+                                            let _ = std::fs::remove_file(partial_paths(&dest, &fp).1);
+                                        }
+                                        r
+                                    }
+                                }
                             }
-                            _ => read_body(recv, &req, &dest, &cancel, cb).await,
+                            Err(e) => Err(e),
                         }
                     }
                     Err(e) => Err(e),
+                };
+                if resumable {
+                    state.partials.lock().unwrap().remove(&fp);
                 }
+                res
             } else {
                 read_body(recv, &req, &dest, &cancel, cb).await
             };
@@ -1248,52 +1319,85 @@ pub fn send_to_friend(
         .unwrap_or_default();
     tauri::async_runtime::spawn(async move {
         let outcome: Result<crate::models::Locality> = async {
-            // Bounded so an offline/unreachable friend FAILS clearly instead of
-            // hanging forever (the exact thing that was wrong with the old path).
-            // Bounded re-dial: a friend who's briefly offline (e.g. just opening
-            // their app) still receives, mirroring croc's old parked-send window.
-            // We keep re-dialing until connected or the budget runs out; the file
-            // stays "Connecting" meanwhile, and a cancel breaks out immediately.
-            let conn = {
-                let started = std::time::Instant::now();
-                loop {
-                    if cancel.load(Ordering::SeqCst) {
-                        anyhow::bail!("canceled");
-                    }
-                    match tokio::time::timeout(
-                        Duration::from_secs(20),
-                        ep.connect(addr.clone(), ALPN),
-                    )
-                    .await
-                    {
-                        Ok(Ok(c)) => break c,
-                        _ => {
-                            if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
-                                anyhow::bail!("Couldn't reach this friend — are they online with Direct mode on?");
+            // A parallel transfer that was UNDERWAY and died is almost always a
+            // network blip / sleep — so we auto-reconnect up to 2 extra times, and
+            // the resume handshake picks up from the receiver's partial instead of
+            // byte zero. The retry is gated on the receiver having replied
+            // {ready:true} THIS attempt: that proves an auto-accept parallel receive
+            // engaged, so the error can't be a manual-accept DECLINE (retrying one
+            // of those would re-prompt the recipient), and classic multi-file sends
+            // keep fail-fast so a retry can't duplicate files.
+            let mut attempt: u32 = 0;
+            loop {
+                // Bounded so an offline/unreachable friend FAILS clearly instead of
+                // hanging forever. Bounded re-dial: a friend who's briefly offline
+                // (e.g. just opening their app) still receives; the file stays
+                // "Connecting" meanwhile, and a cancel breaks out immediately.
+                let conn = {
+                    let started = std::time::Instant::now();
+                    loop {
+                        if cancel.load(Ordering::SeqCst) {
+                            anyhow::bail!("canceled");
+                        }
+                        match tokio::time::timeout(
+                            Duration::from_secs(20),
+                            ep.connect(addr.clone(), ALPN),
+                        )
+                        .await
+                        {
+                            Ok(Ok(c)) => break c,
+                            _ => {
+                                if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
+                                    anyhow::bail!("Couldn't reach this friend — are they online with Direct mode on?");
+                                }
+                                tokio::time::sleep(Duration::from_secs(6)).await;
                             }
-                            tokio::time::sleep(Duration::from_secs(6)).await;
                         }
                     }
+                };
+                let cb = progress_cb(
+                    app.clone(),
+                    id.clone(),
+                    Direction::Send,
+                    names.clone(),
+                    Some(friend_name.clone()),
+                    conn.clone(),
+                );
+                cleanup.conns.lock().unwrap().insert(id.clone(), conn.clone());
+                // Prefer a direct p2p path before sending — the relay is rate-limited
+                // and would crawl. Proceeds over relay if direct never forms.
+                if !wait_for_direct_path(&conn, Duration::from_secs(8)).await {
+                    log::warn!("friend-send: no direct path after 8s — relay (slow)");
                 }
-            };
-            let cb = progress_cb(
-                app.clone(),
-                id.clone(),
-                Direction::Send,
-                names.clone(),
-                Some(friend_name.clone()),
-                conn.clone(),
-            );
-            cleanup.conns.lock().unwrap().insert(id.clone(), conn.clone());
-            // Prefer a direct p2p path before sending — the relay is rate-limited
-            // and would crawl. Proceeds over relay if direct never forms.
-            if !wait_for_direct_path(&conn, Duration::from_secs(8)).await {
-                log::warn!("friend-send: no direct path after 8s — relay (slow)");
+                // Fresh per attempt: only THIS attempt's handshake authorizes a retry.
+                let engaged = AtomicBool::new(false);
+                let __t0 = std::time::Instant::now();
+                match send_files(&conn, &pathbufs, &cancel, cb, &my_name, &engaged).await {
+                    Ok(_) => {
+                        log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
+                        return Ok(conn_locality(&conn));
+                    }
+                    Err(e) => {
+                        let canceled = cancel.load(Ordering::SeqCst)
+                            || e.to_string().contains("canceled");
+                        if !canceled && attempt < 2 && engaged.load(Ordering::SeqCst) {
+                            attempt += 1;
+                            log::warn!(
+                                "friend-send interrupted ({e:#}) — auto-resuming, attempt {attempt}/2"
+                            );
+                            let mut ru =
+                                TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            ru.friend_name = Some(friend_name.clone());
+                            ru.state = TransferState::Connecting;
+                            ru.bytes_total = total;
+                            emit(&app, &ru);
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
             }
-            let __t0 = std::time::Instant::now();
-            send_files(&conn, &pathbufs, &cancel, cb, &my_name).await?;
-            log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
-            Ok(conn_locality(&conn))
         }
         .await;
         match outcome {
@@ -1906,33 +2010,266 @@ async fn drain_with_progress<T: Send + 'static, F: Fn(u64, u64)>(
     }
 }
 
-/// SEND one file across `n` unidirectional streams. Stream i carries the contiguous
-/// segment starting at `i * ceil(total/n)`, prefixed with its 8-byte big-endian
-/// start offset. Always opens exactly `n` streams (empty trailing ones are valid)
-/// so the receiver's `n` accepts never deadlock.
-async fn send_file_parallel<F: Fn(u64, u64)>(
+// ── Resumable transfers ──────────────────────────────────────────────────────
+//
+// Each parallel stream self-describes the byte range it carries, so the receiver
+// tracks WHICH RANGES have landed (a coverage map) instead of counting streams —
+// and persists that map in a sidecar next to a hidden partial file. If anything
+// dies mid-transfer (network blip, sleep, app quit on either side), the partial
+// survives; the next send of the same file (same sender + name + size + mtime)
+// resumes from the missing ranges instead of byte zero, and the sender
+// auto-reconnects to make a connection drop invisible.
+
+/// Sorted, non-overlapping half-open byte ranges `[start, end)` that have landed
+/// on disk. Adjacent/overlapping inserts merge, so ANY mixture of segmentations
+/// (a resumed send, a legacy exact-N send, even both) converges to one range.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Coverage {
+    ranges: Vec<(u64, u64)>,
+}
+
+impl Coverage {
+    fn insert(&mut self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        let (mut ns, mut ne) = (start, end);
+        let mut out = Vec::with_capacity(self.ranges.len() + 1);
+        let mut placed = false;
+        for &(s, e) in &self.ranges {
+            if e < ns || s > ne {
+                // Disjoint (half-open ranges touching at a point DO merge above).
+                if s > ne && !placed {
+                    out.push((ns, ne));
+                    placed = true;
+                }
+                out.push((s, e));
+            } else {
+                ns = ns.min(s);
+                ne = ne.max(e);
+            }
+        }
+        if !placed {
+            out.push((ns, ne));
+        }
+        self.ranges = out;
+    }
+
+    fn covered(&self) -> u64 {
+        self.ranges.iter().map(|(s, e)| e - s).sum()
+    }
+
+    /// The gaps in `[0, total)` not yet covered, as (start, end) pairs.
+    fn missing(&self, total: u64) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut cursor = 0u64;
+        for &(s, e) in &self.ranges {
+            if s > cursor {
+                out.push((cursor, s.min(total)));
+            }
+            cursor = cursor.max(e);
+        }
+        if cursor < total {
+            out.push((cursor, total));
+        }
+        out
+    }
+}
+
+/// On-disk record of a partially received file, written beside the partial so a
+/// resume works across reconnects AND app restarts.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PartialSidecar {
+    v: u32,
+    fp: String,
+    total: u64,
+    coverage: Coverage,
+}
+
+/// Resume bookkeeping for one receive: where the sidecar lives + the fingerprint.
+struct ResumeCtx {
+    side: PathBuf,
+    fp: String,
+}
+
+/// Identity of a transfer for resume purposes: same sender + name + size + mtime
+/// = same bytes (the rsync-style heuristic). An edited file changes mtime/size →
+/// different fingerprint → fresh transfer, never a corrupt mix.
+fn transfer_fingerprint(sender: &str, name: &str, size: u64, mtime: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(sender.as_bytes());
+    h.update([0]);
+    h.update(name.as_bytes());
+    h.update([0]);
+    h.update(size.to_be_bytes());
+    h.update(mtime.to_be_bytes());
+    hex::encode(&h.finalize()[..8])
+}
+
+fn partial_paths(dir: &Path, fp: &str) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!(".dropbeam-partial-{fp}.part")),
+        dir.join(format!(".dropbeam-partial-{fp}.json")),
+    )
+}
+
+fn save_sidecar(path: &Path, sc: &PartialSidecar) {
+    if let Ok(json) = serde_json::to_vec(sc) {
+        // Atomic-ish: write a temp then rename, so a crash never leaves a torn file.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+fn load_sidecar(path: &Path, fp: &str, total: u64) -> Option<Coverage> {
+    let sc: PartialSidecar = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if sc.v != 1 || sc.fp != fp || sc.total != total {
+        return None;
+    }
+    // NEVER trust on-disk ranges blindly — covered()/missing() and the completion
+    // check assume sorted/disjoint/in-bounds, and a corrupted sidecar claiming
+    // full coverage would short-circuit a garbage partial straight into a
+    // "completed" file. Rebuild through insert(), which restores every invariant.
+    let mut c = Coverage::default();
+    for (s, e) in sc.coverage.ranges {
+        c.insert(s.min(total), e.min(total));
+    }
+    Some(c)
+}
+
+/// Abandoned partials are cleaned up after a week — long enough to resume a big
+/// transfer "tomorrow", short enough not to hoard disk.
+const PARTIAL_TTL_SECS: u64 = 7 * 24 * 3600;
+
+fn gc_stale_partials(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let now = std::time::SystemTime::now();
+    for e in rd.flatten() {
+        if !e.file_name().to_string_lossy().starts_with(".dropbeam-partial-") {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs() > PARTIAL_TTL_SECS)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Open (or reopen) the hidden partial for `fp`, pre-sized to `total`, returning
+/// any prior coverage from a matching sidecar — i.e. how much we already have.
+fn prepare_partial(dir: &Path, fp: &str, total: u64) -> Result<(PathBuf, Coverage)> {
+    std::fs::create_dir_all(dir)?;
+    gc_stale_partials(dir);
+    let (part, side) = partial_paths(dir, fp);
+    let coverage = if part.is_file() {
+        load_sidecar(&side, fp, total).unwrap_or_default()
+    } else {
+        // No partial → any surviving sidecar is an orphan describing bytes that no
+        // longer exist. Remove it NOW, or a later crash-before-persist could let it
+        // claim coverage over the fresh zero-filled file we're about to create.
+        let _ = std::fs::remove_file(&side);
+        Coverage::default()
+    };
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&part)?;
+    f.set_len(total)?;
+    Ok((part, coverage))
+}
+
+/// The legacy equal segmentation that pre-resume receivers expect: EXACTLY `n`
+/// streams (including zero-length trailing ones), so their fixed accept loop
+/// never blocks waiting for a stream that won't come.
+fn legacy_plan(total: u64, n: u64) -> Vec<(u64, u64)> {
+    let seg = total.div_ceil(n.max(1));
+    (0..n.max(1))
+        .map(|i| {
+            let s = (i * seg).min(total);
+            (s, seg.min(total - s))
+        })
+        .collect()
+}
+
+/// Plan streams for the MISSING ranges of a resumed transfer, as (offset, len).
+/// Coverage-aware receivers don't care about stream count, so: merge the
+/// closest-together ranges if there are more gaps than streams (re-sending the
+/// small covered sliver between them is harmless — writes are positioned), then
+/// split the biggest ranges so large resumes still get multi-stream speed.
+fn plan_resume_ranges(missing: &[(u64, u64)], max_streams: u64) -> Vec<(u64, u64)> {
+    let max = max_streams.max(1) as usize;
+    let mut ranges: Vec<(u64, u64)> = missing
+        .iter()
+        .filter(|&&(s, e)| e > s)
+        .map(|&(s, e)| (s, e - s))
+        .collect();
+    while ranges.len() > max {
+        let mut best = 0;
+        let mut best_gap = u64::MAX;
+        for i in 0..ranges.len() - 1 {
+            let gap = ranges[i + 1].0 - (ranges[i].0 + ranges[i].1);
+            if gap < best_gap {
+                best_gap = gap;
+                best = i;
+            }
+        }
+        let (s1, _) = ranges[best];
+        let (s2, l2) = ranges[best + 1];
+        ranges[best] = (s1, (s2 + l2) - s1);
+        ranges.remove(best + 1);
+    }
+    while ranges.len() < max {
+        let Some((idx, &(s, l))) = ranges
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &(_, l))| l)
+        else {
+            break;
+        };
+        if l < 8 * 1024 * 1024 {
+            break;
+        }
+        let half = l / 2;
+        ranges[idx] = (s, half);
+        ranges.insert(idx + 1, (s + half, l - half));
+    }
+    ranges
+}
+
+/// SEND the given (offset, len) ranges of one file, each on its own uni stream
+/// (16-byte offset+len header, then the bytes). `base` is how many bytes the
+/// receiver already has, so progress starts where the resume left off instead of
+/// lying back to 0%.
+async fn send_ranges_parallel<F: Fn(u64, u64)>(
     conn: &Connection,
     path: &Path,
     total: u64,
-    n: u64,
+    base: u64,
+    plan: &[(u64, u64)],
     cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<()> {
-    let seg = total.div_ceil(n.max(1));
-    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(base));
     let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
-    for i in 0..n {
-        let start = (i * seg).min(total);
-        let len = seg.min(total - start);
+    for &(start, len) in plan {
         let conn = conn.clone();
         let path = path.to_path_buf();
         let progress = progress.clone();
         set.spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut uni = conn.open_uni().await?;
-            // 16-byte frame header: start offset + segment length (big-endian). The
-            // explicit length lets the receiver write EXACTLY its region and reject
-            // an over- or under-sending peer, instead of trusting stream EOF.
+            // The explicit length lets the receiver write EXACTLY its region and
+            // reject an over- or under-sending peer, instead of trusting EOF.
             uni.write_all(&start.to_be_bytes()).await?;
             uni.write_all(&len.to_be_bytes()).await?;
             if len > 0 {
@@ -1958,123 +2295,213 @@ async fn send_file_parallel<F: Fn(u64, u64)>(
             Ok(())
         });
     }
-    drain_with_progress(set, &progress, total, cancel, &on_progress).await?;
+    if !set.is_empty() {
+        drain_with_progress(set, &progress, total, cancel, &on_progress).await?;
+    }
     on_progress(total, total);
     Ok(())
 }
 
-/// Spawn one worker to drain a single inbound segment stream into `tmp`. The stream
-/// begins with a 16-byte header (start offset + segment length); the worker seeks to
-/// the offset and writes EXACTLY that many bytes (bounding a misbehaving peer), then
-/// returns the segment length for the caller's completeness check.
-fn spawn_segment_reader(
-    set: &mut tokio::task::JoinSet<Result<u64>>,
+/// One worker draining one inbound `[offset, len]` stream into the partial,
+/// marking each chunk in the shared coverage map as it lands.
+fn spawn_range_reader(
+    set: &mut tokio::task::JoinSet<Result<()>>,
     mut uni: RecvStream,
-    tmp: PathBuf,
-    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    part: PathBuf,
+    total: u64,
+    cov: std::sync::Arc<Mutex<Coverage>>,
 ) {
     set.spawn(async move {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
         let mut hdr = [0u8; 16];
         uni.read_exact(&mut hdr).await?;
         let offset = u64::from_be_bytes(hdr[0..8].try_into().unwrap());
-        let seg_len = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
-        let mut f = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
+        let len = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+        anyhow::ensure!(
+            offset.checked_add(len).map(|e| e <= total).unwrap_or(false),
+            "segment out of bounds ({offset}+{len} > {total})"
+        );
+        if len == 0 {
+            return Ok(());
+        }
+        let mut f = tokio::fs::OpenOptions::new().write(true).open(&part).await?;
         f.seek(std::io::SeekFrom::Start(offset)).await?;
-        let mut remaining = seg_len;
+        let mut done = 0u64;
         let mut buf = vec![0u8; CHUNK];
-        while remaining > 0 {
-            let want = remaining.min(CHUNK as u64) as usize;
+        while done < len {
+            let want = (len - done).min(CHUNK as u64) as usize;
             match uni.read(&mut buf[..want]).await? {
                 Some(k) if k > 0 => {
                     f.write_all(&buf[..k]).await?;
-                    remaining -= k as u64;
-                    progress.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
+                    // Mark coverage only AFTER the bytes are written, so the
+                    // sidecar never claims data the disk doesn't have (app-level
+                    // interruptions, the overwhelmingly common case, stay safe).
+                    let end = offset + done + k as u64;
+                    cov.lock().unwrap().insert(offset + done, end);
+                    done += k as u64;
                 }
-                _ => anyhow::bail!("segment stream ended early ({remaining} bytes short)"),
+                _ => anyhow::bail!("segment stream ended early ({} bytes short)", len - done),
             }
         }
         f.flush().await?;
-        Ok(seg_len)
+        Ok(())
     });
 }
 
-/// RECEIVE one file fanned across `n` unidirectional streams into `dest_dir`. `first`
-/// is the already-accepted stream 0 (the caller peeled it off with a timeout to
-/// detect a sender that raced into its classic fallback). Each stream self-describes
-/// its offset + length, so arrival order doesn't matter. Receives into a hidden
-/// `.part` temp and atomically renames on success — a failed transfer is removed,
-/// never left as a full-size garbage file at the real name.
-async fn recv_file_parallel<F: Fn(u64, u64)>(
+/// RECEIVE one file fanned across self-describing range streams into `dest_dir`.
+/// `first` is the already-accepted stream 0 (the caller peeled it with a timeout
+/// to detect a sender that raced into its classic fallback). Completion = every
+/// byte of `[0, total)` covered — stream COUNT doesn't matter, so resumed sends
+/// (fewer streams) and legacy sends (exactly N) both converge. On success the
+/// partial is renamed into place and its sidecar removed; on ANY failure or
+/// cancel the partial + sidecar are KEPT (when `resume` is Some) so the next
+/// attempt picks up where this one died.
+#[allow(clippy::too_many_arguments)]
+async fn recv_file_resumable<F: Fn(u64, u64)>(
     conn: &Connection,
     dest_dir: &Path,
     name: &str,
     total: u64,
-    n: u64,
+    part: PathBuf,
+    resume: Option<ResumeCtx>,
+    start_cov: Coverage,
     first: RecvStream,
     cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<PathBuf> {
-    std::fs::create_dir_all(dest_dir)?;
     let safe = Path::new(name)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "file".to_string());
-    let dest = unique_path(dest_dir, &safe);
-    let tmp = dest_dir.join(format!(".{safe}.{}.part", uuid::Uuid::new_v4()));
-    {
-        // Pre-size so each segment can seek to its offset and write in place.
-        let f = std::fs::File::create(&tmp)?;
-        f.set_len(total)?;
-    }
-    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut set: tokio::task::JoinSet<Result<u64>> = tokio::task::JoinSet::new();
-    spawn_segment_reader(&mut set, first, tmp.clone(), progress.clone());
-    let mut accept_err = None;
-    for _ in 1..n {
-        // The rest of the streams (the sender opened all `n` at once, so once the
-        // first arrived these follow immediately). Nothing else uses uni streams.
-        match conn.accept_uni().await {
-            Ok(uni) => spawn_segment_reader(&mut set, uni, tmp.clone(), progress.clone()),
-            Err(e) => {
-                accept_err = Some(anyhow::anyhow!("accept segment stream: {e}"));
-                break;
+    let cov = std::sync::Arc::new(Mutex::new(start_cov));
+    let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+    spawn_range_reader(&mut set, first, part.clone(), total, cov.clone());
+
+    let persist = |cov: &Coverage| {
+        if let Some(rc) = &resume {
+            // Push the data pages to stable storage BEFORE the sidecar claims them,
+            // so a hard kill / power cut can't leave a sidecar describing ranges the
+            // disk never got (resuming over zeros). One fsync per ~2s — negligible.
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&part) {
+                let _ = f.sync_data();
             }
-        }
-    }
-    let outcome: Result<()> = if let Some(e) = accept_err {
-        set.abort_all();
-        Err(e)
-    } else {
-        match drain_with_progress(set, &progress, total, cancel, &on_progress).await {
-            Ok(counts) => {
-                let received: u64 = counts.iter().sum();
-                if received == total {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("parallel receive incomplete: {received}/{total} bytes"))
-                }
-            }
-            Err(e) => Err(e),
+            save_sidecar(
+                &rc.side,
+                &PartialSidecar { v: 1, fp: rc.fp.clone(), total, coverage: cov.clone() },
+            );
         }
     };
-    match outcome {
-        Ok(()) => {
-            std::fs::rename(&tmp, &dest)
-                .with_context(|| format!("finalize {}", dest.display()))?;
-            on_progress(total, total);
-            Ok(dest)
+
+    let mut err: Option<anyhow::Error> = None;
+    let mut last_covered = cov.lock().unwrap().covered();
+    let mut last_growth = Instant::now();
+    let mut last_persist = Instant::now();
+    loop {
+        let covered = cov.lock().unwrap().covered();
+        if covered != last_covered {
+            last_covered = covered;
+            last_growth = Instant::now();
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+        if covered >= total {
+            break; // every byte accounted for
         }
+        tokio::select! {
+            uni = conn.accept_uni() => match uni {
+                Ok(u) => spawn_range_reader(&mut set, u, part.clone(), total, cov.clone()),
+                Err(e) => { err = Some(anyhow::anyhow!("connection lost: {e}")); break; }
+            },
+            joined = set.join_next(), if !set.is_empty() => match joined {
+                Some(Ok(Err(e))) => { err = Some(e); break; }
+                Some(Err(e)) => { err = Some(anyhow::anyhow!("transfer worker failed: {e}")); break; }
+                _ => {} // a worker finished cleanly; loop re-checks coverage
+            },
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    err = Some(anyhow::anyhow!("canceled"));
+                    break;
+                }
+                on_progress(covered, total);
+                if last_growth.elapsed() > Duration::from_secs(60) {
+                    err = Some(anyhow::anyhow!("transfer stalled — no data for 60s"));
+                    break;
+                }
+                // Persist coverage every couple of seconds so even a hard kill
+                // loses at most a moment of progress.
+                if last_persist.elapsed() > Duration::from_secs(2) {
+                    last_persist = Instant::now();
+                    persist(&cov.lock().unwrap().clone());
+                }
+            }
+        }
+    }
+    if err.is_some() {
+        // Error path: kill stragglers, then drain so every worker has dropped its
+        // file handle before we touch the partial (Windows rename safety).
+        set.abort_all();
+        while set.join_next().await.is_some() {}
+    } else {
+        // SUCCESS path: JOIN the remaining workers instead of aborting them. They
+        // are finishing their final write/flush (or draining a redundant
+        // already-covered tail from a legacy sender) — aborting here would (a)
+        // silently swallow a failed last write (ENOSPC is realistic: the partial
+        // is pre-sized SPARSE, so set_len allocated nothing) and then rename + ack
+        // a corrupt file, and (b) reset streams a still-writing sender interprets
+        // as failure for a transfer that actually landed. Bounded: a dead peer's
+        // streams error out via QUIC idle timeout well inside this window.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !set.is_empty() {
+            match tokio::time::timeout_at(deadline, set.join_next()).await {
+                Ok(Some(Ok(Ok(())))) => {}
+                Ok(Some(Ok(Err(e)))) => {
+                    err = Some(e);
+                    break;
+                }
+                Ok(Some(Err(e))) => {
+                    err = Some(anyhow::anyhow!("transfer worker failed: {e}"));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    err = Some(anyhow::anyhow!("worker still running after completion"));
+                    break;
+                }
+            }
+        }
+        if err.is_some() {
+            set.abort_all();
+            while set.join_next().await.is_some() {}
+        }
+    }
+
+    let final_cov = cov.lock().unwrap().clone();
+    if err.is_none() && final_cov.covered() >= total {
+        // Flush to the OS before the rename makes it "real".
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&part) {
+            let _ = f.sync_all();
+        }
+        let dest = unique_path(dest_dir, &safe);
+        std::fs::rename(&part, &dest).with_context(|| format!("finalize {}", dest.display()))?;
+        if let Some(rc) = &resume {
+            let _ = std::fs::remove_file(&rc.side);
+        }
+        on_progress(total, total);
+        Ok(dest)
+    } else {
+        let e = err.unwrap_or_else(|| anyhow::anyhow!("incomplete transfer"));
+        if resume.is_some() {
+            // Keep the partial — this is the whole feature. Even a CANCEL keeps it
+            // (cancel becomes "pause": re-sending the file later resumes).
+            persist(&final_cov);
+        } else {
+            let _ = std::fs::remove_file(&part);
+        }
+        Err(e)
     }
 }
 
-/// Gather (path, name, size) for each file to send, plus the byte total.
-fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64)>, u64)> {
+/// Gather (path, name, size, mtime) for each file to send, plus the byte total.
+fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, u64)> {
     let mut items = Vec::new();
     for p in paths {
         let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
@@ -2082,7 +2509,7 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64)>, u64)>
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .ok_or_else(|| anyhow::anyhow!("missing file name for {}", p.display()))?;
-        items.push((p.clone(), name, meta.len()));
+        items.push((p.clone(), name, meta.len(), mtime_secs(&meta)));
     }
     let total = items.iter().map(|i| i.2).sum();
     Ok((items, total))
@@ -2090,13 +2517,15 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64)>, u64)>
 
 /// The JSON header describing a files push. `parallel` > 0 advertises that the body
 /// will arrive split across that many uni streams (the receiver opts in by replying
-/// `{ready:true}`); an older peer simply ignores the field and reads classically.
-fn files_header(items: &[(PathBuf, String, u64)], total: u64, parallel: u64, from_name: &str) -> serde_json::Value {
+/// `{ready:true}` — plus a `resume` map of byte ranges it already has from an
+/// interrupted earlier attempt); an older peer ignores the extra fields and reads
+/// classically. `mtime` identifies the file version for resume fingerprinting.
+fn files_header(items: &[(PathBuf, String, u64, u64)], total: u64, parallel: u64, from_name: &str) -> serde_json::Value {
     serde_json::json!({
         "kind": "files",
         "items": items
             .iter()
-            .map(|(_, n, s)| serde_json::json!({ "name": n, "size": s }))
+            .map(|(_, n, s, mt)| serde_json::json!({ "name": n, "size": s, "mtime": mt }))
             .collect::<Vec<_>>(),
         "total": total,
         "parallel": parallel,
@@ -2110,14 +2539,14 @@ fn files_header(items: &[(PathBuf, String, u64)], total: u64, parallel: u64, fro
 /// (the header must already have been written).
 async fn write_files_body<F: Fn(u64, u64)>(
     send: &mut SendStream,
-    items: &[(PathBuf, String, u64)],
+    items: &[(PathBuf, String, u64, u64)],
     total: u64,
     cancel: &AtomicBool,
     on_progress: &F,
 ) -> Result<u64> {
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
-    for (path, _, _) in items {
+    for (path, _, _, _) in items {
         let mut f = tokio::fs::File::open(path).await?;
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -2222,6 +2651,11 @@ pub async fn send_files<F: Fn(u64, u64)>(
     cancel: &AtomicBool,
     on_progress: F,
     my_name: &str,
+    // Set true the moment the receiver replies {ready:true} — i.e. an auto-accept,
+    // parallel/resumable receive is underway. The caller's auto-retry is gated on
+    // this so a DECLINED manual-accept send (which can also error mid-write) never
+    // retries and re-prompts the recipient.
+    parallel_engaged: &AtomicBool,
 ) -> Result<u64> {
     let (mut send, mut recv) = conn.open_bi().await?;
     let (items, total) = gather_items(paths)?;
@@ -2235,12 +2669,55 @@ pub async fn send_files<F: Fn(u64, u64)>(
         // this same stream. No hard failure during a staggered rollout.
         // Comfortably under the receiver's 12s first-stream wait, so if {ready}
         // arrives we both pick parallel, and if it doesn't we both pick classic.
-        let ready = match tokio::time::timeout(Duration::from_secs(6), read_frame(&mut recv)).await {
-            Ok(Ok(v)) => v.get("ready").and_then(|r| r.as_bool()).unwrap_or(false),
-            _ => false,
+        let reply = match tokio::time::timeout(Duration::from_secs(6), read_frame(&mut recv)).await {
+            Ok(Ok(v)) => Some(v),
+            _ => None,
         };
+        let ready = reply
+            .as_ref()
+            .and_then(|v| v.get("ready"))
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
         if ready {
-            send_file_parallel(conn, &items[0].0, total, n, cancel, on_progress).await?;
+            parallel_engaged.store(true, Ordering::SeqCst);
+            // A `resume` key marks a coverage-aware receiver: it told us which byte
+            // ranges it ALREADY has from an interrupted earlier attempt, and it
+            // finishes on coverage (not stream count) — so we send only the missing
+            // ranges. No `resume` key = an older exact-N receiver: send the legacy
+            // equal segmentation so its fixed accept loop never starves.
+            let (base, plan) = match reply.as_ref().and_then(|v| v.get("resume")) {
+                Some(r) => {
+                    let mut have = Coverage::default();
+                    if let Some(arr) = r.get("have").and_then(|h| h.as_array()) {
+                        for pair in arr {
+                            if let (Some(s), Some(e)) = (
+                                pair.get(0).and_then(|x| x.as_u64()),
+                                pair.get(1).and_then(|x| x.as_u64()),
+                            ) {
+                                have.insert(s.min(total), e.min(total));
+                            }
+                        }
+                    }
+                    let base = have.covered();
+                    if base > 0 {
+                        log::info!(
+                            "friend-send: resuming — receiver already has {base}/{total} bytes"
+                        );
+                    }
+                    let mut plan = plan_resume_ranges(&have.missing(total), n);
+                    // Receiver already has EVERYTHING (a prior attempt finished
+                    // writing but died before finalizing)? Still open one zero-length
+                    // stream: its arrival is what lets the receiver's first-stream
+                    // wait succeed, see complete coverage, and finalize + ack.
+                    if plan.is_empty() {
+                        plan.push((0, 0));
+                    }
+                    (base, plan)
+                }
+                None => (0, legacy_plan(total, n)),
+            };
+            send_ranges_parallel(conn, &items[0].0, total, base, &plan, cancel, on_progress)
+                .await?;
             send.finish()?;
             let ack = recv.read_to_end(16).await.unwrap_or_default();
             anyhow::ensure!(
@@ -2400,16 +2877,15 @@ mod tests {
 
     #[test]
     fn parallel_segments_cover_every_byte_exactly_once() {
-        // The EXACT split the sender uses and the receiver trusts: any gap, overlap,
-        // or short-fall here would corrupt the reassembled file, so prove coverage.
+        // The EXACT split old receivers trust: any gap, overlap, or short-fall here
+        // would corrupt the reassembled file, so prove coverage and exact count.
         for total in [PARALLEL_MIN, 100u64, 541 * 1024 * 1024, 17, 1, PARALLEL_MIN + 1] {
             let n = parallel_stream_count(1, total).max(1);
-            let seg = total.div_ceil(n);
+            let plan = legacy_plan(total, n);
+            assert_eq!(plan.len() as u64, n, "legacy plan must have EXACTLY n streams");
             let mut prev_end = 0u64;
             let mut covered = 0u64;
-            for i in 0..n {
-                let start = (i * seg).min(total);
-                let len = seg.min(total - start);
+            for (i, &(start, len)) in plan.iter().enumerate() {
                 assert_eq!(start, prev_end, "gap/overlap before stream {i} (total={total})");
                 prev_end = start + len;
                 covered += len;
@@ -2417,6 +2893,100 @@ mod tests {
             assert_eq!(prev_end, total, "coverage ends exactly at total={total}");
             assert_eq!(covered, total, "segments sum to total={total}");
         }
+    }
+
+    #[test]
+    fn coverage_merges_and_reports_missing() {
+        let mut c = Coverage::default();
+        c.insert(10, 20);
+        c.insert(30, 40);
+        assert_eq!(c.ranges, vec![(10, 20), (30, 40)]);
+        // Adjacent ranges merge (half-open: [20,30) bridges the gap exactly).
+        c.insert(20, 30);
+        assert_eq!(c.ranges, vec![(10, 40)]);
+        // Overlapping + extending merges.
+        c.insert(35, 50);
+        assert_eq!(c.ranges, vec![(10, 50)]);
+        // Out-of-order + empty inserts are safe.
+        c.insert(0, 5);
+        c.insert(7, 7);
+        assert_eq!(c.ranges, vec![(0, 5), (10, 50)]);
+        assert_eq!(c.covered(), 45);
+        assert_eq!(c.missing(60), vec![(5, 10), (50, 60)]);
+        // Completing the file leaves nothing missing.
+        c.insert(5, 10);
+        c.insert(50, 60);
+        assert_eq!(c.ranges, vec![(0, 60)]);
+        assert!(c.missing(60).is_empty());
+        assert_eq!(c.covered(), 60);
+    }
+
+    #[test]
+    fn coverage_sidecar_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-sidecar-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let fp = transfer_fingerprint("sender", "a.bin", 100, 7);
+        let (_, side) = partial_paths(&dir, &fp);
+        let mut cov = Coverage::default();
+        cov.insert(0, 30);
+        cov.insert(60, 100);
+        save_sidecar(&side, &PartialSidecar { v: 1, fp: fp.clone(), total: 100, coverage: cov.clone() });
+        // Matching identity loads the coverage back…
+        assert_eq!(load_sidecar(&side, &fp, 100), Some(cov));
+        // …but a different total (file changed size) or fingerprint does not.
+        assert_eq!(load_sidecar(&side, &fp, 101), None);
+        assert_eq!(load_sidecar(&side, "other", 100), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_tracks_file_identity() {
+        let a = transfer_fingerprint("eid1", "movie.mp4", 1000, 5);
+        // Same identity → same fingerprint (resume finds the partial)…
+        assert_eq!(a, transfer_fingerprint("eid1", "movie.mp4", 1000, 5));
+        // …but ANY change (edited file, different sender/name) → different one,
+        // so stale bytes can never be mixed into a new version.
+        assert_ne!(a, transfer_fingerprint("eid1", "movie.mp4", 1000, 6));
+        assert_ne!(a, transfer_fingerprint("eid1", "movie.mp4", 1001, 5));
+        assert_ne!(a, transfer_fingerprint("eid2", "movie.mp4", 1000, 5));
+        assert_ne!(a, transfer_fingerprint("eid1", "movie2.mp4", 1000, 5));
+    }
+
+    #[test]
+    fn resume_plan_covers_exactly_the_missing_bytes() {
+        const MB: u64 = 1024 * 1024;
+        // Typical interrupted-parallel shape: a few large holes.
+        let missing = vec![(10 * MB, 40 * MB), (50 * MB, 90 * MB)];
+        let plan = plan_resume_ranges(&missing, 6);
+        assert!(plan.len() <= 6 && !plan.is_empty());
+        // Every missing byte is covered by the plan (re-sending extra is allowed —
+        // positioned writes make it harmless — but gaps are NOT).
+        let mut cov = Coverage::default();
+        for &(s, l) in &plan {
+            cov.insert(s, s + l);
+        }
+        for &(s, e) in &missing {
+            assert!(
+                cov.ranges.iter().any(|&(cs, ce)| cs <= s && e <= ce),
+                "plan must cover all missing bytes ({s},{e})"
+            );
+        }
+        // More gaps than streams → merged down to the cap, still covering all.
+        let many: Vec<(u64, u64)> = (0..12).map(|i| (i * 10 * MB, i * 10 * MB + MB)).collect();
+        let plan = plan_resume_ranges(&many, 6);
+        assert!(plan.len() <= 6);
+        let mut cov = Coverage::default();
+        for &(s, l) in &plan {
+            cov.insert(s, s + l);
+        }
+        for &(s, e) in &many {
+            assert!(
+                cov.ranges.iter().any(|&(cs, ce)| cs <= s && e <= ce),
+                "merged plan still covers ({s},{e})"
+            );
+        }
+        // Nothing missing → empty plan (receiver already has the whole file).
+        assert!(plan_resume_ranges(&[], 6).is_empty());
     }
 
     // The core parallel-transfer guarantee: a file fanned across N uni streams and
@@ -2449,14 +3019,22 @@ mod tests {
             let conn = srv.accept().await.unwrap().await.unwrap();
             // Peel off the first segment stream like the live receiver does.
             let first = conn.accept_uni().await.unwrap();
-            recv_file_parallel(&conn, &dest_dir_c, "blob.bin", total, n, first, &AtomicBool::new(false), |_, _| {})
-                .await
-                .unwrap()
+            let fp = transfer_fingerprint("test-sender", "blob.bin", total, 0);
+            let (part, cov) = prepare_partial(&dest_dir_c, &fp, total).unwrap();
+            let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp).1, fp };
+            recv_file_resumable(
+                &conn, &dest_dir_c, "blob.bin", total, part, Some(rc), cov, first,
+                &AtomicBool::new(false), |_, _| {},
+            )
+            .await
+            .unwrap()
         });
 
         let client = Endpoint::bind(presets::N0).await.unwrap();
         let conn = client.connect(addr, ALPN).await.unwrap();
-        send_file_parallel(&conn, &src, total, n, &AtomicBool::new(false), |_, _| {})
+        // Send the legacy exact-n plan — the layout an old sender would use; the
+        // coverage-based receiver must converge on it just the same.
+        send_ranges_parallel(&conn, &src, total, 0, &legacy_plan(total, n), &AtomicBool::new(false), |_, _| {})
             .await
             .unwrap();
 
@@ -2467,6 +3045,98 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest_dir);
         println!("parallel transfer OK: {total} bytes across {n} streams, byte-identical");
+    }
+
+    // THE RESUME GUARANTEE: a receiver that already has part of the file (an
+    // interrupted earlier attempt) advertises its coverage; the sender transmits
+    // only the missing ranges; the reassembled file is byte-identical and the
+    // partial + sidecar are cleaned up. Ignored (touches the relay network).
+    #[tokio::test]
+    #[ignore]
+    async fn resumed_transfer_sends_only_missing_and_reassembles() {
+        let pid = std::process::id();
+        let total: u64 = 24 * 1024 * 1024;
+        let mut data = vec![0u8; total as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i as u64).wrapping_mul(40503) % 253) as u8;
+        }
+        let src = std::env::temp_dir().join(format!("dropbeam-res-src-{pid}.bin"));
+        std::fs::write(&src, &data).unwrap();
+        let dest_dir = std::env::temp_dir().join(format!("dropbeam-res-rx-{pid}"));
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        // Simulate the interrupted earlier attempt: the receiver already has the
+        // first 10 MiB on disk, recorded in the sidecar.
+        let have: u64 = 10 * 1024 * 1024;
+        let fp = transfer_fingerprint("test-sender", "blob.bin", total, 42);
+        let (part, side) = partial_paths(&dest_dir, &fp);
+        {
+            let f = std::fs::OpenOptions::new().create(true).write(true).open(&part).unwrap();
+            f.set_len(total).unwrap();
+        }
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&data[..have as usize]).unwrap();
+        }
+        let mut cov0 = Coverage::default();
+        cov0.insert(0, have);
+        save_sidecar(&side, &PartialSidecar { v: 1, fp: fp.clone(), total, coverage: cov0 });
+
+        let server = Endpoint::builder(presets::N0).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+        server.online().await;
+        let addr = server.addr();
+
+        let srv = server.clone();
+        let dest_dir_c = dest_dir.clone();
+        let fp_c = fp.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let (mut bsend, mut brecv) = conn.accept_bi().await.unwrap();
+            let req = read_frame(&mut brecv).await.unwrap();
+            assert_eq!(req["kind"], "files");
+            // The live receiver's resume offer: ranges we already have.
+            let (part, cov) = prepare_partial(&dest_dir_c, &fp_c, total).unwrap();
+            assert_eq!(cov.covered(), have, "sidecar coverage survived");
+            write_frame(&mut bsend, &serde_json::json!({ "ready": true, "resume": { "have": cov.ranges } }))
+                .await
+                .unwrap();
+            let first = conn.accept_uni().await.unwrap();
+            let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp_c).1, fp: fp_c.clone() };
+            let dest = recv_file_resumable(
+                &conn, &dest_dir_c, "blob.bin", total, part, Some(rc), cov, first,
+                &AtomicBool::new(false), |_, _| {},
+            )
+            .await
+            .unwrap();
+            // The receiver acks like the live files arm does. In production the
+            // connection lives on in the accept loop; here the task ending would
+            // DROP it and could discard the buffered ack — so wait until the
+            // sender has read it (stopped() resolves on peer read-to-end).
+            let _ = bsend.write_all(b"ok").await;
+            let _ = bsend.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(10), bsend.stopped()).await;
+            dest
+        });
+
+        // Track how much the SENDER actually pushed: progress starts at the resume
+        // base, so (final - base) must be only the missing tail.
+        let client = Endpoint::bind(presets::N0).await.unwrap();
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        let sent = send_files(&conn, &[src.clone()], &AtomicBool::new(false), |_, _| {}, "tester", &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert_eq!(sent, total);
+
+        let dest = recv.await.unwrap();
+        let got = std::fs::read(&dest).unwrap();
+        assert!(got == data, "resumed bytes must match the source exactly");
+        assert!(!part.exists(), "partial removed after completion");
+        assert!(!side.exists(), "sidecar removed after completion");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+        println!("resume OK: completed from {have}/{total} pre-seeded bytes, byte-identical");
     }
 
     // Real end-to-end file transfer over iroh. Ignored by default because it
@@ -2501,7 +3171,7 @@ mod tests {
 
         let client = Endpoint::bind(presets::N0).await.unwrap();
         let conn = client.connect(addr, ALPN).await.unwrap();
-        let sent = send_files(&conn, &[src.clone()], &AtomicBool::new(false), |_, _| {}, "tester")
+        let sent = send_files(&conn, &[src.clone()], &AtomicBool::new(false), |_, _| {}, "tester", &AtomicBool::new(false))
             .await
             .unwrap();
         assert_eq!(sent, data.len() as u64);
