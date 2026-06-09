@@ -115,7 +115,11 @@ function groupFolders(pairs: Pair[]): { key: string; rep: Pair; members: Pair[] 
   return [...byKey.entries()].map(([key, members]) => ({ key, rep: members[0], members }))
 }
 
-function statusInfo(pair: Pair, status?: FolderStatus): { color: string; label: string } {
+function statusInfo(
+  pair: Pair,
+  status?: FolderStatus,
+  lastSynced?: number,
+): { color: string; label: string } {
   const peer = pair.peerName || 'your friend'
   // Only truly "waiting" if the creator has never been reached by anyone yet.
   if (pair.role === 'a' && !pair.peerName && !status?.peerOnline) {
@@ -143,7 +147,10 @@ function statusInfo(pair: Pair, status?: FolderStatus): { color: string; label: 
       if (status && !status.peerOnline && pair.peerName) {
         return { color: 'var(--text-faint)', label: `${peer} is offline — will sync when they're back` }
       }
-      return { color: 'var(--green)', label: 'In sync' }
+      return {
+        color: 'var(--green)',
+        label: lastSynced ? `Up to date · synced ${formatRelativeTime(lastSynced)}` : 'Up to date',
+      }
   }
 }
 
@@ -163,6 +170,7 @@ function FolderCard({
   const toast = useStore((s) => s.toast)
   const myName = useStore((s) => s.settings?.displayName || 'You')
   const status = statuses[pair.id]
+  const lastSynced = useStore((s) => s.folderLastSynced[pair.id])
   const isGroup = members.length > 1 || !!pair.groupId
   // Settings + unpair apply to the WHOLE folder (every member link).
   const updateGroup = (patch: Partial<PairUpdate>) =>
@@ -200,7 +208,7 @@ function FolderCard({
     }
   }
 
-  const info = statusInfo(pair, status)
+  const info = statusInfo(pair, status, lastSynced)
   const folderName = pair.folder.split('/').pop() || pair.folder
   const peer = pair.peerName || 'Pending peer'
 

@@ -87,6 +87,8 @@ interface AppStore {
   pairs: Pair[]
   friends: Friend[]
   folderStatuses: Record<string, FolderStatus>
+  /** When each folder pair last synced a file (ms) — for the "synced 2m ago" label. */
+  folderLastSynced: Record<string, number>
   /** Files picked/dropped that are awaiting a "send to whom?" choice. */
   pendingSend: string[] | null
   /** Last time (ms) a friend was seen online, keyed by lowercased name. */
@@ -162,6 +164,7 @@ export const useStore = create<AppStore>((set, get) => ({
   pairs: [],
   friends: [],
   folderStatuses: {},
+  folderLastSynced: {},
   pendingSend: null,
   friendSeen: {},
   chats: {},
@@ -220,6 +223,9 @@ export const useStore = create<AppStore>((set, get) => ({
     // you can *hear* a folder syncing. Off by default (folders sync constantly);
     // the toggle lives on each folder card and is stored in localStorage.
     onFolderSynced((s) => {
+      // Remember when this folder last moved a file, for the "Up to date · 2m ago"
+      // resting status (a Dropbox-style reassurance the folder card lacked).
+      set((st) => ({ folderLastSynced: { ...st.folderLastSynced, [s.pairId]: Date.now() } }))
       if (isOverlay) return
       let on = false
       try {
