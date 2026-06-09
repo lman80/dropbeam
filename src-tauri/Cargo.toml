@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.11.0"
+version = "0.11.1"
 description = "DropBeam — seamless peer-to-peer file transfer"
 authors = ["DropBeam"]
 license = ""
@@ -50,6 +50,9 @@ iroh = { version = "0.98", features = ["address-lookup-mdns"] }
 # the same minor iroh 0.98.x depends on so the ControllerFactory trait matches
 # (bump together with iroh).
 noq-proto = { version = "0.17", default-features = false }
+# iroh's async re-export crate (already in the tree via iroh) — used for the
+# StreamExt to drain the mDNS discovery-event stream into the log.
+n0-future = "0.3"
 anyhow = "1"
 
 # Windows only: iroh's `wmi` dep (via netwatch) declares windows + windows-core

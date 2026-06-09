@@ -228,6 +228,96 @@ pub enum CancelKind {
 /// explainable. Cheap + synchronous — reads the currently selected path.
 /// (The selected path can upgrade relay→direct mid-transfer, so we re-read it
 /// on every progress tick for a live badge.)
+// ── Known-address cache ──────────────────────────────────────────────────────
+//
+// The bulletproof layer for same-LAN sends. Discovery can fail silently (macOS
+// Local Network permission denied → multicast dropped; hotel/apartment Wi-Fi
+// filtering mDNS) and then two machines a metre apart try to reach each other
+// via their shared PUBLIC IP (hairpin NAT, often broken) or a distant relay —
+// finicky and slow. So: every time a connection has working direct addresses,
+// remember them per peer (persisted across restarts), and seed every future
+// dial with them. Stale entries are harmless — iroh races all addresses plus
+// discovery and uses whichever answers first.
+
+static PEER_ADDRS: std::sync::OnceLock<Mutex<HashMap<String, Vec<std::net::SocketAddr>>>> =
+    std::sync::OnceLock::new();
+static PEER_ADDRS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn peer_addrs() -> &'static Mutex<HashMap<String, Vec<std::net::SocketAddr>>> {
+    PEER_ADDRS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Load the persisted cache (called once at endpoint startup).
+fn load_peer_addrs(config_dir: &Path) {
+    let path = config_dir.join("peer-addrs.json");
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(map) = serde_json::from_slice::<HashMap<String, Vec<std::net::SocketAddr>>>(&bytes)
+        {
+            *peer_addrs().lock().unwrap() = map;
+        }
+    }
+    let _ = PEER_ADDRS_PATH.set(path);
+}
+
+fn save_peer_addrs() {
+    if let Some(path) = PEER_ADDRS_PATH.get() {
+        let map = peer_addrs().lock().unwrap().clone();
+        if let Ok(json) = serde_json::to_vec(&map) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// Remember every live direct (IP) address of this connection for its peer —
+/// newest first, capped, deduped. Called when a direct path forms, when a
+/// transfer completes, and shortly after accepting an inbound connection, so
+/// BOTH sides learn each other.
+fn remember_conn_addrs(conn: &Connection) {
+    use iroh::Watcher as _;
+    let eid = conn.remote_id().to_string();
+    let mut watcher = conn.paths();
+    let addrs: Vec<std::net::SocketAddr> = watcher
+        .get()
+        .iter()
+        .filter_map(|p| match p.remote_addr() {
+            iroh::TransportAddr::Ip(s) => Some(*s),
+            _ => None,
+        })
+        .collect();
+    if addrs.is_empty() {
+        return;
+    }
+    let mut changed = false;
+    {
+        let mut map = peer_addrs().lock().unwrap();
+        let entry = map.entry(eid).or_default();
+        for a in addrs {
+            if entry.first() != Some(&a) {
+                entry.retain(|x| x != &a);
+                entry.insert(0, a);
+                entry.truncate(6);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        save_peer_addrs();
+    }
+}
+
+/// The address to dial for `id`: the bare EndpointId (discovery) PLUS every
+/// direct address that has worked before — so a repeat send on the same LAN
+/// connects instantly even when discovery is blind.
+fn dial_addr(id: iroh::EndpointId) -> iroh::EndpointAddr {
+    let cached = peer_addrs()
+        .lock()
+        .unwrap()
+        .get(&id.to_string())
+        .cloned()
+        .unwrap_or_default();
+    iroh::EndpointAddr::from(id).with_addrs(cached.into_iter().map(iroh::TransportAddr::Ip))
+}
+
 /// Is this `remote_addr` Debug string a private/link-local IP (i.e. same LAN)?
 /// `PathInfo::remote_addr()` Debug-formats as e.g. `Ip(192.168.1.5:54321)` (seen in
 /// our PERF logs). Best-effort string match; an unrecognized format degrades to
@@ -304,6 +394,8 @@ fn log_transfer_perf(
     log::info!(
         "PERF[{tag}] {direction}: {mbps:.1} MB/s ({mb:.1} MB in {secs:.2}s) · {path_kind} · rtt={rtt} · peer={addr}"
     );
+    // A completed transfer is proof these addresses work — cache them.
+    remember_conn_addrs(conn);
 }
 
 /// Wait until the connection has selected a DIRECT (hole-punched) p2p path, or give
@@ -338,7 +430,13 @@ async fn wait_for_direct_path(conn: &Connection, max: std::time::Duration) -> bo
         }
     })
     .await;
-    res.unwrap_or(false)
+    let ok = res.unwrap_or(false);
+    if ok {
+        // A direct path just formed — remember the peer's working addresses so
+        // future dials skip discovery entirely.
+        remember_conn_addrs(conn);
+    }
+    ok
 }
 
 /// Load the device's secret key from disk, or generate + persist a fresh one.
@@ -376,6 +474,9 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
 /// (n0) relays + discovery for now; Phase 5 swaps in self-hosted infrastructure.
 pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     let secret = load_or_create_secret(config_dir);
+    // Seed the known-address cache so the FIRST dial after a relaunch already
+    // carries every peer address that worked before.
+    load_peer_addrs(config_dir);
     // Throughput tuning. BBR congestion control replaces quinn's CUBIC default:
     // iroh's own benchmark (n0-computer/iroh#4286) shows single-stream throughput
     // up to ~30x higher with BBR, and it removes the "fill the 32 MB window, stall,
@@ -406,6 +507,19 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
         match MdnsAddressLookup::builder().build(ep.id()) {
             Ok(mdns) => match ep.address_lookup() {
                 Ok(al) => {
+                    // Log every LAN peer that appears/disappears. This makes the
+                    // log DECISIVE about local discovery: if two machines sit on
+                    // one LAN and neither logs "discovered ... on the local
+                    // network", multicast is being blocked (macOS Local Network
+                    // permission / AP isolation) — vs. iroh just not using it.
+                    let sub = mdns.clone();
+                    tauri::async_runtime::spawn(async move {
+                        use n0_future::StreamExt as _;
+                        let mut events = sub.subscribe().await;
+                        while let Some(ev) = events.next().await {
+                            log::info!("mDNS: {ev:?}");
+                        }
+                    });
                     al.add(mdns);
                     log::info!("iroh: local-network (mDNS) discovery enabled");
                 }
@@ -435,6 +549,16 @@ pub async fn accept_loop(ep: Endpoint, state: Arc<IrohState>) {
 /// Per-connection handler: each incoming stream is dispatched by its first frame.
 async fn handle_conn(conn: Connection, state: Arc<IrohState>) {
     let who = conn.remote_id();
+    // Give hole-punching a moment to settle, then remember the caller's direct
+    // addresses — so the RECEIVING side also learns how to reach this peer
+    // directly next time, even if local discovery is blocked.
+    {
+        let c = conn.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            remember_conn_addrs(&c);
+        });
+    }
     loop {
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
@@ -1287,7 +1411,7 @@ pub fn send_to_friend(
     let parsed: iroh::EndpointId = endpoint_id
         .parse()
         .map_err(|_| "This friend's direct address is invalid.".to_string())?;
-    let addr = iroh::EndpointAddr::from(parsed);
+    let addr = dial_addr(parsed);
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let names: Vec<String> = pathbufs
         .iter()
@@ -1436,7 +1560,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
         return;
     };
     let my_id = ep.id().to_string();
-    let addr = iroh::EndpointAddr::from(parsed);
+    let addr = dial_addr(parsed);
     tauri::async_runtime::spawn(async move {
         let hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": friend_id, "endpoint_id": my_id, "name": my_name,
@@ -1465,7 +1589,7 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
         return;
     };
     let my_id = ep.id().to_string();
-    let addr = iroh::EndpointAddr::from(parsed);
+    let addr = dial_addr(parsed);
     tauri::async_runtime::spawn(async move {
         let hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": "", "endpoint_id": my_id, "name": my_name,
@@ -1498,7 +1622,7 @@ pub fn say_hello_folder(
         return;
     };
     let my_id = ep.id().to_string();
-    let addr = iroh::EndpointAddr::from(parsed);
+    let addr = dial_addr(parsed);
     tauri::async_runtime::spawn(async move {
         let hello = serde_json::json!({
             "kind": "folder-hello", "pair_id": pair_id, "endpoint_id": my_id, "name": my_name,
@@ -1529,7 +1653,7 @@ pub async fn send_folder_ctrl(
     members: &[(String, String)],
 ) -> Result<()> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
-    let addr = iroh::EndpointAddr::from(parsed);
+    let addr = dial_addr(parsed);
     let dels: Vec<serde_json::Value> = deletes
         .iter()
         .map(|(rel, ts)| serde_json::json!({ "rel": rel, "ts": ts }))
@@ -1565,7 +1689,7 @@ pub async fn send_folder_ctrl(
 /// they were unreachable — the message is kept locally (no store-and-forward yet).
 pub async fn send_chat(ep: &Endpoint, endpoint_id: &str, payload: serde_json::Value) -> Result<()> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
-    let addr = iroh::EndpointAddr::from(parsed);
+    let addr = dial_addr(parsed);
     let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
         .await
         .map_err(|_| anyhow::anyhow!("chat dial timed out"))?
@@ -1665,7 +1789,7 @@ pub async fn ping_endpoint(ep: &Endpoint, endpoint_id: &str) -> bool {
     let Ok(parsed) = endpoint_id.parse::<iroh::EndpointId>() else {
         return false;
     };
-    let addr = iroh::EndpointAddr::from(parsed);
+    let addr = dial_addr(parsed);
     let fut = async {
         let conn = ep.connect(addr, ALPN).await.ok()?;
         let (mut send, mut recv) = conn.open_bi().await.ok()?;
@@ -1698,7 +1822,7 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
     let parsed: iroh::EndpointId = endpoint_id
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid folder peer endpoint id"))?;
-    let addr = iroh::EndpointAddr::from(parsed);
+    let addr = dial_addr(parsed);
     let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
         .await
         .map_err(|_| anyhow::anyhow!("folder peer unreachable over iroh"))?

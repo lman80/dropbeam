@@ -13,6 +13,14 @@
   <key>NSDownloadsFolderUsageDescription</key>
   <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
 
+  <!-- macOS 15+ gates multicast behind the Local Network privilege and DENIES IT
+       SILENTLY without this string — which blocks the mDNS discovery that lets two
+       machines on the same Wi-Fi find each other and transfer at full local speed.
+       (If LAN discovery still fails: System Settings -> Privacy & Security ->
+       Local Network -> enable DropBeam.) -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>DropBeam finds your friends' devices on the same network so files transfer directly between them at full local speed.</string>
+
   <!-- Finder right-click → Services → "Share with DropBeam". Tauri v2 merges
        this file into the generated Info.plist at bundle time. The app must live
        in /Applications for macOS (pbs) to index the service. -->

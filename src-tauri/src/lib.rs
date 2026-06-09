@@ -164,6 +164,11 @@ pub fn run() {
                 tauri_plugin_log::Builder::default()
                     .level(log::LevelFilter::Warn)
                     .level_for("app_lib", log::LevelFilter::Info)
+                    // The default cap is a tiny 40 KB with discard-on-rotate, which
+                    // kept deleting exactly the history we need when diagnosing a
+                    // user-reported transfer. Keep rotated files, 2 MB each.
+                    .max_file_size(2_000_000)
+                    .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                     .targets([
                         tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
                         tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
