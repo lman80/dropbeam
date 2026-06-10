@@ -146,6 +146,11 @@ pub struct Settings {
     /// default; can be turned off to fall back to the relay engine (croc).
     #[serde(default = "default_true")]
     pub direct_mode: bool,
+    /// Cap the OUTGOING transfer speed over the internet, in megabits/sec, to
+    /// leave headroom for the rest of your connection (0 = unlimited). Only
+    /// applies to internet/relay transfers — local-network sends stay full speed.
+    #[serde(default)]
+    pub upload_limit_mbps: u32,
 }
 
 impl Default for Settings {
@@ -162,6 +167,7 @@ impl Default for Settings {
             notify_on_complete: true,
             play_sounds: true,
             direct_mode: true,
+            upload_limit_mbps: 0,
         }
     }
 }
@@ -300,5 +306,14 @@ pub struct FolderStatus {
     /// Whether the active transfer is going over the LAN or the internet relay —
     /// the same signal Quick Send shows, so folder speed is explainable.
     pub locality: Locality,
+    /// The peer removed/stopped sharing this folder on their side. The link is
+    /// effectively dead; the UI surfaces "no longer shared by ___".
+    #[serde(default)]
+    pub peer_unshared: bool,
+    /// File names still waiting in the send queue (the active one excluded), so a
+    /// dropped batch shows as a list with per-file rows instead of popping up one
+    /// file at a time. Capped to keep the event payload small.
+    #[serde(default)]
+    pub queued_files: Vec<String>,
 }
 

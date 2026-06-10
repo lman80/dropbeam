@@ -191,6 +191,7 @@ function FolderCard({
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [loadingInvite, setLoadingInvite] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [verifying, setVerifying] = useState(false)
   const [soundOn, setSoundOn] = useState(() => {
     try {
       return localStorage.getItem(`folder-sound-${pair.id}`) === 'on'
@@ -320,6 +321,29 @@ function FolderCard({
         )}
       </div>
 
+      {/* The peer stopped sharing this folder — the link is effectively dead. */}
+      {status?.peerUnshared && (
+        <div
+          style={{
+            marginTop: 11,
+            padding: '10px 12px',
+            borderRadius: 10,
+            background: 'color-mix(in srgb, var(--red) 12%, transparent)',
+            border: '1px solid color-mix(in srgb, var(--red) 35%, transparent)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 9,
+            fontSize: 12.5,
+          }}
+        >
+          <Unlink size={15} color="var(--red)" style={{ flexShrink: 0 }} />
+          <span style={{ color: 'var(--text-muted)' }}>
+            {(pair.peerName || 'The other person')} no longer shares this folder. Your files are
+            still here — you can remove this now-inactive folder.
+          </span>
+        </div>
+      )}
+
       {/* Members — everyone in this folder (you + each person you're linked to) */}
       <div style={{ display: 'flex', gap: 8, marginTop: 11, flexWrap: 'wrap', alignItems: 'center' }}>
         <Member name={myName} you online />
@@ -378,9 +402,51 @@ function FolderCard({
               marginTop: 6,
             }}
           >
-            <span>{formatSpeed(status.speedBps)}</span>
+            <span>{status.sendingFile ? status.sendingFile : formatSpeed(status.speedBps)}</span>
             <span>{formatEta(status.etaSeconds)} left</span>
           </div>
+
+          {/* The rest of a dropped batch, listed up front with per-file rows so it
+              reads as "all these files are going through" — not one popup at a time. */}
+          {status.queuedFiles && status.queuedFiles.length > 0 && (
+            <div
+              style={{
+                marginTop: 10,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 6,
+                maxHeight: 168,
+                overflowY: 'auto',
+              }}
+            >
+              {status.queuedFiles.map((name, i) => (
+                <div key={`${name}-${i}`} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 7,
+                      fontSize: 12,
+                      color: 'var(--text-faint)',
+                    }}
+                  >
+                    <Clock size={12} style={{ flexShrink: 0 }} />
+                    <span
+                      style={{
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {name}
+                    </span>
+                    <span style={{ marginLeft: 'auto', flexShrink: 0 }}>Queued</span>
+                  </div>
+                  <ProgressBar percent={0} />
+                </div>
+              ))}
+            </div>
+          )}
         </motion.div>
       )}
 
@@ -463,6 +529,25 @@ function FolderCard({
                     onClick={() => setHistoryOpen(true)}
                   >
                     <History size={14} /> History
+                  </button>
+                )}
+                {pair.mirror && (
+                  <button
+                    className="btn btn-ghost"
+                    title="Re-check that both folders are identical and fix any difference"
+                    disabled={verifying}
+                    onClick={async () => {
+                      setVerifying(true)
+                      try {
+                        await api.verifyFolders()
+                      } catch {
+                        /* best-effort */
+                      }
+                      setTimeout(() => setVerifying(false), 2500)
+                    }}
+                  >
+                    {verifying ? <Spinner size={13} /> : <FolderSync size={14} />}{' '}
+                    {verifying ? 'Checking…' : 'Verify'}
                   </button>
                 )}
                 {pair.role === 'a' && (

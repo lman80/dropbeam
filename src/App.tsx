@@ -88,7 +88,106 @@ export default function App() {
         </main>
       </div>
       <SendToChooser />
+      <NameSetupModal />
       <Toasts />
+    </div>
+  )
+}
+
+/** First-run: ask the user what name people should see, so they're not shown as a
+ * device default like "MacBook Air". Pre-filled with the current name; shown once
+ * (tracked in localStorage), and always changeable later in Settings. */
+function NameSetupModal() {
+  const settings = useStore((s) => s.settings)
+  const save = useStore((s) => s.saveSettings)
+  const [show, setShow] = useState(false)
+  const [name, setName] = useState('')
+
+  useEffect(() => {
+    if (settings && !localStorage.getItem('dropbeam.namedSelf')) {
+      setName(settings.displayName || '')
+      setShow(true)
+    }
+  }, [settings])
+
+  if (!show || !settings) return null
+  const finish = () => {
+    const trimmed = name.trim()
+    if (trimmed && trimmed !== settings.displayName) save({ displayName: trimmed })
+    localStorage.setItem('dropbeam.namedSelf', '1')
+    setShow(false)
+  }
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 1000,
+        display: 'grid',
+        placeItems: 'center',
+        background: 'color-mix(in srgb, black 45%, transparent)',
+        backdropFilter: 'blur(3px)',
+      }}
+    >
+      <motion.div
+        initial={{ opacity: 0, scale: 0.96, y: 8 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        style={{
+          width: 380,
+          maxWidth: '90vw',
+          background: 'var(--bg-elev)',
+          border: '1px solid var(--border)',
+          borderRadius: 16,
+          padding: 22,
+          boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
+          <BeamLogo size={36} />
+        </div>
+        <h2 style={{ fontSize: 18, fontWeight: 750, textAlign: 'center', margin: '0 0 6px' }}>
+          What should people call you?
+        </h2>
+        <p
+          style={{
+            fontSize: 13,
+            color: 'var(--text-muted)',
+            textAlign: 'center',
+            margin: '0 0 16px',
+            lineHeight: 1.45,
+          }}
+        >
+          This is the name friends see when you send files or share a folder. You can change it
+          anytime in Settings.
+        </p>
+        <input
+          autoFocus
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && finish()}
+          placeholder="Your name"
+          maxLength={40}
+          style={{
+            width: '100%',
+            boxSizing: 'border-box',
+            padding: '11px 13px',
+            fontSize: 15,
+            borderRadius: 10,
+            border: '1px solid var(--border)',
+            background: 'var(--bg)',
+            color: 'var(--text)',
+            marginBottom: 14,
+          }}
+        />
+        <button
+          className="btn btn-primary"
+          style={{ width: '100%', justifyContent: 'center', padding: '11px' }}
+          onClick={finish}
+          disabled={!name.trim()}
+        >
+          Continue
+        </button>
+      </motion.div>
     </div>
   )
 }

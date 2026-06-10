@@ -477,18 +477,26 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // Seed the known-address cache so the FIRST dial after a relaunch already
     // carries every peer address that worked before.
     load_peer_addrs(config_dir);
-    // Throughput tuning. BBR congestion control replaces quinn's CUBIC default:
-    // iroh's own benchmark (n0-computer/iroh#4286) shows single-stream throughput
-    // up to ~30x higher with BBR, and it removes the "fill the 32 MB window, stall,
-    // repeat" pattern that makes big transfers start fast then crawl. The larger
-    // flow-control windows (32/64 MB) let BBR fill the link on higher-latency
-    // paths. (noq-proto is iroh's quinn fork — pinned to match iroh.)
+    // Throughput tuning, balanced against NOT wrecking the user's whole connection.
+    // BBR congestion control replaces quinn's CUBIC default (iroh benchmark
+    // n0-computer/iroh#4286: up to ~30x single-stream throughput, no "fill the
+    // window, stall, repeat" crawl).
+    //
+    // CRITICAL: the flow-control windows are an UPPER BOUND on bytes in flight =
+    // the most data we can dump into the router's buffer. The old 32/64 MB windows
+    // let BBR's bandwidth probing balloon the home-router queue to tens of MB —
+    // multi-second bufferbloat that froze the user's OTHER traffic (YouTube, DNS),
+    // starved DNS into "lookup failed", and pushed the direct path onto the relay.
+    // 8 MB caps the queue depth while still covering a high-latency link's
+    // bandwidth-delay product (8 MB sustains ~320 Mbps at a 200 ms RTT — far beyond
+    // any home uplink), so realistic throughput is unchanged but the link stays
+    // usable for everything else during a transfer.
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
         noq_proto::congestion::BbrConfig::default(),
     ));
-    tcfg = tcfg.stream_receive_window((32u32 * 1024 * 1024).into());
-    tcfg = tcfg.send_window(64 * 1024 * 1024);
+    tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
+    tcfg = tcfg.send_window(8 * 1024 * 1024);
 
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)
@@ -1215,11 +1223,56 @@ async fn serve_stream(
                         .collect()
                 })
                 .unwrap_or_default();
+            let unshared = req.get("unshared").and_then(|u| u.as_bool()).unwrap_or(false);
             if !pair_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
-                        sm.apply_remote_control(&pair_id, &name, &deletes, &group_id, &members);
+                        // reconcile rides its own message (folder-reconcile) now.
+                        sm.apply_remote_control(
+                            &pair_id, &name, &deletes, &group_id, &members, None, unshared,
+                        );
+                    }
+                }
+            }
+            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            send.finish()?;
+        }
+        Some("folder-reconcile") => {
+            // The self-heal manifest on its own stream — read the payload frame with
+            // the large cap so a huge folder's manifest isn't truncated/rejected.
+            let pair_id = req
+                .get("pair_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let payload = read_frame_cap(recv, MAX_RECONCILE).await?;
+            let mut files = std::collections::HashMap::new();
+            if let Some(f) = payload.get("files").and_then(|f| f.as_object()) {
+                for (rel, v) in f {
+                    if let Some(arr) = v.as_array() {
+                        let size = arr.first().and_then(|x| x.as_u64()).unwrap_or(0);
+                        let mtime = arr.get(1).and_then(|x| x.as_u64()).unwrap_or(0);
+                        files.insert(rel.clone(), (size, mtime));
+                    }
+                }
+            }
+            let mut tombstones = std::collections::HashMap::new();
+            if let Some(t) = payload.get("tombstones").and_then(|t| t.as_object()) {
+                for (rel, v) in t {
+                    if let Some(ts) = v.as_u64() {
+                        tombstones.insert(rel.clone(), ts);
+                    }
+                }
+            }
+            let reconcile = crate::sync::Reconcile { files, tombstones };
+            if !pair_id.is_empty() {
+                if let Some(app) = state.app.get() {
+                    if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
+                        let sm = sm.inner().clone();
+                        sm.apply_remote_control(
+                            &pair_id, "", &[], "", &[], Some(&reconcile), false,
+                        );
                     }
                 }
             }
@@ -1838,6 +1891,7 @@ pub fn say_hello_folder(
 /// display name and any pending mirror deletes. This is the iroh replacement for
 /// the croc control beacon — `Ok(())` means the peer received it (so they're
 /// online), `Err` means "fall back to croc / mark offline" to the caller.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_folder_ctrl(
     ep: &Endpoint,
     endpoint_id: &str,
@@ -1846,6 +1900,7 @@ pub async fn send_folder_ctrl(
     deletes: &[(String, u64)],
     group_id: &str,
     members: &[(String, String)],
+    unshared: bool,
 ) -> Result<()> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
     let addr = dial_addr(parsed);
@@ -1859,9 +1914,13 @@ pub async fn send_folder_ctrl(
         .iter()
         .map(|(eid, n)| serde_json::json!({ "eid": eid, "name": n }))
         .collect();
+    // `unshared` is a newer optional field — an older peer ignores unknown keys.
+    // The self-heal manifest is sent SEPARATELY (send_folder_reconcile) so a huge
+    // folder's manifest can never bloat this presence beacon past the frame cap.
     let msg = serde_json::json!({
         "kind": "folder-ctrl", "pair_id": pair_id, "name": name, "deletes": dels,
         "group_id": group_id, "members": mem,
+        "unshared": unshared,
     });
     // Bounded dial so a perpetually-offline peer fails fast and the caller can
     // back off, exactly like the old croc control timeout.
@@ -1875,6 +1934,32 @@ pub async fn send_folder_ctrl(
     // Best-effort ack: success is connect+write+finish; the peer applies the
     // payload when it reads the finished stream. We wait briefly for the ok but
     // don't fail delivery if the ack is slow.
+    let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
+    Ok(())
+}
+
+/// Deliver a shared-folder self-heal manifest on its OWN stream, read with a large
+/// cap — so even a folder with hundreds of thousands of files reconciles without
+/// the manifest ever bloating (and getting dropped from) the presence beacon.
+pub async fn send_folder_reconcile(
+    ep: &Endpoint,
+    endpoint_id: &str,
+    pair_id: &str,
+    reconcile: &serde_json::Value,
+) -> Result<()> {
+    let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
+    let addr = dial_addr(parsed);
+    let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
+        .await
+        .map_err(|_| anyhow::anyhow!("reconcile dial timed out"))?
+        .context("dial folder peer for reconcile")?;
+    let (mut send, mut recv) = conn.open_bi().await.context("open reconcile stream")?;
+    // Two frames: a SMALL dispatch header (fits the 1 MiB accept-loop cap), then
+    // the manifest payload on its own frame the handler reads with MAX_RECONCILE.
+    write_frame(&mut send, &serde_json::json!({ "kind": "folder-reconcile", "pair_id": pair_id }))
+        .await?;
+    write_frame(&mut send, reconcile).await?;
+    send.finish()?;
     let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
     Ok(())
 }
@@ -2027,6 +2112,8 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
     // background and LAN peers get a direct path via mDNS almost immediately).
     let _ = wait_for_direct_path(&conn, Duration::from_secs(5)).await;
     let __t0 = std::time::Instant::now();
+    // Internet folder sync respects the upload cap; LAN sync stays full speed.
+    let pace = !matches!(conn_locality(&conn), crate::models::Locality::Local);
 
     let mut items = Vec::new();
     for p in paths {
@@ -2066,7 +2153,7 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
             .unwrap_or(false);
         if ready {
             let (base, plan) = parse_resume_reply(reply.as_ref(), total, n);
-            send_ranges_parallel(&conn, &items[0].0, total, base, &plan, cancel, on_progress)
+            send_ranges_parallel(&conn, &items[0].0, total, base, &plan, cancel, pace, on_progress)
                 .await?;
             send.finish()?;
             let ack = recv.read_to_end(4096).await.unwrap_or_default();
@@ -2076,7 +2163,7 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
         }
     }
 
-    write_folder_body(&mut send, &items, total, cancel, &on_progress).await?;
+    write_folder_body(&mut send, &items, total, cancel, pace, &on_progress).await?;
     send.finish()?;
     // Require the receiver's "ok" so "delivered" means the bytes actually landed
     // in their folder (not just that we finished writing to the socket).
@@ -2158,6 +2245,7 @@ async fn write_folder_body<F: Fn(u64, u64)>(
     items: &[(PathBuf, String, u64, u64)],
     total: u64,
     cancel: &AtomicBool,
+    pace: bool,
     on_progress: &F,
 ) -> Result<u64> {
     let mut sent = 0u64;
@@ -2184,6 +2272,9 @@ async fn write_folder_body<F: Fn(u64, u64)>(
             let n = f.read(&mut buf).await?;
             if n == 0 {
                 break;
+            }
+            if pace {
+                pace_bytes(n as u64).await;
             }
             send.write_all(&buf[..n]).await?;
             sent += n as u64;
@@ -2302,10 +2393,19 @@ async fn write_frame(send: &mut SendStream, v: &serde_json::Value) -> Result<()>
 }
 
 async fn read_frame(recv: &mut RecvStream) -> Result<serde_json::Value> {
+    read_frame_cap(recv, MAX_HEADER).await
+}
+
+/// 64 MiB — the reconcile manifest of a HUGE shared folder (hundreds of thousands
+/// of files) on its own dedicated stream, so a big folder's self-heal never trips
+/// the 1 MiB control-frame cap (which would drop the whole presence beacon).
+const MAX_RECONCILE: usize = 64 << 20;
+
+async fn read_frame_cap(recv: &mut RecvStream, cap: usize) -> Result<serde_json::Value> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
-    anyhow::ensure!(n <= MAX_HEADER, "header too large ({n} bytes)");
+    anyhow::ensure!(n <= cap, "frame too large ({n} bytes)");
     let mut buf = vec![0u8; n];
     recv.read_exact(&mut buf).await?;
     Ok(serde_json::from_slice(&buf)?)
@@ -2335,12 +2435,61 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{stem}-dup{ext}"))
 }
 
+// ── Outgoing-speed limiter ────────────────────────────────────────────────
+// Optional user cap on internet upload speed so a transfer leaves headroom for
+// the rest of the connection. Global (shared across all streams + transfers) so
+// the TOTAL outbound rate is bounded; a token bucket paced in the send loops.
+// LAN sends skip it entirely (they don't touch the internet uplink).
+static UPLOAD_LIMIT_BPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UPLOAD_BUCKET: std::sync::OnceLock<Mutex<(f64, Instant)>> = std::sync::OnceLock::new();
+
+/// Set the internet upload cap from settings. 0 Mbps = unlimited.
+pub fn set_upload_limit_mbps(mbps: u32) {
+    // Megabits/sec → bytes/sec.
+    let bps = (mbps as u64).saturating_mul(1_000_000) / 8;
+    UPLOAD_LIMIT_BPS.store(bps, Ordering::Relaxed);
+}
+
+/// Block until `n` bytes' worth of send budget is available. No-op when the cap
+/// is unlimited (the common case) — one relaxed atomic load, no contention.
+async fn pace_bytes(n: u64) {
+    let rate = UPLOAD_LIMIT_BPS.load(Ordering::Relaxed);
+    if rate == 0 {
+        return;
+    }
+    let bucket = UPLOAD_BUCKET.get_or_init(|| Mutex::new((0.0, Instant::now())));
+    loop {
+        let wait = {
+            let mut g = bucket.lock().unwrap();
+            let now = Instant::now();
+            let elapsed = now.duration_since(g.1).as_secs_f64();
+            // Refill, capping banked burst at ~0.5s of rate so a paused transfer
+            // can't resume with a giant spike. CRITICAL: never below one CHUNK, or a
+            // full-chunk request at a low limit could NEVER be granted (the bucket
+            // would top out under `n` and the loop would spin forever).
+            let cap = (rate as f64 * 0.5).max(CHUNK as f64);
+            g.0 = (g.0 + elapsed * rate as f64).min(cap);
+            g.1 = now;
+            if g.0 >= n as f64 {
+                g.0 -= n as f64;
+                return;
+            }
+            Duration::from_secs_f64((n as f64 - g.0) / rate as f64)
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
 /// Parallel transfer tuning. A single QUIC stream tops out around ~40% of link
 /// capacity in iroh 0.98 (n0-computer/iroh#4286), so for a large single file we fan
 /// the bytes across several unidirectional streams on the same connection and
 /// reassemble. Each stream carries one CONTIGUOUS segment, so the receiver just
 /// seeks once and writes sequentially — no fragile positioned-write juggling.
-const PARALLEL_STREAMS: u64 = 8;
+// 4, not 8: more parallel QUIC streams don't add bandwidth (they share ONE
+// per-connection congestion controller) but each extra one ramps its own probe
+// burst, piling more into the router buffer at once. 4 keeps the per-stream-stall
+// resilience without the extra buffer pressure that broke the user's network.
+const PARALLEL_STREAMS: u64 = 4;
 /// Don't split anything smaller than this — the negotiation + extra stream setup
 /// isn't worth it and small files already transfer instantly.
 const PARALLEL_MIN: u64 = 16 * 1024 * 1024; // 16 MiB
@@ -2642,6 +2791,7 @@ async fn send_ranges_parallel<F: Fn(u64, u64)>(
     base: u64,
     plan: &[(u64, u64)],
     cancel: &AtomicBool,
+    pace: bool,
     on_progress: F,
 ) -> Result<()> {
     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(base));
@@ -2667,6 +2817,9 @@ async fn send_ranges_parallel<F: Fn(u64, u64)>(
                     let k = f.read(&mut buf[..want]).await?;
                     if k == 0 {
                         anyhow::bail!("file ended early while sending segment");
+                    }
+                    if pace {
+                        pace_bytes(k as u64).await;
                     }
                     uni.write_all(&buf[..k]).await?;
                     remaining -= k as u64;
@@ -2966,6 +3119,7 @@ async fn write_files_body<F: Fn(u64, u64)>(
     items: &[(PathBuf, String, u64, u64)],
     total: u64,
     cancel: &AtomicBool,
+    pace: bool,
     on_progress: &F,
 ) -> Result<u64> {
     let mut sent = 0u64;
@@ -2979,6 +3133,9 @@ async fn write_files_body<F: Fn(u64, u64)>(
             let n = f.read(&mut buf).await?;
             if n == 0 {
                 break;
+            }
+            if pace {
+                pace_bytes(n as u64).await;
             }
             send.write_all(&buf[..n]).await?;
             sent += n as u64;
@@ -2999,7 +3156,8 @@ async fn write_files<F: Fn(u64, u64)>(
 ) -> Result<u64> {
     let (items, total) = gather_items(paths)?;
     write_frame(send, &files_header(&items, total, 0, "")).await?;
-    write_files_body(send, &items, total, cancel, &on_progress).await
+    // Legacy single-stream fallback (no conn here to read locality) — unpaced.
+    write_files_body(send, &items, total, cancel, false, &on_progress).await
 }
 
 /// Core: read `[header][file bytes…]` from a recv stream into `dest_dir`.
@@ -3084,6 +3242,9 @@ pub async fn send_files<F: Fn(u64, u64)>(
     let (mut send, mut recv) = conn.open_bi().await?;
     let (items, total) = gather_items(paths)?;
     let n = parallel_stream_count(items.len(), total);
+    // Rate-limit only INTERNET sends — a LAN transfer doesn't touch the uplink, so
+    // it stays full speed regardless of the cap.
+    let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
     write_frame(&mut send, &files_header(&items, total, n, my_name)).await?;
 
     if n > 0 {
@@ -3126,7 +3287,7 @@ pub async fn send_files<F: Fn(u64, u64)>(
         if ready {
             parallel_engaged.store(true, Ordering::SeqCst);
             let (base, plan) = parse_resume_reply(reply.as_ref(), total, n);
-            send_ranges_parallel(conn, &items[0].0, total, base, &plan, cancel, on_progress)
+            send_ranges_parallel(conn, &items[0].0, total, base, &plan, cancel, pace, on_progress)
                 .await?;
             send.finish()?;
             let ack = recv.read_to_end(4096).await.unwrap_or_default();
@@ -3139,7 +3300,7 @@ pub async fn send_files<F: Fn(u64, u64)>(
     }
 
     // Classic single-stream body (the header was already written above).
-    let sent = write_files_body(&mut send, &items, total, cancel, &on_progress).await?;
+    let sent = write_files_body(&mut send, &items, total, cancel, pace, &on_progress).await?;
     send.finish()?;
     // Require the receiver's "ok" so we never report Completed for a transfer the
     // peer declined or failed to write (declined pushes stop the stream, surfacing
@@ -3303,6 +3464,8 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     } else {
         0
     };
+    // Internet Quick Send respects the upload cap; LAN stays full speed.
+    let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
     write_frame(send, &files_header(&items, total, n, "")).await?;
     if n > 0 {
         let reply = match tokio::time::timeout(Duration::from_secs(6), read_frame(recv)).await {
@@ -3316,13 +3479,13 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
             .unwrap_or(false);
         if ready {
             let (base, plan) = parse_resume_reply(reply.as_ref(), total, n);
-            send_ranges_parallel(conn, &items[0].0, total, base, &plan, cancel, on_progress)
+            send_ranges_parallel(conn, &items[0].0, total, base, &plan, cancel, pace, on_progress)
                 .await?;
             send.finish()?;
             return Ok(total);
         }
     }
-    let sent = write_files_body(send, &items, total, cancel, &on_progress).await?;
+    let sent = write_files_body(send, &items, total, cancel, pace, &on_progress).await?;
     send.finish()?;
     Ok(sent)
 }
@@ -3455,6 +3618,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn upload_limiter_throttles_and_never_stalls() {
+        // 16 Mbps = 2 MB/s. A 1 MB chunk must be grantable (cap >= CHUNK), and
+        // pushing several chunks must take roughly bytes/rate — proving the cap
+        // both throttles AND can never deadlock a full-chunk request at a low rate.
+        set_upload_limit_mbps(16);
+        let t0 = Instant::now();
+        for _ in 0..4 {
+            pace_bytes(CHUNK as u64).await; // 4 × 1 MB = 4 MB
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        set_upload_limit_mbps(0); // reset so other tests are unaffected
+        // 4 MB at 2 MB/s ≈ 2s, minus the initial ~1 MB burst → expect ~1.5s+.
+        assert!(secs >= 1.3, "limiter should throttle 4 MB @ 2 MB/s, took {secs:.2}s");
+        assert!(secs < 4.0, "but not stall: {secs:.2}s");
+        // And unlimited (0) must be an instant no-op.
+        let t1 = Instant::now();
+        pace_bytes(CHUNK as u64).await;
+        assert!(t1.elapsed().as_millis() < 50, "unlimited must not throttle");
+    }
+
     #[test]
     fn fingerprint_tracks_file_identity() {
         let a = transfer_fingerprint("eid1", "movie.mp4", 1000, 5);
@@ -3552,7 +3736,7 @@ mod tests {
         let conn = client.connect(addr, ALPN).await.unwrap();
         // Send the legacy exact-n plan — the layout an old sender would use; the
         // coverage-based receiver must converge on it just the same.
-        send_ranges_parallel(&conn, &src, total, 0, &legacy_plan(total, n), &AtomicBool::new(false), |_, _| {})
+        send_ranges_parallel(&conn, &src, total, 0, &legacy_plan(total, n), &AtomicBool::new(false), false, |_, _| {})
             .await
             .unwrap();
 

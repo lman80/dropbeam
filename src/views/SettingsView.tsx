@@ -180,6 +180,33 @@ export function SettingsView() {
             {testing ? <Spinner size={14} /> : <RefreshCw size={15} />} Test
           </button>
         </Row>
+        {SEP}
+        <Row
+          title="Limit internet upload speed"
+          desc="Cap how much of your upload a transfer uses, so video calls, streaming, and browsing stay smooth. Local-network transfers always run full speed."
+        >
+          <select
+            value={settings.uploadLimitMbps}
+            onChange={(e) => save({ uploadLimitMbps: Number(e.target.value) })}
+            style={{
+              fontSize: 13,
+              fontWeight: 600,
+              padding: '6px 10px',
+              borderRadius: 8,
+              border: '1px solid var(--border)',
+              background: 'var(--bg-elev)',
+              color: 'var(--text)',
+              cursor: 'pointer',
+            }}
+          >
+            <option value={0}>Unlimited</option>
+            <option value={5}>5 Mbps</option>
+            <option value={10}>10 Mbps</option>
+            <option value={20}>20 Mbps</option>
+            <option value={50}>50 Mbps</option>
+            <option value={100}>100 Mbps</option>
+          </select>
+        </Row>
       </Card>
 
       <SectionTitle>Updates</SectionTitle>

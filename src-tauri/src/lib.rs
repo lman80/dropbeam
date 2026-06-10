@@ -203,6 +203,14 @@ pub fn run() {
                 .unwrap_or_default();
             let default_name = default_display_name();
             let loaded = settings::load(&config_dir, &default_download, &default_name);
+            // Honor the saved internet upload cap from first launch.
+            iroh_net::set_upload_limit_mbps(loaded.upload_limit_mbps);
+            // One-time cleanup: collapse any legacy duplicate friend records left by
+            // the old name-keyed pairing path (identity is endpoint-id-keyed now).
+            let removed = friends::dedupe_friends(&config_dir);
+            if removed > 0 {
+                log::info!("startup: removed {removed} duplicate friend record(s)");
+            }
 
             app.manage(Arc::new(AppState {
                 config_dir: config_dir.clone(),
@@ -306,6 +314,7 @@ pub fn run() {
             commands::list_pairs,
             commands::update_pair,
             commands::remove_pair,
+            commands::verify_folders,
             commands::pair_invite,
             commands::folder_add_person,
             commands::get_folder_statuses,

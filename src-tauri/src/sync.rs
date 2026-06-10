@@ -57,6 +57,11 @@ struct PairHandle {
     pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
     /// Wakes this link's control sender to flush a freshly-queued delete now.
     control_wake: Arc<Notify>,
+    /// Tombstones (rel → deleted-at ms): every deletion we've observed locally or
+    /// adopted from the peer. Rides the reconcile beacon so a delete propagates
+    /// even if the live event was missed, and prevents a deleted file from being
+    /// resurrected by the peer's add-reconcile. Persisted across restarts.
+    tombstones: Arc<Mutex<HashMap<String, u64>>>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
 
@@ -73,6 +78,8 @@ struct StatusSnapshot {
     peer_online: bool,
     peer_name: Option<String>,
     locality: Locality,
+    /// The peer told us they removed/stopped sharing this folder.
+    peer_unshared: bool,
 }
 
 impl Default for StatusSnapshot {
@@ -89,6 +96,7 @@ impl Default for StatusSnapshot {
             peer_online: false,
             peer_name: None,
             locality: Locality::Unknown,
+            peer_unshared: false,
         }
     }
 }
@@ -98,6 +106,14 @@ impl Default for StatusSnapshot {
 struct DeleteEvent {
     rel: String,
     ts: u64,
+}
+
+/// A peer's full folder snapshot, carried on the control beacon for the periodic
+/// self-heal reconcile. `files`: rel → (size, mtime). `tombstones`: rel → ms.
+#[derive(Default, Clone)]
+pub struct Reconcile {
+    pub files: HashMap<String, (u64, u64)>,
+    pub tombstones: HashMap<String, u64>,
 }
 
 impl SyncManager {
@@ -215,14 +231,35 @@ impl SyncManager {
         }
     }
 
+    /// Force a self-heal reconcile NOW: wake every link's control sender so it
+    /// re-beacons its manifest immediately (instead of waiting up to 5 min). Both
+    /// sides then exchange snapshots and converge. Drives the manual "Verify"
+    /// button.
+    pub fn verify_now(&self) {
+        for h in self.handles.lock().unwrap().values() {
+            h.control_wake.notify_one();
+        }
+    }
+
     /// Current status snapshots for all active folders (for initial UI load).
     pub fn statuses(&self) -> Vec<FolderStatus> {
         let handles = self.handles.lock().unwrap();
         handles
             .iter()
             .map(|(id, h)| {
-                let queued = h.queue.lock().unwrap().len();
+                let q = h.queue.lock().unwrap();
+                let queued = q.len();
+                let queued_files: Vec<String> = q.iter().take(60).map(|p| file_name_of(p)).collect();
+                drop(q);
                 let s = h.status.lock().unwrap().clone();
+                let peer_name = h
+                    .config
+                    .lock()
+                    .unwrap()
+                    .endpoint_id
+                    .as_deref()
+                    .and_then(|e| friends::label_for_endpoint(&self.config_dir, e))
+                    .or(s.peer_name);
                 FolderStatus {
                     pair_id: id.clone(),
                     state: s.state,
@@ -235,8 +272,10 @@ impl SyncManager {
                     eta_seconds: s.eta_seconds,
                     detail: s.detail,
                     peer_online: s.peer_online,
-                    peer_name: s.peer_name,
+                    peer_name,
                     locality: s.locality,
+                    peer_unshared: s.peer_unshared,
+                    queued_files,
                 }
             })
             .collect()
@@ -260,6 +299,8 @@ impl SyncManager {
         let pending_deletes: Arc<Mutex<Vec<DeleteEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let self_deleted: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let control_wake = Arc::new(Notify::new());
+        let tombstones: Arc<Mutex<HashMap<String, u64>>> =
+            Arc::new(Mutex::new(load_tombstones(&self.config_dir, &pair.id)));
 
         if pairing::runs_sender(&pair) {
             // Filesystem watcher → candidate channel. We deliberately do NOT trust
@@ -308,6 +349,7 @@ impl SyncManager {
                 pending_deletes.clone(),
                 self_deleted.clone(),
                 control_wake.clone(),
+                tombstones.clone(),
             );
 
             // Sender worker.
@@ -339,6 +381,7 @@ impl SyncManager {
             status.clone(),
             pending_deletes.clone(),
             control_wake.clone(),
+            tombstones.clone(),
         );
         // iroh-only: the peer's control payload (presence + name + mirror deletes)
         // arrives via the iroh accept loop's "folder-ctrl" handler.
@@ -355,6 +398,7 @@ impl SyncManager {
             self_deleted,
             pending_deletes,
             control_wake,
+            tombstones,
             _watcher: watcher,
         };
         self.handles.lock().unwrap().insert(pair.id.clone(), handle);
@@ -372,7 +416,10 @@ impl SyncManager {
         pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
         self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
         control_wake: Arc<Notify>,
+        tombstones: Arc<Mutex<HashMap<String, u64>>>,
     ) {
+        let config_dir = self.config_dir.clone();
+        let pair_id_c = config.lock().unwrap().id.clone();
         let debounce: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         tauri::async_runtime::spawn(async move {
             while let Some(path) = evt_rx.recv().await {
@@ -401,6 +448,9 @@ impl SyncManager {
                 let pd = pending_deletes.clone();
                 let cw = control_wake.clone();
                 let self_deleted2 = self_deleted.clone();
+                let tomb2 = tombstones.clone();
+                let cfgdir2 = config_dir.clone();
+                let pidc2 = pair_id_c.clone();
                 tauri::async_runtime::spawn(async move {
                     // Classify by EXISTENCE, not by the OS event kind. A file that
                     // is present is an add/change; one that's gone is a delete —
@@ -466,11 +516,41 @@ impl SyncManager {
                                 return;
                             }
                         }
+                        // Expand a DIRECTORY deletion into its children. macOS fires
+                        // one Remove event for the folder, not one per file inside —
+                        // so propagating only the folder rel left every file behind
+                        // on the peer. We recover the children from the manifest
+                        // (the files we know lived under `rel/`), tombstone + queue a
+                        // delete for each, AND for the folder rel itself (a real file
+                        // delete has no children, so it just tombstones itself).
+                        let mut targets: Vec<String> = {
+                            let inb = inbound2.lock().unwrap();
+                            let prefix = format!("{rel}/");
+                            inb.iter()
+                                .filter_map(|sig| sig_rel(sig))
+                                .filter(|r| r == &rel || r.starts_with(&prefix))
+                                .collect()
+                        };
+                        if !targets.iter().any(|r| r == &rel) {
+                            targets.push(rel.clone());
+                        }
+                        let ts = now_ms();
                         {
                             let mut pend = pd.lock().unwrap();
-                            if !pend.iter().any(|d| d.rel == rel) {
-                                pend.push(DeleteEvent { rel: rel.clone(), ts: now_ms() });
+                            for t in &targets {
+                                note_tombstone(&cfgdir2, &pidc2, &tomb2, t, ts);
+                                if !pend.iter().any(|d| &d.rel == t) {
+                                    pend.push(DeleteEvent { rel: t.clone(), ts });
+                                }
                             }
+                        }
+                        // Forget the deleted files in the loop-guard manifest so a
+                        // later same-name file is treated as new.
+                        {
+                            let prefix = format!("{rel}/");
+                            inbound2.lock().unwrap().retain(|sig| {
+                                sig_rel(sig).map_or(true, |r| r != rel && !r.starts_with(&prefix))
+                            });
                         }
                         cw.notify_one();
                     }
@@ -625,6 +705,7 @@ impl SyncManager {
         status: Arc<Mutex<StatusSnapshot>>,
         pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
         control_wake: Arc<Notify>,
+        tombstones: Arc<Mutex<HashMap<String, u64>>>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
@@ -660,6 +741,24 @@ impl SyncManager {
                 });
                 let _ = std::fs::write(&ctrl_file, payload.to_string());
 
+                // The self-heal reconcile snapshot: our full current file set +
+                // tombstones, so the peer can converge to identical (mirror only).
+                let reconcile_json = if pair.mirror {
+                    let files: serde_json::Map<String, serde_json::Value> = live_manifest(&pair.folder)
+                        .into_iter()
+                        .map(|(rel, e)| (rel, serde_json::json!([e.size, e.mtime])))
+                        .collect();
+                    let tombs: serde_json::Map<String, serde_json::Value> = tombstones
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(rel, ts)| (rel.clone(), serde_json::json!(ts)))
+                        .collect();
+                    Some(serde_json::json!({ "files": files, "tombstones": tombs }))
+                } else {
+                    None
+                };
+
                 // Dial the peer directly and hand them the control payload.
                 // Success means they're online AND received it (deletes included).
                 let iroh_ok = match (pair.endpoint_id.clone(), manager.iroh_endpoint()) {
@@ -668,11 +767,23 @@ impl SyncManager {
                             dels.iter().map(|d| (d.rel.clone(), d.ts)).collect();
                         let (group_id, roster) =
                             build_group_roster(&manager.config_dir, &pair, &ep, &my_name);
-                        crate::iroh_net::send_folder_ctrl(
-                            &ep, &eid, &pair_id, &my_name, &del_pairs, &group_id, &roster,
+                        let ok = crate::iroh_net::send_folder_ctrl(
+                            &ep, &eid, &pair_id, &my_name, &del_pairs, &group_id, &roster, false,
                         )
                         .await
-                        .is_ok()
+                        .is_ok();
+                        // Self-heal manifest goes on its OWN stream (large cap), so a
+                        // huge folder never bloats the presence beacon above. Only
+                        // when the beacon landed (peer is reachable).
+                        if ok {
+                            if let Some(rec) = &reconcile_json {
+                                let _ = crate::iroh_net::send_folder_reconcile(
+                                    &ep, &eid, &pair_id, rec,
+                                )
+                                .await;
+                            }
+                        }
+                        ok
                     }
                     _ => false,
                 };
@@ -729,6 +840,35 @@ impl SyncManager {
         });
     }
 
+    /// Tell the peer(s) of `pair_id` that we're no longer sharing this folder, so
+    /// their side can show "no longer shared by ___" instead of a dead link.
+    /// Best-effort + fire-and-forget — called just BEFORE the pair record is
+    /// removed, so the endpoint id is still available.
+    pub fn announce_unshare(self: &Arc<Self>, pair_id: &str) {
+        let pairs = pairing::load(&self.config_dir);
+        let Some(pair) = pairs.into_iter().find(|p| p.id == pair_id) else {
+            return;
+        };
+        let Some(eid) = pair.endpoint_id.clone() else {
+            return;
+        };
+        let Some(ep) = self.iroh_endpoint() else {
+            return;
+        };
+        let my_name = self
+            .app
+            .try_state::<Arc<AppState>>()
+            .map(|st| st.settings.lock().unwrap().display_name.clone())
+            .unwrap_or_default();
+        let pid = pair_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            let _ = crate::iroh_net::send_folder_ctrl(
+                &ep, &eid, &pid, &my_name, &[], "", &[], true,
+            )
+            .await;
+        });
+    }
+
     fn on_peer_hello(
         self: &Arc<Self>,
         pair_id: &str,
@@ -736,18 +876,34 @@ impl SyncManager {
         name: &str,
         status: &Arc<Mutex<StatusSnapshot>>,
     ) {
+        // Surface the user's own LABEL for this peer if they set one (resolved by
+        // the peer's stable endpoint id), otherwise the name the peer broadcast.
+        let (eid, secret, role) = {
+            let p = config.lock().unwrap();
+            (p.endpoint_id.clone(), p.secret.clone(), p.role)
+        };
+        let shown = eid
+            .as_deref()
+            .and_then(|e| friends::label_for_endpoint(&self.config_dir, e))
+            .unwrap_or_else(|| name.to_string());
         if let Ok(mut s) = status.lock() {
             s.peer_online = true;
-            s.peer_name = Some(name.to_string());
+            s.peer_name = Some(shown);
+            // A normal beacon means they're sharing again — clear a stale "unshared".
+            s.peer_unshared = false;
         }
         let changed = pairing::set_peer_name(&self.config_dir, pair_id, name);
         if changed {
-            let (secret, role) = {
-                let mut p = config.lock().unwrap();
-                p.peer_name = name.to_string();
-                (p.secret.clone(), p.role)
-            };
-            friends::upsert_from_pairing(&self.config_dir, name, &secret, role);
+            config.lock().unwrap().peer_name = name.to_string();
+            // Link the friend by their STABLE endpoint id (dedups, never clobbers a
+            // user-set label). Fall back to the legacy name-keyed path only when we
+            // somehow don't have their endpoint id yet.
+            match &eid {
+                Some(e) => {
+                    let _ = friends::upsert_by_endpoint(&self.config_dir, e, name);
+                }
+                None => friends::upsert_from_pairing(&self.config_dir, name, &secret, role),
+            }
             self.reconcile_friends();
             let _ = self.app.emit("pairs://changed", ());
         }
@@ -765,14 +921,36 @@ impl SyncManager {
         deletes: &[(String, u64)],
         group_id: &str,
         members: &[(String, String)],
+        reconcile: Option<&Reconcile>,
+        unshared: bool,
     ) {
-        let (config, status, self_deleted) = {
+        let (config, status, self_deleted, tombstones, queue, wake, inbound) = {
             let handles = self.handles.lock().unwrap();
             let Some(h) = handles.get(pair_id) else {
                 return; // not a folder we're actively managing
             };
-            (h.config.clone(), h.status.clone(), h.self_deleted.clone())
+            (
+                h.config.clone(),
+                h.status.clone(),
+                h.self_deleted.clone(),
+                h.tombstones.clone(),
+                h.queue.clone(),
+                h.wake.clone(),
+                h.inbound.clone(),
+            )
         };
+        // The peer stopped sharing this folder. Mark it so the UI can say so and
+        // stop pestering them — we KEEP our local copy of the files (the user can
+        // remove the now-defunct link themselves). One signal is enough; ignore
+        // everything else in this beacon.
+        if unshared {
+            if let Ok(mut s) = status.lock() {
+                s.peer_online = false;
+                s.peer_unshared = true;
+            }
+            self.emit_status(pair_id);
+            return;
+        }
         // Presence + name (also links the friend), same as the croc path. If no
         // name rode along, still mark them online — we just heard from them.
         let name = name.trim();
@@ -797,7 +975,16 @@ impl SyncManager {
         if mirror && !deletes.is_empty() {
             let mut applied: Vec<(String, u64)> = Vec::new();
             for (rel, ts) in deletes {
-                if apply_remote_delete(&folder, rel, &self_deleted) {
+                let mut removed_rels: Vec<String> = Vec::new();
+                let did = apply_remote_delete(&folder, rel, &self_deleted, &mut removed_rels);
+                // Tombstone the rel(s) so reconcile won't resurrect them and so the
+                // delete keeps propagating across a group. Always tombstone the
+                // named rel (even a no-op re-delivery) at the peer's timestamp.
+                note_tombstone(&self.config_dir, pair_id, &tombstones, rel, *ts);
+                for r in &removed_rels {
+                    note_tombstone(&self.config_dir, pair_id, &tombstones, r, *ts);
+                }
+                if did {
                     applied.push((rel.clone(), *ts));
                 }
             }
@@ -810,6 +997,17 @@ impl SyncManager {
                 if group_ok {
                     self.fan_group_deletes(pair_id, group_id, &applied);
                 }
+            }
+        }
+
+        // Self-heal reconcile: the peer told us its full file set + tombstones.
+        // Apply any deletes we missed, and queue any files the peer is missing —
+        // the bulletproof double-check that both folders converge to identical.
+        if mirror {
+            if let Some(rec) = reconcile {
+                self.reconcile_apply(
+                    pair_id, &folder, rec, &self_deleted, &tombstones, &queue, &wake, &inbound,
+                );
             }
         }
 
@@ -846,6 +1044,76 @@ impl SyncManager {
                     let _ = self.app.emit("pairs://changed", ());
                 }
             }
+        }
+    }
+
+    /// Self-heal reconcile. Given the PEER's full folder snapshot (`rec.files`)
+    /// and its tombstones, bring our copy into agreement WITHOUT ever guessing:
+    ///   • Apply each peer tombstone newer than our local file → delete it (so a
+    ///     missed live delete still converges). Pure tombstone-driven — we never
+    ///     delete just because the peer "doesn't have" a file.
+    ///   • Queue every file WE have that the peer lacks (and hasn't tombstoned
+    ///     newer than ours) → re-send it. Catches any add the live path missed.
+    /// The push is symmetric (the peer runs the same against our snapshot), so the
+    /// two folders converge to the union of non-deleted files. Safe failure mode:
+    /// a lost tombstone resurrects a file (extra copy), never silent data loss.
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_apply(
+        self: &Arc<Self>,
+        pair_id: &str,
+        folder: &str,
+        rec: &Reconcile,
+        self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
+        tombstones: &Arc<Mutex<HashMap<String, u64>>>,
+        queue: &Arc<Mutex<VecDeque<String>>>,
+        wake: &Arc<Notify>,
+        inbound: &Arc<Mutex<HashSet<String>>>,
+    ) {
+        let mine = live_manifest(folder);
+        let my_tomb = tombstones.lock().unwrap().clone();
+        let plan = reconcile_plan(&mine, &rec.files, &rec.tombstones, &my_tomb);
+
+        // 1) Apply peer tombstones we missed: delete a local file the peer deleted
+        //    AFTER our copy. Archive first (recoverable from history).
+        let mut deleted_any = false;
+        for rel in &plan.delete {
+            let tomb_ts = rec.tombstones.get(rel).copied().unwrap_or_else(now_ms);
+            let mut removed: Vec<String> = Vec::new();
+            if apply_remote_delete(folder, rel, self_deleted, &mut removed) {
+                deleted_any = true;
+                for r in &removed {
+                    note_tombstone(&self.config_dir, pair_id, tombstones, r, tomb_ts);
+                    inbound
+                        .lock()
+                        .unwrap()
+                        .retain(|sig| sig_rel(sig).as_deref() != Some(r.as_str()));
+                }
+            }
+        }
+        // Adopt EVERY peer tombstone so we forward it and never resurrect, even the
+        // ones for files we never had.
+        for (rel, &ts) in &rec.tombstones {
+            note_tombstone(&self.config_dir, pair_id, tombstones, rel, ts);
+        }
+        if deleted_any {
+            let _ = self.app.emit("folder-history://changed", pair_id);
+        }
+
+        // 2) Push files the peer is missing or has an older copy of.
+        let mut queued = 0usize;
+        for rel in &plan.push {
+            let abs = Path::new(folder).join(rel).to_string_lossy().to_string();
+            if Path::new(&abs).is_file() {
+                let mut q = queue.lock().unwrap();
+                if !q.iter().any(|x| x == &abs) {
+                    q.push_back(abs);
+                    queued += 1;
+                }
+            }
+        }
+        if queued > 0 {
+            log::info!("reconcile[{pair_id}]: re-queued {queued} file(s) the peer was missing");
+            wake.notify_one();
         }
     }
 
@@ -1075,11 +1343,23 @@ impl SyncManager {
             let Some(h) = handles.get(pair_id) else {
                 return;
             };
-            let queued = h.queue.lock().unwrap().len();
+            let q = h.queue.lock().unwrap();
+            let queued = q.len();
+            let queued_files: Vec<String> =
+                q.iter().take(60).map(|p| file_name_of(p)).collect();
+            drop(q);
             let s = h.status.lock().unwrap().clone();
-            (queued, s)
+            let eid = h.config.lock().unwrap().endpoint_id.clone();
+            (queued, queued_files, s, eid)
         };
-        let (queued, s) = snapshot;
+        let (queued, queued_files, mut s, eid) = snapshot;
+        // Always prefer the user's own label for this peer (by stable endpoint id).
+        if let Some(label) = eid
+            .as_deref()
+            .and_then(|e| friends::label_for_endpoint(&self.config_dir, e))
+        {
+            s.peer_name = Some(label);
+        }
         let status = FolderStatus {
             pair_id: pair_id.to_string(),
             state: s.state,
@@ -1094,6 +1374,8 @@ impl SyncManager {
             peer_online: s.peer_online,
             peer_name: s.peer_name,
             locality: s.locality,
+            peer_unshared: s.peer_unshared,
+            queued_files,
         };
         let _ = self.app.emit("folder://status", status);
     }
@@ -1218,9 +1500,16 @@ fn list_files_rec(dir: &Path) -> Vec<PathBuf> {
             if name.starts_with('.') {
                 continue;
             }
-            if path.is_dir() {
+            // file_type() does NOT follow symlinks (unlike is_dir/is_file). Skip a
+            // symlink entirely so a link inside the folder can never lead a
+            // recursive delete — or a send — out to external files.
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
                 stack.push(path);
-            } else if path.is_file() {
+            } else if ft.is_file() {
                 out.push(path);
             }
         }
@@ -1418,10 +1707,16 @@ fn prune_self_deleted(map: &mut HashMap<String, Instant>) {
 /// Apply a delete the peer made (mirror mode): move the file to history (so it's
 /// recoverable) and mark it self-deleted so our watcher doesn't echo it back.
 /// Returns true if a file was archived to history.
+/// Apply a delete the peer propagated. `rel` may name a FILE or a DIRECTORY (when
+/// the peer removed a whole folder). Every file removed is archived to history
+/// first (so nothing is unrecoverable) and recorded in `self_deleted` (loop
+/// guard) and `applied` (the rels we actually removed, for tombstoning). Returns
+/// true if anything was removed.
 fn apply_remote_delete(
     folder: &str,
     rel: &str,
     self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
+    applied: &mut Vec<String>,
 ) -> bool {
     let rel_norm = rel.replace('\\', "/");
     // Never let a peer reach outside the folder.
@@ -1429,22 +1724,65 @@ fn apply_remote_delete(
         return false;
     }
     let dest = Path::new(folder).join(&rel_norm);
+    let mut removed = false;
     if dest.is_file() {
         self_deleted
             .lock()
             .unwrap()
             .insert(rel_norm.clone(), Instant::now());
         // archive MOVES the file out; if it fails, the file stays (no data loss).
-        crate::folder_history::archive(folder, &dest.to_string_lossy(), &rel_norm, "deleted")
+        if crate::folder_history::archive(folder, &dest.to_string_lossy(), &rel_norm, "deleted") {
+            applied.push(rel_norm.clone());
+            removed = true;
+        }
     } else if dest.is_dir() {
+        // A whole folder was removed on the peer. Archive + remove every file
+        // inside (recording each child rel), then prune the now-empty tree.
+        for child_abs in list_files_rec(&dest) {
+            let Some(child_rel) = rel_path_of(&child_abs.to_string_lossy(), folder) else {
+                continue;
+            };
+            self_deleted
+                .lock()
+                .unwrap()
+                .insert(child_rel.clone(), Instant::now());
+            if crate::folder_history::archive(
+                folder,
+                &child_abs.to_string_lossy(),
+                &child_rel,
+                "deleted",
+            ) {
+                applied.push(child_rel);
+                removed = true;
+            }
+        }
         self_deleted
             .lock()
             .unwrap()
             .insert(rel_norm.clone(), Instant::now());
-        let _ = std::fs::remove_dir(&dest); // only succeeds if already empty
-        false
-    } else {
-        false
+        let _ = std::fs::remove_dir_all(&dest);
+        removed = true;
+    }
+    // Tidy up: drop any now-empty parent directories up to (but not including)
+    // the shared-folder root, so a removed subtree doesn't leave hollow folders.
+    prune_empty_dirs(folder, &rel_norm);
+    removed
+}
+
+/// Remove empty ancestor directories of `rel` within `folder` (never the root).
+fn prune_empty_dirs(folder: &str, rel: &str) {
+    let mut cur = Path::new(rel).parent().map(|p| p.to_path_buf());
+    while let Some(dir) = cur {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        let abs = Path::new(folder).join(&dir);
+        if abs.is_dir() && std::fs::read_dir(&abs).map(|mut e| e.next().is_none()).unwrap_or(false) {
+            let _ = std::fs::remove_dir(&abs);
+            cur = dir.parent().map(|p| p.to_path_buf());
+        } else {
+            break;
+        }
     }
 }
 
@@ -1551,6 +1889,20 @@ fn file_sig(path: &str, folder: &str) -> Option<String> {
     Some(format!("{rel}|{}|{}", meta.len(), mtime))
 }
 
+/// Recover the relative path from a `rel|size|mtime` signature. Splits from the
+/// RIGHT so a relative path that itself contains '|' is preserved intact.
+fn sig_rel(sig: &str) -> Option<String> {
+    let mut it = sig.rsplitn(3, '|');
+    let _mtime = it.next()?;
+    let _size = it.next()?;
+    let rel = it.next()?;
+    if rel.is_empty() {
+        None
+    } else {
+        Some(rel.to_string())
+    }
+}
+
 fn manifest_path(config_dir: &Path, pair_id: &str) -> PathBuf {
     config_dir.join(format!("synced-{pair_id}.json"))
 }
@@ -1566,6 +1918,151 @@ fn save_manifest(config_dir: &Path, pair_id: &str, set: &HashSet<String>) {
     if let Ok(txt) = serde_json::to_string(set) {
         let _ = std::fs::write(manifest_path(config_dir, pair_id), txt);
     }
+}
+
+// ── Tombstones ──────────────────────────────────────────────────────────────
+// A tombstone records that `rel` was deleted at `ts` (ms). They travel on the
+// reconcile beacon so a deletion converges across the group even if the live
+// event was dropped, and they stop the peer's add-reconcile from resurrecting a
+// file we deliberately removed. Pruned after a long TTL so the file can't grow
+// without bound (by then both sides have long since converged).
+const TOMBSTONE_TTL_MS: u64 = 45 * 24 * 3600 * 1000;
+
+fn tombstones_path(config_dir: &Path, pair_id: &str) -> PathBuf {
+    config_dir.join(format!("tombstones-{pair_id}.json"))
+}
+
+fn load_tombstones(config_dir: &Path, pair_id: &str) -> HashMap<String, u64> {
+    std::fs::read_to_string(tombstones_path(config_dir, pair_id))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_tombstones(config_dir: &Path, pair_id: &str, map: &HashMap<String, u64>) {
+    let cutoff = now_ms().saturating_sub(TOMBSTONE_TTL_MS);
+    let pruned: HashMap<&String, &u64> = map.iter().filter(|(_, &ts)| ts >= cutoff).collect();
+    if let Ok(txt) = serde_json::to_string(&pruned) {
+        let _ = std::fs::write(tombstones_path(config_dir, pair_id), txt);
+    }
+}
+
+/// Record `rel` as deleted at `ts` (keeping the NEWEST timestamp), in memory and
+/// on disk. No-op if an equal-or-newer tombstone already exists.
+fn note_tombstone(
+    config_dir: &Path,
+    pair_id: &str,
+    tomb: &Arc<Mutex<HashMap<String, u64>>>,
+    rel: &str,
+    ts: u64,
+) {
+    // Clamp an absurd FUTURE timestamp down to ~now. A peer with a wildly-ahead
+    // clock (or a malicious one) could otherwise stamp a tombstone "newer than
+    // everything forever" and have reconcile delete files the user still wants.
+    // Clamping DOWN is the safe direction — at worst a legit delete from a very
+    // fast clock won't reconcile-propagate (the live delete path still does), it
+    // never causes an extra deletion.
+    let ts = ts.min(now_ms().saturating_add(24 * 3600 * 1000));
+    let mut changed = false;
+    {
+        let mut t = tomb.lock().unwrap();
+        let e = t.entry(rel.to_string()).or_insert(0);
+        if ts > *e {
+            *e = ts;
+            changed = true;
+        }
+    }
+    if changed {
+        let snapshot = tomb.lock().unwrap().clone();
+        save_tombstones(config_dir, pair_id, &snapshot);
+    }
+}
+
+/// Every relative file path currently present under `folder`, mapped to its
+/// signature (`size|mtime`). The authoritative "what I actually have on disk".
+fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
+    let mut out = HashMap::new();
+    for abs in list_files_rec(Path::new(folder)) {
+        let p = abs.to_string_lossy().to_string();
+        if p.ends_with(".dropbeam-incoming") {
+            continue;
+        }
+        let Some(rel) = rel_path_of(&p, folder) else {
+            continue;
+        };
+        if rel.is_empty() || rel.split('/').any(|c| c.starts_with('.')) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&abs) {
+            out.insert(
+                rel,
+                FileEntry {
+                    size: meta.len(),
+                    mtime: meta_mtime(&meta),
+                },
+            );
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+struct FileEntry {
+    size: u64,
+    mtime: u64,
+}
+
+/// What a reconcile pass decided to do to OUR folder, given the peer's snapshot.
+#[derive(Default, Debug, PartialEq)]
+struct ReconcilePlan {
+    /// Local rels to delete (the peer tombstoned them newer than our copy).
+    delete: Vec<String>,
+    /// Local rels to (re)send to the peer (it lacks them or has an older copy).
+    push: Vec<String>,
+}
+
+/// THE data-loss-critical decision, isolated as a pure function so it can be
+/// exhaustively unit-tested. Inputs: our live files, the peer's files + the
+/// peer's tombstones + our own tombstones (all rel→ts in ms). Rules:
+///   • DELETE a local file only when the peer has a tombstone for it strictly
+///     newer than the file's mtime — an explicit deletion, never inferred from
+///     mere absence. (A concurrent local EDIT newer than the tombstone wins.)
+///   • PUSH a local file when the peer lacks it, or has an older copy — UNLESS
+///     a tombstone (peer's OR ours) is newer than it (that's a pending delete).
+/// `mtime` is epoch SECONDS; tombstone `ts` is epoch MILLIS (compared as ms).
+fn reconcile_plan(
+    mine: &HashMap<String, FileEntry>,
+    peer_files: &HashMap<String, (u64, u64)>,
+    peer_tombs: &HashMap<String, u64>,
+    my_tombs: &HashMap<String, u64>,
+) -> ReconcilePlan {
+    let mut plan = ReconcilePlan::default();
+    for (rel, entry) in mine {
+        let file_ms = entry.mtime.saturating_mul(1000);
+        let peer_t = peer_tombs.get(rel).copied().unwrap_or(0);
+        let mine_t = my_tombs.get(rel).copied().unwrap_or(0);
+        // A tombstone newer than our file means it should be gone.
+        if peer_t > file_ms {
+            plan.delete.push(rel.clone());
+            continue;
+        }
+        if mine_t > file_ms {
+            // We already know it's deleted locally-pending; don't push it.
+            continue;
+        }
+        let need = match peer_files.get(rel) {
+            None => true,
+            Some(&(psize, pmtime)) => {
+                (psize != entry.size || pmtime != entry.mtime) && entry.mtime > pmtime
+            }
+        };
+        if need {
+            plan.push.push(rel.clone());
+        }
+    }
+    plan.delete.sort();
+    plan.push.sort();
+    plan
 }
 
 fn friend_sig(f: &Friend) -> String {
@@ -1763,8 +2260,10 @@ mod tests {
         std::fs::write(folder.join("sub/x.txt"), b"hello world").unwrap();
 
         let sd = Arc::new(Mutex::new(HashMap::new()));
-        let archived = apply_remote_delete(&folder_s, "sub/x.txt", &sd);
+        let mut applied = Vec::new();
+        let archived = apply_remote_delete(&folder_s, "sub/x.txt", &sd, &mut applied);
         assert!(archived, "a file should have been archived");
+        assert_eq!(applied, vec!["sub/x.txt".to_string()]);
         assert!(!folder.join("sub/x.txt").exists(), "original is gone");
         assert!(
             sd.lock().unwrap().contains_key("sub/x.txt"),
@@ -1791,10 +2290,139 @@ mod tests {
         let folder = temp_dir("trav");
         let folder_s = folder.to_string_lossy().to_string();
         let sd = Arc::new(Mutex::new(HashMap::new()));
-        assert!(!apply_remote_delete(&folder_s, "../escape.txt", &sd));
-        assert!(!apply_remote_delete(&folder_s, "/etc/passwd", &sd));
-        assert!(!apply_remote_delete(&folder_s, "a/../../b.txt", &sd));
+        let mut ap = Vec::new();
+        assert!(!apply_remote_delete(&folder_s, "../escape.txt", &sd, &mut ap));
+        assert!(!apply_remote_delete(&folder_s, "/etc/passwd", &sd, &mut ap));
+        assert!(!apply_remote_delete(&folder_s, "a/../../b.txt", &sd, &mut ap));
+        assert!(ap.is_empty());
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn sig_rel_recovers_path_even_with_pipes() {
+        assert_eq!(sig_rel("a/b.txt|123|456").as_deref(), Some("a/b.txt"));
+        assert_eq!(sig_rel("weird|name.txt|0|99").as_deref(), Some("weird|name.txt"));
+        assert_eq!(sig_rel("noseps"), None);
+    }
+
+    #[test]
+    fn deleting_a_directory_removes_every_file_inside_on_the_peer() {
+        // THE BUG: deleting a subfolder left all its files on the peer because
+        // apply_remote_delete could only remove an EMPTY dir. Now it recursively
+        // archives + removes the whole tree and reports each child rel.
+        let folder = temp_dir("dirdel");
+        let folder_s = folder.to_string_lossy().to_string();
+        std::fs::create_dir_all(folder.join("clips/raw")).unwrap();
+        std::fs::write(folder.join("clips/a.mov"), b"a").unwrap();
+        std::fs::write(folder.join("clips/raw/b.mov"), b"b").unwrap();
+        std::fs::write(folder.join("keep.txt"), b"k").unwrap();
+
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let mut applied = Vec::new();
+        let removed = apply_remote_delete(&folder_s, "clips", &sd, &mut applied);
+        assert!(removed, "the directory delete should report removal");
+        assert!(!folder.join("clips").exists(), "whole subtree gone");
+        assert!(folder.join("keep.txt").exists(), "sibling untouched");
+        applied.sort();
+        assert_eq!(applied, vec!["clips/a.mov".to_string(), "clips/raw/b.mov".to_string()]);
+        // Both removed files are recoverable from history.
+        assert_eq!(crate::folder_history::load(&folder_s).len(), 2);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn prune_empty_dirs_collapses_emptied_tree_but_keeps_root() {
+        let folder = temp_dir("prune");
+        let folder_s = folder.to_string_lossy().to_string();
+        std::fs::create_dir_all(folder.join("a/b/c")).unwrap();
+        prune_empty_dirs(&folder_s, "a/b/c/gone.txt");
+        assert!(!folder.join("a").exists(), "empty tree collapsed up");
+        assert!(folder.exists(), "root folder preserved");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn reconcile_plan_pushes_missing_and_never_deletes_without_a_tombstone() {
+        let mut mine = HashMap::new();
+        mine.insert("have.txt".into(), FileEntry { size: 1, mtime: 100 });
+        mine.insert("alsohave.txt".into(), FileEntry { size: 2, mtime: 100 });
+        // Peer has neither → both must be pushed; NOTHING deleted (no tombstones).
+        let plan = reconcile_plan(&mine, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert_eq!(plan.push, vec!["alsohave.txt".to_string(), "have.txt".to_string()]);
+        assert!(plan.delete.is_empty(), "absence alone must NEVER cause a delete");
+    }
+
+    #[test]
+    fn reconcile_plan_applies_a_newer_tombstone_as_a_delete() {
+        let mut mine = HashMap::new();
+        mine.insert("old.mov".into(), FileEntry { size: 9, mtime: 100 }); // mtime 100s
+        let mut peer_tombs = HashMap::new();
+        peer_tombs.insert("old.mov".to_string(), 200_000u64); // deleted at 200s (ms)
+        let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new());
+        assert_eq!(plan.delete, vec!["old.mov".to_string()]);
+        assert!(plan.push.is_empty(), "a tombstoned file is never pushed");
+    }
+
+    #[test]
+    fn reconcile_plan_local_edit_newer_than_tombstone_wins() {
+        // We edited the file AFTER the peer's delete → keep + push (edit beats delete).
+        let mut mine = HashMap::new();
+        mine.insert("doc.txt".into(), FileEntry { size: 9, mtime: 300 }); // edited at 300s
+        let mut peer_tombs = HashMap::new();
+        peer_tombs.insert("doc.txt".to_string(), 200_000u64); // delete at 200s
+        let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new());
+        assert!(plan.delete.is_empty(), "newer local edit must survive the delete");
+        assert_eq!(plan.push, vec!["doc.txt".to_string()]);
+    }
+
+    #[test]
+    fn tombstone_future_timestamp_is_clamped() {
+        let dir = temp_dir("tomb");
+        let tomb = Arc::new(Mutex::new(HashMap::new()));
+        // A peer claims a delete a century in the future → must be clamped to ~now,
+        // so it can't sit "newer than everything forever" and delete wanted files.
+        let absurd = now_ms() + 100 * 365 * 24 * 3600 * 1000;
+        note_tombstone(&dir, "p", &tomb, "x.mov", absurd);
+        let stored = *tomb.lock().unwrap().get("x.mov").unwrap();
+        assert!(stored <= now_ms() + 24 * 3600 * 1000 + 1000, "clamped to ~now+1day");
+        // A normal recent timestamp is kept as-is.
+        let normal = now_ms().saturating_sub(5000);
+        note_tombstone(&dir, "p", &tomb, "y.mov", normal);
+        assert_eq!(*tomb.lock().unwrap().get("y.mov").unwrap(), normal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_files_rec_skips_symlinks() {
+        let dir = temp_dir("syml");
+        std::fs::write(dir.join("real.txt"), b"r").unwrap();
+        let outside = temp_dir("syml-ext");
+        std::fs::write(outside.join("secret.txt"), b"s").unwrap();
+        // A symlink inside the folder pointing OUT must not be walked.
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&outside, dir.join("link"));
+            let files = list_files_rec(&dir);
+            let names: Vec<String> =
+                files.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+            assert!(names.contains(&"real.txt".to_string()));
+            assert!(
+                !names.iter().any(|n| n == "secret.txt"),
+                "must not follow the symlink to external files: {names:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn reconcile_plan_identical_files_do_nothing() {
+        let mut mine = HashMap::new();
+        mine.insert("same.txt".into(), FileEntry { size: 5, mtime: 100 });
+        let mut peer = HashMap::new();
+        peer.insert("same.txt".to_string(), (5u64, 100u64));
+        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
+        assert!(plan.push.is_empty() && plan.delete.is_empty(), "no-op when in sync");
     }
 
     #[test]
@@ -1804,7 +2432,8 @@ mod tests {
         let folder_s = folder.to_string_lossy().to_string();
         std::fs::write(folder.join("a.txt"), b"x").unwrap();
         let sd = Arc::new(Mutex::new(HashMap::new()));
-        apply_remote_delete(&folder_s, "a.txt", &sd);
+        let mut ap = Vec::new();
+        apply_remote_delete(&folder_s, "a.txt", &sd, &mut ap);
         let inbound = Arc::new(Mutex::new(HashSet::new()));
         for f in list_files_rec(&folder) {
             let p = f.to_string_lossy().to_string();

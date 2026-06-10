@@ -69,6 +69,8 @@ export interface Settings {
   playSounds: boolean
   /** Opt in to the new direct P2P engine (iroh) for Quick Send. */
   directMode: boolean
+  /** Cap internet upload speed (Mbps) to leave headroom; 0 = unlimited. */
+  uploadLimitMbps: number
 }
 
 export type PairRole = 'a' | 'b'
@@ -160,6 +162,11 @@ export interface FolderStatus {
   peerOnline: boolean
   peerName: string | null
   locality: Locality
+  /** The peer stopped sharing this folder on their side. */
+  peerUnshared?: boolean
+  /** File names still waiting to send (active one excluded) — drives the per-file
+   *  drop list instead of one-at-a-time popups. */
+  queuedFiles?: string[]
 }
 
 export interface PairUpdate {
@@ -210,6 +217,7 @@ const realApi = {
       peerName: u.peerName,
     }),
   removePair: (id: string) => invoke<void>('remove_pair', { id }),
+  verifyFolders: () => invoke<void>('verify_folders'),
   pairInvite: (id: string) => invoke<string>('pair_invite', { id }),
   /** Invite another person into an existing folder (makes it a 3+ person group). */
   folderAddPerson: (id: string) => invoke<string>('folder_add_person', { id }),

@@ -158,6 +158,52 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
     let _ = save(config_dir, &friends);
 }
 
+/// Collapse legacy duplicate friends created before identity was keyed purely by
+/// endpoint id. A friend with NO endpoint id whose name matches one that HAS an
+/// endpoint id is the stale name-keyed copy (the real, reachable record is the
+/// endpoint-keyed one) — drop it. Conservative: only removes a no-endpoint record
+/// that's clearly shadowed, never merges two reachable friends (which could orphan
+/// chat history). Returns how many duplicates were removed.
+pub fn dedupe_friends(config_dir: &Path) -> usize {
+    let _guard = LOCK.lock().unwrap();
+    let mut friends = load(config_dir);
+    let keyed_names: std::collections::HashSet<String> = friends
+        .iter()
+        .filter(|f| f.endpoint_id.is_some())
+        .map(|f| f.name.trim().to_lowercase())
+        .collect();
+    let before = friends.len();
+    friends.retain(|f| {
+        // Keep every endpoint-keyed friend. Drop a legacy name-keyed record ONLY
+        // when an endpoint-keyed friend shares its name AND it has no chat history
+        // — so we can never orphan a real conversation by collapsing two different
+        // people who happen to share a name.
+        if f.endpoint_id.is_some() {
+            return true;
+        }
+        let shadowed = keyed_names.contains(&f.name.trim().to_lowercase());
+        let has_chat = !crate::chat::messages(config_dir, &f.id).is_empty();
+        !(shadowed && !has_chat)
+    });
+    let removed = before - friends.len();
+    if removed > 0 {
+        let _ = save(config_dir, &friends);
+    }
+    removed
+}
+
+/// The display name the local user has for the friend at `endpoint_id`, if any.
+/// This is the user's own LABEL (whatever they renamed the friend to, or the name
+/// the friend broadcast) — so every surface that shows a peer can prefer it over a
+/// raw device name like "MacBook Air".
+pub fn label_for_endpoint(config_dir: &Path, endpoint_id: &str) -> Option<String> {
+    load(config_dir)
+        .into_iter()
+        .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
+        .map(|f| f.name)
+        .filter(|n| !n.trim().is_empty())
+}
+
 /// Record a friend's iroh EndpointId (learned when they say hello after pairing).
 /// Returns true if a friend was updated.
 pub fn set_endpoint_id(config_dir: &Path, id: &str, endpoint_id: String) -> bool {

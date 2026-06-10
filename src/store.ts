@@ -34,6 +34,7 @@ const DEFAULT_SETTINGS: Settings = {
   notifyOnComplete: true,
   playSounds: true,
   directMode: true,
+  uploadLimitMbps: 0,
 }
 
 /** Resolve `p`, but never hang: fall back on error OR after `ms`, logging why. */

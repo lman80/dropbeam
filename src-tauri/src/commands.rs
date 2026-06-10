@@ -42,6 +42,9 @@ pub fn update_settings(
     settings: Settings,
 ) -> Result<Settings, String> {
     apply_autostart(&app, settings.launch_at_login);
+    // Apply the internet upload cap live (0 = unlimited) — takes effect on the
+    // next chunk, no restart needed.
+    crate::iroh_net::set_upload_limit_mbps(settings.upload_limit_mbps);
     {
         let mut guard = state.settings.lock().unwrap();
         *guard = settings.clone();
@@ -310,9 +313,20 @@ pub fn remove_pair(
     sync: State<'_, Arc<SyncManager>>,
     id: String,
 ) -> Result<(), String> {
+    // Let the peer know BEFORE we forget the link, so their side can show
+    // "no longer shared by ___" instead of a silently-dead folder.
+    sync.announce_unshare(&id);
     pairing::remove(&state.config_dir, &id)?;
     sync.reconcile();
     Ok(())
+}
+
+/// Manually trigger the self-heal reconcile for every shared folder NOW — each
+/// side re-exchanges its manifest and converges to identical. Drives the
+/// "Verify" button.
+#[tauri::command]
+pub fn verify_folders(sync: State<'_, Arc<SyncManager>>) {
+    sync.verify_now();
 }
 
 #[tauri::command]
