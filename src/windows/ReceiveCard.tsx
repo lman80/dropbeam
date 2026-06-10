@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { currentMonitor, getCurrentWindow, LogicalPosition } from '@tauri-apps/api/window'
+import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from '@tauri-apps/api/window'
 import { desktopDir, documentDir, downloadDir, homeDir } from '@tauri-apps/api/path'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
@@ -10,6 +10,7 @@ import {
   FileImage,
   FileText,
   FileVideo,
+  Minus,
   Send as SendIcon,
   X,
 } from 'lucide-react'
@@ -45,6 +46,12 @@ interface SaveDir {
 }
 
 const SENDING_STATES = ['starting', 'waitingForPeer', 'connecting', 'transferring'] as const
+
+// Window sizes for the expanded card vs. the minimized pill (logical px).
+const FULL_W = 360
+const FULL_H = 400
+const MINI_W = 268
+const MINI_H = 86
 
 /**
  * The floating Blip-style transfer card (bottom-right, near Downloads).
@@ -177,6 +184,32 @@ export function ReceiveCard() {
     if (HAS_TAURI) void getCurrentWindow().startResizeDragging('SouthEast')
   }
 
+  // Minimize → collapse to a small pill (and shrink the window to match).
+  const [minimized, setMinimized] = useState(false)
+  const setWinSize = (w: number, h: number) => {
+    if (HAS_TAURI) void getCurrentWindow().setSize(new LogicalSize(w, h)).catch(() => {})
+  }
+  const minimize = () => {
+    setMenuOpen(false)
+    setMinimized(true)
+    setWinSize(MINI_W, MINI_H)
+  }
+  const restore = () => {
+    setMinimized(false)
+    setWinSize(FULL_W, FULL_H)
+  }
+  // A genuinely NEW transfer opens expanded. We track the last key in a ref so the
+  // brief null between "sending" and "sent ✓" (same transfer) doesn't pop a
+  // minimized card back open.
+  const lastKey = useRef<string | null>(null)
+  useEffect(() => {
+    if (!cardKey || lastKey.current === cardKey) return
+    lastKey.current = cardKey
+    setMinimized(false)
+    setWinSize(FULL_W, FULL_H)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cardKey])
+
   const respond = (accept: boolean, dest?: string) => {
     if (!incoming) return
     setMenuOpen(false)
@@ -224,7 +257,43 @@ export function ReceiveCard() {
   return (
     <div className="rc-root">
       <AnimatePresence>
-        {t && (
+        {t && minimized && (
+          <motion.div
+            key={`mini-${cardKey}`}
+            className="rc-mini"
+            onClick={restore}
+            title="Click to expand"
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 10 }}
+            transition={{ type: 'spring', stiffness: 360, damping: 28 }}
+          >
+            <div className={`rc-mini-av${done ? ' done' : ''}`}>
+              {done ? (
+                <Check size={16} strokeWidth={3} />
+              ) : sending && !friendName ? (
+                <SendIcon size={14} />
+              ) : (
+                initialOf(friendName)
+              )}
+            </div>
+            <div className="rc-mini-text">
+              <div className="rc-mini-name">{midTruncate(name, 24)}</div>
+              <div className="rc-mini-sub">{incoming || done ? sub : `${Math.round(pct)}%`}</div>
+            </div>
+            <button
+              className="rc-close"
+              onClick={(e) => {
+                e.stopPropagation()
+                closeCard()
+              }}
+              title="Close"
+            >
+              <X size={14} />
+            </button>
+          </motion.div>
+        )}
+        {t && !minimized && (
           <motion.div
             key={`${t.direction}-${t.id}`}
             className="rc-card"
@@ -233,8 +302,11 @@ export function ReceiveCard() {
             exit={{ opacity: 0, y: 16, scale: 0.94 }}
             transition={{ type: 'spring', stiffness: 360, damping: 28 }}
           >
-            {/* Drag handle (move the card) + close button */}
+            {/* Drag handle (move the card) + minimize + close */}
             <div className="rc-top" data-tauri-drag-region>
+              <button className="rc-min" onClick={minimize} title="Minimize">
+                <Minus size={15} />
+              </button>
               <button className="rc-close" onClick={closeCard} title="Close">
                 <X size={15} />
               </button>
@@ -344,8 +416,8 @@ function usePositionBottomRight() {
         const screenH = mon.size.height / scale
         const originX = mon.position.x / scale
         const originY = mon.position.y / scale
-        const w = 330
-        const h = 380
+        const w = FULL_W
+        const h = FULL_H
         const x = originX + Math.max(8, screenW - w - 20)
         const y = originY + Math.max(8, screenH - h - 70) // above the Dock
         await getCurrentWindow().setPosition(new LogicalPosition(x, y))

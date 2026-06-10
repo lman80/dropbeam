@@ -1003,7 +1003,9 @@ html.overlay-window #root {
   height: 100%;
   display: grid;
   place-items: center;
-  padding: 16px;
+  /* Generous transparent margin so the card's shadow fades fully instead of
+     being clipped at the window edge (which read as a hard, boxy halo). */
+  padding: 30px;
 }
 .rc-card {
   position: relative;
@@ -1020,7 +1022,7 @@ html.overlay-window #root {
      (--bg-elev was never defined, so the old card was actually see-through.) */
   background: var(--surface);
   border: 1px solid var(--border);
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.32);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   color: var(--text);
 }
 /* Top bar: a drag handle (move the card) with the close button on the right. */
@@ -1033,11 +1035,13 @@ html.overlay-window #root {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 2px;
   padding: 0 6px;
   border-top-left-radius: 22px;
   border-top-right-radius: 22px;
 }
-.rc-close {
+.rc-close,
+.rc-min {
   width: 24px;
   height: 24px;
   display: grid;
@@ -1048,9 +1052,57 @@ html.overlay-window #root {
   color: var(--text-muted);
   cursor: pointer;
 }
-.rc-close:hover {
+.rc-close:hover,
+.rc-min:hover {
   background: color-mix(in srgb, var(--text) 12%, transparent);
   color: var(--text);
+}
+
+/* Minimized "pill" form — a small horizontal bar showing just the essentials. */
+.rc-mini {
+  position: relative;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px 9px 11px;
+  border-radius: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  color: var(--text);
+  cursor: pointer;
+}
+.rc-mini-av {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  background: #5b616b;
+}
+.rc-mini-av.done {
+  background: var(--green, #2fbf5a);
+}
+.rc-mini-text {
+  flex: 1;
+  min-width: 0;
+}
+.rc-mini-name {
+  font-size: 12.5px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rc-mini-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 1px;
 }
 /* Bottom-right resize grip. */
 .rc-grip {
