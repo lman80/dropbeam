@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react'
 import { CheckCircle2, Download, FolderOpen, RefreshCw } from 'lucide-react'
 import { api, type Settings } from '../lib/api'
 import { useStore } from '../store'
-import { ProgressBar, SectionTitle, Spinner } from '../components/bits'
+import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
 
 function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -158,6 +158,13 @@ export function SettingsView() {
           <Toggle on={settings.notifyOnComplete} onChange={(v) => save({ notifyOnComplete: v })} />
         </Row>
         {SEP}
+        <Row
+          title="Chat message notifications"
+          desc="Pop a notification when a friend messages you and the app isn’t focused."
+        >
+          <Toggle on={settings.notifyOnMessage} onChange={(v) => save({ notifyOnMessage: v })} />
+        </Row>
+        {SEP}
         <Row title="Play sounds" desc="Soft cues when you send, receive, or get a file offer.">
           <Toggle on={settings.playSounds} onChange={(v) => save({ playSounds: v })} />
         </Row>
@@ -179,6 +186,13 @@ export function SettingsView() {
           <button className="btn btn-ghost" onClick={runDirectTest} disabled={testing}>
             {testing ? <Spinner size={14} /> : <RefreshCw size={15} />} Test
           </button>
+        </Row>
+        {SEP}
+        <Row
+          title="Only send over direct connections"
+          desc="Refuse the slow relay: if a direct path (local network or peer-to-peer) can't be made, the send fails instead of crawling through the relay. Applies to Quick Send + friend sends; shared folders always use the best available path."
+        >
+          <Toggle on={settings.requireDirect} onChange={(v) => save({ requireDirect: v })} />
         </Row>
         {SEP}
         <Row
@@ -216,6 +230,43 @@ export function SettingsView() {
         >
           <Toggle on={settings.showMegabits} onChange={(v) => save({ showMegabits: v })} />
         </Row>
+      </Card>
+
+      <SectionTitle>How transfers connect</SectionTitle>
+      <Card>
+        <div style={{ padding: '4px 2px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {[
+            {
+              loc: 'local' as const,
+              text: "You and the other device are on the same Wi-Fi / network. Files go straight across your local network — the fastest option, and they never touch the internet.",
+            },
+            {
+              loc: 'direct' as const,
+              text: 'A direct peer-to-peer link across the internet (DropBeam "hole-punches" through both routers). Files go straight between the two computers, end-to-end encrypted, no middleman. Fast and private.',
+            },
+            {
+              loc: 'internet' as const,
+              text: "When a direct link can't be made (a strict or locked-down network), files hop through an encrypted relay server. Still private — the relay can't read them — but much slower, since everything routes through a shared middle server.",
+            },
+            {
+              loc: 'unknown' as const,
+              text: "Still working out the best route to the other device — usually a second or two while it tries for a direct path before settling.",
+            },
+          ].map((c) => (
+            <div key={c.loc} style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
+              <div style={{ flexShrink: 0, marginTop: 1 }}>
+                <ChannelBadge locality={c.loc} showConnecting />
+              </div>
+              <span style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                {c.text}
+              </span>
+            </div>
+          ))}
+          <span style={{ fontSize: 11.5, color: 'var(--text-faint)', lineHeight: 1.5 }}>
+            The badge on each transfer shows which one it's using. Want to avoid the slow relay
+            entirely? Turn on "Only send over direct connections" above.
+          </span>
+        </div>
       </Card>
 
       <SectionTitle>Updates</SectionTitle>

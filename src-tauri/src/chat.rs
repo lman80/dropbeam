@@ -105,6 +105,44 @@ pub fn clear(config_dir: &Path, peer_id: &str) {
     }
 }
 
+/// Fold the conversation under `from_id` INTO `into_id` (used when two friend
+/// records turn out to be the same person and we collapse them — see
+/// `friends::reconcile`). Non-destructive: messages are UNIONED (dedup by id),
+/// re-keyed to the surviving peer, re-sorted, and bounded. The old thread is
+/// removed. Safe to call when `from_id` has no history (a no-op). Returns how
+/// many messages moved.
+pub fn merge_threads(config_dir: &Path, from_id: &str, into_id: &str) -> usize {
+    if from_id == into_id {
+        return 0;
+    }
+    let _guard = LOCK.lock().unwrap();
+    let mut all = load_all(config_dir);
+    let Some(mut moving) = all.remove(from_id) else {
+        return 0;
+    };
+    if moving.is_empty() {
+        save_all(config_dir, &all);
+        return 0;
+    }
+    let dest = all.entry(into_id.to_string()).or_default();
+    let mut moved = 0;
+    for mut m in moving.drain(..) {
+        if dest.iter().any(|x| x.id == m.id) {
+            continue;
+        }
+        m.peer_id = into_id.to_string();
+        dest.push(m);
+        moved += 1;
+    }
+    dest.sort_by_key(|m| m.ts);
+    if dest.len() > MAX_PER_PEER {
+        let drop = dest.len() - MAX_PER_PEER;
+        dest.drain(0..drop);
+    }
+    save_all(config_dir, &all);
+    moved
+}
+
 /// Update a sent message's delivery status (sending → sent/failed). Returns the
 /// updated message so the caller can re-emit it to the UI.
 pub fn set_status(config_dir: &Path, peer_id: &str, msg_id: &str, status: &str) -> Option<ChatMessage> {

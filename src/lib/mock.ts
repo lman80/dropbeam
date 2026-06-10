@@ -43,6 +43,9 @@ let settings: Settings = {
   directMode: false,
   uploadLimitMbps: 0,
   showMegabits: false,
+  requireDirect: false,
+  avatar: '',
+  notifyOnMessage: true,
 }
 
 const history: HistoryEntry[] = [
@@ -207,8 +210,19 @@ function mockIncoming(manual: boolean) {
     setTimeout(() => simulate(t, 64_000_000), 900)
   }
 }
+// Dev helper to preview the outgoing transfer card: window.__mockSend('Hui').
+function mockSend(to = 'Hui') {
+  const id = `s${++counter}`
+  const t = base(id, 'send', ['Voice Over Main (Fixed).txt'])
+  t.friendName = to
+  t.state = 'connecting'
+  emit('transfer://update', { ...t })
+  setTimeout(() => simulate(t, 2_400_000), 700)
+}
 if (typeof window !== 'undefined') {
-  ;(window as unknown as { __mockIncoming?: (m: boolean) => void }).__mockIncoming = mockIncoming
+  const w = window as unknown as { __mockIncoming?: (m: boolean) => void; __mockSend?: (to?: string) => void }
+  w.__mockIncoming = mockIncoming
+  w.__mockSend = mockSend
 }
 
 export const mockApi = {
@@ -274,6 +288,11 @@ export const mockApi = {
   getHistory: async (): Promise<HistoryEntry[]> => [...history],
   clearHistory: async (): Promise<void> => {
     history.length = 0
+  },
+  setProfileAvatar: async (): Promise<Settings> => settings,
+  clearProfileAvatar: async (): Promise<Settings> => {
+    settings = { ...settings, avatar: '' }
+    return settings
   },
   pickFiles: async (): Promise<string[]> => [
     '/Users/you/Desktop/Q3 Presentation.key',

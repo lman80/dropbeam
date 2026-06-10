@@ -366,6 +366,28 @@ function FolderCard({
         </button>
       </div>
 
+      {/* Sync state — lets you confirm both folders actually match. */}
+      {pair.mirror && status?.peerOnline && status?.state === 'idle' && (status?.queued ?? 0) === 0 && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 7,
+            marginTop: 10,
+            fontSize: 12.5,
+            color: 'var(--text-muted)',
+          }}
+        >
+          <Check size={14} color="var(--green)" style={{ flexShrink: 0 }} />
+          <span>
+            In sync
+            {typeof status.peerFiles === 'number' && status.peerFiles > 0
+              ? ` — ${pair.peerName || 'they'} ${pair.peerName ? 'has' : 'have'} ${status.peerFiles} file${status.peerFiles === 1 ? '' : 's'}`
+              : ''}
+          </span>
+        </div>
+      )}
+
       {/* Live transfer progress while sending or receiving */}
       {(status?.state === 'sending' || status?.state === 'receiving') && (
         <motion.div

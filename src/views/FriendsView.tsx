@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
+  Camera,
   Check,
   Copy,
   MessageCircle,
@@ -14,7 +16,7 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import { api, type Friend } from '../lib/api'
+import { api, HAS_TAURI, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
 import { avatarGradient, initials } from '../lib/avatar'
@@ -22,49 +24,47 @@ import { friendPresence, presenceLabel } from '../lib/presence'
 
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
-  const [modal, setModal] = useState<'mycode' | 'add' | null>(null)
+  const [adding, setAdding] = useState(false)
 
   return (
-    <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
+    <div style={{ maxWidth: 640, margin: '0 auto', padding: '8px 28px 40px' }}>
       <div
         className="titlebar-drag"
         style={{
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          marginBottom: 18,
+          marginBottom: 16,
           gap: 12,
         }}
       >
         <h1 style={{ fontSize: 20, fontWeight: 750, margin: 0 }}>Friends</h1>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-ghost" onClick={() => setModal('mycode')}>
-            <QrCode size={15} /> My code
-          </button>
-          <button className="btn btn-primary" onClick={() => setModal('add')}>
-            <UserPlus size={15} /> Add friend
-          </button>
-        </div>
+        <button className="btn btn-primary" onClick={() => setAdding(true)}>
+          <UserPlus size={15} /> Add friend
+        </button>
       </div>
 
+      {/* ── You ─────────────────────────────────────────────── */}
+      <SectionLabel>You</SectionLabel>
+      <YouCard />
+
+      {/* ── Friends ─────────────────────────────────────────── */}
+      <SectionLabel>{friends.length ? `Friends · ${friends.length}` : 'Friends'}</SectionLabel>
       {friends.length === 0 ? (
-        <div className="card">
+        <div className="card" style={{ padding: '6px 0 0' }}>
           <EmptyState
             icon={<Users size={24} />}
             title="No friends yet"
-            hint="Share your code with a friend (or paste theirs) once — then beam files and chat by name forever. It survives app updates, so you never have to re-add anyone."
+            hint="Share your code with someone (or paste theirs). Add them once and you can beam files and chat by name forever — it survives app updates, so you never re-add anyone."
           />
-          <div style={{ display: 'flex', gap: 10, justifyContent: 'center', paddingBottom: 24 }}>
-            <button className="btn btn-ghost" onClick={() => setModal('mycode')}>
-              <QrCode size={15} /> Show my code
-            </button>
-            <button className="btn btn-primary" onClick={() => setModal('add')}>
+          <div style={{ display: 'flex', justifyContent: 'center', paddingBottom: 22 }}>
+            <button className="btn btn-primary" onClick={() => setAdding(true)}>
               <UserPlus size={15} /> Add a friend
             </button>
           </div>
         </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <AnimatePresence initial={false}>
             {friends.map((f) => (
               <FriendCard key={f.id} friend={f} />
@@ -73,7 +73,221 @@ export function FriendsView() {
         </div>
       )}
 
-      {modal && <FriendModal mode={modal} onClose={() => setModal(null)} />}
+      {adding && <AddFriendModal onClose={() => setAdding(false)} />}
+    </div>
+  )
+}
+
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <div
+      style={{
+        fontSize: 11.5,
+        fontWeight: 700,
+        letterSpacing: 0.5,
+        textTransform: 'uppercase',
+        color: 'var(--text-faint)',
+        margin: '18px 2px 9px',
+      }}
+    >
+      {children}
+    </div>
+  )
+}
+
+/** Reusable avatar: the user's chosen picture, or an initials monogram. */
+function Avatar({
+  name,
+  seed,
+  picture,
+  size = 44,
+  radius = 14,
+}: {
+  name: string
+  seed: string
+  picture?: string | null
+  size?: number
+  radius?: number
+}) {
+  const showPic = !!picture && HAS_TAURI
+  return (
+    <div
+      style={{
+        width: size,
+        height: size,
+        borderRadius: radius,
+        display: 'grid',
+        placeItems: 'center',
+        color: 'white',
+        fontWeight: 700,
+        fontSize: size * 0.34,
+        overflow: 'hidden',
+        background: avatarGradient(seed),
+      }}
+    >
+      {showPic ? (
+        <img
+          src={convertFileSrc(picture!)}
+          alt={name}
+          style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+          onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
+        />
+      ) : (
+        initials(name)
+      )}
+    </div>
+  )
+}
+
+/** Your own profile: picture, editable name, and your permanent code. */
+function YouCard() {
+  const settings = useStore((s) => s.settings)
+  const saveSettings = useStore((s) => s.saveSettings)
+  const pickAvatar = useStore((s) => s.pickAvatar)
+  const clearAvatar = useStore((s) => s.clearAvatar)
+  const toast = useStore((s) => s.toast)
+
+  const displayName = settings?.displayName ?? ''
+  const [editing, setEditing] = useState(false)
+  const [name, setName] = useState(displayName)
+  const [code, setCode] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+  const [showQR, setShowQR] = useState(false)
+
+  useEffect(() => {
+    if (!editing) setName(displayName)
+  }, [displayName, editing])
+
+  useEffect(() => {
+    let alive = true
+    api
+      .myInviteCode()
+      .then((c) => alive && setCode(c))
+      .catch(() => alive && setCode(''))
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const saveName = () => {
+    const n = name.trim()
+    if (n && n !== displayName) void saveSettings({ displayName: n })
+    setEditing(false)
+  }
+
+  const copyCode = async () => {
+    if (!code) return
+    try {
+      await navigator.clipboard.writeText(code)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1600)
+    } catch {
+      toast('error', 'Could not copy')
+    }
+  }
+
+  return (
+    <div className="card" style={{ padding: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        {/* Avatar with a hover "change" affordance */}
+        <button
+          className="you-avatar-btn"
+          title="Change picture"
+          onClick={() => void pickAvatar()}
+          style={{ position: 'relative', flexShrink: 0, padding: 0, border: 'none', background: 'none', cursor: 'pointer' }}
+        >
+          <Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={56} radius={18} />
+          <span className="you-avatar-cam">
+            <Camera size={13} />
+          </span>
+        </button>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {editing ? (
+            <input
+              className="input"
+              value={name}
+              autoFocus
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') saveName()
+                if (e.key === 'Escape') {
+                  setName(displayName)
+                  setEditing(false)
+                }
+              }}
+              onBlur={saveName}
+              style={{ fontSize: 15, fontWeight: 700, padding: '6px 10px', maxWidth: 260 }}
+            />
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <span style={{ fontWeight: 750, fontSize: 17 }}>{displayName || 'You'}</span>
+              <button
+                className="icon-btn"
+                title="Edit your name"
+                style={{ width: 24, height: 24 }}
+                onClick={() => {
+                  setName(displayName)
+                  setEditing(true)
+                }}
+              >
+                <Pencil size={12.5} />
+              </button>
+            </div>
+          )}
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
+            This is the name and picture your friends see.
+          </div>
+          {settings?.avatar ? (
+            <button
+              onClick={() => void clearAvatar()}
+              style={{ background: 'none', border: 'none', padding: 0, marginTop: 5, cursor: 'pointer', color: 'var(--text-faint)', fontSize: 11.5 }}
+            >
+              Remove picture
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {/* Your permanent code */}
+      <div
+        style={{
+          marginTop: 14,
+          paddingTop: 14,
+          borderTop: '1px solid var(--border)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+          <div style={{ fontSize: 13, fontWeight: 650 }}>Your DropBeam code</div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button className="btn btn-ghost" onClick={() => setShowQR((v) => !v)} disabled={!code}>
+              <QrCode size={14} /> {showQR ? 'Hide QR' : 'QR'}
+            </button>
+            <button className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} onClick={copyCode} disabled={!code}>
+              {copied ? <Check size={14} /> : <Copy size={14} />} {copied ? 'Copied' : 'Copy code'}
+            </button>
+          </div>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.5 }}>
+          Share this once. It never changes — friends who add you stay connected across every update.
+        </div>
+        <AnimatePresence>
+          {showQR && code && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+              style={{ overflow: 'hidden' }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 14 }}>
+                <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
+                  <QRCodeSVG value={code} size={132} level="M" fgColor="#15161d" bgColor="#fff" />
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
     </div>
   )
 }
@@ -99,7 +313,6 @@ function FriendCard({ friend }: { friend: Friend }) {
 
   const presence = friendPresence(friend.name, friendSeen, folderStatuses)
   const isOnline = presence.status === 'online'
-  // The live channel to this friend, if we share an active folder connection.
   const channel = Object.values(folderStatuses).find(
     (s) => s.peerName?.trim().toLowerCase() === friend.name.trim().toLowerCase(),
   )?.locality
@@ -135,6 +348,10 @@ function FriendCard({ friend }: { friend: Friend }) {
   }
 
   const showInvite = async () => {
+    if (invite) {
+      setInvite(null)
+      return
+    }
     setLoadingInvite(true)
     try {
       setInvite(await api.friendInvite(friend.id))
@@ -157,25 +374,11 @@ function FriendCard({ friend }: { friend: Friend }) {
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, scale: 0.97 }}
       className="card"
-      style={{ padding: 16, overflow: 'hidden' }}
+      style={{ padding: 14, overflow: 'hidden' }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <div style={{ position: 'relative', flexShrink: 0 }}>
-          <div
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: 14,
-              display: 'grid',
-              placeItems: 'center',
-              color: 'white',
-              fontWeight: 700,
-              fontSize: 15,
-              background: avatarGradient(friend.id),
-            }}
-          >
-            {initials(friend.name)}
-          </div>
+          <Avatar name={friend.name} seed={friend.id} size={44} radius={14} />
           <span
             title={presenceLabel(presence)}
             style={{
@@ -213,13 +416,13 @@ function FriendCard({ friend }: { friend: Friend }) {
               <button
                 className="icon-btn"
                 title="Rename"
-                style={{ width: 24, height: 24 }}
+                style={{ width: 22, height: 22 }}
                 onClick={() => {
                   setName(friend.name)
                   setEditing(true)
                 }}
               >
-                <Pencil size={12.5} />
+                <Pencil size={12} />
               </button>
             </div>
           )}
@@ -229,7 +432,7 @@ function FriendCard({ friend }: { friend: Friend }) {
               alignItems: 'center',
               gap: 7,
               fontSize: 12,
-              marginTop: 3,
+              marginTop: 2,
               flexWrap: 'wrap',
               color: isOnline ? 'var(--green)' : 'var(--text-faint)',
             }}
@@ -267,45 +470,31 @@ function FriendCard({ friend }: { friend: Friend }) {
           <MessageCircle size={18} />
         </button>
         <button className="btn btn-primary" onClick={send} disabled={busy}>
-          {busy ? <Spinner size={14} /> : <Send size={15} />} Send files
+          {busy ? <Spinner size={14} /> : <Send size={15} />} Send
         </button>
       </div>
 
+      {/* One compact management row: auto-accept + invite + remove */}
       <div
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 12,
+          gap: 10,
           marginTop: 12,
           paddingTop: 12,
           borderTop: '1px solid var(--border)',
         }}
       >
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 13.5, fontWeight: 600 }}>Auto-accept files</div>
-          <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.4 }}>
-            {friend.autoAccept
-              ? 'Files arrive and save automatically'
-              : "You'll approve each incoming file first"}
-          </div>
-        </div>
         <button
           className={`toggle${friend.autoAccept ? ' on' : ''}`}
-          title={friend.autoAccept ? 'Auto-accept on' : 'Manual approval'}
+          title={friend.autoAccept ? 'Files save automatically' : 'You approve each file'}
           onClick={() => setFriendAutoAccept(friend.id, !friend.autoAccept)}
         />
-      </div>
-
-      <div
-        style={{
-          display: 'flex',
-          gap: 8,
-          justifyContent: 'flex-end',
-          marginTop: 12,
-        }}
-      >
+        <span style={{ fontSize: 12.5, color: 'var(--text-muted)', flex: 1 }}>
+          {friend.autoAccept ? 'Auto-accept files' : 'Approve files first'}
+        </span>
         <button className="btn btn-ghost" onClick={showInvite} disabled={loadingInvite}>
-          {loadingInvite ? <Spinner size={13} /> : <Copy size={13} />} Show invite
+          {loadingInvite ? <Spinner size={13} /> : <Copy size={13} />} {invite ? 'Hide invite' : 'Invite'}
         </button>
         {confirmRemove ? (
           <>
@@ -317,19 +506,13 @@ function FriendCard({ friend }: { friend: Friend }) {
             </button>
           </>
         ) : (
-          <button className="btn btn-danger" onClick={() => setConfirmRemove(true)}>
-            <Trash2 size={14} /> Remove
+          <button className="icon-btn" title="Remove friend" onClick={() => setConfirmRemove(true)}>
+            <Trash2 size={14} />
           </button>
         )}
       </div>
 
-      {invite && (
-        <InvitePanel
-          invite={invite}
-          friendName={friend.name}
-          onClose={() => setInvite(null)}
-        />
-      )}
+      {invite && <InvitePanel invite={invite} friendName={friend.name} onClose={() => setInvite(null)} />}
     </motion.div>
   )
 }
@@ -376,7 +559,7 @@ function InvitePanel({
         </div>
         <div style={{ flex: 1, minWidth: 200 }}>
           <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.45 }}>
-            Send this to {friendName}. They open DropBeam → Friends → <b>Accept invite</b>.
+            Send this to {friendName}. They open DropBeam → Friends → <b>Add friend</b>.
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <button className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} onClick={copy} style={{ flex: 1 }}>
@@ -393,32 +576,14 @@ function InvitePanel({
   )
 }
 
-function FriendModal({ mode, onClose }: { mode: 'mycode' | 'add'; onClose: () => void }) {
+function AddFriendModal({ onClose }: { onClose: () => void }) {
   const acceptFriend = useStore((s) => s.acceptFriend)
   const addFriendByCode = useStore((s) => s.addFriendByCode)
   const toast = useStore((s) => s.toast)
   const [codeInput, setCodeInput] = useState('')
-  const [myCode, setMyCode] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [copied, setCopied] = useState(false)
 
-  useEffect(() => {
-    if (mode !== 'mycode') return
-    let alive = true
-    api
-      .myInviteCode()
-      .then((c) => {
-        if (alive) setMyCode(c)
-      })
-      .catch(() => {
-        if (alive) setMyCode('')
-      })
-    return () => {
-      alive = false
-    }
-  }, [mode])
-
-  const submitCode = async () => {
+  const submit = async () => {
     const code = codeInput.trim()
     if (!code) {
       toast('error', "Paste your friend's code first.")
@@ -437,17 +602,6 @@ function FriendModal({ mode, onClose }: { mode: 'mycode' | 'add'; onClose: () =>
       toast('error', String(e))
     } finally {
       setBusy(false)
-    }
-  }
-
-  const copyMine = async () => {
-    if (!myCode) return
-    try {
-      await navigator.clipboard.writeText(myCode)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1600)
-    } catch {
-      toast('error', 'Could not copy')
     }
   }
 
@@ -476,96 +630,38 @@ function FriendModal({ mode, onClose }: { mode: 'mycode' | 'add'; onClose: () =>
           transition={{ type: 'spring', stiffness: 320, damping: 28 }}
           onClick={(e) => e.stopPropagation()}
           className="card"
-          style={{ width: 460, maxWidth: '100%', padding: 22, borderRadius: 20 }}
+          style={{ width: 440, maxWidth: '100%', padding: 22, borderRadius: 20 }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-            <div style={{ fontSize: 17, fontWeight: 750 }}>
-              {mode === 'mycode' ? 'Your DropBeam code' : 'Add a friend'}
-            </div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+            <div style={{ fontSize: 17, fontWeight: 750 }}>Add a friend</div>
             <button className="icon-btn" onClick={onClose}>
               <X size={17} />
             </button>
           </div>
-
-          {mode === 'mycode' ? (
-            <div>
-              <p style={{ fontSize: 13.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 0 }}>
-                Share this with anyone so they can add you. It’s tied to this device and{' '}
-                <b>never changes</b> — share it once and you stay reachable, even across app updates.
-              </p>
-              {myCode === null ? (
-                <div style={{ display: 'grid', placeItems: 'center', padding: 30 }}>
-                  <Spinner size={20} />
-                </div>
-              ) : myCode === '' ? (
-                <div style={{ fontSize: 13, color: 'var(--text-muted)', padding: '10px 0' }}>
-                  Your code isn’t ready yet — Direct mode is still starting. Close this and try again
-                  in a moment.
-                </div>
-              ) : (
-                <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
-                  <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
-                    <QRCodeSVG value={myCode} size={120} level="M" fgColor="#15161d" bgColor="#fff" />
-                  </div>
-                  <div style={{ flex: 1, minWidth: 200 }}>
-                    <div
-                      className="selectable"
-                      style={{
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: 11.5,
-                        background: 'var(--surface-2)',
-                        border: '1px solid var(--border)',
-                        borderRadius: 11,
-                        padding: '10px 12px',
-                        wordBreak: 'break-all',
-                        maxHeight: 96,
-                        overflowY: 'auto',
-                        color: 'var(--text-muted)',
-                        lineHeight: 1.5,
-                      }}
-                    >
-                      {myCode}
-                    </div>
-                    <button
-                      className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`}
-                      style={{ width: '100%', marginTop: 10 }}
-                      onClick={copyMine}
-                    >
-                      {copied ? <Check size={15} /> : <Copy size={15} />}
-                      {copied ? 'Copied to clipboard' : 'Copy my code'}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div>
-              <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
-                Your friend's code
-              </label>
-              <textarea
-                className="input"
-                style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
-                placeholder="Paste their dropbeam:… code here"
-                value={codeInput}
-                autoFocus
-                onChange={(e) => setCodeInput(e.target.value)}
-              />
-              <p style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
-                Ask your friend for their code (Friends → <b>My code</b>) and paste it here. Their
-                name fills in automatically, and you’ll both be connected — no need to retype names,
-                and no re-adding after updates.
-              </p>
-              <button
-                className="btn btn-primary"
-                style={{ width: '100%', marginTop: 12 }}
-                onClick={submitCode}
-                disabled={busy}
-              >
-                {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend
-              </button>
-            </div>
-          )}
+          <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+            Your friend's code
+          </label>
+          <textarea
+            className="input"
+            style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
+            placeholder="Paste their dropbeam:… code here"
+            value={codeInput}
+            autoFocus
+            onChange={(e) => setCodeInput(e.target.value)}
+          />
+          <p style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
+            Ask your friend for their code (Friends → <b>You</b> → Copy code) and paste it here. Their
+            name fills in automatically and you’ll both be connected — no retyping names, no re-adding
+            after updates.
+          </p>
+          <button
+            className="btn btn-primary"
+            style={{ width: '100%', marginTop: 12 }}
+            onClick={submit}
+            disabled={busy}
+          >
+            {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend
+          </button>
         </motion.div>
       </motion.div>
     </AnimatePresence>

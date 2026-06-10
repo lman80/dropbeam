@@ -37,6 +37,9 @@ const DEFAULT_SETTINGS: Settings = {
   directMode: true,
   uploadLimitMbps: 0,
   showMegabits: false,
+  requireDirect: false,
+  avatar: '',
+  notifyOnMessage: true,
 }
 
 /** Resolve `p`, but never hang: fall back on error OR after `ms`, logging why. */
@@ -113,6 +116,8 @@ interface AppStore {
   markFriendSeen: (name: string) => void
   applyTheme: (theme: Settings['theme']) => void
   saveSettings: (patch: Partial<Settings>) => Promise<void>
+  pickAvatar: () => Promise<void>
+  clearAvatar: () => Promise<void>
   sendPaths: (paths: string[]) => Promise<void>
   receiveCode: (code: string) => Promise<void>
   upsertTransfer: (u: TransferUpdate) => void
@@ -408,6 +413,23 @@ export const useStore = create<AppStore>((set, get) => ({
       set({ settings: saved })
     } catch (e) {
       get().toast('error', `Couldn't save settings: ${e}`)
+    }
+  },
+
+  pickAvatar: async () => {
+    try {
+      const saved = await api.setProfileAvatar()
+      set({ settings: saved })
+    } catch (e) {
+      get().toast('error', `Couldn't set picture: ${e}`)
+    }
+  },
+  clearAvatar: async () => {
+    try {
+      const saved = await api.clearProfileAvatar()
+      set({ settings: saved })
+    } catch (e) {
+      get().toast('error', `Couldn't remove picture: ${e}`)
     }
   },
 

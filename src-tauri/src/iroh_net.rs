@@ -636,16 +636,24 @@ async fn serve_stream(
                     // small file finishes over the rate-limited relay before hole-
                     // punching completes (the 0.3 KB/s bug). Falls through to relay
                     // if a direct path never forms (symmetric NAT).
-                    if !wait_for_direct_path(conn, Duration::from_secs(8)).await {
+                    let got_direct = wait_for_direct_path(conn, Duration::from_secs(8)).await;
+                    if !got_direct {
                         log::warn!("quick-send: no direct path after 8s — relay (slow)");
                     }
                     let __t0 = std::time::Instant::now();
                     let __total = p.total;
                     let want_parallel =
                         req.get("parallel").and_then(|v| v.as_bool()).unwrap_or(false);
-                    match serve_pull_negotiated(conn, send, recv, &p.paths, want_parallel, &p.cancel, cb)
-                        .await
-                    {
+                    // "Only send over direct connections" → refuse the relay.
+                    let send_result = if require_direct() && !got_direct {
+                        Err(anyhow::anyhow!(
+                            "No direct connection — and \"Only send over direct connections\" is on, so the slow relay wasn't used. Try the same Wi-Fi network, or turn that setting off in Settings."
+                        ))
+                    } else {
+                        serve_pull_negotiated(conn, send, recv, &p.paths, want_parallel, &p.cancel, cb)
+                            .await
+                    };
+                    match send_result {
                         Ok(_) => {
                             // Wait for the receiver to confirm every byte landed
                             // before reporting done. Otherwise our timer only
@@ -705,7 +713,7 @@ async fn serve_stream(
                     (st.config_dir.clone(), dl)
                 })
                 .unwrap_or_else(|| (std::env::temp_dir(), String::new()));
-            let dest = if configured.trim().is_empty() {
+            let mut dest = if configured.trim().is_empty() {
                 app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
             } else {
                 PathBuf::from(configured)
@@ -783,21 +791,29 @@ async fn serve_stream(
                 wu.friend_name = sender.clone();
                 wu.bytes_total = total;
                 emit(&app, &wu);
-                let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
                     st.offers.lock().unwrap().insert(id.clone(), tx);
                 }
                 // Don't park forever: resolve on the user's choice, on the sender
                 // giving up (connection closed), or after a TTL — so a declined or
                 // ignored offer always cleans up instead of leaking the task and
-                // leaving the sender blocked.
-                let accept = tokio::select! {
-                    r = rx => r.unwrap_or(false),
-                    _ = conn.closed() => false,
-                    _ = tokio::time::sleep(Duration::from_secs(300)) => false,
+                // leaving the sender blocked. `Some(dir)` = accept (empty = default),
+                // `None` = decline.
+                let decision: Option<String> = tokio::select! {
+                    r = rx => r.ok().flatten(),
+                    _ = conn.closed() => None,
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => None,
                 };
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
                     st.offers.lock().unwrap().remove(&id);
+                }
+                let accept = decision.is_some();
+                // Honor the "Save to" choice from the receive card, if any.
+                if let Some(dir) = decision {
+                    if !dir.trim().is_empty() {
+                        dest = PathBuf::from(dir);
+                    }
                 }
                 if !accept {
                     // Tell a waiting modern sender so it stops cleanly instead of
@@ -1279,7 +1295,12 @@ async fn serve_stream(
                     }
                 }
             }
-            let reconcile = crate::sync::Reconcile { files, tombstones };
+            let empty_dirs: Vec<String> = payload
+                .get("emptyDirs")
+                .and_then(|d| d.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let reconcile = crate::sync::Reconcile { files, tombstones, empty_dirs };
             if !pair_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
@@ -1389,6 +1410,7 @@ async fn serve_stream(
                     };
                     if crate::chat::append(&config_dir, &msg) {
                         let _ = app.emit("chat://message", &msg);
+                        maybe_notify_chat(&app, &friend.name, &msg);
                     }
                 }
             }
@@ -1708,6 +1730,12 @@ pub fn send_to_friend(
                 let got_direct = wait_for_direct_path(&conn, Duration::from_secs(8)).await;
                 if !got_direct {
                     log::warn!("friend-send: no direct path after 8s — relay (slow)");
+                    // "Only send over direct connections" → refuse the relay.
+                    if require_direct() {
+                        return Err(anyhow::anyhow!(
+                            "No direct connection to this friend — and you have \"Only send over direct connections\" on, so the slow relay wasn't used. They may be on a restrictive network; try the same Wi-Fi, or turn that setting off in Settings."
+                        ));
+                    }
                 }
                 // Fresh per attempt: only THIS attempt's handshake authorizes a
                 // retry AND the degradation watchdog. Shared (Arc) so the watchdog
@@ -1997,6 +2025,47 @@ pub async fn send_folder_reconcile(
     send.finish()?;
     let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
     Ok(())
+}
+
+/// Pop a native OS notification for an inbound chat message — but only when the
+/// main window isn't focused (if you're already looking at the app, the live
+/// in-app bubble is enough) and the user hasn't turned message notifications off.
+/// This is what makes DropBeam chat feel like Telegram: a message reaches you
+/// even when the app is in the tray or behind another window.
+fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessage) {
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else {
+        return;
+    };
+    if !st.settings.lock().unwrap().notify_on_message {
+        return;
+    }
+    let focused = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_focused().ok())
+        .unwrap_or(false);
+    if focused {
+        return;
+    }
+    let who = {
+        let s = sender.trim();
+        if s.is_empty() { "New message" } else { s }
+    };
+    let body = if msg.kind == "file" {
+        match msg.files.len() {
+            0 => "Sent you a file".to_string(),
+            1 => format!("Sent you {}", msg.files[0]),
+            n => format!("Sent you {n} files"),
+        }
+    } else {
+        let t = msg.text.trim();
+        if t.chars().count() > 140 {
+            format!("{}…", t.chars().take(140).collect::<String>())
+        } else {
+            t.to_string()
+        }
+    };
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app.notification().builder().title(who).body(body).show();
 }
 
 /// Deliver a chat message to a friend over iroh (dial-by-key). `payload` is the
@@ -2478,11 +2547,24 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 static UPLOAD_LIMIT_BPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UPLOAD_BUCKET: std::sync::OnceLock<Mutex<(f64, Instant)>> = std::sync::OnceLock::new();
 
+/// When true, an explicit send (Quick Send / friend) that can't get a DIRECT path
+/// (local network or hole-punched p2p) fails instead of crawling over the relay.
+static REQUIRE_DIRECT: AtomicBool = AtomicBool::new(false);
+
 /// Set the internet upload cap from settings. 0 Mbps = unlimited.
 pub fn set_upload_limit_mbps(mbps: u32) {
     // Megabits/sec → bytes/sec.
     let bps = (mbps as u64).saturating_mul(1_000_000) / 8;
     UPLOAD_LIMIT_BPS.store(bps, Ordering::Relaxed);
+}
+
+/// "Only send over direct connections" — fail rather than relay-fallback.
+pub fn set_require_direct(on: bool) {
+    REQUIRE_DIRECT.store(on, Ordering::Relaxed);
+}
+
+fn require_direct() -> bool {
+    REQUIRE_DIRECT.load(Ordering::Relaxed)
 }
 
 /// Block until `n` bytes' worth of send budget is available. No-op when the cap

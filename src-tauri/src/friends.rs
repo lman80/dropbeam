@@ -158,37 +158,103 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
     let _ = save(config_dir, &friends);
 }
 
-/// Collapse legacy duplicate friends created before identity was keyed purely by
-/// endpoint id. A friend with NO endpoint id whose name matches one that HAS an
-/// endpoint id is the stale name-keyed copy (the real, reachable record is the
-/// endpoint-keyed one) — drop it. Conservative: only removes a no-endpoint record
-/// that's clearly shadowed, never merges two reachable friends (which could orphan
-/// chat history). Returns how many duplicates were removed.
-pub fn dedupe_friends(config_dir: &Path) -> usize {
-    let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
-    let keyed_names: std::collections::HashSet<String> = friends
-        .iter()
-        .filter(|f| f.endpoint_id.is_some())
-        .map(|f| f.name.trim().to_lowercase())
-        .collect();
-    let before = friends.len();
-    friends.retain(|f| {
-        // Keep every endpoint-keyed friend. Drop a legacy name-keyed record ONLY
-        // when an endpoint-keyed friend shares its name AND it has no chat history
-        // — so we can never orphan a real conversation by collapsing two different
-        // people who happen to share a name.
-        if f.endpoint_id.is_some() {
-            return true;
+/// True for the auto-generated placeholder names we assign before a real name is
+/// known — never treated as a user-chosen identity for name-based merging.
+fn is_placeholder(name: &str) -> bool {
+    matches!(name.trim(), "" | "New friend" | "Friend")
+}
+
+/// Pure planner behind [`reconcile`]: given the raw friend list, return the
+/// collapsed survivor list plus the `(from_id → into_id)` chat migrations needed.
+///
+/// Identity rules (so we NEVER duplicate a person and NEVER lose one):
+///   * two records with the **same endpoint id** are the same device → merge;
+///   * a record with **no** endpoint id whose **name** matches another record
+///     (case-insensitive, non-placeholder) is the same friend reached by a
+///     different path (e.g. a folder pairing vs. their permanent code) → merge.
+/// The endpoint-keyed record always wins (it's the reachable one); otherwise the
+/// older record wins. Merging is non-destructive: we keep the user-chosen name,
+/// OR the auto-accept flags, carry the endpoint id forward, and migrate chat.
+/// `chat_ids` is the set of friend ids that currently have a conversation. We use
+/// it as a guard: a NAME-based merge (which could in theory be two different people
+/// who happen to share a custom name) is refused when BOTH records already hold
+/// chat history, so we can never fuse two real conversations. An endpoint-id match
+/// is always safe to merge (it's provably the same device) regardless of chat.
+pub fn plan_reconcile(
+    input: &[Friend],
+    chat_ids: &std::collections::HashSet<String>,
+) -> (Vec<Friend>, Vec<(String, String)>) {
+    let mut kept: Vec<Friend> = Vec::new();
+    let mut merges: Vec<(String, String)> = Vec::new();
+    for f in input {
+        let found = kept.iter().position(|s| {
+            let same_endpoint = match (s.endpoint_id.as_deref(), f.endpoint_id.as_deref()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            let either_unkeyed = s.endpoint_id.is_none() || f.endpoint_id.is_none();
+            let both_have_chat = chat_ids.contains(&s.id) && chat_ids.contains(&f.id);
+            let name_match = either_unkeyed
+                && !is_placeholder(&s.name)
+                && s.name.trim().eq_ignore_ascii_case(f.name.trim())
+                && !both_have_chat;
+            same_endpoint || name_match
+        });
+        let Some(i) = found else {
+            kept.push(f.clone());
+            continue;
+        };
+        let s = kept[i].clone();
+        // Survivor: the reachable (endpoint-keyed) record wins; if both or neither
+        // are keyed, the older one wins (stable, preserves the earliest identity).
+        let f_keyed = f.endpoint_id.is_some();
+        let s_keyed = s.endpoint_id.is_some();
+        let f_wins = if f_keyed != s_keyed {
+            f_keyed
+        } else {
+            f.created_at < s.created_at
+        };
+        let (mut survivor, loser) = if f_wins { (f.clone(), s) } else { (s, f.clone()) };
+        if is_placeholder(&survivor.name) && !is_placeholder(&loser.name) {
+            survivor.name = loser.name.clone();
         }
-        let shadowed = keyed_names.contains(&f.name.trim().to_lowercase());
-        let has_chat = !crate::chat::messages(config_dir, &f.id).is_empty();
-        !(shadowed && !has_chat)
-    });
-    let removed = before - friends.len();
-    if removed > 0 {
-        let _ = save(config_dir, &friends);
+        survivor.auto_accept = survivor.auto_accept || loser.auto_accept;
+        if survivor.endpoint_id.is_none() {
+            survivor.endpoint_id = loser.endpoint_id.clone();
+        }
+        if survivor.id != loser.id {
+            merges.push((loser.id.clone(), survivor.id.clone()));
+        }
+        kept[i] = survivor;
     }
+    (kept, merges)
+}
+
+/// Collapse duplicate friend records into one canonical entry per person and
+/// migrate any chat history onto the survivor. This is what makes friendships
+/// permanent: no matter how many ways the same person was added (folder pairing,
+/// permanent code, classic invite) across app updates, they end up as a single
+/// friend with their full conversation intact. Returns how many records collapsed.
+pub fn reconcile(config_dir: &Path) -> usize {
+    let _guard = LOCK.lock().unwrap();
+    let friends = load(config_dir);
+    // Which friends currently hold a conversation — the safety guard for name-based
+    // merges (never fuse two records that both already have chat history).
+    let chat_ids: std::collections::HashSet<String> = crate::chat::overview(config_dir)
+        .into_iter()
+        .map(|o| o.peer_id)
+        .collect();
+    let (kept, merges) = plan_reconcile(&friends, &chat_ids);
+    let removed = friends.len().saturating_sub(kept.len());
+    if merges.is_empty() && removed == 0 {
+        return 0;
+    }
+    // Apply migrations IN ORDER: a survivor that is itself later superseded chains
+    // its (already-merged) history forward correctly only if applied sequentially.
+    for (from, into) in &merges {
+        crate::chat::merge_threads(config_dir, from, into);
+    }
+    let _ = save(config_dir, &kept);
     removed
 }
 
@@ -269,10 +335,6 @@ fn decode_user_code(code: &str) -> Result<UserCode, String> {
         return Err("That code is missing a device id.".into());
     }
     Ok(uc)
-}
-
-fn is_placeholder(name: &str) -> bool {
-    matches!(name.trim(), "" | "New friend" | "Friend")
 }
 
 /// Find a friend by their EndpointId and refresh their name, or add them new.
@@ -463,5 +525,133 @@ mod tests {
         assert_eq!(friend_inbox_code(&a), my_inbox_code(&b));
         assert_eq!(friend_inbox_code(&b), my_inbox_code(&a));
         assert_ne!(my_inbox_code(&a), my_inbox_code(&b));
+    }
+
+    fn f(id: &str, name: &str, eid: Option<&str>, created: u64) -> Friend {
+        Friend {
+            id: id.into(),
+            role: PairRole::A,
+            name: name.into(),
+            secret: "s".into(),
+            created_at: created,
+            auto_accept: false,
+            endpoint_id: eid.map(String::from),
+        }
+    }
+
+    fn none() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+    fn ids(list: &[&str]) -> std::collections::HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reconcile_merges_same_endpoint() {
+        // Same device dialed in twice under different record ids → one friend.
+        let input = vec![
+            f("1", "Bob", Some("EID"), 10),
+            f("2", "Bob", Some("EID"), 20),
+        ];
+        let (kept, merges) = plan_reconcile(&input, &none());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "1"); // older record survives
+        assert_eq!(merges, vec![("2".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn reconcile_folds_unkeyed_into_keyed_by_name() {
+        // A folder pairing made an unkeyed "Bob"; later his permanent code made a
+        // keyed "Bob". They're the same person → collapse onto the reachable one,
+        // migrating the unkeyed record's chat history forward.
+        let input = vec![
+            f("folder", "Bob", None, 5),
+            f("keyed", "bob", Some("EID"), 50),
+        ];
+        let (kept, merges) = plan_reconcile(&input, &none());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "keyed"); // endpoint-keyed (reachable) survives
+        assert_eq!(kept[0].endpoint_id.as_deref(), Some("EID"));
+        assert_eq!(merges, vec![("folder".to_string(), "keyed".to_string())]);
+    }
+
+    #[test]
+    fn reconcile_keeps_user_chosen_name_and_auto_accept() {
+        // Same device twice: the older record still carries the placeholder name,
+        // the newer one learned the real name and had auto-accept on. The merged
+        // friend keeps the real name and the enabled flag.
+        let mut older = f("older", "Friend", Some("EID"), 5); // placeholder, survives
+        older.auto_accept = false;
+        let mut newer = f("newer", "Bob the Builder", Some("EID"), 50);
+        newer.auto_accept = true;
+        let (kept, merges) = plan_reconcile(&[older, newer], &none());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "older");
+        assert_eq!(kept[0].name, "Bob the Builder"); // adopt the real name
+        assert!(kept[0].auto_accept); // OR of the two
+        assert_eq!(merges, vec![("newer".to_string(), "older".to_string())]);
+    }
+
+    #[test]
+    fn reconcile_does_not_merge_distinct_placeholders() {
+        // Two different unknown people, both still named the generic placeholder —
+        // never merge on a placeholder name.
+        let input = vec![f("a", "Friend", None, 1), f("b", "Friend", None, 2)];
+        let (kept, merges) = plan_reconcile(&input, &none());
+        assert_eq!(kept.len(), 2);
+        assert!(merges.is_empty());
+    }
+
+    #[test]
+    fn reconcile_noop_when_already_canonical() {
+        let input = vec![
+            f("1", "Bob", Some("E1"), 1),
+            f("2", "Carol", Some("E2"), 2),
+            f("3", "Dave", None, 3),
+        ];
+        let (kept, merges) = plan_reconcile(&input, &none());
+        assert_eq!(kept.len(), 3);
+        assert!(merges.is_empty());
+    }
+
+    #[test]
+    fn reconcile_chains_superseded_survivor() {
+        // unkeyed "Bob" (a) is folded into keyed "Bob" (b); both keyed records then
+        // collapse. History must chain a→b then b→… correctly via ordered merges.
+        let input = vec![
+            f("a", "Bob", None, 1),
+            f("b", "Bob", Some("EID"), 2),
+            f("c", "Bob", Some("EID"), 3),
+        ];
+        let (kept, merges) = plan_reconcile(&input, &none());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "b");
+        assert_eq!(
+            merges,
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("c".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_refuses_name_merge_when_both_have_chat() {
+        // Two records that share a name but BOTH already hold a conversation — could
+        // be two different people. Never fuse their chats: keep both.
+        let input = vec![f("u", "Sam", None, 1), f("k", "Sam", Some("EID"), 2)];
+        let (kept, merges) = plan_reconcile(&input, &ids(&["u", "k"]));
+        assert_eq!(kept.len(), 2);
+        assert!(merges.is_empty());
+    }
+
+    #[test]
+    fn reconcile_same_endpoint_merges_even_with_chat_on_both() {
+        // Same device (same endpoint id) is provably the same person — merge and
+        // union the conversation even if both records have chat.
+        let input = vec![f("a", "Sam", Some("EID"), 1), f("b", "Sam", Some("EID"), 2)];
+        let (kept, merges) = plan_reconcile(&input, &ids(&["a", "b"]));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(merges, vec![("b".to_string(), "a".to_string())]);
     }
 }

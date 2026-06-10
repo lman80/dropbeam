@@ -84,6 +84,9 @@ struct StatusSnapshot {
     locality: Locality,
     /// The peer told us they removed/stopped sharing this folder.
     peer_unshared: bool,
+    /// How many files the peer reported in its last reconcile snapshot — so the UI
+    /// can show "both have N files, in sync" and the user can SEE the folders match.
+    peer_files: u32,
 }
 
 impl Default for StatusSnapshot {
@@ -101,6 +104,7 @@ impl Default for StatusSnapshot {
             peer_name: None,
             locality: Locality::Unknown,
             peer_unshared: false,
+            peer_files: 0,
         }
     }
 }
@@ -118,6 +122,10 @@ struct DeleteEvent {
 pub struct Reconcile {
     pub files: HashMap<String, (u64, u64)>,
     pub tombstones: HashMap<String, u64>,
+    /// Relative paths of directories with NO files anywhere beneath them, so a
+    /// folder someone makes to organize (even an empty one) still appears on the
+    /// peer. Purely additive on apply — only ever creates directories.
+    pub empty_dirs: Vec<String>,
 }
 
 impl SyncManager {
@@ -211,6 +219,10 @@ impl SyncManager {
 
     /// Bring friend inbox listeners in line with what's persisted on disk.
     pub fn reconcile_friends(self: &Arc<Self>) {
+        // First collapse any duplicate records for the same person (added via more
+        // than one path) and migrate their chat history — so the list below, and
+        // every window we notify, only ever sees one canonical friend per person.
+        friends::reconcile(&self.config_dir);
         let desired = friends::load(&self.config_dir);
         let desired_ids: HashSet<String> = desired.iter().map(|f| f.id.clone()).collect();
 
@@ -305,6 +317,7 @@ impl SyncManager {
                     locality: s.locality,
                     peer_unshared: s.peer_unshared,
                     queued_files,
+                    peer_files: s.peer_files,
                 }
             })
             .collect()
@@ -509,8 +522,52 @@ impl SyncManager {
                             }
                         }
                         wake2.notify_one();
+                    } else if Path::new(&p).is_dir() {
+                        // ── DIRECTORY appeared / changed ──────────────────────
+                        // A new subfolder, a folder dragged or moved IN, or the new
+                        // side of a folder rename. macOS often fires one event for
+                        // the directory rather than per child, so we recursively
+                        // enqueue every sendable file inside — that syncs the whole
+                        // structure + contents. CRITICAL: this branch also stops a
+                        // directory from being misread as a delete (it isn't a file,
+                        // so it used to fall through to the delete path and could
+                        // wipe the folder's contents on the peer). The reconcile is
+                        // the backstop for anything the live events still miss.
+                        //
+                        // Let an in-progress copy settle before scanning, so a folder
+                        // dragged in mid-copy doesn't enqueue a half-written file. The
+                        // reconcile re-sends on any later size/mtime change, so this
+                        // just shrinks the partial-file window.
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                        if stopped2.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let files = list_files_rec(Path::new(&p));
+                        let had_files = !files.is_empty();
+                        let mut any = false;
+                        {
+                            let mut q = queue2.lock().unwrap();
+                            for f in files {
+                                let fp = f.to_string_lossy().to_string();
+                                if is_sendable_candidate(&fp, &folder2, &inbound2)
+                                    && !q.iter().any(|x| x == &fp)
+                                {
+                                    q.push_back(fp);
+                                    any = true;
+                                }
+                            }
+                        }
+                        if any {
+                            wake2.notify_one();
+                        }
+                        // An EMPTY new folder has no files to send — nudge the
+                        // control beacon so its `emptyDirs` reconcile reaches the
+                        // peer promptly instead of waiting for the idle cadence.
+                        if mirror && !had_files {
+                            cw.notify_one();
+                        }
                     } else if mirror {
-                        // ── DELETE (total-sync only) ──────────────────────────
+                        // ── DELETE (total-sync only; path is truly GONE) ──────
                         let Some(rel) = rel_path_of(&p, &folder2) else {
                             return;
                         };
@@ -530,10 +587,11 @@ impl SyncManager {
                             }
                         }
                         // An editor's atomic save is unlink+rename; wait briefly and
-                        // re-check. If the file came back, it was a save (its own
-                        // create event re-sends it) — not a real delete.
+                        // re-check. If the path came back as ANYTHING — a file (a
+                        // save) or a directory (recreated/renamed) — it isn't a
+                        // delete; bail so we don't propagate a phantom removal.
                         tokio::time::sleep(Duration::from_millis(1200)).await;
-                        if stopped2.load(Ordering::SeqCst) || Path::new(&p).is_file() {
+                        if stopped2.load(Ordering::SeqCst) || Path::new(&p).exists() {
                             return;
                         }
                         // A newer event for this path superseded us (e.g. recreated
@@ -825,7 +883,8 @@ impl SyncManager {
                         .iter()
                         .map(|(rel, ts)| (rel.clone(), serde_json::json!(ts)))
                         .collect();
-                    Some(serde_json::json!({ "files": files, "tombstones": tombs }))
+                    let empty_dirs = live_empty_dirs(&pair.folder);
+                    Some(serde_json::json!({ "files": files, "tombstones": tombs, "emptyDirs": empty_dirs }))
                 } else {
                     None
                 };
@@ -1076,9 +1135,15 @@ impl SyncManager {
         // the bulletproof double-check that both folders converge to identical.
         if mirror {
             if let Some(rec) = reconcile {
+                // Record the peer's file count for the "both have N files, in sync"
+                // visibility indicator.
+                if let Ok(mut s) = status.lock() {
+                    s.peer_files = rec.files.len() as u32;
+                }
                 self.reconcile_apply(
                     pair_id, &folder, rec, &self_deleted, &tombstones, &queue, &wake, &inbound,
                 );
+                self.emit_status(pair_id);
             }
         }
 
@@ -1185,6 +1250,39 @@ impl SyncManager {
         if queued > 0 {
             log::info!("reconcile[{pair_id}]: re-queued {queued} file(s) the peer was missing");
             wake.notify_one();
+        }
+
+        // 3) Empty directories. Purely additive: create any empty folder the peer
+        //    has that we don't — UNLESS we hold a tombstone for that path (we
+        //    deleted it; don't resurrect). And honor a peer's delete: remove an
+        //    empty dir we have if the peer tombstoned it (remove_dir only removes
+        //    it when it's actually empty, so a dir that's since gained files is
+        //    never touched). Never deletes data.
+        for rel in &rec.empty_dirs {
+            let norm = rel.replace('\\', "/");
+            if norm.is_empty()
+                || norm.starts_with('/')
+                || norm.split('/').any(|c| c == ".." || c.starts_with('.'))
+            {
+                continue;
+            }
+            if my_tomb.contains_key(&norm) || rec.tombstones.contains_key(&norm) {
+                continue; // deleted somewhere — don't recreate
+            }
+            let abs = Path::new(folder).join(&norm);
+            if !abs.exists() {
+                let _ = std::fs::create_dir_all(&abs);
+            }
+        }
+        for (rel, _) in &rec.tombstones {
+            let abs = Path::new(folder).join(rel);
+            if abs.is_dir() {
+                self_deleted
+                    .lock()
+                    .unwrap()
+                    .insert(rel.clone(), Instant::now());
+                let _ = std::fs::remove_dir(&abs); // only succeeds if empty
+            }
         }
     }
 
@@ -1524,6 +1622,7 @@ impl SyncManager {
             locality: s.locality,
             peer_unshared: s.peer_unshared,
             queued_files,
+            peer_files: s.peer_files,
         };
         let _ = self.app.emit("folder://status", status);
     }
@@ -2160,6 +2259,57 @@ struct FileEntry {
     mtime: u64,
 }
 
+/// Relative paths of directories under `folder` that contain NO files anywhere
+/// beneath them (a dir whose whole subtree is file-less). Skips dot-dirs and
+/// symlinks. Used so empty organizing-folders still sync.
+fn live_empty_dirs(folder: &str) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    // For every file, every ANCESTOR directory rel is "has files".
+    let mut has_files: HashSet<String> = HashSet::new();
+    let mut stack = vec![Path::new(folder).to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            let Some(rel) = rel_path_of(&path.to_string_lossy(), folder) else {
+                continue;
+            };
+            if rel.is_empty() {
+                continue;
+            }
+            if ft.is_dir() {
+                dirs.push(rel);
+                stack.push(path);
+            } else if ft.is_file() {
+                // Mark every ancestor dir rel as containing files.
+                let mut anc = Path::new(&rel).parent();
+                while let Some(a) = anc {
+                    let s = a.to_string_lossy().to_string();
+                    if s.is_empty() {
+                        break;
+                    }
+                    has_files.insert(s);
+                    anc = a.parent();
+                }
+            }
+        }
+    }
+    dirs.into_iter().filter(|d| !has_files.contains(d)).collect()
+}
+
 /// What a reconcile pass decided to do to OUR folder, given the peer's snapshot.
 #[derive(Default, Debug, PartialEq)]
 struct ReconcilePlan {
@@ -2561,6 +2711,24 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn live_empty_dirs_finds_only_fileless_directories() {
+        let folder = temp_dir("emptydirs");
+        let fs = folder.to_string_lossy().to_string();
+        std::fs::create_dir_all(folder.join("empty")).unwrap();
+        std::fs::create_dir_all(folder.join("has/sub")).unwrap();
+        std::fs::write(folder.join("has/sub/f.txt"), b"x").unwrap();
+        std::fs::create_dir_all(folder.join("outer/inner")).unwrap(); // both empty of files
+        let mut got = live_empty_dirs(&fs);
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["empty".to_string(), "outer".to_string(), "outer/inner".to_string()],
+            "only truly file-less dirs; 'has' and 'has/sub' contain a file"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

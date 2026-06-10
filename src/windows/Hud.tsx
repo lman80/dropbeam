@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { currentMonitor, getCurrentWindow, LogicalPosition } from '@tauri-apps/api/window'
 import { AnimatePresence, motion } from 'framer-motion'
 import { ArrowDownToLine, Send, X } from 'lucide-react'
-import { HAS_TAURI, isActive } from '../lib/api'
+import { HAS_TAURI } from '../lib/api'
 import type { Locality } from '../lib/api'
 import { ChannelBadge } from '../components/bits'
 import { useStore } from '../store'
@@ -19,8 +19,6 @@ interface Pill {
 
 export function Hud() {
   const init = useStore((s) => s.init)
-  const transfers = useStore((s) => s.transfers)
-  const order = useStore((s) => s.order)
   const folderStatuses = useStore((s) => s.folderStatuses)
   const pairs = useStore((s) => s.pairs)
 
@@ -28,37 +26,10 @@ export function Hud() {
     init()
   }, [init])
 
-  // The single most relevant thing happening right now: a live quick/friend
-  // transfer if any, otherwise a folder sync in progress.
+  // The single most relevant background activity. One-off sends AND receives now
+  // get the Blip-style bottom-right transfer card, so the top HUD is dedicated to
+  // shared-folder syncs (the long-running background activity).
   const pill: Pill | null = useMemo(() => {
-    const live = order
-      .map((id) => transfers[id])
-      .filter(Boolean)
-      .filter((t) => isActive(t.state))
-      .reverse()
-    const t = live[0]
-    if (t) {
-      const name = t.fileNames[0] ?? (t.direction === 'receive' ? 'Incoming file' : 'File')
-      const peer = t.friendName ? (t.direction === 'send' ? ` → ${t.friendName}` : ` ← ${t.friendName}`) : ''
-      const sub =
-        t.state === 'transferring'
-          ? `${Math.round(t.percent)}%${peer}`
-          : t.state === 'waitingForAccept'
-            ? 'Waiting to accept'
-            : t.direction === 'receive'
-              ? 'Connecting…'
-              : t.friendName
-                ? `Sending${peer}`
-                : 'Ready to send'
-      return {
-        key: t.id,
-        direction: t.direction,
-        title: name,
-        sub,
-        percent: t.state === 'transferring' ? t.percent : 0,
-        locality: t.locality,
-      }
-    }
     const folder = Object.values(folderStatuses).find(
       (s) => s.state === 'sending' || s.state === 'receiving',
     )
@@ -76,7 +47,7 @@ export function Hud() {
       }
     }
     return null
-  }, [order, transfers, folderStatuses, pairs])
+  }, [folderStatuses, pairs])
 
   usePositionOnce()
 

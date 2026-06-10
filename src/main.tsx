@@ -4,6 +4,7 @@ import './index.css'
 import App from './App'
 import { Popover } from './windows/Popover'
 import { Hud } from './windows/Hud'
+import { ReceiveCard } from './windows/ReceiveCard'
 import { api, HAS_TAURI } from './lib/api'
 import { SuperFeedback } from './vendor/superfeedback'
 
@@ -29,7 +30,7 @@ function windowLabel(): string {
 const label = windowLabel()
 
 // The popover/HUD are transparent windows — the body must not paint a background.
-if (label === 'popover' || label === 'hud') {
+if (label === 'popover' || label === 'hud' || label === 'receive') {
   document.documentElement.classList.add('overlay-window', `window-${label}`)
 }
 
@@ -38,7 +39,8 @@ if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
   document.documentElement.classList.add('dark')
 }
 
-const Root = label === 'popover' ? Popover : label === 'hud' ? Hud : App
+const Root =
+  label === 'popover' ? Popover : label === 'hud' ? Hud : label === 'receive' ? ReceiveCard : App
 createRoot(document.getElementById('root')!).render(<Root />)
 
 // SuperFeedback — a floating "Send feedback" button (main window only, not the

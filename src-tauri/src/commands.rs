@@ -45,6 +45,7 @@ pub fn update_settings(
     // Apply the internet upload cap live (0 = unlimited) — takes effect on the
     // next chunk, no restart needed.
     crate::iroh_net::set_upload_limit_mbps(settings.upload_limit_mbps);
+    crate::iroh_net::set_require_direct(settings.require_direct);
     {
         let mut guard = state.settings.lock().unwrap();
         *guard = settings.clone();
@@ -103,6 +104,69 @@ pub async fn pick_directory(app: AppHandle) -> Option<String> {
         Ok(Some(p)) => p.into_path().ok().map(|pb| pb.to_string_lossy().to_string()),
         _ => None,
     }
+}
+
+/// Let the user pick an image and set it as their profile picture. The chosen
+/// file is COPIED into the app config dir under a fresh name (so the webview's
+/// asset cache always loads the new image) and any previous avatar is removed.
+/// Returns the updated settings. Cancelling leaves settings unchanged.
+#[tauri::command]
+pub async fn set_profile_avatar(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Settings, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "heic", "bmp"])
+        .pick_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let picked = match rx.await {
+        Ok(Some(p)) => p.into_path().map_err(|e| e.to_string())?,
+        _ => return Ok(state.settings.lock().unwrap().clone()),
+    };
+    let ext = picked
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_lowercase();
+    let config_dir = state.config_dir.clone();
+    let _ = std::fs::create_dir_all(&config_dir);
+    // Drop any earlier avatar files so they don't accumulate in the config dir.
+    if let Ok(rd) = std::fs::read_dir(&config_dir) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with("avatar-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let dest = config_dir.join(format!("avatar-{}.{ext}", crate::chat::now_ms()));
+    std::fs::copy(&picked, &dest).map_err(|e| e.to_string())?;
+    let updated = {
+        let mut g = state.settings.lock().unwrap();
+        g.avatar = dest.to_string_lossy().to_string();
+        g.clone()
+    };
+    settings::save(&config_dir, &updated)?;
+    Ok(updated)
+}
+
+/// Remove the profile picture, falling back to the initials avatar.
+#[tauri::command]
+pub fn clear_profile_avatar(state: State<'_, Arc<AppState>>) -> Result<Settings, String> {
+    let config_dir = state.config_dir.clone();
+    let updated = {
+        let mut g = state.settings.lock().unwrap();
+        if !g.avatar.is_empty() {
+            let _ = std::fs::remove_file(&g.avatar);
+        }
+        g.avatar = String::new();
+        g.clone()
+    };
+    settings::save(&config_dir, &updated)?;
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -463,10 +527,17 @@ pub fn set_friend_auto_accept(
 }
 
 /// Answer a pending manual-accept offer (the user tapped Accept or Decline).
+/// `dest` is an optional save folder from the receive card's "Save to" picker —
+/// empty / None means the default download folder.
 #[tauri::command]
-pub fn respond_to_offer(state: State<'_, Arc<AppState>>, id: String, accept: bool) {
+pub fn respond_to_offer(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    accept: bool,
+    dest: Option<String>,
+) {
     if let Some(tx) = state.offers.lock().unwrap().remove(&id) {
-        let _ = tx.send(accept);
+        let _ = tx.send(if accept { Some(dest.unwrap_or_default()) } else { None });
     }
 }
 

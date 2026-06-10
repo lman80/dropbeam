@@ -117,7 +117,9 @@ pub struct AppState {
     pub transfers: Mutex<HashMap<String, Arc<Notify>>>,
     /// Pending manual-accept offers: a friend transfer awaiting the user's
     /// accept/decline, keyed by transfer id. `respond_to_offer` resolves these.
-    pub offers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// `None` = declined; `Some(dir)` = accepted (empty string = default download
+    /// folder, otherwise save into `dir` — the receive card's "Save to" picker).
+    pub offers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>>,
     /// Set when the user really wants to quit (vs. close-to-tray).
     pub force_quit: AtomicBool,
 }
@@ -207,11 +209,15 @@ pub fn run() {
             let loaded = settings::load(&config_dir, &default_download, &default_name);
             // Honor the saved internet upload cap from first launch.
             iroh_net::set_upload_limit_mbps(loaded.upload_limit_mbps);
-            // One-time cleanup: collapse any legacy duplicate friend records left by
-            // the old name-keyed pairing path (identity is endpoint-id-keyed now).
-            let removed = friends::dedupe_friends(&config_dir);
+            iroh_net::set_require_direct(loaded.require_direct);
+            // Collapse any duplicate friend records (the same person added via more
+            // than one path — folder pairing, permanent code, classic invite) into
+            // one canonical entry, migrating chat history onto the survivor. Runs
+            // every launch so a friendship can never duplicate or get lost across
+            // updates.
+            let removed = friends::reconcile(&config_dir);
             if removed > 0 {
-                log::info!("startup: removed {removed} duplicate friend record(s)");
+                log::info!("startup: reconciled {removed} duplicate friend record(s)");
             }
 
             app.manage(Arc::new(AppState {
@@ -305,6 +311,8 @@ pub fn run() {
             commands::clear_history,
             commands::pick_files,
             commands::pick_directory,
+            commands::set_profile_avatar,
+            commands::clear_profile_avatar,
             commands::reveal_path,
             commands::open_path,
             commands::open_url,

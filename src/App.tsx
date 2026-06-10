@@ -3,6 +3,7 @@ import { motion } from 'framer-motion'
 import { AlertTriangle, X } from 'lucide-react'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { onFileDrop } from './lib/api'
+import { setTaskbarProgress } from './lib/taskbar'
 import { useStore } from './store'
 import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
@@ -22,10 +23,30 @@ export default function App() {
   const init = useStore((s) => s.init)
   const setPendingSend = useStore((s) => s.setPendingSend)
   const setDragHovering = useStore((s) => s.setDragHovering)
+  const transfers = useStore((s) => s.transfers)
+  const order = useStore((s) => s.order)
+  const folderStatuses = useStore((s) => s.folderStatuses)
 
   useEffect(() => {
     init()
   }, [init])
+
+  // Drive the Windows/Linux taskbar progress from the most relevant active
+  // transfer (macOS shows this on the Downloads stack instead — no-op there).
+  useEffect(() => {
+    const active = order
+      .map((id) => transfers[id])
+      .filter(Boolean)
+      .filter((t) => t.state === 'transferring')
+    let pct: number | null = active.length ? active[active.length - 1].percent : null
+    if (pct == null) {
+      const f = Object.values(folderStatuses).find(
+        (s) => s.state === 'sending' || s.state === 'receiving',
+      )
+      if (f) pct = f.percent
+    }
+    setTaskbarProgress(pct)
+  }, [transfers, order, folderStatuses])
 
   useEffect(() => {
     let un: UnlistenFn | undefined

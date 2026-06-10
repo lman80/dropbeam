@@ -227,24 +227,10 @@ fn send_drop_to_friend(app: &AppHandle, friend_id: &str, paths: Vec<String>) {
     };
     log::info!("[traydrag] sending {} file(s) to friend '{}'", paths.len(), friend.name);
 
-    // Immediate, reliable feedback — fired from Rust, so it shows even though the
-    // menu webview was inactive during the drag. (Research: native apps like Blip
-    // activate + show a "Sending to X" affordance on drop rather than relying on
-    // the inactive web UI.)
-    {
-        let fname = paths
-            .first()
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".into());
-        let body = if paths.len() > 1 {
-            format!("Sending {} files to {}", paths.len(), friend.name)
-        } else {
-            format!("Sending {fname} to {}", friend.name)
-        };
-        use tauri_plugin_notification::NotificationExt;
-        let _ = app.notification().builder().title("DropBeam").body(body).show();
-    }
+    // Feedback is the Blip-style transfer card (the `receive` overlay window picks
+    // up this outgoing transfer and shows "Sending to X" → "Sent ✓"), which only
+    // appears while the main window is in the background — exactly the drag case.
+    // No native notification: the card replaces it.
 
     // iroh-only: dial the friend's endpoint directly.
     if let Some(eid) = friend.endpoint_id.clone() {

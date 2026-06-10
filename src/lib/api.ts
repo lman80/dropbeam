@@ -73,6 +73,12 @@ export interface Settings {
   uploadLimitMbps: number
   /** Show speeds in megabits/sec (Mbps) instead of megabytes/sec (MB/s). */
   showMegabits: boolean
+  /** Only send over a direct path (local/p2p) — fail rather than use the relay. */
+  requireDirect: boolean
+  /** Absolute path to the user's profile picture (in the config dir). '' = none. */
+  avatar: string
+  /** Pop a native notification when a chat arrives & the app isn't focused. */
+  notifyOnMessage: boolean
 }
 
 export type PairRole = 'a' | 'b'
@@ -169,6 +175,9 @@ export interface FolderStatus {
   /** File names still waiting to send (active one excluded) — drives the per-file
    *  drop list instead of one-at-a-time popups. */
   queuedFiles?: string[]
+  /** How many files the peer has (from its last reconcile) — for the "both have N
+   *  files, in sync" indicator. */
+  peerFiles?: number
 }
 
 export interface PairUpdate {
@@ -198,6 +207,9 @@ const realApi = {
   clearHistory: () => invoke<void>('clear_history'),
   pickFiles: () => invoke<string[]>('pick_files'),
   pickDirectory: () => invoke<string | null>('pick_directory'),
+  /** Pick an image and set it as the profile picture. Returns updated settings. */
+  setProfileAvatar: () => invoke<Settings>('set_profile_avatar'),
+  clearProfileAvatar: () => invoke<Settings>('clear_profile_avatar'),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
   openUrl: (url: string) => invoke<void>('open_url', { url }),
@@ -242,8 +254,8 @@ const realApi = {
   pingFriend: (id: string) => invoke<boolean>('ping_friend', { id }),
   setFriendAutoAccept: (id: string, autoAccept: boolean) =>
     invoke<void>('set_friend_auto_accept', { id, autoAccept }),
-  respondToOffer: (id: string, accept: boolean) =>
-    invoke<void>('respond_to_offer', { id, accept }),
+  respondToOffer: (id: string, accept: boolean, dest?: string) =>
+    invoke<void>('respond_to_offer', { id, accept, dest: dest ?? null }),
   friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
   sendToFriend: (id: string, paths: string[]) =>
     invoke<TransferUpdate>('send_to_friend', { id, paths }),

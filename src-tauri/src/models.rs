@@ -155,6 +155,20 @@ pub struct Settings {
     /// (MB/s). Off by default (MB/s, what most file tools show).
     #[serde(default)]
     pub show_megabits: bool,
+    /// Only send over a DIRECT path (local network or hole-punched peer-to-peer).
+    /// If no direct path forms, the send fails instead of falling back to the slow
+    /// relay. Off by default. Applies to Quick Send + friend sends, not the
+    /// background folder sync (which always uses the best available path).
+    #[serde(default)]
+    pub require_direct: bool,
+    /// Absolute path to the user's chosen profile picture (copied into the app
+    /// config dir). Empty = no picture (we render initials instead). Local-only.
+    #[serde(default)]
+    pub avatar: String,
+    /// Pop a native OS notification when a chat message arrives while the app
+    /// isn't focused (like any messaging app). On by default.
+    #[serde(default = "default_true")]
+    pub notify_on_message: bool,
 }
 
 impl Default for Settings {
@@ -173,6 +187,9 @@ impl Default for Settings {
             direct_mode: true,
             upload_limit_mbps: 0,
             show_megabits: false,
+            require_direct: false,
+            avatar: String::new(),
+            notify_on_message: true,
         }
     }
 }
@@ -320,5 +337,9 @@ pub struct FolderStatus {
     /// file at a time. Capped to keep the event payload small.
     #[serde(default)]
     pub queued_files: Vec<String>,
+    /// How many files the peer reported in its last reconcile — lets the UI show
+    /// "both have N files, in sync" so the user can confirm the folders match.
+    #[serde(default)]
+    pub peer_files: u32,
 }
 
