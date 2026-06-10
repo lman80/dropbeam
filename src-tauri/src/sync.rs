@@ -676,6 +676,25 @@ impl SyncManager {
                             Some(format!("Waiting for {} to come online", peer_label(&pair))),
                         );
                         manager.emit_status(&pair_id);
+                        // Don't let ONE file that keeps failing (e.g. a stalled send
+                        // to a peer whose path just died) block every other file
+                        // forever: after a few tries, rotate it to the BACK so the
+                        // rest of the queue gets a turn. The file is never dropped —
+                        // it comes back around and keeps retrying with backoff.
+                        if offline_attempts >= 3 {
+                            let mut q = queue.lock().unwrap();
+                            if q.len() > 1 {
+                                if let Some(pos) = q.iter().position(|x| x == &file) {
+                                    if let Some(f) = q.remove(pos) {
+                                        q.push_back(f);
+                                    }
+                                }
+                                drop(q);
+                                current = String::new();
+                                offline_attempts = 0;
+                                continue;
+                            }
+                        }
                         // Keep the file queued; just back off until the peer returns.
                         if wait_backoff(&stop_notify, &stopped, offline_attempts).await {
                             break;
@@ -1288,12 +1307,17 @@ impl SyncManager {
         let eid = pair.endpoint_id.clone()?;
         let ep = self.iroh_endpoint()?;
         let paths = vec![PathBuf::from(file)];
+        // Tracks the last time bytes actually moved, so a STALL watchdog can abandon
+        // a frozen transfer instead of letting it wedge the whole folder queue.
+        let last_progress = Arc::new(AtomicU64::new(now_ms()));
         let cb = {
             let mgr = self.clone();
             let status = status.clone();
             let pair_id = pair.id.clone();
             let last = Arc::new(AtomicU64::new(0));
+            let lp = last_progress.clone();
             move |done: u64, total: u64| {
+                lp.store(now_ms(), Ordering::Relaxed);
                 // Throttle to ~1% steps so we don't flood the UI per chunk.
                 let permille = if total > 0 { done * 1000 / total } else { 0 };
                 if done < total && permille <= last.load(Ordering::Relaxed) {
@@ -1311,7 +1335,15 @@ impl SyncManager {
                 mgr.emit_status(&pair_id);
             }
         };
-        match crate::iroh_net::send_folder_file(
+        // Race the send against a no-progress watchdog. A flaky/dead path (e.g. an
+        // international link that drops, leaving the QUIC connection alive via
+        // keep-alives but the stream flow-control-stuck) would otherwise hang
+        // `send_folder_file` FOREVER — freezing this folder's single-file queue and
+        // blocking every other file behind it. If no byte moves for STALL_SECS we
+        // bail; dropping the future closes the wedged connection, and the sender
+        // loop retries (or rotates the file) so the queue keeps flowing.
+        const STALL_SECS: u64 = 45;
+        let send_fut = crate::iroh_net::send_folder_file(
             &ep,
             &eid,
             &pair.id,
@@ -1319,9 +1351,33 @@ impl SyncManager {
             &paths,
             &**stopped,
             cb,
-        )
-        .await
-        {
+        );
+        let watchdog = {
+            let lp = last_progress.clone();
+            let stopped = stopped.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if now_ms().saturating_sub(lp.load(Ordering::Relaxed)) > STALL_SECS * 1000 {
+                        return;
+                    }
+                }
+            }
+        };
+        let outcome = tokio::select! {
+            r = send_fut => r,
+            _ = watchdog => {
+                log::warn!(
+                    "folder send '{}' stalled ({}s no progress) — abandoning so the queue keeps moving",
+                    file_name_of(file), STALL_SECS
+                );
+                Err(anyhow::anyhow!("folder send stalled"))
+            }
+        };
+        match outcome {
             Ok(loc) => {
                 if let Ok(mut s) = status.lock() {
                     if !matches!(loc, Locality::Unknown) {
