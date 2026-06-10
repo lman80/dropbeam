@@ -72,6 +72,8 @@ pub fn create(
         created_at: now_ms(),
         auto_accept: true,
         endpoint_id: None, // learned when they accept + say hello
+        avatar: None,
+        name_custom: false,
     };
     let invite = Invite {
         v: 1,
@@ -114,6 +116,8 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         created_at: now_ms(),
         auto_accept: true,
         endpoint_id: invite.endpoint_id, // the inviter's id, for direct sends
+        avatar: None,
+        name_custom: false,
     };
     friends.push(friend.clone());
     save(config_dir, &friends)?;
@@ -154,6 +158,8 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         created_at: now_ms(),
         auto_accept: true,
         endpoint_id: None,
+        avatar: None,
+        name_custom: false,
     });
     let _ = save(config_dir, &friends);
 }
@@ -219,8 +225,12 @@ pub fn plan_reconcile(
             survivor.name = loser.name.clone();
         }
         survivor.auto_accept = survivor.auto_accept || loser.auto_accept;
+        survivor.name_custom = survivor.name_custom || loser.name_custom;
         if survivor.endpoint_id.is_none() {
             survivor.endpoint_id = loser.endpoint_id.clone();
+        }
+        if survivor.avatar.is_none() {
+            survivor.avatar = loser.avatar.clone();
         }
         if survivor.id != loser.id {
             merges.push((loser.id.clone(), survivor.id.clone()));
@@ -348,9 +358,8 @@ pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> F
         .iter_mut()
         .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
     {
-        // Refresh the name only if ours is still a placeholder — never clobber a
-        // name the user deliberately set.
-        if !name.is_empty() && is_placeholder(&f.name) {
+        // Adopt the broadcast name unless the user locally renamed this friend.
+        if !name.is_empty() && !f.name_custom && f.name != name {
             f.name = name.to_string();
         }
         let out = f.clone();
@@ -365,6 +374,8 @@ pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> F
         created_at: now_ms(),
         auto_accept: true,
         endpoint_id: Some(endpoint_id.to_string()),
+        avatar: None,
+        name_custom: false,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -395,7 +406,9 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
                     f.endpoint_id = Some(endpoint_id.to_string());
                     changed = true;
                 }
-                if !name.trim().is_empty() && is_placeholder(&f.name) {
+                // Adopt the broadcast name unless the user has locally renamed this
+                // friend — so a friend changing their own name propagates to you.
+                if !name.trim().is_empty() && !f.name_custom && f.name != name.trim() {
                     f.name = name.trim().to_string();
                     changed = true;
                 }
@@ -414,12 +427,32 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
     let _ = upsert_by_endpoint(config_dir, endpoint_id, name);
 }
 
+/// Store the friend-at-`endpoint_id`'s profile picture path (received over the
+/// wire and already saved to disk by the caller). Returns true if a record changed.
+pub fn set_avatar_by_endpoint(config_dir: &Path, endpoint_id: &str, path: String) -> bool {
+    let _guard = LOCK.lock().unwrap();
+    let mut friends = load(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        if f.avatar.as_deref() != Some(path.as_str()) {
+            f.avatar = Some(path.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &friends);
+    }
+    changed
+}
+
 pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
     let mut friends = load(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
         if !name.trim().is_empty() {
             f.name = name.trim().to_string();
+            // Mark as user-chosen so an incoming profile broadcast won't override it.
+            f.name_custom = true;
         }
     }
     save(config_dir, &friends)
@@ -514,6 +547,8 @@ mod tests {
             created_at: 0,
             auto_accept: true,
             endpoint_id: None,
+            avatar: None,
+            name_custom: false,
         }
     }
 
@@ -536,6 +571,8 @@ mod tests {
             created_at: created,
             auto_accept: false,
             endpoint_id: eid.map(String::from),
+            avatar: None,
+            name_custom: false,
         }
     }
 

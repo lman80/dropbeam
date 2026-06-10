@@ -52,7 +52,16 @@ export default function App() {
     let un: UnlistenFn | undefined
     let active = true
     onFileDrop(
-      (paths) => setPendingSend(paths),
+      (paths) => {
+        // On the Chat page with a conversation open, a dropped file/folder is sent
+        // INTO that chat (as a file message), not routed to the global send chooser.
+        const st = useStore.getState()
+        if (st.view === 'chat' && st.activeChatId) {
+          void st.shareFilesInChat(st.activeChatId, paths)
+        } else {
+          setPendingSend(paths)
+        }
+      },
       (h) => setDragHovering(h),
     ).then((f) => {
       if (active) un = f

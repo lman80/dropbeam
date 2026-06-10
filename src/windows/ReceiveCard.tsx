@@ -1,10 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  currentMonitor,
-  getAllWindows,
-  getCurrentWindow,
-  LogicalPosition,
-} from '@tauri-apps/api/window'
+import { currentMonitor, getCurrentWindow, LogicalPosition } from '@tauri-apps/api/window'
 import { desktopDir, documentDir, downloadDir, homeDir } from '@tauri-apps/api/path'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
@@ -124,30 +119,10 @@ export function ReceiveCard() {
     return () => clearTimeout(h)
   }, [justSent])
 
-  // Is the main app window front-and-center? If so we suppress the SEND card —
-  // the user is already looking at the app. (Incoming always shows.)
+  // The card pops for every send and receive (the user wants it every time, even
+  // with the main window open). The one place it would be redundant — dropping a
+  // file directly on the main Send page — is handled there, not here.
   const sendCandidate = outgoing ?? justSent
-  // Assume focused until proven otherwise, so the send card never flashes when
-  // you're sending from inside the app — it only appears once we confirm the
-  // main window is in the background (the menu-bar drag case).
-  const [mainFocused, setMainFocused] = useState(true)
-  useEffect(() => {
-    if (!sendCandidate || !HAS_TAURI) return
-    let alive = true
-    void (async () => {
-      try {
-        const wins = await getAllWindows()
-        const main = wins.find((w) => w.label === 'main')
-        const f = main ? await main.isFocused() : false
-        if (alive) setMainFocused(f)
-      } catch {
-        if (alive) setMainFocused(false)
-      }
-    })()
-    return () => {
-      alive = false
-    }
-  }, [sendCandidate?.id, sendCandidate?.state])
 
   usePositionBottomRight()
 
@@ -175,7 +150,7 @@ export function ReceiveCard() {
 
   // Decide which card (if any) to show. Incoming wins; otherwise the send card,
   // gated on the app not being focused.
-  const showSend = !incoming && !!sendCandidate && !(HAS_TAURI && mainFocused)
+  const showSend = !incoming && !!sendCandidate
   const visible = !!incoming || showSend
   useEffect(() => {
     if (!HAS_TAURI) return

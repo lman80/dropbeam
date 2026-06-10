@@ -378,7 +378,7 @@ function FriendCard({ friend }: { friend: Friend }) {
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <div style={{ position: 'relative', flexShrink: 0 }}>
-          <Avatar name={friend.name} seed={friend.id} size={44} radius={14} />
+          <Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={44} radius={14} />
           <span
             title={presenceLabel(presence)}
             style={{

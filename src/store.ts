@@ -54,7 +54,7 @@ async function guarded<T>(p: Promise<T>, fallback: T, label: string, ms = 9000):
     return fallback
   }
 }
-import { playIncoming, playOffer, playReceived, playSent } from './lib/sounds'
+import { playError, playIncoming, playOffer, playReceived, playSent } from './lib/sounds'
 
 /** Leading-edge throttle (per pair+direction) so a burst of synced files cues once. */
 const folderSoundThrottle = new Map<string, number>()
@@ -451,10 +451,14 @@ export const useStore = create<AppStore>((set, get) => ({
       if (u.state === 'completed') {
         if (u.direction === 'send') playSent()
         else playReceived()
+      } else if (u.state === 'failed' || u.state === 'canceled') {
+        // A transfer errored out or was canceled — a soft descending "uh-oh".
+        playError()
       } else if (u.state === 'waitingForAccept') {
         playOffer()
-      } else if (u.direction === 'receive' && !prev && u.state !== 'failed' && u.state !== 'canceled') {
+      } else if (u.direction === 'receive' && !prev) {
         // First time we see an incoming transfer (auto-accept) — a soft cue.
+        // (failed/canceled are handled above, so this is a live arrival.)
         playIncoming()
       }
     }

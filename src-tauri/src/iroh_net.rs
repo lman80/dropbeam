@@ -992,10 +992,28 @@ async fn serve_stream(
             // authoritative for their key (don't trust the self-reported one).
             let friend_id = req.get("friend_id").and_then(|v| v.as_str()).unwrap_or("");
             let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let avatar_b64 = req.get("avatar").and_then(|v| v.as_str());
             let who = conn.remote_id().to_string();
             if let Some(app) = state.app.get() {
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
                     crate::friends::apply_hello(&st.config_dir, friend_id, &who, name);
+                    // Cache their profile picture (if they sent one) and point the
+                    // friend record at it.
+                    if let Some(b64) = avatar_b64 {
+                        use base64::Engine;
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                            if !bytes.is_empty() && bytes.len() <= 2_000_000 {
+                                let path = st.config_dir.join(format!("friend-avatar-{who}.jpg"));
+                                if std::fs::write(&path, &bytes).is_ok() {
+                                    crate::friends::set_avatar_by_endpoint(
+                                        &st.config_dir,
+                                        &who,
+                                        path.to_string_lossy().to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let _ = app.emit("pairs://changed", ());
                     let _ = app.emit("friends://changed", ());
                 }
@@ -1863,6 +1881,62 @@ pub fn send_to_friend(
 /// After accepting a friend invite, dial the inviter (whose EndpointId is in the
 /// invite) and tell them our id for the shared friend record — so the reverse
 /// direction (them → us) also works. Best-effort, fire-and-forget.
+/// Cache the encoded avatar thumbnail by (path, mtime) so a profile broadcast to
+/// N friends decodes the image at most once.
+static AVATAR_THUMB_CACHE: std::sync::Mutex<Option<(String, u64, Option<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// Encode the user's profile picture as a small base64 JPEG (≤256px) for the
+/// friend-hello broadcast — tiny enough to ride inside the header frame. None when
+/// there's no avatar or it can't be read/decoded.
+fn my_avatar_thumb_b64(app: &AppHandle) -> Option<String> {
+    let path = app
+        .try_state::<Arc<crate::AppState>>()
+        .map(|st| st.settings.lock().unwrap().avatar.clone())?;
+    if path.trim().is_empty() {
+        return None;
+    }
+    let mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some((p, mt, b64)) = AVATAR_THUMB_CACHE.lock().unwrap().as_ref() {
+        if p == &path && *mt == mtime {
+            return b64.clone();
+        }
+    }
+    let b64 = encode_avatar_thumb(&path);
+    *AVATAR_THUMB_CACHE.lock().unwrap() = Some((path, mtime, b64.clone()));
+    b64
+}
+
+fn encode_avatar_thumb(path: &str) -> Option<String> {
+    let img = image::open(path).ok()?;
+    // JPEG has no alpha — flatten to RGB. `thumbnail` keeps the aspect ratio.
+    let small = image::DynamicImage::ImageRgb8(img.thumbnail(256, 256).to_rgb8());
+    let mut buf = std::io::Cursor::new(Vec::new());
+    small.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+    use base64::Engine;
+    Some(base64::engine::general_purpose::STANDARD.encode(buf.get_ref()))
+}
+
+/// Push our current profile (display name + picture) to every friend we can reach,
+/// via a friend-hello. Called on startup and whenever the user changes their name
+/// or picture, so friends see the update.
+pub fn broadcast_profile(app: AppHandle, state: Arc<IrohState>) {
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else {
+        return;
+    };
+    let my_name = st.settings.lock().unwrap().display_name.clone();
+    for f in crate::friends::load(&st.config_dir) {
+        if let Some(eid) = f.endpoint_id {
+            say_hello_to_endpoint(state.clone(), eid, my_name.clone());
+        }
+    }
+}
+
 pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: String, my_name: String) {
     let Some(ep) = state.get().cloned() else {
         return;
@@ -1872,9 +1946,11 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
     };
     let my_id = ep.id().to_string();
     let addr = dial_addr(parsed);
+    let avatar = state.app.get().and_then(my_avatar_thumb_b64);
     tauri::async_runtime::spawn(async move {
         let hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": friend_id, "endpoint_id": my_id, "name": my_name,
+            "avatar": avatar,
         });
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
@@ -1901,9 +1977,11 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
     };
     let my_id = ep.id().to_string();
     let addr = dial_addr(parsed);
+    let avatar = state.app.get().and_then(my_avatar_thumb_b64);
     tauri::async_runtime::spawn(async move {
         let hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": "", "endpoint_id": my_id, "name": my_name,
+            "avatar": avatar,
         });
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
@@ -2039,13 +2117,9 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
     if !st.settings.lock().unwrap().notify_on_message {
         return;
     }
-    let focused = app
-        .get_webview_window("main")
-        .and_then(|w| w.is_focused().ok())
-        .unwrap_or(false);
-    if focused {
-        return;
-    }
+    // Always notify on an inbound message — minimized, on another Space, or quit to
+    // the tray. (A chat app you can't get pinged from isn't a chat app.) The user
+    // can turn this off in Settings.
     let who = {
         let s = sender.trim();
         if s.is_empty() { "New message" } else { s }

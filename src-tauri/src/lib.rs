@@ -235,6 +235,17 @@ pub fn run() {
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
             // Keep retrying undelivered chat messages until they land (reliable chat).
             iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
+            // Once iroh has had a moment to bind, re-introduce ourselves to every
+            // friend so any profile (name/picture) change made while we were offline
+            // propagates to friends who are online now.
+            {
+                let app2 = app.handle().clone();
+                let iroh2 = iroh_state.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    iroh_net::broadcast_profile(app2, iroh2);
+                });
+            }
             app.manage(iroh_state);
             log::info!("setup: iroh spawned + state managed");
 

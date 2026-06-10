@@ -46,11 +46,17 @@ pub fn update_settings(
     // next chunk, no restart needed.
     crate::iroh_net::set_upload_limit_mbps(settings.upload_limit_mbps);
     crate::iroh_net::set_require_direct(settings.require_direct);
-    {
+    let name_changed = {
         let mut guard = state.settings.lock().unwrap();
+        let changed = guard.display_name != settings.display_name;
         *guard = settings.clone();
-    }
+        changed
+    };
     settings::save(&state.config_dir, &settings)?;
+    // If the user renamed themselves, push the new name out to all friends.
+    if name_changed {
+        crate::iroh_net::broadcast_profile(app.clone(), iroh.inner().clone());
+    }
     // iroh always runs (it's the only transport); start it if it somehow isn't
     // up yet. The `app` OnceCell guards against double-starting.
     if iroh.app.get().is_none() {
@@ -150,12 +156,16 @@ pub async fn set_profile_avatar(
         g.clone()
     };
     settings::save(&config_dir, &updated)?;
+    broadcast_profile(&app);
     Ok(updated)
 }
 
 /// Remove the profile picture, falling back to the initials avatar.
 #[tauri::command]
-pub fn clear_profile_avatar(state: State<'_, Arc<AppState>>) -> Result<Settings, String> {
+pub fn clear_profile_avatar(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Settings, String> {
     let config_dir = state.config_dir.clone();
     let updated = {
         let mut g = state.settings.lock().unwrap();
@@ -166,7 +176,16 @@ pub fn clear_profile_avatar(state: State<'_, Arc<AppState>>) -> Result<Settings,
         g.clone()
     };
     settings::save(&config_dir, &updated)?;
+    broadcast_profile(&app);
     Ok(updated)
+}
+
+/// Push the user's current profile (name + picture) to all friends, if iroh is up.
+fn broadcast_profile(app: &AppHandle) {
+    use tauri::Manager;
+    if let Some(iroh) = app.try_state::<Arc<crate::iroh_net::IrohState>>() {
+        crate::iroh_net::broadcast_profile(app.clone(), iroh.inner().clone());
+    }
 }
 
 #[tauri::command]

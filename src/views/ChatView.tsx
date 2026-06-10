@@ -40,6 +40,21 @@ function fileKind(name: string | undefined): Kind {
   return 'file'
 }
 
+/** A friend's avatar inner content: their received picture, or initials. */
+function avatarContent(friend: Friend) {
+  if (friend.avatar && HAS_TAURI) {
+    return (
+      <img
+        className="avatar-img"
+        src={convertFileSrc(friend.avatar)}
+        alt=""
+        onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
+      />
+    )
+  }
+  return initials(friend.name)
+}
+
 /** A short wall-clock label, e.g. "3:42 PM". */
 function clock(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
@@ -137,7 +152,7 @@ export function ChatView() {
                 onClick={() => void openChat(friend.id)}
               >
                 <span className="chat-avatar" style={{ background: avatarGradient(friend.id) }}>
-                  {initials(friend.name)}
+                  {avatarContent(friend)}
                   {online(friend) && <span className="chat-dot" />}
                 </span>
                 <span style={{ flex: 1, minWidth: 0 }}>
@@ -228,7 +243,7 @@ function Conversation({ friendId }: { friendId: string }) {
         }}
       >
         <span className="chat-avatar" style={{ background: avatarGradient(friend.id) }}>
-          {initials(friend.name)}
+          {avatarContent(friend)}
           {online && <span className="chat-dot" />}
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -332,7 +347,7 @@ function MessageRow({
       {/* incoming sender avatar (only on the last bubble of a run) */}
       {!mine && (
         <span className="chat-line-avatar" style={{ visibility: lastOfRun ? 'visible' : 'hidden', background: avatarGradient(friend.id) }}>
-          {initials(friend.name)}
+          {avatarContent(friend)}
         </span>
       )}
       <div className="chat-line-body">

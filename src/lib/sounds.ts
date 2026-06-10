@@ -67,3 +67,9 @@ export function playOffer() {
   note(523.25, 0, 0.14, 0.12, 'triangle')
   note(659.25, 0.11, 0.2, 0.12, 'triangle')
 }
+
+/** Error / canceled: a soft descending two-note "uh-oh" (G4 → D4), not harsh. */
+export function playError() {
+  note(392.0, 0, 0.18, 0.11, 'triangle')
+  note(293.66, 0.12, 0.34, 0.12, 'triangle')
+}

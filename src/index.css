@@ -686,6 +686,14 @@ html.overlay-window #root {
   font-size: 12px;
   flex-shrink: 0;
 }
+.avatar-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
 .chat-dot {
   position: absolute;
   right: -2px;

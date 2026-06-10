@@ -121,6 +121,10 @@ export interface Friend {
   autoAccept: boolean
   /** The friend's iroh device id, learned at pairing — enables direct sends. */
   endpointId: string | null
+  /** Local path to the friend's profile picture (received over the wire). */
+  avatar: string | null
+  /** True once you've renamed this friend locally (their broadcasts won't override). */
+  nameCustom?: boolean
 }
 
 /** One message in a chat with a friend (experimental). */

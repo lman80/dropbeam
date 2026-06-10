@@ -286,6 +286,14 @@ pub struct Friend {
     /// iroh (dial-by-key) instead of croc. None for friends paired before this.
     #[serde(default)]
     pub endpoint_id: Option<String>,
+    /// Local path to the friend's profile picture (received over the wire and
+    /// cached in the config dir). None = render their initials.
+    #[serde(default)]
+    pub avatar: Option<String>,
+    /// True once the user has renamed this friend locally — so an incoming profile
+    /// broadcast never overwrites a name the user deliberately chose.
+    #[serde(default)]
+    pub name_custom: bool,
 }
 
 fn default_true() -> bool {
