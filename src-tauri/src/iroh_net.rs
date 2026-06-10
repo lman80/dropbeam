@@ -36,6 +36,7 @@ pub const ALPN: &[u8] = b"dropbeam/1";
 const FRIEND_SEND_RETRY_SECS: u64 = 90;
 
 /// A Quick Send staged on this node, waiting for a receiver to pull it.
+#[derive(Clone)]
 struct PendingSend {
     transfer_id: String,
     paths: Vec<PathBuf>,
@@ -608,7 +609,10 @@ async fn serve_stream(
         }
         Some("pull") => {
             let token = req.get("token").and_then(|t| t.as_str()).unwrap_or("");
-            let pending = state.pending.lock().unwrap().remove(token);
+            // Keep the staged send (clone, don't remove) so the receiver can re-pull
+            // to RESUME after a dropped connection — a huge Quick Send must survive a
+            // path blip. We remove the token only once delivery is confirmed.
+            let pending = state.pending.lock().unwrap().get(token).cloned();
             let p = pending.ok_or_else(|| anyhow::anyhow!("no pending send for token"))?;
             // Register the flag + connection so the sender can cancel mid-pull
             // (close the conn to unblock a stalled write).
@@ -636,9 +640,9 @@ async fn serve_stream(
                     // small file finishes over the rate-limited relay before hole-
                     // punching completes (the 0.3 KB/s bug). Falls through to relay
                     // if a direct path never forms (symmetric NAT).
-                    let got_direct = wait_for_direct_path(conn, Duration::from_secs(8)).await;
+                    let got_direct = wait_for_direct_path(conn, Duration::from_secs(12)).await;
                     if !got_direct {
-                        log::warn!("quick-send: no direct path after 8s — relay (slow)");
+                        log::warn!("quick-send: no direct path after 12s — relay (slow)");
                     }
                     let __t0 = std::time::Instant::now();
                     let __total = p.total;
@@ -670,6 +674,9 @@ async fn serve_stream(
                                 _ = recv.read_to_end(16) => {}
                                 _ = conn.closed() => {}
                             }
+                            // Delivery confirmed — retire the one-time token now (no
+                            // more resumes needed).
+                            state.pending.lock().unwrap().remove(token);
                             log_transfer_perf(conn, "quick-send", "send", __total, __t0.elapsed());
                             emit_completed(
                                 &app,
@@ -1566,61 +1573,101 @@ pub fn start_receive(
         // ticks read the live Direct/Relay path for the badge.
         let outcome: Result<(Vec<PathBuf>, crate::models::Locality)> = async {
             let (addr, token) = parse_ticket(&ticket)?;
-            let conn = ep.connect(addr, ALPN).await.context("dial ticket")?;
-            let (mut send, mut recv) = conn.open_bi().await?;
-            // `parallel: true` tells the sender we understand multi-stream +
-            // resume; an older sender just ignores it.
-            write_frame(
-                &mut send,
-                &serde_json::json!({ "kind": "pull", "token": token, "parallel": true }),
-            )
-            .await?;
-            let cb = progress_cb(
-                app.clone(),
-                id.clone(),
-                Direction::Receive,
-                Vec::new(),
-                None,
-                conn.clone(),
-            );
-            let __t0 = std::time::Instant::now();
-            let header = read_frame(&mut recv).await?;
-            // Native macOS Dock download-progress: for a single incoming file,
-            // publish an NSProgress on its destination so it shows a live progress
-            // ring in the Downloads stack, like a browser download. Wrap the UI
-            // progress callback to also drive it. (No-op on a multi-file pull / off
-            // macOS.)
-            let items = header.get("items").and_then(|i| i.as_array());
-            let dl = match items {
-                Some(arr) if arr.len() == 1 => {
-                    let name = arr[0].get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let total = header.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
-                    let final_path = dest.join(name).to_string_lossy().to_string();
-                    crate::download_progress::DownloadProgress::begin(&final_path, total)
+            // Resume across drops: re-dial + re-pull and pick up from the on-disk
+            // partial. The budget is PROGRESS-based, not a fixed count — a huge Quick
+            // Send that loses its path many times still finishes; we only give up
+            // after several attempts in a row that move zero new bytes.
+            const MAX_STALL: u32 = 8;
+            let progress_high = Arc::new(AtomicU64::new(0));
+            let mut last_high: u64 = 0;
+            let mut stall: u32 = 0;
+            let mut attempt: u32 = 0;
+            loop {
+                if cancel.load(Ordering::SeqCst) {
+                    anyhow::bail!("canceled");
                 }
-                _ => None,
-            };
-            let cb = move |done: u64, total: u64| {
-                if let Some(d) = &dl {
-                    d.set(done);
-                }
-                cb(done, total);
-            };
-            let paths =
-                read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest, &cancel, cb)
+                let one = async {
+                    let conn = ep.connect(addr.clone(), ALPN).await.context("dial ticket")?;
+                    let (mut send, mut recv) = conn.open_bi().await?;
+                    // `parallel: true` tells the sender we understand multi-stream +
+                    // resume; an older sender just ignores it.
+                    write_frame(
+                        &mut send,
+                        &serde_json::json!({ "kind": "pull", "token": token, "parallel": true }),
+                    )
                     .await?;
-            // Confirm receipt so the SENDER can measure REAL delivery time (it now
-            // waits for this before finalizing) — making both sides report identical
-            // bytes + speed instead of the sender's instant-buffer fiction.
-            let _ = send.write_all(b"ok").await;
-            let _ = send.finish();
-            let loc = conn_locality(&conn);
-            let __bytes: u64 = paths
-                .iter()
-                .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-                .sum();
-            log_transfer_perf(&conn, "quick-recv", "recv", __bytes, __t0.elapsed());
-            Ok((paths, loc))
+                    let __t0 = std::time::Instant::now();
+                    let header = read_frame(&mut recv).await?;
+                    // Native macOS Dock download-progress for a single incoming file.
+                    let items = header.get("items").and_then(|i| i.as_array());
+                    let dl = match items {
+                        Some(arr) if arr.len() == 1 => {
+                            let name = arr[0].get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let total = header.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+                            let final_path = dest.join(name).to_string_lossy().to_string();
+                            crate::download_progress::DownloadProgress::begin(&final_path, total)
+                        }
+                        _ => None,
+                    };
+                    let base_cb = progress_cb(
+                        app.clone(),
+                        id.clone(),
+                        Direction::Receive,
+                        Vec::new(),
+                        None,
+                        conn.clone(),
+                    );
+                    let ph = progress_high.clone();
+                    let cb = move |done: u64, total: u64| {
+                        ph.fetch_max(done, Ordering::SeqCst);
+                        if let Some(d) = &dl {
+                            d.set(done);
+                        }
+                        base_cb(done, total);
+                    };
+                    let paths =
+                        read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest, &cancel, cb)
+                            .await?;
+                    // Confirm receipt so the SENDER measures REAL delivery time.
+                    let _ = send.write_all(b"ok").await;
+                    let _ = send.finish();
+                    let loc = conn_locality(&conn);
+                    let bytes: u64 = paths
+                        .iter()
+                        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                        .sum();
+                    log_transfer_perf(&conn, "quick-recv", "recv", bytes, __t0.elapsed());
+                    Ok::<(Vec<PathBuf>, crate::models::Locality), anyhow::Error>((paths, loc))
+                }
+                .await;
+                match one {
+                    Ok(r) => break Ok(r),
+                    Err(e) => {
+                        if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") {
+                            break Err(e);
+                        }
+                        let high = progress_high.load(Ordering::SeqCst);
+                        if high > last_high {
+                            last_high = high;
+                            stall = 0;
+                        } else {
+                            stall += 1;
+                        }
+                        if stall >= MAX_STALL {
+                            break Err(e);
+                        }
+                        attempt += 1;
+                        log::warn!(
+                            "quick-recv interrupted ({e:#}) — resuming, attempt {attempt} (no-progress {stall}/{MAX_STALL})"
+                        );
+                        let mut ru = TransferUpdate::new(id.clone(), Direction::Receive, Vec::new());
+                        ru.state = TransferState::Connecting;
+                        ru.out_dir = Some(out_dir.clone());
+                        emit(&app, &ru);
+                        tokio::time::sleep(Duration::from_secs(1 + attempt.min(8) as u64)).await;
+                    }
+                }
+            }
         }
         .await;
         match outcome {
@@ -1706,6 +1753,15 @@ pub fn send_to_friend(
             // engaged, so the error can't be a manual-accept DECLINE (retrying one
             // of those would re-prompt the recipient), and classic multi-file sends
             // keep fail-fast so a retry can't duplicate files.
+            // Retry budget is PROGRESS-based, not a fixed count: as long as each
+            // resume pushes new bytes we keep going — so a huge file that loses its
+            // path many times (or has to re-holepunch for a direct link) still
+            // finishes. We only give up after several CONSECUTIVE attempts that move
+            // zero new bytes. This is what lets a 6 GB / 1 TB send survive a flaky LAN.
+            const MAX_STALL: u32 = 8;
+            let progress_high = std::sync::Arc::new(AtomicU64::new(0));
+            let mut last_high: u64 = 0;
+            let mut stall: u32 = 0;
             let mut attempt: u32 = 0;
             loop {
                 // Bounded so an offline/unreachable friend FAILS clearly instead of
@@ -1734,7 +1790,7 @@ pub fn send_to_friend(
                         }
                     }
                 };
-                let cb = progress_cb(
+                let base_cb = progress_cb(
                     app.clone(),
                     id.clone(),
                     Direction::Send,
@@ -1742,18 +1798,52 @@ pub fn send_to_friend(
                     Some(friend_name.clone()),
                     conn.clone(),
                 );
+                // Wrap the progress callback to track the high-water mark of confirmed
+                // bytes across ALL attempts — the retry loop uses it to tell "this
+                // resume advanced" from "stuck".
+                let cb = {
+                    let ph = progress_high.clone();
+                    move |done: u64, total: u64| {
+                        ph.fetch_max(done, Ordering::SeqCst);
+                        base_cb(done, total);
+                    }
+                };
                 cleanup.conns.lock().unwrap().insert(id.clone(), conn.clone());
                 // Prefer a direct p2p path before sending — the relay is rate-limited
-                // and would crawl. Proceeds over relay if direct never forms.
-                let got_direct = wait_for_direct_path(&conn, Duration::from_secs(8)).await;
-                if !got_direct {
-                    log::warn!("friend-send: no direct path after 8s — relay (slow)");
-                    // "Only send over direct connections" → refuse the relay.
-                    if require_direct() {
+                // and would crawl. A re-holepunch (after a path blip) can take longer
+                // than a first connect, so allow more time on retries.
+                let direct_window = if attempt == 0 { 8 } else { 14 };
+                let got_direct = wait_for_direct_path(&conn, Duration::from_secs(direct_window)).await;
+                if !got_direct && require_direct() {
+                    // "Only send over direct connections": never crawl on the relay. But
+                    // if we've already moved bytes, this transfer WAS direct and is fully
+                    // resumable — keep re-holepunching instead of killing it, so a
+                    // momentary path blip can't lose a 6 GB / 1 TB send. Only give up on
+                    // a brand-new send that can't reach the peer directly at all, or
+                    // after several fruitless tries in a row.
+                    conn.close(1u32.into(), b"want-direct");
+                    if progress_high.load(Ordering::SeqCst) == 0 && attempt == 0 {
                         return Err(anyhow::anyhow!(
                             "No direct connection to this friend — and you have \"Only send over direct connections\" on, so the slow relay wasn't used. They may be on a restrictive network; try the same Wi-Fi, or turn that setting off in Settings."
                         ));
                     }
+                    stall += 1;
+                    if stall >= MAX_STALL {
+                        return Err(anyhow::anyhow!(
+                            "Lost the direct connection and couldn't get it back. The other device may have changed networks — try again, or turn off \"Only send over direct connections\" in Settings."
+                        ));
+                    }
+                    attempt += 1;
+                    log::warn!(
+                        "friend-send: no direct path — re-holepunching (attempt {attempt}, no-progress {stall}/{MAX_STALL})"
+                    );
+                    let mut ru = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                    ru.friend_name = Some(friend_name.clone());
+                    ru.state = TransferState::Connecting;
+                    ru.bytes_total = total;
+                    emit(&app, &ru);
+                    tokio::time::sleep(Duration::from_secs(2 + attempt.min(6) as u64)).await;
+                    continue;
                 }
                 // Fresh per attempt: only THIS attempt's handshake authorizes a
                 // retry AND the degradation watchdog. Shared (Arc) so the watchdog
@@ -1819,6 +1909,15 @@ pub fn send_to_friend(
                         let canceled = cancel.load(Ordering::SeqCst)
                             || e.to_string().contains("canceled")
                             || e.to_string().contains("declined");
+                        // Did this attempt push any NEW bytes? If so, reset the stall
+                        // counter — a transfer that keeps advancing never gives up.
+                        let high = progress_high.load(Ordering::SeqCst);
+                        if high > last_high {
+                            last_high = high;
+                            stall = 0;
+                        } else {
+                            stall += 1;
+                        }
                         if !canceled && !was_engaged {
                             // No resumable handshake = a classic single-stream send
                             // (the receiver is on an older build, or had manual-
@@ -1830,13 +1929,15 @@ pub fn send_to_friend(
                                  receiver didn't negotiate fast-resume (update them to \
                                  the latest version, or have them enable auto-accept)"
                             );
+                            return Err(e);
                         }
-                        // With resume, attempts are cheap — a 2 GB send that loses
-                        // its path every ~400 MB still completes within the budget.
-                        if !canceled && attempt < 5 && was_engaged {
+                        // Resume makes attempts cheap, and the budget is progress-based:
+                        // as long as bytes keep moving we keep going, so a multi-GB (or
+                        // TB) send survives a path that drops over and over.
+                        if !canceled && was_engaged && stall < MAX_STALL {
                             attempt += 1;
                             log::warn!(
-                                "friend-send interrupted ({e:#}) — auto-resuming, attempt {attempt}/5"
+                                "friend-send interrupted ({e:#}) — auto-resuming, attempt {attempt} (no-progress {stall}/{MAX_STALL})"
                             );
                             let mut ru =
                                 TransferUpdate::new(id.clone(), Direction::Send, names.clone());
@@ -1844,7 +1945,7 @@ pub fn send_to_friend(
                             ru.state = TransferState::Connecting;
                             ru.bytes_total = total;
                             emit(&app, &ru);
-                            tokio::time::sleep(Duration::from_secs(1 + attempt as u64)).await;
+                            tokio::time::sleep(Duration::from_secs(1 + attempt.min(8) as u64)).await;
                             continue;
                         }
                         return Err(e);
