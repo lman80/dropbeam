@@ -1002,21 +1002,67 @@ html.overlay-window #root {
 .rc-root {
   height: 100%;
   display: grid;
-  place-items: end center;
-  padding: 0 0 6px 0;
+  place-items: center;
+  padding: 16px;
 }
 .rc-card {
-  width: 290px;
+  position: relative;
+  width: 100%;
+  max-width: 440px;
+  min-width: 230px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 20px 18px 16px;
-  border-radius: 24px;
-  background: color-mix(in srgb, var(--bg-elev) 82%, transparent);
-  -webkit-backdrop-filter: saturate(180%) blur(30px);
-  backdrop-filter: saturate(180%) blur(30px);
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(255, 255, 255, 0.10) inset;
+  padding: 24px 18px 16px;
+  border-radius: 22px;
+  /* SOLID, opaque background — no backdrop-filter. A frosted blur over a
+     transparent window samples the desktop behind it and flickers on macOS.
+     (--bg-elev was never defined, so the old card was actually see-through.) */
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.32);
   color: var(--text);
+}
+/* Top bar: a drag handle (move the card) with the close button on the right. */
+.rc-top {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 6px;
+  border-top-left-radius: 22px;
+  border-top-right-radius: 22px;
+}
+.rc-close {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.rc-close:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+/* Bottom-right resize grip. */
+.rc-grip {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 16px;
+  height: 16px;
+  cursor: nwse-resize;
+  color: var(--text-faint);
+  display: grid;
+  place-items: center;
 }
 .rc-art {
   position: relative;

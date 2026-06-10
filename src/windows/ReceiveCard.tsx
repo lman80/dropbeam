@@ -11,6 +11,7 @@ import {
   FileText,
   FileVideo,
   Send as SendIcon,
+  X,
 } from 'lucide-react'
 import { HAS_TAURI, api, type TransferUpdate } from '../lib/api'
 import { useStore } from '../store'
@@ -148,10 +149,14 @@ export function ReceiveCard() {
     })()
   }, [])
 
-  // Decide which card (if any) to show. Incoming wins; otherwise the send card,
-  // gated on the app not being focused.
+  // Decide which card (if any) to show. Incoming wins; otherwise the send card.
   const showSend = !incoming && !!sendCandidate
-  const visible = !!incoming || showSend
+  const active = incoming ?? (showSend ? sendCandidate : null)
+  const cardKey = active ? `${active.direction}-${active.id}` : null
+  // The close (✕) button dismisses the current item; a different transfer later
+  // shows the card again.
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null)
+  const visible = !!active && cardKey !== dismissedKey
   useEffect(() => {
     if (!HAS_TAURI) return
     const win = getCurrentWindow()
@@ -161,6 +166,16 @@ export function ReceiveCard() {
       void win.hide()
     }
   }, [visible])
+
+  const closeCard = () => {
+    setMenuOpen(false)
+    if (cardKey) setDismissedKey(cardKey)
+    setJustSent(null)
+  }
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    if (HAS_TAURI) void getCurrentWindow().startResizeDragging('SouthEast')
+  }
 
   const respond = (accept: boolean, dest?: string) => {
     if (!incoming) return
@@ -179,7 +194,7 @@ export function ReceiveCard() {
   }
 
   // ── Render data for whichever card is active ──────────────────────────────
-  const t = incoming ?? (showSend ? sendCandidate : null)
+  const t = visible ? active : null
   const sending = !incoming && showSend
   const done = sending && !outgoing && !!justSent // a send that just completed
 
@@ -218,7 +233,13 @@ export function ReceiveCard() {
             exit={{ opacity: 0, y: 16, scale: 0.94 }}
             transition={{ type: 'spring', stiffness: 360, damping: 28 }}
           >
-            <div className="rc-art">
+            {/* Drag handle (move the card) + close button */}
+            <div className="rc-top" data-tauri-drag-region>
+              <button className="rc-close" onClick={closeCard} title="Close">
+                <X size={15} />
+              </button>
+            </div>
+            <div className="rc-art" data-tauri-drag-region>
               <div className="rc-page">
                 <Glyph size={40} strokeWidth={1.4} />
                 <span className="rc-ext">{name.split('.').pop()?.slice(0, 4).toUpperCase()}</span>
@@ -294,6 +315,13 @@ export function ReceiveCard() {
             ) : (
               <div className="rc-status">{incoming ? sub : `${Math.round(pct)}%`}</div>
             )}
+
+            {/* Bottom-right resize grip */}
+            <div className="rc-grip" onMouseDown={startResize} title="Drag to resize">
+              <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>
+                <path d="M9 2 L2 9 M9 6 L6 9" stroke="currentColor" strokeWidth="1.2" fill="none" />
+              </svg>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -316,8 +344,8 @@ function usePositionBottomRight() {
         const screenH = mon.size.height / scale
         const originX = mon.position.x / scale
         const originY = mon.position.y / scale
-        const w = 320
-        const h = 440 // taller than the card so the "Save to" menu has room
+        const w = 330
+        const h = 380
         const x = originX + Math.max(8, screenW - w - 20)
         const y = originY + Math.max(8, screenH - h - 70) // above the Dock
         await getCurrentWindow().setPosition(new LogicalPosition(x, y))
