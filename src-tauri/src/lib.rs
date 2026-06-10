@@ -315,6 +315,7 @@ pub fn run() {
             commands::update_pair,
             commands::remove_pair,
             commands::verify_folders,
+            commands::stop_folder_transfer,
             commands::pair_invite,
             commands::folder_add_person,
             commands::get_folder_statuses,

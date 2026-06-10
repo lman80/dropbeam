@@ -329,6 +329,13 @@ pub fn verify_folders(sync: State<'_, Arc<SyncManager>>) {
     sync.verify_now();
 }
 
+/// Abort the in-flight transfer for a shared folder (the "Stop" button) so a
+/// stuck send can't trap the queue. The file isn't dropped — it cycles back.
+#[tauri::command]
+pub fn stop_folder_transfer(sync: State<'_, Arc<SyncManager>>, pair_id: String) {
+    sync.stop_folder_transfer(&pair_id);
+}
+
 #[tauri::command]
 pub fn pair_invite(
     state: State<'_, Arc<AppState>>,

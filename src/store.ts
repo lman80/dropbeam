@@ -19,6 +19,7 @@ import {
   type Settings,
   type TransferUpdate,
 } from './lib/api'
+import { setSpeedUnit } from './lib/format'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
@@ -35,6 +36,7 @@ const DEFAULT_SETTINGS: Settings = {
   playSounds: true,
   directMode: true,
   uploadLimitMbps: 0,
+  showMegabits: false,
 }
 
 /** Resolve `p`, but never hang: fall back on error OR after `ms`, logging why. */
@@ -197,6 +199,7 @@ export const useStore = create<AppStore>((set, get) => ({
     } catch {
       /* theme is non-critical */
     }
+    setSpeedUnit(settings.showMegabits)
     const folderStatuses: Record<string, FolderStatus> = {}
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
     set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })
@@ -399,6 +402,7 @@ export const useStore = create<AppStore>((set, get) => ({
     const next = { ...current, ...patch }
     set({ settings: next })
     if (patch.theme) get().applyTheme(patch.theme)
+    if (patch.showMegabits !== undefined) setSpeedUnit(patch.showMegabits)
     try {
       const saved = await api.updateSettings(next)
       set({ settings: saved })

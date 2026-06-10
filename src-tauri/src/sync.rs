@@ -62,6 +62,10 @@ struct PairHandle {
     /// even if the live event was missed, and prevents a deleted file from being
     /// resurrected by the peer's add-reconcile. Persisted across restarts.
     tombstones: Arc<Mutex<HashMap<String, u64>>>,
+    /// Set by the "Stop" button to immediately abort the in-flight folder transfer
+    /// and move it aside, so a stuck send never traps the queue. Cleared by the
+    /// sender once it's acted on.
+    skip_current: Arc<AtomicBool>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
 
@@ -231,6 +235,16 @@ impl SyncManager {
         }
     }
 
+    /// Abort the in-flight transfer for one folder NOW (the "Stop" button). The
+    /// sender's watchdog catches the flag within ~1s, abandons the send, and moves
+    /// the file aside so the rest of the folder keeps flowing. Nothing is dropped.
+    pub fn stop_folder_transfer(&self, pair_id: &str) {
+        if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
+            h.skip_current.store(true, Ordering::SeqCst);
+            h.wake.notify_one();
+        }
+    }
+
     /// Force a self-heal reconcile NOW: wake every link's control sender so it
     /// re-beacons its manifest immediately (instead of waiting up to 5 min). Both
     /// sides then exchange snapshots and converge. Drives the manual "Verify"
@@ -301,6 +315,7 @@ impl SyncManager {
         let control_wake = Arc::new(Notify::new());
         let tombstones: Arc<Mutex<HashMap<String, u64>>> =
             Arc::new(Mutex::new(load_tombstones(&self.config_dir, &pair.id)));
+        let skip_current = Arc::new(AtomicBool::new(false));
 
         if pairing::runs_sender(&pair) {
             // Filesystem watcher → candidate channel. We deliberately do NOT trust
@@ -361,6 +376,7 @@ impl SyncManager {
                 queue.clone(),
                 inbound.clone(),
                 status.clone(),
+                skip_current.clone(),
             );
 
             // Seed the queue with any files already sitting in the folder.
@@ -399,6 +415,7 @@ impl SyncManager {
             pending_deletes,
             control_wake,
             tombstones,
+            skip_current,
             _watcher: watcher,
         };
         self.handles.lock().unwrap().insert(pair.id.clone(), handle);
@@ -559,6 +576,7 @@ impl SyncManager {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_sender(
         self: Arc<Self>,
         config: Arc<Mutex<Pair>>,
@@ -568,6 +586,7 @@ impl SyncManager {
         queue: Arc<Mutex<VecDeque<String>>>,
         inbound: Arc<Mutex<HashSet<String>>>,
         status: Arc<Mutex<StatusSnapshot>>,
+        skip_current: Arc<AtomicBool>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
@@ -631,8 +650,26 @@ impl SyncManager {
                 // queued file lands the instant the peer is reachable, instead of
                 // waiting up to the 300s beacon cadence to flip peer_online.
                 let iroh_loc = manager
-                    .try_iroh_folder_send(&pair, &settings, &file, &status, &stopped)
+                    .try_iroh_folder_send(&pair, &settings, &file, &status, &stopped, &skip_current)
                     .await;
+
+                // The user hit "Stop" on this transfer: it was aborted above. Move
+                // it to the back of the queue (never dropped — reconcile + the queue
+                // will bring it back) so the rest of the folder keeps flowing NOW.
+                if skip_current.swap(false, Ordering::SeqCst) {
+                    let mut q = queue.lock().unwrap();
+                    if let Some(pos) = q.iter().position(|x| x == &file) {
+                        if let Some(f) = q.remove(pos) {
+                            q.push_back(f);
+                        }
+                    }
+                    drop(q);
+                    current = String::new();
+                    offline_attempts = 0;
+                    set_status(&status, FolderState::Idle, None, 0.0, None);
+                    manager.emit_status(&pair_id);
+                    continue;
+                }
 
                 // iroh-only: deliver over iroh, else keep the file queued and back
                 // off (the peer is offline / not yet reachable). The file is only
@@ -1204,10 +1241,26 @@ impl SyncManager {
             .unwrap_or(true);
         if settings_notify {
             use tauri_plugin_notification::NotificationExt;
-            let body = if names.len() == 1 {
-                format!("{} arrived in {}", names[0], folder_name(&pair.folder))
+            // Who it's from — your saved label for them by stable endpoint id, else
+            // the name they broadcast. Surfaces provenance the way the user asked
+            // for (issue #12), via a notification rather than a Finder badge.
+            let from = pair
+                .endpoint_id
+                .as_deref()
+                .and_then(|e| friends::label_for_endpoint(&self.config_dir, e))
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| {
+                    let n = pair.peer_name.trim();
+                    (!n.is_empty()).then(|| n.to_string())
+                });
+            let what = if names.len() == 1 {
+                names[0].clone()
             } else {
-                format!("{} files arrived in {}", names.len(), folder_name(&pair.folder))
+                format!("{} files", names.len())
+            };
+            let body = match &from {
+                Some(name) => format!("{what} from {name} → {}", folder_name(&pair.folder)),
+                None => format!("{what} arrived in {}", folder_name(&pair.folder)),
             };
             let _ = self.app.notification().builder().title("DropBeam").body(body).show();
         }
@@ -1303,6 +1356,7 @@ impl SyncManager {
         file: &str,
         status: &Arc<Mutex<StatusSnapshot>>,
         stopped: &Arc<AtomicBool>,
+        skip_current: &Arc<AtomicBool>,
     ) -> Option<Locality> {
         let eid = pair.endpoint_id.clone()?;
         let ep = self.iroh_endpoint()?;
@@ -1316,6 +1370,7 @@ impl SyncManager {
             let pair_id = pair.id.clone();
             let last = Arc::new(AtomicU64::new(0));
             let lp = last_progress.clone();
+            let start = Instant::now();
             move |done: u64, total: u64| {
                 lp.store(now_ms(), Ordering::Relaxed);
                 // Throttle to ~1% steps so we don't flood the UI per chunk.
@@ -1324,12 +1379,19 @@ impl SyncManager {
                     return;
                 }
                 last.store(permille, Ordering::Relaxed);
+                // Live speed + ETA, same as the Send/Receive tab — folder transfers
+                // showed neither before (issues #11/#13).
+                let secs = start.elapsed().as_secs_f64().max(0.001);
+                let speed = done as f64 / secs;
                 if let Ok(mut s) = status.lock() {
                     s.state = FolderState::Sending;
                     s.bytes_done = done;
+                    s.speed_bps = speed;
                     if total > 0 {
                         s.bytes_total = total;
                         s.percent = done as f64 / total as f64 * 100.0;
+                        let remaining = total.saturating_sub(done) as f64;
+                        s.eta_seconds = if speed > 1.0 { Some(remaining / speed) } else { None };
                     }
                 }
                 mgr.emit_status(&pair_id);
@@ -1355,26 +1417,30 @@ impl SyncManager {
         let watchdog = {
             let lp = last_progress.clone();
             let stopped = stopped.clone();
+            let skip = skip_current.clone();
             async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    if stopped.load(Ordering::SeqCst) {
-                        return;
+                    // Poll at 1s so a manual "Stop" aborts within a second.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if stopped.load(Ordering::SeqCst) || skip.load(Ordering::SeqCst) {
+                        return false; // user/teardown abort — not a stall
                     }
                     if now_ms().saturating_sub(lp.load(Ordering::Relaxed)) > STALL_SECS * 1000 {
-                        return;
+                        return true; // stalled
                     }
                 }
             }
         };
         let outcome = tokio::select! {
             r = send_fut => r,
-            _ = watchdog => {
-                log::warn!(
-                    "folder send '{}' stalled ({}s no progress) — abandoning so the queue keeps moving",
-                    file_name_of(file), STALL_SECS
-                );
-                Err(anyhow::anyhow!("folder send stalled"))
+            stalled = watchdog => {
+                if stalled {
+                    log::warn!(
+                        "folder send '{}' stalled ({}s no progress) — abandoning so the queue keeps moving",
+                        file_name_of(file), STALL_SECS
+                    );
+                }
+                Err(anyhow::anyhow!("folder send aborted"))
             }
         };
         match outcome {

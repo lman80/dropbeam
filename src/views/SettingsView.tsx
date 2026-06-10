@@ -183,29 +183,38 @@ export function SettingsView() {
         {SEP}
         <Row
           title="Limit internet upload speed"
-          desc="Cap how much of your upload a transfer uses, so video calls, streaming, and browsing stay smooth. Local-network transfers always run full speed."
+          desc="Cap how much of your upload a transfer uses, so video calls, streaming, and browsing stay smooth. 0 = unlimited. Local-network transfers always run full speed."
         >
-          <select
-            value={settings.uploadLimitMbps}
-            onChange={(e) => save({ uploadLimitMbps: Number(e.target.value) })}
-            style={{
-              fontSize: 13,
-              fontWeight: 600,
-              padding: '6px 10px',
-              borderRadius: 8,
-              border: '1px solid var(--border)',
-              background: 'var(--bg-elev)',
-              color: 'var(--text)',
-              cursor: 'pointer',
-            }}
-          >
-            <option value={0}>Unlimited</option>
-            <option value={5}>5 Mbps</option>
-            <option value={10}>10 Mbps</option>
-            <option value={20}>20 Mbps</option>
-            <option value={50}>50 Mbps</option>
-            <option value={100}>100 Mbps</option>
-          </select>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <input
+              type="number"
+              min={0}
+              max={100000}
+              value={settings.uploadLimitMbps || 0}
+              onChange={(e) =>
+                save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })
+              }
+              style={{
+                width: 72,
+                fontSize: 13,
+                fontWeight: 600,
+                padding: '6px 8px',
+                borderRadius: 8,
+                border: '1px solid var(--border)',
+                background: 'var(--bg-elev)',
+                color: 'var(--text)',
+                textAlign: 'right',
+              }}
+            />
+            <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Mbps</span>
+          </div>
+        </Row>
+        {SEP}
+        <Row
+          title="Show speeds in megabits (Mbps)"
+          desc="Off shows megabytes per second (MB/s), what most file tools use. On shows megabits per second (Mbps), like internet plans."
+        >
+          <Toggle on={settings.showMegabits} onChange={(v) => save({ showMegabits: v })} />
         </Row>
       </Card>
 

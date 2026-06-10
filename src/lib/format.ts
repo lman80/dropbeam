@@ -9,9 +9,22 @@ export function formatBytes(bytes: number, decimals = 1): string {
   return `${v.toFixed(i === 0 ? 0 : decimals)} ${units[i]}`
 }
 
-export function formatSpeed(bps: number): string {
-  if (!bps || bps <= 0) return '—'
-  return `${formatBytes(bps)}/s`
+// Whether to show speeds in megaBITS/sec (Mbps) vs megaBYTES/sec (MB/s). Set
+// once from settings (setSpeedUnit) so every formatSpeed call stays consistent
+// without threading the preference through every component.
+let SPEED_IN_MEGABITS = false
+export function setSpeedUnit(megabits: boolean): void {
+  SPEED_IN_MEGABITS = megabits
+}
+
+// `bytesPerSec` is BYTES per second (despite the legacy name).
+export function formatSpeed(bytesPerSec: number): string {
+  if (!bytesPerSec || bytesPerSec <= 0) return '—'
+  if (SPEED_IN_MEGABITS) {
+    const mbps = (bytesPerSec * 8) / 1_000_000
+    return `${mbps.toFixed(mbps < 10 ? 1 : 0)} Mbps`
+  }
+  return `${formatBytes(bytesPerSec)}/s`
 }
 
 export function formatEta(seconds: number | null | undefined): string {

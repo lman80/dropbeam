@@ -71,6 +71,8 @@ export interface Settings {
   directMode: boolean
   /** Cap internet upload speed (Mbps) to leave headroom; 0 = unlimited. */
   uploadLimitMbps: number
+  /** Show speeds in megabits/sec (Mbps) instead of megabytes/sec (MB/s). */
+  showMegabits: boolean
 }
 
 export type PairRole = 'a' | 'b'
@@ -218,6 +220,7 @@ const realApi = {
     }),
   removePair: (id: string) => invoke<void>('remove_pair', { id }),
   verifyFolders: () => invoke<void>('verify_folders'),
+  stopFolderTransfer: (pairId: string) => invoke<void>('stop_folder_transfer', { pairId }),
   pairInvite: (id: string) => invoke<string>('pair_invite', { id }),
   /** Invite another person into an existing folder (makes it a 3+ person group). */
   folderAddPerson: (id: string) => invoke<string>('folder_add_person', { id }),

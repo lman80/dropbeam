@@ -42,6 +42,7 @@ let settings: Settings = {
   playSounds: true,
   directMode: false,
   uploadLimitMbps: 0,
+  showMegabits: false,
 }
 
 const history: HistoryEntry[] = [

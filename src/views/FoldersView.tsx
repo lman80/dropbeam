@@ -387,10 +387,22 @@ function FolderCard({
               </span>
               <LocalityBadge locality={status.locality} />
             </div>
-            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              {formatBytes(status.bytesDone)}
-              {status.bytesTotal > 0 ? ` / ${formatBytes(status.bytesTotal)}` : ''}
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                {formatBytes(status.bytesDone)}
+                {status.bytesTotal > 0 ? ` / ${formatBytes(status.bytesTotal)}` : ''}
+              </span>
+              {status.state === 'sending' && (
+                <button
+                  className="btn btn-ghost"
+                  title="Stop this transfer (it won't be lost — it retries)"
+                  style={{ padding: '3px 9px', fontSize: 12 }}
+                  onClick={() => api.stopFolderTransfer(pair.id)}
+                >
+                  <X size={13} /> Stop
+                </button>
+              )}
+            </div>
           </div>
           <ProgressBar percent={status.percent} />
           <div
@@ -400,10 +412,18 @@ function FolderCard({
               fontSize: 11.5,
               color: 'var(--text-faint)',
               marginTop: 6,
+              gap: 10,
             }}
           >
-            <span>{status.sendingFile ? status.sendingFile : formatSpeed(status.speedBps)}</span>
-            <span>{formatEta(status.etaSeconds)} left</span>
+            <span
+              style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+            >
+              {status.sendingFile || (status.state === 'sending' ? 'Sending…' : 'Receiving…')}
+            </span>
+            <span style={{ flexShrink: 0 }}>
+              {formatSpeed(status.speedBps)}
+              {status.etaSeconds != null ? ` · ${formatEta(status.etaSeconds)} left` : ''}
+            </span>
           </div>
 
           {/* The rest of a dropped batch, listed up front with per-file rows so it

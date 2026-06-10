@@ -151,6 +151,10 @@ pub struct Settings {
     /// applies to internet/relay transfers — local-network sends stay full speed.
     #[serde(default)]
     pub upload_limit_mbps: u32,
+    /// Show transfer speeds in megaBITS/sec (Mbps) instead of megaBYTES/sec
+    /// (MB/s). Off by default (MB/s, what most file tools show).
+    #[serde(default)]
+    pub show_megabits: bool,
 }
 
 impl Default for Settings {
@@ -168,6 +172,7 @@ impl Default for Settings {
             play_sounds: true,
             direct_mode: true,
             upload_limit_mbps: 0,
+            show_megabits: false,
         }
     }
 }
