@@ -824,6 +824,20 @@ async fn serve_stream(
                 sender.clone(),
                 conn.clone(),
             );
+            // Native Dock download-progress for a single incoming file (same as
+            // Quick Send), so a friend-sent file shows a live ring in Downloads.
+            let dl = if names.len() == 1 {
+                let final_path = dest.join(&names[0]).to_string_lossy().to_string();
+                crate::download_progress::DownloadProgress::begin(&final_path, total)
+            } else {
+                None
+            };
+            let cb = move |done: u64, total: u64| {
+                if let Some(d) = &dl {
+                    d.set(done);
+                }
+                cb(done, total);
+            };
             let __t0 = std::time::Instant::now();
             // Resumable parallel receive for a single big file: reply {ready:true},
             // pull the N uni streams, reassemble into a hidden partial that survives
@@ -1531,6 +1545,27 @@ pub fn start_receive(
             );
             let __t0 = std::time::Instant::now();
             let header = read_frame(&mut recv).await?;
+            // Native macOS Dock download-progress: for a single incoming file,
+            // publish an NSProgress on its destination so it shows a live progress
+            // ring in the Downloads stack, like a browser download. Wrap the UI
+            // progress callback to also drive it. (No-op on a multi-file pull / off
+            // macOS.)
+            let items = header.get("items").and_then(|i| i.as_array());
+            let dl = match items {
+                Some(arr) if arr.len() == 1 => {
+                    let name = arr[0].get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let total = header.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+                    let final_path = dest.join(name).to_string_lossy().to_string();
+                    crate::download_progress::DownloadProgress::begin(&final_path, total)
+                }
+                _ => None,
+            };
+            let cb = move |done: u64, total: u64| {
+                if let Some(d) = &dl {
+                    d.set(done);
+                }
+                cb(done, total);
+            };
             let paths =
                 read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest, &cancel, cb)
                     .await?;

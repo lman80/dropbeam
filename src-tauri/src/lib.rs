@@ -1,5 +1,6 @@
 mod chat;
 mod commands;
+mod download_progress;
 mod folder_history;
 mod friends;
 mod history;
@@ -8,6 +9,7 @@ mod iroh_net;
 mod mac_service;
 mod models;
 mod pairing;
+mod provenance;
 mod settings;
 mod sync;
 #[cfg(target_os = "macos")]

@@ -63,6 +63,8 @@ if (label === 'main') {
       // centered panel from a "Feedback" item in the left sidebar instead.
       trigger: 'none',
       appVersion,
+      // v1.2.0 redesign follows the system theme — match DropBeam's light/dark.
+      theme: 'auto',
       // Default DOM-snapshot capture (no native plugin) — avoids a macOS
       // Screen-Recording permission prompt; the webview IS the app UI.
     })

@@ -171,7 +171,22 @@ impl SyncManager {
             }
         }
 
+        self.write_finder_folders();
         self.reconcile_friends();
+    }
+
+    /// Publish the list of shared-folder paths to a file the macOS Finder Sync
+    /// extension reads (`finder-folders.json` in our app-support dir), so it knows
+    /// which directories to watch + badge with sender provenance. No-op-safe.
+    fn write_finder_folders(&self) {
+        let folders: Vec<String> = pairing::load(&self.config_dir)
+            .into_iter()
+            .map(|p| p.folder)
+            .filter(|f| !f.trim().is_empty())
+            .collect();
+        if let Ok(txt) = serde_json::to_string(&folders) {
+            let _ = std::fs::write(self.config_dir.join("finder-folders.json"), txt);
+        }
     }
 
     fn stop_pair(&self, id: &str) {
@@ -1208,6 +1223,17 @@ impl SyncManager {
     fn note_received(&self, pair: &Pair, files: &[String]) {
         use crate::history;
         use crate::models::{Direction, HistoryEntry, Locality, TransferState};
+        // Stamp each received file with WHO it's from (your saved label, else their
+        // broadcast name) as a macOS extended attribute, so the Finder Sync
+        // extension — and Get Info — can show its provenance. Best-effort.
+        let from = pair
+            .endpoint_id
+            .as_deref()
+            .and_then(|e| friends::label_for_endpoint(&self.config_dir, e))
+            .unwrap_or_else(|| pair.peer_name.clone());
+        for f in files {
+            crate::provenance::set_sender(Path::new(f), &from);
+        }
         let names: Vec<String> = files.iter().map(|f| file_name_of(f)).collect();
         let total: u64 = files
             .iter()

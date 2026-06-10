@@ -1,5 +1,11 @@
-// Types for the vendored SuperFeedback widget (lman80/SuperFeedback) v1.1.0.
+// Types for the vendored SuperFeedback widget (lman80/SuperFeedback) v1.3.0.
 export interface SuperFeedbackConfig {
+  /** Panel theme — follows the system by default (v1.2.0+). */
+  theme?: 'auto' | 'light' | 'dark'
+  /** Max user-attached images (v1.3.0+, default 5). */
+  maxImages?: number
+  /** Gentle opt-in "leave feedback" nudge (v1.2.0+). */
+  nudge?: boolean | { message?: string; delayMs?: number; cooldownDays?: number }
   /** The deployed backend Worker URL. */
   backendUrl: string
   /** Where Issues open, as "owner/name". */
