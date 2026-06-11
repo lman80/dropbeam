@@ -652,6 +652,35 @@ impl SyncManager {
                                 .filter(|r| r == &rel || r.starts_with(&prefix))
                                 .collect()
                         };
+                        // DATA-LOSS GUARD: a directory delete that would wipe MANY
+                        // files is the dangerous case. A folder REPLACE (drop a new
+                        // version over an existing one) shows up as remove-then-copy,
+                        // and a multi-GB copy can outlast the 1200ms settle above — so
+                        // re-verify over a longer window. If the directory (or any of
+                        // its files) re-materializes, it's a replace/re-drop, NOT a
+                        // delete: bail and let the live ADD path + reconcile sync it.
+                        if targets.len() > 1 {
+                            let prefix = format!("{rel}/");
+                            for _ in 0..12 {
+                                tokio::time::sleep(Duration::from_millis(1000)).await;
+                                if stopped2.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                let reappeared = Path::new(&p).exists()
+                                    || targets.iter().any(|t| {
+                                        (t == &rel || t.starts_with(&prefix))
+                                            && Path::new(&folder2).join(t).exists()
+                                    });
+                                if reappeared {
+                                    log::warn!(
+                                        "folder delete of {rel:?} ({} files) ABORTED — path \
+                                         reappeared (folder replace/re-drop, not a delete)",
+                                        targets.len()
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                         if !targets.iter().any(|r| r == &rel) {
                             targets.push(rel.clone());
                         }
@@ -1218,7 +1247,15 @@ impl SyncManager {
             let mut applied: Vec<(String, u64)> = Vec::new();
             for (rel, ts) in deletes {
                 let mut removed_rels: Vec<String> = Vec::new();
-                let did = apply_remote_delete(&folder, rel, &self_deleted, &mut removed_rels);
+                let did =
+                    apply_remote_delete(&folder, rel, &self_deleted, &mut removed_rels, DELETE_GRACE_MS);
+                // If the target is a freshly-dropped file we refused to delete, do
+                // NOT tombstone or forward it — that would just spread the bogus
+                // delete to other members. Let the fresh re-add win instead.
+                let abs = Path::new(&folder).join(norm_rel(rel));
+                if !did && file_is_fresh(&abs, DELETE_GRACE_MS) {
+                    continue;
+                }
                 // Tombstone the rel(s) so reconcile won't resurrect them and so the
                 // delete keeps propagating across a group. Always tombstone the
                 // named rel (even a no-op re-delivery) at the peer's timestamp.
@@ -1319,15 +1356,26 @@ impl SyncManager {
     ) {
         let mine = live_manifest(folder);
         let my_tomb = tombstones.lock().unwrap().clone();
-        let plan = reconcile_plan(&mine, &rec.files, &rec.tombstones, &my_tomb);
+        let plan = reconcile_plan(&mine, &rec.files, &rec.tombstones, &my_tomb, now_ms());
 
         // 1) Apply peer tombstones we missed: delete a local file the peer deleted
         //    AFTER our copy. Archive first (recoverable from history).
+        if !plan.delete.is_empty() {
+            log::warn!(
+                "reconcile[{pair_id}]: applying {} peer delete(s){}",
+                plan.delete.len(),
+                if plan.delete.len() <= 12 {
+                    format!(": {:?}", plan.delete)
+                } else {
+                    String::new()
+                }
+            );
+        }
         let mut deleted_any = false;
         for rel in &plan.delete {
             let tomb_ts = rec.tombstones.get(rel).copied().unwrap_or_else(now_ms);
             let mut removed: Vec<String> = Vec::new();
-            if apply_remote_delete(folder, rel, self_deleted, &mut removed) {
+            if apply_remote_delete(folder, rel, self_deleted, &mut removed, DELETE_GRACE_MS) {
                 deleted_any = true;
                 for r in &removed {
                     note_tombstone(&self.config_dir, pair_id, tombstones, r, tomb_ts);
@@ -1339,8 +1387,14 @@ impl SyncManager {
             }
         }
         // Adopt EVERY peer tombstone so we forward it and never resurrect, even the
-        // ones for files we never had.
+        // ones for files we never had — EXCEPT a rel whose LOCAL file is freshly
+        // added (within grace). Adopting+forwarding that would spread a delete that
+        // is racing the user's drop. The peer re-advertises its tombstones every
+        // cycle, so a GENUINE delete still lands once the file ages past the window.
         for (rel, &ts) in &rec.tombstones {
+            if file_is_fresh(&Path::new(folder).join(norm_rel(rel)), DELETE_GRACE_MS) {
+                continue;
+            }
             note_tombstone(&self.config_dir, pair_id, tombstones, rel, ts);
         }
         if deleted_any {
@@ -2047,6 +2101,74 @@ fn meta_mtime(meta: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+/// A file's "version" timestamp in epoch MILLIS: the most recent of its content
+/// modification (mtime), its inode-change time (ctime — bumped when the file is
+/// MOVED or COPIED into a folder), and its birth time. THE data-loss fix: a file
+/// freshly dropped into a synced folder keeps its old content mtime (a video shot
+/// weeks ago), but its ctime/birthtime is "now". Comparing a delete tombstone
+/// against this max lets a just-added file defend itself against a stale "deleted"
+/// tombstone instead of being silently wiped the instant it lands.
+fn meta_version_ms(meta: &std::fs::Metadata) -> u64 {
+    let to_ms = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis() as u64)
+    };
+    let mtime = meta.modified().ok().and_then(to_ms).unwrap_or(0);
+    let birth = meta.created().ok().and_then(to_ms).unwrap_or(0);
+    #[cfg(unix)]
+    let ctime = {
+        use std::os::unix::fs::MetadataExt;
+        let s = meta.ctime();
+        if s > 0 {
+            (s as u64).saturating_mul(1000) + (meta.ctime_nsec().max(0) as u64 / 1_000_000)
+        } else {
+            0
+        }
+    };
+    #[cfg(not(unix))]
+    let ctime = 0u64;
+    mtime.max(birth).max(ctime)
+}
+
+/// How long after a file is created/moved into a synced folder it stays immune
+/// from a sync-driven delete. A delete targeting a file this fresh is almost
+/// always a race with the user dropping it in — a bogus tombstone arriving at the
+/// same instant (the "dropped a folder and it deleted right away" bug). We refuse
+/// it. A genuine delete still lands once the file ages past this window (the
+/// tombstone persists; reconcile retries). Generous on purpose — a multi-GB
+/// folder drop can take minutes to finish copying, and data safety outranks a few
+/// minutes of delete latency.
+const DELETE_GRACE_MS: u64 = 10 * 60 * 1000;
+
+/// True when `v` (epoch ms) is within `grace_ms` of `now` in EITHER direction.
+/// Bounded on the future side on purpose: a wildly future-stamped file (clock
+/// skew, or copied from a fast-clock machine) must NOT be protected forever — past
+/// the window it ages out and obeys deletes again.
+fn within_grace(v: u64, now: u64, grace_ms: u64) -> bool {
+    if v == 0 || grace_ms == 0 {
+        return false;
+    }
+    if v >= now {
+        v - now < grace_ms
+    } else {
+        now - v < grace_ms
+    }
+}
+
+/// True if `path` exists and was placed/modified within `grace_ms` — i.e. it's a
+/// freshly-added file that must NOT be wiped by an incoming delete. `grace_ms` is
+/// a parameter (not the constant directly) so tests can disable the protection.
+fn file_is_fresh(path: &Path, grace_ms: u64) -> bool {
+    if grace_ms == 0 {
+        return false;
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        return within_grace(meta_version_ms(&meta), now_ms(), grace_ms);
+    }
+    false
+}
+
 /// Stamp a file's modified-time to a specific epoch-seconds value (no-op on 0).
 fn stamp_mtime(path: &Path, secs: u64) {
     if secs == 0 {
@@ -2124,6 +2246,7 @@ fn apply_remote_delete(
     rel: &str,
     self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
     applied: &mut Vec<String>,
+    grace_ms: u64,
 ) -> bool {
     let rel_norm = norm_rel(rel);
     // Never let a peer reach outside the folder.
@@ -2133,6 +2256,18 @@ fn apply_remote_delete(
     let dest = Path::new(folder).join(&rel_norm);
     let mut removed = false;
     if dest.is_file() {
+        // DATA-LOSS GUARD: never wipe a file the user just dropped in. A delete
+        // landing on a brand-new file is almost always a stale tombstone racing the
+        // drop — refuse it. The tombstone persists, so a GENUINE delete still lands
+        // once the file ages past the grace window.
+        if file_is_fresh(&dest, grace_ms) {
+            log::warn!(
+                "apply_remote_delete: REFUSED delete of freshly-added file {rel_norm:?} \
+                 (placed within {}m) — protecting just-dropped data",
+                grace_ms / 60_000
+            );
+            return false;
+        }
         self_deleted
             .lock()
             .unwrap()
@@ -2145,7 +2280,14 @@ fn apply_remote_delete(
     } else if dest.is_dir() {
         // A whole folder was removed on the peer. Archive + remove every file
         // inside (recording each child rel), then prune the now-empty tree.
+        // BUT skip any freshly-dropped child (same guard as above) — so re-adding a
+        // folder that shares a name with a deleted one can't nuke the new contents.
+        let mut kept_fresh = 0usize;
         for child_abs in list_files_rec(&dest) {
+            if file_is_fresh(&child_abs, grace_ms) {
+                kept_fresh += 1;
+                continue;
+            }
             let Some(child_rel) = rel_path_of(&child_abs.to_string_lossy(), folder) else {
                 continue;
             };
@@ -2163,12 +2305,22 @@ fn apply_remote_delete(
                 removed = true;
             }
         }
-        self_deleted
-            .lock()
-            .unwrap()
-            .insert(rel_norm.clone(), Instant::now());
-        let _ = std::fs::remove_dir_all(&dest);
-        removed = true;
+        if kept_fresh > 0 {
+            log::warn!(
+                "apply_remote_delete: kept {kept_fresh} freshly-added file(s) under {rel_norm:?} \
+                 instead of deleting — protecting just-dropped data"
+            );
+        }
+        // Only obliterate the directory if NOTHING fresh survives inside it.
+        // Otherwise leave it in place (any now-empty subdirs are harmless).
+        if kept_fresh == 0 {
+            self_deleted
+                .lock()
+                .unwrap()
+                .insert(rel_norm.clone(), Instant::now());
+            let _ = std::fs::remove_dir_all(&dest);
+            removed = true;
+        }
     }
     // Tidy up: drop any now-empty parent directories up to (but not including)
     // the shared-folder root, so a removed subtree doesn't leave hollow folders.
@@ -2406,6 +2558,7 @@ fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
                 FileEntry {
                     size: meta.len(),
                     mtime: meta_mtime(&meta),
+                    version_ms: meta_version_ms(&meta),
                 },
             );
         }
@@ -2416,7 +2569,12 @@ fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
 #[derive(Clone, Copy)]
 struct FileEntry {
     size: u64,
+    /// Content modification time, epoch SECONDS (the conflict tie-breaker).
     mtime: u64,
+    /// Placement "version", epoch MILLIS: max(mtime, ctime, birthtime). What a
+    /// delete tombstone is compared against, so a freshly-dropped file (old mtime,
+    /// brand-new ctime) isn't wiped on arrival. See [`meta_version_ms`].
+    version_ms: u64,
 }
 
 /// Relative paths of directories under `folder` that contain NO files anywhere
@@ -2493,6 +2651,7 @@ fn reconcile_plan(
     peer_files: &HashMap<String, (u64, u64)>,
     peer_tombs: &HashMap<String, u64>,
     my_tombs: &HashMap<String, u64>,
+    now: u64,
 ) -> ReconcilePlan {
     // Compare on NFC-normalized keys so a subfolder name that macOS stored
     // decomposed (NFD) and the peer stored composed (NFC) is recognized as the
@@ -2507,9 +2666,25 @@ fn reconcile_plan(
     let mut plan = ReconcilePlan::default();
     for (rel0, entry) in mine {
         let rel = norm_rel(rel0);
-        let file_ms = entry.mtime.saturating_mul(1000);
+        // Compare a tombstone against the file's PLACEMENT version (max of mtime,
+        // ctime, birthtime), not just content mtime — so a re-dropped file with an
+        // old mtime but a brand-new ctime defends itself. Fall back to mtime when
+        // version_ms is unset (e.g. unit tests).
+        let file_ms = entry
+            .version_ms
+            .max(entry.mtime.saturating_mul(1000));
         let peer_t = peer_tombs.get(&rel).copied().unwrap_or(0);
         let mine_t = my_tombs.get(&rel).copied().unwrap_or(0);
+        // A file placed/edited within the grace window is OFF-LIMITS: it's almost
+        // certainly something the user is dropping in right now, racing a stale
+        // "deleted" tombstone. SKIP it entirely — neither delete (don't wipe it) nor
+        // push (the live watcher already sends genuine drops; re-pushing here would
+        // resurrect a file legitimately deleted right after a sync). Once it ages
+        // past the window, normal rules resume and it converges.
+        let fresh = within_grace(file_ms, now, DELETE_GRACE_MS);
+        if fresh {
+            continue;
+        }
         // A tombstone newer than our file means it should be gone.
         if peer_t > file_ms {
             plan.delete.push(rel);
@@ -2611,6 +2786,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A "now" far in the future for reconcile_plan tests, so the small epoch-second
+    /// mtimes used below read as ancient (non-fresh) and exercise the normal rules.
+    const TEST_NOW: u64 = 10_000_000_000_000;
 
     fn temp_dir(tag: &str) -> PathBuf {
         use std::sync::atomic::AtomicU32;
@@ -2738,7 +2917,7 @@ mod tests {
 
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut applied = Vec::new();
-        let archived = apply_remote_delete(&folder_s, "sub/x.txt", &sd, &mut applied);
+        let archived = apply_remote_delete(&folder_s, "sub/x.txt", &sd, &mut applied, 0);
         assert!(archived, "a file should have been archived");
         assert_eq!(applied, vec!["sub/x.txt".to_string()]);
         assert!(!folder.join("sub/x.txt").exists(), "original is gone");
@@ -2768,9 +2947,9 @@ mod tests {
         let folder_s = folder.to_string_lossy().to_string();
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut ap = Vec::new();
-        assert!(!apply_remote_delete(&folder_s, "../escape.txt", &sd, &mut ap));
-        assert!(!apply_remote_delete(&folder_s, "/etc/passwd", &sd, &mut ap));
-        assert!(!apply_remote_delete(&folder_s, "a/../../b.txt", &sd, &mut ap));
+        assert!(!apply_remote_delete(&folder_s, "../escape.txt", &sd, &mut ap, 0));
+        assert!(!apply_remote_delete(&folder_s, "/etc/passwd", &sd, &mut ap, 0));
+        assert!(!apply_remote_delete(&folder_s, "a/../../b.txt", &sd, &mut ap, 0));
         assert!(ap.is_empty());
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -2796,7 +2975,7 @@ mod tests {
 
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut applied = Vec::new();
-        let removed = apply_remote_delete(&folder_s, "clips", &sd, &mut applied);
+        let removed = apply_remote_delete(&folder_s, "clips", &sd, &mut applied, 0);
         assert!(removed, "the directory delete should report removal");
         assert!(!folder.join("clips").exists(), "whole subtree gone");
         assert!(folder.join("keep.txt").exists(), "sibling untouched");
@@ -2821,10 +3000,10 @@ mod tests {
     #[test]
     fn reconcile_plan_pushes_missing_and_never_deletes_without_a_tombstone() {
         let mut mine = HashMap::new();
-        mine.insert("have.txt".into(), FileEntry { size: 1, mtime: 100 });
-        mine.insert("alsohave.txt".into(), FileEntry { size: 2, mtime: 100 });
+        mine.insert("have.txt".into(), FileEntry { size: 1, mtime: 100, version_ms: 0 });
+        mine.insert("alsohave.txt".into(), FileEntry { size: 2, mtime: 100, version_ms: 0 });
         // Peer has neither → both must be pushed; NOTHING deleted (no tombstones).
-        let plan = reconcile_plan(&mine, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        let plan = reconcile_plan(&mine, &HashMap::new(), &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert_eq!(plan.push, vec!["alsohave.txt".to_string(), "have.txt".to_string()]);
         assert!(plan.delete.is_empty(), "absence alone must NEVER cause a delete");
     }
@@ -2832,10 +3011,10 @@ mod tests {
     #[test]
     fn reconcile_plan_applies_a_newer_tombstone_as_a_delete() {
         let mut mine = HashMap::new();
-        mine.insert("old.mov".into(), FileEntry { size: 9, mtime: 100 }); // mtime 100s
+        mine.insert("old.mov".into(), FileEntry { size: 9, mtime: 100, version_ms: 0 }); // mtime 100s
         let mut peer_tombs = HashMap::new();
         peer_tombs.insert("old.mov".to_string(), 200_000u64); // deleted at 200s (ms)
-        let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new());
+        let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new(), TEST_NOW);
         assert_eq!(plan.delete, vec!["old.mov".to_string()]);
         assert!(plan.push.is_empty(), "a tombstoned file is never pushed");
     }
@@ -2844,12 +3023,105 @@ mod tests {
     fn reconcile_plan_local_edit_newer_than_tombstone_wins() {
         // We edited the file AFTER the peer's delete → keep + push (edit beats delete).
         let mut mine = HashMap::new();
-        mine.insert("doc.txt".into(), FileEntry { size: 9, mtime: 300 }); // edited at 300s
+        mine.insert("doc.txt".into(), FileEntry { size: 9, mtime: 300, version_ms: 0 }); // edited at 300s
         let mut peer_tombs = HashMap::new();
         peer_tombs.insert("doc.txt".to_string(), 200_000u64); // delete at 200s
-        let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new());
+        let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new(), TEST_NOW);
         assert!(plan.delete.is_empty(), "newer local edit must survive the delete");
         assert_eq!(plan.push, vec!["doc.txt".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_plan_freshly_dropped_file_with_old_mtime_is_not_deleted() {
+        // THE data-loss bug: a folder of videos dropped into a synced folder keeps
+        // its OLD content mtime, but a bogus "deleted" tombstone arrives stamped
+        // ~now. The file's placement VERSION (ctime/birthtime ≈ now) must defend it:
+        // it's within the grace window, so it is KEPT and re-pushed, never wiped.
+        let now = 1_900_000_000_000u64; // fixed "now" in ms
+        let mut mine = HashMap::new();
+        // mtime is months old (epoch seconds), but version_ms is "just now".
+        mine.insert(
+            "Smartness Deluxe/clip.mp4".into(),
+            FileEntry {
+                size: 246_806_641,
+                mtime: 1_700_000_000, // old content time (seconds)
+                version_ms: now - 3_000, // dropped 3s ago
+            },
+        );
+        let mut peer_tombs = HashMap::new();
+        // Peer tombstoned it 1s ago — newer than the old mtime, but the file is fresh.
+        peer_tombs.insert("Smartness Deluxe/clip.mp4".to_string(), now - 1_000);
+        let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new(), now);
+        assert!(
+            plan.delete.is_empty(),
+            "a freshly-dropped file must NOT be deleted by a same-instant tombstone"
+        );
+        // It is also NOT force-pushed from reconcile (that would resurrect a file
+        // legitimately deleted right after a sync). The live watcher sends genuine
+        // user drops; reconcile just protects the fresh file from deletion.
+        assert!(
+            plan.push.is_empty(),
+            "a fresh file is skipped by reconcile (neither deleted nor pushed)"
+        );
+    }
+
+    #[test]
+    fn reconcile_plan_settled_old_file_still_obeys_a_tombstone() {
+        // The guard must NOT block legitimate deletes: a file that has sat in the
+        // folder since well before the grace window still deletes on a peer tombstone.
+        let now = 1_900_000_000_000u64;
+        let mut mine = HashMap::new();
+        mine.insert(
+            "old/settled.mov".into(),
+            FileEntry {
+                size: 9,
+                mtime: 1_700_000_000,
+                version_ms: now - 60 * 60 * 1000, // placed an hour ago (past grace)
+            },
+        );
+        let mut peer_tombs = HashMap::new();
+        peer_tombs.insert("old/settled.mov".to_string(), now - 30 * 60 * 1000); // deleted 30m ago
+        let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new(), now);
+        assert_eq!(plan.delete, vec!["old/settled.mov".to_string()]);
+        assert!(plan.push.is_empty());
+    }
+
+    #[test]
+    fn within_grace_is_bounded_on_both_sides() {
+        let now = 1_000_000_000u64;
+        let g = 10 * 60 * 1000; // 10 min
+        assert!(within_grace(now - 1000, now, g), "1s ago = fresh");
+        assert!(within_grace(now + 1000, now, g), "1s future (skew) = fresh");
+        assert!(!within_grace(now - g - 1, now, g), "past the window = not fresh");
+        assert!(
+            !within_grace(now + 100 * g, now, g),
+            "a wildly future-stamped file must NOT be protected forever"
+        );
+        assert!(!within_grace(0, now, g), "no timestamp = not fresh");
+        assert!(!within_grace(now, now, 0), "zero grace disables protection");
+    }
+
+    #[test]
+    fn apply_remote_delete_refuses_a_freshly_created_file() {
+        // The receive-side net: even if a bogus tombstone slips through, a file the
+        // user just created on disk is refused (it's fresh) and survives.
+        let folder = temp_dir("fresh-del");
+        let folder_s = folder.to_string_lossy().to_string();
+        std::fs::write(folder.join("just-dropped.mp4"), b"brand new").unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let mut applied = Vec::new();
+        let removed = apply_remote_delete(&folder_s, "just-dropped.mp4", &sd, &mut applied, DELETE_GRACE_MS);
+        assert!(!removed, "a just-created file must not be deleted");
+        assert!(applied.is_empty());
+        assert!(
+            folder.join("just-dropped.mp4").exists(),
+            "the fresh file must still be on disk"
+        );
+        assert!(
+            crate::folder_history::load(&folder_s).is_empty(),
+            "and nothing should have been archived"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
@@ -2913,10 +3185,10 @@ mod tests {
     #[test]
     fn reconcile_plan_identical_files_do_nothing() {
         let mut mine = HashMap::new();
-        mine.insert("same.txt".into(), FileEntry { size: 5, mtime: 100 });
+        mine.insert("same.txt".into(), FileEntry { size: 5, mtime: 100, version_ms: 0 });
         let mut peer = HashMap::new();
         peer.insert("same.txt".to_string(), (5u64, 100u64));
-        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
+        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert!(plan.push.is_empty() && plan.delete.is_empty(), "no-op when in sync");
     }
 
@@ -2925,17 +3197,17 @@ mod tests {
         // The infinite-re-send bug: same file, mtimes 1s apart (cross-filesystem
         // rounding). Must NOT push — and must be symmetric so neither side loops.
         let mut mine = HashMap::new();
-        mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12346 });
+        mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12346, version_ms: 0 });
         let mut peer = HashMap::new();
         peer.insert("vid.mp4".to_string(), (1000u64, 12345u64));
-        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
+        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert!(plan.push.is_empty(), "same-size file with skewed mtime must not re-push");
         // The peer side (roles flipped) must also not push → converged.
         let mut peer_mine = HashMap::new();
-        peer_mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12345 });
+        peer_mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12345, version_ms: 0 });
         let mut my_snap = HashMap::new();
         my_snap.insert("vid.mp4".to_string(), (1000u64, 12346u64));
-        let plan2 = reconcile_plan(&peer_mine, &my_snap, &HashMap::new(), &HashMap::new());
+        let plan2 = reconcile_plan(&peer_mine, &my_snap, &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert!(plan2.push.is_empty(), "convergence: the other side must not push either");
     }
 
@@ -2946,21 +3218,21 @@ mod tests {
         let nfd = "Re\u{301}sume\u{301}/x.bin"; // e + combining acute
         let nfc = "R\u{e9}sum\u{e9}/x.bin"; // é precomposed
         let mut mine = HashMap::new();
-        mine.insert(nfd.to_string(), FileEntry { size: 10, mtime: 5 });
+        mine.insert(nfd.to_string(), FileEntry { size: 10, mtime: 5, version_ms: 0 });
         let mut peer = HashMap::new();
         peer.insert(nfc.to_string(), (10u64, 5u64));
-        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
+        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert!(plan.push.is_empty(), "NFD and NFC forms of the same name must match");
     }
 
     #[test]
     fn reconcile_still_pushes_missing_and_changed() {
         let mut mine = HashMap::new();
-        mine.insert("new.txt".into(), FileEntry { size: 7, mtime: 50 });
-        mine.insert("edited.txt".into(), FileEntry { size: 200, mtime: 99 });
+        mine.insert("new.txt".into(), FileEntry { size: 7, mtime: 50, version_ms: 0 });
+        mine.insert("edited.txt".into(), FileEntry { size: 200, mtime: 99, version_ms: 0 });
         let mut peer = HashMap::new();
         peer.insert("edited.txt".to_string(), (100u64, 40u64)); // peer has older, smaller
-        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
+        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert!(plan.push.contains(&"new.txt".to_string()), "missing file is pushed");
         assert!(
             plan.push.contains(&"edited.txt".to_string()),
@@ -2976,7 +3248,7 @@ mod tests {
         std::fs::write(folder.join("a.txt"), b"x").unwrap();
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut ap = Vec::new();
-        apply_remote_delete(&folder_s, "a.txt", &sd, &mut ap);
+        apply_remote_delete(&folder_s, "a.txt", &sd, &mut ap, 0);
         let inbound = Arc::new(Mutex::new(HashSet::new()));
         for f in list_files_rec(&folder) {
             let p = f.to_string_lossy().to_string();
