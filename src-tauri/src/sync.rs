@@ -1334,7 +1334,7 @@ impl SyncManager {
         //    it when it's actually empty, so a dir that's since gained files is
         //    never touched). Never deletes data.
         for rel in &rec.empty_dirs {
-            let norm = rel.replace('\\', "/");
+            let norm = norm_rel(rel);
             if norm.is_empty()
                 || norm.starts_with('/')
                 || norm.split('/').any(|c| c == ".." || c.starts_with('.'))
@@ -1858,7 +1858,7 @@ fn move_staged_into_folder(
         let Ok(rel) = src.strip_prefix(staging) else {
             continue;
         };
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let rel_str = norm_rel(&rel.to_string_lossy());
         let dest_path = folder_path.join(rel);
         if let Some(parent) = dest_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1874,15 +1874,15 @@ fn move_staged_into_folder(
         // file we already landed — without this check a plain folder grows a
         // visible "name (1)" duplicate that a two-way pair then syncs BACK, and
         // a 1:1 mirror pointlessly archives another multi-GB copy to history on
-        // every redelivery. Same size + same stamped mtime + same bytes = the
-        // exact file we already have; just record it and drop the staged copy.
+        // every redelivery. Identity is SIZE + content HASH — NOT mtime: a
+        // re-received identical file often reads back with a 1-2s-skewed mtime
+        // across filesystems, and gating on mtime here made every redelivery fall
+        // through to the conflict branch and archive-then-re-land the file each
+        // cycle (the user's "it never stays in my folder"). Same bytes = the file
+        // we already have, whatever its mtime; record it and drop the staged copy.
         if dest_path.is_file() {
             let loc_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
-            let loc_mtime = std::fs::metadata(&dest_path)
-                .ok()
-                .map(|m| meta_mtime(&m))
-                .unwrap_or(u64::MAX);
-            if in_size == loc_size && in_mtime == loc_mtime {
+            if in_size == loc_size {
                 let h = content_hash(&src);
                 if !h.is_empty() && h == content_hash(&dest_path) {
                     let _ = std::fs::remove_file(&src);
@@ -2039,9 +2039,22 @@ fn content_hash(path: &Path) -> String {
 
 /// Compute a file's path relative to the folder (forward-slashed, so the same
 /// key is used on both peers). Works even when the file is already gone.
+/// Canonical form of a folder-relative path used as a sync KEY. Two peers must
+/// produce the SAME string for the same file, or reconcile thinks each is
+/// "missing" it forever. Two normalizations matter:
+///   • forward slashes (Windows back-slashes → `/`), and
+///   • Unicode NFC. macOS stores filenames decomposed (NFD: `e` + ´) while
+///     Windows/Linux use composed (NFC: `é`). Without this, a subfolder named
+///     `Résumé` keys differently on each side → the file re-sends forever. This
+///     is the classic Syncthing normalization bug; NFC-on-compare fixes it.
+pub(crate) fn norm_rel(rel: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    rel.replace('\\', "/").nfc().collect()
+}
+
 fn rel_path_of(abs: &str, folder: &str) -> Option<String> {
     let p = Path::new(abs);
-    let norm = |r: &Path| r.to_string_lossy().replace('\\', "/");
+    let norm = |r: &Path| norm_rel(&r.to_string_lossy());
     if let Ok(rel) = p.strip_prefix(folder) {
         return Some(norm(rel));
     }
@@ -2073,7 +2086,7 @@ fn apply_remote_delete(
     self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
     applied: &mut Vec<String>,
 ) -> bool {
-    let rel_norm = rel.replace('\\', "/");
+    let rel_norm = norm_rel(rel);
     // Never let a peer reach outside the folder.
     if rel_norm.is_empty() || rel_norm.starts_with('/') || rel_norm.split('/').any(|c| c == "..") {
         return false;
@@ -2230,11 +2243,11 @@ fn file_sig(path: &str, folder: &str) -> Option<String> {
     // macOS) and the configured folder path resolve to a matching relative path.
     let canon_p = std::fs::canonicalize(p).ok()?;
     let canon_folder = std::fs::canonicalize(folder).ok()?;
-    let rel = canon_p
-        .strip_prefix(&canon_folder)
-        .ok()?
-        .to_string_lossy()
-        .to_string();
+    // NFC-normalize the rel like every other sync key, so the signatures stored
+    // in `inbound` and the tombstone keys derived from them match the (NFC)
+    // reconcile manifest — otherwise a delete inside a non-ASCII subfolder
+    // (NFD on macOS) never propagates via the reconcile backstop.
+    let rel = norm_rel(&canon_p.strip_prefix(&canon_folder).ok()?.to_string_lossy());
     let mtime = meta
         .modified()
         .ok()
@@ -2442,32 +2455,51 @@ fn reconcile_plan(
     peer_tombs: &HashMap<String, u64>,
     my_tombs: &HashMap<String, u64>,
 ) -> ReconcilePlan {
+    // Compare on NFC-normalized keys so a subfolder name that macOS stored
+    // decomposed (NFD) and the peer stored composed (NFC) is recognized as the
+    // SAME file instead of "missing" → re-sent forever.
+    let peer_files: HashMap<String, (u64, u64)> =
+        peer_files.iter().map(|(k, v)| (norm_rel(k), *v)).collect();
+    let peer_tombs: HashMap<String, u64> =
+        peer_tombs.iter().map(|(k, v)| (norm_rel(k), *v)).collect();
+    let my_tombs: HashMap<String, u64> =
+        my_tombs.iter().map(|(k, v)| (norm_rel(k), *v)).collect();
+
     let mut plan = ReconcilePlan::default();
-    for (rel, entry) in mine {
+    for (rel0, entry) in mine {
+        let rel = norm_rel(rel0);
         let file_ms = entry.mtime.saturating_mul(1000);
-        let peer_t = peer_tombs.get(rel).copied().unwrap_or(0);
-        let mine_t = my_tombs.get(rel).copied().unwrap_or(0);
+        let peer_t = peer_tombs.get(&rel).copied().unwrap_or(0);
+        let mine_t = my_tombs.get(&rel).copied().unwrap_or(0);
         // A tombstone newer than our file means it should be gone.
         if peer_t > file_ms {
-            plan.delete.push(rel.clone());
+            plan.delete.push(rel);
             continue;
         }
         if mine_t > file_ms {
             // We already know it's deleted locally-pending; don't push it.
             continue;
         }
-        let need = match peer_files.get(rel) {
+        // Convergence rule: push ONLY when the peer is missing the file, or has a
+        // genuinely different version (different SIZE) that's older than ours.
+        // NEVER re-push on an mtime-only difference — two machines round file
+        // mtimes differently (APFS nanoseconds vs FAT/NTFS 2-second buckets, plus
+        // clock skew), so an identical file reads back a second or two apart and
+        // would re-send forever. mtime stays a tie-breaker for genuine conflicts
+        // (in move_staged_into_folder), never the in-sync test. This is what makes
+        // the sync actually converge instead of ping-ponging the same file.
+        let need = match peer_files.get(&rel) {
             None => true,
-            Some(&(psize, pmtime)) => {
-                (psize != entry.size || pmtime != entry.mtime) && entry.mtime > pmtime
-            }
+            Some(&(psize, pmtime)) => psize != entry.size && entry.mtime > pmtime,
         };
         if need {
-            plan.push.push(rel.clone());
+            plan.push.push(rel);
         }
     }
     plan.delete.sort();
     plan.push.sort();
+    plan.delete.dedup();
+    plan.push.dedup();
     plan
 }
 
@@ -2847,6 +2879,54 @@ mod tests {
         peer.insert("same.txt".to_string(), (5u64, 100u64));
         let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
         assert!(plan.push.is_empty() && plan.delete.is_empty(), "no-op when in sync");
+    }
+
+    #[test]
+    fn reconcile_same_size_mtime_skew_does_not_loop() {
+        // The infinite-re-send bug: same file, mtimes 1s apart (cross-filesystem
+        // rounding). Must NOT push — and must be symmetric so neither side loops.
+        let mut mine = HashMap::new();
+        mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12346 });
+        let mut peer = HashMap::new();
+        peer.insert("vid.mp4".to_string(), (1000u64, 12345u64));
+        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
+        assert!(plan.push.is_empty(), "same-size file with skewed mtime must not re-push");
+        // The peer side (roles flipped) must also not push → converged.
+        let mut peer_mine = HashMap::new();
+        peer_mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12345 });
+        let mut my_snap = HashMap::new();
+        my_snap.insert("vid.mp4".to_string(), (1000u64, 12346u64));
+        let plan2 = reconcile_plan(&peer_mine, &my_snap, &HashMap::new(), &HashMap::new());
+        assert!(plan2.push.is_empty(), "convergence: the other side must not push either");
+    }
+
+    #[test]
+    fn reconcile_subfolder_nfd_nfc_is_the_same_file() {
+        // macOS stores "Résumé/x" decomposed (NFD); the peer composed (NFC). They
+        // must be recognized as ONE file, not re-sent forever.
+        let nfd = "Re\u{301}sume\u{301}/x.bin"; // e + combining acute
+        let nfc = "R\u{e9}sum\u{e9}/x.bin"; // é precomposed
+        let mut mine = HashMap::new();
+        mine.insert(nfd.to_string(), FileEntry { size: 10, mtime: 5 });
+        let mut peer = HashMap::new();
+        peer.insert(nfc.to_string(), (10u64, 5u64));
+        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
+        assert!(plan.push.is_empty(), "NFD and NFC forms of the same name must match");
+    }
+
+    #[test]
+    fn reconcile_still_pushes_missing_and_changed() {
+        let mut mine = HashMap::new();
+        mine.insert("new.txt".into(), FileEntry { size: 7, mtime: 50 });
+        mine.insert("edited.txt".into(), FileEntry { size: 200, mtime: 99 });
+        let mut peer = HashMap::new();
+        peer.insert("edited.txt".to_string(), (100u64, 40u64)); // peer has older, smaller
+        let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new());
+        assert!(plan.push.contains(&"new.txt".to_string()), "missing file is pushed");
+        assert!(
+            plan.push.contains(&"edited.txt".to_string()),
+            "different-size newer file is pushed"
+        );
     }
 
     #[test]
