@@ -51,6 +51,21 @@ export function Hud() {
 
   usePositionOnce()
 
+  // Hold the last active pill through brief gaps. The folder sync worker dips to
+  // "idle" for a moment between files in a burst, which made `pill` flip to null
+  // and back — flickering the whole HUD window off and on. Keep showing the last
+  // pill for a short grace period so a multi-file sync stays steady; only when
+  // things are genuinely quiet for ~1.8s does the card retract.
+  const [shown, setShown] = useState<Pill | null>(null)
+  useEffect(() => {
+    if (pill) {
+      setShown(pill)
+      return
+    }
+    const id = setTimeout(() => setShown(null), 1800)
+    return () => clearTimeout(id)
+  }, [pill])
+
   const [dismissed, setDismissed] = useState<string | null>(null)
   // A dismissal sticks only to the activity it was made on. If a *different*
   // item becomes current, show it at once; if everything goes quiet, clear the
@@ -58,13 +73,13 @@ export function Hud() {
   // between files in a burst stay hidden).
   useEffect(() => {
     if (!dismissed) return
-    if (pill && pill.key === dismissed) return
-    const id = setTimeout(() => setDismissed(null), pill ? 0 : 6000)
+    if (shown && shown.key === dismissed) return
+    const id = setTimeout(() => setDismissed(null), shown ? 0 : 6000)
     return () => clearTimeout(id)
-  }, [pill, dismissed])
+  }, [shown, dismissed])
 
-  // Drive the native window's visibility from whether there's anything to show.
-  const visible = !!pill && pill.key !== dismissed
+  // Drive the native window's visibility from the (debounced) pill.
+  const visible = !!shown && shown.key !== dismissed
   useEffect(() => {
     if (!HAS_TAURI) return
     const win = getCurrentWindow()
@@ -75,9 +90,9 @@ export function Hud() {
   return (
     <div className="hud-root">
       <AnimatePresence>
-        {pill && (
+        {shown && (
           <motion.div
-            key={pill.key}
+            key={shown.key}
             className="hud-pill"
             initial={{ opacity: 0, y: -14, scale: 0.9 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -86,22 +101,22 @@ export function Hud() {
             onClick={() => invoke('open_main_window').catch(() => {})}
           >
             <span className="hud-icon">
-              {pill.direction === 'send' ? <Send size={15} /> : <ArrowDownToLine size={15} />}
+              {shown.direction === 'send' ? <Send size={15} /> : <ArrowDownToLine size={15} />}
             </span>
             <span style={{ flex: 1, minWidth: 0 }}>
-              <span className="hud-title">{pill.title}</span>
-              <span className="hud-sub">{pill.sub}</span>
+              <span className="hud-title">{shown.title}</span>
+              <span className="hud-sub">{shown.sub}</span>
             </span>
-            {pill.locality !== 'unknown' && <ChannelBadge locality={pill.locality} />}
+            {shown.locality !== 'unknown' && <ChannelBadge locality={shown.locality} />}
             <span className="hud-ring" aria-hidden>
-              {Math.round(pill.percent)}
+              {Math.round(shown.percent)}
             </span>
             <button
               className="hud-x"
               title="Dismiss"
               onClick={(e) => {
                 e.stopPropagation()
-                setDismissed(pill.key)
+                setDismissed(shown.key)
               }}
             >
               <X size={13} />

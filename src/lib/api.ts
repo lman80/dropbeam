@@ -239,6 +239,8 @@ const realApi = {
   stopFolderTransfer: (pairId: string) => invoke<void>('stop_folder_transfer', { pairId }),
   /** Delete abandoned transfer leftovers (paused/failed partials). Returns bytes freed. */
   clearTransferCache: () => invoke<number>('clear_transfer_cache'),
+  /** Tell the backend a transfer card is on screen (true) or gone (false) — drives the transient Dock icon. */
+  setCardActive: (active: boolean) => invoke<void>('set_card_active', { active }),
   pairInvite: (id: string) => invoke<string>('pair_invite', { id }),
   /** Invite another person into an existing folder (makes it a 3+ person group). */
   folderAddPerson: (id: string) => invoke<string>('folder_add_person', { id }),

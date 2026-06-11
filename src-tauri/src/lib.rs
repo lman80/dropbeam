@@ -368,8 +368,16 @@ pub fn run() {
                     let _ = window.hide();
                     api.prevent_close();
                     // Back to a menu-bar-only app (no Dock icon) while the window
-                    // is tucked away — but still running and receiving.
-                    set_dock_icon_visible(&app, false);
+                    // is tucked away — but still running and receiving. Keep the
+                    // Dock icon if a transfer card is on screen (it needs one to
+                    // minimize into); the card drops it when it's done.
+                    let card_up = app
+                        .get_webview_window("receive")
+                        .and_then(|w| w.is_visible().ok())
+                        .unwrap_or(false);
+                    if !card_up {
+                        set_dock_icon_visible(&app, false);
+                    }
                 }
             }
             // The menu-bar popover dismisses itself when it loses focus.
@@ -403,6 +411,7 @@ pub fn run() {
             commands::verify_folders,
             commands::stop_folder_transfer,
             commands::clear_transfer_cache,
+            commands::set_card_active,
             commands::pair_invite,
             commands::folder_add_person,
             commands::get_folder_statuses,

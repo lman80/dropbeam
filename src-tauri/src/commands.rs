@@ -295,6 +295,27 @@ pub fn hide_popover(app: AppHandle) {
     }
 }
 
+/// The send/receive transfer card became visible (`active=true`) or went away
+/// (`active=false`). While a card is on screen we briefly become a regular app
+/// (Dock icon), so its native yellow button can minimize it INTO the Dock and
+/// you can click it back — just like any Mac window. When the card is gone we
+/// drop back to a menu-bar-only app (no Dock icon), unless the main window is
+/// open. macOS-only effect; harmless elsewhere.
+#[tauri::command]
+pub fn set_card_active(app: AppHandle, active: bool) {
+    if active {
+        crate::set_dock_icon_visible(&app, true);
+        return;
+    }
+    let main_open = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    if !main_open {
+        crate::set_dock_icon_visible(&app, false);
+    }
+}
+
 #[tauri::command]
 pub fn get_default_download_dir(app: AppHandle) -> String {
     app.path()

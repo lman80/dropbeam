@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from '@tauri-apps/api/window'
+import { currentMonitor, getCurrentWindow, LogicalPosition } from '@tauri-apps/api/window'
 import { desktopDir, documentDir, downloadDir, homeDir } from '@tauri-apps/api/path'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
@@ -10,9 +10,7 @@ import {
   FileImage,
   FileText,
   FileVideo,
-  Minus,
   Send as SendIcon,
-  X,
 } from 'lucide-react'
 import { HAS_TAURI, api, type TransferUpdate } from '../lib/api'
 import { useStore } from '../store'
@@ -47,11 +45,11 @@ interface SaveDir {
 
 const SENDING_STATES = ['starting', 'waitingForPeer', 'connecting', 'transferring'] as const
 
-// Window sizes for the expanded card vs. the minimized pill (logical px).
+// Card window size (logical px). The window has native macOS traffic-light
+// controls (titleBarStyle Overlay) — yellow minimizes it into the Dock, red
+// dismisses it — so there's no custom minimize/close chrome anymore.
 const FULL_W = 360
 const FULL_H = 400
-const MINI_W = 268
-const MINI_H = 86
 
 /**
  * The floating Blip-style transfer card (bottom-right, near Downloads).
@@ -164,50 +162,65 @@ export function ReceiveCard() {
   // shows the card again.
   const [dismissedKey, setDismissedKey] = useState<string | null>(null)
   const visible = !!active && cardKey !== dismissedKey
-  useEffect(() => {
-    if (!HAS_TAURI) return
-    const win = getCurrentWindow()
-    if (visible) void win.show()
-    else {
-      setMenuOpen(false)
-      void win.hide()
-    }
-  }, [visible])
 
   const closeCard = () => {
     setMenuOpen(false)
     if (cardKey) setDismissedKey(cardKey)
     setJustSent(null)
   }
-  const startResize = (e: React.MouseEvent) => {
-    e.preventDefault()
-    if (HAS_TAURI) void getCurrentWindow().startResizeDragging('SouthEast')
-  }
+  // The native-close listener registers ONCE (below), so it must reach the
+  // latest closeCard — not the one captured at mount (when cardKey was null).
+  const closeCardRef = useRef(closeCard)
+  closeCardRef.current = closeCard
 
-  // Minimize → collapse to a small pill (and shrink the window to match).
-  const [minimized, setMinimized] = useState(false)
-  const setWinSize = (w: number, h: number) => {
-    if (HAS_TAURI) void getCurrentWindow().setSize(new LogicalSize(w, h)).catch(() => {})
-  }
-  const minimize = () => {
+  useEffect(() => {
+    if (!HAS_TAURI) return
+    const win = getCurrentWindow()
+    if (visible) {
+      // Briefly become a regular app (Dock icon) so the card's native yellow
+      // button can minimize it INTO the Dock and you can click it back.
+      void api.setCardActive(true)
+      void win.unminimize().catch(() => {})
+      void win.show()
+      return
+    }
     setMenuOpen(false)
-    setMinimized(true)
-    setWinSize(MINI_W, MINI_H)
-  }
-  const restore = () => {
-    setMinimized(false)
-    setWinSize(FULL_W, FULL_H)
-  }
-  // A genuinely NEW transfer opens expanded. We track the last key in a ref so the
-  // brief null between "sending" and "sent ✓" (same transfer) doesn't pop a
-  // minimized card back open.
+    void win.hide()
+    // Debounce dropping the Dock icon: back-to-back transfers shouldn't flap the
+    // activation policy off→on→off. Only revert to menu-bar-only after a quiet
+    // beat (same idea as the HUD's anti-flicker grace period).
+    const id = setTimeout(() => void api.setCardActive(false), 1800)
+    return () => clearTimeout(id)
+  }, [visible])
+
+  // The native red traffic-light button should DISMISS the card (not destroy the
+  // window — it's reused for the next transfer). Intercept the close request and
+  // route it through the LATEST closeCard via the ref.
+  useEffect(() => {
+    if (!HAS_TAURI) return
+    let unlisten: (() => void) | undefined
+    void getCurrentWindow()
+      .onCloseRequested((e) => {
+        e.preventDefault()
+        closeCardRef.current()
+      })
+      .then((u) => {
+        unlisten = u
+      })
+    return () => unlisten?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // A genuinely NEW transfer should surface even if the previous card was
+  // minimized into the Dock — un-minimize and raise it. A ref guards against the
+  // brief null between "sending" and "sent ✓" of the SAME transfer re-popping it.
   const lastKey = useRef<string | null>(null)
   useEffect(() => {
-    if (!cardKey || lastKey.current === cardKey) return
+    if (!HAS_TAURI || !cardKey || lastKey.current === cardKey) return
     lastKey.current = cardKey
-    setMinimized(false)
-    setWinSize(FULL_W, FULL_H)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const win = getCurrentWindow()
+    void win.unminimize().catch(() => {})
+    void win.show()
   }, [cardKey])
 
   const respond = (accept: boolean, dest?: string) => {
@@ -257,43 +270,7 @@ export function ReceiveCard() {
   return (
     <div className="rc-root">
       <AnimatePresence>
-        {t && minimized && (
-          <motion.div
-            key={`mini-${cardKey}`}
-            className="rc-mini"
-            onClick={restore}
-            title="Click to expand"
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 10 }}
-            transition={{ type: 'spring', stiffness: 360, damping: 28 }}
-          >
-            <div className={`rc-mini-av${done ? ' done' : ''}`}>
-              {done ? (
-                <Check size={16} strokeWidth={3} />
-              ) : sending && !friendName ? (
-                <SendIcon size={14} />
-              ) : (
-                initialOf(friendName)
-              )}
-            </div>
-            <div className="rc-mini-text">
-              <div className="rc-mini-name">{midTruncate(name, 24)}</div>
-              <div className="rc-mini-sub">{incoming || done ? sub : `${Math.round(pct)}%`}</div>
-            </div>
-            <button
-              className="rc-close"
-              onClick={(e) => {
-                e.stopPropagation()
-                closeCard()
-              }}
-              title="Close"
-            >
-              <X size={14} />
-            </button>
-          </motion.div>
-        )}
-        {t && !minimized && (
+        {t && (
           <motion.div
             key={`${t.direction}-${t.id}`}
             className="rc-card"
@@ -302,15 +279,9 @@ export function ReceiveCard() {
             exit={{ opacity: 0, y: 16, scale: 0.94 }}
             transition={{ type: 'spring', stiffness: 360, damping: 28 }}
           >
-            {/* Drag handle (move the card) + minimize + close */}
-            <div className="rc-top" data-tauri-drag-region>
-              <button className="rc-min" onClick={minimize} title="Minimize">
-                <Minus size={15} />
-              </button>
-              <button className="rc-close" onClick={closeCard} title="Close">
-                <X size={15} />
-              </button>
-            </div>
+            {/* Spacer under the native traffic-light buttons (titleBarStyle
+                Overlay puts red/yellow/green here); also a drag handle. */}
+            <div className="rc-top" data-tauri-drag-region />
             <div className="rc-art" data-tauri-drag-region>
               <div className="rc-page">
                 <Glyph size={40} strokeWidth={1.4} />
@@ -387,13 +358,6 @@ export function ReceiveCard() {
             ) : (
               <div className="rc-status">{incoming ? sub : `${Math.round(pct)}%`}</div>
             )}
-
-            {/* Bottom-right resize grip */}
-            <div className="rc-grip" onMouseDown={startResize} title="Drag to resize">
-              <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden>
-                <path d="M9 2 L2 9 M9 6 L6 9" stroke="currentColor" strokeWidth="1.2" fill="none" />
-              </svg>
-            </div>
           </motion.div>
         )}
       </AnimatePresence>

@@ -999,46 +999,30 @@ html.overlay-window #root {
 }
 
 /* ── Blip-style receive card (the "receive" overlay window) ──────────────── */
+/* The card now fills a NORMAL macOS window (titleBarStyle Overlay): the OS draws
+   the rounded corners, shadow, and red/yellow/green traffic-light buttons, so the
+   content just fills the window edge-to-edge with an opaque surface. */
 .rc-root {
-  height: 100%;
-  display: grid;
-  place-items: center;
-  /* Generous transparent margin so the card's shadow fades fully instead of
-     being clipped at the window edge (which read as a hard, boxy halo). */
-  padding: 30px;
+  height: 100vh;
+  display: flex;
+  background: var(--surface);
+  color: var(--text);
 }
 .rc-card {
   position: relative;
-  width: 100%;
-  max-width: 440px;
-  min-width: 230px;
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 24px 18px 16px;
-  border-radius: 22px;
-  /* SOLID, opaque background — no backdrop-filter. A frosted blur over a
-     transparent window samples the desktop behind it and flickers on macOS.
-     (--bg-elev was never defined, so the old card was actually see-through.) */
+  padding: 6px 18px 18px;
   background: var(--surface);
-  border: 1px solid var(--border);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
   color: var(--text);
 }
-/* Top bar: a drag handle (move the card) with the close button on the right. */
+/* Spacer under the native traffic-light buttons (top-left), also a drag strip. */
 .rc-top {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 30px;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 2px;
-  padding: 0 6px;
-  border-top-left-radius: 22px;
-  border-top-right-radius: 22px;
+  height: 28px;
+  flex-shrink: 0;
+  align-self: stretch;
 }
 .rc-close,
 .rc-min {

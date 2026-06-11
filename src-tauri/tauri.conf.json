@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "DropBeam",
   "mainBinaryName": "DropBeam",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "identifier": "com.dropbeam.app",
   "build": {
     "frontendDist": "../dist",
@@ -63,14 +63,15 @@
         "width": 360,
         "height": 400,
         "minWidth": 250,
-        "minHeight": 84,
+        "minHeight": 200,
         "resizable": true,
-        "decorations": false,
-        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "transparent": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "visible": false,
-        "shadow": false,
+        "shadow": true,
         "focus": false
       }
     ],
