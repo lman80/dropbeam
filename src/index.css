@@ -283,6 +283,12 @@ textarea,
   color: var(--text);
   border-color: var(--border);
 }
+/* Quit button (menu-bar popover): red tint on hover so it reads as "leave". */
+.icon-btn-quit:hover {
+  background: color-mix(in srgb, #e5484d 16%, transparent);
+  color: #e5484d;
+  border-color: color-mix(in srgb, #e5484d 32%, transparent);
+}
 
 .card {
   background: var(--surface);

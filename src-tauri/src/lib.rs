@@ -412,6 +412,7 @@ pub fn run() {
             commands::stop_folder_transfer,
             commands::clear_transfer_cache,
             commands::set_card_active,
+            commands::quit_app,
             commands::pair_invite,
             commands::folder_add_person,
             commands::get_folder_statuses,

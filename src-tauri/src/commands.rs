@@ -295,6 +295,17 @@ pub fn hide_popover(app: AppHandle) {
     }
 }
 
+/// Fully quit DropBeam. As a menu-bar app there's no Dock icon to right-click,
+/// so the popover offers an explicit Quit. `force_quit` makes the close-to-tray
+/// handler let the app actually exit instead of hiding to the menu bar.
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        state.force_quit.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    app.exit(0);
+}
+
 /// The send/receive transfer card became visible (`active=true`) or went away
 /// (`active=false`). While a card is on screen we briefly become a regular app
 /// (Dock icon), so its native yellow button can minimize it INTO the Dock and

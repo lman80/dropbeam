@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ArrowDownToLine, Check, Copy, Search, Send, Settings, UserPlus, X } from 'lucide-react'
+import { ArrowDownToLine, Check, Copy, Power, Search, Send, Settings, UserPlus, X } from 'lucide-react'
 import { api, HAS_TAURI, isActive, type TransferUpdate } from '../lib/api'
 import { useStore } from '../store'
 import { Spinner } from '../components/bits'
@@ -13,6 +13,7 @@ import { formatSpeed } from '../lib/format'
 
 const openMain = () => invoke('open_main_window').catch(() => {})
 const hideSelf = () => invoke('hide_popover').catch(() => {})
+const quitApp = () => invoke('quit_app').catch(() => {})
 
 export function Popover() {
   const init = useStore((s) => s.init)
@@ -247,9 +248,18 @@ export function Popover() {
             <Settings size={15} />
           </button>
           <span className="popover-title">DropBeam</span>
-          <button className="icon-btn" title="Close" onClick={hideSelf}>
-            <X size={15} />
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <button
+              className="icon-btn icon-btn-quit"
+              title="Quit DropBeam"
+              onClick={quitApp}
+            >
+              <Power size={15} />
+            </button>
+            <button className="icon-btn" title="Close" onClick={hideSelf}>
+              <X size={15} />
+            </button>
+          </div>
         </header>
 
         <div className="pop-search-wrap">
