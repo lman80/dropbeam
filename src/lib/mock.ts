@@ -226,6 +226,7 @@ if (typeof window !== 'undefined') {
 }
 
 export const mockApi = {
+  clearTransferCache: async (): Promise<number> => 0,
   sendFiles: async (paths: string[]): Promise<TransferUpdate> => {
     const id = `m${++counter}`
     const names = paths.map((p) => p.split('/').pop() || p)

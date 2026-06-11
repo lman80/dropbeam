@@ -43,6 +43,11 @@ struct PendingSend {
     names: Vec<String>,
     total: u64,
     cancel: Arc<AtomicBool>,
+    /// Serve-attempt generation, shared across clones. Each pull bumps it, so a
+    /// stale serve task (its connection died, a resume re-pull took over) can
+    /// tell it is no longer the owner — it must not emit Failed, retire the
+    /// token, or tear down the live attempt's cancel/conn registrations.
+    gen: Arc<AtomicU64>,
 }
 
 /// Shared iroh state, managed by Tauri as `Arc<IrohState>`. The boot task fills
@@ -74,11 +79,24 @@ impl IrohState {
         let was_staged = {
             let mut p = self.pending.lock().unwrap();
             let before = p.len();
-            p.retain(|_, ps| ps.transfer_id != id);
+            // Flip the shared flag BEFORE dropping the entry — an in-flight pull
+            // of this staged send holds a clone of the same Arc, so this is the
+            // only way the cancel reliably reaches it.
+            p.retain(|_, ps| {
+                if ps.transfer_id == id {
+                    ps.cancel.store(true, Ordering::SeqCst);
+                    false
+                } else {
+                    true
+                }
+            });
             before != p.len()
         };
         let mut active = false;
-        if let Some(flag) = self.cancels.lock().unwrap().get(id) {
+        // Take (not just read) the entry: a staged-then-canceled Quick Send that
+        // was never pulled has no other cleanup path, so leaving it would leak
+        // one map entry per canceled link for the life of the process.
+        if let Some(flag) = self.cancels.lock().unwrap().remove(id) {
             flag.store(true, Ordering::SeqCst);
             active = true;
         }
@@ -414,6 +432,20 @@ fn log_transfer_perf(
 /// gave us a direct path.
 async fn wait_for_direct_path(conn: &Connection, max: std::time::Duration) -> bool {
     use iroh::Watcher as _;
+    // Per-peer memory of hole-punch failure. A relay-only peer (symmetric
+    // NAT/CGNAT) used to cost the FULL window on every single transfer — +5-12s
+    // of dead waiting per file, forever, even after the first file proved the
+    // peer never goes direct. If a full window recently expired for this peer,
+    // wait only briefly (iroh still upgrades to direct mid-transfer if the
+    // hole-punch lands later). Cleared the moment any direct path forms, and
+    // entries expire after 10 minutes so a network change gets a fresh chance.
+    // "Only send over direct connections" mode never shortens the wait.
+    let eid = conn.remote_id().to_string();
+    let max = if !require_direct() && relay_only_recent(&eid) {
+        max.min(Duration::from_millis(800))
+    } else {
+        max
+    };
     let mut watcher = conn.paths();
     let res = tokio::time::timeout(max, async {
         loop {
@@ -431,13 +463,73 @@ async fn wait_for_direct_path(conn: &Connection, max: std::time::Duration) -> bo
         }
     })
     .await;
+    let timed_out = res.is_err();
     let ok = res.unwrap_or(false);
     if ok {
         // A direct path just formed — remember the peer's working addresses so
         // future dials skip discovery entirely.
         remember_conn_addrs(conn);
+        clear_relay_only(&eid);
+    } else if timed_out && max >= Duration::from_secs(4) {
+        // Only a FULL-length window counts as evidence of a relay-only peer — a
+        // shortened recheck or a dropped connection proves nothing.
+        note_relay_only(&eid);
     }
     ok
+}
+
+static RELAY_ONLY: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::OnceLock::new();
+
+fn relay_only_map() -> &'static Mutex<HashMap<String, Instant>> {
+    RELAY_ONLY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn relay_only_recent(eid: &str) -> bool {
+    relay_only_map()
+        .lock()
+        .unwrap()
+        .get(eid)
+        .map(|t| t.elapsed() < Duration::from_secs(600))
+        .unwrap_or(false)
+}
+
+fn note_relay_only(eid: &str) {
+    let mut m = relay_only_map().lock().unwrap();
+    // Drop expired entries so the map can't grow without bound across a long
+    // session that talks to many distinct relay-only peers.
+    m.retain(|_, t| t.elapsed() < Duration::from_secs(600));
+    m.insert(eid.to_string(), Instant::now());
+}
+
+fn clear_relay_only(eid: &str) {
+    relay_only_map().lock().unwrap().remove(eid);
+}
+
+// Connections on which the user just granted a manual accept, so the rest of a
+// multi-file batch (split into one push per file over the same connection)
+// doesn't re-prompt. Keyed by the connection's stable id; entries expire so a
+// later send on a reused id can't inherit a stale accept.
+static CONN_ACCEPTED: std::sync::OnceLock<Mutex<HashMap<usize, Instant>>> =
+    std::sync::OnceLock::new();
+
+fn conn_accepted_map() -> &'static Mutex<HashMap<usize, Instant>> {
+    CONN_ACCEPTED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_conn_accepted(conn: &Connection) {
+    let mut m = conn_accepted_map().lock().unwrap();
+    m.retain(|_, t| t.elapsed() < Duration::from_secs(600));
+    m.insert(conn.stable_id(), Instant::now());
+}
+
+fn conn_recently_accepted(conn: &Connection) -> bool {
+    conn_accepted_map()
+        .lock()
+        .unwrap()
+        .get(&conn.stable_id())
+        .map(|t| t.elapsed() < Duration::from_secs(600))
+        .unwrap_or(false)
 }
 
 /// Load the device's secret key from disk, or generate + persist a fresh one.
@@ -478,6 +570,9 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // Seed the known-address cache so the FIRST dial after a relaunch already
     // carries every peer address that worked before.
     load_peer_addrs(config_dir);
+    // Sweep crash litter (orphaned staging dirs, week-old abandoned partials in
+    // every dir that ever held one) before any transfer can start.
+    startup_cleanup(config_dir);
     // Throughput tuning, balanced against NOT wrecking the user's whole connection.
     // BBR congestion control replaces quinn's CUBIC default (iroh benchmark
     // n0-computer/iroh#4286: up to ~30x single-stream throughput, no "fill the
@@ -614,18 +709,29 @@ async fn serve_stream(
             // path blip. We remove the token only once delivery is confirmed.
             let pending = state.pending.lock().unwrap().get(token).cloned();
             let p = pending.ok_or_else(|| anyhow::anyhow!("no pending send for token"))?;
+            // This attempt now OWNS the transfer: bump the generation so any
+            // older serve task for the same token knows it has been superseded.
+            let my_gen = p.gen.fetch_add(1, Ordering::SeqCst) + 1;
             // Register the flag + connection so the sender can cancel mid-pull
-            // (close the conn to unblock a stalled write).
+            // (close the conn to unblock a stalled write). If a previous attempt's
+            // connection is still registered (silently dead, wedged on flow
+            // control), close it — its serve task unblocks, sees the newer
+            // generation, and bows out without touching anything.
             state
                 .cancels
                 .lock()
                 .unwrap()
                 .insert(p.transfer_id.clone(), p.cancel.clone());
-            state
+            if let Some(old) = state
                 .conns
                 .lock()
                 .unwrap()
-                .insert(p.transfer_id.clone(), conn.clone());
+                .insert(p.transfer_id.clone(), conn.clone())
+            {
+                if old.stable_id() != conn.stable_id() {
+                    old.close(1u32.into(), b"superseded");
+                }
+            }
             match state.app.get().cloned() {
                 Some(app) => {
                     let cb = progress_cb(
@@ -657,53 +763,120 @@ async fn serve_stream(
                         serve_pull_negotiated(conn, send, recv, &p.paths, want_parallel, &p.cancel, cb)
                             .await
                     };
+                    // Did this attempt end in CONFIRMED delivery? Only a real ack
+                    // (the receiver's trailing "ok") counts. conn.closed() is NOT
+                    // confirmation — it fires exactly when the path died, and the
+                    // old code treating it as success retired the resume token at
+                    // the very moment the receiver needed it to resume (then
+                    // emitted a false "Completed" for undelivered bytes).
+                    let mut unconfirmed_err: Option<String> = None;
                     match send_result {
                         Ok(_) => {
                             // Wait for the receiver to confirm every byte landed
                             // before reporting done. Otherwise our timer only
                             // measures filling the local send buffer (instant) — not
-                            // real delivery — so the sender's speed/duration would
-                            // never match the receiver's. The friend + folder paths
-                            // already do this; Quick Send was the one that didn't.
-                            // Robust + lenient: a peer on an older build that never
-                            // acks resets the stream (resolves fast), and a peer that
-                            // vanishes mid-flight unblocks us via conn.closed() — so
-                            // we never hang, and we fall back to the old timing rather
-                            // than a false failure.
-                            tokio::select! {
-                                _ = recv.read_to_end(16) => {}
-                                _ = conn.closed() => {}
+                            // real delivery. Bounded: a vanished peer unblocks us
+                            // via conn.closed(), an old build that closes without
+                            // acking resolves the read fast.
+                            let acked = tokio::select! {
+                                r = recv.read_to_end(256) => {
+                                    r.map(|b| b.ends_with(b"ok")).unwrap_or(false)
+                                }
+                                _ = conn.closed() => false,
+                            };
+                            // A modern receiver (it asked for `parallel`) ALWAYS
+                            // acks on success, so a missing ack means the path died
+                            // and we should hold for its resume re-pull. But a
+                            // PRE-v0.11 receiver never sends "ok" and can't resume —
+                            // it just reads the full classic body and closes. For
+                            // that old peer, a graceful close after a completed
+                            // write IS delivery (the behavior every version before
+                            // this shipped); holding 150s then false-failing it
+                            // would be a regression.
+                            if acked || !want_parallel {
+                                // Delivery confirmed — retire the one-time token.
+                                state.pending.lock().unwrap().remove(token);
+                                log_transfer_perf(
+                                    conn,
+                                    "quick-send",
+                                    "send",
+                                    __total,
+                                    __t0.elapsed(),
+                                );
+                                emit_completed(
+                                    &app,
+                                    &p.transfer_id,
+                                    Direction::Send,
+                                    p.names.clone(),
+                                    p.total,
+                                    conn_locality(conn),
+                                    None,
+                                    None,
+                                )
+                            } else {
+                                unconfirmed_err = Some(
+                                    "the receiver disconnected before confirming delivery"
+                                        .to_string(),
+                                );
                             }
-                            // Delivery confirmed — retire the one-time token now (no
-                            // more resumes needed).
-                            state.pending.lock().unwrap().remove(token);
-                            log_transfer_perf(conn, "quick-send", "send", __total, __t0.elapsed());
-                            emit_completed(
-                                &app,
-                                &p.transfer_id,
-                                Direction::Send,
-                                p.names,
-                                p.total,
-                                conn_locality(conn),
-                                None,
-                                None,
-                            )
                         }
                         Err(e)
                             if p.cancel.load(Ordering::SeqCst)
                                 || e.to_string().contains("canceled") =>
                         {
+                            // Canceled on our side: retire the token so the link is
+                            // truly dead, then report Canceled.
+                            state.pending.lock().unwrap().remove(token);
                             emit_canceled(&app, &p.transfer_id, Direction::Send)
                         }
-                        Err(e) => emit_failed(&app, &p.transfer_id, Direction::Send, &e.to_string()),
+                        Err(e) => unconfirmed_err = Some(e.to_string()),
+                    }
+                    if let Some(err) = unconfirmed_err {
+                        // The path died mid-pull (or before the ack). The receiver's
+                        // retry loop re-pulls within seconds and RESUMES from its
+                        // partial — so keep the token staged and show "connecting",
+                        // not a false Failed that the resume immediately contradicts.
+                        // If no resume takes over within the grace window, give up
+                        // for real: retire the token (restores one-time-link
+                        // semantics) and report the failure.
+                        let token_alive = state.pending.lock().unwrap().contains_key(token);
+                        if token_alive && p.gen.load(Ordering::SeqCst) == my_gen {
+                            log::warn!(
+                                "quick-send interrupted ({err}) — holding for the receiver to resume"
+                            );
+                            let mut ru = TransferUpdate::new(
+                                p.transfer_id.clone(),
+                                Direction::Send,
+                                p.names.clone(),
+                            );
+                            ru.state = TransferState::Connecting;
+                            ru.bytes_total = p.total;
+                            emit(&app, &ru);
+                            tokio::time::sleep(Duration::from_secs(150)).await;
+                            if p.gen.load(Ordering::SeqCst) == my_gen
+                                && !p.cancel.load(Ordering::SeqCst)
+                                && state.pending.lock().unwrap().remove(token).is_some()
+                            {
+                                emit_failed(&app, &p.transfer_id, Direction::Send, &err);
+                            }
+                        }
+                        // A newer attempt owns the transfer (or the token is gone):
+                        // this stale task says nothing and touches nothing.
                     }
                 }
                 None => {
+                    // Headless (no app handle): classic one-shot serve — consume
+                    // the token on success like the pre-resume behavior.
                     serve_pull(send, &p.paths, &p.cancel, |_, _| {}).await?;
+                    state.pending.lock().unwrap().remove(token);
                 }
             }
-            state.cancels.lock().unwrap().remove(&p.transfer_id);
-            state.conns.lock().unwrap().remove(&p.transfer_id);
+            // Only the latest attempt may clear the registrations — a stale task
+            // unregistering here would disarm the live attempt's Cancel button.
+            if p.gen.load(Ordering::SeqCst) == my_gen {
+                state.cancels.lock().unwrap().remove(&p.transfer_id);
+                state.conns.lock().unwrap().remove(&p.transfer_id);
+            }
         }
         Some("files") => {
             // A friend pushed files straight to us. Receive into the download
@@ -788,11 +961,61 @@ async fn serve_stream(
                 let _ = write_frame(send, &serde_json::json!({ "hold": true })).await;
             }
 
+            // A retry of a transfer the user ALREADY accepted must not re-prompt —
+            // and must never die on the 300s offer TTL while they're away from the
+            // screen. If this push's fingerprint matches a partial with real
+            // progress whose sidecar was touched in the last 10 minutes, that
+            // proves a prior accept of this exact file (sender + name + size +
+            // mtime): resume silently into the same destination.
+            let mut resume_accept = false;
+            if !auto_accept && want_parallel {
+                let item0 = &req["items"][0];
+                let name0 = names.first().cloned().unwrap_or_default();
+                let fp0 = transfer_fingerprint(
+                    &who,
+                    &name0,
+                    item0["size"].as_u64().unwrap_or(total),
+                    item0["mtime"].as_u64().unwrap_or(0),
+                );
+                let mut candidates = vec![dest.clone()];
+                candidates.extend(load_partial_dirs());
+                for dir in candidates {
+                    let (part0, side0) = partial_paths(&dir, &fp0);
+                    let recent = std::fs::metadata(&side0)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                        .map(|d| d.as_secs() < 600)
+                        .unwrap_or(false);
+                    if recent
+                        && part0.is_file()
+                        && load_sidecar(&side0, &fp0, total)
+                            .map(|c| c.covered() > 0)
+                            .unwrap_or(false)
+                    {
+                        dest = dir;
+                        resume_accept = true;
+                        break;
+                    }
+                }
+            }
+
+            // A multi-file send to a manual-accept friend arrives as one push per
+            // file, all on the SAME connection (the sender splits big files so each
+            // gets resume). Prompting for every file would be three dialogs for a
+            // three-file drop. Once the user accepts ONE transfer on a connection,
+            // auto-accept the rest of that batch arriving on the same connection —
+            // tightly scoped: a brand-new connection (a separate send) prompts
+            // again, so this never grants standing access.
+            if !auto_accept && !resume_accept && conn_recently_accepted(conn) {
+                resume_accept = true;
+            }
+
             // Manual accept/decline — the iroh twin of run_croc_receive_interactive.
             // Pause before reading the body, surface the offer, and wait for the
             // user's decision (resolved by the respond_to_offer command). On
             // decline we drop the streams, which stops the sender's push.
-            if !auto_accept {
+            if !auto_accept && !resume_accept {
                 let mut wu = TransferUpdate::new(id.clone(), Direction::Receive, names.clone());
                 wu.state = TransferState::WaitingForAccept;
                 wu.friend_name = sender.clone();
@@ -816,6 +1039,11 @@ async fn serve_stream(
                     st.offers.lock().unwrap().remove(&id);
                 }
                 let accept = decision.is_some();
+                // Remember the accept so the rest of this batch (same connection)
+                // doesn't re-prompt.
+                if accept {
+                    note_conn_accepted(conn);
+                }
                 // Honor the "Save to" choice from the receive card, if any.
                 if let Some(dir) = decision {
                     if !dir.trim().is_empty() {
@@ -884,7 +1112,34 @@ async fn serve_stream(
                 );
                 // One resumable partial per fingerprint at a time; a concurrent
                 // duplicate of the same file gets a throwaway temp instead.
-                let resumable = state.partials.lock().unwrap().insert(fp.clone());
+                let mut resumable = state.partials.lock().unwrap().insert(fp.clone());
+                if !resumable {
+                    // Common cause: the PREVIOUS attempt's dying handler is still
+                    // flushing its final sidecar persist (an fsync of gigabytes of
+                    // dirty pages can take many seconds) and unregisters the
+                    // fingerprint when done — while the sender's auto-resume has
+                    // already reconnected. Degrading to a throwaway temp here would
+                    // silently restart a multi-GB resume from byte 0, so WAIT for
+                    // the handoff: a modern sender can be held ({hold}), an old one
+                    // waits out its ~6s ready-window anyway.
+                    let budget = if resumable_hs {
+                        if auto_accept {
+                            // (manual-accept already sent its {hold} above)
+                            let _ = write_frame(send, &serde_json::json!({ "hold": true })).await;
+                        }
+                        Duration::from_secs(45)
+                    } else {
+                        Duration::from_secs(4)
+                    };
+                    let t0 = std::time::Instant::now();
+                    while t0.elapsed() < budget {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if state.partials.lock().unwrap().insert(fp.clone()) {
+                            resumable = true;
+                            break;
+                        }
+                    }
+                }
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
                     prepare_partial(&dest, &fp, total)
                 } else {
@@ -948,7 +1203,12 @@ async fn serve_stream(
                                     }
                                 }
                             }
-                            Err(e) => Err(e),
+                            Err(e) => {
+                                if !resumable {
+                                    let _ = std::fs::remove_file(&part);
+                                }
+                                Err(e)
+                            }
                         }
                     }
                     Err(e) => Err(e),
@@ -1082,8 +1342,16 @@ async fn serve_stream(
             if !sm.has_pair(&pair_id) {
                 anyhow::bail!("push for unknown folder pair {pair_id}");
             }
-            let staging = config_dir.join(format!(".iroh-folder-{pair_id}"));
-            let _ = std::fs::remove_dir_all(&staging);
+            // Each receive gets its OWN staging dir. A shared per-pair dir was a
+            // data-loss race: two handlers for the same pair overlap routinely (a
+            // group member pushing while another's send retries, or the sender's
+            // stall watchdog reconnecting while the old wedged handler is still
+            // alive) — and the second handler's wipe-on-entry deleted the first's
+            // in-flight file, while the first's error cleanup could wipe the
+            // second's. With auto-delete on, a falsely-acked empty ingest could
+            // destroy the only copy. Stale dirs from crashes are swept at startup.
+            let staging =
+                config_dir.join(format!(".iroh-folder-{pair_id}-{}", uuid::Uuid::new_v4()));
             // Drop visible "<name>.dropbeam-incoming" placeholders in the REAL folder
             // so the recipient sees a file is on the way (esp. a multi-minute big
             // transfer), then remove them once the real files land. The suffix is
@@ -1145,7 +1413,24 @@ async fn serve_stream(
                 let who = conn.remote_id().to_string();
                 let fp = transfer_fingerprint(&who, &rel.to_string_lossy(), total, mtime);
                 let partial_dir = config_dir.join("folder-partials");
-                let resumable = state.partials.lock().unwrap().insert(fp.clone());
+                let mut resumable = state.partials.lock().unwrap().insert(fp.clone());
+                if !resumable {
+                    // The sender's 45s stall watchdog retries ~2s after abandoning
+                    // a wedged send — while OUR previous handler for this same file
+                    // is often still unwinding (final sidecar fsync, QUIC teardown)
+                    // and hasn't released the fingerprint yet. Falling to a
+                    // throwaway temp here silently restarts a multi-GB file from
+                    // byte 0 — on a flapping link, forever. Wait briefly for the
+                    // handoff (the sender's ready-window gives us ~6s).
+                    let t0 = std::time::Instant::now();
+                    while t0.elapsed() < Duration::from_secs(5) {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        if state.partials.lock().unwrap().insert(fp.clone()) {
+                            resumable = true;
+                            break;
+                        }
+                    }
+                }
                 // A concurrent receive of the same fingerprint must never share the
                 // partial — the loser writes into a throwaway temp instead.
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
@@ -1199,7 +1484,12 @@ async fn serve_stream(
                                     read_folder_body(recv, &req, &staging, &cancel, cb).await
                                 }
                             },
-                            Err(e) => Err(e),
+                            Err(e) => {
+                                if !resumable {
+                                    let _ = std::fs::remove_file(&part);
+                                }
+                                Err(e)
+                            }
                         }
                     }
                     Err(e) => Err(e),
@@ -1532,6 +1822,7 @@ pub fn start_send(
             names: names.clone(),
             total,
             cancel,
+            gen: Arc::new(AtomicU64::new(0)),
         },
     );
     let mut update = TransferUpdate::new(id, Direction::Send, names);
@@ -1579,6 +1870,12 @@ pub fn start_receive(
             // after several attempts in a row that move zero new bytes.
             const MAX_STALL: u32 = 8;
             let progress_high = Arc::new(AtomicU64::new(0));
+            // Set the moment any attempt enters the resumable (partial-backed)
+            // receive path. Retrying is only safe then: a classic-body pull writes
+            // files at their final names, so re-pulling it would land "name (1)"
+            // duplicates of every finished file (the friend-send loop gates its
+            // retries on exactly this).
+            let engaged_ever = Arc::new(AtomicBool::new(false));
             let mut last_high: u64 = 0;
             let mut stall: u32 = 0;
             let mut attempt: u32 = 0;
@@ -1587,7 +1884,19 @@ pub fn start_receive(
                     anyhow::bail!("canceled");
                 }
                 let one = async {
-                    let conn = ep.connect(addr.clone(), ALPN).await.context("dial ticket")?;
+                    // Bounded dial: re-dialing a sender that just went offline is
+                    // exactly when connect can hang forever, and the cancel flag is
+                    // only checked between attempts.
+                    let conn = tokio::time::timeout(
+                        Duration::from_secs(20),
+                        ep.connect(addr.clone(), ALPN),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("dial ticket timed out"))?
+                    .context("dial ticket")?;
+                    // Register the live connection so Cancel can close it and
+                    // unblock a read wedged on a silently-dead path.
+                    cleanup.conns.lock().unwrap().insert(id.clone(), conn.clone());
                     let (mut send, mut recv) = conn.open_bi().await?;
                     // `parallel: true` tells the sender we understand multi-stream +
                     // resume; an older sender just ignores it.
@@ -1625,9 +1934,18 @@ pub fn start_receive(
                         }
                         base_cb(done, total);
                     };
-                    let paths =
-                        read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest, &cancel, cb)
-                            .await?;
+                    let paths = read_files_negotiated(
+                        &conn,
+                        &mut send,
+                        &mut recv,
+                        &header,
+                        &dest,
+                        &cancel,
+                        &engaged_ever,
+                        Some(&cleanup.partials),
+                        cb,
+                    )
+                    .await?;
                     // Confirm receipt so the SENDER measures REAL delivery time.
                     let _ = send.write_all(b"ok").await;
                     let _ = send.finish();
@@ -1644,6 +1962,14 @@ pub fn start_receive(
                     Ok(r) => break Ok(r),
                     Err(e) => {
                         if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") {
+                            break Err(e);
+                        }
+                        // Never auto-retry a pull that hasn't gone resumable: the
+                        // classic body writes final-named files, so a re-pull would
+                        // duplicate everything that already finished. Once the
+                        // transfer HAS engaged resume, even a failed re-dial keeps
+                        // retrying — the partial on disk makes attempts free.
+                        if !engaged_ever.load(Ordering::SeqCst) {
                             break Err(e);
                         }
                         let high = progress_high.load(Ordering::SeqCst);
@@ -1692,6 +2018,7 @@ pub fn start_receive(
             Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
         }
         cleanup.cancels.lock().unwrap().remove(&id);
+        cleanup.conns.lock().unwrap().remove(&id);
     });
     Ok(snapshot)
 }
@@ -1763,6 +2090,16 @@ pub fn send_to_friend(
             let mut last_high: u64 = 0;
             let mut stall: u32 = 0;
             let mut attempt: u32 = 0;
+            // Per-file split for multi-file selections that include a big file —
+            // index of the first file NOT yet confirmed delivered. Survives across
+            // retry attempts so a reconnect never re-sends finished files.
+            let mut next_file: usize = 0;
+            let split = pathbufs.len() > 1
+                && pathbufs.iter().any(|p| {
+                    std::fs::metadata(p)
+                        .map(|m| m.len() >= PARALLEL_MIN)
+                        .unwrap_or(false)
+                });
             loop {
                 // Bounded so an offline/unreachable friend FAILS clearly instead of
                 // hanging forever. Bounded re-dial: a friend who's briefly offline
@@ -1800,14 +2137,15 @@ pub fn send_to_friend(
                 );
                 // Wrap the progress callback to track the high-water mark of confirmed
                 // bytes across ALL attempts — the retry loop uses it to tell "this
-                // resume advanced" from "stuck".
-                let cb = {
+                // resume advanced" from "stuck". Arc'd so per-file sub-sends can
+                // share it while reporting batch-cumulative progress.
+                let cb = std::sync::Arc::new({
                     let ph = progress_high.clone();
                     move |done: u64, total: u64| {
                         ph.fetch_max(done, Ordering::SeqCst);
                         base_cb(done, total);
                     }
-                };
+                });
                 cleanup.conns.lock().unwrap().insert(id.clone(), conn.clone());
                 // Prefer a direct p2p path before sending — the relay is rate-limited
                 // and would crawl. A re-holepunch (after a path blip) can take longer
@@ -1862,16 +2200,54 @@ pub fn send_to_friend(
                 // retried — closing its connection just kills it with no safety net.
                 // (A real 2 GB send died exactly this way: watchdog fired, transfer
                 // was classic, retry was blocked, instant fail.)
-                let watchdog = got_direct.then(|| {
+                let watchdog = {
                     let c = conn.clone();
                     let eng = engaged.clone();
+                    let ph = progress_high.clone();
+                    let started_direct = got_direct;
                     tauri::async_runtime::spawn(async move {
                         let mut relay_since: Option<Instant> = None;
+                        let mut last_p = ph.load(Ordering::SeqCst);
+                        let mut last_change = Instant::now();
                         loop {
                             tokio::time::sleep(Duration::from_secs(2)).await;
+                            // ── No-progress stall guard ──────────────────────────
+                            // The field's nastiest mode: the path dies but QUIC
+                            // keep-alives keep the conn "open" and a write wedges on
+                            // flow control FOREVER. Folder sync got this watchdog in
+                            // v0.13.1; friend sends could still freeze at a fixed %.
+                            // An engaged (resumable) send is closed fast — the retry
+                            // loop reconnects and RESUMES, so it costs nothing. A
+                            // classic send has no retry net, so only a hopeless
+                            // wedge (no byte for 10 min — far past the ~310s
+                            // manual-accept hold window, the longest legitimate
+                            // quiet stretch) is cut loose: a clear failure beats a
+                            // transfer frozen at 30% forever.
+                            let p = ph.load(Ordering::SeqCst);
+                            if p != last_p {
+                                last_p = p;
+                                last_change = Instant::now();
+                            }
+                            let stall_budget = if eng.load(Ordering::SeqCst) {
+                                // Generous enough for the receiver's end-game (join
+                                // workers + final fsync of a huge file) after the
+                                // last progress tick.
+                                Duration::from_secs(120)
+                            } else {
+                                Duration::from_secs(600)
+                            };
+                            if last_change.elapsed() > stall_budget {
+                                log::warn!(
+                                    "friend-send made no progress for {}s — closing the wedged connection",
+                                    stall_budget.as_secs()
+                                );
+                                c.close(1u32.into(), b"stalled");
+                                break;
+                            }
+                            // ── direct→relay degradation guard ───────────────────
                             // Resume-capable transfers only — never force-close a
                             // classic one (it has no retry to catch it).
-                            if !eng.load(Ordering::SeqCst) {
+                            if !started_direct || !eng.load(Ordering::SeqCst) {
                                 relay_since = None;
                                 continue;
                             }
@@ -1893,13 +2269,58 @@ pub fn send_to_friend(
                             }
                         }
                     })
-                });
+                };
                 let __t0 = std::time::Instant::now();
-                let outcome = send_files(&conn, &pathbufs, &cancel, cb, &my_name, &engaged).await;
+                // A multi-file selection with a big file in it used to ride ONE
+                // classic stream end-to-end: ~40% of the link (iroh#4286), no
+                // resume, no retry — a path blip at 90% of a 24 GB batch was
+                // terminal. Split mode pushes each file as its OWN negotiated
+                // transfer over the same connection: every big file gets parallel
+                // streams + the {hold} handshake + per-file resume, and files
+                // confirmed in earlier attempts are never re-sent (no duplicates).
+                // Small-only batches keep the proven one-push classic body.
+                let outcome = if split {
+                    let mut res: Result<u64> = Ok(0);
+                    while next_file < pathbufs.len() {
+                        if cancel.load(Ordering::SeqCst) {
+                            res = Err(anyhow::anyhow!("canceled"));
+                            break;
+                        }
+                        let i = next_file;
+                        // Progress is batch-cumulative: completed files' bytes + the
+                        // current file's live count.
+                        let base: u64 = pathbufs[..i]
+                            .iter()
+                            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                            .sum();
+                        let cb_i = {
+                            let c = cb.clone();
+                            move |done: u64, _t: u64| c(base + done, total)
+                        };
+                        // Fresh per file: the retry gate + watchdog react to the
+                        // file currently on the wire.
+                        engaged.store(false, Ordering::SeqCst);
+                        match send_files(&conn, &pathbufs[i..=i], &cancel, cb_i, &my_name, &engaged)
+                            .await
+                        {
+                            Ok(n) => {
+                                next_file = i + 1;
+                                res = Ok(n);
+                            }
+                            Err(e) => {
+                                res = Err(e);
+                                break;
+                            }
+                        }
+                    }
+                    res
+                } else {
+                    let c = cb.clone();
+                    send_files(&conn, &pathbufs, &cancel, move |d, t| c(d, t), &my_name, &engaged)
+                        .await
+                };
                 let was_engaged = engaged.load(Ordering::SeqCst);
-                if let Some(w) = watchdog {
-                    w.abort();
-                }
+                watchdog.abort();
                 match outcome {
                     Ok(_) => {
                         log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
@@ -2529,10 +2950,16 @@ async fn write_folder_body<F: Fn(u64, u64)>(
 ) -> Result<u64> {
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
-    for (path, _, _, _) in items {
+    for (path, name, size, _) in items {
         let mut f = tokio::fs::File::open(path).await?;
         let mut since_check: u32 = 0;
-        loop {
+        // Cut each file at its ADVERTISED size — the receiver consumes exactly
+        // that many bytes per item, so a file that grows mid-send (a render still
+        // writing, a live log) would otherwise bleed its extra bytes into the
+        // NEXT item and corrupt the rest of the batch. A shrunken file fails
+        // loudly instead of under-filling the stream.
+        let mut remaining = *size;
+        while remaining > 0 {
             if cancel.load(Ordering::SeqCst) {
                 anyhow::bail!("canceled");
             }
@@ -2548,14 +2975,16 @@ async fn write_folder_body<F: Fn(u64, u64)>(
                     anyhow::bail!("source file was removed during send");
                 }
             }
-            let n = f.read(&mut buf).await?;
+            let want = remaining.min(CHUNK as u64) as usize;
+            let n = f.read(&mut buf[..want]).await?;
             if n == 0 {
-                break;
+                anyhow::bail!("\"{name}\" changed while sending (file shrank)");
             }
             if pace {
                 pace_bytes(n as u64).await;
             }
             send.write_all(&buf[..n]).await?;
+            remaining -= n as u64;
             sent += n as u64;
             on_progress(sent, total);
         }
@@ -2595,23 +3024,49 @@ async fn read_folder_body<F: Fn(u64, u64)>(
         let mut f =
             tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&dest).await?);
         let mut remaining = size;
+        let mut failed: Option<anyhow::Error> = None;
         while remaining > 0 {
             if cancel.load(Ordering::SeqCst) {
-                anyhow::bail!("canceled");
+                failed = Some(anyhow::anyhow!("canceled"));
+                break;
             }
             let want = remaining.min(buf.len() as u64) as usize;
-            match recv.read(&mut buf[..want]).await? {
-                Some(n) if n > 0 => {
-                    f.write_all(&buf[..n]).await?;
+            match recv.read(&mut buf[..want]).await {
+                Ok(Some(n)) if n > 0 => {
+                    if let Err(e) = f.write_all(&buf[..n]).await {
+                        failed = Some(e.into());
+                        break;
+                    }
                     remaining -= n as u64;
                     got += n as u64;
                     on_progress(got, total);
                 }
-                _ => anyhow::bail!("stream ended before {} finished", dest.display()),
+                Ok(_) => {
+                    failed = Some(anyhow::anyhow!(
+                        "stream ended before {} finished",
+                        dest.display()
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    failed = Some(e.into());
+                    break;
+                }
             }
         }
-        f.flush().await?;
-        drop(f); // close before stamping the mtime
+        if failed.is_none() {
+            if let Err(e) = f.flush().await {
+                failed = Some(e.into());
+            }
+        }
+        drop(f); // close before stamping the mtime / removing
+        if let Some(e) = failed {
+            // A half-written staged file must not survive — ingest would move it
+            // into the real folder as if complete, and in a mirror it would then
+            // sync to every member.
+            let _ = std::fs::remove_file(&dest);
+            return Err(e);
+        }
         // Preserve the origin's modified-time so this file's signature matches on
         // every member (older peers omit `mtime` → falls back to receive-time).
         set_mtime_secs(&dest, item["mtime"].as_u64().unwrap_or(0));
@@ -2990,11 +3445,112 @@ fn gc_stale_partials(dir: &Path) {
     }
 }
 
+// ---- Partial-dir registry + startup cleanup ---------------------------------
+// Partials can land in ANY directory the user receives into (a Quick Send dest,
+// the download dir, folder-partials). gc_stale_partials only runs when a NEW
+// resumable receive starts in that same dir — so a dir never received into again
+// would keep its abandoned partial forever. Remember every dir that has held a
+// partial (partial-dirs.json) and sweep them all at startup and from the
+// Settings "Clear transfer cache" button.
+static PARTIAL_DIRS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn load_partial_dirs() -> Vec<PathBuf> {
+    let Some(path) = PARTIAL_DIRS_PATH.get() else {
+        return Vec::new();
+    };
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn note_partial_dir(dir: &Path) {
+    let Some(path) = PARTIAL_DIRS_PATH.get() else {
+        return;
+    };
+    let mut dirs = load_partial_dirs();
+    if dirs.first().map(|d| d.as_path()) == Some(dir) {
+        return;
+    }
+    dirs.retain(|d| d != dir);
+    dirs.insert(0, dir.to_path_buf());
+    dirs.truncate(16);
+    if let Ok(json) = serde_json::to_vec(&dirs) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Startup sweep, run once before the accept loop: crash-littered folder
+/// staging dirs (each receive uses its own uuid-suffixed dir, so any survivor
+/// is from a dead process) + stale partials in every dir that ever held one.
+fn startup_cleanup(config_dir: &Path) {
+    let _ = PARTIAL_DIRS_PATH.set(config_dir.join("partial-dirs.json"));
+    if let Ok(rd) = std::fs::read_dir(config_dir) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with(".iroh-folder-")
+                && e.path().is_dir()
+            {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    gc_stale_partials(&config_dir.join("folder-partials"));
+    for d in load_partial_dirs() {
+        gc_stale_partials(&d);
+    }
+}
+
+impl IrohState {
+    /// Settings "Clear transfer cache": delete every resumable partial +
+    /// sidecar that is not actively being written, in every dir that ever held
+    /// one. Returns bytes freed. Clearing a partial only costs a future resume
+    /// — the next send of that file simply starts from zero.
+    pub fn clear_transfer_cache(&self, config_dir: &Path) -> u64 {
+        let active = self.partials.lock().unwrap().clone();
+        let mut dirs = load_partial_dirs();
+        dirs.push(config_dir.join("folder-partials"));
+        let mut freed: u64 = 0;
+        for dir in dirs {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !name.starts_with(".dropbeam-partial-") {
+                    continue;
+                }
+                // A throwaway temp (the concurrent-duplicate loser) isn't tracked
+                // in `partials`, so don't yank one out from under a live receive.
+                if name.starts_with(".dropbeam-partial-tmp-") {
+                    continue;
+                }
+                // ".dropbeam-partial-{fp}.part|json" → skip in-flight fingerprints.
+                let fp = name
+                    .trim_start_matches(".dropbeam-partial-")
+                    .trim_end_matches(".part")
+                    .trim_end_matches(".json");
+                if active.contains(fp) {
+                    continue;
+                }
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                if std::fs::remove_file(e.path()).is_ok() {
+                    freed += size;
+                }
+            }
+        }
+        // NOTE: .iroh-folder-* staging dirs are deliberately NOT touched here —
+        // a live folder receive may be writing into one right now. The startup
+        // sweep (no receives running yet) handles crash litter.
+        freed
+    }
+}
+
 /// Open (or reopen) the hidden partial for `fp`, pre-sized to `total`, returning
 /// any prior coverage from a matching sidecar — i.e. how much we already have.
 fn prepare_partial(dir: &Path, fp: &str, total: u64) -> Result<(PathBuf, Coverage)> {
     std::fs::create_dir_all(dir)?;
     gc_stale_partials(dir);
+    note_partial_dir(dir);
     let (part, side) = partial_paths(dir, fp);
     let coverage = if part.is_file() {
         load_sidecar(&side, fp, total).unwrap_or_default()
@@ -3163,9 +3719,15 @@ fn spawn_range_reader(
             match uni.read(&mut buf[..want]).await? {
                 Some(k) if k > 0 => {
                     f.write_all(&buf[..k]).await?;
-                    // Mark coverage only AFTER the bytes are written, so the
-                    // sidecar never claims data the disk doesn't have (app-level
-                    // interruptions, the overwhelmingly common case, stay safe).
+                    // tokio::fs write is DEFERRED — write_all returns once the
+                    // chunk is handed to a background blocking task, and a failed
+                    // syscall (ENOSPC on the sparse pre-sized partial, EIO on an
+                    // external drive) only surfaces on the NEXT operation. Flush
+                    // first: it joins the in-flight op and returns its error, so
+                    // coverage never claims bytes the OS rejected — otherwise a
+                    // resume could skip the "covered" hole and finalize a file
+                    // with a stretch of zeros where data should be.
+                    f.flush().await?;
                     let end = offset + done + k as u64;
                     cov.lock().unwrap().insert(offset + done, end);
                     done += k as u64;
@@ -3416,20 +3978,29 @@ async fn write_files_body<F: Fn(u64, u64)>(
 ) -> Result<u64> {
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
-    for (path, _, _, _) in items {
+    for (path, name, size, _) in items {
         let mut f = tokio::fs::File::open(path).await?;
-        loop {
+        // The receiver consumes EXACTLY the advertised size per item, so the
+        // stream must match the header byte-for-byte. A file that GROWS between
+        // stat and send (still downloading/copying, a live log) must be cut at
+        // the advertised size — its extra bytes would otherwise be parsed as the
+        // NEXT item's head, silently corrupting every later file in the batch.
+        // A file that SHRINKS must fail loudly, not under-fill the stream.
+        let mut remaining = *size;
+        while remaining > 0 {
             if cancel.load(Ordering::SeqCst) {
                 anyhow::bail!("canceled");
             }
-            let n = f.read(&mut buf).await?;
+            let want = remaining.min(CHUNK as u64) as usize;
+            let n = f.read(&mut buf[..want]).await?;
             if n == 0 {
-                break;
+                anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
             }
             if pace {
                 pace_bytes(n as u64).await;
             }
             send.write_all(&buf[..n]).await?;
+            remaining -= n as u64;
             sent += n as u64;
             on_progress(sent, total);
         }
@@ -3496,22 +4067,49 @@ async fn read_body<F: Fn(u64, u64)>(
         let mut f =
             tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&dest).await?);
         let mut remaining = size;
+        let mut failed: Option<anyhow::Error> = None;
         while remaining > 0 {
             if cancel.load(Ordering::SeqCst) {
-                anyhow::bail!("canceled");
+                failed = Some(anyhow::anyhow!("canceled"));
+                break;
             }
             let want = remaining.min(buf.len() as u64) as usize;
-            match recv.read(&mut buf[..want]).await? {
-                Some(n) if n > 0 => {
-                    f.write_all(&buf[..n]).await?;
+            match recv.read(&mut buf[..want]).await {
+                Ok(Some(n)) if n > 0 => {
+                    if let Err(e) = f.write_all(&buf[..n]).await {
+                        failed = Some(e.into());
+                        break;
+                    }
                     remaining -= n as u64;
                     got += n as u64;
                     on_progress(got, total);
                 }
-                _ => anyhow::bail!("stream ended before {} finished", dest.display()),
+                Ok(_) => {
+                    failed = Some(anyhow::anyhow!(
+                        "stream ended before {} finished",
+                        dest.display()
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    failed = Some(e.into());
+                    break;
+                }
             }
         }
-        f.flush().await?;
+        if failed.is_none() {
+            if let Err(e) = f.flush().await {
+                failed = Some(e.into());
+            }
+        }
+        if let Some(e) = failed {
+            // Never leave a half-written file sitting at its real, visible name —
+            // the user can't tell a truncated "video.mov" from a good one days
+            // later. Files that completed in this batch (already in `out`) stay.
+            drop(f);
+            let _ = std::fs::remove_file(&dest);
+            return Err(e);
+        }
         out.push(dest);
     }
     Ok(out)
@@ -3621,6 +4219,12 @@ pub async fn recv_files<F: Fn(u64, u64)>(
     let out = read_files(&mut recv, dest_dir, cancel, on_progress).await?;
     let _ = send.write_all(b"ok").await;
     let _ = send.finish();
+    // Wait until the sender has actually consumed the ack — a caller that drops
+    // the connection the moment we return would otherwise discard the queued
+    // "ok" and the sender would report "interrupted before the recipient
+    // confirmed receipt". (Production receives live in handle_conn's accept
+    // loop, which keeps the connection alive; this helper is used by tests.)
+    let _ = send.stopped().await;
     Ok(out)
 }
 
@@ -3674,6 +4278,10 @@ pub async fn pull_files<F: Fn(u64, u64)>(
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token })).await?;
     let out = read_files(&mut recv, dest_dir, cancel, on_progress).await?;
+    // Confirm receipt, matching the production receiver — the sender only treats
+    // a pull as delivered (and retires its one-time token) on this ack.
+    let _ = send.write_all(b"ok").await;
+    let _ = send.finish();
     Ok(out)
 }
 
@@ -3688,6 +4296,8 @@ async fn read_files_negotiated<F: Fn(u64, u64)>(
     header: &serde_json::Value,
     dest_dir: &Path,
     cancel: &AtomicBool,
+    engaged: &AtomicBool,
+    partials: Option<&Mutex<std::collections::HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let total = header["total"].as_u64().unwrap_or(0);
@@ -3699,39 +4309,91 @@ async fn read_files_negotiated<F: Fn(u64, u64)>(
         let mtime = item0["mtime"].as_u64().unwrap_or(0);
         let who = conn.remote_id().to_string();
         let fp = transfer_fingerprint(&who, &name, total, mtime);
-        let (part, cov) = prepare_partial(dest_dir, &fp, total)?;
-        let ready = serde_json::json!({ "ready": true, "resume": { "have": cov.ranges } });
-        write_frame(bsend, &ready).await?;
-        match tokio::time::timeout(Duration::from_secs(12), conn.accept_uni()).await {
-            Ok(Ok(first)) => {
-                let rc = Some(ResumeCtx { side: partial_paths(dest_dir, &fp).1, fp });
-                recv_file_resumable(
-                    conn,
-                    FinalizeDest::UniqueIn(dest_dir.to_path_buf(), name),
-                    total,
-                    part,
-                    rc,
-                    cov,
-                    first,
-                    cancel,
-                    on_progress,
-                )
-                .await
-                .map(|p| vec![p])
-            }
-            // Sender raced into its classic fallback — read the classic body,
-            // then drop the partial+sidecar: the file arrived in full, so a kept
-            // partial would only resume a later pull into a "name (1)" duplicate.
-            _ => {
-                let r = read_body(recv, header, dest_dir, cancel, on_progress).await;
-                if r.is_ok() {
-                    let (p, sd) = partial_paths(dest_dir, &fp);
-                    let _ = std::fs::remove_file(p);
-                    let _ = std::fs::remove_file(sd);
+        // Single-writer guard (same as the friend + folder paths): two concurrent
+        // receives of the same file must never share one partial — the loser
+        // writes into a throwaway, non-resumable temp.
+        let owns_partial = partials
+            .map(|set| set.lock().unwrap().insert(fp.clone()))
+            .unwrap_or(true);
+        let prep: Result<(PathBuf, Coverage)> = if owns_partial {
+            prepare_partial(dest_dir, &fp, total)
+        } else {
+            (|| {
+                let p = dest_dir
+                    .join(format!(".dropbeam-partial-tmp-{}.part", uuid::Uuid::new_v4()));
+                std::fs::File::create(&p)?.set_len(total)?;
+                Ok((p, Coverage::default()))
+            })()
+        };
+        let res = match prep {
+            Ok((part, cov)) => {
+                let ready =
+                    serde_json::json!({ "ready": true, "resume": { "have": cov.ranges } });
+                match write_frame(bsend, &ready).await {
+                    Ok(()) => {
+                        match tokio::time::timeout(Duration::from_secs(12), conn.accept_uni())
+                            .await
+                        {
+                            Ok(Ok(first)) => {
+                                // From here every byte lands in a hidden partial and
+                                // the final name appears only on success — a retry
+                                // can't duplicate files, so the outer loop is now
+                                // allowed to auto-resume this pull.
+                                engaged.store(true, Ordering::SeqCst);
+                                let rc = owns_partial.then(|| ResumeCtx {
+                                    side: partial_paths(dest_dir, &fp).1,
+                                    fp: fp.clone(),
+                                });
+                                recv_file_resumable(
+                                    conn,
+                                    FinalizeDest::UniqueIn(dest_dir.to_path_buf(), name),
+                                    total,
+                                    part,
+                                    rc,
+                                    cov,
+                                    first,
+                                    cancel,
+                                    on_progress,
+                                )
+                                .await
+                                .map(|p| vec![p])
+                            }
+                            // Sender raced into its classic fallback — read the
+                            // classic body. Drop the partial+sidecar only if WE own
+                            // them (the file arrived in full, a kept partial would
+                            // only resume a later pull into a "name (1)" dup); a
+                            // loser must never delete the winner's live partial.
+                            _ => {
+                                if !owns_partial {
+                                    let _ = std::fs::remove_file(&part);
+                                }
+                                let r =
+                                    read_body(recv, header, dest_dir, cancel, on_progress).await;
+                                if r.is_ok() && owns_partial {
+                                    let (p, sd) = partial_paths(dest_dir, &fp);
+                                    let _ = std::fs::remove_file(p);
+                                    let _ = std::fs::remove_file(sd);
+                                }
+                                r
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if !owns_partial {
+                            let _ = std::fs::remove_file(&part);
+                        }
+                        Err(e)
+                    }
                 }
-                r
+            }
+            Err(e) => Err(e),
+        };
+        if owns_partial {
+            if let Some(set) = partials {
+                set.lock().unwrap().remove(&fp);
             }
         }
+        res
     } else {
         read_body(recv, header, dest_dir, cancel, on_progress).await
     }
@@ -4297,6 +4959,11 @@ mod tests {
             serve_pull(&mut send, &staged, &AtomicBool::new(false), |_, _| {})
                 .await
                 .unwrap();
+            // Wait for the puller's ack before dropping the connection — exactly
+            // what every production serve path does. Dropping immediately races
+            // the connection close against the client's final reads (quinn
+            // discards untransmitted data on close).
+            let _ = recv.read_to_end(256).await;
         });
 
         let client = Endpoint::bind(presets::N0).await.unwrap();
@@ -4340,6 +5007,7 @@ mod tests {
                 names: vec!["f.bin".into()],
                 total: data.len() as u64,
                 cancel: Arc::new(AtomicBool::new(false)),
+                gen: Arc::new(AtomicU64::new(0)),
             },
         );
         let ticket = make_ticket(&server, &token).unwrap();
@@ -4356,8 +5024,17 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(std::fs::read(&got[0]).unwrap(), data);
-        // The pending entry was consumed by the serve.
-        assert!(state.pending.lock().unwrap().is_empty());
+        // The pending entry is consumed once the serve completes (it's retired on
+        // delivery now, not at pull entry — poll briefly for the server task).
+        let mut consumed = false;
+        for _ in 0..40 {
+            if state.pending.lock().unwrap().is_empty() {
+                consumed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(consumed, "pending token not retired after a completed serve");
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest);
         println!("iroh accept-loop Quick Send OK");

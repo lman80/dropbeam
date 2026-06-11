@@ -29,6 +29,17 @@ pub fn cancel_transfer(
     }
 }
 
+/// Settings "Clear transfer cache": delete every abandoned resumable partial
+/// (paused/failed transfer leftovers) that isn't actively being written.
+/// Returns the number of bytes freed so the UI can show it.
+#[tauri::command]
+pub fn clear_transfer_cache(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+) -> u64 {
+    iroh.clear_transfer_cache(&state.config_dir)
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, Arc<AppState>>) -> Settings {
     state.settings.lock().unwrap().clone()

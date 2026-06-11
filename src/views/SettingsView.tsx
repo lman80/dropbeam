@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react'
-import { CheckCircle2, Download, FolderOpen, RefreshCw } from 'lucide-react'
+import { CheckCircle2, Download, FolderOpen, RefreshCw, Trash2 } from 'lucide-react'
 import { api, type Settings } from '../lib/api'
+import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
 import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
 
@@ -74,6 +75,25 @@ export function SettingsView() {
     if (d) save({ downloadDir: d })
   }
 
+  const toast = useStore((s) => s.toast)
+  const [clearing, setClearing] = useState(false)
+  const clearCache = async () => {
+    setClearing(true)
+    try {
+      const freed = await api.clearTransferCache()
+      toast(
+        'success',
+        freed > 0
+          ? `Cleared ${formatBytes(freed)} of transfer leftovers.`
+          : 'Nothing to clear — no transfer leftovers found.',
+      )
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setClearing(false)
+    }
+  }
+
   const runDirectTest = async () => {
     setTesting(true)
     setTestResult(null)
@@ -119,6 +139,16 @@ export function SettingsView() {
             >
               {settings.downloadDir.split('/').pop() || settings.downloadDir}
             </span>
+          </button>
+        </Row>
+        {SEP}
+        <Row
+          title="Clear transfer cache"
+          desc="Interrupted transfers keep their progress on disk so they can resume. Old leftovers are cleaned automatically after a week; this removes them now."
+        >
+          <button className="btn btn-ghost" onClick={clearCache} disabled={clearing}>
+            {clearing ? <Spinner size={14} /> : <Trash2 size={15} />}
+            <span>Clear now</span>
           </button>
         </Row>
       </Card>

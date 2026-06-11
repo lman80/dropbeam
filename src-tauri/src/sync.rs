@@ -324,6 +324,28 @@ impl SyncManager {
     }
 
     fn start_pair(self: &Arc<Self>, pair: Pair) {
+        // Sweep crash-orphaned "<name>.dropbeam-incoming" placeholders for EVERY
+        // pair, not just sender-role ones — seed_existing's sweep only runs in
+        // the sender worker, so a receive-only pair kept its litter forever. Only
+        // stale ones go (>10 min): a live receive may legitimately own a fresh
+        // placeholder right now.
+        {
+            let now = std::time::SystemTime::now();
+            for f in list_files_rec(Path::new(&pair.folder)) {
+                if !f.to_string_lossy().ends_with(".dropbeam-incoming") {
+                    continue;
+                }
+                let stale = std::fs::metadata(&f)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs() > 600)
+                    .unwrap_or(true);
+                if stale {
+                    let _ = std::fs::remove_file(&f);
+                }
+            }
+        }
         let stopped = Arc::new(AtomicBool::new(false));
         let stop_notify = Arc::new(Notify::new());
         let wake = Arc::new(Notify::new());
@@ -702,6 +724,34 @@ impl SyncManager {
                     offline_attempts = 0;
                 }
 
+                // BATCH small files into one push. Every send pays a fresh dial +
+                // direct-path wait + header/ack round-trips; one-at-a-time, a
+                // 300-photo folder spends 10+ minutes on pure per-file overhead
+                // over a WAN. The wire protocol has always supported multi-item
+                // bodies (the header carries an `items` array and the receiver
+                // loops it), so consecutive small files ride together. Big files
+                // stay SOLO — that keeps their parallel-streams + resume path.
+                const BATCH_MAX_FILES: usize = 32;
+                const BATCH_FILE_CAP: u64 = 4 * 1024 * 1024; // only files ≤4 MiB batch
+                const BATCH_BYTES_CAP: u64 = 64 * 1024 * 1024;
+                let head_size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(u64::MAX);
+                let mut batch: Vec<String> = vec![file.clone()];
+                if head_size <= BATCH_FILE_CAP {
+                    let mut bytes = head_size;
+                    let q = queue.lock().unwrap();
+                    for cand in q.iter().skip(1) {
+                        if batch.len() >= BATCH_MAX_FILES || bytes >= BATCH_BYTES_CAP {
+                            break;
+                        }
+                        let Ok(m) = std::fs::metadata(cand) else { break };
+                        if m.len() > BATCH_FILE_CAP || bytes + m.len() > BATCH_BYTES_CAP {
+                            break;
+                        }
+                        bytes += m.len();
+                        batch.push(cand.clone());
+                    }
+                }
+
                 let (pair, settings) = {
                     let p = config.lock().unwrap().clone();
                     let s = manager
@@ -711,7 +761,11 @@ impl SyncManager {
                         .unwrap_or_default();
                     (p, s)
                 };
-                let name = file_name_of(&file);
+                let name = if batch.len() > 1 {
+                    format!("{} (+{} more)", file_name_of(&file), batch.len() - 1)
+                } else {
+                    file_name_of(&file)
+                };
 
                 set_status(&status, FolderState::Sending, Some(name.clone()), 0.0, None);
                 manager.emit_status(&pair_id);
@@ -723,7 +777,7 @@ impl SyncManager {
                 // queued file lands the instant the peer is reachable, instead of
                 // waiting up to the 300s beacon cadence to flip peer_online.
                 let iroh_loc = manager
-                    .try_iroh_folder_send(&pair, &settings, &file, &status, &stopped, &skip_current)
+                    .try_iroh_folder_send(&pair, &settings, &batch, &status, &stopped, &skip_current)
                     .await;
 
                 // The user hit "Stop" on this transfer: it was aborted above. Move
@@ -731,9 +785,11 @@ impl SyncManager {
                 // will bring it back) so the rest of the folder keeps flowing NOW.
                 if skip_current.swap(false, Ordering::SeqCst) {
                     let mut q = queue.lock().unwrap();
-                    if let Some(pos) = q.iter().position(|x| x == &file) {
-                        if let Some(f) = q.remove(pos) {
-                            q.push_back(f);
+                    for f in &batch {
+                        if let Some(pos) = q.iter().position(|x| x == f) {
+                            if let Some(item) = q.remove(pos) {
+                                q.push_back(item);
+                            }
                         }
                     }
                     drop(q);
@@ -756,17 +812,34 @@ impl SyncManager {
 
                 match result {
                     SendOutcome::Delivered => {
-                        queue.lock().unwrap().pop_front();
+                        {
+                            let mut q = queue.lock().unwrap();
+                            for f in &batch {
+                                if q.front() == Some(f) {
+                                    q.pop_front();
+                                } else if let Some(pos) = q.iter().position(|x| x == f) {
+                                    q.remove(pos);
+                                }
+                            }
+                        }
                         offline_attempts = 0;
-                        // Remember it so a restart won't re-send it.
-                        if let Some(sig) = file_sig(&file, &pair.folder) {
-                            inbound.lock().unwrap().insert(sig);
-                            let snapshot = inbound.lock().unwrap().clone();
+                        // Remember them so a restart won't re-send.
+                        {
+                            let mut inb = inbound.lock().unwrap();
+                            for f in &batch {
+                                if let Some(sig) = file_sig(f, &pair.folder) {
+                                    inb.insert(sig);
+                                }
+                            }
+                            let snapshot = inb.clone();
+                            drop(inb);
                             manager.persist_manifest(&pair_id, &snapshot);
                         }
                         // Auto-delete only AFTER confirmed delivery.
                         if pair.auto_delete {
-                            delete_local(&file, pair.delete_mode);
+                            for f in &batch {
+                                delete_local(f, pair.delete_mode);
+                            }
                         }
                         set_status(&status, FolderState::Idle, None, 0.0, None);
                         manager.emit_status(&pair_id);
@@ -793,10 +866,12 @@ impl SyncManager {
                         // it comes back around and keeps retrying with backoff.
                         if offline_attempts >= 3 {
                             let mut q = queue.lock().unwrap();
-                            if q.len() > 1 {
-                                if let Some(pos) = q.iter().position(|x| x == &file) {
-                                    if let Some(f) = q.remove(pos) {
-                                        q.push_back(f);
+                            if q.len() > batch.len() {
+                                for f in &batch {
+                                    if let Some(pos) = q.iter().position(|x| x == f) {
+                                        if let Some(item) = q.remove(pos) {
+                                            q.push_back(item);
+                                        }
                                     }
                                 }
                                 drop(q);
@@ -1477,14 +1552,16 @@ impl SyncManager {
         self: &Arc<Self>,
         pair: &Pair,
         _settings: &Settings,
-        file: &str,
+        files: &[String],
         status: &Arc<Mutex<StatusSnapshot>>,
         stopped: &Arc<AtomicBool>,
         skip_current: &Arc<AtomicBool>,
     ) -> Option<Locality> {
         let eid = pair.endpoint_id.clone()?;
         let ep = self.iroh_endpoint()?;
-        let paths = vec![PathBuf::from(file)];
+        let file = files.first().cloned().unwrap_or_default();
+        let file = file.as_str();
+        let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
         // Tracks the last time bytes actually moved, so a STALL watchdog can abandon
         // a frozen transfer instead of letting it wedge the whole folder queue.
         let last_progress = Arc::new(AtomicU64::new(now_ms()));
@@ -1792,6 +1869,31 @@ fn move_staged_into_folder(
         let in_size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
         let in_mtime = std::fs::metadata(&src).ok().map(|m| meta_mtime(&m)).unwrap_or(0);
 
+        // RE-DELIVERY is a no-op in EVERY mode. If the sender never saw our "ok"
+        // (ack lost to a path drop, or its stall watchdog fired) it re-sends a
+        // file we already landed — without this check a plain folder grows a
+        // visible "name (1)" duplicate that a two-way pair then syncs BACK, and
+        // a 1:1 mirror pointlessly archives another multi-GB copy to history on
+        // every redelivery. Same size + same stamped mtime + same bytes = the
+        // exact file we already have; just record it and drop the staged copy.
+        if dest_path.is_file() {
+            let loc_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+            let loc_mtime = std::fs::metadata(&dest_path)
+                .ok()
+                .map(|m| meta_mtime(&m))
+                .unwrap_or(u64::MAX);
+            if in_size == loc_size && in_mtime == loc_mtime {
+                let h = content_hash(&src);
+                if !h.is_empty() && h == content_hash(&dest_path) {
+                    let _ = std::fs::remove_file(&src);
+                    if let Some(sig) = file_sig(&dest_path.to_string_lossy(), folder_str) {
+                        inbound.lock().unwrap().insert(sig);
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Mirror = shared source of truth. Resolve every incoming file
         // DETERMINISTICALLY so all members converge to the same bytes:
         //   • identical version already here → no-op (kills the mesh echo/storm),
@@ -1921,11 +2023,17 @@ fn stamp_mtime(path: &Path, secs: u64) {
 /// ties identically on every member. Empty string on read error (sorts lowest).
 fn content_hash(path: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let Ok(bytes) = std::fs::read(path) else {
+    // Stream in bounded chunks — this runs on multi-GB files during conflict
+    // resolution, and reading the whole file into RAM (the old way) could spike
+    // gigabytes of memory on the receiving machine mid-sync.
+    let Ok(f) = std::fs::File::open(path) else {
         return String::new();
     };
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, f);
     let mut h = Sha256::new();
-    h.update(&bytes);
+    if std::io::copy(&mut reader, &mut h).is_err() {
+        return String::new();
+    }
     hex::encode(h.finalize())
 }
 

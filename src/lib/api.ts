@@ -237,6 +237,8 @@ const realApi = {
   removePair: (id: string) => invoke<void>('remove_pair', { id }),
   verifyFolders: () => invoke<void>('verify_folders'),
   stopFolderTransfer: (pairId: string) => invoke<void>('stop_folder_transfer', { pairId }),
+  /** Delete abandoned transfer leftovers (paused/failed partials). Returns bytes freed. */
+  clearTransferCache: () => invoke<number>('clear_transfer_cache'),
   pairInvite: (id: string) => invoke<string>('pair_invite', { id }),
   /** Invite another person into an existing folder (makes it a 3+ person group). */
   folderAddPerson: (id: string) => invoke<string>('folder_add_person', { id }),

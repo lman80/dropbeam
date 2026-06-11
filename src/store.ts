@@ -158,6 +158,9 @@ let lastDropAt = 0
 // the menu-bar popover drag-to-send) would otherwise send the same files twice.
 let lastFriendSig = ''
 let lastFriendAt = 0
+// In-flight receives by ticket, so pasting the same code twice can't start two
+// pulls of the same files racing each other into "name (1)" duplicates.
+const activeReceives = new Map<string, string>()
 
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
@@ -387,7 +390,19 @@ export const useStore = create<AppStore>((set, get) => ({
         )
         return
       }
+      // One receive per ticket at a time: a double-paste/double-click would
+      // start two pulls of the same files racing each other into duplicates.
+      const priorId = activeReceives.get(code)
+      if (priorId) {
+        const prior = get().transfers[priorId]
+        if (prior && !['completed', 'failed', 'canceled'].includes(prior.state)) {
+          get().toast('info', 'Already receiving this transfer.')
+          return
+        }
+        activeReceives.delete(code)
+      }
       const u = await api.irohReceive(code)
+      activeReceives.set(code, u.id)
       get().upsertTransfer(u)
     } catch (e) {
       get().toast('error', String(e))

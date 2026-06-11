@@ -181,6 +181,30 @@ pub fn run() {
                     ])
                     .build(),
             );
+            // KeepAll preserves diagnostic history but never deletes anything — an
+            // always-running menu-bar app would grow ~/Library/Logs without bound.
+            // Sweep rotated files beyond the newest 5 (~10 MB of history) at start.
+            if let Ok(log_dir) = app.path().app_log_dir() {
+                if let Ok(rd) = std::fs::read_dir(&log_dir) {
+                    let mut rotated: Vec<(std::time::SystemTime, PathBuf)> = rd
+                        .flatten()
+                        .filter(|e| {
+                            let n = e.file_name().to_string_lossy().to_string();
+                            n.starts_with("DropBeam") && n.ends_with(".log") && n != "DropBeam.log"
+                        })
+                        .filter_map(|e| {
+                            e.metadata()
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .map(|t| (t, e.path()))
+                        })
+                        .collect();
+                    rotated.sort_by(|a, b| b.0.cmp(&a.0));
+                    for (_, p) in rotated.into_iter().skip(5) {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
             // Log panics (including ones inside commands) so a crash on a remote
             // machine leaves a trace in the file instead of a silent hang.
             std::panic::set_hook(Box::new(|info| {
@@ -337,6 +361,7 @@ pub fn run() {
             commands::remove_pair,
             commands::verify_folders,
             commands::stop_folder_transfer,
+            commands::clear_transfer_cache,
             commands::pair_invite,
             commands::folder_add_person,
             commands::get_folder_statuses,
