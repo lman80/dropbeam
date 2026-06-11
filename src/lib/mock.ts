@@ -34,7 +34,7 @@ let settings: Settings = {
   displayName: "Ashton's MacBook Pro",
   theme: 'system',
   minimizeToTray: true,
-  launchAtLogin: false,
+  launchAtLogin: true,
   preferDirectP2p: true,
   customRelay: '',
   customRelayPass: '',

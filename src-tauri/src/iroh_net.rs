@@ -183,6 +183,35 @@ fn emit_completed(
     u.out_dir = out_dir.clone();
     emit(app, &u);
 
+    // Pop a native OS notification for an INCOMING file — this is what makes
+    // DropBeam feel "always ready in the background": the app runs in the menu
+    // bar, a friend sends, and a notification tells you even when no window is
+    // open (the receive card already pops, but a notification reaches you in
+    // another app / full-screen). Receives only; sends already show the send
+    // card. Gated by the same "notify when transfers finish" setting folder
+    // syncs use. (Folder syncs notify themselves via SyncManager.)
+    if matches!(dir, Direction::Receive) {
+        if let Some(st) = app.try_state::<std::sync::Arc<crate::AppState>>() {
+            if st.settings.lock().unwrap().notify_on_complete && !names.is_empty() {
+                use tauri_plugin_notification::NotificationExt;
+                let who = friend
+                    .as_deref()
+                    .map(|n| n.to_string())
+                    .filter(|n| !n.trim().is_empty());
+                let what = if names.len() == 1 {
+                    names[0].clone()
+                } else {
+                    format!("{} files", names.len())
+                };
+                let (title, body) = match who {
+                    Some(name) => (format!("{name} sent you {what}"), "Saved — click to open DropBeam".to_string()),
+                    None => (format!("Received {what}"), "Saved — click to open DropBeam".to_string()),
+                };
+                let _ = app.notification().builder().title(title).body(body).show();
+            }
+        }
+    }
+
     // Persist to History so iroh transfers survive a restart. Folder receives log
     // via note_received; this covers Quick Send + friend sends/receives.
     if let Some(st) = app.try_state::<std::sync::Arc<crate::AppState>>() {

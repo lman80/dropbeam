@@ -275,6 +275,8 @@ pub fn macos_install_hint() -> Option<String> {
 /// tuck the popover away.
 #[tauri::command]
 pub fn open_main_window(app: AppHandle) {
+    // Restore the Dock icon + normal focus while the window is open.
+    crate::set_dock_icon_visible(&app, true);
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.unminimize();
         let _ = main.show();
@@ -301,7 +303,7 @@ pub fn get_default_download_dir(app: AppHandle) -> String {
         .unwrap_or_default()
 }
 
-fn apply_autostart(app: &AppHandle, enable: bool) {
+pub(crate) fn apply_autostart(app: &AppHandle, enable: bool) {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();
     let _ = if enable {

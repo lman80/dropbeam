@@ -178,7 +178,9 @@ impl Default for Settings {
             display_name: String::new(),
             theme: "system".into(),
             minimize_to_tray: true,
-            launch_at_login: false,
+            // Always ready: new installs auto-start (silently, in the menu bar) so
+            // a friend's file can land without the app being open first.
+            launch_at_login: true,
             prefer_direct_p2p: true,
             custom_relay: String::new(),
             custom_relay_pass: String::new(),

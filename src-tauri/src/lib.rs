@@ -230,7 +230,20 @@ pub fn run() {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
             let default_name = default_display_name();
-            let loaded = settings::load(&config_dir, &default_download, &default_name);
+            let mut loaded = settings::load(&config_dir, &default_download, &default_name);
+            // One-time "always ready in the background" migration: existing installs
+            // had launch-at-login OFF, so a closed app couldn't receive. Turn it ON
+            // once (the app then starts silently in the menu bar at every login).
+            // A marker FILE — not a settings field — records that we did, so it
+            // can't be reset by the frontend's full-object settings save, and so we
+            // never override a later manual choice to turn it off.
+            let bg_marker = config_dir.join(".bg-ready-migrated");
+            if !bg_marker.exists() {
+                loaded.launch_at_login = true;
+                let _ = settings::save(&config_dir, &loaded);
+                let _ = std::fs::write(&bg_marker, b"1");
+            }
+            let want_autostart = loaded.launch_at_login;
             // Honor the saved internet upload cap from first launch.
             iroh_net::set_upload_limit_mbps(loaded.upload_limit_mbps);
             iroh_net::set_require_direct(loaded.require_direct);
@@ -282,6 +295,31 @@ pub fn run() {
             build_tray(app.handle())?;
             log::info!("setup: tray built");
 
+            // Register (or clear) the login item so DropBeam is ready to receive
+            // after every restart without being opened. Re-applied each launch so
+            // it survives app updates.
+            commands::apply_autostart(app.handle(), want_autostart);
+
+            // Present the window — UNLESS we were auto-started at login (the
+            // autostart plugin passes `--minimized`), in which case we stay silent
+            // in the menu bar, ready to receive. The main window is created hidden
+            // (visible:false in the config) so a login launch never flashes it.
+            // The app is born menu-bar-only (LSUIElement in Info.plist on macOS),
+            // so a login launch never flashes a Dock icon or the window. On a
+            // NORMAL launch, become a regular app FIRST (so the window comes to the
+            // front), then show it. On an autostart launch (`--minimized` from the
+            // login item) stay quietly in the menu bar, ready to receive.
+            let autostart_launch = std::env::args().any(|a| a == "--minimized");
+            if autostart_launch {
+                log::info!("setup: launched at login — staying in the menu bar");
+            } else {
+                set_dock_icon_visible(app.handle(), true);
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+
             // Native macOS: let a file dragged over the menu-bar icon spring the
             // popover open (Blip-style). The status item appears a beat after the
             // tray is built, so retry on the main thread until the button exists.
@@ -329,6 +367,9 @@ pub fn run() {
                 if !force && minimize {
                     let _ = window.hide();
                     api.prevent_close();
+                    // Back to a menu-bar-only app (no Dock icon) while the window
+                    // is tucked away — but still running and receiving.
+                    set_dock_icon_visible(&app, false);
                 }
             }
             // The menu-bar popover dismisses itself when it loses focus.
@@ -402,6 +443,7 @@ pub fn run() {
             // this the window "disappears" after it's been hidden to the tray.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = &_event {
+                set_dock_icon_visible(_app, true);
                 if let Some(w) = _app.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.unminimize();
@@ -468,12 +510,34 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn show_main_window(app: &AppHandle) {
+    // Become a normal app (Dock icon + proper focus) while the window is open.
+    set_dock_icon_visible(app, true);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
 }
+
+/// macOS: show or hide the Dock icon by switching the activation policy.
+/// DropBeam lives in the menu bar with no Dock icon while idle, and becomes a
+/// regular app (Dock icon + Cmd-Tab + reliable focus) whenever its main window
+/// is open — the standard menu-bar-app pattern. No-op off macOS.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_dock_icon_visible(app: &AppHandle, visible: bool) {
+    let handle = app.clone();
+    let policy = if visible {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    };
+    let _ = app.run_on_main_thread(move || {
+        let _ = handle.set_activation_policy(policy);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_dock_icon_visible(_app: &AppHandle, _visible: bool) {}
 
 /// Toggle the menu-bar popover, anchoring it just below the clicked tray icon.
 fn toggle_popover(app: &AppHandle, cursor: tauri::PhysicalPosition<f64>) {

@@ -28,7 +28,7 @@ const DEFAULT_SETTINGS: Settings = {
   displayName: '',
   theme: 'system',
   minimizeToTray: true,
-  launchAtLogin: false,
+  launchAtLogin: true,
   preferDirectP2p: true,
   customRelay: '',
   customRelayPass: '',

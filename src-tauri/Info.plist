@@ -2,6 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!-- Menu-bar app (like Blip): born with NO Dock icon so a login launch is
+       silent and DropBeam just sits in the menu bar, ready to receive. We flip to
+       a regular app (Dock icon + focus) at runtime ONLY while the main window is
+       open (set_activation_policy in lib.rs). Starting Accessory and only ever
+       going Accessory->Regular at runtime avoids the flaky Regular->Accessory
+       hide transition and the login Dock-icon flash. -->
+  <key>LSUIElement</key>
+  <true/>
+
   <!-- Why we touch these folders, so the macOS access prompt is correct (a
        Shared Drop Folder often lives on the Desktop). The repeated-prompt fix is
        the stable ad-hoc signature + getting the app out of quarantine, not these

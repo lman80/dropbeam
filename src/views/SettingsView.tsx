@@ -173,18 +173,24 @@ export function SettingsView() {
 
       <SectionTitle>Behavior</SectionTitle>
       <Card>
-        <Row title="Launch at login" desc="Start DropBeam automatically so transfers can arrive.">
+        <Row
+          title="Stay ready in the background"
+          desc="Start DropBeam automatically at login and keep it quietly in the menu bar, so files can arrive even when you haven’t opened it. Turn off and DropBeam only receives while it’s open."
+        >
           <Toggle on={settings.launchAtLogin} onChange={(v) => save({ launchAtLogin: v })} />
         </Row>
         {SEP}
         <Row
-          title="Keep running in the menu bar"
-          desc="Closing the window hides DropBeam to the menu bar instead of quitting."
+          title="Keep running when you close the window"
+          desc="Closing the window tucks DropBeam into the menu bar instead of quitting, so it keeps receiving."
         >
           <Toggle on={settings.minimizeToTray} onChange={(v) => save({ minimizeToTray: v })} />
         </Row>
         {SEP}
-        <Row title="Notify when transfers finish">
+        <Row
+          title="Notify when a file arrives"
+          desc="Pop a notification when someone sends you a file, even if DropBeam is in the background."
+        >
           <Toggle on={settings.notifyOnComplete} onChange={(v) => save({ notifyOnComplete: v })} />
         </Row>
         {SEP}
