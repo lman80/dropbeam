@@ -246,6 +246,10 @@ export const useStore = create<AppStore>((set, get) => ({
         /* localStorage unavailable — treat as off */
       }
       if (!on) return
+      // One sound for the whole drop, not 50. If more files are still queued
+      // (remaining > 0), stay quiet and let the final one chime. (remaining is
+      // absent on receives / older builds → fall back to the 1.5s throttle.)
+      if (s.remaining !== undefined && s.remaining > 0) return
       const key = `${s.pairId}:${s.direction}`
       const now = Date.now()
       if (now - (folderSoundThrottle.get(key) ?? 0) < 1500) return

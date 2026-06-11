@@ -351,5 +351,11 @@ pub struct FolderStatus {
     /// "both have N files, in sync" so the user can confirm the folders match.
     #[serde(default)]
     pub peer_files: u32,
+    /// Aggregate progress for the current send burst (a folder drop). Drives ONE
+    /// "12 of 50 files" progress bar instead of a card flashing per file.
+    #[serde(default)]
+    pub session_total_files: u32,
+    #[serde(default)]
+    pub session_done_files: u32,
 }
 

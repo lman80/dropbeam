@@ -87,6 +87,11 @@ struct StatusSnapshot {
     /// How many files the peer reported in its last reconcile snapshot — so the UI
     /// can show "both have N files, in sync" and the user can SEE the folders match.
     peer_files: u32,
+    /// Aggregate progress for the CURRENT send burst (a folder drop = one burst):
+    /// total files queued this burst, and how many are done. Lets the UI show ONE
+    /// progress bar ("12 of 50 files") instead of a card flashing once per file.
+    session_total_files: u32,
+    session_done_files: u32,
 }
 
 impl Default for StatusSnapshot {
@@ -105,6 +110,8 @@ impl Default for StatusSnapshot {
             locality: Locality::Unknown,
             peer_unshared: false,
             peer_files: 0,
+            session_total_files: 0,
+            session_done_files: 0,
         }
     }
 }
@@ -318,6 +325,8 @@ impl SyncManager {
                     peer_unshared: s.peer_unshared,
                     queued_files,
                     peer_files: s.peer_files,
+                    session_total_files: s.session_total_files,
+                    session_done_files: s.session_done_files,
                 }
             })
             .collect()
@@ -688,12 +697,20 @@ impl SyncManager {
         tauri::async_runtime::spawn(async move {
             let mut current = String::new();
             let mut offline_attempts: u32 = 0;
+            // Files delivered in the CURRENT burst — reset whenever the queue
+            // drains, so "12 of 50" tracks one folder drop, not all time.
+            let mut session_done: u32 = 0;
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }
                 let next = queue.lock().unwrap().front().cloned();
                 let Some(file) = next else {
+                    session_done = 0;
+                    if let Ok(mut s) = status.lock() {
+                        s.session_total_files = 0;
+                        s.session_done_files = 0;
+                    }
                     set_status(&status, FolderState::Idle, None, 0.0, None);
                     manager.emit_status(&pair_id);
                     // While idle, periodically re-scan for any local file that never
@@ -768,6 +785,15 @@ impl SyncManager {
                 };
 
                 set_status(&status, FolderState::Sending, Some(name.clone()), 0.0, None);
+                // Aggregate burst progress: total = already done + everything still
+                // queued (incl. this batch). Drives the single "12 of 50 files" bar.
+                {
+                    let remaining = queue.lock().unwrap().len() as u32;
+                    if let Ok(mut s) = status.lock() {
+                        s.session_done_files = session_done;
+                        s.session_total_files = session_done + remaining;
+                    }
+                }
                 manager.emit_status(&pair_id);
 
                 // Always ATTEMPT the direct push (try_iroh_folder_send has its own
@@ -841,12 +867,23 @@ impl SyncManager {
                                 delete_local(f, pair.delete_mode);
                             }
                         }
+                        session_done += batch.len() as u32;
+                        let remaining = queue.lock().unwrap().len();
                         set_status(&status, FolderState::Idle, None, 0.0, None);
+                        // Hold the burst counters across the gap before the next file
+                        // (set_status leaves these new fields alone) so the bar shows
+                        // a steady "N of M", not a reset between files.
+                        if let Ok(mut s) = status.lock() {
+                            s.session_done_files = session_done;
+                            s.session_total_files = session_done + remaining as u32;
+                        }
                         manager.emit_status(&pair_id);
                         // Cue the UI to optionally play a sound + flash the HUD.
+                        // `remaining` lets the UI ding ONCE when the whole drop is
+                        // done, not once per file.
                         let _ = manager.app.emit(
                             "folder-synced",
-                            serde_json::json!({ "pairId": pair_id, "direction": "send" }),
+                            serde_json::json!({ "pairId": pair_id, "direction": "send", "remaining": remaining }),
                         );
                     }
                     SendOutcome::Offline => {
@@ -1700,6 +1737,8 @@ impl SyncManager {
             peer_unshared: s.peer_unshared,
             queued_files,
             peer_files: s.peer_files,
+            session_total_files: s.session_total_files,
+            session_done_files: s.session_done_files,
         };
         let _ = self.app.emit("folder://status", status);
     }

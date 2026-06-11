@@ -43,6 +43,22 @@ export function Hud() {
       const pair = pairs.find((p) => p.id === folder.pairId)
       const who = folder.peerName || pair?.peerName || 'folder'
       const sending = folder.state === 'sending'
+      const total = folder.sessionTotalFiles ?? 0
+      if (total > 1) {
+        // A whole folder drop = ONE bar. Overall % = files already done plus the
+        // current file's fraction, spread across the batch — so it climbs once to
+        // 100% instead of resetting per file.
+        const done = folder.sessionDoneFiles ?? 0
+        const overall = Math.min(100, ((done + folder.percent / 100) / total) * 100)
+        return {
+          key: folder.pairId,
+          direction: sending ? 'send' : 'receive',
+          title: sending ? `Syncing to ${who}` : `Syncing from ${who}`,
+          sub: `${Math.min(done + 1, total)} of ${total} files · ${Math.round(overall)}%`,
+          percent: overall,
+          locality: folder.locality,
+        }
+      }
       return {
         key: folder.pairId,
         direction: sending ? 'send' : 'receive',
@@ -147,10 +163,12 @@ function usePositionOnce() {
         const screenW = mon.size.width / scale
         const originX = mon.position.x / scale
         const originY = mon.position.y / scale
-        const hudW = 340
-        // Tuck it under the menu-bar tray icon, in the top-right corner.
-        const x = originX + Math.max(8, screenW - hudW - 14)
-        const y = originY + 8
+        const hudW = 384
+        // Tuck it under the menu-bar tray icon, in the top-right corner. The
+        // window is wider than the pill (transparent margin for the shadow), so
+        // nudge right by that margin to keep the visible pill in the same spot.
+        const x = originX + Math.max(8, screenW - hudW + 2)
+        const y = originY + 2
         await getCurrentWindow().setPosition(new LogicalPosition(x, y))
       } catch {
         /* positioning is best-effort */

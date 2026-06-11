@@ -182,6 +182,10 @@ export interface FolderStatus {
   /** How many files the peer has (from its last reconcile) — for the "both have N
    *  files, in sync" indicator. */
   peerFiles?: number
+  /** Aggregate progress for the current send burst (a folder drop): total files
+   *  and how many are done, so the HUD shows one "12 of 50" bar. */
+  sessionTotalFiles?: number
+  sessionDoneFiles?: number
 }
 
 export interface PairUpdate {
@@ -294,6 +298,9 @@ export function onFolderStatus(cb: (s: FolderStatus) => void): Promise<UnlistenF
 export interface FolderSynced {
   pairId: string
   direction: 'send' | 'receive'
+  /** Files still queued for this folder after this one — 0 means the whole drop
+   *  finished, so the UI can play the sound ONCE instead of once per file. */
+  remaining?: number
 }
 
 /** A shared-folder transfer just completed (one file delivered or received). */

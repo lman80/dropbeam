@@ -584,7 +584,10 @@ html.overlay-window #root {
   height: 100%;
   display: grid;
   place-items: start end;
-  padding: 2px 4px 0 0;
+  /* Transparent margin on every side so the pill's soft shadow fades INSIDE the
+     window instead of being clipped at the edge — the clip was the boxy "square
+     halo". Window is 384x132; the 320px pill sits top-right with room to bleed. */
+  padding: 8px 16px 30px 16px;
 }
 .hud-pill {
   display: flex;
@@ -597,7 +600,7 @@ html.overlay-window #root {
   border-radius: 18px;
   background: rgba(14, 15, 22, 0.92);
   color: #fff;
-  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.34), 0 0 0 1px rgba(255, 255, 255, 0.06) inset;
   -webkit-backdrop-filter: blur(18px);
   backdrop-filter: blur(18px);
   cursor: pointer;
