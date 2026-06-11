@@ -30,8 +30,14 @@ export function Hud() {
   // get the Blip-style bottom-right transfer card, so the top HUD is dedicated to
   // shared-folder syncs (the long-running background activity).
   const pill: Pill | null = useMemo(() => {
+    // Only surface a folder that is ACTUALLY moving bytes (bytesDone > 0). The
+    // folder worker sets state=sending at 0% while it spends ~12s trying to dial
+    // a peer; if the peer is offline/unreachable that fails, backs off, and
+    // retries — which used to pop this card up over and over at "0%" even though
+    // nothing was transferring. Requiring real progress means an offline queue
+    // stays silent and the card only appears for a live transfer.
     const folder = Object.values(folderStatuses).find(
-      (s) => s.state === 'sending' || s.state === 'receiving',
+      (s) => (s.state === 'sending' || s.state === 'receiving') && s.bytesDone > 0,
     )
     if (folder) {
       const pair = pairs.find((p) => p.id === folder.pairId)
