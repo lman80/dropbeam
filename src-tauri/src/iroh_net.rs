@@ -1563,6 +1563,14 @@ async fn serve_stream(
                     clear_placeholders();
                     let _ = send.write_all(b"ok").await;
                     let _ = send.finish();
+                    // Wait until the SENDER has actually consumed the "ok" before we
+                    // return (which can let the connection tear down). Without this
+                    // the ack races the teardown, the sender reads an empty reply,
+                    // marks a fully-delivered file as "did not confirm receipt", and
+                    // re-sends it forever. Mirrors recv_files. Bounded by a timeout so
+                    // a wedged sender can't pin this receive task open (the data is
+                    // already safely ingested above — timing out costs nothing).
+                    let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
                 }
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&staging);
@@ -3200,6 +3208,31 @@ async fn read_frame_cap(recv: &mut RecvStream, cap: usize) -> Result<serde_json:
 }
 
 /// A collision-free destination path inside `dir` for an incoming `name`.
+/// Like `unique_path` but takes a full target path and resolves collisions IN ITS
+/// OWN directory (so a received `Project/clips/a.mp4` that already exists becomes
+/// `Project/clips/a (1).mp4`, not a flattened `a (1).mp4` at the root).
+fn unique_full(target: PathBuf) -> PathBuf {
+    if !target.exists() {
+        return target;
+    }
+    let parent = target.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = target
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    for i in 1..100_000 {
+        let cand = parent.join(format!("{stem} ({i}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    target
+}
+
 fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let dest = dir.join(name);
     if !dest.exists() {
@@ -3986,14 +4019,52 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
     let mut items = Vec::new();
     for p in paths {
         let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
-        let name = p
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .ok_or_else(|| anyhow::anyhow!("missing file name for {}", p.display()))?;
-        items.push((p.clone(), name, meta.len(), mtime_secs(&meta)));
+        if meta.is_dir() {
+            // A dropped FOLDER → expand it into its files, preserving structure under
+            // the folder's own name ("Project/clips/a.mp4"). Without this, sending a
+            // directory to a friend failed with "Is a directory (os error 21)" when
+            // the body sender tried to open the dir as a file.
+            let base = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "folder".to_string());
+            collect_dir_items(p, &base, &mut items);
+        } else {
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .ok_or_else(|| anyhow::anyhow!("missing file name for {}", p.display()))?;
+            items.push((p.clone(), name, meta.len(), mtime_secs(&meta)));
+        }
     }
     let total = items.iter().map(|i| i.2).sum();
     Ok((items, total))
+}
+
+/// Recursively collect every file under `dir` as `(abs_path, "prefix/rel/name", size,
+/// mtime)`. Skips dot-files/dirs and symlinks. The `prefix` carries the dropped
+/// folder's own name so the receiver recreates the tree under it.
+fn collect_dir_items(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String, u64, u64)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = format!("{prefix}/{name}");
+        if ft.is_dir() {
+            collect_dir_items(&path, &rel, out);
+        } else if ft.is_file() {
+            if let Ok(meta) = entry.metadata() {
+                out.push((path, rel, meta.len(), mtime_secs(&meta)));
+            }
+        }
+    }
 }
 
 /// The JSON header describing a files push. `parallel` > 0 advertises that the body
@@ -4106,15 +4177,30 @@ async fn read_body<F: Fn(u64, u64)>(
     let mut out = Vec::new();
     let mut buf = vec![0u8; CHUNK];
     for item in &items {
-        // Take only the file name — never honor an absolute/`..` path from a peer.
+        // Preserve a sender's subfolders ("Project/clips/a.mp4" → a real subtree)
+        // but NEVER honor an absolute path, a Windows drive prefix, or any "."/".."
+        // component — so a peer can't write outside dest_dir. Keeping only Normal
+        // path components is the same traversal guard the folder-sync receiver uses.
         let raw = item["name"].as_str().unwrap_or("file");
-        let name = Path::new(raw)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "file".to_string());
+        let rel: PathBuf = Path::new(raw)
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let rel = if rel.as_os_str().is_empty() {
+            PathBuf::from("file")
+        } else {
+            rel
+        };
         let size = item["size"].as_u64().unwrap_or(0);
-        let dest = unique_path(dest_dir, &name);
+        if let Some(parent) = rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(dest_dir.join(parent));
+            }
+        }
+        let dest = unique_full(dest_dir.join(&rel));
         // Buffer disk writes: QUIC delivers data in small pieces, and one blocking
         // write syscall per piece throttles big receives. A 1 MiB buffer batches
         // them into far fewer, larger writes. Flushed before the file is finalized.

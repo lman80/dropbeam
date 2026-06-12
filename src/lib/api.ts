@@ -81,6 +81,8 @@ export interface Settings {
   notifyOnMessage: boolean
   /** Detailed diagnostics logging (app + iroh internals). Applied on restart. */
   verboseLogging: boolean
+  /** Show the floating "syncing folder…" popup during shared-folder transfers. */
+  showSyncPopup: boolean
 }
 
 export type PairRole = 'a' | 'b'

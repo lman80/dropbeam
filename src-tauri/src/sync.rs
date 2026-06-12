@@ -1745,8 +1745,28 @@ impl SyncManager {
                 Some(loc)
             }
             Err(e) => {
-                log::debug!("iroh folder send failed (falling back to croc): {e}");
-                None
+                let msg = format!("{e:#}");
+                // SOFT SUCCESS — ONLY the final-ack race: the whole body was streamed
+                // and finished (QUIC delivered it), the receiver landed the file and
+                // wrote "ok", but that 2-byte ack raced the connection teardown so we
+                // read an empty reply. "did not confirm receipt" is OUR sentinel,
+                // raised ONLY after the full body + finish() (iroh_net send_folder_file),
+                // so it can't be a mid-stream/header failure. Treat it as DELIVERED so
+                // the file leaves the queue instead of re-sending forever. If the peer
+                // truly lacks it, the next reconcile re-queues it (its snapshot shows
+                // it missing / wrong size) — no data lost.
+                //
+                // NOTE: a bare "stopped by peer: error 0" is NOT treated as success —
+                // in this codebase the receiver always reads the FULL body before it
+                // acks, so a stream stopped mid-send means a TRUNCATED file, which must
+                // be retried (and must never trip auto-delete of the local source).
+                if msg.contains("did not confirm receipt") {
+                    log::debug!("folder send treated as delivered (full body sent, ack raced teardown): {msg}");
+                    Some(Locality::Unknown)
+                } else {
+                    log::debug!("folder send failed, will retry on next reconcile: {msg}");
+                    None
+                }
             }
         }
     }

@@ -47,6 +47,7 @@ let settings: Settings = {
   avatar: '',
   notifyOnMessage: true,
   verboseLogging: false,
+  showSyncPopup: true,
 }
 
 const history: HistoryEntry[] = [

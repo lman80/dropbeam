@@ -218,6 +218,13 @@ export function SettingsView() {
         <Row title="Play sounds" desc="Soft cues when you send, receive, or get a file offer.">
           <Toggle on={settings.playSounds} onChange={(v) => save({ playSounds: v })} />
         </Row>
+        {SEP}
+        <Row
+          title="Show the folder-sync popup"
+          desc="The little floating “syncing folder…” card that appears during a shared-folder transfer. Turn it off if it’s distracting."
+        >
+          <Toggle on={settings.showSyncPopup} onChange={(v) => save({ showSyncPopup: v })} />
+        </Row>
       </Card>
 
       <SectionTitle>Connection</SectionTitle>

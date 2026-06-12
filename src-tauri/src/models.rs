@@ -176,6 +176,10 @@ pub struct Settings {
     /// transfer issues from a tester's machine via Export Diagnostics.
     #[serde(default)]
     pub verbose_logging: bool,
+    /// Show the floating "syncing folder…" popup (HUD) during shared-folder
+    /// transfers. On by default; turn off if it's distracting. Live (no restart).
+    #[serde(default = "default_true")]
+    pub show_sync_popup: bool,
 }
 
 impl Default for Settings {
@@ -200,6 +204,7 @@ impl Default for Settings {
             avatar: String::new(),
             notify_on_message: true,
             verbose_logging: false,
+            show_sync_popup: true,
         }
     }
 }

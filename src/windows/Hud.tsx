@@ -21,6 +21,7 @@ export function Hud() {
   const init = useStore((s) => s.init)
   const folderStatuses = useStore((s) => s.folderStatuses)
   const pairs = useStore((s) => s.pairs)
+  const showSyncPopup = useStore((s) => s.settings?.showSyncPopup ?? true)
 
   useEffect(() => {
     init()
@@ -30,6 +31,9 @@ export function Hud() {
   // get the Blip-style bottom-right transfer card, so the top HUD is dedicated to
   // shared-folder syncs (the long-running background activity).
   const pill: Pill | null = useMemo(() => {
+    // The user can turn the folder-sync popup off entirely (Settings → it can be
+    // distracting during a long sync). When off, the HUD never surfaces folders.
+    if (!showSyncPopup) return null
     // Only surface a folder that is ACTUALLY moving bytes (bytesDone > 0). The
     // folder worker sets state=sending at 0% while it spends ~12s trying to dial
     // a peer; if the peer is offline/unreachable that fails, backs off, and
@@ -69,7 +73,7 @@ export function Hud() {
       }
     }
     return null
-  }, [folderStatuses, pairs])
+  }, [folderStatuses, pairs, showSyncPopup])
 
   usePositionOnce()
 

@@ -41,6 +41,7 @@ const DEFAULT_SETTINGS: Settings = {
   avatar: '',
   notifyOnMessage: true,
   verboseLogging: false,
+  showSyncPopup: true,
 }
 
 /** Resolve `p`, but never hang: fall back on error OR after `ms`, logging why. */
