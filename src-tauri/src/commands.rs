@@ -207,6 +207,106 @@ pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Bundle every `DropBeam*.log` file (oldest → newest) plus a redacted header
+/// (version, OS, settings, friend/folder counts) into ONE text file in the
+/// Downloads folder, and return its path. The user sends that single file back —
+/// over DropBeam itself or AirDrop — for analysis. No secrets are included.
+#[tauri::command]
+pub fn export_diagnostics(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let log_dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(out, "===== DropBeam diagnostics =====");
+    let _ = writeln!(out, "app version : {}", app.package_info().version);
+    let _ = writeln!(
+        out,
+        "os / arch   : {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let _ = writeln!(out, "exported    : {now_ms} (epoch ms)");
+    {
+        let s = state.settings.lock().unwrap();
+        let _ = writeln!(out, "verbose log : {}", s.verbose_logging);
+        let _ = writeln!(
+            out,
+            "transport   : direct_mode={} require_direct={} upload_cap_mbps={}",
+            s.direct_mode, s.require_direct, s.upload_limit_mbps
+        );
+        let _ = writeln!(
+            out,
+            "relay       : {}",
+            if s.custom_relay.is_empty() {
+                "(public)".to_string()
+            } else {
+                s.custom_relay.clone()
+            }
+        );
+    }
+    let friends = friends::load(&state.config_dir);
+    let pairs = pairing::load(&state.config_dir);
+    let _ = writeln!(out, "friends     : {}", friends.len());
+    let _ = writeln!(out, "shared dirs : {}", pairs.len());
+    for p in &pairs {
+        let _ = writeln!(
+            out,
+            "  - peer={:?} mirror={} group={:?} folder={:?}",
+            p.peer_name, p.mirror, p.group_id, p.folder
+        );
+    }
+    let _ = writeln!(out, "================================");
+
+    // Every DropBeam log file, oldest first, so the story reads top-to-bottom.
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&log_dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("DropBeam") && n.ends_with(".log"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    if files.is_empty() {
+        let _ = writeln!(out, "\n(no log files found in {log_dir:?})");
+    }
+    for f in &files {
+        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let _ = writeln!(out, "\n\n========== {name} ==========");
+        match std::fs::read_to_string(f) {
+            Ok(t) => out.push_str(&t),
+            Err(e) => {
+                let _ = writeln!(out, "(could not read: {e})");
+            }
+        }
+    }
+
+    let downloads = app.path().download_dir().unwrap_or_else(|_| log_dir.clone());
+    let dest = downloads.join(format!("DropBeam-diagnostics-{now_ms}.txt"));
+    std::fs::write(&dest, out.as_bytes()).map_err(|e| e.to_string())?;
+    log::info!("export_diagnostics: wrote {} bytes to {dest:?}", out.len());
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Relaunch the app — used to apply the verbose-logging toggle (the file log's
+/// level is fixed at startup).
+#[tauri::command]
+pub fn restart_app(app: AppHandle) {
+    app.restart();
+}
+
 /// Open a path with the system default handler. A folder opens INTO itself (not
 /// revealed in its parent); a file launches in its default app. Resilient: if the
 /// exact path no longer exists (a received file got a unique name on a collision,

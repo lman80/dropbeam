@@ -79,6 +79,8 @@ export interface Settings {
   avatar: string
   /** Pop a native notification when a chat arrives & the app isn't focused. */
   notifyOnMessage: boolean
+  /** Detailed diagnostics logging (app + iroh internals). Applied on restart. */
+  verboseLogging: boolean
 }
 
 export type PairRole = 'a' | 'b'
@@ -220,6 +222,10 @@ const realApi = {
   clearProfileAvatar: () => invoke<Settings>('clear_profile_avatar'),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
+  /** Bundle all logs + a redacted header into one .txt in Downloads; returns its path. */
+  exportDiagnostics: () => invoke<string>('export_diagnostics'),
+  /** Relaunch the app (to apply the verbose-logging toggle). */
+  restartApp: () => invoke<void>('restart_app'),
   openUrl: (url: string) => invoke<void>('open_url', { url }),
   getDefaultDownloadDir: () => invoke<string>('get_default_download_dir'),
   // Shared Drop Folders. Tauri v2 maps camelCase JS keys → snake_case Rust params,

@@ -164,14 +164,45 @@ pub fn run() {
             // %APPDATA%\com.dropbeam.app\logs\DropBeam.log, or ~/Library/Logs/
             // com.dropbeam.app/ on macOS). iroh's per-packet INFO spam stays at
             // Warn so our own [app_lib]/[ui] breadcrumbs survive.
+            // Verbose diagnostics (Settings → "Detailed logging"): when on, capture
+            // DEBUG-level app breadcrumbs PLUS iroh's connection internals so we can
+            // diagnose hard-to-reproduce transfer issues from a tester's machine.
+            // Read straight from settings.json — the plugin's level is fixed at
+            // startup, so the toggle takes effect on the next launch.
+            let verbose = app
+                .path()
+                .app_config_dir()
+                .ok()
+                .map(|d| crate::settings::load(&d, "", ""))
+                .map(|s| s.verbose_logging)
+                .unwrap_or(false);
+            let (global_level, app_level, iroh_level) = if verbose {
+                (
+                    log::LevelFilter::Info,
+                    log::LevelFilter::Debug,
+                    log::LevelFilter::Debug,
+                )
+            } else {
+                (
+                    log::LevelFilter::Warn,
+                    log::LevelFilter::Info,
+                    log::LevelFilter::Warn,
+                )
+            };
             let _ = app.handle().plugin(
                 tauri_plugin_log::Builder::default()
-                    .level(log::LevelFilter::Warn)
-                    .level_for("app_lib", log::LevelFilter::Info)
+                    .level(global_level)
+                    .level_for("app_lib", app_level)
+                    // iroh's transport internals: hole-punch, relay-vs-direct path
+                    // selection, connection lifecycle. Noisy, so only in verbose.
+                    .level_for("iroh", iroh_level)
+                    .level_for("iroh_relay", iroh_level)
+                    .level_for("iroh_net", iroh_level)
                     // The default cap is a tiny 40 KB with discard-on-rotate, which
                     // kept deleting exactly the history we need when diagnosing a
-                    // user-reported transfer. Keep rotated files, 2 MB each.
-                    .max_file_size(2_000_000)
+                    // user-reported transfer. Keep rotated files, 2 MB each (4 MB in
+                    // verbose, since DEBUG fills them faster and we want the history).
+                    .max_file_size(if verbose { 4_000_000 } else { 2_000_000 })
                     .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                     .targets([
                         tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
@@ -180,6 +211,14 @@ pub fn run() {
                         }),
                     ])
                     .build(),
+            );
+            // Stamp every log file so it's self-identifying when exported for support.
+            log::warn!(
+                "DropBeam {} starting on {} {} — verbose diagnostics: {}",
+                app.package_info().version,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                if verbose { "ON" } else { "off" }
             );
             // KeepAll preserves diagnostic history but never deletes anything — an
             // always-running menu-bar app would grow ~/Library/Logs without bound.
@@ -399,6 +438,8 @@ pub fn run() {
             commands::clear_profile_avatar,
             commands::reveal_path,
             commands::open_path,
+            commands::export_diagnostics,
+            commands::restart_app,
             commands::open_url,
             commands::open_main_window,
             commands::hide_popover,

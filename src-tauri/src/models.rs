@@ -169,6 +169,13 @@ pub struct Settings {
     /// isn't focused (like any messaging app). On by default.
     #[serde(default = "default_true")]
     pub notify_on_message: bool,
+    /// Detailed diagnostics: when on, the file log captures DEBUG-level app
+    /// breadcrumbs PLUS iroh's connection internals (hole-punch, relay-vs-direct,
+    /// chunk timing). Off by default (keeps logs small). Applied at startup, so
+    /// flipping it needs an app restart. Used to diagnose hard-to-reproduce
+    /// transfer issues from a tester's machine via Export Diagnostics.
+    #[serde(default)]
+    pub verbose_logging: bool,
 }
 
 impl Default for Settings {
@@ -192,6 +199,7 @@ impl Default for Settings {
             require_direct: false,
             avatar: String::new(),
             notify_on_message: true,
+            verbose_logging: false,
         }
     }
 }

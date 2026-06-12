@@ -94,6 +94,20 @@ export function SettingsView() {
     }
   }
 
+  const [exporting, setExporting] = useState(false)
+  const exportLogs = async () => {
+    setExporting(true)
+    try {
+      const path = await api.exportDiagnostics()
+      await api.revealPath(path).catch(() => {})
+      toast('success', 'Logs exported to Downloads — send it over DropBeam or AirDrop to get it diagnosed.')
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const runDirectTest = async () => {
     setTesting(true)
     setTestResult(null)
@@ -368,6 +382,34 @@ export function SettingsView() {
         )}
       </Card>
 
+      <SectionTitle>Diagnostics</SectionTitle>
+      <Card>
+        <Row
+          title="Detailed logging"
+          desc="Record a deep log of every transfer — connection setup, local vs. direct vs. relay path, speeds, and folder-sync decisions. Leave off for normal use; turn on to capture a hard-to-spot issue. Takes effect after a restart."
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <button
+              className="btn btn-ghost"
+              onClick={() => api.restartApp().catch(() => {})}
+              title="Restart DropBeam so the logging change takes effect"
+            >
+              <RefreshCw size={14} /> Restart
+            </button>
+            <Toggle on={settings.verboseLogging} onChange={(v) => save({ verboseLogging: v })} />
+          </div>
+        </Row>
+        {SEP}
+        <Row
+          title="Export logs"
+          desc="Bundle the logs into one file in your Downloads folder (no passwords or file contents — just diagnostics). Send it over DropBeam (drop it on a friend) or AirDrop to get the issue diagnosed."
+        >
+          <button className="btn btn-ghost" onClick={exportLogs} disabled={exporting}>
+            {exporting ? <Spinner size={14} /> : <Download size={15} />}
+            <span>Export</span>
+          </button>
+        </Row>
+      </Card>
 
       <div
         style={{

@@ -46,6 +46,7 @@ let settings: Settings = {
   requireDirect: false,
   avatar: '',
   notifyOnMessage: true,
+  verboseLogging: false,
 }
 
 const history: HistoryEntry[] = [
@@ -307,6 +308,8 @@ export const mockApi = {
   pickDirectory: async (): Promise<string | null> => '/Users/you/Desktop/Beam to Alex',
   revealPath: async (_path: string): Promise<void> => {},
   openPath: async (_path: string): Promise<void> => {},
+  exportDiagnostics: async (): Promise<string> => '/Users/you/Downloads/DropBeam-diagnostics-0.txt',
+  restartApp: async (): Promise<void> => {},
   openUrl: async (_url: string): Promise<void> => {},
   getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
 

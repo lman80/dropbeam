@@ -40,6 +40,7 @@ const DEFAULT_SETTINGS: Settings = {
   requireDirect: false,
   avatar: '',
   notifyOnMessage: true,
+  verboseLogging: false,
 }
 
 /** Resolve `p`, but never hang: fall back on error OR after `ms`, logging why. */
