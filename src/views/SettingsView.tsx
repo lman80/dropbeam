@@ -319,6 +319,31 @@ export function SettingsView() {
         </div>
       </Card>
 
+      <SectionTitle>Custom relay (advanced)</SectionTitle>
+      <Card>
+        <Row
+          title="Relay server URL"
+          desc="When two devices can't connect directly, files fall back to a relay. By default that's iroh's shared public relays — fine, but sometimes slow or flaky for far-apart devices. Point BOTH devices at your own free relay for a fast, reliable fallback. Leave blank to use the public relays. Applied on restart. See RELAY-SETUP.md for the free 10-minute setup."
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              className="btn btn-ghost"
+              onClick={() => api.restartApp().catch(() => {})}
+              title="Restart DropBeam so the relay change takes effect"
+            >
+              <RefreshCw size={14} /> Restart
+            </button>
+            <input
+              className="input"
+              style={{ width: 230 }}
+              placeholder="https://relay.example.com"
+              value={settings.customRelay}
+              onChange={(e) => save({ customRelay: e.target.value })}
+            />
+          </div>
+        </Row>
+      </Card>
+
       <SectionTitle>Updates</SectionTitle>
       <Card>
         <Row title="Version" desc={`DropBeam ${appVer || '…'}`}>

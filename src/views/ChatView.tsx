@@ -380,7 +380,12 @@ function MessageRow({
 function FileMessage({ m, mine }: { m: ChatMessage; mine: boolean }) {
   const name = m.files[0]
   const kind = fileKind(name)
-  const canPreview = !!m.path && HAS_TAURI
+  // Once a preview fails (the file was moved/deleted off disk), STOP rendering the
+  // media element — otherwise every re-render re-requests the missing path and
+  // floods the log with "File does not exist" asset errors. Fall back to the
+  // clickable header (glyph + name) below.
+  const [broken, setBroken] = useState(false)
+  const canPreview = !!m.path && HAS_TAURI && !broken
   const src = canPreview ? convertFileSrc(m.path!) : null
   const open = () => m.path && api.openPath(m.path).catch(() => {})
 
@@ -391,10 +396,10 @@ function FileMessage({ m, mine }: { m: ChatMessage; mine: boolean }) {
     <div className="chat-fileblock">
       {/* preview */}
       {!multi && src && kind === 'image' && (
-        <img src={src} alt={name} className="chat-img" onClick={open} onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')} />
+        <img src={src} alt={name} className="chat-img" onClick={open} onError={() => setBroken(true)} />
       )}
       {!multi && src && kind === 'video' && (
-        <video className="chat-media" src={src} controls preload="metadata" onError={(e) => ((e.currentTarget as HTMLVideoElement).style.display = 'none')} />
+        <video className="chat-media" src={src} controls preload="metadata" onError={() => setBroken(true)} />
       )}
       {!multi && src && kind === 'audio' && (
         <audio className="chat-audio" src={src} controls preload="metadata" />

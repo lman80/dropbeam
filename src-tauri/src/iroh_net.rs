@@ -623,10 +623,35 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
 
-    let ep = Endpoint::builder(presets::N0)
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
-        .transport_config(tcfg.build())
+        .transport_config(tcfg.build());
+
+    // OPT-IN custom relay (Settings → "Custom relay"). iroh's bundled public
+    // relays are number0's CANARY servers, which can be unstable for far-apart
+    // peers (constant resets show up as stalled internet transfers). Pointing both
+    // ends at your OWN iroh-relay (a free VM — see RELAY-SETUP.md) makes the
+    // internet fallback reliable. Empty = unchanged default (the public relays).
+    // Both peers must use the SAME relay URL. Only ever ADDITIVE: a blank or
+    // unparseable value leaves the default path exactly as it was.
+    let custom_relay = crate::settings::load(config_dir, "", "")
+        .custom_relay
+        .trim()
+        .to_string();
+    if !custom_relay.is_empty() {
+        match custom_relay.parse::<iroh::RelayUrl>() {
+            Ok(url) => {
+                log::warn!("iroh: using CUSTOM relay {url} (overrides the default public relays)");
+                builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
+            }
+            Err(e) => {
+                log::warn!("iroh: custom relay {custom_relay:?} is not a valid URL ({e}) — falling back to the default relays");
+            }
+        }
+    }
+
+    let ep = builder
         .bind()
         .await
         .context("bind iroh endpoint")?;
