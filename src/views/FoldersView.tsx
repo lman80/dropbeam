@@ -189,6 +189,17 @@ function FolderCard({
   }
   const [open, setOpen] = useState(false)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
+  // Per-member removal (incl. clearing a stuck "waiting to join" invite).
+  const [confirmMember, setConfirmMember] = useState<string | null>(null)
+  const memberToRemove = members.find((m) => m.id === confirmMember)
+  const doRemoveMember = async () => {
+    if (!confirmMember) return
+    try {
+      await removePair(confirmMember)
+    } finally {
+      setConfirmMember(null)
+    }
+  }
   const [loadingInvite, setLoadingInvite] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -353,6 +364,7 @@ function FolderCard({
             name={m.peerName || 'Waiting to join…'}
             online={statuses[m.id]?.peerOnline ?? false}
             pending={!m.peerName}
+            onRemove={() => setConfirmMember(m.id)}
           />
         ))}
         <button
@@ -365,6 +377,35 @@ function FolderCard({
           {addingPerson ? <Spinner size={13} /> : <UserPlus size={13} />} Add person
         </button>
       </div>
+
+      {/* Confirm removing one member (or clearing a stuck pending invite). */}
+      {memberToRemove && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            marginTop: 9,
+            padding: '9px 12px',
+            background: 'var(--amber-soft)',
+            border: '1px solid var(--border)',
+            borderRadius: 10,
+            fontSize: 12.5,
+          }}
+        >
+          <span style={{ flex: 1, lineHeight: 1.4 }}>
+            {memberToRemove.peerName
+              ? `Remove ${memberToRemove.peerName} from this folder? They'll stop syncing it with you.`
+              : 'Cancel this pending invite? Anyone you already sent the link to won’t be able to join with it.'}
+          </span>
+          <button className="btn btn-ghost" style={{ padding: '5px 10px' }} onClick={() => setConfirmMember(null)}>
+            Cancel
+          </button>
+          <button className="btn btn-danger" style={{ padding: '5px 10px' }} onClick={doRemoveMember}>
+            {memberToRemove.peerName ? 'Remove' : 'Cancel invite'}
+          </button>
+        </div>
+      )}
 
       {/* Sync state — lets you confirm both folders actually match. */}
       {pair.mirror && status?.peerOnline && status?.state === 'idle' && (status?.queued ?? 0) === 0 && (
@@ -767,11 +808,13 @@ function Member({
   online,
   you,
   pending,
+  onRemove,
 }: {
   name: string
   online: boolean
   you?: boolean
   pending?: boolean
+  onRemove?: () => void
 }) {
   return (
     <div
@@ -779,7 +822,7 @@ function Member({
         display: 'flex',
         alignItems: 'center',
         gap: 7,
-        padding: '4px 11px 4px 5px',
+        padding: onRemove && !you ? '4px 6px 4px 5px' : '4px 11px 4px 5px',
         background: 'var(--surface-2)',
         borderRadius: 999,
         border: '1px solid var(--border)',
@@ -824,6 +867,32 @@ function Member({
       <span style={{ fontSize: 12.5, fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
         {you ? `${name} (you)` : name}
       </span>
+      {onRemove && !you && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation()
+            onRemove()
+          }}
+          title={pending ? 'Cancel this invite' : `Remove ${name} from this folder`}
+          style={{
+            display: 'grid',
+            placeItems: 'center',
+            width: 18,
+            height: 18,
+            borderRadius: 999,
+            border: 'none',
+            background: 'transparent',
+            color: 'var(--text-faint)',
+            cursor: 'pointer',
+            padding: 0,
+            flexShrink: 0,
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--red)')}
+          onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-faint)')}
+        >
+          <X size={13} />
+        </button>
+      )}
     </div>
   )
 }
