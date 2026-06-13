@@ -241,29 +241,29 @@ export function PairingModal({
               {mode === 'create' && (
                 <div style={{ marginTop: 16 }}>
                   <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
-                    Sync mode
+                    Who can do what
                   </label>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
                     <DirOption
                       active={syncMode === 'mirror'}
                       onClick={() => setSyncMode('mirror')}
                       icon={<FolderSync size={16} />}
-                      title="Total sync"
-                      desc="A shared source of truth — adds, edits, and deletes all sync both ways. Deleted files are kept in history so nothing is lost."
+                      title="Full access · total sync"
+                      desc="Everyone can add, edit, and delete — both folders stay identical (a shared source of truth). Deleted files are kept in history so nothing is lost."
                     />
                     <DirOption
                       active={syncMode === 'twoway'}
                       onClick={() => setSyncMode('twoway')}
                       icon={<ArrowLeftRight size={16} />}
-                      title="Two-way"
-                      desc="New and changed files sync both ways. Deletes don't propagate."
+                      title="Full access · no deletes"
+                      desc="Both sides can add and change files and they sync both ways, but deletes stay local (a safer shared drop)."
                     />
                     <DirOption
                       active={syncMode === 'oneway'}
                       onClick={() => setSyncMode('oneway')}
                       icon={<ArrowRight size={16} />}
-                      title="One-way"
-                      desc="This folder only sends — the other side just receives."
+                      title="View only (read-only for them)"
+                      desc="You’re the owner: your files flow to everyone you invite, but their changes never come back to you. They can view and download — not change your folder."
                     />
                   </div>
                 </div>

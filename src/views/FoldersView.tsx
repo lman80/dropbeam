@@ -273,7 +273,11 @@ function FolderCard({
                 style={{ background: 'var(--surface-2)', color: 'var(--text-muted)' }}
               >
                 {pair.twoWay ? <ArrowLeftRight size={11} /> : <ArrowRight size={11} />}
-                {pair.twoWay ? 'Two-way' : 'One-way'}
+                {pair.twoWay
+                  ? 'Two-way'
+                  : pair.role === 'a'
+                    ? 'View only (they receive)'
+                    : 'View only (you receive)'}
               </span>
             )}
             {pair.autoDelete && (
