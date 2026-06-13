@@ -311,6 +311,8 @@ export const mockApi = {
   openPath: async (_path: string): Promise<void> => {},
   exportDiagnostics: async (): Promise<string> => '/Users/you/Downloads/DropBeam-diagnostics-0.txt',
   restartApp: async (): Promise<void> => {},
+  lanNetworkBlocked: async (): Promise<boolean> => false,
+  openLocalNetworkSettings: async (): Promise<void> => {},
   openUrl: async (_url: string): Promise<void> => {},
   getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
 

@@ -246,6 +246,18 @@ export function SettingsView() {
         </Row>
         {SEP}
         <Row
+          title="Local network access"
+          desc="macOS must allow DropBeam on your Local Network for fast same-Wi-Fi transfers. If transfers to a nearby device keep using the slow relay, enable DropBeam here — and check it on the other device too."
+        >
+          <button
+            className="btn btn-ghost"
+            onClick={() => api.openLocalNetworkSettings().catch(() => {})}
+          >
+            Open Settings
+          </button>
+        </Row>
+        {SEP}
+        <Row
           title="Only send over direct connections"
           desc="Refuse the slow relay: if a direct path (local network or peer-to-peer) can't be made, the send fails instead of crawling through the relay. Applies to Quick Send + friend sends; shared folders always use the best available path."
         >

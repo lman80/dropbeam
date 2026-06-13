@@ -341,6 +341,27 @@ pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// True when transfers are stuck on the slow relay despite a peer being on the
+/// local network — the fingerprint of the macOS "Local Network" permission being
+/// off. Drives the in-app nudge. (See `iroh_net::lan_path_blocked`.)
+#[tauri::command]
+pub fn lan_network_blocked() -> bool {
+    crate::iroh_net::lan_path_blocked()
+}
+
+/// Deep-link straight to System Settings → Privacy & Security → Local Network so
+/// the user can enable DropBeam in one click (no scavenger hunt).
+#[tauri::command]
+pub fn open_local_network_settings(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork",
+            None::<&str>,
+        )
+        .map_err(|e| e.to_string())
+}
+
 /// On macOS, return a one-line warning if the app is running from a spot that
 /// makes the system forget folder permissions every launch — App Translocation
 /// (a quarantined app run from a randomized read-only path) or straight from the

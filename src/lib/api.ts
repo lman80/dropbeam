@@ -228,6 +228,10 @@ const realApi = {
   exportDiagnostics: () => invoke<string>('export_diagnostics'),
   /** Relaunch the app (to apply the verbose-logging toggle). */
   restartApp: () => invoke<void>('restart_app'),
+  /** True when transfers are stuck on the relay despite a LAN peer (Local Network perm likely off). */
+  lanNetworkBlocked: () => invoke<boolean>('lan_network_blocked'),
+  /** Open System Settings → Privacy & Security → Local Network. */
+  openLocalNetworkSettings: () => invoke<void>('open_local_network_settings'),
   openUrl: (url: string) => invoke<void>('open_url', { url }),
   getDefaultDownloadDir: () => invoke<string>('get_default_download_dir'),
   // Shared Drop Folders. Tauri v2 maps camelCase JS keys → snake_case Rust params,

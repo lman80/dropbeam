@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import { AlertTriangle, X } from 'lucide-react'
 import type { UnlistenFn } from '@tauri-apps/api/event'
-import { onFileDrop } from './lib/api'
+import { api, onFileDrop } from './lib/api'
 import { setTaskbarProgress } from './lib/taskbar'
 import { useStore } from './store'
 import { TitleBar } from './components/TitleBar'
@@ -87,6 +87,7 @@ export default function App() {
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <TitleBar />
       <InstallBanner />
+      <LocalNetworkBanner />
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         <Sidebar />
         <main
@@ -218,6 +219,62 @@ function NameSetupModal() {
           Continue
         </button>
       </motion.div>
+    </div>
+  )
+}
+
+/** macOS "Local Network permission" nudge. We can't READ the permission state (no
+ * API), so we detect the SYMPTOM in the engine — a peer is on the LAN but every
+ * transfer falls back to the slow relay — and surface a one-click fix. Polls the
+ * heuristic every 15s; dismissable per session. */
+function LocalNetworkBanner() {
+  const [blocked, setBlocked] = useState(false)
+  const [dismissed, setDismissed] = useState(false)
+  useEffect(() => {
+    let alive = true
+    const check = () => {
+      api
+        .lanNetworkBlocked()
+        .then((b) => alive && setBlocked(b))
+        .catch(() => {})
+    }
+    check()
+    const id = setInterval(check, 15000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [])
+  if (!blocked || dismissed) return null
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        padding: '8px 14px',
+        fontSize: 12.5,
+        lineHeight: 1.4,
+        background: 'var(--amber-soft)',
+        color: 'var(--amber)',
+        borderBottom: '1px solid var(--border)',
+      }}
+    >
+      <AlertTriangle size={15} style={{ flexShrink: 0 }} />
+      <span style={{ flex: 1 }}>
+        DropBeam can’t reach a device on your network directly, so transfers are using a slow relay.
+        Enable DropBeam under <b>Local Network</b> — and check it on the <b>other</b> device too.
+      </span>
+      <button
+        className="btn btn-ghost"
+        style={{ flexShrink: 0, padding: '4px 10px', fontSize: 12 }}
+        onClick={() => api.openLocalNetworkSettings().catch(() => {})}
+      >
+        Open Settings
+      </button>
+      <button className="icon-btn" onClick={() => setDismissed(true)} title="Dismiss">
+        <X size={15} />
+      </button>
     </div>
   )
 }

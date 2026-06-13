@@ -390,6 +390,23 @@ fn addr_is_lan(dbg: &str) -> bool {
 /// Which channel the live connection is using: relayed (slow), a direct LAN path,
 /// or a hole-punched DIRECT path over the internet. Read from the SELECTED QUIC
 /// path on every progress tick, so it's live + truthful.
+// ── LAN-health heuristic (macOS "Local Network" permission nudge) ──────────────
+// macOS gives no API to READ that permission's state, so we infer it from
+// behavior: if a peer is on our LAN (mDNS saw it) yet we've only ever reached
+// peers through the slow relay — never once a direct LOCAL path — the local
+// network is almost certainly blocked (the permission is off, or AP isolation).
+static MDNS_PEER_SEEN: AtomicBool = AtomicBool::new(false);
+static EVER_LOCAL: AtomicBool = AtomicBool::new(false);
+static RELAY_USED: AtomicBool = AtomicBool::new(false);
+
+/// True when we should nudge the user to check Local Network permission: a LAN
+/// peer exists, we've used the relay, and we've NEVER managed a local connection.
+pub fn lan_path_blocked() -> bool {
+    MDNS_PEER_SEEN.load(Ordering::Relaxed)
+        && RELAY_USED.load(Ordering::Relaxed)
+        && !EVER_LOCAL.load(Ordering::Relaxed)
+}
+
 fn conn_locality(conn: &Connection) -> crate::models::Locality {
     use crate::models::Locality;
     use iroh::Watcher as _; // brings `.get()` into scope for the path watcher
@@ -400,14 +417,20 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
         .iter()
         .find(|p| p.is_selected())
         .map(|p| (p.is_relay(), format!("{:?}", p.remote_addr())));
-    match selected {
+    let loc = match selected {
         Some((true, _)) => Locality::Internet, // relayed = the slow path
         // Direct peer-to-peer — distinguish same-LAN from a hole-punched WAN path by
         // the remote address so the badge can say "Local network" vs "Direct".
         Some((false, addr)) if addr_is_lan(&addr) => Locality::Local,
         Some((false, _)) => Locality::Direct,
         None => Locality::Unknown,
+    };
+    match loc {
+        Locality::Local => EVER_LOCAL.store(true, Ordering::Relaxed),
+        Locality::Internet => RELAY_USED.store(true, Ordering::Relaxed),
+        _ => {}
     }
+    loc
 }
 
 /// One-line performance summary for a finished transfer, written to the always-on
@@ -679,6 +702,11 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
                         let mut seen = std::collections::HashSet::new();
                         while let Some(ev) = events.next().await {
                             let line = format!("{ev:?}");
+                            // A discovery event = a peer is on our LAN segment AND our
+                            // multicast works. Feeds the "Local Network blocked" nudge.
+                            if line.contains("discovered") || line.contains("Discovered") {
+                                MDNS_PEER_SEEN.store(true, Ordering::Relaxed);
+                            }
                             if seen.insert(line.clone()) {
                                 log::info!("mDNS: {line}");
                             }

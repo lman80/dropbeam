@@ -440,6 +440,8 @@ pub fn run() {
             commands::open_path,
             commands::export_diagnostics,
             commands::restart_app,
+            commands::lan_network_blocked,
+            commands::open_local_network_settings,
             commands::open_url,
             commands::open_main_window,
             commands::hide_popover,
