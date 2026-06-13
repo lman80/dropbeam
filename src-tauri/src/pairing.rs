@@ -67,6 +67,12 @@ struct Invite {
     /// needs to carry the group id. None on a classic 1:1 invite.
     #[serde(default)]
     gid: Option<String>,
+    /// Role authority: the folder OWNER's endpoint_id + the current role epoch, so
+    /// the accepter knows whose role assignments to trust and from which version.
+    #[serde(default)]
+    own: Option<String>,
+    #[serde(default)]
+    eph: u64,
 }
 
 /// Create a new pair (this device is A). Returns the pair + a shareable invite.
@@ -111,6 +117,10 @@ pub fn create(
         // The accepter's id arrives later via their folder-hello.
         endpoint_id: None,
         group_id: Some(group_id.clone()),
+        i_am_viewer: false,
+        peer_is_viewer: false,
+        owner_eid: my_endpoint_id.clone(),
+        role_epoch: 0,
     };
 
     let invite = Invite {
@@ -123,6 +133,8 @@ pub fn create(
         mir: mirror,
         eid: my_endpoint_id,
         gid: Some(group_id),
+        own: pair.owner_eid.clone(),
+        eph: pair.role_epoch,
     };
     let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
     let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
@@ -176,6 +188,10 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
         // Learned straight from the invite — lets us sync directly over iroh.
         endpoint_id: invite.eid.clone(),
         group_id: invite.gid.clone(),
+        i_am_viewer: false,
+        peer_is_viewer: false,
+        owner_eid: invite.own.clone(),
+        role_epoch: invite.eph,
     };
     pairs.push(pair.clone());
     save(config_dir, &pairs)?;
@@ -260,6 +276,8 @@ pub fn invite_for(pair: &Pair, my_name: &str, my_endpoint_id: Option<String>) ->
         mir: pair.mirror,
         eid: my_endpoint_id,
         gid: pair.group_id.clone(),
+        own: pair.owner_eid.clone(),
+        eph: pair.role_epoch,
     };
     let json = serde_json::to_string(&invite).unwrap_or_default();
     format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
@@ -314,6 +332,10 @@ pub fn ensure_member(
         created_at: now_ms(),
         endpoint_id: Some(endpoint_id.to_string()),
         group_id: Some(group_id.to_string()),
+        i_am_viewer: false,
+        peer_is_viewer: false,
+        owner_eid: template.owner_eid.clone(),
+        role_epoch: template.role_epoch,
     };
     pairs.push(new.clone());
     let _ = save(config_dir, &pairs);
@@ -405,6 +427,10 @@ pub fn group_invite(
         created_at: now_ms(),
         endpoint_id: None, // arrives via the newcomer's folder-hello
         group_id: Some(group_id.clone()),
+        i_am_viewer: false,
+        peer_is_viewer: false,
+        owner_eid: source.owner_eid.clone(),
+        role_epoch: source.role_epoch,
     };
     let invite = Invite {
         v: 1,
@@ -416,6 +442,8 @@ pub fn group_invite(
         mir: new.mirror,
         eid: my_endpoint_id,
         gid: Some(group_id),
+        own: new.owner_eid.clone(),
+        eph: new.role_epoch,
     };
     let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
     let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
@@ -499,11 +527,226 @@ fn derive_code(secret: &str, channel: &str) -> String {
 }
 
 pub fn runs_sender(p: &Pair) -> bool {
+    // A VIEWER never sends — read-only copy, no watcher/sender, no pushes.
+    if p.i_am_viewer {
+        return false;
+    }
     p.mirror || p.two_way || p.role == PairRole::A
 }
 
 pub fn runs_listener(p: &Pair) -> bool {
+    // We never receive FROM a viewer peer (they don't change the folder).
+    if p.peer_is_viewer {
+        return false;
+    }
     p.mirror || p.two_way || p.role == PairRole::B
+}
+
+/// Owner action: set whether the PEER on a given link is a viewer (read-only),
+/// and BUMP the group's role epoch so this assignment wins across the mesh (only
+/// the owner originates new epochs; everyone else applies the newest one they see
+/// from the owner). The change rides the next roster beacon. Returns true if it
+/// changed.
+pub fn set_peer_viewer(
+    config_dir: &Path,
+    pair_id: &str,
+    viewer: bool,
+    my_eid: Option<&str>,
+) -> bool {
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let gid = pairs
+        .iter()
+        .find(|p| p.id == pair_id)
+        .and_then(|p| p.group_id.clone());
+    // OWNER-ONLY: refuse unless THIS device is the group's owner. The whole mesh
+    // trusts the owner_eid we relay, so a non-owner must never originate a role
+    // change / epoch bump (else any member could silence an editor).
+    let is_owner = match (&gid, my_eid) {
+        (Some(g), Some(me)) => pairs.iter().any(|p| {
+            p.group_id.as_deref() == Some(g.as_str()) && p.owner_eid.as_deref() == Some(me)
+        }),
+        _ => false,
+    };
+    if !is_owner {
+        return false;
+    }
+    let mut changed = false;
+    for p in pairs.iter_mut() {
+        if p.id == pair_id && p.peer_is_viewer != viewer {
+            p.peer_is_viewer = viewer;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Some(gid) = gid {
+            let next = pairs
+                .iter()
+                .filter(|p| p.group_id.as_deref() == Some(gid.as_str()))
+                .map(|p| p.role_epoch)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            for p in pairs.iter_mut() {
+                if p.group_id.as_deref() == Some(gid.as_str()) {
+                    p.role_epoch = next;
+                }
+            }
+        }
+        let _ = save(config_dir, &pairs);
+    }
+    changed
+}
+
+/// Apply a group's role roster (endpoint_id → is_viewer) from a control beacon —
+/// OWNER-AUTHORITATIVE + MONOTONIC, so roles never flap and a non-owner can't
+/// reassign them. Applies ONLY when: the beacon's claimed owner matches the owner
+/// we recorded for this group, AND the beacon's epoch is strictly newer than ours.
+/// Members relay the owner's (owner, epoch, roles) verbatim, so an offline owner's
+/// last assignment still reaches everyone, and the highest epoch always wins.
+/// Sets each link's `peer_is_viewer` + our own `i_am_viewer`, and advances every
+/// group link's `role_epoch`. Returns true if anything changed.
+pub fn apply_group_roles(
+    config_dir: &Path,
+    group_id: &str,
+    my_eid: &str,
+    beacon_owner: Option<&str>,
+    beacon_epoch: u64,
+    roles: &std::collections::HashMap<String, bool>,
+) -> bool {
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+
+    // The owner + current epoch we recorded for THIS group (all its links agree).
+    let my_owner = pairs
+        .iter()
+        .find(|p| p.group_id.as_deref() == Some(group_id))
+        .and_then(|p| p.owner_eid.clone());
+    let cur_epoch = pairs
+        .iter()
+        .filter(|p| p.group_id.as_deref() == Some(group_id))
+        .map(|p| p.role_epoch)
+        .max()
+        .unwrap_or(0);
+
+    // Trust only the owner, and only a strictly-newer assignment. A legacy folder
+    // (owner_eid unknown) carries no roles, so there's nothing to apply.
+    match (my_owner.as_deref(), beacon_owner) {
+        (Some(mine), Some(claimed)) if mine == claimed => {}
+        _ => return false,
+    }
+    if beacon_epoch <= cur_epoch {
+        return false;
+    }
+
+    let my_role = roles.get(my_eid).copied();
+    let mut changed = false;
+    for p in pairs.iter_mut() {
+        if p.group_id.as_deref() != Some(group_id) {
+            continue;
+        }
+        if p.role_epoch != beacon_epoch {
+            p.role_epoch = beacon_epoch;
+            changed = true;
+        }
+        if let Some(v) = my_role {
+            if p.i_am_viewer != v {
+                p.i_am_viewer = v;
+                changed = true;
+            }
+        }
+        if let Some(peer_eid) = &p.endpoint_id {
+            if let Some(&v) = roles.get(peer_eid) {
+                if p.peer_is_viewer != v {
+                    p.peer_is_viewer = v;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &pairs);
+    }
+    changed
+}
+
+/// The owner + role epoch recorded for a group (for the roster beacon). Returns
+/// (owner_eid, epoch); owner is None on a legacy pre-roles folder.
+pub fn group_role_authority(config_dir: &Path, group_id: &str) -> (Option<String>, u64) {
+    let pairs = load(config_dir);
+    let owner = pairs
+        .iter()
+        .find(|p| p.group_id.as_deref() == Some(group_id))
+        .and_then(|p| p.owner_eid.clone());
+    let epoch = pairs
+        .iter()
+        .filter(|p| p.group_id.as_deref() == Some(group_id))
+        .map(|p| p.role_epoch)
+        .max()
+        .unwrap_or(0);
+    (owner, epoch)
+}
+
+/// One-time repair: stamp our own endpoint id as `owner_eid` on folders WE created
+/// while iroh wasn't up yet (so `owner_eid` was None at create time, leaving the
+/// group permanently ownerless and roles inert). We identify "a folder we created"
+/// as a group whose EARLIEST link is role A — the original `create()` link. An
+/// accepter's earliest link is role B, so a member never wrongly claims ownership.
+/// Idempotent: only touches groups where NO link has an owner yet. Returns whether
+/// anything changed.
+pub fn backfill_owner_eid(config_dir: &Path, my_eid: &str) -> bool {
+    if my_eid.is_empty() {
+        return false;
+    }
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let mut groups: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in &pairs {
+        if let Some(g) = &p.group_id {
+            groups.insert(g.clone());
+        }
+    }
+    let mut changed = false;
+    for g in groups {
+        // Skip groups that already have an owner (assigned correctly at create).
+        if pairs
+            .iter()
+            .any(|p| p.group_id.as_deref() == Some(g.as_str()) && p.owner_eid.is_some())
+        {
+            continue;
+        }
+        // Am I the creator? My earliest-created link in this group is role A.
+        let i_created = pairs
+            .iter()
+            .filter(|p| p.group_id.as_deref() == Some(g.as_str()))
+            .min_by_key(|p| p.created_at)
+            .map(|p| p.role == PairRole::A)
+            .unwrap_or(false);
+        if !i_created {
+            continue;
+        }
+        for p in pairs
+            .iter_mut()
+            .filter(|p| p.group_id.as_deref() == Some(g.as_str()))
+        {
+            p.owner_eid = Some(my_eid.to_string());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &pairs);
+    }
+    changed
+}
+
+/// Fresh-from-disk role flags for one link: `(peer_is_viewer, i_am_viewer)`.
+/// Used right after `apply_group_roles` writes pairs.json, since the in-memory
+/// worker handle isn't refreshed until the next reconcile.
+pub fn pair_roles(config_dir: &Path, pair_id: &str) -> Option<(bool, bool)> {
+    load(config_dir)
+        .iter()
+        .find(|p| p.id == pair_id)
+        .map(|p| (p.peer_is_viewer, p.i_am_viewer))
 }
 
 fn random_secret() -> String {
@@ -554,6 +797,10 @@ mod tests {
             created_at: 0,
             endpoint_id: None,
             group_id: None,
+            i_am_viewer: false,
+            peer_is_viewer: false,
+            owner_eid: None,
+            role_epoch: 0,
         }
     }
 
@@ -579,5 +826,112 @@ mod tests {
         // One-way: A sends only, B listens only.
         assert!(runs_sender(&a) && !runs_listener(&a));
         assert!(!runs_sender(&b) && runs_listener(&b));
+    }
+
+    fn role_test_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("dropbeam-roletest-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Two links in one group: my own (role A) + a link to member B.
+    fn group_pair(id: &str, group: &str, owner: Option<&str>, peer_eid: Option<&str>) -> Pair {
+        let mut p = pair(PairRole::A);
+        p.id = id.into();
+        p.mirror = true;
+        p.group_id = Some(group.into());
+        p.owner_eid = owner.map(|s| s.into());
+        p.endpoint_id = peer_eid.map(|s| s.into());
+        p
+    }
+
+    #[test]
+    fn set_peer_viewer_is_owner_only_and_bumps_epoch() {
+        let dir = role_test_dir("ownergate");
+        // I am the owner ("me"); my link to B carries B's eid.
+        let link = group_pair("lb", "g1", Some("me"), Some("B"));
+        save(&dir, &[link]).unwrap();
+
+        // A non-owner caller (wrong eid) is refused — no change, no epoch bump.
+        assert!(!set_peer_viewer(&dir, "lb", true, Some("not-me")));
+        let after = load(&dir);
+        assert!(!after[0].peer_is_viewer);
+        assert_eq!(after[0].role_epoch, 0);
+
+        // The owner succeeds: B becomes a viewer and the epoch advances.
+        assert!(set_peer_viewer(&dir, "lb", true, Some("me")));
+        let after = load(&dir);
+        assert!(after[0].peer_is_viewer);
+        assert_eq!(after[0].role_epoch, 1);
+    }
+
+    #[test]
+    fn apply_group_roles_owner_authoritative_and_monotonic() {
+        let dir = role_test_dir("apply");
+        // We are member "me"; owner is "owner". One link to peer "B".
+        let link = group_pair("lb", "g1", Some("owner"), Some("B"));
+        save(&dir, &[link]).unwrap();
+
+        let roles_b_viewer: std::collections::HashMap<String, bool> =
+            [("B".to_string(), true)].into_iter().collect();
+
+        // A NON-owner beacon is ignored even at a higher epoch.
+        assert!(!apply_group_roles(&dir, "g1", "me", Some("imposter"), 9, &roles_b_viewer));
+        assert!(!load(&dir)[0].peer_is_viewer);
+
+        // The owner's newer-epoch beacon applies: B → viewer, epoch advances.
+        assert!(apply_group_roles(&dir, "g1", "me", Some("owner"), 5, &roles_b_viewer));
+        let after = load(&dir);
+        assert!(after[0].peer_is_viewer);
+        assert_eq!(after[0].role_epoch, 5);
+
+        // A STALE re-broadcast (<= current epoch) is rejected → no flap.
+        let roles_b_editor: std::collections::HashMap<String, bool> =
+            [("B".to_string(), false)].into_iter().collect();
+        assert!(!apply_group_roles(&dir, "g1", "me", Some("owner"), 5, &roles_b_editor));
+        assert!(load(&dir)[0].peer_is_viewer); // unchanged
+
+        // The owner promotes B back at a newer epoch → converges to editor.
+        assert!(apply_group_roles(&dir, "g1", "me", Some("owner"), 6, &roles_b_editor));
+        let after = load(&dir);
+        assert!(!after[0].peer_is_viewer);
+        assert_eq!(after[0].role_epoch, 6);
+    }
+
+    #[test]
+    fn apply_group_roles_sets_my_own_viewer_flag() {
+        let dir = role_test_dir("selfrole");
+        let link = group_pair("lb", "g1", Some("owner"), Some("B"));
+        save(&dir, &[link]).unwrap();
+        // The owner marks ME ("me") a viewer.
+        let roles: std::collections::HashMap<String, bool> =
+            [("me".to_string(), true)].into_iter().collect();
+        assert!(apply_group_roles(&dir, "g1", "me", Some("owner"), 2, &roles));
+        assert!(load(&dir)[0].i_am_viewer);
+    }
+
+    #[test]
+    fn backfill_claims_only_folders_i_created() {
+        let dir = role_test_dir("backfill");
+        // A folder I created (earliest link is role A), still ownerless.
+        let mut created = group_pair("mine", "gc", None, Some("peer"));
+        created.created_at = 100;
+        // A folder I ACCEPTED (my earliest link is role B), ownerless.
+        let mut accepted = group_pair("theirs", "ga", None, Some("owner-peer"));
+        accepted.role = PairRole::B;
+        accepted.created_at = 50;
+        save(&dir, &[created, accepted]).unwrap();
+
+        assert!(backfill_owner_eid(&dir, "me"));
+        let after = load(&dir);
+        let mine = after.iter().find(|p| p.id == "mine").unwrap();
+        let theirs = after.iter().find(|p| p.id == "theirs").unwrap();
+        assert_eq!(mine.owner_eid.as_deref(), Some("me")); // I claimed it
+        assert_eq!(theirs.owner_eid, None); // I did NOT claim a folder I joined
     }
 }

@@ -7,9 +7,11 @@ import {
   Check,
   Clock,
   Copy,
+  Eye,
   FolderOpen,
   FolderSync,
   History,
+  Pencil,
   Plus,
   QrCode,
   RotateCcw,
@@ -167,10 +169,14 @@ function FolderCard({
 }) {
   const updatePair = useStore((s) => s.updatePair)
   const removePair = useStore((s) => s.removePair)
+  const reloadPairs = useStore((s) => s.reloadPairs)
   const toast = useStore((s) => s.toast)
   const myName = useStore((s) => s.settings?.displayName || 'You')
   const status = statuses[pair.id]
   const lastSynced = useStore((s) => s.folderLastSynced[pair.id])
+  const myEid = useStore((s) => s.myEid)
+  // We own this folder iff its recorded owner endpoint id is OURS.
+  const iAmOwner = !!myEid && !!pair.ownerEid && pair.ownerEid === myEid
   const isGroup = members.length > 1 || !!pair.groupId
   // Settings + unpair apply to the WHOLE folder (every member link).
   const updateGroup = (patch: Partial<PairUpdate>) =>
@@ -198,6 +204,15 @@ function FolderCard({
       await removePair(confirmMember)
     } finally {
       setConfirmMember(null)
+    }
+  }
+  // Owner only: flip a member between editor (full) and viewer (read-only).
+  const toggleRole = async (m: Pair) => {
+    try {
+      await api.setMemberRole(m.id, !m.peerIsViewer)
+      await reloadPairs()
+    } catch (e) {
+      toast('error', String(e))
     }
   }
   const [loadingInvite, setLoadingInvite] = useState(false)
@@ -361,13 +376,18 @@ function FolderCard({
 
       {/* Members — everyone in this folder (you + each person you're linked to) */}
       <div style={{ display: 'flex', gap: 8, marginTop: 11, flexWrap: 'wrap', alignItems: 'center' }}>
-        <Member name={myName} you online />
+        <Member name={myName} you online viewerSelf={pair.iAmViewer} />
         {members.map((m) => (
           <Member
             key={m.id}
             name={m.peerName || 'Waiting to join…'}
             online={statuses[m.id]?.peerOnline ?? false}
             pending={!m.peerName}
+            isViewer={!!m.peerIsViewer}
+            // Only the folder OWNER may assign roles (enforced in the engine too).
+            // We own it iff the folder's ownerEid matches THIS device's endpoint id.
+            canSetRole={iAmOwner && !!m.peerName}
+            onToggleRole={() => toggleRole(m)}
             onRemove={() => setConfirmMember(m.id)}
           />
         ))}
@@ -812,14 +832,23 @@ function Member({
   online,
   you,
   pending,
+  isViewer,
+  viewerSelf,
+  canSetRole,
+  onToggleRole,
   onRemove,
 }: {
   name: string
   online: boolean
   you?: boolean
   pending?: boolean
+  isViewer?: boolean
+  viewerSelf?: boolean
+  canSetRole?: boolean
+  onToggleRole?: () => void
   onRemove?: () => void
 }) {
+  const showViewer = isViewer || viewerSelf
   return (
     <div
       style={{
@@ -871,6 +900,51 @@ function Member({
       <span style={{ fontSize: 12.5, fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
         {you ? `${name} (you)` : name}
       </span>
+      {showViewer && (
+        <span
+          title="Read-only — they can view and download, but not change the folder"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 3,
+            fontSize: 10.5,
+            fontWeight: 700,
+            padding: '1px 6px',
+            borderRadius: 999,
+            background: 'var(--surface)',
+            color: 'var(--text-muted)',
+            border: '1px solid var(--border)',
+          }}
+        >
+          <Eye size={10} /> Viewer
+        </span>
+      )}
+      {canSetRole && !you && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggleRole?.()
+          }}
+          title={isViewer ? 'Make an editor (full access)' : 'Make view-only (read-only)'}
+          style={{
+            display: 'grid',
+            placeItems: 'center',
+            width: 18,
+            height: 18,
+            borderRadius: 999,
+            border: 'none',
+            background: 'transparent',
+            color: 'var(--text-faint)',
+            cursor: 'pointer',
+            padding: 0,
+            flexShrink: 0,
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
+          onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-faint)')}
+        >
+          {isViewer ? <Pencil size={12} /> : <Eye size={12} />}
+        </button>
+      )}
       {onRemove && !you && (
         <button
           onClick={(e) => {

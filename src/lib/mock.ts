@@ -390,6 +390,10 @@ export const mockApi = {
   removePair: async (id: string): Promise<void> => {
     pairs = pairs.filter((p) => p.id !== id)
   },
+  setMemberRole: async (id: string, viewer: boolean): Promise<void> => {
+    pairs = pairs.map((p) => (p.id === id ? { ...p, peerIsViewer: viewer } : p))
+  },
+  myEndpointId: async (): Promise<string | null> => null,
   pairInvite: async (id: string): Promise<string> => `dropbeam1:MOCK${id}invitecodewouldgohere0000`,
   folderAddPerson: async (id: string): Promise<string> => `dropbeam1:MOCK${id}groupinvitewouldgohere000`,
   listFolderHistory: async (pairId: string): Promise<HistoryItem[]> =>

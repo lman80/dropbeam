@@ -1424,6 +1424,13 @@ async fn serve_stream(
             if !sm.has_pair(&pair_id) {
                 anyhow::bail!("push for unknown folder pair {pair_id}");
             }
+            // ROLE ENFORCEMENT (receive side): a read-only VIEWER must never push
+            // files into our folder. The viewer's own sender is suppressed, but
+            // that can be stale during role propagation — so reject here too, where
+            // it's authoritative, rather than trust the sender to behave.
+            if sm.peer_is_viewer(&pair_id) {
+                anyhow::bail!("ignoring folder push from a read-only viewer ({pair_id})");
+            }
             // Each receive gets its OWN staging dir. A shared per-pair dir was a
             // data-loss race: two handlers for the same pair overlap routinely (a
             // group member pushing while another's send retries, or the sender's
@@ -1641,7 +1648,7 @@ async fn serve_stream(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let members: Vec<(String, String)> = req
+            let members: Vec<(String, String, bool)> = req
                 .get("members")
                 .and_then(|d| d.as_array())
                 .map(|arr| {
@@ -1653,19 +1660,25 @@ async fn serve_stream(
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            Some((eid, n))
+                            // `viewer` is a newer optional field — absent = editor.
+                            let viewer = m.get("viewer").and_then(|v| v.as_bool()).unwrap_or(false);
+                            Some((eid, n, viewer))
                         })
                         .collect()
                 })
                 .unwrap_or_default();
             let unshared = req.get("unshared").and_then(|u| u.as_bool()).unwrap_or(false);
+            // Role authority: who claims to own role assignments + which version.
+            let owner = req.get("owner").and_then(|v| v.as_str()).map(String::from);
+            let role_epoch = req.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
             if !pair_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
                         // reconcile rides its own message (folder-reconcile) now.
                         sm.apply_remote_control(
-                            &pair_id, &name, &deletes, &group_id, &members, None, unshared,
+                            &pair_id, &name, &deletes, &group_id, &members,
+                            owner.as_deref(), role_epoch, None, unshared,
                         );
                     }
                 }
@@ -1711,7 +1724,7 @@ async fn serve_stream(
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
                         sm.apply_remote_control(
-                            &pair_id, "", &[], "", &[], Some(&reconcile), false,
+                            &pair_id, "", &[], "", &[], None, 0, Some(&reconcile), false,
                         );
                     }
                 }
@@ -1863,6 +1876,12 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
                     ep.id()
                 );
                 let _ = state.endpoint.set(ep.clone());
+                // Stamp ownership on any folder we created before iroh was up (so
+                // owner_eid was None and roles couldn't work). Now that we know our
+                // own endpoint id, claim the folders we created.
+                if crate::pairing::backfill_owner_eid(&config_dir, &ep.id().to_string()) {
+                    log::info!("backfilled owner_eid on folders created before iroh start");
+                }
                 accept_loop(ep, state).await;
             }
             Err(e) => log::warn!("iroh endpoint failed to start: {e:#}"),
@@ -2652,7 +2671,9 @@ pub async fn send_folder_ctrl(
     name: &str,
     deletes: &[(String, u64)],
     group_id: &str,
-    members: &[(String, String)],
+    members: &[(String, String, bool)],
+    owner: Option<&str>,
+    role_epoch: u64,
     unshared: bool,
 ) -> Result<()> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
@@ -2665,7 +2686,7 @@ pub async fn send_folder_ctrl(
     // (multi-person folders). Empty group_id / members on a classic 1:1 folder.
     let mem: Vec<serde_json::Value> = members
         .iter()
-        .map(|(eid, n)| serde_json::json!({ "eid": eid, "name": n }))
+        .map(|(eid, n, viewer)| serde_json::json!({ "eid": eid, "name": n, "viewer": viewer }))
         .collect();
     // `unshared` is a newer optional field — an older peer ignores unknown keys.
     // The self-heal manifest is sent SEPARATELY (send_folder_reconcile) so a huge
@@ -2673,6 +2694,9 @@ pub async fn send_folder_ctrl(
     let msg = serde_json::json!({
         "kind": "folder-ctrl", "pair_id": pair_id, "name": name, "deletes": dels,
         "group_id": group_id, "members": mem,
+        // Role authority: who owns role assignments + which version. Older peers
+        // ignore unknown keys; absent = no role info (legacy folder).
+        "owner": owner, "epoch": role_epoch,
         "unshared": unshared,
     });
     // Bounded dial so a perpetually-offline peer fails fast and the caller can

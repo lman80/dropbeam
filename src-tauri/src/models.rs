@@ -265,6 +265,29 @@ pub struct Pair {
     /// control beacon so everyone meshes with everyone.
     #[serde(default)]
     pub group_id: Option<String>,
+    /// Per-member access roles (owner-authoritative). A "viewer" gets a read-only
+    /// copy: they RECEIVE the folder but never push their own changes back.
+    ///   • `i_am_viewer`  — THIS device is a viewer on this folder → we never send
+    ///     (no watcher/sender, no reconcile push, no delete propagation).
+    ///   • `peer_is_viewer` — the PEER on this link is a viewer → we never accept
+    ///     their pushes/deletes (they shouldn't be changing the folder).
+    /// Both default false = full editor, so every existing folder is unchanged.
+    /// The folder owner assigns roles; they ride the roster beacon so the whole
+    /// mesh converges. See pairing::runs_sender/runs_listener.
+    #[serde(default)]
+    pub i_am_viewer: bool,
+    #[serde(default)]
+    pub peer_is_viewer: bool,
+    /// Role authority + convergence: the folder OWNER's (creator's) endpoint_id —
+    /// only role assignments from the owner are trusted. `role_epoch` is the
+    /// owner's monotonically-increasing version of the role assignment; we only
+    /// apply a roster whose epoch is newer than ours (kills role flapping and the
+    /// "any member can silence an editor" issue). Owner bumps it on each change;
+    /// every group link shares the same owner_eid + the latest epoch we've seen.
+    #[serde(default)]
+    pub owner_eid: Option<String>,
+    #[serde(default)]
+    pub role_epoch: u64,
 }
 
 /// One restorable entry in a folder's history (a deleted or overwritten file).

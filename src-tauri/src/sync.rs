@@ -1036,10 +1036,11 @@ impl SyncManager {
                     (Some(eid), Some(ep)) => {
                         let del_pairs: Vec<(String, u64)> =
                             dels.iter().map(|d| (d.rel.clone(), d.ts)).collect();
-                        let (group_id, roster) =
+                        let (group_id, roster, owner_eid, role_epoch) =
                             build_group_roster(&manager.config_dir, &pair, &ep, &my_name);
                         let ok = crate::iroh_net::send_folder_ctrl(
-                            &ep, &eid, &pair_id, &my_name, &del_pairs, &group_id, &roster, false,
+                            &ep, &eid, &pair_id, &my_name, &del_pairs, &group_id, &roster,
+                            owner_eid.as_deref(), role_epoch, false,
                         )
                         .await
                         .is_ok();
@@ -1134,7 +1135,7 @@ impl SyncManager {
         let pid = pair_id.to_string();
         tauri::async_runtime::spawn(async move {
             let _ = crate::iroh_net::send_folder_ctrl(
-                &ep, &eid, &pid, &my_name, &[], "", &[], true,
+                &ep, &eid, &pid, &my_name, &[], "", &[], None, 0, true,
             )
             .await;
         });
@@ -1191,7 +1192,10 @@ impl SyncManager {
         name: &str,
         deletes: &[(String, u64)],
         group_id: &str,
-        members: &[(String, String)],
+        members: &[(String, String, bool)],
+        // Role authority: the beacon sender's claimed owner + role epoch.
+        owner_eid: Option<&str>,
+        role_epoch: u64,
         reconcile: Option<&Reconcile>,
         unshared: bool,
     ) {
@@ -1232,7 +1236,9 @@ impl SyncManager {
             self.emit_status(pair_id);
         }
         // Mirror-mode delete propagation (apply_remote_delete is idempotent, so a
-        // re-delivered delete is a harmless no-op).
+        // re-delivered delete is a harmless no-op). Role flags are read AFTER the
+        // role block below, so this beacon's deletes/reconcile use the up-to-date
+        // role even when the SAME beacon also demotes the peer to a viewer.
         let (folder, mirror) = {
             let p = config.lock().unwrap();
             (p.folder.clone(), p.mirror)
@@ -1243,7 +1249,69 @@ impl SyncManager {
         let my_group = config.lock().unwrap().group_id.clone();
         let group_ok = !group_id.is_empty() && my_group.as_deref() == Some(group_id);
 
-        if mirror && !deletes.is_empty() {
+        // Multi-person folders: apply the roster + per-member roles FIRST, before we
+        // touch any files. The beacon carries the group roster, so mesh with any
+        // member we don't have a link to yet (gossip — converges the whole group and
+        // self-heals if someone was offline when a person joined), then apply the
+        // owner's role assignment. Doing this up front means a beacon that demotes a
+        // peer to read-only takes effect for THIS beacon's deletes/reconcile, not one
+        // cycle late. A classic 1:1 folder has an empty group/roster → no-op here.
+        if group_ok && !members.is_empty() {
+            let my_eid = self
+                .iroh_endpoint()
+                .map(|ep| ep.id().to_string())
+                .unwrap_or_default();
+            // Without our own key we can't safely tell ourselves apart from a
+            // roster entry → skip rather than risk a self-referential link.
+            if !my_eid.is_empty() {
+                let template = config.lock().unwrap().clone();
+                let mut added = false;
+                for (eid, mname, _viewer) in members {
+                    if pairing::ensure_member(
+                        &self.config_dir,
+                        group_id,
+                        &template,
+                        eid,
+                        mname,
+                        &my_eid,
+                    )
+                    .is_some()
+                    {
+                        added = true;
+                    }
+                }
+                // Apply per-member roles from the roster: who's a viewer (read-only).
+                // Owner-authoritative + monotonic epoch (apply_group_roles enforces
+                // both), so only the owner's newest assignment ever takes effect.
+                let roles: std::collections::HashMap<String, bool> =
+                    members.iter().map(|(e, _, v)| (e.clone(), *v)).collect();
+                let roles_changed = pairing::apply_group_roles(
+                    &self.config_dir,
+                    group_id,
+                    &my_eid,
+                    owner_eid,
+                    role_epoch,
+                    &roles,
+                );
+                if added || roles_changed {
+                    self.clone().reconcile();
+                    let _ = self.app.emit("pairs://changed", ());
+                }
+            }
+        }
+
+        // Role flags fresh from disk — apply_group_roles just wrote pairs.json, and
+        // the in-memory worker handle isn't refreshed until the reconcile lands, so
+        // re-read rather than trust the stale `config` snapshot.
+        let (peer_is_viewer, i_am_viewer) = pairing::pair_roles(&self.config_dir, pair_id)
+            .unwrap_or_else(|| {
+                let p = config.lock().unwrap();
+                (p.peer_is_viewer, p.i_am_viewer)
+            });
+
+        // A VIEWER peer must never delete our files: ignore deletes coming FROM a
+        // read-only member (they shouldn't be changing the folder at all).
+        if mirror && !peer_is_viewer && !deletes.is_empty() {
             let mut applied: Vec<(String, u64)> = Vec::new();
             for (rel, ts) in deletes {
                 let mut removed_rels: Vec<String> = Vec::new();
@@ -1291,43 +1359,9 @@ impl SyncManager {
                 }
                 self.reconcile_apply(
                     pair_id, &folder, rec, &self_deleted, &tombstones, &queue, &wake, &inbound,
+                    !peer_is_viewer, !i_am_viewer,
                 );
                 self.emit_status(pair_id);
-            }
-        }
-
-        // Multi-person folders: the beacon carries the group roster, so mesh with
-        // any member we don't have a link to yet (gossip — this converges the whole
-        // group and self-heals if someone was offline when a person joined). A
-        // classic 1:1 folder has an empty group/roster, so this is a no-op there.
-        if group_ok && !members.is_empty() {
-            let my_eid = self
-                .iroh_endpoint()
-                .map(|ep| ep.id().to_string())
-                .unwrap_or_default();
-            // Without our own key we can't safely tell ourselves apart from a
-            // roster entry → skip rather than risk a self-referential link.
-            if !my_eid.is_empty() {
-                let template = config.lock().unwrap().clone();
-                let mut added = false;
-                for (eid, mname) in members {
-                    if pairing::ensure_member(
-                        &self.config_dir,
-                        group_id,
-                        &template,
-                        eid,
-                        mname,
-                        &my_eid,
-                    )
-                    .is_some()
-                    {
-                        added = true;
-                    }
-                }
-                if added {
-                    self.clone().reconcile();
-                    let _ = self.app.emit("pairs://changed", ());
-                }
             }
         }
     }
@@ -1353,6 +1387,10 @@ impl SyncManager {
         queue: &Arc<Mutex<VecDeque<String>>>,
         wake: &Arc<Notify>,
         inbound: &Arc<Mutex<HashSet<String>>>,
+        // Per-member roles: don't apply a VIEWER peer's deletes/tombstones (they
+        // can't change the folder); don't push if WE are a viewer (read-only).
+        apply_peer_deletes: bool,
+        push_missing: bool,
     ) {
         let mine = live_manifest(folder);
         let my_tomb = tombstones.lock().unwrap().clone();
@@ -1360,7 +1398,7 @@ impl SyncManager {
 
         // 1) Apply peer tombstones we missed: delete a local file the peer deleted
         //    AFTER our copy. Archive first (recoverable from history).
-        if !plan.delete.is_empty() {
+        if apply_peer_deletes && !plan.delete.is_empty() {
             log::warn!(
                 "reconcile[{pair_id}]: applying {} peer delete(s){}",
                 plan.delete.len(),
@@ -1372,44 +1410,51 @@ impl SyncManager {
             );
         }
         let mut deleted_any = false;
-        for rel in &plan.delete {
-            let tomb_ts = rec.tombstones.get(rel).copied().unwrap_or_else(now_ms);
-            let mut removed: Vec<String> = Vec::new();
-            if apply_remote_delete(folder, rel, self_deleted, &mut removed, DELETE_GRACE_MS) {
-                deleted_any = true;
-                for r in &removed {
-                    note_tombstone(&self.config_dir, pair_id, tombstones, r, tomb_ts);
-                    inbound
-                        .lock()
-                        .unwrap()
-                        .retain(|sig| sig_rel(sig).as_deref() != Some(r.as_str()));
+        if apply_peer_deletes {
+            for rel in &plan.delete {
+                let tomb_ts = rec.tombstones.get(rel).copied().unwrap_or_else(now_ms);
+                let mut removed: Vec<String> = Vec::new();
+                if apply_remote_delete(folder, rel, self_deleted, &mut removed, DELETE_GRACE_MS) {
+                    deleted_any = true;
+                    for r in &removed {
+                        note_tombstone(&self.config_dir, pair_id, tombstones, r, tomb_ts);
+                        inbound
+                            .lock()
+                            .unwrap()
+                            .retain(|sig| sig_rel(sig).as_deref() != Some(r.as_str()));
+                    }
                 }
             }
-        }
-        // Adopt EVERY peer tombstone so we forward it and never resurrect, even the
-        // ones for files we never had — EXCEPT a rel whose LOCAL file is freshly
-        // added (within grace). Adopting+forwarding that would spread a delete that
-        // is racing the user's drop. The peer re-advertises its tombstones every
-        // cycle, so a GENUINE delete still lands once the file ages past the window.
-        for (rel, &ts) in &rec.tombstones {
-            if file_is_fresh(&Path::new(folder).join(norm_rel(rel)), DELETE_GRACE_MS) {
-                continue;
+            // Adopt EVERY peer tombstone so we forward it and never resurrect, even
+            // the ones for files we never had — EXCEPT a rel whose LOCAL file is
+            // freshly added (within grace). Adopting+forwarding that would spread a
+            // delete that is racing the user's drop. The peer re-advertises its
+            // tombstones every cycle, so a GENUINE delete still lands once the file
+            // ages past the window. (Skipped entirely for a viewer peer — we never
+            // trust a read-only member's deletes.)
+            for (rel, &ts) in &rec.tombstones {
+                if file_is_fresh(&Path::new(folder).join(norm_rel(rel)), DELETE_GRACE_MS) {
+                    continue;
+                }
+                note_tombstone(&self.config_dir, pair_id, tombstones, rel, ts);
             }
-            note_tombstone(&self.config_dir, pair_id, tombstones, rel, ts);
-        }
-        if deleted_any {
-            let _ = self.app.emit("folder-history://changed", pair_id);
+            if deleted_any {
+                let _ = self.app.emit("folder-history://changed", pair_id);
+            }
         }
 
-        // 2) Push files the peer is missing or has an older copy of.
+        // 2) Push files the peer is missing or has an older copy of. Skipped when
+        //    WE are a viewer — a read-only member never sends.
         let mut queued = 0usize;
-        for rel in &plan.push {
-            let abs = Path::new(folder).join(rel).to_string_lossy().to_string();
-            if Path::new(&abs).is_file() {
-                let mut q = queue.lock().unwrap();
-                if !q.iter().any(|x| x == &abs) {
-                    q.push_back(abs);
-                    queued += 1;
+        if push_missing {
+            for rel in &plan.push {
+                let abs = Path::new(folder).join(rel).to_string_lossy().to_string();
+                if Path::new(&abs).is_file() {
+                    let mut q = queue.lock().unwrap();
+                    if !q.iter().any(|x| x == &abs) {
+                        q.push_back(abs);
+                        queued += 1;
+                    }
                 }
             }
         }
@@ -1569,6 +1614,18 @@ impl SyncManager {
     /// The iroh accept loop checks this before landing a pushed folder file.
     pub fn has_pair(&self, pair_id: &str) -> bool {
         self.handles.lock().unwrap().contains_key(pair_id)
+    }
+
+    /// True if the PEER on this link is a read-only viewer — a viewer must never
+    /// be able to push files INTO our folder. THE receive-side enforcement of the
+    /// role (the send-side suppression is only an optimization, and can be stale).
+    pub fn peer_is_viewer(&self, pair_id: &str) -> bool {
+        self.handles
+            .lock()
+            .unwrap()
+            .get(pair_id)
+            .map(|h| h.config.lock().unwrap().peer_is_viewer)
+            .unwrap_or(false)
     }
 
     /// Live progress for an in-flight iroh folder RECEIVE — drives the same status
@@ -2743,9 +2800,12 @@ fn friend_sig(f: &Friend) -> String {
 }
 
 fn structural_sig(p: &Pair) -> String {
+    // Roles are part of the structural signature so a role change restarts the
+    // pair's workers — the new direction takes effect AND the control sender
+    // re-beacons the roster immediately (instead of waiting out its idle cadence).
     format!(
-        "{}|{:?}|{}|{}|{}",
-        p.folder, p.role, p.secret, p.two_way, p.mirror
+        "{}|{:?}|{}|{}|{}|{}|{}",
+        p.folder, p.role, p.secret, p.two_way, p.mirror, p.i_am_viewer, p.peer_is_viewer
     )
 }
 
@@ -2778,22 +2838,31 @@ fn build_group_roster(
     pair: &Pair,
     ep: &iroh::Endpoint,
     my_name: &str,
-) -> (String, Vec<(String, String)>) {
+) -> (String, Vec<(String, String, bool)>, Option<String>, u64) {
     let Some(gid) = pair.group_id.clone() else {
-        return (String::new(), Vec::new());
+        return (String::new(), Vec::new(), None, 0);
     };
-    let mut roster: Vec<(String, String)> = vec![(ep.id().to_string(), my_name.to_string())];
-    for p in pairing::members_of_group(config_dir, &gid) {
+    let members = pairing::members_of_group(config_dir, &gid);
+    // My own role in the group (all my links share it). The roster carries each
+    // member's `is_viewer` so the whole mesh converges on the owner's assignment.
+    let am_i_viewer = members.iter().any(|p| p.i_am_viewer);
+    let mut roster: Vec<(String, String, bool)> =
+        vec![(ep.id().to_string(), my_name.to_string(), am_i_viewer)];
+    for p in &members {
         if let Some(eid) = &p.endpoint_id {
             let n = if p.peer_name.trim().is_empty() {
                 "Member".to_string()
             } else {
                 p.peer_name.clone()
             };
-            roster.push((eid.clone(), n));
+            roster.push((eid.clone(), n, p.peer_is_viewer));
         }
     }
-    (gid, roster)
+    // The owner + role epoch: who's authoritative for roles and which version we're
+    // on. We relay the owner's value verbatim so an offline owner's last assignment
+    // still reaches the whole mesh.
+    let (owner_eid, role_epoch) = pairing::group_role_authority(config_dir, &gid);
+    (gid, roster, owner_eid, role_epoch)
 }
 
 fn now_ms() -> u64 {

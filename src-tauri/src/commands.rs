@@ -570,6 +570,36 @@ pub fn remove_pair(
     Ok(())
 }
 
+/// Owner action: make a folder member a viewer (read-only) or an editor again.
+/// `id` is the owner's link to that member; the role rides the roster beacon to
+/// the whole group, so the member stops/starts sending accordingly.
+#[tauri::command]
+pub fn set_member_role(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    id: String,
+    viewer: bool,
+) -> Result<(), String> {
+    // Only the folder OWNER may assign roles — enforced in the engine, not just
+    // the UI, because every peer trusts the owner_eid relayed on the beacon.
+    let my_eid = iroh.get().map(|ep| ep.id().to_string());
+    if !pairing::set_peer_viewer(&state.config_dir, &id, viewer, my_eid.as_deref()) {
+        return Err("Only the folder's owner can change who can edit.".into());
+    }
+    sync.reconcile();
+    let _ = app.emit("pairs://changed", ());
+    Ok(())
+}
+
+/// This device's own iroh endpoint id (None until iroh is up). The UI compares it
+/// to a folder's `ownerEid` to show role controls only to the actual owner.
+#[tauri::command]
+pub fn my_endpoint_id(iroh: State<'_, Arc<crate::iroh_net::IrohState>>) -> Option<String> {
+    iroh.get().map(|ep| ep.id().to_string())
+}
+
 /// Manually trigger the self-heal reconcile for every shared folder NOW — each
 /// side re-exchanges its manifest and converges to identical. Drives the
 /// "Verify" button.

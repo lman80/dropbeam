@@ -104,6 +104,13 @@ export interface Pair {
   /** Multi-person folders: all pairwise links of one shared folder share this id.
    * Null = a classic 1:1 folder. */
   groupId: string | null
+  /** This device is a read-only viewer on this folder (we never send). */
+  iAmViewer?: boolean
+  /** The peer on this link is a read-only viewer (we never receive from them). */
+  peerIsViewer?: boolean
+  /** The folder OWNER's (creator's) endpoint id. We are the owner iff this equals
+   * our own endpoint id. Only the owner may assign roles. Null on legacy folders. */
+  ownerEid?: string | null
 }
 
 /** A restorable deleted/overwritten file in a mirror folder's history. */
@@ -251,6 +258,11 @@ const realApi = {
       peerName: u.peerName,
     }),
   removePair: (id: string) => invoke<void>('remove_pair', { id }),
+  /** Owner: make a folder member view-only (read-only) or an editor again. */
+  setMemberRole: (id: string, viewer: boolean) => invoke<void>('set_member_role', { id, viewer }),
+  /** This device's own iroh endpoint id (null until iroh is up). Used to tell
+   * whether we own a folder (pair.ownerEid === this) before showing role controls. */
+  myEndpointId: () => invoke<string | null>('my_endpoint_id'),
   verifyFolders: () => invoke<void>('verify_folders'),
   stopFolderTransfer: (pairId: string) => invoke<void>('stop_folder_transfer', { pairId }),
   /** Delete abandoned transfer leftovers (paused/failed partials). Returns bytes freed. */

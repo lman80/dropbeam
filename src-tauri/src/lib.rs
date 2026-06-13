@@ -451,6 +451,8 @@ pub fn run() {
             commands::list_pairs,
             commands::update_pair,
             commands::remove_pair,
+            commands::set_member_role,
+            commands::my_endpoint_id,
             commands::verify_folders,
             commands::stop_folder_transfer,
             commands::clear_transfer_cache,

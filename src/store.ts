@@ -93,6 +93,8 @@ interface AppStore {
   dragHovering: boolean
   history: HistoryEntry[]
   pairs: Pair[]
+  /** This device's own iroh endpoint id (null until iroh is up). Owner check. */
+  myEid: string | null
   friends: Friend[]
   folderStatuses: Record<string, FolderStatus>
   /** When each folder pair last synced a file (ms) — for the "synced 2m ago" label. */
@@ -175,6 +177,7 @@ export const useStore = create<AppStore>((set, get) => ({
   dragHovering: false,
   history: [],
   pairs: [],
+  myEid: null,
   friends: [],
   folderStatuses: {},
   folderLastSynced: {},
@@ -213,6 +216,26 @@ export const useStore = create<AppStore>((set, get) => ({
     const folderStatuses: Record<string, FolderStatus> = {}
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
     set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })
+
+    // Our own endpoint id (for the folder-owner check). iroh may still be starting
+    // at bootstrap, so poll until it's up, then stop.
+    const fetchMyEid = async () => {
+      try {
+        const eid = await api.myEndpointId()
+        if (eid) {
+          set({ myEid: eid })
+          return true
+        }
+      } catch {
+        /* iroh not ready yet */
+      }
+      return false
+    }
+    if (!(await fetchMyEid())) {
+      const t = setInterval(async () => {
+        if (await fetchMyEid()) clearInterval(t)
+      }, 2000)
+    }
 
     // Only the main window owns window-scoped side effects (sounds, update check).
     // The popover/HUD webviews share this store but must not double/triple-fire.
