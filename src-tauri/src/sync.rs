@@ -617,12 +617,28 @@ impl SyncManager {
                                 return;
                             }
                         }
-                        // An editor's atomic save is unlink+rename; wait briefly and
-                        // re-check. If the path came back as ANYTHING — a file (a
-                        // save) or a directory (recreated/renamed) — it isn't a
-                        // delete; bail so we don't propagate a phantom removal.
-                        tokio::time::sleep(Duration::from_millis(1200)).await;
-                        if stopped2.load(Ordering::SeqCst) || Path::new(&p).exists() {
+                        // An editor's atomic save is unlink+rename, and a freshly
+                        // RECEIVED file is momentarily gone while the receive side
+                        // archives-then-rewrites it (incoming-wins replace). Re-verify
+                        // over several seconds and ABORT the instant the path returns
+                        // as anything — a file (a save / re-receive) or a directory
+                        // (recreated/renamed). This is what stops a rapid SECOND drop
+                        // into a subfolder from being misread as a delete and
+                        // tombstoned (then wrongly applied once the freshness window
+                        // lapses). Deletes aren't latency-critical, so a few extra
+                        // seconds of settle is a cheap price for not wiping live data.
+                        let mut reappeared = false;
+                        for _ in 0..5 {
+                            tokio::time::sleep(Duration::from_millis(1000)).await;
+                            if stopped2.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            if Path::new(&p).exists() {
+                                reappeared = true;
+                                break;
+                            }
+                        }
+                        if reappeared {
                             return;
                         }
                         // A newer event for this path superseded us (e.g. recreated
@@ -807,6 +823,27 @@ impl SyncManager {
                         .unwrap_or_default();
                     (p, s)
                 };
+                // Drop any batch entry we can't root under the folder. For a normally
+                // queued path this never fires (its string is under the folder), but
+                // if it ever does, NOT sending the file must also mean NOT popping /
+                // auto-deleting it as if delivered — otherwise auto-delete could wipe a
+                // file the peer never received. Remove it from the queue so it doesn't
+                // spin; the local copy stays put.
+                batch.retain(|f| {
+                    if crate::iroh_net::folder_rel(Path::new(f), &pair.folder).is_some() {
+                        return true;
+                    }
+                    log::warn!("folder send: dropping un-rootable queued path {f}");
+                    let mut q = queue.lock().unwrap();
+                    if let Some(pos) = q.iter().position(|x| x == f) {
+                        q.remove(pos);
+                    }
+                    false
+                });
+                if batch.is_empty() {
+                    continue;
+                }
+                let file = batch[0].clone();
                 let name = if batch.len() > 1 {
                     format!("{} (+{} more)", file_name_of(&file), batch.len() - 1)
                 } else {
@@ -2140,6 +2177,28 @@ fn move_staged_into_folder(
             }
         }
 
+        // TYPE SWAP: a DIRECTORY occupies the exact path where this incoming FILE
+        // must land (a peer replaced a folder with a same-named file). `rename`/
+        // `copy` can't overwrite a directory, so without this the file is silently
+        // dropped and reconcile re-queues it forever (permanent divergence). Archive
+        // the directory's contents to History (nothing lost), loop-guard each removal
+        // so our watcher doesn't echo it back, then clear it so the file can land.
+        if mirror && dest_path.is_dir() {
+            for child in list_files_rec(&dest_path) {
+                if let Some(crel) = rel_path_of(&child.to_string_lossy(), folder_str) {
+                    self_deleted.lock().unwrap().insert(crel.clone(), Instant::now());
+                    crate::folder_history::archive(
+                        folder_str,
+                        &child.to_string_lossy(),
+                        &crel,
+                        "replaced",
+                    );
+                }
+            }
+            self_deleted.lock().unwrap().insert(rel_str.clone(), Instant::now());
+            let _ = std::fs::remove_dir_all(&dest_path);
+        }
+
         let dest = if mirror {
             dest_path
         } else {
@@ -2936,6 +2995,29 @@ mod tests {
         write_with_mtime(&staging.join("a.txt"), b"new", 2000);
         apply(&staging, &folder);
         assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn type_swap_file_replaces_existing_directory() {
+        // A peer replaced a folder named "notes" with a FILE named "notes". Without
+        // the type-swap guard the incoming file can't overwrite the directory, so it
+        // was silently dropped and re-queued forever. It must now land as a file, and
+        // the old directory's contents must be preserved in History.
+        let folder = temp_dir("swap-f");
+        let staging = temp_dir("swap-s");
+        std::fs::create_dir_all(folder.join("notes")).unwrap();
+        write_with_mtime(&folder.join("notes/inner.txt"), b"kept", 1000);
+        write_with_mtime(&staging.join("notes"), b"i am a file now", 2000);
+        let moved = apply(&staging, &folder);
+        assert!(folder.join("notes").is_file(), "incoming file must land");
+        assert_eq!(std::fs::read(folder.join("notes")).unwrap(), b"i am a file now");
+        assert_eq!(moved.len(), 1, "exactly the landed file is reported");
+        // The replaced directory's child survives in History (nothing lost).
+        let hist = folder.join(".dropbeam-history");
+        let recoverable = list_files_rec(&hist)
+            .iter()
+            .any(|p| std::fs::read(p).map(|b| b == b"kept").unwrap_or(false));
+        assert!(recoverable, "old directory contents archived to History");
     }
 
     #[test]

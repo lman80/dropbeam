@@ -2932,8 +2932,18 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
     let mut items = Vec::new();
     for p in paths {
         let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
-        items.push((p.clone(), folder_rel(p, root), meta.len(), mtime_secs(&meta)));
+        let Some(rel) = folder_rel(p, root) else {
+            // Not provably under the folder root — skip rather than risk sending it
+            // at the wrong (root) level. The reconcile re-sends it correctly later.
+            log::warn!("folder send: skipping {} — not under folder root {root}", p.display());
+            continue;
+        };
+        items.push((p.clone(), rel, meta.len(), mtime_secs(&meta)));
     }
+    anyhow::ensure!(
+        !items.is_empty(),
+        "no sendable items under folder root (skipped un-rootable paths)"
+    );
     let total: u64 = items.iter().map(|i| i.2).sum();
     // Big single folder files fan across parallel streams exactly like friend
     // sends (same negotiation, same resume). Folder sync was the LAST big-file
@@ -3189,32 +3199,58 @@ async fn read_folder_body<F: Fn(u64, u64)>(
     Ok(out)
 }
 
-/// A file's path relative to the folder root, forward-slashed; falls back to the
-/// bare file name if it isn't under `root`.
-fn folder_rel(path: &Path, root: &str) -> String {
-    let norm = |r: &Path| r.to_string_lossy().replace('\\', "/");
+/// A file's path relative to the folder root, NFC-normalized + forward-slashed —
+/// the SAME normalization `sync::norm_rel` uses for every comparison key, so the
+/// wire rel and the reconcile/manifest keys are byte-identical (a non-ASCII name
+/// that macOS stores decomposed no longer reads as "missing" → re-sent forever).
+///
+/// Returns `None` when `path` is NOT provably under `root`. We must NEVER fall back
+/// to the bare file name: that silently relocates a SUBFOLDER file to the folder
+/// ROOT on the peer, creating a wrong-level duplicate the mirror then echoes back
+/// (the user's "kicked the file out + duplicate" bug). A file we can't root is
+/// skipped; the reconcile re-sends it later with a correctly-rooted path.
+pub(crate) fn folder_rel(path: &Path, root: &str) -> Option<String> {
+    let norm = |r: &Path| crate::sync::norm_rel(&r.to_string_lossy());
     if let Ok(rel) = path.strip_prefix(root) {
-        return norm(rel);
+        return Some(norm(rel));
     }
-    if let Ok(canon) = std::fs::canonicalize(root) {
-        if let Ok(rel) = path.strip_prefix(&canon) {
-            return norm(rel);
+    // macOS firmlinks: FSEvents can hand us a /System/Volumes/Data/... path while
+    // `root` is /Users/... (or vice-versa). Canonicalize BOTH sides and retry so a
+    // genuinely-under-root file is still recognized instead of dropped.
+    if let Ok(canon_root) = std::fs::canonicalize(root) {
+        if let Ok(rel) = path.strip_prefix(&canon_root) {
+            return Some(norm(rel));
+        }
+        if let Ok(canon_path) = std::fs::canonicalize(path) {
+            if let Ok(rel) = canon_path.strip_prefix(&canon_root) {
+                return Some(norm(rel));
+            }
         }
     }
-    path.file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string())
+    None
 }
 
 /// Sanitize a peer-supplied relative path: drop empties, `.` and `..`, and any
 /// drive/root prefix, so a malicious peer can't write outside the staging dir.
 fn sanitize_rel(raw: &str) -> PathBuf {
+    use unicode_normalization::UnicodeNormalization;
     let mut out = PathBuf::new();
     for comp in raw.replace('\\', "/").split('/') {
         if comp.is_empty() || comp == "." || comp == ".." || comp.contains(':') {
             continue;
         }
-        out.push(comp);
+        // Neutralize a LEADING dot. The watcher, manifest, and reconcile all skip
+        // dot-paths, so a peer-supplied ".dropbeam-incoming" / ".iroh-folder-x" /
+        // ".hidden" would land in the folder yet be invisible to sync forever — and
+        // could collide with our own placeholder/staging names. DropBeam never SENDS
+        // a dotfile (the watcher skips them), so stripping the lead dot is safe.
+        let cleaned = comp.trim_start_matches('.');
+        if cleaned.is_empty() {
+            continue;
+        }
+        // NFC-normalize so a received name lands on disk in the SAME form every
+        // platform/comparison key uses (a macOS sender ships NFD otherwise).
+        out.push(cleaned.nfc().collect::<String>());
     }
     if out.as_os_str().is_empty() {
         out.push("file");
@@ -4677,14 +4713,27 @@ mod tests {
         // Degenerate input still yields a safe, non-empty name.
         assert_eq!(sanitize_rel(""), Path::new("file"));
         assert_eq!(sanitize_rel("../.."), Path::new("file"));
+        // A leading dot is neutralized so a peer can't land an invisible / colliding
+        // name (".dropbeam-incoming", ".iroh-folder-x", ".hidden") that sync skips.
+        assert_eq!(sanitize_rel(".dropbeam-incoming"), Path::new("dropbeam-incoming"));
+        assert_eq!(sanitize_rel("sub/.hidden/a.txt"), Path::new("sub/hidden/a.txt"));
+        // An all-dots component drops out entirely (no empty/invisible segment).
+        assert_eq!(sanitize_rel("a/.../b"), Path::new("a/b"));
+        // NFD input is normalized to NFC so the on-disk name matches every key:
+        // "Cafe" + combining acute → precomposed "Café".
+        assert_eq!(sanitize_rel("Cafe\u{301}"), Path::new("Caf\u{e9}"));
     }
 
     #[test]
     fn folder_rel_is_relative_and_forward_slashed() {
         use std::path::Path;
-        assert_eq!(folder_rel(Path::new("/data/share/sub/a.txt"), "/data/share"), "sub/a.txt");
-        // A path outside the root degrades to the bare file name (never absolute).
-        assert_eq!(folder_rel(Path::new("/somewhere/else/b.txt"), "/data/share"), "b.txt");
+        assert_eq!(
+            folder_rel(Path::new("/data/share/sub/a.txt"), "/data/share").as_deref(),
+            Some("sub/a.txt")
+        );
+        // A path OUTSIDE the root must NOT be sent — never degrade to the bare name,
+        // which would relocate the file to the peer's folder root (wrong-level dup).
+        assert_eq!(folder_rel(Path::new("/somewhere/else/b.txt"), "/data/share"), None);
     }
 
     #[test]
