@@ -745,6 +745,10 @@ impl SyncManager {
             // Files delivered in the CURRENT burst — reset whenever the queue
             // drains, so "12 of 50" tracks one folder drop, not all time.
             let mut session_done: u32 = 0;
+            // Bytes delivered + when the burst started, for the end-of-drop summary
+            // (total size, duration, average speed) — same as the Send/Receive tab.
+            let mut session_bytes: u64 = 0;
+            let mut session_start: Option<Instant> = None;
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
@@ -752,6 +756,8 @@ impl SyncManager {
                 let next = queue.lock().unwrap().front().cloned();
                 let Some(file) = next else {
                     session_done = 0;
+                    session_bytes = 0;
+                    session_start = None;
                     if let Ok(mut s) = status.lock() {
                         s.session_total_files = 0;
                         s.session_done_files = 0;
@@ -784,6 +790,40 @@ impl SyncManager {
                 if file != current {
                     current = file.clone();
                     offline_attempts = 0;
+                }
+
+                // PRESENCE GATE: don't dial-spam a peer we believe is offline. The
+                // control beacon already probes presence on its own backoff and sets
+                // `peer_online`; until that flips true we show a STABLE "waiting"
+                // status instead of flapping Sending↔Waiting every few seconds and
+                // burning CPU on doomed 12-second dials (the user's "it loops sending
+                // over and over while my friend's computer is off"). We re-check the
+                // cheap presence flag every 5s and send the instant the peer is back.
+                if !status.lock().map(|s| s.peer_online).unwrap_or(false) {
+                    let already_waiting = status
+                        .lock()
+                        .map(|s| matches!(s.state, FolderState::Waiting))
+                        .unwrap_or(false);
+                    if !already_waiting {
+                        let label = {
+                            let c = config.lock().unwrap();
+                            peer_label(&c)
+                        };
+                        set_status(
+                            &status,
+                            FolderState::Waiting,
+                            None,
+                            0.0,
+                            Some(format!("Waiting for {label} to come online")),
+                        );
+                        manager.emit_status(&pair_id);
+                    }
+                    tokio::select! {
+                        _ = wake.notified() => {}
+                        _ = stop_notify.notified() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+                    continue;
                 }
 
                 // BATCH small files into one push. Every send pays a fresh dial +
@@ -844,6 +884,17 @@ impl SyncManager {
                     continue;
                 }
                 let file = batch[0].clone();
+                // Size of this batch (for the burst's running byte total) + start the
+                // burst clock on the first file so the end-of-drop summary can report
+                // total bytes, elapsed time, and average speed.
+                let batch_bytes: u64 = batch
+                    .iter()
+                    .filter_map(|f| std::fs::metadata(f).ok())
+                    .map(|m| m.len())
+                    .sum();
+                if session_start.is_none() {
+                    session_start = Some(Instant::now());
+                }
                 let name = if batch.len() > 1 {
                     format!("{} (+{} more)", file_name_of(&file), batch.len() - 1)
                 } else {
@@ -944,6 +995,7 @@ impl SyncManager {
                             s.session_total_files = session_done + remaining as u32;
                         }
                         manager.emit_status(&pair_id);
+                        session_bytes += batch_bytes;
                         // Cue the UI to optionally play a sound + flash the HUD.
                         // `remaining` lets the UI ding ONCE when the whole drop is
                         // done, not once per file.
@@ -951,6 +1003,36 @@ impl SyncManager {
                             "folder-synced",
                             serde_json::json!({ "pairId": pair_id, "direction": "send", "remaining": remaining }),
                         );
+                        // Whole drop finished → emit a completion summary (files, total
+                        // bytes, elapsed, average speed) so the folder card can show it
+                        // like the Send/Receive tab does, then re-check convergence.
+                        if remaining == 0 {
+                            let elapsed_ms = session_start
+                                .map(|t| t.elapsed().as_millis() as u64)
+                                .unwrap_or(0);
+                            let avg_bps = if elapsed_ms > 0 {
+                                (session_bytes as f64) / (elapsed_ms as f64 / 1000.0)
+                            } else {
+                                0.0
+                            };
+                            let _ = manager.app.emit(
+                                "folder-complete",
+                                serde_json::json!({
+                                    "pairId": pair_id,
+                                    "direction": "send",
+                                    "files": session_done,
+                                    "bytes": session_bytes,
+                                    "durationMs": elapsed_ms,
+                                    "avgBps": avg_bps,
+                                }),
+                            );
+                            manager.nudge_reconcile(&pair_id);
+                            // Start the next drop's summary fresh — don't let a second
+                            // drop landing back-to-back inflate the next recap.
+                            session_done = 0;
+                            session_bytes = 0;
+                            session_start = None;
+                        }
                     }
                     SendOutcome::Offline => {
                         offline_attempts = offline_attempts.saturating_add(1);
@@ -1099,6 +1181,9 @@ impl SyncManager {
                 if iroh_ok {
                     offline_streak = 0;
                     set_peer_online(&status, true);
+                    // Peer is reachable → kick the file-sender so a drop parked behind
+                    // the presence gate starts immediately (no 5s poll wait).
+                    manager.wake_sender(&pair_id);
                     manager.emit_status(&pair_id);
                     if !dels.is_empty() {
                         let sent: HashSet<String> =
@@ -1272,6 +1357,9 @@ impl SyncManager {
             set_peer_online(&status, true);
             self.emit_status(pair_id);
         }
+        // We just heard from the peer → they're online. Kick the file-sender so any
+        // drop parked behind the presence gate goes out now, not on the next poll.
+        self.wake_sender(pair_id);
         // Mirror-mode delete propagation (apply_remote_delete is idempotent, so a
         // re-delivered delete is a harmless no-op). Role flags are read AFTER the
         // role block below, so this beacon's deletes/reconcile use the up-to-date
@@ -1726,7 +1814,30 @@ impl SyncManager {
             }
         }
         self.emit_status(pair_id);
+        // Right after landing files, kick the control beacon to re-exchange our
+        // manifest + tombstones so both sides re-verify they're identical (and any
+        // delete/missed-file converges) instead of waiting out the idle cadence.
+        self.nudge_reconcile(pair_id);
         moved
+    }
+
+    /// Kick the control beacon for `pair_id` to re-exchange its manifest + tombstones
+    /// NOW rather than waiting out the idle cadence — so the two folders re-check that
+    /// they're identical the moment a transfer finishes (the "run a check every time a
+    /// file is sent or received" convergence the user asked for). Cheap + idempotent.
+    pub fn nudge_reconcile(&self, pair_id: &str) {
+        if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
+            h.control_wake.notify_one();
+        }
+    }
+
+    /// Kick the file-SENDER worker for `pair_id` — used the moment the peer comes
+    /// back online so a drop that's been parked behind the presence gate starts
+    /// sending immediately instead of waiting out the gate's 5s re-check poll.
+    pub fn wake_sender(&self, pair_id: &str) {
+        if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
+            h.wake.notify_one();
+        }
     }
 
     /// Try to push one folder file directly over iroh. Returns `Some(locality)` on
@@ -2271,11 +2382,15 @@ fn meta_version_ms(meta: &std::fs::Metadata) -> u64 {
 /// from a sync-driven delete. A delete targeting a file this fresh is almost
 /// always a race with the user dropping it in — a bogus tombstone arriving at the
 /// same instant (the "dropped a folder and it deleted right away" bug). We refuse
-/// it. A genuine delete still lands once the file ages past this window (the
-/// tombstone persists; reconcile retries). Generous on purpose — a multi-GB
-/// folder drop can take minutes to finish copying, and data safety outranks a few
-/// minutes of delete latency.
-const DELETE_GRACE_MS: u64 = 10 * 60 * 1000;
+/// it. A GENUINE delete (e.g. the user drags a folder in and right back out) still
+/// lands once the file ages past this window — the tombstone persists and the
+/// reconcile retries. The race this guards against is sub-second to a few seconds,
+/// so a 2-minute window covers it with wide margin while keeping delete-convergence
+/// snappy. (Per-file write-completion is handled separately by `wait_until_stable`
+/// BEFORE a file is ever queued, so a slow multi-GB copy doesn't need a long window
+/// here.) Earlier this was 10 minutes, which made a deliberate drag-in/drag-out take
+/// up to 10 minutes to disappear on the peer — too slow to feel reliable.
+const DELETE_GRACE_MS: u64 = 2 * 60 * 1000;
 
 /// True when `v` (epoch ms) is within `grace_ms` of `now` in EITHER direction.
 /// Bounded on the future side on purpose: a wildly future-stamped file (clock

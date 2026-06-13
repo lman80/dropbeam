@@ -174,6 +174,7 @@ function FolderCard({
   const myName = useStore((s) => s.settings?.displayName || 'You')
   const status = statuses[pair.id]
   const lastSynced = useStore((s) => s.folderLastSynced[pair.id])
+  const summary = useStore((s) => s.folderSummaries[pair.id])
   const myEid = useStore((s) => s.myEid)
   // We own this folder iff its recorded owner endpoint id is OURS.
   const iAmOwner = !!myEid && !!pair.ownerEid && pair.ownerEid === myEid
@@ -555,6 +556,28 @@ function FolderCard({
             </div>
           )}
         </motion.div>
+      )}
+
+      {/* Last completed-drop summary — total files, size, time, and average speed,
+          the same recap the Send/Receive tab shows when a transfer finishes. */}
+      {status?.state !== 'sending' && status?.state !== 'receiving' && summary && summary.files > 0 && (
+        <div
+          style={{
+            marginTop: 10,
+            fontSize: 11.5,
+            color: 'var(--text-faint)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+          }}
+        >
+          <Check size={12} color="var(--green)" style={{ flexShrink: 0 }} />
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {summary.direction === 'send' ? 'Sent' : 'Received'} {summary.files} file
+            {summary.files === 1 ? '' : 's'} · {formatBytes(summary.bytes)} ·{' '}
+            {formatEta(summary.durationMs / 1000)} · {formatSpeed(summary.avgBps)} avg
+          </span>
+        </div>
       )}
 
       <AnimatePresence initial={false}>

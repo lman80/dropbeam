@@ -333,6 +333,22 @@ export function onFolderSynced(cb: (s: FolderSynced) => void): Promise<UnlistenF
   return listen<FolderSynced>('folder-synced', (e) => cb(e.payload))
 }
 
+/** A whole shared-folder drop finished — summary stats for the folder card,
+ *  mirroring the Send/Receive tab's completion line (size, time, avg speed). */
+export interface FolderComplete {
+  pairId: string
+  direction: 'send' | 'receive'
+  files: number
+  bytes: number
+  durationMs: number
+  avgBps: number
+}
+
+export function onFolderComplete(cb: (s: FolderComplete) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('folder-complete', (p) => cb(p as FolderComplete))
+  return listen<FolderComplete>('folder-complete', (e) => cb(e.payload))
+}
+
 /** A chat message arrived (from a friend) or was just sent by us. */
 export function onChatMessage(cb: (m: ChatMessage) => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('chat://message', (p) => cb(p as ChatMessage))

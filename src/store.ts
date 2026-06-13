@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import {
   api,
   onChatMessage,
+  onFolderComplete,
   onFolderStatus,
   onFolderSynced,
   onFriendsChanged,
@@ -11,6 +12,7 @@ import {
   onTransferUpdate,
   type ChatMessage,
   type ChatOverview,
+  type FolderComplete,
   type FolderStatus,
   type Friend,
   type HistoryEntry,
@@ -99,6 +101,8 @@ interface AppStore {
   folderStatuses: Record<string, FolderStatus>
   /** When each folder pair last synced a file (ms) — for the "synced 2m ago" label. */
   folderLastSynced: Record<string, number>
+  /** Last completed-drop summary per folder pair (size, time, avg speed). */
+  folderSummaries: Record<string, FolderComplete>
   /** Files picked/dropped that are awaiting a "send to whom?" choice. */
   pendingSend: string[] | null
   /** Last time (ms) a friend was seen online, keyed by lowercased name. */
@@ -181,6 +185,7 @@ export const useStore = create<AppStore>((set, get) => ({
   friends: [],
   folderStatuses: {},
   folderLastSynced: {},
+  folderSummaries: {},
   pendingSend: null,
   friendSeen: {},
   chats: {},
@@ -282,6 +287,11 @@ export const useStore = create<AppStore>((set, get) => ({
       if (s.direction === 'send') playSent()
       else playReceived()
     })
+    // A whole folder drop finished — stash its summary (size, time, avg speed) so
+    // the folder card can show it like the Send/Receive tab's completion line.
+    onFolderComplete((c) =>
+      set((st) => ({ folderSummaries: { ...st.folderSummaries, [c.pairId]: c } })),
+    )
     // Chat lives in the main window only. Load the conversation previews and
     // listen for live messages (from friends, and our own echoed sends).
     if (!isOverlay) {
