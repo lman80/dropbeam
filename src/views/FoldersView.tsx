@@ -207,10 +207,12 @@ function FolderCard({
       setConfirmMember(null)
     }
   }
-  // Owner only: flip a member between editor (full) and viewer (read-only).
-  const toggleRole = async (m: Pair) => {
+  // Owner only: set a member to editor (full) or viewer (read-only). No-op if
+  // they're already that role (so clicking the active segment does nothing).
+  const setRole = async (m: Pair, viewer: boolean) => {
+    if (!!m.peerIsViewer === viewer) return
     try {
-      await api.setMemberRole(m.id, !m.peerIsViewer)
+      await api.setMemberRole(m.id, viewer)
       await reloadPairs()
     } catch (e) {
       toast('error', String(e))
@@ -388,7 +390,7 @@ function FolderCard({
             // Only the folder OWNER may assign roles (enforced in the engine too).
             // We own it iff the folder's ownerEid matches THIS device's endpoint id.
             canSetRole={iAmOwner && !!m.peerName}
-            onToggleRole={() => toggleRole(m)}
+            onSetRole={(viewer) => setRole(m, viewer)}
             onRemove={() => setConfirmMember(m.id)}
           />
         ))}
@@ -858,7 +860,7 @@ function Member({
   isViewer,
   viewerSelf,
   canSetRole,
-  onToggleRole,
+  onSetRole,
   onRemove,
 }: {
   name: string
@@ -868,7 +870,7 @@ function Member({
   isViewer?: boolean
   viewerSelf?: boolean
   canSetRole?: boolean
-  onToggleRole?: () => void
+  onSetRole?: (viewer: boolean) => void
   onRemove?: () => void
 }) {
   const showViewer = isViewer || viewerSelf
@@ -923,50 +925,61 @@ function Member({
       <span style={{ fontSize: 12.5, fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
         {you ? `${name} (you)` : name}
       </span>
-      {showViewer && (
-        <span
-          title="Read-only — they can view and download, but not change the folder"
+      {/* Owner control: a clear two-option toggle that always shows BOTH roles with
+          the current one highlighted — so it's obvious what they are AND how to
+          change it (the old single icon showed only the opposite action). */}
+      {canSetRole && !you ? (
+        <div
           style={{
             display: 'inline-flex',
-            alignItems: 'center',
-            gap: 3,
-            fontSize: 10.5,
-            fontWeight: 700,
-            padding: '1px 6px',
             borderRadius: 999,
-            background: 'var(--surface)',
-            color: 'var(--text-muted)',
             border: '1px solid var(--border)',
-          }}
-        >
-          <Eye size={10} /> Viewer
-        </span>
-      )}
-      {canSetRole && !you && (
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            onToggleRole?.()
-          }}
-          title={isViewer ? 'Make an editor (full access)' : 'Make view-only (read-only)'}
-          style={{
-            display: 'grid',
-            placeItems: 'center',
-            width: 18,
-            height: 18,
-            borderRadius: 999,
-            border: 'none',
-            background: 'transparent',
-            color: 'var(--text-faint)',
-            cursor: 'pointer',
-            padding: 0,
+            background: 'var(--surface)',
+            overflow: 'hidden',
             flexShrink: 0,
           }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
-          onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-faint)')}
         >
-          {isViewer ? <Pencil size={12} /> : <Eye size={12} />}
-        </button>
+          <RoleSeg
+            active={!isViewer}
+            icon={<Pencil size={10} />}
+            label="Editor"
+            title="Full access — can add, change, and delete files"
+            onClick={(e) => {
+              e.stopPropagation()
+              onSetRole?.(false)
+            }}
+          />
+          <RoleSeg
+            active={!!isViewer}
+            icon={<Eye size={10} />}
+            label="Viewer"
+            title="Read-only — can view and download, but not change the folder"
+            onClick={(e) => {
+              e.stopPropagation()
+              onSetRole?.(true)
+            }}
+          />
+        </div>
+      ) : (
+        showViewer && (
+          <span
+            title="Read-only — they can view and download, but not change the folder"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 3,
+              fontSize: 10.5,
+              fontWeight: 700,
+              padding: '1px 6px',
+              borderRadius: 999,
+              background: 'var(--surface)',
+              color: 'var(--text-muted)',
+              border: '1px solid var(--border)',
+            }}
+          >
+            <Eye size={10} /> Viewer
+          </span>
+        )
       )}
       {onRemove && !you && (
         <button
@@ -995,6 +1008,49 @@ function Member({
         </button>
       )}
     </div>
+  )
+}
+
+/** One segment of the Editor|Viewer role toggle. Active = filled accent. */
+function RoleSeg({
+  active,
+  icon,
+  label,
+  title,
+  onClick,
+}: {
+  active: boolean
+  icon: React.ReactNode
+  label: string
+  title: string
+  onClick: (e: React.MouseEvent) => void
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 3,
+        padding: '2px 8px',
+        fontSize: 10.5,
+        fontWeight: 700,
+        border: 'none',
+        cursor: active ? 'default' : 'pointer',
+        background: active ? 'var(--accent)' : 'transparent',
+        color: active ? '#fff' : 'var(--text-faint)',
+        transition: 'all 0.12s',
+      }}
+      onMouseEnter={(e) => {
+        if (!active) e.currentTarget.style.color = 'var(--text)'
+      }}
+      onMouseLeave={(e) => {
+        if (!active) e.currentTarget.style.color = 'var(--text-faint)'
+      }}
+    >
+      {icon} {label}
+    </button>
   )
 }
 

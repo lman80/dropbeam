@@ -112,6 +112,9 @@ let pairs: Pair[] = [
     createdAt: Date.now() - 3 * 86400_000,
     endpointId: null,
     groupId: null,
+    // Mock: we own this folder (matches myEndpointId below) so the owner role
+    // controls render in dev/preview.
+    ownerEid: 'mock-me',
   },
 ]
 let pairCounter = 1
@@ -393,7 +396,7 @@ export const mockApi = {
   setMemberRole: async (id: string, viewer: boolean): Promise<void> => {
     pairs = pairs.map((p) => (p.id === id ? { ...p, peerIsViewer: viewer } : p))
   },
-  myEndpointId: async (): Promise<string | null> => null,
+  myEndpointId: async (): Promise<string | null> => 'mock-me',
   pairInvite: async (id: string): Promise<string> => `dropbeam1:MOCK${id}invitecodewouldgohere0000`,
   folderAddPerson: async (id: string): Promise<string> => `dropbeam1:MOCK${id}groupinvitewouldgohere000`,
   inviteFriendToFolder: async (
