@@ -23,7 +23,7 @@ jobs:
           # builds + signs fine. macos-15 (the last stable, Apple Silicon) creates the
           # DMG reliably. Revisit when the macOS 26 runner image stabilizes.
           - platform: macos-15 # universal: Apple Silicon + Intel in one .dmg
-            args: "--verbose --target universal-apple-darwin"
+            args: "--target universal-apple-darwin"
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
           - platform: windows-latest # Windows x64 (.exe / .msi)
             args: ""
@@ -50,6 +50,15 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm install
+
+      # macOS only: Spotlight auto-mounts + indexes the DMG while tauri's
+      # bundle_dmg.sh is still attaching it, which intermittently fails the bundle
+      # with "hdiutil: create/attach failed - Resource busy" on the GitHub runner
+      # images (started after a mid-June-2026 image roll). Turning indexing off for
+      # the run removes that contention so DMG creation is reliable.
+      - name: Disable Spotlight indexing (avoid hdiutil "Resource busy")
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off || true
 
       - name: Build, sign, and publish release
         uses: tauri-apps/tauri-action@v0
