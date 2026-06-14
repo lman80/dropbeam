@@ -17,7 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest # universal: Apple Silicon + Intel in one .dmg
+          # Pinned to macos-15 (NOT macos-latest): the macos-latest image rolled to
+          # macOS 26 in mid-June 2026, whose hdiutil regressed — `bundle_dmg.sh` dies
+          # with "hdiutil: create failed - Resource busy" (~6s) even though the .app
+          # builds + signs fine. macos-15 (the last stable, Apple Silicon) creates the
+          # DMG reliably. Revisit when the macOS 26 runner image stabilizes.
+          - platform: macos-15 # universal: Apple Silicon + Intel in one .dmg
             args: "--target universal-apple-darwin"
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
           - platform: windows-latest # Windows x64 (.exe / .msi)
