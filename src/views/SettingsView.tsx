@@ -95,6 +95,7 @@ export function SettingsView() {
   }
 
   const [exporting, setExporting] = useState(false)
+  const [testingDiag, setTestingDiag] = useState(false)
   const exportLogs = async () => {
     setExporting(true)
     try {
@@ -453,6 +454,50 @@ export function SettingsView() {
             <span>Export</span>
           </button>
         </Row>
+        {SEP}
+        <Row
+          title="Share background diagnostics"
+          desc="Automatically send a small, redacted summary of errors and transfer performance (never file names or contents) so problems can be found and fixed without you reporting them. Uploads about once a day — only to the endpoint set below."
+        >
+          <Toggle on={settings.shareDiagnostics} onChange={(v) => save({ shareDiagnostics: v })} />
+        </Row>
+        {settings.shareDiagnostics && (
+          <>
+            {SEP}
+            <Row
+              title="Diagnostics endpoint"
+              desc="The collector URL diagnostics are sent to (your own Cloudflare Worker — see DIAGNOSTICS-SETUP.md). Leave empty to upload nowhere."
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  className="input"
+                  style={{ minWidth: 240 }}
+                  placeholder="https://…workers.dev/ingest"
+                  value={settings.diagnosticsUrl}
+                  onChange={(e) => save({ diagnosticsUrl: e.target.value })}
+                  spellCheck={false}
+                  autoCapitalize="off"
+                />
+                <button
+                  className="btn btn-ghost"
+                  disabled={testingDiag || !settings.diagnosticsUrl.startsWith('https://')}
+                  onClick={async () => {
+                    setTestingDiag(true)
+                    try {
+                      toast('info', await api.diagnosticsTest())
+                    } catch (e) {
+                      toast('error', String(e))
+                    } finally {
+                      setTestingDiag(false)
+                    }
+                  }}
+                >
+                  {testingDiag ? <Spinner size={14} /> : 'Send test'}
+                </button>
+              </div>
+            </Row>
+          </>
+        )}
       </Card>
 
       <div
@@ -466,7 +511,7 @@ export function SettingsView() {
       >
         DropBeam · Direct, end-to-end encrypted peer-to-peer transfers
         <br />
-        No accounts · No telemetry · Your files never touch a server
+        No accounts · Your files never touch a server · Diagnostics are opt-out
       </div>
     </div>
   )

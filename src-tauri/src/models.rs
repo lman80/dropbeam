@@ -180,6 +180,17 @@ pub struct Settings {
     /// transfers. On by default; turn off if it's distracting. Live (no restart).
     #[serde(default = "default_true")]
     pub show_sync_popup: bool,
+    /// Share anonymous background diagnostics (errors + performance metadata, never
+    /// file names or contents) so the developer can find and fix issues users never
+    /// see. A redacted digest uploads ~once a day. On by default; opt out anytime.
+    #[serde(default = "default_true")]
+    pub share_diagnostics: bool,
+    /// Where diagnostics digests are uploaded — the operator's own collector URL
+    /// (e.g. a Cloudflare Worker). EMPTY by default: with no URL set, nothing is
+    /// ever sent anywhere. This keeps the destination operator-controlled, never a
+    /// baked-in endpoint.
+    #[serde(default)]
+    pub diagnostics_url: String,
 }
 
 impl Default for Settings {
@@ -205,6 +216,8 @@ impl Default for Settings {
             notify_on_message: true,
             verbose_logging: false,
             show_sync_popup: true,
+            share_diagnostics: true,
+            diagnostics_url: String::new(),
         }
     }
 }

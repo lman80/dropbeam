@@ -300,6 +300,16 @@ pub fn export_diagnostics(
     Ok(dest.to_string_lossy().to_string())
 }
 
+/// Send one diagnostics digest right now (the "Send a test now" button), so the
+/// operator can confirm their collector endpoint works without waiting for the
+/// daily upload. Returns a human summary or an error.
+#[tauri::command]
+pub async fn diagnostics_test(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let config_dir = state.config_dir.clone();
+    let log_dir = app.path().app_log_dir().ok();
+    crate::telemetry::run_once(&app, &config_dir, log_dir.as_deref()).await
+}
+
 /// Relaunch the app — used to apply the verbose-logging toggle (the file log's
 /// level is fixed at startup).
 #[tauri::command]

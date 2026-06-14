@@ -83,6 +83,12 @@ export interface Settings {
   verboseLogging: boolean
   /** Show the floating "syncing folder…" popup during shared-folder transfers. */
   showSyncPopup: boolean
+  /** Upload a redacted error/perf digest ~daily so the developer can fix issues
+   *  users never see. Never sends file names or contents. On by default. */
+  shareDiagnostics: boolean
+  /** Where diagnostics go — the operator's own collector URL (empty = send
+   *  nowhere). Keeps the destination operator-controlled, never baked in. */
+  diagnosticsUrl: string
 }
 
 export type PairRole = 'a' | 'b'
@@ -233,6 +239,8 @@ const realApi = {
   openPath: (path: string) => invoke<void>('open_path', { path }),
   /** Bundle all logs + a redacted header into one .txt in Downloads; returns its path. */
   exportDiagnostics: () => invoke<string>('export_diagnostics'),
+  /** Send one diagnostics digest now to verify the endpoint. Returns a summary. */
+  diagnosticsTest: () => invoke<string>('diagnostics_test'),
   /** Relaunch the app (to apply the verbose-logging toggle). */
   restartApp: () => invoke<void>('restart_app'),
   /** True when transfers are stuck on the relay despite a LAN peer (Local Network perm likely off). */

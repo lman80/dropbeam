@@ -48,6 +48,8 @@ let settings: Settings = {
   notifyOnMessage: true,
   verboseLogging: false,
   showSyncPopup: true,
+  shareDiagnostics: true,
+  diagnosticsUrl: '',
 }
 
 const history: HistoryEntry[] = [
@@ -313,6 +315,7 @@ export const mockApi = {
   revealPath: async (_path: string): Promise<void> => {},
   openPath: async (_path: string): Promise<void> => {},
   exportDiagnostics: async (): Promise<string> => '/Users/you/Downloads/DropBeam-diagnostics-0.txt',
+  diagnosticsTest: async (): Promise<string> => 'Sent a test digest (3 distinct issues) to your endpoint.',
   restartApp: async (): Promise<void> => {},
   lanNetworkBlocked: async (): Promise<boolean> => false,
   openLocalNetworkSettings: async (): Promise<void> => {},

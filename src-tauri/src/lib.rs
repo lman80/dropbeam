@@ -12,6 +12,7 @@ mod pairing;
 mod provenance;
 mod settings;
 mod sync;
+mod telemetry;
 #[cfg(target_os = "macos")]
 mod tray_drag;
 
@@ -311,6 +312,19 @@ pub fn run() {
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
             // Keep retrying undelivered chat messages until they land (reliable chat).
             iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
+            // Background diagnostics: periodically upload a REDACTED error/perf digest
+            // so background problems surface without users reporting them. Uploads ONLY
+            // to the operator-configured `settings.diagnostics_url` (empty by default →
+            // sends nowhere), and only while `share_diagnostics` is on. Never sends
+            // file names or contents.
+            {
+                let app_h = app.handle().clone();
+                let cfg = config_dir.clone();
+                let log_dir = app.path().app_log_dir().ok();
+                tauri::async_runtime::spawn(async move {
+                    telemetry::run(app_h, cfg, log_dir).await;
+                });
+            }
             // Once iroh has had a moment to bind, re-introduce ourselves to every
             // friend so any profile (name/picture) change made while we were offline
             // propagates to friends who are online now.
@@ -439,6 +453,7 @@ pub fn run() {
             commands::reveal_path,
             commands::open_path,
             commands::export_diagnostics,
+            commands::diagnostics_test,
             commands::restart_app,
             commands::lan_network_blocked,
             commands::open_local_network_settings,
