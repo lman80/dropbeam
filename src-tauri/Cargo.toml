@@ -68,7 +68,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # 0.61 — the two coexist fine.)
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"
-windows = "0.62"
+# `Win32_UI_Shell` gates SetCurrentProcessExplicitAppUserModelID (ties the process
+# to the installer's Start-menu AppUserModelID so chat toast notifications show).
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation"] }
 
 # macOS only: native menu-bar drag-to-open. We attach a file-drag-accepting
 # overlay to the status-item button so dragging a file over the icon springs the
