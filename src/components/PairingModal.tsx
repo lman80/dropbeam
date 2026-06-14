@@ -16,9 +16,12 @@ export function PairingModal({
   const reloadPairs = useStore((s) => s.reloadPairs)
   const reloadFriends = useStore((s) => s.reloadFriends)
   const toast = useStore((s) => s.toast)
+  const friends = useStore((s) => s.friends)
   const [folder, setFolder] = useState('')
   const [syncMode, setSyncMode] = useState<'mirror' | 'twoway' | 'oneway'>('twoway')
   const [peerName, setPeerName] = useState('')
+  // Existing friends the user picked to invite straight into this folder (no code).
+  const [invitees, setInvitees] = useState<string[]>([])
   const [inviteInput, setInviteInput] = useState('')
   const [createdInvite, setCreatedInvite] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -42,9 +45,33 @@ export function PairingModal({
         peerName.trim() || undefined,
         syncMode === 'mirror',
       )
-      setCreatedInvite(res.invite)
+      // Invite the friends the user picked — each gets a prompt on their side.
+      let invitedNames: string[] = []
+      if (invitees.length) {
+        // Reuse create_pair's own pending invite for the FIRST friend (so its link
+        // isn't left dangling as a stuck "waiting to join"); mint fresh group
+        // invites for the rest.
+        const results = await Promise.allSettled(
+          invitees.map((fid, i) =>
+            api.inviteFriendToFolder(res.pair.id, fid, i === 0 ? res.invite : null),
+          ),
+        )
+        invitedNames = invitees
+          .filter((_, i) => results[i].status === 'fulfilled')
+          .map((fid) => friends.find((f) => f.id === fid)?.name || 'friend')
+        const failed = results.filter((r) => r.status === 'rejected').length
+        if (failed) toast('error', `Couldn't invite ${failed} friend(s) — share the code instead.`)
+      }
       reloadPairs()
       if (peerName.trim()) reloadFriends()
+      // If we invited friends directly, that's the whole flow — confirm + close.
+      // Otherwise reveal the code to share manually.
+      if (invitedNames.length) {
+        toast('success', `Invited ${invitedNames.join(', ')} to “${folderName}”.`)
+        onClose()
+      } else {
+        setCreatedInvite(res.invite)
+      }
     } catch (e) {
       toast('error', String(e))
     } finally {
@@ -269,6 +296,61 @@ export function PairingModal({
                 </div>
               )}
 
+              {mode === 'create' && friends.length > 0 && (
+                <div style={{ marginTop: 16 }}>
+                  <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+                    Invite friends{' '}
+                    <span style={{ color: 'var(--text-faint)', fontWeight: 500 }}>(optional)</span>
+                  </label>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+                    {friends.map((f) => {
+                      const on = invitees.includes(f.id)
+                      return (
+                        <button
+                          key={f.id}
+                          type="button"
+                          onClick={() =>
+                            setInvitees((prev) =>
+                              prev.includes(f.id)
+                                ? prev.filter((x) => x !== f.id)
+                                : [...prev, f.id],
+                            )
+                          }
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 6,
+                            padding: '6px 11px',
+                            borderRadius: 999,
+                            fontSize: 12.5,
+                            fontWeight: 600,
+                            cursor: 'default',
+                            transition: 'all 0.14s',
+                            border: `1.5px solid ${on ? 'var(--accent)' : 'var(--border)'}`,
+                            background: on ? 'var(--accent-soft)' : 'var(--surface-2)',
+                            color: on ? 'var(--accent)' : 'var(--text)',
+                          }}
+                        >
+                          {on && <Check size={13} />}
+                          {f.name}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 11.5,
+                      color: 'var(--text-faint)',
+                      marginTop: 6,
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    They’ll get a prompt to accept and choose where to save the folder. Or skip
+                    this and share the invite code with anyone.
+                  </div>
+                </div>
+              )}
+
               <button
                 className="btn btn-primary"
                 style={{ width: '100%', marginTop: 20 }}
@@ -276,7 +358,11 @@ export function PairingModal({
                 disabled={busy}
               >
                 {busy ? <Spinner size={15} /> : null}
-                {mode === 'create' ? 'Create & get invite' : 'Pair folder'}
+                {mode === 'create'
+                  ? invitees.length > 0
+                    ? `Create & invite ${invitees.length}`
+                    : 'Create & get invite'
+                  : 'Pair folder'}
               </button>
             </div>
           )}

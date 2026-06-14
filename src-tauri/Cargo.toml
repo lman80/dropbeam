@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.18.15"
+version = "0.18.16"
 description = "DropBeam — seamless peer-to-peer file transfer"
 authors = ["DropBeam"]
 license = ""

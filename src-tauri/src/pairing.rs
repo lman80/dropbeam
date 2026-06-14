@@ -295,6 +295,92 @@ pub fn members_of_group(config_dir: &Path, group_id: &str) -> Vec<Pair> {
 /// the control-beacon roster reconciliation to mesh everyone with everyone).
 /// `template` is any existing pair in the group — we copy its folder + sync mode.
 /// Returns the new pair if one was created, or None if it already existed / self.
+/// Key an inviter's still-unkeyed link to the beacon sender — but ONLY if that link
+/// is genuinely unkeyed AND no OTHER link in its group already belongs to that eid.
+/// The second guard stops a peer who is already a member (or a stranger replaying a
+/// leaked invite `pair_id`) from claiming a second, unkeyed invite slot. Atomic
+/// under LOCK; returns whether it keyed.
+pub fn key_unkeyed_group_link(config_dir: &Path, pair_id: &str, eid: &str) -> bool {
+    if eid.is_empty() {
+        return false;
+    }
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let (gid, already_keyed) = match pairs.iter().find(|p| p.id == pair_id) {
+        Some(p) => (p.group_id.clone(), p.endpoint_id.is_some()),
+        None => return false,
+    };
+    if already_keyed {
+        return false;
+    }
+    if let Some(g) = &gid {
+        if pairs.iter().any(|p| {
+            p.id != pair_id
+                && p.group_id.as_deref() == Some(g.as_str())
+                && p.endpoint_id.as_deref() == Some(eid)
+        }) {
+            return false; // that eid is already meshed in this group — don't dup-slot it
+        }
+    }
+    let mut changed = false;
+    for p in pairs.iter_mut() {
+        if p.id == pair_id {
+            p.endpoint_id = Some(eid.to_string());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &pairs);
+    }
+    changed
+}
+
+/// Collapse duplicate links that point at the SAME `(group_id, endpoint_id)` — a
+/// member who got meshed in twice by a race between their folder-hello and their
+/// control beacon (the "adds them twice" bug). Keeps the OLDEST link per (group,
+/// eid) — the original invite link, whose secret the peer actually matches — and
+/// drops the rest. Only keyed, grouped links are considered; unkeyed/1:1 links are
+/// left untouched. Returns how many duplicates were removed.
+pub fn dedup_group_links(config_dir: &Path) -> usize {
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let before = pairs.len();
+    // Oldest created_at per (group_id, endpoint_id).
+    let mut oldest: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::new();
+    for p in &pairs {
+        if let (Some(g), Some(e)) = (&p.group_id, &p.endpoint_id) {
+            let k = (g.clone(), e.clone());
+            let entry = oldest.entry(k).or_insert(p.created_at);
+            if p.created_at < *entry {
+                *entry = p.created_at;
+            }
+        }
+    }
+    let mut kept: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    pairs.retain(|p| match (&p.group_id, &p.endpoint_id) {
+        (Some(g), Some(e)) => {
+            let k = (g.clone(), e.clone());
+            // Keep exactly the first link that matches the oldest timestamp for this
+            // (group, eid); every other link to the same person is the duplicate.
+            if p.created_at == oldest.get(&k).copied().unwrap_or(p.created_at) && !kept.contains(&k)
+            {
+                kept.insert(k);
+                true
+            } else {
+                false
+            }
+        }
+        _ => true, // ungrouped or not-yet-keyed links are never deduped here
+    });
+    let removed = before - pairs.len();
+    if removed > 0 {
+        let _ = save(config_dir, &pairs);
+        log::info!("dedup_group_links: removed {removed} duplicate folder-member link(s)");
+    }
+    removed
+}
+
 pub fn ensure_member(
     config_dir: &Path,
     group_id: &str,
@@ -913,6 +999,30 @@ mod tests {
             [("me".to_string(), true)].into_iter().collect();
         assert!(apply_group_roles(&dir, "g1", "me", Some("owner"), 2, &roles));
         assert!(load(&dir)[0].i_am_viewer);
+    }
+
+    #[test]
+    fn dedup_collapses_double_added_member_keeps_oldest() {
+        let dir = role_test_dir("dedup");
+        // Inviter A's view: the original invite link to C (older) + a duplicate
+        // meshed-in link to the SAME C (newer), plus a distinct member D.
+        let mut l_inv = group_pair("U", "g1", Some("A"), Some("C"));
+        l_inv.created_at = 100;
+        let mut l_mesh = group_pair("gDERIVED", "g1", Some("A"), Some("C"));
+        l_mesh.created_at = 200;
+        let mut l_d = group_pair("gD", "g1", Some("A"), Some("D"));
+        l_d.created_at = 150;
+        save(&dir, &[l_inv, l_mesh, l_d]).unwrap();
+
+        assert_eq!(dedup_group_links(&dir), 1, "one duplicate removed");
+        let after = load(&dir);
+        assert_eq!(after.len(), 2);
+        // The oldest C link (the invite link, id "U") survives; the derived dup is gone.
+        assert!(after.iter().any(|p| p.id == "U"));
+        assert!(!after.iter().any(|p| p.id == "gDERIVED"));
+        assert!(after.iter().any(|p| p.id == "gD")); // distinct member untouched
+        // Idempotent.
+        assert_eq!(dedup_group_links(&dir), 0);
     }
 
     #[test]

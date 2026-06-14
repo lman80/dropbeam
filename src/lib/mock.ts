@@ -396,6 +396,11 @@ export const mockApi = {
   myEndpointId: async (): Promise<string | null> => null,
   pairInvite: async (id: string): Promise<string> => `dropbeam1:MOCK${id}invitecodewouldgohere0000`,
   folderAddPerson: async (id: string): Promise<string> => `dropbeam1:MOCK${id}groupinvitewouldgohere000`,
+  inviteFriendToFolder: async (
+    _pairId: string,
+    _friendId: string,
+    _code?: string | null,
+  ): Promise<void> => {},
   listFolderHistory: async (pairId: string): Promise<HistoryItem[]> =>
     [...(folderHistory[pairId] ?? [])].sort((a, b) => b.timestampMs - a.timestampMs),
   restoreFolderItem: async (pairId: string, itemId: string): Promise<void> => {

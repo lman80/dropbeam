@@ -272,6 +272,10 @@ const realApi = {
   pairInvite: (id: string) => invoke<string>('pair_invite', { id }),
   /** Invite another person into an existing folder (makes it a 3+ person group). */
   folderAddPerson: (id: string) => invoke<string>('folder_add_person', { id }),
+  /** Invite an existing friend straight into a shared folder (no code) — they get a
+   *  prompt to accept + pick a folder. `pairId` is any link of the folder/group. */
+  inviteFriendToFolder: (pairId: string, friendId: string, code?: string | null) =>
+    invoke<void>('invite_friend_to_folder', { pairId, friendId, code: code ?? null }),
   getFolderStatuses: () => invoke<FolderStatus[]>('get_folder_statuses'),
   listFolderHistory: (pairId: string) =>
     invoke<HistoryItem[]>('list_folder_history', { pairId }),
@@ -347,6 +351,20 @@ export interface FolderComplete {
 export function onFolderComplete(cb: (s: FolderComplete) => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('folder-complete', (p) => cb(p as FolderComplete))
   return listen<FolderComplete>('folder-complete', (e) => cb(e.payload))
+}
+
+/** A friend invited us directly into a shared folder (they picked us when creating
+ *  it). We show a prompt to accept + choose a local folder. */
+export interface FolderInvite {
+  code: string
+  folderName: string
+  fromName: string
+  fromId: string
+}
+
+export function onFolderInvite(cb: (i: FolderInvite) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('folder-invite://incoming', (p) => cb(p as FolderInvite))
+  return listen<FolderInvite>('folder-invite://incoming', (e) => cb(e.payload))
 }
 
 /** A chat message arrived (from a friend) or was just sent by us. */

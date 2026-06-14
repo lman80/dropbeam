@@ -1396,6 +1396,45 @@ async fn serve_stream(
             write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
             send.finish()?;
         }
+        Some("folder-invite") => {
+            // A friend invited us into a shared folder directly (no copy-pasted
+            // code). Surface it to the UI as an incoming offer — the user accepts and
+            // picks a local folder, which runs the normal accept_pair(code, folder).
+            let code = req.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let folder_name = req.get("folder").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let from = req.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let from_id = conn.remote_id().to_string();
+            if !code.is_empty() {
+                if let Some(app) = state.app.get() {
+                    // Only surface invites from a KNOWN FRIEND — this feature is
+                    // friend-to-friend, and gating here stops a stranger who learned
+                    // our endpoint id from popping invite prompts at us.
+                    let is_friend = app
+                        .try_state::<Arc<crate::AppState>>()
+                        .map(|st| {
+                            crate::friends::load(&st.config_dir)
+                                .iter()
+                                .any(|f| f.endpoint_id.as_deref() == Some(from_id.as_str()))
+                        })
+                        .unwrap_or(false);
+                    if is_friend {
+                        let _ = app.emit(
+                            "folder-invite://incoming",
+                            serde_json::json!({
+                                "code": code,
+                                "folderName": folder_name,
+                                "fromName": from,
+                                "fromId": from_id,
+                            }),
+                        );
+                    } else {
+                        log::warn!("ignoring folder-invite from a non-friend ({from_id})");
+                    }
+                }
+            }
+            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            send.finish()?;
+        }
         Some("folder-files") => {
             // The folder peer pushed files straight to us. Receive into a private
             // staging dir, then hand them to the SyncManager to land in the shared
@@ -1675,10 +1714,15 @@ async fn serve_stream(
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
+                        // The connection's remote id = who actually sent this beacon,
+                        // used to key the inviter's still-unkeyed link so a newcomer
+                        // isn't added twice.
+                        let sender_eid = conn.remote_id().to_string();
                         // reconcile rides its own message (folder-reconcile) now.
                         sm.apply_remote_control(
                             &pair_id, &name, &deletes, &group_id, &members,
                             owner.as_deref(), role_epoch, None, unshared,
+                            Some(&sender_eid),
                         );
                     }
                 }
@@ -1724,7 +1768,7 @@ async fn serve_stream(
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
                         sm.apply_remote_control(
-                            &pair_id, "", &[], "", &[], None, 0, Some(&reconcile), false,
+                            &pair_id, "", &[], "", &[], None, 0, Some(&reconcile), false, None,
                         );
                     }
                 }
@@ -1882,6 +1926,9 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
                 if crate::pairing::backfill_owner_eid(&config_dir, &ep.id().to_string()) {
                     log::info!("backfilled owner_eid on folders created before iroh start");
                 }
+                // Clean up any duplicate folder-member links from the pre-fix
+                // hello/beacon race (a person added twice to a shared folder).
+                crate::pairing::dedup_group_links(&config_dir);
                 accept_loop(ep, state).await;
             }
             Err(e) => log::warn!("iroh endpoint failed to start: {e:#}"),
@@ -2656,6 +2703,49 @@ pub fn say_hello_folder(
                 let _ = recv.read_to_end(64).await;
             }
         }
+    });
+}
+
+/// Push a shared-folder INVITE straight to a known friend over iroh (we already
+/// have their endpoint id, so no copy-pasted code). They get an in-app prompt to
+/// accept and choose a local folder. Fire-and-forget with a couple of quick
+/// retries — if the friend is offline it simply doesn't arrive (the inviter still
+/// holds the code to share manually).
+pub fn send_folder_invite(
+    state: Arc<IrohState>,
+    friend_endpoint_id: String,
+    code: String,
+    folder_name: String,
+    from_name: String,
+) {
+    let Some(ep) = state.get().cloned() else {
+        return;
+    };
+    let Ok(parsed) = friend_endpoint_id.parse::<iroh::EndpointId>() else {
+        return;
+    };
+    let addr = dial_addr(parsed);
+    tauri::async_runtime::spawn(async move {
+        let msg = serde_json::json!({
+            "kind": "folder-invite", "code": code, "folder": folder_name, "from": from_name,
+        });
+        for attempt in 0..3 {
+            if let Ok(Ok(conn)) =
+                tokio::time::timeout(Duration::from_secs(20), ep.connect(addr.clone(), ALPN)).await
+            {
+                if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                    if write_frame(&mut send, &msg).await.is_ok() {
+                        let _ = send.finish();
+                        let _ = recv.read_to_end(64).await;
+                        return;
+                    }
+                }
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+        log::warn!("folder invite to a friend could not be delivered (they may be offline)");
     });
 }
 

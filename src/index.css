@@ -835,6 +835,12 @@ html.overlay-window #root {
   margin-bottom: 9px;
 }
 .chat-line-avatar {
+  /* MUST be positioned: the avatar <img> (.avatar-img) is position:absolute;inset:0;
+     so without a positioned ancestor here it sizes against the whole .chat-line row
+     and balloons to cover the message — e.g. a long "dropbeam1:…" invite code made
+     the row tall and the picture rendered giant on the recipient's side. */
+  position: relative;
+  overflow: hidden;
   flex-shrink: 0;
   width: 26px;
   height: 26px;

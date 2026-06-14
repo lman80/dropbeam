@@ -8,6 +8,7 @@ import { useStore } from './store'
 import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
 import { Toasts } from './components/Toasts'
+import { FolderInviteModal } from './components/FolderInviteModal'
 import { BeamLogo } from './components/bits'
 import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
@@ -120,6 +121,7 @@ export default function App() {
       </div>
       <SendToChooser />
       <NameSetupModal />
+      <FolderInviteModal />
       <Toasts />
     </div>
   )

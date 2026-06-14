@@ -1320,6 +1320,11 @@ impl SyncManager {
         role_epoch: u64,
         reconcile: Option<&Reconcile>,
         unshared: bool,
+        // The iroh connection's REMOTE endpoint id — i.e. who actually sent this
+        // beacon. Used to key an inviter's still-unkeyed link (the original invite
+        // whose folder-hello hasn't landed) so the roster gossip below recognizes the
+        // sender as already-meshed instead of adding them a SECOND time.
+        sender_eid: Option<&str>,
     ) {
         let (config, status, self_deleted, tombstones, queue, wake, inbound) = {
             let handles = self.handles.lock().unwrap();
@@ -1356,6 +1361,26 @@ impl SyncManager {
         } else {
             set_peer_online(&status, true);
             self.emit_status(pair_id);
+        }
+        // KEY THE LINK from the beacon's true sender. This beacon arrived on THIS
+        // link from `sender_eid`, so that IS this link's peer. An inviter's original
+        // invite link starts with endpoint_id=None until the newcomer's folder-hello
+        // lands — and the periodic control beacon often beats that hello. Without
+        // keying here, the roster gossip below runs `ensure_member` for the sender's
+        // eid, doesn't find it on the still-unkeyed invite link, and creates a SECOND
+        // link to the same person (the "adds them twice" bug). Keying from the
+        // reliable beacon closes that race regardless of whether the hello arrives.
+        if let Some(seid) = sender_eid {
+            // Guarded + atomic: keys ONLY a genuinely-unkeyed link, and refuses if
+            // that eid is already a member of this group (so a leaked invite pair_id
+            // can't be replayed to claim a second slot).
+            if pairing::key_unkeyed_group_link(&self.config_dir, pair_id, seid) {
+                // Keying may have revealed a pre-existing duplicate link to this same
+                // person (created before this fix) — collapse it now.
+                pairing::dedup_group_links(&self.config_dir);
+                self.clone().reconcile();
+                let _ = self.app.emit("pairs://changed", ());
+            }
         }
         // We just heard from the peer → they're online. Kick the file-sender so any
         // drop parked behind the presence gate goes out now, not on the next poll.

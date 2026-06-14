@@ -647,6 +647,53 @@ pub fn folder_add_person(
     Ok(invite)
 }
 
+/// Invite an existing FRIEND straight into a shared folder — no copy-pasted code.
+/// Generates a group invite for `pair_id` and pushes it to the friend over iroh;
+/// on their side a prompt appears to accept and pick a local folder. If the friend
+/// is offline the push is best-effort (the inviter still has the code to share).
+#[tauri::command]
+pub fn invite_friend_to_folder(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    app: AppHandle,
+    pair_id: String,
+    friend_id: String,
+    // An EXISTING invite code to reuse (e.g. the one create_pair just produced for
+    // its first pending link) instead of minting a new one — so the folder's
+    // original pending link is consumed by this friend rather than left dangling as
+    // a stuck "waiting to join" member. None → mint a fresh group invite.
+    code: Option<String>,
+) -> Result<(), String> {
+    let friend = friends::load(&state.config_dir)
+        .into_iter()
+        .find(|f| f.id == friend_id)
+        .ok_or("Friend not found.")?;
+    let eid = friend
+        .endpoint_id
+        .ok_or("That friend hasn't connected yet — share the invite code instead.")?;
+    let name = state.settings.lock().unwrap().display_name.clone();
+    let my_id = iroh.get().map(|ep| ep.id().to_string());
+    let invite = match code {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => pairing::group_invite(&state.config_dir, &pair_id, name.clone(), my_id)?,
+    };
+    let folder_name = pairing::load(&state.config_dir)
+        .iter()
+        .find(|p| p.id == pair_id)
+        .map(|p| {
+            std::path::Path::new(&p.folder)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    crate::iroh_net::send_folder_invite(iroh.inner().clone(), eid, invite, folder_name, name);
+    sync.reconcile();
+    let _ = app.emit("pairs://changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_folder_statuses(sync: State<'_, Arc<SyncManager>>) -> Vec<FolderStatus> {
     sync.statuses()

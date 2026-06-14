@@ -460,6 +460,7 @@ pub fn run() {
             commands::quit_app,
             commands::pair_invite,
             commands::folder_add_person,
+            commands::invite_friend_to_folder,
             commands::get_folder_statuses,
             commands::list_folder_history,
             commands::restore_folder_item,
