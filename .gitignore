@@ -29,3 +29,6 @@ dist-ssr
 
 # local Claude Code tooling (launch configs, etc.)
 .claude/
+
+# Cloudflare deploy config (account + KV ids) — keep out of the public repo
+diagnostics-worker/wrangler.toml
