@@ -466,13 +466,13 @@ export function SettingsView() {
             {SEP}
             <Row
               title="Diagnostics endpoint"
-              desc="The collector URL diagnostics are sent to (your own Cloudflare Worker — see DIAGNOSTICS-SETUP.md). Leave empty to upload nowhere."
+              desc="A collector is built in, so this works out of the box. Override it here only if you run your own (advanced)."
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <input
                   className="input"
                   style={{ minWidth: 240 }}
-                  placeholder="https://…workers.dev/ingest"
+                  placeholder="Built-in (leave blank)"
                   value={settings.diagnosticsUrl}
                   onChange={(e) => save({ diagnosticsUrl: e.target.value })}
                   spellCheck={false}
@@ -480,7 +480,10 @@ export function SettingsView() {
                 />
                 <button
                   className="btn btn-ghost"
-                  disabled={testingDiag || !settings.diagnosticsUrl.startsWith('https://')}
+                  disabled={
+                    testingDiag ||
+                    (settings.diagnosticsUrl !== '' && !settings.diagnosticsUrl.startsWith('https://'))
+                  }
                   onClick={async () => {
                     setTestingDiag(true)
                     try {

@@ -16,10 +16,25 @@ use std::sync::{Arc, OnceLock};
 use regex::Regex;
 use tauri::{AppHandle, Manager};
 
-// The upload destination is NOT hardcoded. It comes from `settings.diagnostics_url`
-// (empty by default → nothing is ever uploaded). The developer deploys a small
-// Cloudflare Worker (see DIAGNOSTICS-SETUP.md) and sets that URL — so digests only
-// ever go to an endpoint the operator explicitly configured, never a baked-in one.
+// The operator's deployed collector, built in for EVERY install (the user explicitly
+// asked for built-in-for-everyone) unless a device overrides it in Settings. It's the
+// developer's own Cloudflare Worker (see DIAGNOSTICS-SETUP.md). The `?t=` ingest token
+// is intentionally public here — in a public build it can't be kept secret, so ingest
+// is effectively open (the Worker still caps body size; the review dashboard stays
+// password-gated). Still gated by the `share_diagnostics` opt-out, and only error/perf
+// METADATA is ever sent (see `redact()`).
+const DEFAULT_DIAG_URL: &str =
+    "https://dropbeam-diag.ashton-mcp-worker.workers.dev/ingest?t=b85e1e1c2bb1964fbe44c5cd";
+
+/// The endpoint to use: a device's own override if set, else the built-in default.
+fn endpoint_for(configured: &str) -> String {
+    let c = configured.trim();
+    if c.is_empty() {
+        DEFAULT_DIAG_URL.to_string()
+    } else {
+        c.to_string()
+    }
+}
 
 const FIRST_DELAY_SECS: u64 = 30;
 const UPLOAD_INTERVAL_SECS: u64 = 12 * 3600; // twice a day while running
@@ -328,13 +343,14 @@ pub async fn run(app: AppHandle, config_dir: PathBuf, log_dir: Option<PathBuf>) 
     loop {
         // Read BOTH the opt-in toggle and the operator-configured endpoint each
         // cycle. No URL set → upload nowhere (the safe default for a public build).
-        let (enabled, endpoint) = app
+        let (enabled, configured) = app
             .try_state::<Arc<crate::AppState>>()
             .map(|st| {
                 let s = st.settings.lock().unwrap();
-                (s.share_diagnostics, s.diagnostics_url.trim().to_string())
+                (s.share_diagnostics, s.diagnostics_url.clone())
             })
             .unwrap_or((false, String::new()));
+        let endpoint = endpoint_for(&configured);
         if enabled && endpoint.starts_with("https://") {
             let header = {
                 let name = app
@@ -369,18 +385,19 @@ pub async fn run_once(app: &AppHandle, config_dir: &Path, log_dir: Option<&Path>
     let Some(log_dir) = log_dir else {
         return Err("No log directory available.".into());
     };
-    let (enabled, endpoint, name) = app
+    let (enabled, configured, name) = app
         .try_state::<Arc<crate::AppState>>()
         .map(|st| {
             let s = st.settings.lock().unwrap();
-            (s.share_diagnostics, s.diagnostics_url.trim().to_string(), s.display_name.clone())
+            (s.share_diagnostics, s.diagnostics_url.clone(), s.display_name.clone())
         })
         .unwrap_or((false, String::new(), String::new()));
     if !enabled {
         return Err("Diagnostics sharing is turned off.".into());
     }
+    let endpoint = endpoint_for(&configured);
     if !endpoint.starts_with("https://") {
-        return Err("Set a diagnostics endpoint URL first (must start with https://).".into());
+        return Err("Diagnostics endpoint is not a valid https URL.".into());
     }
     let header = serde_json::json!({
         "deviceId": device_id(config_dir),
