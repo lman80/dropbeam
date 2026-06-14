@@ -169,6 +169,15 @@ pub struct Settings {
     /// isn't focused (like any messaging app). On by default.
     #[serde(default = "default_true")]
     pub notify_on_message: bool,
+    /// Send read receipts: let friends see when you've read their message (like
+    /// iMessage/WhatsApp). On by default; turning it off stops you sending them.
+    #[serde(default = "default_true")]
+    pub send_read_receipts: bool,
+    /// A free Giphy API key (developers.giphy.com) that powers GIF search in chat.
+    /// Empty by default → the GIF picker shows a one-line setup prompt instead.
+    /// Giphy sanctions client-side keys, so this rides in the client safely.
+    #[serde(default)]
+    pub giphy_api_key: String,
     /// Detailed diagnostics: when on, the file log captures DEBUG-level app
     /// breadcrumbs PLUS iroh's connection internals (hole-punch, relay-vs-direct,
     /// chunk timing). Off by default (keeps logs small). Applied at startup, so
@@ -214,6 +223,8 @@ impl Default for Settings {
             require_direct: false,
             avatar: String::new(),
             notify_on_message: true,
+            send_read_receipts: true,
+            giphy_api_key: String::new(),
             verbose_logging: false,
             show_sync_popup: true,
             share_diagnostics: true,

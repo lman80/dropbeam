@@ -1777,111 +1777,216 @@ async fn serve_stream(
             send.finish()?;
         }
         Some("chat") => {
-            // A friend sent us a chat message. Identify them by their endpoint
-            // id, persist it to the conversation, and surface it live to the UI.
+            // A friend sent us a chat message OR an update to one (reaction, edit,
+            // delete). Identify them by endpoint id, apply it, surface it live.
             if let Some(app) = state.app.get().cloned() {
                 let config_dir = app
                     .try_state::<Arc<crate::AppState>>()
                     .map(|st| st.config_dir.clone())
                     .unwrap_or_else(std::env::temp_dir);
                 let who = conn.remote_id().to_string();
-                // Identify the sender by their endpoint id; fall back to the
-                // friend id they carry in the frame (invite friends share an id
-                // on both sides) so chat still lands if we haven't learned their
-                // key yet. Either way, remember the key for future sends.
-                let friends = crate::friends::load(&config_dir);
-                let claimed = req.get("friendId").and_then(|v| v.as_str());
-                let from_name = req.get("fromName").and_then(|v| v.as_str()).unwrap_or("");
-                let friend = friends
-                    .iter()
-                    .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
-                    .or_else(|| claimed.and_then(|id| friends.iter().find(|f| f.id == id)))
-                    .cloned()
-                    .or_else(|| {
-                        // Unknown sender who introduced themselves (they hold our
-                        // permanent code) → auto-add so the conversation is two-way.
-                        if from_name.is_empty() {
-                            None
-                        } else {
-                            let f = crate::friends::upsert_by_endpoint(&config_dir, &who, from_name);
-                            let _ = app.emit("friends://changed", ());
-                            Some(f)
-                        }
-                    });
+                let msg_kind = req.get("msgKind").and_then(|k| k.as_str()).unwrap_or("text");
+                // Updates (reaction/edit/delete) only come from a KNOWN friend
+                // identified by their CRYPTOGRAPHIC endpoint id — never auto-add,
+                // and never trust a peer-claimed friendId (which could target
+                // someone else's thread). New messages keep the introduce-by-name
+                // + claimed-id bootstrap so invite-friends become two-way.
+                let is_op = matches!(msg_kind, "reaction" | "edit" | "delete");
+                let friend = if is_op {
+                    crate::friends::load(&config_dir)
+                        .into_iter()
+                        .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
+                } else {
+                    resolve_chat_friend(&app, &config_dir, &who, &req, true)
+                };
                 if let Some(friend) = friend {
                     if friend.endpoint_id.as_deref() != Some(who.as_str()) {
                         crate::friends::set_endpoint_id(&config_dir, &friend.id, who.clone());
                     }
-                    let msg_kind = req
-                        .get("msgKind")
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("text")
-                        .to_string();
-                    let text = req
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let files: Vec<String> = req
-                        .get("files")
-                        .and_then(|f| f.as_array())
-                        .map(|arr| {
-                            arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-                        })
-                        .unwrap_or_default();
-                    let bytes = req.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
-                    let id = req
-                        .get("id")
-                        .and_then(|i| i.as_str())
-                        .map(String::from)
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    let ts = req
-                        .get("ts")
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or_else(crate::chat::now_ms);
-                    // Best-effort local path so the receiver can preview/open the
-                    // file once it lands: a friend's files save into the download
-                    // dir under the same name (collision-renames are the rare miss).
-                    let path = if msg_kind == "file" {
-                        files.first().map(|name| {
-                            let configured = app
-                                .try_state::<Arc<crate::AppState>>()
-                                .map(|st| st.settings.lock().unwrap().download_dir.clone())
+                    let peer_id = friend.id.clone();
+                    match msg_kind {
+                        "reaction" => {
+                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                                let emoji = req.get("emoji").and_then(|e| e.as_str()).unwrap_or("");
+                                let add = req.get("add").and_then(|a| a.as_bool()).unwrap_or(true);
+                                if let Some(u) = crate::chat::apply_reaction(
+                                    &config_dir, &peer_id, target, emoji, false, add,
+                                ) {
+                                    let _ = app.emit("chat://message", &u);
+                                }
+                            }
+                        }
+                        "edit" => {
+                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                                let new_text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                                // author_is_me=false: a remote edit may only touch
+                                // the PEER's own message, never one we authored.
+                                if let Some(u) =
+                                    crate::chat::apply_edit(&config_dir, &peer_id, target, new_text, false)
+                                {
+                                    let _ = app.emit("chat://message", &u);
+                                }
+                            }
+                        }
+                        "delete" => {
+                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                                if let Some(u) =
+                                    crate::chat::apply_delete(&config_dir, &peer_id, target, false)
+                                {
+                                    let _ = app.emit("chat://message", &u);
+                                }
+                            }
+                        }
+                        _ => {
+                            // A new text / file / gif message.
+                            let text =
+                                req.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                            let files: Vec<String> = req
+                                .get("files")
+                                .and_then(|f| f.as_array())
+                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                                 .unwrap_or_default();
-                            let dir = if configured.trim().is_empty() {
-                                app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                            let bytes = req.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
+                            let id = req
+                                .get("id")
+                                .and_then(|i| i.as_str())
+                                .map(String::from)
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let ts = req.get("ts").and_then(|t| t.as_u64()).unwrap_or_else(crate::chat::now_ms);
+                            // Lamport merge: order this incoming message after
+                            // everything we already have if its seq is stale/absent.
+                            let recv_seq = req.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+                            let seq = recv_seq.max(crate::chat::next_seq(&config_dir, &peer_id));
+                            let reply_to = req.get("replyTo").and_then(|r| r.as_str()).map(String::from);
+                            let reply_preview =
+                                req.get("replyPreview").and_then(|r| r.as_str()).map(String::from);
+                            let gif: Option<crate::chat::GifMeta> =
+                                req.get("gif").and_then(|g| serde_json::from_value(g.clone()).ok());
+                            let is_file = msg_kind == "file" || msg_kind == "gif";
+                            let path = if is_file {
+                                files.first().map(|name| {
+                                    let configured = app
+                                        .try_state::<Arc<crate::AppState>>()
+                                        .map(|st| st.settings.lock().unwrap().download_dir.clone())
+                                        .unwrap_or_default();
+                                    let dir = if configured.trim().is_empty() {
+                                        app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                                    } else {
+                                        PathBuf::from(configured)
+                                    };
+                                    dir.join(name).to_string_lossy().to_string()
+                                })
                             } else {
-                                PathBuf::from(configured)
+                                None
                             };
-                            dir.join(name).to_string_lossy().to_string()
-                        })
-                    } else {
-                        None
-                    };
-                    let msg = crate::chat::ChatMessage {
-                        id,
-                        peer_id: friend.id.clone(),
-                        from_me: false,
-                        kind: msg_kind,
-                        text,
-                        files,
-                        bytes,
-                        path,
-                        status: None,
-                        ts,
-                    };
-                    if crate::chat::append(&config_dir, &msg) {
-                        let _ = app.emit("chat://message", &msg);
-                        maybe_notify_chat(&app, &friend.name, &msg);
+                            let msg = crate::chat::ChatMessage {
+                                id,
+                                peer_id: peer_id.clone(),
+                                from_me: false,
+                                kind: if is_file { "file".into() } else { "text".into() },
+                                text,
+                                files,
+                                bytes,
+                                path,
+                                status: None,
+                                ts,
+                                seq,
+                                reply_to,
+                                reply_preview,
+                                reactions: vec![],
+                                edited: false,
+                                deleted: false,
+                                gif,
+                            };
+                            if crate::chat::append(&config_dir, &msg) {
+                                let _ = app.emit("chat://message", &msg);
+                                maybe_notify_chat(&app, &friend.name, &msg);
+                            }
+                        }
                     }
                 }
             }
             write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
             send.finish()?;
         }
-        other => anyhow::bail!("unknown stream kind: {other:?}"),
+        Some("chat-signal") => {
+            // Ephemeral, online-only chat signals: typing indicator + read
+            // receipts. Never stored, never retried — a stale "typing…" is a bug,
+            // not a feature. Only honored from a known friend.
+            if let Some(app) = state.app.get().cloned() {
+                let config_dir = app
+                    .try_state::<Arc<crate::AppState>>()
+                    .map(|st| st.config_dir.clone())
+                    .unwrap_or_else(std::env::temp_dir);
+                let who = conn.remote_id().to_string();
+                // Signals are honored only from a friend identified by their
+                // endpoint id — never a peer-claimed friendId (can't forge another
+                // friend's typing/read state).
+                let friend = crate::friends::load(&config_dir)
+                    .into_iter()
+                    .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()));
+                if let Some(friend) = friend {
+                    match req.get("signal").and_then(|s| s.as_str()).unwrap_or("") {
+                        "typing" => {
+                            let on = req.get("on").and_then(|o| o.as_bool()).unwrap_or(false);
+                            let _ = app.emit(
+                                "chat://typing",
+                                serde_json::json!({ "peerId": friend.id, "on": on }),
+                            );
+                        }
+                        "read" => {
+                            let up_to = req.get("upTo").and_then(|t| t.as_u64()).unwrap_or(0);
+                            for u in crate::chat::mark_read_up_to(&config_dir, &friend.id, up_to) {
+                                let _ = app.emit("chat://message", &u);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            send.finish()?;
+        }
+        // Forward-compatible: a newer peer may send a stream kind we don't know
+        // yet. Ack and ignore instead of erroring the stream, so adding message
+        // types never breaks an older build's connection.
+        other => {
+            log::debug!("ignoring unknown stream kind: {other:?}");
+            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            let _ = send.finish();
+        }
     }
     Ok(())
+}
+
+/// Identify the friend a chat frame came from: by endpoint id, then by the
+/// `friendId` they carry (invite-friends share an id), and — only when
+/// `allow_introduce` — auto-add an unknown sender who introduced themselves by
+/// name (they hold our permanent code), so a first message becomes two-way.
+fn resolve_chat_friend(
+    app: &AppHandle,
+    config_dir: &Path,
+    who: &str,
+    req: &serde_json::Value,
+    allow_introduce: bool,
+) -> Option<crate::models::Friend> {
+    let friends = crate::friends::load(config_dir);
+    let claimed = req.get("friendId").and_then(|v| v.as_str());
+    let from_name = req.get("fromName").and_then(|v| v.as_str()).unwrap_or("");
+    friends
+        .iter()
+        .find(|f| f.endpoint_id.as_deref() == Some(who))
+        .or_else(|| claimed.and_then(|id| friends.iter().find(|f| f.id == id)))
+        .cloned()
+        .or_else(|| {
+            if allow_introduce && !from_name.is_empty() {
+                let f = crate::friends::upsert_by_endpoint(config_dir, who, from_name);
+                let _ = app.emit("friends://changed", ());
+                Some(f)
+            } else {
+                None
+            }
+        })
 }
 
 /// Prove iroh works inside the running app: spin up a throwaway client endpoint,
@@ -2831,11 +2936,11 @@ pub async fn send_folder_reconcile(
     Ok(())
 }
 
-/// Pop a native OS notification for an inbound chat message — but only when the
-/// main window isn't focused (if you're already looking at the app, the live
-/// in-app bubble is enough) and the user hasn't turned message notifications off.
-/// This is what makes DropBeam chat feel like Telegram: a message reaches you
-/// even when the app is in the tray or behind another window.
+/// Pop a native OS notification for an inbound chat message — the iMessage rule:
+/// notify UNLESS the user is actively looking at THIS conversation (main window
+/// focused AND this chat open). So you're pinged when the app is in the tray, on
+/// another Space, behind another window, or just viewing a different chat — but
+/// not while you're already reading the thread the message landed in.
 fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessage) {
     let Some(st) = app.try_state::<Arc<crate::AppState>>() else {
         return;
@@ -2843,9 +2948,22 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
     if !st.settings.lock().unwrap().notify_on_message {
         return;
     }
-    // Always notify on an inbound message — minimized, on another Space, or quit to
-    // the tray. (A chat app you can't get pinged from isn't a chat app.) The user
-    // can turn this off in Settings.
+    // Suppress only when you're staring right at this conversation (the live
+    // in-app bubble + sound is enough). Every other case pings you. Use the LIVE
+    // window focus (not just the cached atomic) so a focus-event lag can't make us
+    // wrongly swallow a banner. This mirrors the frontend's sound/unread gate.
+    let focused = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_focused().ok())
+        .unwrap_or_else(|| st.main_focused.load(Ordering::Relaxed));
+    let active_here = st
+        .active_chat
+        .lock()
+        .map(|a| a.as_deref() == Some(msg.peer_id.as_str()))
+        .unwrap_or(false);
+    if focused && active_here {
+        return;
+    }
     let who = {
         let s = sender.trim();
         if s.is_empty() { "New message" } else { s }
@@ -2888,19 +3006,36 @@ pub async fn send_chat(ep: &Endpoint, endpoint_id: &str, payload: serde_json::Va
 }
 
 /// Build the wire frame for a chat message (shared by the send command + the
-/// outbox retry so they stay identical).
-fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) -> serde_json::Value {
-    if m.kind == "file" {
-        serde_json::json!({
-            "kind": "chat", "msgKind": "file", "friendId": peer_id, "fromName": my_name,
-            "id": m.id, "files": m.files, "bytes": m.bytes, "ts": m.ts,
-        })
+/// outbox retry so they stay identical). `v:2` = the versioned, extensible chat
+/// protocol (seq for ordering; optional reply/gif metadata old peers ignore).
+pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) -> serde_json::Value {
+    let mut f = serde_json::json!({
+        "kind": "chat", "v": 2, "friendId": peer_id, "fromName": my_name,
+        "id": m.id, "ts": m.ts, "seq": m.seq,
+    });
+    let o = f.as_object_mut().unwrap();
+    if let Some(g) = &m.gif {
+        o.insert("msgKind".into(), serde_json::json!("gif"));
+        o.insert("files".into(), serde_json::json!(m.files));
+        o.insert("bytes".into(), serde_json::json!(m.bytes));
+        if let Ok(gv) = serde_json::to_value(g) {
+            o.insert("gif".into(), gv);
+        }
+    } else if m.kind == "file" {
+        o.insert("msgKind".into(), serde_json::json!("file"));
+        o.insert("files".into(), serde_json::json!(m.files));
+        o.insert("bytes".into(), serde_json::json!(m.bytes));
     } else {
-        serde_json::json!({
-            "kind": "chat", "msgKind": "text", "friendId": peer_id, "fromName": my_name,
-            "id": m.id, "text": m.text, "ts": m.ts,
-        })
+        o.insert("msgKind".into(), serde_json::json!("text"));
+        o.insert("text".into(), serde_json::json!(m.text));
     }
+    if let Some(rt) = &m.reply_to {
+        o.insert("replyTo".into(), serde_json::json!(rt));
+    }
+    if let Some(rp) = &m.reply_preview {
+        o.insert("replyPreview".into(), serde_json::json!(rp));
+    }
+    f
 }
 
 /// Background loop that flushes the chat outbox: every few seconds it retries
@@ -2946,7 +3081,8 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                     let payload = chat_payload(&m, &peer_id, &my_name);
                     match send_chat(&ep, &eid, payload).await {
                         Ok(_) => {
-                            if let Some(u) = crate::chat::set_status(&config_dir, &peer_id, &m.id, "sent")
+                            if let Some(u) =
+                                crate::chat::set_status(&config_dir, &peer_id, &m.id, "delivered")
                             {
                                 let _ = app.emit("chat://message", &u);
                             }

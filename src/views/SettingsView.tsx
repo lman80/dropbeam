@@ -216,6 +216,30 @@ export function SettingsView() {
           <Toggle on={settings.notifyOnMessage} onChange={(v) => save({ notifyOnMessage: v })} />
         </Row>
         {SEP}
+        <Row
+          title="Send read receipts"
+          desc="Let friends see when you’ve read their message. Turning this off stops you sending them."
+        >
+          <Toggle on={settings.sendReadReceipts} onChange={(v) => save({ sendReadReceipts: v })} />
+        </Row>
+        {SEP}
+        <Row
+          title="GIFs (Giphy key)"
+          desc="Paste a free key from developers.giphy.com to enable the GIF picker in chat. Leave blank to hide it."
+        >
+          <input
+            className="input"
+            style={{ width: 220 }}
+            type="text"
+            placeholder="Giphy API key"
+            defaultValue={settings.giphyApiKey}
+            onBlur={(e) => {
+              const v = e.target.value.trim()
+              if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
+            }}
+          />
+        </Row>
+        {SEP}
         <Row title="Play sounds" desc="Soft cues when you send, receive, or get a file offer.">
           <Toggle on={settings.playSounds} onChange={(v) => save({ playSounds: v })} />
         </Row>

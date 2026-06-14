@@ -760,9 +760,11 @@ html.overlay-window #root {
 }
 .chat-input {
   flex: 1;
+  min-width: 0;
   resize: none;
-  max-height: 120px;
+  max-height: 132px;
   min-height: 38px;
+  height: 38px;
   padding: 9px 12px;
   border-radius: 12px;
   border: 1px solid var(--border);
@@ -819,7 +821,6 @@ html.overlay-window #root {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  cursor: grab;
 }
 .chat-line {
   position: relative;
@@ -994,6 +995,402 @@ html.overlay-window #root {
 .chat-file-size {
   font-size: 11.5px;
   opacity: 0.7;
+}
+
+/* ── Chat v2: reactions, replies, edit/delete, typing, GIFs, polish ───────── */
+.chat-state.read {
+  color: var(--accent);
+  font-weight: 650;
+}
+.chat-edited {
+  opacity: 0.6;
+  font-size: 11px;
+  font-style: italic;
+}
+.chat-bubble.deleted {
+  background: transparent;
+  border-style: dashed;
+}
+.chat-deleted {
+  color: var(--text-faint);
+  font-style: italic;
+  font-size: 12.5px;
+}
+.chat-bubble.media {
+  padding: 3px;
+  background: transparent;
+  border-color: transparent;
+}
+.chat-bubble.mine.media {
+  background: transparent;
+}
+.chat-gif {
+  display: block;
+  max-width: 240px;
+  max-height: 260px;
+  border-radius: 12px;
+  cursor: pointer;
+}
+.chat-gif-loading {
+  display: grid;
+  place-items: center;
+  width: 180px;
+  max-width: 240px;
+  min-height: 120px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+/* hover action cluster + reaction tray + ⋯ menu */
+.chat-bubble-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.chat-line.mine .chat-bubble-wrap {
+  flex-direction: row-reverse;
+}
+.chat-actions {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  margin: 0 4px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.chat-bubble-wrap:hover .chat-actions {
+  opacity: 1;
+}
+.chat-act {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.chat-act:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.react-tray,
+.chat-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  z-index: 40;
+  display: flex;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  padding: 3px;
+}
+.chat-line.mine .react-tray,
+.chat-line.mine .chat-menu {
+  right: 0;
+}
+.react-tray-cell {
+  border: none;
+  background: transparent;
+  font-size: 17px;
+  line-height: 1;
+  padding: 4px 5px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: transform 0.1s ease, background 0.1s ease;
+}
+.react-tray-cell:hover {
+  transform: scale(1.25);
+  background: var(--surface-2);
+}
+.chat-menu {
+  flex-direction: column;
+  border-radius: 11px;
+  padding: 4px;
+  min-width: 132px;
+}
+.chat-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+}
+.chat-menu button:hover {
+  background: var(--surface-2);
+}
+.chat-menu button.danger {
+  color: var(--red);
+}
+
+/* reaction chips under a bubble */
+.chat-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.chat-reactions.mine {
+  justify-content: flex-end;
+}
+.react-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.react-chip.mine {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface-2));
+}
+.react-chip-n {
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--text-muted);
+}
+
+/* reply quote above a bubble */
+.chat-quote {
+  display: flex;
+  gap: 7px;
+  align-items: stretch;
+  max-width: 100%;
+  margin-bottom: 2px;
+  padding-left: 2px;
+  opacity: 0.85;
+}
+.chat-quote.mine {
+  align-self: flex-end;
+}
+.chat-quote-bar {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+.chat-quote-text {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+/* "new messages" pill */
+.chat-newpill {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 86px;
+  z-index: 30;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 13px;
+  border: none;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 650;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+}
+
+/* composer + reply/edit bar */
+.chat-composer {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+.chat-send {
+  align-self: stretch;
+}
+.chat-replybar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+.chat-replybar.editing {
+  color: var(--accent);
+}
+.chat-replybar-who {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+}
+.chat-replybar-text {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.icon-btn.on {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* emoji popover */
+.emoji-pop {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 14px;
+  z-index: 50;
+  width: 300px;
+  max-height: 220px;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 2px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.2);
+}
+.emoji-cell {
+  border: none;
+  background: transparent;
+  font-size: 19px;
+  line-height: 1;
+  padding: 5px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.emoji-cell:hover {
+  background: var(--surface-2);
+  transform: scale(1.15);
+}
+
+/* GIF picker popover */
+.gif-picker {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 14px;
+  z-index: 50;
+  width: 340px;
+  height: 380px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.24);
+  overflow: hidden;
+}
+.gif-picker-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--border);
+}
+.gif-picker-search-ic {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.gif-picker-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  outline: none;
+}
+.gif-picker-close {
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.gif-picker-grid {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  align-content: start;
+}
+.gif-tile {
+  border: none;
+  padding: 0;
+  background: var(--surface-2);
+  border-radius: 9px;
+  overflow: hidden;
+  cursor: pointer;
+  aspect-ratio: 1 / 1;
+}
+.gif-tile img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.gif-picker-note {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  padding: 24px 0;
+}
+.gif-picker-foot {
+  text-align: center;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  padding: 5px;
+  border-top: 1px solid var(--border);
+}
+
+/* click-to-enlarge lightbox */
+.chat-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.72);
+  cursor: zoom-out;
+}
+.chat-lightbox img {
+  max-width: 88vw;
+  max-height: 88vh;
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
 }
 
 /* Recipient chooser rows (the "send to whom?" sheet) */

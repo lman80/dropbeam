@@ -1,28 +1,45 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { convertFileSrc } from '@tauri-apps/api/core'
-import { motion } from 'framer-motion'
+import { AnimatePresence, motion } from 'framer-motion'
 import {
+  ArrowDown,
   Check,
+  CheckCheck,
   Clock,
+  CornerUpLeft,
   File as FileIcon,
   FileText,
   FolderOpen,
   MessageCircle,
+  MoreHorizontal,
   Music,
   Paperclip,
+  Pencil,
   Send as SendIcon,
+  Smile,
+  Sparkles,
+  Trash2,
   Users,
   Video,
+  X,
 } from 'lucide-react'
 import { api, HAS_TAURI, type ChatMessage, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState } from '../components/bits'
+import { GifPicker } from '../components/GifPicker'
 import { avatarGradient, initials } from '../lib/avatar'
 import { formatBytes } from '../lib/format'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 
 /** Stable empty array so the messages selector doesn't return a fresh ref each render. */
 const EMPTY_MSGS: ChatMessage[] = []
+
+/** Quick-reaction emojis (the hover tray) + a compact composer emoji set. */
+const QUICK = ['👍', '❤️', '😂', '🔥', '😮', '😢', '🙏']
+const EMOJIS =
+  '😀 😂 🥹 😊 😍 😎 🤩 🥳 😅 😭 😡 🤔 🙄 😴 🤝 🙏 👍 👎 👏 🙌 💪 🤞 👌 ✌️ 🔥 ✨ ⭐ 🎉 🎈 💯 ❤️ 🧡 💛 💚 💙 💜 🖤 💔 💖 ✅ ❌ ⚡ 💡 📎 📁 🎁 🍕 ☕ 🍺 🎵 🚀 🌟 👀 😬 😏'.split(
+    ' ',
+  )
 
 const IMG = /\.(png|jpe?g|gif|webp|bmp|svg|avif|heic)$/i
 const VIDEO = /\.(mp4|mov|m4v|webm|ogv)$/i
@@ -69,7 +86,11 @@ function dayLabel(ms: number): string {
   y.setDate(now.getDate() - 1)
   if (sameDay(d, now)) return 'Today'
   if (sameDay(d, y)) return 'Yesterday'
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: d.getFullYear() === now.getFullYear() ? undefined : 'numeric' })
+  return d.toLocaleDateString([], {
+    month: 'short',
+    day: 'numeric',
+    year: d.getFullYear() === now.getFullYear() ? undefined : 'numeric',
+  })
 }
 
 export function ChatView() {
@@ -184,20 +205,82 @@ function Conversation({ friendId }: { friendId: string }) {
   const messages = useStore((s) => s.chats[friendId] ?? EMPTY_MSGS)
   const pairs = useStore((s) => s.pairs)
   const sendChat = useStore((s) => s.sendChat)
+  const sendGif = useStore((s) => s.sendGif)
+  const editChat = useStore((s) => s.editChatMessage)
   const shareFilesInChat = useStore((s) => s.shareFilesInChat)
   const friendSeen = useStore((s) => s.friendSeen)
   const folderStatuses = useStore((s) => s.folderStatuses)
+  const typing = useStore((s) => !!s.chatTyping[friendId])
+  const giphyKey = useStore((s) => s.settings?.giphyApiKey ?? '')
+  const setView = useStore((s) => s.setView)
+
   const [text, setText] = useState('')
+  const [reply, setReply] = useState<ChatMessage | null>(null)
+  const [editing, setEditing] = useState<ChatMessage | null>(null)
+  const [showEmoji, setShowEmoji] = useState(false)
+  const [showGif, setShowGif] = useState(false)
+  const [lightbox, setLightbox] = useState<string | null>(null)
+  const [newCount, setNewCount] = useState(0)
+
   const scrollRef = useRef<HTMLDivElement>(null)
+  const taRef = useRef<HTMLTextAreaElement>(null)
+  const atBottomRef = useRef(true)
+  const prevLenRef = useRef(messages.length)
+  const typingSentRef = useRef(false)
+  const typingTimer = useRef<number | undefined>(undefined)
 
-  useEffect(() => {
+  const isAtBottom = () => {
     const el = scrollRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [messages.length, friendId])
+    if (!el) return true
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 70
+  }
+  const scrollToBottom = (smooth = false) => {
+    const el = scrollRef.current
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+    setNewCount(0)
+  }
 
-  // Build per-message render hints: group runs from the same sender, drop an
-  // avatar only on the last bubble of an incoming run, and insert a day/time
-  // divider when there's a sizeable gap.
+  // Smart autoscroll: stick to the bottom only when you're already there (or the
+  // new message is yours). Otherwise leave the scroll alone and surface a pill.
+  useLayoutEffect(() => {
+    const grew = messages.length > prevLenRef.current
+    const last = messages[messages.length - 1]
+    if (!grew) {
+      // status/edit/reaction update of an existing message — don't yank.
+      prevLenRef.current = messages.length
+      return
+    }
+    if (atBottomRef.current || last?.fromMe) {
+      scrollToBottom()
+    } else {
+      setNewCount((n) => n + 1)
+    }
+    prevLenRef.current = messages.length
+  }, [messages])
+
+  // On open, jump to bottom.
+  useLayoutEffect(() => {
+    scrollToBottom()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [friendId])
+
+  // Stop signalling "typing" when leaving / unmounting.
+  useEffect(() => {
+    return () => {
+      if (typingSentRef.current) void api.sendTyping(friendId, false)
+      window.clearTimeout(typingTimer.current)
+    }
+  }, [friendId])
+
+  // Auto-grow the composer up to a few lines. Empty → let CSS hold a single row
+  // (measuring scrollHeight on an empty field can read stale/inflated values).
+  useLayoutEffect(() => {
+    const ta = taRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    if (text) ta.style.height = `${Math.min(ta.scrollHeight, 132)}px`
+  }, [text])
+
   const items = useMemo(() => {
     const GAP = 30 * 60 * 1000 // 30 min
     return messages.map((m, i) => {
@@ -218,16 +301,76 @@ function Conversation({ friendId }: { friendId: string }) {
   const presence = friendPresence(friend.name, friendSeen, folderStatuses)
   const online = presence.status === 'online'
 
+  const onType = (v: string) => {
+    setText(v)
+    // Throttled typing beacon: send "on" once, refresh an "off" timer.
+    if (!editing) {
+      if (v.trim() && !typingSentRef.current) {
+        typingSentRef.current = true
+        void api.sendTyping(friendId, true)
+      }
+      window.clearTimeout(typingTimer.current)
+      typingTimer.current = window.setTimeout(() => {
+        if (typingSentRef.current) {
+          typingSentRef.current = false
+          void api.sendTyping(friendId, false)
+        }
+      }, 2500)
+    }
+  }
+
+  const stopTyping = () => {
+    window.clearTimeout(typingTimer.current)
+    if (typingSentRef.current) {
+      typingSentRef.current = false
+      void api.sendTyping(friendId, false)
+    }
+  }
+
   const submit = () => {
     const body = text.trim()
     if (!body) return
+    if (editing) {
+      void editChat(friendId, editing.id, body)
+      setEditing(null)
+    } else {
+      void sendChat(friendId, body, reply)
+      setReply(null)
+    }
     setText('')
-    void sendChat(friendId, body)
+    stopTyping()
+    scrollToBottom()
+  }
+
+  const beginEdit = (m: ChatMessage) => {
+    setEditing(m)
+    setReply(null)
+    setText(m.text)
+    setShowEmoji(false)
+    setShowGif(false)
+    setTimeout(() => taRef.current?.focus(), 0)
+  }
+  const cancelEdit = () => {
+    setEditing(null)
+    setText('')
   }
 
   const attach = async () => {
     const paths = await api.pickFiles()
     if (paths.length) void shareFilesInChat(friendId, paths)
+  }
+
+  const pickGif = (g: { id: string; sendUrl: string; pageUrl: string; w: number; h: number }) => {
+    setShowGif(false)
+    void sendGif(friendId, {
+      provider: 'giphy',
+      id: g.id,
+      url: g.sendUrl,
+      page: g.pageUrl,
+      w: g.w,
+      h: g.h,
+    })
+    scrollToBottom()
   }
 
   return (
@@ -248,8 +391,13 @@ function Conversation({ friendId }: { friendId: string }) {
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 14.5 }}>{friend.name}</div>
-          <div style={{ fontSize: 12, color: online ? 'var(--green)' : 'var(--text-faint)' }}>
-            {presenceLabel(presence)}
+          <div
+            style={{
+              fontSize: 12,
+              color: typing ? 'var(--accent)' : online ? 'var(--green)' : 'var(--text-faint)',
+            }}
+          >
+            {typing ? 'typing…' : presenceLabel(presence)}
           </div>
         </div>
         {sharedFolder && (
@@ -263,21 +411,22 @@ function Conversation({ friendId }: { friendId: string }) {
         )}
       </div>
 
-      <div ref={scrollRef} className="scroll-area chat-thread" style={{ flex: 1, minHeight: 0 }}>
+      <div ref={scrollRef} className="scroll-area chat-thread" style={{ flex: 1, minHeight: 0 }} onScroll={() => {
+        atBottomRef.current = isAtBottom()
+        if (atBottomRef.current && newCount) setNewCount(0)
+      }}>
         {messages.length === 0 ? (
           <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-faint)', paddingTop: 40 }}>
             <MessageCircle size={30} style={{ opacity: 0.5 }} />
-            <div style={{ marginTop: 8, fontSize: 13 }}>Say hi to {friend.name}.</div>
+            <div style={{ marginTop: 8, fontSize: 13 }}>Say hi to {friend.name} 👋</div>
+            {!online && (
+              <div style={{ marginTop: 4, fontSize: 12, opacity: 0.75 }}>
+                They’re offline — your message delivers when they’re back.
+              </div>
+            )}
           </div>
         ) : (
-          <motion.div
-            className="chat-track"
-            drag="x"
-            dragConstraints={{ left: -68, right: 0 }}
-            dragElastic={0.05}
-            dragMomentum={false}
-            whileDrag={{ cursor: 'grabbing' }}
-          >
+          <div className="chat-track">
             {items.map(({ m, firstOfRun, lastOfRun, divider }) => (
               <div key={m.id}>
                 {divider && (
@@ -290,44 +439,147 @@ function Conversation({ friendId }: { friendId: string }) {
                   friend={friend}
                   firstOfRun={firstOfRun}
                   lastOfRun={lastOfRun}
+                  allById={messages}
+                  onReply={() => {
+                    setReply(m)
+                    setEditing(null)
+                    taRef.current?.focus()
+                  }}
+                  onEdit={() => beginEdit(m)}
+                  onLightbox={setLightbox}
                 />
               </div>
             ))}
-          </motion.div>
+          </div>
         )}
       </div>
 
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'flex-end',
-          gap: 8,
-          padding: '10px 14px',
-          borderTop: '1px solid var(--border)',
-        }}
-      >
-        <button className="icon-btn" title="Share a file" onClick={attach}>
+      <AnimatePresence>
+        {newCount > 0 && (
+          <motion.button
+            className="chat-newpill"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            onClick={() => scrollToBottom(true)}
+          >
+            <ArrowDown size={13} /> {newCount} new message{newCount > 1 ? 's' : ''}
+          </motion.button>
+        )}
+      </AnimatePresence>
+
+      {reply && !editing && (
+        <div className="chat-replybar">
+          <CornerUpLeft size={14} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="chat-replybar-who">Replying to {reply.fromMe ? 'yourself' : friend.name}</div>
+            <div className="chat-replybar-text">{quoteText(reply)}</div>
+          </div>
+          <button className="icon-btn" onClick={() => setReply(null)} title="Cancel reply">
+            <X size={15} />
+          </button>
+        </div>
+      )}
+      {editing && (
+        <div className="chat-replybar editing">
+          <Pencil size={14} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="chat-replybar-who">Editing message</div>
+          </div>
+          <button className="icon-btn" onClick={cancelEdit} title="Cancel edit">
+            <X size={15} />
+          </button>
+        </div>
+      )}
+
+      <div className="chat-composer">
+        {showGif && (
+          <GifPicker
+            apiKey={giphyKey}
+            onPick={pickGif}
+            onClose={() => setShowGif(false)}
+            onSetup={() => {
+              setShowGif(false)
+              setView('settings')
+            }}
+          />
+        )}
+        {showEmoji && (
+          <div className="emoji-pop" onMouseDown={(e) => e.stopPropagation()}>
+            {EMOJIS.map((e) => (
+              <button
+                key={e}
+                className="emoji-cell"
+                onClick={() => {
+                  onType(text + e)
+                  taRef.current?.focus()
+                }}
+              >
+                {e}
+              </button>
+            ))}
+          </div>
+        )}
+        <button className="icon-btn" title="Share a file" onClick={attach} disabled={!!editing}>
           <Paperclip size={18} />
         </button>
+        <button
+          className={`icon-btn${showGif ? ' on' : ''}`}
+          title="Send a GIF"
+          onClick={() => {
+            setShowGif((v) => !v)
+            setShowEmoji(false)
+          }}
+          disabled={!!editing}
+        >
+          <Sparkles size={18} />
+        </button>
+        <button
+          className={`icon-btn${showEmoji ? ' on' : ''}`}
+          title="Emoji"
+          onClick={() => {
+            setShowEmoji((v) => !v)
+            setShowGif(false)
+          }}
+        >
+          <Smile size={18} />
+        </button>
         <textarea
+          ref={taRef}
           className="chat-input"
           value={text}
-          placeholder={`Message ${friend.name}…`}
+          placeholder={editing ? 'Edit your message…' : `Message ${friend.name}…`}
           rows={1}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => onType(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
               submit()
+            } else if (e.key === 'Escape' && editing) {
+              cancelEdit()
             }
           }}
         />
-        <button className="btn btn-primary" onClick={submit} disabled={!text.trim()}>
-          <SendIcon size={16} />
+        <button className="btn btn-primary chat-send" onClick={submit} disabled={!text.trim()}>
+          {editing ? <Check size={16} /> : <SendIcon size={16} />}
         </button>
       </div>
+
+      {lightbox && (
+        <div className="chat-lightbox" onClick={() => setLightbox(null)}>
+          <img src={lightbox} alt="" />
+        </div>
+      )}
     </>
   )
+}
+
+/** One line of text representing a message, for reply quotes. */
+function quoteText(m: ChatMessage): string {
+  if (m.deleted) return 'Deleted message'
+  if (m.gif) return 'GIF'
+  if (m.kind === 'file') return m.files.length === 1 ? `📎 ${m.files[0]}` : `📎 ${m.files.length} files`
+  return m.text
 }
 
 function MessageRow({
@@ -335,55 +587,227 @@ function MessageRow({
   friend,
   firstOfRun,
   lastOfRun,
+  allById,
+  onReply,
+  onEdit,
+  onLightbox,
 }: {
   m: ChatMessage
   friend: Friend
   firstOfRun: boolean
   lastOfRun: boolean
+  allById: ChatMessage[]
+  onReply: () => void
+  onEdit: () => void
+  onLightbox: (src: string) => void
 }) {
   const mine = m.fromMe
+  const react = useStore((s) => s.reactToMessage)
+  const del = useStore((s) => s.deleteChatMessage)
+  const [tray, setTray] = useState(false)
+  const [menu, setMenu] = useState(false)
+
+  // Collapse reactions to one chip per emoji; mark the ones we added.
+  const reactionChips = useMemo(() => {
+    const map = new Map<string, { count: number; mine: boolean }>()
+    for (const r of m.reactions ?? []) {
+      const e = map.get(r.emoji) ?? { count: 0, mine: false }
+      e.count += 1
+      if (r.fromMe) e.mine = true
+      map.set(r.emoji, e)
+    }
+    return [...map.entries()]
+  }, [m.reactions])
+
+  const replied = m.replyTo ? allById.find((x) => x.id === m.replyTo) : undefined
+  const quote = m.replyPreview ?? (replied ? quoteText(replied) : undefined)
+
+  const doReact = (emoji: string) => {
+    setTray(false)
+    void react(friend.id, m.id, emoji)
+  }
+
   return (
-    <div className={`chat-line${mine ? ' mine' : ''}${lastOfRun ? ' run-end' : ''}`}>
-      {/* incoming sender avatar (only on the last bubble of a run) */}
+    <div
+      className={`chat-line${mine ? ' mine' : ''}${lastOfRun ? ' run-end' : ''}`}
+      onMouseLeave={() => {
+        setTray(false)
+        setMenu(false)
+      }}
+    >
       {!mine && (
-        <span className="chat-line-avatar" style={{ visibility: lastOfRun ? 'visible' : 'hidden', background: avatarGradient(friend.id) }}>
+        <span
+          className="chat-line-avatar"
+          style={{ visibility: lastOfRun ? 'visible' : 'hidden', background: avatarGradient(friend.id) }}
+        >
           {avatarContent(friend)}
         </span>
       )}
       <div className="chat-line-body">
-        <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className={`chat-bubble${mine ? ' mine' : ''}${firstOfRun ? ' first' : ''}`}>
-          {m.kind === 'file' ? <FileMessage m={m} mine={mine} /> : (
-            <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{m.text}</span>
+        {quote && (
+          <div className={`chat-quote${mine ? ' mine' : ''}`}>
+            <span className="chat-quote-bar" />
+            <span className="chat-quote-text">{quote}</span>
+          </div>
+        )}
+
+        <div className="chat-bubble-wrap">
+          <motion.div
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            className={`chat-bubble${mine ? ' mine' : ''}${firstOfRun ? ' first' : ''}${m.deleted ? ' deleted' : ''}${
+              m.gif ? ' media' : ''
+            }`}
+          >
+            {m.deleted ? (
+              <span className="chat-deleted">This message was deleted</span>
+            ) : m.gif ? (
+              <GifBubble m={m} onLightbox={onLightbox} />
+            ) : m.kind === 'file' ? (
+              <FileMessage m={m} mine={mine} onLightbox={onLightbox} />
+            ) : (
+              <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {m.text}
+                {m.edited && <span className="chat-edited"> (edited)</span>}
+              </span>
+            )}
+          </motion.div>
+
+          {!m.deleted && (
+            <div className="chat-actions">
+              <button className="chat-act" title="React" onClick={() => setTray((v) => !v)}>
+                <Smile size={15} />
+              </button>
+              <button className="chat-act" title="Reply" onClick={onReply}>
+                <CornerUpLeft size={15} />
+              </button>
+              {mine && (
+                <button className="chat-act" title="More" onClick={() => setMenu((v) => !v)}>
+                  <MoreHorizontal size={15} />
+                </button>
+              )}
+              {tray && (
+                <div className="react-tray" onMouseDown={(e) => e.stopPropagation()}>
+                  {QUICK.map((e) => (
+                    <button key={e} className="react-tray-cell" onClick={() => doReact(e)}>
+                      {e}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {menu && mine && (
+                <div className="chat-menu" onMouseDown={(e) => e.stopPropagation()}>
+                  {m.kind === 'text' && !m.gif && (
+                    <button
+                      onClick={() => {
+                        setMenu(false)
+                        onEdit()
+                      }}
+                    >
+                      <Pencil size={14} /> Edit
+                    </button>
+                  )}
+                  <button
+                    className="danger"
+                    onClick={() => {
+                      setMenu(false)
+                      void del(friend.id, m.id)
+                    }}
+                  >
+                    <Trash2 size={14} /> Unsend
+                  </button>
+                </div>
+              )}
+            </div>
           )}
-        </motion.div>
-        {/* delivery state for our own messages, shown subtly under the run */}
-        {mine && lastOfRun && m.status && m.status !== 'sent' && (
-          <span className={`chat-state${m.status === 'failed' ? ' failed' : ''}`}>
-            {m.status === 'sending' ? <Clock size={11} /> : null}
-            {m.status === 'failed' ? 'not delivered — retrying…' : ''}
-          </span>
+        </div>
+
+        {reactionChips.length > 0 && (
+          <div className={`chat-reactions${mine ? ' mine' : ''}`}>
+            {reactionChips.map(([emoji, info]) => (
+              <button
+                key={emoji}
+                className={`react-chip${info.mine ? ' mine' : ''}`}
+                onClick={() => doReact(emoji)}
+                title={info.mine ? 'Remove reaction' : 'React'}
+              >
+                {emoji}
+                {info.count > 1 && <span className="react-chip-n">{info.count}</span>}
+              </button>
+            ))}
+          </div>
         )}
-        {mine && lastOfRun && m.status === 'sent' && (
-          <span className="chat-state">
-            <Check size={11} /> Sent
-          </span>
-        )}
+
+        {mine && lastOfRun && <DeliveryState status={m.status} />}
       </div>
-      {/* timestamp revealed by swiping the thread left */}
       <span className="chat-time-gutter">{clock(m.ts)}</span>
     </div>
   )
 }
 
+/** The subtle delivery line under your own last bubble. Offline/queued shows a
+ *  calm clock (not a scary "failed"); delivery + read mirror iMessage. */
+function DeliveryState({ status }: { status: ChatMessage['status'] }) {
+  if (status === 'read')
+    return (
+      <span className="chat-state read">
+        <CheckCheck size={12} /> Read
+      </span>
+    )
+  if (status === 'delivered' || status === 'sent')
+    return (
+      <span className="chat-state">
+        <Check size={12} /> Delivered
+      </span>
+    )
+  // sending / failed / null → still on its way (the outbox keeps retrying).
+  return (
+    <span className="chat-state" title="Sending — delivers when they’re online">
+      <Clock size={11} /> Sending
+    </span>
+  )
+}
+
+/** A GIF bubble: renders the LOCAL transferred copy only (animated GIFs autoplay
+ *  natively in <img>), capped size, click to enlarge. We deliberately never load
+ *  the Giphy CDN url — doing so would leak the receiver's IP to a third party for
+ *  a P2P-private chat. Until the bytes arrive, show a sized placeholder. */
+function GifBubble({ m, onLightbox }: { m: ChatMessage; onLightbox: (src: string) => void }) {
+  const src = m.path && HAS_TAURI ? convertFileSrc(m.path) : null
+  const [broken, setBroken] = useState(false)
+  const ratio = m.gif && m.gif.w && m.gif.h ? { aspectRatio: `${m.gif.w} / ${m.gif.h}` } : undefined
+  if (!src || broken) {
+    return (
+      <div className="chat-gif-loading" style={ratio}>
+        GIF…
+      </div>
+    )
+  }
+  return (
+    <img
+      className="chat-gif"
+      src={src}
+      alt="GIF"
+      style={ratio}
+      onClick={() => onLightbox(src)}
+      onError={() => setBroken(true)}
+    />
+  )
+}
+
 /** A file/media message: an inline preview (when we can render one) plus a
  *  clickable header that opens the file in its default app. */
-function FileMessage({ m, mine }: { m: ChatMessage; mine: boolean }) {
+function FileMessage({
+  m,
+  mine,
+  onLightbox,
+}: {
+  m: ChatMessage
+  mine: boolean
+  onLightbox: (src: string) => void
+}) {
   const name = m.files[0]
   const kind = fileKind(name)
-  // Once a preview fails (the file was moved/deleted off disk), STOP rendering the
-  // media element — otherwise every re-render re-requests the missing path and
-  // floods the log with "File does not exist" asset errors. Fall back to the
-  // clickable header (glyph + name) below.
   const [broken, setBroken] = useState(false)
   const canPreview = !!m.path && HAS_TAURI && !broken
   const src = canPreview ? convertFileSrc(m.path!) : null
@@ -394,9 +818,14 @@ function FileMessage({ m, mine }: { m: ChatMessage; mine: boolean }) {
 
   return (
     <div className="chat-fileblock">
-      {/* preview */}
       {!multi && src && kind === 'image' && (
-        <img src={src} alt={name} className="chat-img" onClick={open} onError={() => setBroken(true)} />
+        <img
+          src={src}
+          alt={name}
+          className="chat-img"
+          onClick={() => onLightbox(src)}
+          onError={() => setBroken(true)}
+        />
       )}
       {!multi && src && kind === 'video' && (
         <video className="chat-media" src={src} controls preload="metadata" onError={() => setBroken(true)} />
@@ -408,8 +837,11 @@ function FileMessage({ m, mine }: { m: ChatMessage; mine: boolean }) {
         <TextPreview src={src} onOpen={open} />
       )}
 
-      {/* clickable header (always present) */}
-      <div className={`chat-file${m.path ? ' clickable' : ''}`} onClick={m.path ? open : undefined} title={m.path ? 'Open' : undefined}>
+      <div
+        className={`chat-file${m.path ? ' clickable' : ''}`}
+        onClick={m.path ? open : undefined}
+        title={m.path ? 'Open' : undefined}
+      >
         <span className={`chat-file-ic${mine ? ' mine' : ''}`}>
           <GlyphIcon size={16} />
         </span>

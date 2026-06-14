@@ -5,6 +5,7 @@
 import type {
   ChatMessage,
   ChatOverview,
+  GifMeta,
   FolderStatus,
   Friend,
   HistoryEntry,
@@ -46,6 +47,8 @@ let settings: Settings = {
   requireDirect: false,
   avatar: '',
   notifyOnMessage: true,
+  sendReadReceipts: true,
+  giphyApiKey: '',
   verboseLogging: false,
   showSyncPopup: true,
   shareDiagnostics: true,
@@ -561,7 +564,12 @@ export const mockApi = {
         }
       })
       .sort((a, b) => b.lastTs - a.lastTs),
-  sendChatMessage: async (friendId: string, text: string): Promise<ChatMessage> => {
+  sendChatMessage: async (
+    friendId: string,
+    text: string,
+    replyTo?: string | null,
+    replyPreview?: string | null,
+  ): Promise<ChatMessage> => {
     const m: ChatMessage = {
       id: `c${++counter}`,
       peerId: friendId,
@@ -571,8 +579,15 @@ export const mockApi = {
       files: [],
       bytes: 0,
       path: null,
-      status: 'sent',
+      status: 'delivered',
       ts: Date.now(),
+      seq: counter,
+      replyTo: replyTo ?? null,
+      replyPreview: replyPreview ?? null,
+      reactions: [],
+      edited: false,
+      deleted: false,
+      gif: null,
     }
     ;(mockChats[friendId] ??= []).push(m)
     emit('chat://message', m)
@@ -593,11 +608,80 @@ export const mockApi = {
       files: names,
       bytes,
       path: paths[0] ?? null,
-      status: 'sent',
+      status: 'delivered',
       ts: Date.now(),
+      seq: counter,
+      replyTo: null,
+      replyPreview: null,
+      reactions: [],
+      edited: false,
+      deleted: false,
+      gif: null,
     }
     ;(mockChats[friendId] ??= []).push(m)
     emit('chat://message', m)
     return m
   },
+  reactToMessage: async (friendId: string, messageId: string, emoji: string, add: boolean) => {
+    const thread = mockChats[friendId] ?? []
+    const i = thread.findIndex((x) => x.id === messageId)
+    if (i < 0) return
+    const m = { ...thread[i], reactions: [...thread[i].reactions] }
+    const ri = m.reactions.findIndex((r) => r.fromMe && r.emoji === emoji)
+    if (add && ri < 0) m.reactions.push({ emoji, fromMe: true })
+    else if (!add && ri >= 0) m.reactions.splice(ri, 1)
+    thread[i] = m
+    emit('chat://message', m)
+  },
+  editChatMessage: async (friendId: string, messageId: string, text: string) => {
+    const thread = mockChats[friendId] ?? []
+    const i = thread.findIndex((x) => x.id === messageId)
+    if (i < 0) return
+    const m = { ...thread[i], text, edited: true }
+    thread[i] = m
+    emit('chat://message', m)
+  },
+  deleteChatMessage: async (friendId: string, messageId: string) => {
+    const thread = mockChats[friendId] ?? []
+    const i = thread.findIndex((x) => x.id === messageId)
+    if (i < 0) return
+    const m = { ...thread[i], deleted: true, text: '', files: [], path: null, gif: null, reactions: [] }
+    thread[i] = m
+    emit('chat://message', m)
+  },
+  sendTyping: async () => {},
+  sendReadReceipt: async () => {},
+  downloadGif: async (url: string) => url,
+  sendChatGif: async (
+    friendId: string,
+    name: string,
+    bytes: number,
+    path: string,
+    gif: GifMeta,
+  ): Promise<ChatMessage> => {
+    const m: ChatMessage = {
+      id: `c${++counter}`,
+      peerId: friendId,
+      fromMe: true,
+      kind: 'file',
+      text: '',
+      files: [name],
+      bytes,
+      path,
+      status: 'delivered',
+      ts: Date.now(),
+      seq: counter,
+      replyTo: null,
+      replyPreview: null,
+      reactions: [],
+      edited: false,
+      deleted: false,
+      gif,
+    }
+    ;(mockChats[friendId] ??= []).push(m)
+    emit('chat://message', m)
+    return m
+  },
+  setActiveChat: async () => {},
+  setUnreadBadge: async () => {},
 }

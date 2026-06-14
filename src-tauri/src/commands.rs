@@ -870,6 +870,8 @@ pub async fn send_chat_message(
     app: AppHandle,
     friend_id: String,
     text: String,
+    reply_to: Option<String>,
+    reply_preview: Option<String>,
 ) -> Result<ChatMessage, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -889,20 +891,40 @@ pub async fn send_chat_message(
         path: None,
         status: Some("sending".into()),
         ts: chat::now_ms(),
+        seq: chat::next_seq(&state.config_dir, &friend_id),
+        reply_to,
+        reply_preview: reply_preview.map(|p| p.chars().take(160).collect()),
+        reactions: vec![],
+        edited: false,
+        deleted: false,
+        gif: None,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
+    deliver_chat(&state, &iroh, &app, &friend, &msg);
+    // No endpoint yet → leave it "sending"; the outbox retry flushes it once the
+    // friend is reachable (self-healing learns their key on first contact).
+    Ok(msg)
+}
+
+/// Fire-and-forget delivery of a stored chat message over iroh, flipping its
+/// status to "delivered"/"failed" and re-emitting. Shared by text/file/gif sends.
+fn deliver_chat(
+    state: &Arc<AppState>,
+    iroh: &Arc<crate::iroh_net::IrohState>,
+    app: &AppHandle,
+    friend: &crate::models::Friend,
+    msg: &ChatMessage,
+) {
     if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
         let my_name = state.settings.lock().unwrap().display_name.clone();
-        let payload = serde_json::json!({
-            "kind": "chat", "msgKind": "text", "friendId": friend_id, "fromName": my_name,
-            "id": msg.id, "text": msg.text, "ts": msg.ts,
-        });
+        let payload = crate::iroh_net::chat_payload(msg, &friend.id, &my_name);
         let config_dir = state.config_dir.clone();
-        let (pid, mid) = (friend_id.clone(), msg.id.clone());
+        let (pid, mid) = (friend.id.clone(), msg.id.clone());
+        let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let status = match crate::iroh_net::send_chat(&ep, &eid, payload).await {
-                Ok(_) => "sent",
+                Ok(_) => "delivered",
                 Err(e) => {
                     log::debug!("chat send failed: {e:#}");
                     "failed"
@@ -913,9 +935,6 @@ pub async fn send_chat_message(
             }
         });
     }
-    // No endpoint yet → leave it "sending"; the outbox retry flushes it once the
-    // friend is reachable (self-healing learns their key on first contact).
-    Ok(msg)
 }
 
 /// Record + deliver a "file" chat message. The bytes themselves ride the normal
@@ -944,31 +963,274 @@ pub async fn send_chat_file_note(
         path: paths.into_iter().next(),
         status: Some("sending".into()),
         ts: chat::now_ms(),
+        seq: chat::next_seq(&state.config_dir, &friend_id),
+        reply_to: None,
+        reply_preview: None,
+        reactions: vec![],
+        edited: false,
+        deleted: false,
+        gif: None,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
-    if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
-        let my_name = state.settings.lock().unwrap().display_name.clone();
-        let payload = serde_json::json!({
-            "kind": "chat", "msgKind": "file", "friendId": friend_id, "fromName": my_name,
-            "id": msg.id, "files": names, "bytes": bytes, "ts": msg.ts,
-        });
-        let config_dir = state.config_dir.clone();
-        let (pid, mid) = (friend_id.clone(), msg.id.clone());
-        tauri::async_runtime::spawn(async move {
-            let status = match crate::iroh_net::send_chat(&ep, &eid, payload).await {
-                Ok(_) => "sent",
-                Err(e) => {
-                    log::debug!("chat file note send failed: {e:#}");
-                    "failed"
-                }
-            };
-            if let Some(u) = chat::set_status(&config_dir, &pid, &mid, status) {
-                let _ = app.emit("chat://message", &u);
-            }
-        });
-    }
+    deliver_chat(&state, &iroh, &app, &friend, &msg);
     Ok(msg)
+}
+
+// --- New chat capabilities: reactions, edit, delete, typing, read, GIFs -----
+
+/// Build + send a small chat control op (reaction/edit/delete) to a friend over
+/// iroh, retrying a few times so it lands even if the first dial misses. These
+/// mutate an existing message rather than create one, so they're not queued in
+/// the outbox; best-effort with retry is the right reliability tier for them.
+fn send_chat_op(
+    iroh: &Arc<crate::iroh_net::IrohState>,
+    eid: String,
+    payload: serde_json::Value,
+) {
+    let Some(ep) = iroh.get().cloned() else { return };
+    tauri::async_runtime::spawn(async move {
+        for attempt in 0..3u8 {
+            if crate::iroh_net::send_chat(&ep, &eid, payload.clone()).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2 * (attempt as u64 + 1))).await;
+        }
+    });
+}
+
+/// Add or remove an emoji reaction on a message (ours or the friend's). Applies
+/// locally immediately, then tells the peer.
+#[tauri::command]
+pub async fn react_to_message(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    app: AppHandle,
+    friend_id: String,
+    message_id: String,
+    emoji: String,
+    add: bool,
+) -> Result<(), String> {
+    if let Some(u) = chat::apply_reaction(&state.config_dir, &friend_id, &message_id, &emoji, true, add) {
+        let _ = app.emit("chat://message", &u);
+    }
+    if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
+        if let Some(eid) = friend.endpoint_id {
+            let my_name = state.settings.lock().unwrap().display_name.clone();
+            let payload = serde_json::json!({
+                "kind": "chat", "v": 2, "msgKind": "reaction", "friendId": friend_id,
+                "fromName": my_name, "targetId": message_id, "emoji": emoji, "add": add,
+            });
+            send_chat_op(&iroh, eid, payload);
+        }
+    }
+    Ok(())
+}
+
+/// Edit the text of a message we sent. Applies locally, then tells the peer.
+#[tauri::command]
+pub async fn edit_chat_message(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    app: AppHandle,
+    friend_id: String,
+    message_id: String,
+    text: String,
+) -> Result<(), String> {
+    let body: String = text.trim().chars().take(4000).collect();
+    if body.is_empty() {
+        return Err("Message is empty.".into());
+    }
+    if let Some(u) = chat::apply_edit(&state.config_dir, &friend_id, &message_id, &body, true) {
+        let _ = app.emit("chat://message", &u);
+    }
+    if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
+        if let Some(eid) = friend.endpoint_id {
+            let my_name = state.settings.lock().unwrap().display_name.clone();
+            let payload = serde_json::json!({
+                "kind": "chat", "v": 2, "msgKind": "edit", "friendId": friend_id,
+                "fromName": my_name, "targetId": message_id, "text": body,
+            });
+            send_chat_op(&iroh, eid, payload);
+        }
+    }
+    Ok(())
+}
+
+/// Unsend a message we sent. Applies locally (tombstone), then tells the peer.
+#[tauri::command]
+pub async fn delete_chat_message(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    app: AppHandle,
+    friend_id: String,
+    message_id: String,
+) -> Result<(), String> {
+    if let Some(u) = chat::apply_delete(&state.config_dir, &friend_id, &message_id, true) {
+        let _ = app.emit("chat://message", &u);
+    }
+    if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
+        if let Some(eid) = friend.endpoint_id {
+            let my_name = state.settings.lock().unwrap().display_name.clone();
+            let payload = serde_json::json!({
+                "kind": "chat", "v": 2, "msgKind": "delete", "friendId": friend_id,
+                "fromName": my_name, "targetId": message_id,
+            });
+            send_chat_op(&iroh, eid, payload);
+        }
+    }
+    Ok(())
+}
+
+/// Tell a friend whether we're currently typing to them (ephemeral; not stored).
+#[tauri::command]
+pub async fn send_typing(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    friend_id: String,
+    on: bool,
+) -> Result<(), String> {
+    if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
+        if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id) {
+            let my_name = state.settings.lock().unwrap().display_name.clone();
+            let payload = serde_json::json!({
+                "kind": "chat-signal", "signal": "typing", "friendId": friend_id,
+                "fromName": my_name, "on": on,
+            });
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::iroh_net::send_chat(&ep, &eid, payload).await;
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Send a read receipt: tell a friend we've seen everything up to `up_to` (ms).
+/// Honors the privacy toggle — if read receipts are off, sends nothing.
+#[tauri::command]
+pub async fn send_read_receipt(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    friend_id: String,
+    up_to: u64,
+) -> Result<(), String> {
+    if !state.settings.lock().unwrap().send_read_receipts {
+        return Ok(());
+    }
+    if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
+        if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id) {
+            let my_name = state.settings.lock().unwrap().display_name.clone();
+            let payload = serde_json::json!({
+                "kind": "chat-signal", "signal": "read", "friendId": friend_id,
+                "fromName": my_name, "upTo": up_to,
+            });
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::iroh_net::send_chat(&ep, &eid, payload).await;
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Download a GIF's bytes (from Giphy's CDN) into a temp file so it can be sent
+/// over the normal P2P file path. Returns the local path. Fetched in Rust to
+/// avoid webview CORS/CSP and keep the key/usage server-agnostic.
+#[tauri::command]
+pub async fn download_gif(app: AppHandle, url: String, id: String) -> Result<String, String> {
+    // Only ever fetch from a real giphy.com host over https (parse the host, don't
+    // substring-match — `https://media.evil.com/?giphy.com` must NOT pass).
+    let host_ok = url
+        .strip_prefix("https://")
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or(""))
+        .map(|hostport| hostport.split(':').next().unwrap_or(""))
+        .map(|host| host == "giphy.com" || host.ends_with(".giphy.com"))
+        .unwrap_or(false);
+    if !host_ok {
+        return Err("Unexpected GIF URL.".into());
+    }
+    let bytes = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("fetch gif: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("read gif: {e}"))?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("GIF too large.".into());
+    }
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("gifs");
+    let _ = std::fs::create_dir_all(&dir);
+    let safe: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).take(40).collect();
+    let path = dir.join(format!("giphy-{}.gif", if safe.is_empty() { "x" } else { &safe }));
+    std::fs::write(&path, &bytes).map_err(|e| format!("save gif: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Send a GIF as a chat message: it rides the normal friend file transfer (the
+/// caller already kicked that off), and this drops a GIF card in the thread on
+/// both sides with the Giphy metadata for rich rendering.
+#[tauri::command]
+pub async fn send_chat_gif(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    app: AppHandle,
+    friend_id: String,
+    name: String,
+    bytes: u64,
+    path: String,
+    gif: chat::GifMeta,
+) -> Result<ChatMessage, String> {
+    let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
+    let msg = ChatMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        peer_id: friend_id.clone(),
+        from_me: true,
+        kind: "file".into(),
+        text: String::new(),
+        files: vec![name],
+        bytes,
+        path: Some(path),
+        status: Some("sending".into()),
+        ts: chat::now_ms(),
+        seq: chat::next_seq(&state.config_dir, &friend_id),
+        reply_to: None,
+        reply_preview: None,
+        reactions: vec![],
+        edited: false,
+        deleted: false,
+        gif: Some(gif),
+    };
+    chat::append(&state.config_dir, &msg);
+    let _ = app.emit("chat://message", &msg);
+    deliver_chat(&state, &iroh, &app, &friend, &msg);
+    Ok(msg)
+}
+
+/// The frontend tells us which conversation is open in the main window (or None).
+/// Used to suppress a notification for a chat the user is actively looking at.
+#[tauri::command]
+pub fn set_active_chat(state: State<'_, Arc<AppState>>, peer_id: Option<String>) {
+    if let Ok(mut a) = state.active_chat.lock() {
+        *a = peer_id;
+    }
+}
+
+/// Reflect the total unread chat count on the Dock (macOS) / taskbar (Windows).
+#[tauri::command]
+pub fn set_unread_badge(app: AppHandle, count: u32) {
+    // macOS Dock badge (the window owns the badge API in this Tauri version).
+    // Windows has no numeric badge; we leave its taskbar alone.
+    #[cfg(target_os = "macos")]
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_badge_count(if count == 0 { None } else { Some(count as i64) });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&app, count);
+    }
 }
 
 // ---------------------------------------------------------------------------

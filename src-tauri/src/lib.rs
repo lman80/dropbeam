@@ -123,6 +123,15 @@ pub struct AppState {
     pub offers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>>,
     /// Set when the user really wants to quit (vs. close-to-tray).
     pub force_quit: AtomicBool,
+    /// Whether the MAIN window currently has OS focus. Updated from the window
+    /// focus event. Used (with `active_chat`) to suppress a chat notification only
+    /// when the user is actively looking at the conversation it belongs to.
+    pub main_focused: AtomicBool,
+    /// The friend id of the chat the user is currently viewing in the main window
+    /// (None when no chat is open / they've navigated away). The frontend pushes
+    /// this via `set_active_chat`. iMessage rule: don't banner a message for the
+    /// chat that's already on screen and focused.
+    pub active_chat: Mutex<Option<String>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -303,7 +312,37 @@ pub fn run() {
                 transfers: Mutex::new(HashMap::new()),
                 offers: Mutex::new(HashMap::new()),
                 force_quit: AtomicBool::new(false),
+                // Assume focused at launch (the window shows on first run); the
+                // focus event corrects it immediately on the first blur/focus.
+                main_focused: AtomicBool::new(true),
+                active_chat: Mutex::new(None),
             }));
+
+            // Ask for notification permission once on first run so chat banners
+            // actually fire (macOS prompts + remembers; on Windows this is a no-op
+            // beyond reading state). Without this, the very first OS notification
+            // can be silently dropped until the user manually allows it.
+            {
+                use tauri_plugin_notification::NotificationExt;
+                let nh = app.notification();
+                if !matches!(
+                    nh.permission_state(),
+                    Ok(tauri_plugin_notification::PermissionState::Granted)
+                ) {
+                    let _ = nh.request_permission();
+                }
+            }
+            // Windows: tie the running process to the installer's Start-menu
+            // shortcut AppUserModelID so WinRT toasts are attributed to DropBeam
+            // (and actually show) instead of being dropped. Must match the bundle
+            // identifier used by the NSIS shortcut.
+            #[cfg(windows)]
+            unsafe {
+                use windows::core::PCWSTR;
+                use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+                let id: Vec<u16> = "com.dropbeam.app".encode_utf16().chain([0]).collect();
+                let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR(id.as_ptr()));
+            }
 
             // iroh is the ONLY transport now, so always bring up the direct P2P
             // endpoint in the background (it fills once bound). A user who'd
@@ -433,6 +472,13 @@ pub fn run() {
                     }
                 }
             }
+            // Track main-window focus so chat notifications can stay quiet only
+            // while you're actually looking at the app (see maybe_notify_chat).
+            tauri::WindowEvent::Focused(focused) if window.label() == "main" => {
+                if let Some(st) = window.app_handle().try_state::<Arc<AppState>>() {
+                    st.main_focused.store(*focused, Ordering::Relaxed);
+                }
+            }
             // The menu-bar popover dismisses itself when it loses focus.
             tauri::WindowEvent::Focused(false) if window.label() == "popover" => {
                 *LAST_POPOVER_HIDE.lock().unwrap() = Some(Instant::now());
@@ -498,6 +544,15 @@ pub fn run() {
             commands::list_chats,
             commands::send_chat_message,
             commands::send_chat_file_note,
+            commands::react_to_message,
+            commands::edit_chat_message,
+            commands::delete_chat_message,
+            commands::send_typing,
+            commands::send_read_receipt,
+            commands::download_gif,
+            commands::send_chat_gif,
+            commands::set_active_chat,
+            commands::set_unread_badge,
             commands::my_invite_code,
             commands::add_friend_by_code,
             commands::macos_install_hint,

@@ -79,6 +79,10 @@ export interface Settings {
   avatar: string
   /** Pop a native notification when a chat arrives & the app isn't focused. */
   notifyOnMessage: boolean
+  /** Send read receipts so friends see when you've read their message. */
+  sendReadReceipts: boolean
+  /** Free Giphy API key (developers.giphy.com) powering GIF search. '' = off. */
+  giphyApiKey: string
   /** Detailed diagnostics logging (app + iroh internals). Applied on restart. */
   verboseLogging: boolean
   /** Show the floating "syncing folder…" popup during shared-folder transfers. */
@@ -144,7 +148,23 @@ export interface Friend {
   nameCustom?: boolean
 }
 
-/** One message in a chat with a friend (experimental). */
+/** A GIF attachment on a chat message (Giphy). */
+export interface GifMeta {
+  provider: string
+  id: string
+  url: string
+  page: string
+  w: number
+  h: number
+}
+
+/** One emoji reaction on a message (from me or the friend). */
+export interface Reaction {
+  emoji: string
+  fromMe: boolean
+}
+
+/** One message in a chat with a friend. */
 export interface ChatMessage {
   id: string
   /** The friend id this conversation belongs to. */
@@ -160,10 +180,22 @@ export interface ChatMessage {
   /** For file messages: the local path to the (first) file on THIS device —
    * sender's source or receiver's saved copy. Enables preview + open. */
   path: string | null
-  /** Delivery state for messages WE sent: 'sending' | 'sent' | 'failed'. Null for
-   * received messages. */
-  status: 'sending' | 'sent' | 'failed' | null
+  /** Delivery state for messages WE sent. 'sent' is tolerated from older builds. */
+  status: 'sending' | 'delivered' | 'read' | 'failed' | 'sent' | null
   ts: number
+  /** Logical ordering clock — sort by this (then ts, then id), not wall-clock. */
+  seq: number
+  /** Reply/quote: id of the message this replies to + a cached one-line preview. */
+  replyTo?: string | null
+  replyPreview?: string | null
+  /** Emoji reactions (a set keyed by from-me + emoji). */
+  reactions: Reaction[]
+  /** The author edited the text. */
+  edited: boolean
+  /** The author unsent it (render a tombstone). */
+  deleted: boolean
+  /** A GIF attachment — render a GIF bubble when present. */
+  gif?: GifMeta | null
 }
 
 /** A preview of one conversation, for the chat list. */
@@ -318,10 +350,48 @@ const realApi = {
   getChatMessages: (friendId: string) =>
     invoke<ChatMessage[]>('get_chat_messages', { friendId }),
   listChats: () => invoke<ChatOverview[]>('list_chats'),
-  sendChatMessage: (friendId: string, text: string) =>
-    invoke<ChatMessage>('send_chat_message', { friendId, text }),
+  sendChatMessage: (
+    friendId: string,
+    text: string,
+    replyTo?: string | null,
+    replyPreview?: string | null,
+  ) =>
+    invoke<ChatMessage>('send_chat_message', {
+      friendId,
+      text,
+      replyTo: replyTo ?? null,
+      replyPreview: replyPreview ?? null,
+    }),
   sendChatFileNote: (friendId: string, names: string[], bytes: number, paths: string[]) =>
     invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes, paths }),
+  /** Add/remove an emoji reaction on a message (ours or theirs). */
+  reactToMessage: (friendId: string, messageId: string, emoji: string, add: boolean) =>
+    invoke<void>('react_to_message', { friendId, messageId, emoji, add }),
+  /** Edit the text of a message we sent. */
+  editChatMessage: (friendId: string, messageId: string, text: string) =>
+    invoke<void>('edit_chat_message', { friendId, messageId, text }),
+  /** Unsend a message we sent (tombstone on both sides). */
+  deleteChatMessage: (friendId: string, messageId: string) =>
+    invoke<void>('delete_chat_message', { friendId, messageId }),
+  /** Tell a friend whether we're typing (ephemeral, online-only). */
+  sendTyping: (friendId: string, on: boolean) => invoke<void>('send_typing', { friendId, on }),
+  /** Send a read receipt: seen everything up to `upTo` (ms). Honors the toggle. */
+  sendReadReceipt: (friendId: string, upTo: number) =>
+    invoke<void>('send_read_receipt', { friendId, upTo }),
+  /** Download a GIF's bytes (Giphy CDN) to a temp file; returns the local path. */
+  downloadGif: (url: string, id: string) => invoke<string>('download_gif', { url, id }),
+  /** Drop a GIF card in the thread (bytes already sent via the file transfer). */
+  sendChatGif: (
+    friendId: string,
+    name: string,
+    bytes: number,
+    path: string,
+    gif: GifMeta,
+  ) => invoke<ChatMessage>('send_chat_gif', { friendId, name, bytes, path, gif }),
+  /** Tell Rust which chat is open (so it won't notify for the one on screen). */
+  setActiveChat: (peerId: string | null) => invoke<void>('set_active_chat', { peerId }),
+  /** Reflect total unread on the Dock/taskbar badge. */
+  setUnreadBadge: (count: number) => invoke<void>('set_unread_badge', { count }),
 }
 
 export const api: typeof realApi = HAS_TAURI ? realApi : (mockApi as typeof realApi)
@@ -379,6 +449,16 @@ export function onFolderInvite(cb: (i: FolderInvite) => void): Promise<UnlistenF
 export function onChatMessage(cb: (m: ChatMessage) => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('chat://message', (p) => cb(p as ChatMessage))
   return listen<ChatMessage>('chat://message', (e) => cb(e.payload))
+}
+
+/** A friend started/stopped typing to us (ephemeral). */
+export interface ChatTyping {
+  peerId: string
+  on: boolean
+}
+export function onChatTyping(cb: (t: ChatTyping) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('chat://typing', (p) => cb(p as ChatTyping))
+  return listen<ChatTyping>('chat://typing', (e) => cb(e.payload))
 }
 
 export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {

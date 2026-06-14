@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import {
   api,
   onChatMessage,
+  onChatTyping,
   onFolderComplete,
   onFolderStatus,
   onFolderSynced,
@@ -15,6 +16,7 @@ import {
   type FolderComplete,
   type FolderStatus,
   type Friend,
+  type GifMeta,
   type HistoryEntry,
   type Pair,
   type PairUpdate,
@@ -42,6 +44,8 @@ const DEFAULT_SETTINGS: Settings = {
   requireDirect: false,
   avatar: '',
   notifyOnMessage: true,
+  sendReadReceipts: true,
+  giphyApiKey: '',
   verboseLogging: false,
   showSyncPopup: true,
   shareDiagnostics: true,
@@ -151,14 +155,37 @@ interface AppStore {
   chatOverview: ChatOverview[]
   chatUnread: Record<string, number>
   activeChatId: string | null
+  /** Friend ids currently typing to us (ephemeral). */
+  chatTyping: Record<string, boolean>
+  /** Whether the main window has OS focus (drives notification suppression). */
+  windowFocused: boolean
   loadChats: () => Promise<void>
   openChat: (friendId: string) => Promise<void>
   closeChat: () => void
-  sendChat: (friendId: string, text: string) => Promise<void>
+  sendChat: (friendId: string, text: string, replyTo?: ChatMessage | null) => Promise<void>
+  sendGif: (friendId: string, gif: GifMeta) => Promise<void>
+  reactToMessage: (friendId: string, messageId: string, emoji: string) => Promise<void>
+  editChatMessage: (friendId: string, messageId: string, text: string) => Promise<void>
+  deleteChatMessage: (friendId: string, messageId: string) => Promise<void>
   shareFilesInChat: (friendId: string, paths: string[]) => Promise<void>
   addChatMessage: (m: ChatMessage) => void
+  markChatRead: (friendId: string) => void
   toast: (kind: Toast['kind'], message: string) => void
   dismissToast: (id: string) => void
+}
+
+/** A short one-line preview of a message, for reply quotes + list rows. */
+function previewOf(m: ChatMessage): string {
+  if (m.deleted) return 'Message deleted'
+  if (m.gif) return '🎞️ GIF'
+  if (m.kind === 'file')
+    return m.files.length === 1 ? `📎 ${m.files[0]}` : `📎 ${m.files.length} files`
+  return m.text
+}
+
+/** Causal order: logical seq first, then wall-clock, then id (stable tiebreak). */
+function byOrder(a: ChatMessage, b: ChatMessage): number {
+  return (a.seq ?? 0) - (b.seq ?? 0) || a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
 }
 
 // Guard against Tauri's occasional double-fire of a single OS file drop.
@@ -194,6 +221,8 @@ export const useStore = create<AppStore>((set, get) => ({
   chatOverview: [],
   chatUnread: {},
   activeChatId: null,
+  chatTyping: {},
+  windowFocused: true,
   toasts: [],
   defaultDownloadDir: '',
   appVer: '',
@@ -306,16 +335,29 @@ export const useStore = create<AppStore>((set, get) => ({
           if (h) set({ installHint: h })
         })
         .catch(() => {})
+      // Track main-window focus so the in-app sound (and read receipts) use the
+      // same "are you looking at it" rule the Rust notifier does.
+      const onFocus = () => set({ windowFocused: true })
+      const onBlur = () => set({ windowFocused: false })
+      window.addEventListener('focus', onFocus)
+      window.addEventListener('blur', onBlur)
+      set({ windowFocused: document.hasFocus() })
       onChatMessage((m) => {
         get().addChatMessage(m)
-        if (
-          !m.fromMe &&
-          get().activeChatId !== m.peerId &&
-          (get().settings?.playSounds ?? true)
-        ) {
+        // iMessage rule: a soft chime only when the message isn't landing in the
+        // conversation you're actively looking at. The OS banner (fired in Rust)
+        // uses the same gate, so the two never double up.
+        const lookingHere =
+          get().windowFocused && get().activeChatId === m.peerId
+        if (!m.fromMe && !lookingHere && (get().settings?.playSounds ?? true)) {
           playIncoming()
         }
+        // If it landed in the open + focused chat, it's been seen → read receipt.
+        if (!m.fromMe && lookingHere) get().markChatRead(m.peerId)
       })
+      onChatTyping((t) =>
+        set((s) => ({ chatTyping: { ...s.chatTyping, [t.peerId]: t.on } })),
+      )
     }
     // The control channel can learn the peer's name after the fact — reload pairs
     // so the folder shows who's in it (and clears the stale "waiting" state).
@@ -615,26 +657,88 @@ export const useStore = create<AppStore>((set, get) => ({
 
   openChat: async (friendId) => {
     set({ activeChatId: friendId, view: 'chat' })
+    void api.setActiveChat(friendId)
     const msgs = await api.getChatMessages(friendId).catch(() => [])
-    set((s) => ({
-      chats: { ...s.chats, [friendId]: msgs },
-      chatUnread: { ...s.chatUnread, [friendId]: 0 },
-    }))
+    set((s) => {
+      const chatUnread = { ...s.chatUnread, [friendId]: 0 }
+      const total = Object.values(chatUnread).reduce((a, b) => a + b, 0)
+      void api.setUnreadBadge(total)
+      return { chats: { ...s.chats, [friendId]: msgs }, chatUnread }
+    })
+    get().markChatRead(friendId)
   },
 
-  closeChat: () => set({ activeChatId: null }),
+  closeChat: () => {
+    set({ activeChatId: null })
+    void api.setActiveChat(null)
+  },
 
-  sendChat: async (friendId, text) => {
+  // Tell the friend we've read up to the newest message in this thread (honors
+  // the read-receipts privacy toggle on the Rust side).
+  markChatRead: (friendId) => {
+    const thread = get().chats[friendId] ?? []
+    const newest = thread.length ? thread[thread.length - 1].ts : 0
+    if (newest > 0) void api.sendReadReceipt(friendId, newest)
+  },
+
+  sendChat: async (friendId, text, replyTo) => {
     const body = text.trim()
     if (!body) return
     // The Rust side persists the message and IMMEDIATELY emits it back over
-    // `chat://message` (status 'sending'), then a background outbox auto-retries
-    // and emits 'sent'/'failed' — so the bubble paints + recovers on its own. We
-    // just trigger the send and let those echoes drive the thread (adding it
-    // optimistically here would double-render every message against that echo).
+    // `chat://message` (status 'sending'), then delivery flips it to
+    // 'delivered'/'read' — so the bubble paints + updates on its own.
     try {
-      const m = await api.sendChatMessage(friendId, body)
+      const m = await api.sendChatMessage(
+        friendId,
+        body,
+        replyTo?.id ?? null,
+        replyTo ? previewOf(replyTo) : null,
+      )
       get().addChatMessage(m)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  sendGif: async (friendId, gif) => {
+    try {
+      // Pull the bytes down (Rust, no CORS), beam them over the friend transfer,
+      // then drop a GIF card carrying the Giphy metadata on both sides.
+      const path = await api.downloadGif(gif.url, gif.id)
+      const name = `giphy-${gif.id}.gif`
+      const t = await api.sendToFriend(friendId, [path])
+      get().upsertTransfer(t)
+      const m = await api.sendChatGif(friendId, name, t.bytesTotal || 0, path, gif)
+      get().addChatMessage(m)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  reactToMessage: async (friendId, messageId, emoji) => {
+    const thread = get().chats[friendId] ?? []
+    const m = thread.find((x) => x.id === messageId)
+    const has = !!m?.reactions.some((r) => r.fromMe && r.emoji === emoji)
+    try {
+      await api.reactToMessage(friendId, messageId, emoji, !has)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  editChatMessage: async (friendId, messageId, text) => {
+    const body = text.trim()
+    if (!body) return
+    try {
+      await api.editChatMessage(friendId, messageId, body)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  deleteChatMessage: async (friendId, messageId) => {
+    try {
+      await api.deleteChatMessage(friendId, messageId)
     } catch (e) {
       get().toast('error', String(e))
     }
@@ -663,23 +767,17 @@ export const useStore = create<AppStore>((set, get) => ({
     set((s) => {
       const thread = s.chats[m.peerId] ?? []
       const idx = thread.findIndex((x) => x.id === m.id)
-      // A repeat id is an UPDATE (e.g. a delivery-status change), not a new
-      // message — replace it in place and don't re-bump unread/count.
+      // A repeat id is an UPDATE (a status change, edit, delete, reaction), not a
+      // new message — replace it in place and don't re-bump unread/count.
       const isNew = idx < 0
       const nextThread = isNew
-        ? [...thread, m].sort((a, b) => a.ts - b.ts)
+        ? [...thread, m].sort(byOrder)
         : thread.map((x) => (x.id === m.id ? m : x))
       const prev = s.chatOverview.find((o) => o.peerId === m.peerId)
       const last = nextThread[nextThread.length - 1]
-      const lastText =
-        last.kind === 'file'
-          ? last.files.length === 1
-            ? `📎 ${last.files[0]}`
-            : `📎 ${last.files.length} files`
-          : last.text
       const row: ChatOverview = {
         peerId: m.peerId,
-        lastText,
+        lastText: previewOf(last),
         lastTs: last.ts,
         lastFromMe: last.fromMe,
         count: isNew ? (prev ? prev.count + 1 : nextThread.length) : (prev?.count ?? nextThread.length),
@@ -687,10 +785,18 @@ export const useStore = create<AppStore>((set, get) => ({
       const chatOverview = [row, ...s.chatOverview.filter((o) => o.peerId !== m.peerId)].sort(
         (a, b) => b.lastTs - a.lastTs,
       )
+      // Count it unread only if it's a brand-new incoming message and you're not
+      // actively looking at that chat (focused). Then reflect the new total on the
+      // Dock/taskbar badge.
+      const lookingHere = s.windowFocused && s.activeChatId === m.peerId
       const chatUnread =
-        isNew && !m.fromMe && s.activeChatId !== m.peerId
+        isNew && !m.fromMe && !lookingHere
           ? { ...s.chatUnread, [m.peerId]: (s.chatUnread[m.peerId] ?? 0) + 1 }
           : s.chatUnread
+      if (chatUnread !== s.chatUnread) {
+        const total = Object.values(chatUnread).reduce((a, b) => a + b, 0)
+        void api.setUnreadBadge(total)
+      }
       return { chats: { ...s.chats, [m.peerId]: nextThread }, chatOverview, chatUnread }
     })
   },
