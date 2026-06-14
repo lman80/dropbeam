@@ -44,6 +44,8 @@ const DEFAULT_SETTINGS: Settings = {
   notifyOnMessage: true,
   verboseLogging: false,
   showSyncPopup: true,
+  shareDiagnostics: true,
+  diagnosticsUrl: '',
 }
 
 /** Resolve `p`, but never hang: fall back on error OR after `ms`, logging why. */
