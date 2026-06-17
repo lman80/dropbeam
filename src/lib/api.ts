@@ -235,6 +235,8 @@ export interface FolderStatus {
    *  and how many are done, so the HUD shows one "12 of 50" bar. */
   sessionTotalFiles?: number
   sessionDoneFiles?: number
+  /** Sync is paused for this folder (a shared switch — either member set it). */
+  paused?: boolean
 }
 
 export interface PairUpdate {
@@ -305,6 +307,9 @@ const realApi = {
   myEndpointId: () => invoke<string | null>('my_endpoint_id'),
   verifyFolders: () => invoke<void>('verify_folders'),
   stopFolderTransfer: (pairId: string) => invoke<void>('stop_folder_transfer', { pairId }),
+  /** Pause or resume sync for a shared folder (a shared switch — flips both sides). */
+  setFolderPaused: (pairId: string, paused: boolean) =>
+    invoke<void>('set_folder_paused', { pairId, paused }),
   /** Delete abandoned transfer leftovers (paused/failed partials). Returns bytes freed. */
   clearTransferCache: () => invoke<number>('clear_transfer_cache'),
   /** Tell the backend a transfer card is on screen (true) or gone (false) — drives the transient Dock icon. */

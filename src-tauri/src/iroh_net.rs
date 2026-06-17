@@ -1724,6 +1724,9 @@ async fn serve_stream(
                 })
                 .unwrap_or_default();
             let unshared = req.get("unshared").and_then(|u| u.as_bool()).unwrap_or(false);
+            // Shared pause switch (absent on older peers → false/0).
+            let peer_paused = req.get("paused").and_then(|p| p.as_bool()).unwrap_or(false);
+            let peer_pause_epoch = req.get("pauseEpoch").and_then(|e| e.as_u64()).unwrap_or(0);
             // Role authority: who claims to own role assignments + which version.
             let owner = req.get("owner").and_then(|v| v.as_str()).map(String::from);
             let role_epoch = req.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1738,8 +1741,8 @@ async fn serve_stream(
                         // reconcile rides its own message (folder-reconcile) now.
                         sm.apply_remote_control(
                             &pair_id, &name, &deletes, &moves, &group_id, &members,
-                            owner.as_deref(), role_epoch, None, unshared,
-                            Some(&sender_eid),
+                            owner.as_deref(), role_epoch, peer_paused, peer_pause_epoch,
+                            None, unshared, Some(&sender_eid),
                         );
                     }
                 }
@@ -1785,7 +1788,8 @@ async fn serve_stream(
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
                         sm.apply_remote_control(
-                            &pair_id, "", &[], &[], "", &[], None, 0, Some(&reconcile), false, None,
+                            &pair_id, "", &[], &[], "", &[], None, 0, false, 0,
+                            Some(&reconcile), false, None,
                         );
                     }
                 }
@@ -2890,6 +2894,10 @@ pub async fn send_folder_ctrl(
     members: &[(String, String, bool)],
     owner: Option<&str>,
     role_epoch: u64,
+    // Shared pause switch: whether THIS sender has the folder paused, + the epoch
+    // (ms) of that toggle so the newest wins. Older peers ignore the unknown keys.
+    paused: bool,
+    pause_epoch: u64,
     unshared: bool,
 ) -> Result<()> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
@@ -2918,6 +2926,7 @@ pub async fn send_folder_ctrl(
         // Role authority: who owns role assignments + which version. Older peers
         // ignore unknown keys; absent = no role info (legacy folder).
         "owner": owner, "epoch": role_epoch,
+        "paused": paused, "pauseEpoch": pause_epoch,
         "unshared": unshared,
     });
     // Bounded dial so a perpetually-offline peer fails fast and the caller can

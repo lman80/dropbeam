@@ -312,6 +312,15 @@ pub struct Pair {
     pub owner_eid: Option<String>,
     #[serde(default)]
     pub role_epoch: u64,
+    /// Sync paused for this folder. A SHARED switch: either member can pause/resume,
+    /// the state rides the control beacon, and the NEWEST toggle (by `pause_epoch`,
+    /// epoch-ms) wins so both sides converge. While paused, nothing uploads, no
+    /// deletes/renames propagate, and incoming changes aren't applied — each person
+    /// edits their own copy freely; Resume runs the normal reconcile to merge both.
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub pause_epoch: u64,
 }
 
 /// One restorable entry in a folder's history (a deleted or overwritten file).
@@ -417,5 +426,9 @@ pub struct FolderStatus {
     pub session_total_files: u32,
     #[serde(default)]
     pub session_done_files: u32,
+    /// Sync is paused for this folder (a shared switch — either member set it). The
+    /// UI shows a Paused badge + a Resume button instead of live sync.
+    #[serde(default)]
+    pub paused: bool,
 }
 

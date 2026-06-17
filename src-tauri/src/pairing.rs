@@ -121,6 +121,8 @@ pub fn create(
         peer_is_viewer: false,
         owner_eid: my_endpoint_id.clone(),
         role_epoch: 0,
+        paused: false,
+        pause_epoch: 0,
     };
 
     let invite = Invite {
@@ -192,6 +194,8 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
         peer_is_viewer: false,
         owner_eid: invite.own.clone(),
         role_epoch: invite.eph,
+        paused: false,
+        pause_epoch: 0,
     };
     pairs.push(pair.clone());
     save(config_dir, &pairs)?;
@@ -422,6 +426,10 @@ pub fn ensure_member(
         peer_is_viewer: false,
         owner_eid: template.owner_eid.clone(),
         role_epoch: template.role_epoch,
+        // A new member link inherits the folder's pause state; if it's stale, the
+        // next beacon's newer epoch corrects it.
+        paused: template.paused,
+        pause_epoch: template.pause_epoch,
     };
     pairs.push(new.clone());
     let _ = save(config_dir, &pairs);
@@ -517,6 +525,8 @@ pub fn group_invite(
         peer_is_viewer: false,
         owner_eid: source.owner_eid.clone(),
         role_epoch: source.role_epoch,
+        paused: source.paused,
+        pause_epoch: source.pause_epoch,
     };
     let invite = Invite {
         v: 1,
@@ -633,6 +643,36 @@ pub fn runs_listener(p: &Pair) -> bool {
 /// the owner originates new epochs; everyone else applies the newest one they see
 /// from the owner). The change rides the next roster beacon. Returns true if it
 /// changed.
+/// Set the shared pause state for the folder that `pair_id` belongs to, at `epoch`.
+/// Pause is FOLDER-wide: in a group folder, every pairwise link of that folder
+/// (same `group_id`) flips together; a classic 1:1 folder is just the one link.
+/// Returns the ids of every link changed, so the caller can wake + re-beacon each.
+pub fn set_pause(config_dir: &Path, pair_id: &str, paused: bool, epoch: u64) -> Vec<String> {
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let gid = pairs
+        .iter()
+        .find(|p| p.id == pair_id)
+        .and_then(|p| p.group_id.clone());
+    let mut affected = Vec::new();
+    for p in pairs.iter_mut() {
+        let in_scope = match &gid {
+            Some(g) => p.group_id.as_deref() == Some(g.as_str()),
+            None => p.id == pair_id,
+        };
+        // Only move FORWARD in epoch so a stale beacon can't un-pause us.
+        if in_scope && epoch >= p.pause_epoch {
+            p.paused = paused;
+            p.pause_epoch = epoch;
+            affected.push(p.id.clone());
+        }
+    }
+    if !affected.is_empty() {
+        let _ = save(config_dir, &pairs);
+    }
+    affected
+}
+
 pub fn set_peer_viewer(
     config_dir: &Path,
     pair_id: &str,
@@ -887,6 +927,8 @@ mod tests {
             peer_is_viewer: false,
             owner_eid: None,
             role_epoch: 0,
+            paused: false,
+            pause_epoch: 0,
         }
     }
 

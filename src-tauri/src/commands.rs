@@ -625,6 +625,14 @@ pub fn stop_folder_transfer(sync: State<'_, Arc<SyncManager>>, pair_id: String) 
     sync.stop_folder_transfer(&pair_id);
 }
 
+/// Pause or resume sync for a shared folder. A SHARED switch: this flips the whole
+/// folder (every group member) and beacons the new state to the peer, where the
+/// newest toggle wins. While paused nothing syncs; Resume runs the normal reconcile.
+#[tauri::command]
+pub fn set_folder_paused(sync: State<'_, Arc<SyncManager>>, pair_id: String, paused: bool) {
+    sync.set_paused(&pair_id, paused, chat::now_ms());
+}
+
 #[tauri::command]
 pub fn pair_invite(
     state: State<'_, Arc<AppState>>,

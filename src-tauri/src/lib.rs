@@ -516,6 +516,7 @@ pub fn run() {
             commands::my_endpoint_id,
             commands::verify_folders,
             commands::stop_folder_transfer,
+            commands::set_folder_paused,
             commands::clear_transfer_cache,
             commands::set_card_active,
             commands::quit_app,

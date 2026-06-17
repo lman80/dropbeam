@@ -11,7 +11,9 @@ import {
   FolderOpen,
   FolderSync,
   History,
+  Pause,
   Pencil,
+  Play,
   Plus,
   QrCode,
   RotateCcw,
@@ -123,6 +125,9 @@ function statusInfo(
   lastSynced?: number,
 ): { color: string; label: string } {
   const peer = pair.peerName || 'your friend'
+  if (status?.paused) {
+    return { color: 'var(--amber)', label: 'Sync paused — Resume to merge changes' }
+  }
   // Only truly "waiting" if the creator has never been reached by anyone yet.
   if (pair.role === 'a' && !pair.peerName && !status?.peerOnline) {
     return { color: 'var(--amber)', label: 'Waiting for someone to accept the invite' }
@@ -303,6 +308,11 @@ function FolderCard({
                 Auto-delete
               </span>
             )}
+            {status?.paused && (
+              <span className="chip" style={{ background: 'var(--amber-soft)', color: 'var(--amber)' }}>
+                Paused
+              </span>
+            )}
           </div>
           <div
             style={{
@@ -320,6 +330,16 @@ function FolderCard({
         <button className="icon-btn" title="Open folder" onClick={() => api.openPath(pair.folder)}>
           <FolderOpen size={16} />
         </button>
+        {pair.mirror && (
+          <button
+            className="icon-btn"
+            title={status?.paused ? 'Resume syncing this folder' : 'Pause syncing this folder'}
+            onClick={() => void api.setFolderPaused(pair.id, !status?.paused)}
+            style={{ color: status?.paused ? 'var(--amber)' : undefined }}
+          >
+            {status?.paused ? <Play size={16} /> : <Pause size={16} />}
+          </button>
+        )}
         <button
           className="icon-btn"
           title="Folder settings"

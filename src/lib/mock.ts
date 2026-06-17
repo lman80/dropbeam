@@ -242,6 +242,7 @@ export const mockApi = {
   takeLaunchFile: async (): Promise<string | null> => null,
   verifyFolders: async (): Promise<void> => {},
   stopFolderTransfer: async (): Promise<void> => {},
+  setFolderPaused: async (): Promise<void> => {},
   sendFiles: async (paths: string[]): Promise<TransferUpdate> => {
     const id = `m${++counter}`
     const names = paths.map((p) => p.split('/').pop() || p)

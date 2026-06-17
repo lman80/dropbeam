@@ -69,6 +69,9 @@ struct PairHandle {
     /// inode → (rel, size) for files currently on disk — how the collector
     /// recognizes a moved file (same inode, new path) as the SAME bytes.
     ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+    /// Sync paused for this folder (live flag the workers read). Mirrors the
+    /// persisted `Pair.paused`; updated by the user toggle + the peer's beacon.
+    paused: Arc<AtomicBool>,
     /// Set by the "Stop" button to immediately abort the in-flight folder transfer
     /// and move it aside, so a stuck send never traps the queue. Cleared by the
     /// sender once it's acted on.
@@ -334,6 +337,7 @@ impl SyncManager {
                     peer_files: s.peer_files,
                     session_total_files: s.session_total_files,
                     session_done_files: s.session_done_files,
+                    paused: h.paused.load(Ordering::Relaxed),
                 }
             })
             .collect()
@@ -394,6 +398,7 @@ impl SyncManager {
                 .map(|(rel, e)| (e.inode, (rel, e.size)))
                 .collect(),
         ));
+        let paused = Arc::new(AtomicBool::new(pair.paused));
         let skip_current = Arc::new(AtomicBool::new(false));
 
         if pairing::runs_sender(&pair) {
@@ -458,6 +463,7 @@ impl SyncManager {
                 inbound.clone(),
                 status.clone(),
                 skip_current.clone(),
+                paused.clone(),
             );
 
             // Seed the queue with any files already sitting in the folder.
@@ -481,6 +487,7 @@ impl SyncManager {
             tombstones.clone(),
             moves.clone(),
             ino_index.clone(),
+            paused.clone(),
         );
         // iroh-only: the peer's control payload (presence + name + mirror deletes)
         // arrives via the iroh accept loop's "folder-ctrl" handler.
@@ -500,6 +507,7 @@ impl SyncManager {
             tombstones,
             moves,
             ino_index,
+            paused,
             skip_current,
             _watcher: watcher,
         };
@@ -780,6 +788,7 @@ impl SyncManager {
         inbound: Arc<Mutex<HashSet<String>>>,
         status: Arc<Mutex<StatusSnapshot>>,
         skip_current: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
@@ -796,6 +805,19 @@ impl SyncManager {
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
+                }
+                // PAUSE GATE: while this folder is paused, park the sender entirely —
+                // no uploads. Local edits keep queuing; Resume (notifies `wake`) flushes
+                // them and the normal reconcile merges both sides.
+                if paused.load(Ordering::Relaxed) {
+                    set_status(&status, FolderState::Idle, None, 0.0, None);
+                    manager.emit_status(&pair_id);
+                    tokio::select! {
+                        _ = wake.notified() => {}
+                        _ = stop_notify.notified() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
+                    continue;
                 }
                 let next = queue.lock().unwrap().front().cloned();
                 let Some(file) = next else {
@@ -1141,6 +1163,7 @@ impl SyncManager {
         tombstones: Arc<Mutex<HashMap<String, u64>>>,
         moves: Arc<Mutex<HashMap<String, MoveRec>>>,
         ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+        paused: Arc<AtomicBool>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
@@ -1161,6 +1184,11 @@ impl SyncManager {
                         .unwrap_or_default();
                     (p, s)
                 };
+                // While paused, the beacon still flows (presence + the pause state,
+                // so the peer converges to paused) but carries NO sync payload — no
+                // deletes, no moves, no reconcile snapshot — so nothing propagates.
+                let is_paused = paused.load(Ordering::Relaxed);
+                let pause_epoch = pair.pause_epoch;
                 let my_name = if settings.display_name.trim().is_empty() {
                     "DropBeam user".to_string()
                 } else {
@@ -1178,7 +1206,7 @@ impl SyncManager {
 
                 // The self-heal reconcile snapshot: our full current file set +
                 // tombstones, so the peer can converge to identical (mirror only).
-                let reconcile_json = if pair.mirror {
+                let reconcile_json = if pair.mirror && !is_paused {
                     let lm = live_manifest(&pair.folder);
                     // Refresh the inode index from disk each round so move detection
                     // also covers files that were RECEIVED this session (those skip
@@ -1212,12 +1240,18 @@ impl SyncManager {
                 // Success means they're online AND received it (deletes included).
                 let iroh_ok = match (pair.endpoint_id.clone(), manager.iroh_endpoint()) {
                     (Some(eid), Some(ep)) => {
-                        let del_pairs: Vec<(String, u64)> =
-                            dels.iter().map(|d| (d.rel.clone(), d.ts)).collect();
+                        // Paused → no deletes, no moves (hold them until Resume).
+                        let del_pairs: Vec<(String, u64)> = if is_paused {
+                            Vec::new()
+                        } else {
+                            dels.iter().map(|d| (d.rel.clone(), d.ts)).collect()
+                        };
                         // Recent intra-folder renames ride the beacon ALONGSIDE the
                         // deletes (applied first on the peer) so a moved file relocates
                         // in place instead of re-downloading. Drop expired ones.
-                        let move_ops: Vec<(String, String, u64, u64)> = {
+                        let move_ops: Vec<(String, String, u64, u64)> = if is_paused {
+                            Vec::new()
+                        } else {
                             let cutoff = now_ms().saturating_sub(MOVE_TTL_MS);
                             moves
                                 .lock()
@@ -1231,7 +1265,7 @@ impl SyncManager {
                             build_group_roster(&manager.config_dir, &pair, &ep, &my_name);
                         let ok = crate::iroh_net::send_folder_ctrl(
                             &ep, &eid, &pair_id, &my_name, &del_pairs, &move_ops, &group_id, &roster,
-                            owner_eid.as_deref(), role_epoch, false,
+                            owner_eid.as_deref(), role_epoch, is_paused, pause_epoch, false,
                         )
                         .await
                         .is_ok();
@@ -1257,7 +1291,7 @@ impl SyncManager {
                     // the presence gate starts immediately (no 5s poll wait).
                     manager.wake_sender(&pair_id);
                     manager.emit_status(&pair_id);
-                    if !dels.is_empty() {
+                    if !dels.is_empty() && !is_paused {
                         let sent: HashSet<String> =
                             dels.iter().map(|d| format!("{}|{}", d.rel, d.ts)).collect();
                         pending_deletes
@@ -1329,7 +1363,7 @@ impl SyncManager {
         let pid = pair_id.to_string();
         tauri::async_runtime::spawn(async move {
             let _ = crate::iroh_net::send_folder_ctrl(
-                &ep, &eid, &pid, &my_name, &[], &[], "", &[], None, 0, true,
+                &ep, &eid, &pid, &my_name, &[], &[], "", &[], None, 0, false, 0, true,
             )
             .await;
         });
@@ -1393,6 +1427,10 @@ impl SyncManager {
         // Role authority: the beacon sender's claimed owner + role epoch.
         owner_eid: Option<&str>,
         role_epoch: u64,
+        // Shared pause switch from the beacon: whether the SENDER has it paused + the
+        // epoch of that toggle. Newest epoch wins so both sides converge.
+        peer_paused: bool,
+        peer_pause_epoch: u64,
         reconcile: Option<&Reconcile>,
         unshared: bool,
         // The iroh connection's REMOTE endpoint id — i.e. who actually sent this
@@ -1401,7 +1439,7 @@ impl SyncManager {
         // sender as already-meshed instead of adding them a SECOND time.
         sender_eid: Option<&str>,
     ) {
-        let (config, status, self_deleted, tombstones, queue, wake, inbound) = {
+        let (config, status, self_deleted, tombstones, queue, wake, inbound, paused_flag) = {
             let handles = self.handles.lock().unwrap();
             let Some(h) = handles.get(pair_id) else {
                 return; // not a folder we're actively managing
@@ -1414,8 +1452,18 @@ impl SyncManager {
                 h.queue.clone(),
                 h.wake.clone(),
                 h.inbound.clone(),
+                h.paused.clone(),
             )
         };
+        // Adopt the shared pause state if the peer's toggle is NEWER than ours (the
+        // newest-wins rule that makes pause a clean shared switch). Fans across the
+        // whole folder's group links + wakes the workers so it takes effect at once.
+        if peer_pause_epoch > config.lock().unwrap().pause_epoch {
+            self.set_paused(pair_id, peer_paused, peer_pause_epoch);
+        }
+        // While WE are paused, ignore the peer's sync payload entirely (deletes,
+        // moves, reconcile) — nothing changes our folder until Resume.
+        let locally_paused = paused_flag.load(Ordering::Relaxed);
         // The peer stopped sharing this folder. Mark it so the UI can say so and
         // stop pestering them — we KEEP our local copy of the files (the user can
         // remove the now-defunct link themselves). One signal is enough; ignore
@@ -1539,7 +1587,7 @@ impl SyncManager {
         // Content-verified, so a stale/mis-detected move never touches the wrong file;
         // if it doesn't apply, the delete + reconcile backstop still converge. A
         // viewer peer can't reorganize our folder.
-        if mirror && !peer_is_viewer && !moves.is_empty() {
+        if mirror && !peer_is_viewer && !locally_paused && !moves.is_empty() {
             let mut moved_any = false;
             for (from, to, size, mtime) in moves {
                 if apply_remote_move(
@@ -1560,7 +1608,7 @@ impl SyncManager {
 
         // A VIEWER peer must never delete our files: ignore deletes coming FROM a
         // read-only member (they shouldn't be changing the folder at all).
-        if mirror && !peer_is_viewer && !deletes.is_empty() {
+        if mirror && !peer_is_viewer && !locally_paused && !deletes.is_empty() {
             let mut applied: Vec<(String, u64)> = Vec::new();
             for (rel, ts) in deletes {
                 let mut removed_rels: Vec<String> = Vec::new();
@@ -1599,7 +1647,8 @@ impl SyncManager {
         // Self-heal reconcile: the peer told us its full file set + tombstones.
         // Apply any deletes we missed, and queue any files the peer is missing —
         // the bulletproof double-check that both folders converge to identical.
-        if mirror {
+        // (Skipped while paused — convergence resumes on Resume.)
+        if mirror && !locally_paused {
             if let Some(rec) = reconcile {
                 // Record the peer's file count for the "both have N files, in sync"
                 // visibility indicator.
@@ -1917,6 +1966,11 @@ impl SyncManager {
             let Some(h) = handles.get(pair_id) else {
                 return Vec::new();
             };
+            // Paused → don't land incoming files (the staging copy is just dropped).
+            // The sender won't send while paused; this covers a brief propagation lag.
+            if h.paused.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
             (h.config.clone(), h.inbound.clone(), h.self_deleted.clone())
         };
         let (folder, mirror, group) = {
@@ -1962,6 +2016,34 @@ impl SyncManager {
         if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
             h.wake.notify_one();
         }
+    }
+
+    /// Set the shared pause switch for `pair_id`'s folder at `epoch`. Persists +
+    /// flips the live flag on EVERY link of the folder (a group pauses as one),
+    /// wakes each sender (park on pause / flush on resume), and kicks each control
+    /// sender so the new state beacons to peers immediately. Either side may toggle;
+    /// the newest epoch wins so both converge.
+    pub fn set_paused(self: &Arc<Self>, pair_id: &str, paused: bool, epoch: u64) {
+        let affected = pairing::set_pause(&self.config_dir, pair_id, paused, epoch);
+        {
+            let handles = self.handles.lock().unwrap();
+            for pid in &affected {
+                if let Some(h) = handles.get(pid) {
+                    {
+                        let mut p = h.config.lock().unwrap();
+                        p.paused = paused;
+                        p.pause_epoch = epoch;
+                    }
+                    h.paused.store(paused, Ordering::Relaxed);
+                    h.wake.notify_one();
+                    h.control_wake.notify_one();
+                }
+            }
+        }
+        for pid in &affected {
+            self.emit_status(pid);
+        }
+        let _ = self.app.emit("pairs://changed", ());
     }
 
     /// Try to push one folder file directly over iroh. Returns `Some(locality)` on
@@ -2113,9 +2195,10 @@ impl SyncManager {
             drop(q);
             let s = h.status.lock().unwrap().clone();
             let eid = h.config.lock().unwrap().endpoint_id.clone();
-            (queued, queued_files, s, eid)
+            let paused = h.paused.load(Ordering::Relaxed);
+            (queued, queued_files, s, eid, paused)
         };
-        let (queued, queued_files, mut s, eid) = snapshot;
+        let (queued, queued_files, mut s, eid, paused) = snapshot;
         // Always prefer the user's own label for this peer (by stable endpoint id).
         if let Some(label) = eid
             .as_deref()
@@ -2142,6 +2225,7 @@ impl SyncManager {
             peer_files: s.peer_files,
             session_total_files: s.session_total_files,
             session_done_files: s.session_done_files,
+            paused,
         };
         let _ = self.app.emit("folder://status", status);
     }
@@ -3161,12 +3245,12 @@ fn meta_inode(meta: &std::fs::Metadata) -> u64 {
         use std::os::unix::fs::MetadataExt;
         meta.ino()
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        meta.file_index().unwrap_or(0)
-    }
-    #[cfg(not(any(unix, windows)))]
+    // Windows: the stable std API has no file index (`file_index()` is behind the
+    // unstable `windows_by_handle` feature), so we return 0 → move DETECTION is a
+    // no-op on Windows and it falls back to the normal re-send + delete. (Windows
+    // can still RECEIVE a move from another OS — apply matches by size+mtime, not
+    // inode.) Getting it would mean GetFileInformationByHandle; not worth it here.
+    #[cfg(not(unix))]
     {
         let _ = meta;
         0
