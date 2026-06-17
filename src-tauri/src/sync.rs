@@ -62,6 +62,13 @@ struct PairHandle {
     /// even if the live event was missed, and prevents a deleted file from being
     /// resurrected by the peer's add-reconcile. Persisted across restarts.
     tombstones: Arc<Mutex<HashMap<String, u64>>>,
+    /// Recent intra-folder renames/moves (`from_rel → (to_rel, size, mtime, ts)`)
+    /// to send to this link's peer on the control beacon, so they relocate instead
+    /// of re-downloading. Persisted; idempotent + content-verified on apply.
+    moves: Arc<Mutex<HashMap<String, MoveRec>>>,
+    /// inode → (rel, size) for files currently on disk — how the collector
+    /// recognizes a moved file (same inode, new path) as the SAME bytes.
+    ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>>,
     /// Set by the "Stop" button to immediately abort the in-flight folder transfer
     /// and move it aside, so a stuck send never traps the queue. Cleared by the
     /// sender once it's acted on.
@@ -374,6 +381,19 @@ impl SyncManager {
         let control_wake = Arc::new(Notify::new());
         let tombstones: Arc<Mutex<HashMap<String, u64>>> =
             Arc::new(Mutex::new(load_tombstones(&self.config_dir, &pair.id)));
+        // Move/rename detection state. The inode index seeds from what's on disk so
+        // a file moved right after launch is still recognized; it's refreshed each
+        // control round. Recorded moves ride the control beacon as a pure optimization
+        // (the file's own deletion is still propagated as the reliable backstop).
+        let moves: Arc<Mutex<HashMap<String, MoveRec>>> =
+            Arc::new(Mutex::new(load_moves(&self.config_dir, &pair.id)));
+        let ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>> = Arc::new(Mutex::new(
+            live_manifest(&pair.folder)
+                .into_iter()
+                .filter(|(_, e)| e.inode != 0)
+                .map(|(rel, e)| (e.inode, (rel, e.size)))
+                .collect(),
+        ));
         let skip_current = Arc::new(AtomicBool::new(false));
 
         if pairing::runs_sender(&pair) {
@@ -424,6 +444,8 @@ impl SyncManager {
                 self_deleted.clone(),
                 control_wake.clone(),
                 tombstones.clone(),
+                moves.clone(),
+                ino_index.clone(),
             );
 
             // Sender worker.
@@ -457,6 +479,8 @@ impl SyncManager {
             pending_deletes.clone(),
             control_wake.clone(),
             tombstones.clone(),
+            moves.clone(),
+            ino_index.clone(),
         );
         // iroh-only: the peer's control payload (presence + name + mirror deletes)
         // arrives via the iroh accept loop's "folder-ctrl" handler.
@@ -474,6 +498,8 @@ impl SyncManager {
             pending_deletes,
             control_wake,
             tombstones,
+            moves,
+            ino_index,
             skip_current,
             _watcher: watcher,
         };
@@ -493,6 +519,8 @@ impl SyncManager {
         self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
         control_wake: Arc<Notify>,
         tombstones: Arc<Mutex<HashMap<String, u64>>>,
+        moves: Arc<Mutex<HashMap<String, MoveRec>>>,
+        ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>>,
     ) {
         let config_dir = self.config_dir.clone();
         let pair_id_c = config.lock().unwrap().id.clone();
@@ -527,6 +555,8 @@ impl SyncManager {
                 let tomb2 = tombstones.clone();
                 let cfgdir2 = config_dir.clone();
                 let pidc2 = pair_id_c.clone();
+                let moves2 = moves.clone();
+                let ino2 = ino_index.clone();
                 tauri::async_runtime::spawn(async move {
                     // Classify by EXISTENCE, not by the OS event kind. A file that
                     // is present is an add/change; one that's gone is a delete —
@@ -545,6 +575,20 @@ impl SyncManager {
                         }
                         if !is_sendable_candidate(&p, &folder2, &inbound2) {
                             return;
+                        }
+                        // ── MOVE / RENAME detection (mirror folders) ─────────────
+                        // If this file's inode previously lived at a DIFFERENT path
+                        // that's now gone, the user moved/renamed it inside the
+                        // folder. Record a move op (rides the control beacon, applied
+                        // before the delete) so the peer relocates its copy instead of
+                        // re-uploading the bytes. We DON'T suppress the old path's
+                        // deletion — it's the reliable backstop if the move is lost or
+                        // the peer is older. Inode+size match = same file (no false
+                        // positives for a same-volume move, the case the user hits).
+                        if mirror
+                            && handle_move_candidate(&p, &folder2, &cfgdir2, &pidc2, &moves2, &ino2, &cw)
+                        {
+                            return; // recorded as a move — don't enqueue a byte send
                         }
                         {
                             let mut q = queue2.lock().unwrap();
@@ -1095,6 +1139,8 @@ impl SyncManager {
         pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
         control_wake: Arc<Notify>,
         tombstones: Arc<Mutex<HashMap<String, u64>>>,
+        moves: Arc<Mutex<HashMap<String, MoveRec>>>,
+        ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
@@ -1133,9 +1179,22 @@ impl SyncManager {
                 // The self-heal reconcile snapshot: our full current file set +
                 // tombstones, so the peer can converge to identical (mirror only).
                 let reconcile_json = if pair.mirror {
-                    let files: serde_json::Map<String, serde_json::Value> = live_manifest(&pair.folder)
-                        .into_iter()
-                        .map(|(rel, e)| (rel, serde_json::json!([e.size, e.mtime])))
+                    let lm = live_manifest(&pair.folder);
+                    // Refresh the inode index from disk each round so move detection
+                    // also covers files that were RECEIVED this session (those skip
+                    // the live add-branch that normally warms the index).
+                    {
+                        let mut idx = ino_index.lock().unwrap();
+                        idx.clear();
+                        for (rel, e) in &lm {
+                            if e.inode != 0 {
+                                idx.insert(e.inode, (rel.clone(), e.size));
+                            }
+                        }
+                    }
+                    let files: serde_json::Map<String, serde_json::Value> = lm
+                        .iter()
+                        .map(|(rel, e)| (rel.clone(), serde_json::json!([e.size, e.mtime])))
                         .collect();
                     let tombs: serde_json::Map<String, serde_json::Value> = tombstones
                         .lock()
@@ -1155,10 +1214,23 @@ impl SyncManager {
                     (Some(eid), Some(ep)) => {
                         let del_pairs: Vec<(String, u64)> =
                             dels.iter().map(|d| (d.rel.clone(), d.ts)).collect();
+                        // Recent intra-folder renames ride the beacon ALONGSIDE the
+                        // deletes (applied first on the peer) so a moved file relocates
+                        // in place instead of re-downloading. Drop expired ones.
+                        let move_ops: Vec<(String, String, u64, u64)> = {
+                            let cutoff = now_ms().saturating_sub(MOVE_TTL_MS);
+                            moves
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|(_, (_, _, _, ts))| *ts >= cutoff)
+                                .map(|(from, (to, sz, mt, _))| (from.clone(), to.clone(), *sz, *mt))
+                                .collect()
+                        };
                         let (group_id, roster, owner_eid, role_epoch) =
                             build_group_roster(&manager.config_dir, &pair, &ep, &my_name);
                         let ok = crate::iroh_net::send_folder_ctrl(
-                            &ep, &eid, &pair_id, &my_name, &del_pairs, &group_id, &roster,
+                            &ep, &eid, &pair_id, &my_name, &del_pairs, &move_ops, &group_id, &roster,
                             owner_eid.as_deref(), role_epoch, false,
                         )
                         .await
@@ -1257,7 +1329,7 @@ impl SyncManager {
         let pid = pair_id.to_string();
         tauri::async_runtime::spawn(async move {
             let _ = crate::iroh_net::send_folder_ctrl(
-                &ep, &eid, &pid, &my_name, &[], "", &[], None, 0, true,
+                &ep, &eid, &pid, &my_name, &[], &[], "", &[], None, 0, true,
             )
             .await;
         });
@@ -1313,6 +1385,9 @@ impl SyncManager {
         pair_id: &str,
         name: &str,
         deletes: &[(String, u64)],
+        // Intra-folder renames (from, to, size, mtime) — applied BEFORE deletes so a
+        // moved file relocates in place instead of being re-downloaded.
+        moves: &[(String, String, u64, u64)],
         group_id: &str,
         members: &[(String, String, bool)],
         // Role authority: the beacon sender's claimed owner + role epoch.
@@ -1458,6 +1533,30 @@ impl SyncManager {
                 let p = config.lock().unwrap();
                 (p.peer_is_viewer, p.i_am_viewer)
             });
+
+        // Intra-folder renames FIRST (before deletes): relocate our copy in place so
+        // the matching delete of the old path is a harmless no-op (no re-download).
+        // Content-verified, so a stale/mis-detected move never touches the wrong file;
+        // if it doesn't apply, the delete + reconcile backstop still converge. A
+        // viewer peer can't reorganize our folder.
+        if mirror && !peer_is_viewer && !moves.is_empty() {
+            let mut moved_any = false;
+            for (from, to, size, mtime) in moves {
+                if apply_remote_move(
+                    &folder, from, to, *size, *mtime, &self_deleted, &inbound, DELETE_GRACE_MS,
+                ) {
+                    moved_any = true;
+                    let from_n = norm_rel(from);
+                    inbound
+                        .lock()
+                        .unwrap()
+                        .retain(|sig| sig_rel(sig).as_deref() != Some(from_n.as_str()));
+                }
+            }
+            if moved_any {
+                let _ = self.app.emit("folder-history://changed", pair_id);
+            }
+        }
 
         // A VIEWER peer must never delete our files: ignore deletes coming FROM a
         // read-only member (they shouldn't be changing the folder at all).
@@ -2813,6 +2912,200 @@ fn note_tombstone(
     }
 }
 
+// ── Moves / renames ─────────────────────────────────────────────────────────
+// When a user MOVES or RENAMES a file that's already synced (e.g. drags it into a
+// subfolder of the shared folder), DropBeam recognizes it's the SAME bytes (same
+// inode) and records a move `from_rel → to_rel`. The move op rides the SAME control
+// beacon as deletes and is applied BEFORE them: the peer renames its copy in place
+// (no re-download), then the (still-sent) delete of `from` is a harmless no-op.
+//
+// SAFETY: the move is a pure OPTIMIZATION layered on the existing, reliable
+// delete+reconcile machinery — we do NOT suppress the deletion of `from`. So if the
+// move op is lost, mismatched, or the peer is on an older build that ignores it, the
+// peer simply removes `from` and reconcile re-pushes `to` (correct, just a re-upload).
+// The apply is content-VERIFIED (size+mtime) so a stale or mis-detected move can
+// never relocate/remove the wrong file. Moves expire fast (the delete backstops
+// reliability), which also means a week-old stale op can't resurface.
+const MOVE_TTL_MS: u64 = 15 * 60 * 1000;
+
+fn moves_path(config_dir: &Path, pair_id: &str) -> PathBuf {
+    config_dir.join(format!("moves-{pair_id}.json"))
+}
+
+/// `from_rel → (to_rel, size, mtime, ts_ms)`. size+mtime identify the moved bytes
+/// so the receiver only relocates if its `from` really is that file.
+type MoveRec = (String, u64, u64, u64);
+
+fn load_moves(config_dir: &Path, pair_id: &str) -> HashMap<String, MoveRec> {
+    std::fs::read_to_string(moves_path(config_dir, pair_id))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_moves(config_dir: &Path, pair_id: &str, map: &HashMap<String, MoveRec>) {
+    let cutoff = now_ms().saturating_sub(MOVE_TTL_MS);
+    let pruned: HashMap<&String, &MoveRec> =
+        map.iter().filter(|(_, (_, _, _, ts))| *ts >= cutoff).collect();
+    if let Ok(txt) = serde_json::to_string(&pruned) {
+        let _ = std::fs::write(moves_path(config_dir, pair_id), txt);
+    }
+}
+
+/// Record that `from` was moved/renamed to `to` (carrying the moved file's
+/// size+mtime so the peer can verify), in memory + on disk.
+#[allow(clippy::too_many_arguments)]
+fn note_move(
+    config_dir: &Path,
+    pair_id: &str,
+    moves: &Arc<Mutex<HashMap<String, MoveRec>>>,
+    from: &str,
+    to: &str,
+    size: u64,
+    mtime: u64,
+    ts: u64,
+) {
+    {
+        let mut m = moves.lock().unwrap();
+        // Collapse a chain A→from then from→to into A→to so the peer does one hop.
+        let chained: Vec<String> = m
+            .iter()
+            .filter(|(_, (t, _, _, _))| t == &norm_rel(from))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in chained {
+            m.insert(k, (norm_rel(to), size, mtime, ts));
+        }
+        m.insert(norm_rel(from), (norm_rel(to), size, mtime, ts));
+    }
+    let snapshot = moves.lock().unwrap().clone();
+    save_moves(config_dir, pair_id, &snapshot);
+}
+
+/// Apply a peer's MOVE: they renamed `from_rel`→`to_rel` inside the shared folder,
+/// so relocate OUR copy instead of re-receiving the bytes. CONTENT-VERIFIED: only
+/// acts if our `from` actually matches the moved file's `exp_size`+`exp_mtime`, so a
+/// stale or mis-detected move can never touch the wrong file. Freshness-guarded;
+/// archives anything removed to History (recoverable). Applied BEFORE the peer's
+/// delete of `from`, so the common case never re-downloads.
+///   • from matches, to missing → rename from→to (clean move; never clobbers).
+///   • from matches, to matches → `to` already has the bytes (reconcile raced
+///     ahead) → archive + remove the duplicate `from`.
+///   • anything else            → no-op (the delete + reconcile backstop converge).
+/// Returns true if it changed the filesystem.
+#[allow(clippy::too_many_arguments)]
+fn apply_remote_move(
+    folder: &str,
+    from_rel: &str,
+    to_rel: &str,
+    exp_size: u64,
+    exp_mtime: u64,
+    self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
+    inbound: &Arc<Mutex<HashSet<String>>>,
+    grace_ms: u64,
+) -> bool {
+    let from = norm_rel(from_rel);
+    let to = norm_rel(to_rel);
+    let bad = |r: &str| r.is_empty() || r.starts_with('/') || r.split('/').any(|c| c == "..");
+    if bad(&from) || bad(&to) || from == to {
+        return false;
+    }
+    let from_abs = Path::new(folder).join(&from);
+    let to_abs = Path::new(folder).join(&to);
+    // Our `from` must BE the moved file (same size + mtime). A different file that
+    // merely shares the old path (e.g. a coincidental new file, or an inode-recycle
+    // mis-detection on the sender) won't match → we leave it untouched and let the
+    // normal delete + reconcile handle convergence.
+    let Ok(fmeta) = std::fs::metadata(&from_abs) else {
+        return false; // from gone → already moved / never had it
+    };
+    if !fmeta.is_file() || fmeta.len() != exp_size || meta_mtime(&fmeta) != exp_mtime {
+        return false;
+    }
+    // Never disturb a file the user may be actively editing right now.
+    if file_is_fresh(&from_abs, grace_ms) {
+        return false;
+    }
+    if let Ok(tmeta) = std::fs::metadata(&to_abs) {
+        // `to` already exists. Only treat `from` as a removable duplicate if `to`
+        // is genuinely the SAME bytes; otherwise leave both alone (don't clobber a
+        // real, different file that happens to sit at `to`).
+        if !tmeta.is_file() || tmeta.len() != exp_size || meta_mtime(&tmeta) != exp_mtime {
+            return false;
+        }
+        if file_is_fresh(&to_abs, grace_ms) {
+            return false;
+        }
+        self_deleted.lock().unwrap().insert(from.clone(), Instant::now());
+        let removed =
+            crate::folder_history::archive(folder, &from_abs.to_string_lossy(), &from, "moved");
+        if removed {
+            prune_empty_dirs(folder, &from);
+        }
+        return removed;
+    }
+    // Clean rename. Loop-guard BEFORE touching the fs so OUR OWN watcher (which
+    // will see a Remove of `from` + a Create of `to`) doesn't echo the move back:
+    //  • mark `from` self-deleted (our delete branch ignores it),
+    //  • pre-register `to`'s post-rename signature in `inbound` (add branch skips it).
+    if let Some(parent) = to_abs.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    self_deleted.lock().unwrap().insert(from.clone(), Instant::now());
+    if std::fs::rename(&from_abs, &to_abs).is_err() {
+        return false;
+    }
+    if let Some(sig) = file_sig(&to_abs.to_string_lossy(), folder) {
+        inbound.lock().unwrap().insert(sig);
+    }
+    prune_empty_dirs(folder, &from);
+    true
+}
+
+/// Decide whether a file that just APPEARED at `p` is actually a MOVE/RENAME of a
+/// file we already had (its inode previously lived at a different path that's now
+/// gone). On a hit: record the move (with the file's size+mtime so the peer can
+/// verify), keep the inode index current, kick the control sender, and return true
+/// (the caller skips the byte-send — the move op + the existing delete/reconcile
+/// convey the relocation). Inode + size match = same file, so no false positives
+/// for a same-volume move; a genuinely-new file or a copy never matches. We do NOT
+/// suppress the deletion of the old path — it stays as the reliable backstop.
+fn handle_move_candidate(
+    p: &str,
+    folder: &str,
+    config_dir: &Path,
+    pair_id: &str,
+    moves: &Arc<Mutex<HashMap<String, MoveRec>>>,
+    ino_index: &Arc<Mutex<HashMap<u64, (String, u64)>>>,
+    control_wake: &Arc<Notify>,
+) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    let inode = meta_inode(&meta);
+    let size = meta.len();
+    let mtime = meta_mtime(&meta);
+    let Some(new_rel) = rel_path_of(p, folder) else {
+        return false;
+    };
+    if inode == 0 || new_rel.is_empty() {
+        return false;
+    }
+    let prev = ino_index.lock().unwrap().get(&inode).cloned();
+    if let Some((old_rel, old_size)) = prev {
+        if old_rel != new_rel && old_size == size && !Path::new(folder).join(&old_rel).exists() {
+            note_move(config_dir, pair_id, moves, &old_rel, &new_rel, size, mtime, now_ms());
+            ino_index.lock().unwrap().insert(inode, (new_rel.clone(), size));
+            control_wake.notify_one();
+            log::info!("folder move detected: {old_rel:?} → {new_rel:?} (relocating, no re-upload)");
+            return true;
+        }
+    }
+    // A genuine add/change — keep the inode index warm for future move detection.
+    ino_index.lock().unwrap().insert(inode, (new_rel, size));
+    false
+}
+
 /// Every relative file path currently present under `folder`, mapped to its
 /// signature (`size|mtime`). The authoritative "what I actually have on disk".
 fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
@@ -2835,6 +3128,7 @@ fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
                     size: meta.len(),
                     mtime: meta_mtime(&meta),
                     version_ms: meta_version_ms(&meta),
+                    inode: meta_inode(&meta),
                 },
             );
         }
@@ -2842,7 +3136,7 @@ fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
     out
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct FileEntry {
     size: u64,
     /// Content modification time, epoch SECONDS (the conflict tie-breaker).
@@ -2851,6 +3145,32 @@ struct FileEntry {
     /// delete tombstone is compared against, so a freshly-dropped file (old mtime,
     /// brand-new ctime) isn't wiped on arrival. See [`meta_version_ms`].
     version_ms: u64,
+    /// Filesystem inode (Unix) / file index (Windows). 0 when unavailable. A `mv`
+    /// within the SAME volume preserves this, so it's how move detection recognizes
+    /// that a file which "appeared" at a new path is the SAME bytes that "vanished"
+    /// from an old one — letting us send a rename instruction instead of re-uploading.
+    inode: u64,
+}
+
+/// A file's inode (Unix) / file index (Windows) — a stable identity within one
+/// volume that survives a move/rename. 0 when the platform can't provide it (then
+/// move detection simply doesn't trigger and we fall back to re-send + delete).
+fn meta_inode(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_index().unwrap_or(0)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        0
+    }
 }
 
 /// Relative paths of directories under `folder` that contain NO files anywhere
@@ -3311,8 +3631,8 @@ mod tests {
     #[test]
     fn reconcile_plan_pushes_missing_and_never_deletes_without_a_tombstone() {
         let mut mine = HashMap::new();
-        mine.insert("have.txt".into(), FileEntry { size: 1, mtime: 100, version_ms: 0 });
-        mine.insert("alsohave.txt".into(), FileEntry { size: 2, mtime: 100, version_ms: 0 });
+        mine.insert("have.txt".into(), FileEntry { size: 1, mtime: 100, version_ms: 0, inode: 0 });
+        mine.insert("alsohave.txt".into(), FileEntry { size: 2, mtime: 100, version_ms: 0, inode: 0 });
         // Peer has neither → both must be pushed; NOTHING deleted (no tombstones).
         let plan = reconcile_plan(&mine, &HashMap::new(), &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert_eq!(plan.push, vec!["alsohave.txt".to_string(), "have.txt".to_string()]);
@@ -3322,7 +3642,7 @@ mod tests {
     #[test]
     fn reconcile_plan_applies_a_newer_tombstone_as_a_delete() {
         let mut mine = HashMap::new();
-        mine.insert("old.mov".into(), FileEntry { size: 9, mtime: 100, version_ms: 0 }); // mtime 100s
+        mine.insert("old.mov".into(), FileEntry { size: 9, mtime: 100, version_ms: 0, inode: 0 }); // mtime 100s
         let mut peer_tombs = HashMap::new();
         peer_tombs.insert("old.mov".to_string(), 200_000u64); // deleted at 200s (ms)
         let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new(), TEST_NOW);
@@ -3334,7 +3654,7 @@ mod tests {
     fn reconcile_plan_local_edit_newer_than_tombstone_wins() {
         // We edited the file AFTER the peer's delete → keep + push (edit beats delete).
         let mut mine = HashMap::new();
-        mine.insert("doc.txt".into(), FileEntry { size: 9, mtime: 300, version_ms: 0 }); // edited at 300s
+        mine.insert("doc.txt".into(), FileEntry { size: 9, mtime: 300, version_ms: 0, inode: 0 }); // edited at 300s
         let mut peer_tombs = HashMap::new();
         peer_tombs.insert("doc.txt".to_string(), 200_000u64); // delete at 200s
         let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new(), TEST_NOW);
@@ -3357,6 +3677,7 @@ mod tests {
                 size: 246_806_641,
                 mtime: 1_700_000_000, // old content time (seconds)
                 version_ms: now - 3_000, // dropped 3s ago
+                inode: 0,
             },
         );
         let mut peer_tombs = HashMap::new();
@@ -3388,6 +3709,7 @@ mod tests {
                 size: 9,
                 mtime: 1_700_000_000,
                 version_ms: now - 60 * 60 * 1000, // placed an hour ago (past grace)
+                inode: 0,
             },
         );
         let mut peer_tombs = HashMap::new();
@@ -3433,6 +3755,131 @@ mod tests {
             "and nothing should have been archived"
         );
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    // size+mtime of a file just written, for the content-verified move apply.
+    fn sig_of(p: &std::path::Path) -> (u64, u64) {
+        let m = std::fs::metadata(p).unwrap();
+        (m.len(), meta_mtime(&m))
+    }
+
+    #[test]
+    fn apply_remote_move_renames_when_to_missing() {
+        // The clean case: peer renamed a/x.txt → a/sub/x.txt. We relocate our copy
+        // (no re-download) and arm the loop-guards so our own watcher won't echo it.
+        let folder = temp_dir("mv-rename");
+        let fs = folder.to_string_lossy().to_string();
+        std::fs::create_dir_all(folder.join("a")).unwrap();
+        std::fs::write(folder.join("a/x.txt"), b"payload").unwrap();
+        let (sz, mt) = sig_of(&folder.join("a/x.txt"));
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let inb = Arc::new(Mutex::new(HashSet::new()));
+        let did = apply_remote_move(&fs, "a/x.txt", "a/sub/x.txt", sz, mt, &sd, &inb, 0);
+        assert!(did);
+        assert!(!folder.join("a/x.txt").exists(), "source is moved away");
+        assert_eq!(std::fs::read(folder.join("a/sub/x.txt")).unwrap(), b"payload");
+        assert!(sd.lock().unwrap().contains_key("a/x.txt"), "source marked self-deleted");
+        assert!(!inb.lock().unwrap().is_empty(), "dest signature pre-registered (no echo)");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn apply_remote_move_refuses_when_source_content_differs() {
+        // CONTENT VERIFICATION: a move op whose size/mtime DON'T match our local
+        // `from` (a coincidental new file, or a mis-detected/stale move) must NOT
+        // be relocated — we leave it untouched and let delete+reconcile converge.
+        let folder = temp_dir("mv-mismatch");
+        let fs = folder.to_string_lossy().to_string();
+        std::fs::write(folder.join("report.txt"), b"the user's NEW unrelated file").unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let inb = Arc::new(Mutex::new(HashSet::new()));
+        // Op claims report.txt (size 5, mtime 123) moved → archive/report.txt.
+        let did = apply_remote_move(&fs, "report.txt", "archive/report.txt", 5, 123, &sd, &inb, 0);
+        assert!(!did, "a non-matching source is never moved");
+        assert!(folder.join("report.txt").exists(), "the user's file is untouched");
+        assert!(!folder.join("archive/report.txt").exists());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn apply_remote_move_removes_orphan_only_when_to_matches() {
+        // A reconcile push raced ahead and `to` already has the SAME bytes → `from`
+        // is a stale duplicate → archive+remove it. (If `to` differed, we'd leave both.)
+        let folder = temp_dir("mv-dedup");
+        let fs = folder.to_string_lossy().to_string();
+        std::fs::write(folder.join("old.txt"), b"same").unwrap();
+        let (sz, mt) = sig_of(&folder.join("old.txt"));
+        std::fs::write(folder.join("new.txt"), b"same").unwrap();
+        // Make `new.txt` share old's mtime (a real synced copy would).
+        stamp_mtime(&folder.join("new.txt"), mt);
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let inb = Arc::new(Mutex::new(HashSet::new()));
+        let did = apply_remote_move(&fs, "old.txt", "new.txt", sz, mt, &sd, &inb, 0);
+        assert!(did, "the orphaned duplicate `from` is removed");
+        assert!(!folder.join("old.txt").exists(), "duplicate gone");
+        assert_eq!(std::fs::read(folder.join("new.txt")).unwrap(), b"same", "content kept at `to`");
+        assert!(
+            !crate::folder_history::load(&fs).is_empty(),
+            "the removed copy is recoverable from history"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn apply_remote_move_noop_when_from_missing() {
+        // `from` already gone (move applied earlier, or we never had it) → no-op;
+        // never touches an unrelated file at `to`.
+        let folder = temp_dir("mv-noop");
+        let fs = folder.to_string_lossy().to_string();
+        std::fs::write(folder.join("here.txt"), b"x").unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let inb = Arc::new(Mutex::new(HashSet::new()));
+        assert!(!apply_remote_move(&fs, "gone.txt", "here.txt", 1, 1, &sd, &inb, 0));
+        assert!(folder.join("here.txt").exists());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn apply_remote_move_refuses_fresh_source() {
+        // A just-written source (within grace) must NOT be yanked — the user may be
+        // editing it; this is the same data-loss guard the delete path enforces.
+        let folder = temp_dir("mv-fresh");
+        let fs = folder.to_string_lossy().to_string();
+        std::fs::write(folder.join("editing.txt"), b"live").unwrap();
+        let (sz, mt) = sig_of(&folder.join("editing.txt"));
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let inb = Arc::new(Mutex::new(HashSet::new()));
+        let did = apply_remote_move(&fs, "editing.txt", "moved.txt", sz, mt, &sd, &inb, DELETE_GRACE_MS);
+        assert!(!did);
+        assert!(folder.join("editing.txt").exists());
+        assert!(!folder.join("moved.txt").exists());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn apply_remote_move_rejects_path_escape() {
+        // A peer can never make a move reach outside the shared folder.
+        let folder = temp_dir("mv-escape");
+        let fs = folder.to_string_lossy().to_string();
+        std::fs::write(folder.join("ok.txt"), b"x").unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let inb = Arc::new(Mutex::new(HashSet::new()));
+        assert!(!apply_remote_move(&fs, "ok.txt", "../escape.txt", 1, 1, &sd, &inb, 0));
+        assert!(!apply_remote_move(&fs, "../../etc/x", "ok2.txt", 1, 1, &sd, &inb, 0));
+        assert!(folder.join("ok.txt").exists());
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn note_move_persists_and_collapses_chains() {
+        let dir = temp_dir("mv-persist");
+        let m = Arc::new(Mutex::new(HashMap::new()));
+        note_move(&dir, "p", &m, "a.txt", "b.txt", 10, 100, now_ms());
+        // a→b then b→c collapses to a→c, so the peer does one relocation, not two.
+        note_move(&dir, "p", &m, "b.txt", "c.txt", 10, 100, now_ms());
+        let reloaded = load_moves(&dir, "p");
+        assert_eq!(reloaded.get("a.txt").map(|(t, _, _, _)| t.as_str()), Some("c.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3496,7 +3943,7 @@ mod tests {
     #[test]
     fn reconcile_plan_identical_files_do_nothing() {
         let mut mine = HashMap::new();
-        mine.insert("same.txt".into(), FileEntry { size: 5, mtime: 100, version_ms: 0 });
+        mine.insert("same.txt".into(), FileEntry { size: 5, mtime: 100, version_ms: 0, inode: 0 });
         let mut peer = HashMap::new();
         peer.insert("same.txt".to_string(), (5u64, 100u64));
         let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new(), TEST_NOW);
@@ -3508,14 +3955,14 @@ mod tests {
         // The infinite-re-send bug: same file, mtimes 1s apart (cross-filesystem
         // rounding). Must NOT push — and must be symmetric so neither side loops.
         let mut mine = HashMap::new();
-        mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12346, version_ms: 0 });
+        mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12346, version_ms: 0, inode: 0 });
         let mut peer = HashMap::new();
         peer.insert("vid.mp4".to_string(), (1000u64, 12345u64));
         let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert!(plan.push.is_empty(), "same-size file with skewed mtime must not re-push");
         // The peer side (roles flipped) must also not push → converged.
         let mut peer_mine = HashMap::new();
-        peer_mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12345, version_ms: 0 });
+        peer_mine.insert("vid.mp4".into(), FileEntry { size: 1000, mtime: 12345, version_ms: 0, inode: 0 });
         let mut my_snap = HashMap::new();
         my_snap.insert("vid.mp4".to_string(), (1000u64, 12346u64));
         let plan2 = reconcile_plan(&peer_mine, &my_snap, &HashMap::new(), &HashMap::new(), TEST_NOW);
@@ -3529,7 +3976,7 @@ mod tests {
         let nfd = "Re\u{301}sume\u{301}/x.bin"; // e + combining acute
         let nfc = "R\u{e9}sum\u{e9}/x.bin"; // é precomposed
         let mut mine = HashMap::new();
-        mine.insert(nfd.to_string(), FileEntry { size: 10, mtime: 5, version_ms: 0 });
+        mine.insert(nfd.to_string(), FileEntry { size: 10, mtime: 5, version_ms: 0, inode: 0 });
         let mut peer = HashMap::new();
         peer.insert(nfc.to_string(), (10u64, 5u64));
         let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new(), TEST_NOW);
@@ -3539,8 +3986,8 @@ mod tests {
     #[test]
     fn reconcile_still_pushes_missing_and_changed() {
         let mut mine = HashMap::new();
-        mine.insert("new.txt".into(), FileEntry { size: 7, mtime: 50, version_ms: 0 });
-        mine.insert("edited.txt".into(), FileEntry { size: 200, mtime: 99, version_ms: 0 });
+        mine.insert("new.txt".into(), FileEntry { size: 7, mtime: 50, version_ms: 0, inode: 0 });
+        mine.insert("edited.txt".into(), FileEntry { size: 200, mtime: 99, version_ms: 0, inode: 0 });
         let mut peer = HashMap::new();
         peer.insert("edited.txt".to_string(), (100u64, 40u64)); // peer has older, smaller
         let plan = reconcile_plan(&mine, &peer, &HashMap::new(), &HashMap::new(), TEST_NOW);

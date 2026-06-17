@@ -1706,6 +1706,23 @@ async fn serve_stream(
                         .collect()
                 })
                 .unwrap_or_default();
+            // Intra-folder renames (from, to, size, mtime) — applied before the
+            // deletes so a moved file relocates in place. Absent on older peers.
+            let moves: Vec<(String, String, u64, u64)> = req
+                .get("moves")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            let from = m.get("from").and_then(|r| r.as_str())?.to_string();
+                            let to = m.get("to").and_then(|r| r.as_str())?.to_string();
+                            let size = m.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                            let mtime = m.get("mtime").and_then(|t| t.as_u64()).unwrap_or(0);
+                            Some((from, to, size, mtime))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let unshared = req.get("unshared").and_then(|u| u.as_bool()).unwrap_or(false);
             // Role authority: who claims to own role assignments + which version.
             let owner = req.get("owner").and_then(|v| v.as_str()).map(String::from);
@@ -1720,7 +1737,7 @@ async fn serve_stream(
                         let sender_eid = conn.remote_id().to_string();
                         // reconcile rides its own message (folder-reconcile) now.
                         sm.apply_remote_control(
-                            &pair_id, &name, &deletes, &group_id, &members,
+                            &pair_id, &name, &deletes, &moves, &group_id, &members,
                             owner.as_deref(), role_epoch, None, unshared,
                             Some(&sender_eid),
                         );
@@ -1768,7 +1785,7 @@ async fn serve_stream(
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
                         sm.apply_remote_control(
-                            &pair_id, "", &[], "", &[], None, 0, Some(&reconcile), false, None,
+                            &pair_id, "", &[], &[], "", &[], None, 0, Some(&reconcile), false, None,
                         );
                     }
                 }
@@ -2865,6 +2882,10 @@ pub async fn send_folder_ctrl(
     pair_id: &str,
     name: &str,
     deletes: &[(String, u64)],
+    // Intra-folder renames (from, to, size, mtime) — applied BEFORE deletes so a
+    // moved file relocates in place instead of being re-downloaded. Older peers
+    // ignore the unknown `moves` key and just apply the delete (re-send fallback).
+    moves: &[(String, String, u64, u64)],
     group_id: &str,
     members: &[(String, String, bool)],
     owner: Option<&str>,
@@ -2877,6 +2898,10 @@ pub async fn send_folder_ctrl(
         .iter()
         .map(|(rel, ts)| serde_json::json!({ "rel": rel, "ts": ts }))
         .collect();
+    let mvs: Vec<serde_json::Value> = moves
+        .iter()
+        .map(|(from, to, sz, mt)| serde_json::json!({ "from": from, "to": to, "size": sz, "mtime": mt }))
+        .collect();
     // The group roster rides the beacon so everyone meshes with everyone
     // (multi-person folders). Empty group_id / members on a classic 1:1 folder.
     let mem: Vec<serde_json::Value> = members
@@ -2888,6 +2913,7 @@ pub async fn send_folder_ctrl(
     // folder's manifest can never bloat this presence beacon past the frame cap.
     let msg = serde_json::json!({
         "kind": "folder-ctrl", "pair_id": pair_id, "name": name, "deletes": dels,
+        "moves": mvs,
         "group_id": group_id, "members": mem,
         // Role authority: who owns role assignments + which version. Older peers
         // ignore unknown keys; absent = no role info (legacy folder).
