@@ -280,6 +280,31 @@ export interface FolderStatus {
   connDetail?: ConnDetail | null
 }
 
+/** The honest answer to "are these two folders identical?" from `verifyFolder`.
+ *  "Identical" = same set of relative paths, each the same byte size (mtime is not
+ *  compared — two machines round it differently; that's the same rule the sync uses
+ *  to decide a file is in sync). Any genuine difference is counted and being fixed. */
+export interface VerifyResult {
+  /** false when we couldn't reach the peer (offline / no fresh snapshot in time). */
+  compared: boolean
+  /** true only when the two folders are byte-size identical across every path. */
+  identical: boolean
+  /** Files present on both sides with the same size (the agreeing core). */
+  matched: number
+  /** Total differences the reconcile will fix (the number shown to the user). */
+  differences: number
+  /** Files we have that the peer is missing / has a different-size copy of. */
+  missingOnPeer: number
+  /** Files the peer has that we're missing / have a different-size copy of. */
+  missingLocally: number
+  /** Pending deletes still propagating either way. */
+  pendingDeletes: number
+  /** Our current file count. */
+  localFiles: number
+  /** The peer's current file count from the snapshot we compared against. */
+  peerFiles: number
+}
+
 export interface PairUpdate {
   id: string
   twoWay?: boolean
@@ -347,6 +372,10 @@ const realApi = {
    * whether we own a folder (pair.ownerEid === this) before showing role controls. */
   myEndpointId: () => invoke<string | null>('my_endpoint_id'),
   verifyFolders: () => invoke<void>('verify_folders'),
+  /** Re-exchange manifests for ONE shared folder and report a trustworthy answer:
+   *  are the two folders identical, how many files match, how many differ (and are
+   *  being fixed). Reuses the existing reconcile plumbing. `pairId` is the link. */
+  verifyFolder: (pairId: string) => invoke<VerifyResult>('verify_folder', { pairId }),
   stopFolderTransfer: (pairId: string) => invoke<void>('stop_folder_transfer', { pairId }),
   /** Pause or resume sync for a shared folder (a shared switch — flips both sides). */
   setFolderPaused: (pairId: string, paused: boolean) =>

@@ -2,9 +2,11 @@ import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
+  AlertCircle,
   ArrowLeftRight,
   ArrowRight,
   Check,
+  CheckCircle2,
   Clock,
   Copy,
   Eye,
@@ -19,6 +21,7 @@ import {
   Settings2,
   Unlink,
   UserPlus,
+  WifiOff,
   X,
 } from 'lucide-react'
 import {
@@ -26,6 +29,7 @@ import {
   type FolderStatus,
   type Pair,
   type PairUpdate,
+  type VerifyResult,
 } from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState, LocalityBadge, ProgressBar, Spinner } from '../components/bits'
@@ -222,6 +226,20 @@ function FolderCard({
   }
   const [loadingInvite, setLoadingInvite] = useState(false)
   const [verifying, setVerifying] = useState(false)
+  // The last Verify outcome, shown inline as a clear confirmation. null = not run.
+  const [verifyResult, setVerifyResult] = useState<VerifyResult | null>(null)
+  const runVerify = async () => {
+    setVerifying(true)
+    setVerifyResult(null)
+    try {
+      const r = await api.verifyFolder(pair.id)
+      setVerifyResult(r)
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setVerifying(false)
+    }
+  }
   const [soundOn, setSoundOn] = useState(() => {
     try {
       return localStorage.getItem(`folder-sound-${pair.id}`) === 'on'
@@ -345,6 +363,7 @@ function FolderCard({
               if (o) {
                 setConfirmUnpair(false)
                 setVerifying(false)
+                setVerifyResult(null)
               }
               return !o
             })
@@ -685,6 +704,9 @@ function FolderCard({
                   </div>
                 </SettingRow>
               )}
+              {pair.mirror && (verifying || verifyResult) && (
+                <VerifyBanner verifying={verifying} result={verifyResult} />
+              )}
               <div
                 style={{
                   display: 'flex',
@@ -709,18 +731,7 @@ function FolderCard({
                     className="btn btn-ghost"
                     title="Re-check that both folders are identical and fix any difference"
                     disabled={verifying}
-                    onClick={async () => {
-                      setVerifying(true)
-                      try {
-                        await api.verifyFolders()
-                        // Accurate: we kicked off a reconcile — we can't claim the
-                        // folders already match (the check runs in the background).
-                        toast('info', 'Re-checking both folders…')
-                      } catch (e) {
-                        toast('error', String(e))
-                      }
-                      setTimeout(() => setVerifying(false), 2500)
-                    }}
+                    onClick={runVerify}
                   >
                     {verifying ? <Spinner size={13} /> : <FolderSync size={14} />}{' '}
                     {verifying ? 'Checking…' : 'Verify'}
@@ -953,6 +964,85 @@ function RoleSeg({
     >
       {icon} {label}
     </button>
+  )
+}
+
+/** The Verify outcome banner: a spinner while the manifest round-trip runs, then a
+ *  clear, trustworthy confirmation of whether the two folders are identical. */
+function VerifyBanner({
+  verifying,
+  result,
+}: {
+  verifying: boolean
+  result: VerifyResult | null
+}) {
+  // While checking, OR if a result is mid-render but a new check started.
+  if (verifying || !result) {
+    return (
+      <Banner color="var(--accent)" bg="var(--accent-soft)" icon={<Spinner size={14} />}>
+        Checking both folders match…
+      </Banner>
+    )
+  }
+  if (!result.compared) {
+    return (
+      <Banner color="var(--amber)" bg="var(--amber-soft)" icon={<WifiOff size={15} />}>
+        Couldn't reach the other device — try again when they're online.
+      </Banner>
+    )
+  }
+  if (result.identical) {
+    const n = result.matched.toLocaleString()
+    return (
+      <Banner color="var(--green)" bg="var(--green-soft)" icon={<CheckCircle2 size={15} />}>
+        Both folders match — {n} {result.matched === 1 ? 'file' : 'files'}, identical.
+      </Banner>
+    )
+  }
+  const d = result.differences
+  // Spell out the breakdown so the user trusts the number.
+  const parts: string[] = []
+  if (result.missingOnPeer) parts.push(`${result.missingOnPeer} to send`)
+  if (result.missingLocally) parts.push(`${result.missingLocally} to receive`)
+  if (result.pendingDeletes) parts.push(`${result.pendingDeletes} to remove`)
+  return (
+    <Banner color="var(--amber)" bg="var(--amber-soft)" icon={<AlertCircle size={15} />}>
+      Found {d} {d === 1 ? 'difference' : 'differences'}
+      {parts.length > 0 ? ` (${parts.join(', ')})` : ''} — syncing them now…
+    </Banner>
+  )
+}
+
+function Banner({
+  color,
+  bg,
+  icon,
+  children,
+}: {
+  color: string
+  bg: string
+  icon: React.ReactNode
+  children: React.ReactNode
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        marginTop: 12,
+        padding: '10px 12px',
+        borderRadius: 10,
+        background: bg,
+        color,
+        fontSize: 13,
+        fontWeight: 600,
+        lineHeight: 1.4,
+      }}
+    >
+      <span style={{ flexShrink: 0, display: 'inline-flex' }}>{icon}</span>
+      <span>{children}</span>
+    </div>
   )
 }
 

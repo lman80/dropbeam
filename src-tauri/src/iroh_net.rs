@@ -1232,6 +1232,12 @@ async fn serve_stream(
                 }
                 cb(done, total);
             };
+            // Recreate any empty directories the sender advertised (GitHub #22)
+            // BEFORE the body branch — the single-big-file parallel path below
+            // bypasses read_body, so a folder of "one big file + empty subdirs"
+            // would otherwise drop the dirs. Idempotent + never fails the receive.
+            let _ = std::fs::create_dir_all(&dest);
+            recreate_empty_dirs(&req, &dest);
             let __t0 = std::time::Instant::now();
             // Resumable parallel receive for a single big file: reply {ready:true},
             // pull the N uni streams, reassemble into a hidden partial that survives
@@ -3866,6 +3872,38 @@ fn prepare_subtree_dest(dest_dir: &Path, rel: &Path) -> PathBuf {
     unique_full(dest_dir.join(rel))
 }
 
+/// Recreate the empty directories a sender advertised in the manifest's optional
+/// `dirs` field (GitHub #22). Purely additive — only ever calls `create_dir_all`,
+/// never removes anything — and each rel is run through the SAME `sanitize_rel`
+/// traversal guard as a received file, so a peer can't `mkdir` outside `dest_dir`
+/// or land an invisible dot-dir. A dir that fails to create (e.g. an ancestor is a
+/// FILE → ENOTDIR) is logged and skipped: a missing empty folder must NEVER fail
+/// the transfer (the bytes already landed). Absent on older senders → no-op.
+fn recreate_empty_dirs(header: &serde_json::Value, dest_dir: &Path) {
+    let Some(arr) = header.get("dirs").and_then(|d| d.as_array()) else {
+        return;
+    };
+    for d in arr {
+        let Some(raw) = d.as_str() else { continue };
+        let rel = sanitize_rel(raw);
+        // sanitize_rel("") → "file"; an empty/degenerate dir entry would create a
+        // junk "file" directory — skip anything that didn't survive as a real rel.
+        if rel.as_os_str().is_empty() || raw.trim().is_empty() {
+            continue;
+        }
+        let abs = dest_dir.join(&rel);
+        if abs.exists() {
+            continue; // already there (a file landed under it, or a prior pass)
+        }
+        if let Err(e) = std::fs::create_dir_all(&abs) {
+            log::warn!(
+                "receive: skipping empty dir {} ({e}) — not failing the transfer",
+                abs.display()
+            );
+        }
+    }
+}
+
 // ── Outgoing-speed limiter ────────────────────────────────────────────────
 // Optional user cap on internet upload speed so a transfer leaves headroom for
 // the rest of the connection. Global (shared across all streams + transfers) so
@@ -4678,8 +4716,13 @@ async fn recv_file_resumable<F: Fn(u64, u64)>(
 }
 
 /// Gather (path, name, size, mtime) for each file to send, plus the byte total.
-fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, u64)> {
+fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>, u64)> {
     let mut items = Vec::new();
+    // Relative paths of EMPTY directories under any dropped folder — carried in the
+    // manifest's optional `dirs` field so the receiver recreates them too (GitHub
+    // #22: "send empty subfolders too"). Files alone never represent a dir that
+    // holds no files, so without this an empty subfolder is silently lost.
+    let mut dirs: Vec<String> = Vec::new();
     for p in paths {
         // PRE-FILTER: a file the user moved or deleted between the drop and this
         // moment must be DROPPED from the batch — never fail the whole send. We
@@ -4705,7 +4748,13 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "folder".to_string());
-            collect_dir_items(p, &base, &mut items);
+            // If the dropped folder (and everything under it) holds no files, record
+            // the folder itself as empty so the peer still recreates it — otherwise a
+            // user sending a brand-new empty folder would send literally nothing.
+            let had_file = collect_dir_items(p, &base, &mut items, &mut dirs);
+            if !had_file {
+                dirs.push(base);
+            }
         } else {
             let name = p
                 .file_name()
@@ -4715,14 +4764,30 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
         }
     }
     let total = items.iter().map(|i| i.2).sum();
-    Ok((items, total))
+    Ok((items, dirs, total))
 }
 
 /// Recursively collect every file under `dir` as `(abs_path, "prefix/rel/name", size,
 /// mtime)`. Skips dot-files/dirs and symlinks. The `prefix` carries the dropped
 /// folder's own name so the receiver recreates the tree under it.
-fn collect_dir_items(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String, u64, u64)>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+///
+/// `empty_out` collects the rel path of any directory that ends up holding NO files
+/// anywhere beneath it (an empty subfolder, or one with only empty subfolders), so
+/// the receiver recreates that structure too — files alone can't represent it
+/// (GitHub #22). Returns true iff `dir` (or something under it) contained a file, so
+/// a parent can decide whether IT is empty.
+fn collect_dir_items(
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<(PathBuf, String, u64, u64)>,
+    empty_out: &mut Vec<String>,
+) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        // Unreadable dir: never fail the whole send — treat as "no files here". The
+        // dir is still recorded as empty by the caller so its existence survives.
+        return false;
+    };
+    let mut had_file = false;
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
@@ -4735,13 +4800,23 @@ fn collect_dir_items(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String, u
         let path = entry.path();
         let rel = format!("{prefix}/{name}");
         if ft.is_dir() {
-            collect_dir_items(&path, &rel, out);
+            // Recurse; if the subtree held no files, record the subfolder itself as
+            // empty so the peer recreates it. A subtree WITH files needs no entry —
+            // its files already imply every ancestor directory.
+            let sub_had_file = collect_dir_items(&path, &rel, out, empty_out);
+            if sub_had_file {
+                had_file = true;
+            } else {
+                empty_out.push(rel);
+            }
         } else if ft.is_file() {
             if let Ok(meta) = entry.metadata() {
                 out.push((path, rel, meta.len(), mtime_secs(&meta)));
+                had_file = true;
             }
         }
     }
+    had_file
 }
 
 /// The JSON header describing a files push. `parallel` > 0 advertises that the body
@@ -4749,13 +4824,18 @@ fn collect_dir_items(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String, u
 /// `{ready:true}` — plus a `resume` map of byte ranges it already has from an
 /// interrupted earlier attempt); an older peer ignores the extra fields and reads
 /// classically. `mtime` identifies the file version for resume fingerprinting.
-fn files_header(items: &[(PathBuf, String, u64, u64)], total: u64, parallel: u64, from_name: &str) -> serde_json::Value {
+fn files_header(items: &[(PathBuf, String, u64, u64)], dirs: &[String], total: u64, parallel: u64, from_name: &str) -> serde_json::Value {
     serde_json::json!({
         "kind": "files",
         "items": items
             .iter()
             .map(|(_, n, s, mt)| serde_json::json!({ "name": n, "size": s, "mtime": mt }))
             .collect::<Vec<_>>(),
+        // Empty directories to recreate on the receiver (GitHub #22). OPTIONAL: an
+        // older receiver simply ignores this key — no protocol break. Carried OUT of
+        // `items` so the body byte-stream and the single-big-file parallel fast path
+        // (which keys off items.len()==1) are completely unchanged.
+        "dirs": dirs,
         "total": total,
         "parallel": parallel,
         // True iff we'll honor a {hold}/{ready} resume handshake for this send — it
@@ -4819,8 +4899,8 @@ async fn write_files<F: Fn(u64, u64)>(
     cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<u64> {
-    let (items, total) = gather_items(paths)?;
-    write_frame(send, &files_header(&items, total, 0, "")).await?;
+    let (items, dirs, total) = gather_items(paths)?;
+    write_frame(send, &files_header(&items, &dirs, total, 0, "")).await?;
     // Legacy single-stream fallback (no conn here to read locality) — unpaced.
     write_files_body(send, &items, total, cancel, false, &on_progress).await
 }
@@ -4849,6 +4929,10 @@ async fn read_body<F: Fn(u64, u64)>(
     let items = header["items"].as_array().cloned().unwrap_or_default();
     let total = header["total"].as_u64().unwrap_or(0);
     std::fs::create_dir_all(dest_dir)?;
+    // Recreate any EMPTY directories the sender advertised (GitHub #22) — done up
+    // front so structure exists even for a folder that is ONLY empty dirs (zero file
+    // items, e.g. a brand-new folder). Never fails the receive.
+    recreate_empty_dirs(header, dest_dir);
 
     let mut got = 0u64;
     let mut out = Vec::new();
@@ -4946,12 +5030,12 @@ pub async fn send_files<F: Fn(u64, u64)>(
     parallel_engaged: &AtomicBool,
 ) -> Result<u64> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    let (items, total) = gather_items(paths)?;
+    let (items, dirs, total) = gather_items(paths)?;
     let n = parallel_stream_count(items.len(), total);
     // Rate-limit only INTERNET sends — a LAN transfer doesn't touch the uplink, so
     // it stays full speed regardless of the cap.
     let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
-    write_frame(&mut send, &files_header(&items, total, n, my_name)).await?;
+    write_frame(&mut send, &files_header(&items, &dirs, total, n, my_name)).await?;
 
     if n > 0 {
         // Resume handshake. The receiver replies {ready:true} to take the parallel,
@@ -5119,6 +5203,11 @@ async fn read_files_negotiated<F: Fn(u64, u64)>(
     let total = header["total"].as_u64().unwrap_or(0);
     let n = header["parallel"].as_u64().unwrap_or(0).min(PARALLEL_STREAMS);
     let single = header["items"].as_array().map(|a| a.len()) == Some(1);
+    // Recreate advertised empty dirs (GitHub #22) regardless of which body path runs
+    // below — the parallel single-file fast path bypasses read_body. Idempotent, so
+    // the read_body fallthroughs re-running it is harmless.
+    std::fs::create_dir_all(dest_dir)?;
+    recreate_empty_dirs(header, dest_dir);
     if n > 0 && single && total >= PARALLEL_MIN {
         let item0 = &header["items"][0];
         let name = item0["name"].as_str().unwrap_or("file").to_string();
@@ -5228,7 +5317,7 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<u64> {
-    let (items, total) = gather_items(paths)?;
+    let (items, dirs, total) = gather_items(paths)?;
     let n = if allow_parallel {
         parallel_stream_count(items.len(), total)
     } else {
@@ -5236,7 +5325,7 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     };
     // Internet Quick Send respects the upload cap; LAN stays full speed.
     let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
-    write_frame(send, &files_header(&items, total, n, "")).await?;
+    write_frame(send, &files_header(&items, &dirs, total, n, "")).await?;
     if n > 0 {
         let reply = match tokio::time::timeout(Duration::from_secs(6), read_frame(recv)).await {
             Ok(Ok(v)) => Some(v),
@@ -6392,6 +6481,155 @@ mod loopback_tests {
                 p.display()
             );
         }
+
+        client.close().await;
+        server.close().await;
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// GitHub #22: sending a folder TREE that contains an EMPTY subdirectory must
+    /// recreate that empty subdir on the receiver — folder structure must not be
+    /// silently lost — and an empty/odd subfolder must NEVER fail the whole send.
+    ///
+    /// Source tree (sent as the folder `Project/`):
+    ///   Project/notes.txt          (a file)
+    ///   Project/clips/a.bin        (a file in a subfolder)
+    ///   Project/empty/             (EMPTY subfolder — no files anywhere beneath)
+    ///   Project/nested/deeper/     (EMPTY, nested two levels deep)
+    ///
+    /// Drives the REAL friend/Quick "send a folder" path
+    /// (`send_files` → `gather_items`/`collect_dir_items` → `files_header` `dirs`
+    /// field → `recv_files` → `read_body`/`recreate_empty_dirs`). With the fix BOTH
+    /// empty dirs exist on the receiver, every file arrives byte-identical, and the
+    /// transfer succeeds.
+    #[tokio::test]
+    async fn loopback_folder_empty_subdir_is_recreated_on_receiver() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let server_addr = server.addr();
+
+        let src_root = scratch("empty-src");
+        let project = src_root.join("Project");
+        std::fs::create_dir_all(project.join("clips")).unwrap();
+        std::fs::create_dir_all(project.join("empty")).unwrap(); // EMPTY
+        std::fs::create_dir_all(project.join("nested").join("deeper")).unwrap(); // EMPTY, nested
+        let notes = payload(3 * 1024, 201);
+        let clip = payload(48 * 1024, 202);
+        std::fs::write(project.join("notes.txt"), &notes).unwrap();
+        std::fs::write(project.join("clips").join("a.bin"), &clip).unwrap();
+
+        let dest_dir = scratch("empty-rx");
+
+        let srv = server.clone();
+        let dest_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {}).await
+        });
+
+        let conn = client.connect(server_addr, ALPN).await.unwrap();
+        let send_res = send_files(
+            &conn,
+            &[project.clone()],
+            &AtomicBool::new(false),
+            |_, _| {},
+            "loopback-tester",
+            &AtomicBool::new(false),
+        )
+        .await;
+
+        // Neither side may fail because of the empty subfolders.
+        let received = recv
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("folder receive must not fail on empty subdirs: {e:#}"));
+        send_res.expect("sender completes the whole batch despite empty subdirs");
+
+        // The two files arrived, structure preserved + byte-identical.
+        let got_notes = dest_dir.join("Project").join("notes.txt");
+        let got_clip = dest_dir.join("Project").join("clips").join("a.bin");
+        assert!(got_notes.is_file(), "notes.txt landed at its real subpath");
+        assert!(got_clip.is_file(), "clips/a.bin landed at its real subpath");
+        assert!(std::fs::read(&got_notes).unwrap() == notes, "notes.txt byte-identical");
+        assert!(std::fs::read(&got_clip).unwrap() == clip, "clips/a.bin byte-identical");
+
+        // ── The CORE #22 assertion: the EMPTY subfolders exist on the receiver.
+        let got_empty = dest_dir.join("Project").join("empty");
+        let got_deeper = dest_dir.join("Project").join("nested").join("deeper");
+        assert!(
+            got_empty.is_dir(),
+            "the empty subfolder Project/empty/ must be recreated on the receiver"
+        );
+        assert!(
+            got_deeper.is_dir(),
+            "the nested empty subfolder Project/nested/deeper/ must be recreated"
+        );
+        // And they really are empty (no junk landed inside).
+        assert_eq!(std::fs::read_dir(&got_empty).unwrap().count(), 0, "empty/ stays empty");
+        assert_eq!(
+            std::fs::read_dir(&got_deeper).unwrap().count(),
+            0,
+            "nested/deeper/ stays empty"
+        );
+
+        // Two files received, no phantom extras for the dirs.
+        assert_eq!(received.len(), 2, "exactly the two real files were received");
+
+        client.close().await;
+        server.close().await;
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// GitHub #22 edge case: a folder that is ENTIRELY empty (no files at all) must
+    /// still be recreated on the receiver — sending it must not be a silent no-op.
+    /// This is the pure "manifest carries only `dirs`, zero file items" path: the
+    /// body is empty, so `read_body` creates the dir from the header up front.
+    #[tokio::test]
+    async fn loopback_wholly_empty_folder_is_recreated() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let server_addr = server.addr();
+
+        let src_root = scratch("wholly-src");
+        let folder = src_root.join("BrandNew");
+        std::fs::create_dir_all(folder.join("sub")).unwrap(); // empty, with an empty child
+        let dest_dir = scratch("wholly-rx");
+
+        let srv = server.clone();
+        let dest_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {}).await
+        });
+
+        let conn = client.connect(server_addr, ALPN).await.unwrap();
+        let send_res = send_files(
+            &conn,
+            &[folder.clone()],
+            &AtomicBool::new(false),
+            |_, _| {},
+            "loopback-tester",
+            &AtomicBool::new(false),
+        )
+        .await;
+
+        let received = recv
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("receiving a wholly-empty folder must not fail: {e:#}"));
+        send_res.expect("sending a wholly-empty folder must not fail");
+
+        assert!(
+            dest_dir.join("BrandNew").is_dir(),
+            "the wholly-empty folder BrandNew/ must be recreated on the receiver"
+        );
+        assert!(
+            dest_dir.join("BrandNew").join("sub").is_dir(),
+            "its empty child sub/ must be recreated too"
+        );
+        assert!(received.is_empty(), "no files were received (none existed)");
 
         client.close().await;
         server.close().await;

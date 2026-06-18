@@ -659,6 +659,22 @@ pub fn verify_folders(sync: State<'_, Arc<SyncManager>>) {
     sync.verify_now();
 }
 
+/// Drive a REAL verification for ONE shared folder and report a trustworthy answer:
+/// are the two folders identical, how many files match, and how many differences
+/// were found (and are being fixed). Reuses the existing reconcile/manifest-exchange
+/// — it re-exchanges manifests now, waits for the peer's fresh snapshot, then
+/// compares the two using the same per-file signatures the self-heal already uses.
+/// Drives the "Verify" button's confirmation. `pair_id` is the folder link to check.
+#[tauri::command]
+pub async fn verify_folder(
+    sync: State<'_, Arc<SyncManager>>,
+    pair_id: String,
+) -> Result<crate::models::VerifyResult, String> {
+    // Clone the Arc out of State so we don't hold the (non-Send) guard across .await.
+    let sync = sync.inner().clone();
+    Ok(sync.verify_folder(&pair_id).await)
+}
+
 /// Abort the in-flight transfer for a shared folder (the "Stop" button) so a
 /// stuck send can't trap the queue. The file isn't dropped — it cycles back.
 #[tauri::command]

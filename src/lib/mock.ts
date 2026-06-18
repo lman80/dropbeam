@@ -14,6 +14,7 @@ import type {
   PairUpdate,
   Settings,
   TransferUpdate,
+  VerifyResult,
 } from './api'
 
 type Cb = (payload: unknown) => void
@@ -246,6 +247,21 @@ export const mockApi = {
   frontendLog: async (): Promise<void> => {},
   takeLaunchFile: async (): Promise<string | null> => null,
   verifyFolders: async (): Promise<void> => {},
+  verifyFolder: async (): Promise<VerifyResult> => {
+    // Simulate the manifest round-trip taking a moment, then report a match.
+    await new Promise((r) => setTimeout(r, 1400))
+    return {
+      compared: true,
+      identical: true,
+      matched: 1234,
+      differences: 0,
+      missingOnPeer: 0,
+      missingLocally: 0,
+      pendingDeletes: 0,
+      localFiles: 1234,
+      peerFiles: 1234,
+    }
+  },
   stopFolderTransfer: async (): Promise<void> => {},
   setFolderPaused: async (): Promise<void> => {},
   sendFiles: async (paths: string[]): Promise<TransferUpdate> => {

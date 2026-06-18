@@ -519,3 +519,40 @@ pub struct FolderStatus {
     pub conn_detail: Option<ConnDetail>,
 }
 
+/// The honest answer to "are these two folders identical?", returned by the
+/// `verify_folder` command that drives the Verify button. Computed from the SAME
+/// per-file signatures (relative path + size) the self-heal reconcile uses — not a
+/// new sync path. "Identical" therefore means: same set of relative paths, each
+/// with the same byte size (content mtime is deliberately NOT compared, because
+/// two machines round mtimes differently — that's why the reconcile never re-sends
+/// on an mtime-only diff). Any genuine difference the reconcile would act on is
+/// counted here and is being fixed in the background.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyResult {
+    /// `false` when we never heard a fresh snapshot from the peer (offline, or no
+    /// beacon arrived in time). Then `matched`/`differences` are not meaningful and
+    /// the UI says "couldn't reach the other device".
+    pub compared: bool,
+    /// `true` only when the two folders are byte-size identical across every path —
+    /// no missing files either way, no size mismatches, no pending deletes.
+    pub identical: bool,
+    /// Files present on BOTH sides with the same size (the agreeing core).
+    pub matched: u32,
+    /// Total count of differences the reconcile will fix: files we'll send the peer
+    /// + files the peer will send us + deletes that still need to propagate. This is
+    /// the number surfaced as "Found N differences — syncing them now…".
+    pub differences: u32,
+    /// Breakdown of `differences`, so the copy can be specific if desired.
+    /// Files we have that the peer is missing or has an older/different-size copy of.
+    pub missing_on_peer: u32,
+    /// Files the peer has that we're missing or have an older/different-size copy of.
+    pub missing_locally: u32,
+    /// Pending deletes (a tombstone on either side not yet honored on the other).
+    pub pending_deletes: u32,
+    /// Our own current file count (for "1,234 files, identical").
+    pub local_files: u32,
+    /// The peer's current file count from the snapshot we compared against.
+    pub peer_files: u32,
+}
+

@@ -538,6 +538,7 @@ pub fn run() {
             commands::set_member_role,
             commands::my_endpoint_id,
             commands::verify_folders,
+            commands::verify_folder,
             commands::stop_folder_transfer,
             commands::set_folder_paused,
             commands::clear_transfer_cache,

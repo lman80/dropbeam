@@ -19,7 +19,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 
 use crate::models::{
-    DeleteMode, FolderState, FolderStatus, Friend, Locality, Pair, Settings,
+    DeleteMode, FolderState, FolderStatus, Friend, Locality, Pair, Settings, VerifyResult,
 };
 use crate::{friends, pairing, AppState};
 
@@ -72,6 +72,11 @@ struct PairHandle {
     /// Sync paused for this folder (live flag the workers read). Mirrors the
     /// persisted `Pair.paused`; updated by the user toggle + the peer's beacon.
     paused: Arc<AtomicBool>,
+    /// The most recent full snapshot the peer beaconed (its file set + tombstones)
+    /// plus the local ms when it landed. The "Verify" button reads this to compare
+    /// the two folders WITHOUT inventing a new sync path — it's exactly what the
+    /// self-heal reconcile already runs on. `None` until the peer beacons once.
+    last_peer_snapshot: Arc<Mutex<Option<(Reconcile, u64)>>>,
     /// Set by the "Stop" button to immediately abort the in-flight folder transfer
     /// and move it aside, so a stuck send never traps the queue. Cleared by the
     /// sender once it's acted on.
@@ -299,6 +304,98 @@ impl SyncManager {
         }
     }
 
+    /// Drive a REAL, trustworthy verification for ONE folder link and report whether
+    /// the two folders are identical. Reuses the existing reconcile/manifest-exchange
+    /// plumbing — it does NOT invent a new sync path:
+    ///   1. Wake this link's control sender so it re-beacons our manifest now, and
+    ///      ask the peer (via the same beacon) to send theirs back promptly.
+    ///   2. Wait (bounded) for a FRESH peer snapshot to land on the control channel.
+    ///   3. Compare our live manifest against that snapshot using the same per-file
+    ///      signature rule the self-heal reconcile uses (`reconcile_plan` for the
+    ///      delete/push decisions, plus the reverse direction for files the peer has
+    ///      that we lack), and count matches + differences.
+    /// The differences it reports are exactly what the background reconcile is
+    /// already converging, so the UI can honestly say "syncing them now".
+    pub async fn verify_folder(self: &Arc<Self>, pair_id: &str) -> VerifyResult {
+        // Grab the per-link state we need (or bail with "couldn't compare" if this
+        // isn't a folder we're actively managing — e.g. a non-mirror pair).
+        let (folder, control_wake, tombstones, last_snapshot, snapshot_before) = {
+            let handles = self.handles.lock().unwrap();
+            let Some(h) = handles.get(pair_id) else {
+                return VerifyResult {
+                    compared: false,
+                    identical: false,
+                    matched: 0,
+                    differences: 0,
+                    missing_on_peer: 0,
+                    missing_locally: 0,
+                    pending_deletes: 0,
+                    local_files: 0,
+                    peer_files: 0,
+                };
+            };
+            let folder = h.config.lock().unwrap().folder.clone();
+            let before = h.last_peer_snapshot.lock().unwrap().as_ref().map(|(_, ts)| *ts);
+            (
+                folder,
+                h.control_wake.clone(),
+                h.tombstones.clone(),
+                h.last_peer_snapshot.clone(),
+                before,
+            )
+        };
+
+        // Kick BOTH sides to re-exchange manifests now (same mechanism as verify_now,
+        // scoped to this link). The peer, on receiving our beacon, beacons back its
+        // own snapshot, which lands in `last_peer_snapshot`.
+        control_wake.notify_one();
+
+        // Wait up to ~6s for a snapshot that's NEWER than the one we had before we
+        // nudged — so we compare against a genuinely fresh exchange, not a stale one.
+        // Polls cheaply; returns as soon as a fresh snapshot arrives.
+        let deadline = Instant::now() + Duration::from_millis(6000);
+        let (peer_snapshot, got_fresh) = loop {
+            let cur = last_snapshot.lock().unwrap().clone();
+            let is_fresh = match (&cur, snapshot_before) {
+                (Some((_, ts)), Some(before)) => *ts > before,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if is_fresh {
+                break (cur.map(|(rec, _)| rec), true);
+            }
+            if Instant::now() >= deadline {
+                // No fresh exchange — fall back to whatever (possibly stale) snapshot
+                // we have so we can still report a best-effort answer, but flag that
+                // we couldn't confirm a live round-trip.
+                break (cur.map(|(rec, _)| rec), false);
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        };
+
+        let Some(rec) = peer_snapshot else {
+            // Never heard from the peer at all — be honest that we couldn't compare.
+            let local = live_manifest(&folder);
+            return VerifyResult {
+                compared: false,
+                identical: false,
+                matched: 0,
+                differences: 0,
+                missing_on_peer: 0,
+                missing_locally: 0,
+                pending_deletes: 0,
+                local_files: local.len() as u32,
+                peer_files: 0,
+            };
+        };
+
+        let mine = live_manifest(&folder);
+        let my_tomb = tombstones.lock().unwrap().clone();
+        let mut result = compute_verify(&mine, &rec, &my_tomb, now_ms());
+        result.compared = got_fresh;
+        result
+    }
+
     /// Current status snapshots for all active folders (for initial UI load).
     pub fn statuses(&self) -> Vec<FolderStatus> {
         let handles = self.handles.lock().unwrap();
@@ -509,6 +606,7 @@ impl SyncManager {
             moves,
             ino_index,
             paused,
+            last_peer_snapshot: Arc::new(Mutex::new(None)),
             skip_current,
             _watcher: watcher,
         };
@@ -1440,7 +1538,7 @@ impl SyncManager {
         // sender as already-meshed instead of adding them a SECOND time.
         sender_eid: Option<&str>,
     ) {
-        let (config, status, self_deleted, tombstones, queue, wake, inbound, paused_flag) = {
+        let (config, status, self_deleted, tombstones, queue, wake, inbound, paused_flag, last_peer_snapshot) = {
             let handles = self.handles.lock().unwrap();
             let Some(h) = handles.get(pair_id) else {
                 return; // not a folder we're actively managing
@@ -1454,6 +1552,7 @@ impl SyncManager {
                 h.wake.clone(),
                 h.inbound.clone(),
                 h.paused.clone(),
+                h.last_peer_snapshot.clone(),
             )
         };
         // Adopt the shared pause state if the peer's toggle is NEWER than ours (the
@@ -1645,6 +1744,12 @@ impl SyncManager {
             }
         }
 
+        // Stash the peer's full snapshot for the "Verify" button to compare against
+        // — recorded even while paused (so a Verify is honest about the current
+        // divergence) and even for a viewer peer (Verify only READS, never deletes).
+        if let Some(rec) = reconcile {
+            *last_peer_snapshot.lock().unwrap() = Some((rec.clone(), now_ms()));
+        }
         // Self-heal reconcile: the peer told us its full file set + tombstones.
         // Apply any deletes we missed, and queue any files the peer is missing —
         // the bulletproof double-check that both folders converge to identical.
@@ -3435,6 +3540,130 @@ fn reconcile_plan(
     plan
 }
 
+/// Compute the honest "are these two folders identical?" answer that drives the
+/// Verify button, from OUR live manifest, the PEER's snapshot (`rec`), and our own
+/// tombstones. Pure (no I/O) so it can be exhaustively unit-tested. It reuses
+/// `reconcile_plan` for both directions — exactly the size-only signature rule the
+/// background self-heal already converges — so the difference count it reports IS
+/// what is being fixed:
+///   • `missing_on_peer` = `reconcile_plan(ours → peer).push` (files we'll send).
+///   • `missing_locally` = `reconcile_plan(peer → ours).push` (files we'll receive),
+///     computed by running the SAME planner with the sides swapped.
+///   • `pending_deletes`  = local files the peer tombstoned newer than ours (we'll
+///     delete) + peer files WE tombstoned newer than theirs (they'll delete).
+///   • `matched`          = paths present on both with the same byte size.
+/// `identical` is true iff every one of those difference buckets is empty.
+fn compute_verify(
+    mine: &HashMap<String, FileEntry>,
+    rec: &Reconcile,
+    my_tombs: &HashMap<String, u64>,
+    now: u64,
+) -> VerifyResult {
+    // Direction 1: what WE would push/delete given the peer's snapshot.
+    let forward = reconcile_plan(mine, &rec.files, &rec.tombstones, my_tombs, now);
+
+    // Direction 2: what the PEER would push given OUR snapshot — i.e. files the peer
+    // has that we're missing or have a stale-size copy of. Model our side as a
+    // FileEntry map (size + mtime; ctime/inode irrelevant for this comparison) and
+    // run the very same planner with the roles swapped. We pass empty tombstones
+    // here because `forward` already accounts for every delete in BOTH directions
+    // (peer→us via `forward.delete`, us→peer via the my_tombs scan below); folding
+    // them in again would double-count.
+    let mine_as_peer: HashMap<String, (u64, u64)> =
+        mine.iter().map(|(k, e)| (k.clone(), (e.size, e.mtime))).collect();
+    // Pre-normalize our tombstones so a peer file WE deleted (tombstone newer than
+    // the peer's copy) is excluded from "to receive" — it's a pending DELETE we'll
+    // push, counted separately below, not a file we'll pull back down.
+    let my_tombs_norm: HashMap<String, u64> =
+        my_tombs.iter().map(|(k, v)| (norm_rel(k), *v)).collect();
+    let peer_as_mine: HashMap<String, FileEntry> = rec
+        .files
+        .iter()
+        .filter(|(k, &(_, mtime))| {
+            my_tombs_norm.get(&norm_rel(k)).copied().unwrap_or(0) <= mtime.saturating_mul(1000)
+        })
+        .map(|(k, &(size, mtime))| {
+            (
+                k.clone(),
+                FileEntry {
+                    size,
+                    mtime,
+                    version_ms: mtime.saturating_mul(1000),
+                    inode: 0,
+                },
+            )
+        })
+        .collect();
+    let no_tombs: HashMap<String, u64> = HashMap::new();
+    let reverse = reconcile_plan(&peer_as_mine, &mine_as_peer, &no_tombs, &no_tombs, now);
+
+    let missing_on_peer = forward.push.len() as u32;
+    let missing_locally = reverse.push.len() as u32;
+
+    // Deletes the peer told us about that still apply to a local file (forward.delete),
+    // plus deletes WE hold for a file the peer still has (we'll push our tombstone).
+    let mut pending_deletes = forward.delete.len() as u32;
+    let peer_norm: HashMap<String, (u64, u64)> =
+        rec.files.iter().map(|(k, v)| (norm_rel(k), *v)).collect();
+    let peer_tomb_norm: HashMap<String, u64> =
+        rec.tombstones.iter().map(|(k, v)| (norm_rel(k), *v)).collect();
+    for (rel0, &ts) in my_tombs {
+        let rel = norm_rel(rel0);
+        if let Some(&(_psize, pmtime)) = peer_norm.get(&rel) {
+            // We deleted it; the peer still has a copy whose placement predates our
+            // tombstone, and the peer hasn't already tombstoned it itself.
+            let peer_already = peer_tomb_norm.get(&rel).copied().unwrap_or(0) >= ts;
+            if ts > pmtime.saturating_mul(1000) && !peer_already {
+                pending_deletes += 1;
+            }
+        }
+    }
+
+    // Matched = same path on both sides with the same byte size (mtime ignored, per
+    // the reconcile's own in-sync rule). NFC-normalize both sides so a name macOS
+    // stored decomposed and the peer stored composed counts as the same file.
+    let mine_norm: HashMap<String, u64> =
+        mine.iter().map(|(k, e)| (norm_rel(k), e.size)).collect();
+    let mut matched = 0u32;
+    for (rel, size) in &mine_norm {
+        if peer_norm.get(rel).map(|&(psize, _)| psize == *size).unwrap_or(false) {
+            matched += 1;
+        }
+    }
+
+    // A path on BOTH sides whose byte SIZE differs is a real difference (different
+    // content) — but the mtime-based planner misses it when the two copies happen
+    // to share an mtime (equal mtime → no push in either direction), which would
+    // make `identical` wrongly true. Count those explicitly, excluding any path the
+    // planners already flagged as a push (avoid double-counting). This guarantees
+    // "identical" can never be reported while a same-path size mismatch exists.
+    let fwd_push: std::collections::HashSet<String> =
+        forward.push.iter().map(|p| norm_rel(p)).collect();
+    let rev_push: std::collections::HashSet<String> =
+        reverse.push.iter().map(|p| norm_rel(p)).collect();
+    let mut size_mismatch = 0u32;
+    for (rel, size) in &mine_norm {
+        if let Some(&(psize, _)) = peer_norm.get(rel) {
+            if psize != *size && !fwd_push.contains(rel) && !rev_push.contains(rel) {
+                size_mismatch += 1;
+            }
+        }
+    }
+
+    let differences = missing_on_peer + missing_locally + pending_deletes + size_mismatch;
+    VerifyResult {
+        compared: true,
+        identical: differences == 0,
+        matched,
+        differences,
+        missing_on_peer,
+        missing_locally,
+        pending_deletes,
+        local_files: mine.len() as u32,
+        peer_files: rec.files.len() as u32,
+    }
+}
+
 fn friend_sig(f: &Friend) -> String {
     // auto_accept is included so flipping it restarts the listener in the new mode.
     format!("{}|{:?}|{}|{}", f.id, f.role, f.secret, f.auto_accept)
@@ -3759,6 +3988,114 @@ mod tests {
         let plan = reconcile_plan(&mine, &HashMap::new(), &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert_eq!(plan.push, vec!["alsohave.txt".to_string(), "have.txt".to_string()]);
         assert!(plan.delete.is_empty(), "absence alone must NEVER cause a delete");
+    }
+
+    // ---- compute_verify (the Verify-button answer) ----
+
+    fn fe(size: u64, mtime: u64) -> FileEntry {
+        FileEntry { size, mtime, version_ms: mtime.saturating_mul(1000), inode: 0 }
+    }
+
+    #[test]
+    fn verify_identical_folders_report_match() {
+        let mut mine = HashMap::new();
+        mine.insert("a.txt".into(), fe(10, 100));
+        mine.insert("sub/b.bin".into(), fe(20, 100));
+        let mut rec = Reconcile::default();
+        rec.files.insert("a.txt".into(), (10, 100));
+        rec.files.insert("sub/b.bin".into(), (20, 100));
+        let r = compute_verify(&mine, &rec, &HashMap::new(), TEST_NOW);
+        assert!(r.identical, "same paths + sizes must read as identical");
+        assert_eq!(r.matched, 2);
+        assert_eq!(r.differences, 0);
+        assert_eq!(r.local_files, 2);
+        assert_eq!(r.peer_files, 2);
+    }
+
+    #[test]
+    fn verify_identical_when_only_mtime_differs() {
+        // Two machines round mtimes differently — an mtime-only delta is NOT a
+        // difference (same rule the reconcile uses to avoid re-sending forever).
+        let mut mine = HashMap::new();
+        mine.insert("a.txt".into(), fe(10, 100));
+        let mut rec = Reconcile::default();
+        rec.files.insert("a.txt".into(), (10, 102)); // same size, 2s skew
+        let r = compute_verify(&mine, &rec, &HashMap::new(), TEST_NOW);
+        assert!(r.identical, "mtime-only skew is not a real difference");
+        assert_eq!(r.matched, 1);
+    }
+
+    #[test]
+    fn verify_same_path_different_size_same_mtime_is_not_identical() {
+        // The trust-breaking edge: same path + SAME mtime but DIFFERENT byte size.
+        // The mtime-based planner pushes nothing (equal mtime → no winner), so this
+        // must be caught explicitly or "identical" would be wrongly reported true.
+        let mut mine = HashMap::new();
+        mine.insert("x.txt".into(), fe(10, 100));
+        let mut rec = Reconcile::default();
+        rec.files.insert("x.txt".into(), (20, 100)); // different size, identical mtime
+        let r = compute_verify(&mine, &rec, &HashMap::new(), TEST_NOW);
+        assert!(!r.identical, "a same-path size mismatch is never 'identical'");
+        assert_eq!(r.matched, 0, "different size → not matched");
+        assert!(r.differences >= 1);
+    }
+
+    #[test]
+    fn verify_counts_files_to_send_and_receive() {
+        let mut mine = HashMap::new();
+        mine.insert("shared.txt".into(), fe(5, 100));
+        mine.insert("only_local.txt".into(), fe(7, 100)); // peer lacks → we send
+        let mut rec = Reconcile::default();
+        rec.files.insert("shared.txt".into(), (5, 100));
+        rec.files.insert("only_peer.txt".into(), (9, 100)); // we lack → we receive
+        let r = compute_verify(&mine, &rec, &HashMap::new(), TEST_NOW);
+        assert!(!r.identical);
+        assert_eq!(r.matched, 1, "only shared.txt matches");
+        assert_eq!(r.missing_on_peer, 1);
+        assert_eq!(r.missing_locally, 1);
+        assert_eq!(r.pending_deletes, 0);
+        assert_eq!(r.differences, 2);
+    }
+
+    #[test]
+    fn verify_counts_a_peer_tombstone_as_a_pending_delete() {
+        // Peer deleted a file we still have (tombstone newer than our copy) — that's
+        // a difference still converging.
+        let mut mine = HashMap::new();
+        mine.insert("gone.txt".into(), fe(3, 100)); // mtime 100s → 100_000ms
+        let mut rec = Reconcile::default();
+        rec.tombstones.insert("gone.txt".into(), 200_000); // deleted at 200s
+        let r = compute_verify(&mine, &rec, &HashMap::new(), TEST_NOW);
+        assert!(!r.identical);
+        assert_eq!(r.pending_deletes, 1);
+        assert_eq!(r.missing_on_peer, 0, "a tombstoned file is never 'to send'");
+        assert_eq!(r.differences, 1);
+    }
+
+    #[test]
+    fn verify_counts_our_tombstone_for_a_file_the_peer_still_has() {
+        // WE deleted a file; the peer still has its older copy → we'll push our
+        // tombstone. One pending delete, not a "to receive".
+        let mine: HashMap<String, FileEntry> = HashMap::new();
+        let mut rec = Reconcile::default();
+        rec.files.insert("doc.txt".into(), (4, 100)); // peer's copy, mtime 100s
+        let mut my_tombs = HashMap::new();
+        my_tombs.insert("doc.txt".to_string(), 200_000u64); // we deleted at 200s
+        let r = compute_verify(&mine, &rec, &my_tombs, TEST_NOW);
+        assert!(!r.identical);
+        assert_eq!(r.pending_deletes, 1);
+        assert_eq!(r.missing_locally, 0, "we deleted it; it's not 'to receive'");
+        assert_eq!(r.differences, 1);
+    }
+
+    #[test]
+    fn verify_empty_folders_are_identical() {
+        let mine: HashMap<String, FileEntry> = HashMap::new();
+        let rec = Reconcile::default();
+        let r = compute_verify(&mine, &rec, &HashMap::new(), TEST_NOW);
+        assert!(r.identical);
+        assert_eq!(r.matched, 0);
+        assert_eq!(r.differences, 0);
     }
 
     #[test]
