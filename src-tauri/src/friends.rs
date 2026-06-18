@@ -233,6 +233,14 @@ pub fn plan_reconcile(
         if is_placeholder(&survivor.name) && !is_placeholder(&loser.name) {
             survivor.name = loser.name.clone();
         }
+        // A name the user explicitly chose (custom + non-placeholder) outranks a
+        // non-custom name like a broadcast device name, regardless of which record
+        // survives — otherwise an older non-custom record silently reverts the
+        // rename held on the newer one, and the OR below then locks it in so no
+        // future broadcast can repair it.
+        if loser.name_custom && !survivor.name_custom && !is_placeholder(&loser.name) {
+            survivor.name = loser.name.clone();
+        }
         survivor.auto_accept = survivor.auto_accept || loser.auto_accept;
         survivor.name_custom = survivor.name_custom || loser.name_custom;
         if survivor.endpoint_id.is_none() {

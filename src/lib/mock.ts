@@ -46,6 +46,7 @@ let settings: Settings = {
   showMegabits: false,
   requireDirect: false,
   waitForDirect: false,
+  parallelStreams: true,
   avatar: '',
   notifyOnMessage: true,
   sendReadReceipts: true,

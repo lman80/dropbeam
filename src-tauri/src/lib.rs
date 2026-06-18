@@ -297,6 +297,7 @@ pub fn run() {
             iroh_net::set_upload_limit_mbps(loaded.upload_limit_mbps);
             iroh_net::set_require_direct(loaded.require_direct);
             iroh_net::set_wait_for_direct(loaded.wait_for_direct);
+            iroh_net::set_parallel_streams(loaded.parallel_streams);
             // Apply recovery-history retention, then sweep old/oversized saved
             // copies once at startup so even idle folders (no deletes since the
             // last launch) shrink to the budget. Off-thread — never blocks the

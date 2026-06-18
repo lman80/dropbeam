@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
@@ -24,7 +24,12 @@ function title(t: TransferUpdate): string {
   return t.direction === 'receive' ? 'Incoming files' : 'Files'
 }
 
-export function TransferCard({ t }: { t: TransferUpdate }) {
+// Memoized: upsertTransfer only mints a fresh object for the id that changed, so
+// a referential-equality memo stops every OTHER card re-rendering (with its
+// framer-motion layout) on every progress tick.
+export const TransferCard = memo(TransferCardImpl)
+
+function TransferCardImpl({ t }: { t: TransferUpdate }) {
   const removeTransfer = useStore((s) => s.removeTransfer)
   const respondToOffer = useStore((s) => s.respondToOffer)
   const toast = useStore((s) => s.toast)

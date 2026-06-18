@@ -3872,10 +3872,32 @@ const PARALLEL_STREAMS: u64 = 4;
 /// isn't worth it and small files already transfer instantly.
 const PARALLEL_MIN: u64 = 16 * 1024 * 1024; // 16 MiB
 
+/// Field kill-switch for parallel streams. DEFAULT = ON — parallel streams are
+/// already shipped and field-proven, so the default preserves today's behavior.
+/// Flipping it OFF makes EVERY send advertise `parallel:0`, so both sides fall back
+/// to the classic single-stream body that pre-dates this feature — the proven path,
+/// with zero protocol/wire change (the receiver simply never sees a multi-stream
+/// layout). Lets us disable parallel on a misbehaving network from Settings WITHOUT
+/// a new release. Routed through the single chokepoint `parallel_stream_count`, so
+/// it covers friend sends, Quick Send, AND folder sync at once.
+static PARALLEL_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Settings hook: turn parallel multi-stream sends on/off live (no restart). When
+/// off, large single files send over one classic stream (the v0.23-era path).
+pub fn set_parallel_streams(on: bool) {
+    PARALLEL_ENABLED.store(on, Ordering::Relaxed);
+}
+
 /// How many streams to fan a transfer across: only a SINGLE file at least
 /// PARALLEL_MIN big, and never so many that a stream would carry under ~4 MiB.
 /// Returns 0 = "send the classic single-stream way".
 fn parallel_stream_count(item_count: usize, total: u64) -> u64 {
+    // Kill-switch first: off → 0 → every path sends the classic single stream, and
+    // the receiver (which only forks parallel on an advertised `parallel > 0`)
+    // transparently reads the classic body. No capability mismatch is possible.
+    if !PARALLEL_ENABLED.load(Ordering::Relaxed) {
+        return 0;
+    }
     if item_count != 1 || total < PARALLEL_MIN {
         return 0;
     }
@@ -5203,6 +5225,19 @@ mod tests {
         // Right at the threshold → at least one stream, never more than the cap.
         let n = parallel_stream_count(1, PARALLEL_MIN);
         assert!((1..=PARALLEL_STREAMS).contains(&n));
+    }
+
+    #[test]
+    fn kill_switch_forces_classic_single_stream() {
+        // A file that WOULD fan across streams…
+        assert!(parallel_stream_count(1, 541 * 1024 * 1024) > 1);
+        // …goes classic (0) the instant the switch is off.
+        set_parallel_streams(false);
+        assert_eq!(parallel_stream_count(1, 541 * 1024 * 1024), 0);
+        assert_eq!(parallel_stream_count(1, PARALLEL_MIN), 0);
+        // Flipping back on restores the fan-out (and resets global for other tests).
+        set_parallel_streams(true);
+        assert!(parallel_stream_count(1, 541 * 1024 * 1024) > 1);
     }
 
     #[test]

@@ -1784,14 +1784,21 @@ impl SyncManager {
                 let _ = std::fs::create_dir_all(&abs);
             }
         }
-        for (rel, _) in &rec.tombstones {
-            let abs = Path::new(folder).join(rel);
-            if abs.is_dir() {
-                self_deleted
-                    .lock()
-                    .unwrap()
-                    .insert(rel.clone(), Instant::now());
-                let _ = std::fs::remove_dir(&abs); // only succeeds if empty
+        // Honor a peer's directory delete: remove an empty dir the peer tombstoned.
+        // Gated on apply_peer_deletes so a read-only VIEWER can't erase our folder
+        // structure; freshness-guarded so a just-created (still-empty) dir isn't
+        // removed under a stale tombstone; NFC-normalized to match on-disk names.
+        if apply_peer_deletes {
+            for (rel, _) in &rec.tombstones {
+                let norm = norm_rel(rel);
+                let abs = Path::new(folder).join(&norm);
+                if abs.is_dir() && !file_is_fresh(&abs, DELETE_GRACE_MS) {
+                    self_deleted
+                        .lock()
+                        .unwrap()
+                        .insert(norm.clone(), Instant::now());
+                    let _ = std::fs::remove_dir(&abs); // only succeeds if empty
+                }
             }
         }
     }
@@ -2388,8 +2395,37 @@ fn move_staged_into_folder(
         };
         let rel_str = norm_rel(&rel.to_string_lossy());
         let dest_path = folder_path.join(rel);
+        // REVERSE TYPE SWAP: an ancestor of this incoming FILE exists locally as a
+        // FILE (a peer kept a folder where we replaced it with a same-named file).
+        // create_dir_all(parent) would fail (AlreadyExists) and the file could never
+        // land → reconcile re-queues it forever. Archive the blocking ancestor file
+        // to History (nothing lost), loop-guard its removal so our watcher doesn't
+        // echo a spurious delete, then remove it so the dir chain can be created.
+        if mirror {
+            let mut anc = rel.parent();
+            while let Some(a) = anc {
+                if a.as_os_str().is_empty() {
+                    break;
+                }
+                let anc_abs = folder_path.join(a);
+                if anc_abs.is_file() {
+                    let arel = norm_rel(&a.to_string_lossy());
+                    self_deleted.lock().unwrap().insert(arel.clone(), Instant::now());
+                    crate::folder_history::archive(
+                        folder_str,
+                        &anc_abs.to_string_lossy(),
+                        &arel,
+                        "replaced",
+                    );
+                    let _ = std::fs::remove_file(&anc_abs);
+                }
+                anc = a.parent();
+            }
+        }
         if let Some(parent) = dest_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("move_staged_into_folder: create_dir_all {parent:?} failed: {e}");
+            }
         }
 
         // The incoming (staged) version's identity. mtime was already stamped to

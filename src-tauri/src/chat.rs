@@ -143,7 +143,9 @@ pub fn append(config_dir: &Path, msg: &ChatMessage) -> bool {
     let _guard = LOCK.lock().unwrap();
     let mut all = load_all(config_dir);
     let thread = all.entry(msg.peer_id.clone()).or_default();
-    if thread.iter().any(|m| m.id == msg.id) {
+    // Dedup scoped by direction: an incoming (peer-chosen) id can never collide
+    // with one of OUR outgoing ids and silently suppress a real message.
+    if thread.iter().any(|m| m.id == msg.id && m.from_me == msg.from_me) {
         return false;
     }
     thread.push(msg.clone());

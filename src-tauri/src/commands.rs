@@ -63,6 +63,7 @@ pub fn update_settings(
     crate::iroh_net::set_upload_limit_mbps(settings.upload_limit_mbps);
     crate::iroh_net::set_require_direct(settings.require_direct);
     crate::iroh_net::set_wait_for_direct(settings.wait_for_direct);
+    crate::iroh_net::set_parallel_streams(settings.parallel_streams);
     // Apply recovery-history retention live, then sweep so a tightened budget/age
     // frees space immediately (not just on the next delete).
     let retention_changed = {

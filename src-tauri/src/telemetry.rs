@@ -82,6 +82,9 @@ fn redactors() -> &'static [(Regex, &'static str)] {
             // names/paths while preserving the message for grouping. Run FIRST so a
             // quoted path/id is caught here before the looser rules below.
             (Regex::new(r#""[^"]{0,200}""#).unwrap(), "\"<q>\""),
+            // Some logs quote the variable with single quotes — scrub those too.
+            // {1,200} (not 0) so a lone apostrophe in prose isn't a match start.
+            (Regex::new(r#"'[^']{1,200}'"#).unwrap(), "'<q>'"),
             // Any absolute filesystem path (prefix-agnostic: /Users, /Volumes,
             // /System/Volumes/Data firmlinks, /home, Windows drives) → <path>.
             (Regex::new(r"(?:/[\w.+\- ]+){2,}/?").unwrap(), "<path>"),

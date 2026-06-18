@@ -27,6 +27,9 @@ import { setSpeedUnit } from './lib/format'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
+// Wire the periodic/online update re-check listeners exactly once.
+let updateWatchersWired = false
+
 const DEFAULT_SETTINGS: Settings = {
   downloadDir: '',
   displayName: '',
@@ -43,6 +46,7 @@ const DEFAULT_SETTINGS: Settings = {
   showMegabits: false,
   requireDirect: false,
   waitForDirect: false,
+  parallelStreams: true,
   avatar: '',
   notifyOnMessage: true,
   sendReadReceipts: true,
@@ -388,7 +392,17 @@ export const useStore = create<AppStore>((set, get) => ({
     appVersion().then((v) => set({ appVer: v }))
     // Only the main window owns the update check (the popover/HUD share state but
     // shouldn't each trigger their own launch check).
-    if (!isOverlay) get().checkForUpdates(false)
+    if (!isOverlay) {
+      get().checkForUpdates(false)
+      // A one-shot launch check means a user who's offline at launch never
+      // updates. Re-check every 6h and again whenever the network comes back,
+      // wired once for the main window only.
+      if (!updateWatchersWired) {
+        updateWatchersWired = true
+        setInterval(() => void get().checkForUpdates(false), 6 * 60 * 60 * 1000)
+        window.addEventListener('online', () => void get().checkForUpdates(false))
+      }
+    }
   },
 
   checkForUpdates: async (manual) => {

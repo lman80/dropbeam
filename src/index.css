@@ -790,6 +790,8 @@ html.overlay-window #root {
   max-height: 200px;
   width: auto;
   height: auto;
+  min-height: 120px; /* reserve space before decode so the thread doesn't jump */
+  background: var(--surface-2); /* visible placeholder while loading */
   border-radius: 9px;
   object-fit: cover;
   cursor: pointer;

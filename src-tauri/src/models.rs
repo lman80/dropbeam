@@ -195,6 +195,14 @@ pub struct Settings {
     /// escape. Off by default. Applies to friend sends AND folder sync.
     #[serde(default)]
     pub wait_for_direct: bool,
+    /// Fan a single large file (≥16 MiB) across several QUIC streams on one
+    /// connection for higher throughput, reassembled byte-identically. ON by
+    /// default (field-proven). Turn OFF only if a network is unstable under
+    /// multi-stream load — the file then sends over one classic stream (the same
+    /// proven path used for small files and older peers). Live; a kill-switch, not
+    /// a feature gate, so it never changes the wire format — the receiver follows.
+    #[serde(default = "default_true")]
+    pub parallel_streams: bool,
     /// Absolute path to the user's chosen profile picture (copied into the app
     /// config dir). Empty = no picture (we render initials instead). Local-only.
     #[serde(default)]
@@ -266,6 +274,7 @@ impl Default for Settings {
             show_megabits: false,
             require_direct: false,
             wait_for_direct: false,
+            parallel_streams: true,
             avatar: String::new(),
             notify_on_message: true,
             send_read_receipts: true,

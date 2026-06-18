@@ -775,12 +775,23 @@ pub fn apply_group_roles(
     }
 
     let my_role = roles.get(my_eid).copied();
+    let my_covered = my_role.is_some();
     let mut changed = false;
     for p in pairs.iter_mut() {
         if p.group_id.as_deref() != Some(group_id) {
             continue;
         }
-        if p.role_epoch != beacon_epoch {
+        // Only advance this link's epoch if the beacon actually carried roles for
+        // both us AND this link's peer. A relayed PARTIAL roster (build_group_roster
+        // omits not-yet-keyed members) must NOT bump the epoch past what it can
+        // prove — otherwise the owner's complete beacon at the same epoch is later
+        // rejected by the monotonic gate and the missing member stays frozen on a
+        // stale role forever.
+        let peer_covered = p
+            .endpoint_id
+            .as_ref()
+            .is_some_and(|e| roles.contains_key(e));
+        if my_covered && peer_covered && p.role_epoch != beacon_epoch {
             p.role_epoch = beacon_epoch;
             changed = true;
         }
@@ -1014,8 +1025,10 @@ mod tests {
         let link = group_pair("lb", "g1", Some("owner"), Some("B"));
         save(&dir, &[link]).unwrap();
 
+        // A realistic owner roster covers every keyed member (incl. the recipient
+        // "me"), so the partial-roster epoch gate is satisfied.
         let roles_b_viewer: std::collections::HashMap<String, bool> =
-            [("B".to_string(), true)].into_iter().collect();
+            [("B".to_string(), true), ("me".to_string(), false)].into_iter().collect();
 
         // A NON-owner beacon is ignored even at a higher epoch.
         assert!(!apply_group_roles(&dir, "g1", "me", Some("imposter"), 9, &roles_b_viewer));
@@ -1029,7 +1042,7 @@ mod tests {
 
         // A STALE re-broadcast (<= current epoch) is rejected → no flap.
         let roles_b_editor: std::collections::HashMap<String, bool> =
-            [("B".to_string(), false)].into_iter().collect();
+            [("B".to_string(), false), ("me".to_string(), false)].into_iter().collect();
         assert!(!apply_group_roles(&dir, "g1", "me", Some("owner"), 5, &roles_b_editor));
         assert!(load(&dir)[0].peer_is_viewer); // unchanged
 

@@ -95,6 +95,9 @@ export interface Settings {
    *  path forms (park, don't fail). Friend sends show a "Send over relay anyway"
    *  escape; folder sync waits much longer for direct before settling for relay. */
   waitForDirect: boolean
+  /** Fan one big file across several QUIC streams for speed (reassembled
+   *  byte-identically). On by default; a kill-switch for flaky networks. */
+  parallelStreams: boolean
   /** Absolute path to the user's profile picture (in the config dir). '' = none. */
   avatar: string
   /** Pop a native notification when a chat arrives & the app isn't focused. */

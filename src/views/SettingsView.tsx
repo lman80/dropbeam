@@ -350,6 +350,13 @@ export function SettingsView() {
         </Row>
         {SEP}
         <Row
+          title="Use parallel streams for big files"
+          desc="Send one large file (16 MB or more) over several connections at once for higher speed — the file is reassembled exactly. On by default. Turn off only if a transfer keeps stalling on a particular network; it'll then send the steady, single-stream way."
+        >
+          <Toggle on={settings.parallelStreams} onChange={(v) => save({ parallelStreams: v })} />
+        </Row>
+        {SEP}
+        <Row
           title="Limit internet upload speed"
           desc="Cap how much of your upload a transfer uses, so video calls, streaming, and browsing stay smooth. 0 = unlimited. Local-network transfers always run full speed."
         >
