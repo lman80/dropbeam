@@ -495,6 +495,11 @@ export interface FolderSynced {
   /** Files still queued for this folder after this one — 0 means the whole drop
    *  finished, so the UI can play the sound ONCE instead of once per file. */
   remaining?: number
+  /** Relative names of the files moved in this batch — for the chat timeline rows
+   *  (GitHub #23). Absent on older engines. */
+  files?: string[]
+  /** Total bytes moved in this batch. */
+  bytes?: number
 }
 
 /** A shared-folder transfer just completed (one file delivered or received). */

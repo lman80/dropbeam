@@ -217,11 +217,14 @@ export interface FolderActivityEvent {
   id: string
   ts: number
   direction: 'send' | 'receive'
-  files: number
+  /** Relative names of the files moved in this batch. */
+  files: string[]
   bytes: number
+  /** The shared folder this synced — resolves to the on-disk root + the friend. */
+  pairId: string
 }
 
-const FOLDER_ACTIVITY_KEY = 'dropbeam-folder-activity'
+const FOLDER_ACTIVITY_KEY = 'dropbeam-folder-activity-v2'
 function loadFolderActivity(): Record<string, FolderActivityEvent[]> {
   try {
     return JSON.parse(localStorage.getItem(FOLDER_ACTIVITY_KEY) || '{}')
@@ -350,6 +353,26 @@ export const useStore = create<AppStore>((set, get) => ({
       // Remember when this folder last moved a file, for the "Up to date · 2m ago"
       // resting status (a Dropbox-style reassurance the folder card lacked).
       set((st) => ({ folderLastSynced: { ...st.folderLastSynced, [s.pairId]: Date.now() } }))
+      // Log this batch as rich rows in the folder's chat timeline (GitHub #23).
+      // MAIN WINDOW ONLY — the HUD/popover windows share this localStorage, so
+      // logging there too would double every entry.
+      const syncedFiles = s.files ?? []
+      if (!isOverlay && syncedFiles.length > 0) {
+        set((st) => {
+          const ev: FolderActivityEvent = {
+            id: `fa-${s.pairId}-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
+            ts: Date.now(),
+            direction: s.direction,
+            files: syncedFiles,
+            bytes: s.bytes ?? 0,
+            pairId: s.pairId,
+          }
+          const list = [...(st.folderActivity[s.pairId] ?? []), ev].slice(-200)
+          const folderActivity = { ...st.folderActivity, [s.pairId]: list }
+          saveFolderActivity(folderActivity)
+          return { folderActivity }
+        })
+      }
       if (isOverlay) return
       let on = false
       try {
@@ -372,24 +395,7 @@ export const useStore = create<AppStore>((set, get) => ({
     // A whole folder drop finished — stash its summary (size, time, avg speed) so
     // the folder card can show it like the Send/Receive tab's completion line.
     onFolderComplete((c) =>
-      set((st) => {
-        const folderSummaries = { ...st.folderSummaries, [c.pairId]: c }
-        // A real sync (≥1 file moved) also drops a row in this pair's chat
-        // timeline (GitHub #23). Fires on both the sending and receiving side, so
-        // each end logs its own view.
-        if (c.files <= 0) return { folderSummaries }
-        const ev: FolderActivityEvent = {
-          id: `fa-${c.pairId}-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
-          ts: Date.now(),
-          direction: c.direction,
-          files: c.files,
-          bytes: c.bytes,
-        }
-        const list = [...(st.folderActivity[c.pairId] ?? []), ev].slice(-100)
-        const folderActivity = { ...st.folderActivity, [c.pairId]: list }
-        saveFolderActivity(folderActivity)
-        return { folderSummaries, folderActivity }
-      }),
+      set((st) => ({ folderSummaries: { ...st.folderSummaries, [c.pairId]: c } })),
     )
     // Chat lives in the main window only. Load the conversation previews and
     // listen for live messages (from friends, and our own echoed sends).

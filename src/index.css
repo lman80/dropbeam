@@ -1297,26 +1297,74 @@ html.overlay-window #root {
 .chat-staged-x:hover {
   color: var(--text);
 }
-/* A shared-folder sync event woven into the chat timeline (GitHub #23) — a
-   centered, muted "system" pill, clearly not a message bubble. */
-.chat-activity {
+/* A shared-folder sync woven into the chat timeline (GitHub #23) — styled like a
+   file message, attributed by direction (yours right, theirs left), distinct from
+   a text bubble. Click a file row to reveal it in Finder. */
+.sync-row {
+  display: flex;
+  margin: 4px 0;
+  padding: 0 6px;
+}
+.sync-row.mine {
+  justify-content: flex-end;
+}
+.sync-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 78%;
+}
+.sync-row.mine .sync-stack {
+  align-items: flex-end;
+}
+.sync-cap {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  width: fit-content;
-  max-width: 84%;
-  margin: 7px auto;
-  padding: 4px 12px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  font-size: 11.5px;
+  gap: 5px;
+  padding: 0 4px;
+  font-size: 10.5px;
+  color: var(--text-faint);
 }
-.chat-activity svg {
+.sync-cap svg {
   flex-shrink: 0;
   opacity: 0.8;
+}
+.sync-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 320px;
+  padding: 7px 11px;
+  border-radius: 13px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.sync-file:hover {
+  border-color: var(--border-strong);
+}
+.sync-row.mine .sync-file {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-2));
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
+}
+.sync-file svg {
+  flex-shrink: 0;
+}
+.sync-file-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.sync-thumb {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex-shrink: 0;
 }
 .chat-send {
   align-self: stretch;

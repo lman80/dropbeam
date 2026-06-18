@@ -29,6 +29,7 @@ import { EmptyState } from '../components/bits'
 import { ConnInspector } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient, initials } from '../lib/avatar'
+import { FileIcon as TypeIcon, fileKind as typeKind } from '../components/FileIcon'
 import { formatBytes } from '../lib/format'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 
@@ -366,7 +367,7 @@ function Conversation({ friendId }: { friendId: string }) {
     const GAP = 30 * 60 * 1000 // 30 min
     type Row =
       | { kind: 'msg'; ts: number; m: ChatMessage }
-      | { kind: 'activity'; ts: number; ev: FolderActivityEvent; folderName: string }
+      | { kind: 'activity'; ts: number; ev: FolderActivityEvent; folderName: string; folder: string }
     const rows: Row[] = [
       ...messages.map((m) => ({ kind: 'msg' as const, ts: m.ts, m })),
       ...myPairs.flatMap((p) => {
@@ -376,6 +377,7 @@ function Conversation({ friendId }: { friendId: string }) {
           ts: ev.ts,
           ev,
           folderName,
+          folder: p.folder,
         }))
       }),
     ].sort((a, b) => a.ts - b.ts || (a.kind === 'msg' ? -1 : 1))
@@ -555,7 +557,12 @@ function Conversation({ friendId }: { friendId: string }) {
                   </div>
                 )}
                 {row.kind === 'activity' ? (
-                  <FolderActivityRow ev={row.ev} folderName={row.folderName} />
+                  <FolderSyncRow
+                    ev={row.ev}
+                    folder={row.folder}
+                    folderName={row.folderName}
+                    friendName={friend.name}
+                  />
                 ) : (
                   <MessageRow
                     m={row.m}
@@ -723,17 +730,66 @@ function Conversation({ friendId }: { friendId: string }) {
   )
 }
 
-/** A shared-folder sync woven into the timeline (GitHub #23) — a compact, centered
- *  "system" line, distinct from a chat bubble. */
-function FolderActivityRow({ ev, folderName }: { ev: FolderActivityEvent; folderName: string }) {
-  const verb = ev.direction === 'send' ? 'Synced' : 'Received'
+/** A shared-folder sync woven into the timeline (GitHub #23) — rendered like a chat
+ *  file message: attributed by direction (yours on the right, theirs on the left),
+ *  a type-aware icon/thumbnail, and clickable to reveal the exact file in Finder.
+ *  ≤8 files show per-file; a bigger batch collapses to one summary that opens the
+ *  folder. */
+function FolderSyncRow({
+  ev,
+  folder,
+  folderName,
+  friendName,
+}: {
+  ev: FolderActivityEvent
+  folder: string
+  folderName: string
+  friendName: string
+}) {
+  const mine = ev.direction === 'send'
+  const sep = folder.includes('\\') ? '\\' : '/'
+  const full = (rel: string) => `${folder}${sep}${rel.split('/').join(sep)}`
+  const many = ev.files.length > 8
   return (
-    <div className="chat-activity">
-      <FolderOpen size={12} />
-      <span>
-        {verb} {ev.files} file{ev.files === 1 ? '' : 's'} · {formatBytes(ev.bytes)}
-        {folderName ? ` in “${folderName}”` : ''}
-      </span>
+    <div className={`sync-row${mine ? ' mine' : ''}`}>
+      <div className="sync-stack">
+        <div className="sync-cap">
+          <FolderOpen size={11} />
+          <span>
+            {mine ? 'You added' : `${friendName} added`} · {folderName} · {formatBytes(ev.bytes)}
+          </span>
+        </div>
+        {many ? (
+          <button
+            className="sync-file"
+            onClick={() => void api.openPath(folder).catch(() => {})}
+            title="Open the shared folder"
+          >
+            <TypeIcon name="files" size={18} />
+            <span className="sync-file-name">{ev.files.length} files synced</span>
+          </button>
+        ) : (
+          ev.files.map((rel) => {
+            const base = rel.split('/').pop() || rel
+            const img = HAS_TAURI && typeKind(base) === 'image'
+            return (
+              <button
+                className="sync-file"
+                key={rel}
+                onClick={() => void api.revealPath(full(rel)).catch(() => {})}
+                title={`Reveal ${base} in Finder`}
+              >
+                {img ? (
+                  <img className="sync-thumb" src={convertFileSrc(full(rel))} alt="" loading="lazy" />
+                ) : (
+                  <FileIcon name={base} size={18} />
+                )}
+                <span className="sync-file-name">{base}</span>
+              </button>
+            )
+          })
+        )}
+      </div>
     </div>
   )
 }

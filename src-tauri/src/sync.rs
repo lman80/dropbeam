@@ -1164,9 +1164,17 @@ impl SyncManager {
                         // Cue the UI to optionally play a sound + flash the HUD.
                         // `remaining` lets the UI ding ONCE when the whole drop is
                         // done, not once per file.
+                        // Relative names of the files this batch moved, for the
+                        // chat timeline (GitHub #23). Additive — older UIs ignore it.
+                        let synced_names: Vec<String> = batch
+                            .iter()
+                            .filter_map(|f| {
+                                crate::iroh_net::folder_rel(Path::new(f), &pair.folder)
+                            })
+                            .collect();
                         let _ = manager.app.emit(
                             "folder-synced",
-                            serde_json::json!({ "pairId": pair_id, "direction": "send", "remaining": remaining }),
+                            serde_json::json!({ "pairId": pair_id, "direction": "send", "remaining": remaining, "files": synced_names, "bytes": batch_bytes }),
                         );
                         // Whole drop finished → emit a completion summary (files, total
                         // bytes, elapsed, average speed) so the folder card can show it
@@ -1976,9 +1984,14 @@ impl SyncManager {
             },
         );
         let _ = self.app.emit("history://changed", ());
+        // Relative names of the files just received, for the chat timeline (#23).
+        let synced_names: Vec<String> = files
+            .iter()
+            .filter_map(|f| crate::iroh_net::folder_rel(Path::new(f), &pair.folder))
+            .collect();
         let _ = self.app.emit(
             "folder-synced",
-            serde_json::json!({ "pairId": pair.id, "direction": "receive" }),
+            serde_json::json!({ "pairId": pair.id, "direction": "receive", "files": synced_names, "bytes": total }),
         );
         let settings_notify = self
             .app

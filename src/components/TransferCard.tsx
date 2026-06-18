@@ -70,15 +70,15 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
       exit={{ opacity: 0, scale: 0.97, transition: { duration: 0.15 } }}
       transition={{ type: 'spring', stiffness: 320, damping: 28 }}
       className="card"
-      style={{ padding: 18, overflow: 'hidden' }}
+      style={{ padding: 13, overflow: 'hidden' }}
     >
       {/* header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <div
           style={{
-            width: 38,
-            height: 38,
-            borderRadius: 11,
+            width: 30,
+            height: 30,
+            borderRadius: 9,
             display: 'grid',
             placeItems: 'center',
             flexShrink: 0,
@@ -87,11 +87,11 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
           }}
         >
           {t.state === 'completed' ? (
-            <CheckCircle2 size={20} />
+            <CheckCircle2 size={17} />
           ) : t.state === 'failed' ? (
-            <AlertCircle size={20} />
+            <AlertCircle size={17} />
           ) : (
-            <DirIcon size={19} />
+            <DirIcon size={16} />
           )}
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -99,7 +99,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             className="selectable"
             style={{
               fontWeight: 650,
-              fontSize: 14.5,
+              fontSize: 13.5,
               whiteSpace: 'nowrap',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
@@ -149,8 +149,8 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
 
       {/* manual-accept offer from a friend */}
       {isOffer && (
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
             <b style={{ color: 'var(--text)' }}>{t.friendName ?? 'Someone'}</b> wants to send you{' '}
             <b style={{ color: 'var(--text)' }}>
               {t.fileNames.length ? t.fileNames[0] : 'files'}
@@ -181,8 +181,8 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
         <div
           style={{
             display: 'flex',
-            gap: 18,
-            marginTop: 16,
+            gap: 16,
+            marginTop: 12,
             alignItems: 'center',
             flexWrap: 'wrap',
           }}
@@ -256,19 +256,19 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
 
       {/* transferring: progress */}
       {t.state === 'transferring' && (
-        <div style={{ marginTop: 16 }}>
+        <div style={{ marginTop: 10 }}>
           <div
             style={{
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'baseline',
-              marginBottom: 8,
+              marginBottom: 6,
             }}
           >
-            <span style={{ fontSize: 22, fontWeight: 750 }} className="gradient-text">
+            <span style={{ fontSize: 16, fontWeight: 750 }} className="gradient-text">
               {Math.round(t.percent)}%
             </span>
-            <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
               {formatBytesLive(t.bytesDone)}
               {t.bytesTotal > 0 ? ` / ${formatBytesLive(t.bytesTotal)}` : ''}
             </span>
@@ -278,8 +278,8 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             style={{
               display: 'flex',
               justifyContent: 'space-between',
-              marginTop: 9,
-              fontSize: 12.5,
+              marginTop: 6,
+              fontSize: 12,
               color: 'var(--text-muted)',
             }}
           >
@@ -296,7 +296,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             display: 'flex',
             alignItems: 'center',
             gap: 9,
-            marginTop: 14,
+            marginTop: 10,
             fontSize: 13,
             color: 'var(--text-muted)',
           }}
@@ -314,7 +314,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
               display: 'flex',
               alignItems: 'center',
               gap: 9,
-              marginTop: 14,
+              marginTop: 10,
               fontSize: 13,
               color: 'var(--text-muted)',
             }}
@@ -331,7 +331,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            marginTop: 14,
+            marginTop: 10,
             gap: 12,
           }}
         >
