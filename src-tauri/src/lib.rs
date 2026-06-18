@@ -179,12 +179,18 @@ pub fn run() {
             // diagnose hard-to-reproduce transfer issues from a tester's machine.
             // Read straight from settings.json — the plugin's level is fixed at
             // startup, so the toggle takes effect on the next launch.
+            // Verbose (Debug-level) logging is ON whenever the device shares
+            // diagnostics — which is the default for every install — so the daily
+            // digest carries the connection-lifecycle detail (path selection,
+            // hole-punch, relay-vs-direct) needed to diagnose slowness, not just bare
+            // errors. The explicit `verbose_logging` toggle still forces it on for a
+            // device that has opted OUT of sharing.
             let verbose = app
                 .path()
                 .app_config_dir()
                 .ok()
                 .map(|d| crate::settings::load(&d, "", ""))
-                .map(|s| s.verbose_logging)
+                .map(|s| s.verbose_logging || s.share_diagnostics)
                 .unwrap_or(false);
             let (global_level, app_level, iroh_level) = if verbose {
                 (
