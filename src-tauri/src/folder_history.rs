@@ -171,7 +171,10 @@ pub fn restore(folder: &str, id: &str) -> Result<String, String> {
         save(folder, &items);
         return Err("The saved copy of that file is missing.".into());
     }
-    let mut dest = Path::new(folder).join(&item.rel_path);
+    // Sanitize before joining so a tampered index rel_path (../, leading /, etc.)
+    // can never restore OUTSIDE the folder root — same invariant the receive side
+    // enforces on incoming paths.
+    let mut dest = Path::new(folder).join(crate::iroh_net::sanitize_rel(&item.rel_path));
     if let Some(parent) = dest.parent() {
         let _ = fs::create_dir_all(parent);
     }

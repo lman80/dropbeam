@@ -1382,6 +1382,14 @@ async fn serve_stream(
                     );
                     let _ = send.write_all(b"ok").await;
                     let _ = send.finish();
+                    // Keep this stream alive until the SENDER has actually consumed
+                    // the "ok". Otherwise, if its degradation/stall watchdog closes
+                    // the conn (relay flap) in the window right after we finalized +
+                    // deleted the partial, the queued ack is discarded, the sender
+                    // reports "interrupted before the recipient confirmed receipt",
+                    // auto-resumes, and re-receives the whole file as "name (1).ext".
+                    // Bounded so a truly-dead peer can't hang us — the data is on disk.
+                    let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
                 }
                 Err(e) if e.to_string().contains("canceled") => {
                     emit_canceled(&app, &id, Direction::Receive)
@@ -3649,7 +3657,7 @@ pub(crate) fn folder_rel(path: &Path, root: &str) -> Option<String> {
 
 /// Sanitize a peer-supplied relative path: drop empties, `.` and `..`, and any
 /// drive/root prefix, so a malicious peer can't write outside the staging dir.
-fn sanitize_rel(raw: &str) -> PathBuf {
+pub(crate) fn sanitize_rel(raw: &str) -> PathBuf {
     use unicode_normalization::UnicodeNormalization;
     let mut out = PathBuf::new();
     for comp in raw.replace('\\', "/").split('/') {
@@ -5727,5 +5735,301 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest);
         println!("iroh accept-loop Quick Send OK");
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    //! Deterministic, in-process LOOPBACK integration tests for the transfer
+    //! engine — NOT marked `#[ignore]` (unlike the `tests` module's E2E cases,
+    //! which dial the public n0 relay/DNS network). These bind two real iroh
+    //! endpoints on `127.0.0.1` with the relay AND all discovery DISABLED, then
+    //! dial directly by the server's own `EndpointAddr`. No relay, no mDNS, no
+    //! DNS, no internet — the connection can only form over loopback, so it's
+    //! fast (sub-second) and can't flake on network conditions.
+    //!
+    //! This is the exact "two-direct-only" pattern iroh's own test suite uses
+    //! (`Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)` +
+    //! `connect(server.addr(), ALPN)`), pointed at DropBeam's REAL `send_files`
+    //! / `recv_files` / resumable-receive functions.
+    use super::*;
+    use iroh::RelayMode;
+
+    /// A unique scratch dir under the OS temp dir, namespaced by pid + a label so
+    /// parallel test binaries never collide. Removed by the caller at the end.
+    fn scratch(label: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "dropbeam-loop-{label}-{}-{}",
+            std::process::id(),
+            // A monotonic-ish salt so two scratch() calls in one test differ.
+            Instant::now().elapsed().as_nanos().wrapping_add(rand::random::<u64>() as u128),
+        ));
+        let _ = std::fs::create_dir_all(&p);
+        p
+    }
+
+    /// A deterministic pseudo-random payload — a swapped, duplicated, or dropped
+    /// segment changes the bytes, so byte-equality is a real reassembly check
+    /// (not just a length check that a zero-fill would pass).
+    fn payload(len: usize, seed: u64) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = ((i as u64).wrapping_mul(2654435761).wrapping_add(seed) % 251) as u8;
+        }
+        v
+    }
+
+    /// Bind a loopback-only endpoint: NO relay, NO address lookup (mDNS/DNS), bound
+    /// to 127.0.0.1 so its advertised `EndpointAddr` is a direct loopback socket the
+    /// peer can dial immediately — zero network, fully deterministic.
+    ///
+    /// `presets::Minimal` sets only the mandatory crypto provider (the same one the
+    /// app's `presets::N0` path resolves to), then we strip the relay. We do NOT add
+    /// any `address_lookup`, so nothing is ever published or resolved off-box.
+    async fn loopback_endpoint(accept: bool) -> Endpoint {
+        let mut b = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")
+            .expect("127.0.0.1:0 is a valid bind address");
+        if accept {
+            b = b.alpns(vec![ALPN.to_vec()]);
+        }
+        b.bind().await.expect("bind loopback iroh endpoint")
+    }
+
+    /// THE core loopback guarantee: a real file pushed through the engine's actual
+    /// `send_files` and received with `recv_files` comes out byte-for-byte identical,
+    /// entirely over loopback with no relay/discovery. This is the un-runtime-testable
+    /// happy path that no unit test could cover before.
+    #[tokio::test]
+    async fn loopback_single_file_roundtrips_byte_identical() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let server_addr = server.addr(); // direct loopback addr — no online() wait needed
+
+        // 1 MiB: small enough to stay sub-second, big enough to span many chunks.
+        let data = payload(1024 * 1024, 1);
+        let src_dir = scratch("s1-src");
+        let src = src_dir.join("hello.bin");
+        std::fs::write(&src, &data).unwrap();
+        let dest_dir = scratch("s1-rx");
+
+        // Receiver: accept the dialed connection and run the REAL recv_files.
+        let srv = server.clone();
+        let dest_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {})
+                .await
+                .unwrap()
+        });
+
+        // Sender: dial the loopback addr directly and push via the REAL send_files.
+        let conn = client.connect(server_addr, ALPN).await.unwrap();
+        let sent = send_files(
+            &conn,
+            &[src.clone()],
+            &AtomicBool::new(false),
+            |_, _| {},
+            "loopback-tester",
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, data.len() as u64, "sender reports the full size");
+
+        let received = recv.await.unwrap();
+        assert_eq!(received.len(), 1, "exactly one file landed");
+        let got = std::fs::read(&received[0]).unwrap();
+        assert_eq!(got.len(), data.len(), "received length matches");
+        assert!(got == data, "received bytes are byte-identical to the source");
+
+        client.close().await;
+        server.close().await;
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// SPLIT-MODE over loopback: a multi-file selection is sent as ONE negotiated
+    /// transfer carrying several files (the engine's `gather_items` expands the
+    /// path list into per-file items). Every file must arrive intact, all over
+    /// loopback. Exercises the multi-item header + body path of `send_files`.
+    #[tokio::test]
+    async fn loopback_multi_file_split_mode_all_arrive_intact() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let server_addr = server.addr();
+
+        // Three distinct files of different sizes/contents. Multi-file => the engine
+        // takes the classic per-file body path (parallel_stream_count == 0 for >1
+        // item), so this proves the split/multi body, not the single-file fan-out.
+        let src_dir = scratch("mf-src");
+        let specs = [
+            ("alpha.bin", payload(64 * 1024, 11)),
+            ("beta.dat", payload(200 * 1024, 22)),
+            ("gamma.txt", payload(7, 33)), // tiny, odd size — boundary case
+        ];
+        let mut paths = Vec::new();
+        for (name, bytes) in &specs {
+            let p = src_dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            paths.push(p);
+        }
+        let total: u64 = specs.iter().map(|(_, b)| b.len() as u64).sum();
+        let dest_dir = scratch("mf-rx");
+
+        let srv = server.clone();
+        let dest_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {})
+                .await
+                .unwrap()
+        });
+
+        let conn = client.connect(server_addr, ALPN).await.unwrap();
+        let sent = send_files(
+            &conn,
+            &paths,
+            &AtomicBool::new(false),
+            |_, _| {},
+            "loopback-tester",
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, total, "sender reports the summed size of all files");
+
+        let received = recv.await.unwrap();
+        assert_eq!(received.len(), specs.len(), "all files landed");
+
+        // Match each received file to its source by name and verify the bytes.
+        for (name, want) in &specs {
+            let got_path = received
+                .iter()
+                .find(|p| p.file_name().and_then(|s| s.to_str()) == Some(*name))
+                .unwrap_or_else(|| panic!("file {name} was not received"));
+            let got = std::fs::read(got_path).unwrap();
+            assert!(got == *want, "file {name} arrived byte-identical");
+        }
+
+        client.close().await;
+        server.close().await;
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// RESUME over loopback: the receiver already holds the first half of the file
+    /// (a simulated interrupted earlier attempt, recorded in the sidecar). It offers
+    /// its coverage in the {ready, resume} reply; the REAL `send_files` transmits
+    /// only the missing tail; the reassembled file is byte-identical and the
+    /// partial + sidecar are cleaned up. Drives the engine's actual resume
+    /// handshake (`prepare_partial` + `recv_file_resumable` + `send_files`'s
+    /// parse_resume_reply path) end-to-end over loopback.
+    #[tokio::test]
+    async fn loopback_resume_sends_only_missing_tail_and_completes() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let server_addr = server.addr();
+
+        // Must be > PARALLEL_MIN so send_files advertises the resumable/parallel
+        // handshake (the only path that honors a {ready, resume} reply).
+        let total: u64 = (PARALLEL_MIN + 4 * 1024 * 1024).max(8 * 1024 * 1024);
+        let data = payload(total as usize, 7);
+        let src_dir = scratch("res-src");
+        let src = src_dir.join("blob.bin");
+        std::fs::write(&src, &data).unwrap();
+
+        let dest_dir = scratch("res-rx");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        // Pre-seed the interrupted attempt: receiver already has the first half on
+        // disk, recorded in the sidecar under the transfer's fingerprint. The
+        // fingerprint mtime (0) must match what the receiver computes below.
+        let have = total / 2;
+        let fp = transfer_fingerprint("loopback-sender", "blob.bin", total, 0);
+        let (part, side) = partial_paths(&dest_dir, &fp);
+        {
+            let f = std::fs::OpenOptions::new().create(true).write(true).open(&part).unwrap();
+            f.set_len(total).unwrap();
+        }
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
+            f.write_all(&data[..have as usize]).unwrap();
+        }
+        let mut cov0 = Coverage::default();
+        cov0.insert(0, have);
+        save_sidecar(&side, &PartialSidecar { v: 1, fp: fp.clone(), total, coverage: cov0 });
+
+        // Receiver: drive the real resumable receive, offering the coverage it has.
+        let srv = server.clone();
+        let dest_c = dest_dir.clone();
+        let fp_c = fp.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let (mut bsend, mut brecv) = conn.accept_bi().await.unwrap();
+            let header = read_frame(&mut brecv).await.unwrap();
+            assert_eq!(header["kind"], "files");
+            assert_eq!(header["resumable"].as_bool(), Some(true), "sender advertises resumable");
+            // Load the pre-seeded partial + its coverage, then offer it.
+            let (part, cov) = prepare_partial(&dest_c, &fp_c, total).unwrap();
+            assert_eq!(cov.covered(), have, "sidecar coverage survived round-trip");
+            write_frame(
+                &mut bsend,
+                &serde_json::json!({ "ready": true, "resume": { "have": cov.ranges } }),
+            )
+            .await
+            .unwrap();
+            let first = conn.accept_uni().await.unwrap();
+            let rc = ResumeCtx { side: partial_paths(&dest_c, &fp_c).1, fp: fp_c.clone() };
+            let dest = recv_file_resumable(
+                &conn,
+                FinalizeDest::UniqueIn(dest_c.clone(), "blob.bin".into()),
+                total,
+                part,
+                Some(rc),
+                cov,
+                first,
+                &AtomicBool::new(false),
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+            // Ack exactly like the live files arm; wait until the sender consumes it
+            // (in production the conn lives on in the accept loop — here the task
+            // ending would drop it and discard the buffered ack).
+            let _ = bsend.write_all(b"ok").await;
+            let _ = bsend.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(10), bsend.stopped()).await;
+            dest
+        });
+
+        // Sender: the REAL send_files negotiates resume and pushes only the tail.
+        let conn = client.connect(server_addr, ALPN).await.unwrap();
+        let engaged = AtomicBool::new(false);
+        let sent = send_files(
+            &conn,
+            &[src.clone()],
+            &AtomicBool::new(false),
+            |_, _| {},
+            "loopback-sender",
+            &engaged,
+        )
+        .await
+        .unwrap();
+        assert!(engaged.load(Ordering::SeqCst), "resumable/parallel path engaged on {{ready}}");
+        assert_eq!(sent, total, "progress is reported relative to the whole file");
+
+        let dest = recv.await.unwrap();
+        let got = std::fs::read(&dest).unwrap();
+        assert!(got == data, "resumed file is byte-identical to the source");
+        assert!(!part.exists(), "partial cleaned up after completion");
+        assert!(!side.exists(), "sidecar cleaned up after completion");
+
+        client.close().await;
+        server.close().await;
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
     }
 }

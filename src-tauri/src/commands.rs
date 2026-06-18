@@ -52,6 +52,11 @@ pub fn update_settings(
     iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     settings: Settings,
 ) -> Result<Settings, String> {
+    // Bound the display name before it's stored AND broadcast to every peer — an
+    // unbounded name would bloat the control frame and could push past its header
+    // limit. 64 chars is ample for a name.
+    let mut settings = settings;
+    settings.display_name = settings.display_name.trim().chars().take(64).collect();
     apply_autostart(&app, settings.launch_at_login);
     // Apply the internet upload cap live (0 = unlimited) — takes effect on the
     // next chunk, no restart needed.
@@ -361,6 +366,13 @@ pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
 #[tauri::command]
 pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
+    // Only ever open real web links from this generic command — never file://,
+    // smb://, x-apple.systempreferences:, or a custom app handler that could be
+    // smuggled in via an untrusted name/filename rendered as a link.
+    let lower = url.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err("Only http and https links can be opened.".into());
+    }
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())

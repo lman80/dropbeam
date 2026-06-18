@@ -33,12 +33,16 @@ export function SendView() {
     if (paths.length) setPendingSend(paths)
   }
 
-  const submitReceive = (e: React.FormEvent) => {
+  const submitReceive = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!code.trim()) return
-    receiveCode(code)
-    setCode('')
-    setShowReceive(false)
+    // Only clear the field + close the panel if the receive actually started —
+    // otherwise the user loses what they typed before they can read the error.
+    const ok = await receiveCode(code)
+    if (ok) {
+      setCode('')
+      setShowReceive(false)
+    }
   }
 
   return (
@@ -53,13 +57,13 @@ export function SendView() {
             style={{ fontSize: 12.5 }}
             onClick={() => setShowReceive(true)}
           >
-            <ArrowDownToLine size={14} /> Have a code? Receive a file
+            <ArrowDownToLine size={14} /> Have a link? Receive a file
           </button>
         ) : (
           <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 440 }}>
             <input
               className="input"
-              placeholder="Enter the code…"
+              placeholder="Paste the Direct link the sender shared…"
               value={code}
               autoFocus
               spellCheck={false}

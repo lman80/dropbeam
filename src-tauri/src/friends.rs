@@ -30,7 +30,16 @@ pub fn friends_path(config_dir: &Path) -> PathBuf {
 
 pub fn load(config_dir: &Path) -> Vec<Friend> {
     match fs::read_to_string(friends_path(config_dir)) {
-        Ok(txt) => serde_json::from_str(&txt).unwrap_or_default(),
+        // Parse element-wise so one corrupt/forward-incompatible friend record
+        // drops only itself instead of wiping every friend (plain from_str would
+        // Err on a single bad element → unwrap_or_default loses them all).
+        Ok(txt) => serde_json::from_str::<Vec<serde_json::Value>>(&txt)
+            .map(|vals| {
+                vals.into_iter()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }

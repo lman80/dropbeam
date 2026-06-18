@@ -5,12 +5,23 @@ import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
 import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
 
-function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
+function Toggle({
+  on,
+  onChange,
+  disabled,
+}: {
+  on: boolean
+  onChange: (v: boolean) => void
+  disabled?: boolean
+}) {
   return (
     <button
       className={`toggle${on ? ' on' : ''}`}
-      onClick={() => onChange(!on)}
+      onClick={() => !disabled && onChange(!on)}
       aria-pressed={on}
+      aria-disabled={disabled}
+      disabled={disabled}
+      style={disabled ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
     />
   )
 }
@@ -325,10 +336,15 @@ export function SettingsView() {
         {SEP}
         <Row
           title="Wait for a direct connection"
-          desc="When a send can only reach the relay, DropBeam holds off and keeps trying for a fast direct path instead of crawling through the relay. Your files stay put until a direct link forms — and each transfer card shows a “Send over relay anyway” button if you'd rather not wait."
+          desc={
+            settings.requireDirect
+              ? 'Off because “Only send over direct connections” above already refuses the relay outright — there’s nothing to wait for.'
+              : 'When a send can only reach the relay, DropBeam holds off and keeps trying for a fast direct path instead of crawling through the relay. Your files stay put until a direct link forms — and each transfer card shows a “Send over relay anyway” button if you’d rather not wait.'
+          }
         >
           <Toggle
-            on={settings.waitForDirect}
+            on={settings.requireDirect ? false : settings.waitForDirect}
+            disabled={settings.requireDirect}
             onChange={(v) => save({ waitForDirect: v })}
           />
         </Row>

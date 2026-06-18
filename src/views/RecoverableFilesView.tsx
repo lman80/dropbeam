@@ -255,7 +255,16 @@ function FolderRow({
     <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
       <div
         className="row-hover"
+        role="button"
+        tabIndex={0}
+        aria-expanded={isOpen}
         onClick={onToggle}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            onToggle()
+          }
+        }}
         style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '13px 15px', cursor: 'pointer' }}
       >
         <motion.div animate={{ rotate: isOpen ? 90 : 0 }} style={{ display: 'grid', placeItems: 'center', color: 'var(--text-faint)' }}>

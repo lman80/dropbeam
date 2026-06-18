@@ -141,7 +141,7 @@ interface AppStore {
   pickAvatar: () => Promise<void>
   clearAvatar: () => Promise<void>
   sendPaths: (paths: string[]) => Promise<void>
-  receiveCode: (code: string) => Promise<void>
+  receiveCode: (code: string) => Promise<boolean>
   upsertTransfer: (u: TransferUpdate) => void
   removeTransfer: (id: string) => void
   reloadHistory: () => Promise<void>
@@ -474,15 +474,15 @@ export const useStore = create<AppStore>((set, get) => ({
 
   receiveCode: async (code) => {
     code = code.trim()
-    if (!code) return
+    if (!code) return false
     try {
       // iroh-only: receives use the Direct ticket from the sender's link/QR.
       if (!code.startsWith('direct')) {
         get().toast(
           'error',
-          'Paste the Direct link or scan the QR to receive. (Short word-codes return once a rendezvous broker is set up — see SHORT-CODES.md.)',
+          "That doesn't look like a DropBeam link. Paste the full link the sender shared, or scan their QR code to receive.",
         )
-        return
+        return false
       }
       // One receive per ticket at a time: a double-paste/double-click would
       // start two pulls of the same files racing each other into duplicates.
@@ -491,15 +491,17 @@ export const useStore = create<AppStore>((set, get) => ({
         const prior = get().transfers[priorId]
         if (prior && !['completed', 'failed', 'canceled'].includes(prior.state)) {
           get().toast('info', 'Already receiving this transfer.')
-          return
+          return false
         }
         activeReceives.delete(code)
       }
       const u = await api.irohReceive(code)
       activeReceives.set(code, u.id)
       get().upsertTransfer(u)
+      return true
     } catch (e) {
       get().toast('error', String(e))
+      return false
     }
   },
 
@@ -671,10 +673,15 @@ export const useStore = create<AppStore>((set, get) => ({
     void api.setActiveChat(friendId)
     const msgs = await api.getChatMessages(friendId).catch(() => [])
     set((s) => {
+      // Merge by id rather than overwrite: a live message delivered via
+      // addChatMessage WHILE getChatMessages was awaiting would otherwise be lost.
+      const byId = new Map(msgs.map((m) => [m.id, m]))
+      for (const m of s.chats[friendId] ?? []) if (!byId.has(m.id)) byId.set(m.id, m)
+      const merged = [...byId.values()].sort(byOrder)
       const chatUnread = { ...s.chatUnread, [friendId]: 0 }
       const total = Object.values(chatUnread).reduce((a, b) => a + b, 0)
       void api.setUnreadBadge(total)
-      return { chats: { ...s.chats, [friendId]: msgs }, chatUnread }
+      return { chats: { ...s.chats, [friendId]: merged }, chatUnread }
     })
     get().markChatRead(friendId)
   },

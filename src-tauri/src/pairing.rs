@@ -31,7 +31,16 @@ pub fn pairs_path(config_dir: &Path) -> PathBuf {
 
 pub fn load(config_dir: &Path) -> Vec<Pair> {
     match fs::read_to_string(pairs_path(config_dir)) {
-        Ok(txt) => serde_json::from_str(&txt).unwrap_or_default(),
+        // Parse element-wise: one corrupt/forward-incompatible entry drops only
+        // ITSELF, never wiping every other shared folder (a plain from_str returns
+        // Err on any single bad element → unwrap_or_default would lose them all).
+        Ok(txt) => serde_json::from_str::<Vec<serde_json::Value>>(&txt)
+            .map(|vals| {
+                vals.into_iter()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }

@@ -33,6 +33,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag matches app version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          CARGO=$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "tag=$TAG conf=$CONF cargo=$CARGO"
+          test "$TAG" = "$CONF" || { echo "::error::tag v$TAG != tauri.conf.json $CONF"; exit 1; }
+          test "$TAG" = "$CARGO" || { echo "::error::tag v$TAG != Cargo.toml $CARGO"; exit 1; }
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

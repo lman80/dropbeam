@@ -339,7 +339,16 @@ function FolderCard({
         <button
           className="icon-btn"
           title="Folder settings"
-          onClick={() => setOpen((o) => !o)}
+          onClick={() =>
+            setOpen((o) => {
+              // Re-arm the destructive confirms fresh each time the drawer reopens.
+              if (o) {
+                setConfirmUnpair(false)
+                setVerifying(false)
+              }
+              return !o
+            })
+          }
           style={{ color: open ? 'var(--accent)' : undefined }}
         >
           <Settings2 size={16} />
@@ -612,13 +621,22 @@ function FolderCard({
                 title="Play sound on sync"
                 desc="Hear a soft cue whenever a file is sent to or received from this folder. Off by default."
               >
-                <button className={`toggle${soundOn ? ' on' : ''}`} onClick={toggleSound} />
+                <button
+                  role="switch"
+                  aria-checked={soundOn}
+                  aria-label="Play sound on sync"
+                  className={`toggle${soundOn ? ' on' : ''}`}
+                  onClick={toggleSound}
+                />
               </SettingRow>
               <SettingRow
                 title="Total sync (source of truth)"
                 desc="Adds, edits, and deletes all sync both ways — like a shared drive. Deleted and replaced files are kept in History so nothing is lost."
               >
                 <button
+                  role="switch"
+                  aria-checked={pair.mirror}
+                  aria-label="Total sync (source of truth)"
                   className={`toggle${pair.mirror ? ' on' : ''}`}
                   onClick={() => updateGroup({ mirror: !pair.mirror })}
                 />
@@ -629,6 +647,9 @@ function FolderCard({
                   desc="Receive the peer's files too, not just send."
                 >
                   <button
+                    role="switch"
+                    aria-checked={pair.twoWay}
+                    aria-label="Two-way sync"
                     className={`toggle${pair.twoWay ? ' on' : ''}`}
                     onClick={() => updateGroup({ twoWay: !pair.twoWay })}
                   />
@@ -640,6 +661,9 @@ function FolderCard({
                   desc="Remove the local copy once the peer confirms receipt — a self-emptying outbox."
                 >
                   <button
+                    role="switch"
+                    aria-checked={pair.autoDelete}
+                    aria-label="Delete after delivery"
                     className={`toggle${pair.autoDelete ? ' on' : ''}`}
                     onClick={() => updateGroup({ autoDelete: !pair.autoDelete })}
                   />
@@ -689,8 +713,11 @@ function FolderCard({
                       setVerifying(true)
                       try {
                         await api.verifyFolders()
-                      } catch {
-                        /* best-effort */
+                        // Accurate: we kicked off a reconcile — we can't claim the
+                        // folders already match (the check runs in the background).
+                        toast('info', 'Re-checking both folders…')
+                      } catch (e) {
+                        toast('error', String(e))
                       }
                       setTimeout(() => setVerifying(false), 2500)
                     }}

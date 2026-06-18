@@ -332,15 +332,37 @@ function FriendCard({ friend }: { friend: Friend }) {
     }
   }
 
-  // Auto-check the live path once when a friend comes online; clear it when they drop.
+  // Auto-check the live path once when a friend comes online; clear it when they
+  // drop. The `alive` guard stops a late-resolving probe from a prior cycle (or
+  // after the card unmounts/reorders) from clobbering current state.
   useEffect(() => {
     if (!isOnline) {
       setConn(null)
       return
     }
-    void probe()
+    let alive = true
+    ;(async () => {
+      setProbing(true)
+      try {
+        const d = await api.probeConnection(friend.id)
+        if (alive) setConn(d)
+      } catch {
+        if (alive) setConn(null)
+      } finally {
+        if (alive) setProbing(false)
+      }
+    })()
+    return () => {
+      alive = false
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOnline, friend.id])
+
+  // A live presence recovery clears a stale "No response" from an earlier Check,
+  // so the label, dot, and connection line all agree the friend is back.
+  useEffect(() => {
+    if (isOnline) setPingedOffline(false)
+  }, [isOnline])
 
   const check = async () => {
     setPinging(true)
