@@ -749,7 +749,31 @@ function FolderSyncRow({
   const mine = ev.direction === 'send'
   const sep = folder.includes('\\') ? '\\' : '/'
   const full = (rel: string) => `${folder}${sep}${rel.split('/').join(sep)}`
-  const many = ev.files.length > 8
+
+  // Group the synced paths: a file directly in the shared root shows on its own,
+  // but files inside a subfolder collapse into ONE folder entry — so creating a
+  // folder and dropping files in it, or moving a folder in, reads as "added
+  // <folder>" instead of a flat list of files (GitHub #23).
+  type Entry = { kind: 'dir'; name: string; count: number } | { kind: 'file'; rel: string }
+  const entries: Entry[] = (() => {
+    const roots: string[] = []
+    const dirs = new Map<string, number>()
+    for (const raw of ev.files) {
+      const rel = raw.split('\\').join('/')
+      const slash = rel.indexOf('/')
+      if (slash === -1) roots.push(rel)
+      else {
+        const top = rel.slice(0, slash)
+        dirs.set(top, (dirs.get(top) ?? 0) + 1)
+      }
+    }
+    const out: Entry[] = []
+    for (const [name, count] of dirs) out.push({ kind: 'dir', name, count })
+    for (const rel of roots) out.push({ kind: 'file', rel })
+    return out
+  })()
+
+  const many = entries.length > 8
   return (
     <div className={`sync-row${mine ? ' mine' : ''}`}>
       <div className="sync-stack">
@@ -766,23 +790,39 @@ function FolderSyncRow({
             title="Open the shared folder"
           >
             <TypeIcon name="files" size={18} />
-            <span className="sync-file-name">{ev.files.length} files synced</span>
+            <span className="sync-file-name">{ev.files.length} items synced</span>
           </button>
         ) : (
-          ev.files.map((rel) => {
-            const base = rel.split('/').pop() || rel
+          entries.map((e) => {
+            if (e.kind === 'dir') {
+              return (
+                <button
+                  className="sync-file"
+                  key={'d:' + e.name}
+                  onClick={() => void api.openPath(full(e.name)).catch(() => {})}
+                  title={`Open ${e.name}`}
+                >
+                  <FolderOpen size={18} style={{ color: 'var(--accent)' }} />
+                  <span className="sync-file-name">{e.name}</span>
+                  <span className="sync-count">
+                    {e.count} item{e.count === 1 ? '' : 's'}
+                  </span>
+                </button>
+              )
+            }
+            const base = e.rel.split('/').pop() || e.rel
             const img = HAS_TAURI && typeKind(base) === 'image'
             return (
               <button
                 className="sync-file"
-                key={rel}
-                onClick={() => void api.revealPath(full(rel)).catch(() => {})}
+                key={'f:' + e.rel}
+                onClick={() => void api.revealPath(full(e.rel)).catch(() => {})}
                 title={`Reveal ${base} in Finder`}
               >
                 {img ? (
-                  <img className="sync-thumb" src={convertFileSrc(full(rel))} alt="" loading="lazy" />
+                  <img className="sync-thumb" src={convertFileSrc(full(e.rel))} alt="" loading="lazy" />
                 ) : (
-                  <FileIcon name={base} size={18} />
+                  <TypeIcon name={base} size={18} />
                 )}
                 <span className="sync-file-name">{base}</span>
               </button>

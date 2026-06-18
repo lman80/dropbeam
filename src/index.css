@@ -1359,6 +1359,13 @@ html.overlay-window #root {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+.sync-count {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding-left: 8px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
 .sync-thumb {
   width: 26px;
   height: 26px;
