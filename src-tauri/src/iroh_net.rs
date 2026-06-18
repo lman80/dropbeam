@@ -3356,7 +3356,18 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
 
     let mut items = Vec::new();
     for p in paths {
-        let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
+        // PRE-FILTER: drop any file moved/deleted since the folder scan built this
+        // batch, BEFORE the header is written — so the advertised manifest matches
+        // the body byte-for-byte. A single vanished file used to fail the WHOLE
+        // folder send (the "File does not exist at path" / "folder send stalled"
+        // reports). The deletion still reaches the peer via the normal delete path.
+        let meta = match std::fs::metadata(p) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("folder send: skipping {} — {e}", p.display());
+                continue;
+            }
+        };
         let Some(rel) = folder_rel(p, root) else {
             // Not provably under the folder root — skip rather than risk sending it
             // at the wrong (root) level. The reconcile re-sends it correctly later.
@@ -3365,10 +3376,13 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
         };
         items.push((p.clone(), rel, meta.len(), mtime_secs(&meta)));
     }
-    anyhow::ensure!(
-        !items.is_empty(),
-        "no sendable items under folder root (skipped un-rootable paths)"
-    );
+    // After pre-filter, an empty batch is a clean NO-OP, not an error: every item
+    // was deleted/moved (or un-rootable), and each deletion propagates on its own.
+    // Returning Ok here means a vanished-file folder send never error-spams.
+    if items.is_empty() {
+        log::info!("folder send: nothing to send (all items vanished or un-rootable) — no-op");
+        return Ok(conn_locality(&conn));
+    }
     let total: u64 = items.iter().map(|i| i.2).sum();
     // Big single folder files fan across parallel streams exactly like friend
     // sends (same negotiation, same resume). Folder sync was the LAST big-file
@@ -4584,7 +4598,21 @@ async fn recv_file_resumable<F: Fn(u64, u64)>(
 fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, u64)> {
     let mut items = Vec::new();
     for p in paths {
-        let meta = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
+        // PRE-FILTER: a file the user moved or deleted between the drop and this
+        // moment must be DROPPED from the batch — never fail the whole send. We
+        // re-stat here, the instant the manifest is finalized, so the count/total
+        // we're about to advertise matches exactly what the body will stream (the
+        // receiver consumes precisely `header["items"]`). The vanished file's
+        // removal propagates via the normal delete path; here it's just absent.
+        // Reported in diagnostics as "File does not exist at path" (17×) +
+        // "folder send stalled" — one moved file used to kill the entire batch.
+        let meta = match std::fs::metadata(p) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("send pre-filter: skipping {} — {e}", p.display());
+                continue;
+            }
+        };
         if meta.is_dir() {
             // A dropped FOLDER → expand it into its files, preserving structure under
             // the folder's own name ("Project/clips/a.mp4"). Without this, sending a
@@ -6061,6 +6089,105 @@ mod loopback_tests {
         assert!(got == data, "resumed file is byte-identical to the source");
         assert!(!part.exists(), "partial cleaned up after completion");
         assert!(!side.exists(), "sidecar cleaned up after completion");
+
+        client.close().await;
+        server.close().await;
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// PRE-FILTER over loopback: a multi-file batch where ONE file is DELETED after
+    /// the path list is built but BEFORE the send runs (the exact race behind the
+    /// real "File does not exist at path" / "folder send stalled" reports). The send
+    /// must drop the vanished file from the manifest at finalize time and deliver
+    /// the OTHERS intact — no error, sender/receiver perfectly in sync (advertised
+    /// count == streamed count). Drives the REAL `send_files` → `gather_items`
+    /// pre-filter (the shared chokepoint for every friend / Quick-Send path) and the
+    /// REAL `recv_files`. The folder path (`send_folder_file`) re-stats through the
+    /// same skip-on-vanish logic, so this one case proves both.
+    #[tokio::test]
+    async fn loopback_deleted_file_is_dropped_others_arrive_intact() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let server_addr = server.addr();
+
+        // Build a 3-file batch, then delete the MIDDLE one before sending — proving
+        // the drop happens mid-list (not just at an edge) and the survivors keep
+        // their order/contents. Multi-file => classic per-file body (no parallel).
+        let src_dir = scratch("delrace-src");
+        let specs = [
+            ("keep-first.bin", payload(48 * 1024, 101)),
+            ("VANISHES.dat", payload(256 * 1024, 202)),
+            ("keep-last.txt", payload(9, 303)),
+        ];
+        let mut paths = Vec::new();
+        for (name, bytes) in &specs {
+            let p = src_dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            paths.push(p);
+        }
+        // The race: the middle file is removed AFTER the batch was assembled but
+        // BEFORE send_files re-stats it. Pre-filter must drop it from the manifest.
+        std::fs::remove_file(&paths[1]).unwrap();
+        assert!(!paths[1].exists(), "the middle file is gone before the send");
+
+        // What SHOULD survive: every spec except the deleted one.
+        let survivors: Vec<&(&str, Vec<u8>)> =
+            specs.iter().filter(|(n, _)| *n != "VANISHES.dat").collect();
+        let want_total: u64 = survivors.iter().map(|(_, b)| b.len() as u64).sum();
+
+        let srv = server.clone();
+        let dest_dir = scratch("delrace-rx");
+        let dest_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            // The REAL receiver: it reads EXACTLY the advertised manifest. If the
+            // sender advertised 3 but streamed 2 (or vice-versa) this would hang or
+            // error — so a clean return here is itself proof the two stayed in sync.
+            recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {})
+                .await
+                .unwrap()
+        });
+
+        let conn = client.connect(server_addr, ALPN).await.unwrap();
+        // The whole point: this MUST NOT error just because one file vanished.
+        let sent = send_files(
+            &conn,
+            &paths,
+            &AtomicBool::new(false),
+            |_, _| {},
+            "loopback-tester",
+            &AtomicBool::new(false),
+        )
+        .await
+        .expect("a vanished file must NOT fail the batch — it is pre-filtered out");
+        assert_eq!(
+            sent, want_total,
+            "sender reports the summed size of the SURVIVORS only (deleted file excluded)"
+        );
+
+        let received = recv.await.unwrap();
+        assert_eq!(
+            received.len(),
+            survivors.len(),
+            "exactly the surviving files landed — advertised count == streamed count"
+        );
+        // No file named after the deleted one may have landed.
+        assert!(
+            received
+                .iter()
+                .all(|p| p.file_name().and_then(|s| s.to_str()) != Some("VANISHES.dat")),
+            "the deleted file must NOT appear on the receiver"
+        );
+        // Every survivor arrived byte-identical.
+        for (name, want) in &survivors {
+            let got_path = received
+                .iter()
+                .find(|p| p.file_name().and_then(|s| s.to_str()) == Some(*name))
+                .unwrap_or_else(|| panic!("survivor {name} was not received"));
+            let got = std::fs::read(got_path).unwrap();
+            assert!(got == *want, "survivor {name} arrived byte-identical");
+        }
 
         client.close().await;
         server.close().await;
