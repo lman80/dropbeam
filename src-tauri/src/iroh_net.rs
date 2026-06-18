@@ -205,10 +205,24 @@ fn emit_completed(
                     format!("{} files", names.len())
                 };
                 let (title, body) = match who {
-                    Some(name) => (format!("{name} sent you {what}"), "Saved — click to open DropBeam".to_string()),
-                    None => (format!("Received {what}"), "Saved — click to open DropBeam".to_string()),
+                    Some(name) => (
+                        format!("{name} sent you {what}"),
+                        "Saved — click to open DropBeam".to_string(),
+                    ),
+                    None => (
+                        format!("Received {what}"),
+                        "Saved — click to open DropBeam".to_string(),
+                    ),
                 };
-                let _ = app.notification().builder().title(title).body(body).show();
+                // Audible (the silent-banner fix) — fires for every receive so a
+                // Quick Send can never slip by unnoticed.
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title(title)
+                    .body(body)
+                    .sound("default")
+                    .show();
             }
         }
     }
@@ -3170,7 +3184,16 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
         }
     };
     use tauri_plugin_notification::NotificationExt;
-    let _ = app.notification().builder().title(who).body(body).show();
+    // `.sound("default")` is the fix for "I keep missing messages": without it macOS
+    // shows a SILENT banner (easy to miss), unlike iMessage. With it you get the
+    // distinct OS notification ping every time you're not staring at the thread.
+    let _ = app
+        .notification()
+        .builder()
+        .title(who)
+        .body(body)
+        .sound("default")
+        .show();
 }
 
 /// Deliver a chat message to a friend over iroh (dial-by-key). `payload` is the

@@ -2017,11 +2017,27 @@ impl SyncManager {
             } else {
                 format!("{} files", names.len())
             };
-            let body = match &from {
-                Some(name) => format!("{what} from {name} → {}", folder_name(&pair.folder)),
-                None => format!("{what} arrived in {}", folder_name(&pair.folder)),
+            // Read like a chat notification (the user asked for sync activity to
+            // ping the same way a message does): sender as the title, what+where as
+            // the body, and an audible sound so it isn't a silent banner.
+            let (title, body) = match &from {
+                Some(name) => (
+                    name.clone(),
+                    format!("Added {what} to {}", folder_name(&pair.folder)),
+                ),
+                None => (
+                    "Shared folder".to_string(),
+                    format!("{what} arrived in {}", folder_name(&pair.folder)),
+                ),
             };
-            let _ = self.app.notification().builder().title("DropBeam").body(body).show();
+            let _ = self
+                .app
+                .notification()
+                .builder()
+                .title(title)
+                .body(body)
+                .sound("default")
+                .show();
         }
     }
 
