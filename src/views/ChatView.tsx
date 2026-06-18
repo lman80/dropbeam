@@ -24,7 +24,7 @@ import {
   X,
 } from 'lucide-react'
 import { api, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend } from '../lib/api'
-import { useStore } from '../store'
+import { useStore, type FolderActivityEvent } from '../store'
 import { EmptyState } from '../components/bits'
 import { ConnInspector } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
@@ -243,10 +243,15 @@ function Conversation({ friendId }: { friendId: string }) {
   // just keeps the UI alive until that lands (or for read-only history).
   const friend: Friend = realFriend ?? placeholderFriend(friendId)
   const pairs = useStore((s) => s.pairs)
+  const folderActivity = useStore((s) => s.folderActivity)
   const sendChat = useStore((s) => s.sendChat)
   const sendGif = useStore((s) => s.sendGif)
   const editChat = useStore((s) => s.editChatMessage)
   const shareFilesInChat = useStore((s) => s.shareFilesInChat)
+  const stagedFiles = useStore((s) => s.chatDraftFiles)
+  const stageChatFiles = useStore((s) => s.stageChatFiles)
+  const unstageChatFile = useStore((s) => s.unstageChatFile)
+  const clearChatDraftFiles = useStore((s) => s.clearChatDraftFiles)
   const friendSeen = useStore((s) => s.friendSeen)
   const folderStatuses = useStore((s) => s.folderStatuses)
   const typing = useStore((s) => !!s.chatTyping[friendId])
@@ -343,21 +348,49 @@ function Conversation({ friendId }: { friendId: string }) {
     if (text) ta.style.height = `${Math.min(ta.scrollHeight, 132)}px`
   }, [text])
 
+  // Every shared folder with THIS friend (matched by peer name), so we can weave
+  // its sync activity into the timeline and show the "Shared folder" button.
+  const myPairs = useMemo(
+    () =>
+      pairs.filter(
+        (p) => !!p.peerName && p.peerName.trim().toLowerCase() === friend.name.trim().toLowerCase(),
+      ),
+    [pairs, friend.name],
+  )
+  const sharedFolder = myPairs[0]
+
+  // Combined chat timeline (GitHub #23): messages + shared-folder sync events,
+  // ordered by time. Folder-sync rows are full-width "system" lines; the avatar/
+  // tail run-grouping only applies to consecutive MESSAGE rows.
   const items = useMemo(() => {
     const GAP = 30 * 60 * 1000 // 30 min
-    return messages.map((m, i) => {
-      const prev = messages[i - 1]
-      const next = messages[i + 1]
-      const firstOfRun = !prev || prev.fromMe !== m.fromMe || m.ts - prev.ts > GAP
-      const lastOfRun = !next || next.fromMe !== m.fromMe || next.ts - m.ts > GAP
-      const divider = !prev || m.ts - prev.ts > GAP ? dayLabel(m.ts) : null
-      return { m, firstOfRun, lastOfRun, divider }
+    type Row =
+      | { kind: 'msg'; ts: number; m: ChatMessage }
+      | { kind: 'activity'; ts: number; ev: FolderActivityEvent; folderName: string }
+    const rows: Row[] = [
+      ...messages.map((m) => ({ kind: 'msg' as const, ts: m.ts, m })),
+      ...myPairs.flatMap((p) => {
+        const folderName = p.folder.split(/[/\\]/).filter(Boolean).pop() || 'shared folder'
+        return (folderActivity[p.id] ?? []).map((ev) => ({
+          kind: 'activity' as const,
+          ts: ev.ts,
+          ev,
+          folderName,
+        }))
+      }),
+    ].sort((a, b) => a.ts - b.ts || (a.kind === 'msg' ? -1 : 1))
+    return rows.map((row, i) => {
+      const prev = rows[i - 1]
+      const next = rows[i + 1]
+      const divider = !prev || row.ts - prev.ts > GAP ? dayLabel(row.ts) : null
+      if (row.kind !== 'msg') return { ...row, divider, firstOfRun: true, lastOfRun: true }
+      const pm = prev && prev.kind === 'msg' ? prev.m : undefined
+      const nm = next && next.kind === 'msg' ? next.m : undefined
+      const firstOfRun = !pm || pm.fromMe !== row.m.fromMe || row.ts - pm.ts > GAP
+      const lastOfRun = !nm || nm.fromMe !== row.m.fromMe || nm.ts - row.ts > GAP
+      return { ...row, firstOfRun, lastOfRun, divider }
     })
-  }, [messages])
-
-  const sharedFolder = pairs.find(
-    (p) => !!p.peerName && p.peerName.trim().toLowerCase() === friend.name.trim().toLowerCase(),
-  )
+  }, [messages, myPairs, folderActivity])
   const presence = friendPresence(friend.name, friendSeen, folderStatuses)
   const online = presence.status === 'online'
 
@@ -389,11 +422,26 @@ function Conversation({ friendId }: { friendId: string }) {
 
   const submit = () => {
     const body = text.trim()
-    if (!body) return
     if (editing) {
+      // Editing is text-only; the attach/staging UI is disabled in this mode.
+      if (!body) return
       void editChat(friendId, editing.id, body)
       setEditing(null)
-    } else {
+      setText('')
+      stopTyping()
+      scrollToBottom()
+      return
+    }
+    // Nothing staged and nothing typed → no-op.
+    if (!body && stagedFiles.length === 0) return
+    // Send any staged files first (each becomes a chat file note + a real
+    // transfer), then the text — so the attachment and its caption go out together
+    // (iMessage-style, GitHub #23).
+    if (stagedFiles.length) {
+      void shareFilesInChat(friendId, [...stagedFiles])
+      clearChatDraftFiles()
+    }
+    if (body) {
       void sendChat(friendId, body, reply)
       setReply(null)
     }
@@ -416,8 +464,11 @@ function Conversation({ friendId }: { friendId: string }) {
   }
 
   const attach = async () => {
+    // Stage the picked files in the composer (chips) rather than firing them off
+    // immediately — they send with the next message (GitHub #23). Same staging a
+    // drag-and-drop uses.
     const paths = await api.pickFiles()
-    if (paths.length) void shareFilesInChat(friendId, paths)
+    if (paths.length) stageChatFiles(paths)
   }
 
   const pickGif = (g: { id: string; sendUrl: string; pageUrl: string; w: number; h: number }) => {
@@ -484,7 +535,7 @@ function Conversation({ friendId }: { friendId: string }) {
         atBottomRef.current = isAtBottom()
         if (atBottomRef.current && newCount) setNewCount(0)
       }}>
-        {messages.length === 0 ? (
+        {items.length === 0 ? (
           <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-faint)', paddingTop: 40 }}>
             <MessageCircle size={30} style={{ opacity: 0.5 }} />
             <div style={{ marginTop: 8, fontSize: 13 }}>Say hi to {friend.name} 👋</div>
@@ -496,27 +547,31 @@ function Conversation({ friendId }: { friendId: string }) {
           </div>
         ) : (
           <div className="chat-track">
-            {items.map(({ m, firstOfRun, lastOfRun, divider }) => (
-              <div key={m.id}>
-                {divider && (
+            {items.map((row) => (
+              <div key={row.kind === 'msg' ? row.m.id : row.ev.id}>
+                {row.divider && (
                   <div className="chat-divider">
-                    <span>{divider}</span>
+                    <span>{row.divider}</span>
                   </div>
                 )}
-                <MessageRow
-                  m={m}
-                  friend={friend}
-                  firstOfRun={firstOfRun}
-                  lastOfRun={lastOfRun}
-                  allById={messages}
-                  onReply={() => {
-                    setReply(m)
-                    setEditing(null)
-                    taRef.current?.focus()
-                  }}
-                  onEdit={() => beginEdit(m)}
-                  onLightbox={setLightbox}
-                />
+                {row.kind === 'activity' ? (
+                  <FolderActivityRow ev={row.ev} folderName={row.folderName} />
+                ) : (
+                  <MessageRow
+                    m={row.m}
+                    friend={friend}
+                    firstOfRun={row.firstOfRun}
+                    lastOfRun={row.lastOfRun}
+                    allById={messages}
+                    onReply={() => {
+                      setReply(row.m)
+                      setEditing(null)
+                      taRef.current?.focus()
+                    }}
+                    onEdit={() => beginEdit(row.m)}
+                    onLightbox={setLightbox}
+                  />
+                )}
               </div>
             ))}
           </div>
@@ -558,6 +613,27 @@ function Conversation({ friendId }: { friendId: string }) {
           <button className="icon-btn" onClick={cancelEdit} title="Cancel edit">
             <X size={15} />
           </button>
+        </div>
+      )}
+
+      {stagedFiles.length > 0 && (
+        <div className="chat-staged">
+          {stagedFiles.map((p) => {
+            const name = p.split(/[/\\]/).pop() || p
+            return (
+              <span className="chat-staged-chip" key={p} title={p}>
+                <Paperclip size={13} />
+                <span className="chat-staged-name">{name}</span>
+                <button
+                  className="chat-staged-x"
+                  title="Remove"
+                  onClick={() => unstageChatFile(p)}
+                >
+                  <X size={12} />
+                </button>
+              </span>
+            )
+          })}
         </div>
       )}
 
@@ -629,7 +705,11 @@ function Conversation({ friendId }: { friendId: string }) {
             }
           }}
         />
-        <button className="btn btn-primary chat-send" onClick={submit} disabled={!text.trim()}>
+        <button
+          className="btn btn-primary chat-send"
+          onClick={submit}
+          disabled={editing ? !text.trim() : !text.trim() && stagedFiles.length === 0}
+        >
           {editing ? <Check size={16} /> : <SendIcon size={16} />}
         </button>
       </div>
@@ -640,6 +720,21 @@ function Conversation({ friendId }: { friendId: string }) {
         </div>
       )}
     </>
+  )
+}
+
+/** A shared-folder sync woven into the timeline (GitHub #23) — a compact, centered
+ *  "system" line, distinct from a chat bubble. */
+function FolderActivityRow({ ev, folderName }: { ev: FolderActivityEvent; folderName: string }) {
+  const verb = ev.direction === 'send' ? 'Synced' : 'Received'
+  return (
+    <div className="chat-activity">
+      <FolderOpen size={12} />
+      <span>
+        {verb} {ev.files} file{ev.files === 1 ? '' : 's'} · {formatBytes(ev.bytes)}
+        {folderName ? ` in “${folderName}”` : ''}
+      </span>
+    </div>
   )
 }
 

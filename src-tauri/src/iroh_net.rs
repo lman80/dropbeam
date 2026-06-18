@@ -3834,28 +3834,28 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{stem}-dup{ext}"))
 }
 
-/// Resolve the on-disk destination for one received item with relative path `rel`
-/// (already traversal-sanitized to Normal components only, so it can't escape
-/// `dest_dir`), CREATING the parent subtree, and return a collision-free path the
-/// caller can `File::create`.
+/// Ensure the parent subtree for `rel` exists under `dest_dir`, and return the
+/// INTENDED on-disk path for the item (`dest_dir/rel`). The returned path is NOT
+/// collision- or dedup-resolved — it MAY already exist from a prior send; the
+/// caller decides skip-vs-keep-both based on content.
 ///
-/// The whole point: a single blocked ancestor must NEVER fail the batch. If the
-/// parent subtree can't be built because some ancestor already exists as a plain
-/// FILE — `create_dir_all` returns ENOTDIR (os error 20), the real-user folder-
-/// receive crash — we DON'T propagate. Instead we land this one file flat in
-/// `dest_dir` itself (which the caller has already created and verified is a
-/// directory) under a collision-free name derived from its leaf, preserving the
-/// bytes. Structure is preserved for every file whose parent we CAN create; only
-/// the genuinely-blocked file deviates. Never writes outside `dest_dir`.
-fn prepare_subtree_dest(dest_dir: &Path, rel: &Path) -> PathBuf {
+/// A single blocked ancestor must NEVER fail the batch. If the parent subtree
+/// can't be built because some ancestor already exists as a plain FILE —
+/// `create_dir_all` returns ENOTDIR (os error 20), the real-user folder-receive
+/// crash — we DON'T propagate. Instead we fall back to a flat path
+/// `dest_dir/<leaf>` (which the caller has already created and verified is a
+/// directory) so the bytes still land. Structure is preserved for every file whose
+/// parent we CAN create; only the genuinely-blocked file deviates. Because `rel`
+/// is pre-sanitized to Normal components, the result never escapes `dest_dir`.
+fn ensure_parent_or_flat(dest_dir: &Path, rel: &Path) -> PathBuf {
     if let Some(parent) = rel.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(dest_dir.join(parent)) {
                 // ENOTDIR = an ancestor component is a FILE, not a dir (leftover
                 // from a prior/partial/flattened receive, or a same-named file
                 // already sitting in Downloads). Can't recreate the subtree —
-                // fall back to a flat, collision-free name in dest_dir so this
-                // file still lands instead of killing the multi-GB transfer.
+                // fall back to a flat name in dest_dir so this file still lands
+                // instead of killing the multi-GB transfer.
                 log::warn!(
                     "receive: can't create subtree {} ({e}); landing {} flat in dest root",
                     dest_dir.join(parent).display(),
@@ -3865,11 +3865,39 @@ fn prepare_subtree_dest(dest_dir: &Path, rel: &Path) -> PathBuf {
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "file".to_string());
-                return unique_path(dest_dir, &leaf);
+                return dest_dir.join(leaf);
             }
         }
     }
-    unique_full(dest_dir.join(rel))
+    dest_dir.join(rel)
+}
+
+/// Byte-for-byte equality of two files. Cheap length check first, then a streamed
+/// compare in fixed-size reads — never loads a whole file into memory, so it's safe
+/// on multi-GB media. Any I/O error returns `Err`; callers treat that conservatively
+/// as "not identical" and keep BOTH files, so a transient read glitch can never
+/// cause data loss. Used to dedup a re-sent folder: an incoming file that's
+/// byte-identical to one already on disk is skipped instead of piling up a
+/// "name (1)" copy (real-user bug: re-sending a 44 GB folder created 461 dups).
+fn files_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(false);
+    }
+    let mut fa = std::io::BufReader::new(std::fs::File::open(a)?);
+    let mut fb = std::io::BufReader::new(std::fs::File::open(b)?);
+    let mut ba = vec![0u8; 1 << 16];
+    let mut bb = vec![0u8; 1 << 16];
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true); // equal length, reached EOF together → identical
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 /// Recreate the empty directories a sender advertised in the manifest's optional
@@ -4676,6 +4704,27 @@ async fn recv_file_resumable<F: Fn(u64, u64)>(
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&part) {
             let _ = f.sync_all();
         }
+        // Re-send dedup (single-file friend/Quick sends): if this exact file is
+        // already sitting at its natural destination byte-for-byte, keep that one
+        // and drop the freshly-received copy instead of minting a "name (1)" dup.
+        // Folder-sync sends use FinalizeDest::Exact and are handled by reconcile, so
+        // only the UniqueIn (collision-named) path needs this.
+        if let FinalizeDest::UniqueIn(dir, name) = &finalize {
+            let safe = Path::new(name)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "file".to_string());
+            let natural = dir.join(&safe);
+            if natural.is_file() && files_identical(&part, &natural).unwrap_or(false) {
+                let _ = std::fs::remove_file(&part);
+                if let Some(rc) = &resume {
+                    let _ = std::fs::remove_file(&rc.side);
+                }
+                on_progress(total, total);
+                return Ok(natural);
+            }
+        }
         let (dest, stamp) = match &finalize {
             FinalizeDest::UniqueIn(dir, name) => {
                 let safe = Path::new(name)
@@ -4956,11 +5005,31 @@ async fn read_body<F: Fn(u64, u64)>(
             rel
         };
         let size = item["size"].as_u64().unwrap_or(0);
-        // Build the parent subtree and pick a collision-free dest. If an ancestor
-        // already exists as a FILE (ENOTDIR), this lands the one blocked file flat
-        // in dest_dir rather than aborting the whole batch — the real-user folder-
-        // receive crash. Structure is preserved for every non-blocked file.
-        let dest = prepare_subtree_dest(dest_dir, &rel);
+        // Ensure the parent subtree exists (or fall back to a flat leaf if an
+        // ancestor is a FILE — ENOTDIR — rather than aborting the whole batch, the
+        // real-user folder-receive crash). `natural` is the INTENDED path; it may
+        // already exist from a prior send of the same folder.
+        let natural = ensure_parent_or_flat(dest_dir, &rel);
+        // Re-send dedup: don't pile up "name (1)" copies when the same folder is
+        // sent again. Free slot → write straight to it. A same-SIZE occupant is
+        // ambiguous (an identical re-send, or a same-size edit), so write to a
+        // hidden temp and byte-compare after the bytes land. A different-SIZE
+        // occupant is definitely a different file, so keep both under a collision
+        // name — never clobber what the peer already has.
+        let occupant_same_size = std::fs::symlink_metadata(&natural)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len() == size);
+        let temp = if occupant_same_size == Some(true) {
+            Some(natural.with_file_name(format!(".dropbeam-recv-{}.part", uuid::Uuid::new_v4())))
+        } else {
+            None
+        };
+        let dest = match (&temp, occupant_same_size) {
+            (Some(t), _) => t.clone(),                           // compare-then-decide
+            (None, Some(false)) => unique_full(natural.clone()), // different file → keep both
+            (None, _) => natural.clone(),                        // free slot → write directly
+        };
         // Buffer disk writes: QUIC delivers data in small pieces, and one blocking
         // write syscall per piece throttles big receives. A 1 MiB buffer batches
         // them into far fewer, larger writes. Flushed before the file is finalized.
@@ -5002,15 +5071,38 @@ async fn read_body<F: Fn(u64, u64)>(
                 failed = Some(e.into());
             }
         }
+        drop(f); // release the handle before any rename (Windows) or removal
         if let Some(e) = failed {
             // Never leave a half-written file sitting at its real, visible name —
             // the user can't tell a truncated "video.mov" from a good one days
             // later. Files that completed in this batch (already in `out`) stay.
-            drop(f);
             let _ = std::fs::remove_file(&dest);
             return Err(e);
         }
-        out.push(dest);
+        // Finalize the same-size dedup now the bytes are on disk.
+        let landed = if let Some(tmp) = &temp {
+            match files_identical(tmp, &natural) {
+                Ok(true) => {
+                    // Byte-identical re-send → keep the original, drop the dup copy.
+                    let _ = std::fs::remove_file(tmp);
+                    natural.clone()
+                }
+                _ => {
+                    // Same size but different bytes (or unreadable) → keep both so
+                    // we never clobber the peer's existing file with a changed one.
+                    let alt = unique_full(natural.clone());
+                    if let Err(e) = std::fs::rename(tmp, &alt) {
+                        let _ = std::fs::remove_file(tmp); // don't leak the hidden temp
+                        return Err(anyhow::Error::new(e)
+                            .context(format!("finalize {}", alt.display())));
+                    }
+                    alt
+                }
+            }
+        } else {
+            dest.clone()
+        };
+        out.push(landed);
     }
     Ok(out)
 }
@@ -6484,6 +6576,109 @@ mod loopback_tests {
 
         client.close().await;
         server.close().await;
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// REGRESSION (real-user bug): re-sending the SAME folder must NOT pile up
+    /// "name (1)" duplicate copies on the receiver. A user sent a 44 GB / 802-file
+    /// folder ~3× over the LAN; each re-send collision-renamed every file, leaving
+    /// 1263 files / 461 dups. With the content-aware dedup, a byte-identical
+    /// re-received file is skipped (the original kept), so a second send of the
+    /// identical folder adds zero files and zero "(1)" copies.
+    #[tokio::test]
+    async fn loopback_resending_identical_folder_makes_no_duplicates() {
+        // One real folder send → receive into dest_dir, over fresh endpoints.
+        async fn send_folder(
+            folder: &Path,
+            dest_dir: &Path,
+        ) -> (Result<u64>, Result<Vec<PathBuf>>) {
+            let server = loopback_endpoint(true).await;
+            let client = loopback_endpoint(false).await;
+            let server_addr = server.addr();
+            let srv = server.clone();
+            let dest_c = dest_dir.to_path_buf();
+            let recv = tokio::spawn(async move {
+                let conn = srv.accept().await.unwrap().await.unwrap();
+                recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {}).await
+            });
+            let conn = client.connect(server_addr, ALPN).await.unwrap();
+            let send_res = send_files(
+                &conn,
+                &[folder.to_path_buf()],
+                &AtomicBool::new(false),
+                |_, _| {},
+                "tester",
+                &AtomicBool::new(false),
+            )
+            .await;
+            let received = recv.await.unwrap();
+            client.close().await;
+            server.close().await;
+            (send_res, received)
+        }
+
+        fn count_files(d: &Path) -> usize {
+            let mut n = 0;
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        n += count_files(&p);
+                    } else if p.is_file()
+                        && !e.file_name().to_string_lossy().starts_with('.')
+                    {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        }
+        fn any_dup(d: &Path) -> bool {
+            std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    let p = e.path();
+                    let name = e.file_name().to_string_lossy().to_string();
+                    (p.is_dir() && any_dup(&p)) || (p.is_file() && name.contains(" (1)"))
+                })
+        }
+
+        let src_root = scratch("twice-src");
+        let folder = src_root.join("Album");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        let a = payload(40 * 1024, 11);
+        let b = payload(72 * 1024, 22);
+        let c = payload(8 * 1024, 33);
+        std::fs::write(folder.join("a.bin"), &a).unwrap();
+        std::fs::write(folder.join("sub").join("b.bin"), &b).unwrap();
+        std::fs::write(folder.join("sub").join("c.bin"), &c).unwrap();
+
+        let dest_dir = scratch("twice-rx");
+
+        // First send lands all 3 files.
+        let (s1, r1) = send_folder(&folder, &dest_dir).await;
+        s1.expect("first send completes");
+        assert_eq!(r1.expect("first receive ok").len(), 3, "first send lands all 3 files");
+        assert_eq!(count_files(&dest_dir), 3, "exactly 3 files after first send");
+
+        // Second send of the IDENTICAL folder must add ZERO files and ZERO dups.
+        let (s2, r2) = send_folder(&folder, &dest_dir).await;
+        s2.expect("second send completes");
+        r2.expect("second receive ok");
+        assert_eq!(
+            count_files(&dest_dir),
+            3,
+            "re-sending the identical folder adds no files (was 6 pre-fix)"
+        );
+        assert!(!any_dup(&dest_dir), "no 'name (1)' duplicate created on re-send");
+
+        // Originals untouched and byte-identical.
+        assert_eq!(std::fs::read(dest_dir.join("Album").join("a.bin")).unwrap(), a);
+        assert_eq!(std::fs::read(dest_dir.join("Album").join("sub").join("b.bin")).unwrap(), b);
+
         let _ = std::fs::remove_dir_all(&src_root);
         let _ = std::fs::remove_dir_all(&dest_dir);
     }

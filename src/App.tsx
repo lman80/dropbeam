@@ -54,11 +54,13 @@ export default function App() {
     let active = true
     onFileDrop(
       (paths) => {
-        // On the Chat page with a conversation open, a dropped file/folder is sent
-        // INTO that chat (as a file message), not routed to the global send chooser.
+        // On the Chat page with a conversation open, a dropped file/folder is
+        // STAGED in the composer (iMessage-style, GitHub #23) — it waits as a chip
+        // so you can add a message and send them together — instead of firing off
+        // immediately or routing to the global send chooser.
         const st = useStore.getState()
         if (st.view === 'chat' && st.activeChatId) {
-          void st.shareFilesInChat(st.activeChatId, paths)
+          st.stageChatFiles(paths)
         } else {
           setPendingSend(paths)
         }

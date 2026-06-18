@@ -14,6 +14,17 @@ The relay never sees your files unencrypted — it just forwards bytes. A tiny V
 
 ---
 
+## Oracle Cloud — read this BEFORE you sign up (the "does it stay free forever?" answer)
+**Yes — Always Free resources stay free forever. There's no monthly re-activation and no charge.** But three signup choices matter, and one of them you can't undo:
+
+1. **Home region = Tokyo (or Seoul) — this is PERMANENT.** Oracle makes you pick a "home region" at signup and your free VM must live there. For a Korea↔China link, choose **Japan East (Tokyo)** — it's a good neutral hop for both sides (often better than Seoul for the China leg). You cannot change the home region later, so get this right.
+2. **The one "forever" catch — idle reclamation.** On a *pure* free account, Oracle can reclaim a VM it considers **idle** (low CPU/network over ~7 days). A relay is quiet most of the time, so to be safe **upgrade the account to "Pay As You Go"** right after signup — adding a card **keeps all Always Free resources at $0** (it does not start charging), it just removes the idle-reclaim policy so your relay never gets shut off. This is the clean way to make it truly run forever.
+3. **If "Always Free ARM (Ampere A1)" is out of capacity** in Tokyo (common — it's popular), just use the **AMD "VM.Standard.E2.1.Micro"** Always-Free shape instead (1/8 CPU, 1 GB RAM). It's tiny but a relay barely uses CPU/RAM — it's plenty. Pick **Ubuntu 22.04** as the image either way.
+
+Egress on Always Free is **10 TB/month** — far more than 3 people will ever use.
+
+---
+
 ## Step 1 — Open the ports
 On the VM's firewall / cloud security list, allow inbound:
 - **TCP 80** (Let's Encrypt cert check)

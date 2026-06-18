@@ -116,6 +116,8 @@ interface AppStore {
   folderLastSynced: Record<string, number>
   /** Last completed-drop summary per folder pair (size, time, avg speed). */
   folderSummaries: Record<string, FolderComplete>
+  /** Per-pair local log of completed shared-folder syncs (GitHub #23 timeline). */
+  folderActivity: Record<string, FolderActivityEvent[]>
   /** Files picked/dropped that are awaiting a "send to whom?" choice. */
   pendingSend: string[] | null
   /** Last time (ms) a friend was seen online, keyed by lowercased name. */
@@ -181,6 +183,13 @@ interface AppStore {
   deleteChatMessage: (friendId: string, messageId: string) => Promise<void>
   shareFilesInChat: (friendId: string, paths: string[]) => Promise<void>
   addChatMessage: (m: ChatMessage) => void
+  /** Files staged in the active chat's composer (drag-to-attach, iMessage-style):
+   *  they wait, shown as chips, and go out with the next send. Cleared on chat
+   *  switch so a staged file never leaks into the wrong conversation. */
+  chatDraftFiles: string[]
+  stageChatFiles: (paths: string[]) => void
+  unstageChatFile: (path: string) => void
+  clearChatDraftFiles: () => void
   markChatRead: (friendId: string) => void
   toast: (kind: Toast['kind'], message: string) => void
   dismissToast: (id: string) => void
@@ -198,6 +207,34 @@ function previewOf(m: ChatMessage): string {
 /** Causal order: logical seq first, then wall-clock, then id (stable tiebreak). */
 function byOrder(a: ChatMessage, b: ChatMessage): number {
   return (a.seq ?? 0) - (b.seq ?? 0) || a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+}
+
+/** A local, per-pair record of a completed shared-folder sync — woven into that
+ *  friend's chat timeline (GitHub #23). NOT synced over the wire: each device logs
+ *  what IT observed (folder-complete fires on both the sending and receiving side),
+ *  so both ends independently see folder activity in the conversation. */
+export interface FolderActivityEvent {
+  id: string
+  ts: number
+  direction: 'send' | 'receive'
+  files: number
+  bytes: number
+}
+
+const FOLDER_ACTIVITY_KEY = 'dropbeam-folder-activity'
+function loadFolderActivity(): Record<string, FolderActivityEvent[]> {
+  try {
+    return JSON.parse(localStorage.getItem(FOLDER_ACTIVITY_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
+function saveFolderActivity(fa: Record<string, FolderActivityEvent[]>): void {
+  try {
+    localStorage.setItem(FOLDER_ACTIVITY_KEY, JSON.stringify(fa))
+  } catch {
+    /* storage unavailable — the timeline log is best-effort */
+  }
 }
 
 // Guard against Tauri's occasional double-fire of a single OS file drop.
@@ -227,10 +264,12 @@ export const useStore = create<AppStore>((set, get) => ({
   folderStatuses: {},
   folderLastSynced: {},
   folderSummaries: {},
+  folderActivity: loadFolderActivity(),
   pendingSend: null,
   friendSeen: {},
   chats: {},
   chatOverview: [],
+  chatDraftFiles: [],
   chatUnread: {},
   activeChatId: null,
   chatTyping: {},
@@ -333,7 +372,24 @@ export const useStore = create<AppStore>((set, get) => ({
     // A whole folder drop finished — stash its summary (size, time, avg speed) so
     // the folder card can show it like the Send/Receive tab's completion line.
     onFolderComplete((c) =>
-      set((st) => ({ folderSummaries: { ...st.folderSummaries, [c.pairId]: c } })),
+      set((st) => {
+        const folderSummaries = { ...st.folderSummaries, [c.pairId]: c }
+        // A real sync (≥1 file moved) also drops a row in this pair's chat
+        // timeline (GitHub #23). Fires on both the sending and receiving side, so
+        // each end logs its own view.
+        if (c.files <= 0) return { folderSummaries }
+        const ev: FolderActivityEvent = {
+          id: `fa-${c.pairId}-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
+          ts: Date.now(),
+          direction: c.direction,
+          files: c.files,
+          bytes: c.bytes,
+        }
+        const list = [...(st.folderActivity[c.pairId] ?? []), ev].slice(-100)
+        const folderActivity = { ...st.folderActivity, [c.pairId]: list }
+        saveFolderActivity(folderActivity)
+        return { folderSummaries, folderActivity }
+      }),
     )
     // Chat lives in the main window only. Load the conversation previews and
     // listen for live messages (from friends, and our own echoed sends).
@@ -671,6 +727,17 @@ export const useStore = create<AppStore>((set, get) => ({
     try {
       const u = await api.sendToFriend(id, paths)
       get().upsertTransfer(u)
+      // A direct send to a friend also lands in that friend's chat timeline, on
+      // BOTH sides — so every interaction shows up in the conversation (GitHub
+      // #23). Same synced file-note a chat-originated send posts; best-effort, so
+      // a note failure never affects the transfer that already went through.
+      try {
+        const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
+        const m = await api.sendChatFileNote(id, names, u.bytesTotal || 0, paths)
+        get().addChatMessage(m)
+      } catch {
+        /* note is best-effort */
+      }
     } catch (e) {
       get().toast('error', String(e))
     }
@@ -683,7 +750,8 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   openChat: async (friendId) => {
-    set({ activeChatId: friendId, view: 'chat' })
+    // Switching threads drops any files staged for the previous one.
+    set({ activeChatId: friendId, view: 'chat', chatDraftFiles: [] })
     void api.setActiveChat(friendId)
     const msgs = await api.getChatMessages(friendId).catch(() => [])
     set((s) => {
@@ -701,7 +769,7 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   closeChat: () => {
-    set({ activeChatId: null })
+    set({ activeChatId: null, chatDraftFiles: [] })
     void api.setActiveChat(null)
   },
 
@@ -789,6 +857,17 @@ export const useStore = create<AppStore>((set, get) => ({
       get().toast('error', String(e))
     }
   },
+
+  stageChatFiles: (paths) => {
+    const add = paths.filter(Boolean)
+    if (!add.length) return
+    set((s) => ({
+      chatDraftFiles: [...s.chatDraftFiles, ...add.filter((p) => !s.chatDraftFiles.includes(p))],
+    }))
+  },
+  unstageChatFile: (path) =>
+    set((s) => ({ chatDraftFiles: s.chatDraftFiles.filter((p) => p !== path) })),
+  clearChatDraftFiles: () => set({ chatDraftFiles: [] }),
 
   addChatMessage: (m) => {
     // An incoming message means that friend is reachable right now.

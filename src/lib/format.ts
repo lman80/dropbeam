@@ -9,6 +9,15 @@ export function formatBytes(bytes: number, decimals = 1): string {
   return `${v.toFixed(i === 0 ? 0 : decimals)} ${units[i]}`
 }
 
+// Live transfer counter: keep TWO decimals once we're into GB+ so a slow multi-GB
+// transfer visibly ticks (5.11 → 5.22 GB) instead of sitting on a frozen "5.1 GB"
+// (GitHub #25). Sub-GB stays at the usual one decimal.
+export function formatBytesLive(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B'
+  const i = Math.floor(Math.log(bytes) / Math.log(1000))
+  return formatBytes(bytes, i >= 3 ? 2 : 1)
+}
+
 // Whether to show speeds in megaBITS/sec (Mbps) vs megaBYTES/sec (MB/s). Set
 // once from settings (setSpeedUnit) so every formatSpeed call stays consistent
 // without threading the preference through every component.

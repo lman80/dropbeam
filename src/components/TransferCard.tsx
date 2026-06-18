@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react'
 import { api, isActive, type TransferUpdate } from '../lib/api'
-import { formatBytes, formatEta, formatSpeed } from '../lib/format'
+import { formatBytes, formatBytesLive, formatEta, formatSpeed } from '../lib/format'
 import { LocalityBadge, ProgressBar, Spinner } from './bits'
 import { ConnInspector } from './ConnInspector'
 import { useStore } from '../store'
@@ -269,8 +269,8 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
               {Math.round(t.percent)}%
             </span>
             <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
-              {formatBytes(t.bytesDone)}
-              {t.bytesTotal > 0 ? ` / ${formatBytes(t.bytesTotal)}` : ''}
+              {formatBytesLive(t.bytesDone)}
+              {t.bytesTotal > 0 ? ` / ${formatBytesLive(t.bytesTotal)}` : ''}
             </span>
           </div>
           <ProgressBar percent={t.percent} />
