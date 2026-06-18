@@ -358,30 +358,63 @@ export function SettingsView() {
         {SEP}
         <Row
           title="Limit internet upload speed"
-          desc="Cap how much of your upload a transfer uses, so video calls, streaming, and browsing stay smooth. 0 = unlimited. Local-network transfers always run full speed."
+          desc="Cap how much of your upload a transfer uses, so video calls, streaming, and browsing stay smooth — and so a big transfer doesn't overwhelm an older Wi-Fi router. 0 = unlimited. Local-network transfers always run full speed. There's no safe way to auto-test a router's breaking point, so start at the recommended 100 Mbps and raise it until your Wi-Fi stutters, then back off a little."
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-            <input
-              type="number"
-              min={0}
-              max={100000}
-              value={settings.uploadLimitMbps || 0}
-              onChange={(e) =>
-                save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })
-              }
-              style={{
-                width: 72,
-                fontSize: 13,
-                fontWeight: 600,
-                padding: '6px 8px',
-                borderRadius: 8,
-                border: '1px solid var(--border)',
-                background: 'var(--bg-elev)',
-                color: 'var(--text)',
-                textAlign: 'right',
-              }}
-            />
-            <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Mbps</span>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <input
+                type="number"
+                min={0}
+                max={100000}
+                value={settings.uploadLimitMbps || 0}
+                onChange={(e) =>
+                  save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })
+                }
+                style={{
+                  width: 72,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  padding: '6px 8px',
+                  borderRadius: 8,
+                  border: '1px solid var(--border)',
+                  background: 'var(--bg-elev)',
+                  color: 'var(--text)',
+                  textAlign: 'right',
+                }}
+              />
+              <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Mbps</span>
+            </div>
+            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+              {[
+                { label: '50', v: 50 },
+                { label: '100', v: 100, rec: true },
+                { label: '150', v: 150 },
+                { label: '300', v: 300 },
+                { label: 'Unlimited', v: 0 },
+              ].map((p) => {
+                const on = (settings.uploadLimitMbps || 0) === p.v
+                return (
+                  <button
+                    key={p.v}
+                    onClick={() => save({ uploadLimitMbps: p.v })}
+                    title={p.rec ? 'Recommended starting point for most home routers' : undefined}
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 600,
+                      padding: '4px 9px',
+                      borderRadius: 999,
+                      cursor: 'pointer',
+                      border: `1px solid ${on ? 'var(--accent)' : 'var(--border)'}`,
+                      background: on ? 'var(--accent-soft)' : 'var(--surface-2)',
+                      color: on ? 'var(--accent)' : 'var(--text-muted)',
+                    }}
+                  >
+                    {p.label}
+                    {p.rec ? ' ★' : ''}
+                  </button>
+                )
+              })}
+            </div>
           </div>
         </Row>
         {SEP}
