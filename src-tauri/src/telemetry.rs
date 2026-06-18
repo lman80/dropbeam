@@ -40,6 +40,23 @@ const FIRST_DELAY_SECS: u64 = 30;
 const UPLOAD_INTERVAL_SECS: u64 = 12 * 3600; // twice a day while running
 const MAX_GROUPS: usize = 80; // cap distinct issue-signatures per digest
 const MAX_SAMPLE_LEN: usize = 240; // cap each sample line
+/// After a transfer fails, wait this long before uploading — so a burst of
+/// failures coalesces into ONE digest instead of one upload per failure.
+const FAILURE_DEBOUNCE_SECS: u64 = 90;
+
+/// Signalled when a transfer fails, to wake the telemetry loop early (instead of
+/// waiting up to 12h) so a real problem reaches the dashboard within a couple of
+/// minutes. The opt-in toggle + operator URL are still honored by the loop.
+fn failure_nudge() -> &'static tokio::sync::Notify {
+    static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Call from a transfer-failure path (emit_failed): ask the telemetry loop to
+/// upload the new log lines soon. Cheap, non-blocking, safe from any thread.
+pub fn nudge_after_failure() {
+    failure_nudge().notify_one();
+}
 
 /// A stable, NON-identifying per-install id (random uuid persisted in the config
 /// dir). Lets the developer tell the 3 devices apart without any real identity.
@@ -376,7 +393,15 @@ pub async fn run(app: AppHandle, config_dir: PathBuf, log_dir: Option<PathBuf>) 
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(UPLOAD_INTERVAL_SECS)).await;
+        // Wake on the normal 12h cadence OR early when a transfer just failed
+        // (debounced so a burst of failures = one upload) — so a real problem
+        // reaches the dashboard in ~2 min instead of up to half a day.
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(UPLOAD_INTERVAL_SECS)) => {}
+            _ = failure_nudge().notified() => {
+                tokio::time::sleep(std::time::Duration::from_secs(FAILURE_DEBOUNCE_SECS)).await;
+            }
+        }
     }
 }
 

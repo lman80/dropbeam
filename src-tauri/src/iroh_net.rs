@@ -245,6 +245,10 @@ fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
     // reach leaves a trace in DropBeam.log (was invisible — failures only emitted
     // to the UI). Pairs with the PERF lines to explain a bad transfer.
     log::warn!("TRANSFER-FAIL[{dir:?}] id={id}: {err}");
+    // Surface real failures fast: nudge the diagnostics loop to upload soon
+    // (debounced) instead of waiting for the 12h cadence. No-op unless the user
+    // has diagnostics on AND an endpoint configured.
+    crate::telemetry::nudge_after_failure();
     let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
     u.state = TransferState::Failed;
     u.error = Some(err.to_string());
@@ -3579,7 +3583,43 @@ async fn read_folder_body<F: Fn(u64, u64)>(
         let size = item["size"].as_u64().unwrap_or(0);
         let dest = dest_dir.join(&rel);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+            // A blocked ancestor (some component exists as a FILE → ENOTDIR) must
+            // not abort the whole mirror sync. Mirror semantics deliberately write
+            // to the EXACT subpath (reconcile drives convergence, no flat-name
+            // dups), so we can't relocate this file like the friend path does —
+            // instead SKIP just this one item. The next reconcile pass retries it
+            // once the blocking file is resolved/removed.
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!(
+                    "folder receive: skipping {} — can't create {} ({e})",
+                    rel.display(),
+                    parent.display()
+                );
+                // Drain this file's bytes off the stream so the next item stays
+                // framed, then move on.
+                let mut remaining = size;
+                while remaining > 0 {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(anyhow::anyhow!("canceled"));
+                    }
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    match recv.read(&mut buf[..want]).await {
+                        Ok(Some(n)) if n > 0 => {
+                            remaining -= n as u64;
+                            got += n as u64;
+                            on_progress(got, total);
+                        }
+                        Ok(_) => {
+                            return Err(anyhow::anyhow!(
+                                "stream ended before skipped {} finished",
+                                rel.display()
+                            ))
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                continue;
+            }
         }
         // Buffer disk writes: QUIC delivers data in small pieces, and one blocking
         // write syscall per piece throttles big receives. A 1 MiB buffer batches
@@ -3781,6 +3821,44 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
         }
     }
     dir.join(format!("{stem}-dup{ext}"))
+}
+
+/// Resolve the on-disk destination for one received item with relative path `rel`
+/// (already traversal-sanitized to Normal components only, so it can't escape
+/// `dest_dir`), CREATING the parent subtree, and return a collision-free path the
+/// caller can `File::create`.
+///
+/// The whole point: a single blocked ancestor must NEVER fail the batch. If the
+/// parent subtree can't be built because some ancestor already exists as a plain
+/// FILE — `create_dir_all` returns ENOTDIR (os error 20), the real-user folder-
+/// receive crash — we DON'T propagate. Instead we land this one file flat in
+/// `dest_dir` itself (which the caller has already created and verified is a
+/// directory) under a collision-free name derived from its leaf, preserving the
+/// bytes. Structure is preserved for every file whose parent we CAN create; only
+/// the genuinely-blocked file deviates. Never writes outside `dest_dir`.
+fn prepare_subtree_dest(dest_dir: &Path, rel: &Path) -> PathBuf {
+    if let Some(parent) = rel.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(dest_dir.join(parent)) {
+                // ENOTDIR = an ancestor component is a FILE, not a dir (leftover
+                // from a prior/partial/flattened receive, or a same-named file
+                // already sitting in Downloads). Can't recreate the subtree —
+                // fall back to a flat, collision-free name in dest_dir so this
+                // file still lands instead of killing the multi-GB transfer.
+                log::warn!(
+                    "receive: can't create subtree {} ({e}); landing {} flat in dest root",
+                    dest_dir.join(parent).display(),
+                    rel.display()
+                );
+                let leaf = rel
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".to_string());
+                return unique_path(dest_dir, &leaf);
+            }
+        }
+    }
+    unique_full(dest_dir.join(rel))
 }
 
 // ── Outgoing-speed limiter ────────────────────────────────────────────────
@@ -4789,12 +4867,11 @@ async fn read_body<F: Fn(u64, u64)>(
             rel
         };
         let size = item["size"].as_u64().unwrap_or(0);
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(dest_dir.join(parent));
-            }
-        }
-        let dest = unique_full(dest_dir.join(&rel));
+        // Build the parent subtree and pick a collision-free dest. If an ancestor
+        // already exists as a FILE (ENOTDIR), this lands the one blocked file flat
+        // in dest_dir rather than aborting the whole batch — the real-user folder-
+        // receive crash. Structure is preserved for every non-blocked file.
+        let dest = prepare_subtree_dest(dest_dir, &rel);
         // Buffer disk writes: QUIC delivers data in small pieces, and one blocking
         // write syscall per piece throttles big receives. A 1 MiB buffer batches
         // them into far fewer, larger writes. Flushed before the file is finalized.
@@ -6192,6 +6269,128 @@ mod loopback_tests {
         client.close().await;
         server.close().await;
         let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// REGRESSION (real-user bug, v0.25.0): receiving a FOLDER with subfolders died
+    /// instantly on the RECEIVER with `Not a directory (os error 20)` (ENOTDIR),
+    /// aborting the ENTIRE multi-GB transfer, whenever the destination dir already
+    /// held a plain FILE at a path the incoming batch needs as a DIRECTORY. The
+    /// sender expands `Trip/clips/a.mp4` correctly; the failure is purely a
+    /// dest_dir PRE-STATE collision — a leftover/flattened file named like a
+    /// folder. `read_body` ignored the `create_dir_all` error and then
+    /// `File::create` propagated ENOTDIR up through the whole receive.
+    ///
+    /// This test pre-seeds dest_dir with a regular file named `sub`, then sends a
+    /// folder whose items are `Trip/sub/x.bin` + `Trip/sub/y.bin` + a clean
+    /// sibling `Trip/ok.bin`. The blocked subtree `Trip/sub/` cannot be created
+    /// (an ancestor `Trip` is fine, but the receiver's collision is reproduced by
+    /// seeding `dest/Trip` as a FILE — see below). With the fix, NO file is lost:
+    /// the genuinely-blocked files land under a safe alternate path while the rest
+    /// preserve structure, and the whole receive succeeds.
+    #[tokio::test]
+    async fn loopback_folder_blocked_ancestor_file_does_not_fail_batch() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let server_addr = server.addr();
+
+        // Build a real source folder `Trip/` with a subfolder `sub/` and a sibling
+        // file. gather_items expands this into items "Trip/sub/x.bin",
+        // "Trip/sub/y.bin", "Trip/ok.bin" — the exact multi-item folder shape the
+        // production friend/Quick path streams through send_files -> read_body.
+        let src_root = scratch("blk-src");
+        let trip = src_root.join("Trip");
+        let sub = trip.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let x = payload(40 * 1024, 101);
+        let y = payload(55 * 1024, 102);
+        let ok = payload(12 * 1024, 103);
+        std::fs::write(sub.join("x.bin"), &x).unwrap();
+        std::fs::write(sub.join("y.bin"), &y).unwrap();
+        std::fs::write(trip.join("ok.bin"), &ok).unwrap();
+
+        // Receiver dest_dir, PRE-SEEDED so an ancestor that the incoming batch
+        // needs as a DIRECTORY already exists as a FILE. The incoming items live
+        // under "Trip/sub/...", so a plain file at "Trip/sub" makes
+        // create_dir_all("Trip/sub") fail with ENOTDIR and (pre-fix) File::create
+        // at "Trip/sub/x.bin" abort the whole receive.
+        let dest_dir = scratch("blk-rx");
+        std::fs::create_dir_all(dest_dir.join("Trip")).unwrap();
+        std::fs::write(dest_dir.join("Trip").join("sub"), b"i am a file, not a dir").unwrap();
+
+        let srv = server.clone();
+        let dest_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            // The REAL receive entrypoint. Pre-fix this returns Err(ENOTDIR).
+            recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {}).await
+        });
+
+        let conn = client.connect(server_addr, ALPN).await.unwrap();
+        // Send the FOLDER itself (a dir path) — gather_items expands it. This is the
+        // real friend/Quick "send a folder" call.
+        let send_res = send_files(
+            &conn,
+            &[trip.clone()],
+            &AtomicBool::new(false),
+            |_, _| {},
+            "loopback-tester",
+            &AtomicBool::new(false),
+        )
+        .await;
+
+        let received = recv.await.unwrap();
+
+        // ── Core assertion: the receive MUST NOT fail. Pre-fix it returns
+        //    Err("...Not a directory (os error 20)") and `received` is an Err.
+        let received = received.unwrap_or_else(|e| {
+            panic!("folder receive must not be aborted by one blocked path, but failed: {e:#}")
+        });
+        send_res.expect("sender completes the whole batch");
+
+        // EVERY incoming file is accounted for — none silently dropped.
+        assert_eq!(
+            received.len(),
+            3,
+            "all three files landed (two blocked + one clean), none dropped"
+        );
+
+        // The clean sibling preserves structure: dest/Trip/ok.bin, byte-identical.
+        let ok_dest = dest_dir.join("Trip").join("ok.bin");
+        assert!(ok_dest.is_file(), "clean sibling kept its real subpath");
+        assert!(std::fs::read(&ok_dest).unwrap() == ok, "ok.bin byte-identical");
+
+        // The two blocked files landed SOMEWHERE inside dest_dir (under a safe
+        // alternate name — the blocking `Trip/sub` file is untouched), with their
+        // exact bytes. Match by content since the alternate name is engine-chosen.
+        let blocked_seed = std::fs::read(dest_dir.join("Trip").join("sub")).unwrap();
+        assert_eq!(
+            blocked_seed, b"i am a file, not a dir",
+            "the pre-existing blocking file was never overwritten or truncated"
+        );
+        for (label, want) in [("x", &x), ("y", &y)] {
+            let landed = received.iter().any(|p| {
+                p.starts_with(&dest_dir)
+                    && std::fs::read(p).map(|b| &b == want).unwrap_or(false)
+            });
+            assert!(
+                landed,
+                "blocked file {label}.bin must still land somewhere under dest_dir with its real bytes"
+            );
+        }
+
+        // Traversal guard intact: nothing escaped dest_dir.
+        for p in &received {
+            assert!(
+                p.starts_with(&dest_dir),
+                "no received file may be written outside dest_dir: {}",
+                p.display()
+            );
+        }
+
+        client.close().await;
+        server.close().await;
+        let _ = std::fs::remove_dir_all(&src_root);
         let _ = std::fs::remove_dir_all(&dest_dir);
     }
 }
