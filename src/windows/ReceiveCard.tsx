@@ -48,8 +48,8 @@ const SENDING_STATES = ['starting', 'waitingForPeer', 'connecting', 'transferrin
 // Card window size (logical px). The window has native macOS traffic-light
 // controls (titleBarStyle Overlay) — yellow minimizes it into the Dock, red
 // dismisses it — so there's no custom minimize/close chrome anymore.
-const FULL_W = 288
-const FULL_H = 300
+const FULL_W = 214
+const FULL_H = 213
 
 /**
  * The floating Blip-style transfer card (bottom-right, near Downloads).
