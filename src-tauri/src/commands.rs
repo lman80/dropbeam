@@ -1037,20 +1037,38 @@ pub async fn send_chat_file_note(
     bytes: u64,
     paths: Vec<String>,
 ) -> Result<ChatMessage, String> {
-    let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
+    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths)
+        .ok_or_else(|| "Friend not found.".to_string())
+}
+
+/// Post a "sent you a file" note into a friend's chat thread: persist it, echo it to
+/// every window (`chat://message`), and deliver it to the peer. Shared by the
+/// `send_chat_file_note` command AND the native menu-bar/tray drag-send (which
+/// bypasses the JS store), so a direct send shows up in the conversation no matter
+/// how it was initiated (GitHub #23).
+pub(crate) fn post_file_note(
+    state: &Arc<AppState>,
+    iroh: &Arc<crate::iroh_net::IrohState>,
+    app: &AppHandle,
+    friend_id: &str,
+    names: Vec<String>,
+    bytes: u64,
+    paths: Vec<String>,
+) -> Option<ChatMessage> {
+    let friend = friends::get(&state.config_dir, friend_id)?;
     let msg = ChatMessage {
         id: uuid::Uuid::new_v4().to_string(),
-        peer_id: friend_id.clone(),
+        peer_id: friend_id.to_string(),
         from_me: true,
         kind: "file".into(),
         text: String::new(),
-        files: names.clone(),
+        files: names,
         bytes,
         // Sender keeps the source path so they can preview/open what they sent.
         path: paths.into_iter().next(),
         status: Some("sending".into()),
         ts: chat::now_ms(),
-        seq: chat::next_seq(&state.config_dir, &friend_id),
+        seq: chat::next_seq(&state.config_dir, friend_id),
         reply_to: None,
         reply_preview: None,
         reactions: vec![],
@@ -1060,8 +1078,8 @@ pub async fn send_chat_file_note(
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
-    deliver_chat(&state, &iroh, &app, &friend, &msg);
-    Ok(msg)
+    deliver_chat(state, iroh, app, &friend, &msg);
+    Some(msg)
 }
 
 // --- New chat capabilities: reactions, edit, delete, typing, read, GIFs -----

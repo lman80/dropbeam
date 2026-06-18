@@ -235,6 +235,23 @@ fn send_drop_to_friend(app: &AppHandle, friend_id: &str, paths: Vec<String>) {
     // iroh-only: dial the friend's endpoint directly.
     if let Some(eid) = friend.endpoint_id.clone() {
         if iroh.get().is_some() {
+            // This native path bypasses the JS store — the ONLY place that posts the
+            // chat file-note — so a tray/menu-bar drag-send never showed up in the
+            // friend's conversation (GitHub #23). Post it here too, before the move.
+            let names: Vec<String> = paths
+                .iter()
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.clone())
+                })
+                .collect();
+            let bytes: u64 = paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                .sum();
+            crate::commands::post_file_note(&state, &iroh, app, friend_id, names, bytes, paths.clone());
             let _ = crate::iroh_net::send_to_friend(
                 app.clone(),
                 iroh.inner().clone(),

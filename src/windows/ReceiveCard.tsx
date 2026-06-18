@@ -48,8 +48,8 @@ const SENDING_STATES = ['starting', 'waitingForPeer', 'connecting', 'transferrin
 // Card window size (logical px). The window has native macOS traffic-light
 // controls (titleBarStyle Overlay) — yellow minimizes it into the Dock, red
 // dismisses it — so there's no custom minimize/close chrome anymore.
-const FULL_W = 360
-const FULL_H = 400
+const FULL_W = 288
+const FULL_H = 300
 
 /**
  * The floating Blip-style transfer card (bottom-right, near Downloads).
@@ -252,7 +252,7 @@ export function ReceiveCard() {
   const ringActive = !pendingOffer && !done // show the moving ring while transferring
 
   // Progress ring geometry around the avatar.
-  const R = 30
+  const R = 22
   const C = 2 * Math.PI * R
 
   const friendName = t?.friendName ?? null
@@ -284,21 +284,21 @@ export function ReceiveCard() {
             <div className="rc-top" data-tauri-drag-region />
             <div className="rc-art" data-tauri-drag-region>
               <div className="rc-page">
-                <Glyph size={40} strokeWidth={1.4} />
+                <Glyph size={30} strokeWidth={1.4} />
                 <span className="rc-ext">{name.split('.').pop()?.slice(0, 4).toUpperCase()}</span>
               </div>
               <div className="rc-avatar-wrap">
-                <svg width={68} height={68} viewBox="0 0 68 68" className="rc-ring">
-                  <circle cx={34} cy={34} r={R} className="rc-ring-bg" />
+                <svg width={52} height={52} viewBox="0 0 52 52" className="rc-ring">
+                  <circle cx={26} cy={26} r={R} className="rc-ring-bg" />
                   {ringActive && (
                     <circle
-                      cx={34}
-                      cy={34}
+                      cx={26}
+                      cy={26}
                       r={R}
                       className="rc-ring-fg"
                       strokeDasharray={C}
                       strokeDashoffset={C * (1 - pct / 100)}
-                      transform="rotate(-90 34 34)"
+                      transform="rotate(-90 26 26)"
                     />
                   )}
                 </svg>
