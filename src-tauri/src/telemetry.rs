@@ -89,6 +89,44 @@ fn write_watermark(config_dir: &Path, ts: &str) {
     let _ = std::fs::write(watermark_path(config_dir), ts);
 }
 
+/// Keep only the newest few rotated log files (the active `DropBeam.log` is never
+/// touched). `KeepAll` rotation never deletes, and this always-running menu-bar app
+/// rarely restarts, so run this BOTH at startup AND on every telemetry cycle to bound
+/// disk on a long-lived session (a startup-only sweep let 12+ rotations pile up).
+/// Bounded by file COUNT and total BYTES so a transfer-heavy stretch that rotates many
+/// files within one cycle still can't blow the budget. Also clears stale `.log.bak`
+/// orphans from older builds, which the digest never reads.
+pub fn prune_logs(log_dir: &Path) {
+    const KEEP_FILES: usize = 5;
+    const KEEP_BYTES: u64 = 40 * 1024 * 1024; // ~40 MB ceiling on rotated history
+    let Ok(rd) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    let mut rotated: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with("DropBeam")
+                && n != "DropBeam.log"
+                && (n.ends_with(".log") || n.ends_with(".bak"))
+        })
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), e.path()))
+        })
+        .collect();
+    rotated.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    let (mut kept, mut bytes) = (0usize, 0u64);
+    for (_, len, p) in rotated {
+        if kept < KEEP_FILES && bytes + len <= KEEP_BYTES {
+            kept += 1;
+            bytes += len;
+        } else {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Compiled redaction patterns (built once).
 fn redactors() -> &'static [(Regex, &'static str)] {
     static R: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
@@ -102,16 +140,40 @@ fn redactors() -> &'static [(Regex, &'static str)] {
             // Some logs quote the variable with single quotes — scrub those too.
             // {1,200} (not 0) so a lone apostrophe in prose isn't a match start.
             (Regex::new(r#"'[^']{1,200}'"#).unwrap(), "'<q>'"),
+            // URLs → <url>. iroh logs the home-relay/dial URL (wss://…, https://…) on
+            // connect and on relay fallback; the region code in the host is coarse geo.
+            (Regex::new(r#"(?:https?|wss?)://[^\s"']+"#).unwrap(), "<url>"),
+            // Bare hostnames that identify a device or its region: iroh relay/pkarr
+            // hosts (*.iroh.network / *.dns.iroh.link) and .local mDNS names (which
+            // routinely embed the user's real name, e.g. Mong-MacBook-Pro.local).
+            (Regex::new(r"(?i)\b(?:[\w-]+\.)+(?:iroh\.(?:network|link)|local)\.?").unwrap(), "<host>"),
             // Any absolute filesystem path (prefix-agnostic: /Users, /Volumes,
             // /System/Volumes/Data firmlinks, /home, Windows drives) → <path>.
             (Regex::new(r"(?:/[\w.+\- ]+){2,}/?").unwrap(), "<path>"),
             (Regex::new(r"[A-Za-z]:\\[\w.+\\\- ]*").unwrap(), "<path>"),
+            // Windows paths WITHOUT a drive letter: UNC shares (\\srv\share\…) and
+            // relative backslash paths (\Users\name\…) — these leak the OS username and
+            // the drive rule above misses them.
+            (Regex::new(r"(?:\\[\w.$+\- ]+){2,}\\?").unwrap(), "<path>"),
+            // iroh's SHORT node id (fmt_short = first 5 bytes as 10 lowercase-hex chars)
+            // is logged as a structured field — remote_id=, peer=, me=, dst_endpoint=, …
+            // — on nearly every connection-lifecycle line at DEBUG/WARN. The {40,} rule
+            // below only catches the FULL 52/64-char id, so anchor on the field keyword
+            // here to scrub the short prefix too (a stable device fingerprint).
+            (Regex::new(r"(?i)\b(remote_id|node_id|endpoint_id|src_endpoint|dst_endpoint|remote|endpoint|node|peer|conn|me|src|dst|from|to|who|id|key|addr)\b[\s=:]+([0-9a-fA-F]{8,64})\b").unwrap(), "$1 <id>"),
             // iroh node/endpoint ids (z-base-32, 52 chars), sha256 hex (64), and any
             // other long opaque token → <id>. 40+ alnum is an id/hash, not a word.
             (Regex::new(r"\b[A-Za-z0-9_-]{40,}\b").unwrap(), "<id>"),
-            // IP addresses (a peer's IP is personal) → <ip>. IPv4 + IPv6.
+            // MAC / hardware address (immutable, globally-unique device fingerprint):
+            // 6 octets of 2 hex, colon OR hyphen separated. BEFORE the IP rules so the
+            // colon form isn't half-eaten by the leading-hex IPv6 rule below.
+            (Regex::new(r"(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b").unwrap(), "<mac>"),
+            // IP addresses (a peer's IP is personal) → <ip>. IPv4, then bracketed
+            // socket-addr IPv6 ([fe80::1]:port), then a bare IPv6 that REQUIRES a
+            // leading hex group so it can't match a module path's "::" or a clock.
             (Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap(), "<ip>"),
-            (Regex::new(r"\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b").unwrap(), "<ip>"),
+            (Regex::new(r"\[[0-9a-fA-F:]{2,}\]").unwrap(), "[<ip>]"),
+            (Regex::new(r"\b[0-9a-fA-F]{1,4}:(?:[0-9a-fA-F]{0,4}:){1,6}[0-9a-fA-F]{0,4}\b").unwrap(), "<ip>"),
             // Email addresses → <email>.
             (Regex::new(r"[\w.+\-]+@[\w.\-]+\.\w{2,}").unwrap(), "<email>"),
         ]
@@ -142,13 +204,32 @@ fn notable(line: &str) -> Option<&'static str> {
     } else if line.contains("stalled")
         || line.contains("REFUSED")
         || line.contains("re-queued")
-        || line.contains("canary")
+        // "canary" appears both in OUR relay-fallback diagnostics AND in iroh's relay
+        // hostnames (*.iroh-canary.iroh.link). Only keep our own — otherwise iroh's
+        // routine relay chatter floods the "signal" tier and eats MAX_GROUPS slots.
+        || (line.contains("app_lib") && line.contains("canary"))
         || line.contains("Resource busy")
         || line.contains("Local Network")
         || line.contains("unreachable over iroh")
         || line.contains("did not confirm receipt")
     {
         Some("signal")
+    } else {
+        None
+    }
+}
+
+/// Classify a PERF line's transport path: Some(true)=direct, Some(false)=relay,
+/// None=neither. The PERF line tags it `DIRECT/p2p` or `RELAY/internet`
+/// (iroh_net.rs). Compare case-insensitively — the literal token is uppercase
+/// `RELAY`, so a naive `contains("relay")` silently never counts relay transfers,
+/// zeroing THE signal this whole feature exists to surface (relay-vs-direct slowness).
+fn perf_path_kind(line: &str) -> Option<bool> {
+    let l = line.to_ascii_lowercase();
+    if l.contains("direct") || l.contains("p2p") {
+        Some(true)
+    } else if l.contains("relay") {
+        Some(false)
     } else {
         None
     }
@@ -271,10 +352,10 @@ fn build_digest(
                         }
                     }
                 }
-                if line.contains("DIRECT") || line.contains("p2p") {
-                    direct_uses += 1;
-                } else if line.contains("relay") {
-                    relay_uses += 1;
+                match perf_path_kind(line) {
+                    Some(true) => direct_uses += 1,
+                    Some(false) => relay_uses += 1,
+                    None => {}
                 }
                 continue; // perf is aggregated, not grouped as an "issue"
             }
@@ -393,6 +474,9 @@ pub async fn run(app: AppHandle, config_dir: PathBuf, log_dir: Option<PathBuf>) 
                 }
             }
         }
+        // Bound disk every cycle — the startup sweep alone can't keep up on a session
+        // that never restarts. Runs regardless of the share_diagnostics opt-out.
+        prune_logs(&log_dir);
         // Wake on the normal 12h cadence OR early when a transfer just failed
         // (debounced so a burst of failures = one upload) — so a real problem
         // reaches the dashboard in ~2 min instead of up to half a day.
@@ -509,6 +593,82 @@ mod tests {
         assert_eq!(notable("PERF[folder-send] send: 4.0 MB/s"), Some("perf"));
         assert_eq!(notable("re-queued 1 file(s) the peer was missing"), Some("signal"));
         assert_eq!(notable("[INFO] routine chatter"), None);
+        // "canary" is a signal only in OUR logs, not iroh's relay-host chatter.
+        assert_eq!(
+            notable("[2026-06-18][07:59:25][app_lib::iroh_net][INFO] falling back to canary relay"),
+            Some("signal")
+        );
+        assert_eq!(
+            notable("[2026-06-18][07:59:25][iroh_relay::client][DEBUG] Dialing relay dial_url=wss://x.iroh-canary.iroh.link"),
+            None
+        );
+    }
+
+    #[test]
+    fn redaction_strips_network_identifiers() {
+        // iroh short node id (10-hex fmt_short) logged as a structured field — the
+        // {40,}-char rule misses it, so the keyword-anchored rule must catch it.
+        for line in [
+            "dst_endpoint=3b8f2a9c1d alpn=dropbeam",
+            "remote_id=a17f0b9c2e closed",
+            "connected to node 5d0f9908a1",
+        ] {
+            let r = redact(line);
+            assert!(r.contains("<id>"), "short id not redacted: {r}");
+            assert!(
+                !r.contains("3b8f2a9c1d") && !r.contains("a17f0b9c2e") && !r.contains("5d0f9908a1"),
+                "short id leaked: {r}"
+            );
+        }
+        // Relay URL + bare iroh host + pkarr record (coarse geo / topology).
+        for line in [
+            "home relay is https://use1.relay.iroh.network./",
+            "dialing relay use1.relay.iroh.network",
+            "publishing pkarr record _iroh.abc123def456.dns.iroh.link",
+        ] {
+            let r = redact(line);
+            assert!(
+                !r.contains("use1.relay.iroh.network") && !r.contains("dns.iroh.link"),
+                "relay host leaked: {r}"
+            );
+        }
+        // .local mDNS hostname (often contains the user's real name).
+        let r = redact("discovered Mong-MacBook-Pro.local on the LAN");
+        assert!(!r.contains("Mong-MacBook"), ".local hostname leaked: {r}");
+        // Windows path WITHOUT a drive letter (UNC / relative) leaks the OS username.
+        for line in [
+            r"queued path \Users\minkyung\AppData\Local\Temp\x.tmp",
+            r"skipping \\nas\share\minkyung\budget.xlsx",
+        ] {
+            let r = redact(line);
+            assert!(!r.contains("minkyung"), "win path leaked: {r}");
+        }
+        // A module path's "::" must NOT be mistaken for an IPv6 address.
+        let r = redact("app_lib::sync reconcile done");
+        assert!(r.contains("sync") && !r.contains("<ip>"), "module path mangled: {r}");
+        // MAC / hardware address (both colon and hyphen forms) → <mac>.
+        assert_eq!(redact("iface en0 hwaddr 3c:22:fb:8a:9d:1e"), "iface en0 hwaddr <mac>");
+        assert_eq!(redact("iface en0 hwaddr 3c-22-fb-8a-9d-1e"), "iface en0 hwaddr <mac>");
+        // Short id after a non-id keyword ("to"/"from") is still scrubbed.
+        assert!(!redact("sending to 3b8f2a9c1d now").contains("3b8f2a9c1d"));
+        // A plain decimal counter is NOT mistaken for an id (no a-f letters).
+        let r = redact("transferred 12345678 bytes");
+        assert!(r.contains("12345678"), "decimal over-redacted: {r}");
+    }
+
+    #[test]
+    fn perf_path_classification() {
+        // The PERF line tags uppercase RELAY/internet or DIRECT/p2p — count BOTH
+        // (a naive contains("relay") never matched "RELAY", zeroing the relay signal).
+        assert_eq!(
+            perf_path_kind("recv: 5.1 MB/s (276.6 MB in 54s) · DIRECT/p2p · rtt=89ms"),
+            Some(true)
+        );
+        assert_eq!(
+            perf_path_kind("send: 2.0 MB/s (10 MB in 5s) · RELAY/internet · rtt=80ms"),
+            Some(false)
+        );
+        assert_eq!(perf_path_kind("send: 4.0 MB/s"), None);
     }
 }
 

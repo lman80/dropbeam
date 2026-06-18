@@ -178,25 +178,38 @@ pub fn run() {
             // DEBUG-level app breadcrumbs PLUS iroh's connection internals so we can
             // diagnose hard-to-reproduce transfer issues from a tester's machine.
             // Read straight from settings.json — the plugin's level is fixed at
-            // startup, so the toggle takes effect on the next launch.
-            // Verbose (Debug-level) logging is ON whenever the device shares
-            // diagnostics — which is the default for every install — so the daily
-            // digest carries the connection-lifecycle detail (path selection,
-            // hole-punch, relay-vs-direct) needed to diagnose slowness, not just bare
-            // errors. The explicit `verbose_logging` toggle still forces it on for a
-            // device that has opted OUT of sharing.
-            let verbose = app
+            // startup, so a change takes effect on the next launch. Two independent
+            // dials:
+            //  • share_diagnostics (default ON for every install) → DropBeam's OWN
+            //    modules log at Debug, so the exported log / daily digest carry rich
+            //    app-level breadcrumbs. iroh's internal modules stay at Warn on
+            //    purpose: their Debug firehose logs device identifiers + relay hosts
+            //    (a privacy leak once uploaded), burns CPU on an always-running app,
+            //    and adds no digest signal — the direct-vs-relay / speed / RTT data is
+            //    already in our own app-level PERF line (logged at Info).
+            //  • verbose_logging (the explicit "Detailed logging" toggle, for actively
+            //    reproducing a deep connection issue) → cranks iroh's modules to Debug
+            //    too. Heavier; opt-in.
+            let (verbose, diag) = app
                 .path()
                 .app_config_dir()
                 .ok()
                 .map(|d| crate::settings::load(&d, "", ""))
-                .map(|s| s.verbose_logging || s.share_diagnostics)
-                .unwrap_or(false);
+                .map(|s| (s.verbose_logging, s.share_diagnostics))
+                .unwrap_or((false, false));
             let (global_level, app_level, iroh_level) = if verbose {
+                // Full firehose: our app + iroh internals at Debug.
                 (
                     log::LevelFilter::Info,
                     log::LevelFilter::Debug,
                     log::LevelFilter::Debug,
+                )
+            } else if diag {
+                // Default sharer: our app verbose, iroh quiet (no PII/CPU flood).
+                (
+                    log::LevelFilter::Warn,
+                    log::LevelFilter::Debug,
+                    log::LevelFilter::Warn,
                 )
             } else {
                 (
@@ -234,31 +247,20 @@ pub fn run() {
                 app.package_info().version,
                 std::env::consts::OS,
                 std::env::consts::ARCH,
-                if verbose { "ON" } else { "off" }
-            );
-            // KeepAll preserves diagnostic history but never deletes anything — an
-            // always-running menu-bar app would grow ~/Library/Logs without bound.
-            // Sweep rotated files beyond the newest 5 (~10 MB of history) at start.
-            if let Ok(log_dir) = app.path().app_log_dir() {
-                if let Ok(rd) = std::fs::read_dir(&log_dir) {
-                    let mut rotated: Vec<(std::time::SystemTime, PathBuf)> = rd
-                        .flatten()
-                        .filter(|e| {
-                            let n = e.file_name().to_string_lossy().to_string();
-                            n.starts_with("DropBeam") && n.ends_with(".log") && n != "DropBeam.log"
-                        })
-                        .filter_map(|e| {
-                            e.metadata()
-                                .and_then(|m| m.modified())
-                                .ok()
-                                .map(|t| (t, e.path()))
-                        })
-                        .collect();
-                    rotated.sort_by(|a, b| b.0.cmp(&a.0));
-                    for (_, p) in rotated.into_iter().skip(5) {
-                        let _ = std::fs::remove_file(p);
-                    }
+                if verbose {
+                    "full (app+iroh)"
+                } else if diag {
+                    "app-level"
+                } else {
+                    "off"
                 }
+            );
+            // KeepAll never deletes a rotated file, so an always-running menu-bar app
+            // would grow ~/Library/Logs without bound. Sweep at startup AND on every
+            // telemetry cycle (a long-lived session rarely restarts, so a startup-only
+            // sweep let 12+ rotations pile up).
+            if let Ok(log_dir) = app.path().app_log_dir() {
+                crate::telemetry::prune_logs(&log_dir);
             }
             // Log panics (including ones inside commands) so a crash on a remote
             // machine leaves a trace in the file instead of a silent hang.

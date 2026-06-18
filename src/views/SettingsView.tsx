@@ -625,7 +625,7 @@ export function SettingsView() {
       <Card>
         <Row
           title="Detailed logging"
-          desc="Record a deep log of every transfer — connection setup, local vs. direct vs. relay path, speeds, and folder-sync decisions. Sharing diagnostics (below) already keeps this on automatically; this switch only matters if you've turned sharing off. Takes effect after a restart."
+          desc="Add the deepest network-internal logs (iroh connection setup, path selection, hole-punch) on top of the usual diagnostics — turn this on only while reproducing a hard-to-spot connection issue. Sharing diagnostics (below) already keeps DropBeam's own logs detailed; this adds the heavier transport internals. Takes effect after a restart."
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <button
@@ -651,7 +651,7 @@ export function SettingsView() {
         {SEP}
         <Row
           title="Share background diagnostics"
-          desc="Automatically send a small, redacted summary of errors and transfer performance (never file names or contents) so problems can be found and fixed without you reporting them. Keeps detailed logging on so the summary is useful. Uploads about once a day — only to the endpoint set below."
+          desc="Automatically send a small, redacted summary of errors and transfer performance (never file names or contents) so problems can be found and fixed without you reporting them. Keeps DropBeam's own logs detailed so the summary is useful. Uploads about once a day — only to the endpoint set below."
         >
           <Toggle on={settings.shareDiagnostics} onChange={(v) => save({ shareDiagnostics: v })} />
         </Row>
