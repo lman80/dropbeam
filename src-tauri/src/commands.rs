@@ -57,6 +57,18 @@ pub fn update_settings(
     // next chunk, no restart needed.
     crate::iroh_net::set_upload_limit_mbps(settings.upload_limit_mbps);
     crate::iroh_net::set_require_direct(settings.require_direct);
+    crate::iroh_net::set_wait_for_direct(settings.wait_for_direct);
+    // Apply recovery-history retention live, then sweep so a tightened budget/age
+    // frees space immediately (not just on the next delete).
+    let retention_changed = {
+        let guard = state.settings.lock().unwrap();
+        guard.folder_history_keep_days != settings.folder_history_keep_days
+            || guard.folder_history_budget_bytes != settings.folder_history_budget_bytes
+    };
+    crate::folder_history::set_policy(
+        settings.folder_history_keep_days,
+        settings.folder_history_budget_bytes,
+    );
     let name_changed = {
         let mut guard = state.settings.lock().unwrap();
         let changed = guard.display_name != settings.display_name;
@@ -64,6 +76,9 @@ pub fn update_settings(
         changed
     };
     settings::save(&state.config_dir, &settings)?;
+    if retention_changed {
+        sweep_folder_history(&app, state.inner());
+    }
     // If the user renamed themselves, push the new name out to all friends.
     if name_changed {
         crate::iroh_net::broadcast_profile(app.clone(), iroh.inner().clone());
@@ -469,6 +484,19 @@ pub fn get_default_download_dir(app: AppHandle) -> String {
 pub(crate) fn apply_autostart(app: &AppHandle, enable: bool) {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();
+    // ONLY touch the macOS LaunchAgent plist when the state actually needs to change.
+    // The old code called enable()/disable() on every launch + every settings save,
+    // and the underlying crate rewrites ~/Library/LaunchAgents/DropBeam.plist via
+    // File::create EACH call — which makes macOS post a "Background items added —
+    // DropBeam" notification every single time (the user's "over and over" popup).
+    // is_enabled() is just a file-exists check (no write, no notification), so this
+    // makes both call sites idempotent: a normal launch with autostart already
+    // registered does nothing and macOS stays silent. The plist is still (re)written
+    // on a genuine first-enable or if something deleted it — so updates are covered.
+    let current = manager.is_enabled().unwrap_or(false);
+    if enable == current {
+        return;
+    }
     let _ = if enable {
         manager.enable()
     } else {
@@ -838,6 +866,28 @@ pub async fn ping_friend(
         return Ok(false);
     };
     Ok(crate::iroh_net::ping_endpoint(&ep, &eid).await)
+}
+
+/// Probe how we're connected to a friend right now (connection inspector). Returns
+/// the live path detail, or None if they're unreachable / not on a direct build.
+#[tauri::command]
+pub async fn probe_connection(
+    state: State<'_, Arc<AppState>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    friend_id: String,
+) -> Result<Option<crate::models::ConnDetail>, String> {
+    let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
+    let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id) else {
+        return Ok(None);
+    };
+    Ok(crate::iroh_net::probe_conn(&ep, &eid).await)
+}
+
+/// "Send over relay anyway": break the wait-for-direct park for one transfer (by
+/// transfer id) or one folder (by pair id), so it proceeds on the relay now.
+#[tauri::command]
+pub fn force_relay(id: String) {
+    crate::iroh_net::force_relay(&id);
 }
 
 /// Rebuild a friend's invite so the inviter can show it again.
@@ -1318,10 +1368,105 @@ pub fn restore_folder_item(
 }
 
 #[tauri::command]
-pub fn forget_folder_item(state: State<'_, Arc<AppState>>, pair_id: String, item_id: String) {
+pub fn forget_folder_item(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    pair_id: String,
+    item_id: String,
+) {
     if let Some(folder) = folder_for(state.inner(), &pair_id) {
         folder_history::forget(&folder, &item_id);
+        let _ = app.emit("folder-history://changed", &pair_id);
     }
+}
+
+/// All mirror folders with recovery history, deduped by folder path (a group
+/// folder is reached by several pair links but is one archive on disk). Returns
+/// (representative pair id, folder path) per unique folder.
+fn mirror_folders(state: &Arc<AppState>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for p in pairing::load(&state.config_dir) {
+        if !p.mirror {
+            continue;
+        }
+        if out.iter().any(|(_, f)| f == &p.folder) {
+            continue;
+        }
+        out.push((p.id, p.folder));
+    }
+    out
+}
+
+fn folder_display_name(folder: &str) -> String {
+    std::path::Path::new(folder)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| folder.to_string())
+}
+
+/// Per-folder rollup of recovery-history disk usage, for the storage view.
+#[tauri::command]
+pub fn folder_history_summary(
+    state: State<'_, Arc<AppState>>,
+) -> Vec<crate::models::FolderHistorySummary> {
+    mirror_folders(state.inner())
+        .into_iter()
+        .map(|(pair_id, folder)| {
+            let items = folder_history::load(&folder);
+            let bytes = folder_history::folder_size(&folder);
+            let oldest_ms = items.iter().map(|i| i.timestamp_ms).min();
+            crate::models::FolderHistorySummary {
+                pair_id,
+                folder_name: folder_display_name(&folder),
+                folder: folder.clone(),
+                bytes,
+                item_count: items.len() as u64,
+                oldest_ms,
+            }
+        })
+        .filter(|s| s.item_count > 0)
+        .collect()
+}
+
+/// Wipe one folder's recovery history (every saved copy). Returns bytes freed.
+#[tauri::command]
+pub fn clear_folder_history(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    pair_id: String,
+) -> u64 {
+    let freed = match folder_for(state.inner(), &pair_id) {
+        Some(folder) => folder_history::clear_all(&folder),
+        None => 0,
+    };
+    let _ = app.emit("folder-history://changed", &pair_id);
+    freed
+}
+
+/// Wipe recovery history across ALL mirror folders. Returns total bytes freed.
+#[tauri::command]
+pub fn clear_all_folder_history(app: AppHandle, state: State<'_, Arc<AppState>>) -> u64 {
+    let mut freed = 0u64;
+    for (pair_id, folder) in mirror_folders(state.inner()) {
+        freed += folder_history::clear_all(&folder);
+        let _ = app.emit("folder-history://changed", &pair_id);
+    }
+    freed
+}
+
+/// Apply current retention to every mirror folder (used at startup + when the
+/// user changes retention). Best-effort; emits a refresh so the UI updates.
+fn sweep_folder_history(app: &AppHandle, state: &Arc<AppState>) {
+    let folders: Vec<String> = mirror_folders(state).into_iter().map(|(_, f)| f).collect();
+    if folders.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        folder_history::sweep_all(&folders);
+        let _ = app.emit("folder-history://changed", "");
+    });
 }
 
 /// Send files straight to a friend — no code, no QR. Their inbox listener is

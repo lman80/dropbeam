@@ -338,6 +338,7 @@ impl SyncManager {
                     session_total_files: s.session_total_files,
                     session_done_files: s.session_done_files,
                     paused: h.paused.load(Ordering::Relaxed),
+                    conn_detail: None,
                 }
             })
             .collect()
@@ -2226,6 +2227,7 @@ impl SyncManager {
             session_total_files: s.session_total_files,
             session_done_files: s.session_done_files,
             paused,
+            conn_detail: None,
         };
         let _ = self.app.emit("folder://status", status);
     }

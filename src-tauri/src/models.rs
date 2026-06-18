@@ -50,6 +50,24 @@ pub enum Locality {
     Internet,
 }
 
+/// Live detail of HOW two peers are connected right now — the data behind the
+/// "connection inspector" so the user can see exactly what path their files take,
+/// not just a vague Direct/Relay pill.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnDetail {
+    /// "local" (same LAN) | "direct" (hole-punched p2p) | "relay" (via a relay
+    /// server) | "connecting" (no path selected yet).
+    pub path: String,
+    /// Round-trip latency in ms for the active path (None if not measured yet).
+    pub rtt_ms: Option<u64>,
+    /// True when we're on the relay BUT a direct path is actively forming (a
+    /// hole-punch is in progress) — drives the live "upgrading to direct…" hint.
+    pub upgrading: bool,
+    /// Short relay region/host (e.g. "use1") when relayed, else None.
+    pub relay: Option<String>,
+}
+
 /// Full snapshot of a transfer's progress, emitted on the `transfer://update`
 /// event. The frontend keeps a map keyed by `id` and replaces the whole entry.
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +92,13 @@ pub struct TransferUpdate {
     pub out_dir: Option<String>,
     /// Set when sending directly to a friend (shows "Sending to {name}", no code).
     pub friend_name: Option<String>,
+    /// Live connection detail (path kind, rtt, relay, upgrading) for the inspector.
+    #[serde(default)]
+    pub conn_detail: Option<ConnDetail>,
+    /// A short human reason for a PARKED/waiting state — e.g. "Waiting for a direct
+    /// connection". Drives the "wait for direct" parked card + "Send over relay anyway".
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 impl TransferUpdate {
@@ -96,6 +121,8 @@ impl TransferUpdate {
             error: None,
             out_dir: None,
             friend_name: None,
+            conn_detail: None,
+            detail: None,
         }
     }
 }
@@ -161,6 +188,13 @@ pub struct Settings {
     /// background folder sync (which always uses the best available path).
     #[serde(default)]
     pub require_direct: bool,
+    /// "Wait for a direct connection": hold a transfer until a fast DIRECT/LAN path
+    /// forms instead of falling back to the slow relay — but WAIT (park + keep
+    /// hole-punching), never fail outright like `require_direct` does. The transfer
+    /// card shows "Waiting for a direct connection" with a "Send over relay anyway"
+    /// escape. Off by default. Applies to friend sends AND folder sync.
+    #[serde(default)]
+    pub wait_for_direct: bool,
     /// Absolute path to the user's chosen profile picture (copied into the app
     /// config dir). Empty = no picture (we render initials instead). Local-only.
     #[serde(default)]
@@ -200,6 +234,16 @@ pub struct Settings {
     /// baked-in endpoint.
     #[serde(default)]
     pub diagnostics_url: String,
+    /// How long a mirror folder keeps deleted/replaced copies in its recovery
+    /// history before auto-removing them. 0 = keep forever. Default 30 days —
+    /// mirrors macOS "Recently Deleted" so old copies can't pile up unbounded.
+    #[serde(default = "default_keep_days")]
+    pub folder_history_keep_days: u32,
+    /// Per-folder disk budget for the recovery history (bytes). Once a folder's
+    /// saved copies exceed this, the oldest are evicted first. 0 = no limit.
+    /// Default 2 GiB — caps worst-case disk instead of the old unbounded growth.
+    #[serde(default = "default_history_budget")]
+    pub folder_history_budget_bytes: u64,
 }
 
 impl Default for Settings {
@@ -221,6 +265,7 @@ impl Default for Settings {
             upload_limit_mbps: 0,
             show_megabits: false,
             require_direct: false,
+            wait_for_direct: false,
             avatar: String::new(),
             notify_on_message: true,
             send_read_receipts: true,
@@ -229,8 +274,20 @@ impl Default for Settings {
             show_sync_popup: true,
             share_diagnostics: true,
             diagnostics_url: String::new(),
+            folder_history_keep_days: default_keep_days(),
+            folder_history_budget_bytes: default_history_budget(),
         }
     }
+}
+
+/// Default recovery-history retention: keep deleted/replaced copies for 30 days.
+fn default_keep_days() -> u32 {
+    30
+}
+
+/// Default per-folder recovery-history budget: 2 GiB.
+fn default_history_budget() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +393,24 @@ pub struct HistoryItem {
     pub timestamp_ms: u64,
 }
 
+/// A per-folder rollup of recovery-history disk usage, for the storage view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderHistorySummary {
+    /// A pair id that points at this folder (the UI uses it for restore/clear).
+    pub pair_id: String,
+    /// Friendly folder name (its last path component).
+    pub folder_name: String,
+    /// The local folder path (deduped on — group folders share one path).
+    pub folder: String,
+    /// Total bytes the saved copies occupy.
+    pub bytes: u64,
+    /// How many saved copies are kept.
+    pub item_count: u64,
+    /// Timestamp (ms) of the oldest saved copy, if any.
+    pub oldest_ms: Option<u64>,
+}
+
 /// A friend — a named peer you can send files to directly, no code needed.
 /// Backed by the same shared-secret/derived-channel model as a pair. Each friend
 /// runs a small inbox listener so files sent to you arrive automatically.
@@ -430,5 +505,8 @@ pub struct FolderStatus {
     /// UI shows a Paused badge + a Resume button instead of live sync.
     #[serde(default)]
     pub paused: bool,
+    /// Live connection detail for the active folder transfer (inspector data).
+    #[serde(default)]
+    pub conn_detail: Option<ConnDetail>,
 }
 

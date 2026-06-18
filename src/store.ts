@@ -42,6 +42,7 @@ const DEFAULT_SETTINGS: Settings = {
   uploadLimitMbps: 0,
   showMegabits: false,
   requireDirect: false,
+  waitForDirect: false,
   avatar: '',
   notifyOnMessage: true,
   sendReadReceipts: true,
@@ -50,6 +51,8 @@ const DEFAULT_SETTINGS: Settings = {
   showSyncPopup: true,
   shareDiagnostics: true,
   diagnosticsUrl: '',
+  folderHistoryKeepDays: 30,
+  folderHistoryBudgetBytes: 2 * 1024 * 1024 * 1024,
 }
 
 /** Resolve `p`, but never hang: fall back on error OR after `ms`, logging why. */
@@ -125,6 +128,11 @@ interface AppStore {
   checkForUpdates: (manual: boolean) => Promise<void>
   installUpdate: () => Promise<void>
   setView: (v: View) => void
+  /** A pair id to focus in History → Recoverable files (deep-link from a folder).
+   *  Null once consumed. */
+  historyFocusPair: string | null
+  focusFolderHistory: (pairId: string) => void
+  clearHistoryFocus: () => void
   setDragHovering: (v: boolean) => void
   setPendingSend: (paths: string[] | null) => void
   markFriendSeen: (name: string) => void
@@ -431,6 +439,9 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   setView: (view) => set({ view }),
+  historyFocusPair: null,
+  focusFolderHistory: (pairId) => set({ view: 'history', historyFocusPair: pairId }),
+  clearHistoryFocus: () => set({ historyFocusPair: null }),
 
   setDragHovering: (dragHovering) => set({ dragHovering }),
 

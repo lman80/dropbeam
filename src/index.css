@@ -1376,6 +1376,55 @@ html.overlay-window #root {
   border-top: 1px solid var(--border);
 }
 
+/* ── Connection inspector ────────────────────────────────────────────────── */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+.conn-insp {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.conn-insp-ic {
+  display: inline-flex;
+}
+.conn-insp-label {
+  font-weight: 650;
+}
+.conn-insp-rtt {
+  color: var(--text-faint);
+}
+.conn-insp-up {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--accent);
+  font-size: 11px;
+}
+.conn-park {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 9px 12px;
+  border-radius: 11px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: 12.5px;
+}
+.conn-park .btn-ghost {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 35%, transparent);
+  flex-shrink: 0;
+}
+
 /* click-to-enlarge lightbox */
 .chat-lightbox {
   position: fixed;

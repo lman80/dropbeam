@@ -10,15 +10,17 @@ import {
   Pencil,
   QrCode,
   Radar,
+  RefreshCw,
   Send,
   Trash2,
   UserPlus,
   Users,
   X,
 } from 'lucide-react'
-import { api, HAS_TAURI, type Friend } from '../lib/api'
+import { api, HAS_TAURI, type ConnDetail, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
+import { ConnInspector } from '../components/ConnInspector'
 import { avatarGradient, initials } from '../lib/avatar'
 import { friendPresence, presenceLabel } from '../lib/presence'
 
@@ -310,12 +312,35 @@ function FriendCard({ friend }: { friend: Friend }) {
   const [loadingInvite, setLoadingInvite] = useState(false)
   const [pinging, setPinging] = useState(false)
   const [pingedOffline, setPingedOffline] = useState(false)
+  const [conn, setConn] = useState<ConnDetail | null>(null)
+  const [probing, setProbing] = useState(false)
 
   const presence = friendPresence(friend.name, friendSeen, folderStatuses)
   const isOnline = presence.status === 'online'
   const channel = Object.values(folderStatuses).find(
     (s) => s.peerName?.trim().toLowerCase() === friend.name.trim().toLowerCase(),
   )?.locality
+
+  const probe = async () => {
+    setProbing(true)
+    try {
+      setConn(await api.probeConnection(friend.id))
+    } catch {
+      setConn(null)
+    } finally {
+      setProbing(false)
+    }
+  }
+
+  // Auto-check the live path once when a friend comes online; clear it when they drop.
+  useEffect(() => {
+    if (!isOnline) {
+      setConn(null)
+      return
+    }
+    void probe()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOnline, friend.id])
 
   const check = async () => {
     setPinging(true)
@@ -438,7 +463,37 @@ function FriendCard({ friend }: { friend: Friend }) {
             }}
           >
             <span>{pingedOffline ? 'No response' : presenceLabel(presence)}</span>
-            {channel && channel !== 'unknown' && <ChannelBadge locality={channel} size={11} />}
+            {isOnline && conn ? (
+              <>
+                <span style={{ color: 'var(--border-strong)' }}>·</span>
+                <ConnInspector detail={conn} compact />
+                <button
+                  onClick={probe}
+                  disabled={probing}
+                  title="Re-check how you're connected"
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    padding: 0,
+                    cursor: 'pointer',
+                    color: 'var(--text-faint)',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                  }}
+                >
+                  <RefreshCw size={11} className={probing ? 'spin' : undefined} />
+                </button>
+              </>
+            ) : isOnline && probing ? (
+              <>
+                <span style={{ color: 'var(--border-strong)' }}>·</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--text-faint)' }}>
+                  <Spinner size={11} /> checking link…
+                </span>
+              </>
+            ) : (
+              channel && channel !== 'unknown' && <ChannelBadge locality={channel} size={11} />
+            )}
             <span style={{ color: 'var(--border-strong)' }}>·</span>
             <button
               onClick={check}

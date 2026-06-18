@@ -23,9 +23,10 @@ import {
   Video,
   X,
 } from 'lucide-react'
-import { api, HAS_TAURI, type ChatMessage, type Friend } from '../lib/api'
+import { api, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState } from '../components/bits'
+import { ConnInspector } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient, initials } from '../lib/avatar'
 import { formatBytes } from '../lib/format'
@@ -221,6 +222,7 @@ function Conversation({ friendId }: { friendId: string }) {
   const [showGif, setShowGif] = useState(false)
   const [lightbox, setLightbox] = useState<string | null>(null)
   const [newCount, setNewCount] = useState(0)
+  const [conn, setConn] = useState<ConnDetail | null>(null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -228,6 +230,28 @@ function Conversation({ friendId }: { friendId: string }) {
   const prevLenRef = useRef(messages.length)
   const typingSentRef = useRef(false)
   const typingTimer = useRef<number | undefined>(undefined)
+
+  // Live connection path to this friend, refreshed whenever they come online.
+  const onlineNow = useMemo(
+    () => (friend ? friendOnlineState(friend.name, friendSeen, folderStatuses) === true : false),
+    [friend, friendSeen, folderStatuses],
+  )
+  useEffect(() => {
+    if (!onlineNow) {
+      setConn(null)
+      return
+    }
+    let cancelled = false
+    api
+      .probeConnection(friendId)
+      .then((d) => {
+        if (!cancelled) setConn(d)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [onlineNow, friendId])
 
   const isAtBottom = () => {
     const el = scrollRef.current
@@ -393,11 +417,20 @@ function Conversation({ friendId }: { friendId: string }) {
           <div style={{ fontWeight: 700, fontSize: 14.5 }}>{friend.name}</div>
           <div
             style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 7,
               fontSize: 12,
               color: typing ? 'var(--accent)' : online ? 'var(--green)' : 'var(--text-faint)',
             }}
           >
-            {typing ? 'typing…' : presenceLabel(presence)}
+            <span>{typing ? 'typing…' : presenceLabel(presence)}</span>
+            {online && conn && !typing && (
+              <>
+                <span style={{ color: 'var(--border-strong)' }}>·</span>
+                <ConnInspector detail={conn} compact />
+              </>
+            )}
           </div>
         </div>
         {sharedFolder && (

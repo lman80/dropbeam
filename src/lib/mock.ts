@@ -45,6 +45,7 @@ let settings: Settings = {
   uploadLimitMbps: 0,
   showMegabits: false,
   requireDirect: false,
+  waitForDirect: false,
   avatar: '',
   notifyOnMessage: true,
   sendReadReceipts: true,
@@ -53,6 +54,8 @@ let settings: Settings = {
   showSyncPopup: true,
   shareDiagnostics: true,
   diagnosticsUrl: '',
+  folderHistoryKeepDays: 30,
+  folderHistoryBudgetBytes: 2 * 1024 * 1024 * 1024,
 }
 
 const history: HistoryEntry[] = [
@@ -128,7 +131,8 @@ const folderHistory: Record<string, HistoryItem[]> = {
   p1: [
     { id: 'fh1', relPath: 'src/old-logo.svg', size: 24_000, reason: 'deleted', timestampMs: Date.now() - 36 * 60_000 },
     { id: 'fh2', relPath: 'notes.md', size: 4_200, reason: 'replaced', timestampMs: Date.now() - 5 * 3600_000 },
-    { id: 'fh3', relPath: 'drafts/v1.fig', size: 1_840_000, reason: 'deleted', timestampMs: Date.now() - 2 * 86400_000 },
+    { id: 'fh3', relPath: 'drafts/v1.fig', size: 742_000_000, reason: 'deleted', timestampMs: Date.now() - 2 * 86400_000 },
+    { id: 'fh4', relPath: 'shoot/raw/IMG_0421.CR2', size: 38_400_000, reason: 'deleted', timestampMs: Date.now() - 9 * 86400_000 },
   ],
 }
 
@@ -419,6 +423,34 @@ export const mockApi = {
   forgetFolderItem: async (pairId: string, itemId: string): Promise<void> => {
     folderHistory[pairId] = (folderHistory[pairId] ?? []).filter((i) => i.id !== itemId)
   },
+  folderHistorySummary: async () =>
+    Object.entries(folderHistory)
+      .map(([pairId, items]) => {
+        const pair = pairs.find((p) => p.id === pairId)
+        const folder = pair?.folder ?? pairId
+        return {
+          pairId,
+          folderName: folder.split('/').filter(Boolean).pop() ?? folder,
+          folder,
+          bytes: items.reduce((s, i) => s + i.size, 0),
+          itemCount: items.length,
+          oldestMs: items.length ? Math.min(...items.map((i) => i.timestampMs)) : null,
+        }
+      })
+      .filter((s) => s.itemCount > 0),
+  clearFolderHistory: async (pairId: string): Promise<number> => {
+    const freed = (folderHistory[pairId] ?? []).reduce((s, i) => s + i.size, 0)
+    folderHistory[pairId] = []
+    return freed
+  },
+  clearAllFolderHistory: async (): Promise<number> => {
+    let freed = 0
+    for (const k of Object.keys(folderHistory)) {
+      freed += (folderHistory[k] ?? []).reduce((s, i) => s + i.size, 0)
+      folderHistory[k] = []
+    }
+    return freed
+  },
   getFolderStatuses: async (): Promise<FolderStatus[]> =>
     pairs.map((p) =>
       p.id === 'p1'
@@ -502,6 +534,13 @@ export const mockApi = {
     const f = friends.find((x) => x.id === id)
     return f?.name === 'Alex'
   },
+  probeConnection: async (friendId: string) => {
+    await new Promise((r) => setTimeout(r, 600))
+    const f = friends.find((x) => x.id === friendId)
+    if (f?.name === 'Alex') return { path: 'direct', rttMs: 14, upgrading: false, relay: null }
+    return { path: 'relay', rttMs: 48, upgrading: true, relay: 'use1' }
+  },
+  forceRelay: async (): Promise<void> => {},
   respondToOffer: async (id: string, accept: boolean): Promise<void> => {
     const t = pendingOffers[id]
     if (!t) return

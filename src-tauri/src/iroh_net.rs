@@ -13,7 +13,7 @@
 //! Later phases add the real protocols (Quick Send, Friends, Shared Folders) as
 //! additional ALPN-tagged stream handlers on this same endpoint.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -157,6 +157,7 @@ fn progress_cb(
         };
         u.speed_bps = done as f64 / secs;
         u.locality = conn_locality(&conn); // live Direct/Relay badge
+        u.conn_detail = Some(conn_detail(&conn)); // inspector: path, rtt, upgrading
         u.friend_name = friend.clone();
         emit(&app, &u);
     }
@@ -431,6 +432,62 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
         _ => {}
     }
     loc
+}
+
+/// Live connection detail for the inspector — what path is active, its latency,
+/// and whether a direct upgrade is forming. Reads the QUIC multipath set.
+pub fn conn_detail(conn: &Connection) -> crate::models::ConnDetail {
+    use crate::models::ConnDetail;
+    use iroh::Watcher as _;
+    let mut watcher = conn.paths();
+    let paths = watcher.get();
+    let selected = paths.iter().find(|p| p.is_selected());
+    // A direct upgrade is "forming" when we're on the relay but a non-selected,
+    // non-closed IP (direct) candidate path exists — QUIC is validating it.
+    let upgrading = selected.map(|p| p.is_relay()).unwrap_or(false)
+        && paths.iter().any(|p| p.is_ip() && !p.is_selected() && !p.is_closed());
+    match selected {
+        Some(p) => {
+            let addr_dbg = format!("{:?}", p.remote_addr());
+            let (path, relay) = if p.is_relay() {
+                ("relay".to_string(), Some(short_relay(&addr_dbg)))
+            } else if addr_is_lan(&addr_dbg) {
+                ("local".to_string(), None)
+            } else {
+                ("direct".to_string(), None)
+            };
+            ConnDetail {
+                path,
+                rtt_ms: p.rtt().map(|r| r.as_millis() as u64),
+                upgrading,
+                relay,
+            }
+        }
+        None => ConnDetail {
+            path: "connecting".into(),
+            rtt_ms: None,
+            upgrading: false,
+            relay: None,
+        },
+    }
+}
+
+/// Pull a short relay region out of a Debug-formatted relay address for display,
+/// e.g. "Relay(https://use1.relay.iroh.network./)" → "use1". Best-effort.
+fn short_relay(dbg: &str) -> String {
+    if let Some(i) = dbg.find("://") {
+        let rest = &dbg[i + 3..];
+        let host: String = rest
+            .chars()
+            .take_while(|c| *c != '/' && *c != '"' && *c != ')')
+            .collect();
+        if let Some(first) = host.split('.').next() {
+            if !first.is_empty() {
+                return first.to_string();
+            }
+        }
+    }
+    "relay".to_string()
 }
 
 /// One-line performance summary for a finished transfer, written to the always-on
@@ -2301,6 +2358,9 @@ pub fn start_receive(
         }
         cleanup.cancels.lock().unwrap().remove(&id);
         cleanup.conns.lock().unwrap().remove(&id);
+        // Drop any "send over relay anyway" override for this finished transfer so
+        // the set can't grow unboundedly across a long session.
+        clear_force_relay(&id);
     });
     Ok(snapshot)
 }
@@ -2372,6 +2432,16 @@ pub fn send_to_friend(
             let mut last_high: u64 = 0;
             let mut stall: u32 = 0;
             let mut attempt: u32 = 0;
+            // "Wait for a direct connection" parks the send off the relay while a
+            // hole-punch keeps trying. A peer that CAN upgrade does so within
+            // seconds; a peer that never can (symmetric NAT / CGNAT — the exact
+            // case the relay exists for) would otherwise park FOREVER, re-dialing
+            // every few seconds and never delivering. So we bound the park: after
+            // PARK_MAX of fruitless waiting we stop holding and send over the relay
+            // anyway (mirroring send_folder_file's "never parks forever" rule), so
+            // the file still arrives. `park_since` = when the current park began.
+            const PARK_MAX: Duration = Duration::from_secs(75);
+            let mut park_since: Option<Instant> = None;
             // Per-file split for multi-file selections that include a big file —
             // index of the first file NOT yet confirmed delivered. Survives across
             // retry attempts so a reconnect never re-sends finished files.
@@ -2464,6 +2534,62 @@ pub fn send_to_friend(
                     emit(&app, &ru);
                     tokio::time::sleep(Duration::from_secs(2 + attempt.min(6) as u64)).await;
                     continue;
+                }
+                // "Wait for a direct connection" (PARK — don't crawl on relay, don't
+                // FAIL like require_direct): hold the send and keep hole-punching until
+                // a direct/LAN path forms, UNLESS the user hit "Send over relay anyway"
+                // for this transfer. The parked card shows the escape hatch.
+                //
+                // BUT never park forever: a peer that can't hole-punch at all
+                // (symmetric NAT / CGNAT) would loop here indefinitely, re-dialing
+                // every few seconds and never delivering the file. After PARK_MAX of
+                // fruitless waiting we stop holding and let the send fall through to
+                // the relay so the file still arrives (the user can still hit "Send
+                // over relay anyway" for an immediate override). Peers that CAN
+                // upgrade reach `got_direct` long before the deadline.
+                if !got_direct
+                    && wait_for_direct_mode()
+                    && !require_direct()
+                    && !is_force_relay(&id)
+                    && !cancel.load(Ordering::SeqCst)
+                {
+                    let parked_for = park_since.get_or_insert_with(Instant::now).elapsed();
+                    if parked_for < PARK_MAX {
+                        conn.close(1u32.into(), b"wait-direct");
+                        attempt += 1;
+                        log::info!(
+                            "friend-send: waiting for a direct connection (relay held back, attempt {attempt}, parked {}s)",
+                            parked_for.as_secs()
+                        );
+                        let mut ru = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                        ru.friend_name = Some(friend_name.clone());
+                        ru.state = TransferState::WaitingForPeer;
+                        ru.bytes_total = total;
+                        ru.conn_detail = Some(conn_detail(&conn));
+                        ru.detail = Some(
+                            "Waiting for a direct connection — your files haven't gone over the slower relay yet."
+                                .into(),
+                        );
+                        emit(&app, &ru);
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                    // Park deadline hit — this peer can't get a direct path. Stop
+                    // holding and deliver over the relay so the file isn't stuck
+                    // forever. One-time notice; then fall through to the send below.
+                    log::info!(
+                        "friend-send: no direct path after {}s of waiting — delivering over the relay so the file still arrives",
+                        parked_for.as_secs()
+                    );
+                    let mut ru = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                    ru.friend_name = Some(friend_name.clone());
+                    ru.state = TransferState::Connecting;
+                    ru.bytes_total = total;
+                    ru.conn_detail = Some(conn_detail(&conn));
+                    ru.detail = Some(
+                        "Couldn't get a direct path — sending over the relay so your file still arrives.".into(),
+                    );
+                    emit(&app, &ru);
                 }
                 // Fresh per attempt: only THIS attempt's handshake authorizes a
                 // retry AND the degradation watchdog. Shared (Arc) so the watchdog
@@ -2678,6 +2804,9 @@ pub fn send_to_friend(
         }
         cleanup.cancels.lock().unwrap().remove(&id);
         cleanup.conns.lock().unwrap().remove(&id);
+        // Drop any "send over relay anyway" override for this finished transfer so
+        // the set can't grow unboundedly across a long session.
+        clear_force_relay(&id);
     });
     Ok(snapshot)
 }
@@ -3161,6 +3290,24 @@ pub async fn ping_endpoint(ep: &Endpoint, endpoint_id: &str) -> bool {
     )
 }
 
+/// Probe how we're connected to a peer RIGHT NOW (for the connection inspector when
+/// no transfer is active): dial them, let a direct path try to form briefly, read
+/// the live path detail, then close. None if they're unreachable.
+pub async fn probe_conn(ep: &Endpoint, endpoint_id: &str) -> Option<crate::models::ConnDetail> {
+    let parsed = endpoint_id.parse::<iroh::EndpointId>().ok()?;
+    let addr = dial_addr(parsed);
+    let conn = tokio::time::timeout(Duration::from_secs(8), ep.connect(addr, ALPN))
+        .await
+        .ok()?
+        .ok()?;
+    // Give the hole-punch a moment so the detail reflects the BEST available path,
+    // not just the instant relay path the dial returns on.
+    let _ = wait_for_direct_path(&conn, Duration::from_secs(3)).await;
+    let detail = conn_detail(&conn);
+    conn.close(0u32.into(), b"probe");
+    Some(detail)
+}
+
 /// Push folder files to a paired peer over iroh (dial-by-key). Preserves each
 /// file's path relative to `root` so subfolders survive. Returns the connection
 /// locality on success. Any `Err` means "fall back to croc" to the caller — so a
@@ -3184,8 +3331,17 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
         .context("dial folder peer")?;
     let (mut send, mut recv) = conn.open_bi().await?;
     // Prefer a direct path for folder sync too (shorter wait since this runs in the
-    // background and LAN peers get a direct path via mDNS almost immediately).
-    let _ = wait_for_direct_path(&conn, Duration::from_secs(5)).await;
+    // background and LAN peers get a direct path via mDNS almost immediately). With
+    // "Wait for a direct connection" on, give the hole-punch MUCH longer before
+    // settling for the slow relay — unless the user hit "Send over relay anyway" for
+    // this folder. (Folders never park forever: after the window they proceed, so the
+    // background sync can't wedge; the long wait just strongly favors direct.)
+    let direct_window = if wait_for_direct_mode() && !is_force_relay(pair_id) {
+        30
+    } else {
+        5
+    };
+    let _ = wait_for_direct_path(&conn, Duration::from_secs(direct_window)).await;
     let __t0 = std::time::Instant::now();
     // Internet folder sync respects the upload cap; LAN sync stays full speed.
     let pace = !matches!(conn_locality(&conn), crate::models::Locality::Local);
@@ -3631,6 +3787,37 @@ pub fn set_require_direct(on: bool) {
 
 fn require_direct() -> bool {
     REQUIRE_DIRECT.load(Ordering::Relaxed)
+}
+
+/// "Wait for a direct connection" — PARK a transfer (keep hole-punching) until a
+/// direct/LAN path forms instead of crawling on the relay, but never FAIL like
+/// `require_direct`. The user can break the wait per-transfer ("Send over relay
+/// anyway", recorded in FORCE_RELAY by transfer id) or globally (turn the setting off).
+static WAIT_FOR_DIRECT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_wait_for_direct(on: bool) {
+    WAIT_FOR_DIRECT.store(on, Ordering::Relaxed);
+}
+
+fn wait_for_direct_mode() -> bool {
+    WAIT_FOR_DIRECT.load(Ordering::Relaxed)
+}
+
+/// Transfer ids the user told to "Send over relay anyway" — breaks the wait-for-
+/// direct park for that one transfer (and for the folder it belongs to).
+static FORCE_RELAY: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+fn force_relay_set() -> &'static Mutex<HashSet<String>> {
+    FORCE_RELAY.get_or_init(|| Mutex::new(HashSet::new()))
+}
+/// Mark a transfer (or folder pair id) as "relay is fine" — breaks its direct-wait.
+pub fn force_relay(id: &str) {
+    force_relay_set().lock().unwrap().insert(id.to_string());
+}
+fn is_force_relay(id: &str) -> bool {
+    force_relay_set().lock().unwrap().contains(id)
+}
+fn clear_force_relay(id: &str) {
+    force_relay_set().lock().unwrap().remove(id);
 }
 
 /// Block until `n` bytes' worth of send budget is available. No-op when the cap

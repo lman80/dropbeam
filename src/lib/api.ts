@@ -22,6 +22,18 @@ export type TransferState =
   | 'canceled'
 export type Locality = 'unknown' | 'local' | 'direct' | 'internet'
 
+/** Live detail of how two peers are connected — the connection inspector data. */
+export interface ConnDetail {
+  /** "local" | "direct" | "relay" | "connecting" */
+  path: string
+  /** Round-trip latency in ms for the active path (null if not measured). */
+  rttMs: number | null
+  /** True when on relay but a direct path is actively forming (hole-punch). */
+  upgrading: boolean
+  /** Short relay region/host (e.g. "use1") when relayed, else null. */
+  relay: string | null
+}
+
 export interface TransferUpdate {
   id: string
   direction: Direction
@@ -40,6 +52,10 @@ export interface TransferUpdate {
   outDir: string | null
   /** Set when sending straight to a friend — shows "Sending to {name}", no code. */
   friendName: string | null
+  /** Live connection detail (path, rtt, relay, upgrading) for the inspector. */
+  connDetail?: ConnDetail | null
+  /** A short reason for a PARKED/waiting state (e.g. "Waiting for a direct connection"). */
+  detail?: string | null
 }
 
 export interface HistoryEntry {
@@ -75,6 +91,10 @@ export interface Settings {
   showMegabits: boolean
   /** Only send over a direct path (local/p2p) — fail rather than use the relay. */
   requireDirect: boolean
+  /** Wait for a direct connection: hold transfers off the slow relay until a direct
+   *  path forms (park, don't fail). Friend sends show a "Send over relay anyway"
+   *  escape; folder sync waits much longer for direct before settling for relay. */
+  waitForDirect: boolean
   /** Absolute path to the user's profile picture (in the config dir). '' = none. */
   avatar: string
   /** Pop a native notification when a chat arrives & the app isn't focused. */
@@ -93,6 +113,22 @@ export interface Settings {
   /** Where diagnostics go — the operator's own collector URL (empty = send
    *  nowhere). Keeps the destination operator-controlled, never baked in. */
   diagnosticsUrl: string
+  /** How long a mirror folder keeps deleted/replaced copies before auto-removing
+   *  them. 0 = keep forever. Default 30 days. */
+  folderHistoryKeepDays: number
+  /** Per-folder disk budget (bytes) for recoverable copies; oldest evicted first.
+   *  0 = no limit. Default 2 GiB. */
+  folderHistoryBudgetBytes: number
+}
+
+/** Per-folder rollup of recovery-history disk usage, for the storage view. */
+export interface FolderHistorySummary {
+  pairId: string
+  folderName: string
+  folder: string
+  bytes: number
+  itemCount: number
+  oldestMs: number | null
 }
 
 export type PairRole = 'a' | 'b'
@@ -237,6 +273,8 @@ export interface FolderStatus {
   sessionDoneFiles?: number
   /** Sync is paused for this folder (a shared switch — either member set it). */
   paused?: boolean
+  /** Live connection detail for the active folder transfer. */
+  connDetail?: ConnDetail | null
 }
 
 export interface PairUpdate {
@@ -328,6 +366,14 @@ const realApi = {
     invoke<void>('restore_folder_item', { pairId, itemId }),
   forgetFolderItem: (pairId: string, itemId: string) =>
     invoke<void>('forget_folder_item', { pairId, itemId }),
+  /** Disk used by recoverable copies, per shared folder. */
+  folderHistorySummary: () =>
+    invoke<FolderHistorySummary[]>('folder_history_summary'),
+  /** Wipe one folder's recoverable copies. Returns bytes freed. */
+  clearFolderHistory: (pairId: string) =>
+    invoke<number>('clear_folder_history', { pairId }),
+  /** Wipe recoverable copies across every shared folder. Returns bytes freed. */
+  clearAllFolderHistory: () => invoke<number>('clear_all_folder_history'),
   // Friends — named peers you send to directly.
   createFriend: (friendName: string) =>
     invoke<{ friend: Friend; invite: string }>('create_friend', { friendName }),
@@ -337,6 +383,11 @@ const realApi = {
     invoke<void>('rename_friend', { id, name }),
   removeFriend: (id: string) => invoke<void>('remove_friend', { id }),
   pingFriend: (id: string) => invoke<boolean>('ping_friend', { id }),
+  /** Probe how we're connected to a friend right now (connection inspector). */
+  probeConnection: (friendId: string) =>
+    invoke<ConnDetail | null>('probe_connection', { friendId }),
+  /** "Send over relay anyway" — break the wait-for-direct park for this transfer/folder. */
+  forceRelay: (id: string) => invoke<void>('force_relay', { id }),
   setFriendAutoAccept: (id: string, autoAccept: boolean) =>
     invoke<void>('set_friend_auto_accept', { id, autoAccept }),
   respondToOffer: (id: string, accept: boolean, dest?: string) =>

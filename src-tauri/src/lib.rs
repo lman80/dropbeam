@@ -296,6 +296,28 @@ pub fn run() {
             // Honor the saved internet upload cap from first launch.
             iroh_net::set_upload_limit_mbps(loaded.upload_limit_mbps);
             iroh_net::set_require_direct(loaded.require_direct);
+            iroh_net::set_wait_for_direct(loaded.wait_for_direct);
+            // Apply recovery-history retention, then sweep old/oversized saved
+            // copies once at startup so even idle folders (no deletes since the
+            // last launch) shrink to the budget. Off-thread — never blocks the
+            // window. This is what stops the archive ballooning unbounded.
+            folder_history::set_policy(
+                loaded.folder_history_keep_days,
+                loaded.folder_history_budget_bytes,
+            );
+            {
+                let cfg = config_dir.clone();
+                std::thread::spawn(move || {
+                    let folders: Vec<String> = pairing::load(&cfg)
+                        .into_iter()
+                        .filter(|p| p.mirror)
+                        .map(|p| p.folder)
+                        .collect();
+                    if !folders.is_empty() {
+                        folder_history::sweep_all(&folders);
+                    }
+                });
+            }
             // Collapse any duplicate friend records (the same person added via more
             // than one path — folder pairing, permanent code, classic invite) into
             // one canonical entry, migrating chat history onto the survivor. Runs
@@ -527,6 +549,9 @@ pub fn run() {
             commands::list_folder_history,
             commands::restore_folder_item,
             commands::forget_folder_item,
+            commands::folder_history_summary,
+            commands::clear_folder_history,
+            commands::clear_all_folder_history,
             commands::create_friend,
             commands::accept_friend,
             commands::list_friends,
@@ -535,6 +560,8 @@ pub fn run() {
             commands::set_friend_auto_accept,
             commands::respond_to_offer,
             commands::ping_friend,
+            commands::probe_connection,
+            commands::force_relay,
             commands::friend_invite,
             commands::send_to_friend,
             commands::iroh_node_id,

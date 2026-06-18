@@ -1,5 +1,5 @@
-import { useState, type ReactNode } from 'react'
-import { CheckCircle2, Download, FolderOpen, RefreshCw, Trash2 } from 'lucide-react'
+import { useEffect, useState, type ReactNode } from 'react'
+import { CheckCircle2, Download, FolderOpen, HardDrive, RefreshCw, Trash2 } from 'lucide-react'
 import { api, type Settings } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
@@ -69,6 +69,22 @@ export function SettingsView() {
   const installUpdate = useStore((s) => s.installUpdate)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
+  const [historyUsage, setHistoryUsage] = useState<number | null>(null)
+  const [freeingHistory, setFreeingHistory] = useState(false)
+
+  // Total disk used by recoverable copies across all shared folders.
+  useEffect(() => {
+    let alive = true
+    api
+      .folderHistorySummary()
+      .then((sums) => {
+        if (alive) setHistoryUsage(sums.reduce((s, f) => s + f.bytes, 0))
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [settings.folderHistoryKeepDays, settings.folderHistoryBudgetBytes])
 
   const changeDir = async () => {
     const d = await api.pickDirectory()
@@ -91,6 +107,24 @@ export function SettingsView() {
       toast('error', String(e))
     } finally {
       setClearing(false)
+    }
+  }
+
+  const freeHistory = async () => {
+    setFreeingHistory(true)
+    try {
+      const freed = await api.clearAllFolderHistory()
+      setHistoryUsage(0)
+      toast(
+        'success',
+        freed > 0
+          ? `Freed ${formatBytes(freed)} of recoverable copies.`
+          : 'Nothing to free — no recoverable copies right now.',
+      )
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setFreeingHistory(false)
     }
   }
 
@@ -290,6 +324,16 @@ export function SettingsView() {
         </Row>
         {SEP}
         <Row
+          title="Wait for a direct connection"
+          desc="When a send can only reach the relay, DropBeam holds off and keeps trying for a fast direct path instead of crawling through the relay. Your files stay put until a direct link forms — and each transfer card shows a “Send over relay anyway” button if you'd rather not wait."
+        >
+          <Toggle
+            on={settings.waitForDirect}
+            onChange={(v) => save({ waitForDirect: v })}
+          />
+        </Row>
+        {SEP}
+        <Row
           title="Limit internet upload speed"
           desc="Cap how much of your upload a transfer uses, so video calls, streaming, and browsing stay smooth. 0 = unlimited. Local-network transfers always run full speed."
         >
@@ -361,6 +405,76 @@ export function SettingsView() {
             entirely? Turn on "Only send over direct connections" above.
           </span>
         </div>
+      </Card>
+
+      <SectionTitle>Recoverable files</SectionTitle>
+      <Card>
+        <div style={{ padding: '12px 2px 4px' }}>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>Deleted &amp; replaced files in shared folders</div>
+          <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
+            When something is deleted or overwritten in a shared folder, DropBeam keeps a copy so you can
+            get it back. Old copies are cleaned up automatically so they never pile up.{' '}
+            {historyUsage !== null && (
+              <b style={{ color: 'var(--text)' }}>Currently using {formatBytes(historyUsage)}.</b>
+            )}
+          </div>
+        </div>
+
+        <div style={{ padding: '10px 2px' }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Keep copies for</div>
+          <div className="seg" style={{ display: 'flex', width: '100%' }}>
+            {(
+              [
+                { label: '7 days', v: 7 },
+                { label: '30 days', v: 30 },
+                { label: '90 days', v: 90 },
+                { label: 'Forever', v: 0 },
+              ] as const
+            ).map((o) => (
+              <button
+                key={o.v}
+                className={settings.folderHistoryKeepDays === o.v ? 'active' : ''}
+                style={{ flex: 1, justifyContent: 'center' }}
+                onClick={() => save({ folderHistoryKeepDays: o.v })}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ padding: '10px 2px 14px' }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Storage limit per folder</div>
+          <div className="seg" style={{ display: 'flex', width: '100%' }}>
+            {(
+              [
+                { label: '500 MB', v: 500 * 1024 * 1024 },
+                { label: '2 GB', v: 2 * 1024 * 1024 * 1024 },
+                { label: '5 GB', v: 5 * 1024 * 1024 * 1024 },
+                { label: 'No limit', v: 0 },
+              ] as const
+            ).map((o) => (
+              <button
+                key={o.v}
+                className={settings.folderHistoryBudgetBytes === o.v ? 'active' : ''}
+                style={{ flex: 1, justifyContent: 'center' }}
+                onClick={() => save({ folderHistoryBudgetBytes: o.v })}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {SEP}
+        <Row
+          title="Free up space now"
+          desc="Remove every saved copy across all your shared folders. Your live files aren’t touched."
+        >
+          <button className="btn btn-ghost" onClick={freeHistory} disabled={freeingHistory}>
+            {freeingHistory ? <Spinner size={14} /> : <HardDrive size={15} />} Free up
+          </button>
+        </Row>
       </Card>
 
       <SectionTitle>Custom relay (advanced)</SectionTitle>

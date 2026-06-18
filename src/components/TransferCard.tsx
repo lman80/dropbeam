@@ -8,12 +8,14 @@ import {
   CheckCircle2,
   Copy,
   FolderOpen,
+  Loader2,
   Send,
   X,
 } from 'lucide-react'
 import { api, isActive, type TransferUpdate } from '../lib/api'
 import { formatBytes, formatEta, formatSpeed } from '../lib/format'
 import { LocalityBadge, ProgressBar, Spinner } from './bits'
+import { ConnInspector } from './ConnInspector'
 import { useStore } from '../store'
 
 function title(t: TransferUpdate): string {
@@ -102,7 +104,11 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 3 }}>
             <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>{statusLabel(t)}</span>
-            <LocalityBadge locality={t.locality} />
+            {t.connDetail ? (
+              <ConnInspector detail={t.connDetail} compact />
+            ) : (
+              <LocalityBadge locality={t.locality} />
+            )}
           </div>
         </div>
         <button
@@ -119,6 +125,22 @@ export function TransferCard({ t }: { t: TransferUpdate }) {
           <X size={16} />
         </button>
       </div>
+
+      {/* Parked: "Wait for a direct connection" is holding this off the relay.
+          The escape-hatch button only makes sense while we're still parked
+          (waitingForPeer); once we've fallen through to the relay it's just an
+          informational line. */}
+      {t.detail && active && (
+        <div className="conn-park">
+          <Loader2 size={14} className="spin" />
+          <span style={{ flex: 1, minWidth: 0 }}>{t.detail}</span>
+          {t.state === 'waitingForPeer' && (
+            <button className="btn btn-ghost" onClick={() => void api.forceRelay(t.id)}>
+              Send over relay anyway
+            </button>
+          )}
+        </div>
+      )}
 
       {/* manual-accept offer from a friend */}
       {isOffer && (

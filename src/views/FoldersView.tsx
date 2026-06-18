@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
@@ -16,18 +16,14 @@ import {
   Play,
   Plus,
   QrCode,
-  RotateCcw,
   Settings2,
-  Trash2,
   Unlink,
   UserPlus,
   X,
 } from 'lucide-react'
 import {
   api,
-  onFolderHistoryChanged,
   type FolderStatus,
-  type HistoryItem,
   type Pair,
   type PairUpdate,
 } from '../lib/api'
@@ -176,6 +172,7 @@ function FolderCard({
   const removePair = useStore((s) => s.removePair)
   const reloadPairs = useStore((s) => s.reloadPairs)
   const toast = useStore((s) => s.toast)
+  const focusFolderHistory = useStore((s) => s.focusFolderHistory)
   const myName = useStore((s) => s.settings?.displayName || 'You')
   const status = statuses[pair.id]
   const lastSynced = useStore((s) => s.folderLastSynced[pair.id])
@@ -224,7 +221,6 @@ function FolderCard({
     }
   }
   const [loadingInvite, setLoadingInvite] = useState(false)
-  const [historyOpen, setHistoryOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [soundOn, setSoundOn] = useState(() => {
     try {
@@ -678,7 +674,8 @@ function FolderCard({
                   <button
                     className="btn btn-ghost"
                     style={{ marginRight: 'auto' }}
-                    onClick={() => setHistoryOpen(true)}
+                    title="See & restore deleted or replaced files, and manage their storage"
+                    onClick={() => focusFolderHistory(pair.id)}
                   >
                     <History size={14} /> History
                   </button>
@@ -726,149 +723,7 @@ function FolderCard({
           </motion.div>
         )}
       </AnimatePresence>
-
-      {historyOpen && (
-        <HistoryModal pair={pair} onClose={() => setHistoryOpen(false)} />
-      )}
     </motion.div>
-  )
-}
-
-function HistoryModal({ pair, onClose }: { pair: Pair; onClose: () => void }) {
-  const toast = useStore((s) => s.toast)
-  const [items, setItems] = useState<HistoryItem[] | null>(null)
-  const [busy, setBusy] = useState<string | null>(null)
-
-  const load = useCallback(async () => {
-    try {
-      setItems(await api.listFolderHistory(pair.id))
-    } catch (e) {
-      toast('error', String(e))
-      setItems([])
-    }
-  }, [pair.id, toast])
-
-  useEffect(() => {
-    let alive = true
-    // load() is async — setState runs after the await, not during the effect.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load()
-    const un = onFolderHistoryChanged((pid) => {
-      if (alive && pid === pair.id) void load()
-    })
-    return () => {
-      alive = false
-      un.then((f) => f())
-    }
-  }, [pair.id, load])
-
-  const restore = async (item: HistoryItem) => {
-    setBusy(item.id)
-    try {
-      await api.restoreFolderItem(pair.id, item.id)
-      toast('success', `Restored ${item.relPath.split('/').pop()}`)
-      await load()
-    } catch (e) {
-      toast('error', String(e))
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  const forget = async (item: HistoryItem) => {
-    setBusy(item.id)
-    try {
-      await api.forgetFolderItem(pair.id, item.id)
-      await load()
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(8, 9, 14, 0.5)',
-        backdropFilter: 'blur(4px)',
-        display: 'grid',
-        placeItems: 'center',
-        zIndex: 200,
-        padding: 20,
-      }}
-    >
-      <motion.div
-        initial={{ opacity: 0, scale: 0.96 }}
-        animate={{ opacity: 1, scale: 1 }}
-        onClick={(e) => e.stopPropagation()}
-        className="card"
-        style={{ width: 520, maxWidth: '100%', maxHeight: '80vh', padding: 22, borderRadius: 20, display: 'flex', flexDirection: 'column' }}
-      >
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-          <div style={{ fontWeight: 750, fontSize: 16 }}>Folder history</div>
-          <button className="icon-btn" onClick={onClose}>
-            <X size={17} />
-          </button>
-        </div>
-        <p style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.5 }}>
-          Deleted and replaced files are kept here. Restore one and it comes back in the folder —
-          and re-syncs to {pair.peerName || 'everyone'}.
-        </p>
-
-        <div style={{ overflowY: 'auto', marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {items === null ? (
-            <div style={{ display: 'grid', placeItems: 'center', padding: 30 }}>
-              <Spinner size={20} />
-            </div>
-          ) : items.length === 0 ? (
-            <EmptyState icon={<Clock size={22} />} title="Nothing in history yet" hint="When a file is deleted or replaced in this folder, the old copy shows up here so you can get it back." />
-          ) : (
-            items.map((item) => (
-              <div
-                key={item.id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 12,
-                  padding: '10px 12px',
-                  background: 'var(--surface-2)',
-                  border: '1px solid var(--border)',
-                  borderRadius: 12,
-                }}
-              >
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13.5, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {item.relPath}
-                  </div>
-                  <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginTop: 2 }}>
-                    {item.reason === 'replaced' ? 'Replaced' : 'Deleted'} ·{' '}
-                    {formatRelativeTime(item.timestampMs)} · {formatBytes(item.size)}
-                  </div>
-                </div>
-                <button
-                  className="btn btn-primary"
-                  style={{ padding: '6px 12px' }}
-                  onClick={() => restore(item)}
-                  disabled={busy === item.id}
-                >
-                  {busy === item.id ? <Spinner size={13} /> : <RotateCcw size={14} />} Restore
-                </button>
-                <button
-                  className="icon-btn"
-                  title="Forget permanently"
-                  onClick={() => forget(item)}
-                  disabled={busy === item.id}
-                >
-                  <Trash2 size={15} />
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-      </motion.div>
-    </div>
   )
 }
 
