@@ -94,9 +94,29 @@ function dayLabel(ms: number): string {
   })
 }
 
+/** Best-effort placeholder friend for a conversation whose real friend record is
+ *  missing (lost across an update, or not yet self-healed). Keeps a thread VISIBLE
+ *  and selectable so a stored conversation can never be silently swallowed
+ *  (GitHub #18/#19). `name` prefers the stored overview name, then "Unknown
+ *  contact". The Rust receive path recreates a real, replyable record durably —
+ *  this is purely the UI's belt-and-suspenders so nothing ever disappears. */
+function placeholderFriend(id: string, name?: string): Friend {
+  return {
+    id,
+    role: 'b',
+    name: name && name.trim() ? name.trim() : 'Unknown contact',
+    secret: '',
+    createdAt: 0,
+    autoAccept: true,
+    endpointId: null,
+    avatar: null,
+  }
+}
+
 export function ChatView() {
   const friends = useStore((s) => s.friends)
   const overview = useStore((s) => s.chatOverview)
+  const chats = useStore((s) => s.chats)
   const unread = useStore((s) => s.chatUnread)
   const activeChatId = useStore((s) => s.activeChatId)
   const openChat = useStore((s) => s.openChat)
@@ -108,16 +128,26 @@ export function ChatView() {
     const byId = new Map(friends.map((f) => [f.id, f]))
     const ordered: { friend: Friend; last?: string }[] = []
     const seen = new Set<string>()
+    // 1) Every conversation in the overview — in recency order. If the friend
+    //    record is missing, fall back to a placeholder so the thread STILL shows
+    //    (the bug was: a lost friend record made the whole conversation invisible).
     for (const o of overview) {
-      const f = byId.get(o.peerId)
-      if (f) {
-        ordered.push({ friend: f, last: o.lastText })
-        seen.add(f.id)
-      }
+      if (seen.has(o.peerId)) continue
+      const f = byId.get(o.peerId) ?? placeholderFriend(o.peerId)
+      ordered.push({ friend: f, last: o.lastText })
+      seen.add(o.peerId)
     }
+    // 2) Any thread that has messages but somehow isn't in the overview yet.
+    for (const peerId of Object.keys(chats)) {
+      if (seen.has(peerId) || !(chats[peerId]?.length)) continue
+      const f = byId.get(peerId) ?? placeholderFriend(peerId)
+      ordered.push({ friend: f })
+      seen.add(peerId)
+    }
+    // 3) Friends with no conversation yet, so you can start one.
     for (const f of friends) if (!seen.has(f.id)) ordered.push({ friend: f })
     return ordered
-  }, [friends, overview])
+  }, [friends, overview, chats])
 
   useEffect(() => {
     if (activeChatId) return
@@ -128,7 +158,10 @@ export function ChatView() {
 
   const online = (f: Friend) => friendOnlineState(f.name, friendSeen, folderStatuses) === true
 
-  if (friends.length === 0) {
+  // Only show the "nobody to chat with" empty state when there are genuinely no
+  // conversations AND no friends — never when a stored thread exists (otherwise a
+  // lost friend record would hide a real conversation).
+  if (rows.length === 0) {
     return (
       <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
         <h1 style={{ fontSize: 20, fontWeight: 750, margin: '0 0 16px' }}>Chat</h1>
@@ -202,8 +235,13 @@ export function ChatView() {
 }
 
 function Conversation({ friendId }: { friendId: string }) {
-  const friend = useStore((s) => s.friends.find((f) => f.id === friendId))
+  const realFriend = useStore((s) => s.friends.find((f) => f.id === friendId))
   const messages = useStore((s) => s.chats[friendId] ?? EMPTY_MSGS)
+  // Tolerate a missing friend record: render the conversation against a
+  // placeholder so an open thread whose friend was lost (GitHub #18/#19) is never
+  // a blank pane. The Rust receive path self-heals a real, replyable record; this
+  // just keeps the UI alive until that lands (or for read-only history).
+  const friend: Friend = realFriend ?? placeholderFriend(friendId)
   const pairs = useStore((s) => s.pairs)
   const sendChat = useStore((s) => s.sendChat)
   const sendGif = useStore((s) => s.sendGif)
@@ -316,8 +354,6 @@ function Conversation({ friendId }: { friendId: string }) {
       return { m, firstOfRun, lastOfRun, divider }
     })
   }, [messages])
-
-  if (!friend) return null
 
   const sharedFolder = pairs.find(
     (p) => !!p.peerName && p.peerName.trim().toLowerCase() === friend.name.trim().toLowerCase(),
@@ -607,6 +643,62 @@ function Conversation({ friendId }: { friendId: string }) {
   )
 }
 
+/** Matches http(s) URLs in a message. Conservative on purpose: only http/https
+ *  (the only schemes the hardened `open_url` command will open), and we trim a
+ *  trailing ), ., , ! ? : that's almost always sentence punctuation, not the URL. */
+const URL_RE = /\bhttps?:\/\/[^\s<]+/gi
+function trimTrailingPunct(url: string): { url: string; trailing: string } {
+  const m = url.match(/[).,!?:;'"]+$/)
+  if (!m) return { url, trailing: '' }
+  // Keep a closing ) when it balances an opening ( inside the URL (e.g. Wikipedia).
+  let cut = m[0]
+  if (cut.endsWith(')') && (url.match(/\(/g)?.length ?? 0) > (url.match(/\)/g)?.length ?? 0)) {
+    cut = cut.slice(0, -1)
+  }
+  return { url: url.slice(0, url.length - cut.length), trailing: cut }
+}
+
+/** Render message text with http(s) URLs as real clickable links. Clicking opens
+ *  the URL externally via the hardened `open_url` command (http/https only — it
+ *  rejects file://, custom schemes, etc.). Preserves plain text + whitespace. */
+function Linkified({ text }: { text: string }) {
+  const parts = useMemo(() => {
+    const out: Array<{ t: 'text'; v: string } | { t: 'link'; v: string }> = []
+    let last = 0
+    for (const match of text.matchAll(URL_RE)) {
+      const start = match.index ?? 0
+      if (start > last) out.push({ t: 'text', v: text.slice(last, start) })
+      const { url, trailing } = trimTrailingPunct(match[0])
+      out.push({ t: 'link', v: url })
+      if (trailing) out.push({ t: 'text', v: trailing })
+      last = start + match[0].length
+    }
+    if (last < text.length) out.push({ t: 'text', v: text.slice(last) })
+    return out
+  }, [text])
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.t === 'link' ? (
+          <a
+            key={i}
+            href={p.v}
+            className="chat-link"
+            onClick={(e) => {
+              e.preventDefault()
+              api.openUrl(p.v).catch(() => {})
+            }}
+          >
+            {p.v}
+          </a>
+        ) : (
+          <span key={i}>{p.v}</span>
+        ),
+      )}
+    </>
+  )
+}
+
 /** One line of text representing a message, for reply quotes. */
 function quoteText(m: ChatMessage): string {
   if (m.deleted) return 'Deleted message'
@@ -700,7 +792,7 @@ function MessageRow({
               <FileMessage m={m} mine={mine} onLightbox={onLightbox} />
             ) : (
               <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                {m.text}
+                <Linkified text={m.text} />
                 {m.edited && <span className="chat-edited"> (edited)</span>}
               </span>
             )}

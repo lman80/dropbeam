@@ -2063,20 +2063,25 @@ fn resolve_chat_friend(
     let friends = crate::friends::load(config_dir);
     let claimed = req.get("friendId").and_then(|v| v.as_str());
     let from_name = req.get("fromName").and_then(|v| v.as_str()).unwrap_or("");
-    friends
+    let known = friends
         .iter()
         .find(|f| f.endpoint_id.as_deref() == Some(who))
         .or_else(|| claimed.and_then(|id| friends.iter().find(|f| f.id == id)))
-        .cloned()
-        .or_else(|| {
-            if allow_introduce && !from_name.is_empty() {
-                let f = crate::friends::upsert_by_endpoint(config_dir, who, from_name);
-                let _ = app.emit("friends://changed", ());
-                Some(f)
-            } else {
-                None
-            }
-        })
+        .cloned();
+    if known.is_some() || !allow_introduce {
+        return known;
+    }
+    // Unknown sender on a NEW message → self-heal the contact so the conversation
+    // is visible AND replyable (GitHub #18/#19: a notification fired + the message
+    // got stored, but the lost friend record left the thread unreachable). The
+    // endpoint id is the sender's cryptographic identity (conn.remote_id()), so
+    // recreating from it can never impersonate anyone; dedup invariants live in
+    // friends::self_heal_chat_sender (never adds a second record for a known eid).
+    let healed = crate::friends::self_heal_chat_sender(config_dir, who, from_name, claimed);
+    if healed.is_some() {
+        let _ = app.emit("friends://changed", ());
+    }
+    healed
 }
 
 /// Prove iroh works inside the running app: spin up a throwaway client endpoint,

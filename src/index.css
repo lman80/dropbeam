@@ -1012,6 +1012,19 @@ html.overlay-window #root {
   font-size: 11px;
   font-style: italic;
 }
+/* Clickable links inside a message bubble. Underlined, inherit the bubble's text
+   color so they stay legible on both the accent (mine) and surface (theirs)
+   bubbles, and never break the layout on a long URL. */
+.chat-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  word-break: break-all;
+  cursor: pointer;
+}
+.chat-link:hover {
+  opacity: 0.8;
+}
 .chat-bubble.deleted {
   background: transparent;
   border-style: dashed;

@@ -44,10 +44,33 @@ pub fn load(config_dir: &Path) -> Vec<Friend> {
     }
 }
 
-fn save(config_dir: &Path, friends: &[Friend]) -> Result<(), String> {
+/// Persist the friends list. `allow_empty` MUST be true only for paths that
+/// legitimately empty the list (removing your last friend) — every other caller
+/// passes false so a stray empty list (a logic/IO glitch) can never silently wipe
+/// a populated friends.json. That clobber is exactly the "I lost my friend's
+/// contact after update" failure, so we refuse it: if we're about to write `[]`
+/// but the file on disk still holds real records, abort rather than overwrite.
+fn save_inner(config_dir: &Path, friends: &[Friend], allow_empty: bool) -> Result<(), String> {
     let _ = fs::create_dir_all(config_dir);
     let txt = serde_json::to_string_pretty(friends).map_err(|e| e.to_string())?;
+    if friends.is_empty() && !allow_empty {
+        let on_disk = fs::read_to_string(friends_path(config_dir))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(&t).ok())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if on_disk > 0 {
+            log::warn!(
+                "friends::save refused to overwrite {on_disk} existing friend(s) with an empty list"
+            );
+            return Err("refusing to clobber existing friends with an empty list".into());
+        }
+    }
     write_atomic(&friends_path(config_dir), txt.as_bytes()).map_err(|e| e.to_string())
+}
+
+fn save(config_dir: &Path, friends: &[Friend]) -> Result<(), String> {
+    save_inner(config_dir, friends, false)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -405,6 +428,83 @@ pub fn add_by_code(config_dir: &Path, code: &str) -> Result<Friend, String> {
     Ok(upsert_by_endpoint(config_dir, &uc.eid, &uc.name))
 }
 
+/// Self-heal the contact behind an incoming chat message so the conversation is
+/// always visible AND replyable, even if the friend record was lost across an
+/// update (GitHub #18/#19). Given the sender's cryptographic `endpoint_id`
+/// (`conn.remote_id()`), an optional display `name`, and the `claimed_id` the
+/// messages may already be keyed under, return a reachable [`Friend`] keyed to
+/// the right id — recreating it if missing.
+///
+/// Dedup invariants (mirror `reconcile`, so we NEVER duplicate a person):
+///   * a record with this **endpoint id** already exists → reuse it (refresh the
+///     name if we have a better one and the user hasn't locally renamed them),
+///     even if it's filed under a *different* record id than `claimed_id`;
+///   * else a record with `claimed_id` exists (an invite-friend whose endpoint
+///     wasn't keyed yet) → key it to this endpoint id so future dials work;
+///   * else create a minimal reachable record. We reuse `claimed_id` as the new
+///     record's id when present so it lines up with the thread the messages were
+///     already stored under (no orphaned conversation); otherwise a fresh uuid.
+/// The name falls back to "Unknown contact" so the row is never blank.
+pub fn self_heal_chat_sender(
+    config_dir: &Path,
+    endpoint_id: &str,
+    name: &str,
+    claimed_id: Option<&str>,
+) -> Option<Friend> {
+    if endpoint_id.trim().is_empty() {
+        return None;
+    }
+    let _guard = LOCK.lock().unwrap();
+    let mut friends = load(config_dir);
+    let name = name.trim();
+
+    // 1) Already reachable under this endpoint id (anywhere in the list) → reuse.
+    if let Some(f) = friends
+        .iter_mut()
+        .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
+    {
+        if !name.is_empty() && !f.name_custom && f.name != name {
+            f.name = name.to_string();
+        }
+        let out = f.clone();
+        let _ = save(config_dir, &friends);
+        return Some(out);
+    }
+
+    // 2) An invite-friend filed under the claimed id but not yet keyed → key it.
+    if let Some(id) = claimed_id.filter(|id| !id.is_empty()) {
+        if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
+            f.endpoint_id = Some(endpoint_id.to_string());
+            if !name.is_empty() && !f.name_custom && f.name != name {
+                f.name = name.to_string();
+            }
+            let out = f.clone();
+            let _ = save(config_dir, &friends);
+            return Some(out);
+        }
+    }
+
+    // 3) No record at all — recreate a minimal reachable one. Reuse the claimed id
+    //    when we have it so the new friend lines up with the already-stored thread.
+    let friend = Friend {
+        id: claimed_id
+            .filter(|id| !id.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        role: PairRole::B,
+        name: clean_name(name, "Unknown contact"),
+        secret: random_secret(),
+        created_at: now_ms(),
+        auto_accept: true,
+        endpoint_id: Some(endpoint_id.to_string()),
+        avatar: None,
+        name_custom: false,
+    };
+    friends.push(friend.clone());
+    let _ = save(config_dir, &friends);
+    Some(friend)
+}
+
 /// Apply an incoming friend-hello. If `friend_id` matches an existing record
 /// (classic invite flow), learn their EndpointId + name. Otherwise auto-add the
 /// sender by their EndpointId (the permanent-code reverse direction) so one code
@@ -488,7 +588,8 @@ pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
     let mut friends = load(config_dir);
     friends.retain(|f| f.id != id);
-    save(config_dir, &friends)
+    // allow_empty: removing your last friend legitimately writes `[]`.
+    save_inner(config_dir, &friends, true)
 }
 
 pub fn get(config_dir: &Path, id: &str) -> Option<Friend> {
@@ -707,5 +808,88 @@ mod tests {
         let (kept, merges) = plan_reconcile(&input, &ids(&["a", "b"]));
         assert_eq!(kept.len(), 1);
         assert_eq!(merges, vec![("b".to_string(), "a".to_string())]);
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("db-friends-test-{tag}-{}", now_ms()))
+    }
+
+    #[test]
+    fn self_heal_recreates_lost_contact_keyed_to_thread() {
+        // The "lost my friend's contact after update" case: friends.json is empty
+        // but a chat thread exists under the claimed id "thread1". A message lands
+        // → recreate a reachable friend filed under that same id so the stored
+        // conversation isn't orphaned, with the sender's endpoint id + name.
+        let dir = tmp("recreate");
+        let f = self_heal_chat_sender(&dir, "EIDX", "Mong", Some("thread1")).unwrap();
+        assert_eq!(f.id, "thread1"); // lines up with the existing thread
+        assert_eq!(f.name, "Mong");
+        assert_eq!(f.endpoint_id.as_deref(), Some("EIDX"));
+        assert_eq!(load(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_heal_blank_name_falls_back() {
+        // No display name on the wire → a non-blank fallback so the chat row is
+        // never empty/invisible.
+        let dir = tmp("fallback");
+        let f = self_heal_chat_sender(&dir, "EIDY", "", None).unwrap();
+        assert_eq!(f.name, "Unknown contact");
+        assert_eq!(f.endpoint_id.as_deref(), Some("EIDY"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_heal_dedups_by_endpoint_no_duplicate() {
+        // A record for this endpoint id already exists (under a DIFFERENT record id
+        // than the claimed one) → reuse it, never add a second. This preserves the
+        // reconcile invariant that endpoint id IS the identity.
+        let dir = tmp("dedup");
+        let _ = save(&dir, &[f("orig", "Mong", Some("EIDZ"), 5)]);
+        let healed = self_heal_chat_sender(&dir, "EIDZ", "Mong", Some("different-claim")).unwrap();
+        assert_eq!(healed.id, "orig"); // reused the existing record, not a new one
+        assert_eq!(load(&dir).len(), 1); // NO duplicate
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_heal_keys_unkeyed_invite_friend() {
+        // An invite-friend exists under the claimed id but has no endpoint id yet
+        // (so replies couldn't dial back) → learn the endpoint id in place.
+        let dir = tmp("keyinvite");
+        let _ = save(&dir, &[f("invite1", "Mong", None, 5)]);
+        let healed = self_heal_chat_sender(&dir, "NEWEID", "Mong", Some("invite1")).unwrap();
+        assert_eq!(healed.id, "invite1");
+        assert_eq!(healed.endpoint_id.as_deref(), Some("NEWEID"));
+        assert_eq!(load(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_heal_keeps_user_renamed_label() {
+        // The user locally renamed this friend (name_custom) → an incoming
+        // broadcast name must NOT overwrite their chosen label.
+        let dir = tmp("renamed");
+        let mut custom = f("c", "My Bestie", Some("EIDR"), 5);
+        custom.name_custom = true;
+        let _ = save(&dir, &[custom]);
+        let healed = self_heal_chat_sender(&dir, "EIDR", "RawDeviceName", None).unwrap();
+        assert_eq!(healed.name, "My Bestie");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_refuses_to_clobber_with_empty_list() {
+        // The persistence hardening: a stray empty list must never wipe a populated
+        // friends.json (the durable form of "lost my contact"). save() refuses it…
+        let dir = tmp("clobber");
+        let _ = save(&dir, &[f("keep", "Mong", Some("EID1"), 1)]);
+        assert!(save(&dir, &[]).is_err());
+        assert_eq!(load(&dir).len(), 1); // still there
+        // …but a legitimate "remove last friend" (allow_empty) does empty it.
+        assert!(save_inner(&dir, &[], true).is_ok());
+        assert_eq!(load(&dir).len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
