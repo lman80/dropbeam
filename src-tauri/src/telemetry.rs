@@ -468,7 +468,7 @@ pub async fn run(app: AppHandle, config_dir: PathBuf, log_dir: Option<PathBuf>) 
             };
             let since = read_watermark(&config_dir);
             if let Some((digest, newest)) = build_digest(&log_dir, &since, &header) {
-                if upload(&endpoint, &digest).await {
+                if upload(&endpoint, &digest).await.is_ok() {
                     write_watermark(&config_dir, &newest);
                     log::info!("telemetry: uploaded diagnostics digest ({} → {newest})", if since.is_empty() { "start" } else { &since });
                 }
@@ -521,20 +521,14 @@ pub async fn run_once(app: &AppHandle, config_dir: &Path, log_dir: Option<&Path>
     });
     match build_digest(log_dir, "", &header) {
         Some((digest, _newest)) => {
-            if upload(&endpoint, &digest).await {
-                let n = digest["totals"]["distinctIssues"].as_u64().unwrap_or(0);
-                Ok(format!("Sent a test digest ({n} distinct issues) to your endpoint."))
-            } else {
-                Err("Upload failed — check the endpoint URL is reachable.".into())
-            }
+            upload(&endpoint, &digest).await?;
+            let n = digest["totals"]["distinctIssues"].as_u64().unwrap_or(0);
+            Ok(format!("Sent a test digest ({n} distinct issues) to your endpoint."))
         }
         None => {
             // Nothing notable in the logs — still prove the endpoint works with a ping.
-            if upload(&endpoint, &serde_json::json!({ "v": 1, "header": header, "ping": true })).await {
-                Ok("Endpoint reachable. No notable issues in the logs yet.".into())
-            } else {
-                Err("Upload failed — check the endpoint URL is reachable.".into())
-            }
+            upload(&endpoint, &serde_json::json!({ "v": 1, "header": header, "ping": true })).await?;
+            Ok("Endpoint reachable. No notable issues in the logs yet.".into())
         }
     }
 }
@@ -672,19 +666,41 @@ mod tests {
     }
 }
 
-async fn upload(endpoint: &str, digest: &serde_json::Value) -> bool {
-    let client = match reqwest::Client::builder()
+/// POST the digest. Returns Ok(()) on a 2xx, else a human-readable reason. A hard
+/// outer timeout guarantees this can NEVER hang the caller — important because some
+/// networks (e.g. China for *.workers.dev, or a dead corporate proxy) blackhole the
+/// connection instead of refusing it, which would otherwise spin "Send test" forever.
+async fn upload(endpoint: &str, digest: &serde_json::Value) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(20))
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
+        .map_err(|e| format!("HTTP client init failed: {e}"))?;
+    let fut = client.post(endpoint).json(digest).send();
+    let resp = match tokio::time::timeout(std::time::Duration::from_secs(25), fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            log::warn!("telemetry: upload timed out (hard cap) for {endpoint}");
+            return Err("Couldn't reach the diagnostics server within 25s — this network may be blocking it.".into());
+        }
     };
-    match client.post(endpoint).json(digest).send().await {
-        Ok(r) => r.status().is_success(),
+    match resp {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => {
+            let code = r.status().as_u16();
+            log::warn!("telemetry: upload rejected HTTP {code} by {endpoint}");
+            Err(format!("Server rejected the upload (HTTP {code})."))
+        }
         Err(e) => {
-            log::debug!("telemetry: upload failed (will retry next cycle): {e}");
-            false
+            let why = if e.is_timeout() {
+                "timed out — this network may be blocking it"
+            } else if e.is_connect() {
+                "couldn't connect — the host may be blocked on this network"
+            } else {
+                "the request failed"
+            };
+            log::warn!("telemetry: upload failed for {endpoint}: {e}");
+            Err(format!("Couldn't reach the diagnostics server ({why})."))
         }
     }
 }

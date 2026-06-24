@@ -33,9 +33,33 @@ pub fn save(config_dir: &Path, settings: &Settings) -> Result<(), String> {
 
 /// Write a file by writing to a temp sibling then renaming, so a crash mid-write
 /// never corrupts the real file.
+///
+/// On Windows the rename-over-existing transiently fails (ERROR_SHARING_VIOLATION /
+/// ACCESS_DENIED) whenever antivirus, the Search Indexer, or OneDrive momentarily
+/// holds the target open — unlike POSIX, the replace can't proceed over an open
+/// handle. Left unhandled, that means a saved setting (verbose logging, diagnostics
+/// URL, friends, chat, …) is silently lost. So: use a UNIQUE tmp sibling (so a stale
+/// or locked tmp from a prior failed write can't block us), retry the rename a few
+/// times with a short backoff to ride out the transient handle, and as a last resort
+/// write in place so the value is never silently dropped. On macOS/Linux the very
+/// first rename succeeds, so behavior is byte-identical to before (no sleeps, no
+/// fallback).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
     fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..5u32 {
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(25 * (attempt as u64 + 1)));
+            }
+        }
+    }
+    // Atomic swap couldn't complete (Windows handle contention). Persist in place as a
+    // best-effort floor so the value isn't silently lost, then drop the tmp.
+    let direct = fs::write(path, bytes);
+    let _ = fs::remove_file(&tmp);
+    direct.map_err(|e| last_err.unwrap_or(e))
 }

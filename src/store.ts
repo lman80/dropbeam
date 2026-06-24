@@ -599,6 +599,12 @@ export const useStore = create<AppStore>((set, get) => ({
       const saved = await api.updateSettings(next)
       set({ settings: saved })
     } catch (e) {
+      // The save didn't persist — revert the optimistic change (and its side effects)
+      // so the toggle/field honestly shows it didn't stick, instead of a false "on"
+      // that silently reverts on the next launch.
+      set({ settings: current })
+      if (patch.theme) get().applyTheme(current.theme)
+      if (patch.showMegabits !== undefined) setSpeedUnit(current.showMegabits)
       get().toast('error', `Couldn't save settings: ${e}`)
     }
   },
