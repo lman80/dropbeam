@@ -68,7 +68,7 @@ struct PairHandle {
     moves: Arc<Mutex<HashMap<String, MoveRec>>>,
     /// inode → (rel, size) for files currently on disk — how the collector
     /// recognizes a moved file (same inode, new path) as the SAME bytes.
-    ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+    ino_index: Arc<Mutex<HashMap<u64, (String, u64, u64)>>>,
     /// Sync paused for this folder (live flag the workers read). Mirrors the
     /// persisted `Pair.paused`; updated by the user toggle + the peer's beacon.
     paused: Arc<AtomicBool>,
@@ -489,11 +489,11 @@ impl SyncManager {
         // (the file's own deletion is still propagated as the reliable backstop).
         let moves: Arc<Mutex<HashMap<String, MoveRec>>> =
             Arc::new(Mutex::new(load_moves(&self.config_dir, &pair.id)));
-        let ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>> = Arc::new(Mutex::new(
+        let ino_index: Arc<Mutex<HashMap<u64, (String, u64, u64)>>> = Arc::new(Mutex::new(
             live_manifest(&pair.folder)
                 .into_iter()
                 .filter(|(_, e)| e.inode != 0)
-                .map(|(rel, e)| (e.inode, (rel, e.size)))
+                .map(|(rel, e)| (e.inode, (rel, e.size, e.mtime)))
                 .collect(),
         ));
         let paused = Arc::new(AtomicBool::new(pair.paused));
@@ -627,7 +627,7 @@ impl SyncManager {
         control_wake: Arc<Notify>,
         tombstones: Arc<Mutex<HashMap<String, u64>>>,
         moves: Arc<Mutex<HashMap<String, MoveRec>>>,
-        ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+        ino_index: Arc<Mutex<HashMap<u64, (String, u64, u64)>>>,
     ) {
         let config_dir = self.config_dir.clone();
         let pair_id_c = config.lock().unwrap().id.clone();
@@ -1269,7 +1269,7 @@ impl SyncManager {
         control_wake: Arc<Notify>,
         tombstones: Arc<Mutex<HashMap<String, u64>>>,
         moves: Arc<Mutex<HashMap<String, MoveRec>>>,
-        ino_index: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+        ino_index: Arc<Mutex<HashMap<u64, (String, u64, u64)>>>,
         paused: Arc<AtomicBool>,
     ) {
         let manager = self.clone();
@@ -1319,11 +1319,24 @@ impl SyncManager {
                     // also covers files that were RECEIVED this session (those skip
                     // the live add-branch that normally warms the index).
                     {
+                        // Catch moves the LIVE add-branch raced past: the rebuild below
+                        // overwrites an inode's old path with its new one, erasing the
+                        // move. Detect them FIRST by comparing the prior index against
+                        // the live manifest, so a relocated file is sent as a rename op
+                        // (the peer moves its copy) instead of a re-upload that orphans
+                        // the old path and reconciles back to us as a DUPLICATE.
+                        let detected = detect_moves_from_index(&ino_index.lock().unwrap(), &lm);
+                        for (from, to, sz, mt) in detected {
+                            note_move(
+                                &manager.config_dir, &pair_id, &moves, &from, &to, sz, mt, now_ms(),
+                            );
+                            log::info!("folder move detected (reconcile): {from:?} → {to:?}");
+                        }
                         let mut idx = ino_index.lock().unwrap();
                         idx.clear();
                         for (rel, e) in &lm {
                             if e.inode != 0 {
-                                idx.insert(e.inode, (rel.clone(), e.size));
+                                idx.insert(e.inode, (rel.clone(), e.size, e.mtime));
                             }
                         }
                     }
@@ -3238,6 +3251,34 @@ fn note_move(
     save_moves(config_dir, pair_id, &snapshot);
 }
 
+/// Compare the prior inode index (inode → old rel) against the live manifest (inode →
+/// new rel) and return the moves that happened between snapshots: an inode now sitting
+/// at a DIFFERENT rel, same size, whose old rel is gone from the manifest, is a
+/// same-volume move/rename. This is the de-raced backstop for [`handle_move_candidate`]
+/// — the live add-branch can miss a move when the periodic index rebuild fires in its
+/// window, but the reconcile round catches it here before clobbering the index. Inode 0
+/// (e.g. Windows today) yields nothing; that direction needs a real file id.
+fn detect_moves_from_index(
+    idx: &HashMap<u64, (String, u64, u64)>,
+    lm: &HashMap<String, FileEntry>,
+) -> Vec<(String, String, u64, u64)> {
+    lm.iter()
+        .filter(|(_, e)| e.inode != 0)
+        .filter_map(|(rel, e)| {
+            idx.get(&e.inode).and_then(|(old_rel, old_size, old_mtime)| {
+                // Require size AND mtime to match (a genuine rename preserves both) —
+                // as strict as the apply-side content gate, so inode recycling into a
+                // coincidentally same-SIZE file can't be mistaken for a move.
+                (old_rel != rel
+                    && *old_size == e.size
+                    && *old_mtime == e.mtime
+                    && !lm.contains_key(old_rel))
+                .then(|| (old_rel.clone(), rel.clone(), e.size, e.mtime))
+            })
+        })
+        .collect()
+}
+
 /// Apply a peer's MOVE: they renamed `from_rel`→`to_rel` inside the shared folder,
 /// so relocate OUR copy instead of re-receiving the bytes. CONTENT-VERIFIED: only
 /// acts if our `from` actually matches the moved file's `exp_size`+`exp_mtime`, so a
@@ -3332,7 +3373,7 @@ fn handle_move_candidate(
     config_dir: &Path,
     pair_id: &str,
     moves: &Arc<Mutex<HashMap<String, MoveRec>>>,
-    ino_index: &Arc<Mutex<HashMap<u64, (String, u64)>>>,
+    ino_index: &Arc<Mutex<HashMap<u64, (String, u64, u64)>>>,
     control_wake: &Arc<Notify>,
 ) -> bool {
     let Ok(meta) = std::fs::metadata(p) else {
@@ -3344,21 +3385,43 @@ fn handle_move_candidate(
     let Some(new_rel) = rel_path_of(p, folder) else {
         return false;
     };
+    // The reconcile round may have ALREADY recorded a move TO this path (it catches
+    // relocations the live index raced past). If THIS file is that moved file (its
+    // size+mtime match the recorded move), don't also queue a byte-send — the peer is
+    // already being told to relocate its copy, so re-uploading would waste bandwidth
+    // and risk leaving a duplicate. The size+mtime guard is essential: a genuinely new,
+    // DIFFERENT file dropped at the same path must still be sent, not silently skipped.
+    if !new_rel.is_empty()
+        && moves
+            .lock()
+            .unwrap()
+            .values()
+            .any(|(to, sz, mt, _)| *to == new_rel && *sz == size && *mt == mtime)
+    {
+        return true;
+    }
     if inode == 0 || new_rel.is_empty() {
         return false;
     }
     let prev = ino_index.lock().unwrap().get(&inode).cloned();
-    if let Some((old_rel, old_size)) = prev {
-        if old_rel != new_rel && old_size == size && !Path::new(folder).join(&old_rel).exists() {
+    if let Some((old_rel, old_size, old_mtime)) = prev {
+        // Same inode now at a DIFFERENT rel, same size AND mtime (a rename preserves
+        // both), old path gone = a same-volume move. The mtime check matches the
+        // apply-side gate so inode recycling into a same-size file can't false-trigger.
+        if old_rel != new_rel
+            && old_size == size
+            && old_mtime == mtime
+            && !Path::new(folder).join(&old_rel).exists()
+        {
             note_move(config_dir, pair_id, moves, &old_rel, &new_rel, size, mtime, now_ms());
-            ino_index.lock().unwrap().insert(inode, (new_rel.clone(), size));
+            ino_index.lock().unwrap().insert(inode, (new_rel.clone(), size, mtime));
             control_wake.notify_one();
             log::info!("folder move detected: {old_rel:?} → {new_rel:?} (relocating, no re-upload)");
             return true;
         }
     }
     // A genuine add/change — keep the inode index warm for future move detection.
-    ino_index.lock().unwrap().insert(inode, (new_rel, size));
+    ino_index.lock().unwrap().insert(inode, (new_rel, size, mtime));
     false
 }
 
@@ -4310,6 +4373,82 @@ mod tests {
             !crate::folder_history::load(&fs).is_empty(),
             "the removed copy is recoverable from history"
         );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn detect_moves_from_index_finds_raced_relocation() {
+        // Prior index had inode 7 at "a.jpg"; the live manifest now has inode 7 at
+        // "sub/a.jpg" and "a.jpg" is gone → a same-volume move the live add-branch may
+        // have raced past. The reconcile detector must surface it (so it becomes a
+        // rename op, not a re-upload + orphan + duplicate).
+        let mut idx: HashMap<u64, (String, u64, u64)> = HashMap::new();
+        // A rename preserves mtime, so the prior index mtime equals the new file's.
+        idx.insert(7, ("a.jpg".into(), 100, 111));
+        idx.insert(9, ("keep.txt".into(), 50, 5));
+        let mut lm: HashMap<String, FileEntry> = HashMap::new();
+        lm.insert("sub/a.jpg".into(), FileEntry { size: 100, mtime: 111, version_ms: 111_000, inode: 7 });
+        lm.insert("keep.txt".into(), FileEntry { size: 50, mtime: 5, version_ms: 5_000, inode: 9 });
+        let got = detect_moves_from_index(&idx, &lm);
+        assert_eq!(got, vec![("a.jpg".to_string(), "sub/a.jpg".to_string(), 100, 111)]);
+    }
+
+    #[test]
+    fn detect_moves_from_index_ignores_nonmoves_and_inode_zero() {
+        let mut idx: HashMap<u64, (String, u64, u64)> = HashMap::new();
+        idx.insert(7, ("a.jpg".into(), 100, 1));
+        let mut lm: HashMap<String, FileEntry> = HashMap::new();
+        // Same inode, same rel → not a move.
+        lm.insert("a.jpg".into(), FileEntry { size: 100, mtime: 1, version_ms: 1_000, inode: 7 });
+        // A COPY (old still present, new inode) → not a move.
+        lm.insert("copy.jpg".into(), FileEntry { size: 100, mtime: 2, version_ms: 2_000, inode: 42 });
+        // Inode 0 (Windows today) → never matched here.
+        lm.insert("win.bin".into(), FileEntry { size: 100, mtime: 3, version_ms: 3_000, inode: 0 });
+        assert!(detect_moves_from_index(&idx, &lm).is_empty());
+    }
+
+    #[test]
+    fn detect_moves_from_index_rejects_inode_recycle_same_size_diff_mtime() {
+        // inode 7 was "a.jpg" (size 100, mtime 1). a.jpg is GONE; inode 7 now belongs to
+        // a DIFFERENT file "recycled.bin" of the same SIZE but a different mtime (inode
+        // reuse). Without the mtime guard this would synthesize a false move that
+        // wrongly relocates the peer's a.jpg. The mtime guard must reject it.
+        let mut idx: HashMap<u64, (String, u64, u64)> = HashMap::new();
+        idx.insert(7, ("a.jpg".into(), 100, 1));
+        let mut lm: HashMap<String, FileEntry> = HashMap::new();
+        lm.insert("recycled.bin".into(), FileEntry { size: 100, mtime: 999, version_ms: 999_000, inode: 7 });
+        assert!(
+            detect_moves_from_index(&idx, &lm).is_empty(),
+            "inode recycle into a same-size, different-mtime file is NOT a move"
+        );
+    }
+
+    #[test]
+    fn handle_move_candidate_skips_send_when_move_already_recorded() {
+        // The reconcile round already recorded a move TO sub/a.jpg. The live add-branch
+        // must then report "handled" (true) so it does NOT also re-upload the bytes —
+        // re-uploading is what orphaned the old path and produced the duplicate.
+        let folder = temp_dir("mv-skip");
+        let fs = folder.to_string_lossy().to_string();
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        let p = folder.join("sub/a.jpg");
+        std::fs::write(&p, b"payload").unwrap();
+        let (sz, mt) = sig_of(&p);
+        let moves: Arc<Mutex<HashMap<String, MoveRec>>> = Arc::new(Mutex::new(HashMap::new()));
+        // A move A→sub/a.jpg recorded with THIS file's signature ⇒ it's the moved file.
+        moves.lock().unwrap().insert("a.jpg".into(), ("sub/a.jpg".into(), sz, mt, now_ms()));
+        let ino_index = Arc::new(Mutex::new(HashMap::new()));
+        let cw = Arc::new(Notify::new());
+        let did = handle_move_candidate(&p.to_string_lossy(), &fs, &folder, "pid", &moves, &ino_index, &cw);
+        assert!(did, "an already-recorded move of THIS file ⇒ skip the byte-send");
+
+        // Critical: a genuinely DIFFERENT new file dropped at the same path (a move
+        // op for a different-sized file lingers) must NOT be skipped — it must still
+        // sync, or it would be silently lost.
+        let moves2: Arc<Mutex<HashMap<String, MoveRec>>> = Arc::new(Mutex::new(HashMap::new()));
+        moves2.lock().unwrap().insert("a.jpg".into(), ("sub/a.jpg".into(), sz + 999, mt, now_ms()));
+        let did2 = handle_move_candidate(&p.to_string_lossy(), &fs, &folder, "pid", &moves2, &ino_index, &cw);
+        assert!(!did2, "a different file at the same path must NOT be skipped");
         let _ = std::fs::remove_dir_all(&folder);
     }
 
