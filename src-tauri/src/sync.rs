@@ -1278,6 +1278,10 @@ impl SyncManager {
             let ctrl_file = manager.config_dir.join(format!(".ctrl-out-{pair_id}.json"));
             let ctrl_path = ctrl_file.to_string_lossy().to_string();
             let mut offline_streak: u32 = 0;
+            // Prior reconcile manifest (rel → entry), kept across rounds so the OS-agnostic
+            // move detector can spot a vanished→appeared (Windows) relocation by size+mtime.
+            // Task-local; no shared state needed.
+            let mut prev_manifest: HashMap<String, FileEntry> = HashMap::new();
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
@@ -1325,7 +1329,8 @@ impl SyncManager {
                         // the live manifest, so a relocated file is sent as a rename op
                         // (the peer moves its copy) instead of a re-upload that orphans
                         // the old path and reconciles back to us as a DUPLICATE.
-                        let detected = detect_moves_from_index(&ino_index.lock().unwrap(), &lm);
+                        let detected =
+                            detect_moves_from_index(&ino_index.lock().unwrap(), &prev_manifest, &lm);
                         for (from, to, sz, mt) in detected {
                             note_move(
                                 &manager.config_dir, &pair_id, &moves, &from, &to, sz, mt, now_ms(),
@@ -1340,6 +1345,9 @@ impl SyncManager {
                             }
                         }
                     }
+                    // Remember this round's manifest so next round's OS-agnostic detector
+                    // can spot a vanished→appeared (Windows) move by size+mtime.
+                    prev_manifest = lm.clone();
                     let files: serde_json::Map<String, serde_json::Value> = lm
                         .iter()
                         .map(|(rel, e)| (rel.clone(), serde_json::json!([e.size, e.mtime])))
@@ -3260,23 +3268,57 @@ fn note_move(
 /// (e.g. Windows today) yields nothing; that direction needs a real file id.
 fn detect_moves_from_index(
     idx: &HashMap<u64, (String, u64, u64)>,
+    prev_lm: &HashMap<String, FileEntry>,
     lm: &HashMap<String, FileEntry>,
 ) -> Vec<(String, String, u64, u64)> {
-    lm.iter()
-        .filter(|(_, e)| e.inode != 0)
-        .filter_map(|(rel, e)| {
-            idx.get(&e.inode).and_then(|(old_rel, old_size, old_mtime)| {
-                // Require size AND mtime to match (a genuine rename preserves both) —
-                // as strict as the apply-side content gate, so inode recycling into a
-                // coincidentally same-SIZE file can't be mistaken for a move.
-                (old_rel != rel
-                    && *old_size == e.size
-                    && *old_mtime == e.mtime
-                    && !lm.contains_key(old_rel))
-                .then(|| (old_rel.clone(), rel.clone(), e.size, e.mtime))
-            })
-        })
-        .collect()
+    let mut out: Vec<(String, String, u64, u64)> = Vec::new();
+    // (1) FILE-ID (inode) path — reliable for same-volume moves where the platform gives
+    // a stable id (Unix). Require size AND mtime to match (a rename preserves both) — as
+    // strict as the apply gate, so inode RECYCLING into a same-size file can't be mistaken
+    // for a move. Windows has no file id here (inode 0) and falls through to (2).
+    for (rel, e) in lm {
+        if e.inode == 0 {
+            continue;
+        }
+        if let Some((old_rel, old_size, old_mtime)) = idx.get(&e.inode) {
+            if old_rel != rel
+                && *old_size == e.size
+                && *old_mtime == e.mtime
+                && !lm.contains_key(old_rel)
+            {
+                out.push((old_rel.clone(), rel.clone(), e.size, e.mtime));
+            }
+        }
+    }
+    // (2) OS-AGNOSTIC fallback for files with NO file id (e.g. WINDOWS, inode 0): a path
+    // that VANISHED since the prior manifest and a NEW path with IDENTICAL size+mtime is a
+    // move/rename — so a Windows user reorganizing also relocates instead of re-uploading.
+    // Fire ONLY when that (size,mtime) is UNIQUE among both the vanished and appeared sets:
+    // an ambiguous batch (several same-size files) is left to the normal re-upload, never
+    // mis-paired. apply_remote_move re-verifies + archives to History, so even a rare
+    // coincidence is recoverable, never lost.
+    let appeared: Vec<(String, u64, u64)> = lm
+        .iter()
+        .filter(|(rel, e)| e.inode == 0 && !prev_lm.contains_key(*rel))
+        .map(|(rel, e)| (rel.clone(), e.size, e.mtime))
+        .collect();
+    let gone: Vec<(String, u64, u64)> = prev_lm
+        .iter()
+        .filter(|(rel, e)| e.inode == 0 && !lm.contains_key(*rel))
+        .map(|(rel, e)| (rel.clone(), e.size, e.mtime))
+        .collect();
+    for (arel, asz, amt) in &appeared {
+        let app_count = appeared.iter().filter(|(_, s, m)| s == asz && m == amt).count();
+        let matches: Vec<&(String, u64, u64)> =
+            gone.iter().filter(|(_, s, m)| s == asz && m == amt).collect();
+        if app_count == 1 && matches.len() == 1 {
+            let grel = &matches[0].0;
+            if !out.iter().any(|(f, t, _, _)| f == grel || t == arel) {
+                out.push((grel.clone(), arel.clone(), *asz, *amt));
+            }
+        }
+    }
+    out
 }
 
 /// Apply a peer's MOVE: they renamed `from_rel`→`to_rel` inside the shared folder,
@@ -3389,9 +3431,16 @@ fn handle_move_candidate(
     // relocations the live index raced past). If THIS file is that moved file (its
     // size+mtime match the recorded move), don't also queue a byte-send — the peer is
     // already being told to relocate its copy, so re-uploading would waste bandwidth
-    // and risk leaving a duplicate. The size+mtime guard is essential: a genuinely new,
-    // DIFFERENT file dropped at the same path must still be sent, not silently skipped.
-    if !new_rel.is_empty()
+    // and risk a duplicate. TWO guards make this safe: (a) size+mtime must match, so a
+    // genuinely new DIFFERENT file at the same path is still sent; (b) we ONLY trust the
+    // skip when we have a reliable file id (inode != 0) — i.e. the move was inode-detected.
+    // We must NEVER suppress a byte-send on the strength of the weaker size+mtime-only
+    // (no-file-id / Windows) move heuristic: a rare coincidence there would otherwise
+    // leave the peer with stale content that never re-syncs (same size+mtime ⇒ reconcile
+    // sees them as identical). On a no-id platform the bytes always flow and guarantee
+    // correctness; the move op is then just a harmless placement hint.
+    if inode != 0
+        && !new_rel.is_empty()
         && moves
             .lock()
             .unwrap()
@@ -4389,7 +4438,8 @@ mod tests {
         let mut lm: HashMap<String, FileEntry> = HashMap::new();
         lm.insert("sub/a.jpg".into(), FileEntry { size: 100, mtime: 111, version_ms: 111_000, inode: 7 });
         lm.insert("keep.txt".into(), FileEntry { size: 50, mtime: 5, version_ms: 5_000, inode: 9 });
-        let got = detect_moves_from_index(&idx, &lm);
+        let prev: HashMap<String, FileEntry> = HashMap::new();
+        let got = detect_moves_from_index(&idx, &prev, &lm);
         assert_eq!(got, vec![("a.jpg".to_string(), "sub/a.jpg".to_string(), 100, 111)]);
     }
 
@@ -4402,9 +4452,39 @@ mod tests {
         lm.insert("a.jpg".into(), FileEntry { size: 100, mtime: 1, version_ms: 1_000, inode: 7 });
         // A COPY (old still present, new inode) → not a move.
         lm.insert("copy.jpg".into(), FileEntry { size: 100, mtime: 2, version_ms: 2_000, inode: 42 });
-        // Inode 0 (Windows today) → never matched here.
+        // Inode 0 with no prior manifest entry → never matched here.
         lm.insert("win.bin".into(), FileEntry { size: 100, mtime: 3, version_ms: 3_000, inode: 0 });
-        assert!(detect_moves_from_index(&idx, &lm).is_empty());
+        let prev: HashMap<String, FileEntry> = HashMap::new();
+        assert!(detect_moves_from_index(&idx, &prev, &lm).is_empty());
+    }
+
+    #[test]
+    fn detect_moves_from_index_windows_fallback_matches_by_size_mtime() {
+        // Windows has no file id (inode 0). "a.jpg" (100, mtime 7) vanished since the prior
+        // manifest and "sub/a.jpg" (100, mtime 7) appeared → the unique size+mtime match
+        // identifies the move, so a Windows reorg relocates instead of re-uploading.
+        let idx: HashMap<u64, (String, u64, u64)> = HashMap::new();
+        let mut prev: HashMap<String, FileEntry> = HashMap::new();
+        prev.insert("a.jpg".into(), FileEntry { size: 100, mtime: 7, version_ms: 7_000, inode: 0 });
+        let mut lm: HashMap<String, FileEntry> = HashMap::new();
+        lm.insert("sub/a.jpg".into(), FileEntry { size: 100, mtime: 7, version_ms: 7_000, inode: 0 });
+        let got = detect_moves_from_index(&idx, &prev, &lm);
+        assert_eq!(got, vec![("a.jpg".to_string(), "sub/a.jpg".to_string(), 100, 7)]);
+    }
+
+    #[test]
+    fn detect_moves_from_index_windows_fallback_skips_ambiguous() {
+        // Two vanished files share size+mtime → ambiguous → NO move (safe re-upload).
+        let idx: HashMap<u64, (String, u64, u64)> = HashMap::new();
+        let mut prev: HashMap<String, FileEntry> = HashMap::new();
+        prev.insert("a.txt".into(), FileEntry { size: 10, mtime: 1, version_ms: 1_000, inode: 0 });
+        prev.insert("b.txt".into(), FileEntry { size: 10, mtime: 1, version_ms: 1_000, inode: 0 });
+        let mut lm: HashMap<String, FileEntry> = HashMap::new();
+        lm.insert("sub/x.txt".into(), FileEntry { size: 10, mtime: 1, version_ms: 1_000, inode: 0 });
+        assert!(
+            detect_moves_from_index(&idx, &prev, &lm).is_empty(),
+            "ambiguous same-signature set ⇒ no move"
+        );
     }
 
     #[test]
@@ -4417,8 +4497,9 @@ mod tests {
         idx.insert(7, ("a.jpg".into(), 100, 1));
         let mut lm: HashMap<String, FileEntry> = HashMap::new();
         lm.insert("recycled.bin".into(), FileEntry { size: 100, mtime: 999, version_ms: 999_000, inode: 7 });
+        let prev: HashMap<String, FileEntry> = HashMap::new();
         assert!(
-            detect_moves_from_index(&idx, &lm).is_empty(),
+            detect_moves_from_index(&idx, &prev, &lm).is_empty(),
             "inode recycle into a same-size, different-mtime file is NOT a move"
         );
     }
