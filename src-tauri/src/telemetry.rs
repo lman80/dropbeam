@@ -204,6 +204,15 @@ fn notable(line: &str) -> Option<&'static str> {
     if line.contains("File does not exist at path") {
         return None;
     }
+    // iroh/quinn and the networking stack's own crates log WARN/ERROR for routine
+    // transport churn (relay reconnects, path/candidate failures, NAT-PMP, DNS) that
+    // is NOT an app fault — it flooded the dashboard's error/warn tiers and buried
+    // genuine app failures. Demote it. Our own code logs under app_lib::/app::, so it
+    // is never matched here; and the explicit high-value signals below
+    // (canary/unreachable/REFUSED/…) are kept regardless of source.
+    if (line.contains("[ERROR]") || line.contains("[WARN]")) && is_internal_net_module(line) {
+        return None;
+    }
     if line.contains("[ERROR]") || line.contains("panicked") {
         Some("error")
     } else if line.contains("[WARN]") {
@@ -226,6 +235,25 @@ fn notable(line: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// True for log lines emitted by iroh/quinn and the networking stack's OWN crates
+/// (relay, magicsock, NAT-PMP/UPnP, DNS discovery) — routine transport noise, not an
+/// app fault. Matches on the module bracket `[<crate>…]`. Our code logs under
+/// `app_lib::`/`app::`, so `[app_lib::iroh_net]` never matches (no `[iroh` substring).
+fn is_internal_net_module(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "[iroh",
+        "[quinn",
+        "[netwatch",
+        "[magicsock",
+        "[hickory",
+        "[portmapper",
+        "[igd",
+        "[netlink",
+        "[swarm_discovery",
+    ];
+    PREFIXES.iter().any(|p| line.contains(p))
 }
 
 /// Classify a PERF line's transport path: Some(true)=direct, Some(false)=relay,
@@ -611,6 +639,20 @@ mod tests {
         assert_eq!(
             notable("[2026-06-18][07:59:25][ERROR] Asset protocol: File does not exist at path: /x/y.png"),
             None
+        );
+        // iroh/quinn-internal WARN/ERROR is transport churn, not an app fault — demoted.
+        assert_eq!(
+            notable("[2026-06-18][07:59:25][iroh_relay::client][WARN] reconnecting to relay"),
+            None
+        );
+        assert_eq!(
+            notable("[2026-06-18][07:59:25][quinn_proto::connection][ERROR] connection lost"),
+            None
+        );
+        // …but OUR own app errors (app_lib::) are still captured.
+        assert_eq!(
+            notable("[2026-06-18][07:59:25][app_lib::iroh_net][ERROR] real app fault"),
+            Some("error")
         );
     }
 

@@ -150,6 +150,9 @@ interface AppStore {
   receiveCode: (code: string) => Promise<boolean>
   upsertTransfer: (u: TransferUpdate) => void
   removeTransfer: (id: string) => void
+  /** Re-run a failed friend/Quick Send with the same files + recipient (one tap).
+   *  No-op if the original payload is no longer known or the card isn't failed. */
+  retryTransfer: (id: string) => Promise<void>
   reloadHistory: () => Promise<void>
   reloadPairs: () => Promise<void>
   updatePair: (u: PairUpdate) => Promise<void>
@@ -226,6 +229,8 @@ export interface FolderActivityEvent {
   bytes: number
   /** The shared folder this synced — resolves to the on-disk root + the friend. */
   pairId: string
+  /** Who the files came from, on the receive side (#12). Absent on send / older data. */
+  from?: string
 }
 
 const FOLDER_ACTIVITY_KEY = 'dropbeam-folder-activity-v2'
@@ -251,6 +256,44 @@ let lastDropAt = 0
 // the menu-bar popover drag-to-send) would otherwise send the same files twice.
 let lastFriendSig = ''
 let lastFriendAt = 0
+// What it would take to re-run a send, keyed by transfer id, so a FAILED card can
+// offer one-tap Retry. The TransferUpdate itself keeps only basenames + the friend's
+// (mutable) display name — not the absolute paths or the stable friend id the send
+// commands need — so we stash the original payload at send time. Kept in localStorage
+// (NOT a per-webview Map) because a send can START in the menu-bar popover while its
+// failed card — and the Retry button — renders in the MAIN window; both windows must
+// read the same payload. Bounded so it can't grow unbounded across a session.
+type RetryPayload = { kind: 'friend'; id: string; paths: string[] } | { kind: 'quick'; paths: string[] }
+const RETRY_KEY = 'dropbeam-retry-payloads'
+function loadRetryPayloads(): Record<string, RetryPayload> {
+  try {
+    return JSON.parse(localStorage.getItem(RETRY_KEY) || '{}') as Record<string, RetryPayload>
+  } catch {
+    return {}
+  }
+}
+function setRetryPayload(id: string, p: RetryPayload): void {
+  try {
+    const all = loadRetryPayloads()
+    all[id] = p
+    const ids = Object.keys(all)
+    if (ids.length > 50) for (const k of ids.slice(0, ids.length - 50)) delete all[k]
+    localStorage.setItem(RETRY_KEY, JSON.stringify(all))
+  } catch {
+    /* best-effort — Retry is a convenience, never critical */
+  }
+}
+function deleteRetryPayload(id: string): void {
+  try {
+    const all = loadRetryPayloads()
+    if (id in all) {
+      delete all[id]
+      localStorage.setItem(RETRY_KEY, JSON.stringify(all))
+    }
+  } catch {
+    /* best-effort */
+  }
+}
 // In-flight receives by ticket, so pasting the same code twice can't start two
 // pulls of the same files racing each other into "name (1)" duplicates.
 const activeReceives = new Map<string, string>()
@@ -373,6 +416,7 @@ export const useStore = create<AppStore>((set, get) => ({
             files: syncedFiles,
             bytes: s.bytes ?? 0,
             pairId: s.pairId,
+            from: s.from,
           }
           const list = [...(st.folderActivity[s.pairId] ?? []), ev].slice(-200)
           const folderActivity = { ...st.folderActivity, [s.pairId]: list }
@@ -586,6 +630,8 @@ export const useStore = create<AppStore>((set, get) => ({
       // iroh-only Quick Send: stage over the direct P2P engine; the receiver
       // pulls with the Direct link/QR.
       const u = await api.irohSend(paths)
+      // Remember the paths so a failed stage can offer one-tap Retry.
+      setRetryPayload(u.id, { kind: 'quick', paths })
       get().upsertTransfer(u)
     } catch (e) {
       get().toast('error', String(e))
@@ -724,12 +770,27 @@ export const useStore = create<AppStore>((set, get) => ({
     }))
   },
 
-  removeTransfer: (id) =>
+  removeTransfer: (id) => {
+    deleteRetryPayload(id) // free the saved payload so the store can't grow unbounded
     set((s) => {
       const next = { ...s.transfers }
       delete next[id]
       return { transfers: next, order: s.order.filter((x) => x !== id) }
-    }),
+    })
+  },
+
+  retryTransfer: async (id) => {
+    const payload = loadRetryPayloads()[id]
+    if (!payload) return
+    const t = get().transfers[id]
+    // Only retry a card that actually failed — never re-send an in-flight one.
+    if (t && t.state !== 'failed') return
+    // Drop the failed card first so the retry starts a fresh transfer instead of
+    // leaving a zombie alongside it (this also frees the old payload).
+    get().removeTransfer(id)
+    if (payload.kind === 'friend') await get().sendToFriend(payload.id, payload.paths)
+    else await get().sendPaths(payload.paths)
+  },
 
   reloadHistory: async () => {
     const history = await api.getHistory()
@@ -782,6 +843,9 @@ export const useStore = create<AppStore>((set, get) => ({
     set({ view: 'send' })
     try {
       const u = await api.sendToFriend(id, paths)
+      // Remember the recipient + paths so a failed send can offer one-tap Retry
+      // (the TransferUpdate only keeps the friend's display name, not their id).
+      setRetryPayload(u.id, { kind: 'friend', id, paths })
       get().upsertTransfer(u)
       // A direct send to a friend also lands in that friend's chat timeline, on
       // BOTH sides — so every interaction shows up in the conversation (GitHub

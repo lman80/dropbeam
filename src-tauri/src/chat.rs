@@ -126,8 +126,17 @@ fn load_all(config_dir: &Path) -> HashMap<String, Vec<ChatMessage>> {
 
 fn save_all(config_dir: &Path, all: &HashMap<String, Vec<ChatMessage>>) {
     let _ = fs::create_dir_all(config_dir);
-    if let Ok(txt) = serde_json::to_string_pretty(all) {
-        let _ = write_atomic(&chats_path(config_dir), txt.as_bytes());
+    match serde_json::to_string_pretty(all) {
+        Ok(txt) => {
+            // Don't swallow a failed write: a message can be emitted to the UI and
+            // acked over the wire yet silently lost from chats.json (Windows handle
+            // contention), so the thread looks complete in-session but is missing
+            // after a restart. Log it so the diagnostics digest catches the loss.
+            if let Err(e) = write_atomic(&chats_path(config_dir), txt.as_bytes()) {
+                log::error!("chat::save_all failed to persist chats.json: {e}");
+            }
+        }
+        Err(e) => log::error!("chat::save_all failed to serialize chats: {e}"),
     }
 }
 

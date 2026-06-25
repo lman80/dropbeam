@@ -500,6 +500,9 @@ export interface FolderSynced {
   files?: string[]
   /** Total bytes moved in this batch. */
   bytes?: number
+  /** Who these files came from (your saved label for them, else their broadcast
+   *  name). Only present on the receive side; absent on send and older engines. */
+  from?: string
 }
 
 /** A shared-folder transfer just completed (one file delivered or received). */

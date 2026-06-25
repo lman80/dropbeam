@@ -227,8 +227,19 @@ fn broadcast_profile(app: &AppHandle) {
 #[tauri::command]
 pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
+    // If the exact item is gone (moved / deleted / cleared from history), reveal its
+    // parent folder instead of handing a missing path to the opener — that errored
+    // and added to the log noise. Only give up if the parent is gone too.
+    let p = std::path::Path::new(&path);
+    let target = if p.exists() {
+        path.clone()
+    } else if let Some(parent) = p.parent().filter(|d| d.exists()) {
+        parent.to_string_lossy().into_owned()
+    } else {
+        return Err("That item is no longer there.".into());
+    };
     app.opener()
-        .reveal_item_in_dir(&path)
+        .reveal_item_in_dir(&target)
         .map_err(|e| e.to_string())
 }
 

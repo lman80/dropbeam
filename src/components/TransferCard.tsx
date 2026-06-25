@@ -9,6 +9,7 @@ import {
   Copy,
   FolderOpen,
   Loader2,
+  RotateCw,
   Send,
   X,
 } from 'lucide-react'
@@ -31,6 +32,7 @@ export const TransferCard = memo(TransferCardImpl)
 
 function TransferCardImpl({ t }: { t: TransferUpdate }) {
   const removeTransfer = useStore((s) => s.removeTransfer)
+  const retryTransfer = useStore((s) => s.retryTransfer)
   const respondToOffer = useStore((s) => s.respondToOffer)
   const toast = useStore((s) => s.toast)
   const summary = useStore((s) => s.transferSummaries[t.id])
@@ -369,18 +371,30 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
 
       {/* failed */}
       {t.state === 'failed' && (
-        <div
-          style={{
-            marginTop: 12,
-            fontSize: 13,
-            color: 'var(--red)',
-            background: 'var(--red-soft)',
-            borderRadius: 11,
-            padding: '10px 12px',
-            lineHeight: 1.45,
-          }}
-        >
-          {t.error ?? 'The transfer failed.'}
+        <div style={{ marginTop: 12 }}>
+          <div
+            style={{
+              fontSize: 13,
+              color: 'var(--red)',
+              background: 'var(--red-soft)',
+              borderRadius: 11,
+              padding: '10px 12px',
+              lineHeight: 1.45,
+            }}
+          >
+            {t.error ?? 'The transfer failed.'}
+          </div>
+          {/* One-tap re-send, only on a failed SEND (a failed receive has no original
+              paths/recipient to replay — retryTransfer is a no-op there). */}
+          {t.direction === 'send' && (
+            <button
+              className="btn btn-ghost"
+              style={{ marginTop: 10, width: '100%' }}
+              onClick={() => void retryTransfer(t.id)}
+            >
+              <RotateCw size={15} /> Retry
+            </button>
+          )}
         </div>
       )}
 

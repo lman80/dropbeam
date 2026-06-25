@@ -144,8 +144,12 @@ function statusInfo(
     case 'waiting':
       return {
         color: 'var(--amber)',
+        // The Rust sender fills `detail` with the honest, specific reason: either
+        // "Waiting for <peer> to come online" (peer offline) or "Couldn't reach <peer>
+        // just now — retrying" (reached but the transfer failed/stalled). This fallback
+        // only shows if detail is unexpectedly null.
         label:
-          (status?.detail ?? 'Waiting for the other device') +
+          (status?.detail ?? `Waiting for ${peer}`) +
           (status && status.queued > 0 ? ` · ${status.queued} queued` : ''),
       }
     case 'error':

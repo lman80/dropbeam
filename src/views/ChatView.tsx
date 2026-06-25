@@ -795,7 +795,7 @@ function FolderSyncRow({
         <div className="sync-cap">
           <FolderOpen size={11} />
           <span>
-            {mine ? 'You added' : `${friendName} added`} · {folderName} · {formatBytes(ev.bytes)}
+            {mine ? 'You added' : `${(ev.from && ev.from.trim()) || friendName} added`} · {folderName} · {formatBytes(ev.bytes)}
           </span>
         </div>
         {many ? (

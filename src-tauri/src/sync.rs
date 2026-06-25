@@ -1209,12 +1209,21 @@ impl SyncManager {
                     }
                     SendOutcome::Offline => {
                         offline_attempts = offline_attempts.saturating_add(1);
+                        // We reached this arm by PASSING the presence gate (peer_online
+                        // was true), then the actual push returned None — the dial timed
+                        // out, the stall watchdog abandoned a frozen stream, or the
+                        // handshake raced. That is NOT the same as "peer is off": the
+                        // presence gate above (`!peer_online`) owns the truly-offline
+                        // case with its own "come online" copy. Surface an HONEST, distinct
+                        // detail here so the user can tell "my friend is offline" from "we
+                        // connected but the transfer didn't go through". Display-only — the
+                        // queueing + backoff below are unchanged.
                         set_status(
                             &status,
                             FolderState::Waiting,
                             Some(name.clone()),
                             0.0,
-                            Some(format!("Waiting for {} to come online", peer_label(&pair))),
+                            Some(format!("Couldn't reach {} just now — retrying", peer_label(&pair))),
                         );
                         manager.emit_status(&pair_id);
                         // Don't let ONE file that keeps failing (e.g. a stalled send
@@ -2010,9 +2019,16 @@ impl SyncManager {
             .iter()
             .filter_map(|f| crate::iroh_net::folder_rel(Path::new(f), &pair.folder))
             .collect();
+        // `from` = who these files came from (your saved label for them, else their
+        // broadcast name), so the chat sync row can show provenance (#12). Only on the
+        // receive path; the send row already reads "You added". Carry it ONLY when
+        // non-empty — an unkeyed link can still have an empty peer_name until the name
+        // beacon lands, and a blank "from" would render an empty sender. Null lets the
+        // UI's `?? friendName` fallback fire.
+        let from_opt = (!from.trim().is_empty()).then(|| from.clone());
         let _ = self.app.emit(
             "folder-synced",
-            serde_json::json!({ "pairId": pair.id, "direction": "receive", "files": synced_names, "bytes": total }),
+            serde_json::json!({ "pairId": pair.id, "direction": "receive", "files": synced_names, "bytes": total, "from": from_opt }),
         );
         let settings_notify = self
             .app
