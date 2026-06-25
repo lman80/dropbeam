@@ -1889,6 +1889,10 @@ async fn serve_stream(
         Some("chat") => {
             // A friend sent us a chat message OR an update to one (reaction, edit,
             // delete). Identify them by endpoint id, apply it, surface it live.
+            // `applied` rides the ack so the sender's durable op-outbox knows whether
+            // an edit/unsend/reaction actually landed (its target was stored) — only
+            // then does it drop the op. Stays true for plain messages.
+            let mut applied = true;
             if let Some(app) = state.app.get().cloned() {
                 let config_dir = app
                     .try_state::<Arc<crate::AppState>>()
@@ -1919,10 +1923,16 @@ async fn serve_stream(
                             if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
                                 let emoji = req.get("emoji").and_then(|e| e.as_str()).unwrap_or("");
                                 let add = req.get("add").and_then(|a| a.as_bool()).unwrap_or(true);
-                                if let Some(u) = crate::chat::apply_reaction(
+                                // None = we don't have the target message yet → tell the
+                                // sender (applied=false) so it KEEPS the op queued to
+                                // retry, rather than dropping it (apply_* is idempotent).
+                                match crate::chat::apply_reaction(
                                     &config_dir, &peer_id, target, emoji, false, add,
                                 ) {
-                                    let _ = app.emit("chat://message", &u);
+                                    Some(u) => {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                    None => applied = false,
                                 }
                             }
                         }
@@ -1931,19 +1941,22 @@ async fn serve_stream(
                                 let new_text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
                                 // author_is_me=false: a remote edit may only touch
                                 // the PEER's own message, never one we authored.
-                                if let Some(u) =
-                                    crate::chat::apply_edit(&config_dir, &peer_id, target, new_text, false)
+                                match crate::chat::apply_edit(&config_dir, &peer_id, target, new_text, false)
                                 {
-                                    let _ = app.emit("chat://message", &u);
+                                    Some(u) => {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                    None => applied = false,
                                 }
                             }
                         }
                         "delete" => {
                             if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
-                                if let Some(u) =
-                                    crate::chat::apply_delete(&config_dir, &peer_id, target, false)
-                                {
-                                    let _ = app.emit("chat://message", &u);
+                                match crate::chat::apply_delete(&config_dir, &peer_id, target, false) {
+                                    Some(u) => {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                    None => applied = false,
                                 }
                             }
                         }
@@ -2016,7 +2029,7 @@ async fn serve_stream(
                     }
                 }
             }
-            write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
+            write_frame(send, &serde_json::json!({ "kind": "ok", "applied": applied })).await?;
             send.finish()?;
         }
         Some("chat-signal") => {
@@ -3199,7 +3212,7 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
 /// Deliver a chat message to a friend over iroh (dial-by-key). `payload` is the
 /// full `{kind:"chat", ...}` frame. `Ok(())` means they received it; `Err` means
 /// they were unreachable — the message is kept locally (no store-and-forward yet).
-pub async fn send_chat(ep: &Endpoint, endpoint_id: &str, payload: serde_json::Value) -> Result<()> {
+pub async fn send_chat(ep: &Endpoint, endpoint_id: &str, payload: serde_json::Value) -> Result<serde_json::Value> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
     let addr = dial_addr(parsed);
     let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
@@ -3209,10 +3222,16 @@ pub async fn send_chat(ep: &Endpoint, endpoint_id: &str, payload: serde_json::Va
     let (mut send, mut recv) = conn.open_bi().await.context("open chat stream")?;
     write_frame(&mut send, &payload).await?;
     send.finish()?;
-    // Best-effort ack; the peer applies the message when it reads the finished
-    // stream, so we don't fail delivery just because the ok is slow.
-    let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
-    Ok(())
+    // Read the peer's ack and RETURN it, so the durable op-outbox can tell whether an
+    // edit/unsend/reaction actually applied (a new peer answers {"kind":"ok","applied":
+    // bool}; an old peer just {"kind":"ok"}). Use read_frame_cap, NOT a raw read — the
+    // ack is length-prefixed by write_frame, so raw bytes wouldn't parse. Best-effort:
+    // a missing/slow ack returns Null and the caller falls back. Messages ignore it.
+    let ack = match tokio::time::timeout(Duration::from_secs(5), read_frame_cap(&mut recv, 4096)).await {
+        Ok(Ok(v)) => v,
+        _ => serde_json::Value::Null,
+    };
+    Ok(ack)
 }
 
 /// Build the wire frame for a chat message (shared by the send command + the
@@ -3253,10 +3272,24 @@ pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) 
 /// peer (so order is preserved and one failure doesn't let later messages jump
 /// ahead). This is what makes chat reliable — a message that couldn't send keeps
 /// retrying until it lands, instead of being silently dropped.
+static CHAT_OUTBOX_WAKE: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+fn chat_outbox_wake_cell() -> &'static tokio::sync::Notify {
+    CHAT_OUTBOX_WAKE.get_or_init(tokio::sync::Notify::new)
+}
+/// Kick the chat outbox loop to flush right now (after enqueuing a message or an
+/// edit/unsend/reaction op), so the online case stays instant instead of waiting for
+/// the next 12s tick.
+pub fn wake_chat_outbox() {
+    chat_outbox_wake_cell().notify_one();
+}
+
 pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(12)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(12)) => {}
+                _ = chat_outbox_wake_cell().notified() => {}
+            }
             let Some(ep) = state.get().cloned() else {
                 continue;
             };
@@ -3270,41 +3303,112 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 (cd, name)
             };
             let pending = crate::chat::outbox(&config_dir);
-            if pending.is_empty() {
+            let ops = crate::chat::pending_ops(&config_dir);
+            if pending.is_empty() && ops.is_empty() {
                 continue;
             }
             let friends = crate::friends::load(&config_dir);
-            let mut by_peer: std::collections::HashMap<String, Vec<crate::chat::ChatMessage>> =
-                std::collections::HashMap::new();
-            for m in pending {
-                by_peer.entry(m.peer_id.clone()).or_default().push(m);
+
+            // --- Messages first, so an original lands before any op that targets it.
+            // Track which of OUR messages we delivered THIS round.
+            let mut just_delivered: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            if !pending.is_empty() {
+                let mut by_peer: std::collections::HashMap<String, Vec<crate::chat::ChatMessage>> =
+                    std::collections::HashMap::new();
+                for m in pending {
+                    by_peer.entry(m.peer_id.clone()).or_default().push(m);
+                }
+                for (peer_id, msgs) in by_peer {
+                    let Some(eid) = friends
+                        .iter()
+                        .find(|f| f.id == peer_id)
+                        .and_then(|f| f.endpoint_id.clone())
+                    else {
+                        continue;
+                    };
+                    for m in msgs {
+                        let payload = chat_payload(&m, &peer_id, &my_name);
+                        match send_chat(&ep, &eid, payload).await {
+                            Ok(_) => {
+                                just_delivered.insert(m.id.clone());
+                                if let Some(u) = crate::chat::set_status(
+                                    &config_dir,
+                                    &peer_id,
+                                    &m.id,
+                                    "delivered",
+                                ) {
+                                    let _ = app.emit("chat://message", &u);
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(u) = crate::chat::set_status(
+                                    &config_dir,
+                                    &peer_id,
+                                    &m.id,
+                                    "failed",
+                                ) {
+                                    let _ = app.emit("chat://message", &u);
+                                }
+                                break; // preserve order — stop this peer until next round
+                            }
+                        }
+                    }
+                }
             }
-            for (peer_id, msgs) in by_peer {
+
+            // --- Edit/unsend/reaction ops, AFTER messages. Each is gated on its target
+            // being delivered/read so the receiver (which drops an op whose target it
+            // hasn't stored) never loses it. An op whose target we delivered in THIS
+            // SAME round is deferred to the next round: the message frame and the op
+            // frame ride SEPARATE connections with no ordering guarantee, so we wait
+            // until the message has certainly landed.
+            for op in ops {
                 let Some(eid) = friends
                     .iter()
-                    .find(|f| f.id == peer_id)
+                    .find(|f| f.id == op.peer_id)
                     .and_then(|f| f.endpoint_id.clone())
                 else {
                     continue;
                 };
-                for m in msgs {
-                    let payload = chat_payload(&m, &peer_id, &my_name);
-                    match send_chat(&ep, &eid, payload).await {
-                        Ok(_) => {
-                            if let Some(u) =
-                                crate::chat::set_status(&config_dir, &peer_id, &m.id, "delivered")
-                            {
-                                let _ = app.emit("chat://message", &u);
-                            }
-                        }
-                        Err(_) => {
-                            if let Some(u) =
-                                crate::chat::set_status(&config_dir, &peer_id, &m.id, "failed")
-                            {
-                                let _ = app.emit("chat://message", &u);
-                            }
-                            break; // preserve order — stop this peer until next round
-                        }
+                if just_delivered.contains(&op.target_id) {
+                    continue;
+                }
+                let target_ready =
+                    match crate::chat::message_status(&config_dir, &op.peer_id, &op.target_id) {
+                        Some(s) => matches!(s.as_str(), "delivered" | "read"),
+                        // None = the target is the PEER's own message (they authored it,
+                        // so they have it) or it aged out of our store — send anyway.
+                        None => true,
+                    };
+                if !target_ready {
+                    continue;
+                }
+                let payload = match op.kind.as_str() {
+                    "reaction" => serde_json::json!({
+                        "kind": "chat", "v": 2, "msgKind": "reaction", "friendId": op.peer_id,
+                        "fromName": my_name, "targetId": op.target_id, "emoji": op.emoji, "add": op.add,
+                    }),
+                    "edit" => serde_json::json!({
+                        "kind": "chat", "v": 2, "msgKind": "edit", "friendId": op.peer_id,
+                        "fromName": my_name, "targetId": op.target_id, "text": op.text,
+                    }),
+                    "delete" => serde_json::json!({
+                        "kind": "chat", "v": 2, "msgKind": "delete", "friendId": op.peer_id,
+                        "fromName": my_name, "targetId": op.target_id,
+                    }),
+                    _ => continue,
+                };
+                // Drop the op from the queue ONLY when the peer confirms it APPLIED it
+                // (its target message was stored). A new peer answers applied:true/false;
+                // an old peer (no field) just acks the frame, so default true — no worse
+                // than the pre-outbox best-effort behavior. applied=false (the peer
+                // doesn't have the target yet) leaves the op queued to retry — the
+                // receiver's apply_* are idempotent, so at-least-once is safe.
+                if let Ok(ack) = send_chat(&ep, &eid, payload).await {
+                    let applied = ack.get("applied").and_then(|v| v.as_bool()).unwrap_or(true);
+                    if applied {
+                        crate::chat::ack_op(&config_dir, &op.id);
                     }
                 }
             }

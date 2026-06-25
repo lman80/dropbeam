@@ -1105,32 +1105,12 @@ pub(crate) fn post_file_note(
 
 // --- New chat capabilities: reactions, edit, delete, typing, read, GIFs -----
 
-/// Build + send a small chat control op (reaction/edit/delete) to a friend over
-/// iroh, retrying a few times so it lands even if the first dial misses. These
-/// mutate an existing message rather than create one, so they're not queued in
-/// the outbox; best-effort with retry is the right reliability tier for them.
-fn send_chat_op(
-    iroh: &Arc<crate::iroh_net::IrohState>,
-    eid: String,
-    payload: serde_json::Value,
-) {
-    let Some(ep) = iroh.get().cloned() else { return };
-    tauri::async_runtime::spawn(async move {
-        for attempt in 0..3u8 {
-            if crate::iroh_net::send_chat(&ep, &eid, payload.clone()).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2 * (attempt as u64 + 1))).await;
-        }
-    });
-}
-
 /// Add or remove an emoji reaction on a message (ours or the friend's). Applies
-/// locally immediately, then tells the peer.
+/// locally immediately, then DURABLY queues the op so it reaches the peer even if
+/// they're offline now (mirrors the message outbox).
 #[tauri::command]
 pub async fn react_to_message(
     state: State<'_, Arc<AppState>>,
-    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     app: AppHandle,
     friend_id: String,
     message_id: String,
@@ -1140,16 +1120,22 @@ pub async fn react_to_message(
     if let Some(u) = chat::apply_reaction(&state.config_dir, &friend_id, &message_id, &emoji, true, add) {
         let _ = app.emit("chat://message", &u);
     }
-    if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
-        if let Some(eid) = friend.endpoint_id {
-            let my_name = state.settings.lock().unwrap().display_name.clone();
-            let payload = serde_json::json!({
-                "kind": "chat", "v": 2, "msgKind": "reaction", "friendId": friend_id,
-                "fromName": my_name, "targetId": message_id, "emoji": emoji, "add": add,
-            });
-            send_chat_op(&iroh, eid, payload);
-        }
-    }
+    chat::enqueue_op(
+        &state.config_dir,
+        chat::ChatOp {
+            id: uuid::Uuid::new_v4().to_string(),
+            peer_id: friend_id,
+            target_id: message_id,
+            kind: "reaction".into(),
+            emoji,
+            add,
+            text: String::new(),
+            ts: chat::now_ms(),
+        },
+    );
+    // Flush now so the online case stays instant; the loop gates on the target
+    // message being delivered before it actually sends the op.
+    crate::iroh_net::wake_chat_outbox();
     Ok(())
 }
 
@@ -1157,7 +1143,6 @@ pub async fn react_to_message(
 #[tauri::command]
 pub async fn edit_chat_message(
     state: State<'_, Arc<AppState>>,
-    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     app: AppHandle,
     friend_id: String,
     message_id: String,
@@ -1170,16 +1155,20 @@ pub async fn edit_chat_message(
     if let Some(u) = chat::apply_edit(&state.config_dir, &friend_id, &message_id, &body, true) {
         let _ = app.emit("chat://message", &u);
     }
-    if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
-        if let Some(eid) = friend.endpoint_id {
-            let my_name = state.settings.lock().unwrap().display_name.clone();
-            let payload = serde_json::json!({
-                "kind": "chat", "v": 2, "msgKind": "edit", "friendId": friend_id,
-                "fromName": my_name, "targetId": message_id, "text": body,
-            });
-            send_chat_op(&iroh, eid, payload);
-        }
-    }
+    chat::enqueue_op(
+        &state.config_dir,
+        chat::ChatOp {
+            id: uuid::Uuid::new_v4().to_string(),
+            peer_id: friend_id,
+            target_id: message_id,
+            kind: "edit".into(),
+            emoji: String::new(),
+            add: false,
+            text: body,
+            ts: chat::now_ms(),
+        },
+    );
+    crate::iroh_net::wake_chat_outbox();
     Ok(())
 }
 
@@ -1187,7 +1176,6 @@ pub async fn edit_chat_message(
 #[tauri::command]
 pub async fn delete_chat_message(
     state: State<'_, Arc<AppState>>,
-    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     app: AppHandle,
     friend_id: String,
     message_id: String,
@@ -1195,16 +1183,20 @@ pub async fn delete_chat_message(
     if let Some(u) = chat::apply_delete(&state.config_dir, &friend_id, &message_id, true) {
         let _ = app.emit("chat://message", &u);
     }
-    if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
-        if let Some(eid) = friend.endpoint_id {
-            let my_name = state.settings.lock().unwrap().display_name.clone();
-            let payload = serde_json::json!({
-                "kind": "chat", "v": 2, "msgKind": "delete", "friendId": friend_id,
-                "fromName": my_name, "targetId": message_id,
-            });
-            send_chat_op(&iroh, eid, payload);
-        }
-    }
+    chat::enqueue_op(
+        &state.config_dir,
+        chat::ChatOp {
+            id: uuid::Uuid::new_v4().to_string(),
+            peer_id: friend_id,
+            target_id: message_id,
+            kind: "delete".into(),
+            emoji: String::new(),
+            add: false,
+            text: String::new(),
+            ts: chat::now_ms(),
+        },
+    );
+    crate::iroh_net::wake_chat_outbox();
     Ok(())
 }
 

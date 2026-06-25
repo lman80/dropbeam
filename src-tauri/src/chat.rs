@@ -342,6 +342,128 @@ pub fn mark_read_up_to(config_dir: &Path, peer_id: &str, up_to: u64) -> Vec<Chat
     changed
 }
 
+/// A pending edit/unsend/reaction op for a message WE authored, queued durably so it
+/// survives the friend being offline — the mirror of the message outbox, but for ops.
+/// Persisted to chat_ops.json (a NEW file old builds ignore). Flushed by the chat
+/// outbox loop ONLY once the target message is delivered/read (the receiver drops an
+/// op whose target it hasn't stored, so an op must never race ahead of its original),
+/// and the receiver's apply_* are idempotent so an at-least-once retry is safe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatOp {
+    pub id: String,
+    pub peer_id: String,
+    pub target_id: String,
+    /// "reaction" | "edit" | "delete".
+    pub kind: String,
+    #[serde(default)]
+    pub emoji: String,
+    #[serde(default)]
+    pub add: bool,
+    #[serde(default)]
+    pub text: String,
+    pub ts: u64,
+}
+
+const MAX_OPS: usize = 1000;
+const OP_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+fn ops_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("chat_ops.json")
+}
+fn load_ops(config_dir: &Path) -> Vec<ChatOp> {
+    match fs::read_to_string(ops_path(config_dir)) {
+        Ok(txt) => serde_json::from_str(&txt).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+fn save_ops(config_dir: &Path, ops: &[ChatOp]) {
+    let _ = fs::create_dir_all(config_dir);
+    if let Ok(txt) = serde_json::to_string_pretty(ops) {
+        if let Err(e) = write_atomic(&ops_path(config_dir), txt.as_bytes()) {
+            log::error!("chat::save_ops failed to persist chat_ops.json: {e}");
+        }
+    }
+}
+
+/// Queue an edit/unsend/reaction op, COALESCING against what's already queued so the
+/// queue mirrors the message's final LOCAL state (no divergence when it flushes):
+///  - delete supersedes every queued op for that target (an unsent message needs no
+///    edits/reactions sent);
+///  - a newer edit replaces an older queued edit (latest-edit-wins);
+///  - a reaction that toggles its queued opposite cancels it (an offline add+remove of
+///    the same emoji nets to nothing); a same-direction repeat just replaces.
+pub fn enqueue_op(config_dir: &Path, op: ChatOp) {
+    let _guard = LOCK.lock().unwrap();
+    let mut ops = load_ops(config_dir);
+    match op.kind.as_str() {
+        "delete" => ops.retain(|o| !(o.peer_id == op.peer_id && o.target_id == op.target_id)),
+        "edit" => ops.retain(|o| {
+            !(o.peer_id == op.peer_id && o.target_id == op.target_id && o.kind == "edit")
+        }),
+        "reaction" => {
+            if let Some(pos) = ops.iter().position(|o| {
+                o.peer_id == op.peer_id
+                    && o.target_id == op.target_id
+                    && o.kind == "reaction"
+                    && o.emoji == op.emoji
+            }) {
+                let prev_add = ops[pos].add;
+                ops.remove(pos);
+                if prev_add != op.add {
+                    // add then remove (or vice-versa) of the same emoji → no net change.
+                    save_ops(config_dir, &ops);
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+    ops.push(op);
+    if ops.len() > MAX_OPS {
+        let drop = ops.len() - MAX_OPS;
+        ops.drain(0..drop);
+    }
+    save_ops(config_dir, &ops);
+}
+
+/// Drop a delivered op by id.
+pub fn ack_op(config_dir: &Path, op_id: &str) {
+    let _guard = LOCK.lock().unwrap();
+    let mut ops = load_ops(config_dir);
+    let before = ops.len();
+    ops.retain(|o| o.id != op_id);
+    if ops.len() != before {
+        save_ops(config_dir, &ops);
+    }
+}
+
+/// Pending ops oldest-first, pruning any older than OP_MAX_AGE_MS (a peer who never
+/// returns shouldn't pin the queue forever).
+pub fn pending_ops(config_dir: &Path) -> Vec<ChatOp> {
+    let _guard = LOCK.lock().unwrap();
+    let mut ops = load_ops(config_dir);
+    let now = now_ms();
+    let before = ops.len();
+    ops.retain(|o| now.saturating_sub(o.ts) < OP_MAX_AGE_MS);
+    if ops.len() != before {
+        save_ops(config_dir, &ops);
+    }
+    ops.sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
+    ops
+}
+
+/// The delivery status of a message WE sent (the op ordering gate). None if we don't
+/// have it — the target is the PEER's own message, or it aged out of our store.
+pub fn message_status(config_dir: &Path, peer_id: &str, msg_id: &str) -> Option<String> {
+    let _guard = LOCK.lock().unwrap();
+    load_all(config_dir)
+        .get(peer_id)?
+        .iter()
+        .find(|m| m.id == msg_id && m.from_me)
+        .and_then(|m| m.status.clone())
+}
+
 /// All messages WE sent that haven't been delivered yet ("sending"/"failed"),
 /// oldest first — the outbox the retry loop flushes when a peer comes online.
 pub fn outbox(config_dir: &Path) -> Vec<ChatMessage> {
@@ -504,6 +626,86 @@ mod tests {
         assert_eq!(all[0].status.as_deref(), Some("read"));
         assert_eq!(all[1].status.as_deref(), Some("read"));
         assert_eq!(all[2].status, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn op(peer: &str, target: &str, kind: &str, emoji: &str, add: bool, ts: u64) -> ChatOp {
+        ChatOp {
+            id: format!("op-{kind}-{target}-{emoji}-{ts}-{}", std::process::id()),
+            peer_id: peer.into(),
+            target_id: target.into(),
+            kind: kind.into(),
+            emoji: emoji.into(),
+            add,
+            text: String::new(),
+            ts,
+        }
+    }
+    fn ops_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("db-chatops-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d); // start clean (process-id dirs can recur)
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn enqueue_op_coalesces_to_local_final_state() {
+        let dir = ops_dir("coalesce");
+        // Recent timestamps so pending_ops' 7-day age prune doesn't drop them.
+        let t = now_ms();
+        // Two edits → only the latest text survives.
+        let mut e1 = op("p", "m", "edit", "", false, t);
+        e1.text = "first".into();
+        enqueue_op(&dir, e1);
+        let mut e2 = op("p", "m", "edit", "", false, t + 1);
+        e2.text = "second".into();
+        enqueue_op(&dir, e2);
+        let edits: Vec<_> = pending_ops(&dir).into_iter().filter(|o| o.kind == "edit").collect();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].text, "second");
+        // Reaction add then remove of the SAME emoji nets to nothing.
+        enqueue_op(&dir, op("p", "m", "reaction", "👍", true, t + 2));
+        enqueue_op(&dir, op("p", "m", "reaction", "👍", false, t + 3));
+        assert!(pending_ops(&dir).iter().all(|o| o.kind != "reaction"), "add+remove cancels");
+        // A delete supersedes any queued op for that target.
+        enqueue_op(&dir, op("p", "m", "reaction", "🎉", true, t + 4));
+        enqueue_op(&dir, op("p", "m", "delete", "", false, t + 5));
+        let after = pending_ops(&dir);
+        assert_eq!(after.iter().filter(|o| o.target_id == "m").count(), 1);
+        assert_eq!(after.iter().find(|o| o.target_id == "m").unwrap().kind, "delete");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ack_and_prune_ops() {
+        let dir = ops_dir("ackprune");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut keep = op("p", "m", "reaction", "👍", true, now_ms());
+        keep.id = "keep".into();
+        enqueue_op(&dir, keep);
+        // An op older than the 7-day max age is pruned by pending_ops.
+        let mut old = op("p", "m2", "edit", "", false, now_ms().saturating_sub(8 * 24 * 60 * 60 * 1000));
+        old.id = "old".into();
+        enqueue_op(&dir, old);
+        let got = pending_ops(&dir);
+        assert!(got.iter().any(|o| o.id == "keep"));
+        assert!(!got.iter().any(|o| o.id == "old"), "aged-out op pruned");
+        ack_op(&dir, "keep");
+        assert!(pending_ops(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn message_status_gate_distinguishes_ours_from_theirs() {
+        let dir = ops_dir("status");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut m = msg("mm", "p", 1, 1, true);
+        m.status = Some("delivered".into());
+        append(&dir, &m);
+        append(&dir, &msg("theirs", "p", 2, 2, false)); // the peer's own message
+        assert_eq!(message_status(&dir, "p", "mm").as_deref(), Some("delivered"));
+        assert_eq!(message_status(&dir, "p", "theirs"), None); // not from_me → None
+        assert_eq!(message_status(&dir, "p", "nope"), None); // unknown
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
