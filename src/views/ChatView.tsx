@@ -789,13 +789,37 @@ function FolderSyncRow({
   })()
 
   const many = entries.length > 8
+
+  // A specific, human description of what happened — name the file/folder + the
+  // action — instead of a vague "added · folder · bytes".
+  const who = mine ? 'You' : (ev.from && ev.from.trim()) || friendName
+  const baseOf = (p: string) => p.split('/').pop() || p
+  const summary = (() => {
+    if (ev.action === 'moved' && ev.moves?.length) {
+      if (ev.moves.length === 1) {
+        const m = ev.moves[0]
+        return `moved ${baseOf(m.from)} → ${m.to}`
+      }
+      return `moved ${ev.moves.length} items in ${folderName}`
+    }
+    if (entries.length === 1) {
+      const e = entries[0]
+      if (e.kind === 'dir')
+        return `added the folder ${e.name} (${e.count} item${e.count === 1 ? '' : 's'}) to ${folderName}`
+      return `added ${baseOf(e.rel)} to ${folderName}`
+    }
+    return `added ${ev.files.length} items to ${folderName}`
+  })()
+  const showBytes = ev.action !== 'moved' && ev.bytes > 0
+
   return (
     <div className={`sync-row${mine ? ' mine' : ''}`}>
       <div className="sync-stack">
         <div className="sync-cap">
           <FolderOpen size={11} />
           <span>
-            {mine ? 'You added' : `${(ev.from && ev.from.trim()) || friendName} added`} · {folderName} · {formatBytes(ev.bytes)}
+            {who} {summary}
+            {showBytes ? ` · ${formatBytes(ev.bytes)}` : ''}
           </span>
         </div>
         {many ? (

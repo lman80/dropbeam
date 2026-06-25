@@ -1340,11 +1340,22 @@ impl SyncManager {
                         // the old path and reconciles back to us as a DUPLICATE.
                         let detected =
                             detect_moves_from_index(&ino_index.lock().unwrap(), &prev_manifest, &lm);
+                        // Surface moves in the chat timeline ("You moved X → Y") — they
+                        // were previously invisible there (only file ADDS emitted). One
+                        // batched event per reconcile round, so a bulk reorg is one row.
+                        let mut moved_pairs: Vec<serde_json::Value> = Vec::new();
                         for (from, to, sz, mt) in detected {
                             note_move(
                                 &manager.config_dir, &pair_id, &moves, &from, &to, sz, mt, now_ms(),
                             );
                             log::info!("folder move detected (reconcile): {from:?} → {to:?}");
+                            moved_pairs.push(serde_json::json!({ "from": from, "to": to }));
+                        }
+                        if !moved_pairs.is_empty() {
+                            let _ = manager.app.emit(
+                                "folder-synced",
+                                serde_json::json!({ "pairId": pair_id, "direction": "send", "action": "moved", "moves": moved_pairs }),
+                            );
                         }
                         let mut idx = ino_index.lock().unwrap();
                         idx.clear();
@@ -1727,11 +1738,13 @@ impl SyncManager {
         // viewer peer can't reorganize our folder.
         if mirror && !peer_is_viewer && !locally_paused && !moves.is_empty() {
             let mut moved_any = false;
+            let mut moved_pairs: Vec<serde_json::Value> = Vec::new();
             for (from, to, size, mtime) in moves {
                 if apply_remote_move(
                     &folder, from, to, *size, *mtime, &self_deleted, &inbound, DELETE_GRACE_MS,
                 ) {
                     moved_any = true;
+                    moved_pairs.push(serde_json::json!({ "from": from, "to": to }));
                     let from_n = norm_rel(from);
                     inbound
                         .lock()
@@ -1741,6 +1754,22 @@ impl SyncManager {
             }
             if moved_any {
                 let _ = self.app.emit("folder-history://changed", pair_id);
+                // Surface the peer's reorganization in the chat timeline too, so moves
+                // are bidirectional like adds ("<name> moved X → Y"). Provenance name
+                // mirrors note_received; empty → null so the UI falls back to the label.
+                let from_name = {
+                    let p = config.lock().unwrap();
+                    p.endpoint_id
+                        .as_deref()
+                        .and_then(|e| friends::label_for_endpoint(&self.config_dir, e))
+                        .filter(|n| !n.trim().is_empty())
+                        .unwrap_or_else(|| p.peer_name.clone())
+                };
+                let from_opt = (!from_name.trim().is_empty()).then(|| from_name);
+                let _ = self.app.emit(
+                    "folder-synced",
+                    serde_json::json!({ "pairId": pair_id, "direction": "receive", "action": "moved", "moves": moved_pairs, "from": from_opt }),
+                );
             }
         }
 

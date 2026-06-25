@@ -509,6 +509,11 @@ export interface FolderSynced {
   /** Who these files came from (your saved label for them, else their broadcast
    *  name). Only present on the receive side; absent on send and older engines. */
   from?: string
+  /** What happened: 'added' (default — files synced) or 'moved' (files relocated
+   *  within the folder). Absent on older engines → treated as 'added'. */
+  action?: 'added' | 'moved'
+  /** For action='moved': the from→to relative paths of each relocated file. */
+  moves?: { from: string; to: string }[]
 }
 
 /** A shared-folder transfer just completed (one file delivered or received). */

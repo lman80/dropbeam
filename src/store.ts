@@ -234,6 +234,10 @@ export interface FolderActivityEvent {
   pairId: string
   /** Who the files came from, on the receive side (#12). Absent on send / older data. */
   from?: string
+  /** What happened: 'added' (default) or 'moved' (relocated within the folder). */
+  action?: 'added' | 'moved'
+  /** For action='moved': the from→to relative paths of each relocated file. */
+  moves?: { from: string; to: string }[]
 }
 
 const FOLDER_ACTIVITY_KEY = 'dropbeam-folder-activity-v2'
@@ -449,7 +453,8 @@ export const useStore = create<AppStore>((set, get) => ({
       // MAIN WINDOW ONLY — the HUD/popover windows share this localStorage, so
       // logging there too would double every entry.
       const syncedFiles = s.files ?? []
-      if (!isOverlay && syncedFiles.length > 0) {
+      const isMove = s.action === 'moved' && (s.moves?.length ?? 0) > 0
+      if (!isOverlay && (syncedFiles.length > 0 || isMove)) {
         set((st) => {
           const ev: FolderActivityEvent = {
             id: `fa-${s.pairId}-${Date.now()}-${Math.round(Math.random() * 1e6)}`,
@@ -459,6 +464,8 @@ export const useStore = create<AppStore>((set, get) => ({
             bytes: s.bytes ?? 0,
             pairId: s.pairId,
             from: s.from,
+            action: s.action,
+            moves: s.moves,
           }
           const list = [...(st.folderActivity[s.pairId] ?? []), ev].slice(-200)
           const folderActivity = { ...st.folderActivity, [s.pairId]: list }
