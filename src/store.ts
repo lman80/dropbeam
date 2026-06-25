@@ -153,6 +153,9 @@ interface AppStore {
   /** Re-run a failed friend/Quick Send with the same files + recipient (one tap).
    *  No-op if the original payload is no longer known or the card isn't failed. */
   retryTransfer: (id: string) => Promise<void>
+  /** Resend ONLY the bytes for a failed chat file-note card (no new chat note), and
+   *  re-link the SAME card to the fresh transfer so it can recover/re-flag in place. */
+  resendChatFile: (peerId: string, msgId: string, xferId: string) => Promise<void>
   reloadHistory: () => Promise<void>
   reloadPairs: () => Promise<void>
   updatePair: (u: PairUpdate) => Promise<void>
@@ -300,6 +303,45 @@ const activeReceives = new Map<string, string>()
 // Per-peer "stopped typing" safety timers, so a lost "off" signal can't leave the
 // typing indicator stuck on forever (see onChatTyping).
 const typingTimers: Record<string, ReturnType<typeof setTimeout>> = {}
+// Correlates a file transfer to the chat file-note card it belongs to, so when the
+// BYTES fail (a separate transfer from the durable note) the card can flip to "tap to
+// resend" instead of lying that the file arrived. Kept in localStorage (NOT a
+// per-webview Map) because a send started in the menu-bar popover posts the card to
+// the MAIN window via broadcast, and that window's upsertTransfer hook must read the
+// same link to flip the card. Bounded; cleared when the transfer succeeds.
+const CHATXFER_KEY = 'dropbeam-chat-file-xfer'
+function loadChatFileXfer(): Record<string, { peerId: string; msgId: string }> {
+  try {
+    return JSON.parse(localStorage.getItem(CHATXFER_KEY) || '{}') as Record<
+      string,
+      { peerId: string; msgId: string }
+    >
+  } catch {
+    return {}
+  }
+}
+function setChatFileXfer(id: string, link: { peerId: string; msgId: string }): void {
+  try {
+    const all = loadChatFileXfer()
+    all[id] = link
+    const ids = Object.keys(all)
+    if (ids.length > 50) for (const k of ids.slice(0, ids.length - 50)) delete all[k]
+    localStorage.setItem(CHATXFER_KEY, JSON.stringify(all))
+  } catch {
+    /* best-effort */
+  }
+}
+function deleteChatFileXfer(id: string): void {
+  try {
+    const all = loadChatFileXfer()
+    if (id in all) {
+      delete all[id]
+      localStorage.setItem(CHATXFER_KEY, JSON.stringify(all))
+    }
+  } catch {
+    /* best-effort */
+  }
+}
 
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
@@ -763,6 +805,18 @@ export const useStore = create<AppStore>((set, get) => ({
     }
     if (u.state === 'completed' || u.state === 'failed' || u.state === 'canceled') {
       transferStart.delete(u.id)
+      // If this transfer's bytes belong to a chat file-note card, reflect its outcome
+      // on the card: flag "tap to resend" on failure, clear it on a successful resend.
+      const link = loadChatFileXfer()[u.id]
+      if (link) {
+        const card = (get().chats[link.peerId] ?? []).find((x) => x.id === link.msgId)
+        if (u.state === 'failed') {
+          if (card) get().addChatMessage({ ...card, fileXferFailed: true, fileXferId: u.id })
+        } else {
+          if (card && card.fileXferFailed) get().addChatMessage({ ...card, fileXferFailed: false })
+          deleteChatFileXfer(u.id)
+        }
+      }
     }
     set((s) => ({
       transfers: { ...s.transfers, [u.id]: u },
@@ -790,6 +844,26 @@ export const useStore = create<AppStore>((set, get) => ({
     get().removeTransfer(id)
     if (payload.kind === 'friend') await get().sendToFriend(payload.id, payload.paths)
     else await get().sendPaths(payload.paths)
+  },
+
+  resendChatFile: async (peerId, msgId, xferId) => {
+    const payload = loadRetryPayloads()[xferId]
+    if (!payload || payload.kind !== 'friend') return
+    try {
+      // Re-send the BYTES only — api.sendToFriend (the raw transfer), NOT the store
+      // action that also posts a fresh chat note. That avoids a duplicate file card
+      // on every resend; the recipient's engine dedup prevents a double-delivery.
+      const t = await api.sendToFriend(payload.id, payload.paths)
+      setRetryPayload(t.id, payload)
+      setChatFileXfer(t.id, { peerId, msgId })
+      // Re-link the SAME card to the fresh transfer + clear the failed flag, so this
+      // card (not a new one) recovers on success or re-flags on another failure.
+      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId)
+      if (card) get().addChatMessage({ ...card, fileXferFailed: false, fileXferId: t.id })
+      get().upsertTransfer(t)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
   },
 
   reloadHistory: async () => {
@@ -854,7 +928,10 @@ export const useStore = create<AppStore>((set, get) => ({
       try {
         const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
         const m = await api.sendChatFileNote(id, names, u.bytesTotal || 0, paths)
-        get().addChatMessage(m)
+        // Tie this transfer's bytes to its chat card (see shareFilesInChat) so a
+        // failed direct send flips the card to "tap to resend".
+        setChatFileXfer(u.id, { peerId: id, msgId: m.id })
+        get().addChatMessage({ ...m, fileXferId: u.id })
       } catch {
         /* note is best-effort */
       }
@@ -969,10 +1046,14 @@ export const useStore = create<AppStore>((set, get) => ({
     if (!paths.length) return
     try {
       const t = await api.sendToFriend(friendId, paths)
+      setRetryPayload(t.id, { kind: 'friend', id: friendId, paths })
       get().upsertTransfer(t)
       const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
       const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths)
-      get().addChatMessage(m)
+      // Tie this transfer's bytes to THIS card, so a later failure flips it to
+      // "tap to resend" rather than leaving a card for a file that never arrived.
+      setChatFileXfer(t.id, { peerId: friendId, msgId: m.id })
+      get().addChatMessage({ ...m, fileXferId: t.id })
     } catch (e) {
       get().toast('error', String(e))
     }

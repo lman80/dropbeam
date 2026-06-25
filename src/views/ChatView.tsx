@@ -1146,6 +1146,9 @@ function FileMessage({
   const canPreview = !!m.path && HAS_TAURI && !broken
   const src = canPreview ? convertFileSrc(m.path!) : null
   const open = () => m.path && api.openPath(m.path).catch(() => {})
+  const resendChatFile = useStore((s) => s.resendChatFile)
+  // A file whose bytes never landed must not look openable.
+  const openable = !!m.path && !m.fileXferFailed
 
   const multi = m.files.length > 1
   const GlyphIcon = kind === 'video' ? Video : kind === 'audio' ? Music : kind === 'text' ? FileText : FileIcon
@@ -1172,9 +1175,9 @@ function FileMessage({
       )}
 
       <div
-        className={`chat-file${m.path ? ' clickable' : ''}`}
-        onClick={m.path ? open : undefined}
-        title={m.path ? 'Open' : undefined}
+        className={`chat-file${openable ? ' clickable' : ''}`}
+        onClick={openable ? open : undefined}
+        title={openable ? 'Open' : undefined}
       >
         <span className={`chat-file-ic${mine ? ' mine' : ''}`}>
           <GlyphIcon size={16} />
@@ -1184,6 +1187,15 @@ function FileMessage({
           {m.bytes > 0 && <div className="chat-file-size">{formatBytes(m.bytes)}</div>}
         </div>
       </div>
+      {mine && m.fileXferFailed && m.fileXferId && (
+        <button
+          className="chat-file-resend"
+          onClick={() => void resendChatFile(m.peerId, m.id, m.fileXferId!)}
+          title="The file didn't finish sending — tap to resend"
+        >
+          Not delivered — tap to resend
+        </button>
+      )}
     </div>
   )
 }

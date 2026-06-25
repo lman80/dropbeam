@@ -235,6 +235,12 @@ export interface ChatMessage {
   deleted: boolean
   /** A GIF attachment — render a GIF bubble when present. */
   gif?: GifMeta | null
+  /** UI-only (never persisted, never on the wire): set on the SENDER's file card when
+   *  the byte transfer it describes ultimately failed, so the card can offer "tap to
+   *  resend" instead of implying the file arrived. Carries the failed transfer id so
+   *  the resend reuses the dedup-safe retryTransfer. */
+  fileXferFailed?: boolean
+  fileXferId?: string
 }
 
 /** A preview of one conversation, for the chat list. */

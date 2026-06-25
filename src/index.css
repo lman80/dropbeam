@@ -1012,6 +1012,21 @@ html.overlay-window #root {
   font-size: 11.5px;
   opacity: 0.7;
 }
+.chat-file-resend {
+  margin-top: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--red);
+  background: var(--red-soft);
+  border: none;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.chat-file-resend:hover {
+  filter: brightness(0.97);
+}
 
 /* ── Chat v2: reactions, replies, edit/delete, typing, GIFs, polish ───────── */
 .chat-state.read {

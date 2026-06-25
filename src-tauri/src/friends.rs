@@ -480,6 +480,54 @@ pub fn self_heal_chat_sender(
         }
     }
 
+    // 2b) A real record for this person already exists but is endpoint-UNKEYED and
+    //     was filed under a DIFFERENT id than `claimed_id` (the classic phantom case:
+    //     a permanent-code / folder-pairing friend whose wire `friendId` is the
+    //     SENDER's foreign per-device uuid, so steps 1 & 2 both miss). Adopt it by
+    //     NAME and key it to this endpoint id instead of spawning a phantom. Mirrors
+    //     plan_reconcile's name-merge rule (the `either_unkeyed && !is_placeholder &&
+    //     name-match && !both_have_chat` invariant) and carries the SAME guards so two
+    //     distinct people can never be fused: a real non-placeholder name, the
+    //     candidate must be endpoint-UNKEYED (a record keyed to a different eid is a
+    //     provably different device — never touched), the UNIQUE name match only
+    //     (ambiguous → fall through to a fresh record), and refuse when BOTH the
+    //     candidate and the claimed-id thread already hold chat history.
+    if !name.is_empty() && !is_placeholder(name) {
+        let matches: Vec<usize> = friends
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.endpoint_id.is_none() && f.name.trim().eq_ignore_ascii_case(name))
+            .map(|(i, _)| i)
+            .collect();
+        if matches.len() == 1 {
+            let i = matches[0];
+            let cand_id = friends[i].id.clone();
+            let claimed_has_chat = claimed_id
+                .filter(|id| !id.is_empty())
+                .map(|id| !crate::chat::messages(config_dir, id).is_empty())
+                .unwrap_or(false);
+            let cand_has_chat = !crate::chat::messages(config_dir, &cand_id).is_empty();
+            if !(claimed_has_chat && cand_has_chat) {
+                // Key the existing record to the sender's cryptographic endpoint id so
+                // replies dial back AND future messages resolve by eid (step 1).
+                friends[i].endpoint_id = Some(endpoint_id.to_string());
+                if !friends[i].name_custom && friends[i].name != name {
+                    friends[i].name = name.to_string();
+                }
+                let out = friends[i].clone();
+                let _ = save(config_dir, &friends);
+                // Fold any messages a PRIOR buggy build already stored under the
+                // foreign claimed id onto this canonical record (idempotent union;
+                // no-op when the claimed thread is empty — the common live case,
+                // since resolution runs BEFORE chat::append).
+                if let Some(id) = claimed_id.filter(|id| !id.is_empty() && *id != out.id) {
+                    crate::chat::merge_threads(config_dir, id, &out.id);
+                }
+                return Some(out);
+            }
+        }
+    }
+
     // 3) No record at all — recreate a minimal reachable one. Reuse the claimed id
     //    when we have it so the new friend lines up with the already-stored thread.
     let friend = Friend {
@@ -872,6 +920,99 @@ mod tests {
         let _ = save(&dir, &[custom]);
         let healed = self_heal_chat_sender(&dir, "EIDR", "RawDeviceName", None).unwrap();
         assert_eq!(healed.name, "My Bestie");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Seed a received chat message under `peer` so the both-have-chat guard can be
+    // exercised (a real conversation already exists under that record id).
+    fn seed_msg(dir: &Path, peer: &str) {
+        let _ = crate::chat::append(
+            dir,
+            &crate::chat::ChatMessage {
+                id: format!("m-{peer}"),
+                peer_id: peer.into(),
+                from_me: false,
+                kind: "text".into(),
+                text: "hi".into(),
+                files: vec![],
+                bytes: 0,
+                path: None,
+                status: None,
+                ts: 1,
+                seq: 1,
+                reply_to: None,
+                reply_preview: None,
+                reactions: vec![],
+                edited: false,
+                deleted: false,
+                gif: None,
+            },
+        );
+    }
+
+    #[test]
+    fn self_heal_adopts_unkeyed_name_match_no_phantom() {
+        // #19/#18: an inbound message from a permanent-code friend whose wire friendId
+        // is a FOREIGN per-device uuid must ADOPT the existing endpoint-unkeyed record
+        // (the one the open ChatView is subscribed to), NOT spawn a phantom.
+        let dir = tmp("adopt");
+        let _ = save(&dir, &[f("local-uuid", "Mong", None, 5)]);
+        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
+        assert_eq!(healed.id, "local-uuid"); // reused the existing record
+        assert_eq!(healed.endpoint_id.as_deref(), Some("EID")); // …now keyed
+        assert_eq!(load(&dir).len(), 1); // NO phantom
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_heal_does_not_adopt_when_two_share_name() {
+        // Ambiguous: two endpoint-unkeyed records share the name → never guess; fall
+        // through to a fresh record rather than fuse the wrong one.
+        let dir = tmp("ambiguous");
+        let _ = save(&dir, &[f("u1", "Mong", None, 5), f("u2", "Mong", None, 6)]);
+        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
+        assert!(healed.id != "u1" && healed.id != "u2"); // a new record
+        assert_eq!(load(&dir).len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_heal_does_not_adopt_record_keyed_to_other_eid() {
+        // A record already keyed to a DIFFERENT endpoint id is a provably different
+        // device — never adopt it by name.
+        let dir = tmp("otherkey");
+        let _ = save(&dir, &[f("x", "Mong", Some("OTHER_EID"), 5)]);
+        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
+        assert!(healed.id != "x"); // a new record, the OTHER_EID one untouched
+        assert_eq!(load(&dir).len(), 2);
+        let other = load(&dir).into_iter().find(|fr| fr.id == "x").unwrap();
+        assert_eq!(other.endpoint_id.as_deref(), Some("OTHER_EID"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_heal_refuses_name_adopt_when_both_have_chat() {
+        // Two REAL conversations (one under the unkeyed candidate, one under the
+        // claimed id) must never be fused — mirrors reconcile_refuses_name_merge.
+        let dir = tmp("bothchat");
+        let _ = save(&dir, &[f("cand", "Mong", None, 5)]);
+        seed_msg(&dir, "cand");
+        seed_msg(&dir, "foreign-uuid");
+        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
+        assert!(healed.id != "cand"); // refused adoption → fresh record
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_heal_name_adopt_is_idempotent() {
+        // After the first adoption keys the record, a second inbound resolves by
+        // endpoint id (step 1) — same record, no new writes, no duplicate.
+        let dir = tmp("adopt-idem");
+        let _ = save(&dir, &[f("local-uuid", "Mong", None, 5)]);
+        let first = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
+        let second = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(load(&dir).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
