@@ -205,7 +205,11 @@ function previewOf(m: ChatMessage): string {
 }
 
 /** Causal order: logical seq first, then wall-clock, then id (stable tiebreak). */
-function byOrder(a: ChatMessage, b: ChatMessage): number {
+/** Canonical chat message order: Lamport seq first, wall-clock ts and id as
+ *  tiebreaks. Exported so the timeline render uses the SAME order as storage —
+ *  otherwise a pure-ts render re-sort renders messages out of order under peer
+ *  clock skew (e.g. a reply ahead of the message it quotes). */
+export function byOrder(a: ChatMessage, b: ChatMessage): number {
   return (a.seq ?? 0) - (b.seq ?? 0) || a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
 }
 
@@ -250,6 +254,9 @@ let lastFriendAt = 0
 // In-flight receives by ticket, so pasting the same code twice can't start two
 // pulls of the same files racing each other into "name (1)" duplicates.
 const activeReceives = new Map<string, string>()
+// Per-peer "stopped typing" safety timers, so a lost "off" signal can't leave the
+// typing indicator stuck on forever (see onChatTyping).
+const typingTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
@@ -411,7 +418,24 @@ export const useStore = create<AppStore>((set, get) => ({
         .catch(() => {})
       // Track main-window focus so the in-app sound (and read receipts) use the
       // same "are you looking at it" rule the Rust notifier does.
-      const onFocus = () => set({ windowFocused: true })
+      const onFocus = () => {
+        set({ windowFocused: true })
+        // If you're already viewing a chat when the window regains focus, that thread
+        // is now seen — clear its unread so the Dock/taskbar badge doesn't stay stuck
+        // at "17 new" (#27). OS focus alone never cleared it.
+        const s = get()
+        if (s.view === 'chat' && s.activeChatId) {
+          const peer = s.activeChatId
+          if ((s.chatUnread[peer] ?? 0) > 0) {
+            const chatUnread = { ...s.chatUnread, [peer]: 0 }
+            set({ chatUnread })
+            void api.setUnreadBadge(
+              Object.values(chatUnread).reduce((a, b) => a + b, 0),
+            )
+          }
+          get().markChatRead(peer)
+        }
+      }
       const onBlur = () => set({ windowFocused: false })
       window.addEventListener('focus', onFocus)
       window.addEventListener('blur', onBlur)
@@ -429,9 +453,29 @@ export const useStore = create<AppStore>((set, get) => ({
         // If it landed in the open + focused chat, it's been seen → read receipt.
         if (!m.fromMe && lookingHere) get().markChatRead(m.peerId)
       })
-      onChatTyping((t) =>
-        set((s) => ({ chatTyping: { ...s.chatTyping, [t.peerId]: t.on } })),
-      )
+      onChatTyping((t) => {
+        set((s) => ({ chatTyping: { ...s.chatTyping, [t.peerId]: t.on } }))
+        // Receiver-side safety net: the "stopped typing" signal is fire-once and can
+        // be lost (peer goes offline / relay flap), which left "typing…" stuck on
+        // forever. Auto-clear ~8s after the last "typing on" if no fresh signal
+        // arrives. The sender heartbeats "on" every ~3s while actually typing (see
+        // ChatView.onType), so this never hides a genuinely-typing peer.
+        const prev = typingTimers[t.peerId]
+        if (prev) {
+          clearTimeout(prev)
+          delete typingTimers[t.peerId]
+        }
+        if (t.on) {
+          typingTimers[t.peerId] = setTimeout(() => {
+            delete typingTimers[t.peerId]
+            set((s) =>
+              s.chatTyping[t.peerId]
+                ? { chatTyping: { ...s.chatTyping, [t.peerId]: false } }
+                : s,
+            )
+          }, 8000)
+        }
+      })
     }
     // The control channel can learn the peer's name after the fact — reload pairs
     // so the folder shows who's in it (and clears the stale "waiting" state).
@@ -908,14 +952,23 @@ export const useStore = create<AppStore>((set, get) => ({
       const chatOverview = [row, ...s.chatOverview.filter((o) => o.peerId !== m.peerId)].sort(
         (a, b) => b.lastTs - a.lastTs,
       )
-      // Count it unread only if it's a brand-new incoming message and you're not
-      // actively looking at that chat (focused). Then reflect the new total on the
-      // Dock/taskbar badge.
-      const lookingHere = s.windowFocused && s.activeChatId === m.peerId
-      const chatUnread =
-        isNew && !m.fromMe && !lookingHere
-          ? { ...s.chatUnread, [m.peerId]: (s.chatUnread[m.peerId] ?? 0) + 1 }
-          : s.chatUnread
+      // Count it unread only when it's a brand-new incoming message you AREN'T
+      // actually looking at: the thread must be open (view === 'chat' && activeChatId)
+      // AND this window focused. Keeping the focus requirement holds the badge in
+      // lockstep with the OS banner and the in-app chime (both still gate on focus) —
+      // otherwise a chat left open while the window is minimized/backgrounded would
+      // notify by banner + sound yet never raise the badge (under-count). #27 ("always
+      // 17 new") is fixed instead by clearing the open thread when the window REGAINS
+      // focus (see onFocus above), plus the self-heal below: if a message lands in the
+      // open + focused thread, clear any residual count for that peer too.
+      const inOpenThread =
+        s.windowFocused && s.view === 'chat' && s.activeChatId === m.peerId
+      let chatUnread = s.chatUnread
+      if (isNew && !m.fromMe && !inOpenThread) {
+        chatUnread = { ...s.chatUnread, [m.peerId]: (s.chatUnread[m.peerId] ?? 0) + 1 }
+      } else if (inOpenThread && (s.chatUnread[m.peerId] ?? 0) > 0) {
+        chatUnread = { ...s.chatUnread, [m.peerId]: 0 }
+      }
       if (chatUnread !== s.chatUnread) {
         const total = Object.values(chatUnread).reduce((a, b) => a + b, 0)
         void api.setUnreadBadge(total)

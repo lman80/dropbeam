@@ -297,8 +297,14 @@ pub fn run() {
             let bg_marker = config_dir.join(".bg-ready-migrated");
             if !bg_marker.exists() {
                 loaded.launch_at_login = true;
-                let _ = settings::save(&config_dir, &loaded);
-                let _ = std::fs::write(&bg_marker, b"1");
+                // Only record the migration as done if the setting actually persisted.
+                // Writing the marker after a FAILED save (e.g. Windows write
+                // contention) would leave launch_at_login OFF yet the migration
+                // "done" forever — so the app never starts to receive in the
+                // background. On failure, leave the marker absent and retry next launch.
+                if settings::save(&config_dir, &loaded).is_ok() {
+                    let _ = std::fs::write(&bg_marker, b"1");
+                }
             }
             let want_autostart = loaded.launch_at_login;
             // Honor the saved internet upload cap from first launch.

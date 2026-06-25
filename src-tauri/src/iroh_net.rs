@@ -3397,8 +3397,11 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
         // PRE-FILTER: drop any file moved/deleted since the folder scan built this
         // batch, BEFORE the header is written — so the advertised manifest matches
         // the body byte-for-byte. A single vanished file used to fail the WHOLE
-        // folder send (the "File does not exist at path" / "folder send stalled"
-        // reports). The deletion still reaches the peer via the normal delete path.
+        // folder send (surfacing as "No such file or directory (os error 2)" and a
+        // stalled-then-requeued folder; the body open now also retries briefly and
+        // bails cleanly — see open_for_send). The deletion still reaches the peer via
+        // the normal delete path. (NB: the asset-protocol "File does not exist at
+        // path" log line is a SEPARATE, benign convertFileSrc 404 — not this race.)
         let meta = match std::fs::metadata(p) {
             Ok(m) => m,
             Err(e) => {
@@ -3540,6 +3543,38 @@ fn set_mtime_secs(path: &Path, secs: u64) {
     }
 }
 
+/// Open a source file for sending, riding out a TRANSIENT disappearance before
+/// concluding it's gone. There is a TOCTOU window between the manifest pre-filter
+/// (which re-stats every file) and this body open: an editor doing an atomic save
+/// (write-temp + rename-over) or a brief lock can make `File::open` momentarily
+/// return NotFound even though a valid file exists a moment later. A few quick
+/// retries ride that out so we send the REAL bytes instead of failing the batch.
+///
+/// If the file is genuinely gone after the retries we return a clean, typed error
+/// (rather than a raw `?` OS error). The caller aborts the batch — exactly as the
+/// existing mid-send delete guard does — and the removal reaches the peer via the
+/// normal delete path, so the next reconcile converges (the vanished file is dropped
+/// from that round's manifest). A non-NotFound IO error surfaces immediately.
+async fn open_for_send(path: &Path) -> Result<tokio::fs::File> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..3u32 {
+        match tokio::fs::File::open(path).await {
+            Ok(f) => return Ok(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)))
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!(
+        "source file was removed before its bytes were sent: {}{}",
+        path.display(),
+        last.map(|e| format!(" ({e})")).unwrap_or_default()
+    )
+}
+
 /// Classic single-stream folder body (the caller already wrote the header).
 async fn write_folder_body<F: Fn(u64, u64)>(
     send: &mut SendStream,
@@ -3552,7 +3587,7 @@ async fn write_folder_body<F: Fn(u64, u64)>(
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
     for (path, name, size, _) in items {
-        let mut f = tokio::fs::File::open(path).await?;
+        let mut f = open_for_send(path).await?;
         let mut since_check: u32 = 0;
         // Cut each file at its ADVERTISED size — the receiver consumes exactly
         // that many bytes per item, so a file that grows mid-send (a render still
@@ -4495,7 +4530,7 @@ async fn send_ranges_parallel<F: Fn(u64, u64)>(
             uni.write_all(&start.to_be_bytes()).await?;
             uni.write_all(&len.to_be_bytes()).await?;
             if len > 0 {
-                let mut f = tokio::fs::File::open(&path).await?;
+                let mut f = open_for_send(&path).await?;
                 f.seek(std::io::SeekFrom::Start(start)).await?;
                 let mut remaining = len;
                 let mut buf = vec![0u8; CHUNK];
@@ -4802,8 +4837,10 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
         // we're about to advertise matches exactly what the body will stream (the
         // receiver consumes precisely `header["items"]`). The vanished file's
         // removal propagates via the normal delete path; here it's just absent.
-        // Reported in diagnostics as "File does not exist at path" (17×) +
-        // "folder send stalled" — one moved file used to kill the entire batch.
+        // One moved file used to kill the entire batch (surfacing as "No such file
+        // or directory (os error 2)" + a stalled/requeued send). NB: the diagnostics
+        // "File does not exist at path" line is an unrelated, benign asset-protocol
+        // (convertFileSrc) 404, NOT produced by this send path.
         let meta = match std::fs::metadata(p) {
             Ok(m) => m,
             Err(e) => {
@@ -4933,7 +4970,7 @@ async fn write_files_body<F: Fn(u64, u64)>(
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
     for (path, name, size, _) in items {
-        let mut f = tokio::fs::File::open(path).await?;
+        let mut f = open_for_send(path).await?;
         // The receiver consumes EXACTLY the advertised size per item, so the
         // stream must match the header byte-for-byte. A file that GROWS between
         // stat and send (still downloading/copying, a live log) must be cut at
@@ -5637,6 +5674,28 @@ mod tests {
         let t1 = Instant::now();
         pace_bytes(CHUNK as u64).await;
         assert!(t1.elapsed().as_millis() < 50, "unlimited must not throttle");
+    }
+
+    #[tokio::test]
+    async fn open_for_send_opens_an_existing_file() {
+        let p = std::env::temp_dir().join(format!("dropbeam-ofs-ok-{}", std::process::id()));
+        std::fs::write(&p, b"hi").unwrap();
+        assert!(open_for_send(&p).await.is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn open_for_send_reports_a_vanished_file_cleanly() {
+        // A genuinely-gone file yields a clean, typed "removed before its bytes were
+        // sent" error (so the batch aborts like the mid-send delete guard), NOT a raw
+        // OS error. (It retries first, so this also proves the retry terminates.)
+        let p = std::env::temp_dir().join(format!("dropbeam-ofs-gone-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let err = open_for_send(&p).await.unwrap_err().to_string();
+        assert!(
+            err.contains("removed before its bytes were sent"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6383,8 +6442,9 @@ mod loopback_tests {
     }
 
     /// PRE-FILTER over loopback: a multi-file batch where ONE file is DELETED after
-    /// the path list is built but BEFORE the send runs (the exact race behind the
-    /// real "File does not exist at path" / "folder send stalled" reports). The send
+    /// the path list is built but BEFORE the send runs (the race that surfaced as
+    /// "No such file or directory" / a stalled-then-requeued send; the asset-protocol
+    /// "File does not exist at path" line is unrelated). The send
     /// must drop the vanished file from the manifest at finalize time and deliver
     /// the OTHERS intact — no error, sender/receiver perfectly in sync (advertised
     /// count == streamed count). Drives the REAL `send_files` → `gather_items`

@@ -24,7 +24,7 @@ import {
   X,
 } from 'lucide-react'
 import { api, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend } from '../lib/api'
-import { useStore, type FolderActivityEvent } from '../store'
+import { useStore, byOrder, type FolderActivityEvent } from '../store'
 import { EmptyState } from '../components/bits'
 import { ConnInspector } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
@@ -273,6 +273,7 @@ function Conversation({ friendId }: { friendId: string }) {
   const atBottomRef = useRef(true)
   const prevLenRef = useRef(messages.length)
   const typingSentRef = useRef(false)
+  const typingOnAtRef = useRef(0)
   const typingTimer = useRef<number | undefined>(undefined)
 
   // Live connection path to this friend, refreshed whenever they come online.
@@ -380,7 +381,15 @@ function Conversation({ friendId }: { friendId: string }) {
           folder: p.folder,
         }))
       }),
-    ].sort((a, b) => a.ts - b.ts || (a.kind === 'msg' ? -1 : 1))
+    ].sort((a, b) =>
+      // Messages keep their Lamport seq order (peer clock skew — e.g. the China/VPN
+      // path — can make a later message carry an earlier wall-clock ts, which a pure
+      // ts sort would render out of order, notably a reply ahead of its original).
+      // Folder-activity rows have no seq, so they interleave by their local ts.
+      a.kind === 'msg' && b.kind === 'msg'
+        ? byOrder(a.m, b.m)
+        : a.ts - b.ts || (a.kind === 'msg' ? -1 : 1),
+    )
     return rows.map((row, i) => {
       const prev = rows[i - 1]
       const next = rows[i + 1]
@@ -398,10 +407,16 @@ function Conversation({ friendId }: { friendId: string }) {
 
   const onType = (v: string) => {
     setText(v)
-    // Throttled typing beacon: send "on" once, refresh an "off" timer.
+    // Throttled typing beacon: heartbeat "on" while typing, refresh an "off" timer.
     if (!editing) {
-      if (v.trim() && !typingSentRef.current) {
+      const now = Date.now()
+      // Re-emit "on" at most every ~3s. The single-shot "on" used to never repeat,
+      // so the peer's receiver-side auto-clear (~8s, store.onChatTyping) would hide
+      // "typing…" mid-way through a long pause-free message. Heartbeating keeps it
+      // alive; the receiver clears promptly once the "off"/heartbeats stop.
+      if (v.trim() && (!typingSentRef.current || now - typingOnAtRef.current > 3000)) {
         typingSentRef.current = true
+        typingOnAtRef.current = now
         void api.sendTyping(friendId, true)
       }
       window.clearTimeout(typingTimer.current)
@@ -936,7 +951,10 @@ function MessageRow({
   }, [m.reactions])
 
   const replied = m.replyTo ? allById.find((x) => x.id === m.replyTo) : undefined
-  const quote = m.replyPreview ?? (replied ? quoteText(replied) : undefined)
+  // Prefer the LIVE original when it's on-device, so the quote reflects later edits
+  // or an unsend instead of the snapshot taken at reply time. Fall back to the stored
+  // preview only when we don't have the original (e.g. it predates our join).
+  const quote = replied ? quoteText(replied) : m.replyPreview
 
   const doReact = (emoji: string) => {
     setTray(false)

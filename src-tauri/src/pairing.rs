@@ -20,7 +20,6 @@ use sha2::{Digest, Sha256};
 
 use crate::friends;
 use crate::models::{DeleteMode, Pair, PairRole};
-use crate::settings::write_atomic;
 
 static LOCK: Mutex<()> = Mutex::new(());
 const INVITE_PREFIX: &str = "dropbeam1:";
@@ -30,25 +29,46 @@ pub fn pairs_path(config_dir: &Path) -> PathBuf {
 }
 
 pub fn load(config_dir: &Path) -> Vec<Pair> {
-    match fs::read_to_string(pairs_path(config_dir)) {
-        // Parse element-wise: one corrupt/forward-incompatible entry drops only
-        // ITSELF, never wiping every other shared folder (a plain from_str returns
-        // Err on any single bad element → unwrap_or_default would lose them all).
-        Ok(txt) => serde_json::from_str::<Vec<serde_json::Value>>(&txt)
-            .map(|vals| {
-                vals.into_iter()
-                    .filter_map(|v| serde_json::from_value(v).ok())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
+    // Resilient read (retry transient failures + recover from .bak), then parse
+    // element-wise: one corrupt/forward-incompatible entry drops only ITSELF, never
+    // wiping every other shared folder.
+    crate::settings::read_json_array_resilient(&pairs_path(config_dir))
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect()
+}
+
+/// Persist the shared-folder links. `allow_empty` MUST be true only for paths that
+/// legitimately empty the list (the user removing their last shared folder) — every
+/// other caller passes false so a stray empty list (a transient bad load / IO glitch)
+/// can never silently wipe a populated pairs.json. Wiping pairs.json is catastrophic:
+/// the user loses ALL shared folders and has to re-pair and re-sync every one. So we
+/// refuse it: if we're about to write `[]` but the file on disk still holds real
+/// links, abort rather than overwrite. (Mirrors the friends.rs guard.)
+fn save_inner(config_dir: &Path, pairs: &[Pair], allow_empty: bool) -> Result<(), String> {
+    let _ = fs::create_dir_all(config_dir);
+    let txt = serde_json::to_string_pretty(pairs).map_err(|e| e.to_string())?;
+    if pairs.is_empty() && !allow_empty {
+        // Use the resilient reader so a transiently-unreadable primary (with a good
+        // .bak) still blocks the empty write instead of clobbering it.
+        let on_disk = crate::settings::read_json_array_resilient(&pairs_path(config_dir)).len();
+        if on_disk > 0 {
+            log::warn!(
+                "pairing::save refused to overwrite {on_disk} existing shared folder(s) with an empty list"
+            );
+            return Err("refusing to clobber existing shared folders with an empty list".into());
+        }
     }
+    crate::settings::write_atomic_with_backup(
+        &pairs_path(config_dir),
+        txt.as_bytes(),
+        !pairs.is_empty() || allow_empty,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn save(config_dir: &Path, pairs: &[Pair]) -> Result<(), String> {
-    let _ = fs::create_dir_all(config_dir);
-    let txt = serde_json::to_string_pretty(pairs).map_err(|e| e.to_string())?;
-    write_atomic(&pairs_path(config_dir), txt.as_bytes()).map_err(|e| e.to_string())
+    save_inner(config_dir, pairs, false)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -561,7 +581,8 @@ pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
     let mut pairs = load(config_dir);
     pairs.retain(|p| p.id != id);
-    save(config_dir, &pairs)
+    // Legitimately empties pairs.json when removing your last shared folder.
+    save_inner(config_dir, &pairs, true)
 }
 
 /// The code phrase this side SENDS on.
@@ -1107,5 +1128,36 @@ mod tests {
         let theirs = after.iter().find(|p| p.id == "theirs").unwrap();
         assert_eq!(mine.owner_eid.as_deref(), Some("me")); // I claimed it
         assert_eq!(theirs.owner_eid, None); // I did NOT claim a folder I joined
+    }
+
+    #[test]
+    fn save_refuses_to_clobber_all_folders_with_empty() {
+        // pairs.json wipe = catastrophic (lose ALL shared folders). A stray empty list
+        // must be refused unless it's an explicit removal.
+        let dir = role_test_dir("clobber");
+        let link = group_pair("lb", "g1", Some("me"), Some("B"));
+        save(&dir, &[link]).unwrap();
+        assert!(save(&dir, &[]).is_err(), "empty list must be refused");
+        assert_eq!(load(&dir).len(), 1, "the folder still exists");
+        // A genuine remove (allow_empty via remove()) does empty it.
+        remove(&dir, "lb").unwrap();
+        assert_eq!(load(&dir).len(), 0);
+    }
+
+    #[test]
+    fn load_recovers_pairs_from_backup_when_primary_corrupt() {
+        // A transient corrupt/partial pairs.json must recover the real folders from the
+        // .bak, never silently drop every shared folder.
+        let dir = role_test_dir("bakrecover");
+        save(
+            &dir,
+            &[
+                group_pair("a", "g1", Some("me"), Some("B")),
+                group_pair("b", "g2", Some("me"), Some("C")),
+            ],
+        )
+        .unwrap();
+        std::fs::write(pairs_path(&dir), b"[{\"id\":\"a\"").unwrap(); // truncated
+        assert_eq!(load(&dir).len(), 2, "both folders recovered from .bak");
     }
 }

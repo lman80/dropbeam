@@ -195,6 +195,15 @@ fn redact(s: &str) -> String {
 /// Classify a raw log line — `None` means "not worth reporting". We deliberately
 /// only keep signals, not the routine chatter, so digests stay tiny.
 fn notable(line: &str) -> Option<&'static str> {
+    // Tauri's asset protocol logs "File does not exist at path: …" at ERROR level
+    // whenever a convertFileSrc avatar/thumbnail 404s (a missing/edited image — a
+    // benign UI miss, NOT an app fault). It was the single largest [ERROR] bucket on
+    // the dashboard (~194×), burying genuine failures. Drop it before the level
+    // checks. (It is NOT the folder-send race — that surfaces as "No such file or
+    // directory (os error 2)" — see iroh_net.rs.)
+    if line.contains("File does not exist at path") {
+        return None;
+    }
     if line.contains("[ERROR]") || line.contains("panicked") {
         Some("error")
     } else if line.contains("[WARN]") {
@@ -594,6 +603,13 @@ mod tests {
         );
         assert_eq!(
             notable("[2026-06-18][07:59:25][iroh_relay::client][DEBUG] Dialing relay dial_url=wss://x.iroh-canary.iroh.link"),
+            None
+        );
+        // Tauri's asset-protocol 404 (a missing avatar/thumbnail) is logged at ERROR
+        // but is benign UI noise — it must NOT count as an app error (it was the
+        // largest [ERROR] bucket on the dashboard, ~194×, burying real failures).
+        assert_eq!(
+            notable("[2026-06-18][07:59:25][ERROR] Asset protocol: File does not exist at path: /x/y.png"),
             None
         );
     }

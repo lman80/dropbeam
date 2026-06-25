@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::models::{Friend, PairRole};
-use crate::settings::write_atomic;
 
 static LOCK: Mutex<()> = Mutex::new(());
 const INVITE_PREFIX: &str = "dropbeamf1:";
@@ -29,19 +28,13 @@ pub fn friends_path(config_dir: &Path) -> PathBuf {
 }
 
 pub fn load(config_dir: &Path) -> Vec<Friend> {
-    match fs::read_to_string(friends_path(config_dir)) {
-        // Parse element-wise so one corrupt/forward-incompatible friend record
-        // drops only itself instead of wiping every friend (plain from_str would
-        // Err on a single bad element → unwrap_or_default loses them all).
-        Ok(txt) => serde_json::from_str::<Vec<serde_json::Value>>(&txt)
-            .map(|vals| {
-                vals.into_iter()
-                    .filter_map(|v| serde_json::from_value(v).ok())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+    // Resilient read (retry transient failures + recover from .bak), then parse
+    // element-wise so one corrupt/forward-incompatible friend record drops only
+    // itself instead of wiping every friend.
+    crate::settings::read_json_array_resilient(&friends_path(config_dir))
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect()
 }
 
 /// Persist the friends list. `allow_empty` MUST be true only for paths that
@@ -54,11 +47,9 @@ fn save_inner(config_dir: &Path, friends: &[Friend], allow_empty: bool) -> Resul
     let _ = fs::create_dir_all(config_dir);
     let txt = serde_json::to_string_pretty(friends).map_err(|e| e.to_string())?;
     if friends.is_empty() && !allow_empty {
-        let on_disk = fs::read_to_string(friends_path(config_dir))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(&t).ok())
-            .map(|v| v.len())
-            .unwrap_or(0);
+        // Use the resilient reader so a transiently-unreadable primary (with a good
+        // .bak) still blocks the empty write instead of clobbering it.
+        let on_disk = crate::settings::read_json_array_resilient(&friends_path(config_dir)).len();
         if on_disk > 0 {
             log::warn!(
                 "friends::save refused to overwrite {on_disk} existing friend(s) with an empty list"
@@ -66,7 +57,12 @@ fn save_inner(config_dir: &Path, friends: &[Friend], allow_empty: bool) -> Resul
             return Err("refusing to clobber existing friends with an empty list".into());
         }
     }
-    write_atomic(&friends_path(config_dir), txt.as_bytes()).map_err(|e| e.to_string())
+    crate::settings::write_atomic_with_backup(
+        &friends_path(config_dir),
+        txt.as_bytes(),
+        !friends.is_empty() || allow_empty,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn save(config_dir: &Path, friends: &[Friend]) -> Result<(), String> {
@@ -890,6 +886,57 @@ mod tests {
         // …but a legitimate "remove last friend" (allow_empty) does empty it.
         assert!(save_inner(&dir, &[], true).is_ok());
         assert_eq!(load(&dir).len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_recovers_from_backup_when_primary_corrupt() {
+        // The exact "lost my contacts after an update" wipe: a populated friends.json,
+        // then a transient corrupt/partial primary read. load() must recover the real
+        // records from the .bak that save keeps — NOT return [] (which would let a
+        // friend-hello save a shrunken 1-record list and wipe the rest).
+        let dir = tmp("bakrecover");
+        let _ = std::fs::create_dir_all(&dir);
+        save(
+            &dir,
+            &[
+                f("a", "Ann", Some("EIDA"), 1),
+                f("b", "Bob", Some("EIDB"), 2),
+                f("c", "Cy", Some("EIDC"), 3),
+            ],
+        )
+        .unwrap();
+        // Corrupt the primary (truncated JSON). The .bak still holds the good 3.
+        std::fs::write(friends_path(&dir), b"[{\"id\":\"a\",").unwrap();
+        assert_eq!(load(&dir).len(), 3, "must recover all 3 from .bak, not wipe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_clobber_guard_holds_when_primary_unreadable() {
+        // save(allow_empty=false) must still refuse to write [] when the .bak holds
+        // real records even though the primary is momentarily corrupt.
+        let dir = tmp("noclobber-corrupt");
+        let _ = std::fs::create_dir_all(&dir);
+        save(&dir, &[f("a", "Ann", Some("EIDA"), 1)]).unwrap();
+        std::fs::write(friends_path(&dir), b"not json at all").unwrap();
+        assert!(save(&dir, &[]).is_err(), "must refuse to clobber");
+        assert_eq!(load(&dir).len(), 1, "the one real record survives via .bak");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_last_friend_is_not_resurrected_by_backup() {
+        // A legitimate "remove my last friend" must stick even if the primary later
+        // corrupts — the .bak tracks the legit empty, so no zombie contact returns.
+        let dir = tmp("noresurrect");
+        let _ = std::fs::create_dir_all(&dir);
+        save(&dir, &[f("a", "Ann", Some("EIDA"), 1)]).unwrap();
+        remove(&dir, "a").unwrap();
+        assert_eq!(load(&dir).len(), 0, "removed friend stays gone");
+        // Now corrupt the primary; recovery must NOT bring back the removed contact.
+        std::fs::write(friends_path(&dir), b"garbage").unwrap();
+        assert_eq!(load(&dir).len(), 0, "no resurrection from a stale .bak");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

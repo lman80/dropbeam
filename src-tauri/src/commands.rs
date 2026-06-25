@@ -57,31 +57,35 @@ pub fn update_settings(
     // limit. 64 chars is ample for a name.
     let mut settings = settings;
     settings.display_name = settings.display_name.trim().chars().take(64).collect();
+
+    // Persist FIRST. If the disk write fails (e.g. Windows write contention), return
+    // the error WITHOUT mutating in-memory state or applying any live side effect —
+    // so memory never silently diverges from what's on disk (the frontend rolls its
+    // optimistic UI back on the Err). Only once it's durably saved do we apply it.
+    let (retention_changed, name_changed) = {
+        let guard = state.settings.lock().unwrap();
+        (
+            guard.folder_history_keep_days != settings.folder_history_keep_days
+                || guard.folder_history_budget_bytes != settings.folder_history_budget_bytes,
+            guard.display_name != settings.display_name,
+        )
+    };
+    settings::save(&state.config_dir, &settings)?;
+
+    // Saved — now apply live (no restart needed) and commit to in-memory state.
     apply_autostart(&app, settings.launch_at_login);
-    // Apply the internet upload cap live (0 = unlimited) — takes effect on the
-    // next chunk, no restart needed.
+    // Internet upload cap (0 = unlimited) — takes effect on the next chunk.
     crate::iroh_net::set_upload_limit_mbps(settings.upload_limit_mbps);
     crate::iroh_net::set_require_direct(settings.require_direct);
     crate::iroh_net::set_wait_for_direct(settings.wait_for_direct);
     crate::iroh_net::set_parallel_streams(settings.parallel_streams);
-    // Apply recovery-history retention live, then sweep so a tightened budget/age
-    // frees space immediately (not just on the next delete).
-    let retention_changed = {
-        let guard = state.settings.lock().unwrap();
-        guard.folder_history_keep_days != settings.folder_history_keep_days
-            || guard.folder_history_budget_bytes != settings.folder_history_budget_bytes
-    };
+    // Recovery-history retention, then sweep so a tightened budget/age frees space
+    // immediately (not just on the next delete).
     crate::folder_history::set_policy(
         settings.folder_history_keep_days,
         settings.folder_history_budget_bytes,
     );
-    let name_changed = {
-        let mut guard = state.settings.lock().unwrap();
-        let changed = guard.display_name != settings.display_name;
-        *guard = settings.clone();
-        changed
-    };
-    settings::save(&state.config_dir, &settings)?;
+    *state.settings.lock().unwrap() = settings.clone();
     if retention_changed {
         sweep_folder_history(&app, state.inner());
     }
@@ -318,6 +322,12 @@ pub fn export_diagnostics(
     let dest = downloads.join(format!("DropBeam-diagnostics-{now_ms}.txt"));
     std::fs::write(&dest, out.as_bytes()).map_err(|e| e.to_string())?;
     log::info!("export_diagnostics: wrote {} bytes to {dest:?}", out.len());
+    // Reveal it in Finder/Explorer so the user doesn't have to hunt through Downloads
+    // for the file they're about to send back. Best-effort — never fail the export.
+    {
+        use tauri_plugin_opener::OpenerExt;
+        let _ = app.opener().reveal_item_in_dir(&dest);
+    }
     Ok(dest.to_string_lossy().to_string())
 }
 
