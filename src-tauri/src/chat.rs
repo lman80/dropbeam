@@ -126,7 +126,10 @@ fn load_all(config_dir: &Path) -> HashMap<String, Vec<ChatMessage>> {
 
 fn save_all(config_dir: &Path, all: &HashMap<String, Vec<ChatMessage>>) {
     let _ = fs::create_dir_all(config_dir);
-    match serde_json::to_string_pretty(all) {
+    // Compact JSON, not pretty: chats.json is machine-read only and can reach MBs
+    // (2000 msgs/peer); pretty-printing roughly doubles the serialize+write cost on
+    // a file rewritten on every message/status/reaction.
+    match serde_json::to_string(all) {
         Ok(txt) => {
             // Don't swallow a failed write: a message can be emitted to the UI and
             // acked over the wire yet silently lost from chats.json (Windows handle
@@ -221,6 +224,12 @@ pub fn set_status(config_dir: &Path, peer_id: &str, msg_id: &str, status: &str) 
     let mut all = load_all(config_dir);
     let thread = all.get_mut(peer_id)?;
     let msg = thread.iter_mut().find(|m| m.id == msg_id)?;
+    // Already in this state → no rewrite, no UI re-emit. The outbox retry loop calls
+    // this every failed round for an offline peer; without the check it rewrote the
+    // entire (multi-MB) chats.json every ~12s all night.
+    if msg.status.as_deref() == Some(status) {
+        return None;
+    }
     msg.status = Some(status.to_string());
     let out = msg.clone();
     save_all(config_dir, &all);
@@ -379,7 +388,7 @@ fn load_ops(config_dir: &Path) -> Vec<ChatOp> {
 }
 fn save_ops(config_dir: &Path, ops: &[ChatOp]) {
     let _ = fs::create_dir_all(config_dir);
-    if let Ok(txt) = serde_json::to_string_pretty(ops) {
+    if let Ok(txt) = serde_json::to_string(ops) {
         if let Err(e) = write_atomic(&ops_path(config_dir), txt.as_bytes()) {
             log::error!("chat::save_ops failed to persist chat_ops.json: {e}");
         }
@@ -464,6 +473,14 @@ pub fn message_status(config_dir: &Path, peer_id: &str, msg_id: &str) -> Option<
         .and_then(|m| m.status.clone())
 }
 
+/// Cheap change signal for the outbox loop: the mtimes of chats.json + chat_ops.json.
+/// Lets an IDLE tick skip re-parsing the (potentially multi-MB) store entirely when
+/// nothing has been written since the last empty round.
+pub fn store_mtimes(config_dir: &Path) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
+    let m = |p: PathBuf| fs::metadata(p).and_then(|md| md.modified()).ok();
+    (m(chats_path(config_dir)), m(ops_path(config_dir)))
+}
+
 /// All messages WE sent that haven't been delivered yet ("sending"/"failed"),
 /// oldest first — the outbox the retry loop flushes when a peer comes online.
 pub fn outbox(config_dir: &Path) -> Vec<ChatMessage> {
@@ -537,6 +554,16 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("db-chat-test-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
     fn msg(id: &str, peer: &str, ts: u64, seq: u64, from_me: bool) -> ChatMessage {
         ChatMessage {
             id: id.into(),
@@ -561,7 +588,7 @@ mod tests {
 
     #[test]
     fn seq_orders_over_clock_skew() {
-        let dir = std::env::temp_dir().join(format!("db-chat-test-{}", now_ms()));
+        let dir = test_dir("seq");
         let p = "peer1";
         // A later seq with an EARLIER wall-clock must still sort last (skew-proof).
         append(&dir, &msg("a", p, 1000, 1, true));
@@ -575,7 +602,7 @@ mod tests {
 
     #[test]
     fn reactions_are_idempotent_and_toggle() {
-        let dir = std::env::temp_dir().join(format!("db-chat-test-{}", now_ms() + 1));
+        let dir = test_dir("react");
         let p = "peer2";
         append(&dir, &msg("x", p, 1, 1, true));
         // Same reaction applied twice = one entry (survives re-delivery).
@@ -595,7 +622,7 @@ mod tests {
 
     #[test]
     fn delete_tombstones_and_edit_marks() {
-        let dir = std::env::temp_dir().join(format!("db-chat-test-{}", now_ms() + 2));
+        let dir = test_dir("edit");
         let p = "peer3";
         append(&dir, &msg("e", p, 1, 1, true));
         apply_edit(&dir, p, "e", "edited!", true);
@@ -615,7 +642,7 @@ mod tests {
 
     #[test]
     fn read_receipt_marks_only_own_up_to_ts() {
-        let dir = std::env::temp_dir().join(format!("db-chat-test-{}", now_ms() + 3));
+        let dir = test_dir("read");
         let p = "peer4";
         append(&dir, &msg("a", p, 100, 1, true));
         append(&dir, &msg("b", p, 200, 2, true));

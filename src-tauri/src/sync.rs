@@ -853,12 +853,19 @@ impl SyncManager {
                         }
                         let ts = now_ms();
                         {
+                            let mut tomb_changed = false;
                             let mut pend = pd.lock().unwrap();
                             for t in &targets {
-                                note_tombstone(&cfgdir2, &pidc2, &tomb2, t, ts);
+                                tomb_changed |= note_tombstone(&tomb2, t, ts);
                                 if !pend.iter().any(|d| &d.rel == t) {
                                     pend.push(DeleteEvent { rel: t.clone(), ts });
                                 }
+                            }
+                            drop(pend);
+                            // ONE write for the whole delete batch (a big subfolder
+                            // used to rewrite the entire tombstone file per target).
+                            if tomb_changed {
+                                persist_tombstones(&cfgdir2, &pidc2, &tomb2);
                             }
                         }
                         // Forget the deleted files in the loop-guard manifest so a
@@ -1284,17 +1291,44 @@ impl SyncManager {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
         tauri::async_runtime::spawn(async move {
-            let ctrl_file = manager.config_dir.join(format!(".ctrl-out-{pair_id}.json"));
-            let ctrl_path = ctrl_file.to_string_lossy().to_string();
+            // One-time cleanup of the croc-era `.ctrl-out-<pair>.json` — it was written
+            // every round and read by NOTHING (the real control payload dials the peer
+            // directly). Older builds left one behind.
+            let _ = std::fs::remove_file(
+                manager.config_dir.join(format!(".ctrl-out-{pair_id}.json")),
+            );
             let mut offline_streak: u32 = 0;
             // Prior reconcile manifest (rel → entry), kept across rounds so the OS-agnostic
             // move detector can spot a vanished→appeared (Windows) relocation by size+mtime.
             // Task-local; no shared state needed.
             let mut prev_manifest: HashMap<String, FileEntry> = HashMap::new();
+            // When the previous round STARTED — the debounce floor below keys off it.
+            let mut last_round_start: Option<std::time::Instant> = None;
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }
+                // DEBOUNCE: a big drop lands in many batches and every ingest nudges
+                // control_wake, so without a floor this loop runs back-to-back rounds
+                // (each = TWO whole-folder walks + a full manifest send) for the entire
+                // multi-minute transfer, competing with the transfer itself for disk.
+                // Cap round frequency at ~1/15s — a burst of nudges coalesces into ONE
+                // round shortly after the drop settles. Skipped when a delete is
+                // pending (deletes must propagate briskly, unchanged).
+                if let Some(t0) = last_round_start {
+                    let since = t0.elapsed();
+                    let floor = Duration::from_secs(15);
+                    if since < floor && pending_deletes.lock().unwrap().is_empty() {
+                        tokio::select! {
+                            _ = tokio::time::sleep(floor - since) => {}
+                            _ = stop_notify.notified() => break,
+                        }
+                        if stopped.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                }
+                last_round_start = Some(std::time::Instant::now());
                 let (pair, settings) = {
                     let p = config.lock().unwrap().clone();
                     let s = manager
@@ -1315,14 +1349,6 @@ impl SyncManager {
                     settings.display_name.clone()
                 };
                 let dels: Vec<DeleteEvent> = pending_deletes.lock().unwrap().clone();
-                let dels_json: Vec<serde_json::Value> = dels
-                    .iter()
-                    .map(|d| serde_json::json!({ "rel": d.rel, "ts": d.ts }))
-                    .collect();
-                let payload = serde_json::json!({
-                    "v": 1, "name": my_name, "ts": now_ms(), "deletes": dels_json,
-                });
-                let _ = std::fs::write(&ctrl_file, payload.to_string());
 
                 // The self-heal reconcile snapshot: our full current file set +
                 // tombstones, so the peer can converge to identical (mirror only).
@@ -1484,7 +1510,6 @@ impl SyncManager {
                     break;
                 }
             }
-            let _ = std::fs::remove_file(&ctrl_file);
         });
     }
 
@@ -1777,6 +1802,7 @@ impl SyncManager {
         // read-only member (they shouldn't be changing the folder at all).
         if mirror && !peer_is_viewer && !locally_paused && !deletes.is_empty() {
             let mut applied: Vec<(String, u64)> = Vec::new();
+            let mut tomb_changed = false;
             for (rel, ts) in deletes {
                 let mut removed_rels: Vec<String> = Vec::new();
                 let did =
@@ -1791,13 +1817,18 @@ impl SyncManager {
                 // Tombstone the rel(s) so reconcile won't resurrect them and so the
                 // delete keeps propagating across a group. Always tombstone the
                 // named rel (even a no-op re-delivery) at the peer's timestamp.
-                note_tombstone(&self.config_dir, pair_id, &tombstones, rel, *ts);
+                tomb_changed |= note_tombstone(&tombstones, rel, *ts);
                 for r in &removed_rels {
-                    note_tombstone(&self.config_dir, pair_id, &tombstones, r, *ts);
+                    tomb_changed |= note_tombstone(&tombstones, r, *ts);
                 }
                 if did {
                     applied.push((rel.clone(), *ts));
                 }
+            }
+            // ONE write for the whole beacon's deletes (a 1,000-file bulk delete used
+            // to rewrite the entire tombstone file per entry — gigabytes of IO).
+            if tomb_changed {
+                persist_tombstones(&self.config_dir, pair_id, &tombstones);
             }
             if !applied.is_empty() {
                 let _ = self.app.emit("folder-history://changed", pair_id);
@@ -1882,13 +1913,14 @@ impl SyncManager {
         }
         let mut deleted_any = false;
         if apply_peer_deletes {
+            let mut tomb_changed = false;
             for rel in &plan.delete {
                 let tomb_ts = rec.tombstones.get(rel).copied().unwrap_or_else(now_ms);
                 let mut removed: Vec<String> = Vec::new();
                 if apply_remote_delete(folder, rel, self_deleted, &mut removed, DELETE_GRACE_MS) {
                     deleted_any = true;
                     for r in &removed {
-                        note_tombstone(&self.config_dir, pair_id, tombstones, r, tomb_ts);
+                        tomb_changed |= note_tombstone(tombstones, r, tomb_ts);
                         inbound
                             .lock()
                             .unwrap()
@@ -1907,7 +1939,12 @@ impl SyncManager {
                 if file_is_fresh(&Path::new(folder).join(norm_rel(rel)), DELETE_GRACE_MS) {
                     continue;
                 }
-                note_tombstone(&self.config_dir, pair_id, tombstones, rel, ts);
+                tomb_changed |= note_tombstone(tombstones, rel, ts);
+            }
+            // ONE write for the whole snapshot (a new member adopting a 9k-entry
+            // tombstone set used to rewrite the ~MB file once per entry ≈ GBs of IO).
+            if tomb_changed {
+                persist_tombstones(&self.config_dir, pair_id, tombstones);
             }
             if deleted_any {
                 let _ = self.app.emit("folder-history://changed", pair_id);
@@ -3172,7 +3209,10 @@ fn load_manifest(config_dir: &Path, pair_id: &str) -> HashSet<String> {
 
 fn save_manifest(config_dir: &Path, pair_id: &str, set: &HashSet<String>) {
     if let Ok(txt) = serde_json::to_string(set) {
-        let _ = std::fs::write(manifest_path(config_dir, pair_id), txt);
+        // write_atomic, NOT bare fs::write: this manifest is the inbound loop-guard —
+        // a crash mid-write would truncate it, load_manifest would fall back to empty,
+        // and seed_existing would re-queue the WHOLE folder for a pointless re-upload.
+        let _ = crate::settings::write_atomic(&manifest_path(config_dir, pair_id), txt.as_bytes());
     }
 }
 
@@ -3199,19 +3239,29 @@ fn save_tombstones(config_dir: &Path, pair_id: &str, map: &HashMap<String, u64>)
     let cutoff = now_ms().saturating_sub(TOMBSTONE_TTL_MS);
     let pruned: HashMap<&String, &u64> = map.iter().filter(|(_, &ts)| ts >= cutoff).collect();
     if let Ok(txt) = serde_json::to_string(&pruned) {
-        let _ = std::fs::write(tombstones_path(config_dir, pair_id), txt);
+        // write_atomic, NOT bare fs::write: tombstones are the only guard stopping the
+        // peer's reconcile from RESURRECTING deliberately deleted files. A crash
+        // mid-write would truncate the file, load_tombstones falls back to empty, and
+        // every prior delete comes back — the exact failure class this app has fought
+        // hardest.
+        let _ =
+            crate::settings::write_atomic(&tombstones_path(config_dir, pair_id), txt.as_bytes());
     }
 }
 
-/// Record `rel` as deleted at `ts` (keeping the NEWEST timestamp), in memory and
-/// on disk. No-op if an equal-or-newer tombstone already exists.
-fn note_tombstone(
-    config_dir: &Path,
-    pair_id: &str,
-    tomb: &Arc<Mutex<HashMap<String, u64>>>,
-    rel: &str,
-    ts: u64,
-) {
+/// Snapshot the in-memory tombstone map and persist it ONCE. Callers batch: record a
+/// whole burst via `note_tombstone` (memory-only), then persist once per scope. A
+/// bulk delete / first-sync adoption used to rewrite the entire (MB-scale on real
+/// machines) file once PER tombstone — O(N²) write amplification, gigabytes written.
+fn persist_tombstones(config_dir: &Path, pair_id: &str, tomb: &Arc<Mutex<HashMap<String, u64>>>) {
+    let snapshot = tomb.lock().unwrap().clone();
+    save_tombstones(config_dir, pair_id, &snapshot);
+}
+
+/// Record `rel` as deleted at `ts` (keeping the NEWEST timestamp), in MEMORY only.
+/// Returns whether anything changed; the caller persists once per batch via
+/// `persist_tombstones` — never re-add a per-call save here (see above).
+fn note_tombstone(tomb: &Arc<Mutex<HashMap<String, u64>>>, rel: &str, ts: u64) -> bool {
     // Clamp an absurd FUTURE timestamp down to ~now. A peer with a wildly-ahead
     // clock (or a malicious one) could otherwise stamp a tombstone "newer than
     // everything forever" and have reconcile delete files the user still wants.
@@ -3219,18 +3269,13 @@ fn note_tombstone(
     // fast clock won't reconcile-propagate (the live delete path still does), it
     // never causes an extra deletion.
     let ts = ts.min(now_ms().saturating_add(24 * 3600 * 1000));
-    let mut changed = false;
-    {
-        let mut t = tomb.lock().unwrap();
-        let e = t.entry(rel.to_string()).or_insert(0);
-        if ts > *e {
-            *e = ts;
-            changed = true;
-        }
-    }
-    if changed {
-        let snapshot = tomb.lock().unwrap().clone();
-        save_tombstones(config_dir, pair_id, &snapshot);
+    let mut t = tomb.lock().unwrap();
+    let e = t.entry(rel.to_string()).or_insert(0);
+    if ts > *e {
+        *e = ts;
+        true
+    } else {
+        false
     }
 }
 
@@ -3270,7 +3315,8 @@ fn save_moves(config_dir: &Path, pair_id: &str, map: &HashMap<String, MoveRec>) 
     let pruned: HashMap<&String, &MoveRec> =
         map.iter().filter(|(_, (_, _, _, ts))| *ts >= cutoff).collect();
     if let Ok(txt) = serde_json::to_string(&pruned) {
-        let _ = std::fs::write(moves_path(config_dir, pair_id), txt);
+        // write_atomic for crash-consistency, matching manifest/tombstones.
+        let _ = crate::settings::write_atomic(&moves_path(config_dir, pair_id), txt.as_bytes());
     }
 }
 
@@ -4642,13 +4688,19 @@ mod tests {
         // A peer claims a delete a century in the future → must be clamped to ~now,
         // so it can't sit "newer than everything forever" and delete wanted files.
         let absurd = now_ms() + 100 * 365 * 24 * 3600 * 1000;
-        note_tombstone(&dir, "p", &tomb, "x.mov", absurd);
+        assert!(note_tombstone(&tomb, "x.mov", absurd), "first record changes the map");
         let stored = *tomb.lock().unwrap().get("x.mov").unwrap();
         assert!(stored <= now_ms() + 24 * 3600 * 1000 + 1000, "clamped to ~now+1day");
         // A normal recent timestamp is kept as-is.
         let normal = now_ms().saturating_sub(5000);
-        note_tombstone(&dir, "p", &tomb, "y.mov", normal);
+        note_tombstone(&tomb, "y.mov", normal);
         assert_eq!(*tomb.lock().unwrap().get("y.mov").unwrap(), normal);
+        // An equal-or-older re-record is a no-op (returns false → no batch save).
+        assert!(!note_tombstone(&tomb, "y.mov", normal));
+        // Batched persistence round-trips through disk.
+        persist_tombstones(&dir, "p", &tomb);
+        let loaded = load_tombstones(&dir, "p");
+        assert_eq!(loaded.get("y.mov").copied(), Some(normal));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

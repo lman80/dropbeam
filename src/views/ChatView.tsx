@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   ArrowDown,
+  ArrowUp,
   Check,
   CheckCheck,
   Clock,
@@ -15,6 +16,7 @@ import {
   Music,
   Paperclip,
   Pencil,
+  Search,
   Send as SendIcon,
   Smile,
   Sparkles,
@@ -253,11 +255,20 @@ function Conversation({ friendId }: { friendId: string }) {
   const stageChatFiles = useStore((s) => s.stageChatFiles)
   const unstageChatFile = useStore((s) => s.unstageChatFile)
   const clearChatDraftFiles = useStore((s) => s.clearChatDraftFiles)
-  const friendSeen = useStore((s) => s.friendSeen)
-  const folderStatuses = useStore((s) => s.folderStatuses)
+  // PRIMITIVE presence selectors, not the whole friendSeen/folderStatuses records:
+  // folder://status events fire continuously during a big folder sync, and a
+  // record-level subscription re-rendered this entire (up to 2000-row) thread on
+  // every tick. A boolean/string only re-renders when presence actually changes.
+  const onlineNow = useStore((s) =>
+    friend ? friendOnlineState(friend.name, s.friendSeen, s.folderStatuses) === true : false,
+  )
+  const presenceText = useStore((s) =>
+    friend ? presenceLabel(friendPresence(friend.name, s.friendSeen, s.folderStatuses)) : '',
+  )
   const typing = useStore((s) => !!s.chatTyping[friendId])
   const giphyKey = useStore((s) => s.settings?.giphyApiKey ?? '')
   const setView = useStore((s) => s.setView)
+  const toast = useStore((s) => s.toast)
 
   const [text, setText] = useState('')
   const [reply, setReply] = useState<ChatMessage | null>(null)
@@ -267,6 +278,12 @@ function Conversation({ friendId }: { friendId: string }) {
   const [lightbox, setLightbox] = useState<string | null>(null)
   const [newCount, setNewCount] = useState(0)
   const [conn, setConn] = useState<ConnDetail | null>(null)
+  // In-thread search ("where's that link you sent?"): filters the loaded thread
+  // client-side; ↑/↓ jump between matches, Esc closes. Reaches the same ~2000-message
+  // window the thread itself keeps — no backend.
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQ, setSearchQ] = useState('')
+  const [searchIdx, setSearchIdx] = useState(0)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -277,10 +294,6 @@ function Conversation({ friendId }: { friendId: string }) {
   const typingTimer = useRef<number | undefined>(undefined)
 
   // Live connection path to this friend, refreshed whenever they come online.
-  const onlineNow = useMemo(
-    () => (friend ? friendOnlineState(friend.name, friendSeen, folderStatuses) === true : false),
-    [friend, friendSeen, folderStatuses],
-  )
   useEffect(() => {
     if (!onlineNow) {
       setConn(null)
@@ -402,8 +415,40 @@ function Conversation({ friendId }: { friendId: string }) {
       return { ...row, firstOfRun, lastOfRun, divider }
     })
   }, [messages, myPairs, folderActivity])
-  const presence = friendPresence(friend.name, friendSeen, folderStatuses)
-  const online = presence.status === 'online'
+  const online = onlineNow
+
+  // Message ids matching the search, in thread order (oldest → newest). Matches
+  // text, file names, and GIF attachments' titles.
+  const searchMatches = useMemo(() => {
+    const q = searchQ.trim().toLowerCase()
+    if (!searchOpen || !q) return []
+    return messages
+      .filter(
+        (m) =>
+          !m.deleted &&
+          (m.text.toLowerCase().includes(q) ||
+            m.files.some((f) => f.toLowerCase().includes(q))),
+      )
+      .map((m) => m.id)
+  }, [searchOpen, searchQ, messages])
+  const jumpToMatch = (idx: number) => {
+    if (!searchMatches.length) return
+    const clamped = ((idx % searchMatches.length) + searchMatches.length) % searchMatches.length
+    setSearchIdx(clamped)
+    document
+      .getElementById(`msg-${searchMatches[clamped]}`)
+      ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }
+  // A fresh query jumps to its MOST RECENT match (people search for recent things).
+  useEffect(() => {
+    if (searchMatches.length) jumpToMatch(searchMatches.length - 1)
+    else setSearchIdx(0)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQ, searchOpen])
+  const closeSearch = () => {
+    setSearchOpen(false)
+    setSearchQ('')
+  }
 
   const onType = (v: string) => {
     setText(v)
@@ -467,14 +512,22 @@ function Conversation({ friendId }: { friendId: string }) {
     scrollToBottom()
   }
 
-  const beginEdit = (m: ChatMessage) => {
+  const beginEdit = useCallback((m: ChatMessage) => {
     setEditing(m)
     setReply(null)
     setText(m.text)
     setShowEmoji(false)
     setShowGif(false)
     setTimeout(() => taRef.current?.focus(), 0)
-  }
+  }, [])
+  // Stable per-thread callbacks the memoized rows invoke with their OWN message —
+  // inline `() => {...row.m...}` closures would mint a fresh prop per row per render
+  // and defeat React.memo entirely.
+  const beginReply = useCallback((m: ChatMessage) => {
+    setReply(m)
+    setEditing(null)
+    taRef.current?.focus()
+  }, [])
   const cancelEdit = () => {
     setEditing(null)
     setText('')
@@ -486,6 +539,39 @@ function Conversation({ friendId }: { friendId: string }) {
     // drag-and-drop uses.
     const paths = await api.pickFiles()
     if (paths.length) stageChatFiles(paths)
+  }
+
+  // Cmd/Ctrl-V a screenshot straight into the chat: save the clipboard image to an
+  // app-managed folder and stage it as a chip — the same proven flow a dropped file
+  // uses. Text pastes are untouched (we only intercept when an image is present).
+  const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items ?? [])
+    const img = items.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
+    if (!img) return
+    e.preventDefault()
+    const blob = img.getAsFile()
+    if (!blob) return
+    // Reject oversized pastes BEFORE any encoding work — otherwise a 40 MB clipboard
+    // image would freeze the UI for seconds only to be refused on the Rust side.
+    if (blob.size > 25 * 1024 * 1024) {
+      toast('error', 'That image is too large to paste — save it as a file and drop it in.')
+      return
+    }
+    try {
+      // base64 via FileReader (native, off-thread encode) — a Uint8Array invoke arg
+      // would serialize as a multi-million-element JSON array and beachball the app.
+      const b64 = await new Promise<string>((resolve, reject) => {
+        const r = new FileReader()
+        r.onload = () => resolve(String(r.result).split(',')[1] ?? '')
+        r.onerror = () => reject(r.error ?? new Error('Couldn’t read the pasted image.'))
+        r.readAsDataURL(blob)
+      })
+      const ext = (img.type.split('/')[1] || 'png').toLowerCase()
+      const path = await api.savePastedImage(b64, ext)
+      stageChatFiles([path])
+    } catch (err) {
+      toast('error', String(err))
+    }
   }
 
   const pickGif = (g: { id: string; sendUrl: string; pageUrl: string; w: number; h: number }) => {
@@ -528,7 +614,7 @@ function Conversation({ friendId }: { friendId: string }) {
               color: typing ? 'var(--accent)' : online ? 'var(--green)' : 'var(--text-faint)',
             }}
           >
-            <span>{typing ? 'typing…' : presenceLabel(presence)}</span>
+            <span>{typing ? 'typing…' : presenceText}</span>
             {online && conn && !typing && (
               <>
                 <span style={{ color: 'var(--border-strong)' }}>·</span>
@@ -537,6 +623,13 @@ function Conversation({ friendId }: { friendId: string }) {
             )}
           </div>
         </div>
+        <button
+          className={`icon-btn${searchOpen ? ' on' : ''}`}
+          title="Search this conversation"
+          onClick={() => (searchOpen ? closeSearch() : setSearchOpen(true))}
+        >
+          <Search size={16} />
+        </button>
         {sharedFolder && (
           <button
             className="btn btn-ghost"
@@ -547,6 +640,44 @@ function Conversation({ friendId }: { friendId: string }) {
           </button>
         )}
       </div>
+
+      {searchOpen && (
+        <div className="chat-searchbar">
+          <Search size={14} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
+          <input
+            autoFocus
+            value={searchQ}
+            placeholder="Search messages and files…"
+            onChange={(e) => setSearchQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') closeSearch()
+              else if (e.key === 'Enter') jumpToMatch(searchIdx + (e.shiftKey ? -1 : 1))
+            }}
+          />
+          <span className="chat-search-count">
+            {searchQ.trim() ? (searchMatches.length ? `${searchIdx + 1} of ${searchMatches.length}` : 'No matches') : ''}
+          </span>
+          <button
+            className="icon-btn"
+            title="Previous match"
+            disabled={!searchMatches.length}
+            onClick={() => jumpToMatch(searchIdx - 1)}
+          >
+            <ArrowUp size={14} />
+          </button>
+          <button
+            className="icon-btn"
+            title="Next match"
+            disabled={!searchMatches.length}
+            onClick={() => jumpToMatch(searchIdx + 1)}
+          >
+            <ArrowDown size={14} />
+          </button>
+          <button className="icon-btn" title="Close (Esc)" onClick={closeSearch}>
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       <div ref={scrollRef} className="scroll-area chat-thread" style={{ flex: 1, minHeight: 0 }} onScroll={() => {
         atBottomRef.current = isAtBottom()
@@ -565,7 +696,15 @@ function Conversation({ friendId }: { friendId: string }) {
         ) : (
           <div className="chat-track">
             {items.map((row) => (
-              <div key={row.kind === 'msg' ? row.m.id : row.ev.id}>
+              <div
+                key={row.kind === 'msg' ? row.m.id : row.ev.id}
+                id={row.kind === 'msg' ? `msg-${row.m.id}` : undefined}
+                className={
+                  row.kind === 'msg' && searchMatches[searchIdx] === row.m.id
+                    ? 'chat-search-hit'
+                    : undefined
+                }
+              >
                 {row.divider && (
                   <div className="chat-divider">
                     <span>{row.divider}</span>
@@ -585,12 +724,8 @@ function Conversation({ friendId }: { friendId: string }) {
                     firstOfRun={row.firstOfRun}
                     lastOfRun={row.lastOfRun}
                     allById={messages}
-                    onReply={() => {
-                      setReply(row.m)
-                      setEditing(null)
-                      taRef.current?.focus()
-                    }}
-                    onEdit={() => beginEdit(row.m)}
+                    onReply={beginReply}
+                    onEdit={beginEdit}
                     onLightbox={setLightbox}
                   />
                 )}
@@ -690,17 +825,21 @@ function Conversation({ friendId }: { friendId: string }) {
         <button className="icon-btn" title="Share a file" onClick={attach} disabled={!!editing}>
           <Paperclip size={18} />
         </button>
-        <button
-          className={`icon-btn${showGif ? ' on' : ''}`}
-          title="Send a GIF"
-          onClick={() => {
-            setShowGif((v) => !v)
-            setShowEmoji(false)
-          }}
-          disabled={!!editing}
-        >
-          <Sparkles size={18} />
-        </button>
+        {/* Settings promises "leave the key blank to hide" the GIF picker — honor
+            it (an un-keyed picker only shows an error state anyway). */}
+        {giphyKey.trim() !== '' && (
+          <button
+            className={`icon-btn${showGif ? ' on' : ''}`}
+            title="Send a GIF"
+            onClick={() => {
+              setShowGif((v) => !v)
+              setShowEmoji(false)
+            }}
+            disabled={!!editing}
+          >
+            <Sparkles size={18} />
+          </button>
+        )}
         <button
           className={`icon-btn${showEmoji ? ' on' : ''}`}
           title="Emoji"
@@ -718,6 +857,7 @@ function Conversation({ friendId }: { friendId: string }) {
           placeholder={editing ? 'Edit your message…' : `Message ${friend.name}…`}
           rows={1}
           onChange={(e) => onType(e.target.value)}
+          onPaste={(e) => void onPaste(e)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault()
@@ -750,7 +890,9 @@ function Conversation({ friendId }: { friendId: string }) {
  *  a type-aware icon/thumbnail, and clickable to reveal the exact file in Finder.
  *  ≤8 files show per-file; a bigger batch collapses to one summary that opens the
  *  folder. */
-function FolderSyncRow({
+// Memoized: the thread re-renders on every composer keystroke; without memo every
+// row (up to 2000, each ~30 elements) re-reconciled per keypress.
+const FolderSyncRow = memo(function FolderSyncRow({
   ev,
   folder,
   folderName,
@@ -871,7 +1013,7 @@ function FolderSyncRow({
       </div>
     </div>
   )
-}
+})
 
 /** Matches http(s) URLs in a message. Conservative on purpose: only http/https
  *  (the only schemes the hardened `open_url` command will open), and we trim a
@@ -937,7 +1079,7 @@ function quoteText(m: ChatMessage): string {
   return m.text
 }
 
-function MessageRow({
+const MessageRow = memo(function MessageRow({
   m,
   friend,
   firstOfRun,
@@ -952,8 +1094,8 @@ function MessageRow({
   firstOfRun: boolean
   lastOfRun: boolean
   allById: ChatMessage[]
-  onReply: () => void
-  onEdit: () => void
+  onReply: (m: ChatMessage) => void
+  onEdit: (m: ChatMessage) => void
   onLightbox: (src: string) => void
 }) {
   const mine = m.fromMe
@@ -1036,7 +1178,7 @@ function MessageRow({
               <button className="chat-act" title="React" onClick={() => setTray((v) => !v)}>
                 <Smile size={15} />
               </button>
-              <button className="chat-act" title="Reply" onClick={onReply}>
+              <button className="chat-act" title="Reply" onClick={() => onReply(m)}>
                 <CornerUpLeft size={15} />
               </button>
               {mine && (
@@ -1059,7 +1201,7 @@ function MessageRow({
                     <button
                       onClick={() => {
                         setMenu(false)
-                        onEdit()
+                        onEdit(m)
                       }}
                     >
                       <Pencil size={14} /> Edit
@@ -1101,7 +1243,7 @@ function MessageRow({
       <span className="chat-time-gutter">{clock(m.ts)}</span>
     </div>
   )
-}
+})
 
 /** The subtle delivery line under your own last bubble. Offline/queued shows a
  *  calm clock (not a scary "failed"); delivery + read mirror iMessage. */

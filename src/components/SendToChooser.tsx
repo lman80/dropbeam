@@ -126,7 +126,9 @@ export function SendToChooser() {
                       <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
                         <div style={{ fontSize: 14, fontWeight: 650 }}>{f.name}</div>
                         <div style={{ fontSize: 11.5, color: online ? 'var(--green)' : 'var(--text-faint)' }}>
-                          {online ? 'Online now' : 'Tap to send — they’ll get it when online'}
+                          {/* Honest: friend file sends retry ~90s then fail — there is
+                              no store-and-forward for files (chat messages DO queue). */}
+                          {online ? 'Online now' : 'Offline — a send keeps trying for ~2 minutes'}
                         </div>
                       </div>
                       <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />

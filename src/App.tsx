@@ -24,9 +24,6 @@ export default function App() {
   const init = useStore((s) => s.init)
   const setPendingSend = useStore((s) => s.setPendingSend)
   const setDragHovering = useStore((s) => s.setDragHovering)
-  const transfers = useStore((s) => s.transfers)
-  const order = useStore((s) => s.order)
-  const folderStatuses = useStore((s) => s.folderStatuses)
 
   useEffect(() => {
     init()
@@ -34,20 +31,27 @@ export default function App() {
 
   // Drive the Windows/Linux taskbar progress from the most relevant active
   // transfer (macOS shows this on the Downloads stack instead — no-op there).
+  // A plain store SUBSCRIPTION, not useStore selectors: transfers/order change on
+  // EVERY progress event, and root-level selectors re-rendered the entire app tree
+  // per tick. The taskbar is a side effect — it needs no React render at all.
   useEffect(() => {
-    const active = order
-      .map((id) => transfers[id])
-      .filter(Boolean)
-      .filter((t) => t.state === 'transferring')
-    let pct: number | null = active.length ? active[active.length - 1].percent : null
-    if (pct == null) {
-      const f = Object.values(folderStatuses).find(
-        (s) => s.state === 'sending' || s.state === 'receiving',
-      )
-      if (f) pct = f.percent
+    const drive = (s: ReturnType<typeof useStore.getState>) => {
+      const active = s.order
+        .map((id) => s.transfers[id])
+        .filter(Boolean)
+        .filter((t) => t.state === 'transferring')
+      let pct: number | null = active.length ? active[active.length - 1].percent : null
+      if (pct == null) {
+        const f = Object.values(s.folderStatuses).find(
+          (st) => st.state === 'sending' || st.state === 'receiving',
+        )
+        if (f) pct = f.percent
+      }
+      setTaskbarProgress(pct)
     }
-    setTaskbarProgress(pct)
-  }, [transfers, order, folderStatuses])
+    drive(useStore.getState())
+    return useStore.subscribe(drive)
+  }, [])
 
   useEffect(() => {
     let un: UnlistenFn | undefined

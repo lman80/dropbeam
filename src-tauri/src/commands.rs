@@ -243,6 +243,78 @@ pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Save an image pasted into the chat composer (Cmd/Ctrl-V of a screenshot) to a
+/// bounded app-managed folder and return its path, so it can ride the existing
+/// staged-file → send flow exactly like a dropped file. The folder is capped to the
+/// most recent 50 pastes so it can never balloon.
+#[tauri::command]
+pub async fn save_pasted_image(
+    state: State<'_, Arc<AppState>>,
+    b64: String,
+    ext: String,
+) -> Result<String, String> {
+    use base64::Engine;
+    // base64, NOT a JSON number[]: a Vec<u8> invoke arg serializes as an N-element
+    // JSON array (a 10 MB screenshot → a 10-million-element array + ~35 MB JSON),
+    // freezing the webview for seconds. One contiguous string is ~1.37× the bytes.
+    // Cap the payload (25 MB decoded is far beyond any screenshot) and force a known
+    // image extension — never a caller-chosen path.
+    if b64.len() > 35 * 1024 * 1024 {
+        return Err("That image is too large to paste — save it as a file and drop it in.".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|_| "Couldn't read the pasted image.".to_string())?;
+    if bytes.is_empty() {
+        return Err("The clipboard image was empty.".into());
+    }
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err("That image is too large to paste — save it as a file and drop it in.".into());
+    }
+    let ext = match ext.as_str() {
+        "png" | "jpeg" | "jpg" | "gif" | "webp" | "bmp" => ext,
+        _ => "png".to_string(),
+    };
+    let dir = state.config_dir.join("pasted");
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // Friendly, sortable name; a counter suffix avoids same-second collisions.
+        let now = chrono_lite_stamp();
+        let mut path = dir.join(format!("Pasted {now}.{ext}"));
+        let mut n = 2;
+        while path.exists() {
+            path = dir.join(format!("Pasted {now} ({n}).{ext}"));
+            n += 1;
+        }
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        // Keep only the newest 50 pastes (oldest-mtime first out).
+        let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let m = e.metadata().ok()?.modified().ok()?;
+                p.is_file().then_some((m, p))
+            })
+            .collect();
+        if entries.len() > 50 {
+            entries.sort_by_key(|(m, _)| *m);
+            for (_, old) in entries.iter().take(entries.len() - 50) {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+        Ok(path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// "YYYY-MM-DD at HH.MM.SS" in LOCAL time — matches how macOS names screenshots,
+/// so a pasted image sorts and reads naturally next to them.
+fn chrono_lite_stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d at %H.%M.%S").to_string()
+}
+
 /// Bundle every `DropBeam*.log` file (oldest → newest) plus a redacted header
 /// (version, OS, settings, friend/folder counts) into ONE text file in the
 /// Downloads folder, and return its path. The user sends that single file back —
@@ -958,15 +1030,27 @@ pub fn friend_invite(
 // ---------------------------------------------------------------------------
 
 /// Every message in the conversation with a friend, oldest first.
+/// Async so the (potentially multi-MB) chats.json parse runs on a worker thread
+/// instead of blocking the main thread that services every other command.
 #[tauri::command]
-pub fn get_chat_messages(state: State<'_, Arc<AppState>>, friend_id: String) -> Vec<ChatMessage> {
-    chat::messages(&state.config_dir, &friend_id)
+pub async fn get_chat_messages(
+    state: State<'_, Arc<AppState>>,
+    friend_id: String,
+) -> Result<Vec<ChatMessage>, String> {
+    let dir = state.config_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || chat::messages(&dir, &friend_id))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// A preview of every conversation (last message + count), newest first.
+/// Async for the same reason as get_chat_messages.
 #[tauri::command]
-pub fn list_chats(state: State<'_, Arc<AppState>>) -> Vec<chat::ChatOverview> {
-    chat::overview(&state.config_dir)
+pub async fn list_chats(state: State<'_, Arc<AppState>>) -> Result<Vec<chat::ChatOverview>, String> {
+    let dir = state.config_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || chat::overview(&dir))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Send a text message to a friend. Persists + surfaces it immediately, then
@@ -1024,6 +1108,10 @@ fn deliver_chat(
     friend: &crate::models::Friend,
     msg: &ChatMessage,
 ) {
+    // A fresh user send deserves an instant retry of anything stuck for this (or
+    // any) peer — clears the outbox's per-peer backoff so an earlier "failed"
+    // message doesn't wait out a 300s tier while the user is actively chatting.
+    crate::iroh_net::wake_chat_outbox();
     if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
         let my_name = state.settings.lock().unwrap().display_name.clone();
         let payload = crate::iroh_net::chat_payload(msg, &friend.id, &my_name);
@@ -1366,7 +1454,7 @@ pub fn my_invite_code(
     let eid = iroh
         .get()
         .map(|ep| ep.id().to_string())
-        .ok_or("Direct mode is still starting up — try again in a moment.")?;
+        .ok_or("DropBeam is still connecting — try again in a moment.")?;
     Ok(friends::my_code(&my_name, &eid))
 }
 
@@ -1553,10 +1641,10 @@ pub fn send_to_friend(
     // address). A friend added before Direct mode has no endpoint id and needs a
     // quick re-pair to be reachable.
     let eid = friend.endpoint_id.clone().ok_or(
-        "This friend was added before Direct mode — re-pair with them to send directly.",
+        "This friend was added on an old version — re-add them to send directly.",
     )?;
     if iroh.get().is_none() {
-        return Err("Direct mode is still starting up — try again in a moment.".into());
+        return Err("DropBeam is still connecting — try again in a moment.".into());
     }
     crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths)
 }

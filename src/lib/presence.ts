@@ -64,7 +64,8 @@ export function friendPresence(
 /** Human label for a presence — "Online now", "Last seen 5m ago", or a send hint. */
 export function presenceLabel(p: Presence): string {
   if (p.status === 'online') return 'Online now'
-  if (p.lastSeen == null) return 'Send anytime — delivered when online'
+  // Honest: file sends have no store-and-forward — don't promise offline delivery.
+  if (p.lastSeen == null) return 'Not seen yet'
   const mins = Math.floor((Date.now() - p.lastSeen) / 60_000)
   if (mins < 1) return 'Active moments ago'
   if (mins < 60) return `Last seen ${mins}m ago`

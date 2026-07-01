@@ -7,6 +7,7 @@ import { ArrowDownToLine, Check, Copy, Power, Search, Send, Settings, UserPlus, 
 import { api, HAS_TAURI, isActive, type TransferUpdate } from '../lib/api'
 import { useStore } from '../store'
 import { Spinner } from '../components/bits'
+import { Toasts } from '../components/Toasts'
 import { avatarGradient, initials } from '../lib/avatar'
 import { friendOnlineState } from '../lib/presence'
 import { formatSpeed } from '../lib/format'
@@ -157,7 +158,12 @@ export function Popover() {
       if (rows.length) invoke('set_popover_rows', { rows }).catch(() => {})
     }
     const raf = requestAnimationFrame(report)
-    const iv = setInterval(report, 700)
+    // Only poll while the popover is actually VISIBLE — this webview stays alive
+    // hidden 24/7, and the 700ms IPC ticked forever (row rects can't change while
+    // hidden; the mount/refilter report above still fires the moment it shows).
+    const iv = setInterval(() => {
+      if (!document.hidden) report()
+    }, 700)
     return () => {
       cancelAnimationFrame(raf)
       clearInterval(iv)
@@ -224,9 +230,16 @@ export function Popover() {
   const submitReceive = (e: React.FormEvent) => {
     e.preventDefault()
     if (!code.trim()) return
-    receiveCode(code)
-    setCode('')
-    setShowReceive(false)
+    // Only clear + close once the receive actually STARTED. Wiping the pasted code
+    // optimistically meant a bad/expired code vanished with no feedback — now the
+    // code stays put to fix and the toast (rendered here since the popover got its
+    // own toast surface) says what went wrong.
+    void receiveCode(code).then((ok) => {
+      if (ok) {
+        setCode('')
+        setShowReceive(false)
+      }
+    })
   }
 
   const active = useMemo(
@@ -379,6 +392,10 @@ export function Popover() {
           )}
         </AnimatePresence>
       </div>
+      {/* The popover runs its own store instance, so errors toasted here (failed
+          drag-to-send, bad receive code, engine still starting) rendered NOWHERE
+          without a local toast surface — files silently never sent. */}
+      <Toasts />
     </div>
   )
 }

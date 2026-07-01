@@ -679,6 +679,8 @@ export const mockApi = {
     emit('chat://message', m)
     return m
   },
+  savePastedImage: async (_b64: string, ext: string): Promise<string> =>
+    `/tmp/mock-pasted.${ext}`,
   reactToMessage: async (friendId: string, messageId: string, emoji: string, add: boolean) => {
     const thread = mockChats[friendId] ?? []
     const i = thread.findIndex((x) => x.id === messageId)

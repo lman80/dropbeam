@@ -534,6 +534,7 @@ pub fn run() {
             commands::set_profile_avatar,
             commands::clear_profile_avatar,
             commands::reveal_path,
+            commands::save_pasted_image,
             commands::open_path,
             commands::export_diagnostics,
             commands::diagnostics_test,

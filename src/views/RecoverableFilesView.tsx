@@ -212,6 +212,8 @@ function FolderRow({
   const toast = useStore((s) => s.toast)
   const [items, setItems] = useState<HistoryItem[] | null>(null)
   const [itemBusy, setItemBusy] = useState<string | null>(null)
+  /** Item id whose Forget button is ARMED (two-tap confirm; auto-disarms in 4s). */
+  const [confirmForget, setConfirmForget] = useState<string | null>(null)
   const loadedFor = useRef<string | null>(null)
 
   useEffect(() => {
@@ -241,6 +243,15 @@ function FolderRow({
   }
 
   const forget = async (item: HistoryItem) => {
+    // This deletes the ONLY saved copy of a recovered file — it must never be one
+    // accidental click. Two-tap confirm: first click arms the button, second click
+    // (within 4s) deletes; anything else disarms.
+    if (confirmForget !== item.id) {
+      setConfirmForget(item.id)
+      window.setTimeout(() => setConfirmForget((v) => (v === item.id ? null : v)), 4000)
+      return
+    }
+    setConfirmForget(null)
     setItemBusy(item.id)
     try {
       await api.forgetFolderItem(summary.pairId, item.id)
@@ -349,12 +360,18 @@ function FolderRow({
                         {itemBusy === item.id ? <Spinner size={13} /> : <RotateCcw size={14} />} Restore
                       </button>
                       <button
-                        className="icon-btn"
-                        title="Remove this saved copy"
+                        className={confirmForget === item.id ? 'btn btn-ghost' : 'icon-btn'}
+                        style={confirmForget === item.id ? { color: 'var(--red)', padding: '5px 11px' } : undefined}
+                        title={
+                          confirmForget === item.id
+                            ? 'This deletes the only saved copy — click again to confirm'
+                            : 'Remove this saved copy'
+                        }
                         onClick={() => forget(item)}
                         disabled={itemBusy === item.id}
                       >
                         <Trash2 size={14} />
+                        {confirmForget === item.id ? ' Delete forever?' : null}
                       </button>
                     </div>
                   )

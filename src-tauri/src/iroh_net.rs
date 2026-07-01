@@ -2029,6 +2029,11 @@ async fn serve_stream(
                     }
                 }
             }
+            // Any inbound chat frame is proof the sender is ONLINE — kick the outbox
+            // so messages queued while they slept flush NOW instead of waiting out the
+            // per-peer backoff (up to 300s) mid-conversation. Mirrors the folder-side
+            // wake_sender-on-beacon-recv; the woken loop clears all backoff.
+            wake_chat_outbox();
             write_frame(send, &serde_json::json!({ "kind": "ok", "applied": applied })).await?;
             send.finish()?;
         }
@@ -2065,6 +2070,9 @@ async fn serve_stream(
                         }
                         _ => {}
                     }
+                    // A typing/read signal is proof the friend is online — flush any
+                    // messages queued for them (clears the per-peer backoff).
+                    wake_chat_outbox();
                 }
             }
             write_frame(send, &serde_json::json!({ "kind": "ok" })).await?;
@@ -2180,7 +2188,7 @@ pub fn start_send(
     let ep = state
         .get()
         .cloned()
-        .ok_or("Direct mode is still starting up — try again in a moment.")?;
+        .ok_or("DropBeam is still connecting — try again in a moment.")?;
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let names: Vec<String> = pathbufs
         .iter()
@@ -2233,7 +2241,7 @@ pub fn start_receive(
     let ep = state
         .get()
         .cloned()
-        .ok_or("Direct mode is still starting up — try again in a moment.")?;
+        .ok_or("DropBeam is still connecting — try again in a moment.")?;
     let id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     state
@@ -2428,7 +2436,7 @@ pub fn send_to_friend(
     let ep = state
         .get()
         .cloned()
-        .ok_or("Direct mode is still starting up — try again in a moment.")?;
+        .ok_or("DropBeam is still connecting — try again in a moment.")?;
     let parsed: iroh::EndpointId = endpoint_id
         .parse()
         .map_err(|_| "This friend's direct address is invalid.".to_string())?;
@@ -2522,7 +2530,7 @@ pub fn send_to_friend(
                             Ok(Ok(c)) => break c,
                             _ => {
                                 if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
-                                    anyhow::bail!("Couldn't reach this friend — are they online with Direct mode on?");
+                                    anyhow::bail!("Couldn't reach this friend — make sure their DropBeam is running and online.");
                                 }
                                 tokio::time::sleep(Duration::from_secs(6)).await;
                             }
@@ -3285,10 +3293,25 @@ pub fn wake_chat_outbox() {
 
 pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
     tauri::async_runtime::spawn(async move {
+        // Per-peer failure backoff so ONE offline friend (the daily reality for a peer
+        // whose machine sleeps) doesn't cost a 12s dial + a chats.json rewrite every
+        // round all night: 12s → 60s → 300s cap, mirroring the folder control beacon.
+        // Reset on wake — a fresh user send/op deserves an instant attempt — and on
+        // any successful delivery to that peer.
+        let mut backoff: std::collections::HashMap<String, (u32, std::time::Instant)> =
+            std::collections::HashMap::new();
+        // When the last round found nothing to do, remember the store mtimes so idle
+        // ticks skip re-parsing the (potentially multi-MB) chats.json every 12s.
+        let mut idle_since: Option<(Option<std::time::SystemTime>, Option<std::time::SystemTime>)> =
+            None;
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(12)) => {}
-                _ = chat_outbox_wake_cell().notified() => {}
+            let woken = tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(12)) => false,
+                _ = chat_outbox_wake_cell().notified() => true,
+            };
+            if woken {
+                backoff.clear();
+                idle_since = None;
             }
             let Some(ep) = state.get().cloned() else {
                 continue;
@@ -3302,11 +3325,24 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 let name = st.settings.lock().unwrap().display_name.clone();
                 (cd, name)
             };
+            // Idle fast-path: nothing pending last round and no store write since →
+            // skip the parse entirely. (Mtimes are read BEFORE parsing, so a write
+            // landing mid-round flips them and forces a re-parse next tick.)
+            let mtimes = crate::chat::store_mtimes(&config_dir);
+            if idle_since.as_ref() == Some(&mtimes) {
+                continue;
+            }
             let pending = crate::chat::outbox(&config_dir);
             let ops = crate::chat::pending_ops(&config_dir);
             if pending.is_empty() && ops.is_empty() {
+                idle_since = Some(mtimes);
                 continue;
             }
+            idle_since = None;
+            let now = std::time::Instant::now();
+            let deferred = |peer: &str, backoff: &std::collections::HashMap<String, (u32, std::time::Instant)>| {
+                backoff.get(peer).is_some_and(|(_, until)| now < *until)
+            };
             let friends = crate::friends::load(&config_dir);
 
             // --- Messages first, so an original lands before any op that targets it.
@@ -3320,6 +3356,9 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                     by_peer.entry(m.peer_id.clone()).or_default().push(m);
                 }
                 for (peer_id, msgs) in by_peer {
+                    if deferred(&peer_id, &backoff) {
+                        continue; // still backing off this offline peer
+                    }
                     let Some(eid) = friends
                         .iter()
                         .find(|f| f.id == peer_id)
@@ -3331,6 +3370,7 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                         let payload = chat_payload(&m, &peer_id, &my_name);
                         match send_chat(&ep, &eid, payload).await {
                             Ok(_) => {
+                                backoff.remove(&peer_id);
                                 just_delivered.insert(m.id.clone());
                                 if let Some(u) = crate::chat::set_status(
                                     &config_dir,
@@ -3350,6 +3390,14 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                                 ) {
                                     let _ = app.emit("chat://message", &u);
                                 }
+                                // Exponential per-peer backoff: 12s, 60s, then 300s cap.
+                                let fails = backoff.get(&peer_id).map(|(f, _)| *f).unwrap_or(0) + 1;
+                                let delay = match fails {
+                                    1 => Duration::from_secs(12),
+                                    2 => Duration::from_secs(60),
+                                    _ => Duration::from_secs(300),
+                                };
+                                backoff.insert(peer_id.clone(), (fails, now + delay));
                                 break; // preserve order — stop this peer until next round
                             }
                         }
@@ -3364,6 +3412,9 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
             // frame ride SEPARATE connections with no ordering guarantee, so we wait
             // until the message has certainly landed.
             for op in ops {
+                if deferred(&op.peer_id, &backoff) {
+                    continue; // still backing off this offline peer — op stays queued
+                }
                 let Some(eid) = friends
                     .iter()
                     .find(|f| f.id == op.peer_id)

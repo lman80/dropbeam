@@ -248,12 +248,25 @@ function loadFolderActivity(): Record<string, FolderActivityEvent[]> {
     return {}
   }
 }
+// Debounced: folder-synced events fire once per landed batch during a big drop, and
+// each save stringifies up to 200 events × N folders on the main thread. Trailing
+// 1s write coalesces a burst into one; the log is best-effort (worst case a crash
+// inside the window loses the last entries of the local timeline, nothing else).
+let saveFolderActivityTimer: ReturnType<typeof setTimeout> | undefined
+let pendingFolderActivity: Record<string, FolderActivityEvent[]> | null = null
 function saveFolderActivity(fa: Record<string, FolderActivityEvent[]>): void {
-  try {
-    localStorage.setItem(FOLDER_ACTIVITY_KEY, JSON.stringify(fa))
-  } catch {
-    /* storage unavailable — the timeline log is best-effort */
-  }
+  pendingFolderActivity = fa
+  if (saveFolderActivityTimer) return
+  saveFolderActivityTimer = setTimeout(() => {
+    saveFolderActivityTimer = undefined
+    try {
+      if (pendingFolderActivity) {
+        localStorage.setItem(FOLDER_ACTIVITY_KEY, JSON.stringify(pendingFolderActivity))
+      }
+    } catch {
+      /* storage unavailable — the timeline log is best-effort */
+    }
+  }, 1000)
 }
 
 // Guard against Tauri's occasional double-fire of a single OS file drop.

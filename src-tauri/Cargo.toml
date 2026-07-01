@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.39.0"
+version = "0.40.0"
 description = "DropBeam — seamless peer-to-peer file transfer"
 authors = ["DropBeam"]
 license = ""
@@ -29,6 +29,8 @@ serde_json = "1"
 log = "0.4"
 tokio = { version = "1", features = ["process", "io-util", "rt-multi-thread", "macros", "sync", "time", "fs"] }
 uuid = { version = "1", features = ["v4"] }
+# Already in the tree transitively — direct dep only for local-time paste filenames.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rand = "0.8"
 sha2 = "0.10"
 unicode-normalization = "0.1"
