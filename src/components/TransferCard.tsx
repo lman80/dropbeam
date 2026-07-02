@@ -192,7 +192,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
           <div style={{ flex: 1, minWidth: 220 }}>
             <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 7 }}>
               {(t.code?.length ?? 0) > 40
-                ? 'On the other device → Receive: scan the QR, or paste this Direct ticket:'
+                ? 'On their DropBeam → Send & Receive → “Have a code?”: scan the QR or paste this code:'
                 : 'On the other device, open DropBeam → Receive and enter:'}
             </div>
             <div

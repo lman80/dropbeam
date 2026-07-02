@@ -4,6 +4,7 @@ import { QRCodeSVG } from 'qrcode.react'
 import { ArrowLeftRight, ArrowRight, Check, Copy, FolderOpen, FolderSync, X } from 'lucide-react'
 import { api } from '../lib/api'
 import { useStore } from '../store'
+import { friendOnlineState } from '../lib/presence'
 import { Spinner } from './bits'
 
 export function PairingModal({
@@ -65,9 +66,24 @@ export function PairingModal({
       reloadPairs()
       if (peerName.trim()) reloadFriends()
       // If we invited friends directly, that's the whole flow — confirm + close.
-      // Otherwise reveal the code to share manually.
+      // Otherwise reveal the code to share manually. The invite delivery is a
+      // ~1-minute best-effort dial, so be HONEST about offline friends instead of
+      // toasting success for an invite that may never arrive.
       if (invitedNames.length) {
-        toast('success', `Invited ${invitedNames.join(', ')} to “${folderName}”.`)
+        const { friendSeen, folderStatuses } = useStore.getState()
+        const offline = invitees
+          .map((fid) => friends.find((f) => f.id === fid))
+          .filter((f) => f && invitedNames.includes(f.name))
+          .filter((f) => friendOnlineState(f!.name, friendSeen, folderStatuses) !== true)
+          .map((f) => f!.name)
+        const online = invitedNames.filter((n) => !offline.includes(n))
+        if (online.length) toast('success', `Invited ${online.join(', ')} to “${folderName}”.`)
+        if (offline.length) {
+          toast(
+            'info',
+            `${offline.join(', ')} ${offline.length === 1 ? 'is' : 'are'} offline — if the invite doesn't arrive, share the folder's code from its card.`,
+          )
+        }
         onClose()
       } else {
         setCreatedInvite(res.invite)

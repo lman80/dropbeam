@@ -109,7 +109,9 @@ pub fn load(folder: &str) -> Vec<HistoryItem> {
 
 fn save(folder: &str, items: &[HistoryItem]) {
     let _ = fs::create_dir_all(root(folder));
-    if let Ok(txt) = serde_json::to_string_pretty(items) {
+    // Compact JSON: this index is machine-read only and rewritten once per archived
+    // file during a bulk delete — pretty-printing roughly doubled that IO.
+    if let Ok(txt) = serde_json::to_string(items) {
         // Atomic (write temp + rename) so a concurrent reader never sees a
         // half-written, unparseable index.json.
         let _ = write_atomic(&index_path(folder), txt.as_bytes());

@@ -57,13 +57,13 @@ export function SendView() {
             style={{ fontSize: 12.5 }}
             onClick={() => setShowReceive(true)}
           >
-            <ArrowDownToLine size={14} /> Have a link? Receive a file
+            <ArrowDownToLine size={14} /> Have a code? Receive files
           </button>
         ) : (
           <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 440 }}>
             <input
               className="input"
-              placeholder="Paste the Direct link the sender shared…"
+              placeholder="Paste the code the sender shared…"
               value={code}
               autoFocus
               spellCheck={false}
@@ -100,7 +100,7 @@ export function SendView() {
           <EmptyState
             icon={<Inbox size={24} />}
             title="Nothing here yet"
-            hint="Drag files onto the area above and pick who to send to — a friend, or anyone with a code. Whatever you receive shows up here automatically, too."
+            hint="Drag files onto the area above and pick who to send to — a friend, or anyone with a code. Whatever you receive shows up here automatically, too. Tip: you can also drop a file straight onto the DropBeam menu-bar icon to send it to a friend."
           />
         )}
       </div>

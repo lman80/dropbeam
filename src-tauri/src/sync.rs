@@ -908,6 +908,9 @@ impl SyncManager {
             // (total size, duration, average speed) — same as the Send/Receive tab.
             let mut session_bytes: u64 = 0;
             let mut session_start: Option<Instant> = None;
+            // Consecutive idle rescans that queued nothing — drives the
+            // seed_existing backoff below (fast after activity, slow when quiet).
+            let mut idle_scans: u32 = 0;
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
@@ -942,12 +945,22 @@ impl SyncManager {
                     // them is how a total-sync folder reliably converges to the SAME
                     // set of files on both computers (seed_existing skips anything
                     // already delivered or queued, so this is cheap + idempotent).
+                    // BACKOFF: each rescan that finds nothing doubles the wait
+                    // (45s → 90s → 180s cap) so a quiet thousands-file folder isn't
+                    // re-walked every 45s forever; any real work snaps it back to
+                    // 45s. The cap MUST stay under the control beacon's ~300s
+                    // wake_sender kick — that wake restarts this sleep, so a cap
+                    // ≥300s would starve the rescan entirely while the peer is up.
                     tokio::select! {
                         _ = wake.notified() => {}
                         _ = stop_notify.notified() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(45)) => {
+                        _ = tokio::time::sleep(Duration::from_secs(45u64 << idle_scans.min(2))) => {
                             let folder = config.lock().unwrap().folder.clone();
-                            seed_existing(&folder, &inbound, &queue, &wake);
+                            if seed_existing(&folder, &inbound, &queue, &wake) {
+                                idle_scans = 0;
+                            } else {
+                                idle_scans = idle_scans.saturating_add(1);
+                            }
                         }
                     }
                     continue;
@@ -959,6 +972,8 @@ impl SyncManager {
                     queue.lock().unwrap().pop_front();
                     continue;
                 }
+                // Real work in the queue → snap the idle rescan back to 45s.
+                idle_scans = 0;
                 if file != current {
                     current = file.clone();
                     offline_attempts = 0;
@@ -989,6 +1004,16 @@ impl SyncManager {
                             Some(format!("Waiting for {label} to come online")),
                         );
                         manager.emit_status(&pair_id);
+                        // A fresh drop just parked behind a possibly-STALE offline
+                        // flag. Kick the control beacon ONCE so it probes now instead
+                        // of waiting out the remainder of its 60/120/300s offline
+                        // backoff — if the peer is actually reachable, the beacon
+                        // lands, flips peer_online, and wake_sender unparks us within
+                        // seconds. The beacon stays the SOLE prober (we never dial
+                        // from here), and this fires only on the Idle→Waiting
+                        // transition of a new drop — not per 5s poll — so a truly
+                        // offline peer costs one extra dial, not a flap loop.
+                        manager.nudge_reconcile(&pair_id);
                     }
                     tokio::select! {
                         _ = wake.notified() => {}
@@ -2553,26 +2578,37 @@ fn is_sendable_candidate(path: &str, folder: &str, inbound: &Arc<Mutex<HashSet<S
     true
 }
 
+/// Returns true if anything new was queued — drives the idle-rescan backoff.
 fn seed_existing(
     folder: &str,
     inbound: &Arc<Mutex<HashSet<String>>>,
     queue: &Arc<Mutex<VecDeque<String>>>,
     wake: &Arc<Notify>,
-) {
+) -> bool {
     let files = list_files_rec(Path::new(folder));
+    // Run the per-file candidate checks (they stat every file) WITHOUT the
+    // queue lock — holding it across a thousands-file scan would block the
+    // watcher's event handler and the sender for the whole walk. The lock is
+    // taken once at the end, just for the dedupe + push.
+    let mut candidates: Vec<String> = Vec::new();
+    for f in files {
+        let p = f.to_string_lossy().to_string();
+        // Sweep a stale "<name>.dropbeam-incoming" placeholder left by a receive
+        // that was interrupted (e.g. crash mid-transfer). It's never synced —
+        // just visible litter — so delete it on scan instead of leaving it.
+        if p.ends_with(".dropbeam-incoming") {
+            let _ = std::fs::remove_file(&f);
+            continue;
+        }
+        if is_sendable_candidate(&p, folder, inbound) {
+            candidates.push(p);
+        }
+    }
     let mut any = false;
     {
         let mut q = queue.lock().unwrap();
-        for f in files {
-            let p = f.to_string_lossy().to_string();
-            // Sweep a stale "<name>.dropbeam-incoming" placeholder left by a receive
-            // that was interrupted (e.g. crash mid-transfer). It's never synced —
-            // just visible litter — so delete it on scan instead of leaving it.
-            if p.ends_with(".dropbeam-incoming") {
-                let _ = std::fs::remove_file(&f);
-                continue;
-            }
-            if is_sendable_candidate(&p, folder, inbound) && !q.iter().any(|x| x == &p) {
+        for p in candidates {
+            if !q.iter().any(|x| x == &p) {
                 q.push_back(p);
                 any = true;
             }
@@ -2581,6 +2617,7 @@ fn seed_existing(
     if any {
         wake.notify_one();
     }
+    any
 }
 
 fn list_files_rec(dir: &Path) -> Vec<PathBuf> {
@@ -3164,15 +3201,27 @@ async fn wait_fixed(stop_notify: &Arc<Notify>, stopped: &Arc<AtomicBool>, ms: u6
 fn file_sig(path: &str, folder: &str) -> Option<String> {
     let p = Path::new(path);
     let meta = std::fs::metadata(p).ok()?;
-    // Canonicalize both sides so symlinked roots (e.g. /tmp → /private/tmp on
-    // macOS) and the configured folder path resolve to a matching relative path.
-    let canon_p = std::fs::canonicalize(p).ok()?;
-    let canon_folder = std::fs::canonicalize(folder).ok()?;
+    // Fast path: paths from our own walks (seed_existing, move_staged) are literally
+    // rooted at the configured folder string, so the rel falls out of a plain strip —
+    // no syscalls. Only when that fails (watcher events can arrive under a firmlink/
+    // symlink alias like /System/Volumes/Data/… or /private/tmp/…) canonicalize both
+    // sides so the alias and the configured folder path resolve to a matching
+    // relative path. canonicalize is two full realpath walks (on Windows it opens the
+    // file, waking the AV filter) — which the idle rescan used to pay for EVERY file
+    // EVERY tick.
+    let rel_path = match p.strip_prefix(folder) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => {
+            let canon_p = std::fs::canonicalize(p).ok()?;
+            let canon_folder = std::fs::canonicalize(folder).ok()?;
+            canon_p.strip_prefix(&canon_folder).ok()?.to_path_buf()
+        }
+    };
     // NFC-normalize the rel like every other sync key, so the signatures stored
     // in `inbound` and the tombstone keys derived from them match the (NFC)
     // reconcile manifest — otherwise a delete inside a non-ASCII subfolder
     // (NFD on macOS) never propagates via the reconcile backstop.
-    let rel = norm_rel(&canon_p.strip_prefix(&canon_folder).ok()?.to_string_lossy());
+    let rel = norm_rel(&rel_path.to_string_lossy());
     let mtime = meta
         .modified()
         .ok()

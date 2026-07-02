@@ -132,16 +132,28 @@ export function ReceiveCard() {
 
   usePositionBottomRight()
 
-  const [saveDirs, setSaveDirs] = useState<SaveDir[]>([{ label: 'Downloads (default)', path: '' }])
+  const [saveDirs, setSaveDirs] = useState<SaveDir[]>([{ label: 'Default folder', path: '' }])
   const [menuOpen, setMenuOpen] = useState(false)
   useEffect(() => {
     if (!HAS_TAURI) return
     void (async () => {
-      const out: SaveDir[] = [{ label: 'Downloads (default)', path: '' }]
+      // The first row (path: '') = "wherever Settings points" — label it with the
+      // REAL folder name instead of assuming "Downloads" (the user may have changed
+      // it), and skip the shortcut row that duplicates the default's path (the menu
+      // used to always show two Downloads rows).
+      let defaultPath = ''
+      try {
+        const s = await api.getSettings()
+        defaultPath = s.downloadDir || ''
+      } catch {
+        /* fall back to the generic label */
+      }
+      const defaultName = defaultPath.split(/[/\\]/).filter(Boolean).pop() || 'Downloads'
+      const out: SaveDir[] = [{ label: `${defaultName} (default)`, path: '' }]
       const add = async (label: string, fn: () => Promise<string>) => {
         try {
           const p = await fn()
-          if (p) out.push({ label, path: p })
+          if (p && p !== defaultPath) out.push({ label, path: p })
         } catch {
           /* skip */
         }

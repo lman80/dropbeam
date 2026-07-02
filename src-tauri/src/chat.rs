@@ -17,7 +17,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::write_atomic;
 
-static LOCK: Mutex<()> = Mutex::new(());
+/// In-memory cache of every conversation store, keyed by config dir — the
+/// real app has exactly one entry; tests (which pass throwaway temp dirs) each
+/// get their own, so they can't poison each other or the app. chats.json is
+/// parsed ONCE per dir on first touch; every mutation updates memory and
+/// persists write-through, so the per-op re-parse of the (multi-MB) file is
+/// gone. The mutex is also the serialization lock the old `LOCK` provided —
+/// and now covers the read paths (`messages`/`outbox`/`overview`) too, which
+/// previously re-parsed the file unlocked.
+static CACHE: Mutex<Option<HashMap<PathBuf, HashMap<String, Vec<ChatMessage>>>>> =
+    Mutex::new(None);
 
 /// Keep each conversation bounded so chats.json can't grow without limit.
 const MAX_PER_PEER: usize = 2000;
@@ -117,11 +126,25 @@ fn chats_path(config_dir: &Path) -> PathBuf {
     config_dir.join("chats.json")
 }
 
+/// Disk read — used only by `store_mut` to fill the cache on a dir's first touch.
 fn load_all(config_dir: &Path) -> HashMap<String, Vec<ChatMessage>> {
     match fs::read_to_string(chats_path(config_dir)) {
         Ok(txt) => serde_json::from_str(&txt).unwrap_or_default(),
         Err(_) => HashMap::new(),
     }
+}
+
+/// The cached store for `config_dir`, loading it from chats.json on first use.
+/// Callers hold the CACHE lock (the guard derefs to the Option), so every read
+/// and mutation of a store is serialized.
+fn store_mut<'a>(
+    cache: &'a mut Option<HashMap<PathBuf, HashMap<String, Vec<ChatMessage>>>>,
+    config_dir: &Path,
+) -> &'a mut HashMap<String, Vec<ChatMessage>> {
+    cache
+        .get_or_insert_with(HashMap::new)
+        .entry(config_dir.to_path_buf())
+        .or_insert_with(|| load_all(config_dir))
 }
 
 fn save_all(config_dir: &Path, all: &HashMap<String, Vec<ChatMessage>>) {
@@ -145,15 +168,19 @@ fn save_all(config_dir: &Path, all: &HashMap<String, Vec<ChatMessage>>) {
 
 /// Every message in the conversation with `peer_id`, oldest first.
 pub fn messages(config_dir: &Path, peer_id: &str) -> Vec<ChatMessage> {
-    load_all(config_dir).remove(peer_id).unwrap_or_default()
+    let mut cache = CACHE.lock().unwrap();
+    store_mut(&mut cache, config_dir)
+        .get(peer_id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Append a message (dedup by id), bound the history, and persist. Returns
 /// `false` if it was a duplicate we'd already stored (so callers can skip the
 /// live event and avoid double-rendering).
 pub fn append(config_dir: &Path, msg: &ChatMessage) -> bool {
-    let _guard = LOCK.lock().unwrap();
-    let mut all = load_all(config_dir);
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
     let thread = all.entry(msg.peer_id.clone()).or_default();
     // Dedup scoped by direction: an incoming (peer-chosen) id can never collide
     // with one of OUR outgoing ids and silently suppress a real message.
@@ -166,16 +193,16 @@ pub fn append(config_dir: &Path, msg: &ChatMessage) -> bool {
         let drop = thread.len() - MAX_PER_PEER;
         thread.drain(0..drop);
     }
-    save_all(config_dir, &all);
+    save_all(config_dir, all);
     true
 }
 
 /// Drop a whole conversation (e.g. when a friend is removed).
 pub fn clear(config_dir: &Path, peer_id: &str) {
-    let _guard = LOCK.lock().unwrap();
-    let mut all = load_all(config_dir);
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
     if all.remove(peer_id).is_some() {
-        save_all(config_dir, &all);
+        save_all(config_dir, all);
     }
 }
 
@@ -189,13 +216,13 @@ pub fn merge_threads(config_dir: &Path, from_id: &str, into_id: &str) -> usize {
     if from_id == into_id {
         return 0;
     }
-    let _guard = LOCK.lock().unwrap();
-    let mut all = load_all(config_dir);
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
     let Some(mut moving) = all.remove(from_id) else {
         return 0;
     };
     if moving.is_empty() {
-        save_all(config_dir, &all);
+        save_all(config_dir, all);
         return 0;
     }
     let dest = all.entry(into_id.to_string()).or_default();
@@ -213,15 +240,15 @@ pub fn merge_threads(config_dir: &Path, from_id: &str, into_id: &str) -> usize {
         let drop = dest.len() - MAX_PER_PEER;
         dest.drain(0..drop);
     }
-    save_all(config_dir, &all);
+    save_all(config_dir, all);
     moved
 }
 
 /// Update a sent message's delivery status (sending → sent/failed). Returns the
 /// updated message so the caller can re-emit it to the UI.
 pub fn set_status(config_dir: &Path, peer_id: &str, msg_id: &str, status: &str) -> Option<ChatMessage> {
-    let _guard = LOCK.lock().unwrap();
-    let mut all = load_all(config_dir);
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
     let thread = all.get_mut(peer_id)?;
     let msg = thread.iter_mut().find(|m| m.id == msg_id)?;
     // Already in this state → no rewrite, no UI re-emit. The outbox retry loop calls
@@ -242,9 +269,9 @@ pub fn set_status(config_dir: &Path, peer_id: &str, msg_id: &str, status: &str) 
 /// clock: since received messages are stored with the sender's seq, taking
 /// max+1 here advances our clock past anything we've seen.
 pub fn next_seq(config_dir: &Path, peer_id: &str) -> u64 {
-    let _guard = LOCK.lock().unwrap();
-    let all = load_all(config_dir);
-    all.get(peer_id)
+    let mut cache = CACHE.lock().unwrap();
+    store_mut(&mut cache, config_dir)
+        .get(peer_id)
         .map(|t| t.iter().map(|m| m.seq).max().unwrap_or(0) + 1)
         .unwrap_or(1)
 }
@@ -260,8 +287,8 @@ pub fn apply_reaction(
     from_me: bool,
     add: bool,
 ) -> Option<ChatMessage> {
-    let _guard = LOCK.lock().unwrap();
-    let mut all = load_all(config_dir);
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
     let thread = all.get_mut(peer_id)?;
     let msg = thread.iter_mut().find(|m| m.id == target_id)?;
     let existing = msg
@@ -291,8 +318,8 @@ pub fn apply_edit(
     new_text: &str,
     author_is_me: bool,
 ) -> Option<ChatMessage> {
-    let _guard = LOCK.lock().unwrap();
-    let mut all = load_all(config_dir);
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
     let thread = all.get_mut(peer_id)?;
     let msg = thread
         .iter_mut()
@@ -313,8 +340,8 @@ pub fn apply_delete(
     target_id: &str,
     author_is_me: bool,
 ) -> Option<ChatMessage> {
-    let _guard = LOCK.lock().unwrap();
-    let mut all = load_all(config_dir);
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
     let thread = all.get_mut(peer_id)?;
     let msg = thread
         .iter_mut()
@@ -334,8 +361,8 @@ pub fn apply_delete(
 /// the peer covers them). Returns the messages whose status actually changed so
 /// the caller can re-emit just those to the UI.
 pub fn mark_read_up_to(config_dir: &Path, peer_id: &str, up_to: u64) -> Vec<ChatMessage> {
-    let _guard = LOCK.lock().unwrap();
-    let mut all = load_all(config_dir);
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
     let mut changed = Vec::new();
     if let Some(thread) = all.get_mut(peer_id) {
         for m in thread.iter_mut() {
@@ -346,7 +373,7 @@ pub fn mark_read_up_to(config_dir: &Path, peer_id: &str, up_to: u64) -> Vec<Chat
         }
     }
     if !changed.is_empty() {
-        save_all(config_dir, &all);
+        save_all(config_dir, all);
     }
     changed
 }
@@ -403,7 +430,7 @@ fn save_ops(config_dir: &Path, ops: &[ChatOp]) {
 ///  - a reaction that toggles its queued opposite cancels it (an offline add+remove of
 ///    the same emoji nets to nothing); a same-direction repeat just replaces.
 pub fn enqueue_op(config_dir: &Path, op: ChatOp) {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = CACHE.lock().unwrap();
     let mut ops = load_ops(config_dir);
     match op.kind.as_str() {
         "delete" => ops.retain(|o| !(o.peer_id == op.peer_id && o.target_id == op.target_id)),
@@ -438,7 +465,7 @@ pub fn enqueue_op(config_dir: &Path, op: ChatOp) {
 
 /// Drop a delivered op by id.
 pub fn ack_op(config_dir: &Path, op_id: &str) {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = CACHE.lock().unwrap();
     let mut ops = load_ops(config_dir);
     let before = ops.len();
     ops.retain(|o| o.id != op_id);
@@ -450,7 +477,7 @@ pub fn ack_op(config_dir: &Path, op_id: &str) {
 /// Pending ops oldest-first, pruning any older than OP_MAX_AGE_MS (a peer who never
 /// returns shouldn't pin the queue forever).
 pub fn pending_ops(config_dir: &Path) -> Vec<ChatOp> {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = CACHE.lock().unwrap();
     let mut ops = load_ops(config_dir);
     let now = now_ms();
     let before = ops.len();
@@ -465,8 +492,8 @@ pub fn pending_ops(config_dir: &Path) -> Vec<ChatOp> {
 /// The delivery status of a message WE sent (the op ordering gate). None if we don't
 /// have it — the target is the PEER's own message, or it aged out of our store.
 pub fn message_status(config_dir: &Path, peer_id: &str, msg_id: &str) -> Option<String> {
-    let _guard = LOCK.lock().unwrap();
-    load_all(config_dir)
+    let mut cache = CACHE.lock().unwrap();
+    store_mut(&mut cache, config_dir)
         .get(peer_id)?
         .iter()
         .find(|m| m.id == msg_id && m.from_me)
@@ -484,12 +511,14 @@ pub fn store_mtimes(config_dir: &Path) -> (Option<std::time::SystemTime>, Option
 /// All messages WE sent that haven't been delivered yet ("sending"/"failed"),
 /// oldest first — the outbox the retry loop flushes when a peer comes online.
 pub fn outbox(config_dir: &Path) -> Vec<ChatMessage> {
-    let mut out: Vec<ChatMessage> = load_all(config_dir)
-        .into_values()
+    let mut cache = CACHE.lock().unwrap();
+    let mut out: Vec<ChatMessage> = store_mut(&mut cache, config_dir)
+        .values()
         .flatten()
         .filter(|m| {
             m.from_me && matches!(m.status.as_deref(), Some("sending") | Some("failed"))
         })
+        .cloned()
         .collect();
     out.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
     out
@@ -507,12 +536,13 @@ pub struct ChatOverview {
 }
 
 pub fn overview(config_dir: &Path) -> Vec<ChatOverview> {
-    let mut out: Vec<ChatOverview> = load_all(config_dir)
-        .into_iter()
+    let mut cache = CACHE.lock().unwrap();
+    let mut out: Vec<ChatOverview> = store_mut(&mut cache, config_dir)
+        .iter()
         .filter_map(|(peer_id, msgs)| {
             let last = msgs.last()?;
             Some(ChatOverview {
-                peer_id,
+                peer_id: peer_id.clone(),
                 last_text: preview(last),
                 last_ts: last.ts,
                 last_from_me: last.from_me,

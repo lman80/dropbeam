@@ -378,7 +378,7 @@ export function Popover() {
             >
               <input
                 className="input"
-                placeholder="Enter a code"
+                placeholder="Paste a code to receive"
                 value={code}
                 autoFocus
                 spellCheck={false}
