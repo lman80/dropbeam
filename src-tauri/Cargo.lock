@@ -133,7 +133,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app"
-version = "0.42.0"
+version = "0.42.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1420,6 +1420,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "dropbeam-lab"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "app",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -1,0 +1,19 @@
+# Dev-only two-machine test driver + Lab Mode operator CLI. A SEPARATE crate so it
+# is NEVER part of the `app` package tauri bundles — that ambiguity shipped the CLI
+# as the app in v0.42.0. Build with: cargo build --release -p dropbeam-lab
+[package]
+name = "dropbeam-lab"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "dropbeam-lab"
+path = "src/main.rs"
+
+[dependencies]
+# The app's library, for the real engine + labkit surface it drives.
+app_lib = { path = "..", package = "app" }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "fs", "sync"] }

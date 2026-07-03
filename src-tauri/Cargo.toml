@@ -1,18 +1,34 @@
 [package]
 name = "app"
-version = "0.42.0"
+version = "0.42.1"
 description = "DropBeam — seamless peer-to-peer file transfer"
 authors = ["DropBeam"]
 license = ""
 repository = ""
 edition = "2021"
 rust-version = "1.77.2"
+# The app binary is named EXACTLY `mainBinaryName` in tauri.conf.json ("DropBeam")
+# so tauri's bundler selects it unambiguously. With a second binary present and no
+# exact name match, tauri picked the WRONG one and shipped the CLI as the app
+# (v0.42.0). Pinning default-run here (MUST be under [package]) + the [[bin]] name
+# below removes that ambiguity for good.
+default-run = "DropBeam"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "DropBeam"
+path = "src/main.rs"
+
+# The dev-only lab CLI lives in its OWN crate (labtool/) so it is never a bin of
+# this package — tauri only ever sees the single `DropBeam` binary to bundle.
+# Build the tool with: cargo build --release -p dropbeam-lab
+[workspace]
+members = ["labtool"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.2", features = [] }
