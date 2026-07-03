@@ -56,6 +56,8 @@ let settings: Settings = {
   showSyncPopup: true,
   shareDiagnostics: true,
   diagnosticsUrl: '',
+  labModeEnabled: false,
+  labOperatorId: '',
   folderHistoryKeepDays: 30,
   folderHistoryBudgetBytes: 2 * 1024 * 1024 * 1024,
 }

@@ -116,6 +116,13 @@ export interface Settings {
   /** Where diagnostics go — the operator's own collector URL (empty = send
    *  nowhere). Keeps the destination operator-controlled, never baked in. */
   diagnosticsUrl: string
+  /** Lab Mode: let ONE trusted operator device run automated tests and push
+   *  updates over the encrypted link. Off by default; even on, only the exact
+   *  operator id below is accepted. */
+  labModeEnabled: boolean
+  /** The node id of the sole device allowed to drive Lab Mode. Empty = nothing
+   *  is accepted even when enabled. */
+  labOperatorId: string
   /** How long a mirror folder keeps deleted/replaced copies before auto-removing
    *  them. 0 = keep forever. Default 30 days. */
   folderHistoryKeepDays: number

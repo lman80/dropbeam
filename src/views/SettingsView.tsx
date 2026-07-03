@@ -72,6 +72,7 @@ const SEP = (
 export function SettingsView() {
   const settings = useStore((s) => s.settings) as Settings
   const save = useStore((s) => s.saveSettings)
+  const myEid = useStore((s) => s.myEid)
   const appVer = useStore((s) => s.appVer)
   const update = useStore((s) => s.update)
   const checkingUpdate = useStore((s) => s.checkingUpdate)
@@ -692,6 +693,59 @@ export function SettingsView() {
                   {testingDiag ? <Spinner size={14} /> : 'Send test'}
                 </button>
               </div>
+            </Row>
+          </>
+        )}
+      </Card>
+
+      <SectionTitle>Lab Mode</SectionTitle>
+      <Card>
+        <Row
+          title="Enable Lab Mode"
+          desc="Let ONE trusted device (the developer's) run automated tests against this app and install updates for you, over the same encrypted link your files use. Off by default. Even when on, only the exact operator ID below is ever accepted — no one else can connect. Leave this off unless the developer asks you to turn it on."
+        >
+          <Toggle
+            on={settings.labModeEnabled}
+            onChange={(v) => save({ labModeEnabled: v })}
+          />
+        </Row>
+        {settings.labModeEnabled && (
+          <>
+            {SEP}
+            <Row
+              title="Operator device ID"
+              desc="Paste the ID the developer gives you. Only this device can drive Lab Mode. Blank = nothing is accepted."
+            >
+              <input
+                className="input"
+                style={{ minWidth: 240 }}
+                placeholder="Paste operator ID"
+                value={settings.labOperatorId}
+                onChange={(e) => save({ labOperatorId: e.target.value.trim() })}
+                spellCheck={false}
+                autoCapitalize="off"
+              />
+            </Row>
+            {SEP}
+            <Row
+              title="This device's ID"
+              desc="Send this to the developer so they can reach this device for testing."
+            >
+              <button
+                className="btn btn-ghost"
+                disabled={!myEid}
+                onClick={async () => {
+                  if (!myEid) return
+                  try {
+                    await navigator.clipboard.writeText(myEid)
+                    toast('info', 'Device ID copied')
+                  } catch (e) {
+                    toast('error', String(e))
+                  }
+                }}
+              >
+                {myEid ? 'Copy ID' : 'Starting…'}
+              </button>
             </Row>
           </>
         )}
