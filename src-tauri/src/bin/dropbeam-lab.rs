@@ -41,28 +41,51 @@ async fn main() -> Result<()> {
         Some("serve") => serve(&args).await,
         Some("send") => send(&args).await,
         Some("results") => results(&args).await,
+        Some("info") => info(&args).await,
+        Some("push-update") => push_update(&args).await,
+        Some("version") => {
+            println!("{}", labkit::LAB_BUILD);
+            Ok(())
+        }
         _ => {
             eprintln!(
-                "usage:\n  dropbeam-lab serve [--dest <dir>]\n  dropbeam-lab send --to <labADDR> [--mode auto|direct|relay] [--suite quick|full|big] [--parallel on|off] [--dir <corpus>]\n  dropbeam-lab results --to <labADDR>"
+                "usage:\n  dropbeam-lab serve [--dest <dir>] [--state <dir>]\n  dropbeam-lab send --to <labADDR> [--mode auto|direct|relay] [--suite quick|full|big|edge|many|mixed] [--only <case>] [--parallel on|off] [--profile] [--dir <corpus>]\n  dropbeam-lab results --to <labADDR>\n  dropbeam-lab info --to <labADDR>\n  dropbeam-lab push-update --to <labADDR> --bin <path>"
             );
             std::process::exit(2);
         }
     }
 }
 
+/// Exit code the supervisor script watches for: "I staged an update, swap the
+/// binary and relaunch me." Any other exit = real stop (Ctrl-C, crash).
+const EXIT_UPDATE: i32 = 42;
+
 async fn serve(args: &[String]) -> Result<()> {
     let dest_root = flag(args, "--dest")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("dropbeam-lab-recv"));
     std::fs::create_dir_all(&dest_root)?;
+    // Persistent identity dir → stable lab code across self-update restarts.
+    let state_dir = flag(args, "--state")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".dropbeam-lab"))
+                .unwrap_or_else(|_| std::env::temp_dir().join("dropbeam-lab-state"))
+        });
+    std::fs::create_dir_all(&state_dir)?;
+    // Where a pushed update is staged for the supervisor to swap in.
+    let staged_update = state_dir.join("dropbeam-lab.new");
+    let _ = std::fs::remove_file(&staged_update); // clear any stale staging
 
-    let ep = labkit::lab_endpoint(true).await?;
+    let ep = labkit::lab_endpoint_persistent(true, &state_dir).await?;
     let addr = labkit::lab_addr_ready(&ep).await;
     emit(json!({
         "event": "ready",
         "addr": labkit::encode_addr(&addr)?,
         "id": addr.id.to_string(),
         "dest": dest_root.display().to_string(),
+        "build": labkit::LAB_BUILD,
     }));
 
     // Every completed receive is BOTH printed (local runs) and kept in memory so
@@ -76,6 +99,7 @@ async fn serve(args: &[String]) -> Result<()> {
         let idx = n;
         let dest = dest_root.join(format!("conn-{idx:03}"));
         let results = results.clone();
+        let staged_update = staged_update.clone();
         tokio::spawn(async move {
             let started = Instant::now();
             let result: Result<serde_json::Value> = async {
@@ -89,6 +113,38 @@ async fn serve(args: &[String]) -> Result<()> {
                     s.finish()?;
                     let _ = s.stopped().await;
                     return Ok(json!({"event": "results-served", "conn": idx}));
+                }
+                if conn.alpn() == labkit::LAB_INFO_ALPN {
+                    // Build-stamp probe — the runner confirms an update took.
+                    let (mut s, mut r) = conn.accept_bi().await?;
+                    let _ = r.read_to_end(64).await;
+                    s.write_all(labkit::LAB_BUILD.as_bytes()).await?;
+                    s.finish()?;
+                    let _ = s.stopped().await;
+                    return Ok(json!({"event": "info-served", "conn": idx}));
+                }
+                if conn.alpn() == labkit::LAB_UPDATE_ALPN {
+                    // Runner streamed a fresh binary. Stage it atomically, ack,
+                    // then exit(42) so the supervisor swaps it in and relaunches.
+                    let (mut s, mut r) = conn.accept_bi().await?;
+                    let bytes = r.read_to_end(256 * 1024 * 1024).await?;
+                    anyhow::ensure!(bytes.len() > 1_000_000, "update binary implausibly small");
+                    let tmp = staged_update.with_extension("part");
+                    std::fs::write(&tmp, &bytes)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+                    }
+                    // Rename is atomic — the supervisor only ever sees a complete file.
+                    std::fs::rename(&tmp, &staged_update)?;
+                    s.write_all(b"ok").await?;
+                    s.finish()?;
+                    let _ = s.stopped().await;
+                    emit(json!({"event": "update-staged", "bytes": bytes.len(), "conn": idx}));
+                    // Give the ack a beat to flush, then hand off to the supervisor.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    std::process::exit(EXIT_UPDATE);
                 }
                 std::fs::create_dir_all(&dest)?;
                 // Negotiated receive = the same path the app's handlers run, so a
@@ -148,6 +204,47 @@ async fn results(args: &[String]) -> Result<()> {
     s.finish()?;
     let body = r.read_to_end(64 * 1024 * 1024).await?;
     println!("{}", String::from_utf8_lossy(&body));
+    Ok(())
+}
+
+/// Print the running receiver's build stamp (blank line if unreachable). Used by
+/// the loop to confirm a pushed update took effect before re-testing.
+async fn info(args: &[String]) -> Result<()> {
+    let to = flag(args, "--to").context("--to <labADDR> is required")?;
+    let peer = labkit::decode_addr(&to)?;
+    let ep = labkit::lab_endpoint(false).await?;
+    let conn = ep
+        .connect(peer, labkit::LAB_INFO_ALPN)
+        .await
+        .context("dial peer info channel")?;
+    let (mut s, mut r) = conn.open_bi().await?;
+    s.write_all(b"?").await?;
+    s.finish()?;
+    let body = r.read_to_end(4096).await?;
+    println!("{}", String::from_utf8_lossy(&body));
+    Ok(())
+}
+
+/// Stream a freshly-built receiver binary to the running receiver. It stages the
+/// bytes and re-execs; the caller then polls `info` until the new build stamp
+/// appears. This is the wire that makes test→fix→test fully autonomous.
+async fn push_update(args: &[String]) -> Result<()> {
+    let to = flag(args, "--to").context("--to <labADDR> is required")?;
+    let bin = flag(args, "--bin").context("--bin <path> is required")?;
+    let bytes = std::fs::read(&bin).with_context(|| format!("read {bin}"))?;
+    anyhow::ensure!(bytes.len() > 1_000_000, "binary at {bin} looks too small");
+    let peer = labkit::decode_addr(&to)?;
+    let ep = labkit::lab_endpoint(false).await?;
+    let conn = ep
+        .connect(peer, labkit::LAB_UPDATE_ALPN)
+        .await
+        .context("dial peer update channel")?;
+    let (mut s, mut r) = conn.open_bi().await?;
+    s.write_all(&bytes).await?;
+    s.finish()?;
+    let ack = r.read_to_end(64).await.unwrap_or_default();
+    anyhow::ensure!(ack == b"ok", "receiver did not confirm the update");
+    emit(json!({"event": "update-sent", "bytes": bytes.len()}));
     Ok(())
 }
 

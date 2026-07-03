@@ -31,6 +31,47 @@ pub use iroh::endpoint::Connection;
 /// copying from the second machine.
 pub const LAB_RESULTS_ALPN: &[u8] = b"dropbeam-lab/results";
 
+/// The runner streams a freshly-built receiver binary here; the receiver stages
+/// it and re-execs. This is what makes the test→fix loop autonomous — I never
+/// have to ask the user to re-copy the tester.
+pub const LAB_UPDATE_ALPN: &[u8] = b"dropbeam-lab/update";
+
+/// Small ALPN returning the running receiver's build stamp, so the runner can
+/// confirm a pushed update actually took effect before re-testing.
+pub const LAB_INFO_ALPN: &[u8] = b"dropbeam-lab/info";
+
+/// Build stamp compiled into this binary. Set `LAB_BUILD` in the environment at
+/// build time (the loop does); falls back to "dev" for a plain `cargo build`.
+pub const LAB_BUILD: &str = match option_env!("LAB_BUILD") {
+    Some(v) => v,
+    None => "dev",
+};
+
+/// Load or create the receiver's persistent identity so its node id — and thus
+/// the lab code the user pasted once — stays STABLE across self-update restarts.
+/// Ports change on restart; the stable node id + relay in the encoded addr let
+/// the runner reconnect anyway (relay rendezvous + hole-punch, same as the app).
+pub fn lab_secret(state_dir: &Path) -> iroh::SecretKey {
+    let path = state_dir.join("lab-identity.key");
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            return iroh::SecretKey::from_bytes(&seed);
+        }
+    }
+    let seed: [u8; 32] = rand::random();
+    let _ = std::fs::create_dir_all(state_dir);
+    if std::fs::write(&path, seed).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    iroh::SecretKey::from_bytes(&seed)
+}
+
 /// Bind a lab endpoint with the PRODUCTION preset (default relays + discovery)
 /// AND the production transport tuning — BBR congestion control + 8 MB windows
 /// (see `iroh_net::start`). Without this the lab measures quinn's CUBIC
@@ -38,6 +79,16 @@ pub const LAB_RESULTS_ALPN: &[u8] = b"dropbeam-lab/results";
 /// `accept` registers the app ALPN (plus the lab results channel) so peers can
 /// dial us.
 pub async fn lab_endpoint(accept: bool) -> Result<Endpoint> {
+    lab_endpoint_inner(accept, None).await
+}
+
+/// Like `lab_endpoint`, but persists identity under `state_dir` so the node id
+/// survives self-update restarts. Used by `serve`.
+pub async fn lab_endpoint_persistent(accept: bool, state_dir: &Path) -> Result<Endpoint> {
+    lab_endpoint_inner(accept, Some(state_dir)).await
+}
+
+async fn lab_endpoint_inner(accept: bool, state_dir: Option<&Path>) -> Result<Endpoint> {
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
         noq_proto::congestion::BbrConfig::default(),
@@ -45,8 +96,16 @@ pub async fn lab_endpoint(accept: bool) -> Result<Endpoint> {
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
     let mut b = Endpoint::builder(presets::N0).transport_config(tcfg.build());
+    if let Some(dir) = state_dir {
+        b = b.secret_key(lab_secret(dir));
+    }
     if accept {
-        b = b.alpns(vec![ALPN.to_vec(), LAB_RESULTS_ALPN.to_vec()]);
+        b = b.alpns(vec![
+            ALPN.to_vec(),
+            LAB_RESULTS_ALPN.to_vec(),
+            LAB_UPDATE_ALPN.to_vec(),
+            LAB_INFO_ALPN.to_vec(),
+        ]);
     }
     b.bind().await.context("bind lab iroh endpoint")
 }
