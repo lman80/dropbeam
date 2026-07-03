@@ -333,6 +333,39 @@ pub fn build_corpus(dir: &Path, suite: &str) -> Result<Vec<LabCase>> {
         cases.push(LabCase { name: "many-400", paths: vec![many] });
     }
 
+    // "torture2" = second-wave collision/boundary discovery. As with edge, a
+    // sender↔receiver hash difference is a FINDING to inspect, not a hard fail.
+    if suite == "torture2" {
+        cases.clear();
+        // Two DISTINCT files whose names collide only after the receiver strips a
+        // leading dot (".config" + "config", different content). Realistic when a
+        // folder holds both; both must survive — the loser must never silently
+        // clobber the winner. (An NFC/NFD pair can't be tested here: APFS itself
+        // collapses those to one file, so the corpus would only hold one.)
+        cases.push(LabCase {
+            name: "dotstrip-collision",
+            paths: vec![file(".config.bin", 4096, 70)?, file("config.bin", 5000, 71)?],
+        });
+        // Exactly PARALLEL_MIN (16 MiB) — the parallel-threshold boundary.
+        cases.push(LabCase { name: "boundary-16mib", paths: vec![file("edge16.bin", 16 * 1024 * 1024, 72)?] });
+        // One byte under the threshold — must take the classic path.
+        cases.push(LabCase { name: "boundary-under", paths: vec![file("under16.bin", 16 * 1024 * 1024 - 1, 73)?] });
+        // A folder holding a file and a subdir that share a name at the SAME level
+        // (legal on disk; a naive receiver could treat one as the other).
+        let tc = dir.join("TypeClash");
+        std::fs::create_dir_all(tc.join("thing"))?;
+        file("TypeClash/thing/inside.bin", 4096, 74)?;
+        file("TypeClash/thing.bin", 4096, 75)?;
+        cases.push(LabCase { name: "type-clash", paths: vec![tc] });
+        // 2000-file scale batch in one folder.
+        let big = dir.join("Scale2000");
+        std::fs::create_dir_all(&big)?;
+        for i in 0..2000 {
+            file(&format!("Scale2000/s{i:04}.bin"), 512 + (i % 8) * 256, 400 + i as u64)?;
+        }
+        cases.push(LabCase { name: "scale-2000", paths: vec![big] });
+    }
+
     // "mixed" = one big file + many smalls in a single batch: multi-item batches
     // never go parallel, so this measures the classic path carrying bulk.
     if suite == "mixed" {
