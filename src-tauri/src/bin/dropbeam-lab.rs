@@ -183,6 +183,7 @@ async fn send(args: &[String]) -> Result<()> {
                 .connect(peer.clone(), labkit::ALPN)
                 .await
                 .context("dial peer")?;
+            let path_start = labkit::conn_detail(&conn);
             let engaged = AtomicBool::new(false);
             let sent = labkit::send_files(
                 &conn,
@@ -215,6 +216,10 @@ async fn send(args: &[String]) -> Result<()> {
                 "ms": ms,
                 "mbps": (sent as f64 / (1024.0 * 1024.0)) / (ms as f64 / 1000.0),
                 "parallelEngaged": engaged.load(std::sync::atomic::Ordering::Relaxed),
+                // Path the QUIC connection was on at dial time vs after the
+                // transfer — shows relay→direct upgrades and hairpin routes.
+                "pathStart": path_start,
+                "pathEnd": labkit::conn_detail(&conn),
                 "hashes": hashes.iter().map(|(rel, h)| json!({"rel": rel, "sha256": h})).collect::<Vec<_>>(),
             }))
         }

@@ -22,7 +22,7 @@ use iroh::{Endpoint, EndpointAddr, TransportAddr};
 use sha2::{Digest, Sha256};
 
 pub use crate::iroh_net::{
-    recv_files, recv_files_negotiated, send_files, set_parallel_streams, ALPN,
+    conn_detail, recv_files, recv_files_negotiated, send_files, set_parallel_streams, ALPN,
 };
 pub use iroh::endpoint::Connection;
 
@@ -31,11 +31,20 @@ pub use iroh::endpoint::Connection;
 /// copying from the second machine.
 pub const LAB_RESULTS_ALPN: &[u8] = b"dropbeam-lab/results";
 
-/// Bind a lab endpoint with the PRODUCTION preset (default relays + discovery).
+/// Bind a lab endpoint with the PRODUCTION preset (default relays + discovery)
+/// AND the production transport tuning — BBR congestion control + 8 MB windows
+/// (see `iroh_net::start`). Without this the lab measures quinn's CUBIC
+/// defaults, which crawl on lossy Wi-Fi, not what the app actually does.
 /// `accept` registers the app ALPN (plus the lab results channel) so peers can
 /// dial us.
 pub async fn lab_endpoint(accept: bool) -> Result<Endpoint> {
-    let mut b = Endpoint::builder(presets::N0);
+    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
+    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
+        noq_proto::congestion::BbrConfig::default(),
+    ));
+    tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
+    tcfg = tcfg.send_window(8 * 1024 * 1024);
+    let mut b = Endpoint::builder(presets::N0).transport_config(tcfg.build());
     if accept {
         b = b.alpns(vec![ALPN.to_vec(), LAB_RESULTS_ALPN.to_vec()]);
     }
