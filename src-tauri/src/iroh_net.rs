@@ -1343,7 +1343,13 @@ async fn serve_stream(
                                         });
                                         recv_file_resumable(
                                             conn,
-                                            FinalizeDest::UniqueIn(dest.clone(), name.clone()),
+                                            // Land under a receive-safe name (the raw
+                                            // `name` stays in the fingerprint so
+                                            // resume matching is unaffected).
+                                            FinalizeDest::UniqueIn(
+                                                dest.clone(),
+                                                receive_rel(&name).to_string_lossy().into_owned(),
+                                            ),
                                             total, part, rc, cov, first, &cancel, cb,
                                         )
                                         .await
@@ -3935,6 +3941,71 @@ pub(crate) fn folder_rel(path: &Path, root: &str) -> Option<String> {
 
 /// Sanitize a peer-supplied relative path: drop empties, `.` and `..`, and any
 /// drive/root prefix, so a malicious peer can't write outside the staging dir.
+/// Make one path component CREATABLE on Windows: mangle the characters NTFS
+/// forbids (`<>:"/\|?*`, control chars), trim the trailing dots/spaces Explorer
+/// can't produce or delete, and defuse reserved device names (CON, NUL, COM1…).
+/// Without this, one Mac-legal name ("Report 7:3.pdf" — what Finder stores when
+/// the user types "/") makes the receiver's `File::create` fail and ABORTS THE
+/// WHOLE BATCH. Compiled everywhere so the tests run on every platform; only
+/// Windows receive paths actually apply it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_safe_component(comp: &str) -> String {
+    let mut s: String = comp
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            c if (c as u32) < 0x20 => '-',
+            c => c,
+        })
+        .collect();
+    while s.ends_with('.') || s.ends_with(' ') {
+        s.pop();
+    }
+    // "CON", "con.txt", "COM1.tar.gz" are all reserved — the check is on the
+    // portion before the first dot, case-insensitive.
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if RESERVED.contains(&stem.as_str()) {
+        s.insert(0, '_');
+    }
+    if s.is_empty() {
+        s.push('_');
+    }
+    s
+}
+
+/// Receive-side rel for quick-send / friend pushes: keep the sender's subtree,
+/// drop non-Normal components (traversal guard), strip leading dots (a received
+/// dotfile is INVISIBLE in Finder/Explorer — the recipient thinks nothing
+/// arrived), NFC-normalize (same form the folder-sync receiver lands), and on
+/// Windows mangle uncreatable names instead of aborting the batch.
+pub(crate) fn receive_rel(raw: &str) -> PathBuf {
+    use unicode_normalization::UnicodeNormalization;
+    let mut out = PathBuf::new();
+    for c in Path::new(raw).components() {
+        let std::path::Component::Normal(s) = c else {
+            continue;
+        };
+        let s = s.to_string_lossy();
+        let s = s.trim_start_matches('.');
+        if s.is_empty() {
+            continue;
+        }
+        #[cfg(windows)]
+        let s = windows_safe_component(s);
+        #[cfg(windows)]
+        let s = s.as_str();
+        out.push(s.nfc().collect::<String>());
+    }
+    if out.as_os_str().is_empty() {
+        out.push("file");
+    }
+    out
+}
+
 pub(crate) fn sanitize_rel(raw: &str) -> PathBuf {
     use unicode_normalization::UnicodeNormalization;
     let mut out = PathBuf::new();
@@ -4725,6 +4796,10 @@ fn spawn_range_reader(
     part: PathBuf,
     total: u64,
     cov: std::sync::Arc<Mutex<Coverage>>,
+    // Raw bytes read off the wire, bumped per chunk. Coverage now advances in
+    // FLUSH_SPAN steps, so the stall detector watches THIS instead — a slow link
+    // that trickles bytes must never be misread as "no data for 60s".
+    raw: std::sync::Arc<AtomicU64>,
 ) {
     set.spawn(async move {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -4743,28 +4818,42 @@ fn spawn_range_reader(
         f.seek(std::io::SeekFrom::Start(offset)).await?;
         let mut done = 0u64;
         let mut buf = vec![0u8; CHUNK];
+        // tokio::fs writes are DEFERRED — write_all returns once the chunk is
+        // handed to a background blocking task, and a failed syscall (ENOSPC on
+        // the sparse pre-sized partial, EIO on an external drive) only surfaces
+        // on a LATER operation. INVARIANT: coverage may only claim bytes whose
+        // write errors have been observed — flush() joins the in-flight op and
+        // returns its error — otherwise a resume could skip a "covered" hole and
+        // finalize a file with zeros where data should be. Flushing EVERY chunk
+        // made each QUIC read wait out a disk round-trip (the profiled LAN slow
+        // ramp), so we batch: write up to FLUSH_SPAN, flush ONCE, and only then
+        // record the whole span. Writes within one stream are sequential, so the
+        // unrecorded span is contiguous; on error it's simply never claimed and a
+        // resume re-fetches it. Crash-loss is unchanged — the sidecar persists on
+        // its own ~16s cadence, far coarser than this.
+        const FLUSH_SPAN: u64 = 8 * 1024 * 1024;
+        let mut unflushed_from = offset; // start of the span written but not yet claimed
         while done < len {
             let want = (len - done).min(CHUNK as u64) as usize;
             match uni.read(&mut buf[..want]).await? {
                 Some(k) if k > 0 => {
                     f.write_all(&buf[..k]).await?;
-                    // tokio::fs write is DEFERRED — write_all returns once the
-                    // chunk is handed to a background blocking task, and a failed
-                    // syscall (ENOSPC on the sparse pre-sized partial, EIO on an
-                    // external drive) only surfaces on the NEXT operation. Flush
-                    // first: it joins the in-flight op and returns its error, so
-                    // coverage never claims bytes the OS rejected — otherwise a
-                    // resume could skip the "covered" hole and finalize a file
-                    // with a stretch of zeros where data should be.
-                    f.flush().await?;
-                    let end = offset + done + k as u64;
-                    cov.lock().unwrap().insert(offset + done, end);
                     done += k as u64;
+                    raw.fetch_add(k as u64, Ordering::Relaxed);
+                    let end = offset + done;
+                    if end - unflushed_from >= FLUSH_SPAN {
+                        f.flush().await?;
+                        cov.lock().unwrap().insert(unflushed_from, end);
+                        unflushed_from = end;
+                    }
                 }
                 _ => anyhow::bail!("segment stream ended early ({} bytes short)", len - done),
             }
         }
         f.flush().await?;
+        if offset + done > unflushed_from {
+            cov.lock().unwrap().insert(unflushed_from, offset + done);
+        }
         Ok(())
     });
 }
@@ -4800,8 +4889,9 @@ async fn recv_file_resumable<F: Fn(u64, u64)>(
     on_progress: F,
 ) -> Result<PathBuf> {
     let cov = std::sync::Arc::new(Mutex::new(start_cov));
+    let raw = std::sync::Arc::new(AtomicU64::new(0));
     let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
-    spawn_range_reader(&mut set, first, part.clone(), total, cov.clone());
+    spawn_range_reader(&mut set, first, part.clone(), total, cov.clone(), raw.clone());
 
     let persist = |cov: &Coverage, fsync: bool| {
         if let Some(rc) = &resume {
@@ -4834,17 +4924,22 @@ async fn recv_file_resumable<F: Fn(u64, u64)>(
     let mut last_persist = Instant::now();
     let mut persist_n: u32 = 0;
     loop {
-        let covered = cov.lock().unwrap().covered();
-        if covered != last_covered {
-            last_covered = covered;
+        // Stall detection watches RAW wire bytes (per-chunk), not coverage —
+        // coverage now advances in FLUSH_SPAN steps, and a slow-but-alive link
+        // must never trip the 60s "no data" error between steps. Progress and
+        // completion still use coverage: it's the resume-truthful byte count.
+        let wire = raw.load(Ordering::Relaxed);
+        if wire != last_covered {
+            last_covered = wire;
             last_growth = Instant::now();
         }
+        let covered = cov.lock().unwrap().covered();
         if covered >= total {
             break; // every byte accounted for
         }
         tokio::select! {
             uni = conn.accept_uni() => match uni {
-                Ok(u) => spawn_range_reader(&mut set, u, part.clone(), total, cov.clone()),
+                Ok(u) => spawn_range_reader(&mut set, u, part.clone(), total, cov.clone(), raw.clone()),
                 Err(e) => { err = Some(anyhow::anyhow!("connection lost: {e}")); break; }
             },
             joined = set.join_next(), if !set.is_empty() => match joined {
@@ -5059,6 +5154,15 @@ fn collect_dir_items(
         }
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_symlink() {
+            // Symlinks/aliases inside a dropped folder are not followed (a link
+            // to a huge tree or an absolute path outside the folder would send
+            // surprising data). But NEVER silently: the sender believes the whole
+            // folder arrived. The count reaches the user via the WARN log +
+            // diagnostics digest until the UI grows a per-transfer note.
+            log::warn!(
+                "send: skipping symlink/alias inside folder: {}",
+                entry.path().display()
+            );
             continue;
         }
         let path = entry.path();
@@ -5093,7 +5197,25 @@ fn files_header(items: &[(PathBuf, String, u64, u64)], dirs: &[String], total: u
         "kind": "files",
         "items": items
             .iter()
-            .map(|(_, n, s, mt)| serde_json::json!({ "name": n, "size": s, "mtime": mt }))
+            .map(|(p, n, s, mt)| {
+                let mut it = serde_json::json!({ "name": n, "size": s, "mtime": mt });
+                // Carry the executable bit (lab finding: a sent program arrived
+                // un-runnable). OPTIONAL key — old receivers ignore it, and the
+                // receiver honors ONLY +x, never setuid/setgid.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if std::fs::metadata(p)
+                        .map(|m| m.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false)
+                    {
+                        it["exec"] = serde_json::Value::Bool(true);
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = p;
+                it
+            })
             .collect::<Vec<_>>(),
         // Empty directories to recreate on the receiver (GitHub #22). OPTIONAL: an
         // older receiver simply ignores this key — no protocol break. Carried OUT of
@@ -5204,21 +5326,12 @@ async fn read_body<F: Fn(u64, u64)>(
     for item in &items {
         // Preserve a sender's subfolders ("Project/clips/a.mp4" → a real subtree)
         // but NEVER honor an absolute path, a Windows drive prefix, or any "."/".."
-        // component — so a peer can't write outside dest_dir. Keeping only Normal
-        // path components is the same traversal guard the folder-sync receiver uses.
+        // component — so a peer can't write outside dest_dir. receive_rel also
+        // un-hides dotfiles, NFC-normalizes, and (Windows) mangles names the local
+        // filesystem can't create — one Mac-legal "Report 7:3.pdf" used to abort
+        // the entire batch here.
         let raw = item["name"].as_str().unwrap_or("file");
-        let rel: PathBuf = Path::new(raw)
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(s) => Some(s),
-                _ => None,
-            })
-            .collect();
-        let rel = if rel.as_os_str().is_empty() {
-            PathBuf::from("file")
-        } else {
-            rel
-        };
+        let rel = receive_rel(raw);
         let size = item["size"].as_u64().unwrap_or(0);
         // Ensure the parent subtree exists (or fall back to a flat leaf if an
         // ancestor is a FILE — ENOTDIR — rather than aborting the whole batch, the
@@ -5317,6 +5430,17 @@ async fn read_body<F: Fn(u64, u64)>(
         } else {
             dest.clone()
         };
+        // Restore the sender's executable bit (optional manifest key; +x only —
+        // never setuid/setgid, and only once the file is at its final name).
+        #[cfg(unix)]
+        if item["exec"].as_bool().unwrap_or(false) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(m) = std::fs::metadata(&landed) {
+                let mut perm = m.permissions();
+                perm.set_mode((perm.mode() | 0o111) & 0o7777);
+                let _ = std::fs::set_permissions(&landed, perm);
+            }
+        }
         out.push(landed);
     }
     Ok(out)
@@ -5591,7 +5715,12 @@ async fn read_files_negotiated<F: Fn(u64, u64)>(
                                 });
                                 recv_file_resumable(
                                     conn,
-                                    FinalizeDest::UniqueIn(dest_dir.to_path_buf(), name),
+                                    // Receive-safe landing name; raw `name` stays in
+                                    // the fingerprint so resume matching still works.
+                                    FinalizeDest::UniqueIn(
+                                        dest_dir.to_path_buf(),
+                                        receive_rel(&name).to_string_lossy().into_owned(),
+                                    ),
                                     total,
                                     part,
                                     rc,
@@ -5601,7 +5730,20 @@ async fn read_files_negotiated<F: Fn(u64, u64)>(
                                     on_progress,
                                 )
                                 .await
-                                .map(|p| vec![p])
+                                .map(|p| {
+                                    // Restore the sender's +x (optional key; exec
+                                    // bit only, same as the classic body path).
+                                    #[cfg(unix)]
+                                    if item0["exec"].as_bool().unwrap_or(false) {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if let Ok(m) = std::fs::metadata(&p) {
+                                            let mut perm = m.permissions();
+                                            perm.set_mode((perm.mode() | 0o111) & 0o7777);
+                                            let _ = std::fs::set_permissions(&p, perm);
+                                        }
+                                    }
+                                    vec![p]
+                                })
                             }
                             // Sender raced into its classic fallback — read the
                             // classic body. Drop the partial+sidecar only if WE own
@@ -5739,6 +5881,42 @@ mod tests {
         // NFD input is normalized to NFC so the on-disk name matches every key:
         // "Cafe" + combining acute → precomposed "Café".
         assert_eq!(sanitize_rel("Cafe\u{301}"), Path::new("Caf\u{e9}"));
+    }
+
+    #[test]
+    fn windows_safe_component_mangles_uncreatable_names() {
+        // Finder stores "Report 7/3" as "Report 7:3" — must not abort a batch.
+        assert_eq!(windows_safe_component("Report 7:3.pdf"), "Report 7-3.pdf");
+        assert_eq!(windows_safe_component("a<b>c\"d|e?f*g"), "a-b-c-d-e-f-g");
+        // Trailing dots/spaces are uncreatable in Explorer.
+        assert_eq!(windows_safe_component("notes. "), "notes");
+        assert_eq!(windows_safe_component("trail..."), "trail");
+        // Reserved device names, with or without extension, any case.
+        assert_eq!(windows_safe_component("CON"), "_CON");
+        assert_eq!(windows_safe_component("con.txt"), "_con.txt");
+        assert_eq!(windows_safe_component("Com1.tar.gz"), "_Com1.tar.gz");
+        // Degenerate input still yields a creatable name.
+        assert_eq!(windows_safe_component("..."), "_");
+        // Normal names pass through untouched.
+        assert_eq!(windows_safe_component("사진 모음.jpg"), "사진 모음.jpg");
+    }
+
+    #[test]
+    fn receive_rel_guards_traversal_and_unhides_dotfiles() {
+        use std::path::Path;
+        // Subtrees preserved; traversal/absolute/drive can never escape.
+        assert_eq!(receive_rel("Project/clips/a.mp4"), Path::new("Project/clips/a.mp4"));
+        assert_eq!(receive_rel("../../etc/passwd"), Path::new("etc/passwd"));
+        assert_eq!(receive_rel("/etc/passwd"), Path::new("etc/passwd"));
+        // A received dotfile would be INVISIBLE in Finder — the recipient thinks
+        // nothing arrived. Un-hide it, mirroring the folder-sync receiver.
+        assert_eq!(receive_rel(".secrets.bin"), Path::new("secrets.bin"));
+        assert_eq!(receive_rel(".configdir/inner.bin"), Path::new("configdir/inner.bin"));
+        // NFC normalization matches the folder-sync landing form.
+        assert_eq!(receive_rel("Cafe\u{301}"), Path::new("Caf\u{e9}"));
+        // Degenerate input still lands somewhere safe.
+        assert_eq!(receive_rel(""), Path::new("file"));
+        assert_eq!(receive_rel("..."), Path::new("file"));
     }
 
     #[test]
@@ -6439,6 +6617,54 @@ mod loopback_tests {
         let got = std::fs::read(&received[0]).unwrap();
         assert_eq!(got.len(), data.len(), "received length matches");
         assert!(got == data, "received bytes are byte-identical to the source");
+
+        client.close().await;
+        server.close().await;
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// The sender's executable bit rides the manifest and is restored on the
+    /// landed file (+x only) — a sent program/script must arrive runnable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loopback_exec_bit_roundtrips() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let server_addr = server.addr();
+
+        let src_dir = scratch("xb-src");
+        let src = src_dir.join("tool.sh");
+        std::fs::write(&src, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dest_dir = scratch("xb-rx");
+
+        let srv = server.clone();
+        let dest_c = dest_dir.clone();
+        let recv = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            recv_files(&conn, &dest_c, &AtomicBool::new(false), |_, _| {})
+                .await
+                .unwrap()
+        });
+        let conn = client.connect(server_addr, ALPN).await.unwrap();
+        send_files(
+            &conn,
+            &[src],
+            &AtomicBool::new(false),
+            |_, _| {},
+            "exec-tester",
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+
+        let received = recv.await.unwrap();
+        assert_eq!(received.len(), 1);
+        let mode = std::fs::metadata(&received[0]).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "received file kept its executable bit (mode {mode:o})");
+        assert_eq!(mode & 0o6000, 0, "no setuid/setgid ever lands");
 
         client.close().await;
         server.close().await;
