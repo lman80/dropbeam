@@ -859,6 +859,11 @@ async fn serve_stream(
             write_frame(send, &serde_json::json!({ "kind": "pong" })).await?;
             send.finish()?;
         }
+        // Lab Mode: gated remote test + update. The handler enforces the
+        // enabled+operator check before doing anything (see lab.rs).
+        Some("lab") => {
+            crate::lab::handle_lab(conn, send, recv, &req, state).await?;
+        }
         Some("pull") => {
             let token = req.get("token").and_then(|t| t.as_str()).unwrap_or("");
             // Keep the staged send (clone, don't remove) so the receiver can re-pull
@@ -4043,14 +4048,14 @@ pub(crate) fn sanitize_rel(raw: &str) -> PathBuf {
 const MAX_HEADER: usize = 1 << 20; // 1 MiB — generous for a file list, abuse-safe
 const CHUNK: usize = 1024 * 1024; // 1 MiB — fewer read/write/await cycles on big files
 
-async fn write_frame(send: &mut SendStream, v: &serde_json::Value) -> Result<()> {
+pub(crate) async fn write_frame(send: &mut SendStream, v: &serde_json::Value) -> Result<()> {
     let buf = serde_json::to_vec(v)?;
     send.write_all(&(buf.len() as u32).to_be_bytes()).await?;
     send.write_all(&buf).await?;
     Ok(())
 }
 
-async fn read_frame(recv: &mut RecvStream) -> Result<serde_json::Value> {
+pub(crate) async fn read_frame(recv: &mut RecvStream) -> Result<serde_json::Value> {
     read_frame_cap(recv, MAX_HEADER).await
 }
 
@@ -4059,7 +4064,7 @@ async fn read_frame(recv: &mut RecvStream) -> Result<serde_json::Value> {
 /// the 1 MiB control-frame cap (which would drop the whole presence beacon).
 const MAX_RECONCILE: usize = 64 << 20;
 
-async fn read_frame_cap(recv: &mut RecvStream, cap: usize) -> Result<serde_json::Value> {
+pub(crate) async fn read_frame_cap(recv: &mut RecvStream, cap: usize) -> Result<serde_json::Value> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;

@@ -51,6 +51,8 @@ async fn main() -> Result<()> {
         Some("results") => results(&args).await,
         Some("info") => info(&args).await,
         Some("push-update") => push_update(&args).await,
+        Some("lab-id") => lab_id(&args).await,
+        Some("lab") => lab_cmd(&args).await,
         Some("version") => {
             println!("{}", labkit::LAB_BUILD);
             Ok(())
@@ -225,6 +227,43 @@ async fn results(args: &[String]) -> Result<()> {
     let body = r.read_to_end(64 * 1024 * 1024).await?;
     println!("{}", String::from_utf8_lossy(&body));
     shutdown(&ep).await;
+    Ok(())
+}
+
+/// The operator's persistent state dir — its identity lives here so the node id
+/// stays stable across runs (the user pastes it into each device's Lab operator
+/// field once).
+fn operator_state_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".dropbeam-lab-operator"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("dropbeam-lab-operator"))
+}
+
+/// Print this operator's node id — the value the user sets as "Lab operator" on
+/// each device so it will accept our commands.
+async fn lab_id(_args: &[String]) -> Result<()> {
+    let ep = labkit::operator_endpoint(&operator_state_dir()).await?;
+    println!("{}", ep.id());
+    shutdown(&ep).await;
+    Ok(())
+}
+
+/// Run one Lab Mode command against a device's real app, by its node id.
+///   dropbeam-lab lab --to <device-node-id> --cmd ping [--json '{"k":"v"}']
+async fn lab_cmd(args: &[String]) -> Result<()> {
+    let to = flag(args, "--to").context("--to <device-node-id> is required")?;
+    let cmd = flag(args, "--cmd").unwrap_or_else(|| "ping".into());
+    let extra: serde_json::Value = match flag(args, "--json") {
+        Some(j) => serde_json::from_str(&j).context("--json must be a JSON object")?,
+        None => serde_json::json!({}),
+    };
+    let ep = labkit::operator_endpoint(&operator_state_dir()).await?;
+    let reply = labkit::lab_call(&ep, &to, &cmd, extra).await?;
+    println!("{reply}");
+    shutdown(&ep).await;
+    if reply.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

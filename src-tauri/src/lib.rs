@@ -5,6 +5,9 @@ mod folder_history;
 mod friends;
 mod history;
 mod iroh_net;
+// Gated remote test-and-update surface (Settings → Lab Mode). Off by default;
+// only a named operator device can drive it. See lab.rs for the trust model.
+mod lab;
 // Dev-only surface for the `dropbeam-lab` two-machine test driver (src/bin/).
 // Re-exports the real engine send/recv so lab runs exercise shipping code;
 // never bundled into the app the user installs.

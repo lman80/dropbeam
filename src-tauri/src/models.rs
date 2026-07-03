@@ -242,6 +242,19 @@ pub struct Settings {
     /// baked-in endpoint.
     #[serde(default)]
     pub diagnostics_url: String,
+    /// Lab Mode: allow a trusted OPERATOR device to run automated end-to-end tests
+    /// against this app and push new builds to it, all over the encrypted p2p
+    /// link. OFF by default. Even when on, commands are accepted ONLY from the
+    /// `lab_operator_id` below — a random peer can never drive it. Meant for the
+    /// app author's own test devices, not everyday use.
+    #[serde(default)]
+    pub lab_mode_enabled: bool,
+    /// The iroh node id of the single device permitted to drive Lab Mode on this
+    /// machine. Empty = nothing is accepted even when `lab_mode_enabled` is true.
+    /// The node id is cryptographically bound to the QUIC connection, so this is a
+    /// real authentication gate, not a self-reported name.
+    #[serde(default)]
+    pub lab_operator_id: String,
     /// How long a mirror folder keeps deleted/replaced copies in its recovery
     /// history before auto-removing them. 0 = keep forever. Default 30 days —
     /// mirrors macOS "Recently Deleted" so old copies can't pile up unbounded.
@@ -283,6 +296,8 @@ impl Default for Settings {
             show_sync_popup: true,
             share_diagnostics: true,
             diagnostics_url: String::new(),
+            lab_mode_enabled: false,
+            lab_operator_id: String::new(),
             folder_history_keep_days: default_keep_days(),
             folder_history_budget_bytes: default_history_budget(),
         }

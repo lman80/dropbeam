@@ -160,6 +160,63 @@ pub fn filter_addr(addr: EndpointAddr, mode: &str) -> EndpointAddr {
     }
 }
 
+/// Operator endpoint for driving Lab Mode: a PERSISTENT identity (so the node id
+/// the user pastes into each device's "Lab operator" field stays stable) with the
+/// app ALPN as a CLIENT (we dial devices, they don't dial us). Reuses the same
+/// production transport as the app so path behavior matches.
+pub async fn operator_endpoint(state_dir: &Path) -> Result<Endpoint> {
+    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
+    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
+        noq_proto::congestion::BbrConfig::default(),
+    ));
+    tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
+    tcfg = tcfg.send_window(8 * 1024 * 1024);
+    Endpoint::builder(presets::N0)
+        .secret_key(lab_secret(state_dir))
+        .transport_config(tcfg.build())
+        .bind()
+        .await
+        .context("bind operator endpoint")
+}
+
+/// Dial a device's REAL app endpoint by node id and run one Lab Mode command.
+/// `cmd` + `extra` fields form the request; returns the device's JSON reply.
+/// The device only answers if its Lab Mode is on and this operator's node id is
+/// the one it trusts — otherwise the reply is `{ok:false,error:"unauthorized"}`.
+pub async fn lab_call(
+    ep: &Endpoint,
+    node_id: &str,
+    cmd: &str,
+    extra: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let id: iroh::EndpointId = node_id.trim().parse().context("parse device node id")?;
+    let conn = ep
+        .connect(iroh::EndpointAddr::from(id), ALPN)
+        .await
+        .context("dial device app endpoint")?;
+    let (mut s, mut r) = conn.open_bi().await?;
+    let mut req = serde_json::json!({ "kind": "lab", "cmd": cmd });
+    if let serde_json::Value::Object(map) = extra {
+        for (k, v) in map {
+            req[k] = v;
+        }
+    }
+    // Frame: [u32 BE len][json], same as the app's control protocol.
+    let body = serde_json::to_vec(&req)?;
+    use tokio::io::AsyncWriteExt;
+    s.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    s.write_all(&body).await?;
+    s.finish()?;
+    let bytes = r.read_to_end(128 * 1024 * 1024).await?;
+    // Reply is also a length-prefixed frame.
+    anyhow::ensure!(bytes.len() >= 4, "short lab reply");
+    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let json = &bytes[4..4 + len.min(bytes.len() - 4)];
+    let reply: serde_json::Value = serde_json::from_slice(json).context("parse lab reply")?;
+    let _ = conn;
+    Ok(reply)
+}
+
 /// sha256 of a file, hex — the byte-identity check both sides report.
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path)?;
