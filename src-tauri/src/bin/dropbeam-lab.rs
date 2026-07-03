@@ -156,6 +156,7 @@ async fn send(args: &[String]) -> Result<()> {
     let mode = flag(args, "--mode").unwrap_or_else(|| "auto".into());
     let suite = flag(args, "--suite").unwrap_or_else(|| "quick".into());
     let parallel = flag(args, "--parallel").unwrap_or_else(|| "on".into()) != "off";
+    let profile = args.iter().any(|a| a == "--profile");
     let corpus_dir = flag(args, "--dir")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("dropbeam-lab-corpus"));
@@ -167,7 +168,10 @@ async fn send(args: &[String]) -> Result<()> {
     }
 
     let ep = labkit::lab_endpoint(false).await?;
-    let cases = labkit::build_corpus(&corpus_dir, &suite)?;
+    let mut cases = labkit::build_corpus(&corpus_dir, &suite)?;
+    if let Some(only) = flag(args, "--only") {
+        cases.retain(|c| c.name == only);
+    }
     emit(json!({
         "event": "start",
         "mode": mode, "suite": suite, "parallel": parallel,
@@ -185,11 +189,22 @@ async fn send(args: &[String]) -> Result<()> {
                 .context("dial peer")?;
             let path_start = labkit::conn_detail(&conn);
             let engaged = AtomicBool::new(false);
+            // --profile: sample (elapsed_ms, bytes_confirmed) roughly every 2s so
+            // a long transfer's rate-over-time shape is visible (decay vs sawtooth).
+            let samples = Mutex::new(Vec::<(u64, u64)>::new());
             let sent = labkit::send_files(
                 &conn,
                 &case.paths,
                 &AtomicBool::new(false),
-                |_, _| {},
+                |done, _| {
+                    if profile {
+                        let t = started.elapsed().as_millis() as u64;
+                        let mut s = samples.lock().unwrap();
+                        if s.last().map(|(lt, _)| t - lt >= 2000).unwrap_or(true) {
+                            s.push((t, done));
+                        }
+                    }
+                },
                 "dropbeam-lab",
                 &engaged,
             )
@@ -220,6 +235,7 @@ async fn send(args: &[String]) -> Result<()> {
                 // transfer — shows relay→direct upgrades and hairpin routes.
                 "pathStart": path_start,
                 "pathEnd": labkit::conn_detail(&conn),
+                "profile": *samples.lock().unwrap(),
                 "hashes": hashes.iter().map(|(rel, h)| json!({"rel": rel, "sha256": h})).collect::<Vec<_>>(),
             }))
         }

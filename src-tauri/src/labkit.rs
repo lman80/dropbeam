@@ -197,5 +197,92 @@ pub fn build_corpus(dir: &Path, suite: &str) -> Result<Vec<LabCase>> {
     if suite == "big" {
         cases.push(LabCase { name: "huge-1gib", paths: vec![file("huge.bin", 1 << 30, 43)?] });
     }
+
+    // "edge" = hostile-input discovery suite. Sender hashes describe what's on
+    // the sender's disk; receiver hashes show what actually landed — DIFFERENCES
+    // ARE THE FINDINGS (renames, drops, collisions), not automatic failures.
+    if suite == "edge" {
+        cases.clear();
+        // Explicitly-sent dotfile: receiver sanitize_rel strips the leading dot.
+        cases.push(LabCase { name: "dotfile-direct", paths: vec![file(".secrets.bin", 4096, 50)?] });
+        // Dot-named FOLDER sent explicitly (children are normal names).
+        let dotdir = dir.join(".configdir");
+        std::fs::create_dir_all(&dotdir)?;
+        file(".configdir/inner.bin", 4096, 51)?;
+        cases.push(LabCase { name: "dotfolder", paths: vec![dotdir] });
+        // Colon names — what a Finder name like "Report 7/3" becomes on disk.
+        // TWO of them so a sanitize-to-same-name collision shows up too.
+        cases.push(LabCase {
+            name: "colon-names",
+            paths: vec![file("Report 7:3.bin", 5000, 52)?, file("Data 1:2.bin", 6000, 53)?],
+        });
+        // NFD-decomposed Korean filename (what macOS's file system reports).
+        {
+            use unicode_normalization::UnicodeNormalization;
+            let nfd: String = "한국어파일.bin".nfd().collect();
+            cases.push(LabCase { name: "korean-nfd", paths: vec![file(&nfd, 4096, 54)?] });
+        }
+        // 254-byte filename (APFS limit is 255).
+        let long = format!("{}.bin", "L".repeat(250));
+        cases.push(LabCase { name: "long-name", paths: vec![file(&long, 4096, 55)?] });
+        // Newline inside a filename (legal on macOS).
+        cases.push(LabCase { name: "newline-name", paths: vec![file("two\nlines.bin", 4096, 56)?] });
+        // 20-deep nesting with an empty dir mid-tree.
+        let mut deep = String::from("Deep");
+        for i in 0..20 {
+            deep.push_str(&format!("/level{i:02}"));
+        }
+        file(&format!("{deep}/bottom.bin"), 8192, 57)?;
+        std::fs::create_dir_all(dir.join("Deep/level00/empty-here"))?;
+        cases.push(LabCase { name: "deep-nest", paths: vec![dir.join("Deep")] });
+        // Symlinks INSIDE a sent folder: one live (to a sibling), one dangling.
+        #[cfg(unix)]
+        {
+            let sl = dir.join("Symlinks");
+            std::fs::create_dir_all(&sl)?;
+            file("Symlinks/real.bin", 4096, 58)?;
+            // Absolute targets: a relative target would resolve against the LINK's
+            // dir and dangle, testing our corpus instead of the engine.
+            let abs = std::fs::canonicalize(dir)?;
+            let _ = std::os::unix::fs::symlink(
+                abs.join("Symlinks/real.bin"),
+                sl.join("alias-to-real"),
+            );
+            let _ =
+                std::os::unix::fs::symlink(abs.join("Symlinks/gone.bin"), sl.join("dangling"));
+            cases.push(LabCase { name: "symlink-folder", paths: vec![sl] });
+            // A symlink passed DIRECTLY as the dropped path.
+            file("linktarget.bin", 4096, 59)?;
+            let link = dir.join("direct-link.bin");
+            let _ = std::os::unix::fs::symlink(abs.join("linktarget.bin"), &link);
+            cases.push(LabCase { name: "symlink-direct", paths: vec![link] });
+        }
+        // 8 MiB of zeros — degenerate content.
+        let z = dir.join("zeros.bin");
+        std::fs::write(&z, vec![0u8; 8 << 20])?;
+        cases.push(LabCase { name: "zeros-8mib", paths: vec![z] });
+    }
+
+    // "many" = per-file overhead: 400 small files in one folder.
+    if suite == "many" {
+        cases.clear();
+        let many = dir.join("Many");
+        std::fs::create_dir_all(&many)?;
+        for i in 0..400 {
+            file(&format!("Many/doc{i:04}.bin"), 1024 + (i % 16) * 1024, 200 + i as u64)?;
+        }
+        cases.push(LabCase { name: "many-400", paths: vec![many] });
+    }
+
+    // "mixed" = one big file + many smalls in a single batch: multi-item batches
+    // never go parallel, so this measures the classic path carrying bulk.
+    if suite == "mixed" {
+        cases.clear();
+        let mut paths = vec![file("mixed-big.bin", 300 << 20, 60)?];
+        for i in 0..50 {
+            paths.push(file(&format!("mixed-small-{i:02}.bin"), 4096 + i * 7, 300 + i as u64)?);
+        }
+        cases.push(LabCase { name: "mixed-batch", paths });
+    }
     Ok(cases)
 }
