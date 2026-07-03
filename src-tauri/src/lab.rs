@@ -74,11 +74,27 @@ pub(crate) async fn handle_lab(
     Ok(())
 }
 
+/// The device's config dir — where friends/chat/pairing/settings live.
+fn config_dir(state: &IrohState) -> Result<std::path::PathBuf> {
+    use tauri::Manager;
+    let app = state.app.get().ok_or_else(|| anyhow::anyhow!("app not ready"))?;
+    let app_state = app
+        .try_state::<std::sync::Arc<crate::AppState>>()
+        .ok_or_else(|| anyhow::anyhow!("app state not ready"))?;
+    Ok(app_state.config_dir.clone())
+}
+
+fn str_field<'a>(req: &'a serde_json::Value, k: &str) -> Result<&'a str> {
+    req.get(k)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing string field '{k}'"))
+}
+
 /// Run one authorized lab command. Returns the JSON payload to reply with (the
 /// caller stamps `ok`). New commands slot in here.
 async fn dispatch(
     cmd: &str,
-    _req: &serde_json::Value,
+    req: &serde_json::Value,
     _recv: &mut RecvStream,
     state: &IrohState,
 ) -> Result<serde_json::Value> {
@@ -91,8 +107,80 @@ async fn dispatch(
             "arch": std::env::consts::ARCH,
             "nodeId": state.get().map(|ep| ep.id().to_string()).unwrap_or_default(),
         })),
+
+        // Add (or refresh) a friend by their node id — the same call the app's
+        // auto-friend path uses. Returns the friend id. Idempotent.
+        "friend-add" => {
+            let cfg = config_dir(state)?;
+            let node = str_field(req, "nodeId")?;
+            let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("Lab Peer");
+            let f = crate::friends::upsert_by_endpoint(&cfg, node, name);
+            Ok(serde_json::json!({ "friendId": f.id }))
+        }
+
+        // Send a direct message to a friend (by their node id) through the REAL
+        // chat path: record it, then deliver over iroh. Returns msg id + whether
+        // delivery succeeded this attempt.
+        "chat-send" => {
+            let cfg = config_dir(state)?;
+            let node = str_field(req, "nodeId")?;
+            let text: String = str_field(req, "text")?.chars().take(4000).collect();
+            let friend = crate::friends::upsert_by_endpoint(&cfg, node, "Lab Peer");
+            let msg = crate::chat::ChatMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                peer_id: friend.id.clone(),
+                from_me: true,
+                kind: "text".into(),
+                text,
+                files: vec![],
+                bytes: 0,
+                path: None,
+                status: Some("sending".into()),
+                ts: crate::chat::now_ms(),
+                seq: crate::chat::next_seq(&cfg, &friend.id),
+                reply_to: None,
+                reply_preview: None,
+                reactions: vec![],
+                edited: false,
+                deleted: false,
+                gif: None,
+            };
+            crate::chat::append(&cfg, &msg);
+            let ep = state.get().cloned().ok_or_else(|| anyhow::anyhow!("iroh not ready"))?;
+            let my_name = my_display_name(state);
+            let payload = crate::iroh_net::chat_payload(&msg, &friend.id, &my_name);
+            let delivered = crate::iroh_net::send_chat(&ep, node, payload).await.is_ok();
+            if delivered {
+                crate::chat::set_status(&cfg, &friend.id, &msg.id, "delivered");
+            }
+            Ok(serde_json::json!({ "msgId": msg.id, "delivered": delivered }))
+        }
+
+        // Return the message log with a peer (by node id) — text + direction +
+        // seq — so the operator can confirm what actually landed on this device.
+        "chat-log" => {
+            let cfg = config_dir(state)?;
+            let node = str_field(req, "nodeId")?;
+            let friend = crate::friends::upsert_by_endpoint(&cfg, node, "Lab Peer");
+            let msgs: Vec<serde_json::Value> = crate::chat::messages(&cfg, &friend.id)
+                .into_iter()
+                .map(|m| serde_json::json!({
+                    "text": m.text, "fromMe": m.from_me, "seq": m.seq,
+                    "kind": m.kind, "deleted": m.deleted, "edited": m.edited,
+                }))
+                .collect();
+            Ok(serde_json::json!({ "friendId": friend.id, "count": msgs.len(), "messages": msgs }))
+        }
+
         other => bail!("unknown lab command: {other}"),
     }
+}
+
+/// This device's display name (for the chat payload's `fromName`).
+fn my_display_name(state: &IrohState) -> String {
+    config_dir(state)
+        .map(|cfg| crate::settings::load(&cfg, "", "").display_name)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
