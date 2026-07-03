@@ -34,6 +34,14 @@ fn emit(v: serde_json::Value) {
     println!("{v}");
 }
 
+/// Close the endpoint gracefully before the process exits. Dropping it abruptly
+/// cancels iroh's background actor tasks, which panic-print "task N was
+/// cancelled" onto stdout — corrupting the JSON the runner parses. `close()`
+/// shuts those down cleanly first.
+async fn shutdown(ep: &app_lib::labkit::Endpoint) {
+    ep.close().await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -216,6 +224,7 @@ async fn results(args: &[String]) -> Result<()> {
     s.finish()?;
     let body = r.read_to_end(64 * 1024 * 1024).await?;
     println!("{}", String::from_utf8_lossy(&body));
+    shutdown(&ep).await;
     Ok(())
 }
 
@@ -234,6 +243,7 @@ async fn info(args: &[String]) -> Result<()> {
     s.finish()?;
     let body = r.read_to_end(4096).await?;
     println!("{}", String::from_utf8_lossy(&body));
+    shutdown(&ep).await;
     Ok(())
 }
 
@@ -257,6 +267,7 @@ async fn push_update(args: &[String]) -> Result<()> {
     let ack = r.read_to_end(64).await.unwrap_or_default();
     anyhow::ensure!(ack == b"ok", "receiver did not confirm the update");
     emit(json!({"event": "update-sent", "bytes": bytes.len()}));
+    shutdown(&ep).await;
     Ok(())
 }
 
@@ -358,6 +369,7 @@ async fn send(args: &[String]) -> Result<()> {
         }
     }
     emit(json!({"event": "done", "failed": failed}));
+    shutdown(&ep).await;
     if failed > 0 {
         std::process::exit(1);
     }

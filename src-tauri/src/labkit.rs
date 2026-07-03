@@ -18,13 +18,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, TransportAddr};
+use iroh::{EndpointAddr, TransportAddr};
 use sha2::{Digest, Sha256};
 
 pub use crate::iroh_net::{
     conn_detail, recv_files, recv_files_negotiated, send_files, set_parallel_streams, ALPN,
 };
 pub use iroh::endpoint::Connection;
+pub use iroh::Endpoint;
+
 
 /// Side-channel ALPN the lab receiver answers on: the runner dials it to pull
 /// the receiver's accumulated JSON results over iroh itself — no SSH, no file
