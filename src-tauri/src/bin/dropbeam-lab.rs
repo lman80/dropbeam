@@ -105,13 +105,19 @@ async fn serve(args: &[String]) -> Result<()> {
             let result: Result<serde_json::Value> = async {
                 let conn = incoming.await.context("accept connection")?;
                 if conn.alpn() == labkit::LAB_RESULTS_ALPN {
-                    // Runner pulling results: reply with everything so far.
+                    // Runner pulling results: reply with everything so far. A "reset"
+                    // request additionally CLEARS the accumulator so the next test
+                    // round starts clean (the runner sends it before each round).
                     let (mut s, mut r) = conn.accept_bi().await?;
-                    let _ = r.read_to_end(64).await; // drain the "get" request
+                    let req = r.read_to_end(64).await.unwrap_or_default();
                     let body = serde_json::to_vec(&*results.lock().unwrap())?;
                     s.write_all(&body).await?;
                     s.finish()?;
                     let _ = s.stopped().await;
+                    if req == b"reset" {
+                        results.lock().unwrap().clear();
+                        return Ok(json!({"event": "results-reset", "conn": idx}));
+                    }
                     return Ok(json!({"event": "results-served", "conn": idx}));
                 }
                 if conn.alpn() == labkit::LAB_INFO_ALPN {
@@ -146,6 +152,10 @@ async fn serve(args: &[String]) -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     std::process::exit(EXIT_UPDATE);
                 }
+                // Clean any stale files first: conn numbering resets each launch,
+                // so without this a prior session's conn-001 contents leak into a
+                // new receive and the runner's hash tree compares garbage.
+                let _ = std::fs::remove_dir_all(&dest);
                 std::fs::create_dir_all(&dest)?;
                 // Negotiated receive = the same path the app's handlers run, so a
                 // parallel-advertised big file takes the real resumable route.
@@ -193,6 +203,8 @@ async fn serve(args: &[String]) -> Result<()> {
 /// second machine) and print them as one JSON array.
 async fn results(args: &[String]) -> Result<()> {
     let to = flag(args, "--to").context("--to <labADDR> is required")?;
+    // --reset clears the receiver's accumulator after this pull (round boundary).
+    let req: &[u8] = if args.iter().any(|a| a == "--reset") { b"reset" } else { b"get" };
     let peer = labkit::decode_addr(&to)?;
     let ep = labkit::lab_endpoint(false).await?;
     let conn = ep
@@ -200,7 +212,7 @@ async fn results(args: &[String]) -> Result<()> {
         .await
         .context("dial peer results channel")?;
     let (mut s, mut r) = conn.open_bi().await?;
-    s.write_all(b"get").await?;
+    s.write_all(req).await?;
     s.finish()?;
     let body = r.read_to_end(64 * 1024 * 1024).await?;
     println!("{}", String::from_utf8_lossy(&body));
