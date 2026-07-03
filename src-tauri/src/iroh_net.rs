@@ -5435,6 +5435,39 @@ pub async fn recv_files<F: Fn(u64, u64)>(
     Ok(out)
 }
 
+/// PUSH receive that NEGOTIATES like production receivers do: replies
+/// {ready:true} to a parallel-advertised big single file and takes the
+/// resumable multi-stream path, classic body otherwise. `engaged` reports
+/// which path ran. Used by the dropbeam-lab test driver (labkit) so lab runs
+/// exercise the same receive code the app's friend/quick-send handlers run.
+#[allow(dead_code)]
+pub async fn recv_files_negotiated<F: Fn(u64, u64)>(
+    conn: &Connection,
+    dest_dir: &Path,
+    cancel: &AtomicBool,
+    engaged: &AtomicBool,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let header = read_frame(&mut recv).await?;
+    let out = read_files_negotiated(
+        conn,
+        &mut send,
+        &mut recv,
+        &header,
+        dest_dir,
+        cancel,
+        engaged,
+        None,
+        on_progress,
+    )
+    .await?;
+    let _ = send.write_all(b"ok").await;
+    let _ = send.finish();
+    let _ = send.stopped().await;
+    Ok(out)
+}
+
 // ── Quick Send (pull model) ──────────────────────────────────────────────────
 //
 // The sender publishes a *ticket* (its EndpointAddr + a one-time token). The

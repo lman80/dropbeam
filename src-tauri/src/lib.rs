@@ -5,6 +5,10 @@ mod folder_history;
 mod friends;
 mod history;
 mod iroh_net;
+// Dev-only surface for the `dropbeam-lab` two-machine test driver (src/bin/).
+// Re-exports the real engine send/recv so lab runs exercise shipping code;
+// never bundled into the app the user installs.
+pub mod labkit;
 #[cfg(target_os = "macos")]
 mod mac_service;
 mod models;
