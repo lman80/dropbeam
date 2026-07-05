@@ -422,11 +422,15 @@ pub fn run() {
             app.manage(iroh_state);
             log::info!("setup: iroh spawned + state managed");
 
-            // Start the Shared Drop Folder sync service.
+            // Start the Shared Drop Folder sync service. REGISTER it before the
+            // first reconcile, and run that reconcile OFF the setup thread — a
+            // slow or wedged folder (e.g. a huge/pathological directory) must
+            // never block app startup and leave SyncManager unregistered, which
+            // silently breaks ALL folder sync + any command that needs it.
             let sync = sync::SyncManager::new(app.handle().clone(), config_dir);
-            sync.reconcile();
-            app.manage(sync);
-            log::info!("setup: sync reconciled");
+            app.manage(sync.clone());
+            std::thread::spawn(move || sync.reconcile());
+            log::info!("setup: sync service registered (initial reconcile in background)");
 
             build_tray(app.handle())?;
             log::info!("setup: tray built");
