@@ -3814,8 +3814,29 @@ async fn read_folder_body<F: Fn(u64, u64)>(
     let mut buf = vec![0u8; CHUNK];
     for item in &items {
         let raw = item["name"].as_str().unwrap_or("file");
-        let rel = sanitize_rel(raw);
         let size = item["size"].as_u64().unwrap_or(0);
+        // Folder-safe rel: preserves the exact hidden/colon name, but REFUSES
+        // DropBeam's own control paths (`.dropbeam-history` etc.). A refused item
+        // must still have its bytes drained so the next item stays framed.
+        let Some(rel) = folder_receive_rel(raw) else {
+            log::debug!("folder receive: skipping control/degenerate rel {raw:?}");
+            let mut remaining = size;
+            while remaining > 0 {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("canceled"));
+                }
+                let want = remaining.min(buf.len() as u64) as usize;
+                match recv.read(&mut buf[..want]).await {
+                    Ok(Some(n)) if n > 0 => {
+                        remaining -= n as u64;
+                        got += n as u64;
+                        on_progress(got, total);
+                    }
+                    _ => return Err(anyhow::anyhow!("stream ended mid-skip")),
+                }
+            }
+            continue;
+        };
         let dest = dest_dir.join(&rel);
         if let Some(parent) = dest.parent() {
             // A blocked ancestor (some component exists as a FILE → ENOTDIR) must
@@ -4009,6 +4030,56 @@ pub(crate) fn receive_rel(raw: &str) -> PathBuf {
         out.push("file");
     }
     out
+}
+
+/// True if a shared-folder rel names one of DropBeam's OWN control/bookkeeping
+/// paths, which must NEVER travel over the wire in either direction. This covers
+/// the hidden `.dropbeam-history` recovery archive + its previously-LEAKED
+/// de-dotted form `dropbeam-history` (a v0.43.x bug un-hid it on receive; once
+/// visible it self-synced), plus any `.dropbeam-*` staging/incoming placeholder.
+/// Match is on ANY path component so a nested `sub/.dropbeam-history/x` is caught.
+pub(crate) fn is_control_rel(rel: &str) -> bool {
+    rel.split('/').any(|c| {
+        c.starts_with(".dropbeam") || c == "dropbeam-history"
+    })
+}
+
+/// Receive-side rel for FOLDER SYNC (mirror). Unlike `sanitize_rel` (quick-send),
+/// this PRESERVES the exact tree: leading dots stay hidden and colons/odd chars
+/// survive on macOS, so both members converge to identical names. It only:
+///   - blocks traversal (drops non-Normal components: absolute, drive, `.`/`..`),
+///   - NFC-normalizes (so a macOS NFD name lands the same form the manifest uses),
+///   - on Windows, mangles characters the filesystem can't create (so one
+///     Mac-legal `a:b.txt` doesn't abort the batch — it still keeps a real name),
+///   - returns None for a control rel (`.dropbeam-history` etc.) so wire data can
+///     never write DropBeam's own files into the folder.
+/// Returns None = "skip this item" (the caller drains its bytes and moves on).
+pub(crate) fn folder_receive_rel(raw: &str) -> Option<PathBuf> {
+    use unicode_normalization::UnicodeNormalization;
+    let mut out = PathBuf::new();
+    for c in Path::new(raw).components() {
+        let std::path::Component::Normal(s) = c else {
+            continue;
+        };
+        let s = s.to_string_lossy();
+        if s.is_empty() {
+            continue;
+        }
+        #[cfg(windows)]
+        let comp = windows_safe_component(&s);
+        #[cfg(windows)]
+        let comp = comp.as_str();
+        #[cfg(not(windows))]
+        let comp = s.as_ref();
+        out.push(comp.nfc().collect::<String>());
+    }
+    if out.as_os_str().is_empty() {
+        return None;
+    }
+    if is_control_rel(&out.to_string_lossy()) {
+        return None;
+    }
+    Some(out)
 }
 
 pub(crate) fn sanitize_rel(raw: &str) -> PathBuf {
@@ -5922,6 +5993,37 @@ mod tests {
         // Degenerate input still lands somewhere safe.
         assert_eq!(receive_rel(""), Path::new("file"));
         assert_eq!(receive_rel("..."), Path::new("file"));
+    }
+
+    #[test]
+    fn folder_receive_rel_preserves_names_but_refuses_control_paths() {
+        use std::path::Path;
+        // Legit names survive EXACTLY (mirror needs identical trees) — including a
+        // leading dot (stays hidden) and a colon (kept on macOS).
+        assert_eq!(folder_receive_rel("sub/a.txt").as_deref(), Some(Path::new("sub/a.txt")));
+        assert_eq!(folder_receive_rel(".hidden.bin").as_deref(), Some(Path::new(".hidden.bin")));
+        #[cfg(not(windows))]
+        assert_eq!(
+            folder_receive_rel("report 7:3.pdf").as_deref(),
+            Some(Path::new("report 7:3.pdf")),
+            "colon preserved on macOS — no corruption to 'file'"
+        );
+        // Traversal still blocked.
+        assert_eq!(folder_receive_rel("../../etc/passwd").as_deref(), Some(Path::new("etc/passwd")));
+        // DropBeam's own control paths are REFUSED (the history-leak fix).
+        assert_eq!(folder_receive_rel(".dropbeam-history/data/x"), None);
+        assert_eq!(folder_receive_rel("dropbeam-history/data/x"), None); // leaked visible form
+        assert_eq!(folder_receive_rel("sub/.dropbeam-incoming"), None);
+        assert_eq!(folder_receive_rel(""), None);
+    }
+
+    #[test]
+    fn is_control_rel_catches_hidden_and_leaked_history() {
+        assert!(is_control_rel(".dropbeam-history/data/abc"));
+        assert!(is_control_rel("dropbeam-history/index.json")); // dotless leaked form
+        assert!(is_control_rel("a/.dropbeam-incoming"));
+        assert!(!is_control_rel("normal/file.txt"));
+        assert!(!is_control_rel("my-history/notes.txt")); // similar name, not ours
     }
 
     #[test]

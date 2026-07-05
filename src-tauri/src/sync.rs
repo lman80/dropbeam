@@ -442,6 +442,23 @@ impl SyncManager {
     }
 
     fn start_pair(self: &Arc<Self>, pair: Pair) {
+        // One-time cleanup of the v0.43.x history-leak: a VISIBLE `dropbeam-history`
+        // (no leading dot) inside a shared folder is always an artifact of the old
+        // receive-side de-dot bug — the real archive is the hidden `.dropbeam-history`.
+        // Remove it so it stops polluting the folder + syncing. Never touches the
+        // hidden real one.
+        {
+            let leaked = Path::new(&pair.folder).join("dropbeam-history");
+            if leaked.is_dir() {
+                match std::fs::remove_dir_all(&leaked) {
+                    Ok(()) => log::warn!(
+                        "swept leaked visible dropbeam-history from {}",
+                        pair.folder
+                    ),
+                    Err(e) => log::warn!("could not sweep leaked dropbeam-history: {e}"),
+                }
+            }
+        }
         // Sweep crash-orphaned "<name>.dropbeam-incoming" placeholders for EVERY
         // pair, not just sender-role ones — seed_existing's sweep only runs in
         // the sender worker, so a receive-only pair kept its litter forever. Only
@@ -756,6 +773,7 @@ impl SyncManager {
                         if rel.is_empty()
                             || rel.ends_with(".dropbeam-incoming")
                             || rel.split('/').any(|c| c.starts_with('.'))
+                            || crate::iroh_net::is_control_rel(&rel)
                         {
                             return;
                         }
@@ -2331,6 +2349,21 @@ impl SyncManager {
     ) -> Option<Locality> {
         let eid = pair.endpoint_id.clone()?;
         let ep = self.iroh_endpoint()?;
+        // Final chokepoint: never send DropBeam's own control paths (the leaked
+        // visible `dropbeam-history` etc.), whatever queued them. If that leaves
+        // nothing to send, bail cleanly.
+        let files: Vec<String> = files
+            .iter()
+            .filter(|f| {
+                crate::iroh_net::folder_rel(Path::new(f), &pair.folder)
+                    .map(|rel| !crate::iroh_net::is_control_rel(&rel))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
         let file = files.first().cloned().unwrap_or_default();
         let file = file.as_str();
         let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
@@ -2556,13 +2589,18 @@ fn is_sendable_candidate(path: &str, folder: &str, inbound: &Arc<Mutex<HashSet<S
     if !p.is_file() {
         return false;
     }
-    // Skip the staging dir and dotfiles / temp files anywhere in the relative path.
+    // Skip the staging dir and dotfiles / temp files anywhere in the relative
+    // path, plus DropBeam's own control paths (incl. the VISIBLE `dropbeam-history`
+    // leaked by the old receive de-dot bug — dotless, so the dot check misses it).
     if let Ok(rel) = p.strip_prefix(folder) {
         for comp in rel.components() {
             let name = comp.as_os_str().to_string_lossy();
             if name.starts_with('.') {
                 return false;
             }
+        }
+        if crate::iroh_net::is_control_rel(&rel.to_string_lossy().replace('\\', "/")) {
+            return false;
         }
     }
     let fname = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -3626,7 +3664,13 @@ fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
         let Some(rel) = rel_path_of(&p, folder) else {
             continue;
         };
-        if rel.is_empty() || rel.split('/').any(|c| c.starts_with('.')) {
+        // Skip dot-paths AND DropBeam's own control paths — including the VISIBLE
+        // `dropbeam-history` leaked by the old receive de-dot bug, which the dot
+        // check alone misses, letting it self-sync forever.
+        if rel.is_empty()
+            || rel.split('/').any(|c| c.starts_with('.'))
+            || crate::iroh_net::is_control_rel(&rel)
+        {
             continue;
         }
         if let Ok(meta) = std::fs::metadata(&abs) {
