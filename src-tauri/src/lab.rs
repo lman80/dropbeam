@@ -90,6 +90,59 @@ fn str_field<'a>(req: &'a serde_json::Value, k: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("missing string field '{k}'"))
 }
 
+/// The managed SyncManager (for driving real shared-folder sync in tests).
+fn sync_manager(state: &IrohState) -> Result<std::sync::Arc<crate::sync::SyncManager>> {
+    use tauri::Manager;
+    let app = state.app.get().ok_or_else(|| anyhow::anyhow!("app not ready"))?;
+    app.try_state::<std::sync::Arc<crate::sync::SyncManager>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| anyhow::anyhow!("sync manager not ready"))
+}
+
+/// The managed IrohState Arc (say_hello_folder needs the Arc, not a &ref).
+fn iroh_arc(state: &IrohState) -> Result<std::sync::Arc<IrohState>> {
+    use tauri::Manager;
+    let app = state.app.get().ok_or_else(|| anyhow::anyhow!("app not ready"))?;
+    app.try_state::<std::sync::Arc<IrohState>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| anyhow::anyhow!("iroh state not ready"))
+}
+
+/// Resolve a shared folder's on-disk path from a pair id.
+fn pair_folder(cfg: &std::path::Path, pair_id: &str) -> Result<std::path::PathBuf> {
+    crate::pairing::load(cfg)
+        .into_iter()
+        .find(|p| p.id == pair_id)
+        .map(|p| std::path::PathBuf::from(p.folder))
+        .ok_or_else(|| anyhow::anyhow!("no shared folder with pair id {pair_id}"))
+}
+
+/// sha256 of every file under `root`, keyed by forward-slash rel path — the
+/// convergence check for shared-folder tests.
+fn folder_manifest(root: &std::path::Path) -> Vec<serde_json::Value> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<serde_json::Value>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue; // skip DropBeam's own .dropbeam-* control/staging files
+            }
+            if p.is_dir() {
+                walk(&p, root, out);
+            } else if p.is_file() {
+                let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                let sha = crate::labkit::sha256_file(&p).unwrap_or_default();
+                out.push(serde_json::json!({ "rel": rel, "sha256": sha }));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort_by(|a, b| a["rel"].as_str().cmp(&b["rel"].as_str()));
+    out
+}
+
 /// Run one authorized lab command. Returns the JSON payload to reply with (the
 /// caller stamps `ok`). New commands slot in here.
 async fn dispatch(
@@ -170,6 +223,104 @@ async fn dispatch(
                 }))
                 .collect();
             Ok(serde_json::json!({ "friendId": friend.id, "count": msgs.len(), "messages": msgs }))
+        }
+
+        // ── Shared folders ──────────────────────────────────────────────────
+        // Create a shared folder + return its invite string. `dir` is created if
+        // missing. Mirror = two-way total sync (the mode most tests want).
+        "pair-create" => {
+            let cfg = config_dir(state)?;
+            let dir = str_field(req, "dir")?;
+            std::fs::create_dir_all(dir)?;
+            let mirror = req.get("mirror").and_then(|v| v.as_bool()).unwrap_or(true);
+            let name = my_display_name(state);
+            let my_id = state.get().map(|ep| ep.id().to_string());
+            let (pair, invite) = crate::pairing::create(
+                &cfg, dir.to_string(), name, true, "Lab Peer".into(), mirror, my_id,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            sync_manager(state)?.reconcile();
+            Ok(serde_json::json!({ "pairId": pair.id, "invite": invite }))
+        }
+
+        // Accept an invite (from the other device's pair-create) into `dir`.
+        "pair-accept" => {
+            let cfg = config_dir(state)?;
+            let invite = str_field(req, "invite")?;
+            let dir = str_field(req, "dir")?;
+            std::fs::create_dir_all(dir)?;
+            let pair = crate::pairing::accept(&cfg, invite, dir.to_string())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if let Some(inviter_eid) = pair.endpoint_id.clone() {
+                crate::iroh_net::say_hello_folder(
+                    iroh_arc(state)?, pair.id.clone(), inviter_eid, my_display_name(state),
+                );
+            }
+            sync_manager(state)?.reconcile();
+            Ok(serde_json::json!({ "pairId": pair.id }))
+        }
+
+        // List shared folders on this device.
+        "pair-list" => {
+            let cfg = config_dir(state)?;
+            let pairs: Vec<serde_json::Value> = crate::pairing::load(&cfg)
+                .into_iter()
+                .map(|p| serde_json::json!({ "pairId": p.id, "folder": p.folder }))
+                .collect();
+            Ok(serde_json::json!({ "pairs": pairs }))
+        }
+
+        // Write/overwrite a file inside a shared folder (deterministic bytes so both
+        // sides can be hash-compared). rel may contain subfolders.
+        "fs-write" => {
+            let cfg = config_dir(state)?;
+            let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
+            let rel = str_field(req, "rel")?;
+            let size = req.get("size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+            let seed = req.get("seed").and_then(|v| v.as_u64()).unwrap_or(1);
+            let p = root.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&p, crate::labkit::payload(size, seed))?;
+            Ok(serde_json::json!({ "wrote": rel, "bytes": size }))
+        }
+
+        // Delete a file (or dir) inside a shared folder.
+        "fs-delete" => {
+            let cfg = config_dir(state)?;
+            let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
+            let p = root.join(str_field(req, "rel")?);
+            if p.is_dir() { std::fs::remove_dir_all(&p)?; } else { let _ = std::fs::remove_file(&p); }
+            Ok(serde_json::json!({ "deleted": str_field(req, "rel")? }))
+        }
+
+        // Move/rename a file within a shared folder.
+        "fs-move" => {
+            let cfg = config_dir(state)?;
+            let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
+            let from = root.join(str_field(req, "from")?);
+            let to = root.join(str_field(req, "to")?);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&from, &to)?;
+            Ok(serde_json::json!({ "moved": [str_field(req, "from")?, str_field(req, "to")?] }))
+        }
+
+        // The convergence check: hash of every file in the shared folder.
+        "fs-manifest" => {
+            let cfg = config_dir(state)?;
+            let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
+            let files = folder_manifest(&root);
+            Ok(serde_json::json!({ "count": files.len(), "files": files }))
+        }
+
+        // Force a reconcile pass now (self-heal manifest exchange) — lets a test
+        // nudge convergence instead of waiting for the next beacon.
+        "reconcile" => {
+            sync_manager(state)?.verify_now();
+            Ok(serde_json::json!({ "reconciled": true }))
         }
 
         other => bail!("unknown lab command: {other}"),
