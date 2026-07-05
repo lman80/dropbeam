@@ -323,6 +323,36 @@ async fn dispatch(
             Ok(serde_json::json!({ "reconciled": true }))
         }
 
+        // Trigger the app's OWN auto-updater on demand (same signed GitHub release
+        // the 6-hourly check uses — so this is exactly as safe, just immediate).
+        // This is what makes the test loop fast: ship a release, tell both Macs to
+        // self-update, they're on the new build in ~a minute instead of ≤6 hours.
+        "self-update" => {
+            use tauri::Manager;
+            use tauri_plugin_updater::UpdaterExt;
+            let app = state.app.get().ok_or_else(|| anyhow::anyhow!("app not ready"))?.clone();
+            let updater = app.updater().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            match updater.check().await {
+                Ok(Some(update)) => {
+                    let ver = update.version.clone();
+                    update
+                        .download_and_install(|_, _| {}, || {})
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    // Reply must flush before we relaunch into the new binary, so
+                    // schedule the restart a beat later (handle_lab writes the reply
+                    // right after dispatch returns).
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        app.restart();
+                    });
+                    Ok(serde_json::json!({ "updating": true, "version": ver }))
+                }
+                Ok(None) => Ok(serde_json::json!({ "updating": false, "reason": "already latest" })),
+                Err(e) => bail!("update check failed: {e}"),
+            }
+        }
+
         other => bail!("unknown lab command: {other}"),
     }
 }
