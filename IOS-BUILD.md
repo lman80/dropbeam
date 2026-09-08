@@ -1,3 +1,66 @@
+# Native Photos, Files visibility, and Share — 2026-09-09
+
+Implementation commits: `00b3fcf`, `cdfbde2`, `a3b89f1`.
+
+Verified final commands (from this worktree):
+
+```sh
+npm run build
+cargo check --offline --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios --lib
+npx tauri ios build --debug --target aarch64-sim --no-sign --ci
+cargo test --offline --manifest-path src-tauri/Cargo.toml
+```
+
+All passed. Rust: **150 passed, 0 failed, 6 ignored**. The sandbox run
+failed in the same 23 loopback network-monitor tests documented below; the
+unrestricted offline run passed. Xcode also required unrestricted execution.
+Existing simulator build outputs were preserved under timestamped
+`arm64-sim-before-media-*` directories before rebuilding.
+
+Final bundle: `src-tauri/gen/apple/build/arm64-sim/DropBeam.app`.
+Bundle mtime: **2026-09-09 02:18:26.127937 +08:00**.
+Executable mtime: **2026-09-09 02:18:22.156729 +08:00**.
+Installed and launched on the booted iPhone 17 Pro (iOS 26.5).
+
+Changes:
+
+- Mobile Send has Photos and Files buttons. Photos invokes an iOS-only Rust
+  PHPickerViewController command with unlimited multi-selection and image/video
+  filters. NSItemProvider results are copied into unique app temp directories
+  before provider callbacks return. Those paths feed the existing send chooser.
+  Files retains the existing document-picker command. Desktop UI is unchanged.
+- Receive defaults/fallbacks use app Documents on iOS. Startup refreshes and
+  persists the path after container changes. Verified the installed app's
+  settings.json points to its current container's Documents directory and that
+  this directory exists. Both UIFileSharingEnabled and
+  LSSupportsOpeningDocumentsInPlace were already true in source Info.plist and
+  project.yml; verified both remain true in the final built plist.
+- Mobile received cards and History rows have Share, passing the received file
+  URLs to UIActivityViewController. Native presentation runs on the main thread,
+  includes an iPad popover anchor, and exposes the standard system activities.
+  The existing photo-library add usage description remains in the built plist.
+
+Simulator smoke test: Photos opened the native photo library; selecting two
+sample photos produced “Send 2 files to…” and readable copied JPEGs (1,484,524
+and 4,127,524 bytes). No transfer was sent. This interaction was tested before
+`a3b89f1` refined the requested representation to public.image/public.movie;
+that final refinement passed both iOS compilation and the simulator rebuild.
+
+Remaining runtime QA: document-picker button, actual video/iCloud imports,
+Share on both received cards and History, Save Image/Save Video in the system
+sheet, iPad popover layout, and Files-app browsing. Repeated computer-control
+`noWindowsAvailable` errors prevented completing those interactions. A temporary
+local received-file fixture was removed. No separate Save to Photos button was
+added; use the system sheet's supported save activity. No physical-device or
+end-to-end receive smoke test was performed.
+
+Nonfatal warnings remain: frontend chunk size, existing Rust warnings, bundle
+identifier suffix, multiple Xcode destinations, and blake3 simulator SDK versus
+iOS 14 deployment target. Rustfmt was unavailable in the installed toolchain.
+No subagents or push; source changes stayed in this worktree.
+
+---
+
 # Simulator dialog/code verification — 2026-09-09
 
 Source commits: `5c1559e` (Rust code prefixes) and `326ac7b` (mobile UI).
