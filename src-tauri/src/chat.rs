@@ -617,6 +617,24 @@ mod tests {
     }
 
     #[test]
+    fn file_caption_survives_storage_and_wire_payload() {
+        let dir = test_dir("caption");
+        let mut file = msg("file", "peer", 1000, 1, true);
+        file.kind = "file".into();
+        file.text = "Here is the photo".into();
+        file.files = vec!["photo.png".into()];
+        file.path = Some("/private/photo.png".into());
+        append(&dir, &file);
+        let restored = load_all(&dir);
+        let payload = crate::iroh_net::chat_payload(&restored["peer"][0], "peer", "Sender");
+        assert_eq!(payload["msgKind"], "file");
+        assert_eq!(payload["text"], "Here is the photo");
+        assert_eq!(payload["files"][0], "photo.png");
+        assert!(payload.get("path").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn seq_orders_over_clock_skew() {
         let dir = test_dir("seq");
         let p = "peer1";

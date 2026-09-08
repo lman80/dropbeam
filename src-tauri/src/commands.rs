@@ -1211,8 +1211,9 @@ pub async fn send_chat_file_note(
     names: Vec<String>,
     bytes: u64,
     paths: Vec<String>,
+    caption: Option<String>,
 ) -> Result<ChatMessage, String> {
-    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths)
+    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths, caption)
         .ok_or_else(|| "Friend not found.".to_string())
 }
 
@@ -1229,6 +1230,7 @@ pub(crate) fn post_file_note(
     names: Vec<String>,
     bytes: u64,
     paths: Vec<String>,
+    caption: Option<String>,
 ) -> Option<ChatMessage> {
     let friend = friends::get(&state.config_dir, friend_id)?;
     let msg = ChatMessage {
@@ -1236,7 +1238,7 @@ pub(crate) fn post_file_note(
         peer_id: friend_id.to_string(),
         from_me: true,
         kind: "file".into(),
-        text: String::new(),
+        text: caption.unwrap_or_default(),
         files: names,
         bytes,
         // Sender keeps the source path so they can preview/open what they sent.

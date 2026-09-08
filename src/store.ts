@@ -87,6 +87,14 @@ const folderSoundThrottle = new Map<string, number>()
 /** When each transfer started moving bytes, to compute a final average speed. */
 const transferStart = new Map<string, number>()
 
+function loadFriendSeen(): Record<string, number> {
+  try {
+    const cached = JSON.parse(localStorage.getItem('dropbeam-friend-seen') || '{}')
+    return Object.fromEntries(Object.entries(cached).filter((entry): entry is [string, number] =>
+      typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] > 0))
+  } catch { return {} }
+}
+
 interface UpdateState {
   version: string
   notes: string
@@ -196,7 +204,7 @@ interface AppStore {
   reactToMessage: (friendId: string, messageId: string, emoji: string) => Promise<void>
   editChatMessage: (friendId: string, messageId: string, text: string) => Promise<void>
   deleteChatMessage: (friendId: string, messageId: string) => Promise<void>
-  shareFilesInChat: (friendId: string, paths: string[]) => Promise<void>
+  shareFilesInChat: (friendId: string, paths: string[], caption?: string) => Promise<void>
   addChatMessage: (m: ChatMessage) => void
   /** Files staged in the active chat's composer (drag-to-attach, iMessage-style):
    *  they wait, shown as chips, and go out with the next send. Cleared on chat
@@ -387,7 +395,7 @@ export const useStore = create<AppStore>((set, get) => ({
   folderSummaries: {},
   folderActivity: loadFolderActivity(),
   pendingSend: null,
-  friendSeen: {},
+  friendSeen: loadFriendSeen(),
   chats: {},
   chatOverview: [],
   chatDraftFiles: [],
@@ -724,7 +732,11 @@ export const useStore = create<AppStore>((set, get) => ({
 
   markFriendSeen: (name) => {
     const key = name.trim().toLowerCase()
-    if (key) set((s) => ({ friendSeen: { ...s.friendSeen, [key]: Date.now() } }))
+    if (key) {
+      const friendSeen = { ...get().friendSeen, [key]: Date.now() }
+      try { localStorage.setItem('dropbeam-friend-seen', JSON.stringify(friendSeen)) } catch { /* storage unavailable */ }
+      set({ friendSeen })
+    }
   },
 
   sendPaths: async (paths) => {
@@ -851,7 +863,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const key = u.friendName.trim().toLowerCase()
       const last = get().friendSeen[key] ?? 0
       if (Date.now() - last > 5000) {
-        set((s) => ({ friendSeen: { ...s.friendSeen, [key]: Date.now() } }))
+        get().markFriendSeen(u.friendName)
       }
     }
     // Sounds fire on meaningful state changes only (not on every progress tick).
@@ -1129,7 +1141,7 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  shareFilesInChat: async (friendId, paths) => {
+  shareFilesInChat: async (friendId, paths, caption) => {
     paths = paths.filter(Boolean)
     if (!paths.length) return
     try {
@@ -1137,7 +1149,7 @@ export const useStore = create<AppStore>((set, get) => ({
       setRetryPayload(t.id, { kind: 'friend', id: friendId, paths })
       get().upsertTransfer(t)
       const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
-      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths)
+      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths, caption)
       // Tie this transfer's bytes to THIS card, so a later failure flips it to
       // "tap to resend" rather than leaving a card for a file that never arrived.
       setChatFileXfer(t.id, { peerId: friendId, msgId: m.id })

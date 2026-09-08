@@ -443,15 +443,15 @@ function Conversation({ friendId }: { friendId: string }) {
   }, [searchOpen, searchQ, messages])
   const jumpToMatch = (idx: number) => {
     if (!searchMatches.length) return
-    const clamped = ((idx % searchMatches.length) + searchMatches.length) % searchMatches.length
+    const clamped = Math.max(0, Math.min(idx, searchMatches.length - 1))
     setSearchIdx(clamped)
     document
       .getElementById(`msg-${searchMatches[clamped]}`)
       ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }
-  // A fresh query jumps to its MOST RECENT match (people search for recent things).
+  // Start at the oldest match; down always moves toward newer messages.
   useEffect(() => {
-    if (searchMatches.length) jumpToMatch(searchMatches.length - 1)
+    if (searchMatches.length) jumpToMatch(0)
     else setSearchIdx(0)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchQ, searchOpen])
@@ -506,14 +506,11 @@ function Conversation({ friendId }: { friendId: string }) {
     }
     // Nothing staged and nothing typed → no-op.
     if (!body && stagedFiles.length === 0) return
-    // Send any staged files first (each becomes a chat file note + a real
-    // transfer), then the text — so the attachment and its caption go out together
-    // (iMessage-style, GitHub #23).
     if (stagedFiles.length) {
-      void shareFilesInChat(friendId, [...stagedFiles])
+      void shareFilesInChat(friendId, [...stagedFiles], body)
       clearChatDraftFiles()
-    }
-    if (body) {
+      setReply(null)
+    } else if (body) {
       void sendChat(friendId, body, reply)
       setReply(null)
     }
@@ -651,11 +648,12 @@ function Conversation({ friendId }: { friendId: string }) {
           </div>
         </div>
         <button
-          className={`icon-btn${searchOpen ? ' on' : ''}`}
-          title="Search this conversation"
+          className={`icon-btn chat-search-toggle${searchOpen ? ' on' : ''}`}
+          aria-label="Search this conversation"
           onClick={() => (searchOpen ? closeSearch() : setSearchOpen(true))}
         >
           <Search size={16} />
+          <span className="chat-search-tooltip" role="tooltip">Search this conversation</span>
         </button>
         {sharedFolder && (
           <button
@@ -681,13 +679,18 @@ function Conversation({ friendId }: { friendId: string }) {
               else if (e.key === 'Enter') jumpToMatch(searchIdx + (e.shiftKey ? -1 : 1))
             }}
           />
+          {searchQ.trim() && (
+            <button className="chat-search-chip" onClick={() => setSearchQ('')} aria-label="Clear search filter">
+              <span>{searchQ.trim()}</span><X size={12} />
+            </button>
+          )}
           <span className="chat-search-count">
             {searchQ.trim() ? (searchMatches.length ? `${searchIdx + 1} of ${searchMatches.length}` : 'No matches') : ''}
           </span>
           <button
             className="icon-btn"
             title="Previous match"
-            disabled={!searchMatches.length}
+            disabled={!searchMatches.length || searchIdx === 0}
             onClick={() => jumpToMatch(searchIdx - 1)}
           >
             <ArrowUp size={14} />
@@ -695,7 +698,7 @@ function Conversation({ friendId }: { friendId: string }) {
           <button
             className="icon-btn"
             title="Next match"
-            disabled={!searchMatches.length}
+            disabled={!searchMatches.length || searchIdx >= searchMatches.length - 1}
             onClick={() => jumpToMatch(searchIdx + 1)}
           >
             <ArrowDown size={14} />
@@ -728,8 +731,8 @@ function Conversation({ friendId }: { friendId: string }) {
                 id={row.kind === 'msg' ? `msg-${row.m.id}` : undefined}
                 className={
                   row.kind === 'msg' && searchMatches[searchIdx] === row.m.id
-                    ? 'chat-search-hit'
-                    : undefined
+                    ? 'chat-search-hit current'
+                    : row.kind === 'msg' && searchMatches.includes(row.m.id) ? 'chat-search-hit' : undefined
                 }
               >
                 {row.divider && (
@@ -1171,7 +1174,7 @@ const MessageRow = memo(function MessageRow({
         </span>
       )}
       <div className="chat-line-body">
-        {quote && (
+        {!m.deleted && quote && (
           <div className={`chat-quote${mine ? ' mine' : ''}`}>
             <span className="chat-quote-bar" />
             <span className="chat-quote-text">{quote}</span>
@@ -1336,8 +1339,15 @@ function FileMessage({
   const name = m.files[0]
   const kind = fileKind(name)
   const [broken, setBroken] = useState(false)
+  // The chat note can arrive before its separate file transfer finishes.
+  const landedTransfer = useStore((s) => Object.values(s.transfers).reverse().find((t) =>
+    !m.fromMe && t.direction === 'receive' && t.state === 'completed' &&
+    !!t.outDir && t.fileNames.includes(name) &&
+    `${t.outDir.replace(/\\/g, '/').replace(/\/$/, '')}/${name}` === m.path?.replace(/\\/g, '/')
+  )?.id)
+  useEffect(() => setBroken(false), [m.path, landedTransfer])
   const canPreview = !!m.path && HAS_TAURI && !broken
-  const src = canPreview ? convertFileSrc(m.path!) : null
+  const src = canPreview ? `${convertFileSrc(m.path!)}?landed=${landedTransfer ?? 'initial'}` : null
   const open = () => m.path && api.openPath(m.path).catch(() => {})
   const resendChatFile = useStore((s) => s.resendChatFile)
   // A file whose bytes never landed must not look openable.
@@ -1348,6 +1358,7 @@ function FileMessage({
 
   return (
     <div className="chat-fileblock">
+      {m.text && <span style={{ whiteSpace: 'pre-wrap' }}><Linkified text={m.text} /></span>}
       {!multi && src && kind === 'image' && (
         <img
           src={src}

@@ -657,13 +657,14 @@ export const mockApi = {
     names: string[],
     bytes: number,
     paths: string[],
+    caption = '',
   ): Promise<ChatMessage> => {
     const m: ChatMessage = {
       id: `c${++counter}`,
       peerId: friendId,
       fromMe: true,
       kind: 'file',
-      text: '',
+      text: caption,
       files: names,
       bytes,
       path: paths[0] ?? null,

@@ -3688,6 +3688,7 @@ pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) 
         }
     } else if m.kind == "file" {
         o.insert("msgKind".into(), serde_json::json!("file"));
+        o.insert("text".into(), serde_json::json!(m.text));
         o.insert("files".into(), serde_json::json!(m.files));
         o.insert("bytes".into(), serde_json::json!(m.bytes));
     } else {
