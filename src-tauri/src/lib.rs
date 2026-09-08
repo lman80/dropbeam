@@ -3,6 +3,7 @@ mod commands;
 mod download_progress;
 mod folder_history;
 mod friends;
+mod fs_walk;
 mod history;
 mod iroh_net;
 // Gated remote test-and-update surface (Settings → Lab Mode). Off by default;

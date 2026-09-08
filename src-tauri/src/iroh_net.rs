@@ -1021,9 +1021,8 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // Seed the known-address cache so the FIRST dial after a relaunch already
     // carries every peer address that worked before.
     load_peer_addrs(config_dir);
-    // Sweep crash litter (orphaned staging dirs, week-old abandoned partials in
-    // every dir that ever held one) before any transfer can start.
-    startup_cleanup(config_dir);
+    // Publish the tiny registry path before receives can record a destination.
+    let _ = PARTIAL_DIRS_PATH.set(config_dir.join("partial-dirs.json"));
     // Throughput tuning, balanced against NOT wrecking the user's whole connection.
     // BBR congestion control replaces quinn's CUBIC default (iroh benchmark
     // n0-computer/iroh#4286: up to ~30x single-stream throughput, no "fill the
@@ -1690,7 +1689,7 @@ async fn serve_stream(
                     }
                 }
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
-                    prepare_partial(&dest, &fp, total)
+                    prepare_partial_async(&dest, &fp, total).await
                 } else {
                     (|| {
                         std::fs::create_dir_all(&dest)?;
@@ -1893,7 +1892,8 @@ async fn serve_stream(
                             // Refresh the running folder workers so the sender
                             // picks up the new key and the UI updates.
                             if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
-                                sm.inner().clone().reconcile();
+                                let sm = sm.inner().clone();
+                                tokio::task::spawn_blocking(move || sm.reconcile()).await?;
                             }
                             let _ = app.emit("pairs://changed", ());
                         }
@@ -1986,7 +1986,7 @@ async fn serve_stream(
             // second's. With auto-delete on, a falsely-acked empty ingest could
             // destroy the only copy. Stale dirs from crashes are swept at startup.
             let staging =
-                config_dir.join(format!(".iroh-folder-{pair_id}-{}", uuid::Uuid::new_v4()));
+                config_dir.join(format!("{}{pair_id}-{}", staging_prefix(), uuid::Uuid::new_v4()));
             // Drop visible "<name>.dropbeam-incoming" placeholders in the REAL folder
             // so the recipient sees a file is on the way (esp. a multi-minute big
             // transfer), then remove them once the real files land. The suffix is
@@ -2069,7 +2069,7 @@ async fn serve_stream(
                 // A concurrent receive of the same fingerprint must never share the
                 // partial — the loser writes into a throwaway temp instead.
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
-                    prepare_partial(&partial_dir, &fp, total)
+                    prepare_partial_async(&partial_dir, &fp, total).await
                 } else {
                     (|| {
                         std::fs::create_dir_all(&partial_dir)?;
@@ -2139,7 +2139,12 @@ async fn serve_stream(
             match result {
                 Ok(_) => {
                     log_transfer_perf(conn, "folder-recv", "recv", total, __t0.elapsed());
-                    sm.ingest_iroh_folder_files(&pair_id, &staging);
+                    let ingest_sm = sm.clone();
+                    let ingest_pair = pair_id.clone();
+                    let ingest_staging = staging.clone();
+                    tokio::task::spawn_blocking(move || {
+                        ingest_sm.ingest_iroh_folder_files(&ingest_pair, &ingest_staging)
+                    }).await?;
                     let _ = std::fs::remove_dir_all(&staging);
                     clear_placeholders();
                     let _ = send.write_all(b"ok").await;
@@ -2246,11 +2251,13 @@ async fn serve_stream(
                         // isn't added twice.
                         let sender_eid = conn.remote_id().to_string();
                         // reconcile rides its own message (folder-reconcile) now.
-                        sm.apply_remote_control(
-                            &pair_id, &name, &deletes, &moves, &group_id, &members,
-                            owner.as_deref(), role_epoch, peer_paused, peer_pause_epoch,
-                            None, unshared, Some(&sender_eid),
-                        );
+                        tokio::task::spawn_blocking(move || {
+                            sm.apply_remote_control(
+                                &pair_id, &name, &deletes, &moves, &group_id, &members,
+                                owner.as_deref(), role_epoch, peer_paused, peer_pause_epoch,
+                                None, unshared, Some(&sender_eid),
+                            );
+                        }).await?;
                     }
                 }
             }
@@ -2294,10 +2301,14 @@ async fn serve_stream(
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
-                        sm.apply_remote_control(
-                            &pair_id, "", &[], &[], "", &[], None, 0, false, 0,
-                            Some(&reconcile), false, None,
-                        );
+                        let control_sm = sm.clone();
+                        let control_pair = pair_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            control_sm.apply_remote_control(
+                                &control_pair, "", &[], &[], "", &[], None, 0, false, 0,
+                                Some(&reconcile), false, None,
+                            );
+                        }).await?;
                         if payload.get("requestReply").and_then(|v| v.as_bool()) == Some(true) {
                             sm.request_folder_snapshot(&pair_id, &conn.remote_id().to_string());
                         }
@@ -2536,6 +2547,11 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
                     ep.id()
                 );
                 let _ = state.endpoint.set(ep.clone());
+                // TCC may block a Downloads/Desktop read until the user answers.
+                // Never await this sweep or put it on a network runtime worker.
+                let cleanup_dir = config_dir.clone();
+                let cleanup_state = state.clone();
+                tokio::task::spawn_blocking(move || startup_cleanup(&cleanup_dir, &cleanup_state));
                 // Seed the peer progress-capability cache once, here, so the send
                 // path never has to touch friends.json to answer "can this peer
                 // confirm landed bytes?".
@@ -4994,8 +5010,9 @@ fn load_sidecar(path: &Path, fp: &str, total: u64) -> Option<Coverage> {
 /// transfer "tomorrow", short enough not to hoard disk.
 const PARTIAL_TTL_SECS: u64 = 7 * 24 * 3600;
 
-fn gc_stale_partials(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+fn gc_stale_partials(dir: &Path, state: Option<&IrohState>) {
+    let _walk = crate::fs_walk::Watch::new("gc_stale_partials", dir);
+    let Ok(rd) = crate::fs_walk::read_dir(dir) else { return };
     let now = std::time::SystemTime::now();
     for e in rd.flatten() {
         if !e.file_name().to_string_lossy().starts_with(".dropbeam-partial-") {
@@ -5009,6 +5026,15 @@ fn gc_stale_partials(dir: &Path) {
             .map(|d| d.as_secs() > PARTIAL_TTL_SECS)
             .unwrap_or(false);
         if stale {
+            // Startup cleanup now overlaps receives. Hold the single-writer
+            // registry through removal so a resumed old partial cannot be deleted.
+            let active = state.map(|s| s.partials.lock().unwrap());
+            let name = e.file_name().to_string_lossy().to_string();
+            let fp = name.trim_start_matches(".dropbeam-partial-")
+                .trim_end_matches(".part").trim_end_matches(".json");
+            if active.as_ref().is_some_and(|set| set.contains(fp)) {
+                continue;
+            }
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -5049,23 +5075,31 @@ fn note_partial_dir(dir: &Path) {
     }
 }
 
-/// Startup sweep, run once before the accept loop: crash-littered folder
-/// staging dirs (each receive uses its own uuid-suffixed dir, so any survivor
-/// is from a dead process) + stale partials in every dir that ever held one.
-fn startup_cleanup(config_dir: &Path) {
-    let _ = PARTIAL_DIRS_PATH.set(config_dir.join("partial-dirs.json"));
-    if let Ok(rd) = std::fs::read_dir(config_dir) {
-        for e in rd.flatten() {
-            if e.file_name().to_string_lossy().starts_with(".iroh-folder-")
-                && e.path().is_dir()
-            {
-                let _ = std::fs::remove_dir_all(e.path());
+// A process-unique prefix lets the background sweep distinguish crash litter
+// from staging directories created by receives after the endpoint comes up.
+fn staging_prefix() -> &'static str {
+    static PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| format!(".iroh-folder-{}-", uuid::Uuid::new_v4()))
+}
+
+/// Best-effort crash cleanup, on a blocking worker after endpoint publication.
+fn startup_cleanup(config_dir: &Path, state: &IrohState) {
+    {
+        let _walk = crate::fs_walk::Watch::new("startup staging cleanup", config_dir);
+        if let Ok(rd) = crate::fs_walk::read_dir(config_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with(".iroh-folder-")
+                    && !name.starts_with(staging_prefix()) && e.path().is_dir()
+                {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
             }
         }
     }
-    gc_stale_partials(&config_dir.join("folder-partials"));
+    gc_stale_partials(&config_dir.join("folder-partials"), Some(state));
     for d in load_partial_dirs() {
-        gc_stale_partials(&d);
+        gc_stale_partials(&d, Some(state));
     }
 }
 
@@ -5109,16 +5143,22 @@ impl IrohState {
         }
         // NOTE: .iroh-folder-* staging dirs are deliberately NOT touched here —
         // a live folder receive may be writing into one right now. The startup
-        // sweep (no receives running yet) handles crash litter.
+        // sweep skips this process's staging prefix and handles crash litter.
         freed
     }
 }
 
 /// Open (or reopen) the hidden partial for `fp`, pre-sized to `total`, returning
 /// any prior coverage from a matching sidecar — i.e. how much we already have.
+async fn prepare_partial_async(dir: &Path, fp: &str, total: u64) -> Result<(PathBuf, Coverage)> {
+    let dir = dir.to_path_buf();
+    let fp = fp.to_owned();
+    tokio::task::spawn_blocking(move || prepare_partial(&dir, &fp, total)).await?
+}
+
 fn prepare_partial(dir: &Path, fp: &str, total: u64) -> Result<(PathBuf, Coverage)> {
     std::fs::create_dir_all(dir)?;
-    gc_stale_partials(dir);
+    gc_stale_partials(dir, None);
     note_partial_dir(dir);
     let (part, side) = partial_paths(dir, fp);
     let coverage = if part.is_file() {
@@ -6490,7 +6530,7 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
             .map(|set| set.lock().unwrap().insert(fp.clone()))
             .unwrap_or(true);
         let prep: Result<(PathBuf, Coverage)> = if owns_partial {
-            prepare_partial(dest_dir, &fp, total)
+            prepare_partial_async(dest_dir, &fp, total).await
         } else {
             (|| {
                 let p = dest_dir
@@ -6663,6 +6703,37 @@ pub async fn serve_pull<F: Fn(u64, u64)>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_cleanup_preserves_live_staging_and_active_partials() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-cleanup-{}", uuid::Uuid::new_v4()));
+        let old_staging = dir.join(".iroh-folder-old-pair-uuid");
+        let live_staging = dir.join(format!("{}pair-uuid", staging_prefix()));
+        let partials = dir.join("folder-partials");
+        for path in [&old_staging, &live_staging, &partials] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(old_staging.join("crash"), b"old").unwrap();
+        std::fs::write(live_staging.join("receiving"), b"live").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(PARTIAL_TTL_SECS + 60);
+        for fp in ["active", "abandoned"] {
+            for ext in ["part", "json"] {
+                let path = partials.join(format!(".dropbeam-partial-{fp}.{ext}"));
+                let file = std::fs::File::create(path).unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+            }
+        }
+        let state = IrohState::default();
+        state.partials.lock().unwrap().insert("active".into());
+        startup_cleanup(&dir, &state);
+        assert!(!old_staging.exists());
+        assert_eq!(std::fs::read(live_staging.join("receiving")).unwrap(), b"live");
+        for ext in ["part", "json"] {
+            assert!(partials.join(format!(".dropbeam-partial-active.{ext}")).exists());
+            assert!(!partials.join(format!(".dropbeam-partial-abandoned.{ext}")).exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn identity_is_stable_across_loads() {

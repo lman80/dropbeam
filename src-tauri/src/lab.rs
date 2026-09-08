@@ -239,7 +239,8 @@ async fn dispatch(
                 &cfg, dir.to_string(), name, true, "Lab Peer".into(), mirror, my_id,
             )
             .map_err(|e| anyhow::anyhow!(e))?;
-            sync_manager(state)?.reconcile();
+            let sm = sync_manager(state)?;
+            tokio::task::spawn_blocking(move || sm.reconcile()).await?;
             Ok(serde_json::json!({ "pairId": pair.id, "invite": invite }))
         }
 
@@ -256,7 +257,8 @@ async fn dispatch(
                     iroh_arc(state)?, pair.id.clone(), inviter_eid, my_display_name(state),
                 );
             }
-            sync_manager(state)?.reconcile();
+            let sm = sync_manager(state)?;
+            tokio::task::spawn_blocking(move || sm.reconcile()).await?;
             Ok(serde_json::json!({ "pairId": pair.id }))
         }
 
