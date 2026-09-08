@@ -2152,3 +2152,7 @@ html.mobile .settings-row .seg { flex-wrap: wrap; }
 html.mobile .settings-row .seg button { flex: 1; }
 html.mobile main .card svg { flex-shrink: 0; }
 html.mobile main .card svg[role="img"] { max-width: 100%; height: auto; }
+/* Desktop timestamps live beyond the thread edge; phones keep them in-flow. */
+html.mobile .chat-thread { padding: 12px !important; }
+html.mobile .chat-line { flex-wrap: wrap; }
+html.mobile .chat-time-gutter { position: static; margin: 0; flex: 0 0 100%; text-align: right; }

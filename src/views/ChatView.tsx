@@ -166,7 +166,7 @@ export function ChatView() {
   // Only show the "nobody to chat with" empty state when there are genuinely no
   // conversations AND no friends — never when a stored thread exists (otherwise a
   // lost friend record would hide a real conversation).
-  if (rows.length === 0) {
+  if (rows.length === 0 && !activeChatId) {
     return (
       <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
         <h1 style={{ fontSize: 20, fontWeight: 750, margin: '0 0 16px' }}>Chat</h1>
