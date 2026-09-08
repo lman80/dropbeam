@@ -1932,6 +1932,18 @@ html.overlay-window #root {
    =========================================================================== */
 
 /* --- Baseline touch behaviour --- */
+html.mobile {
+  background: var(--bg-grad-1);
+  color-scheme: light;
+}
+html.mobile.dark {
+  color-scheme: dark;
+}
+html.mobile body,
+html.mobile #root {
+  min-height: 100%;
+  background-color: var(--bg-grad-1);
+}
 html.mobile,
 html.mobile body {
   /* No rubber-banding the whole app; individual scroll areas still bounce. */
@@ -2006,6 +2018,8 @@ html.mobile .tabbar {
   gap: 2px;
   padding: 6px 4px 0;
   padding-bottom: max(6px, env(safe-area-inset-bottom));
+  padding-left: max(4px, env(safe-area-inset-left));
+  padding-right: max(4px, env(safe-area-inset-right));
   border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface) 88%, transparent);
   backdrop-filter: saturate(180%) blur(20px);

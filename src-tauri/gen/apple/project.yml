@@ -40,6 +40,8 @@ targets:
       path: app_iOS/Info.plist
       properties:
         LSRequiresIPhoneOS: true
+        UIViewControllerBasedStatusBarAppearance: true
+        UIStatusBarStyle: UIStatusBarStyleDefault
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:

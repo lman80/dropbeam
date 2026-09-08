@@ -28,13 +28,13 @@ export function TitleBar() {
         // Desktop keeps the fixed 46px bar with room for the macOS traffic
         // lights. iOS has neither, but does have a status bar / notch to clear.
         height: MOBILE_UI ? undefined : 46,
-        minHeight: 46,
+        minHeight: MOBILE_UI ? 'calc(46px + env(safe-area-inset-top))' : 46,
         paddingTop: MOBILE_UI ? 'env(safe-area-inset-top)' : undefined,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        paddingLeft: MOBILE_UI ? 16 : 80,
-        paddingRight: MOBILE_UI ? 10 : 12,
+        paddingLeft: MOBILE_UI ? 'calc(16px + env(safe-area-inset-left))' : 80,
+        paddingRight: MOBILE_UI ? 'calc(10px + env(safe-area-inset-right))' : 12,
         flexShrink: 0,
       }}
     >
