@@ -305,7 +305,10 @@ pub fn run() {
             let mut loaded = settings::load(&config_dir, &default_download, &default_name);
             // Sandbox container paths can change across iOS installs.
             #[cfg(target_os = "ios")]
-            { loaded.download_dir = default_download.clone(); }
+            if loaded.download_dir != default_download {
+                loaded.download_dir = default_download.clone();
+                settings::save(&config_dir, &loaded).map_err(std::io::Error::other)?;
+            }
             // One-time "always ready in the background" migration: existing installs
             // had launch-at-login OFF, so a closed app couldn't receive. Turn it ON
             // once (the app then starts silently in the menu bar at every login).

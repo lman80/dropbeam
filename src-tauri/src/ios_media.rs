@@ -76,8 +76,15 @@ unsafe fn presenter() -> Result<Retained<AnyObject>, String> {
 
 fn copy_asset(provider: &NSItemProvider) -> oneshot::Receiver<Result<String, String>> {
     let (tx, rx) = oneshot::channel();
-    let Some(ty) = provider.registeredTypeIdentifiers().firstObject() else {
-        let _ = tx.send(Err("The selected asset has no file representation.".into()));
+    // Request an image/movie representation, not e.g. a Live Photo bundle.
+    let image = NSString::from_str("public.image");
+    let movie = NSString::from_str("public.movie");
+    let ty = if provider.hasItemConformingToTypeIdentifier(&image) {
+        image
+    } else if provider.hasItemConformingToTypeIdentifier(&movie) {
+        movie
+    } else {
+        let _ = tx.send(Err("The selected asset has no image or video representation.".into()));
         return rx;
     };
     let tx = Mutex::new(Some(tx));
