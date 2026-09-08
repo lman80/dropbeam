@@ -39,6 +39,7 @@ function Row({
 }) {
   return (
     <div
+      className="settings-row"
       style={{
         display: 'flex',
         alignItems: 'center',

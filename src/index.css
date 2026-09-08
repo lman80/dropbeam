@@ -2132,3 +2132,23 @@ html.mobile .chat-fileblock,
 html.mobile .chat-media,
 html.mobile .chat-audio,
 html.mobile .chat-img { max-width: 100%; }
+
+/* Shared narrow-screen sizing: wrap actions and let flex content shrink. */
+html.mobile main .card,
+html.mobile main .card div,
+html.mobile main form { min-width: 0 !important; overflow-wrap: anywhere; }
+html.mobile main :is(.card, form) :is(input, textarea, select) { min-width: 0; max-width: 100%; }
+html.mobile main :is(.card, form) div:has(> .btn),
+html.mobile main .card div:has(> .icon-btn),
+html.mobile main form:has(> .btn) { flex-wrap: wrap; }
+html.mobile main .btn { max-width: 100%; white-space: normal; }
+html.mobile main .icon-btn,
+html.mobile main .toggle { flex-shrink: 0; }
+html.mobile main form > .input { flex: 1 1 100%; }
+html.mobile .settings-row { flex-wrap: wrap; }
+html.mobile .settings-row > :first-child { flex-basis: 160px !important; }
+html.mobile .settings-row > :last-child { max-width: 100%; }
+html.mobile .settings-row .seg { flex-wrap: wrap; }
+html.mobile .settings-row .seg button { flex: 1; }
+html.mobile main .card svg { flex-shrink: 0; }
+html.mobile main .card svg[role="img"] { max-width: 100%; height: auto; }
