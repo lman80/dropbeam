@@ -6327,7 +6327,7 @@ pub fn make_ticket(ep: &Endpoint, token: &str) -> Result<String> {
 fn parse_ticket(s: &str) -> Result<(iroh::EndpointAddr, String)> {
     use base64::Engine as _;
     let s = s.trim();
-    let body = s.strip_prefix(TICKET_PREFIX).unwrap_or(s);
+    let body = crate::codes::strip_prefix(s, TICKET_PREFIX).unwrap_or(s);
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(body)
         .context("ticket is not valid base64")?;

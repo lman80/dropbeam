@@ -1,3 +1,4 @@
+mod codes;
 mod chat;
 mod commands;
 mod download_progress;

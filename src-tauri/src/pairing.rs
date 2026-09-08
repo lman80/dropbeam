@@ -182,9 +182,7 @@ pub fn create(
 /// Accept an invite (this device is B).
 pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pair, String> {
     validate_folder(&folder)?;
-    let body = invite_str
-        .trim()
-        .strip_prefix(INVITE_PREFIX)
+    let body = crate::codes::strip_prefix(invite_str, INVITE_PREFIX)
         .ok_or("That doesn't look like a DropBeam invite code.")?;
     let bytes = URL_SAFE_NO_PAD
         .decode(body.trim())

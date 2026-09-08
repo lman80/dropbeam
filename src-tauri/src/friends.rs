@@ -122,9 +122,7 @@ pub fn create(
 
 /// Accept a friend invite (this device is B). The friend is named after the inviter.
 pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
-    let body = invite_str
-        .trim()
-        .strip_prefix(INVITE_PREFIX)
+    let body = crate::codes::strip_prefix(invite_str, INVITE_PREFIX)
         .ok_or("That doesn't look like a friend invite.")?;
     let bytes = URL_SAFE_NO_PAD
         .decode(body.trim())
@@ -371,9 +369,7 @@ pub fn my_code(my_name: &str, my_endpoint_id: &str) -> String {
 }
 
 fn decode_user_code(code: &str) -> Result<UserCode, String> {
-    let body = code
-        .trim()
-        .strip_prefix(USER_PREFIX)
+    let body = crate::codes::strip_prefix(code, USER_PREFIX)
         .ok_or("That doesn't look like a DropBeam code.")?;
     let bytes = URL_SAFE_NO_PAD
         .decode(body.trim())
@@ -1099,5 +1095,23 @@ mod tests {
         std::fs::write(friends_path(&dir), b"garbage").unwrap();
         assert_eq!(load(&dir).len(), 0, "no resurrection from a stale .bak");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod code_tests {
+    use super::*;
+
+    #[test]
+    fn personal_code_accepts_keyboard_capitalization_and_whitespace() {
+        let original = my_code("MiXeD Name", "AbCdEf012345");
+        for code in [original.replacen("dropbeam:", "Dropbeam:", 1), format!(" {original}\n")] {
+            let decoded = decode_user_code(&code).unwrap();
+            assert_eq!(decoded.v, 1);
+            assert_eq!(decoded.name, "MiXeD Name");
+            assert_eq!(decoded.eid, "AbCdEf012345");
+        }
+        assert!(decode_user_code("other:invalid").is_err());
+        assert!(decode_user_code("Dropbeam:invalid").is_err());
     }
 }
