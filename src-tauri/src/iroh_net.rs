@@ -1369,7 +1369,7 @@ async fn serve_stream(
                 })
                 .unwrap_or_else(|| (std::env::temp_dir(), String::new()));
             let mut dest = if configured.trim().is_empty() {
-                app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                crate::commands::download_directory(&app).unwrap_or_else(|_| std::env::temp_dir())
             } else {
                 PathBuf::from(configured)
             };
@@ -2343,7 +2343,7 @@ async fn serve_stream(
                                         .map(|st| st.settings.lock().unwrap().download_dir.clone())
                                         .unwrap_or_default();
                                     let dir = if configured.trim().is_empty() {
-                                        app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                                        crate::commands::download_directory(&app).unwrap_or_else(|_| std::env::temp_dir())
                                     } else {
                                         PathBuf::from(configured)
                                     };

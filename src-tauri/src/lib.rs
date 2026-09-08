@@ -296,13 +296,14 @@ pub fn run() {
                 .unwrap_or_else(|_| PathBuf::from("."));
             let _ = std::fs::create_dir_all(&config_dir);
 
-            let default_download = app
-                .path()
-                .download_dir()
+            let default_download = commands::download_directory(app.handle())
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
             let default_name = default_display_name();
             let mut loaded = settings::load(&config_dir, &default_download, &default_name);
+            // Sandbox container paths can change across iOS installs.
+            #[cfg(target_os = "ios")]
+            { loaded.download_dir = default_download.clone(); }
             // One-time "always ready in the background" migration: existing installs
             // had launch-at-login OFF, so a closed app couldn't receive. Turn it ON
             // once (the app then starts silently in the menu bar at every login).

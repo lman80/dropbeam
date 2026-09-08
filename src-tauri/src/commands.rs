@@ -413,7 +413,7 @@ pub fn export_diagnostics(
         }
     }
 
-    let downloads = app.path().download_dir().unwrap_or_else(|_| log_dir.clone());
+    let downloads = download_directory(&app).unwrap_or_else(|_| log_dir.clone());
     let dest = downloads.join(format!("DropBeam-diagnostics-{now_ms}.txt"));
     std::fs::write(&dest, out.as_bytes()).map_err(|e| e.to_string())?;
     log::info!("export_diagnostics: wrote {} bytes to {dest:?}", out.len());
@@ -594,8 +594,7 @@ pub fn set_card_active(app: AppHandle, active: bool) {
 
 #[tauri::command]
 pub fn get_default_download_dir(app: AppHandle) -> String {
-    app.path()
-        .download_dir()
+    download_directory(&app)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default()
 }
@@ -1721,8 +1720,7 @@ pub fn iroh_receive(
     }
     let configured = { state.settings.lock().unwrap().download_dir.clone() };
     let out = if configured.trim().is_empty() {
-        app.path()
-            .download_dir()
+        download_directory(&app)
             .map(|p| p.to_string_lossy().to_string())
             .map_err(|e| format!("No download folder available: {e}"))?
     } else {
@@ -1730,4 +1728,12 @@ pub fn iroh_receive(
     };
     std::fs::create_dir_all(&out).map_err(|e| format!("Can't write to download folder: {e}"))?;
     crate::iroh_net::start_receive(app, iroh.inner().clone(), ticket, out)
+}
+
+/// iOS receives belong in the Files-visible app Documents directory.
+pub(crate) fn download_directory(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
+    #[cfg(target_os = "ios")]
+    { app.path().document_dir() }
+    #[cfg(not(target_os = "ios"))]
+    { app.path().download_dir() }
 }
