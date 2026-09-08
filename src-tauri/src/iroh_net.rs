@@ -2298,23 +2298,12 @@ async fn serve_stream(
                     .unwrap_or_else(std::env::temp_dir);
                 let who = conn.remote_id().to_string();
                 let msg_kind = req.get("msgKind").and_then(|k| k.as_str()).unwrap_or("text");
-                // Updates (reaction/edit/delete) only come from a KNOWN friend
-                // identified by their CRYPTOGRAPHIC endpoint id — never auto-add,
-                // and never trust a peer-claimed friendId (which could target
-                // someone else's thread). New messages keep the introduce-by-name
-                // + claimed-id bootstrap so invite-friends become two-way.
-                let is_op = matches!(msg_kind, "reaction" | "edit" | "delete");
-                let friend = if is_op {
-                    crate::friends::load(&config_dir)
-                        .into_iter()
-                        .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
-                } else {
-                    resolve_chat_friend(&app, &config_dir, &who, &req, true)
-                };
+                // Unsolicited frames cannot recreate a removed/unknown contact.
+                let friend = crate::friends::chat_sender(&config_dir, &who);
+                if friend.is_none() {
+                    applied = false;
+                }
                 if let Some(friend) = friend {
-                    if friend.endpoint_id.as_deref() != Some(who.as_str()) {
-                        crate::friends::set_endpoint_id(&config_dir, &friend.id, who.clone());
-                    }
                     let peer_id = friend.id.clone();
                     match msg_kind {
                         "reaction" => {
@@ -2486,41 +2475,6 @@ async fn serve_stream(
         }
     }
     Ok(())
-}
-
-/// Identify the friend a chat frame came from: by endpoint id, then by the
-/// `friendId` they carry (invite-friends share an id), and — only when
-/// `allow_introduce` — auto-add an unknown sender who introduced themselves by
-/// name (they hold our permanent code), so a first message becomes two-way.
-fn resolve_chat_friend(
-    app: &AppHandle,
-    config_dir: &Path,
-    who: &str,
-    req: &serde_json::Value,
-    allow_introduce: bool,
-) -> Option<crate::models::Friend> {
-    let friends = crate::friends::load(config_dir);
-    let claimed = req.get("friendId").and_then(|v| v.as_str());
-    let from_name = req.get("fromName").and_then(|v| v.as_str()).unwrap_or("");
-    let known = friends
-        .iter()
-        .find(|f| f.endpoint_id.as_deref() == Some(who))
-        .or_else(|| claimed.and_then(|id| friends.iter().find(|f| f.id == id)))
-        .cloned();
-    if known.is_some() || !allow_introduce {
-        return known;
-    }
-    // Unknown sender on a NEW message → self-heal the contact so the conversation
-    // is visible AND replyable (GitHub #18/#19: a notification fired + the message
-    // got stored, but the lost friend record left the thread unreachable). The
-    // endpoint id is the sender's cryptographic identity (conn.remote_id()), so
-    // recreating from it can never impersonate anyone; dedup invariants live in
-    // friends::self_heal_chat_sender (never adds a second record for a known eid).
-    let healed = crate::friends::self_heal_chat_sender(config_dir, who, from_name, claimed);
-    if healed.is_some() {
-        let _ = app.emit("friends://changed", ());
-    }
-    healed
 }
 
 /// Prove iroh works inside the running app: spin up a throwaway client endpoint,

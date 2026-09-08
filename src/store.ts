@@ -997,8 +997,17 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   reloadFriends: async () => {
-    const friends = await api.listFriends().catch(() => [])
-    set({ friends })
+    const friends = await api.listFriends()
+    const ids = new Set(friends.map((f) => f.id))
+    const chatOverview = (await api.listChats()).filter((o) => ids.has(o.peerId))
+    set((s) => ({
+      friends, chatOverview,
+      chats: Object.fromEntries(Object.entries(s.chats).filter(([id]) => ids.has(id))),
+      chatUnread: Object.fromEntries(Object.entries(s.chatUnread).filter(([id]) => ids.has(id))),
+      activeChatId: s.activeChatId && ids.has(s.activeChatId) ? s.activeChatId : null,
+    }))
+    void api.setActiveChat(get().activeChatId)
+    void api.setUnreadBadge(Object.values(get().chatUnread).reduce((a, b) => a + b, 0))
     for (const f of friends) void get().probeFriend(f.id).catch(() => {})
   },
 
@@ -1045,6 +1054,7 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   openChat: async (friendId) => {
+    if (!get().friends.some((f) => f.id === friendId)) return
     // Switching threads drops any files staged for the previous one.
     set({ activeChatId: friendId, view: 'chat', chatDraftFiles: [] })
     void api.setActiveChat(friendId)
@@ -1173,6 +1183,7 @@ export const useStore = create<AppStore>((set, get) => ({
   clearChatDraftFiles: () => set({ chatDraftFiles: [] }),
 
   addChatMessage: (m) => {
+    if (!get().friends.some((f) => f.id === m.peerId)) return
     // An incoming message means that friend is reachable right now.
     if (!m.fromMe) {
       const f = get().friends.find((fr) => fr.id === m.peerId)

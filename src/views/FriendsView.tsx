@@ -590,6 +590,13 @@ function FriendCard({ friend }: { friend: Friend }) {
         )}
       </div>
 
+      {confirmRemove && (
+        <p role="status" style={{ fontSize: 12.5, color: 'var(--text-muted)', margin: '8px 0 0' }}>
+          Remove {friend.name}? Your chat history will be kept on this device.
+          {friend.endpointId && ' Re-add the same device to restore the conversation.'}
+        </p>
+      )}
+
       {invite && <InvitePanel invite={invite} friendName={friend.name} onClose={() => setInvite(null)} />}
     </motion.div>
   )

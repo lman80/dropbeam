@@ -149,8 +149,12 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         name_custom: false,
         progress_v: None,
     };
+    let detached = detached_threads(config_dir)?;
     friends.push(friend.clone());
     save(config_dir, &friends)?;
+    if let Some(old_id) = friend.endpoint_id.as_ref().and_then(|eid| detached.get(eid)) {
+        crate::chat::merge_threads(config_dir, old_id, &friend.id);
+    }
     Ok(friend)
 }
 
@@ -406,7 +410,12 @@ pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> F
         return out;
     }
     let friend = Friend {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: detached_threads(config_dir).unwrap_or_else(|e| {
+            log::error!("could not read detached chat identity: {e}");
+            Default::default()
+        }).get(endpoint_id)
+            .filter(|id| !friends.iter().any(|f| &f.id == *id))
+            .cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         role: PairRole::B,
         name: clean_name(name, "Friend"),
         secret: random_secret(),
@@ -646,9 +655,36 @@ pub fn set_progress_version(config_dir: &Path, endpoint: &str, version: u64) {
     }
 }
 
+/// Removed friendships retain only an endpoint → conversation id index, never
+/// credentials or auto-accept permission. Chat messages remain in chats.json.
+fn detached_threads(config_dir: &Path) -> Result<std::collections::HashMap<String, String>, String> {
+    match fs::read(config_dir.join("detached-chats.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Incoming chat frames may only resolve a currently trusted endpoint. A name
+/// or a sender-provided friend id is not proof of friendship.
+pub fn chat_sender(config_dir: &Path, endpoint_id: &str) -> Option<Friend> {
+    load(config_dir).into_iter()
+        .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
+}
+
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
     let mut friends = load(config_dir);
+    if let Some(f) = friends.iter().find(|f| f.id == id) {
+        if let Some(endpoint) = &f.endpoint_id {
+            let mut detached = detached_threads(config_dir)?;
+            detached.insert(endpoint.clone(), id.to_string());
+            let bytes = serde_json::to_vec(&detached).map_err(|e| e.to_string())?;
+            // Persist identity BEFORE detaching; a failed write leaves the friend intact.
+            crate::settings::write_atomic(&config_dir.join("detached-chats.json"), &bytes)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     friends.retain(|f| f.id != id);
     // allow_empty: removing your last friend legitimately writes `[]`.
     save_inner(config_dir, &friends, true)
@@ -968,6 +1004,53 @@ mod tests {
                 gif: None,
             },
         );
+    }
+
+    #[test]
+    fn remove_readd_restores_thread_by_endpoint_without_trusting_removed_peer() {
+        let dir = tmp("readd");
+        let original = add_by_code(&dir, &my_code("Ashton", "MAC-EID")).unwrap();
+        seed_msg(&dir, &original.id);
+        remove(&dir, &original.id).unwrap();
+        assert!(load(&dir).is_empty());
+        assert!(chat_sender(&dir, "MAC-EID").is_none());
+        assert_eq!(crate::chat::messages(&dir, &original.id).len(), 1);
+        // The persisted index works without retaining a Friend in memory.
+        let other = add_by_code(&dir, &my_code("Ashton", "OTHER-EID")).unwrap();
+        assert_ne!(other.id, original.id);
+        let restored = add_by_code(&dir, &my_code("Renamed Mac", "MAC-EID")).unwrap();
+        assert_eq!(restored.id, original.id);
+        assert_eq!(chat_sender(&dir, "MAC-EID").unwrap().id, original.id);
+        assert!(chat_sender(&dir, "STRANGER-EID").is_none());
+        let messages = crate::chat::messages(&dir, &restored.id);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].peer_id, restored.id);
+        assert_eq!(messages[0].text, "hi");
+        assert_eq!(crate::chat::overview(&dir).len(), 1);
+        let disk: serde_json::Value = serde_json::from_slice(
+            &fs::read(dir.join("chats.json")).unwrap()).unwrap();
+        assert_eq!(disk[&restored.id].as_array().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readd_by_invite_moves_retained_messages_to_new_pair_id() {
+        let dir = tmp("readd-invite");
+        let sender_dir = tmp("readd-inviter");
+        let original = add_by_code(&dir, &my_code("Ashton", "MAC-EID")).unwrap();
+        seed_msg(&dir, &original.id);
+        remove(&dir, &original.id).unwrap();
+        let (_, invite) = create(&sender_dir, "Ashton".into(), "Linux".into(),
+            Some("MAC-EID".into())).unwrap();
+        let restored = accept(&dir, &invite).unwrap();
+        assert_ne!(restored.id, original.id);
+        assert!(crate::chat::messages(&dir, &original.id).is_empty());
+        let messages = crate::chat::messages(&dir, &restored.id);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].peer_id, restored.id);
+        assert_eq!(crate::chat::overview(&dir).len(), 1);
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(sender_dir);
     }
 
     #[test]
