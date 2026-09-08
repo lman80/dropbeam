@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.46.0"
+version = "0.47.0"
 description = "DropBeam — seamless peer-to-peer file transfer"
 authors = ["DropBeam"]
 license = ""
@@ -99,6 +99,7 @@ windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation"] 
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
+block2 = "0.6"
 # Converts the popover window into a non-activating NSPanel so it can appear OVER
 # full-screen apps (a plain NSWindow can't, since Big Sur) without stealing focus
 # or hiding the Dock icon. Pinned to a v2.1 commit (objc2-based, matches our stack).
@@ -114,4 +115,8 @@ strip = true
 opt-level = "s"
 lto = "thin"
 codegen-units = 16
-strip = true
+# Keep line tables and packed dSYMs so release crashes can be symbolicated.
+# Archive the matching dSYM with each shipped binary.
+debug = 1
+split-debuginfo = "packed"
+strip = false
