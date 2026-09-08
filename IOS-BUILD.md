@@ -1,3 +1,76 @@
+# Mobile Chat and 402pt layout verification — 2026-09-09
+
+Source commits: `9262a68`, `c7f1a83`, `f665ea5`, `de50dee` (branch `ios`).
+
+- MOBILE_UI Chat starts with the full-width thread list. Selecting a thread, the
+  Friends message icon, or a chat notification opens the full-width conversation.
+  Back clears the active thread. Header retains friend name/presence; the composer,
+  attachment and emoji buttons stay above the tab bar. Mobile timestamps stay
+  inside the message area; missing friend records do not block a deep link.
+- Shared CSS under `html.mobile` lets card actions wrap, constrains inputs and
+  allows Settings controls to move below their labels. The iOS download folder
+  was already read-only and remains so. Desktop Chat still has a 232px list and
+  an adjacent conversation (750px at a 1200px browser viewport).
+- iOS chat notifications now carry chatPeerId. A vendored notification plugin
+  preserves this metadata, safely reads notifications created before a restart,
+  and queues taps until the JS channel is ready. Only iOS grants the new command.
+  Upstream desktop/Android implementations are unchanged; patch details are in
+  src-tauri/vendor/tauri-plugin-notification/DROPBEAM-PATCH.md.
+
+Verified commands:
+
+```sh
+npm run build
+cargo check --offline --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios-sim --lib
+cargo test --offline --manifest-path src-tauri/Cargo.toml
+npx tauri ios build --debug --target aarch64-sim --no-sign --ci
+```
+
+All passed. Rust: **150 passed, 0 failed, 6 ignored**. The sandbox run failed in
+23 loopback network-monitor tests; the unrestricted offline run passed. SwiftPM
+and Xcode also required execution outside the sandbox, as in previous builds.
+Previous simulator outputs were preserved in timestamped `arm64-sim-before-*`
+directories. No push or subagents; no files in the ~/DropBeam checkout changed
+(Git necessarily writes the ios worktree's shared metadata under its .git).
+
+Fresh bundle:
+`/Users/ashtonmiller/DropBeam-ios/src-tauri/gen/apple/build/arm64-sim/DropBeam.app`
+
+Bundle mtime: **2026-09-09 02:50:30.608045 +08:00**.
+Executable mtime: **2026-09-09 02:50:26.204327 +08:00**.
+Installed and launched on iPhone 17 Pro, iOS 26.5
+(`E0643E29-45EB-4EFA-B1D1-5EA9565A9D38`). The final app log confirms
+`Chat notification tap listener ready`.
+
+Browser interaction/DOM QA at `?mobile=1`, 402x874, mock backend:
+
+- Chat list/conversation, Back, Friends message shortcut, emoji picker and a
+  deep link without any loaded friend record passed. Conversation/composer span
+  x=0…402. At 402x400, composer y=276.5…337.5 directly precedes the tab bar.
+- Friends, long friend names, removal confirmation controls, own QR, friend
+  invite/QR, receive-with-code, History Recents and Recoverable files all passed
+  horizontal bounds checks. Every rendered Settings button/input can be scrolled
+  fully into the main viewport.
+- Populated waiting/code/QR, transferring, completed, failed and manual-accept
+  transfer cards passed with long filenames, long codes and long error text.
+- Notification routing selects tap payloads and ignores dismissals/unrelated
+  notifications. Native channel initialization is verified; actual notification
+  taps, cold-start delivery and iOS keyboard behavior remain runtime QA items.
+
+Simulator screenshots work and confirm the new app launches, but repeated CUA
+`noWindowsAvailable` errors prevent tapping its controls. Browser screenshot
+capture also timed out, so browser verification used interaction and DOM bounds.
+No physical-device or end-to-end transfer test was performed. Existing frontend
+chunk-size, Xcode destination and blake3 SDK/deployment-target warnings remain.
+
+Changed application files: src/views/ChatView.tsx, src/views/SettingsView.tsx,
+src/index.css, src/store.ts, src/lib/chatNotifications.ts,
+src-tauri/src/iroh_net.rs, src-tauri/Cargo.toml, src-tauri/Cargo.lock,
+src-tauri/capabilities/ios-notifications.json, the vendored notification plugin,
+and this build log.
+
+---
+
 # Native Photos, Files visibility, and Share — 2026-09-09
 
 Implementation commits: `00b3fcf`, `cdfbde2`, `a3b89f1`.
