@@ -321,6 +321,7 @@ function Conversation({ friendId }: { friendId: string }) {
   }
   const scrollToBottom = (smooth = false) => {
     const el = scrollRef.current
+    atBottomRef.current = true
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
     setNewCount(0)
   }
@@ -345,7 +346,20 @@ function Conversation({ friendId }: { friendId: string }) {
 
   // On open, jump to bottom.
   useLayoutEffect(() => {
+    atBottomRef.current = true
     scrollToBottom()
+    // Mobile's hidden thread pane and asynchronously loaded media can settle
+    // after the first layout effect. Preserve bottom anchoring as they resize,
+    // but stop following once the reader scrolls up.
+    if (!MOBILE_UI) return
+    const el = scrollRef.current
+    if (!el) return
+    const observer = new ResizeObserver(() => {
+      if (atBottomRef.current) scrollToBottom()
+    })
+    observer.observe(el)
+    if (el.firstElementChild) observer.observe(el.firstElementChild)
+    return () => observer.disconnect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [friendId])
 
@@ -521,7 +535,7 @@ function Conversation({ friendId }: { friendId: string }) {
     setText(m.text)
     setShowEmoji(false)
     setShowGif(false)
-    setTimeout(() => taRef.current?.focus(), 0)
+    setTimeout(() => taRef.current?.focus({ preventScroll: MOBILE_UI }), 0)
   }, [])
   // Stable per-thread callbacks the memoized rows invoke with their OWN message —
   // inline `() => {...row.m...}` closures would mint a fresh prop per row per render
@@ -529,7 +543,7 @@ function Conversation({ friendId }: { friendId: string }) {
   const beginReply = useCallback((m: ChatMessage) => {
     setReply(m)
     setEditing(null)
-    taRef.current?.focus()
+    taRef.current?.focus({ preventScroll: MOBILE_UI })
   }, [])
   const cancelEdit = () => {
     setEditing(null)
@@ -822,7 +836,7 @@ function Conversation({ friendId }: { friendId: string }) {
                 className="emoji-cell"
                 onClick={() => {
                   onType(text + e)
-                  taRef.current?.focus()
+                  taRef.current?.focus({ preventScroll: MOBILE_UI })
                 }}
               >
                 {e}
@@ -861,6 +875,9 @@ function Conversation({ friendId }: { friendId: string }) {
         <textarea
           ref={taRef}
           className="chat-input"
+          onFocus={() => {
+            if (MOBILE_UI) scrollToBottom()
+          }}
           value={text}
           placeholder={editing ? 'Edit your message…' : `Message ${friend.name}…`}
           rows={1}

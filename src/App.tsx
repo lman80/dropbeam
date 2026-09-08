@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useLayoutEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import { AlertTriangle, X } from 'lucide-react'
 import type { UnlistenFn } from '@tauri-apps/api/event'
@@ -26,6 +26,35 @@ export default function App() {
   const init = useStore((s) => s.init)
   const setPendingSend = useStore((s) => s.setPendingSend)
   const setDragHovering = useStore((s) => s.setDragHovering)
+
+  useLayoutEffect(() => {
+    if (!MOBILE_UI) return
+    const root = document.documentElement
+    const viewport = window.visualViewport
+    let frame = 0
+    const update = () => {
+      // WKWebView can pan the visual viewport even with overflow hidden.
+      // Anchor the fixed shell to its visible origin; only inner panes scroll.
+      root.style.setProperty('--mobile-viewport-height', `${viewport?.height ?? window.innerHeight}px`)
+      root.style.setProperty('--mobile-viewport-top', `${viewport?.offsetTop ?? 0}px`)
+    }
+    const schedule = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(update)
+    }
+    update()
+    viewport?.addEventListener('resize', schedule)
+    viewport?.addEventListener('scroll', schedule)
+    window.addEventListener('resize', schedule)
+    return () => {
+      cancelAnimationFrame(frame)
+      viewport?.removeEventListener('resize', schedule)
+      viewport?.removeEventListener('scroll', schedule)
+      window.removeEventListener('resize', schedule)
+      root.style.removeProperty('--mobile-viewport-height')
+      root.style.removeProperty('--mobile-viewport-top')
+    }
+  }, [])
 
   useEffect(() => {
     init()

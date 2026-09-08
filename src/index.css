@@ -1941,7 +1941,6 @@ html.mobile.dark {
 }
 html.mobile body,
 html.mobile #root {
-  min-height: 100%;
   background-color: var(--bg-grad-1);
 }
 html.mobile,
@@ -2156,3 +2155,20 @@ html.mobile main .card svg[role="img"] { max-width: 100%; height: auto; }
 html.mobile .chat-thread { padding: 12px !important; }
 html.mobile .chat-line { flex-wrap: wrap; }
 html.mobile .chat-time-gutter { position: static; margin: 0; flex: 0 0 100%; text-align: right; }
+
+/* The keyboard changes the visual viewport, not the document's scroll position.
+   The flex shell gives remaining height to the thread and keeps its composer
+   and navigation inside the visible bottom edge. */
+html.mobile,
+html.mobile body { overflow: hidden; }
+html.mobile body { position: fixed; inset: 0; }
+html.mobile #root {
+  position: absolute;
+  top: var(--mobile-viewport-top, 0px);
+  width: 100%;
+  height: var(--mobile-viewport-height, 100%);
+  min-height: 0;
+  overflow: hidden;
+}
+html.mobile .chat-thread { overscroll-behavior: contain; }
+html.mobile .chat-input { font-size: 16px; }

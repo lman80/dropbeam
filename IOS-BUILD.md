@@ -1,3 +1,43 @@
+# Mobile keyboard viewport fix — 2026-09-09
+
+MOBILE_UI now locks the document body in place and sizes/anchors the app root
+using VisualViewport resize and scroll events (height and offsetTop), with a
+window resize fallback. The flex layout reserves the header, composer and tabs;
+the message list owns scrolling. Composer focus jumps to the latest message,
+programmatic focus uses preventScroll, and a ResizeObserver keeps the bottom
+anchored after opening/layout changes while respecting readers who scroll up.
+Mobile textarea text is 16px to avoid focus zoom.
+
+Verified:
+- `npm run build` passed.
+- `npx tauri ios build --debug --target aarch64-sim --no-sign --ci` passed
+  outside the sandbox after CoreSimulator access failed inside it.
+- Browser mock backend at 402x874, `?mobile=1`, 60-message thread:
+  open and focus land at bottom (within 0.5px); scrollY remains zero.
+  VisualViewport height 550 / offsetTop 150 simulation keeps header at visible
+  y=0 and conversation header at y=46; composer bottom moves from 811.5 to
+  487.5, above the viewport bottom. Dismissal restores the original bounds.
+  A 44px accessory-bar shrink preserves a reader's scrollTop=300; subsequent
+  focus returns to bottom. Mock send clears composer with header/scroll stable.
+  Desktop at 1200x874 has no mobile class, fixed body, or viewport override.
+- Installed and launched on iPhone 17 Pro (iOS 26.5),
+  E0643E29-45EB-4EFA-B1D1-5EA9565A9D38. Screenshot confirms app launch.
+  Native Chat taps repeatedly fail with CUA `noWindowsAvailable`, so native
+  keyboard/accessory-bar interaction remains unverified.
+
+Fresh bundle:
+`/Users/ashtonmiller/DropBeam-ios/src-tauri/gen/apple/build/arm64-sim/DropBeam.app`
+
+Bundle mtime: **2026-09-09 03:00:45.736998 +08:00**.
+Executable mtime: **2026-09-09 03:00:42.559642 +08:00**.
+
+Previous simulator output preserved in `arm64-sim-before-keyboard-*`.
+Existing chunk-size, bundle-ID, Xcode destination and blake3 SDK warnings remain.
+Changed files: src/App.tsx, src/index.css, src/views/ChatView.tsx, IOS-BUILD.md.
+No subagents or push; source work restricted to this worktree.
+
+---
+
 # Mobile Chat and 402pt layout verification — 2026-09-09
 
 Source commits: `9262a68`, `c7f1a83`, `f665ea5`, `de50dee` (branch `ios`).
