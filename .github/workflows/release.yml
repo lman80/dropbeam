@@ -1,6 +1,6 @@
 name: Release
 
-# Push a version tag (e.g. v0.1.1) to build installers for macOS + Windows,
+# Push a version tag (e.g. v0.1.1) to build installers for macOS + Windows + Linux (.deb/.AppImage),
 # sign them for the in-app updater, and publish a GitHub Release.
 on:
   push:
@@ -27,6 +27,9 @@ jobs:
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
           - platform: windows-latest # Windows x64 (.exe / .msi)
             args: ""
+            rust-targets: ""
+          - platform: ubuntu-22.04 # Linux x86_64 (.deb / .AppImage)
+            args: "--bundles deb,appimage"
             rust-targets: ""
 
     runs-on: ${{ matrix.platform }}
@@ -61,6 +64,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+
       # macOS only: Spotlight auto-mounts + indexes the DMG while tauri's
       # bundle_dmg.sh is still attaching it, which intermittently fails the bundle
       # with "hdiutil: create/attach failed - Resource busy" on the GitHub runner
@@ -84,6 +93,7 @@ jobs:
 
             - **macOS** (Apple Silicon & Intel): grab the **`.dmg`**, open it, drag DropBeam to Applications.
             - **Windows**: grab the **`.exe`** installer and run it.
+            - **Linux**: install the **`.deb`**, or make the **`.AppImage`** executable and run it.
 
             **First launch (the app is unsigned, so the OS blocks it once):**
             - **macOS (newest):** double‑click → "Apple could not verify…" → **Done**. Then **System Settings → Privacy & Security → Open Anyway** (authenticate, Open Anyway again). *(Older macOS: right‑click → Open.)*
