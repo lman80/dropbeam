@@ -3,6 +3,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
+  ArrowLeft,
   ArrowDown,
   ArrowUp,
   Check,
@@ -154,7 +155,7 @@ export function ChatView() {
   }, [friends, overview, chats])
 
   useEffect(() => {
-    if (activeChatId) return
+    if (MOBILE_UI || activeChatId) return
     const firstId = overview[0]?.peerId ?? friends[0]?.id
     if (firstId) void openChat(firstId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -186,8 +187,9 @@ export function ChatView() {
   }
 
   return (
-    <div style={{ display: 'flex', height: '100%', minHeight: 0 }}>
+    <div className={`chat-layout${activeChatId ? ' thread-open' : ''}`} style={{ display: 'flex', height: '100%', minHeight: 0 }}>
       <div
+        className="chat-list-pane"
         style={{
           width: 232,
           flexShrink: 0,
@@ -225,7 +227,7 @@ export function ChatView() {
         </div>
       </div>
 
-      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <div className="chat-conversation-pane" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         {activeChatId ? (
           <Conversation key={activeChatId} friendId={activeChatId} />
         ) : (
@@ -591,7 +593,7 @@ function Conversation({ friendId }: { friendId: string }) {
   return (
     <>
       <div
-        className="titlebar-drag"
+        className="titlebar-drag chat-header"
         style={{
           display: 'flex',
           alignItems: 'center',
@@ -600,6 +602,11 @@ function Conversation({ friendId }: { friendId: string }) {
           borderBottom: '1px solid var(--border)',
         }}
       >
+        {MOBILE_UI && (
+          <button className="icon-btn" aria-label="Back to chats" onClick={() => useStore.getState().closeChat()}>
+            <ArrowLeft size={20} />
+          </button>
+        )}
         <span className="chat-avatar" style={{ background: avatarGradient(friend.id) }}>
           {avatarContent(friend)}
           {online && <span className="chat-dot" />}
@@ -869,6 +876,7 @@ function Conversation({ friendId }: { friendId: string }) {
           }}
         />
         <button
+          aria-label={editing ? 'Save message' : 'Send message'}
           className="btn btn-primary chat-send"
           onClick={submit}
           disabled={editing ? !text.trim() : !text.trim() && stagedFiles.length === 0}
