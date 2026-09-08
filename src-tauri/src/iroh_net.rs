@@ -3574,13 +3574,15 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
     // `.sound("default")` is the fix for "I keep missing messages": without it macOS
     // shows a SILENT banner (easy to miss), unlike iMessage. With it you get the
     // distinct OS notification ping every time you're not staring at the thread.
-    let _ = app
+    let notification = app
         .notification()
         .builder()
         .title(who)
         .body(body)
-        .sound("default")
-        .show();
+        .sound("default");
+    #[cfg(target_os = "ios")]
+    let notification = notification.extra("chatPeerId", &msg.peer_id);
+    let _ = notification.show();
 }
 
 /// Deliver a chat message to a friend over iroh (dial-by-key). `payload` is the

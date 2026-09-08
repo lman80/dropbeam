@@ -1,0 +1,13 @@
+{
+  "identifier": "ios-notifications",
+  "description": "Receive queued chat notification taps on iOS.",
+  "platforms": [
+    "iOS"
+  ],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "notification:allow-watch-actions"
+  ]
+}

@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { listenForChatNotifications } from './lib/chatNotifications'
 import {
   api,
   onChatMessage,
@@ -418,6 +419,7 @@ export const useStore = create<AppStore>((set, get) => ({
     const folderStatuses: Record<string, FolderStatus> = {}
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
     set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })
+    void listenForChatNotifications((peerId) => get().openChat(peerId))
 
     // Our own endpoint id (for the folder-owner check). iroh may still be starting
     // at bootstrap, so poll until it's up, then stop.
