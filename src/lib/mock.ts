@@ -334,6 +334,8 @@ export const mockApi = {
     settings = { ...settings, avatar: '' }
     return settings
   },
+  pickPhotos: async (): Promise<string[]> => ['/demo/Beach.jpg', '/demo/Clip.mov'],
+  shareFiles: async (_paths: string[]): Promise<void> => {},
   pickFiles: async (): Promise<string[]> => [
     '/Users/you/Desktop/Q3 Presentation.key',
     '/Users/you/Desktop/cover-photo.png',

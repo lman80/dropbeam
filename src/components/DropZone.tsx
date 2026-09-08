@@ -5,13 +5,18 @@ import { MOBILE_UI } from '../lib/platform'
 export function DropZone({
   hovering,
   onPick,
+  onPickPhotos,
+  busy,
 }: {
   hovering: boolean
   onPick: () => void
+  onPickPhotos?: () => void
+  busy?: boolean
 }) {
+  const Panel = MOBILE_UI ? motion.div : motion.button
   return (
-    <motion.button
-      onClick={onPick}
+    <Panel
+      onClick={MOBILE_UI ? undefined : onPick}
       data-testid="dropzone"
       animate={{ scale: hovering ? 1.012 : 1 }}
       transition={{ type: 'spring', stiffness: 400, damping: 25 }}
@@ -52,8 +57,7 @@ export function DropZone({
         {hovering && !MOBILE_UI ? <Upload size={30} /> : <FilePlus2 size={28} />}
       </motion.div>
       <div style={{ textAlign: 'center' }}>
-        {/* There is nothing to drag on a phone — the whole panel is the button,
-            so say what tapping it does instead of talking about dragging. */}
+        {/* Phone users choose between the photo library and Files. */}
         <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--text)' }}>
           {MOBILE_UI ? 'Choose files to send' : hovering ? 'Drop to send' : 'Drag files here to send'}
         </div>
@@ -68,6 +72,12 @@ export function DropZone({
           )}
         </div>
       </div>
-    </motion.button>
+      {MOBILE_UI && (
+        <div style={{ display: 'flex', gap: 12 }}>
+          <button className="btn btn-primary" disabled={busy} onClick={onPickPhotos} aria-label="Photos & Videos">Photos</button>
+          <button className="btn btn-ghost" disabled={busy} onClick={onPick}>Files</button>
+        </div>
+      )}
+    </Panel>
   )
 }

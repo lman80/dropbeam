@@ -15,6 +15,7 @@ export function SendView() {
   const setPendingSend = useStore((s) => s.setPendingSend)
   const receiveCode = useStore((s) => s.receiveCode)
   const [code, setCode] = useState('')
+  const [picking, setPicking] = useState(false)
   const [showReceive, setShowReceive] = useState(false)
 
   // One unified, newest-first list of everything — sends AND receives. Ghost
@@ -29,9 +30,16 @@ export function SendView() {
     [order, transfers],
   )
 
-  const onPick = async () => {
-    const paths = await api.pickFiles()
-    if (paths.length) setPendingSend(paths)
+  const onPick = async (photos = false) => {
+    setPicking(true)
+    try {
+      const paths = await (photos ? api.pickPhotos() : api.pickFiles())
+      if (paths.length) setPendingSend(paths)
+    } catch (error) {
+      useStore.getState().toast('error', String(error))
+    } finally {
+      setPicking(false)
+    }
   }
 
   const submitReceive = async (e: React.FormEvent) => {
@@ -54,7 +62,7 @@ export function SendView() {
         padding: MOBILE_UI ? '4px 16px 24px' : '8px 28px 36px',
       }}
     >
-      <DropZone hovering={dragHovering} onPick={onPick} />
+      <DropZone hovering={dragHovering} onPick={() => void onPick()} onPickPhotos={() => void onPick(true)} busy={picking} />
 
       {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
       <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center' }}>
@@ -107,7 +115,7 @@ export function SendView() {
             title="Nothing here yet"
             hint={
               MOBILE_UI
-                ? 'Tap the panel above to choose files, then pick who to send them to — a friend, or anyone with a code. Anything sent to you shows up here automatically.'
+                ? 'Tap Photos or Files above, then pick who to send them to — a friend, or anyone with a code. Anything sent to you shows up here automatically.'
                 : 'Drag files onto the area above and pick who to send to — a friend, or anyone with a code. Whatever you receive shows up here automatically, too. Tip: you can also drop a file straight onto the DropBeam menu-bar icon to send it to a friend.'
             }
           />

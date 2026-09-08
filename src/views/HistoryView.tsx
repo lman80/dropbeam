@@ -1,3 +1,4 @@
+import { ShareFilesButton } from '../components/ShareFilesButton'
 import { MOBILE_UI } from '../lib/platform'
 import { useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -256,7 +257,10 @@ function RecentRow({ e }: { e: HistoryEntry }) {
       ) : failed ? (
         <XCircle size={16} color="var(--red)" style={{ flexShrink: 0 }} />
       ) : null}
-      {!MOBILE_UI && e.direction === 'receive' && e.outDir && ok && (
+      {MOBILE_UI && e.direction === 'receive' && e.outDir && ok && (
+            <ShareFilesButton outDir={e.outDir} fileNames={e.fileNames} />
+          )}
+          {!MOBILE_UI && e.direction === 'receive' && e.outDir && ok && (
         <button
           className="icon-btn"
           title={e.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}

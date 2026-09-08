@@ -1,3 +1,4 @@
+import { ShareFilesButton } from './ShareFilesButton'
 import { MOBILE_UI } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
@@ -349,6 +350,9 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
               </div>
             )}
           </div>
+          {MOBILE_UI && t.direction === 'receive' && t.outDir && (
+            <ShareFilesButton outDir={t.outDir} fileNames={t.fileNames} />
+          )}
           {!MOBILE_UI && t.direction === 'receive' && t.outDir && (
             <button
               className="btn btn-ghost"

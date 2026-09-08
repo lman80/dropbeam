@@ -1,6 +1,8 @@
 mod codes;
 mod chat;
 mod commands;
+#[cfg(target_os = "ios")]
+mod ios_media;
 mod download_progress;
 mod folder_history;
 mod friends;
@@ -580,6 +582,10 @@ pub fn run() {
             commands::get_history,
             commands::clear_history,
             commands::pick_files,
+            #[cfg(target_os = "ios")]
+            ios_media::pick_photos,
+            #[cfg(target_os = "ios")]
+            ios_media::share_files,
             commands::pick_directory,
             commands::set_profile_avatar,
             commands::clear_profile_avatar,

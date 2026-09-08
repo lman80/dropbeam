@@ -344,6 +344,8 @@ const realApi = {
   getHistory: () => invoke<HistoryEntry[]>('get_history'),
   clearHistory: () => invoke<void>('clear_history'),
   pickFiles: () => invoke<string[]>('pick_files'),
+  pickPhotos: () => invoke<string[]>('pick_photos'),
+  shareFiles: (paths: string[]) => invoke<void>('share_files', { paths }),
   pickDirectory: () => invoke<string | null>('pick_directory'),
   /** Pick an image and set it as the profile picture. Returns updated settings. */
   setProfileAvatar: () => invoke<Settings>('set_profile_avatar'),

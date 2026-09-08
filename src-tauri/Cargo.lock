@@ -137,6 +137,7 @@ version = "0.46.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "block2",
  "chrono",
  "hex",
  "image",

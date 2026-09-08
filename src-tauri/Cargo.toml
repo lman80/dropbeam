@@ -105,6 +105,8 @@ windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation"] 
 # Pinned to the same objc2 stack Tauri/tray-icon already use.
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["block2"] }
 objc2-ui-kit = { version = "0.3", default-features = false, features = ["UIDevice"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
