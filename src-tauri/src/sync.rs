@@ -2419,6 +2419,7 @@ impl SyncManager {
             &paths,
             &**stopped,
             cb,
+            || { last_progress.store(now_ms(), Ordering::Relaxed); },
         );
         let watchdog = {
             let lp = last_progress.clone();

@@ -464,6 +464,9 @@ pub struct Friend {
     /// broadcast never overwrites a name the user deliberately chose.
     #[serde(default)]
     pub name_custom: bool,
+    /// None until hello/ready negotiation; zero denotes a legacy peer.
+    #[serde(default)]
+    pub progress_v: Option<u64>,
 }
 
 fn default_true() -> bool {

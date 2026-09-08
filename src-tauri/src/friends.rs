@@ -102,6 +102,7 @@ pub fn create(
         endpoint_id: None, // learned when they accept + say hello
         avatar: None,
         name_custom: false,
+        progress_v: None,
     };
     let invite = Invite {
         v: 1,
@@ -146,6 +147,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         endpoint_id: invite.endpoint_id, // the inviter's id, for direct sends
         avatar: None,
         name_custom: false,
+        progress_v: None,
     };
     friends.push(friend.clone());
     save(config_dir, &friends)?;
@@ -188,6 +190,7 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         endpoint_id: None,
         avatar: None,
         name_custom: false,
+        progress_v: None,
     });
     let _ = save(config_dir, &friends);
 }
@@ -412,6 +415,7 @@ pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> F
         endpoint_id: Some(endpoint_id.to_string()),
         avatar: None,
         name_custom: false,
+        progress_v: None,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -543,6 +547,7 @@ pub fn self_heal_chat_sender(
         endpoint_id: Some(endpoint_id.to_string()),
         avatar: None,
         name_custom: false,
+        progress_v: None,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -628,6 +633,19 @@ pub fn set_auto_accept(config_dir: &Path, id: &str, auto_accept: bool) -> Result
     save(config_dir, &friends)
 }
 
+pub fn set_progress_version(config_dir: &Path, endpoint: &str, version: u64) {
+    let _guard = LOCK.lock().unwrap();
+    let mut friends = load(config_dir);
+    if let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(endpoint)) {
+        if f.progress_v != Some(version) {
+            f.progress_v = Some(version);
+            if let Err(e) = save(config_dir, &friends) {
+                log::debug!("could not persist peer progress capability: {e}");
+            }
+        }
+    }
+}
+
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
     let mut friends = load(config_dir);
@@ -711,6 +729,7 @@ mod tests {
             endpoint_id: None,
             avatar: None,
             name_custom: false,
+            progress_v: None,
         }
     }
 
@@ -735,6 +754,7 @@ mod tests {
             endpoint_id: eid.map(String::from),
             avatar: None,
             name_custom: false,
+            progress_v: None,
         }
     }
 
