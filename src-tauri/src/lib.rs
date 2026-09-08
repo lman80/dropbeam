@@ -672,6 +672,17 @@ pub fn run() {
         });
 }
 
+#[cfg(target_os = "ios")]
+fn default_display_name() -> String {
+    // Setup runs on the main thread. Fall back safely if called elsewhere.
+    // iOS 16+ may return a generic "iPhone"/"iPad" without Apple's entitlement.
+    objc2::MainThreadMarker::new()
+        .map(|mtm| objc2_ui_kit::UIDevice::currentDevice(mtm).name().to_string())
+        .filter(|name| !name.trim().is_empty() && name != "Unknown")
+        .unwrap_or_else(|| "My iPhone".to_string())
+}
+
+#[cfg(not(target_os = "ios"))]
 fn default_display_name() -> String {
     let name = whoami::devicename();
     if name.trim().is_empty() {

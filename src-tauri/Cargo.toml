@@ -103,6 +103,10 @@ windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation"] 
 # overlay to the status-item button so dragging a file over the icon springs the
 # popover open (Tauri keeps its tray's NSStatusItem private, so we go native).
 # Pinned to the same objc2 stack Tauri/tray-icon already use.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["UIDevice"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
