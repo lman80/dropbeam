@@ -91,6 +91,10 @@ windows-core = "0.62"
 # to the installer's Start-menu AppUserModelID so chat toast notifications show).
 windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation"] }
 
+[target.'cfg(unix)'.dependencies]
+# Ignore SIGPIPE at startup so closed launcher pipes return an I/O error.
+libc = "0.2"
+
 # macOS only: native menu-bar drag-to-open. We attach a file-drag-accepting
 # overlay to the status-item button so dragging a file over the icon springs the
 # popover open (Tauri keeps its tray's NSStatusItem private, so we go native).
