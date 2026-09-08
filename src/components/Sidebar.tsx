@@ -10,6 +10,7 @@ import {
 import type { LucideIcon } from 'lucide-react'
 import { isActive } from '../lib/api'
 import { useStore, type View } from '../store'
+import { FriendAvatar } from './FriendAvatar'
 import { SuperFeedback } from '../vendor/superfeedback'
 
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
@@ -21,16 +22,10 @@ const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'settings', label: 'Settings', icon: Settings },
 ]
 
-function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean)
-  if (!parts.length) return '○'
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
-}
-
 export function Sidebar() {
   const view = useStore((s) => s.view)
   const setView = useStore((s) => s.setView)
+  const avatar = useStore((s) => s.settings?.avatar ?? null)
   const name = useStore((s) => s.settings?.displayName ?? '')
   const activeCount = useStore(
     (s) => Object.values(s.transfers).filter((t) => isActive(t.state)).length,
@@ -114,6 +109,8 @@ export function Sidebar() {
       >
         <div
           style={{
+            position: 'relative',
+            overflow: 'hidden',
             width: 34,
             height: 34,
             borderRadius: 10,
@@ -126,7 +123,7 @@ export function Sidebar() {
             flexShrink: 0,
           }}
         >
-          {initials(name)}
+          <FriendAvatar friend={{ name, avatar }} />
         </div>
         <div style={{ overflow: 'hidden' }}>
           <div

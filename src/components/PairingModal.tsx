@@ -155,7 +155,7 @@ export function PairingModal({
           exit={{ opacity: 0, scale: 0.97 }}
           transition={{ type: 'spring', stiffness: 320, damping: 28 }}
           onClick={(e) => e.stopPropagation()}
-          className="card"
+          className="card dialog" role="dialog" aria-modal="true" aria-label="Shared folder"
           style={{ width: 460, maxWidth: '100%', padding: 22, borderRadius: 20 }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
@@ -173,7 +173,7 @@ export function PairingModal({
 
           {/* CREATE — invite reveal */}
           {createdInvite ? (
-            <div>
+            <div className="dialog-body">
               <p style={{ fontSize: 13.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 0 }}>
                 Send this invite to the other person. In their DropBeam, they choose{' '}
                 <b>Accept invite</b> and pick a folder. After that, anything dropped in{' '}
@@ -220,12 +220,9 @@ export function PairingModal({
                   </button>
                 </div>
               </div>
-              <button className="btn btn-ghost" style={{ width: '100%', marginTop: 16 }} onClick={onClose}>
-                Done
-              </button>
             </div>
           ) : (
-            <div>
+            <div className="dialog-body">
               {/* folder picker */}
               <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
                 {mode === 'create' ? 'Folder to share' : 'Folder to receive into'}
@@ -368,10 +365,15 @@ export function PairingModal({
                   </div>
                 </div>
               )}
-
+            </div>
+          )}
+          <div className="dialog-actions">
+            {createdInvite ? (
+              <button className="btn btn-ghost" style={{ width: '100%' }} onClick={onClose}>Done</button>
+            ) : (
               <button
                 className="btn btn-primary"
-                style={{ width: '100%', marginTop: 20 }}
+                style={{ width: '100%', marginTop: 0 }}
                 onClick={mode === 'create' ? doCreate : doAccept}
                 disabled={busy}
               >
@@ -382,8 +384,8 @@ export function PairingModal({
                     : 'Create & get invite'
                   : 'Pair folder'}
               </button>
-            </div>
-          )}
+            )}
+          </div>
         </motion.div>
       </motion.div>
     </AnimatePresence>

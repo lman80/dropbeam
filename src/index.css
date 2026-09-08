@@ -2075,7 +2075,7 @@ html.mobile .dialog-overlay {
   height: 100dvh;
   box-sizing: border-box;
 }
-html.mobile .dialog-overlay > .card {
+html.mobile .dialog-overlay > :is(.card, .dialog) {
   min-width: 0;
   max-width: calc(100vw - 2 * var(--dialog-x)) !important;
   max-height: calc(100dvh - var(--dialog-top) - var(--dialog-bottom)) !important;
@@ -2198,3 +2198,31 @@ html.mobile .chat-input { font-size: 16px; }
   background: var(--bg);
 }
 .chat-search-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Shared desktop/mobile dialog layout. Keep actions outside the scroll body. */
+.dialog {
+  /* Override legacy inline maxWidth percentages: grid's intrinsic track can
+     otherwise exceed a narrow viewport even when the dialog says 100%. */
+  max-width: calc(100vw - 40px) !important;
+  min-width: 0;
+  max-height: calc(100vh - 40px);
+  max-height: calc(100dvh - 40px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+.dialog > :not(.dialog-body) { flex-shrink: 0; }
+.dialog-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.dialog-actions {
+  position: sticky;
+  bottom: 0;
+  flex-shrink: 0;
+  padding-top: 12px;
+  background: var(--surface);
+  z-index: 1;
+}

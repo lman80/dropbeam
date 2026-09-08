@@ -20,6 +20,7 @@ const BAR_COLORS = ['#5b9bf0', '#34c2a8', '#e0719a', '#d99b3f', '#b08cf0', '#3fa
  *  replaced files, with a global storage gauge and one-tap ways to free space. */
 export function RecoverableFilesView() {
   const toast = useStore((s) => s.toast)
+  const budget = useStore((s) => s.settings?.folderHistoryBudgetBytes ?? 2 * 1024 * 1024 * 1024)
   const setView = useStore((s) => s.setView)
   const focusPair = useStore((s) => s.historyFocusPair)
   const clearFocus = useStore((s) => s.clearHistoryFocus)
@@ -108,7 +109,7 @@ export function RecoverableFilesView() {
       <div className="card" style={{ padding: 18 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
           <div>
-            <div style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Saved copies are using</div>
+            <div style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Saved copies are using ({budget > 0 ? `${formatBytes(budget)} limit per folder` : 'no storage limit'})</div>
             <div style={{ fontSize: 26, fontWeight: 780, letterSpacing: '-0.02em', lineHeight: 1.15 }}>
               {formatBytes(total)}
             </div>
@@ -129,7 +130,7 @@ export function RecoverableFilesView() {
             </button>
           )}
         </div>
-        {/* stacked per-folder share bar */}
+        {/* Used bytes against the configured archive budget (not share of usage). */}
         <div
           style={{
             display: 'flex',
@@ -140,12 +141,12 @@ export function RecoverableFilesView() {
             marginTop: 14,
           }}
         >
-          {total > 0 &&
+          {total > 0 && budget > 0 &&
             summaries.map((f, i) => (
               <div
                 key={f.pairId}
                 title={`${f.folderName} — ${formatBytes(f.bytes)}`}
-                style={{ width: `${(f.bytes / total) * 100}%`, background: BAR_COLORS[i % BAR_COLORS.length] }}
+                style={{ width: `${(f.bytes / Math.max(total, budget * summaries.length, 1)) * 100}%`, background: BAR_COLORS[i % BAR_COLORS.length] }}
               />
             ))}
         </div>
@@ -266,18 +267,15 @@ function FolderRow({
     <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
       <div
         className="row-hover"
-        role="button"
-        tabIndex={0}
-        aria-expanded={isOpen}
-        onClick={onToggle}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault()
-            onToggle()
-          }
-        }}
-        style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '13px 15px', cursor: 'pointer' }}
+        style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '13px 15px' }}
       >
+        <button
+          type="button"
+          aria-expanded={isOpen}
+          onClick={(e) => { e.stopPropagation(); onToggle() }}
+          style={{ display: 'flex', alignItems: 'center', gap: 11, flex: 1, minWidth: 0,
+            textAlign: 'left', background: 'none', border: 0, padding: 0, color: 'inherit', cursor: 'pointer' }}
+        >
         <motion.div animate={{ rotate: isOpen ? 90 : 0 }} style={{ display: 'grid', placeItems: 'center', color: 'var(--text-faint)' }}>
           <ChevronRight size={17} />
         </motion.div>
@@ -289,12 +287,13 @@ function FolderRow({
             {formatBytes(summary.bytes)} · {summary.itemCount} {summary.itemCount === 1 ? 'item' : 'items'}
           </div>
         </div>
+        </button>
         {confirming ? (
           <div style={{ display: 'flex', gap: 8 }} onClick={(e) => e.stopPropagation()}>
-            <button className="btn btn-ghost" onClick={onAskEmpty} disabled={busy}>
+            <button className="btn btn-ghost" onClick={(e) => { e.stopPropagation(); onAskEmpty() }} disabled={busy}>
               Cancel
             </button>
-            <button className="btn btn-danger" onClick={onEmpty} disabled={busy}>
+            <button className="btn btn-danger" onClick={(e) => { e.stopPropagation(); onEmpty() }} disabled={busy}>
               {busy ? <Spinner size={13} /> : <Trash2 size={14} />} Empty
             </button>
           </div>

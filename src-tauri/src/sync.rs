@@ -28,6 +28,7 @@ const MAX_BACKOFF_SECS: u64 = 30;
 /// Manages all active Shared Drop Folders and friend inbox listeners.
 pub struct SyncManager {
     app: AppHandle,
+    viewer_warning_at: Mutex<HashMap<String, Instant>>,
     config_dir: PathBuf,
     handles: Mutex<HashMap<String, PairHandle>>,
     friend_handles: Mutex<HashMap<String, FriendHandle>>,
@@ -57,6 +58,8 @@ struct PairHandle {
     pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
     /// Wakes this link's control sender to flush a freshly-queued delete now.
     control_wake: Arc<Notify>,
+    request_snapshot_reply: Arc<AtomicBool>,
+    force_snapshot: Arc<AtomicBool>,
     /// Tombstones (rel → deleted-at ms): every deletion we've observed locally or
     /// adopted from the peer. Rides the reconcile beacon so a delete propagates
     /// even if the live event was missed, and prevents a deleted file from being
@@ -154,6 +157,7 @@ impl SyncManager {
     pub fn new(app: AppHandle, config_dir: PathBuf) -> Arc<Self> {
         Arc::new(SyncManager {
             app,
+            viewer_warning_at: Mutex::new(HashMap::new()),
             config_dir,
             handles: Mutex::new(HashMap::new()),
             friend_handles: Mutex::new(HashMap::new()),
@@ -319,10 +323,11 @@ impl SyncManager {
     pub async fn verify_folder(self: &Arc<Self>, pair_id: &str) -> VerifyResult {
         // Grab the per-link state we need (or bail with "couldn't compare" if this
         // isn't a folder we're actively managing — e.g. a non-mirror pair).
-        let (folder, control_wake, tombstones, last_snapshot, snapshot_before) = {
+        let (folder, control_wake, tombstones, last_snapshot, snapshot_before, status) = {
             let handles = self.handles.lock().unwrap();
             let Some(h) = handles.get(pair_id) else {
                 return VerifyResult {
+                    peer_online: false,
                     compared: false,
                     identical: false,
                     matched: 0,
@@ -334,6 +339,8 @@ impl SyncManager {
                     peer_files: 0,
                 };
             };
+            h.request_snapshot_reply.store(true, Ordering::SeqCst);
+            h.force_snapshot.store(true, Ordering::SeqCst);
             let folder = h.config.lock().unwrap().folder.clone();
             let before = h.last_peer_snapshot.lock().unwrap().as_ref().map(|(_, ts)| *ts);
             (
@@ -342,6 +349,7 @@ impl SyncManager {
                 h.tombstones.clone(),
                 h.last_peer_snapshot.clone(),
                 before,
+                h.status.clone(),
             )
         };
 
@@ -350,10 +358,11 @@ impl SyncManager {
         // own snapshot, which lands in `last_peer_snapshot`.
         control_wake.notify_one();
 
-        // Wait up to ~6s for a snapshot that's NEWER than the one we had before we
+        // Wait up to 40s (each control sender has a 15s debounce floor) for
+        // a snapshot newer than the one we had before we
         // nudged — so we compare against a genuinely fresh exchange, not a stale one.
         // Polls cheaply; returns as soon as a fresh snapshot arrives.
-        let deadline = Instant::now() + Duration::from_millis(6000);
+        let deadline = Instant::now() + Duration::from_secs(40);
         let (peer_snapshot, got_fresh) = loop {
             let cur = last_snapshot.lock().unwrap().clone();
             let is_fresh = match (&cur, snapshot_before) {
@@ -377,6 +386,7 @@ impl SyncManager {
             // Never heard from the peer at all — be honest that we couldn't compare.
             let local = live_manifest(&folder);
             return VerifyResult {
+                peer_online: status.lock().unwrap().peer_online,
                 compared: false,
                 identical: false,
                 matched: 0,
@@ -393,7 +403,21 @@ impl SyncManager {
         let my_tomb = tombstones.lock().unwrap().clone();
         let mut result = compute_verify(&mine, &rec, &my_tomb, now_ms());
         result.compared = got_fresh;
+        result.peer_online = status.lock().unwrap().peer_online;
+        log::info!("verify folder {pair_id}: online={}, fresh={}, differences={}",
+            result.peer_online, got_fresh, result.differences);
         result
+    }
+
+    /// Reply through this folder's existing control sender, never a separate probe.
+    /// The reply does not request another reply, so idle peers cannot ping-pong.
+    pub fn request_folder_snapshot(&self, pair_id: &str, sender_eid: &str) {
+        if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
+            if h.config.lock().unwrap().endpoint_id.as_deref() == Some(sender_eid) {
+                h.force_snapshot.store(true, Ordering::SeqCst);
+                h.control_wake.notify_one();
+            }
+        }
     }
 
     /// Current status snapshots for all active folders (for initial UI load).
@@ -498,6 +522,8 @@ impl SyncManager {
         let pending_deletes: Arc<Mutex<Vec<DeleteEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let self_deleted: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let control_wake = Arc::new(Notify::new());
+        let request_snapshot_reply = Arc::new(AtomicBool::new(false));
+        let force_snapshot = Arc::new(AtomicBool::new(false));
         let tombstones: Arc<Mutex<HashMap<String, u64>>> =
             Arc::new(Mutex::new(load_tombstones(&self.config_dir, &pair.id)));
         // Move/rename detection state. The inode index seeds from what's on disk so
@@ -516,7 +542,7 @@ impl SyncManager {
         let paused = Arc::new(AtomicBool::new(pair.paused));
         let skip_current = Arc::new(AtomicBool::new(false));
 
-        if pairing::runs_sender(&pair) {
+        if pairing::runs_sender(&pair) || pair.i_am_viewer {
             // Filesystem watcher → candidate channel. We deliberately do NOT trust
             // the event *kind* to tell adds from deletes: macOS reports a
             // "Move to Trash" as a rename, not a Remove, so kind-based routing
@@ -568,21 +594,23 @@ impl SyncManager {
                 ino_index.clone(),
             );
 
-            // Sender worker.
-            self.clone().spawn_sender(
-                config.clone(),
-                stopped.clone(),
-                stop_notify.clone(),
-                wake.clone(),
-                queue.clone(),
-                inbound.clone(),
-                status.clone(),
-                skip_current.clone(),
-                paused.clone(),
-            );
+            if pairing::runs_sender(&pair) {
+                // Sender worker.
+                self.clone().spawn_sender(
+                    config.clone(),
+                    stopped.clone(),
+                    stop_notify.clone(),
+                    wake.clone(),
+                    queue.clone(),
+                    inbound.clone(),
+                    status.clone(),
+                    skip_current.clone(),
+                    paused.clone(),
+                );
 
-            // Seed the queue with any files already sitting in the folder.
-            seed_existing(&pair.folder, &inbound, &queue, &wake);
+                // Seed the queue with any files already sitting in the folder.
+                seed_existing(&pair.folder, &inbound, &queue, &wake);
+            }
         }
 
         // iroh-only: folder pushes arrive via the iroh accept loop's "folder-files"
@@ -597,6 +625,8 @@ impl SyncManager {
             stopped.clone(),
             stop_notify.clone(),
             status.clone(),
+            request_snapshot_reply.clone(),
+            force_snapshot.clone(),
             pending_deletes.clone(),
             control_wake.clone(),
             tombstones.clone(),
@@ -619,6 +649,8 @@ impl SyncManager {
             self_deleted,
             pending_deletes,
             control_wake,
+            request_snapshot_reply,
+            force_snapshot,
             tombstones,
             moves,
             ino_index,
@@ -629,6 +661,15 @@ impl SyncManager {
         };
         self.handles.lock().unwrap().insert(pair.id.clone(), handle);
         self.emit_status(&pair.id);
+    }
+
+    /// One warning per physical folder per minute, including groups with many links.
+    fn warn_viewer_change(&self, folder: &str) {
+        let mut warnings = self.viewer_warning_at.lock().unwrap();
+        if viewer_warning_due(warnings.get(folder).copied(), Instant::now()) {
+            warnings.insert(folder.to_string(), Instant::now());
+            let _ = self.app.emit("folder://viewer-change", folder);
+        }
     }
 
     fn spawn_collector(
@@ -646,6 +687,7 @@ impl SyncManager {
         moves: Arc<Mutex<HashMap<String, MoveRec>>>,
         ino_index: Arc<Mutex<HashMap<u64, (String, u64, u64)>>>,
     ) {
+        let manager = self.clone();
         let config_dir = self.config_dir.clone();
         let pair_id_c = config.lock().unwrap().id.clone();
         let debounce: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -654,9 +696,9 @@ impl SyncManager {
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }
-                let (folder, mirror) = {
+                let (folder, mirror, viewer) = {
                     let c = config.lock().unwrap();
-                    (c.folder.clone(), c.mirror)
+                    (c.folder.clone(), c.mirror, c.i_am_viewer)
                 };
                 let p = path.to_string_lossy().to_string();
                 // One generation counter per path collapses bursts (and lets a
@@ -681,6 +723,7 @@ impl SyncManager {
                 let pidc2 = pair_id_c.clone();
                 let moves2 = moves.clone();
                 let ino2 = ino_index.clone();
+                let manager2 = manager.clone();
                 tauri::async_runtime::spawn(async move {
                     // Classify by EXISTENCE, not by the OS event kind. A file that
                     // is present is an add/change; one that's gone is a delete —
@@ -698,6 +741,10 @@ impl SyncManager {
                             return;
                         }
                         if !is_sendable_candidate(&p, &folder2, &inbound2) {
+                            return;
+                        }
+                        if viewer {
+                            manager2.warn_viewer_change(&folder2);
                             return;
                         }
                         // ── MOVE / RENAME detection (mirror folders) ─────────────
@@ -742,6 +789,12 @@ impl SyncManager {
                             return;
                         }
                         let files = list_files_rec(Path::new(&p));
+                        if viewer {
+                            if files.iter().any(|f| is_sendable_candidate(&f.to_string_lossy(), &folder2, &inbound2)) {
+                                manager2.warn_viewer_change(&folder2);
+                            }
+                            return;
+                        }
                         let had_files = !files.is_empty();
                         let mut any = false;
                         {
@@ -765,7 +818,7 @@ impl SyncManager {
                         if mirror && !had_files {
                             cw.notify_one();
                         }
-                    } else if mirror {
+                    } else if mirror || viewer {
                         // ── DELETE (total-sync only; path is truly GONE) ──────
                         let Some(rel) = rel_path_of(&p, &folder2) else {
                             return;
@@ -821,6 +874,10 @@ impl SyncManager {
                             if sd.remove(&rel).is_some() {
                                 return;
                             }
+                        }
+                        if viewer {
+                            manager2.warn_viewer_change(&folder2);
+                            return;
                         }
                         // Expand a DIRECTORY deletion into its children. macOS fires
                         // one Remove event for the folder, not one per file inside —
@@ -1324,6 +1381,8 @@ impl SyncManager {
         stopped: Arc<AtomicBool>,
         stop_notify: Arc<Notify>,
         status: Arc<Mutex<StatusSnapshot>>,
+        request_snapshot_reply: Arc<AtomicBool>,
+        force_snapshot: Arc<AtomicBool>,
         pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
         control_wake: Arc<Notify>,
         tombstones: Arc<Mutex<HashMap<String, u64>>>,
@@ -1395,12 +1454,14 @@ impl SyncManager {
 
                 // The self-heal reconcile snapshot: our full current file set +
                 // tombstones, so the peer can converge to identical (mirror only).
-                let reconcile_json = if pair.mirror && !is_paused {
+                let forced = force_snapshot.swap(false, Ordering::SeqCst);
+                let request_reply = request_snapshot_reply.swap(false, Ordering::SeqCst);
+                let reconcile_json = if pair.mirror && (!is_paused || forced) {
                     let lm = live_manifest(&pair.folder);
                     // Refresh the inode index from disk each round so move detection
                     // also covers files that were RECEIVED this session (those skip
                     // the live add-branch that normally warms the index).
-                    {
+                    if !is_paused && !pair.i_am_viewer {
                         // Catch moves the LIVE add-branch raced past: the rebuild below
                         // overwrites an inode's old path with its new one, erasing the
                         // move. Detect them FIRST by comparing the prior index against
@@ -1448,7 +1509,7 @@ impl SyncManager {
                         .map(|(rel, ts)| (rel.clone(), serde_json::json!(ts)))
                         .collect();
                     let empty_dirs = live_empty_dirs(&pair.folder);
-                    Some(serde_json::json!({ "files": files, "tombstones": tombs, "emptyDirs": empty_dirs }))
+                    Some(serde_json::json!({ "files": files, "tombstones": tombs, "emptyDirs": empty_dirs, "requestReply": request_reply }))
                 } else {
                     None
                 };
@@ -1591,12 +1652,14 @@ impl SyncManager {
         config: &Arc<Mutex<Pair>>,
         name: &str,
         status: &Arc<Mutex<StatusSnapshot>>,
+        sender_eid: Option<&str>,
     ) {
         // Surface the user's own LABEL for this peer if they set one (resolved by
         // the peer's stable endpoint id), otherwise the name the peer broadcast.
         let (eid, secret, role) = {
             let p = config.lock().unwrap();
-            (p.endpoint_id.clone(), p.secret.clone(), p.role)
+            (sender_eid.filter(|e| !e.is_empty()).map(str::to_string)
+                .or_else(|| p.endpoint_id.clone()), p.secret.clone(), p.role)
         };
         let shown = eid
             .as_deref()
@@ -1693,15 +1756,6 @@ impl SyncManager {
             self.emit_status(pair_id);
             return;
         }
-        // Presence + name (also links the friend), same as the croc path. If no
-        // name rode along, still mark them online — we just heard from them.
-        let name = name.trim();
-        if !name.is_empty() {
-            self.on_peer_hello(pair_id, &config, name, &status);
-        } else {
-            set_peer_online(&status, true);
-            self.emit_status(pair_id);
-        }
         // KEY THE LINK from the beacon's true sender. This beacon arrived on THIS
         // link from `sender_eid`, so that IS this link's peer. An inviter's original
         // invite link starts with endpoint_id=None until the newcomer's folder-hello
@@ -1721,6 +1775,20 @@ impl SyncManager {
                 self.clone().reconcile();
                 let _ = self.app.emit("pairs://changed", ());
             }
+            // Reconcile may replace the handle; update this callback's snapshot
+            // before name processing so it cannot take the legacy friend path.
+            if let Some(pair) = pairing::load(&self.config_dir).into_iter().find(|p| p.id == pair_id) {
+                config.lock().unwrap().endpoint_id = pair.endpoint_id;
+            }
+        }
+        // Presence + name (also links the friend), same as the croc path. If no
+        // name rode along, still mark them online — we just heard from them.
+        let name = name.trim();
+        if !name.is_empty() {
+            self.on_peer_hello(pair_id, &config, name, &status, sender_eid);
+        } else {
+            set_peer_online(&status, true);
+            self.emit_status(pair_id);
         }
         // We just heard from the peer → they're online. Kick the file-sender so any
         // drop parked behind the presence gate goes out now, not on the next poll.
@@ -2583,6 +2651,10 @@ async fn wait_until_stable(
 
 fn file_len(path: &str) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+fn viewer_warning_due(last: Option<Instant>, now: Instant) -> bool {
+    last.map_or(true, |last| now.duration_since(last) >= Duration::from_secs(60))
 }
 
 fn is_sendable_candidate(path: &str, folder: &str, inbound: &Arc<Mutex<HashSet<String>>>) -> bool {
@@ -3982,6 +4054,7 @@ fn compute_verify(
 
     let differences = missing_on_peer + missing_locally + pending_deletes + size_mismatch;
     VerifyResult {
+        peer_online: true,
         compared: true,
         identical: differences == 0,
         matched,
@@ -4318,6 +4391,14 @@ mod tests {
         let plan = reconcile_plan(&mine, &HashMap::new(), &HashMap::new(), &HashMap::new(), TEST_NOW);
         assert_eq!(plan.push, vec!["alsohave.txt".to_string(), "have.txt".to_string()]);
         assert!(plan.delete.is_empty(), "absence alone must NEVER cause a delete");
+    }
+
+    #[test]
+    fn viewer_warning_is_rate_limited() {
+        let now = Instant::now();
+        assert!(viewer_warning_due(None, now));
+        assert!(!viewer_warning_due(Some(now), now + Duration::from_secs(59)));
+        assert!(viewer_warning_due(Some(now), now + Duration::from_secs(60)));
     }
 
     // ---- compute_verify (the Verify-button answer) ----

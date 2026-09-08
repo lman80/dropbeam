@@ -548,9 +548,9 @@ pub struct FolderStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyResult {
-    /// `false` when we never heard a fresh snapshot from the peer (offline, or no
-    /// beacon arrived in time). Then `matched`/`differences` are not meaningful and
-    /// the UI says "couldn't reach the other device".
+    /// Reachability from the same live per-folder status used by the folder card.
+    pub peer_online: bool,
+    /// Whether a fresh peer snapshot was available for comparison.
     pub compared: bool,
     /// `true` only when the two folders are byte-size identical across every path —
     /// no missing files either way, no size mismatches, no pending deletes.

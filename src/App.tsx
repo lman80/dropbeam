@@ -201,7 +201,7 @@ function NameSetupModal() {
         backdropFilter: 'blur(3px)',
       }}
     >
-      <motion.div
+      <motion.div className="dialog" role="dialog" aria-modal="true"
         initial={{ opacity: 0, scale: 0.96, y: 8 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         style={{
@@ -214,51 +214,55 @@ function NameSetupModal() {
           boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
         }}
       >
-        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
-          <BeamLogo size={36} />
+        <div className="dialog-body">
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
+            <BeamLogo size={36} />
+          </div>
+          <h2 style={{ fontSize: 18, fontWeight: 750, textAlign: 'center', margin: '0 0 6px' }}>
+            What should people call you?
+          </h2>
+          <p
+            style={{
+              fontSize: 13,
+              color: 'var(--text-muted)',
+              textAlign: 'center',
+              margin: '0 0 16px',
+              lineHeight: 1.45,
+            }}
+          >
+            This is the name friends see when you send files or share a folder. You can change it
+            anytime in Settings.
+          </p>
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && finish()}
+            placeholder="Your name"
+            maxLength={40}
+            style={{
+              width: '100%',
+              boxSizing: 'border-box',
+              padding: '11px 13px',
+              fontSize: 15,
+              borderRadius: 10,
+              border: '1px solid var(--border)',
+              background: 'var(--bg)',
+              color: 'var(--text)',
+              marginBottom: 14,
+            }}
+          />
         </div>
-        <h2 style={{ fontSize: 18, fontWeight: 750, textAlign: 'center', margin: '0 0 6px' }}>
-          What should people call you?
-        </h2>
-        <p
-          style={{
-            fontSize: 13,
-            color: 'var(--text-muted)',
-            textAlign: 'center',
-            margin: '0 0 16px',
-            lineHeight: 1.45,
-          }}
-        >
-          This is the name friends see when you send files or share a folder. You can change it
-          anytime in Settings.
-        </p>
-        <input
-          autoFocus
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && finish()}
-          placeholder="Your name"
-          maxLength={40}
-          style={{
-            width: '100%',
-            boxSizing: 'border-box',
-            padding: '11px 13px',
-            fontSize: 15,
-            borderRadius: 10,
-            border: '1px solid var(--border)',
-            background: 'var(--bg)',
-            color: 'var(--text)',
-            marginBottom: 14,
-          }}
-        />
-        <button
-          className="btn btn-primary"
-          style={{ width: '100%', justifyContent: 'center', padding: '11px' }}
-          onClick={finish}
-          disabled={!name.trim()}
-        >
-          Continue
-        </button>
+        <div className="dialog-actions">
+          <button
+            className="btn btn-primary"
+            style={{ width: '100%', justifyContent: 'center', padding: '11px' }}
+            onClick={finish}
+            disabled={!name.trim()}
+          >
+            Continue
+          </button>
+        </div>
       </motion.div>
     </div>
   )

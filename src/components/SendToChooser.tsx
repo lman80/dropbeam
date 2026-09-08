@@ -62,8 +62,8 @@ export function SendToChooser() {
             exit={{ opacity: 0, scale: 0.97 }}
             transition={{ type: 'spring', stiffness: 320, damping: 28 }}
             onClick={(e) => e.stopPropagation()}
-            className="card"
-            style={{ width: 440, maxWidth: '100%', padding: 22, borderRadius: 20, maxHeight: '82vh', display: 'flex', flexDirection: 'column' }}
+            className="card dialog" role="dialog" aria-modal="true"
+            style={{ width: 440, maxWidth: '100%', padding: 22, borderRadius: 20, display: 'flex', flexDirection: 'column' }}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
               <div style={{ fontWeight: 750, fontSize: 16.5, minWidth: 0 }}>
@@ -78,7 +78,7 @@ export function SendToChooser() {
               </button>
             </div>
 
-            <div style={{ overflowY: 'auto', marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div className="dialog-body" style={{ overflowY: 'auto', marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
               {friends.length === 0 ? (
                 <button
                   className="btn btn-ghost"
@@ -140,7 +140,7 @@ export function SendToChooser() {
               )}
             </div>
 
-            <div style={{ borderTop: '1px solid var(--border)', marginTop: 12, paddingTop: 12 }}>
+            <div className="dialog-actions" style={{ borderTop: '1px solid var(--border)', marginTop: 12, paddingTop: 12 }}>
               <button className="chooser-row" onClick={withCode}>
                 <span
                   style={{

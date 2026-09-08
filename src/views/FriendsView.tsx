@@ -590,6 +590,13 @@ function FriendCard({ friend }: { friend: Friend }) {
         )}
       </div>
 
+      {confirmRemove && (
+        <p role="status" style={{ fontSize: 12.5, color: 'var(--text-muted)', margin: '8px 0 0' }}>
+          Remove {friend.name}? Your chat history will be kept on this device.
+          {friend.endpointId && ' Re-add the same device to restore the conversation.'}
+        </p>
+      )}
+
       {invite && <InvitePanel invite={invite} friendName={friend.name} onClose={() => setInvite(null)} />}
     </motion.div>
   )
@@ -709,7 +716,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
           exit={{ opacity: 0, scale: 0.97 }}
           transition={{ type: 'spring', stiffness: 320, damping: 28 }}
           onClick={(e) => e.stopPropagation()}
-          className="card"
+          className="card dialog" role="dialog" aria-modal="true"
           style={{ width: 440, maxWidth: '100%', padding: 22, borderRadius: 20 }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
@@ -718,32 +725,36 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
               <X size={17} />
             </button>
           </div>
-          <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
-            Your friend's code
-          </label>
-          <textarea
-            className="input"
-            style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
-            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-            placeholder="Paste their dropbeam:… code here"
-            value={codeInput}
-            autoFocus
-            onChange={(e) => setCodeInput(e.target.value)}
-          />
-          <p style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
-            Ask your friend for their code (Friends → <b>You</b> → Copy code) and paste it here. Their
-            name fills in automatically and you’ll both be connected — no retyping names, no re-adding
-            after updates.
-          </p>
-          {error && <p role="alert" style={{ color: 'var(--red)', overflowWrap: 'anywhere' }}>{error}</p>}
-          <button
-            className="btn btn-primary"
-            style={{ width: '100%', marginTop: 12 }}
-            onClick={submit}
-            disabled={busy}
-          >
-            {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend
-          </button>
+          <div className="dialog-body">
+            <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+              Your friend's code
+            </label>
+            <textarea
+              className="input"
+              style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
+              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
+              placeholder="Paste their dropbeam:… code here"
+              value={codeInput}
+              autoFocus
+              onChange={(e) => setCodeInput(e.target.value)}
+            />
+            <p style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
+              Ask your friend for their code (Friends → <b>You</b> → Copy code) and paste it here. Their
+              name fills in automatically and you’ll both be connected — no retyping names, no re-adding
+              after updates.
+            </p>
+            {error && <p role="alert" style={{ color: 'var(--red)', overflowWrap: 'anywhere' }}>{error}</p>}
+          </div>
+          <div className="dialog-actions">
+            <button
+              className="btn btn-primary"
+              style={{ width: '100%', marginTop: 12 }}
+              onClick={submit}
+              disabled={busy}
+            >
+              {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend
+            </button>
+          </div>
         </motion.div>
       </motion.div>
     </AnimatePresence>

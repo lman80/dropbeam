@@ -119,19 +119,20 @@ export function ChatView() {
     const byId = new Map(friends.map((f) => [f.id, f]))
     const ordered: { friend: Friend; last?: string }[] = []
     const seen = new Set<string>()
-    // 1) Every conversation in the overview — in recency order. If the friend
-    //    record is missing, fall back to a placeholder so the thread STILL shows
-    //    (the bug was: a lost friend record made the whole conversation invisible).
+    // Only current friends can create visible rows. Detached transcripts and
+    // stale file-note caches must not resurrect an Unknown contact.
     for (const o of overview) {
       if (seen.has(o.peerId)) continue
-      const f = byId.get(o.peerId) ?? placeholderFriend(o.peerId)
+      const f = byId.get(o.peerId)
+      if (!f) continue
       ordered.push({ friend: f, last: o.lastText })
       seen.add(o.peerId)
     }
     // 2) Any thread that has messages but somehow isn't in the overview yet.
     for (const peerId of Object.keys(chats)) {
       if (seen.has(peerId) || !(chats[peerId]?.length)) continue
-      const f = byId.get(peerId) ?? placeholderFriend(peerId)
+      const f = byId.get(peerId)
+      if (!f) continue
       ordered.push({ friend: f })
       seen.add(peerId)
     }
@@ -142,7 +143,7 @@ export function ChatView() {
 
   useEffect(() => {
     if (MOBILE_UI || activeChatId) return
-    const firstId = overview[0]?.peerId ?? friends[0]?.id
+    const firstId = rows[0]?.friend.id
     if (firstId) void openChat(firstId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
