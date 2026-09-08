@@ -327,6 +327,7 @@ async fn dispatch(
         // the 6-hourly check uses — so this is exactly as safe, just immediate).
         // This is what makes the test loop fast: ship a release, tell both Macs to
         // self-update, they're on the new build in ~a minute instead of ≤6 hours.
+        #[cfg(desktop)]
         "self-update" => {
             use tauri::Manager;
             use tauri_plugin_updater::UpdaterExt;

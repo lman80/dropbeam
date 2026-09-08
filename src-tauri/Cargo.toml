@@ -39,7 +39,6 @@ tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
-tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
@@ -54,16 +53,9 @@ hex = "0.4"
 whoami = "1"
 regex = "1"
 notify = "6"
-trash = "5"
 base64 = "0.22"
 # Downscale profile pictures to a small thumbnail before broadcasting to friends.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
-tauri-plugin-updater = "2.10.1"
-tauri-plugin-process = "2.3.1"
-# Single-instance: forwards a second launch's file argument to the running app,
-# powering the Windows "Send with DropBeam" right-click menu. Used on Windows
-# only (macOS already single-instances .app bundles + uses the menu-bar drag).
-tauri-plugin-single-instance = "2"
 # Next-gen transport (Phase 1+): direct P2P with NAT hole-punching, replacing
 # croc's relay-only model. Raw QUIC streams — no iroh-blobs (not yet 1.0).
 iroh = { version = "0.98", features = ["address-lookup-mdns"] }
@@ -78,6 +70,23 @@ anyhow = "1"
 # Diagnostics digest upload (telemetry.rs). rustls reuses iroh's TLS stack; no
 # OpenSSL. Only used to POST a small JSON to the operator-configured endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# ---------------------------------------------------------------------------
+# DESKTOP ONLY (macOS / Windows / Linux). None of these build or make sense on
+# iOS/Android: `trash` has no mobile platform impl, and the autostart, updater,
+# process and single-instance plugins are desktop-only in tauri v2. Keeping them
+# in a target-gated block means the desktop dependency graph is byte-identical to
+# before while the iOS target simply never sees them.
+# ---------------------------------------------------------------------------
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+# Single-instance: forwards a second launch's file argument to the running app,
+# powering the Windows "Send with DropBeam" right-click menu. Used on Windows
+# only (macOS already single-instances .app bundles + uses the menu-bar drag).
+tauri-plugin-single-instance = "2"
+trash = "5"
 
 # Windows only: iroh's `wmi` dep (via netwatch) declares windows + windows-core
 # with a wide range and the resolver split it into windows 0.62 / windows-core

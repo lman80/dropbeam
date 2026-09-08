@@ -3178,6 +3178,10 @@ fn unique_dest(dest: PathBuf) -> PathBuf {
 fn delete_local(file: &str, mode: DeleteMode) {
     match mode {
         DeleteMode::Trash => {
+            // iOS has no user-visible Trash (and the `trash` crate has no mobile
+            // backend), so there the "move to trash" mode degrades to a plain
+            // remove. Desktop behaviour is unchanged.
+            #[cfg(desktop)]
             let _ = trash::delete(file);
             // If trash silently no-op'd (some system locations), still remove the
             // local copy — the peer already has it, so the data is safe.

@@ -23,11 +23,6 @@
     "notification:allow-request-permission",
     "notification:allow-permission-state",
     "notification:allow-notify",
-    "opener:default",
-    "autostart:allow-enable",
-    "autostart:allow-disable",
-    "autostart:allow-is-enabled",
-    "updater:default",
-    "process:default"
+    "opener:default"
   ]
 }

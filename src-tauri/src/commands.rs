@@ -73,6 +73,7 @@ pub fn update_settings(
     settings::save(&state.config_dir, &settings)?;
 
     // Saved — now apply live (no restart needed) and commit to in-memory state.
+    #[cfg(desktop)]
     apply_autostart(&app, settings.launch_at_login);
     // Internet upload cap (0 = unlimited) — takes effect on the next chunk.
     crate::iroh_net::set_upload_limit_mbps(settings.upload_limit_mbps);
@@ -138,13 +139,24 @@ pub async fn pick_files(app: AppHandle) -> Vec<String> {
 #[tauri::command]
 pub async fn pick_directory(app: AppHandle) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_folder(move |path| {
-        let _ = tx.send(path);
-    });
-    match rx.await {
-        Ok(Some(p)) => p.into_path().ok().map(|pb| pb.to_string_lossy().to_string()),
-        _ => None,
+    #[cfg(desktop)]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog().file().pick_folder(move |path| {
+            let _ = tx.send(path);
+        });
+        match rx.await {
+            Ok(Some(p)) => p.into_path().ok().map(|pb| pb.to_string_lossy().to_string()),
+            _ => None,
+        }
+    }
+    // iOS: the dialog plugin has no directory picker (and the sandbox has no
+    // user-visible folders to share anyway). Shared Drop Folders are hidden in
+    // the mobile UI, so nothing calls this — return None rather than fail.
+    #[cfg(mobile)]
+    {
+        let _ = app;
+        None
     }
 }
 
@@ -530,6 +542,7 @@ pub fn open_main_window(app: AppHandle) {
     // Restore the Dock icon + normal focus while the window is open.
     crate::set_dock_icon_visible(&app, true);
     if let Some(main) = app.get_webview_window("main") {
+        #[cfg(desktop)]
         let _ = main.unminimize();
         let _ = main.show();
         let _ = main.set_focus();
@@ -587,6 +600,7 @@ pub fn get_default_download_dir(app: AppHandle) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(desktop)]
 pub(crate) fn apply_autostart(app: &AppHandle, enable: bool) {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();

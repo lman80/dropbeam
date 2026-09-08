@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-only",
+  "description": "Permissions for plugins that only exist on desktop (autostart / updater / process). Split out of `default` so the iOS build, which does not register those plugins, still has a valid capability set. Desktop keeps exactly the same permissions it always had — capabilities are unioned.",
+  "platforms": ["macOS", "windows", "linux"],
+  "windows": ["main", "popover", "hud", "receive"],
+  "permissions": [
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
+    "updater:default",
+    "process:default"
+  ]
+}

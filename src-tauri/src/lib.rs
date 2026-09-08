@@ -38,6 +38,7 @@ static LAST_POPOVER_HIDE: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mu
 /// A file the app was launched to send (Windows "Send with DropBeam" right-click,
 /// or a second launch forwarded by single-instance). The UI drains it on load.
 static LAUNCH_FILE: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+#[cfg(desktop)]
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
 
@@ -149,7 +150,7 @@ pub fn run() {
     // DropBeam.exe with the file path — to the already-running app instead of
     // opening a duplicate. (macOS already single-instances .app bundles and has
     // the menu-bar drag-to-send, so it's skipped there.)
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(desktop, not(target_os = "macos")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.show();
@@ -161,14 +162,20 @@ pub fn run() {
             let _ = tauri::Emitter::emit(app, "open-file-send", f);
         }
     }));
+    // Cross-platform plugins (all of these have iOS support).
+    let builder = builder
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init());
+    // Desktop-only plugins. autostart (login items), updater (we ship .dmg/.msi
+    // updates, the App Store/Xcode owns iOS updates) and process (relaunch) have
+    // no mobile implementation at all in tauri v2.
+    #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init());
     // macOS: panel plugin so the popover can float over full-screen apps.
@@ -432,13 +439,19 @@ pub fn run() {
             std::thread::spawn(move || sync.reconcile());
             log::info!("setup: sync service registered (initial reconcile in background)");
 
-            build_tray(app.handle())?;
-            log::info!("setup: tray built");
+            #[cfg(desktop)]
+            {
+                build_tray(app.handle())?;
+                log::info!("setup: tray built");
+            }
 
             // Register (or clear) the login item so DropBeam is ready to receive
             // after every restart without being opened. Re-applied each launch so
             // it survives app updates.
+            #[cfg(desktop)]
             commands::apply_autostart(app.handle(), want_autostart);
+            #[cfg(mobile)]
+            let _ = want_autostart;
 
             // Present the window — UNLESS we were auto-started at login (the
             // autostart plugin passes `--minimized`), in which case we stay silent
@@ -644,6 +657,7 @@ fn default_display_name() -> String {
     }
 }
 
+#[cfg(desktop)]
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -691,6 +705,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(desktop)]
 fn show_main_window(app: &AppHandle) {
     // Become a normal app (Dock icon + proper focus) while the window is open.
     set_dock_icon_visible(app, true);
@@ -722,6 +737,7 @@ pub(crate) fn set_dock_icon_visible(app: &AppHandle, visible: bool) {
 pub(crate) fn set_dock_icon_visible(_app: &AppHandle, _visible: bool) {}
 
 /// Toggle the menu-bar popover, anchoring it just below the clicked tray icon.
+#[cfg(desktop)]
 fn toggle_popover(app: &AppHandle, cursor: tauri::PhysicalPosition<f64>) {
     let Some(w) = app.get_webview_window("popover") else {
         return;
@@ -757,6 +773,7 @@ fn toggle_popover(app: &AppHandle, cursor: tauri::PhysicalPosition<f64>) {
     }
 }
 
+#[cfg(desktop)]
 fn quit_app(app: &AppHandle) {
     if let Some(state) = app.try_state::<Arc<AppState>>() {
         state.force_quit.store(true, Ordering::SeqCst);
