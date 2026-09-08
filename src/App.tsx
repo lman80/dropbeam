@@ -5,8 +5,10 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import { api, onFileDrop } from './lib/api'
 import { setTaskbarProgress } from './lib/taskbar'
 import { useStore } from './store'
+import { MOBILE_UI } from './lib/platform'
 import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
+import { MobileTabBar } from './components/MobileTabBar'
 import { Toasts } from './components/Toasts'
 import { FolderInviteModal } from './components/FolderInviteModal'
 import { BeamLogo } from './components/bits'
@@ -96,7 +98,7 @@ export default function App() {
       <InstallBanner />
       <LocalNetworkBanner />
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        <Sidebar />
+        {!MOBILE_UI && <Sidebar />}
         <main
           className="scroll-area"
           style={{
@@ -125,6 +127,7 @@ export default function App() {
           </motion.div>
         </main>
       </div>
+      {MOBILE_UI && <MobileTabBar />}
       <SendToChooser />
       <NameSetupModal />
       <FolderInviteModal />

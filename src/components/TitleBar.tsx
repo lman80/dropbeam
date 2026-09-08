@@ -1,5 +1,6 @@
 import { Monitor, Moon, Sun } from 'lucide-react'
 import { useStore } from '../store'
+import { MOBILE_UI } from '../lib/platform'
 import { BeamLogo } from './bits'
 
 const ORDER = ['system', 'light', 'dark'] as const
@@ -24,12 +25,16 @@ export function TitleBar() {
       data-tauri-drag-region
       className="titlebar-drag"
       style={{
-        height: 46,
+        // Desktop keeps the fixed 46px bar with room for the macOS traffic
+        // lights. iOS has neither, but does have a status bar / notch to clear.
+        height: MOBILE_UI ? undefined : 46,
+        minHeight: 46,
+        paddingTop: MOBILE_UI ? 'env(safe-area-inset-top)' : undefined,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        paddingLeft: 80,
-        paddingRight: 12,
+        paddingLeft: MOBILE_UI ? 16 : 80,
+        paddingRight: MOBILE_UI ? 10 : 12,
         flexShrink: 0,
       }}
     >

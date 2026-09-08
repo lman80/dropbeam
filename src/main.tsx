@@ -6,6 +6,7 @@ import { Popover } from './windows/Popover'
 import { Hud } from './windows/Hud'
 import { ReceiveCard } from './windows/ReceiveCard'
 import { api, HAS_TAURI } from './lib/api'
+import { MOBILE_UI } from './lib/platform'
 import { SuperFeedback } from './vendor/superfeedback'
 
 // Which window are we? The popover and HUD load the same bundle as the main
@@ -32,6 +33,12 @@ const label = windowLabel()
 // The popover/HUD are transparent windows — the body must not paint a background.
 if (label === 'popover' || label === 'hud' || label === 'receive') {
   document.documentElement.classList.add('overlay-window', `window-${label}`)
+}
+
+// iOS: one class on <html> gates every phone-only style rule in index.css, so
+// the desktop cascade is untouched. Set before the first paint (no reflow).
+if (MOBILE_UI) {
+  document.documentElement.classList.add('mobile')
 }
 
 // Apply the OS theme immediately to avoid a flash; App refines it from settings.

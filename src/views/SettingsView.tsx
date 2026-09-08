@@ -3,6 +3,7 @@ import { CheckCircle2, Download, FolderOpen, HardDrive, RefreshCw, Trash2 } from
 import { api, type Settings } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
+import { MOBILE_UI } from '../lib/platform'
 import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
 
 function Toggle({
@@ -33,7 +34,8 @@ function Row({
 }: {
   title: string
   desc?: string
-  children: ReactNode
+  /** Optional: some rows are informational only (no control on the right). */
+  children?: ReactNode
 }) {
   return (
     <div
@@ -168,7 +170,13 @@ export function SettingsView() {
   }
 
   return (
-    <div style={{ maxWidth: 620, margin: '0 auto', padding: '8px 28px 40px' }}>
+    <div
+      style={{
+        maxWidth: 620,
+        margin: '0 auto',
+        padding: MOBILE_UI ? '4px 16px 28px' : '8px 28px 40px',
+      }}
+    >
       <h1 className="titlebar-drag" style={{ fontSize: 20, fontWeight: 750, margin: '0 0 16px' }}>
         Settings
       </h1>
@@ -187,21 +195,30 @@ export function SettingsView() {
 
       <SectionTitle>Downloads</SectionTitle>
       <Card>
-        <Row title="Save received files to">
-          <button className="btn btn-ghost" onClick={changeDir} title={settings.downloadDir}>
-            <FolderOpen size={15} />
-            <span
-              style={{
-                maxWidth: 200,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              {settings.downloadDir.split('/').pop() || settings.downloadDir}
-            </span>
-          </button>
-        </Row>
+        {MOBILE_UI ? (
+          <Row
+            title="Where received files go"
+            desc="DropBeam's own folder on this iPhone. Open the Files app and look under On My iPhone → DropBeam to find them."
+          >
+            <FolderOpen size={16} style={{ color: 'var(--text-faint)' }} />
+          </Row>
+        ) : (
+          <Row title="Save received files to">
+            <button className="btn btn-ghost" onClick={changeDir} title={settings.downloadDir}>
+              <FolderOpen size={15} />
+              <span
+                style={{
+                  maxWidth: 200,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {settings.downloadDir.split('/').pop() || settings.downloadDir}
+              </span>
+            </button>
+          </Row>
+        )}
         {SEP}
         <Row
           title="Clear transfer cache"
@@ -234,20 +251,26 @@ export function SettingsView() {
 
       <SectionTitle>Behavior</SectionTitle>
       <Card>
-        <Row
-          title="Stay ready in the background"
-          desc="Start DropBeam automatically at login and keep it quietly in the menu bar, so files can arrive even when you haven’t opened it. Turn off and DropBeam only receives while it’s open."
-        >
-          <Toggle on={settings.launchAtLogin} onChange={(v) => save({ launchAtLogin: v })} />
-        </Row>
-        {SEP}
-        <Row
-          title="Keep running when you close the window"
-          desc="Closing the window tucks DropBeam into the menu bar instead of quitting, so it keeps receiving."
-        >
-          <Toggle on={settings.minimizeToTray} onChange={(v) => save({ minimizeToTray: v })} />
-        </Row>
-        {SEP}
+        {/* Login items and the close-to-menu-bar behaviour don't exist on iOS —
+            the system decides when a backgrounded app keeps running. */}
+        {!MOBILE_UI && (
+          <>
+            <Row
+              title="Stay ready in the background"
+              desc="Start DropBeam automatically at login and keep it quietly in the menu bar, so files can arrive even when you haven’t opened it. Turn off and DropBeam only receives while it’s open."
+            >
+              <Toggle on={settings.launchAtLogin} onChange={(v) => save({ launchAtLogin: v })} />
+            </Row>
+            {SEP}
+            <Row
+              title="Keep running when you close the window"
+              desc="Closing the window tucks DropBeam into the menu bar instead of quitting, so it keeps receiving."
+            >
+              <Toggle on={settings.minimizeToTray} onChange={(v) => save({ minimizeToTray: v })} />
+            </Row>
+            {SEP}
+          </>
+        )}
         <Row
           title="Notify when a file arrives"
           desc="Pop a notification when someone sends you a file, even if DropBeam is in the background."
@@ -289,13 +312,17 @@ export function SettingsView() {
         <Row title="Play sounds" desc="Soft cues when you send, receive, or get a file offer.">
           <Toggle on={settings.playSounds} onChange={(v) => save({ playSounds: v })} />
         </Row>
-        {SEP}
-        <Row
-          title="Show the folder-sync popup"
-          desc="The little floating “syncing folder…” card that appears during a shared-folder transfer. Turn it off if it’s distracting."
-        >
-          <Toggle on={settings.showSyncPopup} onChange={(v) => save({ showSyncPopup: v })} />
-        </Row>
+        {!MOBILE_UI && (
+          <>
+            {SEP}
+            <Row
+              title="Show the folder-sync popup"
+              desc="The little floating “syncing folder…” card that appears during a shared-folder transfer. Turn it off if it’s distracting."
+            >
+              <Toggle on={settings.showSyncPopup} onChange={(v) => save({ showSyncPopup: v })} />
+            </Row>
+          </>
+        )}
       </Card>
 
       <SectionTitle>Connection</SectionTitle>
@@ -316,17 +343,24 @@ export function SettingsView() {
           </button>
         </Row>
         {SEP}
-        <Row
-          title="Local network access"
-          desc="macOS must allow DropBeam on your Local Network for fast same-Wi-Fi transfers. If transfers to a nearby device keep using the slow relay, enable DropBeam here — and check it on the other device too."
-        >
-          <button
-            className="btn btn-ghost"
-            onClick={() => api.openLocalNetworkSettings().catch(() => {})}
+        {MOBILE_UI ? (
+          <Row
+            title="Local network access"
+            desc="iOS asks once for permission to find devices on your Wi-Fi. If nearby transfers keep falling back to the slow relay, turn DropBeam on under Settings → Privacy & Security → Local Network — and check it on the other device too."
+          />
+        ) : (
+          <Row
+            title="Local network access"
+            desc="macOS must allow DropBeam on your Local Network for fast same-Wi-Fi transfers. If transfers to a nearby device keep using the slow relay, enable DropBeam here — and check it on the other device too."
           >
-            Open Settings
-          </button>
-        </Row>
+            <button
+              className="btn btn-ghost"
+              onClick={() => api.openLocalNetworkSettings().catch(() => {})}
+            >
+              Open Settings
+            </button>
+          </Row>
+        )}
         {SEP}
         <Row
           title="Only send over direct connections"
@@ -464,6 +498,8 @@ export function SettingsView() {
         </div>
       </Card>
 
+      {!MOBILE_UI && (
+        <>
       <SectionTitle>Recoverable files</SectionTitle>
       <Card>
         <div style={{ padding: '12px 2px 4px' }}>
@@ -533,6 +569,8 @@ export function SettingsView() {
           </button>
         </Row>
       </Card>
+        </>
+      )}
 
       <SectionTitle>Custom relay (advanced)</SectionTitle>
       <Card>
@@ -561,15 +599,22 @@ export function SettingsView() {
 
       <SectionTitle>Updates</SectionTitle>
       <Card>
-        <Row title="Version" desc={`DropBeam ${appVer || '…'}`}>
-          <button
-            className="btn btn-ghost"
-            onClick={() => checkForUpdates(true)}
-            disabled={checkingUpdate}
-          >
-            {checkingUpdate ? <Spinner size={14} /> : <RefreshCw size={15} />} Check for updates
-          </button>
-        </Row>
+        {MOBILE_UI ? (
+          <Row
+            title="Version"
+            desc={`DropBeam ${appVer || '…'} — the iPhone app is updated by installing a new build, not from inside the app.`}
+          />
+        ) : (
+          <Row title="Version" desc={`DropBeam ${appVer || '…'}`}>
+            <button
+              className="btn btn-ghost"
+              onClick={() => checkForUpdates(true)}
+              disabled={checkingUpdate}
+            >
+              {checkingUpdate ? <Spinner size={14} /> : <RefreshCw size={15} />} Check for updates
+            </button>
+          </Row>
+        )}
         {update && (
           <>
             {SEP}

@@ -1922,3 +1922,142 @@ html.overlay-window #root {
 .rc-menu-item:hover {
   background: color-mix(in srgb, var(--accent) 14%, transparent);
 }
+
+/* ===========================================================================
+   iOS / phone layout
+   ---------------------------------------------------------------------------
+   EVERY rule below is scoped under `html.mobile`, a class set once in main.tsx
+   from lib/platform.ts. Nothing here can affect a desktop window: on desktop
+   the class is never present, so the cascade is byte-identical to before.
+   =========================================================================== */
+
+/* --- Baseline touch behaviour --- */
+html.mobile,
+html.mobile body {
+  /* No rubber-banding the whole app; individual scroll areas still bounce. */
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}
+html.mobile * {
+  /* Kill the grey flash on tap and the long-press "copy/share" bubble. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+html.mobile input,
+html.mobile textarea,
+html.mobile .selectable {
+  -webkit-touch-callout: default;
+}
+html.mobile .scroll-area {
+  -webkit-overflow-scrolling: touch;
+  /* An always-visible 9px scrollbar gutter looks broken on a phone. */
+  scrollbar-width: none;
+}
+html.mobile .scroll-area::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+/* Landscape / Dynamic Island: keep content out of the rounded corners. */
+html.mobile .scroll-area {
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+/* --- Touch-sized controls (Apple's 44pt minimum) --- */
+html.mobile .btn {
+  padding: 0.7rem 1.05rem;
+  font-size: 0.9375rem;
+  min-height: 44px;
+  border-radius: 0.85rem;
+}
+html.mobile .btn:active {
+  /* No hover on a touch screen, so the press itself has to read. */
+  filter: brightness(0.94);
+}
+html.mobile .icon-btn {
+  width: 44px;
+  height: 44px;
+}
+html.mobile .input {
+  min-height: 44px;
+}
+/* 16px is the threshold below which iOS auto-zooms the page on focus. */
+html.mobile input,
+html.mobile textarea,
+html.mobile select {
+  font-size: 16px;
+}
+html.mobile .toggle {
+  transform: scale(1.15);
+  transform-origin: right center;
+}
+html.mobile .seg button {
+  min-height: 40px;
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+/* --- Bottom tab bar (replaces the desktop sidebar) --- */
+html.mobile .tabbar {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-around;
+  flex-shrink: 0;
+  gap: 2px;
+  padding: 6px 4px 0;
+  padding-bottom: max(6px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+}
+html.mobile .tabbar-item {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 3px;
+  padding: 5px 2px 7px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: 12px;
+  transition: color 0.14s;
+}
+html.mobile .tabbar-item.active {
+  color: var(--accent);
+}
+html.mobile .tabbar-item:active {
+  background: var(--surface-hover);
+}
+html.mobile .tabbar-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  height: 24px;
+}
+html.mobile .tabbar-label {
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  white-space: nowrap;
+}
+html.mobile .tabbar-badge {
+  position: absolute;
+  top: -5px;
+  left: 11px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}

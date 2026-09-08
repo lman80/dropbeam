@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.46.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.46.0</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_irohv1._udp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>DropBeam finds your friends&apos; devices on the same network so files transfer directly between them at full local speed.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>DropBeam saves photos and videos your friends send you into your photo library.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>DropBeam needs access to your photos so you can send them to a friend or use one as your profile picture.</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+		<string>metal</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Share with DropBeam</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>shareWithDropBeam</string>
+			<key>NSPortName</key>
+			<string>DropBeam</string>
+			<key>NSSendFileTypes</key>
+			<array>
+				<string>public.item</string>
+			</array>
+			<key>NSServiceDescription</key>
+			<string>Send the selected file to a friend with DropBeam.</string>
+			<key>NSTimeout</key>
+			<string>5000</string>
+		</dict>
+	</array>
+</dict>
+</plist>

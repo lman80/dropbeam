@@ -3,6 +3,7 @@ import { AnimatePresence } from 'framer-motion'
 import { ArrowDownToLine, Inbox } from 'lucide-react'
 import { api } from '../lib/api'
 import { useStore } from '../store'
+import { MOBILE_UI } from '../lib/platform'
 import { DropZone } from '../components/DropZone'
 import { TransferCard } from '../components/TransferCard'
 import { EmptyState } from '../components/bits'
@@ -46,7 +47,13 @@ export function SendView() {
   }
 
   return (
-    <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
+    <div
+      style={{
+        maxWidth: 660,
+        margin: '0 auto',
+        padding: MOBILE_UI ? '4px 16px 24px' : '8px 28px 36px',
+      }}
+    >
       <DropZone hovering={dragHovering} onPick={onPick} />
 
       {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
@@ -100,7 +107,11 @@ export function SendView() {
           <EmptyState
             icon={<Inbox size={24} />}
             title="Nothing here yet"
-            hint="Drag files onto the area above and pick who to send to — a friend, or anyone with a code. Whatever you receive shows up here automatically, too. Tip: you can also drop a file straight onto the DropBeam menu-bar icon to send it to a friend."
+            hint={
+              MOBILE_UI
+                ? 'Tap the panel above to choose files, then pick who to send them to — a friend, or anyone with a code. Anything sent to you shows up here automatically.'
+                : 'Drag files onto the area above and pick who to send to — a friend, or anyone with a code. Whatever you receive shows up here automatically, too. Tip: you can also drop a file straight onto the DropBeam menu-bar icon to send it to a friend.'
+            }
           />
         )}
       </div>

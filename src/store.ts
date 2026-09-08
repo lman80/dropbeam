@@ -25,6 +25,7 @@ import {
 } from './lib/api'
 import { setSpeedUnit } from './lib/format'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
+import { MOBILE_UI } from './lib/platform'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
 // Wire the periodic/online update re-check listeners exactly once.
@@ -606,7 +607,9 @@ export const useStore = create<AppStore>((set, get) => ({
     appVersion().then((v) => set({ appVer: v }))
     // Only the main window owns the update check (the popover/HUD share state but
     // shouldn't each trigger their own launch check).
-    if (!isOverlay) {
+    // iOS has no updater plugin (the app is reinstalled from Xcode/TestFlight),
+    // so skip the launch check entirely rather than retry a missing plugin 3x.
+    if (!isOverlay && !MOBILE_UI) {
       get().checkForUpdates(false)
       // A one-shot launch check means a user who's offline at launch never
       // updates. Re-check every 6h and again whenever the network comes back,

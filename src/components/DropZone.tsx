@@ -1,5 +1,6 @@
 import { motion } from 'framer-motion'
 import { FilePlus2, Upload } from 'lucide-react'
+import { MOBILE_UI } from '../lib/platform'
 
 export function DropZone({
   hovering,
@@ -21,7 +22,9 @@ export function DropZone({
           ? 'color-mix(in srgb, var(--accent) 8%, var(--surface))'
           : 'var(--surface)',
         borderRadius: 20,
-        padding: '46px 24px',
+        // A phone screen is short — a 46px-tall pad pushes the transfer list
+        // below the fold.
+        padding: MOBILE_UI ? '30px 20px' : '46px 24px',
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
@@ -46,15 +49,23 @@ export function DropZone({
           boxShadow: '0 10px 28px color-mix(in srgb, var(--accent) 40%, transparent)',
         }}
       >
-        {hovering ? <Upload size={30} /> : <FilePlus2 size={28} />}
+        {hovering && !MOBILE_UI ? <Upload size={30} /> : <FilePlus2 size={28} />}
       </motion.div>
       <div style={{ textAlign: 'center' }}>
+        {/* There is nothing to drag on a phone — the whole panel is the button,
+            so say what tapping it does instead of talking about dragging. */}
         <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--text)' }}>
-          {hovering ? 'Drop to send' : 'Drag files here to send'}
+          {MOBILE_UI ? 'Choose files to send' : hovering ? 'Drop to send' : 'Drag files here to send'}
         </div>
         <div style={{ fontSize: 13.5, color: 'var(--text-muted)', marginTop: 4 }}>
-          or <span style={{ color: 'var(--accent)', fontWeight: 600 }}>click to choose</span> files
-          &amp; folders
+          {MOBILE_UI ? (
+            'Pick photos, videos or documents, then choose who to send them to.'
+          ) : (
+            <>
+              or <span style={{ color: 'var(--accent)', fontWeight: 600 }}>click to choose</span>{' '}
+              files &amp; folders
+            </>
+          )}
         </div>
       </div>
     </motion.button>

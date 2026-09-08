@@ -375,12 +375,36 @@ pub fn run() {
             // can be silently dropped until the user manually allows it.
             {
                 use tauri_plugin_notification::NotificationExt;
-                let nh = app.notification();
-                if !matches!(
-                    nh.permission_state(),
-                    Ok(tauri_plugin_notification::PermissionState::Granted)
-                ) {
-                    let _ = nh.request_permission();
+                // Desktop: a cheap in-process call. Unchanged.
+                #[cfg(desktop)]
+                {
+                    let nh = app.notification();
+                    if !matches!(
+                        nh.permission_state(),
+                        Ok(tauri_plugin_notification::PermissionState::Granted)
+                    ) {
+                        let _ = nh.request_permission();
+                    }
+                }
+                // iOS: these are MOBILE PLUGIN calls — they post a message to the
+                // Swift side and then BLOCK on a channel until the main run loop
+                // delivers the reply. `setup()` runs on the main thread from inside
+                // `application:didFinishLaunching:`, so the run loop isn't pumping
+                // yet: calling them here deadlocks the app forever (webview never
+                // paints — a black screen). Do it off-thread once the loop is up.
+                #[cfg(mobile)]
+                {
+                    let h = app.handle().clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        let nh = h.notification();
+                        if !matches!(
+                            nh.permission_state(),
+                            Ok(tauri_plugin_notification::PermissionState::Granted)
+                        ) {
+                            let _ = nh.request_permission();
+                        }
+                    });
                 }
             }
             // Windows: tie the running process to the installer's Start-menu
