@@ -168,6 +168,7 @@ pub fn run() {
     // Cross-platform plugins (all of these have iOS support).
     let builder = builder
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init());
     // Desktop-only plugins. autostart (login items), updater (we ship .dmg/.msi
@@ -594,6 +595,7 @@ pub fn run() {
             commands::clear_profile_avatar,
             commands::reveal_path,
             commands::save_pasted_image,
+            commands::paste_clipboard_image,
             commands::open_path,
             commands::export_diagnostics,
             commands::diagnostics_test,

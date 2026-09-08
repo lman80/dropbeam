@@ -30,10 +30,14 @@ export function SendView() {
     [order, transfers],
   )
 
-  const onPick = async (photos = false) => {
+  const onPick = async (source: 'files' | 'photos' | 'folder' = 'files') => {
     setPicking(true)
     try {
-      const paths = await (photos ? api.pickPhotos() : api.pickFiles())
+      const paths = source === 'photos'
+        ? await api.pickPhotos()
+        : source === 'folder'
+          ? [await api.pickDirectory()].filter((p): p is string => p !== null)
+          : await api.pickFiles()
       if (paths.length) setPendingSend(paths)
     } catch (error) {
       useStore.getState().toast('error', String(error))
@@ -62,10 +66,15 @@ export function SendView() {
         padding: MOBILE_UI ? '4px 16px 24px' : '8px 28px 36px',
       }}
     >
-      <DropZone hovering={dragHovering} onPick={() => void onPick()} onPickPhotos={() => void onPick(true)} busy={picking} />
+      <DropZone hovering={dragHovering} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} busy={picking} />
 
       {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
-      <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center' }}>
+      <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        {!MOBILE_UI && !/Mac/i.test(navigator.userAgent) && (
+          <button className="btn btn-ghost" disabled={picking} onClick={() => void onPick('folder')} title="On Linux and Windows, folders use a separate picker. Send a folder and all its contents.">
+            Choose a folder
+          </button>
+        )}
         {!showReceive ? (
           <button
             className="btn btn-ghost"

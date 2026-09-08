@@ -34,7 +34,7 @@ import {
 } from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState, LocalityBadge, ProgressBar, Spinner } from '../components/bits'
-import { formatBytes, formatEta, formatRelativeTime, formatSpeed } from '../lib/format'
+import { formatBytes, formatEta, formatRelativeTime, formatSpeed as formatSpeedValue } from '../lib/format'
 import { PairingModal } from '../components/PairingModal'
 import { avatarGradient, initials } from '../lib/avatar'
 
@@ -178,6 +178,8 @@ function FolderCard({
   onShowInvite: (code: string) => void
 }) {
   const updatePair = useStore((s) => s.updatePair)
+  const showMegabits = useStore((s) => s.settings?.showMegabits ?? false)
+  const formatSpeed = (bps: number) => formatSpeedValue(bps, showMegabits)
   const removePair = useStore((s) => s.removePair)
   const reloadPairs = useStore((s) => s.reloadPairs)
   const toast = useStore((s) => s.toast)

@@ -112,27 +112,60 @@ pub fn clear_history(state: State<'_, Arc<AppState>>) {
     history::clear(&state.config_dir);
 }
 
-/// Native multi-file picker (the "+" / choose-files affordance).
-///
-/// IMPORTANT: this is `async` on purpose. A sync command runs on the main UI
-/// thread, and a *blocking* file dialog would then deadlock that thread (the
-/// panel appears but the whole app freezes). Running async + the non-blocking
-/// callback lets the dialog live on the main loop while we await off-thread.
+/// Native send picker. Keep the async command off the UI thread while the
+/// macOS panel runs its modal event loop on the main thread.
 #[tauri::command]
-pub async fn pick_files(app: AppHandle) -> Vec<String> {
-    use tauri_plugin_dialog::DialogExt;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_files(move |paths| {
-        let _ = tx.send(paths);
-    });
-    match rx.await {
-        Ok(Some(list)) => list
-            .into_iter()
-            .filter_map(|p| p.into_path().ok())
-            .map(|pb| pb.to_string_lossy().to_string())
-            .collect(),
-        _ => Vec::new(),
+pub async fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
+    #[cfg(target_os = "macos")]
+    let paths = {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
+            use objc2_foundation::MainThreadMarker;
+            let result = (|| {
+                let mtm = MainThreadMarker::new().ok_or("Picker requires the main thread")?;
+                let panel = NSOpenPanel::openPanel(mtm);
+                // The plugin's file/folder APIs make these mutually exclusive.
+                panel.setCanChooseFiles(true);
+                panel.setCanChooseDirectories(true);
+                panel.setAllowsMultipleSelection(true);
+                if panel.runModal() != NSModalResponseOK {
+                    return Ok(Vec::new());
+                }
+                panel.URLs().iter().map(|url| {
+                    url.path().map(|p| p.to_string()).ok_or_else(|| {
+                        format!("Cannot send selected URL: {}", url.absoluteString().map(|s| s.to_string()).unwrap_or_default())
+                    })
+                }).collect::<Result<Vec<String>, String>>()
+            })();
+            let _ = tx.send(result);
+        }).map_err(|e| e.to_string())?;
+        rx.await.map_err(|e| e.to_string())??
+    };
+    #[cfg(not(target_os = "macos"))]
+    let paths = {
+        use tauri_plugin_dialog::DialogExt;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog().file().pick_files(move |paths| { let _ = tx.send(paths); });
+        rx.await.map_err(|e| e.to_string())?.unwrap_or_default()
+            .into_iter().map(|p| {
+                let label = p.to_string();
+                p.into_path().map_err(|e| format!("Cannot send {label}: {e}"))?
+                    .into_os_string().into_string().map_err(|p| format!("Cannot send path with unsupported encoding: {}", p.to_string_lossy()))
+            }).collect::<Result<Vec<String>, String>>()?
+    };
+    // Fail visibly instead of returning only the usable subset of a selection.
+    for path in &paths {
+        let meta = std::fs::metadata(path).map_err(|e| format!("Cannot send {path}: {e}"))?;
+        if meta.is_dir() {
+            std::fs::read_dir(path).map_err(|e| format!("Cannot send {path}: {e}"))?;
+        } else if meta.is_file() {
+            std::fs::File::open(path).map_err(|e| format!("Cannot send {path}: {e}"))?;
+        } else {
+            return Err(format!("Cannot send {path}: not a regular file or folder"));
+        }
     }
+    Ok(paths)
 }
 
 /// Native folder picker (download folder, shared folder selection).
@@ -319,6 +352,38 @@ pub async fn save_pasted_image(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Native fallback for WebKitGTK paste events that omit image file items.
+/// Keep RGBA and PNG encoding out of the webview's JSON bridge.
+#[tauri::command]
+pub async fn paste_clipboard_image(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    use base64::Engine;
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let b64 = tauri::async_runtime::spawn_blocking(move || {
+        let clipboard = app.clipboard().read_image()
+            .map_err(|e| format!("Couldn't paste an image from the clipboard: {e}"))?;
+        let rgba = clipboard.rgba();
+        if rgba.is_empty() || clipboard.width() == 0 || clipboard.height() == 0 {
+            return Err("No usable image is on the clipboard.".to_string());
+        }
+        if rgba.len() > 100 * 1024 * 1024 {
+            return Err("That image is too large to paste — save it as a file and drop it in.".into());
+        }
+        let mut png = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut png),
+            rgba, clipboard.width(), clipboard.height(), image::ExtendedColorType::Rgba8,
+        ).map_err(|e| format!("Couldn't encode the clipboard image: {e}"))?;
+        if png.len() > 25 * 1024 * 1024 {
+            return Err("That image is too large to paste — save it as a file and drop it in.".into());
+        }
+        Ok(base64::engine::general_purpose::STANDARD.encode(png))
+    }).await.map_err(|e| e.to_string())??;
+    save_pasted_image(state, b64, "png".into()).await
 }
 
 /// "YYYY-MM-DD at HH.MM.SS" in LOCAL time — matches how macOS names screenshots,
@@ -1131,8 +1196,9 @@ fn deliver_chat(
         let config_dir = state.config_dir.clone();
         let (pid, mid) = (friend.id.clone(), msg.id.clone());
         let app = app.clone();
+        let iroh = iroh.clone();
         tauri::async_runtime::spawn(async move {
-            let status = match crate::iroh_net::send_chat(&ep, &eid, payload).await {
+            let status = match crate::iroh_net::send_chat(&iroh, &ep, &eid, payload).await {
                 Ok(_) => "delivered",
                 Err(e) => {
                     log::debug!("chat send failed: {e:#}");
@@ -1158,8 +1224,9 @@ pub async fn send_chat_file_note(
     names: Vec<String>,
     bytes: u64,
     paths: Vec<String>,
+    caption: Option<String>,
 ) -> Result<ChatMessage, String> {
-    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths)
+    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths, caption)
         .ok_or_else(|| "Friend not found.".to_string())
 }
 
@@ -1176,6 +1243,7 @@ pub(crate) fn post_file_note(
     names: Vec<String>,
     bytes: u64,
     paths: Vec<String>,
+    caption: Option<String>,
 ) -> Option<ChatMessage> {
     let friend = friends::get(&state.config_dir, friend_id)?;
     let msg = ChatMessage {
@@ -1183,7 +1251,7 @@ pub(crate) fn post_file_note(
         peer_id: friend_id.to_string(),
         from_me: true,
         kind: "file".into(),
-        text: String::new(),
+        text: caption.unwrap_or_default(),
         files: names,
         bytes,
         // Sender keeps the source path so they can preview/open what they sent.
@@ -1316,8 +1384,9 @@ pub async fn send_typing(
                 "kind": "chat-signal", "signal": "typing", "friendId": friend_id,
                 "fromName": my_name, "on": on,
             });
+            let iroh = iroh.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = crate::iroh_net::send_chat(&ep, &eid, payload).await;
+                let _ = crate::iroh_net::send_chat(&iroh, &ep, &eid, payload).await;
             });
         }
     }
@@ -1343,8 +1412,9 @@ pub async fn send_read_receipt(
                 "kind": "chat-signal", "signal": "read", "friendId": friend_id,
                 "fromName": my_name, "upTo": up_to,
             });
+            let iroh = iroh.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = crate::iroh_net::send_chat(&ep, &eid, payload).await;
+                let _ = crate::iroh_net::send_chat(&iroh, &ep, &eid, payload).await;
             });
         }
     }

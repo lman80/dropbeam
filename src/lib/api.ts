@@ -465,13 +465,14 @@ const realApi = {
       replyTo: replyTo ?? null,
       replyPreview: replyPreview ?? null,
     }),
-  sendChatFileNote: (friendId: string, names: string[], bytes: number, paths: string[]) =>
-    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes, paths }),
+  sendChatFileNote: (friendId: string, names: string[], bytes: number, paths: string[], caption?: string) =>
+    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes, paths, caption }),
   /** Save an image pasted into the chat composer to an app-managed folder (bounded
    *  to the last 50 pastes) and return its path for the staged-file send flow.
    *  Takes base64 — a raw byte array would serialize as a huge JSON number[]. */
   savePastedImage: (b64: string, ext: string) =>
     invoke<string>('save_pasted_image', { b64, ext }),
+  pasteClipboardImage: () => invoke<string>('paste_clipboard_image'),
   /** Add/remove an emoji reaction on a message (ours or theirs). */
   reactToMessage: (friendId: string, messageId: string, emoji: string, add: boolean) =>
     invoke<void>('react_to_message', { friendId, messageId, emoji, add }),

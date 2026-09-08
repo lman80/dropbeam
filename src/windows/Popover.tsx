@@ -10,7 +10,7 @@ import { Spinner } from '../components/bits'
 import { Toasts } from '../components/Toasts'
 import { avatarGradient, initials } from '../lib/avatar'
 import { friendOnlineState } from '../lib/presence'
-import { formatSpeed } from '../lib/format'
+import { formatSpeed as formatSpeedValue } from '../lib/format'
 
 const openMain = () => invoke('open_main_window').catch(() => {})
 const hideSelf = () => invoke('hide_popover').catch(() => {})
@@ -212,6 +212,8 @@ export function Popover() {
     try {
       const paths = await api.pickFiles()
       if (paths.length) await sendToFriend(id, paths)
+    } catch (e) {
+      useStore.getState().toast('error', String(e))
     } finally {
       setPickingFor(null)
     }
@@ -222,6 +224,8 @@ export function Popover() {
     try {
       const paths = await api.pickFiles()
       if (paths.length) sendPaths(paths)
+    } catch (e) {
+      useStore.getState().toast('error', String(e))
     } finally {
       setPickingFor(null)
     }
@@ -400,6 +404,9 @@ export function Popover() {
 }
 
 function PopoverTransfer({ t }: { t: TransferUpdate }) {
+  const showMegabits = useStore((s) => s.settings?.showMegabits ?? false)
+  const formatSpeed = (bps: number) => formatSpeedValue(bps, showMegabits)
+
   const [copied, setCopied] = useState(false)
   const name = t.fileNames[0] ?? (t.direction === 'receive' ? 'Incoming' : 'Files')
   const isSendWaiting =

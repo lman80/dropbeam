@@ -16,7 +16,7 @@ import {
   X,
 } from 'lucide-react'
 import { api, isActive, type TransferUpdate } from '../lib/api'
-import { formatBytes, formatBytesLive, formatEta, formatSpeed } from '../lib/format'
+import { formatBytes, formatBytesLive, formatEta, formatSpeed as formatSpeedValue } from '../lib/format'
 import { LocalityBadge, ProgressBar, Spinner } from './bits'
 import { ConnInspector } from './ConnInspector'
 import { useStore } from '../store'
@@ -33,6 +33,8 @@ function title(t: TransferUpdate): string {
 export const TransferCard = memo(TransferCardImpl)
 
 function TransferCardImpl({ t }: { t: TransferUpdate }) {
+  const showMegabits = useStore((s) => s.settings?.showMegabits ?? false)
+  const formatSpeed = (bps: number) => formatSpeedValue(bps, showMegabits)
   const removeTransfer = useStore((s) => s.removeTransfer)
   const retryTransfer = useStore((s) => s.retryTransfer)
   const respondToOffer = useStore((s) => s.respondToOffer)

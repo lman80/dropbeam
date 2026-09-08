@@ -19,6 +19,7 @@
     "core:window:allow-close",
     "core:webview:allow-internal-toggle-devtools",
     "dialog:allow-open",
+    "clipboard-manager:allow-read-image",
     "notification:default",
     "notification:allow-request-permission",
     "notification:allow-permission-state",

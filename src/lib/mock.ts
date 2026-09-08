@@ -659,13 +659,14 @@ export const mockApi = {
     names: string[],
     bytes: number,
     paths: string[],
+    caption = '',
   ): Promise<ChatMessage> => {
     const m: ChatMessage = {
       id: `c${++counter}`,
       peerId: friendId,
       fromMe: true,
       kind: 'file',
-      text: '',
+      text: caption,
       files: names,
       bytes,
       path: paths[0] ?? null,
@@ -683,6 +684,7 @@ export const mockApi = {
     emit('chat://message', m)
     return m
   },
+  pasteClipboardImage: async (): Promise<string> => { throw new Error('No usable image is on the clipboard.') },
   savePastedImage: async (_b64: string, ext: string): Promise<string> =>
     `/tmp/mock-pasted.${ext}`,
   reactToMessage: async (friendId: string, messageId: string, emoji: string, add: boolean) => {

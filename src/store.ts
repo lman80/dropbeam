@@ -1,7 +1,10 @@
+import { emit, listen } from '@tauri-apps/api/event'
 import { create } from 'zustand'
 import { listenForChatNotifications } from './lib/chatNotifications'
 import {
   api,
+  HAS_TAURI,
+  type ConnDetail,
   onChatMessage,
   onChatTyping,
   onFolderComplete,
@@ -31,6 +34,9 @@ import { MOBILE_UI } from './lib/platform'
 /** Used only if `get_settings` fails at startup, so the app still renders. */
 // Wire the periodic/online update re-check listeners exactly once.
 let updateWatchersWired = false
+let presenceWatchersWired = false
+const presenceProbes = new Map<string, Promise<ConnDetail | null>>()
+const etaSpeeds = new Map<string, { speed: number; samples: number }>()
 
 const DEFAULT_SETTINGS: Settings = {
   downloadDir: '',
@@ -82,6 +88,14 @@ const folderSoundThrottle = new Map<string, number>()
 
 /** When each transfer started moving bytes, to compute a final average speed. */
 const transferStart = new Map<string, number>()
+
+function loadFriendSeen(): Record<string, number> {
+  try {
+    const cached = JSON.parse(localStorage.getItem('dropbeam-friend-seen') || '{}')
+    return Object.fromEntries(Object.entries(cached).filter((entry): entry is [string, number] =>
+      typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] > 0))
+  } catch { return {} }
+}
 
 interface UpdateState {
   version: string
@@ -173,6 +187,7 @@ interface AppStore {
   removeFriend: (id: string) => Promise<void>
   setFriendAutoAccept: (id: string, autoAccept: boolean) => Promise<void>
   respondToOffer: (id: string, accept: boolean) => Promise<void>
+  probeFriend: (id: string) => Promise<ConnDetail | null>
   pingFriend: (id: string) => Promise<boolean>
   // Chat (experimental) — direct messages with friends.
   chats: Record<string, ChatMessage[]>
@@ -191,7 +206,7 @@ interface AppStore {
   reactToMessage: (friendId: string, messageId: string, emoji: string) => Promise<void>
   editChatMessage: (friendId: string, messageId: string, text: string) => Promise<void>
   deleteChatMessage: (friendId: string, messageId: string) => Promise<void>
-  shareFilesInChat: (friendId: string, paths: string[]) => Promise<void>
+  shareFilesInChat: (friendId: string, paths: string[], caption?: string) => Promise<void>
   addChatMessage: (m: ChatMessage) => void
   /** Files staged in the active chat's composer (drag-to-attach, iMessage-style):
    *  they wait, shown as chips, and go out with the next send. Cleared on chat
@@ -382,7 +397,7 @@ export const useStore = create<AppStore>((set, get) => ({
   folderSummaries: {},
   folderActivity: loadFolderActivity(),
   pendingSend: null,
-  friendSeen: {},
+  friendSeen: loadFriendSeen(),
   chats: {},
   chatOverview: [],
   chatDraftFiles: [],
@@ -398,6 +413,15 @@ export const useStore = create<AppStore>((set, get) => ({
   updateError: null,
 
   init: async () => {
+    // Subscribe before fetching the snapshot: beacons arriving during startup
+    // must win over the older snapshot, not disappear until the next beacon.
+    const liveStatuses: Record<string, FolderStatus> = {}
+    await onFolderStatus((status) => {
+      liveStatuses[status.pairId] = status
+      set((st) => ({ folderStatuses: { ...st.folderStatuses, [status.pairId]: status } }))
+      if (status.peerOnline && status.peerName) get().markFriendSeen(status.peerName)
+    }).catch(() => {})
+
     // Bulletproof startup: every call is guarded with a fallback + timeout and
     // we ALWAYS reach ready:true, so a slow or failing backend renders the app
     // (with defaults) rather than hanging on the loading screen forever. Any
@@ -418,8 +442,38 @@ export const useStore = create<AppStore>((set, get) => ({
     setSpeedUnit(settings.showMegabits)
     const folderStatuses: Record<string, FolderStatus> = {}
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
+    Object.assign(folderStatuses, liveStatuses)
     set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })
     void listenForChatNotifications((peerId) => get().openChat(peerId))
+
+    // Probe independently of mounted views, including while iroh starts up.
+    // Each webview has its own store; successful probes feed the same presence input.
+    if (!presenceWatchersWired) {
+      presenceWatchersWired = true
+      const refresh = () => {
+        for (const f of get().friends) void get().probeFriend(f.id).catch(() => {})
+        // Expire recent-contact labels even when there are no transfer events.
+        set((s) => ({ friendSeen: { ...s.friendSeen } }))
+      }
+      refresh()
+      setInterval(refresh, 30_000)
+      window.addEventListener('online', refresh)
+      if (HAS_TAURI) {
+        let settingsEventReceived = false
+        await listen<Settings>('settings://changed', ({ payload }) => {
+          settingsEventReceived = true
+          setSpeedUnit(payload.showMegabits)
+          set({ settings: payload })
+          get().applyTheme(payload.theme)
+        }).catch(() => {})
+        // Close the snapshot/listener gap for settings in newly opened HUDs.
+        const latest = await guarded(api.getSettings(), null, 'getSettings refresh')
+        if (latest && !settingsEventReceived) {
+          setSpeedUnit(latest.showMegabits)
+          set({ settings: latest })
+        }
+      }
+    }
 
     // Our own endpoint id (for the folder-owner check). iroh may still be starting
     // at bootstrap, so poll until it's up, then stop.
@@ -457,9 +511,6 @@ export const useStore = create<AppStore>((set, get) => ({
 
     onTransferUpdate((u) => get().upsertTransfer(u))
     onHistoryChanged(() => get().reloadHistory())
-    onFolderStatus((s) =>
-      set((st) => ({ folderStatuses: { ...st.folderStatuses, [s.pairId]: s } })),
-    )
     // A shared-folder file just left/arrived. Play an opt-in, per-folder cue so
     // you can *hear* a folder syncing. Off by default (folders sync constantly);
     // the toggle lives on each folder card and is stored in localStorage.
@@ -537,13 +588,6 @@ export const useStore = create<AppStore>((set, get) => ({
         const s = get()
         if (s.view === 'chat' && s.activeChatId) {
           const peer = s.activeChatId
-          if ((s.chatUnread[peer] ?? 0) > 0) {
-            const chatUnread = { ...s.chatUnread, [peer]: 0 }
-            set({ chatUnread })
-            void api.setUnreadBadge(
-              Object.values(chatUnread).reduce((a, b) => a + b, 0),
-            )
-          }
           get().markChatRead(peer)
         }
       }
@@ -557,14 +601,20 @@ export const useStore = create<AppStore>((set, get) => ({
         // conversation you're actively looking at. The OS banner (fired in Rust)
         // uses the same gate, so the two never double up.
         const lookingHere =
-          get().windowFocused && get().activeChatId === m.peerId
+          get().windowFocused && get().view === 'chat' && get().activeChatId === m.peerId
         if (!m.fromMe && !lookingHere && (get().settings?.playSounds ?? true)) {
           playIncoming()
         }
         // If it landed in the open + focused chat, it's been seen → read receipt.
         if (!m.fromMe && lookingHere) get().markChatRead(m.peerId)
       })
+      if (HAS_TAURI) void listen<{ peerId: string }>('friend://presence', ({ payload }) => {
+        const friend = get().friends.find((f) => f.id === payload.peerId)
+        if (friend) get().markFriendSeen(friend.name)
+      })
       onChatTyping((t) => {
+        const friend = get().friends.find((f) => f.id === t.peerId)
+        if (friend) get().markFriendSeen(friend.name)
         set((s) => ({ chatTyping: { ...s.chatTyping, [t.peerId]: t.on } }))
         // Receiver-side safety net: the "stopped typing" signal is fire-once and can
         // be lost (peer goes offline / relay flap), which left "typing…" stuck on
@@ -671,7 +721,12 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  setView: (view) => set({ view }),
+  setView: (view) => {
+    set({ view })
+    const peer = view === 'chat' ? get().activeChatId : null
+    void api.setActiveChat(peer)
+    if (peer) get().markChatRead(peer)
+  },
   historyFocusPair: null,
   focusFolderHistory: (pairId) => set({ view: 'history', historyFocusPair: pairId }),
   clearHistoryFocus: () => set({ historyFocusPair: null }),
@@ -682,7 +737,11 @@ export const useStore = create<AppStore>((set, get) => ({
 
   markFriendSeen: (name) => {
     const key = name.trim().toLowerCase()
-    if (key) set((s) => ({ friendSeen: { ...s.friendSeen, [key]: Date.now() } }))
+    if (key) {
+      const friendSeen = { ...get().friendSeen, [key]: Date.now() }
+      try { localStorage.setItem('dropbeam-friend-seen', JSON.stringify(friendSeen)) } catch { /* storage unavailable */ }
+      set({ friendSeen })
+    }
   },
 
   sendPaths: async (paths) => {
@@ -756,7 +815,9 @@ export const useStore = create<AppStore>((set, get) => ({
     if (patch.showMegabits !== undefined) setSpeedUnit(patch.showMegabits)
     try {
       const saved = await api.updateSettings(next)
+      setSpeedUnit(saved.showMegabits)
       set({ settings: saved })
+      if (HAS_TAURI) void emit('settings://changed', saved).catch(() => {})
     } catch (e) {
       // The save didn't persist — revert the optimistic change (and its side effects)
       // so the toggle/field honestly shows it didn't stick, instead of a false "on"
@@ -787,15 +848,29 @@ export const useStore = create<AppStore>((set, get) => ({
 
   upsertTransfer: (u) => {
     const prev = get().transfers[u.id]
+    // Receiver-confirmed sender progress has speed but no backend ETA.
+    // Smooth speed, then divide remaining bytes so completion still tends to zero.
+    if (u.state === 'transferring' && u.bytesTotal > 0 && Number.isFinite(u.speedBps) && u.speedBps > 0) {
+      const previous = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
+        ? etaSpeeds.get(u.id) : undefined
+      // Seed from the first real sample, with no zero-speed prior.
+      const speed = previous == null ? u.speedBps : 0.25 * u.speedBps + 0.75 * previous.speed
+      const samples = (previous?.samples ?? 0) + 1
+      etaSpeeds.set(u.id, { speed, samples })
+      u = { ...u, etaSeconds: samples >= 2 ? Math.max(0, u.bytesTotal - u.bytesDone) / speed : null }
+    } else {
+      etaSpeeds.delete(u.id)
+      if (u.state === 'transferring') u = { ...u, etaSeconds: null }
+    }
     // A friend transfer that actually connected means they were online just now.
     if (
       u.friendName &&
-      (u.state === 'connecting' || u.state === 'transferring' || u.state === 'completed')
+      (u.state === 'transferring' || u.state === 'completed' || !!u.connDetail)
     ) {
       const key = u.friendName.trim().toLowerCase()
       const last = get().friendSeen[key] ?? 0
       if (Date.now() - last > 5000) {
-        set((s) => ({ friendSeen: { ...s.friendSeen, [key]: Date.now() } }))
+        get().markFriendSeen(u.friendName)
       }
     }
     // Sounds fire on meaningful state changes only (not on every progress tick).
@@ -929,6 +1004,7 @@ export const useStore = create<AppStore>((set, get) => ({
   reloadFriends: async () => {
     const friends = await api.listFriends().catch(() => [])
     set({ friends })
+    for (const f of friends) void get().probeFriend(f.id).catch(() => {})
   },
 
   sendToFriend: async (id, paths) => {
@@ -984,10 +1060,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const byId = new Map(msgs.map((m) => [m.id, m]))
       for (const m of s.chats[friendId] ?? []) if (!byId.has(m.id)) byId.set(m.id, m)
       const merged = [...byId.values()].sort(byOrder)
-      const chatUnread = { ...s.chatUnread, [friendId]: 0 }
-      const total = Object.values(chatUnread).reduce((a, b) => a + b, 0)
-      void api.setUnreadBadge(total)
-      return { chats: { ...s.chats, [friendId]: merged }, chatUnread }
+      return { chats: { ...s.chats, [friendId]: merged } }
     })
     get().markChatRead(friendId)
   },
@@ -1000,8 +1073,15 @@ export const useStore = create<AppStore>((set, get) => ({
   // Tell the friend we've read up to the newest message in this thread (honors
   // the read-receipts privacy toggle on the Rust side).
   markChatRead: (friendId) => {
-    const thread = get().chats[friendId] ?? []
-    const newest = thread.length ? thread[thread.length - 1].ts : 0
+    const s = get()
+    if (!s.windowFocused || s.view !== 'chat' || s.activeChatId !== friendId) return
+    if ((s.chatUnread[friendId] ?? 0) > 0) {
+      const chatUnread = { ...s.chatUnread, [friendId]: 0 }
+      set({ chatUnread })
+      void api.setUnreadBadge(Object.values(chatUnread).reduce((a, b) => a + b, 0))
+    }
+    const thread = s.chats[friendId] ?? []
+    const newest = thread.reduce((ts, m) => m.fromMe ? ts : Math.max(ts, m.ts), 0)
     if (newest > 0) void api.sendReadReceipt(friendId, newest)
   },
 
@@ -1068,7 +1148,7 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  shareFilesInChat: async (friendId, paths) => {
+  shareFilesInChat: async (friendId, paths, caption) => {
     paths = paths.filter(Boolean)
     if (!paths.length) return
     try {
@@ -1076,7 +1156,7 @@ export const useStore = create<AppStore>((set, get) => ({
       setRetryPayload(t.id, { kind: 'friend', id: friendId, paths })
       get().upsertTransfer(t)
       const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
-      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths)
+      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths, caption)
       // Tie this transfer's bytes to THIS card, so a later failure flips it to
       // "tap to resend" rather than leaving a card for a file that never arrived.
       setChatFileXfer(t.id, { peerId: friendId, msgId: m.id })
@@ -1197,6 +1277,18 @@ export const useStore = create<AppStore>((set, get) => ({
       get().toast('error', String(e))
       await get().reloadFriends()
     }
+  },
+
+  probeFriend: async (id) => {
+    const pending = presenceProbes.get(id)
+    if (pending) return pending
+    const probe = api.probeConnection(id).then((detail) => {
+      const friend = get().friends.find((f) => f.id === id)
+      if (detail && friend) get().markFriendSeen(friend.name)
+      return detail
+    }).finally(() => presenceProbes.delete(id))
+    presenceProbes.set(id, probe)
+    return probe
   },
 
   pingFriend: async (id) => {
