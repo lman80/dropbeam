@@ -142,6 +142,7 @@ dependencies = [
  "hex",
  "image",
  "iroh",
+ "libc",
  "log",
  "n0-future",
  "noq-proto",

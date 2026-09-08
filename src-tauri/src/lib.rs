@@ -6,6 +6,7 @@ mod ios_media;
 mod download_progress;
 mod folder_history;
 mod friends;
+mod fs_walk;
 mod history;
 mod iroh_net;
 // Gated remote test-and-update surface (Settings → Lab Mode). Off by default;
@@ -28,6 +29,7 @@ mod telemetry;
 mod tray_drag;
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -153,6 +155,13 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // BUG-23: a launcher shell's closed pipe must return EPIPE, not terminate
+    // the app (including when the emergency panic hook writes to stderr).
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: SIG_IGN is a valid disposition; no signal handler is installed.
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     let builder = tauri::Builder::default();
     // Single-instance MUST be the first plugin. Windows/Linux only: it forwards a
     // second launch — e.g. the "Send with DropBeam" right-click menu, which runs
@@ -242,6 +251,21 @@ pub fn run() {
                     log::LevelFilter::Warn,
                 )
             };
+            let mut log_targets = vec![
+                tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                    file_name: Some("DropBeam".into()),
+                }),
+                tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+            ];
+            // BUG-23: a shell-launched release app outlived its stdout/stderr
+            // pipes. EPIPE made fern 0.7.1's stderr fallback panic inside an
+            // AppKit callback that cannot unwind, aborting the app. Keep pipes
+            // out of release logging; retain console output for terminals/dev.
+            if cfg!(debug_assertions) || std::io::stdout().is_terminal() {
+                log_targets.push(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ));
+            }
             let _ = app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .level(global_level)
@@ -257,12 +281,7 @@ pub fn run() {
                     // verbose, since DEBUG fills them faster and we want the history).
                     .max_file_size(if verbose { 4_000_000 } else { 2_000_000 })
                     .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
-                    .targets([
-                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
-                            file_name: Some("DropBeam".into()),
-                        }),
-                    ])
+                    .targets(log_targets)
                     .build(),
             );
             // Stamp every log file so it's self-identifying when exported for support.

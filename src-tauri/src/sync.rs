@@ -165,6 +165,7 @@ impl SyncManager {
     }
 
     /// Bring running folders in line with what's persisted on disk.
+    /// Synchronous filesystem work: async callers must use spawn_blocking.
     pub fn reconcile(self: &Arc<Self>) {
         let desired = pairing::load(&self.config_dir);
         let desired_ids: HashSet<String> = desired.iter().map(|p| p.id.clone()).collect();
@@ -396,7 +397,7 @@ impl SyncManager {
 
         let Some(rec) = peer_snapshot else {
             // Never heard from the peer at all — be honest that we couldn't compare.
-            let local = live_manifest(&folder);
+            let local = live_manifest_async(folder.clone()).await;
             return VerifyResult {
                 peer_online: status.lock().map(|s| s.peer_online).unwrap_or(false),
                 compared: false,
@@ -411,7 +412,7 @@ impl SyncManager {
             };
         };
 
-        let mine = live_manifest(&folder);
+        let mine = live_manifest_async(folder.clone()).await;
         let my_tomb = match tombstones.lock() {
             Ok(tombstones) => tombstones.clone(), Err(_) => return unavailable(),
         };
@@ -481,6 +482,7 @@ impl SyncManager {
     }
 
     fn start_pair(self: &Arc<Self>, pair: Pair) {
+        let _walk = crate::fs_walk::Watch::new("sync startup", Path::new(&pair.folder));
         // One-time cleanup of the v0.43.x history-leak: a VISIBLE `dropbeam-history`
         // (no leading dot) inside a shared folder is always an artifact of the old
         // receive-side de-dot bug — the real archive is the hidden `.dropbeam-history`.
@@ -804,7 +806,9 @@ impl SyncManager {
                         if stopped2.load(Ordering::SeqCst) {
                             return;
                         }
-                        let files = list_files_rec(Path::new(&p));
+                        let scan_dir = PathBuf::from(&p);
+                        let files = tokio::task::spawn_blocking(move || list_files_rec(&scan_dir))
+                            .await.expect("directory scan panicked");
                         if viewer {
                             if files.iter().any(|f| is_sendable_candidate(&f.to_string_lossy(), &folder2, &inbound2)) {
                                 manager2.warn_viewer_change(&folder2);
@@ -1047,7 +1051,12 @@ impl SyncManager {
                         _ = stop_notify.notified() => break,
                         _ = tokio::time::sleep(Duration::from_secs(45u64 << idle_scans.min(2))) => {
                             let folder = config.lock().unwrap().folder.clone();
-                            if seed_existing(&folder, &inbound, &queue, &wake) {
+                            let scan_inbound = inbound.clone();
+                            let scan_queue = queue.clone();
+                            let scan_wake = wake.clone();
+                            if tokio::task::spawn_blocking(move || {
+                                seed_existing(&folder, &scan_inbound, &scan_queue, &scan_wake)
+                            }).await.expect("seed scan panicked") {
                                 idle_scans = 0;
                             } else {
                                 idle_scans = idle_scans.saturating_add(1);
@@ -1473,7 +1482,7 @@ impl SyncManager {
                 let forced = force_snapshot.swap(false, Ordering::SeqCst);
                 let request_reply = request_snapshot_reply.swap(false, Ordering::SeqCst);
                 let reconcile_json = if pair.mirror && (!is_paused || forced) {
-                    let lm = live_manifest(&pair.folder);
+                    let lm = live_manifest_async(pair.folder.clone()).await;
                     // Refresh the inode index from disk each round so move detection
                     // also covers files that were RECEIVED this session (those skip
                     // the live add-branch that normally warms the index).
@@ -1524,7 +1533,9 @@ impl SyncManager {
                         .iter()
                         .map(|(rel, ts)| (rel.clone(), serde_json::json!(ts)))
                         .collect();
-                    let empty_dirs = live_empty_dirs(&pair.folder);
+                    let folder = pair.folder.clone();
+                    let empty_dirs = tokio::task::spawn_blocking(move || live_empty_dirs(&folder))
+                        .await.expect("empty directory scan panicked");
                     Some(serde_json::json!({ "files": files, "tombstones": tombs, "emptyDirs": empty_dirs, "requestReply": request_reply }))
                 } else {
                     None
@@ -2750,10 +2761,11 @@ fn seed_existing(
 }
 
 fn list_files_rec(dir: &Path) -> Vec<PathBuf> {
+    let _walk = crate::fs_walk::Watch::new("list_files_rec", dir);
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
+        let Ok(entries) = crate::fs_walk::read_dir(&d) else {
             continue;
         };
         for e in entries.flatten() {
@@ -3749,7 +3761,13 @@ fn handle_move_candidate(
 
 /// Every relative file path currently present under `folder`, mapped to its
 /// signature (`size|mtime`). The authoritative "what I actually have on disk".
+async fn live_manifest_async(folder: String) -> HashMap<String, FileEntry> {
+    tokio::task::spawn_blocking(move || live_manifest(&folder))
+        .await.expect("manifest scan panicked")
+}
+
 fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
+    let _walk = crate::fs_walk::Watch::new("live_manifest", Path::new(folder));
     let mut out = HashMap::new();
     for abs in list_files_rec(Path::new(folder)) {
         let p = abs.to_string_lossy().to_string();
@@ -3824,12 +3842,13 @@ fn meta_inode(meta: &std::fs::Metadata) -> u64 {
 /// beneath them (a dir whose whole subtree is file-less). Skips dot-dirs and
 /// symlinks. Used so empty organizing-folders still sync.
 fn live_empty_dirs(folder: &str) -> Vec<String> {
+    let _walk = crate::fs_walk::Watch::new("live_empty_dirs", Path::new(folder));
     let mut dirs: Vec<String> = Vec::new();
     // For every file, every ANCESTOR directory rel is "has files".
     let mut has_files: HashSet<String> = HashSet::new();
     let mut stack = vec![Path::new(folder).to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
+        let Ok(entries) = crate::fs_walk::read_dir(&d) else {
             continue;
         };
         for e in entries.flatten() {
