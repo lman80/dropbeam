@@ -137,6 +137,7 @@ export function PairingModal({
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
         onClick={onClose}
+        className="dialog-overlay"
         style={{
           position: 'fixed',
           inset: 0,
@@ -255,6 +256,7 @@ export function PairingModal({
                   <textarea
                     className="input"
                     style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
+                    autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
                     placeholder="Paste the dropbeam1:… invite here"
                     value={inviteInput}
                     onChange={(e) => setInviteInput(e.target.value)}

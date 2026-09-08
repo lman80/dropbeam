@@ -279,9 +279,8 @@ export function Popover() {
           <Search size={15} className="pop-search-icon" />
           <input
             className="pop-search"
-            placeholder="Search friends"
+              placeholder="Search friends"
             value={query}
-            spellCheck={false}
             onChange={(e) => setQuery(e.target.value)}
           />
         </div>
@@ -378,10 +377,10 @@ export function Popover() {
             >
               <input
                 className="input"
+                autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
                 placeholder="Paste a code to receive"
                 value={code}
                 autoFocus
-                spellCheck={false}
                 onChange={(e) => setCode(e.target.value)}
                 style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
               />

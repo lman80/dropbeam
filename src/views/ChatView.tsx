@@ -1,3 +1,4 @@
+import { MOBILE_UI } from '../lib/platform'
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -630,7 +631,7 @@ function Conversation({ friendId }: { friendId: string }) {
         >
           <Search size={16} />
         </button>
-        {sharedFolder && (
+        {sharedFolder && !MOBILE_UI && (
           <button
             className="btn btn-ghost"
             onClick={() => api.openPath(sharedFolder.folder)}
@@ -903,6 +904,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
   folderName: string
   friendName: string
 }) {
+  const FileRow = MOBILE_UI ? 'div' : 'button'
   const mine = ev.direction === 'send'
   const sep = folder.includes('\\') ? '\\' : '/'
   const full = (rel: string) => `${folder}${sep}${rel.split('/').join(sep)}`
@@ -965,40 +967,40 @@ const FolderSyncRow = memo(function FolderSyncRow({
           </span>
         </div>
         {many ? (
-          <button
+          <FileRow
             className="sync-file"
-            onClick={() => void api.openPath(folder).catch(() => {})}
-            title="Open the shared folder"
+            onClick={MOBILE_UI ? undefined : () => void api.openPath(folder).catch(() => {})}
+            title={MOBILE_UI ? undefined : "Open the shared folder"}
           >
             <TypeIcon name="files" size={18} />
             <span className="sync-file-name">{ev.files.length} items synced</span>
-          </button>
+          </FileRow>
         ) : (
           entries.map((e) => {
             if (e.kind === 'dir') {
               return (
-                <button
+                <FileRow
                   className="sync-file"
                   key={'d:' + e.name}
-                  onClick={() => void api.openPath(full(e.name)).catch(() => {})}
-                  title={`Open ${e.name}`}
+                  onClick={MOBILE_UI ? undefined : () => void api.openPath(full(e.name)).catch(() => {})}
+                  title={MOBILE_UI ? undefined : `Open ${e.name}`}
                 >
                   <FolderOpen size={18} style={{ color: 'var(--accent)' }} />
                   <span className="sync-file-name">{e.name}</span>
                   <span className="sync-count">
                     {e.count} item{e.count === 1 ? '' : 's'}
                   </span>
-                </button>
+                </FileRow>
               )
             }
             const base = e.rel.split('/').pop() || e.rel
             const img = HAS_TAURI && typeKind(base) === 'image'
             return (
-              <button
+              <FileRow
                 className="sync-file"
                 key={'f:' + e.rel}
-                onClick={() => void api.revealPath(full(e.rel)).catch(() => {})}
-                title={`Reveal ${base} in Finder`}
+                onClick={MOBILE_UI ? undefined : () => void api.revealPath(full(e.rel)).catch(() => {})}
+                title={MOBILE_UI ? undefined : `Reveal ${base} in Finder`}
               >
                 {img ? (
                   <img className="sync-thumb" src={convertFileSrc(full(e.rel))} alt="" loading="lazy" />
@@ -1006,7 +1008,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
                   <TypeIcon name={base} size={18} />
                 )}
                 <span className="sync-file-name">{base}</span>
-              </button>
+              </FileRow>
             )
           })
         )}

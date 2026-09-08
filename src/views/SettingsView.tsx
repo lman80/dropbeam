@@ -148,7 +148,7 @@ export function SettingsView() {
     setExporting(true)
     try {
       const path = await api.exportDiagnostics()
-      await api.revealPath(path).catch(() => {})
+      if (!MOBILE_UI) await api.revealPath(path).catch(() => {})
       toast('success', 'Logs exported to Downloads — send it over DropBeam or AirDrop to get it diagnosed.')
     } catch (e) {
       toast('error', String(e))
@@ -300,6 +300,7 @@ export function SettingsView() {
             className="input"
             style={{ width: 220 }}
             type="text"
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
             placeholder="Giphy API key"
             defaultValue={settings.giphyApiKey}
             onBlur={(e) => {
@@ -589,6 +590,7 @@ export function SettingsView() {
             <input
               className="input"
               style={{ width: 230 }}
+              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
               placeholder="https://relay.example.com"
               value={settings.customRelay}
               onChange={(e) => save({ customRelay: e.target.value })}
@@ -712,11 +714,10 @@ export function SettingsView() {
                 <input
                   className="input"
                   style={{ minWidth: 240 }}
+                  autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
                   placeholder="Built-in (leave blank)"
                   value={settings.diagnosticsUrl}
                   onChange={(e) => save({ diagnosticsUrl: e.target.value })}
-                  spellCheck={false}
-                  autoCapitalize="off"
                 />
                 <button
                   className="btn btn-ghost"
@@ -764,11 +765,10 @@ export function SettingsView() {
               <input
                 className="input"
                 style={{ minWidth: 240 }}
+                autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
                 placeholder="Paste operator ID"
                 value={settings.labOperatorId}
                 onChange={(e) => save({ labOperatorId: e.target.value.trim() })}
-                spellCheck={false}
-                autoCapitalize="off"
               />
             </Row>
             {SEP}

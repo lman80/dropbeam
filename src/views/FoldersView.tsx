@@ -1,3 +1,4 @@
+import { MOBILE_UI } from '../lib/platform'
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -345,9 +346,9 @@ function FolderCard({
             {folderName}
           </div>
         </div>
-        <button className="icon-btn" title="Open folder" onClick={() => api.openPath(pair.folder)}>
+        {!MOBILE_UI && <button className="icon-btn" title="Open folder" onClick={() => api.openPath(pair.folder)}>
           <FolderOpen size={16} />
-        </button>
+        </button>}
         {pair.mirror && (
           <button
             className="icon-btn"
@@ -1095,6 +1096,7 @@ function InviteModal({
   return (
     <div
       onClick={onClose}
+      className="dialog-overlay"
       style={{
         position: 'fixed',
         inset: 0,

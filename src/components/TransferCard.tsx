@@ -1,3 +1,4 @@
+import { MOBILE_UI } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -348,7 +349,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
               </div>
             )}
           </div>
-          {t.direction === 'receive' && t.outDir && (
+          {!MOBILE_UI && t.direction === 'receive' && t.outDir && (
             <button
               className="btn btn-ghost"
               onClick={() => {

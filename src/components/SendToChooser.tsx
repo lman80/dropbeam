@@ -43,6 +43,7 @@ export function SendToChooser() {
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           onClick={close}
+          className="dialog-overlay"
           style={{
             position: 'fixed',
             inset: 0,

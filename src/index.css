@@ -2075,3 +2075,38 @@ html.mobile .tabbar-badge {
   line-height: 16px;
   text-align: center;
 }
+
+/* Shared mobile dialog contract; inline desktop dimensions stay unchanged. */
+html.mobile .dialog-overlay {
+  --dialog-x: max(16px, env(safe-area-inset-left), env(safe-area-inset-right));
+  --dialog-top: max(16px, env(safe-area-inset-top));
+  --dialog-bottom: max(16px, env(safe-area-inset-bottom));
+  padding: var(--dialog-top) var(--dialog-x) var(--dialog-bottom) !important;
+  grid-template-columns: minmax(0, 1fr);
+  height: 100dvh;
+  box-sizing: border-box;
+}
+html.mobile .dialog-overlay > .card {
+  min-width: 0;
+  max-width: calc(100vw - 2 * var(--dialog-x)) !important;
+  max-height: calc(100dvh - var(--dialog-top) - var(--dialog-bottom)) !important;
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+  box-sizing: border-box;
+}
+html.mobile .dialog-overlay .btn {
+  width: 100% !important;
+  flex: 1 1 100%;
+  white-space: normal;
+}
+html.mobile .dialog-overlay div:has(> .btn) { flex-wrap: wrap; }
+html.mobile .dialog-overlay input,
+html.mobile .dialog-overlay textarea { min-width: 0; max-width: 100%; font-size: 16px !important; }
+html.mobile .dialog-overlay .icon-btn { flex-shrink: 0; }
+
+html.mobile .gif-picker {
+  max-width: calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right));
+  max-height: calc(100dvh - 160px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+}
+html.mobile div.sync-file { cursor: default; }

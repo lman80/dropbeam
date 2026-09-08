@@ -70,12 +70,10 @@ export function SendView() {
           <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 440 }}>
             <input
               className="input"
+              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
               placeholder="Paste the code the sender shared…"
               value={code}
               autoFocus
-              spellCheck={false}
-              autoCapitalize="off"
-              autoCorrect="off"
               onChange={(e) => setCode(e.target.value)}
               style={{ fontFamily: 'var(--font-mono)', fontSize: 14 }}
             />

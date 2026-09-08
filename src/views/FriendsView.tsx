@@ -656,27 +656,28 @@ function InvitePanel({
 function AddFriendModal({ onClose }: { onClose: () => void }) {
   const acceptFriend = useStore((s) => s.acceptFriend)
   const addFriendByCode = useStore((s) => s.addFriendByCode)
-  const toast = useStore((s) => s.toast)
+  const [error, setError] = useState('')
   const [codeInput, setCodeInput] = useState('')
   const [busy, setBusy] = useState(false)
 
   const submit = async () => {
+    setError('')
     const code = codeInput.trim()
     if (!code) {
-      toast('error', "Paste your friend's code first.")
+      setError("Paste your friend's code first.")
       return
     }
     setBusy(true)
     try {
-      if (code.startsWith('dropbeamf1:')) await acceptFriend(code) // legacy invite
-      else if (code.startsWith('dropbeam:')) await addFriendByCode(code)
+      if (/^dropbeamf1:/i.test(code)) await acceptFriend(code) // legacy invite
+      else if (/^dropbeam:/i.test(code)) await addFriendByCode(code)
       else {
-        toast('error', "That doesn't look like a DropBeam code.")
+        setError("That doesn't look like a DropBeam code.")
         return
       }
       onClose()
     } catch (e) {
-      toast('error', String(e))
+      setError(String(e))
     } finally {
       setBusy(false)
     }
@@ -689,6 +690,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
         onClick={onClose}
+        className="dialog-overlay"
         style={{
           position: 'fixed',
           inset: 0,
@@ -721,6 +723,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
           <textarea
             className="input"
             style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
             placeholder="Paste their dropbeam:… code here"
             value={codeInput}
             autoFocus
@@ -731,6 +734,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
             name fills in automatically and you’ll both be connected — no retyping names, no re-adding
             after updates.
           </p>
+          {error && <p role="alert" style={{ color: 'var(--red)', overflowWrap: 'anywhere' }}>{error}</p>}
           <button
             className="btn btn-primary"
             style={{ width: '100%', marginTop: 12 }}

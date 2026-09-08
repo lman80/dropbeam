@@ -161,6 +161,7 @@ function NameSetupModal() {
   }
   return (
     <div
+      className="dialog-overlay"
       style={{
         position: 'fixed',
         inset: 0,

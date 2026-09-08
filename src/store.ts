@@ -710,7 +710,7 @@ export const useStore = create<AppStore>((set, get) => ({
     if (!code) return false
     try {
       // iroh-only: receives use the Direct ticket from the sender's link/QR.
-      if (!code.startsWith('direct')) {
+      if (!/^direct/i.test(code)) {
         get().toast(
           'error',
           "That doesn't look like a DropBeam link. Paste the full link the sender shared, or scan their QR code to receive.",

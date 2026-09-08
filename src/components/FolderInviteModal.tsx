@@ -52,6 +52,7 @@ export function FolderInviteModal() {
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           onClick={dismiss}
+          className="dialog-overlay"
           style={{
             position: 'fixed',
             inset: 0,
