@@ -28,9 +28,13 @@ export function SendView() {
     [order, transfers],
   )
 
-  const onPick = async () => {
-    const paths = await api.pickFiles()
-    if (paths.length) setPendingSend(paths)
+  const onPick = async (folder = false) => {
+    try {
+      const paths = folder ? [await api.pickDirectory()].filter((p): p is string => p !== null) : await api.pickFiles()
+      if (paths.length) setPendingSend(paths)
+    } catch (e) {
+      useStore.getState().toast('error', String(e))
+    }
   }
 
   const submitReceive = async (e: React.FormEvent) => {
@@ -47,7 +51,12 @@ export function SendView() {
 
   return (
     <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
-      <DropZone hovering={dragHovering} onPick={onPick} />
+      <DropZone hovering={dragHovering} onPick={() => onPick()} />
+      {!/Mac/i.test(navigator.userAgent) && (
+        <button className="btn btn-ghost" onClick={() => onPick(true)} style={{ marginTop: 8 }}>
+          Choose a folder
+        </button>
+      )}
 
       {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
       <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center' }}>

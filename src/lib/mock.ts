@@ -681,6 +681,7 @@ export const mockApi = {
     emit('chat://message', m)
     return m
   },
+  pasteClipboardImage: async (): Promise<string> => { throw new Error('No usable image is on the clipboard.') },
   savePastedImage: async (_b64: string, ext: string): Promise<string> =>
     `/tmp/mock-pasted.${ext}`,
   reactToMessage: async (friendId: string, messageId: string, emoji: string, add: boolean) => {

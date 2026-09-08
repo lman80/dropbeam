@@ -470,6 +470,7 @@ const realApi = {
    *  Takes base64 — a raw byte array would serialize as a huge JSON number[]. */
   savePastedImage: (b64: string, ext: string) =>
     invoke<string>('save_pasted_image', { b64, ext }),
+  pasteClipboardImage: () => invoke<string>('paste_clipboard_image'),
   /** Add/remove an emoji reaction on a message (ours or theirs). */
   reactToMessage: (friendId: string, messageId: string, emoji: string, add: boolean) =>
     invoke<void>('react_to_message', { friendId, messageId, emoji, add }),

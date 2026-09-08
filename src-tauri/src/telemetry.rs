@@ -180,13 +180,50 @@ fn redactors() -> &'static [(Regex, &'static str)] {
     })
 }
 
-fn redact(s: &str) -> String {
+/// Sender-facing errors retain filenames, identifiers and the full error chain.
+/// Quoted paths may contain spaces; bare paths end at whitespace or punctuation
+/// (spaces within directory components are supported). No telemetry filters apply.
+pub(crate) fn redact_paths_only(s: &str) -> String {
+    static TOKENS: OnceLock<Regex> = OnceLock::new();
+    let tokens = TOKENS.get_or_init(|| {
+        Regex::new(r#"(?x)
+            "[^"\r\n]*" | '[^'\r\n]*'
+            | (?:[A-Za-z]:[\\/]|\\\\|/)
+              (?:[^\s\\/:"',;()\[\]{}]+(?:[\x20\t]+[^\s\\/:"',;()\[\]{}]+)*[\\/])*
+              [^\s\\/:"',;()\[\]{}]*
+            | [^\s"'=,;()\[\]{}]+
+        "#).unwrap()
+    });
+    tokens.replace_all(s, |caps: &regex::Captures<'_>| {
+        let token = &caps[0];
+        let quote = token.chars().next().filter(|c| matches!(c, '\'' | '"'));
+        let path = if quote.is_some() { &token[1..token.len() - 1] } else { token };
+        let bytes = path.as_bytes();
+        let absolute = path.starts_with('/') || path.starts_with(r"\\")
+            || (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\'));
+        if absolute {
+            match quote {
+                Some(q) => format!("{q}<path>{q}"),
+                None => "<path>".to_string(),
+            }
+        } else {
+            token.to_string()
+        }
+    }).into_owned()
+}
+
+pub(crate) fn redact(s: &str) -> String {
     let mut out = s.to_string();
     for (re, rep) in redactors() {
         out = re.replace_all(&out, *rep).into_owned();
     }
     if out.len() > MAX_SAMPLE_LEN {
-        out.truncate(MAX_SAMPLE_LEN);
+        let mut end = MAX_SAMPLE_LEN;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
         out.push('…');
     }
     out
@@ -573,6 +610,60 @@ pub async fn run_once(app: &AppHandle, config_dir: &Path, log_dir: Option<&Path>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_only_redaction_strips_absolute_paths() {
+        for path in [
+            "/foo.mp4", "/Users/bob/Downloads/foo.mp4",
+            "/Volumes/My Drive/Private Folder/影片.mp4",
+            r"C:\Users\bob\foo.mp4", "D:/Private Folder/foo.mp4",
+            r"\\server\share\Private Folder\影片.mp4",
+        ] {
+            assert_eq!(redact_paths_only(&format!("finalize {path}: Permission denied (os error 13)")),
+                "finalize <path>: Permission denied (os error 13)");
+            for quote in ['\'', '"'] {
+                assert_eq!(redact_paths_only(&format!("open {quote}{path}{quote}: failed")),
+                    format!("open {quote}<path>{quote}: failed"));
+            }
+        }
+        assert_eq!(redact_paths_only("open \"/Volumes/My Drive/my movie.mp4\" failed"),
+            "open \"<path>\" failed");
+        assert_eq!(redact_paths_only("rename /tmp/a to /tmp/b: failed"),
+            "rename <path> to <path>: failed");
+    }
+
+    #[test]
+    fn path_only_redaction_preserves_sender_error_details() {
+        for message in [
+            "\"foo.mp4\" changed while sending (file shrank)",
+            "\"影片 🎬.mp4\" changed while sending (file shrank)",
+            "'foo.mp4' changed while sending (file grew)",
+            "peer=3b8f2a9c1d addr=116.39.54.87:65195 https://example.com/a/b",
+            "relative/path.mp4 ./foo.mp4 ../foo.mp4 C:relative.mp4 app_lib::sync",
+        ] {
+            assert_eq!(redact_paths_only(message), message);
+        }
+        let long = format!("\"{}.mp4\" changed while sending (file shrank)", "界".repeat(300));
+        assert_eq!(redact_paths_only(&long), long);
+    }
+
+    #[test]
+    fn redaction_keeps_transfer_error_reason() {
+        for path in [
+            "/Users/bob/Downloads/private.txt",
+            "/home/bob/Downloads/private.txt",
+            r"C:\Users\bob\Downloads\private.txt",
+        ] {
+            let error = anyhow::anyhow!("Permission denied (os error 13)")
+                .context(format!("finalize {path}"));
+            assert_eq!(
+                redact(&format!("{error:#}")),
+                "finalize <path>: Permission denied (os error 13)"
+            );
+        }
+        let long = redact(&"界".repeat(MAX_SAMPLE_LEN));
+        assert!(long.len() <= MAX_SAMPLE_LEN + '…'.len_utf8());
+    }
 
     #[test]
     fn redaction_strips_personal_data() {

@@ -65,12 +65,15 @@ function fileKind(name: string | undefined): Kind {
 function avatarContent(friend: Friend) {
   if (friend.avatar && HAS_TAURI) {
     return (
-      <img
-        className="avatar-img"
-        src={convertFileSrc(friend.avatar)}
-        alt=""
-        onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
-      />
+      <>
+        {initials(friend.name)}
+        <img
+          className="avatar-img"
+          src={convertFileSrc(friend.avatar)}
+          alt=""
+          onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
+        />
+      </>
     )
   }
   return initials(friend.name)
@@ -158,6 +161,13 @@ export function ChatView() {
     if (firstId) void openChat(firstId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // A remembered selection is only being viewed while Chat is mounted.
+  useEffect(() => {
+    void api.setActiveChat(activeChatId)
+    if (activeChatId) useStore.getState().markChatRead(activeChatId)
+    return () => { void api.setActiveChat(null) }
+  }, [activeChatId])
 
   const online = (f: Friend) => friendOnlineState(f.name, friendSeen, folderStatuses) === true
 
@@ -537,8 +547,12 @@ function Conversation({ friendId }: { friendId: string }) {
     // Stage the picked files in the composer (chips) rather than firing them off
     // immediately — they send with the next message (GitHub #23). Same staging a
     // drag-and-drop uses.
-    const paths = await api.pickFiles()
-    if (paths.length) stageChatFiles(paths)
+    try {
+      const paths = await api.pickFiles()
+      if (paths.length) stageChatFiles(paths)
+    } catch (e) {
+      useStore.getState().toast('error', String(e))
+    }
   }
 
   // Cmd/Ctrl-V a screenshot straight into the chat: save the clipboard image to an
@@ -547,10 +561,22 @@ function Conversation({ friendId }: { friendId: string }) {
   const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(e.clipboardData?.items ?? [])
     const img = items.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
-    if (!img) return
+    const blob = img?.getAsFile() ?? Array.from(e.clipboardData.files).find((f) => f.type.startsWith('image/'))
+    if (!blob) {
+      // Let normal text/file pastes proceed. WebKitGTK can expose an image-only
+      // clipboard as an entirely empty DataTransfer: ask the native clipboard.
+      if (items.some((i) => i.kind === 'file') || e.clipboardData.files.length ||
+          e.clipboardData.getData('text/plain') || e.clipboardData.getData('text/html')) return
+      e.preventDefault()
+      try {
+        if (!HAS_TAURI) throw new Error('No usable image is on the clipboard.')
+        stageChatFiles([await api.pasteClipboardImage()])
+      } catch (err) {
+        toast('error', String(err))
+      }
+      return
+    }
     e.preventDefault()
-    const blob = img.getAsFile()
-    if (!blob) return
     // Reject oversized pastes BEFORE any encoding work — otherwise a 40 MB clipboard
     // image would freeze the UI for seconds only to be refused on the Rust side.
     if (blob.size > 25 * 1024 * 1024) {
@@ -566,7 +592,7 @@ function Conversation({ friendId }: { friendId: string }) {
         r.onerror = () => reject(r.error ?? new Error('Couldn’t read the pasted image.'))
         r.readAsDataURL(blob)
       })
-      const ext = (img.type.split('/')[1] || 'png').toLowerCase()
+      const ext = (blob.type.split('/')[1] || 'png').toLowerCase()
       const path = await api.savePastedImage(b64, ext)
       stageChatFiles([path])
     } catch (err) {
@@ -614,6 +640,7 @@ function Conversation({ friendId }: { friendId: string }) {
               color: typing ? 'var(--accent)' : online ? 'var(--green)' : 'var(--text-faint)',
             }}
           >
+            {/* Typing is a fresh peer signal, independent of the last-seen label. */}
             <span>{typing ? 'typing…' : presenceText}</span>
             {online && conn && !typing && (
               <>

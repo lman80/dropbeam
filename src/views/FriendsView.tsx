@@ -111,7 +111,8 @@ function Avatar({
   size?: number
   radius?: number
 }) {
-  const showPic = !!picture && HAS_TAURI
+  const [brokenPicture, setBrokenPicture] = useState<string | null>(null)
+  const showPic = !!picture && HAS_TAURI && brokenPicture !== picture
   return (
     <div
       style={{
@@ -132,7 +133,7 @@ function Avatar({
           src={convertFileSrc(picture!)}
           alt={name}
           style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-          onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
+          onError={() => setBrokenPicture(picture!)}
         />
       ) : (
         initials(name)
@@ -324,7 +325,7 @@ function FriendCard({ friend }: { friend: Friend }) {
   const probe = async () => {
     setProbing(true)
     try {
-      setConn(await api.probeConnection(friend.id))
+      setConn(await useStore.getState().probeFriend(friend.id))
     } catch {
       setConn(null)
     } finally {
@@ -344,7 +345,7 @@ function FriendCard({ friend }: { friend: Friend }) {
     ;(async () => {
       setProbing(true)
       try {
-        const d = await api.probeConnection(friend.id)
+        const d = await useStore.getState().probeFriend(friend.id)
         if (alive) setConn(d)
       } catch {
         if (alive) setConn(null)

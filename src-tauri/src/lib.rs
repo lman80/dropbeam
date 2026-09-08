@@ -167,6 +167,7 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -546,6 +547,7 @@ pub fn run() {
             commands::clear_profile_avatar,
             commands::reveal_path,
             commands::save_pasted_image,
+            commands::paste_clipboard_image,
             commands::open_path,
             commands::export_diagnostics,
             commands::diagnostics_test,

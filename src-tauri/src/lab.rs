@@ -202,7 +202,7 @@ async fn dispatch(
             let ep = state.get().cloned().ok_or_else(|| anyhow::anyhow!("iroh not ready"))?;
             let my_name = my_display_name(state);
             let payload = crate::iroh_net::chat_payload(&msg, &friend.id, &my_name);
-            let delivered = crate::iroh_net::send_chat(&ep, node, payload).await.is_ok();
+            let delivered = crate::iroh_net::send_chat(state, &ep, node, payload).await.is_ok();
             if delivered {
                 crate::chat::set_status(&cfg, &friend.id, &msg.id, "delivered");
             }

@@ -66,6 +66,8 @@ pub struct IrohState {
     /// once — the flag alone only takes effect between chunks, which is why a
     /// sender couldn't cancel a stalled transfer.
     conns: Mutex<HashMap<String, Connection>>,
+    /// Reusable outgoing chat connections; presence never dials.
+    friend_conns: Mutex<HashMap<String, Connection>>,
     /// Fingerprints of resumable partial files currently being written, so two
     /// concurrent receives of the same file never share one partial (the loser
     /// falls back to a throwaway, non-resumable temp).
@@ -248,7 +250,7 @@ async fn receive_with_landed<T>(
         let result = body.await;
         let terminal = match &result {
             Ok(_) => serde_json::json!({"landed": total, "ok": true}),
-            Err(e) => serde_json::json!({"error": format!("{e:#}")}),
+            Err(e) => serde_json::json!({"error": crate::telemetry::redact_paths_only(&format!("{e:#}"))}),
         };
         let _ = terminal_tx.send(terminal);
         result
@@ -1127,32 +1129,71 @@ pub async fn accept_loop(ep: Endpoint, state: Arc<IrohState>) {
 }
 
 /// Per-connection handler: each incoming stream is dispatched by its first frame.
-async fn handle_conn(conn: Connection, state: Arc<IrohState>) {
-    let who = conn.remote_id();
-    // Give hole-punching a moment to settle, then remember the caller's direct
-    // addresses — so the RECEIVING side also learns how to reach this peer
-    // directly next time, even if local discovery is blocked.
-    {
-        let c = conn.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            remember_conn_addrs(&c);
-        });
-    }
-    loop {
-        match conn.accept_bi().await {
-            Ok((mut send, mut recv)) => {
-                let st = state.clone();
-                let c = conn.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = serve_stream(&c, &mut send, &mut recv, &st).await {
-                        log::debug!("iroh stream error: {e:#}");
+// Box this dispatcher because a served lab command can itself send a chat and
+// start another dispatcher; an opaque async return type creates a Send cycle.
+fn handle_conn(
+    conn: Connection,
+    state: Arc<IrohState>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let who = conn.remote_id();
+        let mut presence_tick = tokio::time::interval(Duration::from_secs(45));
+        presence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // iroh's 5s QUIC keep-alives advance received datagrams even when chat is
+        // idle. An open handle alone isn't proof of life: only refresh on new RX.
+        let mut received = 0;
+        // Give hole-punching a moment to settle, then remember the caller's direct
+        // addresses — so the RECEIVING side also learns how to reach this peer
+        // directly next time, even if local discovery is blocked.
+        {
+            let c = conn.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                remember_conn_addrs(&c);
+            });
+        }
+        loop {
+            let stream = tokio::select! {
+                stream = conn.accept_bi() => stream,
+                _ = presence_tick.tick() => {
+                    let next = conn.stats().udp_rx.datagrams;
+                    if conn.close_reason().is_none() && next > received {
+                        emit_friend_presence(&state, &who.to_string());
                     }
-                });
+                    received = next;
+                    continue;
+                }
+            };
+            match stream {
+                Ok((mut send, mut recv)) => {
+                    let st = state.clone();
+                    let c = conn.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = serve_stream(&c, &mut send, &mut recv, &st).await {
+                            log::debug!("iroh stream error: {e:#}");
+                        }
+                    });
+                }
+                Err(_) => {
+                    let mut connections = state.friend_conns.lock().unwrap();
+                    if connections.get(&who.to_string()).is_some_and(|c| c.stable_id() == conn.stable_id()) {
+                        connections.remove(&who.to_string());
+                    }
+                    log::debug!("iroh: connection from {who} closed");
+                    break;
+                }
             }
-            Err(_) => {
-                log::debug!("iroh: connection from {who} closed");
-                break;
+        }
+    })
+}
+
+/// Map only the authenticated endpoint to a local friend; never trust a wire name.
+fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
+    if let Some(app) = state.app.get() {
+        if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+            if let Some(friend) = crate::friends::load(&st.config_dir).into_iter()
+                .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+                let _ = app.emit("friend://presence", serde_json::json!({ "peerId": friend.id }));
             }
         }
     }
@@ -3543,13 +3584,15 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
     let focused = app
         .get_webview_window("main")
         .and_then(|w| w.is_focused().ok())
-        .unwrap_or_else(|| st.main_focused.load(Ordering::Relaxed));
+        .unwrap_or(false)
+        && st.main_focused.load(Ordering::Relaxed);
     let active_here = st
         .active_chat
         .lock()
         .map(|a| a.as_deref() == Some(msg.peer_id.as_str()))
         .unwrap_or(false);
     if focused && active_here {
+        log::debug!("chat notification suppressed: focused thread {}", msg.peer_id);
         return;
     }
     let who = {
@@ -3571,28 +3614,47 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
         }
     };
     use tauri_plugin_notification::NotificationExt;
-    // `.sound("default")` is the fix for "I keep missing messages": without it macOS
-    // shows a SILENT banner (easy to miss), unlike iMessage. With it you get the
-    // distinct OS notification ping every time you're not staring at the thread.
-    let _ = app
-        .notification()
-        .builder()
-        .title(who)
-        .body(body)
-        .sound("default")
-        .show();
+    // Keep the same content on every platform. Linux uses the desktop sound
+    // theme's message event; "default" is the macOS notification sound name.
+    let notification = app.notification().builder().title(who).body(body);
+    #[cfg(target_os = "linux")]
+    let notification = notification.sound("message-new-instant");
+    #[cfg(not(target_os = "linux"))]
+    let notification = notification.sound("default");
+    match notification.show() {
+        Ok(()) => log::info!("chat notification queued for {}", msg.peer_id),
+        Err(err) => log::warn!("chat notification failed for {}: {err}", msg.peer_id),
+    }
 }
 
 /// Deliver a chat message to a friend over iroh (dial-by-key). `payload` is the
 /// full `{kind:"chat", ...}` frame. `Ok(())` means they received it; `Err` means
 /// they were unreachable — the message is kept locally (no store-and-forward yet).
-pub async fn send_chat(ep: &Endpoint, endpoint_id: &str, payload: serde_json::Value) -> Result<serde_json::Value> {
+pub async fn send_chat(
+    state: &IrohState,
+    ep: &Endpoint,
+    endpoint_id: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
     let addr = dial_addr(parsed);
-    let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
-        .await
-        .map_err(|_| anyhow::anyhow!("chat dial timed out"))?
-        .context("dial friend for chat")?;
+    // Only reuse outgoing connections: older peers may not accept streams on
+    // connections they initiated. The monitor itself never opens streams or dials.
+    let cached = state.friend_conns.lock().unwrap().get(endpoint_id)
+        .filter(|c| c.close_reason().is_none()).cloned();
+    let conn = if let Some(conn) = cached {
+        conn
+    } else {
+        let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
+            .await.map_err(|_| anyhow::anyhow!("chat dial timed out"))?
+            .context("dial friend for chat")?;
+        if let Some(st) = state.app.get().and_then(|app| app.try_state::<Arc<IrohState>>()) {
+            let st = st.inner().clone();
+            st.friend_conns.lock().unwrap().insert(endpoint_id.to_owned(), conn.clone());
+            tauri::async_runtime::spawn(handle_conn(conn.clone(), st));
+        }
+        conn
+    };
     let (mut send, mut recv) = conn.open_bi().await.context("open chat stream")?;
     write_frame(&mut send, &payload).await?;
     send.finish()?;
@@ -3734,7 +3796,7 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                     };
                     for m in msgs {
                         let payload = chat_payload(&m, &peer_id, &my_name);
-                        match send_chat(&ep, &eid, payload).await {
+                        match send_chat(&state, &ep, &eid, payload).await {
                             Ok(_) => {
                                 backoff.remove(&peer_id);
                                 just_delivered.insert(m.id.clone());
@@ -3822,7 +3884,7 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 // than the pre-outbox best-effort behavior. applied=false (the peer
                 // doesn't have the target yet) leaves the op queued to retry — the
                 // receiver's apply_* are idempotent, so at-least-once is safe.
-                if let Ok(ack) = send_chat(&ep, &eid, payload).await {
+                if let Ok(ack) = send_chat(&state, &ep, &eid, payload).await {
                     let applied = ack.get("applied").and_then(|v| v.as_bool()).unwrap_or(true);
                     if applied {
                         crate::chat::ack_op(&config_dir, &op.id);

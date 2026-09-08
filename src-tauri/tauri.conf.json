@@ -30,6 +30,7 @@
       },
       {
         "label": "popover",
+        "title": "DropBeam",
         "url": "index.html",
         "width": 300,
         "height": 390,
@@ -45,6 +46,7 @@
       },
       {
         "label": "hud",
+        "title": "DropBeam",
         "url": "index.html",
         "width": 384,
         "height": 132,
@@ -79,7 +81,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["**", "/**", "$HOME/**"]
+        "scope": ["**", "/**", "$HOME/**", "$APPCONFIG/**"]
       }
     }
   },

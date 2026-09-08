@@ -27,9 +27,9 @@ export function setSpeedUnit(megabits: boolean): void {
 }
 
 // `bytesPerSec` is BYTES per second (despite the legacy name).
-export function formatSpeed(bytesPerSec: number): string {
+export function formatSpeed(bytesPerSec: number, megabits = SPEED_IN_MEGABITS): string {
   if (!bytesPerSec || bytesPerSec <= 0) return '—'
-  if (SPEED_IN_MEGABITS) {
+  if (megabits) {
     const mbps = (bytesPerSec * 8) / 1_000_000
     return `${mbps.toFixed(mbps < 10 ? 1 : 0)} Mbps`
   }

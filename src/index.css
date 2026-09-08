@@ -901,10 +901,9 @@ html.overlay-window #root {
   border-bottom-right-radius: 7px;
 }
 .chat-time-gutter {
-  position: absolute;
-  left: 100%;
-  margin-left: 14px;
-  bottom: 6px;
+  flex-shrink: 0;
+  align-self: flex-end;
+  padding-bottom: 6px;
   white-space: nowrap;
   font-size: 10.5px;
   color: var(--text-faint);
