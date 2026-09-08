@@ -27,6 +27,7 @@ import {
   type TransferUpdate,
 } from './lib/api'
 import { setSpeedUnit } from './lib/format'
+import { LandedEta } from './lib/eta'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
@@ -34,7 +35,7 @@ import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/upda
 let updateWatchersWired = false
 let presenceWatchersWired = false
 const presenceProbes = new Map<string, Promise<ConnDetail | null>>()
-const etaSpeeds = new Map<string, { speed: number; samples: number }>()
+const etaSpeeds = new Map<string, LandedEta>()
 
 const DEFAULT_SETTINGS: Settings = {
   downloadDir: '',
@@ -456,6 +457,10 @@ export const useStore = create<AppStore>((set, get) => ({
       setInterval(refresh, 30_000)
       window.addEventListener('online', refresh)
       if (HAS_TAURI) {
+        await listen<string>('folder://viewer-change', ({ payload }) => {
+          const name = payload.split(/[\\/]/).pop() || 'Shared folder'
+          get().toast('info', `${name} — View only: changes you make here are not sent`)
+        }).catch(() => {})
         let settingsEventReceived = false
         await listen<Settings>('settings://changed', ({ payload }) => {
           settingsEventReceived = true
@@ -843,19 +848,15 @@ export const useStore = create<AppStore>((set, get) => ({
 
   upsertTransfer: (u) => {
     const prev = get().transfers[u.id]
-    // Receiver-confirmed sender progress has speed but no backend ETA.
-    // Smooth speed, then divide remaining bytes so completion still tends to zero.
-    if (u.state === 'transferring' && u.bytesTotal > 0 && Number.isFinite(u.speedBps) && u.speedBps > 0) {
-      const previous = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
+    // Use recent progress bytes, not the backend's whole-transfer average.
+    if (u.state === 'transferring' && u.bytesTotal > 0) {
+      let estimator = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
         ? etaSpeeds.get(u.id) : undefined
-      // Seed from the first real sample, with no zero-speed prior.
-      const speed = previous == null ? u.speedBps : 0.25 * u.speedBps + 0.75 * previous.speed
-      const samples = (previous?.samples ?? 0) + 1
-      etaSpeeds.set(u.id, { speed, samples })
-      u = { ...u, etaSeconds: samples >= 2 ? Math.max(0, u.bytesTotal - u.bytesDone) / speed : null }
+      estimator ??= new LandedEta()
+      etaSpeeds.set(u.id, estimator)
+      u = { ...u, etaSeconds: estimator.update(performance.now(), u.bytesDone, u.bytesTotal) }
     } else {
       etaSpeeds.delete(u.id)
-      if (u.state === 'transferring') u = { ...u, etaSeconds: null }
     }
     // A friend transfer that actually connected means they were online just now.
     if (

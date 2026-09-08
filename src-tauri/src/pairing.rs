@@ -231,7 +231,11 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
     // Folder partners are always friends — that's how you see who's in a folder
     // and beam to them by name. We know the inviter's name from the invite; they
     // learn ours over the control channel's hello.
-    friends::upsert_from_pairing(config_dir, &pair.peer_name, &pair.secret, PairRole::B);
+    if let Some(eid) = pair.endpoint_id.as_deref().filter(|e| !e.is_empty()) {
+        friends::upsert_by_endpoint(config_dir, eid, &pair.peer_name);
+    } else {
+        friends::upsert_from_pairing(config_dir, &pair.peer_name, &pair.secret, PairRole::B);
+    }
     Ok(pair)
 }
 
@@ -463,7 +467,7 @@ pub fn ensure_member(
     pairs.push(new.clone());
     let _ = save(config_dir, &pairs);
     // Folder partners are friends, so they show up by name + you can chat them.
-    friends::upsert_from_pairing(config_dir, &new.peer_name, &new.secret, PairRole::B);
+    friends::upsert_by_endpoint(config_dir, endpoint_id, &new.peer_name);
     Some(new)
 }
 
@@ -575,6 +579,38 @@ pub fn group_invite(
     pairs.push(new);
     save(config_dir, &pairs)?;
     Ok(encoded)
+}
+
+/// Bind the exact invite slot to an existing friend before delivery. The source
+/// may be a different link in the group; never key that source by mistake.
+pub fn bind_friend_invite(
+    config_dir: &Path,
+    source_id: &str,
+    code: &str,
+    eid: &str,
+    name: &str,
+) -> Result<(), String> {
+    let body = code.trim().strip_prefix(INVITE_PREFIX).ok_or("Invalid folder invite.")?;
+    let bytes = URL_SAFE_NO_PAD.decode(body).map_err(|_| "Invalid folder invite.")?;
+    let invite: Invite = serde_json::from_slice(&bytes).map_err(|_| "Invalid folder invite.")?;
+    if eid.trim().is_empty() { return Err("Friend has no endpoint id.".into()); }
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let source = pairs.iter().find(|p| p.id == source_id).ok_or("Folder not found.")?;
+    let index = pairs.iter().position(|p| p.id == invite.id && p.secret == invite.secret
+        && p.folder == source.folder && p.group_id == source.group_id)
+        .ok_or("Invite does not belong to this folder.")?;
+    if pairs[index].endpoint_id.as_deref().is_some_and(|e| !e.is_empty() && e != eid) {
+        return Err("Invite is already assigned to another friend.".into());
+    }
+    if pairs.iter().enumerate().any(|(i, p)| i != index
+        && p.group_id == pairs[index].group_id && p.folder == pairs[index].folder
+        && p.endpoint_id.as_deref() == Some(eid)) {
+        return Err("That friend already has a link to this folder.".into());
+    }
+    pairs[index].endpoint_id = Some(eid.to_string());
+    pairs[index].peer_name = name.to_string();
+    save(config_dir, &pairs)
 }
 
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
@@ -949,6 +985,75 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_friend_invite_keys_exact_slot_and_preserves_alias() {
+        let dir = role_test_dir("friend-invite");
+        let folder = dir.join("shared");
+        fs::create_dir_all(&folder).unwrap();
+        let friend = friends::upsert_by_endpoint(&dir, "peer-eid", "Linux Box");
+        friends::rename(&dir, &friend.id, "Local alias".into()).unwrap();
+        let (pair, code) = create(&dir, folder.to_string_lossy().into(), "Me".into(),
+            true, String::new(), false, Some("me-eid".into())).unwrap();
+        bind_friend_invite(&dir, &pair.id, &code, "peer-eid", "Local alias").unwrap();
+        assert_eq!(load(&dir)[0].endpoint_id.as_deref(), Some("peer-eid"));
+        assert!(!key_unkeyed_group_link(&dir, &pair.id, "other-eid"));
+        assert!(ensure_member(&dir, pair.group_id.as_deref().unwrap(), &pair,
+            "peer-eid", "Ubuntu QA Rig", "me-eid").is_none());
+        let second = group_invite(&dir, &pair.id, "Me".into(), Some("me-eid".into())).unwrap();
+        bind_friend_invite(&dir, &pair.id, &second, "second-eid", "Second").unwrap();
+        assert_eq!(load(&dir)[0].endpoint_id.as_deref(), Some("peer-eid"));
+        assert_eq!(load(&dir)[1].endpoint_id.as_deref(), Some("second-eid"));
+        let contacts = friends::load(&dir);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].id, friend.id);
+        assert_eq!(contacts[0].name, "Local alias");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_repairs_legacy_folder_friend_with_empty_endpoint_and_alias() {
+        let dir = role_test_dir("phantom-friend");
+        let folder = dir.join("shared");
+        fs::create_dir_all(&folder).unwrap();
+        let friend = friends::upsert_by_endpoint(&dir, "peer-eid", "Linux Box");
+        friends::rename(&dir, &friend.id, "Local alias".into()).unwrap();
+        let (pair, code) = create(&dir, folder.to_string_lossy().into(), "Me".into(),
+            true, String::new(), false, Some("me-eid".into())).unwrap();
+        bind_friend_invite(&dir, &pair.id, &code, "peer-eid", "Local alias").unwrap();
+        friends::upsert_from_pairing(&dir, "Ubuntu QA Rig", &pair.secret, PairRole::A);
+        let raw = crate::settings::read_json_array_resilient(&friends::friends_path(&dir));
+        let phantom = raw.iter().find(|f| f["name"] == "Ubuntu QA Rig").unwrap();
+        friends::set_endpoint_id(&dir, phantom["id"].as_str().unwrap(), String::new());
+        let contacts = friends::load(&dir);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].id, friend.id);
+        assert_eq!(contacts[0].name, "Local alias");
+        assert_eq!(crate::settings::read_json_array_resilient(&friends::friends_path(&dir)).len(), 1);
+        assert_eq!(friends::reconcile(&dir), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accepting_folder_and_meshing_reuse_keyed_friend() {
+        let dir = role_test_dir("accept-existing");
+        let sender = dir.join("sender");
+        let folder = dir.join("source");
+        let destination = dir.join("destination");
+        fs::create_dir_all(&folder).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let friend = friends::upsert_by_endpoint(&dir, "inviter-eid", "Old name");
+        friends::rename(&dir, &friend.id, "My alias".into()).unwrap();
+        let (_, code) = create(&sender, folder.to_string_lossy().into(), "New name".into(),
+            true, String::new(), false, Some("inviter-eid".into())).unwrap();
+        let pair = accept(&dir, &code, destination.to_string_lossy().into()).unwrap();
+        ensure_member(&dir, "another-group", &pair, "inviter-eid", "New name", "me-eid").unwrap();
+        let contacts = friends::load(&dir);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].id, friend.id);
+        assert_eq!(contacts[0].name, "My alias");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn pair(role: PairRole) -> Pair {
         Pair {

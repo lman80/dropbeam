@@ -904,6 +904,7 @@ pub fn invite_friend_to_folder(
         .ok_or("Friend not found.")?;
     let eid = friend
         .endpoint_id
+        .filter(|e| !e.trim().is_empty())
         .ok_or("That friend hasn't connected yet — share the invite code instead.")?;
     let name = state.settings.lock().unwrap().display_name.clone();
     let my_id = iroh.get().map(|ep| ep.id().to_string());
@@ -911,6 +912,7 @@ pub fn invite_friend_to_folder(
         Some(c) if !c.trim().is_empty() => c,
         _ => pairing::group_invite(&state.config_dir, &pair_id, name.clone(), my_id)?,
     };
+    pairing::bind_friend_invite(&state.config_dir, &pair_id, &invite, &eid, &friend.name)?;
     let folder_name = pairing::load(&state.config_dir)
         .iter()
         .find(|p| p.id == pair_id)

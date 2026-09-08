@@ -28,12 +28,23 @@ pub fn friends_path(config_dir: &Path) -> PathBuf {
 }
 
 pub fn load(config_dir: &Path) -> Vec<Friend> {
+    reconcile(config_dir);
+    read_raw(config_dir)
+}
+
+fn read_raw(config_dir: &Path) -> Vec<Friend> {
     // Resilient read (retry transient failures + recover from .bak), then parse
     // element-wise so one corrupt/forward-incompatible friend record drops only
     // itself instead of wiping every friend.
     crate::settings::read_json_array_resilient(&friends_path(config_dir))
         .into_iter()
-        .filter_map(|v| serde_json::from_value(v).ok())
+        .filter_map(|v| serde_json::from_value::<Friend>(v).ok())
+        .map(|mut f| {
+            if f.endpoint_id.as_deref().is_some_and(|e| e.trim().is_empty()) {
+                f.endpoint_id = None;
+            }
+            f
+        })
         .collect()
 }
 
@@ -114,7 +125,7 @@ pub fn create(
     let json = serde_json::to_string(&invite).map_err(|e| e.to_string())?;
     let encoded = format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
 
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     friends.push(friend.clone());
     save(config_dir, &friends)?;
     Ok((friend, encoded))
@@ -133,7 +144,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         serde_json::from_slice(&bytes).map_err(|_| "The friend invite is malformed.".to_string())?;
 
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     if friends.iter().any(|f| f.id == invite.id) {
         return Err("You're already friends with this person.".into());
     }
@@ -180,7 +191,7 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         return;
     }
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     if friends.iter().any(|f| f.name.eq_ignore_ascii_case(name)) {
         return; // already a friend by that name
     }
@@ -212,7 +223,8 @@ fn is_placeholder(name: &str) -> bool {
 ///   * two records with the **same endpoint id** are the same device → merge;
 ///   * a record with **no** endpoint id whose **name** matches another record
 ///     (case-insensitive, non-placeholder) is the same friend reached by a
-///     different path (e.g. a folder pairing vs. their permanent code) → merge.
+///     different path (e.g. a folder pairing vs. their permanent code) → merge
+///     only with one unkeyed candidate and one distinct keyed endpoint.
 /// The endpoint-keyed record always wins (it's the reachable one); otherwise the
 /// older record wins. Merging is non-destructive: we keep the user-chosen name,
 /// OR the auto-accept flags, carry the endpoint id forward, and migrate chat.
@@ -235,7 +247,17 @@ pub fn plan_reconcile(
             };
             let either_unkeyed = s.endpoint_id.is_none() || f.endpoint_id.is_none();
             let both_have_chat = chat_ids.contains(&s.id) && chat_ids.contains(&f.id);
+            // Name-only cleanup must not undo the ambiguity guard used when
+            // adopting an invite friend. Multiple unkeyed candidates or distinct
+            // keyed devices with the same label are not proof of identity.
+            let named: Vec<_> = input.iter()
+                .filter(|other| other.name.trim().eq_ignore_ascii_case(f.name.trim()))
+                .collect();
+            let unkeyed = named.iter().filter(|other| other.endpoint_id.is_none()).count();
+            let endpoints: std::collections::HashSet<_> = named.iter()
+                .filter_map(|other| other.endpoint_id.as_deref()).collect();
             let name_match = either_unkeyed
+                && unkeyed == 1 && endpoints.len() == 1
                 && !is_placeholder(&s.name)
                 && s.name.trim().eq_ignore_ascii_case(f.name.trim())
                 && !both_have_chat;
@@ -290,7 +312,29 @@ pub fn plan_reconcile(
 /// friend with their full conversation intact. Returns how many records collapsed.
 pub fn reconcile(config_dir: &Path) -> usize {
     let _guard = LOCK.lock().unwrap();
-    let friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
+    // Most loads already contain only unique, keyed friends. Avoid reading
+    // folder and chat history on that frequent presence/picker path.
+    let mut endpoints = std::collections::HashSet::new();
+    if friends.iter().all(|f| f.endpoint_id.as_deref().is_some_and(|e| endpoints.insert(e))) {
+        return 0;
+    }
+    // Old folder invites derived the phantom's secret from the pair secret.
+    // This proves its identity even when the real friend has a local alias.
+    let pairs = crate::pairing::load(config_dir);
+    let keyed = friends.clone();
+    for friend in &mut friends {
+        if friend.endpoint_id.is_none() {
+            if let Some(pair) = pairs.iter().find(|p| {
+                p.endpoint_id.as_deref().is_some_and(|e| !e.is_empty())
+                    && friend.secret == derive_friend_secret(&p.secret)
+            }) {
+                if let Some(existing) = keyed.iter().find(|f| f.endpoint_id == pair.endpoint_id) {
+                    friend.name = existing.name.clone();
+                }
+            }
+        }
+    }
     // Which friends currently hold a conversation — the safety guard for name-based
     // merges (never fuse two records that both already have chat history).
     let chat_ids: std::collections::HashSet<String> = crate::chat::overview(config_dir)
@@ -316,7 +360,7 @@ pub fn reconcile(config_dir: &Path) -> usize {
 /// the friend broadcast) — so every surface that shows a peer can prefer it over a
 /// raw device name like "MacBook Air".
 pub fn label_for_endpoint(config_dir: &Path, endpoint_id: &str) -> Option<String> {
-    load(config_dir)
+    read_raw(config_dir)
         .into_iter()
         .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
         .map(|f| f.name)
@@ -327,7 +371,7 @@ pub fn label_for_endpoint(config_dir: &Path, endpoint_id: &str) -> Option<String
 /// Returns true if a friend was updated.
 pub fn set_endpoint_id(config_dir: &Path, id: &str, endpoint_id: String) -> bool {
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     let mut changed = false;
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
         if f.endpoint_id.as_deref() != Some(endpoint_id.as_str()) {
@@ -395,7 +439,7 @@ fn decode_user_code(code: &str) -> Result<UserCode, String> {
 /// loses their chat history) across app updates or re-pairs. Returns the friend.
 pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> Friend {
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     let name = name.trim();
     if let Some(f) = friends
         .iter_mut()
@@ -464,7 +508,7 @@ pub fn self_heal_chat_sender(
         return None;
     }
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     let name = name.trim();
 
     // 1) Already reachable under this endpoint id (anywhere in the list) → reuse.
@@ -574,7 +618,7 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
     if !friend_id.is_empty() {
         let matched = {
             let _guard = LOCK.lock().unwrap();
-            let mut friends = load(config_dir);
+            let mut friends = read_raw(config_dir);
             if let Some(f) = friends.iter_mut().find(|f| f.id == friend_id) {
                 let mut changed = false;
                 if f.endpoint_id.as_deref() != Some(endpoint_id) {
@@ -606,7 +650,7 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
 /// wire and already saved to disk by the caller). Returns true if a record changed.
 pub fn set_avatar_by_endpoint(config_dir: &Path, endpoint_id: &str, path: String) -> bool {
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     let mut changed = false;
     for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
         if f.avatar.as_deref() != Some(path.as_str()) {
@@ -622,7 +666,7 @@ pub fn set_avatar_by_endpoint(config_dir: &Path, endpoint_id: &str, path: String
 
 pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
         if !name.trim().is_empty() {
             f.name = name.trim().to_string();
@@ -635,7 +679,7 @@ pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
 
 pub fn set_auto_accept(config_dir: &Path, id: &str, auto_accept: bool) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
         f.auto_accept = auto_accept;
     }
@@ -644,7 +688,7 @@ pub fn set_auto_accept(config_dir: &Path, id: &str, auto_accept: bool) -> Result
 
 pub fn set_progress_version(config_dir: &Path, endpoint: &str, version: u64) {
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(endpoint)) {
         if f.progress_v != Some(version) {
             f.progress_v = Some(version);
@@ -668,13 +712,13 @@ fn detached_threads(config_dir: &Path) -> Result<std::collections::HashMap<Strin
 /// Incoming chat frames may only resolve a currently trusted endpoint. A name
 /// or a sender-provided friend id is not proof of friendship.
 pub fn chat_sender(config_dir: &Path, endpoint_id: &str) -> Option<Friend> {
-    load(config_dir).into_iter()
+    read_raw(config_dir).into_iter()
         .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
 }
 
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
-    let mut friends = load(config_dir);
+    let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter().find(|f| f.id == id) {
         if let Some(endpoint) = &f.endpoint_id {
             let mut detached = detached_threads(config_dir)?;
@@ -691,7 +735,7 @@ pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
 }
 
 pub fn get(config_dir: &Path, id: &str) -> Option<Friend> {
-    load(config_dir).into_iter().find(|f| f.id == id)
+    read_raw(config_dir).into_iter().find(|f| f.id == id)
 }
 
 /// Channel I LISTEN on for files this friend sends me.
@@ -796,6 +840,24 @@ mod tests {
 
     fn none() -> std::collections::HashSet<String> {
         std::collections::HashSet::new()
+    }
+
+    #[test]
+    fn load_merges_empty_endpoint_duplicate_into_keyed_alias_and_keeps_chat() {
+        let dir = tmp("empty-endpoint-alias");
+        fs::create_dir_all(&dir).unwrap();
+        let mut real = f("real", "Local alias", Some("EID"), 20);
+        real.name_custom = true;
+        let phantom = f("phantom", "local ALIAS", Some(""), 10);
+        save(&dir, &[phantom, real]).unwrap();
+        seed_msg(&dir, "phantom");
+        let contacts = load(&dir);
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].id, "real");
+        assert_eq!(contacts[0].name, "Local alias");
+        assert_eq!(crate::chat::overview(&dir)[0].peer_id, "real");
+        assert_eq!(read_raw(&dir).len(), 1);
+        fs::remove_dir_all(dir).unwrap();
     }
     fn ids(list: &[&str]) -> std::collections::HashSet<String> {
         list.iter().map(|s| s.to_string()).collect()

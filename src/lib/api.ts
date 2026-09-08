@@ -298,7 +298,9 @@ export interface FolderStatus {
  *  compared — two machines round it differently; that's the same rule the sync uses
  *  to decide a file is in sync). Any genuine difference is counted and being fixed. */
 export interface VerifyResult {
-  /** false when we couldn't reach the peer (offline / no fresh snapshot in time). */
+  /** Reachability from the live folder status, independent of comparison freshness. */
+  peerOnline: boolean
+  /** Whether a fresh peer snapshot was available for comparison. */
   compared: boolean
   /** true only when the two folders are byte-size identical across every path. */
   identical: boolean

@@ -253,6 +253,7 @@ export const mockApi = {
     // Simulate the manifest round-trip taking a moment, then report a match.
     await new Promise((r) => setTimeout(r, 1400))
     return {
+      peerOnline: true,
       compared: true,
       identical: true,
       matched: 1234,

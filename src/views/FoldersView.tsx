@@ -427,6 +427,12 @@ function FolderCard({
         </div>
       )}
 
+      {pair.iAmViewer && (
+        <Banner color="var(--amber)" bg="var(--amber-soft)" icon={<Eye size={15} />}>
+          View only: changes you make here are not sent
+        </Banner>
+      )}
+
       {/* Members — everyone in this folder (you + each person you're linked to) */}
       <div style={{ display: 'flex', gap: 8, marginTop: 11, flexWrap: 'wrap', alignItems: 'center' }}>
         <Member name={myName} you online viewerSelf={pair.iAmViewer} />
@@ -993,7 +999,9 @@ function VerifyBanner({
   if (!result.compared) {
     return (
       <Banner color="var(--amber)" bg="var(--amber-soft)" icon={<WifiOff size={15} />}>
-        Couldn't reach the other device — try again when they're online.
+        {result.peerOnline
+          ? 'The other device is online. Its latest folder snapshot is not available yet — try Verify again shortly.'
+          : 'The other device is offline — try again when they’re online.'}
       </Banner>
     )
   }
@@ -1112,7 +1120,7 @@ function InviteModal({
         initial={{ opacity: 0, scale: 0.96 }}
         animate={{ opacity: 1, scale: 1 }}
         onClick={(e) => e.stopPropagation()}
-        className="card"
+        className="card dialog" role="dialog" aria-modal="true"
         style={{ width: 420, maxWidth: '100%', padding: 22, borderRadius: 20 }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
@@ -1121,36 +1129,40 @@ function InviteModal({
             <X size={17} />
           </button>
         </div>
-        <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.5 }}>
-          Send this to the other person. They open DropBeam → <b>Accept invite</b>, paste it, and
-          choose a folder.
-        </p>
-        <div style={{ display: 'grid', placeItems: 'center', margin: '6px 0 14px' }}>
-          <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
-            <QRCodeSVG value={code} size={150} level="M" fgColor="#15161d" bgColor="#fff" />
+        <div className="dialog-body">
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.5 }}>
+            Send this to the other person. They open DropBeam → <b>Accept invite</b>, paste it, and
+            choose a folder.
+          </p>
+          <div style={{ display: 'grid', placeItems: 'center', margin: '6px 0 14px' }}>
+            <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
+              <QRCodeSVG value={code} size={150} level="M" fgColor="#15161d" bgColor="#fff" />
+            </div>
+          </div>
+          <div
+            className="selectable"
+            style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 11,
+              background: 'var(--surface-2)',
+              border: '1px solid var(--border)',
+              borderRadius: 11,
+              padding: '10px 12px',
+              wordBreak: 'break-all',
+              maxHeight: 80,
+              overflowY: 'auto',
+              color: 'var(--text-muted)',
+            }}
+          >
+            {code}
           </div>
         </div>
-        <div
-          className="selectable"
-          style={{
-            fontFamily: 'var(--font-mono)',
-            fontSize: 11,
-            background: 'var(--surface-2)',
-            border: '1px solid var(--border)',
-            borderRadius: 11,
-            padding: '10px 12px',
-            wordBreak: 'break-all',
-            maxHeight: 80,
-            overflowY: 'auto',
-            color: 'var(--text-muted)',
-          }}
-        >
-          {code}
+        <div className="dialog-actions">
+          <button className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} style={{ width: '100%', marginTop: 12 }} onClick={copy}>
+            {copied ? <Check size={15} /> : <Copy size={15} />}
+            {copied ? 'Copied' : 'Copy invite'}
+          </button>
         </div>
-        <button className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} style={{ width: '100%', marginTop: 12 }} onClick={copy}>
-          {copied ? <Check size={15} /> : <Copy size={15} />}
-          {copied ? 'Copied' : 'Copy invite'}
-        </button>
       </motion.div>
     </div>
   )

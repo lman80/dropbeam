@@ -1861,15 +1861,16 @@ async fn serve_stream(
             // A folder accepter is handing us their iroh id for our shared pair,
             // so we (the creator) can also push this folder directly over iroh.
             let pair_id = req.get("pair_id").and_then(|v| v.as_str()).unwrap_or("");
-            let their_id = req.get("endpoint_id").and_then(|v| v.as_str()).unwrap_or("");
+            let their_id = conn.remote_id().to_string();
             if !pair_id.is_empty() && !their_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
-                        if crate::pairing::set_endpoint_id(
+                        if crate::pairing::key_unkeyed_group_link(
                             &st.config_dir,
                             pair_id,
-                            their_id.to_string(),
+                            &their_id,
                         ) {
+                            crate::pairing::dedup_group_links(&st.config_dir);
                             // Refresh the running folder workers so the sender
                             // picks up the new key and the UI updates.
                             if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
@@ -2278,6 +2279,9 @@ async fn serve_stream(
                             &pair_id, "", &[], &[], "", &[], None, 0, false, 0,
                             Some(&reconcile), false, None,
                         );
+                        if payload.get("requestReply").and_then(|v| v.as_bool()) == Some(true) {
+                            sm.request_folder_snapshot(&pair_id, &conn.remote_id().to_string());
+                        }
                     }
                 }
             }
