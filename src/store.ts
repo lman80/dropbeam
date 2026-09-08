@@ -34,7 +34,7 @@ import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/upda
 let updateWatchersWired = false
 let presenceWatchersWired = false
 const presenceProbes = new Map<string, Promise<ConnDetail | null>>()
-const etaSpeeds = new Map<string, number>()
+const etaSpeeds = new Map<string, { speed: number; samples: number }>()
 
 const DEFAULT_SETTINGS: Settings = {
   downloadDir: '',
@@ -848,9 +848,11 @@ export const useStore = create<AppStore>((set, get) => ({
     if (u.state === 'transferring' && u.bytesTotal > 0 && Number.isFinite(u.speedBps) && u.speedBps > 0) {
       const previous = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
         ? etaSpeeds.get(u.id) : undefined
-      const speed = previous == null ? u.speedBps : 0.25 * u.speedBps + 0.75 * previous
-      etaSpeeds.set(u.id, speed)
-      u = { ...u, etaSeconds: Math.max(0, u.bytesTotal - u.bytesDone) / speed }
+      // Seed from the first real sample, with no zero-speed prior.
+      const speed = previous == null ? u.speedBps : 0.25 * u.speedBps + 0.75 * previous.speed
+      const samples = (previous?.samples ?? 0) + 1
+      etaSpeeds.set(u.id, { speed, samples })
+      u = { ...u, etaSeconds: samples >= 2 ? Math.max(0, u.bytesTotal - u.bytesDone) / speed : null }
     } else {
       etaSpeeds.delete(u.id)
       if (u.state === 'transferring') u = { ...u, etaSeconds: null }

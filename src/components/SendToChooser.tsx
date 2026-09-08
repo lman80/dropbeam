@@ -1,7 +1,8 @@
 import { AnimatePresence, motion } from 'framer-motion'
 import { ChevronRight, QrCode, Users, X } from 'lucide-react'
 import { useStore } from '../store'
-import { avatarGradient, initials } from '../lib/avatar'
+import { avatarGradient } from '../lib/avatar'
+import { FriendAvatar } from './FriendAvatar'
 import { friendOnlineState } from '../lib/presence'
 
 function baseName(p: string): string {
@@ -108,7 +109,7 @@ export function SendToChooser() {
                           background: avatarGradient(f.id),
                         }}
                       >
-                        {initials(f.name)}
+                        <FriendAvatar friend={f} />
                         <span
                           title={online ? 'Online' : 'Status unknown'}
                           style={{

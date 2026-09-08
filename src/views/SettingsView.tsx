@@ -420,8 +420,8 @@ export function SettingsView() {
         </Row>
         {SEP}
         <Row
-          title="Show speeds in megabits (Mbps)"
-          desc="Off shows megabytes per second (MB/s), what most file tools use. On shows megabits per second (Mbps), like internet plans."
+          title="Show speeds in megabits"
+          desc="Off (default on every device) shows bytes per second (kB/s, MB/s). On shows megabits per second (Mbps), like internet plans. This preference applies to this device."
         >
           <Toggle on={settings.showMegabits} onChange={(v) => save({ showMegabits: v })} />
         </Row>

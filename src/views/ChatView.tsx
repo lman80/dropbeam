@@ -30,7 +30,8 @@ import { useStore, byOrder, type FolderActivityEvent } from '../store'
 import { EmptyState } from '../components/bits'
 import { ConnInspector } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
-import { avatarGradient, initials } from '../lib/avatar'
+import { avatarGradient } from '../lib/avatar'
+import { FriendAvatar } from '../components/FriendAvatar'
 import { FileIcon as TypeIcon, fileKind as typeKind } from '../components/FileIcon'
 import { formatBytes } from '../lib/format'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
@@ -59,24 +60,6 @@ function fileKind(name: string | undefined): Kind {
   if (AUDIO.test(name)) return 'audio'
   if (TEXT.test(name)) return 'text'
   return 'file'
-}
-
-/** A friend's avatar inner content: their received picture, or initials. */
-function avatarContent(friend: Friend) {
-  if (friend.avatar && HAS_TAURI) {
-    return (
-      <>
-        {initials(friend.name)}
-        <img
-          className="avatar-img"
-          src={convertFileSrc(friend.avatar)}
-          alt=""
-          onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
-        />
-      </>
-    )
-  }
-  return initials(friend.name)
 }
 
 /** A short wall-clock label, e.g. "3:42 PM". */
@@ -220,7 +203,7 @@ export function ChatView() {
                 onClick={() => void openChat(friend.id)}
               >
                 <span className="chat-avatar" style={{ background: avatarGradient(friend.id) }}>
-                  {avatarContent(friend)}
+                  <FriendAvatar friend={friend} />
                   {online(friend) && <span className="chat-dot" />}
                 </span>
                 <span style={{ flex: 1, minWidth: 0 }}>
@@ -623,7 +606,7 @@ function Conversation({ friendId }: { friendId: string }) {
         }}
       >
         <span className="chat-avatar" style={{ background: avatarGradient(friend.id) }}>
-          {avatarContent(friend)}
+          <FriendAvatar friend={friend} />
           {online && <span className="chat-dot" />}
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -1170,7 +1153,7 @@ const MessageRow = memo(function MessageRow({
           className="chat-line-avatar"
           style={{ visibility: lastOfRun ? 'visible' : 'hidden', background: avatarGradient(friend.id) }}
         >
-          {avatarContent(friend)}
+          <FriendAvatar friend={friend} />
         </span>
       )}
       <div className="chat-line-body">

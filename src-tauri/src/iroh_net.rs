@@ -478,6 +478,15 @@ fn progress_cb(
     }
 }
 
+fn completed_update(id: &str, dir: Direction, names: Vec<String>, total: u64) -> TransferUpdate {
+    let mut u = TransferUpdate::new(id.to_string(), dir, names);
+    u.state = TransferState::Completed;
+    u.bytes_done = total;
+    u.bytes_total = total;
+    u.percent = 100.0;
+    u
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_completed(
     app: &AppHandle,
@@ -489,11 +498,7 @@ fn emit_completed(
     friend: Option<String>,
     out_dir: Option<String>,
 ) {
-    let mut u = TransferUpdate::new(id.to_string(), dir, names.clone());
-    u.state = TransferState::Completed;
-    u.bytes_done = total;
-    u.bytes_total = total;
-    u.percent = 100.0;
+    let mut u = completed_update(id, dir, names.clone(), total);
     u.locality = locality;
     u.friend_name = friend.clone();
     u.out_dir = out_dir.clone();
@@ -1583,6 +1588,8 @@ async fn serve_stream(
             u0.state = TransferState::Transferring;
             u0.friend_name = sender.clone();
             u0.bytes_total = total;
+            u0.locality = conn_locality(conn);
+            u0.conn_detail = Some(conn_detail(conn));
             emit(&app, &u0);
             let cb = progress_cb(
                 app.clone(),
@@ -2585,18 +2592,7 @@ pub fn start_send(
         .cloned()
         .ok_or("DropBeam is still connecting — try again in a moment.")?;
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let names: Vec<String> = pathbufs
-        .iter()
-        .map(|p| {
-            p.file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default()
-        })
-        .collect();
-    let total: u64 = pathbufs
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
+    let (names, total) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
     let ticket = make_ticket(&ep, &token).map_err(|e| e.to_string())?;
@@ -2840,18 +2836,7 @@ pub fn send_to_friend(
         .map_err(|_| "This friend's direct address is invalid.".to_string())?;
     let addr = dial_addr(parsed);
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let names: Vec<String> = pathbufs
-        .iter()
-        .map(|p| {
-            p.file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default()
-        })
-        .collect();
-    let total: u64 = pathbufs
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
+    let (names, total) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
@@ -3158,10 +3143,7 @@ pub fn send_to_friend(
                         let i = next_file;
                         // Progress is batch-cumulative: completed files' bytes + the
                         // current file's live count.
-                        let base: u64 = pathbufs[..i]
-                            .iter()
-                            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-                            .sum();
+                        let (_, base) = send_summary(&pathbufs[..i])?;
                         let cb_i = {
                             let c = cb.clone();
                             move |done: u64, _t: u64| c(base + done, total)
@@ -5611,6 +5593,17 @@ async fn recv_file_resumable<F: Fn(u64, u64)>(
         }
         Err(e)
     }
+}
+
+// Use the wire manifest for card names and totals, never directory inode sizes.
+fn send_summary(paths: &[PathBuf]) -> Result<(Vec<String>, u64)> {
+    let (items, dirs, total) = gather_items(paths)?;
+    let names = if items.is_empty() {
+        dirs
+    } else {
+        items.into_iter().map(|item| item.1).collect()
+    };
+    Ok((names, total))
 }
 
 /// Gather (path, name, size, mtime) for each file to send, plus the byte total.
@@ -8382,6 +8375,62 @@ mod loopback_tests {
         server.close().await;
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    /// Reproduce build 10's loose file + nested folder summary, including the
+    /// receiver-confirmed callback and the completed card that overwrites it.
+    #[tokio::test]
+    async fn loopback_folder_batch_display_matches_payload() {
+        let src = scratch("summary-src");
+        let dest = scratch("summary-rx");
+        std::fs::create_dir_all(src.join("nested/sub")).unwrap();
+        for (name, size) in [("loose.txt", 29), ("nested/n1.bin", 200_000),
+                             ("nested/sub/n2.bin", 150_000), ("nested/empty.txt", 0)] {
+            std::fs::write(src.join(name), payload(size, 17)).unwrap();
+        }
+        let expected = 350_029;
+        // Exercise both one classic multi-file body and the per-selection offsets
+        // used when a batch includes a large file and is split into sub-sends.
+        for split in [false, true] {
+            let server = loopback_endpoint(true).await;
+            let client = loopback_endpoint(false).await;
+            let paths = vec![src.join("nested"), src.join("loose.txt")];
+            let (names, total) = send_summary(&paths).unwrap();
+            assert_eq!(names.len(), 4);
+            assert_eq!(total, expected, "directory inode sizes must never enter the card");
+            let srv = server.clone();
+            let out = dest.clone();
+            let receiver = tokio::spawn(async move {
+                let conn = srv.accept().await.unwrap().await.unwrap();
+                for _ in 0..if split { 2 } else { 1 } {
+                    recv_files(&conn, &out, &AtomicBool::new(false), |_, _| {}).await.unwrap();
+                }
+            });
+            let conn = client.connect(server.addr(), ALPN).await.unwrap();
+            let displayed = Mutex::new((0, total));
+            let activity = AtomicU64::new(0);
+            for i in 0..if split { 2 } else { 1 } {
+                let (_, base) = send_summary(&paths[..i]).unwrap();
+                let batch = if split { &paths[i..=i] } else { &paths[..] };
+                send_files_with_activity(&conn, batch, &AtomicBool::new(false), |done, wire_total| {
+                    let tick = if split { (base + done, total) } else { (done, wire_total) };
+                    let mut previous = displayed.lock().unwrap();
+                    assert!(tick.0 >= previous.0 && tick.0 <= tick.1);
+                    assert_eq!(tick.1, expected);
+                    *previous = tick;
+                }, "summary-test", &AtomicBool::new(false), &activity, None).await.unwrap();
+            }
+            receiver.await.unwrap();
+            assert_eq!(*displayed.lock().unwrap(), (expected, expected));
+            let card = completed_update("summary", Direction::Send, names, total);
+            assert_eq!(card.bytes_done, expected);
+            assert_eq!(card.bytes_done, card.bytes_total);
+            assert_eq!(card.file_names.len(), 4);
+            client.close().await;
+            server.close().await;
+        }
+        let _ = std::fs::remove_dir_all(src);
+        let _ = std::fs::remove_dir_all(dest);
     }
 
     /// SPLIT-MODE over loopback: a multi-file selection is sent as ONE negotiated

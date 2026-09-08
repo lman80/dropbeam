@@ -52,14 +52,14 @@ export function SendView() {
   return (
     <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
       <DropZone hovering={dragHovering} onPick={() => onPick()} />
-      {!/Mac/i.test(navigator.userAgent) && (
-        <button className="btn btn-ghost" onClick={() => onPick(true)} style={{ marginTop: 8 }}>
-          Choose a folder
-        </button>
-      )}
 
       {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
-      <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center' }}>
+      <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        {!/Mac/i.test(navigator.userAgent) && (
+          <button className="btn btn-ghost" onClick={() => onPick(true)} title="On Linux and Windows, folders use a separate picker. Send a folder and all its contents.">
+            Choose a folder
+          </button>
+        )}
         {!showReceive ? (
           <button
             className="btn btn-ghost"
