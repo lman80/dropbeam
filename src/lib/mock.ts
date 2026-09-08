@@ -20,7 +20,7 @@ import type {
 type Cb = (payload: unknown) => void
 const buses: Record<string, Set<Cb>> = {}
 
-function emit(event: string, payload: unknown) {
+export function emit(event: string, payload: unknown) {
   buses[event]?.forEach((cb) => cb(payload))
 }
 

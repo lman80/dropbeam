@@ -19,6 +19,7 @@ pub mod labkit;
 mod mac_service;
 mod models;
 mod pairing;
+mod panic_log;
 mod provenance;
 mod settings;
 mod sync;
@@ -59,7 +60,12 @@ fn traydrag_debug(msg: String) {
 /// Windows box: the log lands in %APPDATA%\com.dropbeam.app\logs\DropBeam.log).
 #[tauri::command]
 fn frontend_log(msg: String) {
-    log::info!("[ui] {msg}");
+    if msg.starts_with("ui render error:") {
+        // Include caught React failures in the diagnostics digest's error tier.
+        log::error!("[ui] {msg}");
+    } else {
+        log::info!("[ui] {msg}");
+    }
 }
 
 /// First argument (after the executable) that points to an existing file — the
@@ -282,9 +288,7 @@ pub fn run() {
             }
             // Log panics (including ones inside commands) so a crash on a remote
             // machine leaves a trace in the file instead of a silent hang.
-            std::panic::set_hook(Box::new(|info| {
-                log::error!("PANIC: {info}");
-            }));
+            crate::panic_log::install(app.path().app_log_dir().ok().as_deref());
             log::info!("setup: starting v{}", env!("CARGO_PKG_VERSION"));
 
             // Cold start via the "Send with DropBeam" right-click menu: stash the

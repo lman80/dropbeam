@@ -14,8 +14,8 @@ export function SendView() {
   const dragHovering = useStore((s) => s.dragHovering)
   const setPendingSend = useStore((s) => s.setPendingSend)
   const receiveCode = useStore((s) => s.receiveCode)
-  const [code, setCode] = useState('')
   const [picking, setPicking] = useState(false)
+  const [code, setCode] = useState('')
   const [showReceive, setShowReceive] = useState(false)
 
   // One unified, newest-first list of everything — sends AND receives. Ghost
@@ -31,6 +31,7 @@ export function SendView() {
   )
 
   const onPick = async (source: 'files' | 'photos' | 'folder' = 'files') => {
+    if (picking) return
     setPicking(true)
     try {
       const paths = source === 'photos'
@@ -43,6 +44,7 @@ export function SendView() {
       useStore.getState().toast('error', String(error))
     } finally {
       setPicking(false)
+      useStore.getState().setDragHovering(false)
     }
   }
 
@@ -66,7 +68,7 @@ export function SendView() {
         padding: MOBILE_UI ? '4px 16px 24px' : '8px 28px 36px',
       }}
     >
-      <DropZone hovering={dragHovering} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} busy={picking} />
+      <DropZone hovering={dragHovering} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} picking={picking} />
 
       {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
       <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>

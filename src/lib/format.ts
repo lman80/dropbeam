@@ -1,10 +1,10 @@
 // Display formatting helpers. Bytes use decimal units (1000) to match croc.
 
 export function formatBytes(bytes: number, decimals = 1): string {
-  if (!bytes || bytes <= 0) return '0 B'
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
   const k = 1000
   const units = ['B', 'kB', 'MB', 'GB', 'TB', 'PB']
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1)
+  const i = Math.max(0, Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1))
   const v = bytes / Math.pow(k, i)
   return `${v.toFixed(i === 0 ? 0 : decimals)} ${units[i]}`
 }
@@ -13,7 +13,7 @@ export function formatBytes(bytes: number, decimals = 1): string {
 // transfer visibly ticks (5.11 → 5.22 GB) instead of sitting on a frozen "5.1 GB"
 // (GitHub #25). Sub-GB stays at the usual one decimal.
 export function formatBytesLive(bytes: number): string {
-  if (!bytes || bytes <= 0) return '0 B'
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
   const i = Math.floor(Math.log(bytes) / Math.log(1000))
   return formatBytes(bytes, i >= 3 ? 2 : 1)
 }
@@ -28,7 +28,7 @@ export function setSpeedUnit(megabits: boolean): void {
 
 // `bytesPerSec` is BYTES per second (despite the legacy name).
 export function formatSpeed(bytesPerSec: number, megabits = SPEED_IN_MEGABITS): string {
-  if (!bytesPerSec || bytesPerSec <= 0) return '—'
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '—'
   if (megabits) {
     const mbps = (bytesPerSec * 8) / 1_000_000
     return `${mbps.toFixed(mbps < 10 ? 1 : 0)} Mbps`
@@ -50,6 +50,7 @@ export function formatEta(seconds: number | null | undefined): string {
 }
 
 export function formatRelativeTime(ms: number): string {
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return '—'
   const now = Date.now()
   const diff = now - ms
   const sec = Math.floor(diff / 1000)

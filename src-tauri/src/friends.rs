@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::models::{Friend, PairRole};
 
+// This mutex only serializes disk operations; it contains no mutable state.
+// After poisoning, reload the atomically persisted files rather than panic again.
 static LOCK: Mutex<()> = Mutex::new(());
 const INVITE_PREFIX: &str = "dropbeamf1:";
 /// Prefix for the permanent, reusable personal code (carries your stable
@@ -100,7 +102,7 @@ pub fn create(
     friend_name: String,
     my_endpoint_id: Option<String>,
 ) -> Result<(Friend, String), String> {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let id = uuid::Uuid::new_v4().to_string();
     let secret = random_secret();
     let friend = Friend {
@@ -141,7 +143,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
     let invite: Invite =
         serde_json::from_slice(&bytes).map_err(|_| "The friend invite is malformed.".to_string())?;
 
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     if friends.iter().any(|f| f.id == invite.id) {
         return Err("You're already friends with this person.".into());
@@ -188,7 +190,7 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
     if name.is_empty() {
         return;
     }
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     if friends.iter().any(|f| f.name.eq_ignore_ascii_case(name)) {
         return; // already a friend by that name
@@ -309,7 +311,7 @@ pub fn plan_reconcile(
 /// permanent code, classic invite) across app updates, they end up as a single
 /// friend with their full conversation intact. Returns how many records collapsed.
 pub fn reconcile(config_dir: &Path) -> usize {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     // Most loads already contain only unique, keyed friends. Avoid reading
     // folder and chat history on that frequent presence/picker path.
@@ -368,7 +370,7 @@ pub fn label_for_endpoint(config_dir: &Path, endpoint_id: &str) -> Option<String
 /// Record a friend's iroh EndpointId (learned when they say hello after pairing).
 /// Returns true if a friend was updated.
 pub fn set_endpoint_id(config_dir: &Path, id: &str, endpoint_id: String) -> bool {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     let mut changed = false;
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
@@ -434,7 +436,7 @@ fn decode_user_code(code: &str) -> Result<UserCode, String> {
 /// The stable EndpointId IS the identity, so this NEVER duplicates a friend (or
 /// loses their chat history) across app updates or re-pairs. Returns the friend.
 pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> Friend {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     let name = name.trim();
     if let Some(f) = friends
@@ -503,7 +505,7 @@ pub fn self_heal_chat_sender(
     if endpoint_id.trim().is_empty() {
         return None;
     }
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     let name = name.trim();
 
@@ -613,7 +615,7 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
     }
     if !friend_id.is_empty() {
         let matched = {
-            let _guard = LOCK.lock().unwrap();
+            let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut friends = read_raw(config_dir);
             if let Some(f) = friends.iter_mut().find(|f| f.id == friend_id) {
                 let mut changed = false;
@@ -645,7 +647,7 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
 /// Store the friend-at-`endpoint_id`'s profile picture path (received over the
 /// wire and already saved to disk by the caller). Returns true if a record changed.
 pub fn set_avatar_by_endpoint(config_dir: &Path, endpoint_id: &str, path: String) -> bool {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     let mut changed = false;
     for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
@@ -661,7 +663,7 @@ pub fn set_avatar_by_endpoint(config_dir: &Path, endpoint_id: &str, path: String
 }
 
 pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
         if !name.trim().is_empty() {
@@ -674,7 +676,7 @@ pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
 }
 
 pub fn set_auto_accept(config_dir: &Path, id: &str, auto_accept: bool) -> Result<(), String> {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
         f.auto_accept = auto_accept;
@@ -683,7 +685,7 @@ pub fn set_auto_accept(config_dir: &Path, id: &str, auto_accept: bool) -> Result
 }
 
 pub fn set_progress_version(config_dir: &Path, endpoint: &str, version: u64) {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(endpoint)) {
         if f.progress_v != Some(version) {
@@ -713,7 +715,7 @@ pub fn chat_sender(config_dir: &Path, endpoint_id: &str) -> Option<Friend> {
 }
 
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter().find(|f| f.id == id) {
         if let Some(endpoint) = &f.endpoint_id {

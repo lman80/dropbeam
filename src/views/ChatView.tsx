@@ -267,6 +267,7 @@ function Conversation({ friendId }: { friendId: string }) {
   const setView = useStore((s) => s.setView)
   const toast = useStore((s) => s.toast)
 
+  const [picking, setPicking] = useState(false)
   const [text, setText] = useState('')
   const [reply, setReply] = useState<ChatMessage | null>(null)
   const [editing, setEditing] = useState<ChatMessage | null>(null)
@@ -545,11 +546,15 @@ function Conversation({ friendId }: { friendId: string }) {
     // Stage the picked files in the composer (chips) rather than firing them off
     // immediately — they send with the next message (GitHub #23). Same staging a
     // drag-and-drop uses.
+    if (picking) return
+    setPicking(true)
     try {
       const paths = await api.pickFiles()
       if (paths.length) stageChatFiles(paths)
     } catch (e) {
       useStore.getState().toast('error', String(e))
+    } finally {
+      setPicking(false)
     }
   }
 
@@ -858,7 +863,7 @@ function Conversation({ friendId }: { friendId: string }) {
             ))}
           </div>
         )}
-        <button className="icon-btn" title="Share a file" onClick={attach} disabled={!!editing}>
+        <button className="icon-btn" title="Share a file" onClick={attach} disabled={!!editing || picking}>
           <Paperclip size={18} />
         </button>
         {/* Settings promises "leave the key blank to hide" the GIF picker — honor

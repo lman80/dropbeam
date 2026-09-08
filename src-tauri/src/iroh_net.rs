@@ -78,12 +78,10 @@ pub struct IrohState {
 
 impl IrohState {
     fn learn_progress(&self, endpoint: &str, version: u64) {
-        let changed = self
-            .progress_versions
-            .lock()
-            .unwrap()
-            .insert(endpoint.to_owned(), version)
-            != Some(version);
+        let changed = match self.progress_versions.lock() {
+            Ok(mut versions) => versions.insert(endpoint.to_owned(), version) != Some(version),
+            Err(_) => return, // A capability cache is optional, never a reason to panic.
+        };
         // friends.json is a synchronous load+save under a global lock. This runs
         // in the HOT send path (every ready frame, every hello), so it must never
         // block the async runtime — and only ever on an actual change.
@@ -94,7 +92,7 @@ impl IrohState {
             if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
                 let dir = st.config_dir.clone();
                 let endpoint = endpoint.to_owned();
-                std::thread::spawn(move || {
+                let _ = std::thread::Builder::new().spawn(move || {
                     crate::friends::set_progress_version(&dir, &endpoint, version);
                 });
             }
@@ -104,14 +102,14 @@ impl IrohState {
     /// In-memory only — the map is seeded from friends.json once at iroh start
     /// (`seed_progress_versions`), so a cache miss here costs nothing.
     fn progress_version(&self, endpoint: &str) -> Option<u64> {
-        self.progress_versions.lock().unwrap().get(endpoint).copied()
+        self.progress_versions.lock().ok()?.get(endpoint).copied()
     }
 
     /// One-shot seed of the peer-capability map from friends.json. Never
     /// overwrites something already learned live this run.
     fn seed_progress_versions(&self, config_dir: &Path) {
         let disk = crate::friends::load(config_dir);
-        let mut map = self.progress_versions.lock().unwrap();
+        let Ok(mut map) = self.progress_versions.lock() else { return; };
         for f in disk {
             if let (Some(eid), Some(v)) = (f.endpoint_id, f.progress_v) {
                 map.entry(eid).or_insert(v);
@@ -261,7 +259,13 @@ async fn receive_with_landed<T>(
         loop {
             let (frame, terminal) = tokio::select! {
                 biased;
-                frame = &mut terminal_rx => (frame.expect("receive sends terminal"), true),
+                frame = &mut terminal_rx => (match frame {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        cancel.store(true, Ordering::SeqCst);
+                        anyhow::bail!("receiver stopped before terminal progress");
+                    }
+                }, true),
                 _ = ticks.tick() => (serde_json::json!({"landed": landed.load(Ordering::Relaxed)}), false),
             };
             let result = tokio::time::timeout(Duration::from_secs(5), write_frame(send, &frame))
@@ -447,7 +451,7 @@ fn progress_cb(
         // `total > 0` matters: a zero-byte transfer must not treat every tick as
         // "the final one" and sail past the throttle.
         let last = total > 0 && done >= total;
-        let mut previous = last_emit.lock().unwrap();
+        let Ok(mut previous) = last_emit.lock() else { return; };
         if let Some((at, prev_done, prev_total)) = *previous {
             if !last && at.elapsed() < Duration::from_millis(200) {
                 return;
@@ -1161,11 +1165,11 @@ fn handle_conn(
             let stream = tokio::select! {
                 stream = conn.accept_bi() => stream,
                 _ = presence_tick.tick() => {
-                    let next = conn.stats().udp_rx.datagrams;
-                    if conn.close_reason().is_none() && next > received {
+                    if refresh_presence(&conn, &mut received, || {
                         emit_friend_presence(&state, &who.to_string());
+                    }).is_err() {
+                        break;
                     }
-                    received = next;
                     continue;
                 }
             };
@@ -1180,16 +1184,31 @@ fn handle_conn(
                     });
                 }
                 Err(_) => {
-                    let mut connections = state.friend_conns.lock().unwrap();
-                    if connections.get(&who.to_string()).is_some_and(|c| c.stable_id() == conn.stable_id()) {
-                        connections.remove(&who.to_string());
-                    }
                     log::debug!("iroh: connection from {who} closed");
                     break;
                 }
             }
         }
+        // Also clean up when the timer observes closure first; don't remove a
+        // replacement connection installed concurrently for this same endpoint.
+        if let Ok(mut connections) = state.friend_conns.lock() {
+            let key = who.to_string();
+            if connections.get(&key).is_some_and(|c| c.stable_id() == conn.stable_id()) {
+                connections.remove(&key);
+            }
+        }
     })
+}
+
+/// A closed connection is ordinary churn. The second check covers closure
+/// racing the stats snapshot. iroh keeps stats alive with the Connection handle.
+fn refresh_presence(conn: &Connection, received: &mut u64, emit: impl FnOnce()) -> Result<()> {
+    anyhow::ensure!(conn.close_reason().is_none(), "presence connection closed");
+    let next = conn.stats().udp_rx.datagrams;
+    anyhow::ensure!(conn.close_reason().is_none(), "presence connection closed");
+    if next > *received { emit(); }
+    *received = next;
+    Ok(())
 }
 
 /// Map only the authenticated endpoint to a local friend; never trust a wire name.
@@ -2680,7 +2699,7 @@ pub fn start_receive(
                         }
                         base_cb(done, total);
                     };
-                    let paths = read_files_negotiated(
+                    let paths = read_pull_files_negotiated(
                         &conn,
                         &mut send,
                         &mut recv,
@@ -2692,12 +2711,6 @@ pub fn start_receive(
                         cb,
                     )
                     .await?;
-                    // Confirm receipt so the SENDER measures REAL delivery time.
-                    // (A progress_v1 header already got its terminal frame.)
-                    if !speaks_progress_v1(&header) {
-                        let _ = send.write_all(b"ok").await;
-                    }
-                    let _ = send.finish();
                     let loc = conn_locality(&conn);
                     let bytes: u64 = paths
                         .iter()
@@ -3582,8 +3595,9 @@ pub async fn send_chat(
     let addr = dial_addr(parsed);
     // Only reuse outgoing connections: older peers may not accept streams on
     // connections they initiated. The monitor itself never opens streams or dials.
-    let cached = state.friend_conns.lock().unwrap().get(endpoint_id)
-        .filter(|c| c.close_reason().is_none()).cloned();
+    let cached = state.friend_conns.lock().ok()
+        .and_then(|connections| connections.get(endpoint_id).cloned())
+        .filter(|c| c.close_reason().is_none());
     let conn = if let Some(conn) = cached {
         conn
     } else {
@@ -3592,7 +3606,9 @@ pub async fn send_chat(
             .context("dial friend for chat")?;
         if let Some(st) = state.app.get().and_then(|app| app.try_state::<Arc<IrohState>>()) {
             let st = st.inner().clone();
-            st.friend_conns.lock().unwrap().insert(endpoint_id.to_owned(), conn.clone());
+            if let Ok(mut connections) = st.friend_conns.lock() {
+                connections.insert(endpoint_id.to_owned(), conn.clone());
+            }
             tauri::async_runtime::spawn(handle_conn(conn.clone(), st));
         }
         conn
@@ -3953,7 +3969,7 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
             log::info!("folder send: nothing to send (all items vanished or un-rootable) — no-op");
             return Ok(conn_locality(&conn));
         }
-        let total: u64 = items.iter().map(|i| i.2).sum();
+        let total = checked_byte_total(items.iter().map(|i| i.2))?;
         // Big single folder files fan across parallel streams exactly like friend
         // sends (same negotiation, same resume). Folder sync was the LAST big-file
         // path still single-stream — which is where iroh's per-stream stalls hurt.
@@ -3986,7 +4002,7 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
                 .unwrap_or(false);
             if ready {
                 let (base, plan) = parse_resume_reply(reply.as_ref(), total, n);
-                send_ranges_parallel(&conn, &items[0].0, total, base, &plan, cancel, pace, on_progress)
+                send_ranges_parallel(&conn, &items.first().context("parallel transfer has no file")?.0, total, base, &plan, cancel, pace, on_progress)
                     .await?;
                 send.finish()?;
                 let ack = recv.read_to_end(4096).await.unwrap_or_default();
@@ -4184,6 +4200,8 @@ async fn read_folder_body<F: Fn(u64, u64)>(
     anyhow::ensure!(header["kind"] == "folder-files", "unexpected stream kind");
     let items = header["items"].as_array().cloned().unwrap_or_default();
     let total = header["total"].as_u64().unwrap_or(0);
+    let manifest_total = checked_byte_total(items.iter().map(|item| item["size"].as_u64().unwrap_or(0)))?;
+    anyhow::ensure!(total == manifest_total, "file manifest byte total mismatch");
     std::fs::create_dir_all(dest_dir)?;
 
     let mut got = 0u64;
@@ -5189,7 +5207,7 @@ async fn write_payload<W: tokio::io::AsyncWrite + Unpin>(
 ) -> Result<()> {
     while !bytes.is_empty() {
         let n = writer.write(bytes).await?;
-        anyhow::ensure!(n > 0, "payload writer accepted zero bytes");
+        anyhow::ensure!(n > 0 && n <= bytes.len(), "invalid payload write count");
         accepted(n as u64);
         bytes = &bytes[n..];
     }
@@ -5394,7 +5412,7 @@ async fn recv_file_resumable<F: Fn(u64, u64)>(
     // disjoint, so raw is unique. Coverage (resume truth) still advances only per
     // flushed FLUSH_SPAN — the display just doesn't sit at 0% for a minute on a
     // slow link while the first 8 MiB span fills.
-    let display_base = cov.lock().unwrap().covered();
+    let display_base = cov.lock().map_err(|_| anyhow::anyhow!("receive coverage unavailable"))?.covered();
     let mut last_covered = display_base;
     let mut last_growth = Instant::now();
     let mut last_persist = Instant::now();
@@ -5555,6 +5573,12 @@ async fn recv_file_resumable<F: Fn(u64, u64)>(
     }
 }
 
+fn checked_byte_total(sizes: impl Iterator<Item = u64>) -> Result<u64> {
+    sizes.into_iter().try_fold(0u64, |total, size| {
+        total.checked_add(size).context("transfer byte total overflow")
+    })
+}
+
 // Use the wire manifest for card names and totals, never directory inode sizes.
 fn send_summary(paths: &[PathBuf]) -> Result<(Vec<String>, u64)> {
     let (items, dirs, total) = gather_items(paths)?;
@@ -5616,7 +5640,7 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
             items.push((p.clone(), name, meta.len(), mtime_secs(&meta)));
         }
     }
-    let total = items.iter().map(|i| i.2).sum();
+    let total = checked_byte_total(items.iter().map(|i| i.2))?;
     Ok((items, dirs, total))
 }
 
@@ -5825,6 +5849,8 @@ async fn read_body<F: Fn(u64, u64)>(
     anyhow::ensure!(header["kind"] == "files", "unexpected stream kind");
     let items = header["items"].as_array().cloned().unwrap_or_default();
     let total = header["total"].as_u64().unwrap_or(0);
+    let manifest_total = checked_byte_total(items.iter().map(|item| item["size"].as_u64().unwrap_or(0)))?;
+    anyhow::ensure!(total == manifest_total, "file manifest byte total mismatch");
     std::fs::create_dir_all(dest_dir)?;
     // Recreate any EMPTY directories the sender advertised (GitHub #22) — done up
     // front so structure exists even for a folder that is ONLY empty dirs (zero file
@@ -5899,7 +5925,7 @@ async fn read_body<F: Fn(u64, u64)>(
                     got += n as u64;
                     if !negotiated {
                         on_progress(got, total);
-                    } else if got - published >= 1 << 20
+                    } else if got.saturating_sub(published) >= 1 << 20
                         || last_publish.elapsed() >= Duration::from_millis(250)
                     {
                         if let Err(e) = f.flush().await {
@@ -6137,7 +6163,7 @@ async fn send_files_with_activity<F: Fn(u64, u64)>(
             landed_activity.store(base, Ordering::SeqCst);
             if v1 {
                 let write = async {
-                    send_ranges_parallel(conn, &items[0].0, total, base, &plan, cancel, pace, transport).await?;
+                    send_ranges_parallel(conn, &items.first().context("parallel transfer has no file")?.0, total, base, &plan, cancel, pace, transport).await?;
                     send.finish()?;
                     Ok(total)
                 };
@@ -6147,7 +6173,7 @@ async fn send_files_with_activity<F: Fn(u64, u64)>(
                 )
                 .await;
             }
-            send_ranges_parallel(conn, &items[0].0, total, base, &plan, cancel, pace, |d, t| {
+            send_ranges_parallel(conn, &items.first().context("parallel transfer has no file")?.0, total, base, &plan, cancel, pace, |d, t| {
                 transport(d, t);
                 on_progress(d, t);
             }).await?;
@@ -6372,12 +6398,38 @@ pub async fn pull_files<F: Fn(u64, u64)>(
     let conn = client.connect(addr, ALPN).await.context("dial ticket")?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token })).await?;
-    let out = read_files(&mut recv, dest_dir, cancel, on_progress).await?;
-    // Confirm receipt, matching the production receiver — the sender only treats
-    // a pull as delivered (and retires its one-time token) on this ack.
-    let _ = send.write_all(b"ok").await;
-    let _ = send.finish();
-    Ok(out)
+    let header = read_frame(&mut recv).await?;
+    read_pull_files_negotiated(&conn, &mut send, &mut recv, &header, dest_dir,
+        cancel, &AtomicBool::new(false), None, on_progress).await
+}
+
+/// Quick Send's pull protocol uses a raw trailing `ok`, including when an older
+/// sender accidentally advertises push-only progress_v. Preserve parallel/resume
+/// negotiation, but never send ready/progress/terminal frames for progress v1:
+/// serve_pull_negotiated and the production pull arm only consume the raw receipt.
+async fn read_pull_files_negotiated<F: Fn(u64, u64)>(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    header: &serde_json::Value,
+    dest_dir: &Path,
+    cancel: &AtomicBool,
+    engaged: &AtomicBool,
+    partials: Option<&Mutex<HashSet<String>>>,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
+    let mut header = header.clone();
+    header.as_object_mut().context("invalid Quick Send header")?.remove("progress_v");
+    let paths = read_files_negotiated(conn, send, recv, &header, dest_dir,
+        cancel, engaged, partials, on_progress).await?;
+    send.write_all(b"ok").await?;
+    send.finish()?;
+    // A pull owns a short-lived connection. Don't drop it while its receipt is
+    // still queued locally: that can report Saved here and Failed on the sender.
+    let stopped = tokio::time::timeout(Duration::from_secs(10), send.stopped())
+        .await.context("timed out confirming Quick Send receipt")??;
+    anyhow::ensure!(stopped.is_none(), "sender rejected Quick Send receipt");
+    Ok(paths)
 }
 
 /// Receiver half of a maybe-parallel files transfer: the manifest `header` was
@@ -6587,7 +6639,7 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
             .unwrap_or(false);
         if ready {
             let (base, plan) = parse_resume_reply(reply.as_ref(), total, n);
-            send_ranges_parallel(conn, &items[0].0, total, base, &plan, cancel, pace, on_progress)
+            send_ranges_parallel(conn, &items.first().context("parallel transfer has no file")?.0, total, base, &plan, cancel, pace, on_progress)
                 .await?;
             send.finish()?;
             return Ok(total);
@@ -7367,6 +7419,173 @@ mod loopback_tests {
             b = b.alpns(vec![ALPN.to_vec()]);
         }
         b.bind().await.expect("bind loopback iroh endpoint")
+    }
+
+    /// Exercise the ticket and the production pull sender/receiver, and require
+    /// the SENDER to observe delivery (byte equality at the receiver is not enough).
+    async fn quick_send_receipt_case(size: usize, old_progress_header: bool) {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let dir = scratch("quick-send-receipt");
+        let src = dir.join("source.bin");
+        let dest = dir.join("received");
+        let data = payload(size, 27);
+        std::fs::write(&src, &data).unwrap();
+        let ticket = make_ticket(&server, "receipt-test").unwrap();
+        let (addr, token) = parse_ticket(&ticket).unwrap();
+        let staged = vec![src];
+        // The production sender endpoint outlives each serve task. Keep it alive
+        // here too, so returning from the task doesn't stop QUIC's ACK driver.
+        let srv = server.clone();
+        let serve = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let req = read_frame(&mut recv).await.unwrap();
+            assert_eq!(req["kind"], "pull");
+            assert_eq!(req["token"], "receipt-test");
+            let cancel = AtomicBool::new(false);
+            if old_progress_header {
+                // The regressed sender advertised progress but still waited for
+                // raw ok. Emulate that exact wire contract for small AND parallel.
+                let (items, dirs, total) = gather_items(&staged).unwrap();
+                let n = if size >= PARALLEL_MIN as usize { 4 } else { 0 };
+                write_frame(&mut send, &files_header(&items, &dirs, total, n, "", true))
+                    .await.unwrap();
+                if n > 0 {
+                    let reply = read_frame(&mut recv).await.unwrap();
+                    assert_eq!(reply["ready"], true);
+                    assert!(!speaks_progress_v1(&reply));
+                    let (base, plan) = parse_resume_reply(Some(&reply), total, n);
+                    send_ranges_parallel(&conn, &items[0].0, total, base, &plan,
+                        &cancel, false, |_, _| {}).await.unwrap();
+                } else {
+                    write_files_body(&mut send, &items, total, &cancel, false, &|_, _| {})
+                        .await.unwrap();
+                }
+                send.finish().unwrap();
+            } else {
+                let sent = serve_pull_negotiated(&conn, &mut send, &mut recv,
+                    &staged, true, &cancel, |_, _| {}).await.unwrap();
+                assert_eq!(sent, size as u64);
+            }
+            // Same read and success criterion as the production pull arm; require
+            // exactly ok so stray ready/progress frames cannot pass by accident.
+            let ack = recv.read_to_end(256).await.expect("sender must receive receipt");
+            assert_eq!(ack, b"ok", "Quick Send sender must see confirmed success");
+        });
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        write_frame(&mut send, &serde_json::json!({
+            "kind": "pull", "token": token, "parallel": true,
+        })).await.unwrap();
+        let header = read_frame(&mut recv).await.unwrap();
+        if !old_progress_header {
+            assert!(!speaks_progress_v1(&header), "pull must not advertise push progress");
+        }
+        let parallel = header["parallel"].as_u64().unwrap_or(0) > 0;
+        let engaged = AtomicBool::new(false);
+        let got = read_pull_files_negotiated(&conn, &mut send, &mut recv, &header,
+            &dest, &AtomicBool::new(false), &engaged, None, |_, _| {}).await.unwrap();
+        // Production drops its pull connection immediately on returning Saved.
+        drop(conn);
+        assert_eq!(engaged.load(Ordering::SeqCst), parallel);
+        assert_eq!(got.len(), 1);
+        assert_eq!(std::fs::read(&got[0]).unwrap(), data);
+        serve.await.expect("Quick Send sender must succeed, not merely save on receiver");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quick_send_code_confirms_delivery() {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            for size in [0, 1024, PARALLEL_MIN as usize + 1024] {
+                quick_send_receipt_case(size, false).await;
+            }
+        }).await.expect("Quick Send must finish without a receipt deadlock");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quick_send_progress_header_still_gets_raw_receipt() {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            for size in [0, 1024, PARALLEL_MIN as usize + 1024] {
+                quick_send_receipt_case(size, true).await;
+            }
+        }).await.expect("legacy Quick Send must finish without a receipt deadlock");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn presence_refresh_survives_peer_close() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        for _ in 0..8 {
+            let (peer, conn) = tokio::join!(async {
+                server.accept().await.unwrap().await.unwrap()
+            }, async { client.connect(server.addr(), ALPN).await.unwrap() });
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let refresh_conn = conn.clone();
+            let refresh = tokio::spawn(async move {
+                let mut received = 0;
+                refresh_presence(&refresh_conn, &mut received, || {}).unwrap();
+                let _ = started.send(());
+                loop {
+                    tokio::task::yield_now().await;
+                    if refresh_presence(&refresh_conn, &mut received, || {}).is_err() {
+                        break;
+                    }
+                }
+                // Closed handles and missing friends remain ordinary no-ops.
+                assert!(refresh_presence(&refresh_conn, &mut received,
+                    || panic!("closed peer emitted presence")).is_err());
+            });
+            ready.await.unwrap();
+            peer.close(0u32.into(), b"close during presence refresh");
+            tokio::time::timeout(Duration::from_secs(5), refresh).await
+                .expect("refresh must stop after close").expect("presence task must not panic");
+            let state = Arc::new(IrohState::default());
+            let key = conn.remote_id().to_string();
+            state.friend_conns.lock().unwrap().insert(key.clone(), conn.clone());
+            tokio::time::timeout(Duration::from_secs(5), handle_conn(conn, state.clone()))
+                .await.expect("closed dispatcher must exit");
+            assert!(!state.friend_conns.lock().unwrap().contains_key(&key));
+        }
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn landed_reader_rejects_bad_frames_and_closed_peer() {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        for frame in [serde_json::Value::Null, serde_json::json!({"landed": u64::MAX}),
+            serde_json::json!({"landed": 0, "ok": true}), serde_json::json!({"landed": 1})] {
+            let srv = server.clone();
+            let receiver = tokio::spawn(async move {
+                let peer = srv.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = peer.accept_bi().await.unwrap();
+                read_frame(&mut recv).await.unwrap();
+                write_frame(&mut send, &frame).await.unwrap();
+                send.finish().unwrap();
+                let _ = send.stopped().await;
+                peer.close(0u32.into(), b"receipt interrupted");
+            });
+            let conn = client.connect(server.addr(), ALPN).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            write_frame(&mut send, &serde_json::json!({"test": true})).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5),
+                read_landed_progress(&mut recv, 10, 0, &AtomicBool::new(false), &|_, _| {}))
+                .await.expect("receipt reader must exit");
+            assert!(result.is_err());
+            drop(recv);
+            receiver.await.unwrap();
+        }
+        client.close().await;
+        server.close().await;
+    }
+
+    #[test]
+    fn byte_total_overflow_is_fallible() {
+        assert!(checked_byte_total([u64::MAX, 1].into_iter()).is_err());
+        assert_eq!(checked_byte_total([2, 3].into_iter()).unwrap(), 5);
     }
 
     /// A sub-chunk send window must report accepted bytes before the whole

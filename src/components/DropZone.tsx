@@ -4,19 +4,21 @@ import { MOBILE_UI } from '../lib/platform'
 
 export function DropZone({
   hovering,
+  picking = false,
   onPick,
   onPickPhotos,
-  busy,
 }: {
   hovering: boolean
+  picking?: boolean
   onPick: () => void
   onPickPhotos?: () => void
-  busy?: boolean
 }) {
   const Panel = MOBILE_UI ? motion.div : motion.button
   return (
     <Panel
       onClick={MOBILE_UI ? undefined : onPick}
+      disabled={MOBILE_UI ? undefined : picking}
+      aria-busy={picking}
       data-testid="dropzone"
       animate={{ scale: hovering ? 1.012 : 1 }}
       transition={{ type: 'spring', stiffness: 400, damping: 25 }}
@@ -74,8 +76,8 @@ export function DropZone({
       </div>
       {MOBILE_UI && (
         <div style={{ display: 'flex', gap: 12 }}>
-          <button className="btn btn-primary" disabled={busy} onClick={onPickPhotos} aria-label="Photos & Videos">Photos</button>
-          <button className="btn btn-ghost" disabled={busy} onClick={onPick}>Files</button>
+          <button className="btn btn-primary" disabled={picking} onClick={onPickPhotos} aria-label="Photos & Videos">Photos</button>
+          <button className="btn btn-ghost" disabled={picking} onClick={onPick}>Files</button>
         </div>
       )}
     </Panel>

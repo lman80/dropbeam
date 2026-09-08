@@ -1,3 +1,38 @@
+# Merge main v0.47.0 into ios — 2026-09-09
+
+Merged main through `2ff4208` (including `1c3b6ac` and `664363c`).
+Conflicts resolved in Cargo.toml, App.tsx, DropZone.tsx and SendView.tsx:
+release debug symbols coexist with the vendored notification patch; desktop
+sidebar and mobile navigation retain their gates and gain error boundaries;
+mobile Photos/Files selection retains picker guards and drag-hover cleanup.
+Content and overlay boundaries cover mobile too. iOS cfg gates remain intact.
+Cargo and Tauri versions are 0.47.0; tauri.ios.conf.json has no override.
+The generated, tracked iOS Info.plist is also updated to 0.47.0.
+
+Validation:
+- `npm run build`: passed (existing chunk-size warning).
+- `cargo build --release --lib --offline` in src-tauri: passed on the host,
+  optimized with debuginfo.
+- `cargo check --offline --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios-sim --lib`: passed outside the sandbox after SwiftPM sandbox denial.
+- Same check with `--target aarch64-apple-ios`: passed outside the sandbox.
+- `cargo test --offline`: 169 passed, 0 failed, 6 ignored outside the sandbox.
+  Initial sandbox run: 141 passed, 28 loopback failures, all denied netmon
+  creation at endpoint binding (`Operation not permitted`).
+- `node --test tests/ui-data.test.ts`: 4 passed.
+- `npx tauri ios build --debug --target aarch64-sim --no-sign --ci`: passed
+  outside the sandbox. Existing bundle-ID, destination and blake3 SDK warnings.
+
+Fresh app: `/Users/ashtonmiller/DropBeam-ios/src-tauri/gen/apple/build/arm64-sim/DropBeam.app`.
+Verified bundle version and build: **0.47.0**.
+Bundle mtime: **2026-09-09 05:51:26.350018 +08:00**.
+Executable mtime: **2026-09-09 05:51:22.631559 +08:00**.
+Previous output preserved as `arm64-sim-before-047-merge-20260909-054448`.
+No installation or runtime UI smoke test performed in this pass.
+No subagents or push. Source work restricted to this worktree; Git writes its
+shared worktree metadata under ~/DropBeam/.git.
+
+---
+
 # Mobile keyboard viewport fix — 2026-09-09
 
 MOBILE_UI now locks the document body in place and sizes/anchors the app root

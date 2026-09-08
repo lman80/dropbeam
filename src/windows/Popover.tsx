@@ -208,6 +208,7 @@ export function Popover() {
   }, [filtered, sendToFriend])
 
   const beamToFriend = async (id: string) => {
+    if (pickingFor !== null) return
     setPickingFor(id)
     try {
       const paths = await api.pickFiles()
@@ -220,6 +221,7 @@ export function Popover() {
   }
 
   const pickAndSend = async () => {
+    if (pickingFor !== null) return
     setPickingFor('__quick__')
     try {
       const paths = await api.pickFiles()
@@ -357,7 +359,7 @@ export function Popover() {
             className="btn btn-primary"
             style={{ flex: 1, justifyContent: 'center' }}
             onClick={pickAndSend}
-            disabled={pickingFor === '__quick__'}
+            disabled={pickingFor !== null}
           >
             {pickingFor === '__quick__' ? <Spinner size={15} /> : <Send size={15} />} Send a file
           </button>

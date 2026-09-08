@@ -10,6 +10,7 @@ import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
 import { MobileTabBar } from './components/MobileTabBar'
 import { Toasts } from './components/Toasts'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { FolderInviteModal } from './components/FolderInviteModal'
 import { BeamLogo } from './components/bits'
 import { SendView } from './views/SendView'
@@ -123,11 +124,18 @@ export default function App() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-      <TitleBar />
-      <InstallBanner />
-      <LocalNetworkBanner />
+      <ErrorBoundary region="window controls">
+        <TitleBar />
+        <InstallBanner />
+        <LocalNetworkBanner />
+      </ErrorBoundary>
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        {!MOBILE_UI && <Sidebar />}
+        {!MOBILE_UI && (
+          <ErrorBoundary region="sidebar">
+            <Sidebar />
+          </ErrorBoundary>
+        )}
+
         <main
           className="scroll-area"
           style={{
@@ -138,29 +146,38 @@ export default function App() {
             overflowY: view === 'chat' ? 'hidden' : undefined,
           }}
         >
-          {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
-              so it never deadlocks on a view that has its own AnimatePresence. */}
-          <motion.div
-            key={view}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.18 }}
-            style={{ minHeight: '100%', height: view === 'chat' ? '100%' : undefined }}
-          >
-            {view === 'send' && <SendView />}
-            {view === 'friends' && <FriendsView />}
-            {view === 'chat' && <ChatView />}
-            {view === 'folders' && <FoldersView />}
-            {view === 'history' && <HistoryView />}
-            {view === 'settings' && <SettingsView />}
-          </motion.div>
+          <ErrorBoundary region={`content:${view}`} key={view}>
+            {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
+                so it never deadlocks on a view that has its own AnimatePresence. */}
+            <motion.div
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.18 }}
+              style={{ minHeight: '100%', height: view === 'chat' ? '100%' : undefined }}
+            >
+              {view === 'send' && <SendView />}
+              {view === 'friends' && <FriendsView />}
+              {view === 'chat' && <ChatView />}
+              {view === 'folders' && <FoldersView />}
+              {view === 'history' && <HistoryView />}
+              {view === 'settings' && <SettingsView />}
+            </motion.div>
+          </ErrorBoundary>
         </main>
       </div>
-      {MOBILE_UI && <MobileTabBar />}
-      <SendToChooser />
-      <NameSetupModal />
-      <FolderInviteModal />
-      <Toasts />
+      {MOBILE_UI && (
+        <ErrorBoundary region="mobile navigation">
+          <MobileTabBar />
+        </ErrorBoundary>
+      )}
+      <ErrorBoundary region="overlays" fallbackStyle={{ position: 'fixed', bottom: 12, left: 12, zIndex: 201 }}>
+        <SendToChooser />
+        <NameSetupModal />
+        <FolderInviteModal />
+      </ErrorBoundary>
+      <ErrorBoundary region="toasts" fallbackStyle={{ position: 'fixed', bottom: 12, right: 12, zIndex: 101 }}>
+        <Toasts />
+      </ErrorBoundary>
     </div>
   )
 }
