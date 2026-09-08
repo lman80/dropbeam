@@ -3,14 +3,18 @@ import { FilePlus2, Upload } from 'lucide-react'
 
 export function DropZone({
   hovering,
+  picking = false,
   onPick,
 }: {
   hovering: boolean
+  picking?: boolean
   onPick: () => void
 }) {
   return (
     <motion.button
       onClick={onPick}
+      disabled={picking}
+      aria-busy={picking}
       data-testid="dropzone"
       animate={{ scale: hovering ? 1.012 : 1 }}
       transition={{ type: 'spring', stiffness: 400, damping: 25 }}

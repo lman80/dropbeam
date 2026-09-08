@@ -321,10 +321,15 @@ impl SyncManager {
     /// The differences it reports are exactly what the background reconcile is
     /// already converging, so the UI can honestly say "syncing them now".
     pub async fn verify_folder(self: &Arc<Self>, pair_id: &str) -> VerifyResult {
+        let unavailable = || VerifyResult {
+            peer_online: false, compared: false, identical: false, matched: 0,
+            differences: 0, missing_on_peer: 0, missing_locally: 0,
+            pending_deletes: 0, local_files: 0, peer_files: 0,
+        };
         // Grab the per-link state we need (or bail with "couldn't compare" if this
         // isn't a folder we're actively managing — e.g. a non-mirror pair).
         let (folder, control_wake, tombstones, last_snapshot, snapshot_before, status) = {
-            let handles = self.handles.lock().unwrap();
+            let Ok(handles) = self.handles.lock() else { return unavailable(); };
             let Some(h) = handles.get(pair_id) else {
                 return VerifyResult {
                     peer_online: false,
@@ -341,8 +346,13 @@ impl SyncManager {
             };
             h.request_snapshot_reply.store(true, Ordering::SeqCst);
             h.force_snapshot.store(true, Ordering::SeqCst);
-            let folder = h.config.lock().unwrap().folder.clone();
-            let before = h.last_peer_snapshot.lock().unwrap().as_ref().map(|(_, ts)| *ts);
+            let folder = match h.config.lock() {
+                Ok(config) => config.folder.clone(), Err(_) => return unavailable(),
+            };
+            let before = match h.last_peer_snapshot.lock() {
+                Ok(snapshot) => snapshot.as_ref().map(|(_, ts)| *ts),
+                Err(_) => return unavailable(),
+            };
             (
                 folder,
                 h.control_wake.clone(),
@@ -364,7 +374,9 @@ impl SyncManager {
         // Polls cheaply; returns as soon as a fresh snapshot arrives.
         let deadline = Instant::now() + Duration::from_secs(40);
         let (peer_snapshot, got_fresh) = loop {
-            let cur = last_snapshot.lock().unwrap().clone();
+            let cur = match last_snapshot.lock() {
+                Ok(snapshot) => snapshot.clone(), Err(_) => return unavailable(),
+            };
             let is_fresh = match (&cur, snapshot_before) {
                 (Some((_, ts)), Some(before)) => *ts > before,
                 (Some(_), None) => true,
@@ -386,7 +398,7 @@ impl SyncManager {
             // Never heard from the peer at all — be honest that we couldn't compare.
             let local = live_manifest(&folder);
             return VerifyResult {
-                peer_online: status.lock().unwrap().peer_online,
+                peer_online: status.lock().map(|s| s.peer_online).unwrap_or(false),
                 compared: false,
                 identical: false,
                 matched: 0,
@@ -400,10 +412,12 @@ impl SyncManager {
         };
 
         let mine = live_manifest(&folder);
-        let my_tomb = tombstones.lock().unwrap().clone();
+        let my_tomb = match tombstones.lock() {
+            Ok(tombstones) => tombstones.clone(), Err(_) => return unavailable(),
+        };
         let mut result = compute_verify(&mine, &rec, &my_tomb, now_ms());
         result.compared = got_fresh;
-        result.peer_online = status.lock().unwrap().peer_online;
+        result.peer_online = status.lock().map(|s| s.peer_online).unwrap_or(false);
         log::info!("verify folder {pair_id}: online={}, fresh={}, differences={}",
             result.peer_online, got_fresh, result.differences);
         result
@@ -412,8 +426,9 @@ impl SyncManager {
     /// Reply through this folder's existing control sender, never a separate probe.
     /// The reply does not request another reply, so idle peers cannot ping-pong.
     pub fn request_folder_snapshot(&self, pair_id: &str, sender_eid: &str) {
-        if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
-            if h.config.lock().unwrap().endpoint_id.as_deref() == Some(sender_eid) {
+        let Ok(handles) = self.handles.lock() else { return; };
+        if let Some(h) = handles.get(pair_id) {
+            if h.config.lock().ok().is_some_and(|c| c.endpoint_id.as_deref() == Some(sender_eid)) {
                 h.force_snapshot.store(true, Ordering::SeqCst);
                 h.control_wake.notify_one();
             }
@@ -665,9 +680,10 @@ impl SyncManager {
 
     /// One warning per physical folder per minute, including groups with many links.
     fn warn_viewer_change(&self, folder: &str) {
-        let mut warnings = self.viewer_warning_at.lock().unwrap();
+        let Ok(mut warnings) = self.viewer_warning_at.lock() else { return; };
         if viewer_warning_due(warnings.get(folder).copied(), Instant::now()) {
             warnings.insert(folder.to_string(), Instant::now());
+            drop(warnings);
             let _ = self.app.emit("folder://viewer-change", folder);
         }
     }
@@ -1778,7 +1794,9 @@ impl SyncManager {
             // Reconcile may replace the handle; update this callback's snapshot
             // before name processing so it cannot take the legacy friend path.
             if let Some(pair) = pairing::load(&self.config_dir).into_iter().find(|p| p.id == pair_id) {
-                config.lock().unwrap().endpoint_id = pair.endpoint_id;
+                if let Ok(mut config) = config.lock() {
+                    config.endpoint_id = pair.endpoint_id;
+                }
             }
         }
         // Presence + name (also links the friend), same as the croc path. If no
@@ -2654,7 +2672,7 @@ fn file_len(path: &str) -> Option<u64> {
 }
 
 fn viewer_warning_due(last: Option<Instant>, now: Instant) -> bool {
-    last.map_or(true, |last| now.duration_since(last) >= Duration::from_secs(60))
+    last.map_or(true, |last| now.saturating_duration_since(last) >= Duration::from_secs(60))
 }
 
 fn is_sendable_candidate(path: &str, folder: &str, inbound: &Arc<Mutex<HashSet<String>>>) -> bool {

@@ -108,6 +108,7 @@ pub fn prune_logs(log_dir: &Path) {
             let n = e.file_name().to_string_lossy().to_string();
             n.starts_with("DropBeam")
                 && n != "DropBeam.log"
+                && n != "DropBeam-panic.log"
                 && (n.ends_with(".log") || n.ends_with(".bak"))
         })
         .filter_map(|e| {
@@ -353,7 +354,9 @@ fn signature(msg_redacted: &str) -> String {
     let b = ws.replace_all(&a, " ");
     let mut s = b.trim().to_string();
     if s.len() > 120 {
-        s.truncate(120);
+        let mut end = 120;
+        while !s.is_char_boundary(end) { end -= 1; }
+        s.truncate(end);
     }
     s
 }
@@ -401,7 +404,13 @@ fn build_digest(
         let Ok(text) = std::fs::read_to_string(f) else {
             continue;
         };
-        let mut cur_ts = String::new();
+        // The emergency hook deliberately avoids clocks/date formatting. Use
+        // its file mtime here, outside panic handling, for digest watermarks.
+        let mut cur_ts = if f.file_name().is_some_and(|n| n == "DropBeam-panic.log") {
+            std::fs::metadata(f).and_then(|m| m.modified()).ok()
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default()
+        } else { String::new() };
         for line in text.lines() {
             if let Some(ts) = line_ts(line) {
                 cur_ts = ts;
@@ -609,6 +618,12 @@ pub async fn run_once(app: &AppHandle, config_dir: &Path, log_dir: Option<&Path>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signature_truncates_at_utf8_boundary() {
+        let text = format!("{}界", "a".repeat(119));
+        assert_eq!(super::signature(&text), "a".repeat(119));
+    }
+
     use super::*;
 
     #[test]

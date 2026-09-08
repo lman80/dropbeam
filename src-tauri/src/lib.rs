@@ -16,6 +16,7 @@ pub mod labkit;
 mod mac_service;
 mod models;
 mod pairing;
+mod panic_log;
 mod provenance;
 mod settings;
 mod sync;
@@ -272,9 +273,7 @@ pub fn run() {
             }
             // Log panics (including ones inside commands) so a crash on a remote
             // machine leaves a trace in the file instead of a silent hang.
-            std::panic::set_hook(Box::new(|info| {
-                log::error!("PANIC: {info}");
-            }));
+            crate::panic_log::install(app.path().app_log_dir().ok().as_deref());
             log::info!("setup: starting v{}", env!("CARGO_PKG_VERSION"));
 
             // Cold start via the "Send with DropBeam" right-click menu: stash the

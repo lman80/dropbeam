@@ -111,33 +111,67 @@ pub fn clear_history(state: State<'_, Arc<AppState>>) {
     history::clear(&state.config_dir);
 }
 
-/// Native send picker. Keep the async command off the UI thread while the
-/// macOS panel runs its modal event loop on the main thread.
+/// Native send picker. AppKit completion returns to the async command without
+/// nesting an application-modal event loop inside Tauri's main-thread dispatch.
 #[tauri::command]
 pub async fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
+    use std::sync::atomic::Ordering;
+    // Multiple webviews can invoke this command. Own one panel at a time and
+    // release the gate on cancellation, errors, or a dropped command future.
+    static PICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if PICKING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err("A file picker is already open.".into());
+    }
+    struct PickerGuard;
+    impl Drop for PickerGuard {
+        fn drop(&mut self) { PICKING.store(false, Ordering::SeqCst); }
+    }
+    let _picking = PickerGuard;
     #[cfg(target_os = "macos")]
     let paths = {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let owner = app.clone();
         app.run_on_main_thread(move || {
-            use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
+            use objc2_app_kit::{NSModalResponseOK, NSModalResponseCancel, NSOpenPanel, NSWindow};
             use objc2_foundation::MainThreadMarker;
-            let result = (|| {
-                let mtm = MainThreadMarker::new().ok_or("Picker requires the main thread")?;
-                let panel = NSOpenPanel::openPanel(mtm);
-                // The plugin's file/folder APIs make these mutually exclusive.
-                panel.setCanChooseFiles(true);
-                panel.setCanChooseDirectories(true);
-                panel.setAllowsMultipleSelection(true);
-                if panel.runModal() != NSModalResponseOK {
-                    return Ok(Vec::new());
-                }
-                panel.URLs().iter().map(|url| {
-                    url.path().map(|p| p.to_string()).ok_or_else(|| {
-                        format!("Cannot send selected URL: {}", url.absoluteString().map(|s| s.to_string()).unwrap_or_default())
-                    })
-                }).collect::<Result<Vec<String>, String>>()
-            })();
-            let _ = tx.send(result);
+            let Some(mtm) = MainThreadMarker::new() else {
+                let _ = tx.send(Err("Picker requires the main thread".to_string()));
+                return;
+            };
+            let panel = NSOpenPanel::openPanel(mtm);
+            panel.setCanChooseFiles(true);
+            panel.setCanChooseDirectories(true);
+            panel.setAllowsMultipleSelection(true);
+            // AppKit retains the completion block. Take its panel + sender on
+            // completion to break the retain cycle and release the panel on main.
+            let pending = std::cell::RefCell::new(Some((panel.clone(), tx)));
+            let completion = block2::RcBlock::new(move |response| {
+                let Some((panel, tx)) = pending.try_borrow_mut().ok().and_then(|mut p| p.take()) else {
+                    return;
+                };
+                let result = if response == NSModalResponseCancel {
+                    Ok(Vec::new())
+                } else if response != NSModalResponseOK {
+                    Err("The file picker could not be opened.".to_string())
+                } else {
+                    panel.URLs().iter().map(|url| {
+                        url.path().map(|p| p.to_string())
+                            .ok_or_else(|| "Cannot send selected URL: no file path".to_string())
+                    }).collect::<Result<Vec<String>, String>>()
+                };
+                // AppKit invokes this block on the main thread. Hide the sheet
+                // before resolving the command: selection/cancel/error all clean up.
+                panel.orderOut(None);
+                let _ = tx.send(result);
+            });
+            let window = owner.get_webview_window("main");
+            let parent = window.as_ref().filter(|w| w.is_visible().unwrap_or(false))
+                .and_then(|w| w.ns_window().ok());
+            if let Some(parent) = parent.and_then(|p| unsafe { (p as *const NSWindow).as_ref() }) {
+                panel.beginSheetModalForWindow_completionHandler(parent, &completion);
+            } else {
+                panel.beginWithCompletionHandler(&completion);
+            }
         }).map_err(|e| e.to_string())?;
         rx.await.map_err(|e| e.to_string())??
     };
@@ -355,6 +389,11 @@ pub async fn paste_clipboard_image(
         let clipboard = app.clipboard().read_image()
             .map_err(|e| format!("Couldn't paste an image from the clipboard: {e}"))?;
         let rgba = clipboard.rgba();
+        let expected = (clipboard.width() as usize).checked_mul(clipboard.height() as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if expected != Some(rgba.len()) {
+            return Err("The clipboard image has invalid dimensions.".to_string());
+        }
         if rgba.is_empty() || clipboard.width() == 0 || clipboard.height() == 0 {
             return Err("No usable image is on the clipboard.".to_string());
         }
