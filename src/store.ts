@@ -28,6 +28,7 @@ import {
 } from './lib/api'
 import { setSpeedUnit } from './lib/format'
 import { LandedEta } from './lib/eta'
+import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
@@ -848,6 +849,7 @@ export const useStore = create<AppStore>((set, get) => ({
 
   upsertTransfer: (u) => {
     const prev = get().transfers[u.id]
+    u = normalizeTransfer(u, prev)
     // Use recent progress bytes, not the backend's whole-transfer average.
     if (u.state === 'transferring' && u.bytesTotal > 0) {
       let estimator = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
@@ -1063,7 +1065,7 @@ export const useStore = create<AppStore>((set, get) => ({
     set((s) => {
       // Merge by id rather than overwrite: a live message delivered via
       // addChatMessage WHILE getChatMessages was awaiting would otherwise be lost.
-      const byId = new Map(msgs.map((m) => [m.id, m]))
+      const byId = new Map(msgs.map((m) => [m.id, normalizeChatMessage(m)]))
       for (const m of s.chats[friendId] ?? []) if (!byId.has(m.id)) byId.set(m.id, m)
       const merged = [...byId.values()].sort(byOrder)
       return { chats: { ...s.chats, [friendId]: merged } }
@@ -1184,6 +1186,7 @@ export const useStore = create<AppStore>((set, get) => ({
   clearChatDraftFiles: () => set({ chatDraftFiles: [] }),
 
   addChatMessage: (m) => {
+    m = normalizeChatMessage(m)
     if (!get().friends.some((f) => f.id === m.peerId)) return
     // An incoming message means that friend is reachable right now.
     if (!m.fromMe) {

@@ -56,7 +56,12 @@ fn traydrag_debug(msg: String) {
 /// Windows box: the log lands in %APPDATA%\com.dropbeam.app\logs\DropBeam.log).
 #[tauri::command]
 fn frontend_log(msg: String) {
-    log::info!("[ui] {msg}");
+    if msg.starts_with("ui render error:") {
+        // Include caught React failures in the diagnostics digest's error tier.
+        log::error!("[ui] {msg}");
+    } else {
+        log::info!("[ui] {msg}");
+    }
 }
 
 /// First argument (after the executable) that points to an existing file — the

@@ -7,6 +7,7 @@ import { Hud } from './windows/Hud'
 import { ReceiveCard } from './windows/ReceiveCard'
 import { api, HAS_TAURI } from './lib/api'
 import { SuperFeedback } from './vendor/superfeedback'
+import { ErrorBoundary } from './components/ErrorBoundary'
 
 // Which window are we? The popover and HUD load the same bundle as the main
 // app and pick their compact UI from the Tauri window label. `?window=` lets us
@@ -41,7 +42,9 @@ if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
 
 const Root =
   label === 'popover' ? Popover : label === 'hud' ? Hud : label === 'receive' ? ReceiveCard : App
-createRoot(document.getElementById('root')!).render(<Root />)
+createRoot(document.getElementById('root')!).render(
+  <ErrorBoundary region={`window:${label}`}><Root /></ErrorBoundary>,
+)
 
 // SuperFeedback — a floating "Send feedback" button (main window only, not the
 // popover/HUD). It screenshots the app, takes a message, and opens a GitHub

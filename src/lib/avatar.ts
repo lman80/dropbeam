@@ -2,6 +2,7 @@
 // derived from an id, so the same person always gets the same colors.
 
 export function initials(name: string): string {
+  if (typeof name !== 'string') return '○'
   const parts = name.trim().split(/\s+/).filter(Boolean)
   if (!parts.length) return '○'
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()

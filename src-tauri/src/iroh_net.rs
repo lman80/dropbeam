@@ -2699,7 +2699,7 @@ pub fn start_receive(
                         }
                         base_cb(done, total);
                     };
-                    let paths = read_files_negotiated(
+                    let paths = read_pull_files_negotiated(
                         &conn,
                         &mut send,
                         &mut recv,
@@ -2711,12 +2711,6 @@ pub fn start_receive(
                         cb,
                     )
                     .await?;
-                    // Confirm receipt so the SENDER measures REAL delivery time.
-                    // (A progress_v1 header already got its terminal frame.)
-                    if !speaks_progress_v1(&header) {
-                        let _ = send.write_all(b"ok").await;
-                    }
-                    let _ = send.finish();
                     let loc = conn_locality(&conn);
                     let bytes: u64 = paths
                         .iter()
@@ -6402,12 +6396,38 @@ pub async fn pull_files<F: Fn(u64, u64)>(
     let conn = client.connect(addr, ALPN).await.context("dial ticket")?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token })).await?;
-    let out = read_files(&mut recv, dest_dir, cancel, on_progress).await?;
-    // Confirm receipt, matching the production receiver — the sender only treats
-    // a pull as delivered (and retires its one-time token) on this ack.
-    let _ = send.write_all(b"ok").await;
-    let _ = send.finish();
-    Ok(out)
+    let header = read_frame(&mut recv).await?;
+    read_pull_files_negotiated(&conn, &mut send, &mut recv, &header, dest_dir,
+        cancel, &AtomicBool::new(false), None, on_progress).await
+}
+
+/// Quick Send's pull protocol uses a raw trailing `ok`, including when an older
+/// sender accidentally advertises push-only progress_v. Preserve parallel/resume
+/// negotiation, but never send ready/progress/terminal frames for progress v1:
+/// serve_pull_negotiated and the production pull arm only consume the raw receipt.
+async fn read_pull_files_negotiated<F: Fn(u64, u64)>(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    header: &serde_json::Value,
+    dest_dir: &Path,
+    cancel: &AtomicBool,
+    engaged: &AtomicBool,
+    partials: Option<&Mutex<HashSet<String>>>,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
+    let mut header = header.clone();
+    header.as_object_mut().context("invalid Quick Send header")?.remove("progress_v");
+    let paths = read_files_negotiated(conn, send, recv, &header, dest_dir,
+        cancel, engaged, partials, on_progress).await?;
+    send.write_all(b"ok").await?;
+    send.finish()?;
+    // A pull owns a short-lived connection. Don't drop it while its receipt is
+    // still queued locally: that can report Saved here and Failed on the sender.
+    let stopped = tokio::time::timeout(Duration::from_secs(10), send.stopped())
+        .await.context("timed out confirming Quick Send receipt")??;
+    anyhow::ensure!(stopped.is_none(), "sender rejected Quick Send receipt");
+    Ok(paths)
 }
 
 /// Receiver half of a maybe-parallel files transfer: the manifest `header` was
@@ -7397,6 +7417,98 @@ mod loopback_tests {
             b = b.alpns(vec![ALPN.to_vec()]);
         }
         b.bind().await.expect("bind loopback iroh endpoint")
+    }
+
+    /// Exercise the ticket and the production pull sender/receiver, and require
+    /// the SENDER to observe delivery (byte equality at the receiver is not enough).
+    async fn quick_send_receipt_case(size: usize, old_progress_header: bool) {
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let dir = scratch("quick-send-receipt");
+        let src = dir.join("source.bin");
+        let dest = dir.join("received");
+        let data = payload(size, 27);
+        std::fs::write(&src, &data).unwrap();
+        let ticket = make_ticket(&server, "receipt-test").unwrap();
+        let (addr, token) = parse_ticket(&ticket).unwrap();
+        let staged = vec![src];
+        // The production sender endpoint outlives each serve task. Keep it alive
+        // here too, so returning from the task doesn't stop QUIC's ACK driver.
+        let srv = server.clone();
+        let serve = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let req = read_frame(&mut recv).await.unwrap();
+            assert_eq!(req["kind"], "pull");
+            assert_eq!(req["token"], "receipt-test");
+            let cancel = AtomicBool::new(false);
+            if old_progress_header {
+                // The regressed sender advertised progress but still waited for
+                // raw ok. Emulate that exact wire contract for small AND parallel.
+                let (items, dirs, total) = gather_items(&staged).unwrap();
+                let n = if size >= PARALLEL_MIN as usize { 4 } else { 0 };
+                write_frame(&mut send, &files_header(&items, &dirs, total, n, "", true))
+                    .await.unwrap();
+                if n > 0 {
+                    let reply = read_frame(&mut recv).await.unwrap();
+                    assert_eq!(reply["ready"], true);
+                    assert!(!speaks_progress_v1(&reply));
+                    let (base, plan) = parse_resume_reply(Some(&reply), total, n);
+                    send_ranges_parallel(&conn, &items[0].0, total, base, &plan,
+                        &cancel, false, |_, _| {}).await.unwrap();
+                } else {
+                    write_files_body(&mut send, &items, total, &cancel, false, &|_, _| {})
+                        .await.unwrap();
+                }
+                send.finish().unwrap();
+            } else {
+                let sent = serve_pull_negotiated(&conn, &mut send, &mut recv,
+                    &staged, true, &cancel, |_, _| {}).await.unwrap();
+                assert_eq!(sent, size as u64);
+            }
+            // Same read and success criterion as the production pull arm; require
+            // exactly ok so stray ready/progress frames cannot pass by accident.
+            let ack = recv.read_to_end(256).await.expect("sender must receive receipt");
+            assert_eq!(ack, b"ok", "Quick Send sender must see confirmed success");
+        });
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        write_frame(&mut send, &serde_json::json!({
+            "kind": "pull", "token": token, "parallel": true,
+        })).await.unwrap();
+        let header = read_frame(&mut recv).await.unwrap();
+        if !old_progress_header {
+            assert!(!speaks_progress_v1(&header), "pull must not advertise push progress");
+        }
+        let parallel = header["parallel"].as_u64().unwrap_or(0) > 0;
+        let engaged = AtomicBool::new(false);
+        let got = read_pull_files_negotiated(&conn, &mut send, &mut recv, &header,
+            &dest, &AtomicBool::new(false), &engaged, None, |_, _| {}).await.unwrap();
+        // Production drops its pull connection immediately on returning Saved.
+        drop(conn);
+        assert_eq!(engaged.load(Ordering::SeqCst), parallel);
+        assert_eq!(got.len(), 1);
+        assert_eq!(std::fs::read(&got[0]).unwrap(), data);
+        serve.await.expect("Quick Send sender must succeed, not merely save on receiver");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quick_send_code_confirms_delivery() {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            for size in [0, 1024, PARALLEL_MIN as usize + 1024] {
+                quick_send_receipt_case(size, false).await;
+            }
+        }).await.expect("Quick Send must finish without a receipt deadlock");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quick_send_progress_header_still_gets_raw_receipt() {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            for size in [0, 1024, PARALLEL_MIN as usize + 1024] {
+                quick_send_receipt_case(size, true).await;
+            }
+        }).await.expect("legacy Quick Send must finish without a receipt deadlock");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
