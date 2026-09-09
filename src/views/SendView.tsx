@@ -80,7 +80,7 @@ export function SendView() {
         {!showReceive ? (
           <button
             className="btn btn-ghost"
-            style={{ fontSize: 12.5 }}
+            style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
             onClick={() => setShowReceive(true)}
           >
             <ArrowDownToLine size={14} /> Have a code? Receive files
@@ -94,7 +94,7 @@ export function SendView() {
               value={code}
               autoFocus
               onChange={(e) => setCode(e.target.value)}
-              style={{ fontFamily: 'var(--font-mono)', fontSize: 14 }}
+              style={{ fontFamily: 'var(--font-mono)', fontSize: 'calc(14px * var(--ui-font-scale, 1))' }}
             />
             <button className="btn btn-primary" type="submit" disabled={!code.trim()}>
               <ArrowDownToLine size={15} /> Receive

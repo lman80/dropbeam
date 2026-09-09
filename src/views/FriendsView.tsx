@@ -40,7 +40,7 @@ export function FriendsView() {
           gap: 12,
         }}
       >
-        <h1 style={{ fontSize: 20, fontWeight: 750, margin: 0 }}>Friends</h1>
+        <h1 style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: 0 }}>Friends</h1>
         <button className="btn btn-primary" onClick={() => setAdding(true)}>
           <UserPlus size={15} /> Add friend
         </button>
@@ -84,7 +84,7 @@ function SectionLabel({ children }: { children: ReactNode }) {
   return (
     <div
       style={{
-        fontSize: 11.5,
+        fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
         fontWeight: 700,
         letterSpacing: 0.5,
         textTransform: 'uppercase',
@@ -220,11 +220,11 @@ function YouCard() {
                 }
               }}
               onBlur={saveName}
-              style={{ fontSize: 15, fontWeight: 700, padding: '6px 10px', maxWidth: 260 }}
+              style={{ fontSize: 'calc(15px * var(--ui-font-scale, 1))', fontWeight: 700, padding: '6px 10px', maxWidth: 260 }}
             />
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ fontWeight: 750, fontSize: 17 }}>{displayName || 'You'}</span>
+              <span style={{ fontWeight: 750, fontSize: 'calc(17px * var(--ui-font-scale, 1))' }}>{displayName || 'You'}</span>
               <button
                 className="icon-btn"
                 title="Edit your name"
@@ -238,13 +238,13 @@ function YouCard() {
               </button>
             </div>
           )}
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 3 }}>
+          <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 3 }}>
             This is the name and picture your friends see.
           </div>
           {settings?.avatar ? (
             <button
               onClick={() => void clearAvatar()}
-              style={{ background: 'none', border: 'none', padding: 0, marginTop: 5, cursor: 'pointer', color: 'var(--text-faint)', fontSize: 11.5 }}
+              style={{ background: 'none', border: 'none', padding: 0, marginTop: 5, cursor: 'pointer', color: 'var(--text-faint)', fontSize: 'calc(11.5px * var(--ui-font-scale, 1))' }}
             >
               Remove picture
             </button>
@@ -261,7 +261,7 @@ function YouCard() {
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-          <div style={{ fontSize: 13, fontWeight: 650 }}>Your DropBeam code</div>
+          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 650 }}>Your DropBeam code</div>
           <div style={{ display: 'flex', gap: 6 }}>
             <button className="btn btn-ghost" onClick={() => setShowQR((v) => !v)} disabled={!code}>
               <QrCode size={14} /> {showQR ? 'Hide QR' : 'QR'}
@@ -271,7 +271,7 @@ function YouCard() {
             </button>
           </div>
         </div>
-        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.5 }}>
+        <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.5 }}>
           Share this once. It never changes — friends who add you stay connected across every update.
         </div>
         <AnimatePresence>
@@ -456,11 +456,11 @@ function FriendCard({ friend }: { friend: Friend }) {
                 }
               }}
               onBlur={saveName}
-              style={{ fontSize: 14.5, fontWeight: 650, padding: '6px 10px', maxWidth: 240 }}
+              style={{ fontSize: 'calc(14.5px * var(--ui-font-scale, 1))', fontWeight: 650, padding: '6px 10px', maxWidth: 240 }}
             />
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ fontWeight: 700, fontSize: 15 }}>{friend.name}</span>
+              <span style={{ fontWeight: 700, fontSize: 'calc(15px * var(--ui-font-scale, 1))' }}>{friend.name}</span>
               <button
                 className="icon-btn"
                 title="Rename"
@@ -479,7 +479,7 @@ function FriendCard({ friend }: { friend: Friend }) {
               display: 'flex',
               alignItems: 'center',
               gap: 7,
-              fontSize: 12,
+              fontSize: 'calc(12px * var(--ui-font-scale, 1))',
               marginTop: 2,
               flexWrap: 'wrap',
               color: isOnline ? 'var(--green)' : 'var(--text-faint)',
@@ -527,7 +527,7 @@ function FriendCard({ friend }: { friend: Friend }) {
                 padding: 0,
                 cursor: 'pointer',
                 color: 'var(--accent)',
-                fontSize: 12,
+                fontSize: 'calc(12px * var(--ui-font-scale, 1))',
                 fontWeight: 600,
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -568,7 +568,7 @@ function FriendCard({ friend }: { friend: Friend }) {
           title={friend.autoAccept ? 'Files save automatically' : 'You approve each file'}
           onClick={() => setFriendAutoAccept(friend.id, !friend.autoAccept)}
         />
-        <span style={{ fontSize: 12.5, color: 'var(--text-muted)', flex: 1 }}>
+        <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', flex: 1 }}>
           {friend.autoAccept ? 'Auto-accept files' : 'Approve files first'}
         </span>
         <button className="btn btn-ghost" onClick={showInvite} disabled={loadingInvite}>
@@ -591,7 +591,7 @@ function FriendCard({ friend }: { friend: Friend }) {
       </div>
 
       {confirmRemove && (
-        <p role="status" style={{ fontSize: 12.5, color: 'var(--text-muted)', margin: '8px 0 0' }}>
+        <p role="status" style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', margin: '8px 0 0' }}>
           Remove {friend.name}? Your chat history will be kept on this device.
           {friend.endpointId && ' Re-add the same device to restore the conversation.'}
         </p>
@@ -643,7 +643,7 @@ function InvitePanel({
           <QRCodeSVG value={invite} size={92} level="M" fgColor="#15161d" bgColor="#fff" />
         </div>
         <div style={{ flex: 1, minWidth: 200 }}>
-          <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.45 }}>
+          <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.45 }}>
             Send this to {friendName}. They open DropBeam → Friends → <b>Add friend</b>.
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -720,25 +720,25 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
           style={{ width: 440, maxWidth: '100%', padding: 22, borderRadius: 20 }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-            <div style={{ fontSize: 17, fontWeight: 750 }}>Add a friend</div>
+            <div style={{ fontSize: 'calc(17px * var(--ui-font-scale, 1))', fontWeight: 750 }}>Add a friend</div>
             <button className="icon-btn" onClick={onClose}>
               <X size={17} />
             </button>
           </div>
           <div className="dialog-body">
-            <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+            <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
               Your friend's code
             </label>
             <textarea
               className="input"
-              style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
+              style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'calc(12px * var(--ui-font-scale, 1))', resize: 'none' }}
               autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
               placeholder="Paste their dropbeam:… code here"
               value={codeInput}
               autoFocus
               onChange={(e) => setCodeInput(e.target.value)}
             />
-            <p style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
+            <p style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
               Ask your friend for their code (Friends → <b>You</b> → Copy code) and paste it here. Their
               name fills in automatically and you’ll both be connected — no retyping names, no re-adding
               after updates.

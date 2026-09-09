@@ -105,7 +105,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             className="selectable"
             style={{
               fontWeight: 650,
-              fontSize: 13.5,
+              fontSize: 'calc(13.5px * var(--ui-font-scale, 1))',
               whiteSpace: 'nowrap',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
@@ -114,7 +114,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             {title(t)}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 3 }}>
-            <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>{statusLabel(t)}</span>
+            <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>{statusLabel(t)}</span>
             {t.connDetail ? (
               <ConnInspector detail={t.connDetail} compact />
             ) : (
@@ -156,7 +156,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
       {/* manual-accept offer from a friend */}
       {isOffer && (
         <div style={{ marginTop: 10 }}>
-          <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
+          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
             <b style={{ color: 'var(--text)' }}>{t.friendName ?? 'Someone'}</b> wants to send you{' '}
             <b style={{ color: 'var(--text)' }}>
               {t.fileNames.length ? t.fileNames[0] : 'files'}
@@ -194,7 +194,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
           }}
         >
           <div style={{ flex: 1, minWidth: 220 }}>
-            <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 7 }}>
+            <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginBottom: 7 }}>
               {(t.code?.length ?? 0) > 40
                 ? 'On their DropBeam → Send & Receive → “Have a code?”: scan the QR or paste this code:'
                 : 'On the other device, open DropBeam → Receive and enter:'}
@@ -238,7 +238,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
                 alignItems: 'center',
                 gap: 8,
                 marginTop: 12,
-                fontSize: 12.5,
+                fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
                 color: 'var(--text-muted)',
               }}
             >
@@ -271,10 +271,10 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
               marginBottom: 6,
             }}
           >
-            <span style={{ fontSize: 16, fontWeight: 750 }} className="gradient-text">
+            <span style={{ fontSize: 'calc(16px * var(--ui-font-scale, 1))', fontWeight: 750 }} className="gradient-text">
               {Math.round(t.percent)}%
             </span>
-            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            <span style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
               {formatBytesLive(t.bytesDone)}
               {t.bytesTotal > 0 ? ` / ${formatBytesLive(t.bytesTotal)}` : ''}
             </span>
@@ -285,7 +285,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
               display: 'flex',
               justifyContent: 'space-between',
               marginTop: 6,
-              fontSize: 12,
+              fontSize: 'calc(12px * var(--ui-font-scale, 1))',
               color: 'var(--text-muted)',
             }}
           >
@@ -303,7 +303,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             alignItems: 'center',
             gap: 9,
             marginTop: 10,
-            fontSize: 13,
+            fontSize: 'calc(13px * var(--ui-font-scale, 1))',
             color: 'var(--text-muted)',
           }}
         >
@@ -321,7 +321,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
               alignItems: 'center',
               gap: 9,
               marginTop: 10,
-              fontSize: 13,
+              fontSize: 'calc(13px * var(--ui-font-scale, 1))',
               color: 'var(--text-muted)',
             }}
           >
@@ -341,13 +341,13 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             gap: 12,
           }}
         >
-          <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
             <div>
               {t.direction === 'receive' ? 'Saved' : 'Delivered'}
               {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
             </div>
             {summary && (
-              <div style={{ fontSize: 12, color: 'var(--text-faint)', marginTop: 2 }}>
+              <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', marginTop: 2 }}>
                 {formatEta(summary.durationMs / 1000)} · {formatSpeed(summary.avgBps)} avg
               </div>
             )}
@@ -381,7 +381,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
         <div style={{ marginTop: 12 }}>
           <div
             style={{
-              fontSize: 13,
+              fontSize: 'calc(13px * var(--ui-font-scale, 1))',
               color: 'var(--red)',
               background: 'var(--red-soft)',
               borderRadius: 11,
@@ -406,7 +406,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
       )}
 
       {t.state === 'canceled' && (
-        <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-muted)' }}>
+        <div style={{ marginTop: 12, fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
           Transfer canceled.
         </div>
       )}

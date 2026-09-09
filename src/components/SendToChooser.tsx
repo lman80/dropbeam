@@ -66,7 +66,7 @@ export function SendToChooser() {
             style={{ width: 440, maxWidth: '100%', padding: 22, borderRadius: 20, display: 'flex', flexDirection: 'column' }}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-              <div style={{ fontWeight: 750, fontSize: 16.5, minWidth: 0 }}>
+              <div style={{ fontWeight: 750, fontSize: 'calc(16.5px * var(--ui-font-scale, 1))', minWidth: 0 }}>
                 Send{' '}
                 <span style={{ color: 'var(--accent)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {title}
@@ -105,7 +105,7 @@ export function SendToChooser() {
                           placeItems: 'center',
                           color: 'white',
                           fontWeight: 700,
-                          fontSize: 12,
+                          fontSize: 'calc(12px * var(--ui-font-scale, 1))',
                           flexShrink: 0,
                           background: avatarGradient(f.id),
                         }}
@@ -126,8 +126,8 @@ export function SendToChooser() {
                         />
                       </span>
                       <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-                        <div style={{ fontSize: 14, fontWeight: 650 }}>{f.name}</div>
-                        <div style={{ fontSize: 11.5, color: online ? 'var(--green)' : 'var(--text-faint)' }}>
+                        <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 650 }}>{f.name}</div>
+                        <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: online ? 'var(--green)' : 'var(--text-faint)' }}>
                           {/* Honest: friend file sends retry ~90s then fail — there is
                               no store-and-forward for files (chat messages DO queue). */}
                           {online ? 'Online now' : 'Offline — a send keeps trying for ~2 minutes'}
@@ -157,8 +157,8 @@ export function SendToChooser() {
                   <QrCode size={18} />
                 </span>
                 <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-                  <div style={{ fontSize: 14, fontWeight: 650 }}>Share with a code or QR</div>
-                  <div style={{ fontSize: 11.5, color: 'var(--text-faint)' }}>
+                  <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 650 }}>Share with a code or QR</div>
+                  <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)' }}>
                     For anyone — they enter the code to receive
                   </div>
                 </div>

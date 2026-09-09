@@ -40,7 +40,7 @@ export function TitleBar() {
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 9, pointerEvents: 'none' }}>
         <BeamLogo size={19} />
-        <span style={{ fontWeight: 750, letterSpacing: '-0.01em', fontSize: 15 }}>DropBeam</span>
+        <span style={{ fontWeight: 750, letterSpacing: '-0.01em', fontSize: 'calc(15px * var(--ui-font-scale, 1))' }}>DropBeam</span>
       </div>
       <button
         className="icon-btn no-drag"

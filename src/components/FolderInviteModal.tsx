@@ -88,8 +88,8 @@ export function FolderInviteModal() {
                   <FolderSync size={20} />
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 15, fontWeight: 750 }}>Shared folder invite</div>
-                  <div style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
+                  <div style={{ fontSize: 'calc(15px * var(--ui-font-scale, 1))', fontWeight: 750 }}>Shared folder invite</div>
+                  <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
                     <b>{invite.fromName || 'A friend'}</b> wants to share{' '}
                     <b>“{invite.folderName || 'a folder'}”</b> with you.
                   </div>
@@ -98,7 +98,7 @@ export function FolderInviteModal() {
                   <X size={16} />
                 </button>
               </div>
-              <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginBottom: 16, lineHeight: 1.45 }}>
+              <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', marginBottom: 16, lineHeight: 1.45 }}>
                 Accept and choose a folder on this computer to keep in sync. Anything either of you
                 drops in will appear for both.
               </div>

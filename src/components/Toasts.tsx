@@ -42,7 +42,7 @@ export function Toasts() {
               }}
             >
               <Icon size={18} color={color} style={{ flexShrink: 0, marginTop: 1 }} />
-              <div style={{ fontSize: 13.5, lineHeight: 1.45, flex: 1 }}>{t.message}</div>
+              <div style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', lineHeight: 1.45, flex: 1 }}>{t.message}</div>
               <button className="icon-btn" style={{ width: 24, height: 24 }} onClick={() => dismiss(t.id)}>
                 <X size={14} />
               </button>

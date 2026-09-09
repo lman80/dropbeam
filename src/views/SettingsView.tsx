@@ -48,9 +48,9 @@ function Row({
       }}
     >
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 14, fontWeight: 600 }}>{title}</div>
+        <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 600 }}>{title}</div>
         {desc && (
-          <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
+          <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
             {desc}
           </div>
         )}
@@ -178,7 +178,7 @@ export function SettingsView() {
         padding: MOBILE_UI ? '4px 16px 28px' : '8px 28px 40px',
       }}
     >
-      <h1 className="titlebar-drag" style={{ fontSize: 20, fontWeight: 750, margin: '0 0 16px' }}>
+      <h1 className="titlebar-drag" style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: '0 0 16px' }}>
         Settings
       </h1>
 
@@ -333,7 +333,7 @@ export function SettingsView() {
           title="Direct peer-to-peer"
           desc="Every transfer — Quick Send, friends, and shared folders — goes straight to the other computer, end-to-end encrypted, as fast as your network allows. Your firewall may ask once to allow DropBeam."
         >
-          <span style={{ fontSize: 13, fontWeight: 650, color: 'var(--accent)' }}>On</span>
+          <span style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 650, color: 'var(--accent)' }}>On</span>
         </Row>
         {SEP}
         <Row
@@ -409,7 +409,7 @@ export function SettingsView() {
                 }
                 style={{
                   width: 72,
-                  fontSize: 13,
+                  fontSize: 'calc(13px * var(--ui-font-scale, 1))',
                   fontWeight: 600,
                   padding: '6px 8px',
                   borderRadius: 8,
@@ -419,7 +419,7 @@ export function SettingsView() {
                   textAlign: 'right',
                 }}
               />
-              <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Mbps</span>
+              <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>Mbps</span>
             </div>
             <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               {[
@@ -436,7 +436,7 @@ export function SettingsView() {
                     onClick={() => save({ uploadLimitMbps: p.v })}
                     title={p.rec ? 'Recommended starting point for most home routers' : undefined}
                     style={{
-                      fontSize: 12,
+                      fontSize: 'calc(12px * var(--ui-font-scale, 1))',
                       fontWeight: 600,
                       padding: '4px 9px',
                       borderRadius: 999,
@@ -488,12 +488,12 @@ export function SettingsView() {
               <div style={{ flexShrink: 0, marginTop: 1 }}>
                 <ChannelBadge locality={c.loc} showConnecting />
               </div>
-              <span style={{ fontSize: 12.5, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', lineHeight: 1.5 }}>
                 {c.text}
               </span>
             </div>
           ))}
-          <span style={{ fontSize: 11.5, color: 'var(--text-faint)', lineHeight: 1.5 }}>
+          <span style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', lineHeight: 1.5 }}>
             The badge on each transfer shows which one it's using. Want to avoid the slow relay
             entirely? Turn on "Only send over direct connections" above.
           </span>
@@ -505,8 +505,8 @@ export function SettingsView() {
       <SectionTitle>Recoverable files</SectionTitle>
       <Card>
         <div style={{ padding: '12px 2px 4px' }}>
-          <div style={{ fontSize: 14, fontWeight: 600 }}>Deleted &amp; replaced files in shared folders</div>
-          <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
+          <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 600 }}>Deleted &amp; replaced files in shared folders</div>
+          <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
             When something is deleted or overwritten in a shared folder, DropBeam keeps a copy so you can
             get it back. Old copies are cleaned up automatically so they never pile up.{' '}
             {historyUsage !== null && (
@@ -516,7 +516,7 @@ export function SettingsView() {
         </div>
 
         <div style={{ padding: '10px 2px' }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Keep copies for</div>
+          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 600, marginBottom: 8 }}>Keep copies for</div>
           <div className="seg" style={{ display: 'flex', width: '100%' }}>
             {(
               [
@@ -539,7 +539,7 @@ export function SettingsView() {
         </div>
 
         <div style={{ padding: '10px 2px 14px' }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Storage limit per folder</div>
+          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 600, marginBottom: 8 }}>Storage limit per folder</div>
           <div className="seg" style={{ display: 'flex', width: '100%' }}>
             {(
               [
@@ -624,14 +624,14 @@ export function SettingsView() {
             <div style={{ padding: '13px 4px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <CheckCircle2 size={17} color="var(--green)" />
-                <span style={{ fontWeight: 650, fontSize: 14 }}>
+                <span style={{ fontWeight: 650, fontSize: 'calc(14px * var(--ui-font-scale, 1))' }}>
                   Version {update.version} is available
                 </span>
               </div>
               {update.installing ? (
                 <div style={{ marginTop: 11 }}>
                   <ProgressBar percent={update.progress} />
-                  <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 7 }}>
+                  <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 7 }}>
                     {update.progress < 100
                       ? `Downloading… ${update.progress}%`
                       : 'Installing — DropBeam will restart…'}
@@ -653,7 +653,7 @@ export function SettingsView() {
           <>
             {SEP}
             <div style={{ padding: '13px 4px' }}>
-              <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 9, lineHeight: 1.5 }}>
+              <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginBottom: 9, lineHeight: 1.5 }}>
                 Couldn't reach the update server. If you're on a network that blocks
                 GitHub, download the latest installer manually:
               </div>
@@ -800,7 +800,7 @@ export function SettingsView() {
       <div
         style={{
           textAlign: 'center',
-          fontSize: 12,
+          fontSize: 'calc(12px * var(--ui-font-scale, 1))',
           color: 'var(--text-faint)',
           marginTop: 18,
           lineHeight: 1.6,

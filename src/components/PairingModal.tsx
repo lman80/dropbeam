@@ -159,7 +159,7 @@ export function PairingModal({
           style={{ width: 460, maxWidth: '100%', padding: 22, borderRadius: 20 }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-            <div style={{ fontSize: 17, fontWeight: 750 }}>
+            <div style={{ fontSize: 'calc(17px * var(--ui-font-scale, 1))', fontWeight: 750 }}>
               {createdInvite
                 ? 'Share this invite'
                 : mode === 'create'
@@ -174,7 +174,7 @@ export function PairingModal({
           {/* CREATE — invite reveal */}
           {createdInvite ? (
             <div className="dialog-body">
-              <p style={{ fontSize: 13.5, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 0 }}>
+              <p style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 0 }}>
                 Send this invite to the other person. In their DropBeam, they choose{' '}
                 <b>Accept invite</b> and pick a folder. After that, anything dropped in{' '}
                 <b>{folderName}</b> beams over automatically.
@@ -196,7 +196,7 @@ export function PairingModal({
                     className="selectable"
                     style={{
                       fontFamily: 'var(--font-mono)',
-                      fontSize: 11.5,
+                      fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
                       background: 'var(--surface-2)',
                       border: '1px solid var(--border)',
                       borderRadius: 11,
@@ -224,7 +224,7 @@ export function PairingModal({
           ) : (
             <div className="dialog-body">
               {/* folder picker */}
-              <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+              <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
                 {mode === 'create' ? 'Folder to share' : 'Folder to receive into'}
               </label>
               <button
@@ -247,12 +247,12 @@ export function PairingModal({
 
               {mode === 'accept' && (
                 <div style={{ marginTop: 16 }}>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+                  <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
                     Invite code
                   </label>
                   <textarea
                     className="input"
-                    style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'none' }}
+                    style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'calc(12px * var(--ui-font-scale, 1))', resize: 'none' }}
                     autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
                     placeholder="Paste the dropbeam1:… invite here"
                     value={inviteInput}
@@ -263,7 +263,7 @@ export function PairingModal({
 
               {mode === 'create' && (
                 <div style={{ marginTop: 16 }}>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+                  <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
                     Their name <span style={{ color: 'var(--text-faint)', fontWeight: 500 }}>(optional)</span>
                   </label>
                   <input
@@ -273,7 +273,7 @@ export function PairingModal({
                     value={peerName}
                     onChange={(e) => setPeerName(e.target.value)}
                   />
-                  <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginTop: 6, lineHeight: 1.45 }}>
+                  <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', marginTop: 6, lineHeight: 1.45 }}>
                     Add a name and you'll be linked as friends automatically — then you can beam files
                     to each other without sharing a code again.
                   </div>
@@ -282,7 +282,7 @@ export function PairingModal({
 
               {mode === 'create' && (
                 <div style={{ marginTop: 16 }}>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+                  <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
                     Who can do what
                   </label>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
@@ -313,7 +313,7 @@ export function PairingModal({
 
               {mode === 'create' && friends.length > 0 && (
                 <div style={{ marginTop: 16 }}>
-                  <label style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-muted)' }}>
+                  <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
                     Invite friends{' '}
                     <span style={{ color: 'var(--text-faint)', fontWeight: 500 }}>(optional)</span>
                   </label>
@@ -337,7 +337,7 @@ export function PairingModal({
                             gap: 6,
                             padding: '6px 11px',
                             borderRadius: 999,
-                            fontSize: 12.5,
+                            fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
                             fontWeight: 600,
                             cursor: 'default',
                             transition: 'all 0.14s',
@@ -354,7 +354,7 @@ export function PairingModal({
                   </div>
                   <div
                     style={{
-                      fontSize: 11.5,
+                      fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
                       color: 'var(--text-faint)',
                       marginTop: 6,
                       lineHeight: 1.45,
@@ -419,10 +419,10 @@ function DirOption({
         transition: 'all 0.14s',
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: active ? 'var(--accent)' : 'var(--text)', fontWeight: 650, fontSize: 13.5 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: active ? 'var(--accent)' : 'var(--text)', fontWeight: 650, fontSize: 'calc(13.5px * var(--ui-font-scale, 1))' }}>
         {icon} {title}
       </div>
-      <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 3 }}>{desc}</div>
+      <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 3 }}>{desc}</div>
     </button>
   )
 }

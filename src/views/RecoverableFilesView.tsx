@@ -109,14 +109,14 @@ export function RecoverableFilesView() {
       <div className="card" style={{ padding: 18 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
           <div>
-            <div style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Saved copies are using ({budget > 0 ? `${formatBytes(budget)} limit per folder` : 'no storage limit'})</div>
-            <div style={{ fontSize: 26, fontWeight: 780, letterSpacing: '-0.02em', lineHeight: 1.15 }}>
+            <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>Saved copies are using ({budget > 0 ? `${formatBytes(budget)} limit per folder` : 'no storage limit'})</div>
+            <div style={{ fontSize: 'calc(26px * var(--ui-font-scale, 1))', fontWeight: 780, letterSpacing: '-0.02em', lineHeight: 1.15 }}>
               {formatBytes(total)}
             </div>
           </div>
           {confirming === 'all' ? (
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Free {formatBytes(total)}?</span>
+              <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>Free {formatBytes(total)}?</span>
               <button className="btn btn-ghost" onClick={() => setConfirming(null)} disabled={busy}>
                 Cancel
               </button>
@@ -150,7 +150,7 @@ export function RecoverableFilesView() {
               />
             ))}
         </div>
-        <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginTop: 11, lineHeight: 1.5 }}>
+        <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', marginTop: 11, lineHeight: 1.5 }}>
           Old copies are removed automatically to keep this small. Your live files are never touched.{' '}
           <button
             onClick={() => setView('settings')}
@@ -280,10 +280,10 @@ function FolderRow({
           <ChevronRight size={17} />
         </motion.div>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 14, fontWeight: 650, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 650, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
             {summary.folderName}
           </div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+          <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 2 }}>
             {formatBytes(summary.bytes)} · {summary.itemCount} {summary.itemCount === 1 ? 'item' : 'items'}
           </div>
         </div>
@@ -325,7 +325,7 @@ function FolderRow({
                   <Spinner size={18} />
                 </div>
               ) : items.length === 0 ? (
-                <div style={{ padding: '14px 12px', fontSize: 12.5, color: 'var(--text-faint)' }}>
+                <div style={{ padding: '14px 12px', fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)' }}>
                   Nothing saved here.
                 </div>
               ) : (
@@ -340,10 +340,10 @@ function FolderRow({
                     >
                       <FileIcon name={name} />
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13.5, fontWeight: 550, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        <div style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', fontWeight: 550, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                           {name}
                         </div>
-                        <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginTop: 1 }}>
+                        <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', marginTop: 1 }}>
                           {item.reason === 'replaced' ? 'Replaced' : 'Deleted'} · {formatRelativeTime(item.timestampMs)} ·{' '}
                           {formatBytes(item.size)}
                           {dir ? ` · ${dir}` : ''}

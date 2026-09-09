@@ -235,12 +235,12 @@ function NameSetupModal() {
           <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
             <BeamLogo size={36} />
           </div>
-          <h2 style={{ fontSize: 18, fontWeight: 750, textAlign: 'center', margin: '0 0 6px' }}>
+          <h2 style={{ fontSize: 'calc(18px * var(--ui-font-scale, 1))', fontWeight: 750, textAlign: 'center', margin: '0 0 6px' }}>
             What should people call you?
           </h2>
           <p
             style={{
-              fontSize: 13,
+              fontSize: 'calc(13px * var(--ui-font-scale, 1))',
               color: 'var(--text-muted)',
               textAlign: 'center',
               margin: '0 0 16px',
@@ -261,7 +261,7 @@ function NameSetupModal() {
               width: '100%',
               boxSizing: 'border-box',
               padding: '11px 13px',
-              fontSize: 15,
+              fontSize: 'calc(15px * var(--ui-font-scale, 1))',
               borderRadius: 10,
               border: '1px solid var(--border)',
               background: 'var(--bg)',
@@ -315,7 +315,7 @@ function LocalNetworkBanner() {
         alignItems: 'center',
         gap: 10,
         padding: '8px 14px',
-        fontSize: 12.5,
+        fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
         lineHeight: 1.4,
         background: 'var(--amber-soft)',
         color: 'var(--amber)',
@@ -329,7 +329,7 @@ function LocalNetworkBanner() {
       </span>
       <button
         className="btn btn-ghost"
-        style={{ flexShrink: 0, padding: '4px 10px', fontSize: 12 }}
+        style={{ flexShrink: 0, padding: '4px 10px', fontSize: 'calc(12px * var(--ui-font-scale, 1))' }}
         onClick={() => api.openLocalNetworkSettings().catch(() => {})}
       >
         Open Settings
@@ -354,7 +354,7 @@ function InstallBanner() {
         alignItems: 'center',
         gap: 10,
         padding: '8px 14px',
-        fontSize: 12.5,
+        fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
         lineHeight: 1.4,
         background: 'var(--amber-soft)',
         color: 'var(--amber)',

@@ -60,10 +60,10 @@ export function DropZone({
       </motion.div>
       <div style={{ textAlign: 'center' }}>
         {/* Phone users choose between the photo library and Files. */}
-        <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--text)' }}>
+        <div style={{ fontSize: 'calc(17px * var(--ui-font-scale, 1))', fontWeight: 700, color: 'var(--text)' }}>
           {MOBILE_UI ? 'Choose files to send' : hovering ? 'Drop to send' : 'Drag files here to send'}
         </div>
-        <div style={{ fontSize: 13.5, color: 'var(--text-muted)', marginTop: 4 }}>
+        <div style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 4 }}>
           {MOBILE_UI ? (
             'Pick photos, videos or documents, then choose who to send them to.'
           ) : (

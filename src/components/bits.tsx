@@ -153,9 +153,9 @@ export function EmptyState({
       >
         {icon}
       </div>
-      <div style={{ fontWeight: 650, color: 'var(--text)', fontSize: 15 }}>{title}</div>
+      <div style={{ fontWeight: 650, color: 'var(--text)', fontSize: 'calc(15px * var(--ui-font-scale, 1))' }}>{title}</div>
       {hint && (
-        <div style={{ fontSize: 13, marginTop: 5, maxWidth: 320, lineHeight: 1.5 }}>{hint}</div>
+        <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', marginTop: 5, maxWidth: 320, lineHeight: 1.5 }}>{hint}</div>
       )}
     </div>
   )
@@ -165,7 +165,7 @@ export function SectionTitle({ children }: { children: ReactNode }) {
   return (
     <div
       style={{
-        fontSize: 12,
+        fontSize: 'calc(12px * var(--ui-font-scale, 1))',
         fontWeight: 700,
         letterSpacing: '0.04em',
         textTransform: 'uppercase',

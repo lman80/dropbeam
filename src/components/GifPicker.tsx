@@ -85,7 +85,7 @@ export function GifPicker({
             <button className="btn btn-primary" onClick={onSetup}>
               Set it up
             </button>
-            <div style={{ marginTop: 8, fontSize: 11, opacity: 0.7 }}>
+            <div style={{ marginTop: 8, fontSize: 'calc(11px * var(--ui-font-scale, 1))', opacity: 0.7 }}>
               Grab one at developers.giphy.com → paste it in Settings.
             </div>
           </div>

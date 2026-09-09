@@ -56,7 +56,7 @@ export function FoldersView() {
           gap: 12,
         }}
       >
-        <h1 style={{ fontSize: 20, fontWeight: 750, margin: 0 }}>Shared Folders</h1>
+        <h1 style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: 0 }}>Shared Folders</h1>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-ghost" onClick={() => setModal('accept')}>
             <Plus size={15} /> Accept invite
@@ -306,7 +306,7 @@ function FolderCard({
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontWeight: 700, fontSize: 14.5 }}>{peer}</span>
+            <span style={{ fontWeight: 700, fontSize: 'calc(14.5px * var(--ui-font-scale, 1))' }}>{peer}</span>
             {pair.mirror ? (
               <span className="chip" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>
                 <FolderSync size={11} /> Total sync
@@ -337,7 +337,7 @@ function FolderCard({
           </div>
           <div
             style={{
-              fontSize: 12,
+              fontSize: 'calc(12px * var(--ui-font-scale, 1))',
               color: 'var(--text-faint)',
               marginTop: 2,
               overflow: 'hidden',
@@ -392,11 +392,11 @@ function FolderCard({
             boxShadow: `0 0 0 3px color-mix(in srgb, ${info.color} 22%, transparent)`,
           }}
         />
-        <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>{info.label}</span>
+        <span style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>{info.label}</span>
         {pair.role === 'a' && !pair.peerName && (
           <button
             className="btn btn-ghost"
-            style={{ marginLeft: 'auto', padding: '5px 10px', fontSize: 12.5 }}
+            style={{ marginLeft: 'auto', padding: '5px 10px', fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
             onClick={showInvite}
             disabled={loadingInvite}
           >
@@ -417,7 +417,7 @@ function FolderCard({
             display: 'flex',
             alignItems: 'center',
             gap: 9,
-            fontSize: 12.5,
+            fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
           }}
         >
           <Unlink size={15} color="var(--red)" style={{ flexShrink: 0 }} />
@@ -453,7 +453,7 @@ function FolderCard({
         ))}
         <button
           className="btn btn-ghost"
-          style={{ padding: '5px 11px', fontSize: 12.5 }}
+          style={{ padding: '5px 11px', fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
           onClick={addPerson}
           disabled={addingPerson}
           title="Invite another person to this folder"
@@ -474,7 +474,7 @@ function FolderCard({
             background: 'var(--amber-soft)',
             border: '1px solid var(--border)',
             borderRadius: 10,
-            fontSize: 12.5,
+            fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
           }}
         >
           <span style={{ flex: 1, lineHeight: 1.4 }}>
@@ -499,7 +499,7 @@ function FolderCard({
             alignItems: 'center',
             gap: 7,
             marginTop: 10,
-            fontSize: 12.5,
+            fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
             color: 'var(--text-muted)',
           }}
         >
@@ -529,13 +529,13 @@ function FolderCard({
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 15, fontWeight: 750 }} className="gradient-text">
+              <span style={{ fontSize: 'calc(15px * var(--ui-font-scale, 1))', fontWeight: 750 }} className="gradient-text">
                 {Math.round(status.percent)}%
               </span>
               <LocalityBadge locality={status.locality} />
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              <span style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
                 {formatBytes(status.bytesDone)}
                 {status.bytesTotal > 0 ? ` / ${formatBytes(status.bytesTotal)}` : ''}
               </span>
@@ -543,7 +543,7 @@ function FolderCard({
                 <button
                   className="btn btn-ghost"
                   title="Stop this transfer (it won't be lost — it retries)"
-                  style={{ padding: '3px 9px', fontSize: 12 }}
+                  style={{ padding: '3px 9px', fontSize: 'calc(12px * var(--ui-font-scale, 1))' }}
                   onClick={() => api.stopFolderTransfer(pair.id)}
                 >
                   <X size={13} /> Stop
@@ -556,7 +556,7 @@ function FolderCard({
             style={{
               display: 'flex',
               justifyContent: 'space-between',
-              fontSize: 11.5,
+              fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
               color: 'var(--text-faint)',
               marginTop: 6,
               gap: 10,
@@ -593,7 +593,7 @@ function FolderCard({
                       display: 'flex',
                       alignItems: 'center',
                       gap: 7,
-                      fontSize: 12,
+                      fontSize: 'calc(12px * var(--ui-font-scale, 1))',
                       color: 'var(--text-faint)',
                     }}
                   >
@@ -623,7 +623,7 @@ function FolderCard({
         <div
           style={{
             marginTop: 10,
-            fontSize: 11.5,
+            fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
             color: 'var(--text-faint)',
             display: 'flex',
             alignItems: 'center',
@@ -823,7 +823,7 @@ function Member({
           placeItems: 'center',
           color: 'white',
           fontWeight: 700,
-          fontSize: 10,
+          fontSize: 'calc(10px * var(--ui-font-scale, 1))',
           flexShrink: 0,
           background: you
             ? 'linear-gradient(135deg, var(--accent), var(--accent-2))'
@@ -848,7 +848,7 @@ function Member({
           />
         )}
       </span>
-      <span style={{ fontSize: 12.5, fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
+      <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
         {you ? `${name} (you)` : name}
       </span>
       {/* Owner control: a clear two-option toggle that always shows BOTH roles with
@@ -894,7 +894,7 @@ function Member({
               display: 'inline-flex',
               alignItems: 'center',
               gap: 3,
-              fontSize: 10.5,
+              fontSize: 'calc(10.5px * var(--ui-font-scale, 1))',
               fontWeight: 700,
               padding: '1px 6px',
               borderRadius: 999,
@@ -960,7 +960,7 @@ function RoleSeg({
         alignItems: 'center',
         gap: 3,
         padding: '2px 8px',
-        fontSize: 10.5,
+        fontSize: 'calc(10.5px * var(--ui-font-scale, 1))',
         fontWeight: 700,
         border: 'none',
         cursor: active ? 'default' : 'pointer',
@@ -1050,7 +1050,7 @@ function Banner({
         borderRadius: 10,
         background: bg,
         color,
-        fontSize: 13,
+        fontSize: 'calc(13px * var(--ui-font-scale, 1))',
         fontWeight: 600,
         lineHeight: 1.4,
       }}
@@ -1073,8 +1073,8 @@ function SettingRow({
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '11px 2px' }}>
       <div style={{ flex: 1 }}>
-        <div style={{ fontSize: 13.5, fontWeight: 600 }}>{title}</div>
-        <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
+        <div style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', fontWeight: 600 }}>{title}</div>
+        <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
           {desc}
         </div>
       </div>
@@ -1126,13 +1126,13 @@ function InviteModal({
         style={{ width: 420, maxWidth: '100%', padding: 22, borderRadius: 20 }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-          <div style={{ fontWeight: 750, fontSize: 16 }}>Invite for {folderName}</div>
+          <div style={{ fontWeight: 750, fontSize: 'calc(16px * var(--ui-font-scale, 1))' }}>Invite for {folderName}</div>
           <button className="icon-btn" onClick={onClose}>
             <X size={17} />
           </button>
         </div>
         <div className="dialog-body">
-          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.5 }}>
+          <p style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.5 }}>
             Send this to the other person. They open DropBeam → <b>Accept invite</b>, paste it, and
             choose a folder.
           </p>
@@ -1145,7 +1145,7 @@ function InviteModal({
             className="selectable"
             style={{
               fontFamily: 'var(--font-mono)',
-              fontSize: 11,
+              fontSize: 'calc(11px * var(--ui-font-scale, 1))',
               background: 'var(--surface-2)',
               border: '1px solid var(--border)',
               borderRadius: 11,

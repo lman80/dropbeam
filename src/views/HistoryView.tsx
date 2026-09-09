@@ -65,7 +65,7 @@ export function HistoryView() {
         className="titlebar-drag"
         style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}
       >
-        <h1 style={{ fontSize: 20, fontWeight: 750, margin: 0 }}>History</h1>
+        <h1 style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: 0 }}>History</h1>
         {tab === 'recents' && history.length > 0 && (
           <button className="btn btn-ghost" onClick={clearAll} title="Clears this list — your files aren't touched">
             <Trash2 size={15} /> Clear list
@@ -153,7 +153,7 @@ function Recents({
           placeholder="Search files & people"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          style={{ padding: '9px 12px 9px 34px', fontSize: 13.5, width: '100%' }}
+          style={{ padding: '9px 12px 9px 34px', fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', width: '100%' }}
         />
       </div>
 
@@ -166,7 +166,7 @@ function Recents({
           <div key={g.label}>
             <div
               style={{
-                fontSize: 11.5,
+                fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
                 fontWeight: 700,
                 letterSpacing: '0.04em',
                 textTransform: 'uppercase',
@@ -238,10 +238,10 @@ function RecentRow({ e }: { e: HistoryEntry }) {
       </div>
 
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontWeight: 600, fontSize: 14, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        <div style={{ fontWeight: 600, fontSize: 'calc(14px * var(--ui-font-scale, 1))', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
           {entryTitle(e)}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 2, fontSize: 12, color: 'var(--text-muted)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 2, fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
           <span>
             {e.direction === 'send' ? 'Sent' : 'Received'}
             {e.peer ? ` ${e.direction === 'send' ? 'to' : 'from'} ${e.peer}` : ''}

@@ -118,7 +118,7 @@ export function Sidebar() {
             placeItems: 'center',
             color: 'white',
             fontWeight: 700,
-            fontSize: 13,
+            fontSize: 'calc(13px * var(--ui-font-scale, 1))',
             background: 'linear-gradient(135deg, var(--accent), var(--accent-2))',
             flexShrink: 0,
           }}
@@ -128,7 +128,7 @@ export function Sidebar() {
         <div style={{ overflow: 'hidden' }}>
           <div
             style={{
-              fontSize: 13,
+              fontSize: 'calc(13px * var(--ui-font-scale, 1))',
               fontWeight: 650,
               whiteSpace: 'nowrap',
               textOverflow: 'ellipsis',
@@ -137,7 +137,7 @@ export function Sidebar() {
           >
             {name || 'This device'}
           </div>
-          <div style={{ fontSize: 11, color: 'var(--text-faint)' }}>This device</div>
+          <div style={{ fontSize: 'calc(11px * var(--ui-font-scale, 1))', color: 'var(--text-faint)' }}>This device</div>
         </div>
       </div>
     </nav>

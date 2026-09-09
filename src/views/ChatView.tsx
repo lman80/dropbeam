@@ -163,7 +163,7 @@ export function ChatView() {
   if (rows.length === 0 && !activeChatId) {
     return (
       <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
-        <h1 style={{ fontSize: 20, fontWeight: 750, margin: '0 0 16px' }}>Chat</h1>
+        <h1 style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: '0 0 16px' }}>Chat</h1>
         <div className="card">
           <EmptyState
             icon={<MessageCircle size={24} />}
@@ -193,7 +193,7 @@ export function ChatView() {
           minHeight: 0,
         }}
       >
-        <div className="titlebar-drag" style={{ padding: '10px 16px 8px', fontWeight: 750, fontSize: 17 }}>
+        <div className="titlebar-drag" style={{ padding: '10px 16px 8px', fontWeight: 750, fontSize: 'calc(17px * var(--ui-font-scale, 1))' }}>
           Chat
         </div>
         <div className="scroll-area" style={{ flex: 1, padding: '0 8px 8px', minHeight: 0 }}>
@@ -638,13 +638,13 @@ function Conversation({ friendId }: { friendId: string }) {
           {online && <span className="chat-dot" />}
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 700, fontSize: 14.5 }}>{friend.name}</div>
+          <div style={{ fontWeight: 700, fontSize: 'calc(14.5px * var(--ui-font-scale, 1))' }}>{friend.name}</div>
           <div
             style={{
               display: 'flex',
               alignItems: 'center',
               gap: 7,
-              fontSize: 12,
+              fontSize: 'calc(12px * var(--ui-font-scale, 1))',
               color: typing ? 'var(--accent)' : online ? 'var(--green)' : 'var(--text-faint)',
             }}
           >
@@ -727,9 +727,9 @@ function Conversation({ friendId }: { friendId: string }) {
         {items.length === 0 ? (
           <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-faint)', paddingTop: 40 }}>
             <MessageCircle size={30} style={{ opacity: 0.5 }} />
-            <div style={{ marginTop: 8, fontSize: 13 }}>Say hi to {friend.name} 👋</div>
+            <div style={{ marginTop: 8, fontSize: 'calc(13px * var(--ui-font-scale, 1))' }}>Say hi to {friend.name} 👋</div>
             {!online && (
-              <div style={{ marginTop: 4, fontSize: 12, opacity: 0.75 }}>
+              <div style={{ marginTop: 4, fontSize: 'calc(12px * var(--ui-font-scale, 1))', opacity: 0.75 }}>
                 They’re offline — your message delivers when they’re back.
               </div>
             )}

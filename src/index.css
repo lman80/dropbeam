@@ -248,7 +248,7 @@ textarea,
   gap: 10px;
   padding: 9px 11px;
   border-radius: 10px;
-  font-size: 14px;
+  font-size: calc(14px * var(--ui-font-scale, 1));
   font-weight: 600;
   color: var(--text-muted);
   cursor: default;
@@ -314,7 +314,7 @@ textarea,
   gap: 6px;
   padding: 7px 16px;
   border-radius: 9px;
-  font-size: 13.5px;
+  font-size: calc(13.5px * var(--ui-font-scale, 1));
   font-weight: 600;
   color: var(--text-muted);
   background: transparent;
@@ -411,7 +411,7 @@ html.overlay-window #root {
 }
 .popover-title {
   font-weight: 750;
-  font-size: 14px;
+  font-size: calc(14px * var(--ui-font-scale, 1));
   letter-spacing: -0.01em;
 }
 .popover-body {
@@ -423,7 +423,7 @@ html.overlay-window #root {
   gap: 8px;
 }
 .popover-section-label {
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -454,7 +454,7 @@ html.overlay-window #root {
   border: 1.5px solid color-mix(in srgb, var(--accent) 14%, var(--border));
   background: color-mix(in srgb, var(--surface-2) 65%, transparent);
   padding: 7px 12px 7px 32px;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   color: var(--text);
   outline: none;
   transition: border-color 0.14s ease, box-shadow 0.14s ease;
@@ -505,7 +505,7 @@ html.overlay-window #root {
   place-items: center;
   color: #fff;
   font-weight: 700;
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--ui-font-scale, 1));
   flex-shrink: 0;
 }
 .pop-online-dot {
@@ -525,7 +525,7 @@ html.overlay-window #root {
   flex: 1;
 }
 .pop-contact-name {
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   font-weight: 650;
   color: var(--text);
   white-space: nowrap;
@@ -533,7 +533,7 @@ html.overlay-window #root {
   text-overflow: ellipsis;
 }
 .pop-contact-sub {
-  font-size: 11.5px;
+  font-size: calc(11.5px * var(--ui-font-scale, 1));
   color: var(--text-faint);
 }
 .pop-contact-send {
@@ -563,7 +563,7 @@ html.overlay-window #root {
   display: block;
   margin-top: 7px;
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   font-weight: 600;
   color: var(--text);
   word-break: break-all;
@@ -624,7 +624,7 @@ html.overlay-window #root {
 }
 .hud-title {
   display: block;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   font-weight: 650;
   white-space: nowrap;
   overflow: hidden;
@@ -632,7 +632,7 @@ html.overlay-window #root {
 }
 .hud-sub {
   display: block;
-  font-size: 10.5px;
+  font-size: calc(10.5px * var(--ui-font-scale, 1));
   color: rgba(255, 255, 255, 0.6);
   white-space: nowrap;
   overflow: hidden;
@@ -642,7 +642,7 @@ html.overlay-window #root {
   flex-shrink: 0;
   min-width: 28px;
   text-align: right;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   font-weight: 750;
   font-variant-numeric: tabular-nums;
   color: rgba(255, 255, 255, 0.92);
@@ -695,7 +695,7 @@ html.overlay-window #root {
   place-items: center;
   color: #fff;
   font-weight: 700;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   flex-shrink: 0;
 }
 .avatar-img {
@@ -718,7 +718,7 @@ html.overlay-window #root {
 }
 .chat-row-name {
   display: block;
-  font-size: 13.5px;
+  font-size: calc(13.5px * var(--ui-font-scale, 1));
   font-weight: 650;
   color: var(--text);
   white-space: nowrap;
@@ -727,7 +727,7 @@ html.overlay-window #root {
 }
 .chat-row-last {
   display: block;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -742,7 +742,7 @@ html.overlay-window #root {
   border-radius: 999px;
   background: var(--accent);
   color: #fff;
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   font-weight: 700;
   display: grid;
   place-items: center;
@@ -753,7 +753,7 @@ html.overlay-window #root {
   background: var(--surface-2);
   border: 1px solid var(--border);
   color: var(--text);
-  font-size: 13.5px;
+  font-size: calc(13.5px * var(--ui-font-scale, 1));
   line-height: 1.45;
   /* On a computer you copy text out of messages all the time (GitHub #26). The
      app root sets user-select:none; opt message text back in. */
@@ -785,7 +785,7 @@ html.overlay-window #root {
   background: var(--surface-2);
   color: var(--text);
   font: inherit;
-  font-size: 13.5px;
+  font-size: calc(13.5px * var(--ui-font-scale, 1));
   line-height: 1.4;
   outline: none;
 }
@@ -866,7 +866,7 @@ html.overlay-window #root {
   place-items: center;
   color: #fff;
   font-weight: 700;
-  font-size: 10px;
+  font-size: calc(10px * var(--ui-font-scale, 1));
 }
 .chat-line-body {
   display: flex;
@@ -905,7 +905,7 @@ html.overlay-window #root {
   align-self: flex-end;
   padding-bottom: 6px;
   white-space: nowrap;
-  font-size: 10.5px;
+  font-size: calc(10.5px * var(--ui-font-scale, 1));
   color: var(--text-faint);
   pointer-events: none;
   user-select: none;
@@ -916,7 +916,7 @@ html.overlay-window #root {
   margin: 14px 0 10px;
 }
 .chat-divider span {
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   font-weight: 650;
   color: var(--text-muted);
   background: var(--surface-2);
@@ -928,7 +928,7 @@ html.overlay-window #root {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 10.5px;
+  font-size: calc(10.5px * var(--ui-font-scale, 1));
   color: var(--text-faint);
   margin-top: 3px;
 }
@@ -965,7 +965,7 @@ html.overlay-window #root {
   border: 1px solid var(--border);
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1002,13 +1002,13 @@ html.overlay-window #root {
 }
 .chat-file-name {
   font-weight: 600;
-  font-size: 13.5px;
+  font-size: calc(13.5px * var(--ui-font-scale, 1));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .chat-file-size {
-  font-size: 11.5px;
+  font-size: calc(11.5px * var(--ui-font-scale, 1));
   opacity: 0.7;
 }
 /* In-thread search bar and persistent match highlights. */
@@ -1027,10 +1027,10 @@ html.overlay-window #root {
   outline: none;
   background: transparent;
   color: var(--text);
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
 }
 .chat-search-count {
-  font-size: 11.5px;
+  font-size: calc(11.5px * var(--ui-font-scale, 1));
   color: var(--text-faint);
   white-space: nowrap;
 }
@@ -1043,7 +1043,7 @@ html.overlay-window #root {
   margin-top: 6px;
   width: 100%;
   padding: 6px 10px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   font-weight: 600;
   color: var(--red);
   background: var(--red-soft);
@@ -1062,7 +1062,7 @@ html.overlay-window #root {
 }
 .chat-edited {
   opacity: 0.6;
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   font-style: italic;
 }
 /* Clickable links inside a message bubble. Underlined, inherit the bubble's text
@@ -1085,7 +1085,7 @@ html.overlay-window #root {
 .chat-deleted {
   color: var(--text-faint);
   font-style: italic;
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--ui-font-scale, 1));
 }
 .chat-bubble.media {
   padding: 3px;
@@ -1112,7 +1112,7 @@ html.overlay-window #root {
   background: var(--surface-2);
   border: 1px solid var(--border);
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 
 /* hover action cluster + reaction tray + ⋯ menu */
@@ -1170,7 +1170,7 @@ html.overlay-window #root {
 .react-tray-cell {
   border: none;
   background: transparent;
-  font-size: 17px;
+  font-size: calc(17px * var(--ui-font-scale, 1));
   line-height: 1;
   padding: 4px 5px;
   border-radius: 999px;
@@ -1197,7 +1197,7 @@ html.overlay-window #root {
   background: transparent;
   color: var(--text);
   font: inherit;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   border-radius: 7px;
   cursor: pointer;
   text-align: left;
@@ -1224,7 +1224,7 @@ html.overlay-window #root {
   align-items: center;
   gap: 3px;
   padding: 1px 7px;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   line-height: 1.5;
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -1236,7 +1236,7 @@ html.overlay-window #root {
   background: color-mix(in srgb, var(--accent) 16%, var(--surface-2));
 }
 .react-chip-n {
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   font-weight: 650;
   color: var(--text-muted);
 }
@@ -1261,7 +1261,7 @@ html.overlay-window #root {
   flex-shrink: 0;
 }
 .chat-quote-text {
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -1284,7 +1284,7 @@ html.overlay-window #root {
   border-radius: 999px;
   background: var(--accent);
   color: #fff;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   font-weight: 650;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
   cursor: pointer;
@@ -1317,7 +1317,7 @@ html.overlay-window #root {
   background: var(--surface-2);
   border: 1px solid var(--border);
   color: var(--text);
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
 }
 .chat-staged-name {
   overflow: hidden;
@@ -1364,7 +1364,7 @@ html.overlay-window #root {
   align-items: center;
   gap: 5px;
   padding: 0 4px;
-  font-size: 10.5px;
+  font-size: calc(10.5px * var(--ui-font-scale, 1));
   color: var(--text-faint);
 }
 .sync-cap svg {
@@ -1381,7 +1381,7 @@ html.overlay-window #root {
   border: 1px solid var(--border);
   background: var(--surface-2);
   color: var(--text);
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   cursor: pointer;
   text-align: left;
   transition: background 0.12s ease, border-color 0.12s ease;
@@ -1405,7 +1405,7 @@ html.overlay-window #root {
   flex-shrink: 0;
   margin-left: auto;
   padding-left: 8px;
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   color: var(--text-faint);
 }
 .sync-thumb {
@@ -1431,12 +1431,12 @@ html.overlay-window #root {
   color: var(--accent);
 }
 .chat-replybar-who {
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   font-weight: 650;
   color: var(--text);
 }
 .chat-replybar-text {
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -1468,7 +1468,7 @@ html.overlay-window #root {
 .emoji-cell {
   border: none;
   background: transparent;
-  font-size: 19px;
+  font-size: calc(19px * var(--ui-font-scale, 1));
   line-height: 1;
   padding: 5px;
   border-radius: 8px;
@@ -1512,7 +1512,7 @@ html.overlay-window #root {
   background: transparent;
   color: var(--text);
   font: inherit;
-  font-size: 13.5px;
+  font-size: calc(13.5px * var(--ui-font-scale, 1));
   outline: none;
 }
 .gif-picker-close {
@@ -1551,12 +1551,12 @@ html.overlay-window #root {
   grid-column: 1 / -1;
   text-align: center;
   color: var(--text-faint);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--ui-font-scale, 1));
   padding: 24px 0;
 }
 .gif-picker-foot {
   text-align: center;
-  font-size: 10px;
+  font-size: calc(10px * var(--ui-font-scale, 1));
   letter-spacing: 0.04em;
   color: var(--text-faint);
   padding: 5px;
@@ -1576,7 +1576,7 @@ html.overlay-window #root {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   white-space: nowrap;
 }
 .conn-insp-ic {
@@ -1593,7 +1593,7 @@ html.overlay-window #root {
   align-items: center;
   gap: 3px;
   color: var(--accent);
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
 }
 .conn-park {
   display: flex;
@@ -1604,7 +1604,7 @@ html.overlay-window #root {
   border-radius: 11px;
   background: var(--amber-soft);
   color: var(--amber);
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--ui-font-scale, 1));
 }
 .conn-park .btn-ghost {
   color: var(--amber);
@@ -1714,7 +1714,7 @@ html.overlay-window #root {
   place-items: center;
   color: #fff;
   font-weight: 700;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   background: #5b616b;
 }
 .rc-mini-av.done {
@@ -1725,14 +1725,14 @@ html.overlay-window #root {
   min-width: 0;
 }
 .rc-mini-name {
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--ui-font-scale, 1));
   font-weight: 650;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .rc-mini-sub {
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   color: var(--text-muted);
   margin-top: 1px;
 }
@@ -1766,7 +1766,7 @@ html.overlay-window #root {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16);
 }
 .rc-ext {
-  font-size: 10px;
+  font-size: calc(10px * var(--ui-font-scale, 1));
   font-weight: 800;
   letter-spacing: 0.5px;
   color: #aeb3bb;
@@ -1803,7 +1803,7 @@ html.overlay-window #root {
   color: #fff;
   display: grid;
   place-items: center;
-  font-size: 15px;
+  font-size: calc(15px * var(--ui-font-scale, 1));
   font-weight: 700;
   border: 2px solid var(--bg-elev);
 }
@@ -1812,7 +1812,7 @@ html.overlay-window #root {
   border-color: var(--bg-elev);
 }
 .rc-name {
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--ui-font-scale, 1));
   font-weight: 650;
   text-align: center;
   line-height: 1.3;
@@ -1820,7 +1820,7 @@ html.overlay-window #root {
   margin-top: 6px;
 }
 .rc-from {
-  font-size: 11px;
+  font-size: calc(11px * var(--ui-font-scale, 1));
   color: var(--text-muted);
   margin-top: 3px;
   text-align: center;
@@ -1835,7 +1835,7 @@ html.overlay-window #root {
 .rc-btn {
   border: none;
   border-radius: 10px;
-  font-size: 12.5px;
+  font-size: calc(12.5px * var(--ui-font-scale, 1));
   font-weight: 650;
   padding: 7px 11px;
   cursor: pointer;
@@ -1868,7 +1868,7 @@ html.overlay-window #root {
 }
 .rc-status {
   margin-top: 10px;
-  font-size: 12px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
   font-weight: 600;
   color: var(--text-muted);
 }
@@ -1892,7 +1892,7 @@ html.overlay-window #root {
   z-index: 5;
 }
 .rc-menu-label {
-  font-size: 10.5px;
+  font-size: calc(10.5px * var(--ui-font-scale, 1));
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -1904,7 +1904,7 @@ html.overlay-window #root {
   background: transparent;
   color: var(--text);
   text-align: left;
-  font-size: 13px;
+  font-size: calc(13px * var(--ui-font-scale, 1));
   padding: 8px 9px;
   border-radius: 8px;
   cursor: pointer;
@@ -2226,3 +2226,26 @@ html.mobile .chat-input { font-size: 16px; }
   background: var(--surface);
   z-index: 1;
 }
+
+/* Phone typography token also scales legacy inline labels without desktop changes. */
+html.mobile { font-size: 17px; --ui-font-scale: 1.22; }
+html.mobile body { font-size: 1rem; }
+html.mobile button { min-width: 44px; min-height: 44px; }
+html.mobile .btn { font-size: 1rem !important; padding: 12px 18px !important; }
+html.mobile .icon-btn { width: 44px !important; height: 44px !important; }
+html.mobile :is(input, textarea, select) { font-size: 17px !important; min-height: 44px; }
+html.mobile .seg button { min-height: 44px; }
+html.mobile .toggle { width: 51px; height: 44px; transform: none; background: transparent; }
+html.mobile .toggle::before { content: ''; position: absolute; inset: 6px 0; border-radius: 99px; background: var(--border-strong); }
+html.mobile .toggle.on::before { background: var(--accent); }
+html.mobile .toggle::after { width: 26px; height: 26px; top: 9px; }
+html.mobile .toggle.on::after { transform: translateX(19px); }
+html.mobile .settings-row { padding: 17px 4px !important; }
+html.mobile :is(.chat-avatar, .friend-avatar, .chooser-avatar) { min-width: 48px; width: 48px; height: 48px; }
+html.mobile .chooser-row { padding: 14px 12px; }
+html.mobile .chat-composer { padding: 12px 8px; gap: 4px; }
+html.mobile .chat-composer .chat-input { min-height: 50px; padding: 13px 10px; }
+html.mobile .chat-send { height: 50px; }
+html.mobile .tabbar-label { font-size: 12px; }
+html.mobile .emoji-pop { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+html.mobile .emoji-cell { padding: 5px 0; }
