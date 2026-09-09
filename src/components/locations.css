@@ -1,0 +1,92 @@
+.locations-view { max-width: 1100px; margin: 0 auto; padding: 8px 28px 36px; }
+.location-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+.location-heading h1 { font-size: 22px; font-weight: 750; margin: 0 0 5px; }
+.location-heading h2 { font-size: 17px; margin: 0 0 5px; display: flex; align-items: center; gap: 8px; }
+.location-heading h3 { margin: 0; }
+.location-heading p, .location-muted { color: var(--text-muted); font-size: 12.5px; line-height: 1.5; margin: 4px 0; }
+.location-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.location-grow { flex: 1; min-width: 0; }
+.location-empty, .location-empty-small { padding: 38px 22px; text-align: center; color: var(--text-muted); }
+.location-empty { margin-top: 26px; }
+.location-empty > svg { color: var(--accent); margin: 12px auto; }
+.location-empty h2, .location-empty-small h3 { color: var(--text); }
+.location-empty p { font-size: 14px; line-height: 1.7; margin: 10px 0 22px; }
+.location-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(270px, 100%), 1fr)); gap: 16px; }
+.location-tile { padding: 21px; color: var(--text); text-align: left; cursor: pointer; transition: border-color .15s, transform .15s; }
+.location-tile:hover { border-color: var(--accent); transform: translateY(-2px); }
+.location-tile h2 { margin: 20px 0 4px; font-size: 19px; overflow-wrap: anywhere; }
+.location-tile p { color: var(--text-muted); font-size: 13px; margin: 0 0 23px; }
+.location-tile-top, .location-tile-bottom, .location-host-label { display: flex; align-items: center; gap: 10px; }
+.location-tile-top, .location-tile-bottom { justify-content: space-between; }
+.location-tile-bottom { font-size: 11px; color: var(--text-muted); border-top: 1px solid var(--border); padding-top: 14px; }
+.location-drive-icon { display: grid; place-items: center; width: 45px; height: 45px; border-radius: 13px; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.location-presence { font-size: 10px; display: flex; align-items: center; gap: 6px; color: var(--text-muted); }
+.location-presence i { width: 6px; height: 6px; background: var(--text-muted); border-radius: 50%; }
+.location-presence.online i { background: #32b789; }
+.location-back { margin: 0 0 14px; }
+.location-host-label { margin: 0 0 14px; font-size: 13px; color: var(--text-muted); flex-wrap: wrap; }
+.location-connection-details { margin-top: 20px; color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
+.file-browser { overflow: hidden; padding: 0; transition: outline .15s; }
+.file-browser.location-drag { outline: 3px solid var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg-elev)); }
+.location-breadcrumbs { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.location-breadcrumbs span { display: inline-flex; align-items: center; gap: 2px; min-width: 0; }
+.location-breadcrumbs button { display: inline-flex; align-items: center; gap: 7px; padding: 4px 6px; color: var(--text); background: transparent; border: 0; border-radius: 5px; font-size: 12px; cursor: pointer; overflow-wrap: anywhere; }
+.location-breadcrumbs button:hover { background: var(--bg); color: var(--accent); }
+.location-actions { padding: 12px 16px 4px; }
+.location-actions .btn { font-size: 12px; padding: 7px 10px; }
+.location-filter { padding: 12px 16px; justify-content: space-between; }
+.location-filter label { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 140px; color: var(--text-muted); }
+.location-filter input { width: 100%; }
+.location-filter select { max-width: 180px; }
+.location-filter input, .location-filter select, .location-editor input:not([type=checkbox]), .location-modal input:not([type=checkbox]) { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; font: inherit; font-size: 13px; box-sizing: border-box; min-width: 0; }
+.location-table-wrap { overflow-x: auto; min-height: 240px; }
+.location-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.location-table th { text-align: left; font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); padding: 10px; background: var(--bg); }
+.location-table th:first-child, .location-table td:first-child { width: 30px; padding-left: 17px; }
+.location-table th:nth-child(2) { width: 60%; }
+.location-table td { padding: 10px; border-top: 1px solid var(--border); white-space: nowrap; color: var(--text-muted); }
+.location-table tr.selected td { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.location-table tbody tr:hover { background: color-mix(in srgb, var(--text) 3%, transparent); }
+.location-filename { display: flex; align-items: center; gap: 9px; background: none; border: none; cursor: pointer; color: var(--text); font: inherit; width: 100%; text-align: left; padding: 2px 0; }
+.location-filename > span { white-space: normal; overflow-wrap: anywhere; min-width: 70px; }
+.location-filename > svg { flex-shrink: 0; color: var(--accent); }
+.location-browser-footer { padding: 11px 16px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-muted); }
+.location-browser-footer .btn { font-size: 11px; }
+.location-error { color: var(--red, #e47474); padding: 12px 16px; font-size: 13px; overflow-wrap: anywhere; }
+.location-status { color: var(--accent); margin: 5px 16px 12px; font-size: 12px; }
+.location-modal { position: fixed; inset: 0; z-index: 200; display: grid; place-items: center; background: #0008; padding: 20px; backdrop-filter: blur(4px); }
+.location-modal form { width: 440px; max-width: 100%; max-height: 85vh; overflow: auto; padding: 24px; }
+.location-modal p { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; color: var(--text-muted); }
+.location-modal label, .location-editor > label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 16px; }
+.location-modal input:not([type=checkbox]), .location-editor > label > input { display: block; width: 100%; margin-top: 7px; }
+.location-modal .dialog-actions { justify-content: flex-end; margin-top: 22px; }
+.location-trash-items { max-height: 170px; overflow: auto; font-size: 13px; padding-left: 18px; overflow-wrap: anywhere; }
+.location-settings { margin: 26px 0; }
+.location-host-row { padding: 16px; display: flex; align-items: center; gap: 13px; margin-bottom: 10px; flex-wrap: wrap; }
+.location-host-row > svg { color: var(--accent); }
+.location-host-row strong { font-size: 14px; }
+.location-host-row small { color: var(--text-muted); font-size: 11px; }
+.location-path { overflow-wrap: anywhere; font-size: 11px; color: var(--text-muted); margin: 5px 0; }
+.location-editor { padding: 20px; margin-top: 12px; }
+.location-editor .location-toolbar > input { flex: 1; margin: 7px 0; }
+.location-editor fieldset { border: 1px solid var(--border); border-radius: 10px; margin: 20px 0; padding: 12px; }
+.location-editor legend { font-size: 12px; font-weight: 650; padding: 0 7px; }
+.location-check { display: flex; align-items: center; gap: 9px; font-size: 13px; padding: 6px 0; }
+.location-friend-list { max-height: 180px; overflow-y: auto; }
+.location-check input, .location-table input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+.location-spin { animation: location-spin 1.2s linear infinite; }
+@keyframes location-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .location-spin { animation: none; } .location-tile { transition: none; } }
+@media (max-width: 700px) {
+  .app-workspace { flex-direction: column; }
+  nav.app-sidebar { order: 2; width: 100% !important; flex-direction: row !important; padding: 6px 6px max(6px, env(safe-area-inset-bottom)) !important; overflow-x: auto; border-top: 1px solid var(--border); box-sizing: border-box; }
+  .app-sidebar > .nav-item { flex-direction: column; padding: 8px 10px; gap: 4px; font-size: 10px; flex-shrink: 0; }
+  .app-sidebar > div, .app-sidebar > .sidebar-feedback { display: none; }
+  .locations-view { padding: 12px 14px 24px; }
+  .location-heading { gap: 10px; }
+  .location-heading h1 { font-size: 21px; }
+  .location-table th:last-child, .location-table td:last-child { display: none; }
+  .location-filter { gap: 10px; }
+  .location-editor { padding: 14px; }
+  .location-host-row .location-grow { flex-basis: 70%; }
+}
