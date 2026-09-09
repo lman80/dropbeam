@@ -13,6 +13,17 @@ export function DropZone({
   onPick: () => void
   onPickPhotos?: () => void
 }) {
+  if (MOBILE_UI) return (
+    <section className="mobile-send-hero glass glass-card" data-testid="dropzone" aria-busy={picking}>
+      <div className="mobile-file-icon"><FilePlus2 size={32} /></div>
+      <h2 className="ios-title2">Choose files to send</h2>
+      <p className="ios-sub">Pick photos, videos or documents, then choose who to send them to.</p>
+      <div className="mobile-pickers" role="group" aria-label="Choose files to send">
+        <button disabled={picking} onClick={onPickPhotos}>Photos</button>
+        <button disabled={picking} onClick={onPick}>Files</button>
+      </div>
+    </section>
+  )
   const Panel = MOBILE_UI ? motion.div : motion.button
   return (
     <Panel

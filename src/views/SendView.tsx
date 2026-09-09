@@ -4,6 +4,7 @@ import { ArrowDownToLine, Inbox } from 'lucide-react'
 import { api } from '../lib/api'
 import { useStore } from '../store'
 import { MOBILE_UI } from '../lib/platform'
+import { MobileHeader } from '../components/MobileHeader'
 import { DropZone } from '../components/DropZone'
 import { TransferCard } from '../components/TransferCard'
 import { EmptyState } from '../components/bits'
@@ -59,6 +60,24 @@ export function SendView() {
       setShowReceive(false)
     }
   }
+
+  if (MOBILE_UI) return (
+    <div className="mobile-page mobile-send">
+      <MobileHeader title="Send" />
+      <div className="mobile-inset mobile-stack">
+        <DropZone hovering={dragHovering} picking={picking} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} />
+        {!showReceive ? <button className="ios-button glass glass-pill" onClick={() => setShowReceive(true)}><ArrowDownToLine size={18} />Have a code? Receive files</button> :
+          <form className="mobile-receive glass glass-card" onSubmit={submitReceive}>
+            <input className="input" aria-label="Receive code" placeholder="Paste receive code" autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={code} autoFocus onChange={e => setCode(e.target.value)} />
+            <div className="mobile-equal"><button className="ios-button ios-primary" disabled={!code.trim()}>Receive</button><button className="ios-button" type="button" onClick={() => { setShowReceive(false); setCode('') }}>Cancel</button></div>
+          </form>}
+      </div>
+      <div className="mobile-inset mobile-transfers mobile-stack">
+        <AnimatePresence initial={false}>{list.map(t => <TransferCard key={t.id} t={t} />)}</AnimatePresence>
+        {list.length === 0 && <div className="mobile-empty"><Inbox size={28} /><h2 className="ios-headline">Nothing here yet</h2><p className="ios-sub">Choose Photos or Files above. Files sent to you appear here automatically.</p></div>}
+      </div>
+    </div>
+  )
 
   return (
     <div

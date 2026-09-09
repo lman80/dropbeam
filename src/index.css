@@ -2134,11 +2134,6 @@ html.mobile main .btn { max-width: 100%; white-space: normal; }
 html.mobile main .icon-btn,
 html.mobile main .toggle { flex-shrink: 0; }
 html.mobile main form > .input { flex: 1 1 100%; }
-html.mobile .settings-row { flex-wrap: wrap; }
-html.mobile .settings-row > :first-child { flex-basis: 160px !important; }
-html.mobile .settings-row > :last-child { max-width: 100%; }
-html.mobile .settings-row .seg { flex-wrap: wrap; }
-html.mobile .settings-row .seg button { flex: 1; }
 html.mobile main .card svg { flex-shrink: 0; }
 html.mobile main .card svg[role="img"] { max-width: 100%; height: auto; }
 /* Desktop timestamps live beyond the thread edge; phones keep them in-flow. */
@@ -2227,8 +2222,8 @@ html.mobile .chat-input { font-size: 16px; }
   z-index: 1;
 }
 
-/* Phone typography token also scales legacy inline labels without desktop changes. */
-html.mobile { font-size: 17px; --ui-font-scale: 1.22; }
+/* Legacy mobile controls; Slice A typography lives in mobile.css. */
+html.mobile { font-size: 17px; --ui-font-scale: 1; }
 html.mobile body { font-size: 1rem; }
 html.mobile button { min-width: 44px; min-height: 44px; }
 html.mobile .btn { font-size: 1rem !important; padding: 12px 18px !important; }
@@ -2240,7 +2235,6 @@ html.mobile .toggle::before { content: ''; position: absolute; inset: 6px 0; bor
 html.mobile .toggle.on::before { background: var(--accent); }
 html.mobile .toggle::after { width: 26px; height: 26px; top: 9px; }
 html.mobile .toggle.on::after { transform: translateX(19px); }
-html.mobile .settings-row { padding: 17px 4px !important; }
 html.mobile :is(.chat-avatar, .friend-avatar, .chooser-avatar) { min-width: 48px; width: 48px; height: 48px; }
 html.mobile .chooser-row { padding: 14px 12px; }
 html.mobile .chat-composer { padding: 12px 8px; gap: 4px; }
@@ -2252,7 +2246,7 @@ html.mobile .emoji-cell { padding: 5px 0; }
 
 html.mobile button { flex-shrink: 0; }
 /* Transient bottom chrome must not sit between the composer and keyboard. */
-html.mobile.keyboard-visible :is(.tabbar, .app-toasts, [data-mobile-bottom-bar]) { display: none !important; }
+html.mobile.keyboard-visible :is(.app-toasts, [data-mobile-bottom-bar]) { display: none !important; }
 html.mobile .app-toasts { left: 16px; right: 16px !important; bottom: calc(80px + env(safe-area-inset-bottom)) !important; max-width: none !important; }
 html.mobile .dialog-overlay { top: var(--mobile-viewport-top, 0px); height: var(--mobile-viewport-height, 100dvh); }
 html.mobile .dialog-overlay > :is(.card, .dialog) { max-height: calc(var(--mobile-viewport-height, 100dvh) - var(--dialog-top) - var(--dialog-bottom)) !important; }
@@ -2264,14 +2258,5 @@ html.mobile .mobile-file-sheet-body { display: flex; flex-direction: column; gap
 html.mobile .mobile-file-sheet h2 { font-size: 20px; margin: 0 0 8px; }
 html.mobile .mobile-file-sheet .btn { justify-content: flex-start; flex-wrap: wrap; }
 html.mobile .mobile-file-sheet .btn span { flex-basis: 100%; text-align: left; color: var(--text-muted); font-size: 15px; }
-/* Give descriptive settings copy the full phone width; only switches stay inline. */
-html.mobile .settings-row > :first-child { flex-basis: 100% !important; }
-html.mobile .settings-row > :last-child { width: 100%; }
-html.mobile .settings-row:has(.toggle) > :first-child { flex-basis: calc(100% - 70px) !important; }
-html.mobile .settings-row:has(.toggle) > :last-child { width: auto; }
-html.mobile .settings-row .seg { display: flex; width: 100%; }
-html.mobile .settings-row .seg button { overflow-wrap: normal; white-space: nowrap; }
-html.mobile .settings-row > :last-child > .input { width: 100% !important; }
-html.mobile .settings-row > :last-child > div { flex-wrap: wrap; }
 html.mobile .chat-send { padding: 0 !important; }
 html.mobile button > svg { flex-shrink: 0; }

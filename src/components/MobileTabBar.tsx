@@ -26,7 +26,7 @@ export function MobileTabBar() {
   )
 
   return (
-    <nav className="tabbar" aria-label="Main">
+    <nav className="tabbar glass glass-pill" aria-label="Main">
       {TABS.map((tab) => {
         const active = view === tab.id || (tab.id === 'friends' && view === 'locations')
         const Icon = tab.icon

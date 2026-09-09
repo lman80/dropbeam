@@ -49,9 +49,13 @@ if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
 
 const Root =
   label === 'popover' ? Popover : label === 'hud' ? Hud : label === 'receive' ? ReceiveCard : App
-createRoot(document.getElementById('root')!).render(
-  <ErrorBoundary region={`window:${label}`}><Root /></ErrorBoundary>,
-)
+async function renderApp() {
+  if (MOBILE_UI) await import('./mobile.css')
+  createRoot(document.getElementById('root')!).render(
+    <ErrorBoundary region={`window:${label}`}><Root /></ErrorBoundary>,
+  )
+}
+void renderApp()
 
 // SuperFeedback — a floating "Send feedback" button (main window only, not the
 // popover/HUD). It screenshots the app, takes a message, and opens a GitHub

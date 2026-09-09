@@ -1,8 +1,10 @@
 import { MOBILE_UI } from '../lib/platform'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
+  ChevronRight,
+  Plus,
   Camera,
   Check,
   Copy,
@@ -20,6 +22,8 @@ import {
 import { api, fileSrc, HAS_TAURI, type ConnDetail, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
+import { MobileHeader } from '../components/MobileHeader'
+import { createPortal } from 'react-dom'
 import { ConnInspector } from '../components/ConnInspector'
 import { avatarGradient, initials } from '../lib/avatar'
 import { friendPresence, presenceLabel } from '../lib/presence'
@@ -27,6 +31,18 @@ import { friendPresence, presenceLabel } from '../lib/presence'
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
   const [adding, setAdding] = useState(false)
+
+  if (MOBILE_UI) return <div className="mobile-page mobile-friends">
+    <MobileHeader title="Friends" actions={<button className="ios-icon glass glass-pill" aria-label="Add friend" onClick={() => setAdding(true)}><Plus size={22} /></button>} />
+    <h2 className="ios-section-title">You</h2><YouCard />
+    <h2 className="ios-section-title">{friends.length ? `Friends · ${friends.length}` : 'Friends'}</h2>
+    <div className="ios-list glass glass-card">
+      <button className="ios-row mobile-location-row" onClick={() => useStore.getState().setView('locations')}><span>Browse friends’ Locations</span><ChevronRight size={18} /></button>
+      {friends.map(f => <FriendCard key={f.id} friend={f} />)}
+    </div>
+    {friends.length === 0 && <div className="mobile-inset mobile-empty"><Users size={28} /><h2 className="ios-headline">No friends yet</h2><p className="ios-sub">Share your code or add a friend to send files and chat by name.</p><button className="ios-button ios-primary" onClick={() => setAdding(true)}>Add a friend</button></div>}
+    {adding && <AddFriendModal onClose={() => setAdding(false)} />}
+  </div>
 
   return (
     <div style={{ maxWidth: 640, margin: '0 auto', padding: '8px 28px 40px' }}>
@@ -191,6 +207,23 @@ function YouCard() {
     }
   }
 
+  if (MOBILE_UI) return <section className="mobile-you mobile-inset glass glass-card">
+    <div className="mobile-profile">
+      <button className="mobile-avatar-button" aria-label="Change picture" onClick={() => void pickAvatar()}><Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={64} radius={20} /></button>
+      <div className="mobile-grow">
+        {editing ? <input className="input" aria-label="Your name" value={name} autoFocus onChange={e => setName(e.target.value)} onBlur={saveName} onKeyDown={e => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') { setName(displayName); setEditing(false) } }} /> : <button className="mobile-name ios-headline" onClick={() => setEditing(true)}>{displayName || 'You'}<Pencil size={16} /></button>}
+        <p className="ios-footnote">The name and picture your friends see.</p>
+      </div>
+    </div>
+    {settings?.avatar && <button className="ios-button ios-destructive" onClick={() => void clearAvatar()}>Remove picture</button>}
+    <div className="mobile-equal">
+      <button className="ios-button glass glass-pill" disabled={!code} onClick={() => setShowQR(v => !v)}><QrCode size={18} />{showQR ? 'Hide QR' : 'QR code'}</button>
+      <button className="ios-button glass glass-pill" disabled={!code} onClick={copyCode}>{copied ? <Check size={18} /> : <Copy size={18} />}{copied ? 'Copied' : 'Copy code'}</button>
+    </div>
+    {showQR && code && <div className="mobile-qr"><QRCodeSVG value={code} size={160} level="M" /></div>}
+    <p className="ios-footnote">Share this code once. Your friends stay connected across updates.</p>
+  </section>
+
   return (
     <div className="card" style={{ padding: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
@@ -307,6 +340,7 @@ function FriendCard({ friend }: { friend: Friend }) {
   const friendSeen = useStore((s) => s.friendSeen)
   const folderStatuses = useStore((s) => s.folderStatuses)
   const toast = useStore((s) => s.toast)
+  const [sheetOpen, setSheetOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
   const [editing, setEditing] = useState(false)
@@ -416,6 +450,25 @@ function FriendCard({ friend }: { friend: Friend }) {
     if (name.trim() && name.trim() !== friend.name) renameFriend(friend.id, name.trim())
     setEditing(false)
   }
+
+  if (MOBILE_UI) return <>
+    <div className="ios-row mobile-friend-row">
+      <button className="mobile-friend-open" onClick={() => setSheetOpen(true)} aria-label={`Manage ${friend.name}`}>
+        <Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={40} radius={12} />
+        <span className="mobile-grow"><span className="ios-headline mobile-friend-name">{friend.name}</span><span className="ios-footnote mobile-presence"><i className={isOnline ? 'online' : ''} />{presenceLabel(presence)}</span></span>
+      </button>
+      <button className="ios-icon" aria-label={`Send to ${friend.name}`} onClick={send} disabled={busy}>{busy ? <Spinner size={20} /> : <Send size={20} />}</button>
+    </div>
+    {sheetOpen && <MobileFriendSheet title={friend.name} onClose={() => { setSheetOpen(false); setConfirmRemove(false) }}>
+      <label className="ios-row"><span className="mobile-grow">Name</span><input className="input mobile-sheet-name" value={name} onChange={e => setName(e.target.value)} onBlur={saveName} /></label>
+      <div className="ios-row"><span className="mobile-grow">Auto-accept files</span><button className={`toggle${friend.autoAccept ? ' on' : ''}`} role="switch" aria-checked={friend.autoAccept} aria-label="Auto-accept files" onClick={() => setFriendAutoAccept(friend.id, !friend.autoAccept)} /></div>
+      <button className="ios-row" onClick={() => openChat(friend.id)}><MessageCircle size={20} />Message</button>
+      <button className="ios-row" onClick={check} disabled={pinging}><Radar size={20} />{pinging ? 'Checking…' : 'Check presence'}</button>
+      <button className="ios-row" onClick={showInvite} disabled={loadingInvite}><Copy size={20} />{invite ? 'Hide invite' : 'Show invite'}</button>
+      {invite && <div className="mobile-inset mobile-stack"><p className="ios-footnote">Share this invite with {friend.name}.</p><button className="ios-button glass glass-pill" onClick={() => navigator.clipboard.writeText(invite).then(() => toast('success', 'Invite copied')).catch(() => toast('error', 'Could not copy'))}>Copy invite</button></div>}
+      {confirmRemove ? <div className="mobile-inset mobile-stack"><p className="ios-footnote">Remove {friend.name}? Chat history stays on this device.</p><div className="mobile-equal"><button className="ios-button" onClick={() => setConfirmRemove(false)}>Cancel</button><button className="ios-button ios-destructive" onClick={() => removeFriend(friend.id)}>Remove</button></div></div> : <button className="ios-row ios-destructive" onClick={() => setConfirmRemove(true)}><Trash2 size={20} />Remove friend</button>}
+    </MobileFriendSheet>}
+  </>
 
   return (
     <motion.div
@@ -761,4 +814,18 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
       </motion.div>
     </AnimatePresence>
   )
+}
+
+/** Native modal focus trapping, Escape dismissal and focus restoration. */
+function MobileFriendSheet({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
+  const dialog = useRef<HTMLDialogElement>(null)
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null
+    dialog.current?.showModal()
+    return () => { previous?.focus() }
+  }, [])
+  return createPortal(<dialog ref={dialog} className="mobile-friend-sheet glass" aria-label={`Manage ${title}`} onCancel={onClose} onClick={e => { if (e.target === e.currentTarget) { const r = e.currentTarget.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) onClose() } }}>
+    <div className="mobile-sheet-top"><h2 className="ios-title2">{title}</h2><button className="ios-button" onClick={onClose} autoFocus>Done</button></div>
+    {children}
+  </dialog>, document.body)
 }

@@ -44,7 +44,7 @@ export default function App() {
       }
       fullHeight = Math.max(fullHeight, window.innerHeight)
       const height = viewport?.height ?? window.innerHeight
-      const keyboard = !!viewport && viewport.scale === 1 && fullHeight - height > 120
+      const keyboard = !!viewport && viewport.scale === 1 && fullHeight - height > 150
       root.classList.toggle('keyboard-visible', keyboard)
       // WKWebView can pan the visual viewport even with overflow hidden.
       // Anchor the fixed shell to its visible origin; only inner panes scroll.
@@ -143,7 +143,7 @@ export default function App() {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <ErrorBoundary region="window controls">
-        <TitleBar />
+        {!(MOBILE_UI && ['send', 'friends', 'settings'].includes(view)) && <TitleBar />}
         <InstallBanner />
         <LocalNetworkBanner />
       </ErrorBoundary>
@@ -156,7 +156,7 @@ export default function App() {
 
 
         <main
-          className="scroll-area"
+          className={MOBILE_UI ? `scroll-area mobile-main${view === 'chat' ? ' mobile-main-chat' : ''}` : "scroll-area"}
           style={{
             flex: 1,
             minWidth: 0,
@@ -169,7 +169,7 @@ export default function App() {
             {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
                 so it never deadlocks on a view that has its own AnimatePresence. */}
             <motion.div
-              initial={{ opacity: 0, y: 6 }}
+              initial={MOBILE_UI ? false : { opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.18 }}
               style={{ minHeight: '100%', height: view === 'chat' ? '100%' : undefined }}

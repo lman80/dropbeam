@@ -4,6 +4,7 @@ import { api, type Settings } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
 import { MOBILE_UI } from '../lib/platform'
+import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
 import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
 
@@ -169,6 +170,59 @@ export function SettingsView() {
     } finally {
       setTesting(false)
     }
+  }
+
+  if (MOBILE_UI) {
+    const toggle = (key: keyof Settings, label: string, desc: string, disabled = false) => <MobileSetting key={key} title={label} desc={desc}><button className={`toggle${settings[key] && !disabled ? ' on' : ''}`} role="switch" aria-label={label} aria-checked={!!settings[key] && !disabled} disabled={disabled} onClick={() => save({ [key]: !settings[key] })} /></MobileSetting>
+    const field = (key: 'displayName' | 'giphyApiKey' | 'customRelay' | 'diagnosticsUrl' | 'labOperatorId', label: string, placeholder = '') => <input className="input" aria-label={label} autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" placeholder={placeholder} value={settings[key]} onChange={e => save({ [key]: e.target.value })} />
+    return <div className="mobile-page mobile-settings">
+      <MobileHeader title="Settings" />
+      <MobileSection title="Profile"><MobileSetting title="Display name" desc="The name your friends see.">{field('displayName', 'Display name')}</MobileSetting></MobileSection>
+      <MobileSection title="Downloads"><MobileSetting title="Clear transfer cache" desc="Remove interrupted transfer leftovers. Old leftovers are cleaned automatically after a week." destructive><button className="ios-button ios-destructive" disabled={clearing} onClick={clearCache}>{clearing ? <Spinner size={18} /> : 'Clear now'}</button></MobileSetting></MobileSection>
+      <MobileSection title="Appearance"><MobileSetting title="Theme"><div className="mobile-theme" role="group" aria-label="Theme">{(['system', 'light', 'dark'] as const).map(t => <button key={t} aria-pressed={settings.theme === t} onClick={() => save({ theme: t })}>{t}</button>)}</div></MobileSetting></MobileSection>
+      <MobileSection title="Behavior">
+        {toggle('notifyOnComplete', 'File notifications', 'Notify when files arrive. Keep DropBeam open while transferring.')}
+        {toggle('notifyOnMessage', 'Chat notifications', 'Notify outside the conversation. Delivery may pause in the background.')}
+        {toggle('sendReadReceipts', 'Read receipts', 'Let friends see when you have read their message.')}
+        <MobileSetting title="Giphy key" desc="Add a free key from developers.giphy.com to enable GIFs. Leave blank to hide the picker.">{field('giphyApiKey', 'Giphy API key')}</MobileSetting>
+        {toggle('playSounds', 'Play sounds', 'Soft cues for sends, receives and file offers.')}
+      </MobileSection>
+      <MobileSection title="Connection">
+        <MobileSetting title="Direct peer-to-peer" desc="End-to-end encrypted. Keep both devices open until transfers finish."><span className="mobile-accent">On</span></MobileSetting>
+        <MobileSetting title="Test connection" desc={testResult || 'Check the connection on this device.'}><button className="ios-button" disabled={testing} onClick={runDirectTest}>{testing ? <Spinner size={18} /> : 'Test'}</button></MobileSetting>
+        <MobileSetting title="Local network access" desc="If nearby transfers use the relay, enable DropBeam in iOS Settings → Privacy & Security → Local Network on both devices." />
+        {toggle('requireDirect', 'Direct connections only', 'Fail the send if a direct path cannot be made. Shared folders use the best available path.')}
+        {toggle('waitForDirect', 'Wait for direct connection', settings.requireDirect ? 'Unavailable while direct connections are required.' : 'Wait for a fast direct path before sending. You can choose the relay on each transfer.', settings.requireDirect)}
+        {toggle('parallelStreams', 'Parallel streams', 'Send files over 16 MB using several connections. Turn off if transfers stall.')}
+        <MobileSetting title="Upload limit" desc="Mbps; 0 means unlimited. Local transfers run at full speed. Start at 100 Mbps and adjust if your Wi-Fi stutters."><input className="input" aria-label="Upload limit in Mbps" type="number" min={0} max={100000} value={settings.uploadLimitMbps || 0} onChange={e => save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })} /></MobileSetting>
+        {toggle('showMegabits', 'Speeds in megabits', 'Use Mbps instead of kB/s or MB/s on this device.')}
+      </MobileSection>
+      <MobileSection title="How transfers connect">
+        <MobileSetting title="Local" desc="Same Wi-Fi or network. Files travel directly across your network, without the internet." />
+        <MobileSetting title="Direct" desc="An encrypted peer-to-peer link across the internet connects both devices." />
+        <MobileSetting title="Relay" desc="If a direct path is unavailable, an encrypted relay carries files. It cannot read them, but may be slower." />
+        <MobileSetting title="Connecting" desc="Finding the best available route to the other device." />
+      </MobileSection>
+      <MobileSection title="Custom relay (advanced)"><MobileSetting title="Relay URL" desc="Use the same relay on both devices; leave blank for public relays. Close and reopen DropBeam to apply. Setup: github.com/lman80/dropbeam → RELAY-SETUP.md">{field('customRelay', 'Relay URL', 'https://…')}</MobileSetting></MobileSection>
+      <MobileSection title="About"><MobileSetting title="Version"><span>{appVer || '…'}</span></MobileSetting></MobileSection>
+      <MobileSection title="Diagnostics">
+        {toggle('verboseLogging', 'Detailed logging', 'Extra network logs for reproducing issues. Close and reopen DropBeam to apply.')}
+        <MobileSetting title="Export logs" desc="Save diagnostics in DropBeam’s folder in Files to share for troubleshooting."><button className="ios-button" disabled={exporting} onClick={exportLogs}>{exporting ? <Spinner size={18} /> : 'Export'}</button></MobileSetting>
+        {toggle('shareDiagnostics', 'Background diagnostics', 'Send a redacted error and performance summary about once a day. Never includes file names or contents.')}
+        {settings.shareDiagnostics && <>
+          <MobileSetting title="Diagnostics endpoint" desc="Leave blank for the built-in collector. Override only if you run your own.">{field('diagnosticsUrl', 'Diagnostics endpoint', 'Built-in')}</MobileSetting>
+          <MobileSetting title="Test diagnostics"><button className="ios-button" disabled={testingDiag || (settings.diagnosticsUrl !== '' && !settings.diagnosticsUrl.startsWith('https://'))} onClick={async () => { setTestingDiag(true); try { toast('info', await api.diagnosticsTest()) } catch (e) { toast('error', String(e)) } finally { setTestingDiag(false) } }}>{testingDiag ? <Spinner size={18} /> : 'Send test'}</button></MobileSetting>
+        </>}
+      </MobileSection>
+      <MobileSection title="Lab Mode">
+        {toggle('labModeEnabled', 'Enable Lab Mode', 'Allow one trusted developer device to run encrypted diagnostics. Only the operator ID below is accepted. Enable only when asked by the developer.')}
+        {settings.labModeEnabled && <>
+          <MobileSetting title="Operator ID" desc="Only this device can run Lab Mode. Blank accepts no device.">{field('labOperatorId', 'Operator device ID')}</MobileSetting>
+          <MobileSetting title="This device’s ID" desc="Share with the developer for testing."><button className="ios-button" disabled={!myEid} onClick={() => { if (myEid) void navigator.clipboard.writeText(myEid).then(() => toast('info', 'Device ID copied')).catch(e => toast('error', String(e))) }}>Copy ID</button></MobileSetting>
+        </>}
+      </MobileSection>
+      <p className="mobile-inset ios-footnote mobile-footer">DropBeam · Direct, end-to-end encrypted transfers</p>
+    </div>
   }
 
   return (
@@ -807,4 +861,15 @@ export function SettingsView() {
       </div>
     </div>
   )
+}
+
+function MobileSection({ title, children }: { title: string; children: ReactNode }) {
+  return <section><h2 className="ios-section-title">{title}</h2><div className="ios-list glass glass-card">{children}</div></section>
+}
+
+function MobileSetting({ title, desc, children, destructive = false }: { title: string; desc?: string; children?: ReactNode; destructive?: boolean }) {
+  return <div className={`ios-row mobile-setting${destructive ? ' ios-destructive' : ''}`}>
+    <div className="mobile-grow"><div>{title}</div>{desc && <p className="ios-footnote">{desc}</p>}</div>
+    {children && <div className="mobile-setting-control">{children}</div>}
+  </div>
 }
