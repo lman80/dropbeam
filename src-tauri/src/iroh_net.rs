@@ -14,6 +14,8 @@
 //! additional ALPN-tagged stream handlers on this same endpoint.
 
 mod integrity;
+pub(crate) mod receive_stage;
+use receive_stage::{ReceiveStage, is_receive_stage};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -265,8 +267,13 @@ fn matches_chat_manifest(link: &crate::models::ChatTransferLink, m: &crate::chat
 
 fn chat_dir_key(name: &str) -> String { format!("dir:{name}") }
 fn chat_item_key(index: u64, name: &str) -> String { format!("file:{index}:{name}") }
-fn received_item_index(header: &serde_json::Value, index: usize) -> u64 {
-    header["chatTransfer"]["itemOffset"].as_u64().unwrap_or(0) + index as u64
+fn received_item_index(item_offset: u64, index: usize) -> u64 {
+    item_offset + index as u64
+}
+fn normalized_receive_offset(header: &serde_json::Value) -> Result<u64> {
+    if header.get("chatTransfer").is_none() { return Ok(0); }
+    incoming_chat_link(header, "").map(|link| link.item_offset)
+        .context("invalid chat batch manifest")
 }
 struct ChatBatch {
     link: crate::models::ChatTransferLink,
@@ -1769,8 +1776,10 @@ async fn serve_stream_inner(
                 })
                 .unwrap_or_default();
             let id = uuid::Uuid::new_v4().to_string();
+            let mut item_offset = 0;
             if req.get("chatTransfer").is_some() {
                 let link = incoming_chat_link(&req, &who).ok_or_else(|| anyhow::anyhow!("invalid chat batch manifest"))?;
+                item_offset = link.item_offset;
                 // The file note and push use independent streams. Hold modern linked
                 // pushes while their immutable note is being delivered.
                 let deadline = Instant::now() + TRANSFER_STALL;
@@ -2102,7 +2111,7 @@ async fn serve_stream_inner(
                                                 dest.clone(),
                                                 receive_rel(&name).to_string_lossy().into_owned(),
                                             ),
-                                            total, part, rc, cov, first, &cancel, |d, t| cb(location_receive_progress(&req, d), t), &req, recv,
+                                            total, part, rc, cov, first, &cancel, |d, t| cb(location_receive_progress(&req, d), t), &req, item_offset, recv,
                                         ).await.map(|p| vec![p]) })
                                         )
                                     }
@@ -2112,7 +2121,7 @@ async fn serve_stream_inner(
                                         }
                                         let r = landed_receive!(
                                             send, recv; progress_mode, total, &cancel, cb,
-                                            finish_location_receive(location_upload.clone(), req.clone(), cancel.clone(), &cb, read_body_with_landed(recv, &req, &dest, &cancel, |d, t| cb(location_receive_progress(&req, d), t),
+                                            finish_location_receive(location_upload.clone(), req.clone(), cancel.clone(), &cb, read_body_with_landed(recv, &req, item_offset, &id, &dest, &cancel, |d, t| cb(location_receive_progress(&req, d), t),
                             |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); } }))
                                         );
                                         // The file arrived classically — a kept
@@ -2150,7 +2159,7 @@ async fn serve_stream_inner(
                     }
                     landed_receive!(
                         send, recv; progress_mode, total, &cancel, cb,
-                        finish_location_receive(location_upload.clone(), req.clone(), cancel.clone(), &cb, read_body_with_landed(recv, &req, &dest, &cancel, |d, t| cb(location_receive_progress(&req, d), t),
+                        finish_location_receive(location_upload.clone(), req.clone(), cancel.clone(), &cb, read_body_with_landed(recv, &req, item_offset, &id, &dest, &cancel, |d, t| cb(location_receive_progress(&req, d), t),
                             |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); } }))
                     )
                 }
@@ -2171,7 +2180,7 @@ async fn serve_stream_inner(
                         }
                     }
                     for (index, (name, path)) in names.iter().zip(&paths).enumerate() {
-                        chat_file_landed(state, &id, Some(received_item_index(&req, index)), name, path);
+                        chat_file_landed(state, &id, Some(received_item_index(item_offset, index)), name, path);
                     }
                     emit_completed(
                         &app,
@@ -5017,11 +5026,18 @@ fn publish_unique(part: &Path, natural: &Path) -> Result<PathBuf> {
     publish_unique_limit(part, natural, RECEIVE_NAME_LIMIT)
 }
 fn publish_unique_limit(part: &Path, natural: &Path, limit: usize) -> Result<PathBuf> {
+    publish_unique_owned(part, natural, limit, None)
+}
+fn publish_unique_owned(part: &Path, natural: &Path, limit: usize, identity: Option<receive_stage::Identity>) -> Result<PathBuf> {
     if let Some(dir) = natural.parent() { note_partial_dir(dir); }
     // One atomic attempt per candidate. Case-insensitive aliases are reported
     // by the filesystem as the same occupied candidate; never restart the scan.
     for destination in receive_candidates(natural, limit) {
-        match crate::locations::publish_noreplace(part, &destination) {
+        let published = match identity {
+            Some(identity) => crate::locations::publish_noreplace_owned(part, &destination, Some(identity)),
+            None => crate::locations::publish_noreplace(part, &destination),
+        };
+        match published {
             Ok(()) => return Ok(destination),
             Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) => continue,
             Err(e) => return Err(e),
@@ -5244,6 +5260,10 @@ const PARALLEL_STREAMS: u64 = 4;
 /// Don't split anything smaller than this — the negotiation + extra stream setup
 /// isn't worth it and small files already transfer instantly.
 const PARALLEL_MIN: u64 = 16 * 1024 * 1024; // 16 MiB
+/// How long a finished classic body waits for the receiver's integrity echo
+/// before finishing the stream unverified (see the capability race in
+/// `send_files_linked_inner`). Must stay well under a legacy receiver's patience.
+const INTEGRITY_ECHO_GRACE: Duration = Duration::from_secs(1);
 
 /// Field kill-switch for parallel streams. DEFAULT = ON — parallel streams are
 /// already shipped and field-proven, so the default preserves today's behavior.
@@ -5466,35 +5486,22 @@ fn load_sidecar(path: &Path, fp: &str, total: u64) -> Option<Coverage> {
 /// transfer "tomorrow", short enough not to hoard disk.
 const PARTIAL_TTL_SECS: u64 = 7 * 24 * 3600;
 
-static RECEIVE_STAGES: std::sync::LazyLock<Mutex<std::collections::HashSet<PathBuf>>> = std::sync::LazyLock::new(Default::default);
-struct ReceiveStage(PathBuf);
-impl ReceiveStage {
-    fn register(path: PathBuf) -> Self {
-        if let Some(dir) = path.parent() { note_partial_dir(dir); }
-        RECEIVE_STAGES.lock().unwrap().insert(path.clone());
-        Self(path)
-    }
-}
-impl Drop for ReceiveStage {
-    fn drop(&mut self) {
-        let mut active = RECEIVE_STAGES.lock().unwrap();
-        let _ = std::fs::remove_file(&self.0);
-        active.remove(&self.0);
-    }
-}
-fn is_receive_stage(name: &str) -> bool {
-    name.strip_prefix(".dropbeam-recv-").and_then(|n| n.strip_suffix(".part"))
-        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-}
 fn gc_stale_partials(dir: &Path, state: Option<&IrohState>) {
-    if let Some(config) = PARTIAL_DIRS_PATH.get().and_then(|p| p.parent()) { crate::locations::gc_receive_probes(config, dir); }
+    let config = PARTIAL_DIRS_PATH.get().and_then(|p| p.parent())
+        .or_else(|| state.and_then(|s| s.location_config.get()).map(PathBuf::as_path));
+    // Without configuration we cannot prove this isn't a shared Location.
+    let Some(config) = config else { return; };
+    gc_stale_partials_at(dir, state, config);
+}
+fn gc_stale_partials_at(dir: &Path, state: Option<&IrohState>, config: &Path) {
+    if !crate::locations::receive_sweep_allowed(config, dir) { return; }
+    crate::locations::gc_receive_probes(config, dir);
     let _walk = crate::fs_walk::Watch::new("gc_stale_partials", dir);
     let Ok(rd) = crate::fs_walk::read_dir(dir) else { return };
     let now = std::time::SystemTime::now();
     for e in rd.flatten() {
         if is_receive_stage(&e.file_name().to_string_lossy()) {
-            let active = RECEIVE_STAGES.lock().unwrap();
-            if !active.contains(&e.path()) { let _ = std::fs::remove_file(e.path()); }
+            receive_stage::recover(&e.path(), now);
             continue;
         }
         if !e.file_name().to_string_lossy().starts_with(".dropbeam-partial-") {
@@ -5583,9 +5590,9 @@ fn startup_cleanup(config_dir: &Path, state: &IrohState) {
             }
         }
     }
-    gc_stale_partials(&config_dir.join("folder-partials"), Some(state));
+    gc_stale_partials_at(&config_dir.join("folder-partials"), Some(state), config_dir);
     for d in load_partial_dirs() {
-        gc_stale_partials(&d, Some(state));
+        gc_stale_partials_at(&d, Some(state), config_dir);
     }
 }
 
@@ -5600,6 +5607,7 @@ impl IrohState {
         dirs.push(config_dir.join("folder-partials"));
         let mut freed: u64 = 0;
         for dir in dirs {
+            if !crate::locations::receive_sweep_allowed(config_dir, &dir) { continue; }
             crate::locations::gc_receive_probes(config_dir, &dir);
             let Ok(rd) = std::fs::read_dir(&dir) else {
                 continue;
@@ -5607,11 +5615,7 @@ impl IrohState {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
                 if is_receive_stage(&name) {
-                    let active_stages = RECEIVE_STAGES.lock().unwrap();
-                    if !active_stages.contains(&e.path()) {
-                        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                        if std::fs::remove_file(e.path()).is_ok() { freed += size; }
-                    }
+                    freed += receive_stage::recover(&e.path(), std::time::SystemTime::now());
                     continue;
                 }
                 if !name.starts_with(".dropbeam-partial-") { continue; }
@@ -6454,12 +6458,14 @@ async fn read_body<F: Fn(u64, u64)>(
     cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
-    read_body_with_landed(recv, header, dest_dir, cancel, on_progress, |_, _, _| {}).await
+    read_body_with_landed(recv, header, normalized_receive_offset(header)?, &uuid::Uuid::new_v4().to_string(), dest_dir, cancel, on_progress, |_, _, _| {}).await
 }
 
 async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
     recv: &mut RecvStream,
     header: &serde_json::Value,
+    item_offset: u64,
+    transfer_id: &str,
     dest_dir: &Path,
     cancel: &AtomicBool,
     on_progress: F,
@@ -6499,9 +6505,8 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
         // already exist from a prior send of the same folder.
         let natural = ensure_parent_or_flat(dest_dir, &rel);
         let dest = natural.with_file_name(format!(".dropbeam-recv-{}.part", uuid::Uuid::new_v4()));
-        let _stage = ReceiveStage::register(dest.clone());
-        let mut f = tokio::io::BufWriter::with_capacity(1 << 20,
-            tokio::fs::OpenOptions::new().write(true).create_new(true).open(&dest).await?);
+        let (mut stage, file) = ReceiveStage::create(dest.clone(), size, transfer_id)?;
+        let mut f = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::from_std(file));
         let leaves = integrity::Leaves::default();
         let mut hash = integrity::enabled(header).then(|| integrity::Blocks::new(0, leaves.clone()).unwrap());
         let mut remaining = size;
@@ -6566,14 +6571,14 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             // Never leave a half-written file sitting at its real, visible name —
             // the user can't tell a truncated "video.mov" from a good one days
             // later. Files that completed in this batch (already in `out`) stay.
-            let _ = std::fs::remove_file(&dest);
+            stage.remove()?;
             return Err(e);
         }
         let landed = if files_identical(&dest, &natural).unwrap_or(false) {
-            std::fs::remove_file(&dest)?;
+            stage.remove()?;
             natural.clone()
         } else {
-            publish_unique(&dest, &natural)?
+            stage.publish(&natural)?
         };
         // Restore the sender's executable bit (optional manifest key; +x only —
         // never setuid/setgid, and only once the file is at its final name).
@@ -6588,9 +6593,9 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
         }
         if let Some(hash) = hash {
             hash.finish();
-            hashes.push(integrity::FileHash { leaves: integrity::snapshot_leaves(&leaves), index: received_item_index(header, index), name: raw.into(), size, digest: integrity::combine(size, &leaves)? });
+            hashes.push(integrity::FileHash { leaves: integrity::snapshot_leaves(&leaves), index: received_item_index(item_offset, index), name: raw.into(), size, digest: integrity::combine(size, &leaves)? });
         }
-        on_landed(received_item_index(header, index), raw, &landed);
+        on_landed(received_item_index(item_offset, index), raw, &landed);
         out.push(landed);
     }
     if negotiated {
@@ -6874,6 +6879,17 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
         match result {
             Ok(sent) => {
                 *hashes.lock().unwrap() = local.clone();
+                // A small body on a fast link finishes before the receiver's
+                // ready echo has even been polled. Give the receipt task a short,
+                // bounded grace to classify the reply before the body FIN decides
+                // the capability race — a legacy receiver that reads to end of
+                // stream still gets its FIN well inside its own patience, while a
+                // capable one an RTT away gets verified instead of "unverified".
+                let grace = tokio::time::Instant::now() + INTEGRITY_ECHO_GRACE;
+                while decision.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < grace {
+                    anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
                 let _ = decision.compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
                 if decision.load(Ordering::SeqCst) == 1 {
                     integrity::send_hashes(&mut send, &local).await?;
@@ -7257,7 +7273,7 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
                                     cov,
                                     first,
                                     cancel,
-                                    on_progress, header, recv,
+                                    on_progress, header, normalized_receive_offset(header)?, recv,
                                 )
                                 )
                                 .map(|p| {
@@ -8315,7 +8331,7 @@ mod loopback_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn integrity_late_echo_before_and_after_body_fin() {
-        for (size, delay) in [(1024usize, 300u64), (12 << 20, 7100)] {
+        for (size, delay, verified) in [(1024usize, 300u64, true), (1024, 1500, false), (12 << 20, 7100, false)] {
             integrity::scope(async {
                 let server = loopback_endpoint(true).await;
                 let client = loopback_endpoint(false).await;
@@ -8331,13 +8347,15 @@ mod loopback_tests {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     let paths = read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest,
                         &AtomicBool::new(false), &AtomicBool::new(false), None, |_, _| {}).await.unwrap();
-                    assert!(integrity::reports().is_empty(), "late integrity echo must agree unverified");
+                    assert_eq!(!integrity::reports().is_empty(), verified, "both sides must agree on verification (delay {delay} ms)");
+                    assert!(integrity::reports().iter().all(|r| r.verified && r.acknowledged));
                     paths
                 }));
                 let conn = client.connect(server.addr(), ALPN).await.unwrap();
                 tokio::time::timeout(Duration::from_secs(25), send_files(&conn, &[source.clone(), second],
                     &AtomicBool::new(false), |_, _| {}, "late", &AtomicBool::new(false))).await.unwrap().unwrap();
-                assert!(integrity::reports().is_empty());
+                assert_eq!(!integrity::reports().is_empty(), verified);
+                assert!(integrity::reports().iter().all(|r| r.verified && r.acknowledged));
                 let paths = receiver.await.unwrap();
                 assert_eq!(std::fs::read(&paths[0]).unwrap(), std::fs::read(source).unwrap());
                 client.close().await; server.close().await; std::fs::remove_dir_all(dir).unwrap();
@@ -10858,7 +10876,7 @@ mod integrity_round2_tests {
             write_frame(&mut send, &integrity::ready(&header, serde_json::json!({"ready":true,"progress_v":1}))).await.unwrap();
             let cancel = AtomicBool::new(false); let cb = |_, _| {};
             let paths = landed_receive!(&mut send, &mut recv; true, 6, &cancel, cb,
-                read_body_with_landed(&mut recv, &header, &dest, &cancel, cb,
+                read_body_with_landed(&mut recv, &header, link.item_offset, "push", &dest, &cancel, cb,
                     |index, name, path| chat_file_landed(&state, "push", Some(index), name, path))).unwrap();
             assert_ne!(paths[0], paths[1]);
             assert_eq!(std::fs::read(&paths[0]).unwrap(), b"one");
@@ -10908,20 +10926,130 @@ mod integrity_round2_tests {
         }
     }
 
+    #[tokio::test]
+    async fn legacy_indexless_two_file_manifest_verifies_over_receive_stream() {
+        let dir = fixture(); let dest = dir.join("received");
+        let server = endpoint().await; let client = endpoint().await; let srv = server.clone();
+        let receiver = tokio::spawn(integrity::scope(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let header = read_frame(&mut recv).await.unwrap();
+            let paths = read_body(&mut recv, &header, &dest, &AtomicBool::new(false), |_, _| {}).await.unwrap();
+            assert_eq!(std::fs::read(&paths[0]).unwrap(), b"one");
+            assert_eq!(std::fs::read(&paths[1]).unwrap(), b"two");
+            let rows = integrity::reports();
+            assert_eq!(rows.iter().map(|r| r.index).collect::<Vec<_>>(), vec![0, 1]);
+            assert!(rows.iter().all(|r| r.verified));
+            write_frame(&mut send, &serde_json::json!({"ok":true})).await.unwrap();
+            send.finish().unwrap(); let _ = send.stopped().await;
+        }));
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        write_frame(&mut send, &serde_json::json!({"kind":"files","integrity_v":1,"total":6,
+            "items":[{"name":"a","size":3},{"name":"b","size":3}]})).await.unwrap();
+        send.write_all(b"onetwo").await.unwrap();
+        let rows: Vec<_> = [b"one", b"two"].into_iter().zip(["a", "b"]).map(|(bytes, name)| {
+            let leaves = integrity::Leaves::default();
+            let mut blocks = integrity::Blocks::new(0, leaves.clone()).unwrap(); blocks.update(bytes); blocks.finish();
+            serde_json::json!({"name":name,"size":3,"digest":integrity::combine(3, &leaves).unwrap()})
+        }).collect();
+        write_frame(&mut send, &serde_json::json!({"kind":"integrity","integrity_v":1,"files":rows})).await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(read_frame(&mut recv).await.unwrap()["ok"], true);
+        receiver.await.unwrap(); client.close().await; server.close().await; std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_split_chat_normalized_landed_callbacks_complete_batch() {
+        let dir = fixture();
+        let state = IrohState::default();
+        let id = uuid::Uuid::new_v4().to_string();
+        for (index, name) in ["a", "b"].into_iter().enumerate() {
+            let header = serde_json::json!({"kind":"files","total":3,"items":[{"name":name,"size":3}],
+                "chatTransfer":{"id":id,"attempt":1,"manifest":[{"name":"a","size":3},{"name":"b","size":3}],
+                    "offset":index * 3,"total":6,"last":index == 1}});
+            let link = incoming_chat_link(&header, "sender").unwrap();
+            assert_eq!(normalized_receive_offset(&header).unwrap(), index as u64);
+            state.chat_links.lock().unwrap().insert("push".into(), link.clone());
+            state.chat_batches.lock().unwrap().entry(link.id.clone()).or_insert_with(|| batch(&link));
+            let path = dir.join(name); std::fs::write(&path, b"abc").unwrap();
+            chat_file_landed(&state, "push", Some(received_item_index(link.item_offset, 0)), name, &path);
+            let mut batches = state.chat_batches.lock().unwrap();
+            let done = batches.get_mut(&link.id).unwrap().observe(&link, &completed_update("push", Direction::Receive, vec![], 3)).unwrap();
+            assert_eq!(done.completed_paths.len(), index + 1);
+            assert_eq!(done.batch_state, Some(if index == 1 { TransferState::Completed } else { TransferState::Transferring }));
+            if index == 1 { assert_eq!(done.bytes_done, 6); }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_split_chat_inferred_offset_reaches_hashes_and_landing_and_completes() {
+        let dir = fixture(); let dest = dir.join("received");
+        let server = endpoint().await; let client = endpoint().await; let srv = server.clone();
+        let receiver = tokio::spawn(integrity::scope(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let state = IrohState::default();
+            for expected in 0..2 {
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let header = read_frame(&mut recv).await.unwrap();
+                assert!(header["chatTransfer"].get("itemOffset").is_none());
+                let link = incoming_chat_link(&header, &conn.remote_id().to_string()).unwrap();
+                assert_eq!(link.item_offset, expected);
+                state.chat_links.lock().unwrap().insert("push".into(), link.clone());
+                state.chat_batches.lock().unwrap().entry(link.id.clone()).or_insert_with(|| batch(&link));
+                let paths = read_body_with_landed(&mut recv, &header, link.item_offset, "push", &dest, &AtomicBool::new(false), |_, _| {},
+                    |index, name, path| chat_file_landed(&state, "push", Some(index), name, path)).await.unwrap();
+                assert_eq!(paths.len(), 1);
+                // Exercise the final landed callback used by parallel receive too.
+                chat_file_landed(&state, "push", Some(received_item_index(link.item_offset, 0)),
+                    header["items"][0]["name"].as_str().unwrap(), &paths[0]);
+                let done = {
+                    let mut batches = state.chat_batches.lock().unwrap();
+                    batches.get_mut(&link.id).unwrap().observe(&link, &completed_update("push", Direction::Receive, vec![], 3)).unwrap()
+                };
+                assert_eq!(done.batch_state, Some(if expected == 1 { TransferState::Completed } else { TransferState::Transferring }));
+                assert_eq!(done.completed_paths.len(), expected as usize + 1);
+                let rows = integrity::reports();
+                assert!(rows.iter().all(|r| r.verified));
+                assert!(rows.iter().any(|r| r.index == expected));
+                write_frame(&mut send, &serde_json::json!({"ok":true})).await.unwrap();
+                send.finish().unwrap(); let _ = send.stopped().await;
+            }
+        }));
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        for (index, (name, bytes)) in [("a", b"one"), ("b", b"two")].into_iter().enumerate() {
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let header = serde_json::json!({"kind":"files","integrity_v":1,"total":3,"items":[{"name":name,"size":3}],
+                "chatTransfer":{"id":id,"attempt":1,"manifest":[{"name":"a","size":3},{"name":"b","size":3}],
+                    "offset":index * 3,"total":6,"last":index == 1}});
+            write_frame(&mut send, &header).await.unwrap(); send.write_all(bytes).await.unwrap();
+            let leaves = integrity::Leaves::default();
+            let mut blocks = integrity::Blocks::new(0, leaves.clone()).unwrap(); blocks.update(bytes); blocks.finish();
+            write_frame(&mut send, &serde_json::json!({"kind":"integrity","integrity_v":1,"files":[{
+                "index":index,"name":name,"size":3,"digest":integrity::combine(3,&leaves).unwrap()}]})).await.unwrap();
+            send.finish().unwrap(); assert_eq!(read_frame(&mut recv).await.unwrap()["ok"], true);
+        }
+        receiver.await.unwrap(); client.close().await; server.close().await; std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn receive_stage_cleanup_covers_failure_active_stage_and_nested_crash_litter() {
         let dir = fixture(); let nested = dir.join("nested/destination"); std::fs::create_dir_all(&nested).unwrap();
         let stage = nested.join(format!(".dropbeam-recv-{}.part", uuid::Uuid::new_v4()));
         {
-            let _guard = ReceiveStage::register(stage.clone()); std::fs::write(&stage, b"body").unwrap();
-            gc_stale_partials(&nested, None); assert!(stage.exists(), "do not sweep an active receive");
+            let (_guard, file) = ReceiveStage::create(stage.clone(), 4, "test-transfer").unwrap();
+            use std::io::Write;
+            (&file).write_all(b"body").unwrap();
+            gc_stale_partials_at(&nested, None, &dir); assert!(stage.exists(), "do not sweep an active receive");
             std::fs::write(nested.join("occupied"), b"keep").unwrap();
             assert!(publish_unique_limit(&stage, &nested.join("occupied"), 1).unwrap_err().to_string().contains("exhausted"));
         }
         assert!(!stage.exists(), "failed publication must clean its stage");
         std::fs::write(&stage, b"crash litter").unwrap();
         let unrelated = nested.join(".dropbeam-recv-user.part"); std::fs::write(&unrelated, b"keep").unwrap();
-        gc_stale_partials(&nested, None); assert!(!stage.exists()); assert!(unrelated.exists());
+        gc_stale_partials_at(&nested, None, &dir); assert!(stage.exists(), "unregistered UUID names are not proof of ownership"); assert!(unrelated.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

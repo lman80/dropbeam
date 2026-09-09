@@ -281,9 +281,14 @@ impl Root {
     }
 }
 
+#[cfg(test)]
+thread_local! { pub(crate) static FORCE_HARD_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// Publish a private staging file without replacing an occupied destination.
 /// Native exclusive rename, then hard-link publication, then logged reservation fallback.
 pub(crate) fn publish_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    publish_noreplace_owned(source, destination, None)
+}
+pub(crate) fn publish_noreplace_owned(source: &Path, destination: &Path, expected: Option<crate::iroh_net::receive_stage::Identity>) -> Result<()> {
     #[cfg(unix)] {
         use std::os::unix::fs::OpenOptionsExt;
         let open = |p: &Path| fs::OpenOptions::new().read(true)
@@ -291,12 +296,15 @@ pub(crate) fn publish_noreplace(source: &Path, destination: &Path) -> Result<()>
         let from = open(source.parent().context("staging parent missing")?)?;
         let to = open(destination.parent().context("destination parent missing")?)?;
         unix::publish(&from, source.file_name().context("staging name missing")?,
-            &to, destination.file_name().context("destination name missing")?)
+            &to, destination.file_name().context("destination name missing")?, expected)
     }
     #[cfg(not(unix))] {
         // A new hard link is atomic and never replaces an existing directory entry.
+        let file = fs::File::open(source)?;
+        let identity = crate::iroh_net::receive_stage::Identity::of(&file)?;
+        ensure!(expected.is_none_or(|id| id == identity), "Receive stage identity changed before publication");
         fs::hard_link(source, destination)?;
-        fs::remove_file(source)?;
+        if let Err(e) = identity.remove(source) { log::warn!("Published hard link; stage cleanup deferred: {e:#}"); }
         Ok(())
     }
 }
@@ -305,13 +313,17 @@ pub(crate) fn publish_noreplace(source: &Path, destination: &Path) -> Result<()>
 pub(crate) fn gc_receive_probes(config: &Path, dir: &Path) {
     // A user may later share a previously registered Downloads directory.
     // Registration is never permission to sweep a Location or its descendants.
-    let Ok(locations) = load(config) else { return; };
-    let Ok(path) = fs::canonicalize(dir) else { return; };
-    for l in locations {
-        let Ok(root) = canonical_missing(Path::new(&l.path)) else { return; };
-        if path.starts_with(root) { return; }
-    }
+    if !receive_sweep_allowed(config, dir) { return; }
     #[cfg(unix)] unix::gc_probes(dir, std::time::SystemTime::now());
+}
+pub(crate) fn receive_sweep_allowed(config: &Path, dir: &Path) -> bool {
+    let Ok(locations) = load(config) else { return false; };
+    let Ok(path) = fs::canonicalize(dir) else { return false; };
+    for l in locations {
+        let Ok(root) = canonical_missing(Path::new(&l.path)) else { return false; };
+        if path.starts_with(root) { return false; }
+    }
+    true
 }
 
 #[cfg(unix)]
@@ -398,6 +410,31 @@ mod unix {
     fn unlink(parent: &fs::File, name: &std::ffi::OsStr, directory: bool) -> Result<()> {
         io(unsafe { libc::unlinkat(parent.as_raw_fd(), c(name)?.as_ptr(), if directory { libc::AT_REMOVEDIR } else { 0 }) })
     }
+    fn unlink_source(parent: &fs::File, name: &std::ffi::OsStr, source: &fs::File) -> Result<()> {
+        let current = child(parent, name, false)?;
+        let a = current.metadata()?; let b = source.metadata()?;
+        ensure!(a.dev() == b.dev() && a.ino() == b.ino(), "Stage name changed after hard-link publication");
+        unlink(parent, name, false)
+    }
+    #[cfg(test)]
+    mod stage_cleanup_tests {
+        use super::*;
+        #[test]
+        fn hard_link_cleanup_leaves_a_replaced_stage_name_untouched() {
+            let dir = std::env::temp_dir().join(format!("dropbeam-link-cleanup-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("stage"); fs::write(&path, b"body").unwrap();
+            let parent = fs::File::open(&dir).unwrap();
+            let name = std::ffi::OsStr::new("stage");
+            let source = child(&parent, name, false).unwrap();
+            fs::hard_link(&path, dir.join("landed")).unwrap();
+            fs::remove_file(&path).unwrap(); fs::write(&path, b"replacement").unwrap();
+            assert!(unlink_source(&parent, name, &source).is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"replacement");
+            assert_eq!(fs::read(dir.join("landed")).unwrap(), b"body");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
     fn mode(parent: &fs::File, directory: bool) -> Result<libc::mode_t> {
         Ok((parent.metadata()?.mode() & if directory { 0o777 } else { 0o666 }) as libc::mode_t)
     }
@@ -418,23 +455,34 @@ mod unix {
     }
     // Ordinary receives always attempt the real operation, regardless of a
     // cached probe result (permissions during a probe can be transient).
-    pub(super) fn publish(from: &fs::File, old: &std::ffi::OsStr, to: &fs::File, new: &std::ffi::OsStr) -> Result<()> {
+    pub(super) fn publish(from: &fs::File, old: &std::ffi::OsStr, to: &fs::File, new: &std::ffi::OsStr, expected: Option<crate::iroh_net::receive_stage::Identity>) -> Result<()> {
+        if let Some(expected) = expected {
+            ensure!(crate::iroh_net::receive_stage::Identity::of(&child(from, old, false)?)? == expected,
+                "Receive stage identity changed before publication");
+        }
+        #[cfg(test)] if FORCE_HARD_LINK.with(|flag| flag.get()) { return rename_owned(false, from, old, to, new, expected); }
         match native_rename(from, old, to, new) {
             Ok(()) => Ok(()),
-            Err(e) if unsupported(&e) => rename(false, from, old, to, new),
+            Err(e) if unsupported(&e) => rename_owned(false, from, old, to, new, expected),
             Err(e) => Err(e),
         }
     }
     pub(super) fn rename(native: bool, from: &fs::File, old: &std::ffi::OsStr, to: &fs::File, new: &std::ffi::OsStr) -> Result<()> {
+        rename_owned(native, from, old, to, new, None)
+    }
+    fn rename_owned(native: bool, from: &fs::File, old: &std::ffi::OsStr, to: &fs::File, new: &std::ffi::OsStr, expected: Option<crate::iroh_net::receive_stage::Identity>) -> Result<()> {
         if native { return native_rename(from, old, to, new); }
         let source = child(from, old, false)?;
+        if let Some(expected) = expected {
+            ensure!(crate::iroh_net::receive_stage::Identity::of(&source)? == expected, "Receive stage identity changed before publication");
+        }
         let directory = source.metadata()?.is_dir();
         if !directory {
             match io(unsafe { libc::linkat(from.as_raw_fd(), c(old)?.as_ptr(), to.as_raw_fd(), c(new)?.as_ptr(), 0) }) {
                 Ok(()) => {
                     // Publication has succeeded. Cleanup failure must not cause
                     // the caller to publish another copy on retry.
-                    if let Err(e) = unlink(from, old, false) { log::warn!("Published hard link; stage cleanup deferred: {e:#}"); }
+                    if let Err(e) = unlink_source(from, old, &source) { log::warn!("Published hard link; stage cleanup deferred: {e:#}"); }
                     return Ok(());
                 }
                 Err(e) if unsupported(&e) => {},

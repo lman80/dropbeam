@@ -150,7 +150,7 @@ pub async fn verify_received(recv: &mut RecvStream, hashes: &[FileHash], cancel:
     verify_received_indexed(recv, hashes, cancel, true).await
 }
 pub async fn verify_received_indexed(recv: &mut RecvStream, hashes: &[FileHash], cancel: &AtomicBool, bind_index: bool) -> Result<()> {
-    let mut remote: Vec<FileHash> = vec![];
+    let mut remote: Vec<WireHash> = vec![];
     let mut blocks: BTreeMap<(u64, u64), [u8; 32]> = BTreeMap::new();
     let max_blocks: u64 = hashes.iter().map(|h| h.size.div_ceil(BLOCK)).sum();
     let mut blocks_complete = false;
@@ -181,21 +181,14 @@ pub async fn verify_received_indexed(recv: &mut RecvStream, hashes: &[FileHash],
         }
         anyhow::ensure!(blocks.is_empty() || blocks_complete, "incomplete block pages");
         anyhow::ensure!(frame["kind"] == "integrity" && enabled(&frame), "missing integrity manifest");
-        let page: Vec<FileHash> = serde_json::from_value(frame["files"].clone())?;
+        let page: Vec<WireHash> = serde_json::from_value(frame["files"].clone())?;
         anyhow::ensure!(frame["more"] != true || !page.is_empty(), "non-advancing integrity continuation");
         anyhow::ensure!(remote.len() + page.len() <= hashes.len(), "invalid integrity manifest length");
         if !page.is_empty() { deadline.progress(); rehashed(page.len() as u64); }
         remote.extend(page);
         if frame["more"] != true { break; }
     }
-    let mut local = hashes.to_vec();
-    if !bind_index && remote.len() == local.len() {
-        let base = remote.first().map(|h| h.index).unwrap_or(0);
-        for (i, (local, peer)) in local.iter_mut().zip(&remote).enumerate() {
-            anyhow::ensure!(base.checked_add(i as u64) == Some(peer.index), "non-contiguous integrity indices");
-            local.index = peer.index;
-        }
-    }
+    let (local, remote) = normalize_manifest(hashes, remote, bind_index)?;
     let rows = compare(&local, &remote)?;
     let mut matched = Coverage::default();
     for (a, b) in local.iter().zip(&remote) {
@@ -235,8 +228,9 @@ pub async fn receive_ack(recv: &mut RecvStream) {
 pub fn receipt(frame: &serde_json::Value, hashes: &[FileHash]) -> Result<()> {
     if hashes.is_empty() && frame.get("integrity").is_none() { return Ok(()); }
     let rows: Vec<crate::models::FileIntegrity> = serde_json::from_value(frame["integrity"].clone())?;
-    let remote: Vec<_> = rows.iter().map(|r| FileHash { leaves: Default::default(), index: r.index, name: r.name.clone(), size: r.size, digest: r.digest.clone() }).collect();
-    let mut compared = compare(hashes, &remote)?;
+    let wire: Vec<WireHash> = serde_json::from_value(frame["integrity"].clone())?;
+    let (local, remote) = normalize_manifest(hashes, wire, true)?;
+    let mut compared = compare(&local, &remote)?;
     for (row, expected) in rows.iter().zip(&compared) {
         anyhow::ensure!(row.algorithm == ALGORITHM && row.peer_digest == expected.digest && row.verified == expected.verified, "invalid integrity receipt");
     }
@@ -274,7 +268,7 @@ pub async fn send_parallel<F: Fn(u64, u64)>(conn: &Connection, item: &(PathBuf, 
 
 pub async fn receive_parallel<F: Fn(u64, u64)>(conn: &Connection, finalize: FinalizeDest, total: u64,
     part: PathBuf, resume: Option<ResumeCtx>, cov: Coverage, first: RecvStream, cancel: &AtomicBool,
-    progress: F, header: &serde_json::Value, recv: &mut RecvStream) -> Result<PathBuf> {
+    progress: F, header: &serde_json::Value, item_offset: u64, recv: &mut RecvStream) -> Result<PathBuf> {
     if !enabled(header) { return recv_file_resumable(conn, finalize, total, part, resume, cov, first, cancel, progress).await; }
     let leaves = Leaves::default();
     // Retain the partial and sidecar until BOTH hashing and verification finish.
@@ -295,7 +289,7 @@ pub async fn receive_parallel<F: Fn(u64, u64)>(conn: &Connection, finalize: Fina
     );
     hashed?;
     let path = received?;
-    let hash = FileHash { leaves: snapshot_leaves(&leaves), index: received_item_index(header, 0), name: header["items"][0]["name"].as_str().context("missing integrity name")?.into(), size: total, digest: combine(total, &leaves)? };
+    let hash = FileHash { leaves: snapshot_leaves(&leaves), index: received_item_index(item_offset, 0), name: header["items"][0]["name"].as_str().context("missing integrity name")?.into(), size: total, digest: combine(total, &leaves)? };
     // Revoke old coverage BEFORE verification. A failed invalidation save can
     // never leave a fully-covered corrupt sidecar available to the next resume.
     if let Some(rc) = &resume {
@@ -413,7 +407,40 @@ async fn hash_retained_file(mut file: tokio::fs::File, cov: &Coverage, leaves: L
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct FileHash { #[serde(default)] pub index: u64, pub name: String, pub size: u64, pub digest: String, #[serde(skip)] pub leaves: BTreeMap<u64, [u8; 32]> }
+pub struct FileHash { pub index: u64, pub name: String, pub size: u64, pub digest: String, #[serde(skip)] pub leaves: BTreeMap<u64, [u8; 32]> }
+
+// Missing is distinct from explicit zero (and null is invalid). Only a wholly
+// indexless legacy list may acquire indices from the validated manifest order.
+#[derive(serde::Deserialize)]
+struct WireHash {
+    #[serde(default, deserialize_with = "present_index")]
+    index: Option<u64>,
+    name: String,
+    size: u64,
+    digest: String,
+}
+fn present_index<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
+    <u64 as serde::Deserialize>::deserialize(d).map(Some)
+}
+fn normalize_manifest(hashes: &[FileHash], remote: Vec<WireHash>, bind_index: bool) -> Result<(Vec<FileHash>, Vec<FileHash>)> {
+    anyhow::ensure!(hashes.len() == remote.len(), "invalid integrity manifest length");
+    let indexless = remote.iter().all(|row| row.index.is_none());
+    anyhow::ensure!(indexless || remote.iter().all(|row| row.index.is_some()), "mixed integrity index presence");
+    let mut local = hashes.to_vec();
+    let base = remote.first().and_then(|row| row.index).unwrap_or(0);
+    let mut normalized = Vec::with_capacity(remote.len());
+    for (i, (expected, row)) in local.iter_mut().zip(remote).enumerate() {
+        anyhow::ensure!(expected.name == row.name && expected.size == row.size, "invalid integrity manifest order");
+        let index = row.index.unwrap_or(expected.index);
+        if !indexless && !bind_index {
+            anyhow::ensure!(base.checked_add(i as u64) == Some(index), "non-contiguous integrity indices");
+            expected.index = index;
+        }
+        anyhow::ensure!(index == expected.index, "invalid integrity manifest index");
+        normalized.push(FileHash { index, name: row.name, size: row.size, digest: row.digest, leaves: Default::default() });
+    }
+    Ok((local, normalized))
+}
 
 pub fn compare(local: &[FileHash], remote: &[FileHash]) -> Result<Vec<crate::models::FileIntegrity>> {
     anyhow::ensure!(local.len() == remote.len(), "invalid integrity manifest length");
@@ -433,6 +460,43 @@ pub fn compare(local: &[FileHash], remote: &[FileHash]) -> Result<Vec<crate::mod
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn indexless_two_file_manifests_and_receipts_verify_in_manifest_order() {
+        scope(async {
+            let hashes: Vec<_> = (0..2).map(|i| FileHash { index: 7 + i, name: format!("{i}.bin"),
+                size: i, digest: format!("{i}").repeat(64), leaves: Default::default() }).collect();
+            let mut wire = serde_json::to_value(&hashes).unwrap();
+            for row in wire.as_array_mut().unwrap() { row.as_object_mut().unwrap().remove("index"); }
+            for bind in [false, true] {
+                let (local, remote) = normalize_manifest(&hashes, serde_json::from_value(wire.clone()).unwrap(), bind).unwrap();
+                let rows = compare(&local, &remote).unwrap();
+                assert!(rows.iter().all(|r| r.verified));
+                assert_eq!(rows.iter().map(|r| r.index).collect::<Vec<_>>(), vec![7, 8]);
+                let mut receipt_rows = serde_json::to_value(rows).unwrap();
+                for row in receipt_rows.as_array_mut().unwrap() { row.as_object_mut().unwrap().remove("index"); }
+                receipt(&serde_json::json!({"integrity":receipt_rows}), &hashes).unwrap();
+                assert!(reports().iter().all(|r| r.verified && r.acknowledged));
+            }
+            let mut reversed = wire.clone(); reversed.as_array_mut().unwrap().reverse();
+            assert!(normalize_manifest(&hashes, serde_json::from_value(reversed).unwrap(), false).is_err());
+            for indices in [serde_json::json!([0,0]), serde_json::json!([8,7]), serde_json::json!([7,9])] {
+                let mut invalid = wire.clone();
+                for (row, index) in invalid.as_array_mut().unwrap().iter_mut().zip(indices.as_array().unwrap()) { row["index"] = index.clone(); }
+                for bind in [false, true] {
+                    assert!(normalize_manifest(&hashes, serde_json::from_value(invalid.clone()).unwrap(), bind).is_err());
+                }
+            }
+            let mut mixed = wire.clone(); mixed[0]["index"] = serde_json::json!(7);
+            assert!(normalize_manifest(&hashes, serde_json::from_value(mixed).unwrap(), true).is_err());
+            let mut null = wire; null[0]["index"] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<Vec<WireHash>>(null).is_err());
+            let rows = compare(&hashes, &hashes).unwrap();
+            let mut invalid_receipt = serde_json::to_value(rows).unwrap();
+            invalid_receipt[1]["index"] = serde_json::json!(0);
+            assert!(receipt(&serde_json::json!({"integrity":invalid_receipt}), &hashes).is_err());
+        }).await;
+    }
+
     #[test]
     fn combine_is_order_and_chunk_independent() {
         let bytes = vec![37u8; BLOCK as usize * 2 + 91];
