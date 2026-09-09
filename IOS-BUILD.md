@@ -1,3 +1,102 @@
+# iPhone readability, keyboard, and shared picker — 2026-09-09
+
+Source commits: `2f6400b`, `4b3dd7b`, `d7edf12`, `e548244`, `c84dcaf`.
+
+- MOBILE_UI uses a 17px root/body, a 1.22 typography token for legacy pixel
+  labels, at least 44px control targets, 48px chat avatars, and a 50px composer
+  input. Settings controls get full-width rows where appropriate. Desktop
+  typography retains its original pixel values through a default scale of 1.
+- VisualViewport shrink greater than 120px hides tabs, toast chrome, and any
+  data-mobile-bottom-bar element. Small accessory-bar changes and pinch zoom
+  do not trigger keyboard mode. The composer ends at the visual viewport bottom;
+  dismissing the keyboard restores chrome. Mobile dialogs use the visible height.
+- One shared modal Photos/Files sheet wraps the API bridge, covering Chat attach,
+  both Send buttons, send-by-code, Friends Send, compact-window pickers, and
+  profile picture selection. Cancel, duplicate taps and failed imports release
+  the picker cleanly. Photos returns the existing ios_media PHPicker results;
+  Files retains the document picker. Profile selection uses the first selected
+  image, rejects non-image extensions and passes its path to the avatar command.
+- PHPicker keeps unlimited photo/video multi-selection and imports through
+  NSItemProvider without requesting full PhotoKit library access. This supports
+  selection with limited library permissions; no new authorization gate was added.
+  Apple reference: https://developer.apple.com/videos/play/wwdc2020/10641/
+- Onboarding explains chats/photos/files, foreground transfers, and where received
+  files appear in Files. Settings hides download-folder selection, login/tray
+  controls, updater controls/status/errors, and desktop restart buttons. About
+  retains the version. Mobile Lab Mode copy does not promise installing updates.
+
+Validation:
+
+- `npm run build`: passed after the final source edits; existing chunk-size warning.
+- `cargo test --offline --manifest-path src-tauri/Cargo.toml`: **171 passed,
+  0 failed, 6 ignored** outside the sandbox. Initial sandbox run: 143 passed,
+  28 loopback failures due to network-monitor access denial, as in prior builds.
+- `npx tauri ios build --debug --target aarch64-sim --no-sign --ci`: passed
+  outside the sandbox with Xcode/CoreSimulator access. Previous arm64-sim output
+  preserved as `arm64-sim-before-phone-ui-*`. Existing Xcode destination warning.
+- Verified the exact current CSS and JS bytes against the Brotli codegen assets
+  embedded in the finished executable, including the final visual QA refinements:
+  `index-CYJ0QqlS.css`, `index-xZwp-xPz.js`.
+- Browser mock backend at 402x874, `?mobile=1`: inspected screenshots of Send,
+  Settings, Chat, onboarding, picker, and keyboard layout. All five tab views
+  have no horizontal bounds overflow. Settled visible main-view buttons meet
+  44px minimum targets (Friends mount animation temporarily scales cards).
+- Keyboard simulation: height 550 / offsetTop 150 -> composer bottom and root
+  bottom both 700; tabs/toasts hidden, scrollY=0. Restoring height 874 / offset 0
+  restores chrome. Rechecked height 550 / offset 0 -> composer bottom 550,
+  17px input and intact send icon. No real iOS keyboard event was tested here.
+- Send Photos produces two mocked paths; Files flows through recipient selection
+  and code sharing. Chat stages both a photo and video. Friends Send and avatar
+  open the same sheet. Escape/cancel, concurrent open, injected import failure,
+  and reopening after failure passed. No real transfer was sent.
+- Desktop browser at 1200x874 without mobile flag: 16px body, static body,
+  no mobile class, no tab bar or mobile scale override.
+- Screenshots: `/tmp/dropbeam-ios-ui-validation/`.
+  Logs: `/tmp/dropbeam-ios-frontend-build.log`,
+  `/tmp/dropbeam-ios-cargo-test-unrestricted.log`,
+  `/tmp/dropbeam-ios-simulator-build.log`.
+
+Fresh app:
+`/Users/ashtonmiller/DropBeam-ios/src-tauri/gen/apple/build/arm64-sim/DropBeam.app`
+
+Bundle mtime: **2026-09-09 12:14:23.581668 +08:00**.
+Executable mtime: **2026-09-09 12:14:21.394040 +08:00**.
+Bundle version: **0.47.0**.
+Executable SHA-256: `68479662c28ec87dcbdc5bd79fc84cc7a6a0a081a80e5913d83686b91274d1f7`.
+
+No simulator installation or physical-device smoke test was performed in this
+pass. Native limited-permission selection, iCloud downloads, and real keyboard
+transitions still require device QA; browser tests use the mock backend.
+No subagents or push. Source work stayed in this worktree; commits necessarily
+wrote shared Git metadata under ~/DropBeam/.git, not its checkout files.
+
+Changed files (plus this build log):
+
+- `src-tauri/src/commands.rs`
+- `src/App.tsx`
+- `src/components/DropZone.tsx`
+- `src/components/FolderInviteModal.tsx`
+- `src/components/GifPicker.tsx`
+- `src/components/MobileFileSheet.tsx`
+- `src/components/PairingModal.tsx`
+- `src/components/SendToChooser.tsx`
+- `src/components/Sidebar.tsx`
+- `src/components/TitleBar.tsx`
+- `src/components/Toasts.tsx`
+- `src/components/TransferCard.tsx`
+- `src/components/bits.tsx`
+- `src/index.css`
+- `src/lib/api.ts`
+- `src/views/ChatView.tsx`
+- `src/views/FoldersView.tsx`
+- `src/views/FriendsView.tsx`
+- `src/views/HistoryView.tsx`
+- `src/views/RecoverableFilesView.tsx`
+- `src/views/SendView.tsx`
+- `src/views/SettingsView.tsx`
+
+---
+
 # Merge main v0.47.0 into ios — 2026-09-09
 
 Merged main through `2ff4208` (including `1c3b6ac` and `664363c`).
