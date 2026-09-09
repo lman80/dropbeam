@@ -1,7 +1,67 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import type { TransferUpdate } from '../src/lib/api.ts'
-import { completedChatItems, chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTransfers, CHAT_ORPHAN_TTL } from '../src/lib/chatTransfer.ts'
+import type { ChatMessage, HistoryEntry, TransferUpdate } from '../src/lib/api.ts'
+import { completedChatItems, chatTransferUpdate, chatTransferLabel, restoredChatTransfer, loadChatTransfers, saveChatTransfers, pruneChatTransfers, CHAT_ORPHAN_TTL } from '../src/lib/chatTransfer.ts'
+import { integrityLabel } from '../src/lib/integrity.ts'
+
+const oldMessage = { fileXferId: 'shared', fromMe: true, status: 'read', path: '/source/a', files: ['a'], bytes: 50, ts: 1 } satisfies Partial<ChatMessage>
+const historyEntry = (patch: Partial<HistoryEntry> = {}): HistoryEntry => ({
+  id: 'shared', direction: 'send', state: 'completed', fileNames: ['a'], bytesTotal: 50,
+  locality: 'direct', timestampMs: 2, code: null, peer: null, error: null, outDir: null, ...patch,
+})
+
+test('old sender messages with read or delivered receipts restore Delivered', () => {
+  for (const status of ['read', 'delivered'] as const) {
+    assert.equal(chatTransferLabel(restoredChatTransfer({ ...oldMessage, status }, [])), 'Delivered')
+  }
+})
+
+test('receiver landed paths restore Saved without live transfer state', () => {
+  const receiver = { ...oldMessage, fromMe: false, status: null }
+  assert.equal(chatTransferLabel(restoredChatTransfer(receiver, [])), 'Saved')
+  assert.equal(chatTransferLabel(restoredChatTransfer({ ...receiver, path: null }, [], { 'file:0:a': '/saved/a' })), 'Saved')
+})
+
+test('matching terminal history restores locality and the shared Verified badge', () => {
+  const row = { name: 'a', size: 50, algorithm: 'SHA-256', digest: 'a'.repeat(64), peerDigest: 'a'.repeat(64), verified: true, acknowledged: true }
+  for (const locality of ['direct', 'internet'] as const) {
+    const t = restoredChatTransfer(oldMessage, [historyEntry({ integrity: [row], locality })])!
+    assert.equal(chatTransferLabel(t), 'Delivered')
+    assert.equal(t.locality, locality)
+    assert.equal(integrityLabel(t.integrity!, t.bytesTotal, t.state === 'completed'), 'Verified')
+  }
+  for (const integrity of [[], [{ ...row, acknowledged: false }], [{ ...row, size: 25 }]]) {
+    const t = restoredChatTransfer(oldMessage, [historyEntry({ integrity })])!
+    assert.equal(integrityLabel(t.integrity!, t.bytesTotal, true), 'Saved, unverified')
+  }
+  const t = restoredChatTransfer(oldMessage, [historyEntry({ state: 'failed', integrity: [{ ...row, verified: false, peerDigest: 'b'.repeat(64) }] })])!
+  assert.equal(chatTransferLabel(t), 'Not delivered')
+  assert.equal(integrityLabel(t.integrity!, t.bytesTotal, false), 'Verification failed — retry')
+})
+
+test('no durable evidence waits neutrally, including old messages and sender source paths', () => {
+  const message = { ...oldMessage, status: 'sent' as const }
+  assert.equal(chatTransferLabel(restoredChatTransfer(message, [])), 'Waiting for confirmation…')
+  assert.equal(restoredChatTransfer(message, [historyEntry({ id: 'other' }), historyEntry({ direction: 'receive' })]), undefined)
+  assert.equal(restoredChatTransfer({ ...message, fromMe: false, path: null, status: 'read' }, []), undefined)
+})
+
+test('terminal History is selected by newest timestamp and receiver completion restores Saved', () => {
+  const t = restoredChatTransfer({ ...oldMessage, fromMe: false, path: null }, [
+    historyEntry({ direction: 'receive', state: 'failed', timestampMs: 1 }),
+    historyEntry({ direction: 'receive', state: 'completed', timestampMs: 3 }),
+  ])!
+  assert.equal(chatTransferLabel(t), 'Saved')
+})
+
+test('persisted terminal cache retains Direct and Relay locality after restart', () => {
+  storage()
+  for (const locality of ['direct', 'internet'] as const) {
+    saveChatTransfers({ shared: chatTransferUpdate(linked({ batchState: 'completed', bytesDone: 100 }, { locality })) })
+    assert.equal(loadChatTransfers().shared.locality, locality)
+  }
+  Reflect.deleteProperty(globalThis, 'localStorage')
+})
 
 const update = (patch: Partial<TransferUpdate> = {}): TransferUpdate => ({
   id: 'local-transfer', direction: 'receive', state: 'transferring',
