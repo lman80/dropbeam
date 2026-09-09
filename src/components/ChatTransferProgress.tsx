@@ -1,4 +1,5 @@
 import type { TransferUpdate } from '../lib/api'
+import { chatTransferLabel } from '../lib/chatTransfer'
 import { formatBytesLive, formatEta, formatSpeed } from '../lib/format'
 import { useStore } from '../store'
 import { IntegrityDetails } from './IntegrityDetails'
@@ -7,10 +8,7 @@ import { LocalityBadge, ProgressBar } from './bits'
 
 export function ChatTransferProgress({ t }: { t: TransferUpdate }) {
   const megabits = useStore((s) => s.settings?.showMegabits ?? false)
-  const label = t.state === 'completed' ? (t.direction === 'send' ? 'Delivered' : 'Saved')
-    : t.state === 'failed' ? 'Not delivered' : t.state === 'canceled' ? 'Canceled'
-    : t.state === 'waitingForAccept' ? 'Waiting for acceptance'
-    : t.state === 'transferring' ? (t.direction === 'send' ? 'Sending' : 'Receiving') : 'Connecting…'
+  const label = chatTransferLabel(t)
   return <div style={{ padding: '8px 12px', fontSize: 'calc(12px * var(--ui-font-scale, 1))', minWidth: 0 }}>
     <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 6 }}>
       <span>{label}</span>

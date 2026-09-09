@@ -1,5 +1,13 @@
 import type { FileIntegrity } from './api'
 
+/** Shared badge rules for live cards and restored History summaries. */
+export function integrityLabel(rows: FileIntegrity[], total: number, completed: boolean) {
+  if (rows.some(r => !r.verified)) return 'Verification failed — retry'
+  if (completed && rows.length > 0 && rows.every(r => r.acknowledged === true)
+    && rows.reduce((n, r) => n + r.size, 0) === total) return 'Verified'
+  return completed ? 'Saved, unverified' : 'File checksums'
+}
+
 /** Older IPC events and caches have no integrity information. */
 export function integrityRows(value: unknown): FileIntegrity[] {
   if (!Array.isArray(value)) return []

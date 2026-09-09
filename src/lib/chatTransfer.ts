@@ -1,8 +1,43 @@
-import type { TransferUpdate } from './api'
+import type { ChatMessage, HistoryEntry, TransferUpdate } from './api'
 import { integrityRows, mergeIntegrity } from './integrity.ts'
 
 const terminal = (s: string) => ['completed', 'failed', 'canceled'].includes(s)
 export type ChatTransfer = TransferUpdate & { updatedAt?: number; firstSeen?: number; unconfirmed?: boolean }
+
+export function chatTransferLabel(t?: TransferUpdate): string {
+  return !t ? 'Waiting for confirmation…'
+    : t.state === 'completed' ? (t.direction === 'send' ? 'Delivered' : 'Saved')
+    : t.state === 'failed' ? 'Not delivered' : t.state === 'canceled' ? 'Canceled'
+    : t.state === 'waitingForAccept' ? 'Waiting for acceptance'
+    : t.state === 'transferring' ? (t.direction === 'send' ? 'Sending' : 'Receiving') : 'Connecting…'
+}
+
+/** Durable evidence for cards whose live/cache entry is absent. Age alone proves nothing. */
+export function restoredChatTransfer(
+  m: Pick<ChatMessage, 'fileXferId' | 'fromMe' | 'status' | 'path' | 'files' | 'bytes'>,
+  history: HistoryEntry[],
+  completedPaths: Record<string, string> = {},
+): TransferUpdate | undefined {
+  if (!m.fileXferId) return undefined
+  const direction = m.fromMe ? 'send' : 'receive'
+  const entry = history.filter(h => h.id === m.fileXferId && h.direction === direction && terminal(h.state))
+    .sort((a, b) => b.timestampMs - a.timestampMs)[0]
+  const confirmed = m.fromMe ? m.status === 'delivered' || m.status === 'read'
+    : !!m.path || Object.values(completedPaths).some(Boolean)
+  if (!entry && !confirmed) return undefined
+  // Explicit terminal history (including verification failure) outranks a chat-note receipt.
+  const state = entry?.state ?? 'completed'
+  const total = entry?.bytesTotal ?? m.bytes
+  return {
+    id: m.fileXferId, direction, state,
+    fileNames: entry?.fileNames ?? m.files, fileCount: (entry?.fileNames ?? m.files).length,
+    bytesTotal: total, bytesDone: state === 'completed' ? total : 0,
+    percent: state === 'completed' ? 100 : 0, speedBps: 0, etaSeconds: null,
+    locality: entry?.locality ?? 'unknown', integrity: entry?.integrity ?? [],
+    code: entry?.code ?? null, peer: entry?.peer ?? null, error: entry?.error ?? null,
+    outDir: entry?.outDir ?? null, friendName: null,
+  }
+}
 
 /** Receiver batch state is certified by the engine, never inferred from last/offset. */
 export function chatTransferUpdate(u: TransferUpdate, prev?: TransferUpdate): ChatTransfer {
@@ -71,7 +106,8 @@ export function loadChatTransfers(): Record<string, ChatTransfer> {
         },
         bytesDone, bytesTotal: l.total as number, percent: state === 'completed' ? 100 : 0,
         fileNames: strings(v.fileNames) ? v.fileNames : [], fileCount: strings(v.fileNames) ? v.fileNames.length : 0,
-        speedBps: 0, etaSeconds: null, locality: 'unknown', connDetail: null,
+        speedBps: 0, etaSeconds: null,
+        locality: ['local', 'direct', 'internet'].includes(String(v.locality)) ? v.locality as TransferUpdate['locality'] : 'unknown', connDetail: null,
         code: null, peer: null, friendName: typeof v.friendName === 'string' ? v.friendName : null,
         outDir: typeof v.outDir === 'string' ? v.outDir : null,
         error: state === 'failed' ? (typeof v.error === 'string' && !unconfirmed ? v.error : 'Transfer unconfirmed after restart — retry to confirm.') : null,

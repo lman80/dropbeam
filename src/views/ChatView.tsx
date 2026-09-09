@@ -29,7 +29,7 @@ import {
 import { api, fileSrc, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend } from '../lib/api'
 import { useStore, byOrder, type FolderActivityEvent } from '../store'
 import { EmptyState } from '../components/bits'
-import { completedChatItems } from '../lib/chatTransfer'
+import { chatTransferLabel, completedChatItems, restoredChatTransfer } from '../lib/chatTransfer'
 import { ChatTransferProgress } from '../components/ChatTransferProgress'
 import { ConnInspector } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
@@ -1353,7 +1353,9 @@ function FileMessage({
   mine: boolean
   onLightbox: (src: string) => void
 }) {
-  const transfer = useStore((s) => m.fileXferId ? s.chatTransfers[m.fileXferId] : undefined)
+  const liveTransfer = useStore((s) => m.fileXferId ? s.chatTransfers[m.fileXferId] : undefined)
+  const history = useStore((s) => s.history)
+  const transfer = liveTransfer ?? restoredChatTransfer(m, history)
   const name = m.files[0]
   const completed = completedChatItems(transfer?.chatTransfer?.completedPaths)
   const landedPath = completed.find(item => item.name === name)?.path
@@ -1367,7 +1369,7 @@ function FileMessage({
     `${t.outDir.replace(/\\/g, '/').replace(/\/$/, '')}/${name}` === path?.replace(/\\/g, '/')
   )?.id)
   useEffect(() => setBroken(false), [path, landedTransfer, transfer?.state])
-  const available = (!m.fileXferId || !!transfer) && (mine || !transfer || transfer.state === 'completed' || !!landedPath)
+  const available = mine || !!landedPath || !!m.path && (!transfer || transfer.state === 'completed')
   const canPreview = !!path && HAS_TAURI && !broken && available
   const src = canPreview ? `${fileSrc(path!)}?landed=${landedTransfer ?? 'initial'}` : null
   const open = () => path && api.openPath(path).catch(() => {})
@@ -1418,7 +1420,7 @@ function FileMessage({
           void api.openPath(item.path).catch(() => {})
         }}>{item.name} — Open</button>
       ))}
-      {m.fileXferId && !transfer && <div className="chat-file-size">Transfer unconfirmed</div>}
+      {m.fileXferId && !transfer && <div className="chat-file-size">{chatTransferLabel()}</div>}
       {transfer && <ChatTransferProgress t={transfer} />}
       {mine && (transfer ? transfer.state === 'failed' : m.fileXferFailed) && m.fileXferId && (
         <button
