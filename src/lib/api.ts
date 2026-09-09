@@ -1,7 +1,7 @@
 // Typed bridge to the Rust backend: command wrappers + event subscriptions.
 // Types mirror the serde structs in src-tauri/src/models.rs (camelCase).
 
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { mockApi, mockListen } from './mock'
@@ -9,6 +9,11 @@ import { mockApi, mockListen } from './mock'
 /** True when running inside the real Tauri app (vs. a plain browser preview). */
 export const HAS_TAURI =
   typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+
+// Browser previews keep their ordinary URLs; native previews use off-thread I/O.
+export function fileSrc(path: string): string {
+  return HAS_TAURI ? convertFileSrc(path, 'dbfile') : path
+}
 
 export type Direction = 'send' | 'receive'
 export type TransferState =

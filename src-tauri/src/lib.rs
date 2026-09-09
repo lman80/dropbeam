@@ -2,6 +2,7 @@ mod locations;
 mod chat;
 mod commands;
 mod download_progress;
+mod file_protocol;
 mod folder_history;
 mod friends;
 mod fs_walk;
@@ -159,7 +160,25 @@ pub fn run() {
         // SAFETY: SIG_IGN is a valid disposition; no signal handler is installed.
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().register_asynchronous_uri_scheme_protocol(
+        "dbfile",
+        |context, request, responder| {
+            // Never resolve paths or touch the filesystem on the webview thread.
+            let app = context.app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let response = tokio::task::spawn_blocking(move || {
+                    let roots = [app.path().home_dir().ok(), app.path().app_config_dir().ok()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    file_protocol::respond(request, &roots)
+                })
+                .await
+                .unwrap_or_else(|_| file_protocol::empty(404));
+                responder.respond(response);
+            });
+        },
+    );
     // Single-instance MUST be the first plugin. Windows/Linux only: it forwards a
     // second launch — e.g. the "Send with DropBeam" right-click menu, which runs
     // DropBeam.exe with the file path — to the already-running app instead of

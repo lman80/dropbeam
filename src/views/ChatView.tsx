@@ -1,5 +1,4 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { convertFileSrc } from '@tauri-apps/api/core'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   ArrowDown,
@@ -25,7 +24,7 @@ import {
   Video,
   X,
 } from 'lucide-react'
-import { api, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend } from '../lib/api'
+import { api, fileSrc, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend } from '../lib/api'
 import { useStore, byOrder, type FolderActivityEvent } from '../store'
 import { EmptyState } from '../components/bits'
 import { completedChatItems } from '../lib/chatTransfer'
@@ -1022,7 +1021,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
                 title={`Reveal ${base} in Finder`}
               >
                 {img ? (
-                  <img className="sync-thumb" src={convertFileSrc(full(e.rel))} alt="" loading="lazy" />
+                  <img className="sync-thumb" src={fileSrc(full(e.rel))} alt="" loading="lazy" />
                 ) : (
                   <TypeIcon name={base} size={18} />
                 )}
@@ -1294,7 +1293,7 @@ function DeliveryState({ status }: { status: ChatMessage['status'] }) {
  *  the Giphy CDN url — doing so would leak the receiver's IP to a third party for
  *  a P2P-private chat. Until the bytes arrive, show a sized placeholder. */
 function GifBubble({ m, onLightbox }: { m: ChatMessage; onLightbox: (src: string) => void }) {
-  const src = m.path && HAS_TAURI ? convertFileSrc(m.path) : null
+  const src = m.path && HAS_TAURI ? fileSrc(m.path) : null
   const [broken, setBroken] = useState(false)
   const ratio = m.gif && m.gif.w && m.gif.h ? { aspectRatio: `${m.gif.w} / ${m.gif.h}` } : undefined
   if (!src || broken) {
@@ -1343,7 +1342,7 @@ function FileMessage({
   useEffect(() => setBroken(false), [path, landedTransfer, transfer?.state])
   const available = (!m.fileXferId || !!transfer) && (mine || !transfer || transfer.state === 'completed' || !!landedPath)
   const canPreview = !!path && HAS_TAURI && !broken && available
-  const src = canPreview ? `${convertFileSrc(path!)}?landed=${landedTransfer ?? 'initial'}` : null
+  const src = canPreview ? `${fileSrc(path!)}?landed=${landedTransfer ?? 'initial'}` : null
   const open = () => path && api.openPath(path).catch(() => {})
   const resendChatFile = useStore((s) => s.resendChatFile)
   // A file whose bytes never landed must not look openable.

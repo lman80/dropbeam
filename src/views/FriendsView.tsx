@@ -1,5 +1,4 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { convertFileSrc } from '@tauri-apps/api/core'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
@@ -17,7 +16,7 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import { api, HAS_TAURI, type ConnDetail, type Friend } from '../lib/api'
+import { api, fileSrc, HAS_TAURI, type ConnDetail, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
 import { ConnInspector } from '../components/ConnInspector'
@@ -130,7 +129,7 @@ function Avatar({
     >
       {showPic ? (
         <img
-          src={convertFileSrc(picture!)}
+          src={fileSrc(picture!)}
           alt={name}
           style={{ width: '100%', height: '100%', objectFit: 'cover' }}
           onError={() => setBrokenPicture(picture!)}
