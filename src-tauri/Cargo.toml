@@ -34,6 +34,9 @@ members = ["labtool"]
 tauri-build = { version = "2.6.2", features = [] }
 
 [dependencies]
+# Already cached/locked through Tauri; match its asset URL and Range decoding.
+percent-encoding = "2"
+http-range = "0.1"
 tauri = { version = "2.11.2", features = ["tray-icon", "image-png", "macos-private-api", "protocol-asset"] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
