@@ -2264,3 +2264,14 @@ html.mobile .mobile-file-sheet-body { display: flex; flex-direction: column; gap
 html.mobile .mobile-file-sheet h2 { font-size: 20px; margin: 0 0 8px; }
 html.mobile .mobile-file-sheet .btn { justify-content: flex-start; flex-wrap: wrap; }
 html.mobile .mobile-file-sheet .btn span { flex-basis: 100%; text-align: left; color: var(--text-muted); font-size: 15px; }
+/* Give descriptive settings copy the full phone width; only switches stay inline. */
+html.mobile .settings-row > :first-child { flex-basis: 100% !important; }
+html.mobile .settings-row > :last-child { width: 100%; }
+html.mobile .settings-row:has(.toggle) > :first-child { flex-basis: calc(100% - 70px) !important; }
+html.mobile .settings-row:has(.toggle) > :last-child { width: auto; }
+html.mobile .settings-row .seg { display: flex; width: 100%; }
+html.mobile .settings-row .seg button { overflow-wrap: normal; white-space: nowrap; }
+html.mobile .settings-row > :last-child > .input { width: 100% !important; }
+html.mobile .settings-row > :last-child > div { flex-wrap: wrap; }
+html.mobile .chat-send { padding: 0 !important; }
+html.mobile button > svg { flex-shrink: 0; }

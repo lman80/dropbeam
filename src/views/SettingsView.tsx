@@ -742,7 +742,7 @@ export function SettingsView() {
       <Card>
         <Row
           title="Enable Lab Mode"
-          desc="Let ONE trusted device (the developer's) run automated tests against this app and install updates for you, over the same encrypted link your files use. Off by default. Even when on, only the exact operator ID below is ever accepted — no one else can connect. Leave this off unless the developer asks you to turn it on."
+          desc={MOBILE_UI ? "Allow one trusted developer device to run diagnostics over an encrypted connection. Off by default. Only the operator ID below is accepted. Turn this on only when the developer asks." : "Let ONE trusted device (the developer's) run automated tests against this app and install updates for you, over the same encrypted link your files use. Off by default. Even when on, only the exact operator ID below is ever accepted — no one else can connect. Leave this off unless the developer asks you to turn it on."}
         >
           <Toggle
             on={settings.labModeEnabled}
