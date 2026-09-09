@@ -190,6 +190,12 @@ pub fn append(config_dir: &Path, msg: &ChatMessage) -> bool {
     if thread.iter().any(|m| m.id == msg.id && m.from_me == msg.from_me) {
         return false;
     }
+    // A linked manifest is immutable, including across differently named notes.
+    if let Some(link) = &msg.file_xfer_id {
+        if thread.iter().any(|m| m.from_me == msg.from_me && m.file_xfer_id.as_ref() == Some(link)) {
+            return false;
+        }
+    }
     thread.push(msg.clone());
     thread.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
     if thread.len() > MAX_PER_PEER {

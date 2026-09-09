@@ -50,6 +50,9 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rand = "0.8"
 sha2 = "0.10"
+# Already locked via TLS; hardware SHA-256 on Apple Silicon without a new
+# download (sha2's optional ARM assembly dependency is not in the offline cache).
+ring = "0.17"
 unicode-normalization = "0.1"
 hex = "0.4"
 whoami = "1"

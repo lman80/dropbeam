@@ -3,6 +3,7 @@ import { CheckCircle2, Download, FolderOpen, HardDrive, RefreshCw, Trash2 } from
 import { api, type Settings } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
+import { LocationSettings } from '../components/LocationSettings'
 import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
 
 function Toggle({
@@ -172,6 +173,7 @@ export function SettingsView() {
       <h1 className="titlebar-drag" style={{ fontSize: 20, fontWeight: 750, margin: '0 0 16px' }}>
         Settings
       </h1>
+      <LocationSettings />
 
       <SectionTitle>Profile</SectionTitle>
       <Card>

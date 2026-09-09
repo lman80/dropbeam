@@ -1,12 +1,13 @@
 import type { TransferUpdate } from '../lib/api'
 import { formatBytesLive, formatEta, formatSpeed } from '../lib/format'
 import { useStore } from '../store'
+import { IntegrityDetails } from './IntegrityDetails'
 import { ConnInspector } from './ConnInspector'
 import { LocalityBadge, ProgressBar } from './bits'
 
 export function ChatTransferProgress({ t }: { t: TransferUpdate }) {
   const megabits = useStore((s) => s.settings?.showMegabits ?? false)
-  const label = t.state === 'completed' ? (t.direction === 'send' ? 'Delivered' : 'Verified')
+  const label = t.state === 'completed' ? (t.direction === 'send' ? 'Delivered' : 'Saved')
     : t.state === 'failed' ? 'Not delivered' : t.state === 'canceled' ? 'Canceled'
     : t.state === 'waitingForAccept' ? 'Waiting for acceptance'
     : t.state === 'transferring' ? (t.direction === 'send' ? 'Sending' : 'Receiving') : 'Connecting…'
@@ -24,6 +25,7 @@ export function ChatTransferProgress({ t }: { t: TransferUpdate }) {
         <span>{formatSpeed(t.speedBps, megabits)}</span><span>{formatEta(t.etaSeconds)} left</span>
       </div>
     </>}
+    <IntegrityDetails rows={t.integrity} total={t.bytesTotal} completed={t.state === 'completed'} />
     {t.detail && <div>{t.detail}</div>}
     {t.state === 'failed' && <div style={{ color: 'var(--red)', overflowWrap: 'anywhere' }}>{t.error ?? 'The transfer failed.'}</div>}
   </div>

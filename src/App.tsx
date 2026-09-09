@@ -15,6 +15,7 @@ import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
 import { HistoryView } from './views/HistoryView'
 import { SettingsView } from './views/SettingsView'
+import { LocationsView } from './views/LocationsView'
 import { FoldersView } from './views/FoldersView'
 import { FriendsView } from './views/FriendsView'
 import { ChatView } from './views/ChatView'
@@ -64,13 +65,18 @@ export default function App() {
         // so you can add a message and send them together — instead of firing off
         // immediately or routing to the global send chooser.
         const st = useStore.getState()
-        if (st.view === 'chat' && st.activeChatId) {
+        if (st.view === 'locations') {
+          window.dispatchEvent(new CustomEvent('dropbeam:location-drop', { detail: paths }))
+        } else if (st.view === 'chat' && st.activeChatId) {
           st.stageChatFiles(paths)
         } else {
           setPendingSend(paths)
         }
       },
-      (h) => setDragHovering(h),
+      (h) => {
+        setDragHovering(h)
+        if (useStore.getState().view === 'locations') window.dispatchEvent(new CustomEvent('dropbeam:location-hover', { detail: h }))
+      },
     ).then((f) => {
       if (active) un = f
       else f()
@@ -98,7 +104,7 @@ export default function App() {
         <InstallBanner />
         <LocalNetworkBanner />
       </ErrorBoundary>
-      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+      <div className="app-workspace" style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         <ErrorBoundary region="sidebar">
           <Sidebar />
         </ErrorBoundary>
@@ -125,6 +131,7 @@ export default function App() {
               {view === 'friends' && <FriendsView />}
               {view === 'chat' && <ChatView />}
               {view === 'folders' && <FoldersView />}
+              {view === 'locations' && <LocationsView />}
               {view === 'history' && <HistoryView />}
               {view === 'settings' && <SettingsView />}
             </motion.div>

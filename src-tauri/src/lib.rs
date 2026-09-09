@@ -1,3 +1,4 @@
+mod locations;
 mod chat;
 mod commands;
 mod download_progress;
@@ -416,6 +417,7 @@ pub fn run() {
             // endpoint in the background (it fills once bound). A user who'd
             // toggled the old "Direct mode" off must still get a working app.
             let iroh_state = Arc::new(iroh_net::IrohState::default());
+            locations::spawn_gc(config_dir.clone());
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
             // Keep retrying undelivered chat messages until they land (reliable chat).
             iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
@@ -617,6 +619,11 @@ pub fn run() {
             commands::force_relay,
             commands::friend_invite,
             commands::send_to_friend,
+            commands::location_activity,
+            commands::list_locations,
+            commands::save_location,
+            commands::location_request,
+            commands::upload_to_location,
             commands::iroh_node_id,
             commands::iroh_selftest,
             commands::iroh_send,

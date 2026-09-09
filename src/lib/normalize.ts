@@ -1,4 +1,5 @@
 import type { ChatMessage, TransferUpdate } from './api'
+import { integrityRows } from './integrity.ts'
 
 const nonnegative = (n: number): number => Number.isFinite(n) && n >= 0 ? n : 0
 const strings = (value: string[]): string[] =>
@@ -26,6 +27,7 @@ export function normalizeTransfer(u: TransferUpdate, prev?: TransferUpdate): Tra
     : bytesTotal > 0 ? bytesDone / bytesTotal * 100 : 0
   return {
     ...u,
+    integrity: integrityRows(u.integrity),
     fileNames: strings(u.fileNames ?? prev?.fileNames ?? []),
     fileCount: nonnegative(u.fileCount),
     bytesTotal,
