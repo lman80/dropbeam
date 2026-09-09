@@ -1,6 +1,6 @@
 name: app
 options:
-  bundleIdPrefix: com.dropbeam.app
+  bundleIdPrefix: com.ashtonmiller.dropbeam
   deploymentTarget:
     iOS: 14.0
 fileGroups: [../../src]
@@ -11,7 +11,7 @@ settingGroups:
   app:
     base:
       PRODUCT_NAME: DropBeam
-      PRODUCT_BUNDLE_IDENTIFIER: com.dropbeam.app
+      PRODUCT_BUNDLE_IDENTIFIER: com.ashtonmiller.dropbeam
 targetTemplates:
   app:
     type: application
