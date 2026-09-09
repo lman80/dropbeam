@@ -33,7 +33,18 @@ export default function App() {
     const root = document.documentElement
     const viewport = window.visualViewport
     let frame = 0
+    let fullHeight = window.innerHeight
+    let width = window.innerWidth
     const update = () => {
+      // Reset the baseline on rotation; ignore small browser/accessory-bar changes.
+      if (width !== window.innerWidth) {
+        width = window.innerWidth
+        fullHeight = window.innerHeight
+      }
+      fullHeight = Math.max(fullHeight, window.innerHeight)
+      const height = viewport?.height ?? window.innerHeight
+      const keyboard = !!viewport && viewport.scale === 1 && fullHeight - height > 120
+      root.classList.toggle('keyboard-visible', keyboard)
       // WKWebView can pan the visual viewport even with overflow hidden.
       // Anchor the fixed shell to its visible origin; only inner panes scroll.
       root.style.setProperty('--mobile-viewport-height', `${viewport?.height ?? window.innerHeight}px`)
@@ -52,6 +63,7 @@ export default function App() {
       viewport?.removeEventListener('resize', schedule)
       viewport?.removeEventListener('scroll', schedule)
       window.removeEventListener('resize', schedule)
+      root.classList.remove('keyboard-visible')
       root.style.removeProperty('--mobile-viewport-height')
       root.style.removeProperty('--mobile-viewport-top')
     }

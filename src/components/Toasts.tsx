@@ -8,6 +8,7 @@ export function Toasts() {
 
   return (
     <div
+      className="app-toasts"
       style={{
         position: 'fixed',
         bottom: 18,

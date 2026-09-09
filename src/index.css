@@ -2249,3 +2249,11 @@ html.mobile .chat-send { height: 50px; }
 html.mobile .tabbar-label { font-size: 12px; }
 html.mobile .emoji-pop { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 html.mobile .emoji-cell { padding: 5px 0; }
+
+html.mobile button { flex-shrink: 0; }
+/* Transient bottom chrome must not sit between the composer and keyboard. */
+html.mobile.keyboard-visible :is(.tabbar, .app-toasts, [data-mobile-bottom-bar]) { display: none !important; }
+html.mobile .app-toasts { left: 16px; right: 16px !important; bottom: calc(80px + env(safe-area-inset-bottom)) !important; max-width: none !important; }
+html.mobile .dialog-overlay { top: var(--mobile-viewport-top, 0px); height: var(--mobile-viewport-height, 100dvh); }
+html.mobile .dialog-overlay > :is(.card, .dialog) { max-height: calc(var(--mobile-viewport-height, 100dvh) - var(--dialog-top) - var(--dialog-bottom)) !important; }
+html.mobile.keyboard-visible .dialog-overlay { --dialog-bottom: 12px; }
