@@ -92,7 +92,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 windows-core = "0.62"
 # `Win32_UI_Shell` gates SetCurrentProcessExplicitAppUserModelID (ties the process
 # to the installer's Start-menu AppUserModelID so chat toast notifications show).
-windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation"] }
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dependencies]
 # Ignore SIGPIPE at startup so closed launcher pipes return an I/O error.
