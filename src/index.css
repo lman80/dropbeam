@@ -2257,3 +2257,10 @@ html.mobile .app-toasts { left: 16px; right: 16px !important; bottom: calc(80px 
 html.mobile .dialog-overlay { top: var(--mobile-viewport-top, 0px); height: var(--mobile-viewport-height, 100dvh); }
 html.mobile .dialog-overlay > :is(.card, .dialog) { max-height: calc(var(--mobile-viewport-height, 100dvh) - var(--dialog-top) - var(--dialog-bottom)) !important; }
 html.mobile.keyboard-visible .dialog-overlay { --dialog-bottom: 12px; }
+
+html.mobile .mobile-file-sheet { position: fixed; inset: auto 0 0; margin: 0; width: 100%; max-width: none; max-height: 90dvh; padding: 0; border: 0; border-radius: 24px 24px 0 0; background: var(--surface); color: var(--text); }
+html.mobile .mobile-file-sheet::backdrop { background: rgb(0 0 0 / 45%); }
+html.mobile .mobile-file-sheet-body { display: flex; flex-direction: column; gap: 12px; padding: 24px 20px max(24px, env(safe-area-inset-bottom)); }
+html.mobile .mobile-file-sheet h2 { font-size: 20px; margin: 0 0 8px; }
+html.mobile .mobile-file-sheet .btn { justify-content: flex-start; flex-wrap: wrap; }
+html.mobile .mobile-file-sheet .btn span { flex-basis: 100%; text-align: left; color: var(--text-muted); font-size: 15px; }

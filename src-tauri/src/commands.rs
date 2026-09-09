@@ -235,18 +235,21 @@ pub async fn pick_directory(app: AppHandle) -> Option<String> {
 pub async fn set_profile_avatar(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
+    path: Option<String>,
 ) -> Result<Settings, String> {
     use tauri_plugin_dialog::DialogExt;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "heic", "bmp"])
-        .pick_file(move |path| {
-            let _ = tx.send(path);
-        });
-    let picked = match rx.await {
-        Ok(Some(p)) => p.into_path().map_err(|e| e.to_string())?,
-        _ => return Ok(state.settings.lock().unwrap().clone()),
+    let picked = if let Some(path) = path {
+        std::path::PathBuf::from(path)
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog()
+            .file()
+            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "heic", "bmp"])
+            .pick_file(move |path| { let _ = tx.send(path); });
+        match rx.await {
+            Ok(Some(p)) => p.into_path().map_err(|e| e.to_string())?,
+            _ => return Ok(state.settings.lock().unwrap().clone()),
+        }
     };
     let ext = picked
         .extension()

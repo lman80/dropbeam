@@ -5,6 +5,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { mockApi, mockListen } from './mock'
+import { MOBILE_UI } from './platform'
+import { pickMobileFiles } from '../components/MobileFileSheet'
 
 /** True when running inside the real Tauri app (vs. a plain browser preview). */
 export const HAS_TAURI =
@@ -350,7 +352,7 @@ const realApi = {
   shareFiles: (paths: string[]) => invoke<void>('share_files', { paths }),
   pickDirectory: () => invoke<string | null>('pick_directory'),
   /** Pick an image and set it as the profile picture. Returns updated settings. */
-  setProfileAvatar: () => invoke<Settings>('set_profile_avatar'),
+  setProfileAvatar: (path?: string) => invoke<Settings>('set_profile_avatar', { path }),
   clearProfileAvatar: () => invoke<Settings>('clear_profile_avatar'),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
@@ -505,7 +507,19 @@ const realApi = {
   setUnreadBadge: (count: number) => invoke<void>('set_unread_badge', { count }),
 }
 
-export const api: typeof realApi = HAS_TAURI ? realApi : (mockApi as typeof realApi)
+const backend: typeof realApi = HAS_TAURI ? realApi : (mockApi as typeof realApi)
+const mobilePick = () => pickMobileFiles({ photos: backend.pickPhotos, files: backend.pickFiles })
+export const api: typeof realApi = MOBILE_UI ? {
+  ...backend,
+  pickFiles: mobilePick,
+  pickPhotos: mobilePick,
+  setProfileAvatar: async () => {
+    const paths = await mobilePick()
+    if (!paths.length) return backend.getSettings()
+    if (!/\.(png|jpe?g|gif|webp|heic|bmp)$/i.test(paths[0])) throw new Error('Choose an image for your profile picture.')
+    return backend.setProfileAvatar(paths[0])
+  },
+} : backend
 
 export function onFolderStatus(cb: (s: FolderStatus) => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('folder://status', (p) => cb(p as FolderStatus))
