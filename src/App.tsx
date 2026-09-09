@@ -259,9 +259,11 @@ function NameSetupModal() {
               lineHeight: 1.45,
             }}
           >
-            This is the name friends see when you send files or share a folder. You can change it
-            anytime in Settings.
+            {MOBILE_UI
+              ? 'Friends see this name in chats and when you send photos or files. You can change it anytime in Settings.'
+              : 'This is the name friends see when you send files or share a folder. You can change it anytime in Settings.'}
           </p>
+          {MOBILE_UI && <p style={{ lineHeight: 1.5, color: 'var(--text-muted)' }}>Keep DropBeam open while sending or receiving. Find received files in Files → On My iPhone → DropBeam.</p>}
           <input
             autoFocus
             value={name}

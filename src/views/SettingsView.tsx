@@ -184,7 +184,7 @@ export function SettingsView() {
 
       <SectionTitle>Profile</SectionTitle>
       <Card>
-        <Row title="Display name" desc="What paired devices see you as.">
+        <Row title="Display name" desc={MOBILE_UI ? "The name your friends see." : "What paired devices see you as."}>
           <input
             className="input"
             style={{ width: 200 }}
@@ -196,14 +196,7 @@ export function SettingsView() {
 
       <SectionTitle>Downloads</SectionTitle>
       <Card>
-        {MOBILE_UI ? (
-          <Row
-            title="Where received files go"
-            desc="DropBeam's own folder on this iPhone. Open the Files app and look under On My iPhone → DropBeam to find them."
-          >
-            <FolderOpen size={16} style={{ color: 'var(--text-faint)' }} />
-          </Row>
-        ) : (
+        {!MOBILE_UI && (
           <Row title="Save received files to">
             <button className="btn btn-ghost" onClick={changeDir} title={settings.downloadDir}>
               <FolderOpen size={15} />
@@ -220,7 +213,7 @@ export function SettingsView() {
             </button>
           </Row>
         )}
-        {SEP}
+        {!MOBILE_UI && SEP}
         <Row
           title="Clear transfer cache"
           desc="Interrupted transfers keep their progress on disk so they can resume. Old leftovers are cleaned automatically after a week; this removes them now."
@@ -274,14 +267,14 @@ export function SettingsView() {
         )}
         <Row
           title="Notify when a file arrives"
-          desc="Pop a notification when someone sends you a file, even if DropBeam is in the background."
+          desc={MOBILE_UI ? "Show a notification when a file arrives. Keep DropBeam open while transferring files." : "Pop a notification when someone sends you a file, even if DropBeam is in the background."}
         >
           <Toggle on={settings.notifyOnComplete} onChange={(v) => save({ notifyOnComplete: v })} />
         </Row>
         {SEP}
         <Row
           title="Chat message notifications"
-          desc="Pop a notification when a friend messages you and the app isn’t focused."
+          desc={MOBILE_UI ? "Show a notification for new messages when you’re outside the conversation. Delivery may pause while the app is in the background." : "Pop a notification when a friend messages you and the app isn’t focused."}
         >
           <Toggle on={settings.notifyOnMessage} onChange={(v) => save({ notifyOnMessage: v })} />
         </Row>
@@ -331,14 +324,14 @@ export function SettingsView() {
       <Card>
         <Row
           title="Direct peer-to-peer"
-          desc="Every transfer — Quick Send, friends, and shared folders — goes straight to the other computer, end-to-end encrypted, as fast as your network allows. Your firewall may ask once to allow DropBeam."
+          desc={MOBILE_UI ? "Send to other devices with end-to-end encryption. Keep DropBeam open on both devices until the transfer finishes." : "Every transfer — Quick Send, friends, and shared folders — goes straight to the other computer, end-to-end encrypted, as fast as your network allows. Your firewall may ask once to allow DropBeam."}
         >
           <span style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 650, color: 'var(--accent)' }}>On</span>
         </Row>
         {SEP}
         <Row
           title="Test direct connection"
-          desc={testResult || 'Confirm the direct engine is running on this computer.'}
+          desc={testResult || (MOBILE_UI ? 'Check the connection on this device.' : 'Confirm the direct engine is running on this computer.')}
         >
           <button className="btn btn-ghost" onClick={runDirectTest} disabled={testing}>
             {testing ? <Spinner size={14} /> : <RefreshCw size={15} />} Test
@@ -581,13 +574,13 @@ export function SettingsView() {
           desc="When two devices can't connect directly, files fall back to a relay. By default that's iroh's shared public relays — fine, but sometimes slow or flaky for far-apart devices. Point BOTH devices at your own free relay for a fast, reliable fallback. Leave blank to use the public relays. Applied on restart. Setup guide (free, ~10 min): github.com/lman80/dropbeam → RELAY-SETUP.md"
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <button
+            {MOBILE_UI ? <span style={{ color: 'var(--text-muted)' }}>Close and reopen DropBeam to apply changes.</span> : <button
               className="btn btn-ghost"
               onClick={() => api.restartApp().catch(() => {})}
               title="Restart DropBeam so the relay change takes effect"
             >
               <RefreshCw size={14} /> Restart
-            </button>
+            </button>}
             <input
               className="input"
               style={{ width: 230 }}
@@ -600,12 +593,12 @@ export function SettingsView() {
         </Row>
       </Card>
 
-      <SectionTitle>Updates</SectionTitle>
+      <SectionTitle>{MOBILE_UI ? 'About' : 'Updates'}</SectionTitle>
       <Card>
         {MOBILE_UI ? (
           <Row
             title="Version"
-            desc={`DropBeam ${appVer || '…'} — the iPhone app is updated by installing a new build, not from inside the app.`}
+            desc={`DropBeam ${appVer || '…'}`}
           />
         ) : (
           <Row title="Version" desc={`DropBeam ${appVer || '…'}`}>
@@ -618,7 +611,7 @@ export function SettingsView() {
             </button>
           </Row>
         )}
-        {update && (
+        {!MOBILE_UI && update && (
           <>
             {SEP}
             <div style={{ padding: '13px 4px' }}>
@@ -649,7 +642,7 @@ export function SettingsView() {
             </div>
           </>
         )}
-        {updateError && !update && (
+        {!MOBILE_UI && updateError && !update && (
           <>
             {SEP}
             <div style={{ padding: '13px 4px' }}>
@@ -677,20 +670,20 @@ export function SettingsView() {
           desc="Add the deepest network-internal logs (iroh connection setup, path selection, hole-punch) on top of the usual diagnostics — turn this on only while reproducing a hard-to-spot connection issue. Sharing diagnostics (below) already keeps DropBeam's own logs detailed; this adds the heavier transport internals. Takes effect after a restart."
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <button
+            {MOBILE_UI ? <span style={{ color: 'var(--text-muted)' }}>Close and reopen DropBeam to apply changes.</span> : <button
               className="btn btn-ghost"
               onClick={() => api.restartApp().catch(() => {})}
               title="Restart DropBeam so the logging change takes effect"
             >
               <RefreshCw size={14} /> Restart
-            </button>
+            </button>}
             <Toggle on={settings.verboseLogging} onChange={(v) => save({ verboseLogging: v })} />
           </div>
         </Row>
         {SEP}
         <Row
           title="Export logs"
-          desc="Bundle the logs into one file in your Downloads folder (no passwords or file contents — just diagnostics). Send it over DropBeam (drop it on a friend) or AirDrop to get the issue diagnosed."
+          desc={MOBILE_UI ? "Save a diagnostics file in DropBeam’s folder in Files. You can share it to help troubleshoot an issue." : "Bundle the logs into one file in your Downloads folder (no passwords or file contents — just diagnostics). Send it over DropBeam (drop it on a friend) or AirDrop to get the issue diagnosed."}
         >
           <button className="btn btn-ghost" onClick={exportLogs} disabled={exporting}>
             {exporting ? <Spinner size={14} /> : <Download size={15} />}
