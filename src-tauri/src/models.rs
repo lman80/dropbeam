@@ -73,6 +73,10 @@ pub struct ConnDetail {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferUpdate {
+    #[serde(default)]
+    pub integrity: Vec<FileIntegrity>,
+    #[serde(default)]
+    pub chat_transfer: Option<ChatTransferLink>,
     pub id: String,
     pub direction: Direction,
     pub state: TransferState,
@@ -101,10 +105,39 @@ pub struct TransferUpdate {
     pub detail: Option<String>,
 }
 
+/// Chat-only batch coordinates; the transfer list keeps its per-push updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTransferLink {
+    pub id: String,
+    pub attempt: u64,
+    pub manifest: Vec<ChatFile>,
+    #[serde(default)]
+    pub directories: Vec<String>,
+    #[serde(default)]
+    pub batch_state: Option<TransferState>,
+    #[serde(default)]
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub completed_files: Vec<String>,
+    #[serde(default)]
+    pub completed_paths: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub item_offset: u64,
+    pub offset: u64,
+    pub total: u64,
+    pub last: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatFile { pub name: String, pub size: u64 }
+
 impl TransferUpdate {
     pub fn new(id: String, direction: Direction, file_names: Vec<String>) -> Self {
         let file_count = file_names.len();
         TransferUpdate {
+            integrity: vec![],
+            chat_transfer: None,
             id,
             direction,
             state: TransferState::Starting,
@@ -131,6 +164,8 @@ impl TransferUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
+    #[serde(default)]
+    pub integrity: Vec<FileIntegrity>,
     pub id: String,
     pub direction: Direction,
     pub file_names: Vec<String>,
@@ -574,3 +609,19 @@ pub struct VerifyResult {
     pub peer_files: u32,
 }
 
+
+/// Independently computed digests, persisted with the transfer on both devices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileIntegrity {
+    #[serde(default)]
+    pub index: u64,
+    #[serde(default)]
+    pub acknowledged: bool,
+    pub name: String,
+    pub size: u64,
+    pub algorithm: String,
+    pub digest: String,
+    pub peer_digest: String,
+    pub verified: bool,
+}

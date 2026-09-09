@@ -1045,6 +1045,7 @@ mod tests {
         let _ = crate::chat::append(
             dir,
             &crate::chat::ChatMessage {
+                file_xfer_id: None,
                 id: format!("m-{peer}"),
                 peer_id: peer.into(),
                 from_me: false,

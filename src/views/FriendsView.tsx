@@ -1,3 +1,4 @@
+import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useState, type ReactNode } from 'react'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -45,6 +46,8 @@ export function FriendsView() {
           <UserPlus size={15} /> Add friend
         </button>
       </div>
+
+      {MOBILE_UI && <button className="btn btn-ghost" onClick={() => useStore.getState().setView('locations')}>Browse friends’ Locations</button>}
 
       {/* ── You ─────────────────────────────────────────────── */}
       <SectionLabel>You</SectionLabel>

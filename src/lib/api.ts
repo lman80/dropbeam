@@ -36,7 +36,31 @@ export interface ConnDetail {
   relay: string | null
 }
 
+export interface FileIntegrity {
+  index?: number
+  acknowledged?: boolean
+  name: string
+  size: number
+  algorithm: string
+  digest: string
+  peerDigest: string
+  verified: boolean
+}
+
 export interface TransferUpdate {
+  integrity?: FileIntegrity[]
+  chatTransfer?: {
+    id: string
+    offset: number
+    total: number
+    last: boolean
+    attempt?: number
+    /** Receiver-certified batch snapshot; per-push completion alone is insufficient. */
+    batchState?: TransferState | null
+    bytesDone?: number
+    completedFiles?: string[]
+    completedPaths?: Record<string, string>
+  } | null
   id: string
   direction: Direction
   state: TransferState
@@ -61,6 +85,7 @@ export interface TransferUpdate {
 }
 
 export interface HistoryEntry {
+  integrity?: FileIntegrity[]
   id: string
   direction: Direction
   fileNames: string[]
@@ -249,7 +274,8 @@ export interface ChatMessage {
    *  resend" instead of implying the file arrived. Carries the failed transfer id so
    *  the resend reuses the dedup-safe retryTransfer. */
   fileXferFailed?: boolean
-  fileXferId?: string
+  /** Persisted shared transfer ID (receiver IDs are scoped to the authenticated peer). */
+  fileXferId?: string | null
 }
 
 /** A preview of one conversation, for the chat list. */
@@ -444,8 +470,8 @@ const realApi = {
   respondToOffer: (id: string, accept: boolean, dest?: string) =>
     invoke<void>('respond_to_offer', { id, accept, dest: dest ?? null }),
   friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
-  sendToFriend: (id: string, paths: string[]) =>
-    invoke<TransferUpdate>('send_to_friend', { id, paths }),
+  sendToFriend: (id: string, paths: string[], chatTransferId?: string, chatAttempt?: number) =>
+    invoke<TransferUpdate>('send_to_friend', { id, paths, chatTransferId, chatAttempt }),
   /** Your permanent, reusable DropBeam code (stable device key + name). */
   myInviteCode: () => invoke<string>('my_invite_code'),
   /** Add a friend from their permanent code; auto-fills their name, two-way. */
@@ -469,8 +495,8 @@ const realApi = {
       replyTo: replyTo ?? null,
       replyPreview: replyPreview ?? null,
     }),
-  sendChatFileNote: (friendId: string, names: string[], bytes: number, paths: string[], caption?: string) =>
-    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes, paths, caption }),
+  sendChatFileNote: (friendId: string, names: string[], bytes: number, paths: string[], caption?: string, fileXferId?: string) =>
+    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes, paths, caption, fileXferId }),
   /** Save an image pasted into the chat composer to an app-managed folder (bounded
    *  to the last 50 pastes) and return its path for the staged-file send flow.
    *  Takes base64 — a raw byte array would serialize as a huge JSON number[]. */
@@ -659,4 +685,29 @@ export function isActive(state: TransferState): boolean {
     state === 'waitingForAccept' ||
     state === 'transferring'
   )
+}
+
+export interface LocationRights { upload: boolean; manage: boolean }
+export interface HostedLocation { id: string; name: string; path: string; friendIds: string[]; rights: LocationRights; byteCap?: number; device?: number; marker?: string; safePublish?: string }
+export interface SharedLocation { id: string; name: string; rights: LocationRights }
+export interface LocationEntry { name: string; isDir: boolean; size: number; modified: number }
+export interface LocationPage { entries: LocationEntry[]; page?: number; hasMore: boolean; cursor?: string; nextCursor?: string; total?: number }
+export const locationsApi = {
+  activity: () => HAS_TAURI ? invoke<LocationActivity[]>('location_activity') : Promise.resolve([]),
+  listHosted: () => HAS_TAURI ? invoke<HostedLocation[]>('list_locations') : Promise.resolve([]),
+  save: (location: HostedLocation) => invoke<HostedLocation[]>('save_location', { location, removeId: null }),
+  remove: (removeId: string) => invoke<HostedLocation[]>('save_location', { location: null, removeId }),
+  request: <T,>(friendId: string, request: Record<string, unknown>) => invoke<T>('location_request', { friendId, request }),
+  list: (friendId: string) => HAS_TAURI
+    ? invoke<SharedLocation[]>('location_request', { friendId, request: { kind: 'locations.list' } })
+    : Promise.resolve([]),
+  upload: (friendId: string, locationId: string, relPath: string, paths: string[]) =>
+    invoke<TransferUpdate>('upload_to_location', { friendId, target: { location_id: locationId, rel_path: relPath }, paths }),
+}
+export interface LocationActivity { friendId: string; locationId: string; operation: string; item: string; to?: string; at: number }
+export function onLocationActivity(cb: (activity: LocationActivity) => void): Promise<UnlistenFn> {
+  return HAS_TAURI ? listen<LocationActivity>('locations://changed', e => { if (e.payload?.operation) cb(e.payload) }) : Promise.resolve(() => {})
+}
+export function onLocationsChanged(cb: () => void): Promise<UnlistenFn> {
+  return HAS_TAURI ? listen('locations://changed', cb) : Promise.resolve(() => {})
 }

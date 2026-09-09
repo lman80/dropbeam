@@ -1,3 +1,73 @@
+# Merge main: chat progress, Locations, integrity — 2026-09-09
+
+Merged main through `847a63e`, including live chat transfer progress and review
+fixes, Locations, end-to-end transfer integrity, and their design documentation.
+
+Conflicts and resolutions:
+
+- `src-tauri/src/commands.rs`: retained the iOS Documents download helper and
+  added all Locations commands.
+- `src-tauri/src/lib.rs`: retained `codes` and the iOS native media/cfg gates;
+  added the Locations module, command registration and cache GC.
+- `src/App.tsx`: retained MOBILE_UI navigation, viewport/keyboard behavior and
+  error boundaries, with main's workspace class and Locations route.
+- `src/views/SettingsView.tsx`: retained both imports; Locations hosting settings
+  render only on desktop, alongside the existing mobile settings restrictions.
+
+Phone integration:
+
+- Friends opens a Locations sub-page; Friends remains selected in the existing
+  five-tab bar. The client can browse/download/upload and perform permitted
+  remote management. Hosting controls and upload-folder pickers are hidden.
+- Upload files opens the shared Photos/Files sheet. Remote action dialogs use
+  the mobile viewport contract; the file table wraps long names and fits a phone.
+- Native Locations hosting is disabled on iOS: configuration loads as empty,
+  configuration saves fail, and opening a hosted root fails. Imported desktop
+  configuration cannot expose an iOS folder.
+- Chat file cards retain live progress and expandable integrity badges. New
+  progress/integrity labels use the existing phone typography scale. Existing
+  phone polish, Photos/Files bridge, Documents receive path and iOS gates remain.
+
+Validation:
+
+- `npm run build`: passed, including the simulator build's frontend rebuild.
+- `cargo build --release --lib --offline` in src-tauri: passed on the host.
+- `cargo check --offline --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios-sim --lib`: passed outside the sandbox after SwiftPM sandbox_apply denial.
+- Same check with `--target aarch64-apple-ios`: passed outside the sandbox.
+- `cargo test --offline` in src-tauri: **229 passed, 0 failed, 6 ignored** outside
+  the sandbox. Initial sandbox run: 187 passed, 42 failed, 6 ignored; all failures
+  were loopback endpoint setup denied with `Operation not permitted`.
+- `node --test tests/*.test.ts`: **17 passed**.
+- Browser mock backend at 402x874: Friends → Locations navigation and selected
+  tab, populated file table with a long name, hidden hosting/folder-picker
+  controls, Photos/Files sheet, and remote New Folder dialog passed. No horizontal
+  overflow. Phone chat showed percent/speed/ETA and an expandable Verified badge
+  with both hashes, also without overflow. No real transfer was sent in browser QA.
+- `npx tauri ios build --debug --target aarch64-sim --no-sign --ci`: passed outside
+  the sandbox on retry. The first archive failed because its generated simulator
+  dependency directory disappeared mid-build. Several other build-output folders,
+  including previously preserved simulator bundles, also disappeared; their
+  removal was not explained by the scoped host-incremental-cache cleanup performed
+  in this pass. The retry regenerated the required outputs successfully.
+- Verified bundle version **0.47.0**, UIFileSharingEnabled=true and
+  LSSupportsOpeningDocumentsInPlace=true. No simulator installation or device
+  runtime test was performed. Existing chunk-size, Rust and Xcode warnings remain.
+
+Fresh app:
+`/Users/ashtonmiller/DropBeam-ios/src-tauri/gen/apple/build/arm64-sim/DropBeam.app`
+
+Bundle mtime: **2026-09-09 15:44:54.546577 +08:00**.
+Executable mtime: **2026-09-09 15:44:48.117090 +08:00**.
+Executable SHA-256: `f93cb0abf968ef39d861e3e03d13f7d5bceab36d35094c8560180e655b410c28`.
+Frontend assets: `index-4C51nxht.css`, `index-Dn-Nc9KE.js`.
+Logs: `/tmp/dropbeam-ios-merge-{host,sim-check-unrestricted,device-check,tests-unrestricted,simulator-retry}.log`.
+Chat screenshot: `/tmp/dropbeam-ios-merge-chat.png`.
+
+No subagents or push. Source work stayed in this worktree; Git necessarily
+updated shared worktree metadata under ~/DropBeam/.git, not its checkout files.
+
+---
+
 # iPhone readability, keyboard, and shared picker — 2026-09-09
 
 Source commits: `2f6400b`, `4b3dd7b`, `d7edf12`, `e548244`, `c84dcaf`.

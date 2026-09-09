@@ -28,7 +28,7 @@ export function MobileTabBar() {
   return (
     <nav className="tabbar" aria-label="Main">
       {TABS.map((tab) => {
-        const active = view === tab.id
+        const active = view === tab.id || (tab.id === 'friends' && view === 'locations')
         const Icon = tab.icon
         const badge =
           tab.id === 'send' ? activeCount : tab.id === 'chat' ? unreadCount : 0

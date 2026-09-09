@@ -15,6 +15,7 @@ import {
 import { api, type HistoryEntry } from '../lib/api'
 import { useStore } from '../store'
 import { EmptyState, LocalityBadge } from '../components/bits'
+import { IntegrityDetails } from '../components/IntegrityDetails'
 import { FileIcon } from '../components/FileIcon'
 import { RecoverableFilesView } from './RecoverableFilesView'
 import { formatBytes } from '../lib/format'
@@ -250,6 +251,7 @@ function RecentRow({ e }: { e: HistoryEntry }) {
           <span>· {timeOfDay(e.timestampMs)}</span>
           <LocalityBadge locality={e.locality} />
         </div>
+        <IntegrityDetails rows={e.integrity} total={e.bytesTotal} completed={ok} />
       </div>
 
       {ok ? (

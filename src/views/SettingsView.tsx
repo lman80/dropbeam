@@ -4,6 +4,7 @@ import { api, type Settings } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
 import { MOBILE_UI } from '../lib/platform'
+import { LocationSettings } from '../components/LocationSettings'
 import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
 
 function Toggle({
@@ -181,6 +182,7 @@ export function SettingsView() {
       <h1 className="titlebar-drag" style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: '0 0 16px' }}>
         Settings
       </h1>
+      {!MOBILE_UI && <LocationSettings />}
 
       <SectionTitle>Profile</SectionTitle>
       <Card>

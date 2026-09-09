@@ -18,6 +18,7 @@ import {
 import { api, isActive, type TransferUpdate } from '../lib/api'
 import { formatBytes, formatBytesLive, formatEta, formatSpeed as formatSpeedValue } from '../lib/format'
 import { LocalityBadge, ProgressBar, Spinner } from './bits'
+import { IntegrityDetails } from './IntegrityDetails'
 import { ConnInspector } from './ConnInspector'
 import { useStore } from '../store'
 
@@ -375,6 +376,8 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
           )}
         </div>
       )}
+
+      <IntegrityDetails rows={t.integrity} total={t.bytesTotal} completed={t.state === 'completed'} />
 
       {/* failed */}
       {t.state === 'failed' && (

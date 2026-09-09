@@ -1199,6 +1199,7 @@ pub async fn send_chat_message(
     let body: String = trimmed.chars().take(4000).collect();
     let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
     let msg = ChatMessage {
+        file_xfer_id: None,
         id: uuid::Uuid::new_v4().to_string(),
         peer_id: friend_id.clone(),
         from_me: true,
@@ -1273,8 +1274,9 @@ pub async fn send_chat_file_note(
     bytes: u64,
     paths: Vec<String>,
     caption: Option<String>,
+    file_xfer_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths, caption)
+    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths, caption, file_xfer_id)
         .ok_or_else(|| "Friend not found.".to_string())
 }
 
@@ -1292,9 +1294,11 @@ pub(crate) fn post_file_note(
     bytes: u64,
     paths: Vec<String>,
     caption: Option<String>,
+    file_xfer_id: Option<String>,
 ) -> Option<ChatMessage> {
     let friend = friends::get(&state.config_dir, friend_id)?;
     let msg = ChatMessage {
+        file_xfer_id,
         id: uuid::Uuid::new_v4().to_string(),
         peer_id: friend_id.to_string(),
         from_me: true,
@@ -1522,6 +1526,7 @@ pub async fn send_chat_gif(
 ) -> Result<ChatMessage, String> {
     let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
     let msg = ChatMessage {
+        file_xfer_id: None,
         id: uuid::Uuid::new_v4().to_string(),
         peer_id: friend_id.clone(),
         from_me: true,
@@ -1757,6 +1762,8 @@ pub fn send_to_friend(
     iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     id: String,
     paths: Vec<String>,
+    chat_transfer_id: Option<String>,
+    chat_attempt: Option<u64>,
 ) -> Result<TransferUpdate, String> {
     let paths: Vec<String> = paths.into_iter().filter(|p| !p.trim().is_empty()).collect();
     if paths.is_empty() {
@@ -1777,7 +1784,7 @@ pub fn send_to_friend(
     if iroh.get().is_none() {
         return Err("DropBeam is still connecting — try again in a moment.".into());
     }
-    crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths)
+    crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths, chat_transfer_id, chat_attempt)
 }
 
 // ── iroh transport (Phase 1: foundation / diagnostics) ───────────────────────
@@ -1854,4 +1861,53 @@ pub(crate) fn download_directory(app: &AppHandle) -> tauri::Result<std::path::Pa
     { app.path().document_dir() }
     #[cfg(not(target_os = "ios"))]
     { app.path().download_dir() }
+}
+
+// Locations: the local UI edits configuration; remote requests always derive
+// their authority from conn.remote_id() inside the protocol handler.
+#[tauri::command]
+pub fn location_activity(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Value> {
+    crate::locations::activity(&state.config_dir)
+}
+#[tauri::command]
+pub async fn list_locations(state: State<'_, Arc<AppState>>) -> Result<Vec<crate::locations::Location>, String> {
+    let config = state.config_dir.clone();
+    tokio::task::spawn_blocking(move || crate::locations::hosted(&config)).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))
+}
+#[tauri::command]
+pub async fn save_location(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    location: Option<crate::locations::Location>, remove_id: Option<String>) -> Result<Vec<crate::locations::Location>, String> {
+    let config = state.config_dir.clone();
+    let list = tokio::task::spawn_blocking(move || crate::locations::save(&config, location, remove_id.as_deref())).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))?;
+    // Send to previous recipients too: revocation must invalidate their cached list.
+    crate::iroh_net::broadcast_profile(app.clone(), iroh.inner().clone());
+    let _ = app.emit("locations://changed", ());
+    Ok(list)
+}
+#[tauri::command]
+pub async fn location_request(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    friend_id: String, request: serde_json::Value) -> Result<serde_json::Value, String> {
+    let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found")?;
+    let endpoint = friend.endpoint_id.ok_or("Friend has no device address")?;
+    let kind = request["kind"].as_str().unwrap_or("");
+    if !matches!(kind, "locations.list" | "locations.ls" | "locations.download" | "locations.mkdir" | "locations.rename" | "locations.trash") {
+        return Err("Unknown location operation".into());
+    }
+    crate::iroh_net::location_request(&iroh, &endpoint, request).await.map_err(|e| format!("{e:#}"))
+}
+#[tauri::command]
+pub async fn upload_to_location(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    friend_id: String, target: crate::locations::Target, paths: Vec<String>) -> Result<TransferUpdate, String> {
+    if paths.is_empty() { return Err("No files selected".into()); }
+    crate::locations::relative(&target.rel_path).map_err(|e| e.to_string())?;
+    let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found")?;
+    let endpoint = friend.endpoint_id.ok_or("Friend has no device address")?;
+    // Confirm current access before starting. Host repeats this check on header
+    // receipt and again at publication, including after a resumed transfer.
+    let shared = crate::iroh_net::location_request(&iroh, &endpoint, serde_json::json!({"kind":"locations.list"})).await.map_err(|e| e.to_string())?;
+    if !shared.as_array().into_iter().flatten().any(|l| l["id"] == target.location_id && l["rights"]["upload"] == true) {
+        return Err("This location is not shared with upload permission".into());
+    }
+    crate::iroh_net::send_location_to_friend(app, iroh.inner().clone(), friend.name, endpoint, paths,
+        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None })
 }

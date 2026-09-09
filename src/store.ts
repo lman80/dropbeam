@@ -3,6 +3,7 @@ import { create } from 'zustand'
 import { listenForChatNotifications } from './lib/chatNotifications'
 import {
   api,
+  locationsApi,
   HAS_TAURI,
   type ConnDetail,
   onChatMessage,
@@ -29,6 +30,7 @@ import {
 } from './lib/api'
 import { setSpeedUnit } from './lib/format'
 import { LandedEta } from './lib/eta'
+import { chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTransfers } from './lib/chatTransfer'
 import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 import { MOBILE_UI } from './lib/platform'
@@ -106,7 +108,7 @@ interface UpdateState {
   progress: number
 }
 
-export type View = 'send' | 'friends' | 'folders' | 'chat' | 'history' | 'settings'
+export type View = 'locations' | 'send' | 'friends' | 'folders' | 'chat' | 'history' | 'settings'
 
 export interface Toast {
   id: string
@@ -118,6 +120,7 @@ interface AppStore {
   ready: boolean
   view: View
   settings: Settings | null
+  chatTransfers: Record<string, TransferUpdate>
   transfers: Record<string, TransferUpdate>
   order: string[]
   /** Final stats per completed transfer: how long it took + average speed. */
@@ -304,7 +307,7 @@ let lastFriendAt = 0
 // (NOT a per-webview Map) because a send can START in the menu-bar popover while its
 // failed card — and the Retry button — renders in the MAIN window; both windows must
 // read the same payload. Bounded so it can't grow unbounded across a session.
-type RetryPayload = { kind: 'friend'; id: string; paths: string[] } | { kind: 'quick'; paths: string[] }
+type RetryPayload = { kind: 'friend'; id: string; paths: string[] } | { kind: 'quick'; paths: string[] } | { kind: 'location'; id: string; locationId: string; relPath: string; paths: string[] }
 const RETRY_KEY = 'dropbeam-retry-payloads'
 function loadRetryPayloads(): Record<string, RetryPayload> {
   try {
@@ -323,6 +326,9 @@ function setRetryPayload(id: string, p: RetryPayload): void {
   } catch {
     /* best-effort — Retry is a convenience, never critical */
   }
+}
+export function rememberLocationUpload(transferId: string, friendId: string, locationId: string, relPath: string, paths: string[]) {
+  setRetryPayload(transferId, { kind: 'location', id: friendId, locationId, relPath, paths })
 }
 function deleteRetryPayload(id: string): void {
   try {
@@ -385,6 +391,7 @@ export const useStore = create<AppStore>((set, get) => ({
   ready: false,
   view: 'send',
   settings: null,
+  chatTransfers: loadChatTransfers(),
   transfers: {},
   order: [],
   transferSummaries: {},
@@ -459,6 +466,13 @@ export const useStore = create<AppStore>((set, get) => ({
       }
       refresh()
       setInterval(refresh, 30_000)
+      setInterval(() => {
+        const linked = new Set(Object.values(get().chats).flatMap(ms => ms.flatMap(m => m.fileXferId ? [m.fileXferId] : [])))
+        const chatTransfers = get().chatTransfers
+        pruneChatTransfers(chatTransfers, linked)
+        set({ chatTransfers })
+        saveChatTransfers(chatTransfers)
+      }, 30_000)
       window.addEventListener('online', refresh)
       if (HAS_TAURI) {
         await listen<string>('folder://viewer-change', ({ payload }) => {
@@ -865,6 +879,21 @@ export const useStore = create<AppStore>((set, get) => ({
     } else {
       etaSpeeds.delete(u.id)
     }
+    if (u.chatTransfer) {
+      const key = u.chatTransfer.id
+      const chatTransfers = get().chatTransfers
+      const previous = chatTransfers[key]
+      const next = chatTransferUpdate(u, previous)
+      if (next !== previous) {
+        chatTransfers[key] = next
+        if (!previous || previous.state !== next.state || previous.chatTransfer?.attempt !== next.chatTransfer?.attempt) {
+          const linked = new Set(Object.values(get().chats).flatMap(ms => ms.flatMap(m => m.fileXferId ? [m.fileXferId] : [])))
+          pruneChatTransfers(chatTransfers, linked)
+          saveChatTransfers(chatTransfers)
+        }
+        set({ chatTransfers })
+      }
+    }
     // A friend transfer that actually connected means they were online just now.
     if (
       u.friendName &&
@@ -916,7 +945,7 @@ export const useStore = create<AppStore>((set, get) => ({
       if (link) {
         const card = (get().chats[link.peerId] ?? []).find((x) => x.id === link.msgId)
         if (u.state === 'failed') {
-          if (card) get().addChatMessage({ ...card, fileXferFailed: true, fileXferId: u.id })
+          if (card) get().addChatMessage({ ...card, fileXferFailed: true })
         } else {
           if (card && card.fileXferFailed) get().addChatMessage({ ...card, fileXferFailed: false })
           deleteChatFileXfer(u.id)
@@ -930,7 +959,9 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   removeTransfer: (id) => {
-    deleteRetryPayload(id) // free the saved payload so the store can't grow unbounded
+    // Dismissing the transfer list card must not disable Retry in its chat card.
+    // The shared retry cache is already bounded to 50 payloads.
+    if (!Object.values(get().chatTransfers).some((t) => t.id === id)) deleteRetryPayload(id)
     set((s) => {
       const next = { ...s.transfers }
       delete next[id]
@@ -944,6 +975,15 @@ export const useStore = create<AppStore>((set, get) => ({
     const t = get().transfers[id]
     // Only retry a card that actually failed — never re-send an in-flight one.
     if (t && t.state !== 'failed') return
+    if (payload.kind === 'location') {
+      try {
+        const next = await locationsApi.upload(payload.id, payload.locationId, payload.relPath, payload.paths)
+        setRetryPayload(next.id, payload)
+        get().removeTransfer(id)
+        if (!get().transfers[next.id]) get().upsertTransfer(next)
+      } catch (e) { get().toast('error', String(e)) }
+      return
+    }
     // Drop the failed card first so the retry starts a fresh transfer instead of
     // leaving a zombie alongside it (this also frees the old payload).
     get().removeTransfer(id)
@@ -958,14 +998,16 @@ export const useStore = create<AppStore>((set, get) => ({
       // Re-send the BYTES only — api.sendToFriend (the raw transfer), NOT the store
       // action that also posts a fresh chat note. That avoids a duplicate file card
       // on every resend; the recipient's engine dedup prevents a double-delivery.
-      const t = await api.sendToFriend(payload.id, payload.paths)
+      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId)
+      const linkId = card?.fileXferId ?? xferId
+      const current = get().chatTransfers[linkId]
+      if (current && current.state !== 'failed') return
+      const t = await api.sendToFriend(payload.id, payload.paths, linkId, (current?.chatTransfer?.attempt ?? 0) + 1)
       setRetryPayload(t.id, payload)
       setChatFileXfer(t.id, { peerId, msgId })
-      // Re-link the SAME card to the fresh transfer + clear the failed flag, so this
-      // card (not a new one) recovers on success or re-flags on another failure.
-      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId)
-      if (card) get().addChatMessage({ ...card, fileXferFailed: false, fileXferId: t.id })
-      get().upsertTransfer(t)
+      // Keep the shared chat ID on retries so the receiver follows the same card.
+      if (card) get().addChatMessage({ ...card, fileXferFailed: false })
+      if (!get().transfers[t.id]) get().upsertTransfer(t)
     } catch (e) {
       get().toast('error', String(e))
     }
@@ -1035,14 +1077,14 @@ export const useStore = create<AppStore>((set, get) => ({
       // Remember the recipient + paths so a failed send can offer one-tap Retry
       // (the TransferUpdate only keeps the friend's display name, not their id).
       setRetryPayload(u.id, { kind: 'friend', id, paths })
-      get().upsertTransfer(u)
+      if (!get().transfers[u.id]) get().upsertTransfer(u)
       // A direct send to a friend also lands in that friend's chat timeline, on
       // BOTH sides — so every interaction shows up in the conversation (GitHub
       // #23). Same synced file-note a chat-originated send posts; best-effort, so
       // a note failure never affects the transfer that already went through.
       try {
         const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
-        const m = await api.sendChatFileNote(id, names, u.bytesTotal || 0, paths)
+        const m = await api.sendChatFileNote(id, names, u.bytesTotal || 0, paths, undefined, u.id)
         // Tie this transfer's bytes to its chat card (see shareFilesInChat) so a
         // failed direct send flips the card to "tap to resend".
         setChatFileXfer(u.id, { peerId: id, msgId: m.id })
@@ -1124,7 +1166,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const path = await api.downloadGif(gif.url, gif.id)
       const name = `giphy-${gif.id}.gif`
       const t = await api.sendToFriend(friendId, [path])
-      get().upsertTransfer(t)
+      if (!get().transfers[t.id]) get().upsertTransfer(t)
       const m = await api.sendChatGif(friendId, name, t.bytesTotal || 0, path, gif)
       get().addChatMessage(m)
     } catch (e) {
@@ -1167,9 +1209,9 @@ export const useStore = create<AppStore>((set, get) => ({
     try {
       const t = await api.sendToFriend(friendId, paths)
       setRetryPayload(t.id, { kind: 'friend', id: friendId, paths })
-      get().upsertTransfer(t)
+      if (!get().transfers[t.id]) get().upsertTransfer(t)
       const names = paths.map((p) => p.split(/[/\\]/).pop() || p)
-      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths, caption)
+      const m = await api.sendChatFileNote(friendId, names, t.bytesTotal || 0, paths, caption, t.id)
       // Tie this transfer's bytes to THIS card, so a later failure flips it to
       // "tap to resend" rather than leaving a card for a file that never arrived.
       setChatFileXfer(t.id, { peerId: friendId, msgId: m.id })

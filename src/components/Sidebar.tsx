@@ -1,5 +1,6 @@
 import {
   FolderSync,
+  HardDrive,
   History,
   MessageCircle,
   MessageSquarePlus,
@@ -17,6 +18,7 @@ const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
   { id: 'friends', label: 'Friends', icon: Users },
   { id: 'chat', label: 'Chat', icon: MessageCircle },
+  { id: 'locations', label: 'Locations', icon: HardDrive },
   { id: 'folders', label: 'Shared Folders', icon: FolderSync },
   { id: 'history', label: 'History', icon: History },
   { id: 'settings', label: 'Settings', icon: Settings },
@@ -35,7 +37,7 @@ export function Sidebar() {
   )
 
   return (
-    <nav
+    <nav className="app-sidebar"
       style={{
         width: 218,
         padding: '6px 12px 12px',
@@ -90,7 +92,7 @@ export function Sidebar() {
       })}
 
       {/* Opens the SuperFeedback panel (no floating button — it overlapped Send). */}
-      <button className="nav-item" onClick={() => SuperFeedback.open()}>
+      <button className="nav-item sidebar-feedback" onClick={() => SuperFeedback.open()}>
         <MessageSquarePlus size={18} strokeWidth={2.1} />
         <span style={{ flex: 1 }}>Feedback</span>
       </button>

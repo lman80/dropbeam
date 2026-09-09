@@ -30,6 +30,8 @@ import {
 import { api, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend } from '../lib/api'
 import { useStore, byOrder, type FolderActivityEvent } from '../store'
 import { EmptyState } from '../components/bits'
+import { completedChatItems } from '../lib/chatTransfer'
+import { ChatTransferProgress } from '../components/ChatTransferProgress'
 import { ConnInspector } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
@@ -1352,22 +1354,27 @@ function FileMessage({
   mine: boolean
   onLightbox: (src: string) => void
 }) {
+  const transfer = useStore((s) => m.fileXferId ? s.chatTransfers[m.fileXferId] : undefined)
   const name = m.files[0]
+  const completed = completedChatItems(transfer?.chatTransfer?.completedPaths)
+  const landedPath = completed.find(item => item.name === name)?.path
+  const path = landedPath ?? m.path
   const kind = fileKind(name)
   const [broken, setBroken] = useState(false)
   // The chat note can arrive before its separate file transfer finishes.
   const landedTransfer = useStore((s) => Object.values(s.transfers).reverse().find((t) =>
     !m.fromMe && t.direction === 'receive' && t.state === 'completed' &&
     !!t.outDir && t.fileNames.includes(name) &&
-    `${t.outDir.replace(/\\/g, '/').replace(/\/$/, '')}/${name}` === m.path?.replace(/\\/g, '/')
+    `${t.outDir.replace(/\\/g, '/').replace(/\/$/, '')}/${name}` === path?.replace(/\\/g, '/')
   )?.id)
-  useEffect(() => setBroken(false), [m.path, landedTransfer])
-  const canPreview = !!m.path && HAS_TAURI && !broken
-  const src = canPreview ? `${convertFileSrc(m.path!)}?landed=${landedTransfer ?? 'initial'}` : null
-  const open = () => m.path && api.openPath(m.path).catch(() => {})
+  useEffect(() => setBroken(false), [path, landedTransfer, transfer?.state])
+  const available = (!m.fileXferId || !!transfer) && (mine || !transfer || transfer.state === 'completed' || !!landedPath)
+  const canPreview = !!path && HAS_TAURI && !broken && available
+  const src = canPreview ? `${convertFileSrc(path!)}?landed=${landedTransfer ?? 'initial'}` : null
+  const open = () => path && api.openPath(path).catch(() => {})
   const resendChatFile = useStore((s) => s.resendChatFile)
   // A file whose bytes never landed must not look openable.
-  const openable = !!m.path && !m.fileXferFailed
+  const openable = !!path && available
 
   const multi = m.files.length > 1
   const GlyphIcon = kind === 'video' ? Video : kind === 'audio' ? Music : kind === 'text' ? FileText : FileIcon
@@ -1407,13 +1414,20 @@ function FileMessage({
           {m.bytes > 0 && <div className="chat-file-size">{formatBytes(m.bytes)}</div>}
         </div>
       </div>
-      {mine && m.fileXferFailed && m.fileXferId && (
+      {(multi || transfer?.state !== 'completed') && completed.map(item => (
+        <button key={item.key} className="chat-file-resend" onClick={() => {
+          void api.openPath(item.path).catch(() => {})
+        }}>{item.name} — Open</button>
+      ))}
+      {m.fileXferId && !transfer && <div className="chat-file-size">Transfer unconfirmed</div>}
+      {transfer && <ChatTransferProgress t={transfer} />}
+      {mine && (transfer ? transfer.state === 'failed' : m.fileXferFailed) && m.fileXferId && (
         <button
           className="chat-file-resend"
-          onClick={() => void resendChatFile(m.peerId, m.id, m.fileXferId!)}
+          onClick={() => void resendChatFile(m.peerId, m.id, transfer?.id ?? m.fileXferId!)}
           title="The file didn't finish sending — tap to resend"
         >
-          Not delivered — tap to resend
+          Retry
         </button>
       )}
     </div>
