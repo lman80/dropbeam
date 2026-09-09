@@ -334,11 +334,14 @@ mod unix {
     fn io(rc: i32) -> Result<()> { if rc < 0 { Err(std::io::Error::last_os_error().into()) } else { Ok(()) } }
     // Pin cached descriptors to prevent inode reuse. A remount's new device key
     // gets a fresh probe. Roots retain their capability even after LRU eviction.
-    struct Capability { _dir: fs::File, native: bool, used: Instant }
+    pub(super) struct Capability { _dir: fs::File, native: bool, used: Instant }
     static PROBES: LazyLock<Mutex<HashMap<(u64, u64), Capability>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     #[cfg(test)] thread_local! {
         pub(super) static PROBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(super) static PROBE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    }
+    #[cfg(test)] pub(super) fn hold_probe_cache() -> std::sync::MutexGuard<'static, HashMap<(u64, u64), Capability>> {
+        PROBES.lock().unwrap_or_else(|p| p.into_inner())
     }
     #[cfg(test)] pub(super) fn forget_probe(path: &Path) {
         let m = fs::metadata(path).unwrap();
@@ -347,10 +350,15 @@ mod unix {
     pub(super) fn cached_probe(dir: &fs::File) -> Result<bool> {
         let meta = dir.metadata()?;
         let key = (meta.dev(), meta.ino());
-        let mut cache = PROBES.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(cap) = cache.get_mut(&key) { cap.used = Instant::now(); return Ok(cap.native); }
+        if let Some(cap) = PROBES.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&key) { cap.used = Instant::now(); return Ok(cap.native); }
+        // NEVER hold the cache lock across filesystem calls: a probe on a NAS
+        // mount that is asleep, or an open() that macOS parks behind a pending
+        // privacy prompt, would otherwise stall every receive in the process
+        // (they all pass through here). Two racing probes of one directory are
+        // harmless; the second result simply wins.
         let native = probe(dir)?;
-        if cache.len() >= 128 {
+        let mut cache = PROBES.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= 128 && !cache.contains_key(&key) {
             if let Some(key) = cache.iter().min_by_key(|(_, c)| c.used).map(|(k, _)| *k) { cache.remove(&key); }
         }
         cache.insert(key, Capability { _dir: dir.try_clone()?, native, used: Instant::now() });
@@ -386,9 +394,11 @@ mod unix {
         reserve(dir, name, false)
     }
     pub(super) fn gc_probes(dir: &Path, now: std::time::SystemTime) {
-        // Serialize with probe creation, and leave recent names alone across
-        // processes. Only generated, empty regular files are probe litter.
-        let _cache = PROBES.lock().unwrap_or_else(|p| p.into_inner());
+        // Only generated, empty regular files older than a day are probe litter.
+        // The age check alone keeps an in-flight probe (seconds old) safe, so no
+        // lock is taken here: this runs from startup sweeps and receive paths on
+        // directories that may block (sleeping NAS mounts, macOS privacy prompts),
+        // and a global lock held across those calls stalled every receive.
         use std::os::unix::fs::OpenOptionsExt;
         let Ok(parent) = fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(dir) else { return; };
         let _ = names(&parent, |name| {
@@ -1122,6 +1132,34 @@ fn download_snapshot_at(config: &Path, endpoint: &str, request: &Value, now: Ins
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    /// A sleeping NAS mount or a macOS privacy prompt can park a probe or a
+    /// sweep inside a filesystem call for minutes. Neither may hold the shared
+    /// probe cache while it waits, or every receive in the process stalls.
+    #[test]
+    fn probe_sweep_and_probe_never_wait_on_the_probe_cache() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-probe-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join(format!(".dropbeam-probe-{}", uuid::Uuid::new_v4()));
+        fs::write(&stale, b"").unwrap();
+        let held = unix::hold_probe_cache();
+        let sweep_dir = dir.clone();
+        let sweep = std::thread::spawn(move || unix::gc_probes(&sweep_dir, std::time::SystemTime::now() + Duration::from_secs(48 * 3600)));
+        let probe_dir = dir.clone();
+        let probe = std::thread::spawn(move || {
+            use std::os::unix::fs::OpenOptionsExt;
+            let f = fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(&probe_dir).unwrap();
+            unix::probe(&f).is_ok()
+        });
+        let started = Instant::now();
+        while !(sweep.is_finished() && probe.is_finished()) {
+            assert!(started.elapsed() < Duration::from_secs(10), "probe work waited on the probe cache lock");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(held);
+        assert!(!stale.exists(), "stale probe litter must still be collected without the lock");
+        assert!(probe.join().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
     struct Fixture { dir: PathBuf, config: PathBuf, root: PathBuf, friend: String, location: Location }
     impl Fixture {
         fn new() -> Self {
