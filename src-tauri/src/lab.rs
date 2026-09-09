@@ -180,6 +180,7 @@ async fn dispatch(
             let text: String = str_field(req, "text")?.chars().take(4000).collect();
             let friend = crate::friends::upsert_by_endpoint(&cfg, node, "Lab Peer");
             let msg = crate::chat::ChatMessage {
+                file_xfer_id: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 peer_id: friend.id.clone(),
                 from_me: true,

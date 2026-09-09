@@ -73,6 +73,8 @@ pub struct ConnDetail {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferUpdate {
+    #[serde(default)]
+    pub chat_transfer: Option<ChatTransferLink>,
     pub id: String,
     pub direction: Direction,
     pub state: TransferState,
@@ -101,10 +103,21 @@ pub struct TransferUpdate {
     pub detail: Option<String>,
 }
 
+/// Chat-only batch coordinates; the transfer list keeps its per-push updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTransferLink {
+    pub id: String,
+    pub offset: u64,
+    pub total: u64,
+    pub last: bool,
+}
+
 impl TransferUpdate {
     pub fn new(id: String, direction: Direction, file_names: Vec<String>) -> Self {
         let file_count = file_names.len();
         TransferUpdate {
+            chat_transfer: None,
             id,
             direction,
             state: TransferState::Starting,

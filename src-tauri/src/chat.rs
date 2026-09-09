@@ -62,6 +62,9 @@ pub struct Reaction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
+    /// Stable file-transfer link; optional for old history and peers.
+    #[serde(default)]
+    pub file_xfer_id: Option<String>,
     pub id: String,
     /// The friend id this conversation belongs to.
     pub peer_id: String,
@@ -596,6 +599,7 @@ mod tests {
 
     fn msg(id: &str, peer: &str, ts: u64, seq: u64, from_me: bool) -> ChatMessage {
         ChatMessage {
+            file_xfer_id: None,
             id: id.into(),
             peer_id: peer.into(),
             from_me,
@@ -624,9 +628,15 @@ mod tests {
         file.text = "Here is the photo".into();
         file.files = vec!["photo.png".into()];
         file.path = Some("/private/photo.png".into());
+        file.file_xfer_id = Some(uuid::Uuid::new_v4().to_string());
         append(&dir, &file);
         let restored = load_all(&dir);
         let payload = crate::iroh_net::chat_payload(&restored["peer"][0], "peer", "Sender");
+        assert_eq!(payload["fileXferId"].as_str(), file.file_xfer_id.as_deref());
+        assert_eq!(restored["peer"][0].file_xfer_id, file.file_xfer_id);
+        let mut legacy = serde_json::to_value(&file).unwrap();
+        legacy.as_object_mut().unwrap().remove("fileXferId");
+        assert!(serde_json::from_value::<ChatMessage>(legacy).unwrap().file_xfer_id.is_none());
         assert_eq!(payload["msgKind"], "file");
         assert_eq!(payload["text"], "Here is the photo");
         assert_eq!(payload["files"][0], "photo.png");

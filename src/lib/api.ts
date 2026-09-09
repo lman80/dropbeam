@@ -35,6 +35,7 @@ export interface ConnDetail {
 }
 
 export interface TransferUpdate {
+  chatTransfer?: { id: string; offset: number; total: number; last: boolean } | null
   id: string
   direction: Direction
   state: TransferState
@@ -247,7 +248,8 @@ export interface ChatMessage {
    *  resend" instead of implying the file arrived. Carries the failed transfer id so
    *  the resend reuses the dedup-safe retryTransfer. */
   fileXferFailed?: boolean
-  fileXferId?: string
+  /** Persisted shared transfer ID (receiver IDs are scoped to the authenticated peer). */
+  fileXferId?: string | null
 }
 
 /** A preview of one conversation, for the chat list. */
@@ -440,8 +442,8 @@ const realApi = {
   respondToOffer: (id: string, accept: boolean, dest?: string) =>
     invoke<void>('respond_to_offer', { id, accept, dest: dest ?? null }),
   friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
-  sendToFriend: (id: string, paths: string[]) =>
-    invoke<TransferUpdate>('send_to_friend', { id, paths }),
+  sendToFriend: (id: string, paths: string[], chatTransferId?: string) =>
+    invoke<TransferUpdate>('send_to_friend', { id, paths, chatTransferId }),
   /** Your permanent, reusable DropBeam code (stable device key + name). */
   myInviteCode: () => invoke<string>('my_invite_code'),
   /** Add a friend from their permanent code; auto-fills their name, two-way. */
@@ -465,8 +467,8 @@ const realApi = {
       replyTo: replyTo ?? null,
       replyPreview: replyPreview ?? null,
     }),
-  sendChatFileNote: (friendId: string, names: string[], bytes: number, paths: string[], caption?: string) =>
-    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes, paths, caption }),
+  sendChatFileNote: (friendId: string, names: string[], bytes: number, paths: string[], caption?: string, fileXferId?: string) =>
+    invoke<ChatMessage>('send_chat_file_note', { friendId, names, bytes, paths, caption, fileXferId }),
   /** Save an image pasted into the chat composer to an app-managed folder (bounded
    *  to the last 50 pastes) and return its path for the staged-file send flow.
    *  Takes base64 — a raw byte array would serialize as a huge JSON number[]. */

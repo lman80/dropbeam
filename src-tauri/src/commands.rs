@@ -1183,6 +1183,7 @@ pub async fn send_chat_message(
     let body: String = trimmed.chars().take(4000).collect();
     let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
     let msg = ChatMessage {
+        file_xfer_id: None,
         id: uuid::Uuid::new_v4().to_string(),
         peer_id: friend_id.clone(),
         from_me: true,
@@ -1257,8 +1258,9 @@ pub async fn send_chat_file_note(
     bytes: u64,
     paths: Vec<String>,
     caption: Option<String>,
+    file_xfer_id: Option<String>,
 ) -> Result<ChatMessage, String> {
-    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths, caption)
+    post_file_note(&state, &iroh, &app, &friend_id, names, bytes, paths, caption, file_xfer_id)
         .ok_or_else(|| "Friend not found.".to_string())
 }
 
@@ -1276,9 +1278,11 @@ pub(crate) fn post_file_note(
     bytes: u64,
     paths: Vec<String>,
     caption: Option<String>,
+    file_xfer_id: Option<String>,
 ) -> Option<ChatMessage> {
     let friend = friends::get(&state.config_dir, friend_id)?;
     let msg = ChatMessage {
+        file_xfer_id,
         id: uuid::Uuid::new_v4().to_string(),
         peer_id: friend_id.to_string(),
         from_me: true,
@@ -1506,6 +1510,7 @@ pub async fn send_chat_gif(
 ) -> Result<ChatMessage, String> {
     let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found.")?;
     let msg = ChatMessage {
+        file_xfer_id: None,
         id: uuid::Uuid::new_v4().to_string(),
         peer_id: friend_id.clone(),
         from_me: true,
@@ -1741,6 +1746,7 @@ pub fn send_to_friend(
     iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     id: String,
     paths: Vec<String>,
+    chat_transfer_id: Option<String>,
 ) -> Result<TransferUpdate, String> {
     let paths: Vec<String> = paths.into_iter().filter(|p| !p.trim().is_empty()).collect();
     if paths.is_empty() {
@@ -1761,7 +1767,7 @@ pub fn send_to_friend(
     if iroh.get().is_none() {
         return Err("DropBeam is still connecting — try again in a moment.".into());
     }
-    crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths)
+    crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths, chat_transfer_id)
 }
 
 // ── iroh transport (Phase 1: foundation / diagnostics) ───────────────────────

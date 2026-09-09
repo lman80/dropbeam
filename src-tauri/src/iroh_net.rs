@@ -54,6 +54,7 @@ struct PendingSend {
 /// `endpoint` once the node is up; commands and the accept loop read from here.
 #[derive(Default)]
 pub struct IrohState {
+    chat_links: Mutex<HashMap<String, crate::models::ChatTransferLink>>,
     pub endpoint: OnceCell<Endpoint>,
     /// Set at startup so the accept loop can emit `transfer://update` events.
     pub app: OnceCell<AppHandle>,
@@ -206,8 +207,39 @@ fn speaks_progress_v1(frame: &serde_json::Value) -> bool {
     frame["progress_v"].as_u64() == Some(PROGRESS_V)
 }
 
+// Optional JSON metadata only: old peers ignore it, and absent metadata keeps
+// legacy cards static. No new frames or capability-dependent handshake changes.
+fn incoming_chat_id(peer: &str, transfer: &str) -> String {
+    format!("receive:{peer}:{transfer}")
+}
+
+fn incoming_chat_link(req: &serde_json::Value, peer: &str) -> Option<crate::models::ChatTransferLink> {
+    let mut link: crate::models::ChatTransferLink = serde_json::from_value(req.get("chatTransfer")?.clone()).ok()?;
+    uuid::Uuid::parse_str(&link.id).ok()?;
+    let part_total = req.get("total")?.as_u64()?;
+    if link.offset.checked_add(part_total)? > link.total {
+        return None;
+    }
+    link.id = incoming_chat_id(peer, &link.id);
+    Some(link)
+}
+
+struct ChatLinkGuard<'a> {
+    state: &'a IrohState,
+    id: String,
+}
+impl Drop for ChatLinkGuard<'_> {
+    fn drop(&mut self) {
+        self.state.chat_links.lock().unwrap().remove(&self.id);
+    }
+}
+
 fn emit(app: &AppHandle, u: &TransferUpdate) {
-    let _ = app.emit("transfer://update", u);
+    let mut u = u.clone();
+    if let Some(state) = app.try_state::<Arc<IrohState>>() {
+        u.chat_transfer = state.chat_links.lock().unwrap().get(&u.id).cloned();
+    }
+    let _ = app.emit("transfer://update", &u);
 }
 
 // One owner writes all progress frames; the receive future keeps its existing
@@ -1473,6 +1505,10 @@ async fn serve_stream(
                 })
                 .unwrap_or_default();
             let id = uuid::Uuid::new_v4().to_string();
+            if let Some(link) = incoming_chat_link(&req, &who) {
+                state.chat_links.lock().unwrap().insert(id.clone(), link);
+            }
+            let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
             let cancel = Arc::new(AtomicBool::new(false));
             state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
 
@@ -2424,6 +2460,9 @@ async fn serve_stream(
                                 None
                             };
                             let msg = crate::chat::ChatMessage {
+                                file_xfer_id: req.get("fileXferId").and_then(|v| v.as_str())
+                                    .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                                    .map(|id| incoming_chat_id(&who, id)),
                                 id,
                                 peer_id: peer_id.clone(),
                                 from_me: false,
@@ -2813,6 +2852,7 @@ pub fn send_to_friend(
     friend_name: String,
     endpoint_id: String,
     paths: Vec<String>,
+    chat_transfer_id: Option<String>,
 ) -> Result<TransferUpdate, String> {
     let ep = state
         .get()
@@ -2825,6 +2865,9 @@ pub fn send_to_friend(
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let (names, total) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
+    let chat_id = chat_transfer_id.unwrap_or_else(|| id.clone());
+    let chat_link = crate::models::ChatTransferLink { id: chat_id.clone(), offset: 0, total, last: true };
+    state.chat_links.lock().unwrap().insert(id.clone(), chat_link.clone());
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
     let cleanup = state.clone();
@@ -2833,6 +2876,7 @@ pub fn send_to_friend(
     update.state = TransferState::Connecting;
     update.bytes_total = total;
     emit(&app, &update);
+    update.chat_transfer = Some(chat_link);
     let snapshot = update.clone();
     // Our own display name travels with the push so the recipient can auto-add us
     // as a friend if they don't already have us (issue #6).
@@ -2841,6 +2885,7 @@ pub fn send_to_friend(
         .map(|st| st.settings.lock().unwrap().display_name.clone())
         .unwrap_or_default();
     tauri::async_runtime::spawn(async move {
+        let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
         let outcome: Result<crate::models::Locality> = async {
             // A parallel transfer that was UNDERWAY and died is almost always a
             // network blip / sleep — so we auto-reconnect up to 2 extra times, and
@@ -3138,7 +3183,7 @@ pub fn send_to_friend(
                         // Fresh per file: the retry gate + watchdog react to the
                         // file currently on the wire.
                         engaged.store(false, Ordering::SeqCst);
-                        match send_files_with_activity(&conn, &pathbufs[i..=i], &cancel, cb_i, &my_name, &engaged, &transport_activity, Some(&state))
+                        match send_files_linked(&conn, &pathbufs[i..=i], &cancel, cb_i, &my_name, &engaged, &transport_activity, Some(&state), Some(&crate::models::ChatTransferLink { id: chat_id.clone(), offset: base, total, last: i + 1 == pathbufs.len() }))
                             .await
                         {
                             Ok(n) => {
@@ -3154,7 +3199,7 @@ pub fn send_to_friend(
                     res
                 } else {
                     let c = cb.clone();
-                    send_files_with_activity(&conn, &pathbufs, &cancel, move |d, t| c(d, t), &my_name, &engaged, &transport_activity, Some(&state))
+                    send_files_linked(&conn, &pathbufs, &cancel, move |d, t| c(d, t), &my_name, &engaged, &transport_activity, Some(&state), Some(&crate::models::ChatTransferLink { id: chat_id.clone(), offset: 0, total, last: true }))
                         .await
                 };
                 let was_engaged = engaged.load(Ordering::SeqCst);
@@ -3651,6 +3696,9 @@ pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) 
         "id": m.id, "ts": m.ts, "seq": m.seq,
     });
     let o = f.as_object_mut().unwrap();
+    if let Some(id) = &m.file_xfer_id {
+        o.insert("fileXferId".into(), serde_json::json!(id));
+    }
     if let Some(g) = &m.gif {
         o.insert("msgKind".into(), serde_json::json!("gif"));
         o.insert("files".into(), serde_json::json!(m.files));
@@ -6081,6 +6129,24 @@ async fn send_files_with_activity<F: Fn(u64, u64)>(
     activity: &AtomicU64,
     friend_state: Option<&IrohState>,
 ) -> Result<u64> {
+    send_files_linked(conn, paths, cancel, on_progress, my_name, parallel_engaged, activity, friend_state, None).await
+}
+
+async fn send_files_linked<F: Fn(u64, u64)>(
+    conn: &Connection,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+    on_progress: F,
+    my_name: &str,
+    // Set true the moment the receiver replies {ready:true} — i.e. an auto-accept,
+    // parallel/resumable receive is underway. The caller's auto-retry is gated on
+    // this so a DECLINED manual-accept send (which can also error mid-write) never
+    // retries and re-prompts the recipient.
+    parallel_engaged: &AtomicBool,
+    activity: &AtomicU64,
+    friend_state: Option<&IrohState>,
+    chat_link: Option<&crate::models::ChatTransferLink>,
+) -> Result<u64> {
     let peer_id = conn.remote_id().to_string();
     let known_capable = friend_state.and_then(|s| s.progress_version(&peer_id)) == Some(PROGRESS_V);
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -6089,7 +6155,10 @@ async fn send_files_with_activity<F: Fn(u64, u64)>(
     // Rate-limit only INTERNET sends — a LAN transfer doesn't touch the uplink, so
     // it stays full speed regardless of the cap.
     let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
-    let header = files_header(&items, &dirs, total, n, my_name, true);
+    let mut header = files_header(&items, &dirs, total, n, my_name, true);
+    if let Some(link) = chat_link {
+        header["chatTransfer"] = serde_json::to_value(link)?;
+    }
     write_frame(&mut send, &header).await?;
 
     // This file's count is also used for legacy display; the shared watchdog
@@ -9336,5 +9405,31 @@ mod loopback_tests {
         server.close().await;
         let _ = std::fs::remove_dir_all(&src_root);
         let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+}
+
+#[cfg(test)]
+mod chat_transfer_link_tests {
+    use super::*;
+
+    #[test]
+    fn incoming_header_and_chat_note_share_peer_scoped_id() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let header = serde_json::json!({ "total": 60, "chatTransfer": {
+            "id": id, "offset": 40, "total": 100, "last": true
+        }});
+        let link = incoming_chat_link(&header, "alice").unwrap();
+        assert_eq!(link.id, incoming_chat_id("alice", &id));
+        assert_ne!(link.id, incoming_chat_id("bob", &id));
+        assert_eq!((link.offset, link.total, link.last), (40, 100, true));
+        // Reconnects use fresh local transfer IDs, but preserve this shared link.
+        assert_eq!(incoming_chat_link(&header, "alice").unwrap().id, link.id);
+        assert!(incoming_chat_link(&serde_json::json!({"total": 60}), "alice").is_none());
+        let mut invalid = header.clone();
+        invalid["chatTransfer"]["id"] = serde_json::json!("not-a-transfer-id");
+        assert!(incoming_chat_link(&invalid, "alice").is_none());
+        invalid = header;
+        invalid["chatTransfer"]["offset"] = serde_json::json!(u64::MAX);
+        assert!(incoming_chat_link(&invalid, "alice").is_none());
     }
 }
