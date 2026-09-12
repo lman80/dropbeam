@@ -1133,16 +1133,43 @@ pub fn lan_path_blocked() -> bool {
         && !EVER_LOCAL.load(Ordering::Relaxed)
 }
 
+/// Which path a connection is really using, as (is_relay, remote addr).
+///
+/// `is_selected` on a path mirrors the PEER-level choice (iroh picks one
+/// address per remote across all its connections). A transfer connection that
+/// was born on the relay while another connection to the same peer holds the
+/// direct route therefore has NO selected path at all: it kept reporting
+/// Unknown (the card spun on "Connecting…" for the whole transfer) and the
+/// relay-stuck redial never saw "relay". Fall back to the connection's own
+/// open paths: a direct path counts as direct, a relay-only set counts as relay.
+fn locality_evidence(paths: impl Iterator<Item = (bool, bool, bool, String)>) -> Option<(bool, String)> {
+    let paths: Vec<_> = paths.filter(|(_, _, closed, _)| !closed).collect();
+    if let Some((_, relay, _, addr)) = paths.iter().find(|(selected, _, _, _)| *selected) {
+        return Some((*relay, addr.clone()));
+    }
+    if let Some((_, _, _, addr)) = paths.iter().find(|(_, relay, _, _)| !relay) {
+        return Some((false, addr.clone()));
+    }
+    paths.first().map(|(_, relay, _, addr)| (*relay, addr.clone()))
+}
+/// Wait up to `budget` for this connection to hold an open, non-relay path.
+async fn conn_has_direct_path(conn: &Connection, budget: Duration) -> bool {
+    use iroh::Watcher as _;
+    let deadline = Instant::now() + budget;
+    loop {
+        let has = conn.paths().get().iter().any(|p| !p.is_relay() && !p.is_closed());
+        if has { return true; }
+        if Instant::now() >= deadline || conn.close_reason().is_some() { return false; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 fn conn_locality(conn: &Connection) -> crate::models::Locality {
     use crate::models::Locality;
     use iroh::Watcher as _; // brings `.get()` into scope for the path watcher
     let mut watcher = conn.paths();
     let paths = watcher.get();
     // Extract owned (is_relay, addr) up front so the borrow of `paths` ends here.
-    let selected = paths
-        .iter()
-        .find(|p| p.is_selected())
-        .map(|p| (p.is_relay(), format!("{:?}", p.remote_addr())));
+    let selected = locality_evidence(paths.iter().map(|p| (p.is_selected(), p.is_relay(), p.is_closed(), format!("{:?}", p.remote_addr()))));
     remember_conn_addrs(conn);
     let loc = match selected {
         Some((true, _)) => Locality::Internet, // relayed = the slow path
@@ -3557,6 +3584,13 @@ fn send_friend_inner(
                 // "Connecting" meanwhile, and a cancel breaks out immediately.
                 let conn = {
                     let started = std::time::Instant::now();
+                    // A connection is born direct or relay and never migrates (iroh
+                    // 0.98 caps concurrent paths per connection at one, so NAT
+                    // traversal on a relay-born connection fails with "maximum
+                    // number of concurrent paths reached"). When we KNOW a working
+                    // direct address, give the dial a couple of chances to come
+                    // up direct before settling for the relay.
+                    let mut direct_tries: u32 = 0;
                     loop {
                         if cancel.load(Ordering::SeqCst) {
                             anyhow::bail!("canceled");
@@ -3567,7 +3601,21 @@ fn send_friend_inner(
                         )
                         .await
                         {
-                            Ok(Ok(c)) => break c,
+                            Ok(Ok(c)) => {
+                                let known_direct = peer_addrs().lock().ok()
+                                    .and_then(|a| a.get(&parsed.to_string()).map(|a| a.iter().any(|x| x.observed_working)))
+                                    .unwrap_or(false);
+                                if known_direct && direct_tries < 2
+                                    && !conn_has_direct_path(&c, Duration::from_millis(1500)).await
+                                {
+                                    direct_tries += 1;
+                                    log::info!("friend-send: connection came up relay-only while a direct address is known — redialing ({direct_tries}/2)");
+                                    c.close(0u32.into(), b"direct-first redial");
+                                    tokio::time::sleep(Duration::from_millis(400)).await;
+                                    continue;
+                                }
+                                break c;
+                            }
                             _ => {
                                 if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
                                     anyhow::bail!("Couldn't reach this friend — make sure their DropBeam is running and online.");
@@ -8689,6 +8737,23 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest);
         println!("iroh accept-loop Quick Send OK");
+    }
+}
+
+#[cfg(test)]
+mod locality_evidence_tests {
+    use super::locality_evidence;
+    #[test]
+    fn unselected_relay_only_connection_counts_as_relay_and_direct_paths_win() {
+        let relay_only = vec![(false, true, false, "Relay(x)".to_string())];
+        assert_eq!(locality_evidence(relay_only.into_iter()), Some((true, "Relay(x)".into())));
+        let mixed_unselected = vec![(false, true, false, "Relay(x)".to_string()), (false, false, false, "Ip(100.79.126.13:1)".to_string())];
+        assert_eq!(locality_evidence(mixed_unselected.into_iter()), Some((false, "Ip(100.79.126.13:1)".into())));
+        let selected_relay = vec![(true, true, false, "Relay(x)".to_string()), (false, false, false, "Ip(1.2.3.4:1)".to_string())];
+        assert_eq!(locality_evidence(selected_relay.into_iter()), Some((true, "Relay(x)".into())));
+        let closed_direct = vec![(false, false, true, "Ip(1.2.3.4:1)".to_string()), (false, true, false, "Relay(x)".to_string())];
+        assert_eq!(locality_evidence(closed_direct.into_iter()), Some((true, "Relay(x)".into())));
+        assert_eq!(locality_evidence(std::iter::empty()), None);
     }
 }
 
