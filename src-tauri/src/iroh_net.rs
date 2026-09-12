@@ -110,6 +110,56 @@ fn friend_rotation_reason(
     }
 }
 
+/// Per-transfer recovery state. A relay-only replacement gets to keep sending;
+/// observing a direct path re-arms recovery, subject to the global cooldown.
+#[derive(Default)]
+struct RelayRecovery {
+    since: Option<Instant>,
+    last_redial: Option<Instant>,
+    awaiting_direct: bool,
+    #[cfg(test)]
+    forced_locality: Option<crate::models::Locality>,
+}
+impl RelayRecovery {
+    fn observe(&mut self, now: Instant, locality: crate::models::Locality, direct: bool) -> Option<Duration> {
+        use crate::models::Locality;
+        if matches!(locality, Locality::Local | Locality::Direct) {
+            self.awaiting_direct = false;
+        }
+        if !matches!(locality, Locality::Internet) || !direct {
+            self.since = None;
+            return None;
+        }
+        let elapsed = now.duration_since(*self.since.get_or_insert(now));
+        if !self.awaiting_direct && elapsed > Duration::from_secs(60)
+            && self.last_redial.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60)) {
+            Some(elapsed)
+        } else { None }
+    }
+
+    fn check(&mut self, conn: &Connection, safe: bool, requested: &AtomicBool) -> Result<()> {
+        let locality = conn_locality(conn);
+        #[cfg(test)]
+        let locality = self.forced_locality.unwrap_or(locality);
+        let direct = peer_addrs().lock().ok()
+            .and_then(|a| a.get(&conn.remote_id().to_string()).map(|a| !a.is_empty()))
+            .unwrap_or(false);
+        let now = Instant::now();
+        if let Some(elapsed) = self.observe(now, locality, direct) {
+            if safe {
+                self.last_redial = Some(now);
+                self.awaiting_direct = true;
+                self.since = None;
+                requested.store(true, Ordering::SeqCst);
+                log::info!("friend-send: relay-stuck for {}s with direct address known — redialing", elapsed.as_secs());
+                conn.close(0u32.into(), b"relay-stuck redial");
+                anyhow::bail!("relay-stuck redial");
+            }
+        }
+        Ok(())
+    }
+}
+
 impl IrohState {
     /// Check on reuse and presence ticks; the monitor never dials. The expected
     /// id prevents an old dispatcher from rotating a replacement connection.
@@ -3314,7 +3364,7 @@ struct LocationBatch {
 impl LocationBatch {
     async fn send_attempt(&mut self, conn: &Connection, location: &LocationSend, cancel: &AtomicBool,
         name: &str, engaged: &AtomicBool, activity: &AtomicU64, state: Option<&IrohState>,
-        progress: impl Fn(u64, u64), skipped: impl Fn(usize)) -> Result<u64> {
+        progress: impl Fn(u64, u64), skipped: impl Fn(usize), boundary: impl Fn() -> Result<()>) -> Result<u64> {
         require_locations(conn).await?;
         let stat_paths: Vec<_> = self.items.iter().map(|i| i.1.clone()).chain(self.dirs.iter().cloned()).collect();
         let existing = location_stat(conn, location.target.as_ref().context("Missing upload target")?, &stat_paths).await?;
@@ -3325,6 +3375,7 @@ impl LocationBatch {
             .filter(|d| !existing.get(*d).is_some_and(|e| e.0)).cloned().collect() } else { vec![] };
         let mut sent_push = false;
         while self.next_file < self.items.len() {
+            boundary()?;
             let i = self.next_file;
             if landed[i] { self.next_file += 1; continue; }
             anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
@@ -3377,7 +3428,6 @@ fn send_friend_inner(
     let parsed: iroh::EndpointId = endpoint_id
         .parse()
         .map_err(|_| "This friend's direct address is invalid.".to_string())?;
-    let addr = dial_addr(parsed);
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let (items, directories, total) = if let Some(snapshot) = location.as_ref().and_then(|l| l.snapshot.as_ref()) {
         (snapshot.source.items.clone(), snapshot.source.dirs.clone(), snapshot.source.items.iter().map(|i| i.2).sum())
@@ -3459,6 +3509,7 @@ fn send_friend_inner(
                         .map(|m| m.len() >= PARALLEL_MIN)
                         .unwrap_or(false)
                 });
+            let recovery = Arc::new(std::sync::Mutex::new(RelayRecovery::default()));
             let mut generation_attempt = 0;
             loop {
                 if attempt != generation_attempt {
@@ -3482,7 +3533,7 @@ fn send_friend_inner(
                         }
                         match tokio::time::timeout(
                             Duration::from_secs(20),
-                            ep.connect(addr.clone(), ALPN),
+                            ep.connect(dial_addr(parsed), ALPN),
                         )
                         .await
                         {
@@ -3496,6 +3547,7 @@ fn send_friend_inner(
                         }
                     }
                 };
+                recovery.lock().unwrap().since = None;
                 let base_cb = progress_cb(
                     app.clone(),
                     id.clone(),
@@ -3566,6 +3618,7 @@ fn send_friend_inner(
                 // upgrade reach `got_direct` long before the deadline.
                 if !got_direct
                     && wait_for_direct_mode()
+                    && !recovery.lock().unwrap().awaiting_direct
                     && !require_direct()
                     && !is_force_relay(&id)
                     && !cancel.load(Ordering::SeqCst)
@@ -3612,27 +3665,18 @@ fn send_friend_inner(
                 // retry AND the degradation watchdog. Shared (Arc) so the watchdog
                 // can read it live.
                 let engaged = std::sync::Arc::new(AtomicBool::new(false));
-                // Field-confirmed failure mode: a direct path collapses under
-                // sustained load, iroh fails over to the rate-limited RELAY, the
-                // transfer crawls until a stall guard kills it, and the attempt is
-                // wasted. The cure: if this transfer sits on relay for >8s,
-                // proactively close the connection — the retry loop reconnects
-                // (fresh hole-punch → direct again) and RESUMES.
-                //
-                // CRITICAL: only do this once `engaged` is true (the receiver did
-                // the resumable handshake). A classic single-stream transfer (old
-                // receiver, or a manual-accept that missed the 6s window) CANNOT be
-                // retried — closing its connection just kills it with no safety net.
-                // (A real 2 GB send died exactly this way: watchdog fired, transfer
-                // was classic, retry was blocked, instant fail.)
+                // Observe relay duration even while bytes trickle. Split sends
+                // rotate only between files; single pushes require fast-resume.
+                let redial_requested = Arc::new(AtomicBool::new(false));
                 let transport_activity = Arc::new(AtomicU64::new(0));
                 let watchdog = {
                     let c = conn.clone();
                     let eng = engaged.clone();
                     let watchdog_activity = transport_activity.clone();
-                    let started_direct = got_direct;
+                    let recovery = recovery.clone();
+                    let requested = redial_requested.clone();
+                    let per_file = (is_upload && upload_batch.items.len() > 1) || split;
                     tauri::async_runtime::spawn(async move {
-                        let mut relay_since: Option<Instant> = None;
                         let mut last_p = watchdog_activity.load(Ordering::SeqCst);
                         let mut last_frames = transport_stream_frames(&c);
                         let mut last_change = Instant::now();
@@ -3674,28 +3718,11 @@ fn send_friend_inner(
                                 c.close(1u32.into(), b"stalled");
                                 break;
                             }
-                            // ── direct→relay degradation guard ───────────────────
-                            // Resume-capable transfers only — never force-close a
-                            // classic one (it has no retry to catch it).
-                            if !started_direct || !eng.load(Ordering::SeqCst) {
-                                relay_since = None;
-                                continue;
-                            }
-                            let on_relay = matches!(
-                                conn_locality(&c),
-                                crate::models::Locality::Internet
-                            );
-                            match (on_relay, relay_since) {
-                                (true, Some(t)) if t.elapsed() > Duration::from_secs(8) => {
-                                    log::warn!(
-                                        "transfer degraded direct→relay — reconnecting to re-holepunch"
-                                    );
-                                    c.close(1u32.into(), b"degraded-reconnect");
-                                    break;
-                                }
-                                (true, None) => relay_since = Some(Instant::now()),
-                                (false, _) => relay_since = None,
-                                _ => {}
+                            // Split uploads finish the current file first. Only a
+                            // negotiated resumable single push may be interrupted.
+                            if recovery.lock().unwrap().check(&c,
+                                !per_file && eng.load(Ordering::SeqCst), &requested).is_err() {
+                                break;
                             }
                         }
                     })
@@ -3718,12 +3745,16 @@ fn send_friend_inner(
                             notice.friend_name = Some(friend_name.clone());
                             notice.location_skipped = Some(count as u64);
                             emit(&app, &notice);
-                        }).await
+                        }, || recovery.lock().unwrap().check(&conn, true, &redial_requested)).await
                 } else if split {
                     let mut res: Result<u64> = Ok(0);
                     while next_file < pathbufs.len() {
                         if cancel.load(Ordering::SeqCst) {
                             res = Err(anyhow::anyhow!("canceled"));
+                            break;
+                        }
+                        if let Err(e) = recovery.lock().unwrap().check(&conn, true, &redial_requested) {
+                            res = Err(e);
                             break;
                         }
                         let i = next_file;
@@ -3759,6 +3790,12 @@ fn send_friend_inner(
                 };
                 let was_engaged = is_upload || engaged.load(Ordering::SeqCst);
                 watchdog.abort();
+                if redial_requested.load(Ordering::SeqCst) && !cancel.load(Ordering::SeqCst)
+                    && outcome.as_ref().is_err_and(|e| !e.to_string().contains(integrity::FAILED)
+                        && !e.to_string().contains("declined") && !e.to_string().contains("canceled")) {
+                    attempt += 1;
+                    continue;
+                }
                 match outcome {
                     Ok(_) => {
                         log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
@@ -7848,6 +7885,32 @@ mod tests {
         assert!(!super::on_local_subnet("192.168.1.9".parse().unwrap(), &[]));
     }
     #[test]
+    fn relay_recovery_duration_reset_and_cooldown() {
+        use crate::models::Locality::*;
+        let start = Instant::now();
+        let at = |s| start + Duration::from_secs(s);
+        let mut r = RelayRecovery::default();
+        assert!(r.observe(at(0), Internet, true).is_none());
+        assert!(r.observe(at(60), Internet, true).is_none());
+        assert!(r.observe(at(61), Internet, true).is_some());
+        for locality in [Local, Direct, Unknown] {
+            assert!(r.observe(at(62), locality, true).is_none());
+            assert!(r.observe(at(63), Internet, true).is_none());
+        }
+        assert!(r.observe(at(130), Internet, false).is_none());
+        assert!(r.observe(at(131), Internet, true).is_none());
+        assert!(r.observe(at(192), Internet, true).is_some());
+        r.last_redial = Some(at(192)); r.awaiting_direct = true; r.since = None;
+        assert!(r.observe(at(193), Internet, true).is_none());
+        assert!(r.observe(at(900), Internet, true).is_none(), "relay replacement must keep sending");
+        assert!(r.observe(at(901), Direct, true).is_none());
+        assert!(r.observe(at(902), Internet, true).is_none());
+        r.last_redial = Some(at(950));
+        assert!(r.observe(at(963), Internet, true).is_none(), "cooldown");
+        assert!(r.observe(at(1010), Internet, true).is_some());
+    }
+
+    #[test]
     fn friend_connection_rotation_decision() {
         use crate::models::Locality;
         let decision = |age, locality, direct, relay: Option<u64>| super::friend_rotation_reason(
@@ -11184,6 +11247,77 @@ mod location_loopback_tests {
         }).await;
         assert!(!config.join("location-snapshots").exists());
     }
+    #[tokio::test]
+    async fn loopback_relay_stuck_upload_redials_at_file_boundary() {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let base = std::env::temp_dir().join(format!("dropbeam-redial-{}", uuid::Uuid::new_v4()));
+            struct Cleanup(PathBuf, String);
+            impl Drop for Cleanup { fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+                peer_addrs().lock().unwrap().remove(&self.1);
+            } }
+            let host = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+                .alpns(vec![ALPN.to_vec()]).relay_mode(iroh::RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+            let client = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+                .relay_mode(iroh::RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+            let _cleanup = Cleanup(base.clone(), host.id().to_string());
+            let config = base.join("config"); let nas = base.join("nas");
+            std::fs::create_dir_all(&config).unwrap(); std::fs::create_dir_all(&nas).unwrap();
+            let friend = crate::friends::upsert_by_endpoint(&config, &client.id().to_string(), "Sender");
+            crate::locations::save(&config, Some(crate::locations::Location {
+                id:"nas".into(), name:"NAS".into(), path:nas.to_string_lossy().into_owned(),
+                friend_ids:vec![friend.id], rights:crate::locations::Rights::default(),
+                byte_cap:crate::locations::default_byte_cap(), device:None, marker:None, safe_publish:None
+            }), None).unwrap();
+            let state = Arc::new(IrohState::default()); state.location_config.set(config).unwrap();
+            let listener = tokio::spawn(accept_loop(host.clone(), state));
+            peer_addrs().lock().unwrap().insert(host.id().to_string(), host.addr().ip_addrs().copied().collect());
+            let paths: Vec<_> = (0..3).map(|i| {
+                let p = base.join(format!("file{i}.bin"));
+                std::fs::write(&p, vec![i as u8 + 17; 4096]).unwrap(); p
+            }).collect();
+            let (items, dirs, _) = gather_items(&paths).unwrap();
+            let mut batch = LocationBatch { items, dirs, next_file:0, dirs_pending:true };
+            let options = LocationSend { target:Some(crate::locations::Target {
+                location_id:"nas".into(), rel_path:"".into() }),
+                transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None };
+            let recovery = std::sync::Mutex::new(RelayRecovery {
+                forced_locality:Some(crate::models::Locality::Internet), ..Default::default()
+            });
+            let requested = AtomicBool::new(false);
+            let cancel = AtomicBool::new(false); let engaged = AtomicBool::new(false);
+            let activity = AtomicU64::new(0); let mut redials = 0;
+            let mut previous = None;
+            loop {
+                let conn = client.connect(dial_addr(host.id()), ALPN).await.unwrap();
+                if let Some(old) = previous { assert_ne!(old, conn.stable_id()); }
+                previous = Some(conn.stable_id());
+                requested.store(false, Ordering::SeqCst);
+                let result = batch.send_attempt(&conn, &options, &cancel, "Sender", &engaged,
+                    &activity, None, |done, _| {
+                        // Simulate 61s of relay while the first file is in flight.
+                        // Time injection keeps this network test fast and deterministic.
+                        if done > 0 && redials == 0 {
+                            let mut r = recovery.lock().unwrap();
+                            r.since = Some(Instant::now() - Duration::from_secs(61));
+                            r.check(&conn, false, &requested).unwrap();
+                        }
+                    }, |_| {}, || recovery.lock().unwrap().check(&conn, true, &requested)).await;
+                if requested.load(Ordering::SeqCst) {
+                    assert!(result.is_err());
+                    assert_eq!(batch.next_file, 1, "redial only after first receipt");
+                    assert_eq!(std::fs::read(nas.join("file0.bin")).unwrap(), std::fs::read(&paths[0]).unwrap());
+                    redials += 1; assert_eq!(redials, 1); continue;
+                }
+                result.unwrap(); conn.close(0u32.into(), b"done"); break;
+            }
+            assert_eq!(redials, 1); assert_eq!(batch.next_file, 3);
+            for path in paths { assert_eq!(std::fs::read(nas.join(path.file_name().unwrap())).unwrap(), std::fs::read(path).unwrap()); }
+            listener.abort(); client.close().await; host.close().await;
+        }).await.expect("relay recovery must complete");
+    }
+
     #[tokio::test]
     async fn loopback_locations_list_upload_hash_and_permission_denial() {
         use iroh::RelayMode;
