@@ -93,11 +93,13 @@ pub async fn lab_endpoint_persistent(accept: bool, state_dir: &Path) -> Result<E
 async fn lab_endpoint_inner(accept: bool, state_dir: Option<&Path>) -> Result<Endpoint> {
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
-        noq_proto::congestion::BbrConfig::default(),
+        noq_proto::congestion::Bbr3Config::default(),
     ));
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
-    let mut b = Endpoint::builder(presets::N0).transport_config(tcfg.build());
+    let mut b = Endpoint::builder(presets::N0)
+        .path_selector(std::sync::Arc::new(crate::iroh_net::DirectPathSelector))
+        .transport_config(tcfg.build());
     if let Some(dir) = state_dir {
         b = b.secret_key(lab_secret(dir));
     }
@@ -167,11 +169,12 @@ pub fn filter_addr(addr: EndpointAddr, mode: &str) -> EndpointAddr {
 pub async fn operator_endpoint(state_dir: &Path) -> Result<Endpoint> {
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
-        noq_proto::congestion::BbrConfig::default(),
+        noq_proto::congestion::Bbr3Config::default(),
     ));
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
     Endpoint::builder(presets::N0)
+        .path_selector(std::sync::Arc::new(crate::iroh_net::DirectPathSelector))
         .secret_key(lab_secret(state_dir))
         .transport_config(tcfg.build())
         .bind()

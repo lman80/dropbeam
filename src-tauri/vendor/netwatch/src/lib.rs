@@ -1,6 +1,5 @@
 //! Networking related utilities
 
-#[cfg_attr(wasm_browser, path = "interfaces/wasm_browser.rs")]
 pub mod interfaces;
 pub mod ip;
 mod ip_family;

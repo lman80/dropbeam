@@ -1072,8 +1072,8 @@ fn remember_working_addr(peer: String, addr: std::net::SocketAddr) {
 /// A selected, open direct path is evidence of a working address. Candidate
 /// paths alone (including ones still being probed) must never enter the cache.
 fn remember_conn_addrs(conn: &Connection) {
-    use iroh::Watcher as _;
-    for path in conn.paths().get().iter().filter(|p| p.is_selected() && !p.is_closed()) {
+    if conn.close_reason().is_some() { return; }
+    for path in conn.paths().iter().filter(|p| p.is_selected() && path_is_validated_direct(p)) {
         if let iroh::TransportAddr::Ip(addr) = path.remote_addr() {
             remember_working_addr(conn.remote_id().to_string(), *addr);
         }
@@ -1135,18 +1135,14 @@ pub fn lan_path_blocked() -> bool {
 
 /// Which path a connection is really using, as (is_relay, remote addr).
 ///
-/// `is_selected` on a path mirrors the PEER-level choice (iroh picks one
-/// address per remote across all its connections). A transfer connection that
-/// was born on the relay while another connection to the same peer holds the
-/// direct route therefore has NO selected path at all: it kept reporting
-/// Unknown (the card spun on "Connecting…" for the whole transfer) and the
-/// relay-stuck redial never saw "relay". Fall back to the connection's own
-/// open paths: a direct path counts as direct, a relay-only set counts as relay.
+/// `is_selected` mirrors the peer-level path choice across connections. While
+/// that path is being established on this connection, it can have no selected
+/// path. Preserve the fallback to this connection's established direct path,
+/// or its relay, so the badge and relay recovery do not get stuck on Unknown.
 /// (selected, relay, closed, validated, addr) per path → (is_relay, addr).
-/// Order: the selected path, else a validated direct path, else the first open
-/// path (a relay-born connection then honestly reads as relay instead of Unknown).
+/// Order: the selected path, else a validated direct path, else an open relay.
 fn locality_evidence(paths: impl Iterator<Item = (bool, bool, bool, bool, String)>) -> Option<(bool, String)> {
-    let paths: Vec<_> = paths.filter(|(_, _, closed, _, _)| !closed).collect();
+    let paths: Vec<_> = paths.filter(|(_, relay, closed, validated, _)| !closed && (*relay || *validated)).collect();
     if let Some((_, relay, _, _, addr)) = paths.iter().find(|(selected, _, _, _, _)| *selected) {
         return Some((*relay, addr.clone()));
     }
@@ -1154,43 +1150,41 @@ fn locality_evidence(paths: impl Iterator<Item = (bool, bool, bool, bool, String
         return Some((false, addr.clone()));
     }
     paths.iter().find(|(_, relay, _, _, _)| *relay)
-        .or(paths.first())
         .map(|(_, relay, _, _, addr)| (*relay, addr.clone()))
 }
-/// Wait up to `budget` for this connection to hold an open, non-relay path.
-/// Wait up to `budget` for this connection to hold an open, VALIDATED non-relay
-/// path. iroh lists NAT-traversal candidates as open paths the moment it starts
-/// probing them, so "open and not relay" alone is true for every dial; a path
-/// only counts once the peer's packets have actually arrived over it.
+/// Wait up to `budget` for an established non-relay path. Iroh 1.2 excludes
+/// NAT-traversal candidates from the snapshot until peer traffic arrives.
 async fn conn_has_direct_path(conn: &Connection, budget: Duration) -> bool {
-    use iroh::Watcher as _;
     let deadline = Instant::now() + budget;
     loop {
-        let has = conn.paths().get().iter().any(path_is_validated_direct);
+        if conn.close_reason().is_some() { return false; }
+        let has = conn.paths().iter().any(|p| path_is_validated_direct(&p));
         if has { return true; }
-        if Instant::now() >= deadline || conn.close_reason().is_some() { return false; }
+        if Instant::now() >= deadline { return false; }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
-fn path_is_validated_direct(p: &iroh::endpoint::PathInfo) -> bool {
-    !p.is_relay() && !p.is_closed() && p.stats().is_some_and(|s| s.udp_rx.datagrams > 0)
+fn path_is_validated_direct(p: &iroh::endpoint::Path<'_>) -> bool {
+    // In iroh 1.2, PathList only contains paths registered after noq's
+    // Established event (peer traffic received); probing candidates are absent.
+    !p.is_relay()
 }
 /// One-line summary of a connection's paths for the log.
 fn describe_paths(conn: &Connection) -> String {
-    use iroh::Watcher as _;
-    conn.paths().get().iter().map(|p| format!("{}{}{}{:?}",
+    let closed = conn.close_reason().is_some();
+    conn.paths().iter().map(|p| format!("{}{}{}{:?}",
         if p.is_selected() { "*" } else { "" },
-        if p.is_closed() { "x" } else { "" },
-        if path_is_validated_direct(p) { "v" } else { "" },
+        if closed { "x" } else { "" },
+        if !closed && path_is_validated_direct(&p) { "v" } else { "" },
         p.remote_addr())).collect::<Vec<_>>().join(" ")
 }
 fn conn_locality(conn: &Connection) -> crate::models::Locality {
     use crate::models::Locality;
-    use iroh::Watcher as _; // brings `.get()` into scope for the path watcher
-    let mut watcher = conn.paths();
-    let paths = watcher.get();
+    // A final snapshot can outlive connection closure in iroh 1.2.
+    if conn.close_reason().is_some() { return Locality::Unknown; }
+    let paths = conn.paths();
     // Extract owned (is_relay, addr) up front so the borrow of `paths` ends here.
-    let selected = locality_evidence(paths.iter().map(|p| (p.is_selected(), p.is_relay(), p.is_closed(), path_is_validated_direct(p), format!("{:?}", p.remote_addr()))));
+    let selected = locality_evidence(paths.iter().map(|p| (p.is_selected(), p.is_relay(), false, path_is_validated_direct(&p), format!("{:?}", p.remote_addr()))));
     remember_conn_addrs(conn);
     let loc = match selected {
         Some((true, _)) => Locality::Internet, // relayed = the slow path
@@ -1212,14 +1206,12 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
 /// and whether a direct upgrade is forming. Reads the QUIC multipath set.
 pub fn conn_detail(conn: &Connection) -> crate::models::ConnDetail {
     use crate::models::ConnDetail;
-    use iroh::Watcher as _;
-    let mut watcher = conn.paths();
-    let paths = watcher.get();
-    let selected = paths.iter().find(|p| p.is_selected());
-    // A direct upgrade is "forming" when we're on the relay but a non-selected,
-    // non-closed IP (direct) candidate path exists — QUIC is validating it.
-    let upgrading = selected.map(|p| p.is_relay()).unwrap_or(false)
-        && paths.iter().any(|p| p.is_ip() && !p.is_selected() && !p.is_closed());
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected() && conn.close_reason().is_none());
+    // A direct upgrade is ready when an established IP path is present but
+    // the relay is still selected. Probing paths are not exposed in iroh 1.2.
+    let upgrading = selected.as_ref().map(|p| p.is_relay()).unwrap_or(false)
+        && paths.iter().any(|p| p.is_ip() && !p.is_selected());
     match selected {
         Some(p) => {
             let addr_dbg = format!("{:?}", p.remote_addr());
@@ -1232,7 +1224,7 @@ pub fn conn_detail(conn: &Connection) -> crate::models::ConnDetail {
             };
             ConnDetail {
                 path,
-                rtt_ms: p.rtt().map(|r| r.as_millis() as u64),
+                rtt_ms: Some(p.rtt().as_millis() as u64),
                 upgrading,
                 relay,
             }
@@ -1276,19 +1268,15 @@ fn log_transfer_perf(
     bytes: u64,
     elapsed: std::time::Duration,
 ) {
-    use iroh::Watcher as _;
     let secs = elapsed.as_secs_f64();
     let mb = bytes as f64 / 1_000_000.0;
     let mbps = if secs > 0.0 { mb / secs } else { 0.0 };
-    let mut watcher = conn.paths();
-    let paths = watcher.get();
+    let paths = conn.paths();
     let selected = paths.iter().find(|p| p.is_selected());
     let (path_kind, rtt, addr) = match selected {
         Some(p) => (
             if p.is_relay() { "RELAY/internet" } else { "DIRECT/p2p" },
-            p.rtt()
-                .map(|r| format!("{}ms", r.as_millis()))
-                .unwrap_or_else(|| "?".into()),
+            format!("{}ms", p.rtt().as_millis()),
             format!("{:?}", p.remote_addr()),
         ),
         None => ("unknown", "?".into(), "?".into()),
@@ -1314,7 +1302,6 @@ fn log_transfer_perf(
 /// rather than blocking forever. Returns immediately on a LAN where mDNS already
 /// gave us a direct path.
 async fn wait_for_direct_path(conn: &Connection, max: std::time::Duration) -> bool {
-    use iroh::Watcher as _;
     // Per-peer memory of hole-punch failure. A relay-only peer (symmetric
     // NAT/CGNAT) used to cost the FULL window on every single transfer — +5-12s
     // of dead waiting per file, forever, even after the first file proved the
@@ -1329,21 +1316,16 @@ async fn wait_for_direct_path(conn: &Connection, max: std::time::Duration) -> bo
     } else {
         max
     };
-    let mut watcher = conn.paths();
+    use n0_future::StreamExt as _;
+    let mut paths = conn.paths_stream();
     let res = tokio::time::timeout(max, async {
-        loop {
-            if watcher
-                .get()
-                .iter()
-                .any(|p| p.is_selected() && !p.is_relay())
-            {
+        while let Some(snapshot) = paths.next().await {
+            if conn.close_reason().is_some() { return false; }
+            if snapshot.iter().any(|p| p.is_selected() && path_is_validated_direct(&p)) {
                 return true;
             }
-            // Block until the path set changes; bail if the connection drops.
-            if watcher.updated().await.is_err() {
-                return false;
-            }
         }
+        false // The stream ends when the connection closes.
     })
     .await;
     let timed_out = res.is_err();
@@ -1446,6 +1428,46 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Prefer established direct paths, with relay as fallback regardless of RTT.
+/// Keep iroh's IPv6 bias and same-tier hysteresis to avoid path flapping.
+#[derive(Debug)]
+pub(crate) struct DirectPathSelector;
+
+fn path_preference_key(is_relay: bool, is_ipv6: bool, rtt: Duration) -> (bool, i128) {
+    (is_relay, rtt.as_nanos() as i128 - if is_ipv6 { 3_000_000 } else { 0 })
+}
+
+fn should_switch_path(current: Option<(bool, i128)>, best: (bool, i128)) -> bool {
+    current.is_none_or(|current| current.0 != best.0 || best.1 + 5_000_000 <= current.1)
+}
+
+impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
+    fn select(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>) -> iroh::endpoint::transports::PathSelection {
+        use iroh::endpoint::transports::{AddrKind, PathSelection};
+        let mut best = None;
+        let mut current_key = None;
+        // Iroh supplies established paths only, and removes abandoned paths.
+        for path in ctx.paths() {
+            let Some(stats) = path.stats() else { continue; };
+            let tuple = path.network_path();
+            let key = path_preference_key(tuple.is_relay(), tuple.addr_kind() == AddrKind::IpV6, stats.rtt);
+            if Some(tuple) == ctx.current() && current_key.is_none_or(|current| key < current) {
+                current_key = Some(key);
+            }
+            if best.as_ref().is_none_or(|(_, best_key)| key < *best_key) {
+                best = Some((path, key));
+            }
+        }
+        let mut selection = PathSelection::none();
+        if let Some((path, key)) = best {
+            if should_switch_path(current_key, key) {
+                selection.set(&path);
+            }
+        }
+        selection
+    }
+}
+
 /// Build and bind the endpoint with our persistent identity. Uses iroh's default
 /// (n0) relays + discovery for now; Phase 5 swaps in self-hosted infrastructure.
 pub async fn start(config_dir: &Path) -> Result<Endpoint> {
@@ -1478,18 +1500,19 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // usable for everything else during a transfer.
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
-        noq_proto::congestion::BbrConfig::default(),
+        noq_proto::congestion::Bbr3Config::default(),
     ));
     // Field incident (2026-09-12): 14 advertised IPv4 addresses (11 Docker
     // gateways) plus address churn exhausted the default 13 path ids, producing
     // MaxPathIdReached and permanently relay-only connections. Both peers need
     // headroom; iroh 0.98.2 also defaults to only 12 remote NAT addresses.
     tcfg = tcfg.max_concurrent_multipath_paths(256u32);
-    tcfg = tcfg.set_max_remote_nat_traversal_addresses(32u8);
+    tcfg = tcfg.max_remote_nat_traversal_addresses(32u8);
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
 
     let mut builder = Endpoint::builder(presets::N0)
+        .path_selector(Arc::new(DirectPathSelector))
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
         .transport_config(tcfg.build());
@@ -1527,7 +1550,7 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // through the relay. Best-effort — a failure here just means we fall back to
     // the default relay+DNS discovery.
     {
-        use iroh::address_lookup::MdnsAddressLookup;
+        use iroh_mdns_address_lookup::MdnsAddressLookup;
         match MdnsAddressLookup::builder().build(ep.id()) {
             Ok(mdns) => match ep.address_lookup() {
                 Ok(al) => {
@@ -3605,12 +3628,10 @@ fn send_friend_inner(
                 // "Connecting" meanwhile, and a cancel breaks out immediately.
                 let conn = {
                     let started = std::time::Instant::now();
-                    // A connection is born direct or relay and never migrates (iroh
-                    // 0.98 caps concurrent paths per connection at one, so NAT
-                    // traversal on a relay-born connection fails with "maximum
-                    // number of concurrent paths reached"). When we KNOW a working
-                    // direct address, give the dial a couple of chances to come
-                    // up direct before settling for the relay.
+                    // Retain the bounded direct-address retry used with iroh
+                    // 0.98. Iroh 1.2 can also upgrade relay-born connections in
+                    // place, but a known working address still gets a couple of
+                    // chances before this transfer settles for the relay.
                     let mut direct_tries: u32 = 0;
                     loop {
                         if cancel.load(Ordering::SeqCst) {
@@ -8778,11 +8799,42 @@ mod locality_evidence_tests {
         // A probing candidate (no packets received yet) must not read as direct.
         let probing = vec![(false, true, false, false, "Relay(x)".to_string()), (false, false, false, false, "Ip(100.79.126.13:1)".to_string())];
         assert_eq!(locality_evidence(probing.into_iter()), Some((true, "Relay(x)".into())));
+        for selected in [false, true] {
+            let probing_only = [(selected, false, false, false, "Ip(1.2.3.4:1)".into())];
+            assert_eq!(locality_evidence(probing_only.into_iter()), None);
+        }
         let selected_relay = vec![(true, true, false, false, "Relay(x)".to_string()), (false, false, false, true, "Ip(1.2.3.4:1)".to_string())];
         assert_eq!(locality_evidence(selected_relay.into_iter()), Some((true, "Relay(x)".into())));
         let closed_direct = vec![(false, false, true, true, "Ip(1.2.3.4:1)".to_string()), (false, true, false, false, "Relay(x)".to_string())];
         assert_eq!(locality_evidence(closed_direct.into_iter()), Some((true, "Relay(x)".into())));
         assert_eq!(locality_evidence(std::iter::empty()), None);
+    }
+}
+
+#[cfg(test)]
+mod path_preference_tests {
+    use super::{path_preference_key, should_switch_path};
+    use std::time::Duration;
+
+    #[test]
+    fn direct_beats_faster_relay_and_relay_recovers_when_direct_disappears() {
+        let direct = path_preference_key(false, false, Duration::from_secs(1));
+        let relay = path_preference_key(true, false, Duration::from_millis(1));
+        assert!(direct < relay);
+        assert!(should_switch_path(Some(relay), direct));
+        // When the direct path is abandoned it is absent from ctx.paths(),
+        // so the current key is None and the remaining relay must be selected.
+        assert!(should_switch_path(None, relay));
+    }
+
+    #[test]
+    fn direct_paths_keep_ipv6_bias_and_five_ms_hysteresis() {
+        let v4 = path_preference_key(false, false, Duration::from_millis(20));
+        let v6 = path_preference_key(false, true, Duration::from_millis(22));
+        assert!(v6 < v4);
+        assert!(!should_switch_path(Some(v4), v6));
+        assert!(!should_switch_path(Some(v4), path_preference_key(false, false, Duration::from_millis(16))));
+        assert!(should_switch_path(Some(v4), path_preference_key(false, false, Duration::from_millis(15))));
     }
 }
 
@@ -9314,6 +9366,7 @@ mod loopback_tests {
     /// any `address_lookup`, so nothing is ever published or resolved off-box.
     async fn loopback_endpoint(accept: bool) -> Endpoint {
         let mut b = Endpoint::builder(presets::Minimal)
+            .path_selector(Arc::new(super::DirectPathSelector))
             .relay_mode(RelayMode::Disabled)
             .bind_addr("127.0.0.1:0")
             .expect("127.0.0.1:0 is a valid bind address");
@@ -9321,6 +9374,40 @@ mod loopback_tests {
             b = b.alpns(vec![ALPN.to_vec()]);
         }
         b.bind().await.expect("bind loopback iroh endpoint")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn established_direct_path_snapshot_and_stream() {
+        use n0_future::StreamExt as _;
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let (outgoing, incoming) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client.connect(server.addr(), ALPN), async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        }).await.unwrap();
+        let conn = outgoing.unwrap();
+        assert!(conn_has_direct_path(&conn, Duration::from_secs(2)).await);
+        let mut snapshots = conn.paths_stream();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = snapshots.next().await.expect("connection remains open");
+                if snapshot.iter().any(|p| p.is_selected() && path_is_validated_direct(&p)) {
+                    break;
+                }
+            }
+        }).await.unwrap();
+        assert!(matches!(conn_detail(&conn).path.as_str(), "direct" | "local"));
+        assert!(describe_paths(&conn).contains("*vIp("));
+        conn.close(0u32.into(), b"test complete");
+        assert!(!conn_has_direct_path(&conn, Duration::ZERO).await);
+        assert!(matches!(conn_locality(&conn), crate::models::Locality::Unknown));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while snapshots.next().await.is_some() {}
+        }).await.expect("path stream ends when the connection closes");
+        drop(incoming);
+        client.close().await;
+        server.close().await;
     }
 
     /// Exercise the ticket and the production pull sender/receiver, and require

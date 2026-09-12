@@ -124,19 +124,19 @@ async fn process_messages(
                         .unwrap_or_default();
                     if let Some(dst) = get_nla!(msg, route::RouteAttribute::Destination) {
                         match dst {
-                            route::RouteAddress::Inet(addr) => {
+                            route::RouteAddress::Inet(addr)
                                 if (table == 255 || table == 254)
-                                    && (addr.is_multicast() || is_link_local(IpAddr::V4(*addr)))
-                                {
-                                    continue;
-                                }
+                                    && (addr.is_multicast()
+                                        || is_link_local(IpAddr::V4(*addr))) =>
+                            {
+                                continue;
                             }
-                            route::RouteAddress::Inet6(addr) => {
+                            route::RouteAddress::Inet6(addr)
                                 if (table == 255 || table == 254)
-                                    && (addr.is_multicast() || is_link_local(IpAddr::V6(*addr)))
-                                {
-                                    continue;
-                                }
+                                    && (addr.is_multicast()
+                                        || is_link_local(IpAddr::V6(*addr))) =>
+                            {
+                                continue;
                             }
                             _ => {}
                         }
@@ -205,19 +205,4 @@ impl RouteMonitor {
             _handle: AbortOnDropHandle::new(handle),
         })
     }
-}
-
-/// DropBeam patch (vendored netwatch 0.16.0): ignore container/VM virtual
-/// interfaces so their unreachable gateway addresses are never advertised to
-/// peers. A host with a dozen Docker bridges otherwise makes every peer probe a
-/// dozen dead addresses, exhausting the QUIC multipath path-id budget within
-/// minutes ("MaxPathIdReached") and stranding the connection on the relay.
-/// Mirrors Tailscale's netmon interface filter. Tailscale/WireGuard/utun
-/// interfaces stay eligible on purpose.
-pub(crate) fn is_interesting_interface(name: &str) -> bool {
-    const VIRTUAL: &[&str] = &[
-        "docker", "br-", "veth", "virbr", "lxc", "lxd", "cni", "flannel", "cali",
-        "vmnet", "vboxnet", "dummy", "kube-", "podman",
-    ];
-    !VIRTUAL.iter().any(|prefix| name.starts_with(prefix))
 }
