@@ -313,8 +313,14 @@ pub(crate) fn gc_receive_probes(config: &Path, dir: &Path) {
     #[cfg(unix)] unix::gc_probes(dir, std::time::SystemTime::now());
 }
 pub(crate) fn receive_sweep_allowed(config: &Path, dir: &Path) -> bool {
+    // Keep location payload staging out of ordinary receive recovery even after
+    // the owner stops sharing the location (and it disappears from config).
+    let staging = |path: &Path| path.components().any(|part|
+        part.as_os_str().to_string_lossy().eq_ignore_ascii_case(".dropbeam-staging"));
+    if staging(dir) { return false; }
     let Ok(locations) = load(config) else { return false; };
     let Ok(path) = fs::canonicalize(dir) else { return false; };
+    if staging(&path) { return false; }
     for l in locations {
         let Ok(root) = canonical_missing(Path::new(&l.path)) else { return false; };
         if path.starts_with(root) { return false; }
@@ -631,6 +637,86 @@ mod unix {
             }
             Ok(())
         }
+        pub fn create_stage(&self, key: &str) -> Result<PathBuf> {
+            ensure!(key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()), "Invalid stage key");
+            let name = std::ffi::OsStr::new(".dropbeam-staging");
+            if let Err(e) = mkdir(&self.dir, name) {
+                if child(&self.dir, name, true).is_err() { return Err(e); }
+            }
+            let parent = child(&self.dir, name, true)?;
+            let key_name = std::ffi::OsStr::new(key);
+            if let Err(e) = mkdir(&parent, key_name) {
+                if child(&parent, key_name, true).is_err() { return Err(e); }
+            }
+            child(&parent, key_name, true)?;
+            Ok(self.path.join(name).join(key))
+        }
+        pub fn remove_stage(&self, key: &str) -> Result<()> {
+            ensure!(key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()), "Invalid stage key");
+            fn remove(parent: &fs::File, name: &std::ffi::OsStr) -> Result<()> {
+                if let Ok(dir) = child(parent, name, true) {
+                    names(&dir, |entry| { remove(&dir, entry)?; Ok(true) })?;
+                    unlink(parent, name, true)
+                } else { unlink(parent, name, false) }
+            }
+            let parent = child(&self.dir, std::ffi::OsStr::new(".dropbeam-staging"), true)?;
+            remove(&parent, std::ffi::OsStr::new(key))
+        }
+        pub fn gc_stages(&self) -> Result<()> {
+            // Every unleased generated directory is orphaned. Live uploads are
+            // retained even when a very slow transfer lasts longer than 24 hours.
+            let Ok(parent) = child(&self.dir, std::ffi::OsStr::new(".dropbeam-staging"), true) else { return Ok(()); };
+            names(&parent, |name| {
+                let Some(key) = name.to_str() else { return Ok(true); };
+                if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) { return Ok(true); }
+                let path = self.path.join(".dropbeam-staging").join(key);
+                let _lease = {
+                    let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
+                    if leases.contains(&path) { return Ok(true); }
+                    leases.push(path.clone()); UploadLease(path)
+                };
+                if let Err(e) = self.remove_stage(key) { log::warn!("Location staging GC: {e:#}"); }
+                Ok(true)
+            })
+        }
+        /// The integrity receipt already verified the streamed v2 payload.
+        /// Publish its inode directly; v1 alone uses land's hash-while-copy.
+        pub fn land_verified(&self, raw: &str, staged: &Path, digest: &str, cancel: &std::sync::atomic::AtomicBool,
+            progress: impl Fn(u64), publish: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<PathBuf> {
+            let rel = staged.strip_prefix(self.path.join(".dropbeam-staging"))
+                .context("Upload not verified: stage is outside location staging")?;
+            ensure!(rel.components().count() >= 2 && rel.components().all(|c| matches!(c, Component::Normal(_))),
+                "Upload not verified: invalid stage path");
+            let source_rel = staged.strip_prefix(&self.path)?;
+            let source = self.open_rel(source_rel, false)?;
+            ensure!(source.metadata()?.is_file(), "Invalid stage type");
+            let identity = crate::iroh_net::receive_stage::Identity::of(&source)?;
+            let from = self.open_rel(source_rel.parent().context("Missing stage parent")?, true)?;
+            source.sync_all()?;
+            progress(source.metadata()?.len());
+            ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
+            let rel = relative(raw)?;
+            publish(&mut || self.ensure_dirs(&rel.parent().unwrap_or(Path::new("")).to_string_lossy()))?;
+            let (parent, name) = self.parent(raw)?;
+            // A retry can encounter files published before an interrupted final
+            // receipt. Verify only the existing destination in that case; new
+            // files never incur a second payload read or copy.
+            if let Ok(existing) = child(&parent, &name, false) {
+                ensure!(existing.metadata()?.is_file() && existing.metadata()?.len() == source.metadata()?.len(),
+                    "A different file with this name already exists; rename your upload first");
+                let existing_id = crate::iroh_net::receive_stage::Identity::of(&existing)?;
+                ensure!(sha256_file_progress(existing, cancel, &progress)? == digest,
+                    "A different file with this name already exists; rename your upload first");
+                publish(&mut || {
+                    ensure!(crate::iroh_net::receive_stage::Identity::of(&child(&parent, &name, false)?)? == existing_id,
+                        "Destination changed during verification");
+                    Ok(())
+                })?;
+                return Ok(self.path.join(rel));
+            }
+            publish(&mut || super::unix::publish(&from, staged.file_name().context("Missing stage name")?, &parent, &name, Some(identity)))?;
+            Ok(self.path.join(rel))
+        }
         /// Copy from private transfer staging, hash-check, fsync, then publish
         /// using the probed native/reservation capability. Failed copies never publish.
         pub fn land(&self, raw: &str, staged: &Path, digest: &str, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64), publish: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<PathBuf> {
@@ -692,46 +778,30 @@ mod unix {
             })?; }
             Ok(())
         }
-        pub fn snapshot(&self, raw: &str, dest: &Path, budget: &mut Budget, depth: usize, skipped: &mut Vec<String>) -> Result<bool> {
+        pub fn select(&self, raw: &str, wire: &str, budget: &mut Budget, depth: usize,
+            skipped: &mut Vec<String>, items: &mut Vec<(PathBuf, String, u64, u64)>, dirs: &mut Vec<String>) -> Result<()> {
             ensure!(depth < 64 && budget.entries > 0, "Selection too large or deeply nested"); budget.entries -= 1;
             let rel = relative(raw)?;
-            let mut source = match self.open_rel(&rel, false) {
+            let source = match self.open_rel(&rel, false) {
                 Ok(f) => f,
-                Err(e) => { skipped.push(format!("{raw}: {}", crate::telemetry::redact_paths_only(&format!("{e:#}")))); return Ok(false); }
+                Err(e) => { skipped.push(format!("{raw}: {}", crate::telemetry::redact_paths_only(&format!("{e:#}")))); return Ok(()); }
             };
-            if source.metadata()?.is_file() {
-                use std::io::{Read, Write};
-                use std::os::unix::fs::OpenOptionsExt;
-                check_space(dest.parent().context("Missing snapshot parent")?, source.metadata()?.len())?;
-                budget.check(source.metadata()?.len())?;
-                let mut out = match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dest) {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { skipped.push(format!("{raw}: staged name collides with another selected item")); return Ok(false); }
-                    Err(e) => return Err(e.into()),
-                };
-                let mut buf = vec![0; 1 << 20];
-                loop { let n = source.read(&mut buf)?; if n == 0 { break; } budget.consume(n as u64)?; out.write_all(&buf[..n])?; }
-                out.sync_all()?;
+            let meta = source.metadata()?;
+            if meta.is_file() {
+                budget.consume(meta.len())?;
+                items.push((self.path.join(rel), wire.into(), meta.len(),
+                    meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)));
             } else {
-                // Exclusive mkdir prevents case/normalization twins from being
-                // silently merged in the staging filesystem.
-                use std::os::unix::fs::DirBuilderExt;
-                match fs::DirBuilder::new().mode(0o700).create(dest) {
-                    Ok(()) => {},
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { skipped.push(format!("{raw}: staged name collides with another selected item")); return Ok(false); }
-                    Err(e) => return Err(e.into()),
-                }
+                dirs.push(wire.into());
                 names(&source, |name| {
                     let Some(name) = name.to_str() else { skipped.push(format!("{raw}: non-Unicode filename")); return Ok(true); };
                     if name.to_ascii_lowercase().starts_with(".dropbeam-") { return Ok(true); }
-                    let next = if raw.is_empty() { name.to_string() } else { format!("{raw}/{name}") };
-                    self.snapshot(&next, &dest.join(name), budget, depth + 1, skipped)?;
+                    self.select(&format!("{raw}/{name}"), &format!("{wire}/{name}"), budget, depth + 1, skipped, items, dirs)?;
                     Ok(true)
                 })?;
             }
-            Ok(true)
+            Ok(())
         }
-
     }
 }
 
@@ -745,7 +815,11 @@ impl Root {
     pub fn ensure_dirs(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
     pub fn land(&self, _: &str, _: &Path, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<PathBuf> { bail!("Hosting unavailable") }
     fn selection_bytes(&self, _: &str, _: &mut Budget, _: usize) -> Result<()> { bail!("Hosting unavailable") }
-    pub fn snapshot(&self, _: &str, _: &Path, _: &mut Budget, _: usize, _: &mut Vec<String>) -> Result<bool> { bail!("Hosting unavailable") }
+    pub fn create_stage(&self, _: &str) -> Result<PathBuf> { bail!("Hosting unavailable") }
+    pub fn remove_stage(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
+    pub fn gc_stages(&self) -> Result<()> { Ok(()) }
+    pub fn land_verified(&self, _: &str, _: &Path, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<PathBuf> { bail!("Hosting unavailable") }
+    pub fn select(&self, _: &str, _: &str, _: &mut Budget, _: usize, _: &mut Vec<String>, _: &mut Vec<(PathBuf, String, u64, u64)>, _: &mut Vec<String>) -> Result<()> { bail!("Hosting unavailable") }
 }
 
 pub fn dispatch(config: &Path, endpoint: &str, request: &Value) -> Result<Value> {
@@ -808,7 +882,14 @@ fn stage_bytes(path: &Path, entries: &mut usize) -> Result<u64> {
     }
     Ok(bytes)
 }
+#[cfg(test)]
+thread_local! { static SPACE_OVERRIDE: std::cell::RefCell<Option<(PathBuf, u64)>> = const { std::cell::RefCell::new(None) }; }
 fn check_space(path: &Path, bytes: u64) -> Result<()> {
+    #[cfg(test)]
+    if let Some(free) = SPACE_OVERRIDE.with(|v| v.borrow().as_ref().filter(|(p, _)| p == path).map(|(_, free)| *free)) {
+        ensure!(free >= bytes.saturating_add(64 * 1024 * 1024), "Insufficient free space for location transfer");
+        return Ok(());
+    }
     #[cfg(unix)] {
         use std::{os::unix::ffi::OsStrExt, ffi::CString};
         let path = CString::new(path.as_os_str().as_bytes())?;
@@ -925,7 +1006,6 @@ impl Upload {
         })?;
         ensure!(header["total"].as_u64() == Some(manifest_total), "Manifest byte total mismatch");
         Budget { remaining: location.byte_cap, entries: 0 }.check(manifest_total)?;
-        check_space(config, manifest_total)?;
         check_space(&root.path, manifest_total)?;
         let mut seen = std::collections::HashSet::new();
         for item in items {
@@ -942,16 +1022,23 @@ impl Upload {
         let id = text(header, "location_transfer")?;
         ensure!(!id.is_empty() && id.len() <= 100, "Invalid transfer id");
         let key = hex::encode(Sha256::digest(serde_json::to_vec(&(endpoint, &target, items, dirs))?));
-        let staging = config.join("location-transfers").join(key);
+        let staging = if header["location_hash_v"] == 2 { root.path.join(".dropbeam-staging").join(&key) }
+            else { config.join("location-transfers").join(&key) };
         let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
         ensure!(!leases.contains(&staging), "This location upload is already in progress; retry shortly");
         leases.push(staging.clone());
         drop(leases);
         let lease = UploadLease(staging.clone());
-        private_directory(&staging)?;
-        let retained = stage_bytes(&staging, &mut 200_000)?;
-        Budget { remaining: location.byte_cap, entries: 0 }.check(retained.checked_add(manifest_total).context("Stage byte count overflow")?)?;
-        Ok(Self { config: config.into(), endpoint: endpoint.into(), target, destination, staging, _lease: lease, _friend: friend_lease, byte_cap: location.byte_cap, root, location })
+        if header["location_hash_v"] == 2 { root.create_stage(&key)?; } else { private_directory(&staging)?; }
+        let upload = Self { config: config.into(), endpoint: endpoint.into(), target, destination, staging, _lease: lease, _friend: friend_lease, byte_cap: location.byte_cap, root, location };
+        let retained = stage_bytes(&upload.staging, &mut 200_000)?;
+        Budget { remaining: upload.byte_cap, entries: 0 }.check(retained.checked_add(manifest_total).context("Stage byte count overflow")?)?;
+        Ok(upload)
+    }
+    fn cleanup(&self) {
+        if self.staging.starts_with(self.root.path.join(".dropbeam-staging")) {
+            if let Some(key) = self.staging.file_name().and_then(|s| s.to_str()) { let _ = self.root.remove_stage(key); }
+        } else { let _ = fs::remove_dir_all(&self.staging); }
     }
     pub fn finish(&self, header: &Value, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         self.finish_progress(header, paths, &std::sync::atomic::AtomicBool::new(false), |_| {})
@@ -991,13 +1078,16 @@ impl Upload {
         publish(&mut || Ok(()))?;
         let actual = paths.iter().try_fold(0u64, |n, p| -> Result<u64> { n.checked_add(fs::metadata(p)?.len()).context("Stage byte count overflow") })?;
         Budget { remaining: self.byte_cap, entries: 0 }.check(actual)?;
-        check_space(&root.path, actual)?;
+        check_space(&root.path, if digests.is_some() { 0 } else { actual })?;
         let mut out = Vec::new();
         let mut base = 0;
         for (index, (item, staged)) in items.iter().zip(paths).enumerate() {
             let raw = format!("{}/{}", self.target.rel_path, text(item, "name")?).trim_start_matches('/').to_string();
             ensure!(fs::metadata(&staged)?.len() == item["size"].as_u64().context("Invalid file size")?, "Staged file size differs from manifest");
-            let landed = root.land(&raw, &staged, if let Some(digests) = &digests { digests[index] } else { text(item, "sha256")? }, cancel, |n| progress(base + n), &publish)?;
+            let landed = if let Some(digests) = &digests {
+                ensure!(staged.starts_with(&self.staging), "Upload not verified: stage is outside transfer staging");
+                root.land_verified(&raw, &staged, digests[index], cancel, |n| progress(base + n), &publish)?
+            } else { root.land(&raw, &staged, text(item, "sha256")?, cancel, |n| progress(base + n), &publish)? };
             log::info!("locations upload friend={friend} location={} path={raw:?}", l.id);
             out.push(landed);
             base += item["size"].as_u64().context("Invalid file size")?;
@@ -1007,13 +1097,18 @@ impl Upload {
             let raw = format!("{}/{}", self.target.rel_path, dir.as_str().context("Invalid directory")?).trim_start_matches('/').to_string();
             publish(&mut || root.ensure_dirs(&raw))?;
         }
-        let _ = fs::remove_dir_all(&self.staging);
+        self.cleanup();
         Ok(out)
     }
 }
 
+impl Drop for Upload { fn drop(&mut self) { self.cleanup(); } }
+
 /// Only our private cache directories are eligible. Never traverse or GC NAS trash.
 pub fn gc(config: &Path) -> Result<()> {
+    for mut location in load(config)? {
+        if let Ok(root) = Root::for_location(&mut location) { root.gc_stages()?; }
+    }
     let active = UPLOADS.lock().unwrap_or_else(|p| p.into_inner()).clone();
     for category in ["location-snapshots", "location-transfers"] {
         let parent = config.join(category);
@@ -1075,8 +1170,11 @@ pub fn sha256(path: &Path) -> Result<String> {
     sha256_progress(path, &std::sync::atomic::AtomicBool::new(false), |_| {})
 }
 pub fn sha256_progress(path: &Path, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<String> {
+    sha256_file_progress(fs::File::open(path)?, cancel, progress)
+}
+pub(crate) fn sha256_file_progress(mut f: fs::File, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<String> {
     use sha2::{Digest, Sha256}; use std::io::Read;
-    let mut hash = Sha256::new(); let mut f = fs::File::open(path)?; let mut b = vec![0; 1 << 20]; let mut done = 0;
+    let mut hash = Sha256::new(); let mut b = vec![0; 1 << 20]; let mut done = 0;
     loop {
         ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
         let n = f.read(&mut b)?; if n == 0 { break; }
@@ -1094,9 +1192,24 @@ fn private_directory(path: &Path) -> Result<()> {
     builder.create(path)?; Ok(())
 }
 
-/// Keep snapshots alive throughout normal friend-send retries, then remove only
-/// this private generated directory. Never delete anything from a location.
-pub struct Snapshot { pub directory: PathBuf, pub paths: Vec<String>, pub skipped: Vec<String>, _friend: FriendLease, _lease: UploadLease, config: PathBuf, endpoint: String, location_id: String, root_path: String }
+/// A pinned download selection retained throughout friend-send retries; owns no payload copies.
+pub struct Snapshot { pub directory: PathBuf, pub paths: Vec<String>, pub skipped: Vec<String>, _friend: FriendLease, pub(crate) source: std::sync::Arc<DownloadSource>, config: PathBuf, endpoint: String, location_id: String, root_path: String }
+pub(crate) struct DownloadSource {
+    root: Root,
+    pub items: Vec<(PathBuf, String, u64, u64)>,
+    pub dirs: Vec<String>,
+}
+impl DownloadSource {
+    pub fn open(&self, path: &Path) -> Result<fs::File> {
+        let item = self.items.iter().find(|i| i.0 == path).context("File is outside download selection")?;
+        #[cfg(unix)] {
+            let file = self.root.open_rel(&relative(&path.strip_prefix(&self.root.path)?.to_string_lossy())?, false)?;
+            ensure!(file.metadata()?.is_file() && file.metadata()?.len() == item.2, "Download source size or type changed");
+            Ok(file)
+        }
+        #[cfg(not(unix))] { let _ = item; bail!("Hosting unavailable") }
+    }
+}
 impl Snapshot {
     pub fn check_access(&self, endpoint: &str) -> Result<()> {
         ensure!(endpoint == self.endpoint, "Download recipient changed");
@@ -1104,14 +1217,10 @@ impl Snapshot {
         ensure!(l.path == self.root_path, "Location changed during download");
         validate_root(&self.config, Path::new(&l.path))?;
         let _ = Root::for_location(&mut l)?;
+        self.source.root.recheck(&l)?;
         Ok(())
     }
 }
-fn remove_private_async(path: PathBuf) {
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() { runtime.spawn_blocking(move || { let _ = fs::remove_dir_all(path); }); }
-    else { std::thread::spawn(move || { let _ = fs::remove_dir_all(path); }); }
-}
-impl Drop for Snapshot { fn drop(&mut self) { remove_private_async(self.directory.clone()); } }
 pub fn download_snapshot(config: &Path, endpoint: &str, request: &Value) -> Result<Snapshot> {
     download_snapshot_at(config, endpoint, request, Instant::now())
 }
@@ -1126,27 +1235,30 @@ fn download_snapshot_at(config: &Path, endpoint: &str, request: &Value, now: Ins
     ensure!(!paths.is_empty() && paths.len() <= 500, "Select 1–500 items");
     let mut preflight = Budget { remaining: l.byte_cap, entries: 100_000 };
     for raw in paths { root.selection_bytes(raw.as_str().context("Invalid path")?, &mut preflight, 0)?; }
-    check_space(config, l.byte_cap - preflight.remaining)?;
-    let directory = config.join("location-snapshots").join(uuid::Uuid::new_v4().to_string());
-    let lease = {
-        let mut active = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
-        active.push(directory.clone()); UploadLease(directory.clone())
-    };
-    private_directory(&directory)?;
-    let mut snapshot = Snapshot { directory, paths: vec![], skipped: vec![], _friend: friend_lease, _lease: lease, config: config.into(), endpoint: endpoint.into(), location_id: l.id.clone(), root_path: l.path.clone() };
+    let directory = root.path.clone();
+    let mut snapshot = Snapshot { directory, paths: vec![], skipped: vec![], _friend: friend_lease,
+        source: std::sync::Arc::new(DownloadSource { root, items: vec![], dirs: vec![] }),
+        config: config.into(), endpoint: endpoint.into(), location_id: l.id.clone(), root_path: l.path.clone() };
+    let source = std::sync::Arc::get_mut(&mut snapshot.source).unwrap();
     let mut budget = Budget { remaining: l.byte_cap, entries: 100_000 };
+    let mut names = std::collections::HashSet::new();
     for raw in paths {
         let raw = raw.as_str().context("Invalid path")?;
         let rel = relative(raw)?;
-        let leaf = rel.file_name().context("Select items inside the location")?;
-        let dest = snapshot.directory.join(leaf);
-        if root.snapshot(raw, &dest, &mut budget, 0, &mut snapshot.skipped)? { snapshot.paths.push(dest.to_string_lossy().into_owned()); }
+        let leaf = rel.file_name().context("Select items inside the location")?.to_string_lossy();
+        use unicode_normalization::UnicodeNormalization;
+        if !names.insert(leaf.nfc().collect::<String>().to_lowercase()) { snapshot.skipped.push(format!("{raw}: name collides with another selected item")); continue; }
+        let before = snapshot.skipped.len();
+        source.root.select(raw, &leaf, &mut budget, 0, &mut snapshot.skipped, &mut source.items, &mut source.dirs)?;
+        if snapshot.skipped.len() == before || source.root.resolve(raw).is_ok() {
+            snapshot.paths.push(source.root.path.join(rel).to_string_lossy().into_owned());
+        }
     }
-    // Recheck after a potentially long snapshot, before releasing any bytes.
+    // Recheck after selection traversal, before releasing any bytes.
     let (current, _) = authorize(config, endpoint, &l.id, Access::Read)?;
     ensure!(current.path == l.path, "Location changed during download preparation");
     ensure!(current.marker == l.marker, LocationError::MountChanged);
-    root.recheck(&current)?;
+    source.root.recheck(&current)?;
     Ok(snapshot)
 }
 
@@ -1181,12 +1293,113 @@ mod tests {
         assert!(probe.join().unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn root_stage_ignores_config_capacity_moves_inode_and_hides_control_data() {
+        use std::os::unix::fs::MetadataExt;
+        let f = Fixture::new();
+        SPACE_OVERRIDE.with(|v| *v.borrow_mut() = Some((f.config.clone(), 1)));
+        assert!(check_space(&f.config, 4096).is_err());
+        let header = json!({"locations_v":VERSION,"location_hash_v":2,"integrity_v":1,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":"root-stage",
+            "items":[{"name":"folder/data","size":4096}],"dirs":[],"total":4096});
+        for fallback in [false, true] {
+            FORCE_HARD_LINK.with(|v| v.set(fallback));
+            let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            assert_eq!(upload.staging.parent().unwrap(), f.root.join(".dropbeam-staging"));
+            assert!(!f.config.join("location-transfers").exists());
+            let staged = upload.staging.join("received");
+            fs::write(&staged, vec![42; 4096]).unwrap();
+            let before = fs::metadata(&staged).unwrap();
+            let rows = [crate::models::FileIntegrity { index:0, name:"folder/data".into(), size:4096,
+                algorithm:"test".into(), digest:"a".repeat(64), peer_digest:"a".repeat(64),
+                verified:true, acknowledged:false, sha256:Some(sha256(&staged).unwrap()) }];
+            assert!(!upload.root.listing("").unwrap().iter().any(|e| e.name.starts_with(".dropbeam-")));
+            assert!(!receive_sweep_allowed(&f.config, &upload.staging));
+            assert!(!receive_sweep_allowed(&f.dir.join("unconfigured"), &upload.staging));
+            assert!(upload.root.trash(".dropbeam-staging").is_err());
+            assert!(upload.root.rename_item(".dropbeam-staging", "exposed").is_err());
+            upload.finish_verified_progress(&header, vec![staged], &rows,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+            let after = fs::metadata(f.root.join("folder/data")).unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert!(!upload.staging.exists());
+            drop(upload);
+            let retry = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            let staged = retry.staging.join("retry");
+            fs::write(&staged, vec![42; 4096]).unwrap();
+            retry.finish_verified_progress(&header, vec![staged], &rows,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+            let retried = fs::metadata(f.root.join("folder/data")).unwrap();
+            assert_eq!((retried.dev(), retried.ino()), (after.dev(), after.ino()));
+            assert!(!retry.staging.exists());
+            drop(retry);
+            let different = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            let staged = different.staging.join("different");
+            fs::write(&staged, vec![43; 4096]).unwrap();
+            let rows = [crate::models::FileIntegrity { sha256:Some(sha256(&staged).unwrap()), ..rows[0].clone() }];
+            assert!(different.finish_verified_progress(&header, vec![staged], &rows,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).is_err());
+            assert_eq!(fs::read(f.root.join("folder/data")).unwrap(), vec![42; 4096]);
+            drop(different);
+            fs::remove_file(f.root.join("folder/data")).unwrap();
+        }
+        FORCE_HARD_LINK.with(|v| v.set(false));
+        SPACE_OVERRIDE.with(|v| *v.borrow_mut() = None);
+    }
+    #[test]
+    fn failed_root_stage_and_gc_never_follow_symlinks_or_touch_visible_files() {
+        let f = Fixture::new();
+        let header = json!({"locations_v":VERSION,"location_hash_v":2,"integrity_v":1,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":"failed",
+            "items":[{"name":"file","size":4}],"dirs":[],"total":4});
+        let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+        let staging = upload.staging.clone();
+        fs::write(f.root.join("keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&f.root, staging.join("escape")).unwrap();
+        assert!(upload.finish(&header, vec![]).is_err());
+        drop(upload);
+        assert!(!staging.exists());
+        assert_eq!(fs::read(f.root.join("keep")).unwrap(), b"keep");
+        assert!(!f.config.join("location-transfers").exists());
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("orphan"), b"old").unwrap();
+        gc(&f.config).unwrap();
+        assert!(!staging.exists());
+        assert!(f.root.join("keep").exists());
+    }
+    #[test]
+    fn download_pins_root_paths_budget_and_rejects_changed_sources() {
+        let mut f = Fixture::new();
+        fs::create_dir_all(f.root.join("folder/.dropbeam-staging")).unwrap();
+        fs::write(f.root.join("folder/.dropbeam-staging/hidden"), vec![0; 1024]).unwrap();
+        fs::write(f.root.join("folder/data"), b"data").unwrap();
+        f.location.byte_cap = 4;
+        save(&f.config, Some(f.location.clone()), None).unwrap();
+        let snapshot = download_snapshot(&f.config, "owner-device",
+            &json!({"locations_v":VERSION,"id":"nas","paths":["folder"]})).unwrap();
+        assert_eq!(snapshot.paths, vec![f.root.join("folder").to_string_lossy().into_owned()]);
+        assert_eq!(snapshot.source.items.len(), 1);
+        let path = f.root.join("folder/data");
+        assert_eq!(snapshot.source.items[0].0, path);
+        snapshot.source.open(&path).unwrap();
+        assert!(!f.config.join("location-snapshots").exists());
+        fs::write(&path, b"grown").unwrap();
+        assert!(snapshot.source.open(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(snapshot.source.open(&path).is_err());
+        std::os::unix::fs::symlink(f.config.join("locations.json"), &path).unwrap();
+        assert!(snapshot.source.open(&path).is_err());
+        drop(snapshot);
+        assert!(f.root.exists());
+    }
     struct Fixture { dir: PathBuf, config: PathBuf, root: PathBuf, friend: String, location: Location }
     impl Fixture {
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!("dropbeam-location-test-{}", uuid::Uuid::new_v4()));
             let root = dir.join("NAS"); let config = dir.join("config");
             fs::create_dir_all(&root).unwrap(); fs::create_dir_all(&config).unwrap();
+            let dir = fs::canonicalize(dir).unwrap();
+            let root = dir.join("NAS"); let config = dir.join("config");
             let friend = crate::friends::upsert_by_endpoint(&config, "owner-device", "Friend").id;
             let location = Location { id: "nas".into(), name: "Family NAS".into(), path: root.to_string_lossy().into_owned(), friend_ids: vec![friend.clone()], rights: Rights { upload: true, manage: true }, byte_cap: default_byte_cap(), device: None, marker: None, safe_publish: None };
             save(&config, Some(location.clone()), None).unwrap();
@@ -1202,7 +1415,7 @@ mod tests {
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.dir); } }
     #[test]
-    fn v2_upload_requires_verified_rows_and_refuses_tampered_digest() {
+    fn v2_upload_requires_verified_rows_and_root_local_stage() {
         let f = Fixture::new();
         let (old, mut header, source) = f.upload("verified.bin", b"streamed payload");
         drop(old);
@@ -1223,7 +1436,9 @@ mod tests {
         assert!(upload.finish_verified_progress(&header, vec![source.clone()], &rows, &cancel, |_| {}).unwrap_err().to_string().contains("Upload not verified"));
         assert!(!f.root.join("verified.bin").exists());
         header["integrity_v"] = json!(1);
-        upload.finish_verified_progress(&header, vec![source], &rows, &cancel, |_| {}).unwrap();
+        let staged = upload.staging.join("payload");
+        fs::rename(source, &staged).unwrap();
+        upload.finish_verified_progress(&header, vec![staged], &rows, &cancel, |_| {}).unwrap();
         assert_eq!(fs::read(f.root.join("verified.bin")).unwrap(), b"streamed payload");
     }
 
@@ -1319,8 +1534,9 @@ mod tests {
         let snapshot = download_snapshot(&f.config, "owner-device", &req).unwrap();
         assert_eq!(fs::read(&snapshot.paths[0]).unwrap(), b"x");
         let dir = snapshot.directory.clone(); drop(snapshot);
-        for _ in 0..100 { if !dir.exists() { break; } std::thread::sleep(Duration::from_millis(10)); }
-        assert!(!dir.exists());
+        assert_eq!(dir, f.root);
+        assert!(dir.exists());
+        assert!(!f.config.join("location-snapshots").exists());
         std::os::unix::fs::symlink(f.dir.join("config"), f.root.join("link")).unwrap();
         let skipped = download_snapshot(&f.config, "owner-device", &json!({"locations_v":VERSION,"id":"nas","paths":["link"]})).unwrap();
         assert!(skipped.paths.is_empty()); assert!(skipped.skipped[0].starts_with("link:"));
@@ -1513,6 +1729,7 @@ mod tests {
         let mut f = Fixture::new();
         let (upload, header, _) = f.upload("file", b"1234");
         let staging = upload.staging.clone(); drop(upload);
+        fs::create_dir_all(&staging).unwrap(); // Simulate leftovers from a crashed older host.
         fs::write(staging.join("retained"), b"1234").unwrap();
         f.location.byte_cap = 7; save(&f.config, Some(f.location.clone()), None).unwrap();
         error_kind(Upload::prepare(&f.config, "owner-device", &header), LocationError::Quota);
@@ -1563,7 +1780,7 @@ mod tests {
     }
 
     #[test]
-    fn download_staging_collisions_skip_files_and_directories_without_aborting() {
+    fn download_wire_collisions_skip_files_and_directories_without_aborting() {
         let f = Fixture::new();
         for parent in ["left", "right"] {
             fs::create_dir_all(f.root.join(parent).join("folder")).unwrap();
@@ -1572,13 +1789,13 @@ mod tests {
         fs::write(f.root.join("good"), b"keep").unwrap();
         let snapshot = download_snapshot(&f.config, "owner-device", &json!({"locations_v":VERSION,"id":"nas","paths":["left/same","right/same","left/folder","right/folder","good"]})).unwrap();
         assert_eq!(snapshot.paths.len(), 3); assert_eq!(snapshot.skipped.len(), 2);
-        assert_eq!(fs::read(snapshot.directory.join("same")).unwrap(), b"left");
+        assert_eq!(fs::read(&snapshot.paths[0]).unwrap(), b"left");
         assert_eq!(fs::read(snapshot.directory.join("good")).unwrap(), b"keep");
-        assert!(snapshot.skipped.iter().all(|s| s.contains("staged name collides")));
+        assert!(snapshot.skipped.iter().all(|s| s.contains("name collides")));
     }
 
     #[test]
-    fn download_case_and_unicode_twins_follow_staging_filesystem_semantics() {
+    fn download_twins_preserve_source_paths_and_skip_case_collisions() {
         let f = Fixture::new();
         fs::create_dir(f.root.join("left")).unwrap(); fs::create_dir(f.root.join("right")).unwrap();
         for (a, b) in [("Case", "case"), ("é", "e\u{301}")] {
@@ -1586,11 +1803,8 @@ mod tests {
             fs::write(f.root.join("right").join(b), b"right").unwrap();
             let snapshot = download_snapshot(&f.config, "owner-device", &json!({"locations_v":VERSION,"id":"nas","paths":[format!("left/{a}"),format!("right/{b}")]})).unwrap();
             assert_eq!(snapshot.paths.len() + snapshot.skipped.len(), 2);
-            assert_eq!(fs::read(snapshot.directory.join(a)).unwrap(), b"left");
-            #[cfg(target_os = "macos")]
-            if snapshot.directory.join(a) == snapshot.directory.join(b) || fs::canonicalize(snapshot.directory.join(a)).unwrap() == fs::canonicalize(snapshot.directory.join(b)).unwrap() {
-                assert_eq!(snapshot.skipped.len(), 1);
-            }
+            assert_eq!(fs::read(&snapshot.paths[0]).unwrap(), b"left");
+            if a.to_lowercase() == b.to_lowercase() { assert_eq!(snapshot.skipped.len(), 1); }
         }
     }
 

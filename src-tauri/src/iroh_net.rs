@@ -3286,11 +3286,13 @@ fn send_friend_inner(
         .map_err(|_| "This friend's direct address is invalid.".to_string())?;
     let addr = dial_addr(parsed);
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let (names, total) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
+    let (items, directories, total) = if let Some(snapshot) = location.as_ref().and_then(|l| l.snapshot.as_ref()) {
+        (snapshot.source.items.clone(), snapshot.source.dirs.clone(), snapshot.source.items.iter().map(|i| i.2).sum())
+    } else { gather_items(&pathbufs).map_err(|e| e.to_string())? };
+    let names = if items.is_empty() { directories.clone() } else { items.iter().map(|i| i.1.clone()).collect() };
     let id = uuid::Uuid::new_v4().to_string();
     let chat_id = chat_transfer_id.unwrap_or_else(|| id.clone());
     let generation = chat_attempt.unwrap_or(1).max(crate::chat::now_ms());
-    let (items, directories, _) = gather_items(&pathbufs).map_err(|e| e.to_string())?;
     // Freeze offsets before retries; a removed earlier source must not renumber
     // the integrity identity of a later split.
     let mut next_index = 0u64;
@@ -3354,7 +3356,7 @@ fn send_friend_inner(
             // index of the first file NOT yet confirmed delivered. Survives across
             // retry attempts so a reconnect never re-sends finished files.
             let mut next_file: usize = 0;
-            let split = pathbufs.len() > 1
+            let split = location.as_ref().is_none_or(|l| l.snapshot.is_none()) && pathbufs.len() > 1
                 && pathbufs.iter().any(|p| {
                     std::fs::metadata(p)
                         .map(|m| m.len() >= PARALLEL_MIN)
@@ -4609,6 +4611,11 @@ fn set_mtime_secs(path: &Path, secs: u64) {
     }
 }
 
+// Task-local download capabilities also travel explicitly into range workers.
+tokio::task_local! {
+    static LOCATION_SOURCE: Option<Arc<crate::locations::DownloadSource>>;
+}
+
 /// Open a source file for sending, riding out a TRANSIENT disappearance before
 /// concluding it's gone. There is a TOCTOU window between the manifest pre-filter
 /// (which re-stats every file) and this body open: an editor doing an atomic save
@@ -4622,6 +4629,10 @@ fn set_mtime_secs(path: &Path, secs: u64) {
 /// normal delete path, so the next reconcile converges (the vanished file is dropped
 /// from that round's manifest). A non-NotFound IO error surfaces immediately.
 async fn open_for_send(path: &Path) -> Result<tokio::fs::File> {
+    if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() {
+        let path = path.to_path_buf();
+        return Ok(tokio::fs::File::from_std(tokio::task::spawn_blocking(move || source.open(&path)).await??));
+    }
     let mut last: Option<std::io::Error> = None;
     for attempt in 0..3u32 {
         match tokio::fs::File::open(path).await {
@@ -5868,7 +5879,8 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
         let path = path.to_path_buf();
         let progress = progress.clone();
         let leaves = leaves.clone();
-        set.spawn(async move {
+        let source = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten();
+        set.spawn(LOCATION_SOURCE.scope(source, async move {
             let mut hash = leaves.map(|l| integrity::Blocks::new(start, l)).transpose()?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut uni = conn.open_uni().await?;
@@ -5898,13 +5910,14 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
                     remaining -= k as u64;
                 }
             }
+            if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(&path)?; }
             if let Some(hash) = hash { hash.finish(); }
             uni.finish()?;
             // Keep the stream alive until the peer has acked the segment, so the
             // last bytes aren't dropped by an early reset when the task ends.
             let _ = uni.stopped().await;
             Ok(())
-        });
+        }));
     }
     if !set.is_empty() {
         drain_with_progress(set, &progress, total, cancel, &on_progress).await?;
@@ -6502,6 +6515,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
             .await?;
             remaining -= n as u64;
         }
+        if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(path)?; }
         if let Some(hash) = hash {
             hash.finish();
             hashes.as_mut().unwrap().push(integrity::FileHash { sha256: plain.map(|h| hex::encode(h.finish())), leaves: integrity::snapshot_leaves(&leaves), index: if location_hash { index as u64 } else { integrity::item_offset() + index as u64 }, name: name.clone(), size: *size, digest: integrity::combine(*size, &leaves)? });
@@ -6747,8 +6761,9 @@ async fn send_files_linked<F: Fn(u64, u64)>(
     chat_link: Option<&crate::models::ChatTransferLink>,
     location: Option<&LocationSend>,
 ) -> Result<u64> {
-    integrity::ensure_scope(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
-        parallel_engaged, activity, friend_state, chat_link, location)).await
+    let source = location.and_then(|l| l.snapshot.as_ref()).map(|s| s.source.clone());
+    LOCATION_SOURCE.scope(source, integrity::ensure_scope(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
+        parallel_engaged, activity, friend_state, chat_link, location))).await
 }
 
 async fn send_files_linked_inner<F: Fn(u64, u64)>(
@@ -6771,7 +6786,11 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     let known_capable = friend_state.and_then(|s| s.progress_version(&peer_id)) == Some(PROGRESS_V);
     if location.is_some() { require_locations(conn).await?; }
     let (mut send, mut recv) = conn.open_bi().await?;
-    let (items, dirs, total) = gather_items(paths)?;
+    let (items, dirs, total) = if let Some(snapshot) = location.and_then(|l| l.snapshot.as_ref()) {
+        snapshot.check_access(&peer_id)?;
+        let source = &snapshot.source;
+        (source.items.clone(), source.dirs.clone(), source.items.iter().map(|i| i.2).sum())
+    } else { gather_items(paths)? };
     let n = parallel_stream_count(items.len(), total);
     // Rate-limit only INTERNET sends — a LAN transfer doesn't touch the uplink, so
     // it stays full speed regardless of the cap.
@@ -7586,10 +7605,13 @@ async fn location_hashes(paths: Vec<PathBuf>, cancel: &AtomicBool, activity: &At
     impl Drop for StopHash { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
     let _stop_hash = StopHash(stopped.clone());
     let mut deadline = integrity::Inactivity::new(Some(activity));
+    let source = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten();
     let mut worker = tokio::task::spawn_blocking(move || {
         let mut base = 0;
         paths.iter().map(|path| {
-            let hash = crate::locations::sha256_progress(path, &worker_cancel, |n| { worker_progress.fetch_max(base + n, Ordering::Relaxed); })?;
+            let file = if let Some(source) = &source { source.open(path)? } else { std::fs::File::open(path)? };
+            let hash = crate::locations::sha256_file_progress(file, &worker_cancel, |n| { worker_progress.fetch_max(base + n, Ordering::Relaxed); })?;
+            if let Some(source) = &source { source.open(path)?; }
             base = worker_progress.load(Ordering::Relaxed);
             Ok(hash)
         }).collect::<Result<Vec<_>>>()
@@ -10994,6 +11016,42 @@ mod chat_transfer_link_tests {
 #[cfg(all(test, unix))]
 mod location_loopback_tests {
     use super::*;
+    #[tokio::test]
+    async fn location_download_sender_opens_pinned_root_and_rejects_symlink_swap() {
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("dropbeam-download-open-{}", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(base.clone());
+        let config = base.join("config"); let nas = base.join("nas");
+        std::fs::create_dir_all(&config).unwrap(); std::fs::create_dir_all(nas.join("folder")).unwrap();
+        std::fs::write(nas.join("folder/data"), b"NAS bytes").unwrap();
+        let friend = crate::friends::upsert_by_endpoint(&config, "reader", "Reader");
+        crate::locations::save(&config, Some(crate::locations::Location {
+            id:"nas".into(), name:"NAS".into(), path:nas.to_string_lossy().into_owned(),
+            friend_ids:vec![friend.id], rights:crate::locations::Rights::default(),
+            byte_cap:crate::locations::default_byte_cap(), device:None, marker:None, safe_publish:None
+        }), None).unwrap();
+        let snapshot = crate::locations::download_snapshot(&config, "reader",
+            &serde_json::json!({"locations_v":1,"id":"nas","paths":["folder"]})).unwrap();
+        let path = snapshot.source.items[0].0.clone();
+        LOCATION_SOURCE.scope(Some(snapshot.source.clone()), async {
+            let mut file = open_for_send(&path).await.unwrap();
+            let metadata = file.metadata().await.unwrap();
+            let expected = std::fs::metadata(&path).unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), (expected.dev(), expected.ino()));
+            let mut data = vec![];
+            tokio::io::AsyncReadExt::read_to_end(&mut file, &mut data).await.unwrap();
+            assert_eq!(data, b"NAS bytes");
+            assert_eq!(location_hashes(vec![path.clone()], &AtomicBool::new(false), &AtomicU64::new(0)).await.unwrap(),
+                vec![crate::locations::sha256(&path).unwrap()]);
+            std::fs::rename(nas.join("folder"), nas.join("moved")).unwrap();
+            std::os::unix::fs::symlink(nas.join("moved"), nas.join("folder")).unwrap();
+            assert!(open_for_send(&path).await.is_err());
+            assert!(location_hashes(vec![path.clone()], &AtomicBool::new(false), &AtomicU64::new(0)).await.is_err());
+        }).await;
+        assert!(!config.join("location-snapshots").exists());
+    }
     #[tokio::test]
     async fn loopback_locations_list_upload_hash_and_permission_denial() {
         use iroh::RelayMode;
