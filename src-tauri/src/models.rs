@@ -76,6 +76,8 @@ pub struct TransferUpdate {
     #[serde(default)]
     pub integrity: Vec<FileIntegrity>,
     #[serde(default)]
+    pub location_skipped: Option<u64>,
+    #[serde(default)]
     pub chat_transfer: Option<ChatTransferLink>,
     pub id: String,
     pub direction: Direction,
@@ -137,6 +139,7 @@ impl TransferUpdate {
         let file_count = file_names.len();
         TransferUpdate {
             integrity: vec![],
+            location_skipped: None,
             chat_transfer: None,
             id,
             direction,

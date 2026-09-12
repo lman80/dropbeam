@@ -581,6 +581,16 @@ mod unix {
             self.resolve(&parent.to_string_lossy())?;
             Ok((self.open_rel(parent, true)?, name))
         }
+        pub fn stat_entry(&self, raw: &str) -> Result<Option<(bool, u64)>> {
+            let rel = relative(raw)?;
+            // Descriptor-relative, O_NOFOLLOW at every component, just like ls.
+            let file = match self.open_rel(&rel, false) {
+                Ok(file) => file,
+                Err(_) => return Ok(None),
+            };
+            let meta = file.metadata()?;
+            Ok(Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 })))
+        }
         pub fn listing(&self, raw: &str) -> Result<Vec<Entry>> {
             self.resolve(raw)?;
             let dir = self.open_rel(&relative(raw)?, true)?;
@@ -660,11 +670,12 @@ mod unix {
                 } else { unlink(parent, name, false) }
             }
             let parent = child(&self.dir, std::ffi::OsStr::new(".dropbeam-staging"), true)?;
-            remove(&parent, std::ffi::OsStr::new(key))
+            remove(&parent, std::ffi::OsStr::new(key))?;
+            let _ = unlink(&self.dir, std::ffi::OsStr::new(".dropbeam-staging"), true);
+            Ok(())
         }
         pub fn gc_stages(&self) -> Result<()> {
-            // Every unleased generated directory is orphaned. Live uploads are
-            // retained even when a very slow transfer lasts longer than 24 hours.
+            // Keep interrupted transfers for a day; active leases always win.
             let Ok(parent) = child(&self.dir, std::ffi::OsStr::new(".dropbeam-staging"), true) else { return Ok(()); };
             names(&parent, |name| {
                 let Some(key) = name.to_str() else { return Ok(true); };
@@ -675,6 +686,7 @@ mod unix {
                     if leases.contains(&path) { return Ok(true); }
                     leases.push(path.clone()); UploadLease(path)
                 };
+                if !stage_expired(&self.path.join(".dropbeam-staging").join(key)) { return Ok(true); }
                 if let Err(e) = self.remove_stage(key) { log::warn!("Location staging GC: {e:#}"); }
                 Ok(true)
             })
@@ -808,6 +820,7 @@ mod unix {
 // Fail closed on platforms without descriptor-relative filesystem protection.
 #[cfg(not(unix))]
 impl Root {
+    pub fn stat_entry(&self, _: &str) -> Result<Option<(bool, u64)>> { bail!("Hosting unavailable") }
     pub fn listing(&self, _: &str) -> Result<Vec<Entry>> { bail!("Hosting unavailable") }
     pub fn new_folder(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
     pub fn rename_item(&self, _: &str, _: &str) -> Result<()> { bail!("Hosting unavailable") }
@@ -829,7 +842,7 @@ fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> 
     ensure!(request["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
     let kind = text(request, "kind")?;
     if kind == "locations.list" { return shared(config, endpoint); }
-    let access = if kind == "locations.ls" { Access::Read } else { Access::Manage };
+    let access = if matches!(kind, "locations.ls" | "locations.stat") { Access::Read } else { Access::Manage };
     let (mut l, friend) = authorize(config, endpoint, text(request, "id")?, access)?;
     limit_request(config, &friend, if matches!(access, Access::Read) { "ls" } else { "manage" }, now)?;
     let lock = operation(config, text(request, "id")?);
@@ -841,6 +854,20 @@ fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> 
     validate_root(config, Path::new(&l.path))?;
     let root = Root::for_location(&mut l)?;
     let result = match kind {
+        "locations.stat" => {
+            let paths = request["paths"].as_array().context("Missing stat paths")?;
+            ensure!(paths.len() <= 1000, "Too many stat paths");
+            let mut entries = Vec::new();
+            for path in paths {
+                let rel = path.as_str().context("Invalid stat path")?;
+                relative(rel)?;
+                let full = format!("{raw}/{rel}").trim_start_matches('/').to_string();
+                if let Some((is_dir, size)) = root.stat_entry(&full)? {
+                    entries.push(json!({"rel_path":rel,"size":size,"is_dir":is_dir}));
+                }
+            }
+            Ok(json!({"entries":entries}))
+        },
         "locations.ls" => cached_listing(config, &friend, &l.id, &root, raw, request),
         "locations.mkdir" => root.new_folder(raw).map(|_| json!({})),
         "locations.rename" => root.rename_item(raw, text(request, "to")?).map(|_| json!({})),
@@ -978,7 +1005,7 @@ fn cached_listing(config: &Path, friend: &str, location: &str, root: &Root, raw:
 
 /// Private staging avoids ever giving the legacy receive engine a NAS path.
 /// Stable across retries, including manual retries, and scoped by authenticated
-/// endpoint + location + destination + content manifest. A per-target lease prevents concurrent use.
+/// endpoint + location + destination + transfer id. A per-target lease prevents concurrent use.
 pub struct Upload {
     config: PathBuf, endpoint: String, target: Target, pub staging: PathBuf,
     pub destination: PathBuf, _lease: UploadLease, _friend: FriendLease, byte_cap: u64,
@@ -992,13 +1019,17 @@ impl Upload {
         ensure!(header["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
         let target: Target = serde_json::from_value(header["location"].clone())?;
         let (mut location, friend) = authorize(config, endpoint, &target.location_id, Access::Upload)?;
-        let friend_lease = FriendLease::acquire(config, &friend)?;
         validate_root(config, Path::new(&location.path))?;
         let root = Root::for_location(&mut location)?;
         let destination = root.resolve(&target.rel_path)?;
         ensure!(destination.is_dir(), "Upload destination must be a folder");
         let items = header["items"].as_array().context("Missing file manifest")?;
         ensure!(items.len() <= 100_000, "Too many files");
+        if header.get("location_total_items").is_some() || header.get("location_item_offset").is_some() {
+            let total = header["location_total_items"].as_u64().context("Invalid batch total")?;
+            let offset = header["location_item_offset"].as_u64().context("Invalid batch offset")?;
+            ensure!(total <= 100_000 && offset.checked_add(items.len() as u64).is_some_and(|end| end <= total), "Invalid upload batch shape");
+        }
         let dirs = header["dirs"].as_array().context("Missing directory manifest")?;
         ensure!(dirs.len() <= 100_000, "Too many directories");
         let manifest_total = items.iter().try_fold(0u64, |total, item| -> Result<u64> {
@@ -1021,14 +1052,23 @@ impl Upload {
         use sha2::{Digest, Sha256};
         let id = text(header, "location_transfer")?;
         ensure!(!id.is_empty() && id.len() <= 100, "Invalid transfer id");
-        let key = hex::encode(Sha256::digest(serde_json::to_vec(&(endpoint, &target, items, dirs))?));
+        let key = hex::encode(Sha256::digest(serde_json::to_vec(&(endpoint, &target.location_id, &target.rel_path, id))?));
         let staging = if header["location_hash_v"] == 2 { root.path.join(".dropbeam-staging").join(&key) }
             else { config.join("location-transfers").join(&key) };
-        let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
-        ensure!(!leases.contains(&staging), "This location upload is already in progress; retry shortly");
-        leases.push(staging.clone());
-        drop(leases);
-        let lease = UploadLease(staging.clone());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let lease = loop {
+            {
+                let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
+                if !leases.contains(&staging) {
+                    leases.push(staging.clone());
+                    break UploadLease(staging.clone());
+                }
+            }
+            ensure!(Instant::now() < deadline, "This location upload is already in progress; retry shortly");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        // Wait for the previous same-key handler before consuming a friend slot.
+        let friend_lease = FriendLease::acquire(config, &friend)?;
         if header["location_hash_v"] == 2 { root.create_stage(&key)?; } else { private_directory(&staging)?; }
         let upload = Self { config: config.into(), endpoint: endpoint.into(), target, destination, staging, _lease: lease, _friend: friend_lease, byte_cap: location.byte_cap, root, location };
         let retained = stage_bytes(&upload.staging, &mut 200_000)?;
@@ -1097,12 +1137,19 @@ impl Upload {
             let raw = format!("{}/{}", self.target.rel_path, dir.as_str().context("Invalid directory")?).trim_start_matches('/').to_string();
             publish(&mut || root.ensure_dirs(&raw))?;
         }
-        self.cleanup();
+        let offset = header["location_item_offset"].as_u64().unwrap_or(0);
+        let total = header["location_total_items"].as_u64().unwrap_or(items.len() as u64);
+        if offset + items.len() as u64 == total { self.cleanup(); }
         Ok(out)
     }
 }
 
-impl Drop for Upload { fn drop(&mut self) { self.cleanup(); } }
+// Failed pushes retain partials and integrity sidecars for the next attempt.
+
+fn stage_expired(path: &Path) -> bool {
+    fs::symlink_metadata(path).and_then(|m| m.modified()).ok()
+        .and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= Duration::from_secs(24 * 60 * 60))
+}
 
 /// Only our private cache directories are eligible. Never traverse or GC NAS trash.
 pub fn gc(config: &Path) -> Result<()> {
@@ -1129,6 +1176,7 @@ pub fn gc(config: &Path) -> Result<()> {
                 if leases.contains(&path) { continue; }
                 leases.push(path.clone()); UploadLease(path.clone())
             };
+            if !stage_expired(&path) { continue; }
             let result = (|| -> Result<()> {
                 let kind = entry.file_type()?;
                 if kind.is_dir() { fs::remove_dir_all(&path)?; }
@@ -1154,7 +1202,7 @@ pub fn spawn_gc(config: PathBuf) {
 pub fn verified_digests<'a>(header: &Value, rows: &'a [crate::models::FileIntegrity]) -> Result<Vec<&'a str>> {
     ensure!(header["integrity_v"] == 1, "Upload not verified: integrity negotiation required");
     let items = header["items"].as_array().context("Upload not verified: missing manifest")?;
-    let offset = header["chatTransfer"]["itemOffset"].as_u64().unwrap_or(0);
+    let offset = header["location_item_offset"].as_u64().or_else(|| header["chatTransfer"]["itemOffset"].as_u64()).unwrap_or(0);
     items.iter().enumerate().map(|(i, item)| {
         let row = rows.iter().find(|r| r.index == offset + i as u64 && Some(r.name.as_str()) == item["name"].as_str())
             .context("Upload not verified: missing verification row")?;
@@ -1346,6 +1394,54 @@ mod tests {
         FORCE_HARD_LINK.with(|v| v.set(false));
         SPACE_OVERRIDE.with(|v| *v.borrow_mut() = None);
     }
+    fn age_stage(path: &Path) {
+        fs::File::open(path).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600)).unwrap();
+    }
+    #[test]
+    fn stat_uses_listing_auth_rate_limit_and_safe_paths() {
+        let mut f = Fixture::new();
+        fs::create_dir_all(f.root.join("folder/empty")).unwrap();
+        fs::write(f.root.join("folder/file"), b"data").unwrap();
+        std::os::unix::fs::symlink(&f.config, f.root.join("escape")).unwrap();
+        let mut request = f.req("stat", "");
+        request["paths"] = json!(["folder/file", "folder/empty", "absent", "escape/friends.json"]);
+        let now = Instant::now();
+        error_message(dispatch_at(&f.config, "stranger", &request, now), "Location access denied");
+        let reply = dispatch_at(&f.config, "owner-device", &request, now).unwrap();
+        assert_eq!(reply["entries"], json!([
+            {"rel_path":"folder/file","is_dir":false,"size":4},
+            {"rel_path":"folder/empty","is_dir":true,"size":0}]));
+        for _ in 0..9 { dispatch_at(&f.config, "owner-device", &f.req("ls", ""), now).unwrap(); }
+        error_kind(dispatch_at(&f.config, "owner-device", &request, now), LocationError::RateLimit);
+        request["paths"] = json!(["../config"]);
+        assert!(dispatch_at(&f.config, "owner-device", &request, now + Duration::from_secs(1)).is_err());
+        f.location.friend_ids.clear();
+        save(&f.config, Some(f.location.clone()), None).unwrap();
+        error_message(dispatch(&f.config, "owner-device", &request), "Location access denied");
+    }
+    #[test]
+    fn upload_transfer_key_survives_push_changes_and_waits_for_previous_lease() {
+        let f = Fixture::new();
+        let header = json!({"locations_v":VERSION,"location_hash_v":2,"integrity_v":1,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":"stable",
+            "location_total_items":3,"location_item_offset":0,
+            "items":[{"name":"first","size":4}],"dirs":["empty"],"total":4});
+        let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+        let staging = upload.staging.clone();
+        fs::write(staging.join("partial-sidecar"), b"keep").unwrap();
+        let mut second = header.clone();
+        second["items"][0]["name"] = json!("second"); second["dirs"] = json!([]); second["location_item_offset"] = json!(1);
+        let config = f.config.clone();
+        let worker = std::thread::spawn(move || Upload::prepare(&config, "owner-device", &second).unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+        drop(upload);
+        let retry = worker.join().unwrap();
+        assert_eq!(retry.staging, staging);
+        assert_eq!(fs::read(staging.join("partial-sidecar")).unwrap(), b"keep");
+        drop(retry);
+        let mut different = header.clone(); different["location_transfer"] = json!("different");
+        assert_ne!(Upload::prepare(&f.config, "owner-device", &different).unwrap().staging, staging);
+    }
     #[test]
     fn failed_root_stage_and_gc_never_follow_symlinks_or_touch_visible_files() {
         let f = Fixture::new();
@@ -1358,11 +1454,13 @@ mod tests {
         std::os::unix::fs::symlink(&f.root, staging.join("escape")).unwrap();
         assert!(upload.finish(&header, vec![]).is_err());
         drop(upload);
-        assert!(!staging.exists());
+        assert!(staging.exists());
         assert_eq!(fs::read(f.root.join("keep")).unwrap(), b"keep");
         assert!(!f.config.join("location-transfers").exists());
-        fs::create_dir(&staging).unwrap();
         fs::write(staging.join("orphan"), b"old").unwrap();
+        gc(&f.config).unwrap();
+        assert!(staging.exists(), "recent failed push must survive GC");
+        age_stage(&staging);
         gc(&f.config).unwrap();
         assert!(!staging.exists());
         assert!(f.root.join("keep").exists());
@@ -1551,7 +1649,7 @@ mod tests {
         error_message(upload.finish_progress(&header, vec![source.clone()], &cancel, |_| { cancel.store(true, std::sync::atomic::Ordering::SeqCst); }), "canceled");
         assert!(!f.root.join("canceled.bin").exists());
         drop(upload);
-        let mut retry = header.clone(); retry["location_transfer"] = json!(uuid::Uuid::new_v4().to_string());
+        let retry = header.clone();
         let upload = Upload::prepare(&f.config, "owner-device", &retry).unwrap();
         assert_eq!(upload.staging, staging);
         upload.finish(&retry, vec![source]).unwrap();
@@ -1707,6 +1805,8 @@ mod tests {
         error_kind(FriendLease::acquire(&f.config, &f.friend), LocationError::Busy);
         gc(&f.config).unwrap(); assert!(a.staging.exists()); assert!(b.staging.exists());
         let orphan = a.staging.clone(); drop(a); gc(&f.config).unwrap();
+        assert!(orphan.exists());
+        age_stage(&orphan); gc(&f.config).unwrap();
         assert!(!orphan.exists()); assert!(b.staging.exists());
         let root = Root::open(&f.root).unwrap(); root.new_folder("keep").unwrap();
         let trash = root.trash("keep").unwrap(); gc(&f.config).unwrap(); assert!(f.root.join(trash).is_dir());

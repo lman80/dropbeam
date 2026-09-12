@@ -334,6 +334,7 @@ fn received_item_index(item_offset: u64, index: usize) -> u64 {
     item_offset + index as u64
 }
 fn normalized_receive_offset(header: &serde_json::Value) -> Result<u64> {
+    if let Some(offset) = header["location_item_offset"].as_u64() { return Ok(offset); }
     if header.get("chatTransfer").is_none() { return Ok(0); }
     incoming_chat_link(header, "").map(|link| link.item_offset)
         .context("invalid chat batch manifest")
@@ -1006,25 +1007,31 @@ fn dial_addr(id: iroh::EndpointId) -> iroh::EndpointAddr {
     iroh::EndpointAddr::from(id).with_addrs(cached.into_iter().map(iroh::TransportAddr::Ip))
 }
 
-/// Is this `remote_addr` Debug string a private/link-local IP (i.e. same LAN)?
-/// `PathInfo::remote_addr()` Debug-formats as e.g. `Ip(192.168.1.5:54321)` (seen in
-/// our PERF logs). Best-effort string match; an unrecognized format degrades to
-/// "not LAN" → labeled DIRECT, which is still truthful for a non-relay path.
+static LOCAL_SUBNETS: std::sync::RwLock<Vec<netwatch::interfaces::IpNet>> = std::sync::RwLock::new(Vec::new());
+
+fn on_local_subnet(peer: std::net::IpAddr, subnets: &[netwatch::interfaces::IpNet]) -> bool {
+    use netwatch::interfaces::IpNet;
+    // Tailscale/CGNAT is always Direct, even if its interface advertises /10.
+    if let std::net::IpAddr::V4(ip) = peer {
+        if u32::from(ip) & 0xffc0_0000 == 0x6440_0000 { return false; }
+    }
+    subnets.iter().any(|subnet| match (subnet, peer) {
+        (IpNet::V4(net), std::net::IpAddr::V4(ip)) => net.contains(&ip),
+        (IpNet::V6 { net, .. }, std::net::IpAddr::V6(ip)) => net.contains(&ip),
+        _ => false,
+    })
+}
+
 fn addr_is_lan(dbg: &str) -> bool {
-    dbg.contains("Ip(10.")
-        || dbg.contains("Ip(192.168.")
-        || dbg.contains("Ip(127.")
-        || dbg.contains("Ip(169.254.") // link-local
-        || dbg.contains("Ip([fe80") // IPv6 link-local
-        || dbg.contains("Ip([::1]") // IPv6 loopback
-        || (dbg.contains("Ip(172.")
-            && dbg
-                .split("Ip(172.")
-                .nth(1)
-                .and_then(|s| s.split('.').next())
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|o| (16..=31).contains(&o)) // 172.16/12
-                .unwrap_or(false))
+    let Some(addr) = dbg.strip_prefix("Ip(").and_then(|s| s.strip_suffix(')'))
+        .and_then(|s| s.parse::<std::net::SocketAddr>().ok()) else { return false; };
+    on_local_subnet(addr.ip(), &LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner()))
+}
+
+async fn refresh_local_subnets() {
+    let state = netwatch::interfaces::State::new().await;
+    let subnets = state.interfaces.values().filter(|i| i.is_up()).flat_map(|i| i.addrs()).collect();
+    *LOCAL_SUBNETS.write().unwrap_or_else(|p| p.into_inner()) = subnets;
 }
 
 /// Which channel the live connection is using: relayed (slow), a direct LAN path,
@@ -1314,6 +1321,13 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
 /// Build and bind the endpoint with our persistent identity. Uses iroh's default
 /// (n0) relays + discovery for now; Phase 5 swaps in self-hosted infrastructure.
 pub async fn start(config_dir: &Path) -> Result<Endpoint> {
+    refresh_local_subnets().await;
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            refresh_local_subnets().await;
+        }
+    });
     let secret = load_or_create_secret(config_dir);
     // Seed the known-address cache so the FIRST dial after a relaunch already
     // carries every peer address that worked before.
@@ -1846,7 +1860,7 @@ async fn serve_stream_inner(
                 })
                 .unwrap_or_default();
             let id = uuid::Uuid::new_v4().to_string();
-            let mut item_offset = 0;
+            let mut item_offset = normalized_receive_offset(&req)?;
             if req.get("chatTransfer").is_some() {
                 let link = incoming_chat_link(&req, &who).ok_or_else(|| anyhow::anyhow!("invalid chat batch manifest"))?;
                 item_offset = link.item_offset;
@@ -3262,6 +3276,85 @@ pub fn send_to_friend(
     send_friend_inner(app, state, friend_name, endpoint_id, paths, chat_transfer_id, chat_attempt, None)
 }
 
+type SendItem = (PathBuf, String, u64, u64);
+#[derive(Clone)]
+struct LocationPush {
+    items: Vec<SendItem>,
+    dirs: Vec<String>,
+    total_items: u64,
+    offset: u64,
+}
+tokio::task_local! { static LOCATION_PUSH: LocationPush; }
+
+async fn location_stat(conn: &Connection, target: &crate::locations::Target, paths: &[String])
+    -> Result<std::collections::HashMap<String, (bool, u64)>> {
+    let mut entries = std::collections::HashMap::new();
+    for (i, paths) in paths.chunks(1000).enumerate() {
+        if i > 0 { tokio::time::sleep(Duration::from_millis(120)).await; }
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &serde_json::json!({"kind":"locations.stat", "locations_v":crate::locations::VERSION,
+            "id":target.location_id,"rel_path":target.rel_path,"paths":paths})).await?;
+        send.finish()?;
+        let reply = tokio::time::timeout(Duration::from_secs(45), read_frame_cap(&mut recv, 2_000_000)).await??;
+        anyhow::ensure!(reply["ok"] == true, "{}", reply["error"].as_str().unwrap_or("Location stat failed"));
+        for entry in reply["data"]["entries"].as_array().context("Invalid stat response")? {
+            entries.insert(entry["rel_path"].as_str().context("Invalid stat path")?.to_string(),
+                (entry["is_dir"].as_bool().context("Invalid stat type")?, entry["size"].as_u64().context("Invalid stat size")?));
+        }
+    }
+    Ok(entries)
+}
+
+struct LocationBatch {
+    items: Vec<SendItem>,
+    dirs: Vec<String>,
+    next_file: usize,
+    dirs_pending: bool,
+}
+impl LocationBatch {
+    async fn send_attempt(&mut self, conn: &Connection, location: &LocationSend, cancel: &AtomicBool,
+        name: &str, engaged: &AtomicBool, activity: &AtomicU64, state: Option<&IrohState>,
+        progress: impl Fn(u64, u64), skipped: impl Fn(usize)) -> Result<u64> {
+        require_locations(conn).await?;
+        let stat_paths: Vec<_> = self.items.iter().map(|i| i.1.clone()).chain(self.dirs.iter().cloned()).collect();
+        let existing = location_stat(conn, location.target.as_ref().context("Missing upload target")?, &stat_paths).await?;
+        let landed: Vec<_> = self.items.iter().map(|item| existing.get(&item.1) == Some(&(false, item.2))).collect();
+        skipped(landed.iter().filter(|&&v| v).count());
+        let total: u64 = self.items.iter().map(|i| i.2).sum();
+        let mut dirs: Vec<_> = if self.dirs_pending { self.dirs.iter()
+            .filter(|d| !existing.get(*d).is_some_and(|e| e.0)).cloned().collect() } else { vec![] };
+        let mut sent_push = false;
+        while self.next_file < self.items.len() {
+            let i = self.next_file;
+            if landed[i] { self.next_file += 1; continue; }
+            anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+            let base: u64 = self.items[..i].iter().map(|i| i.2).sum();
+            let push = LocationPush { items: vec![self.items[i].clone()], dirs: dirs.clone(),
+                total_items: self.items.len() as u64, offset: i as u64 };
+            engaged.store(false, Ordering::SeqCst);
+            integrity::ITEM_OFFSET.scope(i as u64, LOCATION_PUSH.scope(push,
+                send_files_linked(conn, &[], cancel, |d, _| progress(base + d, total), name,
+                    engaged, activity, state, None, Some(location)))).await?;
+            self.next_file += 1;
+            self.dirs_pending = false;
+            dirs.clear();
+            sent_push = true;
+        }
+        // A trailing skipped file (or an all-skipped/empty batch) still needs
+        // a terminal push to publish dirs and remove retained staging.
+        if !sent_push || landed.last() == Some(&true) {
+            let push = LocationPush { items: vec![], dirs, total_items: self.items.len() as u64,
+                offset: self.items.len() as u64 };
+            integrity::ITEM_OFFSET.scope(push.offset, LOCATION_PUSH.scope(push,
+                send_files_linked(conn, &[], cancel, |_, _| progress(total, total), name,
+                    engaged, activity, state, None, Some(location)))).await?;
+            self.dirs_pending = false;
+        }
+        progress(total, total);
+        Ok(total)
+    }
+}
+
 pub struct LocationSend {
     pub target: Option<crate::locations::Target>,
     pub transfer_id: String,
@@ -3301,6 +3394,9 @@ fn send_friend_inner(
         next_index += items.iter().filter(|item| item.0 == *path || item.0.starts_with(path)).count() as u64;
         offset
     }).collect();
+    let upload_items = items.clone();
+    let upload_dirs = directories.clone();
+    let is_upload = location.as_ref().is_some_and(|l| l.target.is_some());
     let manifest: Vec<crate::models::ChatFile> = items.into_iter()
         .map(|(_, name, size, _)| crate::models::ChatFile { name, size }).collect();
     let mut chat_link = crate::models::ChatTransferLink { id: chat_id.clone(), attempt: generation, manifest, directories, batch_state: None, bytes_done: 0, completed_files: vec![], completed_paths: Default::default(), item_offset: 0, offset: 0, total, last: true };
@@ -3356,6 +3452,7 @@ fn send_friend_inner(
             // index of the first file NOT yet confirmed delivered. Survives across
             // retry attempts so a reconnect never re-sends finished files.
             let mut next_file: usize = 0;
+            let mut upload_batch = LocationBatch { items: upload_items, dirs: upload_dirs, next_file: 0, dirs_pending: true };
             let split = location.as_ref().is_none_or(|l| l.snapshot.is_none()) && pathbufs.len() > 1
                 && pathbufs.iter().any(|p| {
                     std::fs::metadata(p)
@@ -3612,7 +3709,17 @@ fn send_friend_inner(
                 // streams + the {hold} handshake + per-file resume, and files
                 // confirmed in earlier attempts are never re-sent (no duplicates).
                 // Small-only batches keep the proven one-push classic body.
-                let outcome = if split {
+                let outcome = if is_upload {
+                    upload_batch.send_attempt(&conn, location.as_ref().unwrap(), &cancel,
+                        &my_name, &engaged, &transport_activity, Some(&state), |d, t| cb(d, t), |count| {
+                            let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            notice.state = TransferState::Transferring;
+                            notice.bytes_total = total;
+                            notice.friend_name = Some(friend_name.clone());
+                            notice.location_skipped = Some(count as u64);
+                            emit(&app, &notice);
+                        }).await
+                } else if split {
                     let mut res: Result<u64> = Ok(0);
                     while next_file < pathbufs.len() {
                         if cancel.load(Ordering::SeqCst) {
@@ -3650,7 +3757,7 @@ fn send_friend_inner(
                     send_files_linked(&conn, &pathbufs, &cancel, move |d, t| c(d, t), &my_name, &engaged, &transport_activity, Some(&state), if location.is_none() { Some(&chat_link) } else { None }, location.as_ref())
                         .await
                 };
-                let was_engaged = engaged.load(Ordering::SeqCst);
+                let was_engaged = is_upload || engaged.load(Ordering::SeqCst);
                 watchdog.abort();
                 match outcome {
                     Ok(_) => {
@@ -6518,7 +6625,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
         if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(path)?; }
         if let Some(hash) = hash {
             hash.finish();
-            hashes.as_mut().unwrap().push(integrity::FileHash { sha256: plain.map(|h| hex::encode(h.finish())), leaves: integrity::snapshot_leaves(&leaves), index: if location_hash { index as u64 } else { integrity::item_offset() + index as u64 }, name: name.clone(), size: *size, digest: integrity::combine(*size, &leaves)? });
+            hashes.as_mut().unwrap().push(integrity::FileHash { sha256: plain.map(|h| hex::encode(h.finish())), leaves: integrity::snapshot_leaves(&leaves), index: integrity::item_offset() + index as u64, name: name.clone(), size: *size, digest: integrity::combine(*size, &leaves)? });
         }
     }
     Ok(sent)
@@ -6704,7 +6811,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
     if negotiated {
         on_progress(got, total);
     }
-    if integrity::enabled(header) { integrity::verify_received_indexed(recv, &hashes, cancel, header.get("chatTransfer").is_some()).await?; }
+    if integrity::enabled(header) { integrity::verify_received_indexed(recv, &hashes, cancel, header.get("chatTransfer").is_some() || header.get("location_item_offset").is_some()).await?; }
     Ok(out)
 }
 
@@ -6786,7 +6893,10 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     let known_capable = friend_state.and_then(|s| s.progress_version(&peer_id)) == Some(PROGRESS_V);
     if location.is_some() { require_locations(conn).await?; }
     let (mut send, mut recv) = conn.open_bi().await?;
-    let (items, dirs, total) = if let Some(snapshot) = location.and_then(|l| l.snapshot.as_ref()) {
+    let push = LOCATION_PUSH.try_with(Clone::clone).ok();
+    let (items, dirs, total) = if let Some(push) = &push {
+        (push.items.clone(), push.dirs.clone(), push.items.iter().map(|i| i.2).sum())
+    } else if let Some(snapshot) = location.and_then(|l| l.snapshot.as_ref()) {
         snapshot.check_access(&peer_id)?;
         let source = &snapshot.source;
         (source.items.clone(), source.dirs.clone(), source.items.iter().map(|i| i.2).sum())
@@ -6806,6 +6916,10 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
         if let Some(target) = &location.target { header["location"] = serde_json::to_value(target)?; }
         else { header["location_download"] = serde_json::json!(true); }
         header["location_hash_v"] = serde_json::json!(2);
+        if location.target.is_some() {
+            header["location_total_items"] = serde_json::json!(push.as_ref().map_or(items.len() as u64, |p| p.total_items));
+            header["location_item_offset"] = serde_json::json!(push.as_ref().map_or(0, |p| p.offset));
+        }
     }
     if let Some(snapshot) = location.and_then(|l| l.snapshot.as_ref()) { snapshot.check_access(&peer_id)?; }
     #[cfg(test)]
@@ -6916,8 +7030,8 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                                 integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, activity),
                                 location_hashes(vec![items[0].0.clone()], cancel, activity)
                             )?;
-                            // Location headers have no chat batch offset.
-                            rows[0].index = 0;
+                            // Preserve the frozen upload batch identity across reconnects.
+                            rows[0].index = integrity::item_offset();
                             rows[0].sha256 = Some(digests[0].clone());
                             rows
                         } else { integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, activity).await? }
@@ -7687,13 +7801,19 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
 
 async fn receive_location_headless(conn: &Connection, send: &mut SendStream, recv: &mut RecvStream,
     header: &serde_json::Value, upload: Arc<crate::locations::Upload>, cancel: &AtomicBool) -> Result<()> {
+    receive_location_headless_progress(conn, send, recv, header, upload, cancel, |_, _| {}).await
+}
+
+async fn receive_location_headless_progress<F: Fn(u64, u64)>(conn: &Connection, send: &mut SendStream,
+    recv: &mut RecvStream, header: &serde_json::Value, upload: Arc<crate::locations::Upload>,
+    cancel: &AtomicBool, progress: F) -> Result<()> {
     // The normal negotiated engine owns resume and body framing; defer its
     // terminal receipt until publication on the location has succeeded.
     let mut body_header = header.clone();
     body_header.as_object_mut().unwrap().remove("progress_v");
     let result = async {
     let paths = read_files_negotiated(conn, send, recv, &body_header, &upload.staging,
-        cancel, &AtomicBool::new(false), |_, _| {}).await?;
+        cancel, &AtomicBool::new(false), progress).await?;
     let finish_header = header.clone();
     let rows = integrity::reports();
     tokio::task::spawn_blocking(move || upload.finish_verified_progress(&finish_header, paths, &rows, &AtomicBool::new(false), |_| {})).await??;
@@ -7715,6 +7835,18 @@ async fn receive_location_headless(conn: &Connection, send: &mut SendStream, rec
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_label_requires_our_actual_subnet_and_excludes_tailscale() {
+        use netwatch::interfaces::IpNet;
+        let subnets = [IpNet::V4("192.168.1.8/24".parse().unwrap()),
+            IpNet::V4("10.2.4.8/23".parse().unwrap()), IpNet::V4("100.90.1.2/10".parse().unwrap())];
+        for (peer, expected) in [("192.168.1.9", true), ("192.168.2.9", false),
+            ("10.2.5.9", true), ("10.2.6.9", false), ("172.16.0.1", false),
+            ("100.100.1.1", false), ("8.8.8.8", false), ("127.0.0.1", false)] {
+            assert_eq!(super::on_local_subnet(peer.parse().unwrap(), &subnets), expected, "{peer}");
+        }
+        assert!(!super::on_local_subnet("192.168.1.9".parse().unwrap(), &[]));
+    }
     #[test]
     fn friend_connection_rotation_decision() {
         use crate::models::Locality;

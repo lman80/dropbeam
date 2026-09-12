@@ -28,6 +28,7 @@ export function normalizeTransfer(u: TransferUpdate, prev?: TransferUpdate): Tra
   return {
     ...u,
     integrity: integrityRows(u.integrity),
+    locationSkipped: u.locationSkipped ?? prev?.locationSkipped,
     fileNames: strings(u.fileNames ?? prev?.fileNames ?? []),
     fileCount: nonnegative(u.fileCount),
     bytesTotal,

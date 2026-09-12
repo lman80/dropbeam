@@ -146,6 +146,7 @@ dependencies = [
  "libc",
  "log",
  "n0-future",
+ "netwatch",
  "noq-proto",
  "notify",
  "objc2",

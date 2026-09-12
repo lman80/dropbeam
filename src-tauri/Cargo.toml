@@ -34,6 +34,7 @@ members = ["labtool"]
 tauri-build = { version = "2.6.2", features = [] }
 
 [dependencies]
+netwatch = "0.16"
 # Already cached/locked through Tauri; match its asset URL and Range decoding.
 percent-encoding = "2"
 http-range = "0.1"

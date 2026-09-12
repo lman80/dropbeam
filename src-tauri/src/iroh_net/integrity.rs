@@ -295,7 +295,7 @@ pub async fn receive_parallel<F: Fn(u64, u64)>(conn: &Connection, finalize: Fina
     if let Some(rc) = &resume {
         revoke_sidecar(&rc.side)?;
     }
-    if let Err(e) = verify_received_indexed(recv, &[hash], cancel, header.get("chatTransfer").is_some()).await {
+    if let Err(e) = verify_received_indexed(recv, &[hash], cancel, header.get("chatTransfer").is_some() || header.get("location_item_offset").is_some()).await {
         if let Some(rc) = &resume {
             let coverage = e.downcast_ref::<Mismatch>().map(|m| m.matched.clone()).unwrap_or_default();
             save_sidecar_checked(&rc.side, &PartialSidecar { v: 1, fp: rc.fp.clone(), total, coverage })

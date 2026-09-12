@@ -113,7 +113,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             {title(t)}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 3 }}>
-            <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>{statusLabel(t)}</span>
+            <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>{statusLabel(t)}{t.locationSkipped ? ` · ${t.locationSkipped} ${t.locationSkipped === 1 ? 'file' : 'files'} already on the NAS` : ''}</span>
             {t.connDetail ? (
               <ConnInspector detail={t.connDetail} compact />
             ) : (

@@ -51,6 +51,7 @@ export interface FileIntegrity {
 }
 
 export interface TransferUpdate {
+  locationSkipped?: number | null
   integrity?: FileIntegrity[]
   chatTransfer?: {
     id: string
