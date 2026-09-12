@@ -1342,7 +1342,7 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // gateways) plus address churn exhausted the default 13 path ids, producing
     // MaxPathIdReached and permanently relay-only connections. Both peers need
     // headroom; iroh 0.98.2 also defaults to only 12 remote NAT addresses.
-    tcfg = tcfg.max_concurrent_multipath_paths(64u32);
+    tcfg = tcfg.max_concurrent_multipath_paths(256u32);
     tcfg = tcfg.set_max_remote_nat_traversal_addresses(32u8);
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);

@@ -130,3 +130,7 @@ codegen-units = 16
 debug = 1
 split-debuginfo = "packed"
 strip = false
+
+# Vendored with a one-function patch: Linux interface-name filter (see vendor/netwatch/src/netmon/linux.rs).
+[patch.crates-io]
+netwatch = { path = "vendor/netwatch" }

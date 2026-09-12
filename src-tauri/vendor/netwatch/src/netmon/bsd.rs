@@ -1,0 +1,137 @@
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use libc::{RTAX_DST, RTAX_IFP};
+use n0_error::stack_error;
+use n0_future::{
+    task::AbortOnDropHandle,
+    time::{self, Duration},
+};
+use tokio::{io::AsyncReadExt, sync::mpsc};
+use tracing::{trace, warn};
+
+use super::actor::NetworkMessage;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+use crate::interfaces::bsd::{RTAX_DST, RTAX_IFP};
+use crate::{interfaces::bsd::WireMessage, ip::is_link_local};
+
+#[derive(Debug)]
+pub(super) struct RouteMonitor {
+    _handle: AbortOnDropHandle<()>,
+}
+
+#[stack_error(derive, add_meta, from_sources, std_sources)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("IO")]
+    Io { source: std::io::Error },
+}
+
+fn create_socket() -> std::io::Result<tokio::net::UnixStream> {
+    let socket = socket2::Socket::new(libc::AF_ROUTE.into(), socket2::Type::RAW, None)?;
+    socket.set_nonblocking(true)?;
+    let socket_std: std::os::unix::net::UnixStream = socket.into();
+    let socket: tokio::net::UnixStream = socket_std.try_into()?;
+
+    trace!("AF_ROUTE socket bound");
+
+    Ok(socket)
+}
+
+impl RouteMonitor {
+    pub(super) fn new(sender: mpsc::Sender<NetworkMessage>) -> Result<Self, Error> {
+        let mut socket = create_socket()?;
+        let handle = tokio::task::spawn(async move {
+            trace!("AF_ROUTE monitor started");
+
+            let mut buffer = vec![0u8; 2048];
+            let mut backoff = Duration::from_secs(1);
+            const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+            loop {
+                match socket.read(&mut buffer).await {
+                    Ok(read) => {
+                        // Grow buffer if the read filled it, up to 64KiB
+                        if read == buffer.len() && buffer.len() < 65536 {
+                            buffer.resize(buffer.len() * 2, 0);
+                        }
+                        backoff = Duration::from_secs(1);
+                        trace!("AF_ROUTE: read {} bytes", read);
+                        match super::super::interfaces::bsd::parse_rib(
+                            libc::NET_RT_DUMP,
+                            &buffer[..read],
+                        ) {
+                            Ok(msgs) => {
+                                if contains_interesting_message(&msgs)
+                                    && sender.send(NetworkMessage::Change).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                warn!("AF_ROUTE: failed to parse rib: {:?}", err);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!("AF_ROUTE: error reading: {:?}", err);
+                        time::sleep(backoff).await;
+                        match create_socket() {
+                            Ok(new_socket) => {
+                                socket = new_socket;
+                                backoff = Duration::from_secs(1);
+                            }
+                            Err(err) => {
+                                warn!("AF_ROUTE: unable to recreate socket: {:?}", err);
+                                backoff = (backoff * 2).min(MAX_BACKOFF);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(RouteMonitor {
+            _handle: AbortOnDropHandle::new(handle),
+        })
+    }
+}
+
+fn contains_interesting_message(msgs: &[WireMessage]) -> bool {
+    msgs.iter().any(is_interesting_message)
+}
+
+pub(super) fn is_interesting_message(msg: &WireMessage) -> bool {
+    match msg {
+        WireMessage::InterfaceMulticastAddr(_) => true,
+        WireMessage::Interface(_) => false,
+        WireMessage::InterfaceAddr(msg) => {
+            if let Some(addr) = msg.addrs.get(RTAX_IFP as usize)
+                && let Some(name) = addr.name()
+                && !is_interesting_interface(name)
+            {
+                return false;
+            }
+            true
+        }
+        WireMessage::Route(msg) => {
+            // Ignore local unicast
+            if let Some(addr) = msg.addrs.get(RTAX_DST as usize)
+                && let Some(ip) = addr.ip()
+                && is_link_local(ip)
+            {
+                return false;
+            }
+
+            true
+        }
+        WireMessage::InterfaceAnnounce(_) => false,
+    }
+}
+
+pub(crate) fn is_interesting_interface(name: &str) -> bool {
+    let base_name = name.trim_end_matches("0123456789");
+    if base_name == "llw" || base_name == "awdl" || base_name == "ipsec" {
+        return false;
+    }
+
+    true
+}
