@@ -70,6 +70,31 @@ fn frontend_log(msg: String) {
 
 /// First argument (after the executable) that points to an existing file — the
 /// path the "Send with DropBeam" right-click menu passes (`DropBeam.exe "%1"`).
+/// `--location-upload '{"friendId":..,"locationId":..,"relPath":"..","paths":[..]}'`
+/// queues an upload into a friend's shared Location from a script or shell.
+fn location_upload_from_args(argv: &[String]) -> Option<(String, locations::Target, Vec<String>)> {
+    let i = argv.iter().position(|a| a == "--location-upload")?;
+    let v: serde_json::Value = serde_json::from_str(argv.get(i + 1)?).ok()?;
+    let friend = v["friendId"].as_str()?.to_owned();
+    let target = locations::Target { location_id: v["locationId"].as_str()?.to_owned(), rel_path: v["relPath"].as_str().unwrap_or("").to_owned() };
+    let paths: Vec<String> = v["paths"].as_array()?.iter().filter_map(|p| p.as_str().map(str::to_owned)).collect();
+    (!paths.is_empty()).then_some((friend, target, paths))
+}
+
+#[cfg(test)]
+mod launch_arg_tests {
+    #[test]
+    fn location_upload_arg_parses_and_rejects_junk() {
+        let argv = vec!["DropBeam".to_string(), "--location-upload".into(),
+            r#"{"friendId":"f1","locationId":"l1","relPath":"","paths":["/tmp/a","/tmp/b"]}"#.into()];
+        let (friend, target, paths) = super::location_upload_from_args(&argv).unwrap();
+        assert_eq!((friend.as_str(), target.location_id.as_str(), target.rel_path.as_str()), ("f1", "l1", ""));
+        assert_eq!(paths, vec!["/tmp/a", "/tmp/b"]);
+        assert!(super::location_upload_from_args(&["DropBeam".to_string(), "--location-upload".into(), "{}".into()]).is_none());
+        assert!(super::location_upload_from_args(&["DropBeam".to_string(), "/tmp/x".into()]).is_none());
+    }
+}
+
 fn file_from_args(argv: &[String]) -> Option<String> {
     argv.iter()
         .skip(1)
@@ -190,6 +215,20 @@ pub fn run() {
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
+        }
+        if let Some(req) = location_upload_from_args(&argv) {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri::Manager;
+                let state = app.state::<Arc<AppState>>().inner().clone();
+                let iroh = app.state::<Arc<iroh_net::IrohState>>().inner().clone();
+                let (friend, target, paths) = req;
+                match commands::start_location_upload(app.clone(), state, iroh, friend, target, paths).await {
+                    Ok(t) => log::info!("launch-arg location upload started: {}", t.id),
+                    Err(e) => log::warn!("launch-arg location upload refused: {e}"),
+                }
+            });
+            return;
         }
         if let Some(f) = file_from_args(&argv) {
             *LAUNCH_FILE.lock().unwrap() = Some(f.clone());

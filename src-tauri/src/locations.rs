@@ -1069,7 +1069,10 @@ impl Upload {
         };
         // Wait for the previous same-key handler before consuming a friend slot.
         let friend_lease = FriendLease::acquire(config, &friend)?;
-        if header["location_hash_v"] == 2 { root.create_stage(&key)?; } else { private_directory(&staging)?; }
+        if header["location_hash_v"] == 2 {
+            root.create_stage(&key)?;
+            adopt_abandoned_partials(&root.path.join(".dropbeam-staging"), &staging, endpoint, items);
+        } else { private_directory(&staging)?; }
         let upload = Self { config: config.into(), endpoint: endpoint.into(), target, destination, staging, _lease: lease, _friend: friend_lease, byte_cap: location.byte_cap, root, location };
         let retained = stage_bytes(&upload.staging, &mut 200_000)?;
         Budget { remaining: upload.byte_cap, entries: 0 }.check(retained.checked_add(manifest_total).context("Stage byte count overflow")?)?;
@@ -1145,6 +1148,61 @@ impl Upload {
 }
 
 // Failed pushes retain partials and integrity sidecars for the next attempt.
+
+/// Bytes a partial's sidecar says are already on disk.
+fn covered_bytes(sidecar: &Path) -> u64 {
+    fs::read(sidecar).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["coverage"]["ranges"].as_array().map(|r| r.iter().filter_map(|x| {
+            let a = x.get(0)?.as_u64()?; let b = x.get(1)?.as_u64()?; Some(b.saturating_sub(a))
+        }).sum()))
+        .unwrap_or(0)
+}
+
+/// A re-dragged file arrives under a new transfer id and therefore a new stage
+/// key; the bytes its earlier attempt staged would be orphaned and the file
+/// would restart from zero (an 11.8 GB file was found staged three times, each
+/// attempt starting over). Move the partial for the same fingerprint out of any
+/// abandoned (unleased) stage into this one so the receive engine resumes it,
+/// keeping whichever copy covers the most bytes. Empty abandoned stages are
+/// removed; the rest wait for the 24 h GC.
+fn adopt_abandoned_partials(staging_root: &Path, stage: &Path, endpoint: &str, items: &[Value]) {
+    let fps: Vec<String> = items.iter().filter_map(|it| {
+        let raw = it["name"].as_str()?; let size = it["size"].as_u64()?; let mtime = it["mtime"].as_u64().unwrap_or(0);
+        let rel = crate::iroh_net::sanitize_rel(raw);
+        Some(crate::iroh_net::transfer_fingerprint(endpoint, &rel.to_string_lossy(), size, mtime))
+    }).collect();
+    if fps.is_empty() { return; }
+    let Ok(dirs) = fs::read_dir(staging_root) else { return; };
+    for entry in dirs.flatten() {
+        let other = entry.path();
+        if other == stage { continue; }
+        let Some(name) = other.file_name().and_then(|n| n.to_str()) else { continue; };
+        if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) { continue; }
+        if !fs::symlink_metadata(&other).is_ok_and(|m| m.is_dir()) { continue; }
+        // Only stages nobody is writing to; hold their lease while we move files.
+        let _lease = {
+            let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
+            if leases.contains(&other) { continue; }
+            leases.push(other.clone()); UploadLease(other.clone())
+        };
+        for fp in &fps {
+            let src_json = other.join(format!(".dropbeam-partial-{fp}.json"));
+            let src_part = other.join(format!(".dropbeam-partial-{fp}.part"));
+            let is_file = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_file());
+            if !is_file(&src_json) || !is_file(&src_part) { continue; }
+            let dst_json = stage.join(format!(".dropbeam-partial-{fp}.json"));
+            let dst_part = stage.join(format!(".dropbeam-partial-{fp}.part"));
+            let (src_cov, dst_cov) = (covered_bytes(&src_json), if is_file(&dst_json) { covered_bytes(&dst_json) } else { 0 });
+            if src_cov <= dst_cov { let _ = fs::remove_file(&src_part); let _ = fs::remove_file(&src_json); continue; }
+            let _ = fs::remove_file(&dst_part); let _ = fs::remove_file(&dst_json);
+            match fs::rename(&src_part, &dst_part).and_then(|_| fs::rename(&src_json, &dst_json)) {
+                Ok(()) => log::info!("locations upload: resuming {fp} from an abandoned stage ({src_cov} bytes already landed)"),
+                Err(e) => { log::warn!("locations upload: could not adopt abandoned partial {fp}: {e}"); let _ = fs::remove_file(&dst_part); let _ = fs::remove_file(&dst_json); }
+            }
+        }
+        if fs::read_dir(&other).map(|mut d| d.next().is_none()).unwrap_or(false) { let _ = fs::remove_dir(&other); }
+    }
+}
 
 fn stage_expired(path: &Path) -> bool {
     fs::symlink_metadata(path).and_then(|m| m.modified()).ok()
@@ -1419,6 +1477,30 @@ mod tests {
         save(&f.config, Some(f.location.clone()), None).unwrap();
         error_message(dispatch(&f.config, "owner-device", &request), "Location access denied");
     }
+    #[test]
+    fn redragged_upload_adopts_the_abandoned_partial_with_most_coverage() {
+        let f = Fixture::new();
+        let staging = f.root.join(".dropbeam-staging");
+        let old_a = staging.join("a".repeat(64)); let old_b = staging.join("b".repeat(64));
+        fs::create_dir_all(&old_a).unwrap(); fs::create_dir_all(&old_b).unwrap();
+        let fp = crate::iroh_net::transfer_fingerprint("owner-device", "big.bin", 1000, 5);
+        for (dir, cov) in [(&old_a, 100u64), (&old_b, 600u64)] {
+            fs::write(dir.join(format!(".dropbeam-partial-{fp}.part")), vec![0u8; 1000]).unwrap();
+            fs::write(dir.join(format!(".dropbeam-partial-{fp}.json")), json!({"v":1,"fp":fp,"total":1000,"coverage":{"ranges":[[0,cov]]}}).to_string()).unwrap();
+        }
+        // An unrelated partial in an abandoned stage is left alone.
+        fs::write(old_a.join(".dropbeam-partial-ffff.part"), b"x").unwrap();
+        let header = json!({"kind":"files","locations_v":VERSION,"location_hash_v":2,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":"fresh",
+            "items":[{"name":"big.bin","size":1000,"mtime":5}],"dirs":[],"total":1000});
+        let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+        assert_eq!(covered_bytes(&upload.staging.join(format!(".dropbeam-partial-{fp}.json"))), 600);
+        assert!(upload.staging.join(format!(".dropbeam-partial-{fp}.part")).is_file());
+        assert!(!old_b.exists(), "emptied abandoned stage is removed");
+        assert!(old_a.join(".dropbeam-partial-ffff.part").is_file());
+        assert!(!old_a.join(format!(".dropbeam-partial-{fp}.part")).exists(), "the smaller duplicate is dropped");
+    }
+
     #[test]
     fn upload_transfer_key_survives_push_changes_and_waits_for_previous_lease() {
         let f = Fixture::new();

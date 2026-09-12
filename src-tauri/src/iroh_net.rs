@@ -5731,7 +5731,7 @@ struct ResumeCtx {
 /// Identity of a transfer for resume purposes: same sender + name + size + mtime
 /// = same bytes (the rsync-style heuristic). An edited file changes mtime/size →
 /// different fingerprint → fresh transfer, never a corrupt mix.
-fn transfer_fingerprint(sender: &str, name: &str, size: u64, mtime: u64) -> String {
+pub(crate) fn transfer_fingerprint(sender: &str, name: &str, size: u64, mtime: u64) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(sender.as_bytes());
