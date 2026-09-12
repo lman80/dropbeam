@@ -1142,26 +1142,47 @@ pub fn lan_path_blocked() -> bool {
 /// Unknown (the card spun on "Connecting…" for the whole transfer) and the
 /// relay-stuck redial never saw "relay". Fall back to the connection's own
 /// open paths: a direct path counts as direct, a relay-only set counts as relay.
-fn locality_evidence(paths: impl Iterator<Item = (bool, bool, bool, String)>) -> Option<(bool, String)> {
-    let paths: Vec<_> = paths.filter(|(_, _, closed, _)| !closed).collect();
-    if let Some((_, relay, _, addr)) = paths.iter().find(|(selected, _, _, _)| *selected) {
+/// (selected, relay, closed, validated, addr) per path → (is_relay, addr).
+/// Order: the selected path, else a validated direct path, else the first open
+/// path (a relay-born connection then honestly reads as relay instead of Unknown).
+fn locality_evidence(paths: impl Iterator<Item = (bool, bool, bool, bool, String)>) -> Option<(bool, String)> {
+    let paths: Vec<_> = paths.filter(|(_, _, closed, _, _)| !closed).collect();
+    if let Some((_, relay, _, _, addr)) = paths.iter().find(|(selected, _, _, _, _)| *selected) {
         return Some((*relay, addr.clone()));
     }
-    if let Some((_, _, _, addr)) = paths.iter().find(|(_, relay, _, _)| !relay) {
+    if let Some((_, _, _, _, addr)) = paths.iter().find(|(_, relay, _, validated, _)| !relay && *validated) {
         return Some((false, addr.clone()));
     }
-    paths.first().map(|(_, relay, _, addr)| (*relay, addr.clone()))
+    paths.iter().find(|(_, relay, _, _, _)| *relay)
+        .or(paths.first())
+        .map(|(_, relay, _, _, addr)| (*relay, addr.clone()))
 }
 /// Wait up to `budget` for this connection to hold an open, non-relay path.
+/// Wait up to `budget` for this connection to hold an open, VALIDATED non-relay
+/// path. iroh lists NAT-traversal candidates as open paths the moment it starts
+/// probing them, so "open and not relay" alone is true for every dial; a path
+/// only counts once the peer's packets have actually arrived over it.
 async fn conn_has_direct_path(conn: &Connection, budget: Duration) -> bool {
     use iroh::Watcher as _;
     let deadline = Instant::now() + budget;
     loop {
-        let has = conn.paths().get().iter().any(|p| !p.is_relay() && !p.is_closed());
+        let has = conn.paths().get().iter().any(path_is_validated_direct);
         if has { return true; }
         if Instant::now() >= deadline || conn.close_reason().is_some() { return false; }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+fn path_is_validated_direct(p: &iroh::endpoint::PathInfo) -> bool {
+    !p.is_relay() && !p.is_closed() && p.stats().is_some_and(|s| s.udp_rx.datagrams > 0)
+}
+/// One-line summary of a connection's paths for the log.
+fn describe_paths(conn: &Connection) -> String {
+    use iroh::Watcher as _;
+    conn.paths().get().iter().map(|p| format!("{}{}{}{:?}",
+        if p.is_selected() { "*" } else { "" },
+        if p.is_closed() { "x" } else { "" },
+        if path_is_validated_direct(p) { "v" } else { "" },
+        p.remote_addr())).collect::<Vec<_>>().join(" ")
 }
 fn conn_locality(conn: &Connection) -> crate::models::Locality {
     use crate::models::Locality;
@@ -1169,7 +1190,7 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
     let mut watcher = conn.paths();
     let paths = watcher.get();
     // Extract owned (is_relay, addr) up front so the borrow of `paths` ends here.
-    let selected = locality_evidence(paths.iter().map(|p| (p.is_selected(), p.is_relay(), p.is_closed(), format!("{:?}", p.remote_addr()))));
+    let selected = locality_evidence(paths.iter().map(|p| (p.is_selected(), p.is_relay(), p.is_closed(), path_is_validated_direct(p), format!("{:?}", p.remote_addr()))));
     remember_conn_addrs(conn);
     let loc = match selected {
         Some((true, _)) => Locality::Internet, // relayed = the slow path
@@ -3614,6 +3635,8 @@ fn send_friend_inner(
                                     tokio::time::sleep(Duration::from_millis(400)).await;
                                     continue;
                                 }
+                                log::info!("friend-send: dialed {} → {:?} paths=[{}] known_direct={known_direct}",
+                                    &endpoint_id[..10.min(endpoint_id.len())], conn_locality(&c), describe_paths(&c));
                                 break c;
                             }
                             _ => {
@@ -3798,8 +3821,11 @@ fn send_friend_inner(
                             }
                             // Split uploads finish the current file first. Only a
                             // negotiated resumable single push may be interrupted.
+                            // Location uploads resume per file from the NAS-side
+                            // stage, so a relay-stuck multi-GB file need not finish
+                            // on the relay before we try for a direct path.
                             if recovery.lock().unwrap().check(&c,
-                                !per_file && eng.load(Ordering::SeqCst), &requested).is_err() {
+                                (is_upload || !per_file) && eng.load(Ordering::SeqCst), &requested).is_err() {
                                 break;
                             }
                         }
@@ -8745,13 +8771,16 @@ mod locality_evidence_tests {
     use super::locality_evidence;
     #[test]
     fn unselected_relay_only_connection_counts_as_relay_and_direct_paths_win() {
-        let relay_only = vec![(false, true, false, "Relay(x)".to_string())];
+        let relay_only = vec![(false, true, false, false, "Relay(x)".to_string())];
         assert_eq!(locality_evidence(relay_only.into_iter()), Some((true, "Relay(x)".into())));
-        let mixed_unselected = vec![(false, true, false, "Relay(x)".to_string()), (false, false, false, "Ip(100.79.126.13:1)".to_string())];
+        let mixed_unselected = vec![(false, true, false, false, "Relay(x)".to_string()), (false, false, false, true, "Ip(100.79.126.13:1)".to_string())];
         assert_eq!(locality_evidence(mixed_unselected.into_iter()), Some((false, "Ip(100.79.126.13:1)".into())));
-        let selected_relay = vec![(true, true, false, "Relay(x)".to_string()), (false, false, false, "Ip(1.2.3.4:1)".to_string())];
+        // A probing candidate (no packets received yet) must not read as direct.
+        let probing = vec![(false, true, false, false, "Relay(x)".to_string()), (false, false, false, false, "Ip(100.79.126.13:1)".to_string())];
+        assert_eq!(locality_evidence(probing.into_iter()), Some((true, "Relay(x)".into())));
+        let selected_relay = vec![(true, true, false, false, "Relay(x)".to_string()), (false, false, false, true, "Ip(1.2.3.4:1)".to_string())];
         assert_eq!(locality_evidence(selected_relay.into_iter()), Some((true, "Relay(x)".into())));
-        let closed_direct = vec![(false, false, true, "Ip(1.2.3.4:1)".to_string()), (false, true, false, "Relay(x)".to_string())];
+        let closed_direct = vec![(false, false, true, true, "Ip(1.2.3.4:1)".to_string()), (false, true, false, false, "Relay(x)".to_string())];
         assert_eq!(locality_evidence(closed_direct.into_iter()), Some((true, "Relay(x)".into())));
         assert_eq!(locality_evidence(std::iter::empty()), None);
     }
