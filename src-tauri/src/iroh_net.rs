@@ -75,10 +75,6 @@ pub struct IrohState {
     conns: Mutex<HashMap<String, Connection>>,
     /// Reusable outgoing chat connections; presence never dials.
     friend_conns: Mutex<HashMap<String, Connection>>,
-    /// Fingerprints of resumable partial files currently being written, so two
-    /// concurrent receives of the same file never share one partial (the loser
-    /// falls back to a throwaway, non-resumable temp).
-    partials: Mutex<std::collections::HashSet<String>>,
     /// Progress protocol learned from authenticated hello/ready frames.
     progress_versions: Mutex<HashMap<String, u64>>,
 }
@@ -2032,8 +2028,8 @@ async fn serve_stream_inner(
                 );
                 // One resumable partial per fingerprint at a time; a concurrent
                 // duplicate of the same file gets a throwaway temp instead.
-                let mut resumable = state.partials.lock().unwrap().insert(fp.clone());
-                if !resumable {
+                let mut owner = claim_partial_now(&fp);
+                if owner.is_none() {
                     // Common cause: the PREVIOUS attempt's dying handler is still
                     // flushing its final sidecar persist (an fsync of gigabytes of
                     // dirty pages can take many seconds) and unregisters the
@@ -2051,15 +2047,11 @@ async fn serve_stream_inner(
                     } else {
                         Duration::from_secs(4)
                     };
-                    let t0 = std::time::Instant::now();
-                    while t0.elapsed() < budget {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        if state.partials.lock().unwrap().insert(fp.clone()) {
-                            resumable = true;
-                            break;
-                        }
-                    }
+                    owner = claim_partial(&fp, budget).await;
                 }
+                // Ownership lasts until `owner` drops below — every removal of the
+                // fingerprint's partial/sidecar happens while we still hold it.
+                let resumable = owner.is_some();
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
                     prepare_partial_async(&dest, &fp, total).await
                 } else {
@@ -2146,9 +2138,7 @@ async fn serve_stream_inner(
                     }
                     Err(e) => Err(e),
                 };
-                if resumable {
-                    state.partials.lock().unwrap().remove(&fp);
-                }
+                drop(owner);
                 res
             } else {
                 // Keep handshake errors in `body` so terminal UI emission and
@@ -2426,8 +2416,8 @@ async fn serve_stream_inner(
                 let who = conn.remote_id().to_string();
                 let fp = transfer_fingerprint(&who, &rel.to_string_lossy(), total, mtime);
                 let partial_dir = config_dir.join("folder-partials");
-                let mut resumable = state.partials.lock().unwrap().insert(fp.clone());
-                if !resumable {
+                let mut owner = claim_partial_now(&fp);
+                if owner.is_none() {
                     // The sender's 45s stall watchdog retries ~2s after abandoning
                     // a wedged send — while OUR previous handler for this same file
                     // is often still unwinding (final sidecar fsync, QUIC teardown)
@@ -2435,15 +2425,9 @@ async fn serve_stream_inner(
                     // throwaway temp here silently restarts a multi-GB file from
                     // byte 0 — on a flapping link, forever. Wait briefly for the
                     // handoff (the sender's ready-window gives us ~6s).
-                    let t0 = std::time::Instant::now();
-                    while t0.elapsed() < Duration::from_secs(5) {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        if state.partials.lock().unwrap().insert(fp.clone()) {
-                            resumable = true;
-                            break;
-                        }
-                    }
+                    owner = claim_partial(&fp, Duration::from_secs(5)).await;
                 }
+                let resumable = owner.is_some();
                 // A concurrent receive of the same fingerprint must never share the
                 // partial — the loser writes into a throwaway temp instead.
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
@@ -2507,9 +2491,7 @@ async fn serve_stream_inner(
                     }
                     Err(e) => Err(e),
                 };
-                if resumable {
-                    state.partials.lock().unwrap().remove(&fp);
-                }
+                drop(owner);
                 res
             } else {
                 read_folder_body(recv, &req, &staging, &cancel, cb).await
@@ -2931,14 +2913,12 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
                 // TCC may block a Downloads/Desktop read until the user answers.
                 // Never await this sweep or put it on a network runtime worker.
                 let cleanup_dir = config_dir.clone();
-                let cleanup_state = state.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
                         let dir = cleanup_dir.clone();
-                        let state = cleanup_state.clone();
                         // Run once at startup, then sweep registered nested
                         // receive destinations hourly. Never overlap sweeps.
-                        let _ = tokio::task::spawn_blocking(move || startup_cleanup(&dir, &state)).await;
+                        let _ = tokio::task::spawn_blocking(move || startup_cleanup(&dir)).await;
                         tokio::time::sleep(Duration::from_secs(3600)).await;
                     }
                 });
@@ -3113,7 +3093,6 @@ pub fn start_receive(
                         &dest,
                         &cancel,
                         &engaged_ever,
-                        Some(&cleanup.partials),
                         cb,
                     )
                     .await?;
@@ -5433,6 +5412,43 @@ fn transfer_fingerprint(sender: &str, name: &str, size: u64, mtime: u64) -> Stri
     hex::encode(&h.finalize()[..8])
 }
 
+/// Fingerprints of resumable partials currently being written. ONE process-wide
+/// registry: every receive path claims here, so a retry can never adopt — and a
+/// dying attempt can never unlink — a partial another attempt still owns.
+static PARTIALS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+fn partials() -> &'static Mutex<HashSet<String>> { &PARTIALS }
+
+/// Single-writer ownership of one fingerprint's partial + sidecar, held for the
+/// WHOLE attempt: preparation, body, verification, publication and cleanup.
+/// Released by Drop, so even a cancelled receive task hands the fingerprint back
+/// instead of wedging every later attempt into a throwaway temp.
+struct PartialOwner(String);
+impl Drop for PartialOwner {
+    fn drop(&mut self) { partials().lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0); }
+}
+fn claim_partial_now(fp: &str) -> Option<PartialOwner> {
+    partials().lock().unwrap_or_else(|p| p.into_inner())
+        .insert(fp.to_owned())
+        .then(|| PartialOwner(fp.to_owned()))
+}
+/// Claim `fp`, WAITING up to `budget` for the previous attempt's handoff rather
+/// than racing it. The old handler is routinely still unwinding (final sidecar
+/// fsync, verification, QUIC teardown) when the sender's retry arrives: adopting
+/// its partial let its publication rename the file out from under us — the next
+/// range worker then died on a bare "No such file or directory" — while dropping
+/// straight to a throwaway temp silently restarts a multi-GB resume from byte 0.
+/// `None` = the wait expired; the caller uses a throwaway temp.
+async fn claim_partial(fp: &str, budget: Duration) -> Option<PartialOwner> {
+    if let Some(owner) = claim_partial_now(fp) { return Some(owner); }
+    let t0 = Instant::now();
+    while t0.elapsed() < budget {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Some(owner) = claim_partial_now(fp) { return Some(owner); }
+    }
+    None
+}
+
 fn partial_paths(dir: &Path, fp: &str) -> (PathBuf, PathBuf) {
     (
         dir.join(format!(".dropbeam-partial-{fp}.part")),
@@ -5484,14 +5500,12 @@ fn load_sidecar(path: &Path, fp: &str, total: u64) -> Option<Coverage> {
 /// transfer "tomorrow", short enough not to hoard disk.
 const PARTIAL_TTL_SECS: u64 = 7 * 24 * 3600;
 
-fn gc_stale_partials(dir: &Path, state: Option<&IrohState>) {
-    let config = PARTIAL_DIRS_PATH.get().and_then(|p| p.parent())
-        .or_else(|| state.and_then(|s| s.location_config.get()).map(PathBuf::as_path));
+fn gc_stale_partials(dir: &Path) {
     // Without configuration we cannot prove this isn't a shared Location.
-    let Some(config) = config else { return; };
-    gc_stale_partials_at(dir, state, config);
+    let Some(config) = PARTIAL_DIRS_PATH.get().and_then(|p| p.parent()) else { return; };
+    gc_stale_partials_at(dir, config);
 }
-fn gc_stale_partials_at(dir: &Path, state: Option<&IrohState>, config: &Path) {
+fn gc_stale_partials_at(dir: &Path, config: &Path) {
     if !crate::locations::receive_sweep_allowed(config, dir) { return; }
     crate::locations::gc_receive_probes(config, dir);
     let _walk = crate::fs_walk::Watch::new("gc_stale_partials", dir);
@@ -5513,13 +5527,15 @@ fn gc_stale_partials_at(dir: &Path, state: Option<&IrohState>, config: &Path) {
             .map(|d| d.as_secs() > PARTIAL_TTL_SECS)
             .unwrap_or(false);
         if stale {
-            // Startup cleanup now overlaps receives. Hold the single-writer
-            // registry through removal so a resumed old partial cannot be deleted.
-            let active = state.map(|s| s.partials.lock().unwrap());
+            // Startup cleanup and every fresh receive's sweep overlap live
+            // receives. Hold the single-writer registry through removal so a
+            // partial another attempt owns can never be deleted — including the
+            // sweep `prepare_partial` itself runs, which used to see no registry.
+            let active = partials().lock().unwrap_or_else(|p| p.into_inner());
             let name = e.file_name().to_string_lossy().to_string();
             let fp = name.trim_start_matches(".dropbeam-partial-")
                 .trim_end_matches(".part").trim_end_matches(".json");
-            if active.as_ref().is_some_and(|set| set.contains(fp)) {
+            if active.contains(fp) {
                 continue;
             }
             let _ = std::fs::remove_file(e.path());
@@ -5574,7 +5590,7 @@ fn staging_prefix() -> &'static str {
 }
 
 /// Best-effort crash cleanup, on a blocking worker after endpoint publication.
-fn startup_cleanup(config_dir: &Path, state: &IrohState) {
+fn startup_cleanup(config_dir: &Path) {
     {
         let _walk = crate::fs_walk::Watch::new("startup staging cleanup", config_dir);
         if let Ok(rd) = crate::fs_walk::read_dir(config_dir) {
@@ -5588,9 +5604,9 @@ fn startup_cleanup(config_dir: &Path, state: &IrohState) {
             }
         }
     }
-    gc_stale_partials_at(&config_dir.join("folder-partials"), Some(state), config_dir);
+    gc_stale_partials_at(&config_dir.join("folder-partials"), config_dir);
     for d in load_partial_dirs() {
-        gc_stale_partials_at(&d, Some(state), config_dir);
+        gc_stale_partials_at(&d, config_dir);
     }
 }
 
@@ -5600,7 +5616,7 @@ impl IrohState {
     /// one. Returns bytes freed. Clearing a partial only costs a future resume
     /// — the next send of that file simply starts from zero.
     pub fn clear_transfer_cache(&self, config_dir: &Path) -> u64 {
-        let active = self.partials.lock().unwrap().clone();
+        let active = partials().lock().unwrap_or_else(|p| p.into_inner()).clone();
         let mut dirs = load_partial_dirs();
         dirs.push(config_dir.join("folder-partials"));
         let mut freed: u64 = 0;
@@ -5653,7 +5669,7 @@ async fn prepare_partial_async(dir: &Path, fp: &str, total: u64) -> Result<(Path
 
 fn prepare_partial(dir: &Path, fp: &str, total: u64) -> Result<(PathBuf, Coverage)> {
     std::fs::create_dir_all(dir)?;
-    gc_stale_partials(dir, None);
+    gc_stale_partials(dir);
     note_partial_dir(dir);
     let (part, side) = partial_paths(dir, fp);
     let mut options = std::fs::OpenOptions::new();
@@ -6995,7 +7011,7 @@ pub async fn recv_files<F: Fn(u64, u64)>(
     // A progress-capable parallel push needs the negotiated receive path.
     let out = if progress_mode {
         read_files_negotiated(conn, &mut send, &mut recv, &header, dest_dir, cancel,
-            &AtomicBool::new(false), None, on_progress).await?
+            &AtomicBool::new(false), on_progress).await?
     } else {
         read_body(&mut recv, &header, dest_dir, cancel, on_progress).await?
     };
@@ -7035,7 +7051,6 @@ pub async fn recv_files_negotiated<F: Fn(u64, u64)>(
         dest_dir,
         cancel,
         engaged,
-        None,
         on_progress,
     )
     .await?;
@@ -7098,7 +7113,7 @@ pub async fn pull_files<F: Fn(u64, u64)>(
     write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1 })).await?;
     let header = read_frame(&mut recv).await?;
     read_pull_files_negotiated(&conn, &mut send, &mut recv, &header, dest_dir,
-        cancel, &AtomicBool::new(false), None, on_progress).await
+        cancel, &AtomicBool::new(false), on_progress).await
 }
 
 /// Quick Send's pull protocol uses a raw trailing `ok`, including when an older
@@ -7113,11 +7128,10 @@ async fn read_pull_files_negotiated<F: Fn(u64, u64)>(
     dest_dir: &Path,
     cancel: &AtomicBool,
     engaged: &AtomicBool,
-    partials: Option<&Mutex<HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     integrity::ensure_scope(Box::pin(read_pull_files_negotiated_inner(conn, send, recv, header, dest_dir,
-        cancel, engaged, partials, on_progress))).await
+        cancel, engaged, on_progress))).await
 }
 
 async fn read_pull_files_negotiated_inner<F: Fn(u64, u64)>(
@@ -7128,13 +7142,12 @@ async fn read_pull_files_negotiated_inner<F: Fn(u64, u64)>(
     dest_dir: &Path,
     cancel: &AtomicBool,
     engaged: &AtomicBool,
-    partials: Option<&Mutex<HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let mut header = header.clone();
     header.as_object_mut().context("invalid Quick Send header")?.remove("progress_v");
     let result = read_files_negotiated(conn, send, recv, &header, dest_dir,
-        cancel, engaged, partials, on_progress).await;
+        cancel, engaged, on_progress).await;
     if integrity::enabled(&header) {
         let frame = match &result {
             Ok(_) => integrity::terminal(serde_json::json!({"ok": true, "landed": header["total"]})),
@@ -7177,11 +7190,10 @@ async fn read_files_negotiated<F: Fn(u64, u64)>(
     dest_dir: &Path,
     cancel: &AtomicBool,
     engaged: &AtomicBool,
-    partials: Option<&Mutex<std::collections::HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let result = integrity::ensure_scope(Box::pin(read_files_negotiated_inner(
-        conn, bsend, recv, header, dest_dir, cancel, engaged, partials, on_progress,
+        conn, bsend, recv, header, dest_dir, cancel, engaged, on_progress,
     )))
     .await;
     if let Err(e) = &result {
@@ -7200,7 +7212,6 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
     dest_dir: &Path,
     cancel: &AtomicBool,
     engaged: &AtomicBool,
-    partials: Option<&Mutex<std::collections::HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let progress_mode = speaks_progress_v1(header);
@@ -7219,11 +7230,13 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
         let who = conn.remote_id().to_string();
         let fp = transfer_fingerprint(&who, &name, total, mtime);
         // Single-writer guard (same as the friend + folder paths): two concurrent
-        // receives of the same file must never share one partial — the loser
-        // writes into a throwaway, non-resumable temp.
-        let owns_partial = partials
-            .map(|set| set.lock().unwrap().insert(fp.clone()))
-            .unwrap_or(true);
+        // receives of the same file must never share one partial. Wait briefly for
+        // a previous attempt's handoff — bounded well inside the sender's ~6s
+        // ready window — and only then fall back to a throwaway, non-resumable
+        // temp. This is never optional: adopting a partial whose owner is still
+        // finalizing let that owner's publication rename the file away mid-receive.
+        let owner = claim_partial(&fp, Duration::from_secs(4)).await;
+        let owns_partial = owner.is_some();
         let prep: Result<(PathBuf, Coverage)> = if owns_partial {
             prepare_partial_async(dest_dir, &fp, total).await
         } else {
@@ -7322,11 +7335,7 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
             }
             Err(e) => Err(e),
         };
-        if owns_partial {
-            if let Some(set) = partials {
-                set.lock().unwrap().remove(&fp);
-            }
-        }
+        drop(owner);
         res
     } else {
         if progress_mode || integrity::enabled(header) {
@@ -7559,7 +7568,7 @@ async fn receive_location_headless(conn: &Connection, send: &mut SendStream, rec
     body_header.as_object_mut().unwrap().remove("progress_v");
     let result = async {
     let paths = read_files_negotiated(conn, send, recv, &body_header, &upload.staging,
-        cancel, &AtomicBool::new(false), None, |_, _| {}).await?;
+        cancel, &AtomicBool::new(false), |_, _| {}).await?;
     let finish_header = header.clone();
     tokio::task::spawn_blocking(move || upload.finish(&finish_header, paths)).await??;
     Ok(())
@@ -7601,9 +7610,8 @@ mod tests {
                 file.set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
             }
         }
-        let state = IrohState::default();
-        state.partials.lock().unwrap().insert("active".into());
-        startup_cleanup(&dir, &state);
+        let _owner = claim_partial_now("active").expect("claim the live fingerprint");
+        startup_cleanup(&dir);
         assert!(!old_staging.exists());
         assert_eq!(std::fs::read(live_staging.join("receiving")).unwrap(), b"live");
         for ext in ["part", "json"] {
@@ -8344,7 +8352,7 @@ mod loopback_tests {
                     let header = read_frame(&mut recv).await.unwrap();
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     let paths = read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest,
-                        &AtomicBool::new(false), &AtomicBool::new(false), None, |_, _| {}).await.unwrap();
+                        &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}).await.unwrap();
                     assert_eq!(!integrity::reports().is_empty(), verified, "both sides must agree on verification (delay {delay} ms)");
                     assert!(integrity::reports().iter().all(|r| r.verified && r.acknowledged));
                     paths
@@ -8425,7 +8433,7 @@ mod loopback_tests {
                 let (mut send, mut recv) = conn.accept_bi().await.unwrap();
                 let header = read_frame(&mut recv).await.unwrap();
                 let paths = read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest,
-                    &AtomicBool::new(false), &AtomicBool::new(false), None, |d, _| {
+                    &AtomicBool::new(false), &AtomicBool::new(false), |d, _| {
                         if d == total && integrity::rehash_activity() < total {
                             assert!(rx_part.exists() && rx_side.exists(), "rehash must retain partial and sidecar");
                         }
@@ -8501,7 +8509,7 @@ mod loopback_tests {
                         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
                         let header = read_frame(&mut recv).await.unwrap();
                         assert!(header["items"][0].get("index").is_none());
-                        read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest, &AtomicBool::new(false), &AtomicBool::new(false), None, |_, _| {}).await.unwrap();
+                        read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest, &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}).await.unwrap();
                         assert!(integrity::reports()[0].acknowledged);
                     }).await;
                 }
@@ -8577,7 +8585,7 @@ mod loopback_tests {
                 assert!(integrity::enabled(&header));
                 if legacy { header.as_object_mut().unwrap().remove("integrity_v"); }
                 let result = read_files_negotiated(&conn, &mut send, &mut recv, &header, &rx_dest,
-                    &AtomicBool::new(false), &AtomicBool::new(false), None, |_, _| {}).await;
+                    &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}).await;
                 let _ = send.finish();
                 let _ = send.stopped().await;
                 (result, integrity::reports())
@@ -8680,6 +8688,128 @@ mod loopback_tests {
             client.close().await; server.close().await;
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// Poll a cheap filesystem/flag predicate instead of sleeping a fixed time.
+    async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !ready() {
+            assert!(start.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    fn range_header(offset: u64, len: u64) -> Vec<u8> {
+        [offset.to_be_bytes(), len.to_be_bytes()].concat()
+    }
+    fn block_digest(bytes: &[u8]) -> String {
+        let leaves = integrity::Leaves::default();
+        let mut blocks = integrity::Blocks::new(0, leaves.clone()).unwrap();
+        blocks.update(bytes);
+        blocks.finish();
+        integrity::combine(bytes.len() as u64, &leaves).unwrap()
+    }
+
+    /// A first attempt whose verification is parked (the field case: a macOS
+    /// Files-and-Folders permission stall) still owns the hidden partial. When the
+    /// user re-sends the same file, the retry used to ADOPT that partial — and the
+    /// moment the old attempt's verification finally passed, its publication
+    /// renamed the partial away and the retry died on a bare
+    /// "No such file or directory (os error 2)" from the next range worker.
+    /// Ownership must survive the whole first attempt, and the retry must then
+    /// dedup against the published file instead of failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_survives_a_parked_attempt_publishing_the_partial() {
+        let dir = scratch("retry-adopt");
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let total: u64 = 6 * integrity::BLOCK; // > PARALLEL_MIN → negotiated/resumable
+        let bytes = payload(total as usize, 5);
+        let source = dir.join("big.bin");
+        std::fs::write(&source, &bytes).unwrap();
+        let mtime = mtime_secs(&std::fs::metadata(&source).unwrap());
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let header = serde_json::json!({"kind":"files","items":[{"name":"big.bin","size":total,"mtime":mtime}],
+            "dirs":[],"total":total,"parallel":4,"resumable":true,"fromName":"retry","integrity_v":1});
+        let manifest = serde_json::json!({"kind":"integrity","integrity_v":1,
+            "files":[{"name":"big.bin","size":total,"digest":block_digest(&bytes)}]});
+        let (part, side) = partial_paths(&dest, &transfer_fingerprint(
+            &client.id().to_string(), "big.bin", total, mtime));
+
+        // Production receive wiring for recv_files / pull_files / headless location
+        // uploads: no registry handed in, so the engine must supply its own.
+        let receive = |srv: Endpoint, dest: PathBuf, landed: Arc<AtomicBool>| {
+            tokio::spawn(integrity::scope(async move {
+                let conn = srv.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let header = read_frame(&mut recv).await.unwrap();
+                read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest,
+                    &AtomicBool::new(false), &AtomicBool::new(false),
+                    move |d, t| if t > 0 && d >= t { landed.store(true, Ordering::SeqCst) }).await
+            }))
+        };
+
+        // ── attempt 1: the body lands, then verification parks (no manifest yet).
+        let landed = Arc::new(AtomicBool::new(false));
+        let first = receive(server.clone(), dest.clone(), landed.clone());
+        let conn1 = client.connect(server.addr(), ALPN).await.unwrap();
+        let (mut s1, mut r1) = conn1.open_bi().await.unwrap();
+        write_frame(&mut s1, &header).await.unwrap();
+        assert_eq!(read_frame(&mut r1).await.unwrap()["ready"], true);
+        let mut u1 = conn1.open_uni().await.unwrap();
+        u1.write_all(&range_header(0, total)).await.unwrap();
+        u1.write_all(&bytes).await.unwrap();
+        u1.finish().unwrap();
+        until("the first attempt's body", || landed.load(Ordering::SeqCst)).await;
+        until("verification to park", || part.is_file() && !side.exists()).await;
+
+        // ── the user re-sends while that attempt is still parked. The first
+        // range stream goes out from its own task: a receiver that (correctly)
+        // waits for the handoff hasn't accepted it yet, and a blocking write here
+        // would deadlock the test against QUIC flow control.
+        let second = receive(server.clone(), dest.clone(), Arc::new(AtomicBool::new(false)));
+        let conn2 = client.connect(server.addr(), ALPN).await.unwrap();
+        let (mut s2, mut r2) = conn2.open_bi().await.unwrap();
+        write_frame(&mut s2, &header).await.unwrap();
+        let (head, tail) = bytes.split_at(integrity::BLOCK as usize);
+        let (uni, head) = (conn2.clone(), head.to_vec());
+        let first_range = tokio::spawn(async move {
+            let mut u = uni.open_uni().await.unwrap();
+            let _ = u.write_all(&range_header(0, integrity::BLOCK)).await;
+            let _ = u.write_all(&head).await;
+            let _ = u.finish();
+        });
+        // A receiver that answers now has ADOPTED the live partial (the bug); one
+        // that holds its answer is waiting for the fingerprint's owner to finish.
+        let early = tokio::time::timeout(Duration::from_millis(300), read_frame(&mut r2)).await;
+
+        // ── attempt 1 finally verifies and publishes, consuming the partial.
+        write_frame(&mut s1, &manifest).await.unwrap();
+        s1.finish().unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), vec![dest.join("big.bin")]);
+        assert!(!part.exists(), "publication consumed the partial");
+
+        // ── the retry must still land, byte-exact, with no duplicate copy.
+        let ready = match early {
+            Ok(frame) => frame.unwrap(),
+            Err(_) => read_frame(&mut r2).await.unwrap(),
+        };
+        assert_eq!(ready["ready"], true);
+        first_range.await.unwrap();
+        let mut ub = conn2.open_uni().await.unwrap();
+        // Writes into a receive that has already died are reported as stream
+        // resets; assert on the RECEIVER's outcome, which names the real failure.
+        let _ = ub.write_all(&range_header(integrity::BLOCK, total - integrity::BLOCK)).await;
+        let _ = ub.write_all(tail).await;
+        let _ = ub.finish();
+        let _ = write_frame(&mut s2, &manifest).await;
+        let _ = s2.finish();
+        let paths = second.await.unwrap()
+            .expect("a retry must never be killed by the previous attempt's cleanup");
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+        assert_eq!(std::fs::read(dest.join("big.bin")).unwrap(), bytes);
+        assert!(!dest.join("big (2).bin").exists(), "the retry must dedup, not pile up copies");
+        client.close().await; server.close().await; std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A unique scratch dir under the OS temp dir, namespaced by pid + a label so
@@ -8788,7 +8918,7 @@ mod loopback_tests {
         let parallel = header["parallel"].as_u64().unwrap_or(0) > 0;
         let engaged = AtomicBool::new(false);
         let got = read_pull_files_negotiated(&conn, &mut send, &mut recv, &header,
-            &dest, &AtomicBool::new(false), &engaged, None, |_, _| {}).await.unwrap();
+            &dest, &AtomicBool::new(false), &engaged, |_, _| {}).await.unwrap();
         // Production drops its pull connection immediately on returning Saved.
         drop(conn);
         assert_eq!(engaged.load(Ordering::SeqCst), parallel);
@@ -11040,14 +11170,14 @@ mod integrity_round2_tests {
             let (_guard, file) = ReceiveStage::create(stage.clone(), 4, "test-transfer").unwrap();
             use std::io::Write;
             (&file).write_all(b"body").unwrap();
-            gc_stale_partials_at(&nested, None, &dir); assert!(stage.exists(), "do not sweep an active receive");
+            gc_stale_partials_at(&nested, &dir); assert!(stage.exists(), "do not sweep an active receive");
             std::fs::write(nested.join("occupied"), b"keep").unwrap();
             assert!(publish_unique_limit(&stage, &nested.join("occupied"), 1).unwrap_err().to_string().contains("exhausted"));
         }
         assert!(!stage.exists(), "failed publication must clean its stage");
         std::fs::write(&stage, b"crash litter").unwrap();
         let unrelated = nested.join(".dropbeam-recv-user.part"); std::fs::write(&unrelated, b"keep").unwrap();
-        gc_stale_partials_at(&nested, None, &dir); assert!(stage.exists(), "unregistered UUID names are not proof of ownership"); assert!(unrelated.exists());
+        gc_stale_partials_at(&nested, &dir); assert!(stage.exists(), "unregistered UUID names are not proof of ownership"); assert!(unrelated.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
