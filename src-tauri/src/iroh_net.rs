@@ -74,12 +74,79 @@ pub struct IrohState {
     /// sender couldn't cancel a stalled transfer.
     conns: Mutex<HashMap<String, Connection>>,
     /// Reusable outgoing chat connections; presence never dials.
-    friend_conns: Mutex<HashMap<String, Connection>>,
+    friend_conns: Mutex<HashMap<String, CachedFriendConnection>>,
     /// Progress protocol learned from authenticated hello/ready frames.
     progress_versions: Mutex<HashMap<String, u64>>,
 }
 
+struct CachedFriendConnection {
+    conn: Connection,
+    created_at: Instant,
+    relay_with_direct_since: Option<Instant>,
+}
+
+impl CachedFriendConnection {
+    fn new(conn: Connection) -> Self {
+        Self { conn, created_at: Instant::now(), relay_with_direct_since: None }
+    }
+}
+
+/// Pure decision logic using continuous observed relay time.
+fn friend_rotation_reason(
+    age: Duration,
+    locality: crate::models::Locality,
+    has_direct_addrs: bool,
+    relay_duration: Option<Duration>,
+) -> Option<&'static str> {
+    if age > Duration::from_secs(30 * 60) {
+        Some("connection older than 30 minutes")
+    } else if matches!(locality, crate::models::Locality::Internet)
+        && has_direct_addrs
+        && relay_duration.is_some_and(|elapsed| elapsed > Duration::from_secs(60))
+    {
+        Some("relay-only with cached direct addresses for over 60 seconds")
+    } else {
+        None
+    }
+}
+
 impl IrohState {
+    /// Check on reuse and presence ticks; the monitor never dials. The expected
+    /// id prevents an old dispatcher from rotating a replacement connection.
+    fn cached_friend_conn(&self, endpoint: &str, expected_id: Option<usize>) -> Option<Connection> {
+        let has_direct_addrs = peer_addrs().lock().ok()
+            .and_then(|addrs| addrs.get(endpoint).map(|a| !a.is_empty()))
+            .unwrap_or(false);
+        let mut connections = self.friend_conns.lock().ok()?;
+        let cached = connections.get_mut(endpoint)?;
+        if expected_id.is_some_and(|id| id != cached.conn.stable_id()) {
+            return None;
+        }
+        if cached.conn.close_reason().is_some() {
+            connections.remove(endpoint);
+            return None;
+        }
+        let now = Instant::now();
+        let locality = conn_locality(&cached.conn);
+        if matches!(locality, crate::models::Locality::Internet) && has_direct_addrs {
+            cached.relay_with_direct_since.get_or_insert(now);
+        } else {
+            cached.relay_with_direct_since = None;
+        }
+        let reason = friend_rotation_reason(
+            now.duration_since(cached.created_at), locality, has_direct_addrs,
+            cached.relay_with_direct_since.map(|since| now.duration_since(since)),
+        );
+        if let Some(reason) = reason {
+            log::info!("iroh: rotating friend connection {endpoint}: {reason}");
+            cached.conn.close(0u32.into(), b"friend connection rotation");
+            connections.remove(endpoint);
+            None
+        } else {
+            Some(cached.conn.clone())
+        }
+    }
+
     fn learn_progress(&self, endpoint: &str, version: u64) {
         let changed = match self.progress_versions.lock() {
             Ok(mut versions) => versions.insert(endpoint.to_owned(), version) != Some(version),
@@ -1271,6 +1338,12 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
         noq_proto::congestion::BbrConfig::default(),
     ));
+    // Field incident (2026-09-12): 14 advertised IPv4 addresses (11 Docker
+    // gateways) plus address churn exhausted the default 13 path ids, producing
+    // MaxPathIdReached and permanently relay-only connections. Both peers need
+    // headroom; iroh 0.98.2 also defaults to only 12 remote NAT addresses.
+    tcfg = tcfg.max_concurrent_multipath_paths(64u32);
+    tcfg = tcfg.set_max_remote_nat_traversal_addresses(32u8);
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
 
@@ -1394,6 +1467,7 @@ fn handle_conn(
             let stream = tokio::select! {
                 stream = conn.accept_bi() => stream,
                 _ = presence_tick.tick() => {
+                    state.cached_friend_conn(&who.to_string(), Some(conn.stable_id()));
                     if refresh_presence(&conn, &mut received, || {
                         emit_friend_presence(&state, &who.to_string());
                     }).is_err() {
@@ -1422,7 +1496,7 @@ fn handle_conn(
         // replacement connection installed concurrently for this same endpoint.
         if let Ok(mut connections) = state.friend_conns.lock() {
             let key = who.to_string();
-            if connections.get(&key).is_some_and(|c| c.stable_id() == conn.stable_id()) {
+            if connections.get(&key).is_some_and(|c| c.conn.stable_id() == conn.stable_id()) {
                 connections.remove(&key);
             }
         }
@@ -4027,9 +4101,7 @@ pub async fn send_chat(
     let addr = dial_addr(parsed);
     // Only reuse outgoing connections: older peers may not accept streams on
     // connections they initiated. The monitor itself never opens streams or dials.
-    let cached = state.friend_conns.lock().ok()
-        .and_then(|connections| connections.get(endpoint_id).cloned())
-        .filter(|c| c.close_reason().is_none());
+    let cached = state.cached_friend_conn(endpoint_id, None);
     let conn = if let Some(conn) = cached {
         conn
     } else {
@@ -4039,7 +4111,7 @@ pub async fn send_chat(
         if let Some(st) = state.app.get().and_then(|app| app.try_state::<Arc<IrohState>>()) {
             let st = st.inner().clone();
             if let Ok(mut connections) = st.friend_conns.lock() {
-                connections.insert(endpoint_id.to_owned(), conn.clone());
+                connections.insert(endpoint_id.to_owned(), CachedFriendConnection::new(conn.clone()));
             }
             tauri::async_runtime::spawn(handle_conn(conn.clone(), st));
         }
@@ -7463,14 +7535,13 @@ async fn require_locations(conn: &Connection) -> Result<()> {
 
 pub async fn location_request(state: &IrohState, endpoint: &str, mut request: serde_json::Value) -> Result<serde_json::Value> {
     let ep = state.get().context("DropBeam is still connecting")?;
-    let cached = state.friend_conns.lock().ok().and_then(|c| c.get(endpoint).cloned())
-        .filter(|c| c.close_reason().is_none());
+    let cached = state.cached_friend_conn(endpoint, None);
     let conn = match cached {
         Some(conn) => conn,
         None => {
             let conn = tokio::time::timeout(Duration::from_secs(15), ep.connect(dial_addr(endpoint.parse()?), ALPN)).await??;
             if let Some(st) = state.app.get().and_then(|a| a.try_state::<Arc<IrohState>>()) {
-                state.friend_conns.lock().unwrap().insert(endpoint.into(), conn.clone());
+                state.friend_conns.lock().unwrap().insert(endpoint.into(), CachedFriendConnection::new(conn.clone()));
                 tauri::async_runtime::spawn(handle_conn(conn.clone(), st.inner().clone()));
             }
             conn
@@ -7589,6 +7660,25 @@ async fn receive_location_headless(conn: &Connection, send: &mut SendStream, rec
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn friend_connection_rotation_decision() {
+        use crate::models::Locality;
+        let decision = |age, locality, direct, relay: Option<u64>| super::friend_rotation_reason(
+            Duration::from_secs(age), locality, direct, relay.map(Duration::from_secs),
+        );
+        assert!(decision(1800, Locality::Direct, true, None).is_none());
+        for locality in [Locality::Local, Locality::Direct, Locality::Internet, Locality::Unknown] {
+            assert!(decision(1801, locality, false, None).is_some());
+        }
+        assert!(decision(120, Locality::Internet, true, Some(61)).is_some());
+        assert!(decision(120, Locality::Internet, true, Some(60)).is_none());
+        assert!(decision(120, Locality::Internet, true, None).is_none());
+        assert!(decision(120, Locality::Internet, false, Some(61)).is_none());
+        for locality in [Locality::Local, Locality::Direct, Locality::Unknown] {
+            assert!(decision(120, locality, true, Some(61)).is_none());
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -8976,7 +9066,7 @@ mod loopback_tests {
                 .expect("refresh must stop after close").expect("presence task must not panic");
             let state = Arc::new(IrohState::default());
             let key = conn.remote_id().to_string();
-            state.friend_conns.lock().unwrap().insert(key.clone(), conn.clone());
+            state.friend_conns.lock().unwrap().insert(key.clone(), CachedFriendConnection::new(conn.clone()));
             tokio::time::timeout(Duration::from_secs(5), handle_conn(conn, state.clone()))
                 .await.expect("closed dispatcher must exit");
             assert!(!state.friend_conns.lock().unwrap().contains_key(&key));
