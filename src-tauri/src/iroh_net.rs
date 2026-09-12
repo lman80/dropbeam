@@ -702,18 +702,36 @@ async fn read_landed_progress_hashed<F: Fn(u64, u64)>(
     recv: &mut RecvStream, total: u64, base: u64, cancel: &AtomicBool,
     on_progress: &F, hashes: Option<&Mutex<Vec<integrity::FileHash>>>, activity: Option<&AtomicU64>,
 ) -> Result<()> {
+    read_landed_progress_with_work(recv, total, base, cancel, on_progress, hashes, activity, None).await
+}
+
+async fn read_landed_progress_with_work<F: Fn(u64, u64)>(
+    recv: &mut RecvStream, total: u64, base: u64, cancel: &AtomicBool,
+    on_progress: &F, hashes: Option<&Mutex<Vec<integrity::FileHash>>>,
+    activity: Option<&AtomicU64>, sent: Option<&AtomicU64>,
+) -> Result<()> {
     anyhow::ensure!(base <= total, "invalid resume base");
     let mut previous = base;
     let mut rehash = 0;
     let mut receipt_rows = vec![];
     let mut receipt_complete = false;
-    let mut deadline = integrity::Inactivity::new(activity);
+    let mut deadline = integrity::ReceiverInactivity::new(activity);
+    let mut reported_work = 0;
     on_progress(base, total);
     loop {
         let frame = read_frame(recv);
         tokio::pin!(frame);
         let mut v = loop {
-            deadline.check(activity)?;
+            // Preserve cumulative activity for the outer/UI observers without
+            // feeding transport back into this receiver-owned deadline.
+            if let (Some(work), Some(shared)) = (activity, sent) {
+                if !std::ptr::eq(work, shared) {
+                    let current = work.load(Ordering::SeqCst);
+                    shared.fetch_add(current.saturating_sub(reported_work), Ordering::SeqCst);
+                    reported_work = current;
+                }
+            }
+            deadline.check(sent, activity)?;
             tokio::select! {
                 result = &mut frame => break result.context("read receiver landed progress")?,
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
@@ -755,7 +773,7 @@ async fn read_landed_progress_hashed<F: Fn(u64, u64)>(
         anyhow::ensure!(done >= previous && done <= total, "invalid landed byte count");
         let ok = v["ok"].as_bool() == Some(true);
         anyhow::ensure!(!ok || done == total, "incomplete receiver confirmation");
-        if done > previous { deadline.progress(); }
+        deadline.landed(done > previous);
         previous = done;
         on_progress(done, total);
         if ok {
@@ -974,87 +992,98 @@ pub enum CancelKind {
 // via their shared PUBLIC IP (hairpin NAT, often broken) or a distant relay —
 // finicky and slow. So: every time a connection has working direct addresses,
 // remember them per peer (persisted across restarts), and seed every future
-// dial with them. Stale entries are harmless — iroh races all addresses plus
-// discovery and uses whichever answers first.
+// dial with a recent, bounded set. Stale ports consume concurrent path slots
+// and can crowd out the live direct address.
 
-static PEER_ADDRS: std::sync::OnceLock<Mutex<HashMap<String, Vec<std::net::SocketAddr>>>> =
-    std::sync::OnceLock::new();
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct PeerAddr {
+    addr: std::net::SocketAddr,
+    #[serde(default = "peer_addr_now")]
+    last_seen: u64,
+    #[serde(default)]
+    observed_working: bool,
+}
+fn peer_addr_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+fn private_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || (u32::from(ip) & 0xffc0_0000 == 0x6440_0000),
+        std::net::IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+fn prune_peer_addrs(addrs: &mut Vec<PeerAddr>, now: u64, subnets: &[netwatch::interfaces::IpNet]) {
+    addrs.retain(|a| now.saturating_sub(a.last_seen) <= 24 * 60 * 60
+        && (a.observed_working || !private_addr(a.addr.ip()) || on_local_subnet(a.addr.ip(), subnets)));
+    addrs.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    let mut seen = std::collections::HashSet::new();
+    addrs.retain(|a| seen.insert(a.addr));
+    addrs.truncate(3);
+}
+fn decode_peer_addrs(bytes: &[u8], now: u64) -> Result<HashMap<String, Vec<PeerAddr>>> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Entry { Timed(PeerAddr), Flat(std::net::SocketAddr) }
+    let map: HashMap<String, Vec<Entry>> = serde_json::from_slice(bytes)?;
+    Ok(map.into_iter().map(|(peer, entries)| (peer, entries.into_iter().map(|e| match e {
+        Entry::Timed(a) => a,
+        Entry::Flat(addr) => PeerAddr { addr, last_seen: now, observed_working: false },
+    }).collect())).collect())
+}
+static PEER_ADDRS: std::sync::OnceLock<Mutex<HashMap<String, Vec<PeerAddr>>>> = std::sync::OnceLock::new();
 static PEER_ADDRS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-fn peer_addrs() -> &'static Mutex<HashMap<String, Vec<std::net::SocketAddr>>> {
+fn peer_addrs() -> &'static Mutex<HashMap<String, Vec<PeerAddr>>> {
     PEER_ADDRS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
-/// Load the persisted cache (called once at endpoint startup).
 fn load_peer_addrs(config_dir: &Path) {
     let path = config_dir.join("peer-addrs.json");
     if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(map) = serde_json::from_slice::<HashMap<String, Vec<std::net::SocketAddr>>>(&bytes)
-        {
+        if let Ok(map) = decode_peer_addrs(&bytes, peer_addr_now()) {
             *peer_addrs().lock().unwrap() = map;
         }
     }
     let _ = PEER_ADDRS_PATH.set(path);
+    save_peer_addrs();
 }
-
 fn save_peer_addrs() {
+    // Serialize writes under the cache lock so concurrent observations cannot
+    // overwrite newer timestamps via the shared temporary file.
+    let mut map = peer_addrs().lock().unwrap();
+    let subnets = LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner());
+    for entries in map.values_mut() { prune_peer_addrs(entries, peer_addr_now(), &subnets); }
     if let Some(path) = PEER_ADDRS_PATH.get() {
-        let map = peer_addrs().lock().unwrap().clone();
-        if let Ok(json) = serde_json::to_vec(&map) {
+        if let Ok(json) = serde_json::to_vec(&*map) {
             let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() { let _ = std::fs::rename(tmp, path); }
+            if std::fs::write(&tmp, json).is_ok() { let _ = std::fs::rename(tmp, path); }
         }
     }
 }
-
-/// Remember every live direct (IP) address of this connection for its peer —
-/// newest first, capped, deduped. Called when a direct path forms, when a
-/// transfer completes, and shortly after accepting an inbound connection, so
-/// BOTH sides learn each other.
-fn remember_conn_addrs(conn: &Connection) {
-    use iroh::Watcher as _;
-    let eid = conn.remote_id().to_string();
-    let mut watcher = conn.paths();
-    let addrs: Vec<std::net::SocketAddr> = watcher
-        .get()
-        .iter()
-        .filter_map(|p| match p.remote_addr() {
-            iroh::TransportAddr::Ip(s) => Some(*s),
-            _ => None,
-        })
-        .collect();
-    if addrs.is_empty() {
-        return;
-    }
-    let mut changed = false;
+fn remember_working_addr(peer: String, addr: std::net::SocketAddr) {
+    let now = peer_addr_now();
     {
         let mut map = peer_addrs().lock().unwrap();
-        let entry = map.entry(eid).or_default();
-        for a in addrs {
-            if entry.first() != Some(&a) {
-                entry.retain(|x| x != &a);
-                entry.insert(0, a);
-                entry.truncate(6);
-                changed = true;
-            }
+        let entries = map.entry(peer).or_default();
+        if entries.iter().any(|a| a.addr == addr && a.observed_working && a.last_seen == now) { return; }
+        entries.retain(|a| a.addr != addr);
+        entries.insert(0, PeerAddr { addr, last_seen: now, observed_working: true });
+    }
+    save_peer_addrs();
+}
+/// A selected, open direct path is evidence of a working address. Candidate
+/// paths alone (including ones still being probed) must never enter the cache.
+fn remember_conn_addrs(conn: &Connection) {
+    use iroh::Watcher as _;
+    for path in conn.paths().get().iter().filter(|p| p.is_selected() && !p.is_closed()) {
+        if let iroh::TransportAddr::Ip(addr) = path.remote_addr() {
+            remember_working_addr(conn.remote_id().to_string(), *addr);
         }
     }
-    if changed {
-        save_peer_addrs();
-    }
 }
-
-/// The address to dial for `id`: the bare EndpointId (discovery) PLUS every
-/// direct address that has worked before — so a repeat send on the same LAN
-/// connects instantly even when discovery is blind.
 fn dial_addr(id: iroh::EndpointId) -> iroh::EndpointAddr {
-    let cached = peer_addrs()
-        .lock()
-        .unwrap()
-        .get(&id.to_string())
-        .cloned()
-        .unwrap_or_default();
-    iroh::EndpointAddr::from(id).with_addrs(cached.into_iter().map(iroh::TransportAddr::Ip))
+    let mut map = peer_addrs().lock().unwrap();
+    let entries = map.entry(id.to_string()).or_default();
+    prune_peer_addrs(entries, peer_addr_now(), &LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner()));
+    iroh::EndpointAddr::from(id).with_addrs(entries.iter().map(|a| iroh::TransportAddr::Ip(a.addr)))
 }
 
 static LOCAL_SUBNETS: std::sync::RwLock<Vec<netwatch::interfaces::IpNet>> = std::sync::RwLock::new(Vec::new());
@@ -1114,6 +1143,7 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
         .iter()
         .find(|p| p.is_selected())
         .map(|p| (p.is_relay(), format!("{:?}", p.remote_addr())));
+    remember_conn_addrs(conn);
     let loc = match selected {
         Some((true, _)) => Locality::Internet, // relayed = the slow path
         // Direct peer-to-peer — distinguish same-LAN from a hole-punched WAN path by
@@ -6906,8 +6936,12 @@ async fn send_files_linked<F: Fn(u64, u64)>(
     location: Option<&LocationSend>,
 ) -> Result<u64> {
     let source = location.and_then(|l| l.snapshot.as_ref()).map(|s| s.source.clone());
-    LOCATION_SOURCE.scope(source, integrity::ensure_scope(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
-        parallel_engaged, activity, friend_state, chat_link, location))).await
+    let result = LOCATION_SOURCE.scope(source, integrity::ensure_scope(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
+        parallel_engaged, activity, friend_state, chat_link, location))).await;
+    if result.as_ref().is_err_and(|e| e.to_string().contains("inactivity timeout")) {
+        conn.close(1u32.into(), b"receiver stalled");
+    }
+    result
 }
 
 async fn send_files_linked_inner<F: Fn(u64, u64)>(
@@ -6967,10 +7001,10 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     if location.is_some() { on_progress(0, total); }
     write_frame(&mut send, &header).await?;
 
-    // This file's count is also used for legacy display; the shared watchdog
-    // count is cumulative across all files in the attempt. It counts both
-    // accepted writes and advancing landed bytes. The watchdog also samples the
-    // connection's transmitted STREAM frames (never ACKs — see transport_stream_frames).
+    // Keep transport/display activity separate from verification work. The
+    // landed reader enforces its own receiver-only deadline, independent of the
+    // outer watchdog's STREAM sampling (which includes retransmissions).
+    let verification_activity = AtomicU64::new(0);
     let file_activity = AtomicU64::new(0);
     let transport = |done, _total| {
         let previous = file_activity.fetch_max(done, Ordering::SeqCst);
@@ -7052,6 +7086,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                 );
             }
             if integrity::enabled(&reply) {
+                let verification_activity = if v1 { &verification_activity } else { activity };
                 let hashes = Mutex::new(vec![]);
                 let base = if n > 0 { parse_resume_reply(Some(&reply), total, n).0 } else { 0 };
                 file_activity.store(base, Ordering::SeqCst);
@@ -7064,14 +7099,14 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                             // Ranges can arrive out of order: overlap the plain digest
                             // read with sending, then join before writing the manifest.
                             let (mut rows, digests) = tokio::try_join!(
-                                integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, activity),
-                                location_hashes(vec![items[0].0.clone()], cancel, activity)
+                                integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, verification_activity),
+                                location_hashes(vec![items[0].0.clone()], cancel, verification_activity)
                             )?;
                             // Preserve the frozen upload batch identity across reconnects.
                             rows[0].index = integrity::item_offset();
                             rows[0].sha256 = Some(digests[0].clone());
                             rows
-                        } else { integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, activity).await? }
+                        } else { integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, verification_activity).await? }
                     } else {
                         let mut local = vec![];
                         write_files_body_hashed(&mut send, &items, total, cancel, pace, &transport, Some(&mut local), location.is_some()).await?;
@@ -7082,7 +7117,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                     Ok(total)
                 };
                 let sent = write_and_receipt(write,
-                    read_landed_progress_hashed(&mut recv, total, progress_base, cancel, &landed, Some(&hashes), Some(activity))).await?;
+                    read_landed_progress_with_work(&mut recv, total, progress_base, cancel, &landed, Some(&hashes), Some(verification_activity), Some(activity))).await?;
                 integrity::send_ack(&mut send).await?;
                 return Ok(sent);
             }
@@ -7224,7 +7259,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                 if let Some(state) = friend_state {
                     state.learn_progress(&peer_id, PROGRESS_V);
                 }
-                return read_landed_progress_hashed(&mut recv, total, 0, cancel, &|done, total| {
+                return read_landed_progress_with_work(&mut recv, total, 0, cancel, &|done, total| {
                     // Receipts always refresh delivery activity for the watchdogs,
                     // whichever counter the UI is currently showing.
                     let previous = landed_activity.fetch_max(done, Ordering::SeqCst);
@@ -7243,7 +7278,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                         );
                     }
                     on_progress(done, total);
-                }, verify.then_some(&hashes), Some(activity)).await;
+                }, verify.then_some(&hashes), Some(if speaks_progress_v1(&reply) { &verification_activity } else { activity }), Some(activity)).await;
             }
             if reply["ready"].as_bool() == Some(true) {
                 if let Some(state) = friend_state { state.learn_progress(&peer_id, 0); }
@@ -11272,7 +11307,7 @@ mod location_loopback_tests {
             }), None).unwrap();
             let state = Arc::new(IrohState::default()); state.location_config.set(config).unwrap();
             let listener = tokio::spawn(accept_loop(host.clone(), state));
-            peer_addrs().lock().unwrap().insert(host.id().to_string(), host.addr().ip_addrs().copied().collect());
+            peer_addrs().lock().unwrap().insert(host.id().to_string(), host.addr().ip_addrs().map(|addr| PeerAddr { addr: *addr, last_seen: peer_addr_now(), observed_working: true }).collect());
             let paths: Vec<_> = (0..3).map(|i| {
                 let p = base.join(format!("file{i}.bin"));
                 std::fs::write(&p, vec![i as u8 + 17; 4096]).unwrap(); p
@@ -11654,5 +11689,39 @@ mod integrity_round2_tests {
         assert_eq!(publish_unique_limit(&part, &natural, 5).unwrap(), dir.join("same (4).bin"));
         for path in receive_candidates(&natural, 4) { assert_eq!(std::fs::read(path).unwrap(), b"keep"); }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod peer_cache_tests {
+    use super::*;
+    #[test]
+    fn migration_and_timestamp_roundtrip() {
+        let old = br#"{"peer":["8.8.8.8:10","192.168.1.177:43705"]}"#;
+        let map = decode_peer_addrs(old, 100_000).unwrap();
+        assert!(map["peer"].iter().all(|a| a.last_seen == 100_000 && !a.observed_working));
+        assert_eq!(decode_peer_addrs(&serde_json::to_vec(&map).unwrap(), 200_000).unwrap(), map);
+        let unknown = decode_peer_addrs(br#"{"peer":[{"addr":"8.8.8.8:10"}]}"#, 0).unwrap();
+        assert!(unknown["peer"][0].last_seen.abs_diff(peer_addr_now()) <= 1);
+    }
+    #[test]
+    fn pruning_orders_caps_expires_and_filters_subnets() {
+        let subnets = vec![netwatch::interfaces::IpNet::V4("192.168.1.0/24".parse().unwrap())];
+        let entry = |addr: &str, last_seen, observed_working| PeerAddr { addr: addr.parse().unwrap(), last_seen, observed_working };
+        let mut entries = vec![
+            entry("8.8.8.8:1", 99_990, false),
+            entry("192.168.1.177:2", 99_995, false),
+            entry("10.2.3.4:3", 100_000, false),
+            entry("10.2.3.4:4", 99_999, true),
+            entry("100.79.126.13:5", 99_998, true),
+            entry("100.79.126.13:6", 100_000, false),
+            entry("8.8.4.4:7", 1, true),
+            entry("[fd00::1]:8", 100_000, false),
+            entry("10.2.3.4:4", 99_997, true),
+        ];
+        prune_peer_addrs(&mut entries, 100_000, &subnets);
+        assert_eq!(entries.iter().map(|a| a.addr.port()).collect::<Vec<_>>(), vec![4, 5, 2]);
+        prune_peer_addrs(&mut entries, 200_000, &subnets);
+        assert!(entries.is_empty());
     }
 }

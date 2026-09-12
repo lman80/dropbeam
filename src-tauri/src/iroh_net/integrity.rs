@@ -117,6 +117,34 @@ impl Inactivity {
         Ok(())
     }
 }
+/// Receiver progress owns the stall budget. Local writes are useful only before
+/// the first landed frame, and cannot move the initial deadline indefinitely.
+pub struct ReceiverInactivity {
+    deadline: Inactivity,
+    started: tokio::time::Instant,
+    landed_seen: bool,
+}
+impl ReceiverInactivity {
+    pub fn new(work: Option<&AtomicU64>) -> Self {
+        Self { deadline: Inactivity::new(work), started: tokio::time::Instant::now(), landed_seen: false }
+    }
+    pub fn landed(&mut self, advancing: bool) {
+        self.landed_seen = true;
+        if advancing { self.deadline.progress(); }
+    }
+    pub fn progress(&mut self) { self.deadline.progress(); }
+    pub fn check(&mut self, sent: Option<&AtomicU64>, work: Option<&AtomicU64>) -> Result<()> {
+        let sent = sent.map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
+        // The ready wait precedes this reader (at most six seconds). Transport
+        // cannot extend the receiver's budget; verification can, throughout.
+        let result = self.deadline.check(work);
+        if !self.landed_seen && self.started.elapsed() < stall_budget() && sent > 0 {
+            return Ok(());
+        }
+        result
+    }
+}
+
 async fn optional_frame(recv: &mut RecvStream) -> Result<Option<serde_json::Value>> {
     let mut len = [0; 4];
     let Some(n) = recv.read(&mut len).await? else { return Ok(None); };
@@ -622,4 +650,42 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod receiver_watchdog_tests {
+    use super::*;
+    #[test]
+    fn sent_only_cannot_extend_after_any_landed_frame() {
+        let sent = AtomicU64::new(0);
+        let mut watchdog = ReceiverInactivity::new(None);
+        watchdog.landed(false); // even a zero-byte landed frame establishes the rule
+        watchdog.deadline.last = tokio::time::Instant::now() - stall_budget();
+        sent.store(10_000, Ordering::Relaxed);
+        assert!(watchdog.check(Some(&sent), None).is_err());
+        watchdog.landed(true);
+        assert!(watchdog.check(Some(&sent), None).is_ok());
+    }
+    #[test]
+    fn initial_sent_window_is_bounded_and_verification_keeps_alive() {
+        let sent = AtomicU64::new(100);
+        let work = AtomicU64::new(0);
+        let mut watchdog = ReceiverInactivity::new(Some(&work));
+        assert!(watchdog.check(Some(&sent), Some(&work)).is_ok());
+        watchdog.started = tokio::time::Instant::now() - stall_budget();
+        watchdog.deadline.last = watchdog.started;
+        sent.fetch_add(100, Ordering::Relaxed);
+        assert!(watchdog.check(Some(&sent), Some(&work)).is_err());
+        watchdog.landed(false);
+        work.store(10, Ordering::Relaxed);
+        assert!(watchdog.check(Some(&sent), Some(&work)).is_ok());
+    }
+    #[test]
+    fn legacy_activity_still_refreshes_inactivity() {
+        let sent = AtomicU64::new(0);
+        let mut watchdog = Inactivity::new(Some(&sent));
+        watchdog.last = tokio::time::Instant::now() - stall_budget();
+        sent.store(100, Ordering::Relaxed);
+        assert!(watchdog.check(Some(&sent)).is_ok());
+    }
 }
