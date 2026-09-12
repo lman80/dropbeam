@@ -72,9 +72,14 @@ fn frontend_log(msg: String) {
 /// path the "Send with DropBeam" right-click menu passes (`DropBeam.exe "%1"`).
 /// `--location-upload '{"friendId":..,"locationId":..,"relPath":"..","paths":[..]}'`
 /// queues an upload into a friend's shared Location from a script or shell.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn location_upload_from_args(argv: &[String]) -> Option<(String, locations::Target, Vec<String>)> {
     let i = argv.iter().position(|a| a == "--location-upload")?;
-    let v: serde_json::Value = serde_json::from_str(argv.get(i + 1)?).ok()?;
+    parse_location_upload(&serde_json::from_str(argv.get(i + 1)?).ok()?)
+}
+
+/// `{"friendId","locationId","relPath","paths":[..]}` → an upload request.
+fn parse_location_upload(v: &serde_json::Value) -> Option<(String, locations::Target, Vec<String>)> {
     let friend = v["friendId"].as_str()?.to_owned();
     let target = locations::Target { location_id: v["locationId"].as_str()?.to_owned(), rel_path: v["relPath"].as_str().unwrap_or("").to_owned() };
     let paths: Vec<String> = v["paths"].as_array()?.iter().filter_map(|p| p.as_str().map(str::to_owned)).collect();
@@ -92,7 +97,35 @@ mod launch_arg_tests {
         assert_eq!(paths, vec!["/tmp/a", "/tmp/b"]);
         assert!(super::location_upload_from_args(&["DropBeam".to_string(), "--location-upload".into(), "{}".into()]).is_none());
         assert!(super::location_upload_from_args(&["DropBeam".to_string(), "/tmp/x".into()]).is_none());
+        assert!(super::parse_location_upload(&serde_json::json!({"friendId":"f","locationId":"l","paths":[]})).is_none());
     }
+}
+
+/// `upload-queue.json` in the config dir: a JSON array of upload requests (see
+/// `parse_location_upload`). The app consumes and deletes it every few seconds,
+/// so a script can queue Location uploads on any OS without the GUI (macOS has
+/// no second-instance argument forwarding). Outcomes go to the log.
+fn spawn_upload_queue_consumer(app: tauri::AppHandle, config_dir: PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        let path = config_dir.join("upload-queue.json");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let _ = std::fs::remove_file(&path);
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { log::warn!("upload-queue.json: not valid JSON"); continue };
+            let reqs: Vec<_> = v.as_array().into_iter().flatten().filter_map(parse_location_upload).collect();
+            log::info!("upload-queue: {} request(s)", reqs.len());
+            for (friend, target, paths) in reqs {
+                use tauri::Manager;
+                let state = app.state::<Arc<AppState>>().inner().clone();
+                let iroh = app.state::<Arc<iroh_net::IrohState>>().inner().clone();
+                match commands::start_location_upload(app.clone(), state, iroh, friend, target, paths.clone()).await {
+                    Ok(t) => log::info!("upload-queue: started {} ({} path(s))", t.id, paths.len()),
+                    Err(e) => log::warn!("upload-queue: refused {:?}: {e}", paths),
+                }
+            }
+        }
+    });
 }
 
 fn file_from_args(argv: &[String]) -> Option<String> {
@@ -370,6 +403,7 @@ pub fn run() {
                 .app_config_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
             let _ = std::fs::create_dir_all(&config_dir);
+            spawn_upload_queue_consumer(app.handle().clone(), config_dir.clone());
 
             let default_download = app
                 .path()
