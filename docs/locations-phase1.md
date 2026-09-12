@@ -164,7 +164,7 @@ failed selections. Locations polling contacts only friends currently online in
 the existing presence store. Upload chat completion records use landed NAS file
 and directory paths; private staging callbacks cannot mark chat files complete.
 
-Each location has a configurable byte cap (Settings, GB), default **20,000,000,000
+Each location has a configurable byte cap (Settings, GB), default **500,000,000,000
 bytes** per upload stage or download snapshot. Upload manifests are checked before
 receiving, including retained retry bytes plus the prospective incoming copy,
 with actual sizes checked again before publication. A retry near the cap may need

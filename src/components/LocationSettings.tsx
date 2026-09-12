@@ -4,7 +4,7 @@ import { api, locationsApi, onLocationActivity, type LocationActivity, type Host
 import { useStore } from '../store'
 import './locations.css'
 
-const empty = (): HostedLocation => ({ id: '', name: '', path: '', friendIds: [], rights: { upload: true, manage: false }, byteCap: 20_000_000_000 })
+const empty = (): HostedLocation => ({ id: '', name: '', path: '', friendIds: [], rights: { upload: true, manage: false }, byteCap: 500_000_000_000 })
 export function LocationSettings() {
   const friends = useStore(s => s.friends)
   const [locations, setLocations] = useState<HostedLocation[]>([])
@@ -40,7 +40,7 @@ export function LocationSettings() {
     {loaded && locations.length === 0 && !draft && <div className="card location-empty-small">No folders shared. New locations are private until you select friends.</div>}
     {locations.map(l => <div className="card location-host-row" key={l.id}>
       <HardDrive size={23} /><div className="location-grow"><strong>{l.name}</strong><div className="location-path">{l.path}</div>
-        <small>{l.friendIds.length ? `${l.friendIds.length} friend${l.friendIds.length === 1 ? '' : 's'} · Browse & download${l.rights.upload ? ' · Upload' : ''}${l.rights.manage ? ' · Manage' : ''}` : 'Private · Nobody has access'}</small><div><small>Safe publish: {l.safePublish || 'save to probe'} · Cap: {(l.byteCap ?? 20_000_000_000) / 1_000_000_000} GB per transfer</small></div></div>
+        <small>{l.friendIds.length ? `${l.friendIds.length} friend${l.friendIds.length === 1 ? '' : 's'} · Browse & download${l.rights.upload ? ' · Upload' : ''}${l.rights.manage ? ' · Manage' : ''}` : 'Private · Nobody has access'}</small><div><small>Safe publish: {l.safePublish || 'save to probe'} · Cap: {(l.byteCap ?? 500_000_000_000) / 1_000_000_000} GB per transfer</small></div></div>
       <button className="btn btn-ghost" disabled={busy} onClick={() => { setError(''); setDraft({ ...l, friendIds: [...l.friendIds], rights: { ...l.rights } }) }}>Edit</button>
       <button className="btn btn-ghost" disabled={busy} onClick={async () => {
         setBusy(true); setError('')
@@ -55,7 +55,7 @@ export function LocationSettings() {
         <button type="button" className="btn btn-ghost" onClick={async () => {
           try { const path = await api.pickDirectory(); if (path) setDraft(d => d ? { ...d, path, name: d.name || path.split('/').filter(Boolean).pop() || 'Location' } : d) } catch(e) { setError(String(e)) }
         }}><FolderOpen size={16} /> Choose</button></div></label>
-      <label>Byte cap per upload / download (GB)<input type="number" min="0.001" step="0.001" required value={(draft.byteCap ?? 20_000_000_000) / 1_000_000_000} onChange={e => setDraft({ ...draft, byteCap: Math.round(Number(e.target.value) * 1_000_000_000) })} /></label>
+      <label>Byte cap per upload / download (GB)<input type="number" min="0.001" step="0.001" required value={(draft.byteCap ?? 500_000_000_000) / 1_000_000_000} onChange={e => setDraft({ ...draft, byteCap: Math.round(Number(e.target.value) * 1_000_000_000) })} /></label>
       <fieldset><legend>Who can access this location?</legend><p className="location-muted">Only these friend devices. Select each of your devices separately.</p>
         {!friends.length && <p>Add a friend first, or save this location privately.</p>}
         <div className="location-friend-list">{friends.map(f => <label className="location-check" key={f.id}><input type="checkbox" checked={draft.friendIds.includes(f.id)} onChange={e => setDraft({ ...draft, friendIds: e.target.checked ? [...draft.friendIds, f.id] : draft.friendIds.filter(id => id !== f.id) })} />{f.name}</label>)}</div>

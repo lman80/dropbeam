@@ -25,7 +25,7 @@ fn operation(config: &Path, id: &str) -> Arc<Operation> {
         locks.insert((config.into(), id.into()), Arc::downgrade(&lock)); lock
     })
 }
-pub fn default_byte_cap() -> u64 { 20_000_000_000 }
+pub fn default_byte_cap() -> u64 { 500_000_000_000 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocationError { Quota, UnsafeRoot, MirrorOverlap, MountChanged, Permission, Busy, RateLimit }
