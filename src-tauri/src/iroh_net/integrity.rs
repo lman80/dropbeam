@@ -263,7 +263,7 @@ pub async fn send_parallel<F: Fn(u64, u64)>(conn: &Connection, item: &(PathBuf, 
         hash_retained_progress(&item.0, &retained, leaves.clone(), cancel, |n| { activity.fetch_add(n, Ordering::SeqCst); }),
         send_ranges_hashed(conn, &item.0, item.2, retained.covered(), &ranges, cancel, pace, progress, Some(leaves.clone()))
     )?;
-    Ok(vec![FileHash { leaves: snapshot_leaves(&leaves), index: item_offset(), name: item.1.clone(), size: item.2, digest: combine(item.2, &leaves)? }])
+    Ok(vec![FileHash { sha256: None, leaves: snapshot_leaves(&leaves), index: item_offset(), name: item.1.clone(), size: item.2, digest: combine(item.2, &leaves)? }])
 }
 
 pub async fn receive_parallel<F: Fn(u64, u64)>(conn: &Connection, finalize: FinalizeDest, total: u64,
@@ -289,7 +289,7 @@ pub async fn receive_parallel<F: Fn(u64, u64)>(conn: &Connection, finalize: Fina
     );
     hashed?;
     let path = received?;
-    let hash = FileHash { leaves: snapshot_leaves(&leaves), index: received_item_index(item_offset, 0), name: header["items"][0]["name"].as_str().context("missing integrity name")?.into(), size: total, digest: combine(total, &leaves)? };
+    let hash = FileHash { sha256: None, leaves: snapshot_leaves(&leaves), index: received_item_index(item_offset, 0), name: header["items"][0]["name"].as_str().context("missing integrity name")?.into(), size: total, digest: combine(total, &leaves)? };
     // Revoke old coverage BEFORE verification. A failed invalidation save can
     // never leave a fully-covered corrupt sidecar available to the next resume.
     if let Some(rc) = &resume {
@@ -407,7 +407,7 @@ async fn hash_retained_file(mut file: tokio::fs::File, cov: &Coverage, leaves: L
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct FileHash { pub index: u64, pub name: String, pub size: u64, pub digest: String, #[serde(skip)] pub leaves: BTreeMap<u64, [u8; 32]> }
+pub struct FileHash { #[serde(default)] pub sha256: Option<String>, pub index: u64, pub name: String, pub size: u64, pub digest: String, #[serde(skip)] pub leaves: BTreeMap<u64, [u8; 32]> }
 
 // Missing is distinct from explicit zero (and null is invalid). Only a wholly
 // indexless legacy list may acquire indices from the validated manifest order.
@@ -418,6 +418,8 @@ struct WireHash {
     name: String,
     size: u64,
     digest: String,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 fn present_index<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
     <u64 as serde::Deserialize>::deserialize(d).map(Some)
@@ -437,7 +439,7 @@ fn normalize_manifest(hashes: &[FileHash], remote: Vec<WireHash>, bind_index: bo
             expected.index = index;
         }
         anyhow::ensure!(index == expected.index, "invalid integrity manifest index");
-        normalized.push(FileHash { index, name: row.name, size: row.size, digest: row.digest, leaves: Default::default() });
+        normalized.push(FileHash { sha256: row.sha256, index, name: row.name, size: row.size, digest: row.digest, leaves: Default::default() });
     }
     Ok((local, normalized))
 }
@@ -447,12 +449,12 @@ pub fn compare(local: &[FileHash], remote: &[FileHash]) -> Result<Vec<crate::mod
     local.iter().zip(remote).map(|(a, b)| {
         anyhow::ensure!(a.index == b.index && a.name == b.name && a.size == b.size && b.digest.len() == 64
             && b.digest.bytes().all(|c| c.is_ascii_hexdigit()), "invalid integrity manifest");
-        let verified = a.digest == b.digest;
+        let verified = a.digest == b.digest && (a.sha256.is_none() || b.sha256.is_none() || a.sha256 == b.sha256);
         if !verified {
             // Index/name/path are deliberately excluded. Digests and sizes suffice.
             log::warn!("INTEGRITY-MISMATCH size_local={} size_peer={} local={} peer={} algorithm={ALGORITHM}", a.size, b.size, a.digest, b.digest);
         }
-        Ok(crate::models::FileIntegrity { index: a.index, acknowledged: false, name: a.name.clone(), size: a.size, algorithm: ALGORITHM.into(),
+        Ok(crate::models::FileIntegrity { sha256: b.sha256.clone().or_else(|| a.sha256.clone()), index: a.index, acknowledged: false, name: a.name.clone(), size: a.size, algorithm: ALGORITHM.into(),
             digest: a.digest.clone(), peer_digest: b.digest.clone(), verified })
     }).collect()
 }
@@ -460,10 +462,25 @@ pub fn compare(local: &[FileHash], remote: &[FileHash]) -> Result<Vec<crate::mod
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn optional_plain_sha256_manifest_roundtrip() {
+        for sha256 in [None, Some("a".repeat(64))] {
+            let hash = FileHash { sha256: sha256.clone(), index: 0, name: "file".into(), size: 0, digest: "b".repeat(64), leaves: Default::default() };
+            let mut value = serde_json::to_value(&hash).unwrap();
+            if sha256.is_none() { value.as_object_mut().unwrap().remove("sha256"); }
+            assert_eq!(serde_json::from_value::<FileHash>(value.clone()).unwrap(), hash);
+            assert_eq!(serde_json::from_value::<WireHash>(value).unwrap().sha256, sha256);
+            let rows = compare(&[hash.clone()], &[hash]).unwrap();
+            let mut value = serde_json::to_value(&rows[0]).unwrap();
+            if sha256.is_none() { value.as_object_mut().unwrap().remove("sha256"); }
+            assert_eq!(serde_json::from_value::<crate::models::FileIntegrity>(value).unwrap().sha256, sha256);
+        }
+    }
+
     #[tokio::test]
     async fn indexless_two_file_manifests_and_receipts_verify_in_manifest_order() {
         scope(async {
-            let hashes: Vec<_> = (0..2).map(|i| FileHash { index: 7 + i, name: format!("{i}.bin"),
+            let hashes: Vec<_> = (0..2).map(|i| FileHash { sha256: None, index: 7 + i, name: format!("{i}.bin"),
                 size: i, digest: format!("{i}").repeat(64), leaves: Default::default() }).collect();
             let mut wire = serde_json::to_value(&hashes).unwrap();
             for row in wire.as_array_mut().unwrap() { row.as_object_mut().unwrap().remove("index"); }
@@ -547,7 +564,7 @@ mod tests {
 
     #[test]
     fn receipts_cannot_certify_missing_or_different_digests() {
-        let local = FileHash { leaves: Default::default(), index: 0, name: "a".into(), size: 1, digest: "a".repeat(64) };
+        let local = FileHash { sha256: None, leaves: Default::default(), index: 0, name: "a".into(), size: 1, digest: "a".repeat(64) };
         assert!(receipt(&serde_json::json!({"ok": true}), &[local.clone()]).is_err());
         let mut rows = compare(&[local.clone()], &[local.clone()]).unwrap();
         assert!(receipt(&serde_json::json!({"integrity": rows}), &[local.clone()]).is_ok());
@@ -561,8 +578,8 @@ mod tests {
     async fn duplicate_names_keep_both_ordered_receipts() {
         scope(async {
             let hashes = vec![
-                FileHash { leaves: Default::default(), index: 0, name: "same.bin".into(), size: 1, digest: "a".repeat(64) },
-                FileHash { leaves: Default::default(), index: 1, name: "same.bin".into(), size: 2, digest: "b".repeat(64) },
+                FileHash { sha256: None, leaves: Default::default(), index: 0, name: "same.bin".into(), size: 1, digest: "a".repeat(64) },
+                FileHash { sha256: None, leaves: Default::default(), index: 1, name: "same.bin".into(), size: 2, digest: "b".repeat(64) },
             ];
             record(compare(&hashes, &hashes).unwrap());
             assert_eq!(reports().len(), 2);
@@ -573,8 +590,8 @@ mod tests {
     #[tokio::test]
     async fn successive_splits_and_retry_preserve_duplicate_names() {
         scope(async {
-            let first = FileHash { leaves: Default::default(), index: 0, name: "same.bin".into(), size: 1, digest: "a".repeat(64) };
-            let second = FileHash { leaves: Default::default(), index: 1, name: "same.bin".into(), size: 2, digest: "b".repeat(64) };
+            let first = FileHash { sha256: None, leaves: Default::default(), index: 0, name: "same.bin".into(), size: 1, digest: "a".repeat(64) };
+            let second = FileHash { sha256: None, leaves: Default::default(), index: 1, name: "same.bin".into(), size: 2, digest: "b".repeat(64) };
             for hash in [&first, &second, &first] {
                 let rows = compare(std::slice::from_ref(hash), std::slice::from_ref(hash)).unwrap();
                 receipt(&serde_json::json!({"integrity": rows}), std::slice::from_ref(hash)).unwrap();
@@ -587,7 +604,7 @@ mod tests {
 
     #[test]
     fn five_thousand_file_pages_fit_read_cap_and_roundtrip() {
-        let hashes: Vec<_> = (0..5000).map(|i| FileHash { leaves: Default::default(), index: i, name: format!("file-{i}.bin"), size: i, digest: "a".repeat(64) }).collect();
+        let hashes: Vec<_> = (0..5000).map(|i| FileHash { sha256: None, leaves: Default::default(), index: i, name: format!("file-{i}.bin"), size: i, digest: "a".repeat(64) }).collect();
         let rows = compare(&hashes, &hashes).unwrap();
         for (kind, field, values) in [("integrity", "files", serde_json::to_value(&hashes).unwrap()),
             ("integrity_receipt", "integrity", serde_json::to_value(&rows).unwrap())] {

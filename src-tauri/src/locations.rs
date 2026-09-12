@@ -656,7 +656,7 @@ mod unix {
                     ensure!(b[..n] == other[..n], "A different file with this name already exists; rename your upload first");
                     hash.update(&b[..n]); done += n as u64; progress(done);
                 }
-                ensure!(hex::encode(hash.finalize()) == digest, "SHA-256 mismatch");
+                ensure!(hex::encode(hash.finalize()) == digest, "Upload not verified: SHA-256 verification mismatch");
                 publish(&mut || Ok(()))?;
                 return Ok(self.path.join(rel));
             }
@@ -673,7 +673,7 @@ mod unix {
                     ensure!(done + n as u64 <= expected, LocationError::Quota);
                     hash.update(&buf[..n]); f.write_all(&buf[..n])?; done += n as u64; progress(done);
                 }
-                ensure!(hex::encode(hash.finalize()) == digest, "SHA-256 mismatch; upload was not published");
+                ensure!(hex::encode(hash.finalize()) == digest, "Upload not verified: SHA-256 verification mismatch; upload was not published");
                 f.sync_all()?;
                 ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
                 publish(&mut || rename(self.native, &parent, &tmp, &parent, &name))
@@ -932,8 +932,10 @@ impl Upload {
             let name = text(item, "name")?;
             ensure!(seen.insert(relative(name)?), "Duplicate file path");
             ensure!(!relative(name)?.as_os_str().is_empty(), "Empty file name");
-            let digest = text(item, "sha256")?;
-            ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()), "Missing SHA-256");
+            if header["location_hash_v"] != 2 {
+                let digest = text(item, "sha256")?;
+                ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()), "Missing SHA-256");
+            }
         }
         for d in dirs { relative(d.as_str().context("Invalid directory")?)?; }
         use sha2::{Digest, Sha256};
@@ -955,6 +957,10 @@ impl Upload {
         self.finish_progress(header, paths, &std::sync::atomic::AtomicBool::new(false), |_| {})
     }
     pub fn finish_progress(&self, header: &Value, paths: Vec<PathBuf>, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<Vec<PathBuf>> {
+        self.finish_verified_progress(header, paths, &[], cancel, progress)
+    }
+    pub fn finish_verified_progress(&self, header: &Value, paths: Vec<PathBuf>, rows: &[crate::models::FileIntegrity], cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<Vec<PathBuf>> {
+        let digests = if header["location_hash_v"] == 2 { Some(verified_digests(header, rows)?) } else { None };
         let root = &self.root;
         let l = &self.location;
         let friend = &self._friend.0.1;
@@ -988,10 +994,10 @@ impl Upload {
         check_space(&root.path, actual)?;
         let mut out = Vec::new();
         let mut base = 0;
-        for (item, staged) in items.iter().zip(paths) {
+        for (index, (item, staged)) in items.iter().zip(paths).enumerate() {
             let raw = format!("{}/{}", self.target.rel_path, text(item, "name")?).trim_start_matches('/').to_string();
             ensure!(fs::metadata(&staged)?.len() == item["size"].as_u64().context("Invalid file size")?, "Staged file size differs from manifest");
-            let landed = root.land(&raw, &staged, text(item, "sha256")?, cancel, |n| progress(base + n), &publish)?;
+            let landed = root.land(&raw, &staged, if let Some(digests) = &digests { digests[index] } else { text(item, "sha256")? }, cancel, |n| progress(base + n), &publish)?;
             log::info!("locations upload friend={friend} location={} path={raw:?}", l.id);
             out.push(landed);
             base += item["size"].as_u64().context("Invalid file size")?;
@@ -1047,6 +1053,21 @@ pub fn spawn_gc(config: PathBuf) {
             tokio::time::sleep(Duration::from_secs(30 * 60)).await;
         }
     });
+}
+
+/// Require this transfer's verified manifest before any location publication.
+pub fn verified_digests<'a>(header: &Value, rows: &'a [crate::models::FileIntegrity]) -> Result<Vec<&'a str>> {
+    ensure!(header["integrity_v"] == 1, "Upload not verified: integrity negotiation required");
+    let items = header["items"].as_array().context("Upload not verified: missing manifest")?;
+    let offset = header["chatTransfer"]["itemOffset"].as_u64().unwrap_or(0);
+    items.iter().enumerate().map(|(i, item)| {
+        let row = rows.iter().find(|r| r.index == offset + i as u64 && Some(r.name.as_str()) == item["name"].as_str())
+            .context("Upload not verified: missing verification row")?;
+        ensure!(row.verified && Some(row.size) == item["size"].as_u64(), "Upload not verified: verification failed");
+        let digest = row.sha256.as_deref().context("Upload not verified: missing SHA-256")?;
+        ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()), "Upload not verified: invalid SHA-256");
+        Ok(digest)
+    }).collect()
 }
 
 #[cfg(test)]
@@ -1181,6 +1202,32 @@ mod tests {
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.dir); } }
     #[test]
+    fn v2_upload_requires_verified_rows_and_refuses_tampered_digest() {
+        let f = Fixture::new();
+        let (old, mut header, source) = f.upload("verified.bin", b"streamed payload");
+        drop(old);
+        header["location_hash_v"] = json!(2);
+        header["integrity_v"] = json!(1);
+        header["items"][0].as_object_mut().unwrap().remove("sha256");
+        let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let row = crate::models::FileIntegrity { index: 0, name: "verified.bin".into(), size: 16, algorithm: "test".into(), digest: "a".repeat(64), peer_digest: "a".repeat(64), verified: true, acknowledged: false, sha256: Some("0".repeat(64)) };
+        for rows in [vec![], vec![row.clone()], vec![crate::models::FileIntegrity { verified: false, ..row.clone() }], vec![crate::models::FileIntegrity { index: 1, ..row.clone() }], vec![crate::models::FileIntegrity { name: "wrong".into(), ..row.clone() }]] {
+            let error = upload.finish_verified_progress(&header, vec![source.clone()], &rows, &cancel, |_| {}).unwrap_err();
+            assert!(error.to_string().contains("Upload not verified"), "{error}");
+            assert!(!f.root.join("verified.bin").exists());
+            assert!(upload.staging.exists());
+        }
+        let rows = [crate::models::FileIntegrity { sha256: Some(sha256(&source).unwrap()), ..row }];
+        header.as_object_mut().unwrap().remove("integrity_v");
+        assert!(upload.finish_verified_progress(&header, vec![source.clone()], &rows, &cancel, |_| {}).unwrap_err().to_string().contains("Upload not verified"));
+        assert!(!f.root.join("verified.bin").exists());
+        header["integrity_v"] = json!(1);
+        upload.finish_verified_progress(&header, vec![source], &rows, &cancel, |_| {}).unwrap();
+        assert_eq!(fs::read(f.root.join("verified.bin")).unwrap(), b"streamed payload");
+    }
+
+    #[test]
     fn root_binding_rejects_parent_absolute_reserved_and_symlink_escapes() {
         use std::os::unix::fs::symlink;
         let f = Fixture::new(); let root = Root::open(&f.root).unwrap();
@@ -1249,7 +1296,7 @@ mod tests {
         assert!(!f.root.join("nested/文件.txt").exists());
         u.finish(&h, vec![src]).unwrap(); assert_eq!(fs::read(f.root.join("nested/文件.txt")).unwrap(), b"hello NAS"); drop(u);
         let (u, h, src) = f.upload("bad-hash", b"good"); fs::write(&src, b"evil").unwrap();
-        error_message(u.finish(&h, vec![src]), "SHA-256 mismatch"); assert!(!f.root.join("bad-hash").exists()); drop(u);
+        error_message(u.finish(&h, vec![src]), "Upload not verified: SHA-256 verification mismatch"); assert!(!f.root.join("bad-hash").exists()); drop(u);
         let (u, h, src) = f.upload("revoked", b"hello");
         f.location.rights.upload = false; save(&f.config, Some(f.location.clone()), None).unwrap();
         error_kind(u.finish(&h, vec![src]), LocationError::Permission); assert!(!f.root.join("revoked").exists());

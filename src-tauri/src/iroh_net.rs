@@ -6454,7 +6454,7 @@ fn files_header(
 async fn write_files_body<F: Fn(u64, u64)>(send: &mut SendStream,
     items: &[(PathBuf, String, u64, u64)], total: u64, cancel: &AtomicBool,
     pace: bool, on_progress: &F) -> Result<u64> {
-    write_files_body_hashed(send, items, total, cancel, pace, on_progress, None).await
+    write_files_body_hashed(send, items, total, cancel, pace, on_progress, None, false).await
 }
 
 async fn write_files_body_hashed<F: Fn(u64, u64)>(
@@ -6465,6 +6465,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
     pace: bool,
     on_progress: &F,
     mut hashes: Option<&mut Vec<integrity::FileHash>>,
+    location_hash: bool,
 ) -> Result<u64> {
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
@@ -6472,6 +6473,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
         let mut f = open_for_send(path).await?;
         let leaves = integrity::Leaves::default();
         let mut hash = hashes.is_some().then(|| integrity::Blocks::new(0, leaves.clone())).transpose()?;
+        let mut plain = location_hash.then(|| ring::digest::Context::new(&ring::digest::SHA256));
         // The receiver consumes EXACTLY the advertised size per item, so the
         // stream must match the header byte-for-byte. A file that GROWS between
         // stat and send (still downloading/copying, a live log) must be cut at
@@ -6489,6 +6491,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
                 anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
             }
             if let Some(hash) = &mut hash { hash.update(&buf[..n]); }
+            if let Some(plain) = &mut plain { plain.update(&buf[..n]); }
             if pace {
                 pace_bytes(n as u64).await;
             }
@@ -6501,7 +6504,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
         }
         if let Some(hash) = hash {
             hash.finish();
-            hashes.as_mut().unwrap().push(integrity::FileHash { leaves: integrity::snapshot_leaves(&leaves), index: integrity::item_offset() + index as u64, name: name.clone(), size: *size, digest: integrity::combine(*size, &leaves)? });
+            hashes.as_mut().unwrap().push(integrity::FileHash { sha256: plain.map(|h| hex::encode(h.finish())), leaves: integrity::snapshot_leaves(&leaves), index: if location_hash { index as u64 } else { integrity::item_offset() + index as u64 }, name: name.clone(), size: *size, digest: integrity::combine(*size, &leaves)? });
         }
     }
     Ok(sent)
@@ -6679,7 +6682,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
         }
         if let Some(hash) = hash {
             hash.finish();
-            hashes.push(integrity::FileHash { leaves: integrity::snapshot_leaves(&leaves), index: received_item_index(item_offset, index), name: raw.into(), size, digest: integrity::combine(size, &leaves)? });
+            hashes.push(integrity::FileHash { sha256: None, leaves: integrity::snapshot_leaves(&leaves), index: received_item_index(item_offset, index), name: raw.into(), size, digest: integrity::combine(size, &leaves)? });
         }
         on_landed(received_item_index(item_offset, index), raw, &landed);
         out.push(landed);
@@ -6783,11 +6786,15 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
         header["location_transfer"] = serde_json::json!(location.transfer_id);
         if let Some(target) = &location.target { header["location"] = serde_json::to_value(target)?; }
         else { header["location_download"] = serde_json::json!(true); }
-        let sources: Vec<_> = items.iter().map(|(p, _, _, _)| p.clone()).collect();
-        let hashes = location_hashes(sources, cancel, activity).await?;
-        for (item, hash) in header["items"].as_array_mut().unwrap().iter_mut().zip(hashes) { item["sha256"] = serde_json::json!(hash); }
+        header["location_hash_v"] = serde_json::json!(2);
     }
     if let Some(snapshot) = location.and_then(|l| l.snapshot.as_ref()) { snapshot.check_access(&peer_id)?; }
+    #[cfg(test)]
+    if location.is_some() {
+        assert_eq!(header["location_hash_v"], 2);
+        assert!(header["items"].as_array().unwrap().iter().all(|item| item.get("sha256").is_none()));
+    }
+    if location.is_some() { on_progress(0, total); }
     write_frame(&mut send, &header).await?;
 
     // This file's count is also used for legacy display; the shared watchdog
@@ -6820,7 +6827,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     // sends a ready frame at all, so an unbounded await deadlocked the send at
     // "Transferring 0%" with not one body byte written. On timeout we CORRECT the
     // record and drop to the legacy path exactly like an unknown peer does.
-    let reply = if known_capable || n > 0 {
+    let reply = if known_capable || n > 0 || location.is_some() {
         match tokio::time::timeout(Duration::from_secs(6), &mut pending).await {
             Ok(r) => Some(r?),
             Err(_) if held.load(Ordering::SeqCst) => {
@@ -6845,12 +6852,14 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     } else {
         None
     };
+    anyhow::ensure!(location.is_none() || reply.is_some(), "Upload not verified: integrity negotiation required");
     if let Some((reply, mut recv)) = reply {
         drop(pending);
         if let Some(error) = reply["error"].as_str() {
             anyhow::bail!("receiver: {error}");
         }
         anyhow::ensure!(reply["declined"].as_bool() != Some(true), "the recipient declined the transfer");
+        anyhow::ensure!(location.is_none() || integrity::enabled(&reply), "Upload not verified: integrity negotiation required");
         if reply["legacy_ok"].as_bool() == Some(true) {
             // A legacy peer with a zero-byte body can finish (raw `ok`) before we
             // write anything — that is a completed receive, not a protocol error.
@@ -6881,10 +6890,21 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                 let write = async {
                     let local = if n > 0 {
                         parallel_engaged.store(true, Ordering::SeqCst);
-                        integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, activity).await?
+                        if location.is_some() {
+                            // Ranges can arrive out of order: overlap the plain digest
+                            // read with sending, then join before writing the manifest.
+                            let (mut rows, digests) = tokio::try_join!(
+                                integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, activity),
+                                location_hashes(vec![items[0].0.clone()], cancel, activity)
+                            )?;
+                            // Location headers have no chat batch offset.
+                            rows[0].index = 0;
+                            rows[0].sha256 = Some(digests[0].clone());
+                            rows
+                        } else { integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, activity).await? }
                     } else {
                         let mut local = vec![];
-                        write_files_body_hashed(&mut send, &items, total, cancel, pace, &transport, Some(&mut local)).await?;
+                        write_files_body_hashed(&mut send, &items, total, cancel, pace, &transport, Some(&mut local), location.is_some()).await?;
                         local
                     };
                     *hashes.lock().unwrap() = local.clone();
@@ -6961,7 +6981,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
             }
         };
         let mut local = vec![];
-        let result = write_files_body_hashed(&mut send, &items, total, cancel, pace, &cb, if decision.load(Ordering::SeqCst) == 2 { None } else { Some(&mut local) }).await;
+        let result = write_files_body_hashed(&mut send, &items, total, cancel, pace, &cb, if decision.load(Ordering::SeqCst) == 2 { None } else { Some(&mut local) }, location.is_some()).await;
         match result {
             Ok(sent) => {
                 *hashes.lock().unwrap() = local.clone();
@@ -7447,7 +7467,7 @@ async fn serve_pull_verified<F: Fn(u64, u64)>(conn: &Connection, send: &mut Send
             integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &progress, &activity).await?
         } else {
             let mut local = vec![];
-            write_files_body_hashed(send, &items, total, cancel, pace, &progress, Some(&mut local)).await?;
+            write_files_body_hashed(send, &items, total, cancel, pace, &progress, Some(&mut local), false).await?;
             local
         };
         *hashes.lock().unwrap() = local.clone();
@@ -7562,6 +7582,10 @@ async fn location_hashes(paths: Vec<PathBuf>, cancel: &AtomicBool, activity: &At
     let worker_progress = hashed.clone();
     let stopped = Arc::new(AtomicBool::new(cancel.load(Ordering::SeqCst)));
     let worker_cancel = stopped.clone();
+    struct StopHash(Arc<AtomicBool>);
+    impl Drop for StopHash { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+    let _stop_hash = StopHash(stopped.clone());
+    let mut deadline = integrity::Inactivity::new(Some(activity));
     let mut worker = tokio::task::spawn_blocking(move || {
         let mut base = 0;
         paths.iter().map(|path| {
@@ -7580,6 +7604,8 @@ async fn location_hashes(paths: Vec<PathBuf>, cancel: &AtomicBool, activity: &At
                 let done = hashed.load(Ordering::Relaxed);
                 activity.fetch_add(done.saturating_sub(last), Ordering::SeqCst);
                 last = done;
+                anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+                deadline.check(Some(activity))?;
             }
         }
     }
@@ -7596,15 +7622,21 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
 ) -> Result<Vec<PathBuf>> {
     let paths = body.await?;
     if upload.is_none() && header["location_download"] != true { return Ok(paths); }
+    // Capture in the receive task; spawn_blocking cannot access task-local reports.
+    let rows = integrity::reports();
     let total = header["total"].as_u64().unwrap_or(0);
     let copied = Arc::new(AtomicU64::new(0));
     let copy_counter = copied.clone();
     let mut finalize = tokio::task::spawn_blocking(move || {
         if let Some(upload) = upload {
-            return upload.finish_progress(&header, paths, &cancel, |n| { copy_counter.fetch_max(n, Ordering::Relaxed); });
+            return upload.finish_verified_progress(&header, paths, &rows, &cancel, |n| { copy_counter.fetch_max(n, Ordering::Relaxed); });
         }
         let items = header["items"].as_array().context("Missing download manifest")?;
         anyhow::ensure!(items.len() == paths.len(), "Incomplete location download");
+        if header["location_hash_v"] == 2 {
+            crate::locations::verified_digests(&header, &rows)?;
+            return Ok(paths);
+        }
         let mut base = 0;
         for (item, path) in items.iter().zip(&paths) {
             let hash = crate::locations::sha256_progress(path, &cancel, |n| { copy_counter.fetch_max(base + n, Ordering::Relaxed); })?;
@@ -7641,7 +7673,8 @@ async fn receive_location_headless(conn: &Connection, send: &mut SendStream, rec
     let paths = read_files_negotiated(conn, send, recv, &body_header, &upload.staging,
         cancel, &AtomicBool::new(false), |_, _| {}).await?;
     let finish_header = header.clone();
-    tokio::task::spawn_blocking(move || upload.finish(&finish_header, paths)).await??;
+    let rows = integrity::reports();
+    tokio::task::spawn_blocking(move || upload.finish_verified_progress(&finish_header, paths, &rows, &AtomicBool::new(false), |_| {})).await??;
     Ok(())
     }.await;
     if integrity::enabled(header) {
@@ -8462,7 +8495,7 @@ mod loopback_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn integrity_five_thousand_file_manifest_receipt_roundtrip() {
         integrity::scope(async {
-            let hashes: Vec<_> = (0..5000).map(|i| integrity::FileHash { leaves: Default::default(), index: i, name: format!("file-{i}.bin"), size: 0, digest: "a".repeat(64) }).collect();
+            let hashes: Vec<_> = (0..5000).map(|i| integrity::FileHash { sha256: None, leaves: Default::default(), index: i, name: format!("file-{i}.bin"), size: 0, digest: "a".repeat(64) }).collect();
             let server = loopback_endpoint(true).await; let client = loopback_endpoint(false).await;
             let srv = server.clone(); let remote = hashes.clone();
             let receiver = tokio::spawn(integrity::scope(async move {
@@ -8493,7 +8526,7 @@ mod loopback_tests {
             let receiver = tokio::spawn(integrity::scope(async move {
                 let conn = srv.accept().await.unwrap().await.unwrap();
                 let (_, mut recv) = conn.accept_bi().await.unwrap();
-                let hash = integrity::FileHash { leaves: Default::default(), index: 0, name: "saved".into(), size: 0, digest: "a".repeat(64) };
+                let hash = integrity::FileHash { sha256: None, leaves: Default::default(), index: 0, name: "saved".into(), size: 0, digest: "a".repeat(64) };
                 integrity::record(integrity::compare(&[hash.clone()], &[hash]).unwrap());
                 integrity::receive_ack(&mut recv).await;
                 assert!(integrity::reports()[0].verified);
@@ -11122,7 +11155,7 @@ mod integrity_round2_tests {
                 let receiver = tokio::spawn(async move {
                     let conn = srv.accept().await.unwrap().await.unwrap();
                     let (_send, mut recv) = conn.accept_bi().await.unwrap();
-                    let hashes: Vec<_> = (0..2).map(|index| integrity::FileHash { leaves: Default::default(), index,
+                    let hashes: Vec<_> = (0..2).map(|index| integrity::FileHash { sha256: None, leaves: Default::default(), index,
                         name: format!("{index}"), size: 0, digest: "a".repeat(64) }).collect();
                     let cancel = AtomicBool::new(false);
                     let error = integrity::STALL_BUDGET.scope(Duration::from_millis(100), async {

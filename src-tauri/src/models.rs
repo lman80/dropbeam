@@ -615,6 +615,8 @@ pub struct VerifyResult {
 #[serde(rename_all = "camelCase")]
 pub struct FileIntegrity {
     #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
     pub index: u64,
     #[serde(default)]
     pub acknowledged: bool,
