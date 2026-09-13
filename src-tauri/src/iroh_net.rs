@@ -7165,8 +7165,12 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     // sends a ready frame at all, so an unbounded await deadlocked the send at
     // "Transferring 0%" with not one body byte written. On timeout we CORRECT the
     // record and drop to the legacy path exactly like an unknown peer does.
+    // A Location host always answers, but preparing a 400-item batch on a
+    // network-mounted NAS can take longer than the six-second legacy fallback,
+    // and there is no legacy path for Locations anyway: give it a minute.
+    let ready_patience = Duration::from_secs(if location.is_some() { 60 } else { 6 });
     let reply = if known_capable || n > 0 || location.is_some() {
-        match tokio::time::timeout(Duration::from_secs(6), &mut pending).await {
+        match tokio::time::timeout(ready_patience, &mut pending).await {
             Ok(r) => Some(r?),
             Err(_) if held.load(Ordering::SeqCst) => {
                 Some(

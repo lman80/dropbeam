@@ -1195,11 +1195,20 @@ fn adopt_abandoned_partials(staging_root: &Path, stage: &Path, endpoint: &str, i
             if leases.contains(&other) { continue; }
             leases.push(other.clone()); UploadLease(other.clone())
         };
+        // One directory listing per stage: a 400-item batch must not cost
+        // 400 x N stat calls over a network mount (that pushed the host's
+        // ready reply past the sender's patience).
+        let present: std::collections::HashSet<String> = match fs::read_dir(&other) {
+            Ok(rd) => rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .filter_map(|e| e.file_name().to_str().map(str::to_owned)).collect(),
+            Err(_) => continue,
+        };
         for fp in &fps {
-            let src_json = other.join(format!(".dropbeam-partial-{fp}.json"));
-            let src_part = other.join(format!(".dropbeam-partial-{fp}.part"));
+            let (json_name, part_name) = (format!(".dropbeam-partial-{fp}.json"), format!(".dropbeam-partial-{fp}.part"));
+            if !present.contains(&json_name) || !present.contains(&part_name) { continue; }
+            let src_json = other.join(&json_name);
+            let src_part = other.join(&part_name);
             let is_file = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_file());
-            if !is_file(&src_json) || !is_file(&src_part) { continue; }
             let dst_json = stage.join(format!(".dropbeam-partial-{fp}.json"));
             let dst_part = stage.join(format!(".dropbeam-partial-{fp}.part"));
             let (src_cov, dst_cov) = (covered_bytes(&src_json), if is_file(&dst_json) { covered_bytes(&dst_json) } else { 0 });
