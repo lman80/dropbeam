@@ -3462,6 +3462,36 @@ struct LocationBatch {
     next_file: usize,
     dirs_pending: bool,
 }
+const SMALL_FILE_LIMIT: u64 = 4 * 1024 * 1024;
+const BATCH_BYTES: u64 = 32 * 1024 * 1024;
+const BATCH_ITEMS: usize = 400;
+
+/// Plan contiguous pushes without landed files, preserving global integrity indices.
+/// Retries use location_stat to skip landed files. An interrupted small-file batch
+/// is re-sent on the next attempt (at most 32 MiB of rework); large files retain
+/// their existing single-file parallel streams and byte-range resume.
+fn plan_location_pushes(items: &[SendItem], landed: &[bool]) -> Vec<std::ops::Range<usize>> {
+    assert_eq!(items.len(), landed.len());
+    let mut pushes = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        if landed[i] { i += 1; continue; }
+        let start = i;
+        if items[i].2 >= SMALL_FILE_LIMIT {
+            i += 1;
+        } else {
+            let mut bytes = 0;
+            while i < items.len() && !landed[i] && items[i].2 < SMALL_FILE_LIMIT
+                && i - start < BATCH_ITEMS && bytes + items[i].2 <= BATCH_BYTES {
+                bytes += items[i].2;
+                i += 1;
+            }
+        }
+        pushes.push(start..i);
+    }
+    pushes
+}
+
 impl LocationBatch {
     async fn send_attempt(&mut self, conn: &Connection, location: &LocationSend, cancel: &AtomicBool,
         name: &str, engaged: &AtomicBool, activity: &AtomicU64, state: Option<&IrohState>,
@@ -3475,19 +3505,17 @@ impl LocationBatch {
         let mut dirs: Vec<_> = if self.dirs_pending { self.dirs.iter()
             .filter(|d| !existing.get(*d).is_some_and(|e| e.0)).cloned().collect() } else { vec![] };
         let mut sent_push = false;
-        while self.next_file < self.items.len() {
+        for r in plan_location_pushes(&self.items, &landed) {
             boundary()?;
-            let i = self.next_file;
-            if landed[i] { self.next_file += 1; continue; }
             anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
-            let base: u64 = self.items[..i].iter().map(|i| i.2).sum();
-            let push = LocationPush { items: vec![self.items[i].clone()], dirs: dirs.clone(),
-                total_items: self.items.len() as u64, offset: i as u64 };
+            let base: u64 = self.items[..r.start].iter().map(|i| i.2).sum();
+            let push = LocationPush { items: self.items[r.clone()].to_vec(), dirs: dirs.clone(),
+                total_items: self.items.len() as u64, offset: r.start as u64 };
             engaged.store(false, Ordering::SeqCst);
-            integrity::ITEM_OFFSET.scope(i as u64, LOCATION_PUSH.scope(push,
+            integrity::ITEM_OFFSET.scope(r.start as u64, LOCATION_PUSH.scope(push,
                 send_files_linked(conn, &[], cancel, |d, _| progress(base + d, total), name,
                     engaged, activity, state, None, Some(location)))).await?;
-            self.next_file += 1;
+            self.next_file = r.end;
             self.dirs_pending = false;
             dirs.clear();
             sent_push = true;
@@ -8013,6 +8041,43 @@ async fn receive_location_headless_progress<F: Fn(u64, u64)>(conn: &Connection, 
 
 #[cfg(test)]
 mod tests {
+    fn planned(sizes: &[u64], landed: &[bool]) -> Vec<std::ops::Range<usize>> {
+        let items: Vec<super::SendItem> = sizes.iter().enumerate()
+            .map(|(i, &size)| (std::path::PathBuf::new(), i.to_string(), size, 0)).collect();
+        super::plan_location_pushes(&items, landed)
+    }
+
+    #[test]
+    fn location_push_plan_small() {
+        assert_eq!(planned(&[1024; 10], &[false; 10]), vec![0..10]);
+    }
+    #[test]
+    fn location_push_plan_large() {
+        assert_eq!(planned(&[1, super::SMALL_FILE_LIMIT, 1, 1], &[false; 4]), vec![0..1, 1..2, 2..4]);
+        assert_eq!(planned(&[20 * 1024 * 1024; 3], &[false; 3]), vec![0..1, 1..2, 2..3]);
+    }
+    #[test]
+    fn location_push_plan_landed_gap() {
+        assert_eq!(planned(&[1; 4], &[false, false, true, false]), vec![0..2, 3..4]);
+    }
+    #[test]
+    fn location_push_plan_byte_cap() {
+        // 12 MiB items would be singletons under the 4 MiB large-file rule.
+        assert_eq!(planned(&[3 * 1024 * 1024; 11], &[false; 11]), vec![0..10, 10..11]);
+        let mut sizes = vec![3 * 1024 * 1024; 10];
+        sizes.extend([2 * 1024 * 1024, 1]);
+        assert_eq!(planned(&sizes, &[false; 12]), vec![0..11, 11..12]);
+    }
+    #[test]
+    fn location_push_plan_item_cap() {
+        assert_eq!(planned(&[1; 401], &[false; 401]), vec![0..400, 400..401]);
+    }
+    #[test]
+    fn location_push_plan_all_landed() {
+        assert!(planned(&[1; 4], &[true; 4]).is_empty());
+        assert!(planned(&[], &[]).is_empty());
+    }
+
     #[test]
     fn local_label_requires_our_actual_subnet_and_excludes_tailscale() {
         use netwatch::interfaces::IpNet;
@@ -11527,7 +11592,7 @@ mod location_loopback_tests {
             peer_addrs().lock().unwrap().insert(host.id().to_string(), host.addr().ip_addrs().map(|addr| PeerAddr { addr: *addr, last_seen: peer_addr_now(), observed_working: true }).collect());
             let paths: Vec<_> = (0..3).map(|i| {
                 let p = base.join(format!("file{i}.bin"));
-                std::fs::write(&p, vec![i as u8 + 17; 4096]).unwrap(); p
+                std::fs::write(&p, vec![i as u8 + 17; if i == 0 { SMALL_FILE_LIMIT as usize } else { 4096 }]).unwrap(); p
             }).collect();
             let (items, dirs, _) = gather_items(&paths).unwrap();
             let mut batch = LocationBatch { items, dirs, next_file:0, dirs_pending:true };
@@ -11568,6 +11633,60 @@ mod location_loopback_tests {
             for path in paths { assert_eq!(std::fs::read(nas.join(path.file_name().unwrap())).unwrap(), std::fs::read(path).unwrap()); }
             listener.abort(); client.close().await; host.close().await;
         }).await.expect("relay recovery must complete");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback socket binding; run explicitly outside the sandbox"]
+    async fn loopback_locations_batched_small_files() {
+        use iroh::RelayMode;
+        let base = std::env::temp_dir().join(format!("dropbeam-location-loopback-{}", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) {
+            crate::locations::UPLOAD_PREPARE_COUNTS.lock().unwrap().remove(&self.0.join("config"));
+            let _ = std::fs::remove_dir_all(&self.0);
+        } }
+        let _cleanup = Cleanup(base.clone());
+        let config = base.join("config"); let nas = base.join("nas");
+        std::fs::create_dir_all(&config).unwrap(); std::fs::create_dir_all(&nas).unwrap();
+        let host = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let client = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let friend = crate::friends::upsert_by_endpoint(&config, &client.id().to_string(), "Mac");
+        let location = crate::locations::Location { id:"family".into(), name:"Family NAS".into(), path:nas.to_string_lossy().into_owned(), friend_ids:vec![friend.id], rights:crate::locations::Rights::default(), byte_cap:crate::locations::default_byte_cap(), device:None, marker:None, safe_publish:None };
+        crate::locations::save(&config, Some(location.clone()), None).unwrap();
+        let state = Arc::new(IrohState::default()); state.location_config.set(config.clone()).unwrap();
+        let listener = tokio::spawn(accept_loop(host.clone(), state));
+        let addr = host.addr();
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::locations::UPLOAD_PREPARE_COUNTS.lock().unwrap().insert(config.clone(), count.clone());
+        let folder = base.join("corpus");
+        std::fs::create_dir_all(folder.join("empty")).unwrap();
+        for i in 0..25 {
+            std::fs::write(folder.join(format!("small-{i:02}.bin")), vec![i as u8; 4096 + i]).unwrap();
+        }
+        std::fs::write(folder.join("large.bin"), vec![37; SMALL_FILE_LIMIT as usize]).unwrap();
+        let (mut items, dirs, total) = gather_items(&[folder.clone()]).unwrap();
+        // Put the large file between two small batches to verify nonzero offsets.
+        items.sort_by_key(|item| if item.2 >= SMALL_FILE_LIMIT { "small-12a".to_string() }
+            else { item.0.file_name().unwrap().to_string_lossy().into_owned() });
+        let mut batch = LocationBatch { items, dirs, next_file: 0, dirs_pending: true };
+        let options = LocationSend { target: Some(crate::locations::Target {
+            location_id: "family".into(), rel_path: "".into() }),
+            transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None };
+        let sent = tokio::time::timeout(Duration::from_secs(60), batch.send_attempt(
+            &conn, &options, &AtomicBool::new(false), "Mac", &AtomicBool::new(false),
+            &AtomicU64::new(0), None, |_, _| {}, |_| {}, || Ok(()))).await.unwrap().unwrap();
+        assert_eq!(sent, total);
+        assert_eq!(batch.next_file, 26);
+        for item in &batch.items {
+            assert_eq!(std::fs::read(nas.join(&item.1)).unwrap(), std::fs::read(&item.0).unwrap(), "{}", item.1);
+        }
+        assert!(nas.join("corpus/empty").is_dir());
+        let pushes = count.load(Ordering::SeqCst);
+        assert!(pushes > 0 && pushes <= 4, "expected two small batches, one large file, and terminal push; saw {pushes}");
+        conn.close(0u32.into(), b"done"); listener.abort(); client.close().await; host.close().await;
     }
 
     #[tokio::test]

@@ -1014,8 +1014,16 @@ pub struct Upload {
 static UPLOADS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 struct UploadLease(PathBuf);
 impl Drop for UploadLease { fn drop(&mut self) { UPLOADS.lock().unwrap_or_else(|p| p.into_inner()).retain(|p| p != &self.0); } }
+// Per-config counters isolate loopback assertions from concurrently running tests.
+#[cfg(test)]
+pub(crate) static UPLOAD_PREPARE_COUNTS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 impl Upload {
     pub fn prepare(config: &Path, endpoint: &str, header: &Value) -> Result<Self> {
+        #[cfg(test)]
+        if let Some(count) = UPLOAD_PREPARE_COUNTS.lock().unwrap().get(config) {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         ensure!(header["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
         let target: Target = serde_json::from_value(header["location"].clone())?;
         let (mut location, friend) = authorize(config, endpoint, &target.location_id, Access::Upload)?;
