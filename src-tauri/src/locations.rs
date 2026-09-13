@@ -591,6 +591,20 @@ mod unix {
             let meta = file.metadata()?;
             Ok(Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 })))
         }
+        /// Stat many leaves of ONE parent directory: the parent is walked once
+        /// (descriptor-relative, O_NOFOLLOW) and each leaf costs a single open.
+        /// A 17,000-file upload used to stat every path from the root, six
+        /// network round trips each on a mounted NAS, and outran the sender's
+        /// patience. A missing or unreadable parent means every leaf is absent.
+        pub fn stat_many(&self, raw_parent: &str, leaves: &[String]) -> Result<Vec<Option<(bool, u64)>>> {
+            let rel = relative(raw_parent)?;
+            let Ok(dir) = self.open_rel(&rel, true) else { return Ok(vec![None; leaves.len()]); };
+            Ok(leaves.iter().map(|leaf| {
+                let file = child(&dir, std::ffi::OsStr::new(leaf), false).ok()?;
+                let meta = file.metadata().ok()?;
+                Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 }))
+            }).collect())
+        }
         pub fn listing(&self, raw: &str) -> Result<Vec<Entry>> {
             self.resolve(raw)?;
             let dir = self.open_rel(&relative(raw)?, true)?;
@@ -821,6 +835,7 @@ mod unix {
 #[cfg(not(unix))]
 impl Root {
     pub fn stat_entry(&self, _: &str) -> Result<Option<(bool, u64)>> { bail!("Hosting unavailable") }
+    pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64)>>> { bail!("Hosting unavailable") }
     pub fn listing(&self, _: &str) -> Result<Vec<Entry>> { bail!("Hosting unavailable") }
     pub fn new_folder(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
     pub fn rename_item(&self, _: &str, _: &str) -> Result<()> { bail!("Hosting unavailable") }
@@ -857,13 +872,24 @@ fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> 
         "locations.stat" => {
             let paths = request["paths"].as_array().context("Missing stat paths")?;
             ensure!(paths.len() <= 1000, "Too many stat paths");
-            let mut entries = Vec::new();
+            // Group by parent directory so each directory is walked once and
+            // every leaf costs one open (see Root::stat_many).
+            let mut groups: std::collections::BTreeMap<String, Vec<(String, String)>> = std::collections::BTreeMap::new();
             for path in paths {
                 let rel = path.as_str().context("Invalid stat path")?;
-                relative(rel)?;
-                let full = format!("{raw}/{rel}").trim_start_matches('/').to_string();
-                if let Some((is_dir, size)) = root.stat_entry(&full)? {
-                    entries.push(json!({"rel_path":rel,"size":size,"is_dir":is_dir}));
+                let rel_path = relative(rel)?;
+                let leaf = rel_path.file_name().context("Invalid stat path")?.to_string_lossy().into_owned();
+                let parent = rel_path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let full_parent = format!("{raw}/{parent}").trim_matches('/').to_string();
+                groups.entry(full_parent).or_default().push((rel.to_string(), leaf));
+            }
+            let mut entries = Vec::new();
+            for (parent, items) in &groups {
+                let leaves: Vec<String> = items.iter().map(|(_, leaf)| leaf.clone()).collect();
+                for ((rel, _), found) in items.iter().zip(root.stat_many(parent, &leaves)?) {
+                    if let Some((is_dir, size)) = found {
+                        entries.push(json!({"rel_path":rel,"size":size,"is_dir":is_dir}));
+                    }
                 }
             }
             Ok(json!({"entries":entries}))

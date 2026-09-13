@@ -3466,7 +3466,10 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
         write_frame(&mut send, &serde_json::json!({"kind":"locations.stat", "locations_v":crate::locations::VERSION,
             "id":target.location_id,"rel_path":target.rel_path,"paths":paths})).await?;
         send.finish()?;
-        let reply = tokio::time::timeout(Duration::from_secs(45), read_frame_cap(&mut recv, 2_000_000)).await??;
+        // A NAS host answering over a network mount can take a while for a
+        // 1000-path chunk; the sender shows "Connecting…" meanwhile. Three
+        // minutes is generous even for a cold mount and still fails clearly.
+        let reply = tokio::time::timeout(Duration::from_secs(180), read_frame_cap(&mut recv, 2_000_000)).await??;
         anyhow::ensure!(reply["ok"] == true, "{}", reply["error"].as_str().unwrap_or("Location stat failed"));
         for entry in reply["data"]["entries"].as_array().context("Invalid stat response")? {
             entries.insert(entry["rel_path"].as_str().context("Invalid stat path")?.to_string(),
