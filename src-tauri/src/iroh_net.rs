@@ -1935,6 +1935,25 @@ async fn serve_stream_inner(
                 state.conns.lock().unwrap().remove(&p.transfer_id);
             }
         }
+        Some("files.stat") => {
+            let result: Result<serde_json::Value> = async {
+                let app = state.app.get().context("Application is not ready")?;
+                let (config, configured) = app.try_state::<Arc<crate::AppState>>()
+                    .map(|st| (st.config_dir.clone(), st.settings.lock().unwrap().download_dir.clone()))
+                    .context("Application is not ready")?;
+                let who = conn.remote_id().to_string();
+                anyhow::ensure!(crate::friends::load(&config).iter()
+                    .any(|f| f.endpoint_id.as_deref() == Some(who.as_str())), "Friend access denied");
+                let dest = if configured.trim().is_empty() {
+                    app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                } else { PathBuf::from(configured) };
+                let request = req.clone();
+                tokio::task::spawn_blocking(move || friend_stat_reply(&dest, &request)).await?
+            }.await;
+            let reply = result.unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}));
+            write_frame(send, &reply).await?;
+            send.finish()?;
+        }
         Some("files") => {
             // A friend pushed files straight to us. Receive into the download
             // folder and surface it like any other receive.
@@ -2341,6 +2360,7 @@ async fn serve_stream_inner(
                                             FinalizeDest::UniqueIn(
                                                 dest.clone(),
                                                 receive_rel(&name).to_string_lossy().into_owned(),
+                                                item0["mtime"].as_u64().unwrap_or(0),
                                             ),
                                             total, part, rc, cov, first, &cancel, |d, t| cb(location_receive_progress(&req, d), t), &req, item_offset, recv,
                                         ).await.map(|p| vec![p]) })
@@ -3456,6 +3476,85 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
     Ok(entries)
 }
 
+/// Only exact regular-file matches are safe to skip; preserve normal landing
+/// (including collision naming) for every other destination.
+fn friend_file_landed(dest: &Path, name: &str, size: u64, mtime: u64) -> bool {
+    std::fs::symlink_metadata(dest.join(sanitize_rel(name))).is_ok_and(|meta|
+        meta.file_type().is_file() && meta.len() == size
+            && (mtime == 0 || mtime_secs(&meta) == mtime))
+}
+
+fn friend_stat_reply(dest: &Path, req: &serde_json::Value) -> Result<serde_json::Value> {
+    anyhow::ensure!(req["files_v"] == 1, "Unsupported files stat version");
+    let items = req["items"].as_array().context("Invalid stat items")?;
+    anyhow::ensure!(items.len() <= 1000, "Too many stat items");
+    let mut landed = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let name = item["name"].as_str().context("Invalid stat name")?;
+        let size = item["size"].as_u64().context("Invalid stat size")?;
+        let mtime = item["mtime"].as_u64().context("Invalid stat mtime")?;
+        if friend_file_landed(dest, name, size, mtime) { landed.push(index); }
+    }
+    Ok(serde_json::json!({"ok":true,"landed":landed}))
+}
+
+/// Capability probe and stat in one stream. Unsupported or malformed replies
+/// are deliberately equivalent to an empty result, including transport errors.
+async fn friend_stat(conn: &Connection, items: &[SendItem]) -> Vec<bool> {
+    let mut landed = vec![false; items.len()];
+    for (chunk, items) in items.chunks(1000).enumerate() {
+        let result: Result<Vec<usize>> = async {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let rows: Vec<_> = items.iter().map(|i| serde_json::json!({"name":i.1,"size":i.2,"mtime":i.3})).collect();
+            write_frame(&mut send, &serde_json::json!({"kind":"files.stat","files_v":1,"items":rows})).await?;
+            send.finish()?;
+            let reply = read_frame_cap(&mut recv, 2_000_000).await?;
+            anyhow::ensure!(reply["ok"] == true && reply.get("error").is_none(), "Unsupported files stat");
+            let indexes: Vec<usize> = serde_json::from_value(reply["landed"].clone())?;
+            anyhow::ensure!(indexes.iter().all(|&i| i < items.len()), "Invalid stat index");
+            Ok(indexes)
+        }.await;
+        match result {
+            Ok(indexes) => for index in indexes { landed[chunk * 1000 + index] = true; },
+            Err(_) => return vec![false; landed.len()],
+        }
+    }
+    landed
+}
+
+fn friend_split(items: &[SendItem]) -> bool { items.len() > 1 }
+
+async fn send_friend_batch(conn: &Connection, items: &[SendItem], dirs: &[String],
+    link: &crate::models::ChatTransferLink, cancel: &AtomicBool, name: &str,
+    engaged: &AtomicBool, activity: &AtomicU64, state: Option<&IrohState>,
+    progress: impl Fn(u64, u64), skipped: impl Fn(usize), boundary: impl Fn() -> Result<()>) -> Result<u64> {
+    let landed = tokio::time::timeout(Duration::from_secs(45), friend_stat(conn, items)).await
+        .unwrap_or_else(|_| vec![false; items.len()]);
+    skipped(landed.iter().filter(|&&v| v).count());
+    let total = items.iter().map(|i| i.2).sum();
+    let mut done: u64 = items.iter().zip(&landed).filter(|(_, landed)| **landed).map(|(i, _)| i.2).sum();
+    progress(done, total);
+    anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+    let mut pushes = plan_location_pushes(items, &landed);
+    // Even an all-skipped folder may contain empty directories to recreate.
+    if pushes.is_empty() && !dirs.is_empty() { pushes.push(items.len()..items.len()); }
+    for (index, r) in pushes.iter().enumerate() {
+        boundary()?;
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        let push = LocationPush { items: items[r.clone()].to_vec(), dirs: dirs.to_vec(),
+            total_items: items.len() as u64, offset: r.start as u64 };
+        let file_link = crate::models::ChatTransferLink { item_offset: r.start as u64,
+            offset: items[..r.start].iter().map(|i| i.2).sum(), last: index + 1 == pushes.len(), ..link.clone() };
+        engaged.store(false, Ordering::SeqCst);
+        integrity::ITEM_OFFSET.scope(push.offset, LOCATION_PUSH.scope(push,
+            send_files_linked(conn, &[], cancel, |d, _| progress(done + d, total), name,
+                engaged, activity, state, Some(&file_link), None))).await?;
+        done += items[r.clone()].iter().map(|i| i.2).sum::<u64>();
+    }
+    progress(total, total);
+    Ok(total)
+}
+
 struct LocationBatch {
     items: Vec<SendItem>,
     dirs: Vec<String>,
@@ -3606,10 +3705,9 @@ fn send_friend_inner(
             // network blip / sleep — so we auto-reconnect up to 2 extra times, and
             // the resume handshake picks up from the receiver's partial instead of
             // byte zero. The retry is gated on the receiver having replied
-            // {ready:true} THIS attempt: that proves an auto-accept parallel receive
-            // engaged, so the error can't be a manual-accept DECLINE (retrying one
-            // of those would re-prompt the recipient), and classic multi-file sends
-            // keep fail-fast so a retry can't duplicate files.
+            // {ready:true} THIS attempt for single pushes. Linked friend batches
+            // and Location uploads also resume through per-attempt stat probes.
+            // Explicit declines and cancellations remain terminal.
             // Retry budget is PROGRESS-based, not a fixed count: as long as each
             // resume pushes new bytes we keep going — so a huge file that loses its
             // path many times (or has to re-holepunch for a direct link) still
@@ -3635,7 +3733,8 @@ fn send_friend_inner(
             // retry attempts so a reconnect never re-sends finished files.
             let mut next_file: usize = 0;
             let mut upload_batch = LocationBatch { items: upload_items, dirs: upload_dirs, next_file: 0, dirs_pending: true };
-            let split = location.as_ref().is_none_or(|l| l.snapshot.is_none()) && pathbufs.len() > 1
+            let linked = location.is_none() && friend_split(&upload_batch.items);
+            let split = location.is_some() && location.as_ref().is_none_or(|l| l.snapshot.is_none()) && pathbufs.len() > 1
                 && pathbufs.iter().any(|p| {
                     std::fs::metadata(p)
                         .map(|m| m.len() >= PARALLEL_MIN)
@@ -3828,7 +3927,7 @@ fn send_friend_inner(
                     let watchdog_activity = transport_activity.clone();
                     let recovery = recovery.clone();
                     let requested = redial_requested.clone();
-                    let per_file = (is_upload && upload_batch.items.len() > 1) || split;
+                    let per_file = (is_upload && upload_batch.items.len() > 1) || split || linked;
                     tauri::async_runtime::spawn(async move {
                         let mut last_p = watchdog_activity.load(Ordering::SeqCst);
                         let mut last_frames = transport_stream_frames(&c);
@@ -3855,7 +3954,7 @@ fn send_friend_inner(
                                 last_p = p;
                                 last_change = Instant::now();
                             }
-                            let stall_budget = if eng.load(Ordering::SeqCst) {
+                            let stall_budget = if linked || eng.load(Ordering::SeqCst) {
                                 // Generous enough for the receiver's end-game (join
                                 // workers + final fsync of a huge file) after the
                                 // last progress tick.
@@ -3891,10 +3990,22 @@ fn send_friend_inner(
                 // transfer over the same connection: every big file gets parallel
                 // streams + the {hold} handshake + per-file resume, and files
                 // confirmed in earlier attempts are never re-sent (no duplicates).
-                // Small-only batches keep the proven one-push classic body.
+                // Friend batches share the Location planner, including small-only
+                // selections and folders expanded from a single dropped path.
                 let outcome = if is_upload {
                     upload_batch.send_attempt(&conn, location.as_ref().unwrap(), &cancel,
                         &my_name, &engaged, &transport_activity, Some(&state), |d, t| cb(d, t), |count| {
+                            let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            notice.state = TransferState::Transferring;
+                            notice.bytes_total = total;
+                            notice.friend_name = Some(friend_name.clone());
+                            notice.location_skipped = Some(count as u64);
+                            emit(&app, &notice);
+                        }, || recovery.lock().unwrap().check(&conn, true, &redial_requested)).await
+                } else if linked {
+                    send_friend_batch(&conn, &upload_batch.items, &upload_batch.dirs, &chat_link,
+                        &cancel, &my_name, &engaged, &transport_activity, Some(&state),
+                        |d, t| cb(d, t), |count| {
                             let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
                             notice.state = TransferState::Transferring;
                             notice.bytes_total = total;
@@ -3944,7 +4055,7 @@ fn send_friend_inner(
                     send_files_linked(&conn, &pathbufs, &cancel, move |d, t| c(d, t), &my_name, &engaged, &transport_activity, Some(&state), if location.is_none() { Some(&chat_link) } else { None }, location.as_ref())
                         .await
                 };
-                let was_engaged = is_upload || engaged.load(Ordering::SeqCst);
+                let was_engaged = is_upload || linked || engaged.load(Ordering::SeqCst);
                 watchdog.abort();
                 if redial_requested.load(Ordering::SeqCst) && !cancel.load(Ordering::SeqCst)
                     && outcome.as_ref().is_err_and(|e| !e.to_string().contains(integrity::FAILED)
@@ -5371,6 +5482,15 @@ fn receive_candidates(natural: &Path, limit: usize) -> impl Iterator<Item = Path
         natural.with_file_name(format!("{stem} ({i}){ext}"))
     })
 }
+/// Split a receive name into (parent dir under `dir`, leaf name) using the
+/// same sanitising as every other landing path; never escapes `dir`.
+fn unique_in_parts(dir: &Path, name: &str) -> (PathBuf, String) {
+    let rel = sanitize_rel(name);
+    let safe = rel.file_name().map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty()).unwrap_or_else(|| "file".to_string());
+    let parent = rel.parent().map(|p| dir.join(p)).unwrap_or_else(|| dir.to_path_buf());
+    (parent, safe)
+}
 fn unique_path(dir: &Path, name: &str) -> Result<PathBuf> {
     let natural = dir.join(name);
     for candidate in receive_candidates(&natural, RECEIVE_NAME_LIMIT) {
@@ -6320,7 +6440,7 @@ enum FinalizeDest {
     Retain,
     /// Collision-safe name in a directory (friend sends, Quick Send): the final
     /// path is picked at COMPLETION time via `unique_path`.
-    UniqueIn(PathBuf, String),
+    UniqueIn(PathBuf, String, u64),
     /// An exact path + the origin mtime to stamp (folder sync: `staging/rel`,
     /// where the mtime keeps file signatures identical across the group).
     Exact(PathBuf, u64),
@@ -6519,13 +6639,9 @@ fn finalize_received(finalize: FinalizeDest, part: PathBuf, resume: Option<&Resu
         // and drop the freshly-received copy instead of minting a "name (1)" dup.
         // Folder-sync sends use FinalizeDest::Exact and are handled by reconcile, so
         // only the UniqueIn (collision-named) path needs this.
-        if let FinalizeDest::UniqueIn(dir, name) = &finalize {
-            let safe = Path::new(name)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "file".to_string());
-            let natural = dir.join(&safe);
+        if let FinalizeDest::UniqueIn(dir, name, _) = &finalize {
+            let (parent, safe) = unique_in_parts(dir, name);
+            let natural = parent.join(&safe);
             if std::fs::symlink_metadata(&natural).is_ok_and(|m| m.is_file()) && files_identical(&part, &natural).unwrap_or(false) {
                 let _ = std::fs::remove_file(&part);
                 if let Some(rc) = &resume {
@@ -6535,13 +6651,13 @@ fn finalize_received(finalize: FinalizeDest, part: PathBuf, resume: Option<&Resu
             }
         }
         let (dest, stamp) = match &finalize {
-            FinalizeDest::UniqueIn(dir, name) => {
-                let safe = Path::new(name)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "file".to_string());
-                (unique_path(dir, &safe)?, 0)
+            FinalizeDest::UniqueIn(dir, name, mtime) => {
+                // Land under the sender's relative path (a folder push keeps its
+                // tree) with a collision-safe leaf name, stamped with the origin
+                // mtime so a later files.stat recognises the file as landed.
+                let (parent, safe) = unique_in_parts(dir, name);
+                std::fs::create_dir_all(&parent)?;
+                (unique_path(&parent, &safe)?, *mtime)
             }
             FinalizeDest::Retain => return Ok(part),
             FinalizeDest::Exact(path, mtime) => {
@@ -7712,6 +7828,7 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
                                     FinalizeDest::UniqueIn(
                                         dest_dir.to_path_buf(),
                                         receive_rel(&name).to_string_lossy().into_owned(),
+                                        mtime,
                                     ),
                                     total,
                                     part,
@@ -8045,6 +8162,45 @@ async fn receive_location_headless_progress<F: Fn(u64, u64)>(conn: &Connection, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn friend_landed_requires_regular_file_size_and_mtime() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("dropbeam-stat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), b"abc").unwrap();
+        set_mtime_secs(&dir.join("file"), 1_700_000_000);
+        assert!(friend_file_landed(&dir, "file", 3, 1_700_000_000));
+        assert!(!friend_file_landed(&dir, "file", 4, 1_700_000_000));
+        assert!(!friend_file_landed(&dir, "file", 3, 1_700_000_001));
+        assert!(friend_file_landed(&dir, "file", 3, 0));
+        assert!(!friend_file_landed(&dir, "missing", 0, 0));
+        std::fs::create_dir(dir.join("folder")).unwrap();
+        let size = std::fs::metadata(dir.join("folder")).unwrap().len();
+        assert!(!friend_file_landed(&dir, "folder", size, 0));
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(dir.join("file"), dir.join("symlink")).unwrap();
+            assert!(!friend_file_landed(&dir, "symlink", 3, 0));
+        }
+        assert!(friend_stat_reply(&dir, &serde_json::json!({"files_v":2,"items":[]})).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn friend_split_uses_expanded_folder_items() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("dropbeam-split-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a", "b", "c"] { std::fs::write(dir.join(name), b"small").unwrap(); }
+        let (items, _, _) = gather_items(&[dir.clone()]).unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(friend_split(&items));
+        let (items, _, _) = gather_items(&[dir.join("a")]).unwrap();
+        assert!(!friend_split(&items));
+        let mut big = items.clone(); big[0].2 = PARALLEL_MIN;
+        assert!(!friend_split(&big));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn planned(sizes: &[u64], landed: &[bool]) -> Vec<std::ops::Range<usize>> {
         let items: Vec<super::SendItem> = sizes.iter().enumerate()
             .map(|(i, &size)| (std::path::PathBuf::new(), i.to_string(), size, 0)).collect();
@@ -8504,7 +8660,7 @@ mod tests {
             let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp).1, fp };
             recv_file_resumable(
                 &conn,
-                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into()),
+                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into(), 0),
                 total, part, Some(rc), cov, first,
                 &AtomicBool::new(false), |_, _| {},
             )
@@ -8576,7 +8732,7 @@ mod tests {
             let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp).1, fp };
             let dest = recv_file_resumable(
                 &conn,
-                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into()),
+                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into(), 0),
                 total, part, Some(rc), cov, first, &AtomicBool::new(false), |_, _| {},
             )
             .await
@@ -8669,7 +8825,7 @@ mod tests {
             let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp_c).1, fp: fp_c.clone() };
             let dest = recv_file_resumable(
                 &conn,
-                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into()),
+                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into(), 0),
                 total, part, Some(rc), cov, first,
                 &AtomicBool::new(false), |_, _| {},
             )
@@ -10852,7 +11008,7 @@ mod loopback_tests {
             let rc = ResumeCtx { side: partial_paths(&dest_c, &fp_c).1, fp: fp_c.clone() };
             let dest = recv_file_resumable(
                 &conn,
-                FinalizeDest::UniqueIn(dest_c.clone(), "blob.bin".into()),
+                FinalizeDest::UniqueIn(dest_c.clone(), "blob.bin".into(), 0),
                 total,
                 part,
                 Some(rc),
@@ -11758,6 +11914,78 @@ mod integrity_round2_tests {
         Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Disabled)
             .alpns(vec![ALPN.to_vec()]).bind_addr("127.0.0.1:0").unwrap().bind().await.expect("bind loopback")
     }
+    async fn friend_batch_loopback(old_peer: bool) {
+        let dir = fixture();
+        let folder = dir.join("folder"); std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a-big"), vec![37u8; PARALLEL_MIN as usize]).unwrap();
+        std::fs::write(folder.join("b-small"), b"second").unwrap();
+        std::fs::write(folder.join("c-small"), b"third").unwrap();
+        let (mut items, dirs, total) = gather_items(&[folder]).unwrap();
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+        let link: crate::models::ChatTransferLink = serde_json::from_value(serde_json::json!({
+            "id":uuid::Uuid::new_v4().to_string(),"attempt":1,
+            "manifest":items.iter().map(|i| serde_json::json!({"name":i.1,"size":i.2})).collect::<Vec<_>>(),
+            "directories":dirs,"offset":0,"total":total,"last":true})).unwrap();
+        let dest = dir.join("dest"); let target = dest.clone();
+        let server = endpoint().await; let client = endpoint().await; let srv = server.clone();
+        let received = Arc::new(Mutex::new(Vec::<String>::new())); let recorded = received.clone();
+        let receiver = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            loop {
+                let Ok((mut send, mut recv)) = conn.accept_bi().await else { break; };
+                let header = read_frame(&mut recv).await.unwrap();
+                if header["kind"] == "files.stat" {
+                    let reply = if old_peer { serde_json::json!({"error":"unknown kind"}) }
+                        else { friend_stat_reply(&target, &header).unwrap() };
+                    write_frame(&mut send, &reply).await.unwrap(); send.finish().unwrap();
+                } else {
+                    assert!(incoming_chat_link(&header, &conn.remote_id().to_string()).is_some());
+                    recorded.lock().unwrap().extend(header["items"].as_array().unwrap().iter()
+                        .map(|i| i["name"].as_str().unwrap().to_string()));
+                    integrity::scope(read_files_negotiated(&conn, &mut send, &mut recv, &header, &target,
+                        &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {})).await.unwrap();
+                }
+            }
+        });
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let state = IrohState::default(); state.learn_progress(&server.id().to_string(), 1);
+        let cancel = AtomicBool::new(false);
+        let engaged = AtomicBool::new(false); let activity = AtomicU64::new(0);
+        let notice = Mutex::new(TransferUpdate::new("test".into(), Direction::Send, vec![]));
+        if !old_peer {
+            let boundaries = AtomicU64::new(0);
+            let result = integrity::scope(send_friend_batch(&conn, &items, &dirs, &link, &cancel, "friend",
+                &engaged, &activity, Some(&state), |_, _| {}, |_| {}, || {
+                    // The first push has its terminal receipt before the next boundary.
+                    if boundaries.fetch_add(1, Ordering::SeqCst) == 1 { cancel.store(true, Ordering::SeqCst); }
+                    Ok(())
+                })).await;
+            assert!(result.unwrap_err().to_string().contains("canceled"));
+            assert_eq!(*received.lock().unwrap(), vec![items[0].1.clone()]);
+            assert_eq!(friend_stat(&conn, &items).await, vec![true, false, false]);
+            cancel.store(false, Ordering::SeqCst);
+        }
+        let progress = Mutex::new(Vec::new());
+        integrity::scope(send_friend_batch(&conn, &items, &dirs, &link, &cancel, "friend",
+            &engaged, &activity, Some(&state), |d, _| progress.lock().unwrap().push(d),
+            |count| notice.lock().unwrap().location_skipped = Some(count as u64), || Ok(()))).await.unwrap();
+        assert_eq!(notice.lock().unwrap().location_skipped, Some(if old_peer { 0 } else { 1 }));
+        assert_eq!(progress.lock().unwrap()[0], if old_peer { 0 } else { PARALLEL_MIN });
+        assert_eq!(*received.lock().unwrap(), items.iter().map(|i| i.1.clone()).collect::<Vec<_>>());
+        for item in &items { assert_eq!(std::fs::read(&item.0).unwrap(), std::fs::read(dest.join(&item.1)).unwrap()); }
+        assert_eq!(std::fs::read_dir(dest.join("folder")).unwrap().count(), 3, "no collision duplicates");
+        conn.close(0u32.into(), b"done"); receiver.await.unwrap();
+        client.close().await; server.close().await; std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback socket binds"]
+    async fn friend_folder_cancel_resend_skips_landed() { friend_batch_loopback(false).await; }
+
+    #[tokio::test]
+    #[ignore = "requires loopback socket binds"]
+    async fn friend_folder_old_stat_peer_sends_everything() { friend_batch_loopback(true).await; }
+
     fn link(size: u64) -> crate::models::ChatTransferLink {
         serde_json::from_value(serde_json::json!({"id": uuid::Uuid::new_v4().to_string(), "attempt":1,
             "manifest":[{"name":"same.bin", "size":size},{"name":"same.bin", "size":size}],
