@@ -3492,10 +3492,13 @@ impl LocationBatch {
             dirs.clear();
             sent_push = true;
         }
-        // A trailing skipped file (or an all-skipped/empty batch) still needs
-        // a terminal push to publish dirs and remove retained staging.
-        if !sent_push || landed.last() == Some(&true) {
-            let push = LocationPush { items: vec![], dirs, total_items: self.items.len() as u64,
+        // A terminal push always follows: it publishes EVERY directory again
+        // (ensure_dirs is idempotent), so an empty folder whose creation was
+        // lost with the first push is still recreated, and it removes retained
+        // staging after a trailing skipped file or an all-skipped/empty batch.
+        let _ = (sent_push, dirs);
+        {
+            let push = LocationPush { items: vec![], dirs: self.dirs.clone(), total_items: self.items.len() as u64,
                 offset: self.items.len() as u64 };
             integrity::ITEM_OFFSET.scope(push.offset, LOCATION_PUSH.scope(push,
                 send_files_linked(conn, &[], cancel, |_, _| progress(total, total), name,
