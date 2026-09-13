@@ -1131,6 +1131,8 @@ impl Upload {
                 ensure!(staged.starts_with(&self.staging), "Upload not verified: stage is outside transfer staging");
                 root.land_verified(&raw, &staged, digests[index], cancel, |n| progress(base + n), &publish)?
             } else { root.land(&raw, &staged, text(item, "sha256")?, cancel, |n| progress(base + n), &publish)? };
+            // Keep the source's modification time so the copy is a faithful backup.
+            crate::iroh_net::set_mtime_secs(&landed, item["mtime"].as_u64().unwrap_or(0));
             log::info!("locations upload friend={friend} location={} path={raw:?}", l.id);
             out.push(landed);
             base += item["size"].as_u64().context("Invalid file size")?;

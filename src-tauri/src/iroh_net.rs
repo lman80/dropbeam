@@ -3532,7 +3532,7 @@ fn send_friend_inner(
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let (items, directories, total) = if let Some(snapshot) = location.as_ref().and_then(|l| l.snapshot.as_ref()) {
         (snapshot.source.items.clone(), snapshot.source.dirs.clone(), snapshot.source.items.iter().map(|i| i.2).sum())
-    } else { gather_items(&pathbufs).map_err(|e| e.to_string())? };
+    } else { gather_items_with(&pathbufs, location.as_ref().is_some_and(|l| l.target.is_some())).map_err(|e| e.to_string())? };
     let names = if items.is_empty() { directories.clone() } else { items.iter().map(|i| i.1.clone()).collect() };
     let id = uuid::Uuid::new_v4().to_string();
     let chat_id = chat_transfer_id.unwrap_or_else(|| id.clone());
@@ -4870,7 +4870,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
 
 /// Stamp a file's modified-time to a specific epoch-seconds value, so a synced
 /// file carries the SAME mtime on every member (stable signatures, no storm).
-fn set_mtime_secs(path: &Path, secs: u64) {
+pub(crate) fn set_mtime_secs(path: &Path, secs: u64) {
     if secs == 0 {
         return;
     }
@@ -6554,6 +6554,13 @@ fn send_summary(paths: &[PathBuf]) -> Result<(Vec<String>, u64)> {
 
 /// Gather (path, name, size, mtime) for each file to send, plus the byte total.
 fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>, u64)> {
+    gather_items_with(paths, false)
+}
+
+/// `include_hidden` copies dot-files and dot-directories too (Location uploads:
+/// the NAS copy must be a complete backup). DropBeam's own `.dropbeam-*` names
+/// are always left out, and symlinks are still never followed.
+fn gather_items_with(paths: &[PathBuf], include_hidden: bool) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>, u64)> {
     let mut items = Vec::new();
     // Relative paths of EMPTY directories under any dropped folder — carried in the
     // manifest's optional `dirs` field so the receiver recreates them too (GitHub
@@ -6590,7 +6597,7 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
             // If the dropped folder (and everything under it) holds no files, record
             // the folder itself as empty so the peer still recreates it — otherwise a
             // user sending a brand-new empty folder would send literally nothing.
-            let had_file = collect_dir_items(p, &base, &mut items, &mut dirs);
+            let had_file = collect_dir_items(p, &base, &mut items, &mut dirs, include_hidden);
             if !had_file {
                 dirs.push(base);
             }
@@ -6620,6 +6627,7 @@ fn collect_dir_items(
     prefix: &str,
     out: &mut Vec<(PathBuf, String, u64, u64)>,
     empty_out: &mut Vec<String>,
+    include_hidden: bool,
 ) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else {
         // Unreadable dir: never fail the whole send — treat as "no files here". The
@@ -6631,7 +6639,7 @@ fn collect_dir_items(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
+        if name.to_ascii_lowercase().starts_with(".dropbeam-") || (!include_hidden && name.starts_with('.')) {
             continue;
         }
         let Ok(ft) = entry.file_type() else { continue };
@@ -6653,7 +6661,7 @@ fn collect_dir_items(
             // Recurse; if the subtree held no files, record the subfolder itself as
             // empty so the peer recreates it. A subtree WITH files needs no entry —
             // its files already imply every ancestor directory.
-            let sub_had_file = collect_dir_items(&path, &rel, out, empty_out);
+            let sub_had_file = collect_dir_items(&path, &rel, out, empty_out, include_hidden);
             if sub_had_file {
                 had_file = true;
             } else {
@@ -8784,6 +8792,31 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest);
         println!("iroh accept-loop Quick Send OK");
+    }
+}
+
+#[cfg(test)]
+mod hidden_items_tests {
+    use super::collect_dir_items;
+    #[test]
+    fn uploads_include_hidden_entries_but_never_dropbeam_markers() {
+        let root = std::env::temp_dir().join(format!("dropbeam-hidden-{}", uuid::Uuid::new_v4())).join("Lib");
+        std::fs::create_dir_all(root.join(".trash/rec")).unwrap();
+        std::fs::create_dir_all(root.join(".empty-hidden")).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join(".DS_Store"), b"d").unwrap();
+        std::fs::write(root.join(".trash/rec/old.mov"), b"m").unwrap();
+        std::fs::write(root.join(".dropbeam-staging-x"), b"x").unwrap();
+        let mut items = vec![]; let mut dirs = vec![];
+        collect_dir_items(&root, "Lib", &mut items, &mut dirs, false);
+        let names: Vec<_> = items.iter().map(|i| i.1.clone()).collect();
+        assert_eq!(names, vec!["Lib/a.txt"]);
+        assert!(dirs.is_empty());
+        let mut items = vec![]; let mut dirs = vec![];
+        collect_dir_items(&root, "Lib", &mut items, &mut dirs, true);
+        let mut names: Vec<_> = items.iter().map(|i| i.1.clone()).collect(); names.sort();
+        assert_eq!(names, vec!["Lib/.DS_Store", "Lib/.trash/rec/old.mov", "Lib/a.txt"]);
+        assert_eq!(dirs, vec!["Lib/.empty-hidden"]);
     }
 }
 
