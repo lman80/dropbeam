@@ -9,6 +9,9 @@ import {
   Copy,
   FolderOpen,
   Loader2,
+  Pause,
+  PauseCircle,
+  Play,
   RotateCw,
   Send,
   X,
@@ -49,6 +52,14 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
     (t.state === 'waitingForPeer' || t.state === 'starting') &&
     !!t.code &&
     !t.friendName
+  // Pause is for SENDS we're driving: stopping keeps every byte already delivered,
+  // so you can leave the network now and finish later from the same card.
+  const canPause =
+    t.direction === 'send' &&
+    (t.state === 'starting' ||
+      t.state === 'waitingForPeer' ||
+      t.state === 'connecting' ||
+      t.state === 'transferring')
   const isFriendPending =
     t.direction === 'send' &&
     !!t.friendName &&
@@ -95,6 +106,8 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             <CheckCircle2 size={17} />
           ) : t.state === 'failed' ? (
             <AlertCircle size={17} />
+          ) : t.state === 'paused' ? (
+            <PauseCircle size={17} />
           ) : (
             <DirIcon size={16} />
           )}
@@ -121,6 +134,15 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             )}
           </div>
         </div>
+        {canPause && (
+          <button
+            className="icon-btn"
+            title="Pause — keeps what's already been sent"
+            onClick={() => void api.pauseTransfer(t.id)}
+          >
+            <Pause size={15} />
+          </button>
+        )}
         <button
           className="icon-btn"
           title={isOffer ? 'Decline' : active ? 'Cancel' : 'Dismiss'}
@@ -403,6 +425,48 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
         </div>
       )}
 
+      {/* paused: how far it got + one-tap Resume (replays the same send; everything
+          already delivered is skipped). Cancel/Dismiss stays in the header. */}
+      {t.state === 'paused' && (
+        <div style={{ marginTop: 12 }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              fontSize: 13,
+              color: 'var(--text-muted)',
+              background: 'var(--surface-2)',
+              borderRadius: 11,
+              padding: '10px 12px',
+              lineHeight: 1.45,
+            }}
+          >
+            <PauseCircle size={15} style={{ flexShrink: 0 }} />
+            <span>
+              {t.detail ?? 'Paused — resume any time'}
+              {t.bytesTotal > 0
+                ? ` · ${formatBytes(t.bytesDone)} of ${formatBytes(t.bytesTotal)} done`
+                : ''}
+            </span>
+          </div>
+          {t.bytesTotal > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <ProgressBar percent={t.percent} />
+            </div>
+          )}
+          {t.direction === 'send' && (
+            <button
+              className="btn btn-ghost"
+              style={{ marginTop: 10, width: '100%' }}
+              onClick={() => void retryTransfer(t.id)}
+            >
+              <Play size={15} /> Resume
+            </button>
+          )}
+        </div>
+      )}
+
       {t.state === 'canceled' && (
         <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-muted)' }}>
           Transfer canceled.
@@ -416,6 +480,7 @@ function stateColor(t: TransferUpdate): string {
   if (t.state === 'completed') return 'var(--green)'
   if (t.state === 'failed') return 'var(--red)'
   if (t.state === 'canceled') return 'var(--text-faint)'
+  if (t.state === 'paused') return 'var(--text-muted)'
   return 'var(--accent)'
 }
 
@@ -439,5 +504,7 @@ function statusLabel(t: TransferUpdate): string {
       return 'Failed'
     case 'canceled':
       return !send && fn ? 'Declined' : 'Canceled'
+    case 'paused':
+      return fn ? `Paused — sending to ${fn}` : 'Paused'
   }
 }

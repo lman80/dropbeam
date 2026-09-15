@@ -654,6 +654,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::cancel_transfer,
+            commands::pause_transfer,
             commands::get_settings,
             commands::update_settings,
             commands::get_history,

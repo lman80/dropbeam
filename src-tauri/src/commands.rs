@@ -29,6 +29,34 @@ pub fn cancel_transfer(
     }
 }
 
+/// Stop an in-flight SEND but keep everything it already delivered: the receiver's
+/// per-file partials and any landed Location files stay put, and the frontend keeps
+/// the card's retry record, so Resume (`retryTransfer`) replays the same send and
+/// the stat probes skip what already arrived. Same machinery as `cancel_transfer`,
+/// only the reported outcome differs.
+#[tauri::command]
+pub fn pause_transfer(
+    app: AppHandle,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    id: String,
+) {
+    use crate::iroh_net::{CancelKind, CancelReason};
+    match iroh.cancel_with(&id, CancelReason::Pause) {
+        // A staged send isn't running a loop, so report Paused here — and consume
+        // the pause mark, since no loop will.
+        CancelKind::Staged => {
+            iroh.take_reason(&id);
+            crate::iroh_net::emit_paused_send(&app, &id);
+        }
+        // An in-flight send reports Paused from its own loop, which reads the mark.
+        CancelKind::Active => {}
+        // Not a known iroh transfer — nothing to pause; drop the mark again.
+        CancelKind::Unknown => {
+            iroh.take_reason(&id);
+        }
+    }
+}
+
 /// Settings "Clear transfer cache": delete every abandoned resumable partial
 /// (paused/failed transfer leftovers) that isn't actively being written.
 /// Returns the number of bytes freed so the UI can show it.
