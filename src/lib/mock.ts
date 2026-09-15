@@ -167,12 +167,15 @@ function base(id: string, direction: 'send' | 'receive', names: string[]): Trans
   }
 }
 
+/** Simulated transfers still ticking, so the dev mock can pause one mid-flight. */
+const running = new Map<string, { t: TransferUpdate; iv: ReturnType<typeof setInterval> }>()
+
 function simulate(t: TransferUpdate, total: number) {
   t.bytesTotal = total
   t.peer = '192.168.1.55:51022'
   t.locality = 'local'
   let pct = 0
-  const iv = setInterval(() => {
+  const iv: ReturnType<typeof setInterval> = setInterval(() => {
     pct += 6 + Math.random() * 9
     if (pct >= 100) {
       t.state = 'transferring'
@@ -182,6 +185,7 @@ function simulate(t: TransferUpdate, total: number) {
       t.etaSeconds = 0
       emit('transfer://update', { ...t })
       clearInterval(iv)
+      running.delete(t.id)
       setTimeout(() => {
         t.state = 'completed'
         emit('transfer://update', { ...t })
@@ -209,6 +213,7 @@ function simulate(t: TransferUpdate, total: number) {
     t.etaSeconds = (100 - pct) / 11
     emit('transfer://update', { ...t })
   }, 550)
+  running.set(t.id, { t, iv })
 }
 
 // Dev helper to preview incoming transfers: window.__mockIncoming(true) for a
@@ -321,6 +326,17 @@ export const mockApi = {
   },
   irohSelftest: async (): Promise<string> => 'ok · node a1b2c3…f7e8',
   cancelTransfer: async (_id: string): Promise<void> => {},
+  pauseTransfer: async (id: string): Promise<void> => {
+    const live = running.get(id)
+    if (!live) return
+    clearInterval(live.iv)
+    running.delete(id)
+    live.t.state = 'paused'
+    live.t.speedBps = 0
+    live.t.etaSeconds = null
+    live.t.detail = 'Paused — resume any time'
+    emit('transfer://update', { ...live.t })
+  },
   getSettings: async (): Promise<Settings> => settings,
   updateSettings: async (s: Settings): Promise<Settings> => {
     settings = s

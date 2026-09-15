@@ -25,6 +25,8 @@ export type TransferState =
   | 'completed'
   | 'failed'
   | 'canceled'
+  /** Stopped by the user, everything already transferred kept — Resume replays it. */
+  | 'paused'
 export type Locality = 'unknown' | 'local' | 'direct' | 'internet'
 
 /** Live detail of how two peers are connected — the connection inspector data. */
@@ -369,6 +371,8 @@ const realApi = {
   irohReceive: (ticket: string) => invoke<TransferUpdate>('iroh_receive', { ticket }),
   irohSelftest: () => invoke<string>('iroh_selftest'),
   cancelTransfer: (id: string) => invoke<void>('cancel_transfer', { id }),
+  /** Stop a send but keep its progress — the card flips to Paused and offers Resume. */
+  pauseTransfer: (id: string) => invoke<void>('pause_transfer', { id }),
   /** Write a line into the native app log file (for diagnosing remote issues). */
   frontendLog: (msg: string) => invoke<void>('frontend_log', { msg }),
   /** A file the app was launched to send (Windows "Send with DropBeam"). */

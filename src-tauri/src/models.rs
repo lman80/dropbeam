@@ -31,6 +31,10 @@ pub enum TransferState {
     Failed,
     /// User canceled.
     Canceled,
+    /// User paused. Everything already moved is KEPT (per-file partials on the
+    /// receiver, landed files on a Location), so resuming replays the same send
+    /// and skips what already arrived.
+    Paused,
 }
 
 /// Which channel the active connection is using — so the UI can tell the user

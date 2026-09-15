@@ -68,6 +68,10 @@ pub struct IrohState {
     pending: Mutex<HashMap<String, PendingSend>>,
     /// Cancellation flags for in-flight transfers, keyed by transfer id.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The REASON alongside the cancel flag: ids whose stop was a PAUSE, not a
+    /// cancel. Marked before the flag flips, so the send loop that unwinds on the
+    /// cancel can report Paused (and keep every partial) instead of Canceled.
+    paused: Mutex<HashSet<String>>,
     /// Live connections for in-flight transfers, keyed by transfer id. A cancel
     /// CLOSES the connection so a send stuck on QUIC flow-control unblocks at
     /// once — the flag alone only takes effect between chunks, which is why a
@@ -240,6 +244,25 @@ impl IrohState {
     /// Signal cancellation for a transfer id. Drops a still-staged send so it
     /// can't be pulled, and flips the in-flight flag for a running transfer.
     pub fn cancel(&self, id: &str) -> CancelKind {
+        self.cancel_with(id, CancelReason::Cancel)
+    }
+
+    /// Stop a transfer, recording WHY. `CancelReason::Pause` stops it exactly like
+    /// a cancel (the partials are kept either way — see `recv_ranges`) but marks
+    /// the id so the unwinding send loop reports Paused, leaving the card's retry
+    /// record intact for a one-tap Resume.
+    pub fn cancel_with(&self, id: &str, reason: CancelReason) -> CancelKind {
+        // Mark BEFORE anything flips the flag, or a fast loop could unwind and
+        // read the reason before it was recorded.
+        match reason {
+            CancelReason::Pause => {
+                self.paused.lock().unwrap().insert(id.to_owned());
+            }
+            // A cancel after a pause request wins: never resurrect a stale mark.
+            CancelReason::Cancel => {
+                self.paused.lock().unwrap().remove(id);
+            }
+        }
         let was_staged = {
             let mut p = self.pending.lock().unwrap();
             let before = p.len();
@@ -276,6 +299,16 @@ impl IrohState {
             CancelKind::Active
         } else {
             CancelKind::Unknown
+        }
+    }
+
+    /// Why did this transfer stop? One-shot: the mark is consumed, so a later
+    /// failure of the same id can't masquerade as a pause.
+    pub fn take_reason(&self, id: &str) -> CancelReason {
+        if self.paused.lock().unwrap().remove(id) {
+            CancelReason::Pause
+        } else {
+            CancelReason::Cancel
         }
     }
 }
@@ -964,9 +997,64 @@ fn emit_canceled(app: &AppHandle, id: &str, dir: Direction) {
     emit(app, &u);
 }
 
+/// What the user asked for when a transfer was stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Stop for good — the card goes to Canceled.
+    Cancel,
+    /// Stop but keep everything — the card goes to Paused and offers Resume.
+    Pause,
+}
+
+/// Shown on a paused card so it reads as a waypoint, not a failure.
+pub const PAUSE_NOTE: &str = "Paused — resume any time";
+
+/// Which terminal state a user-stopped transfer reports. Pure so the mapping is
+/// unit-testable without a running endpoint.
+pub fn stopped_state(reason: CancelReason) -> TransferState {
+    match reason {
+        CancelReason::Pause => TransferState::Paused,
+        CancelReason::Cancel => TransferState::Canceled,
+    }
+}
+
+/// Report a user-stopped transfer. A pause carries its byte counts so the card
+/// can say how far it got (and the retry record stays put for Resume).
+fn emit_stopped(
+    app: &AppHandle,
+    id: &str,
+    dir: Direction,
+    reason: CancelReason,
+    bytes_done: u64,
+    bytes_total: u64,
+) {
+    let state = stopped_state(reason);
+    if state != TransferState::Paused {
+        emit_canceled(app, id, dir);
+        return;
+    }
+    let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
+    u.state = state;
+    u.bytes_done = bytes_done.min(bytes_total.max(bytes_done));
+    u.bytes_total = bytes_total;
+    u.percent = if bytes_total > 0 {
+        (bytes_done as f64 / bytes_total as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    u.detail = Some(PAUSE_NOTE.to_string());
+    emit(app, &u);
+}
+
 /// Tell the UI a staged (not-yet-pulled) send was canceled.
 pub fn emit_canceled_send(app: &AppHandle, id: &str) {
     emit_canceled(app, id, Direction::Send);
+}
+
+/// Tell the UI a staged (not-yet-pulled) send was paused — nothing had moved, so
+/// there are no bytes to report, but Resume re-stages the same files.
+pub fn emit_paused_send(app: &AppHandle, id: &str) {
+    emit_stopped(app, id, Direction::Send, CancelReason::Pause, 0, 0);
 }
 
 /// What `IrohState::cancel` found for an id.
@@ -3703,6 +3791,10 @@ fn send_friend_inner(
         .unwrap_or_default();
     tauri::async_runtime::spawn(integrity::scope(async move {
         let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
+        // High-water mark of confirmed bytes across ALL attempts. Declared out here
+        // (the retry loop below borrows it) so a PAUSE can report how far the send
+        // actually got.
+        let progress_high = std::sync::Arc::new(AtomicU64::new(0));
         let outcome: Result<crate::models::Locality> = async {
             // A parallel transfer that was UNDERWAY and died is almost always a
             // network blip / sleep — so we auto-reconnect up to 2 extra times, and
@@ -3717,7 +3809,6 @@ fn send_friend_inner(
             // finishes. We only give up after several CONSECUTIVE attempts that move
             // zero new bytes. This is what lets a 6 GB / 1 TB send survive a flaky LAN.
             const MAX_STALL: u32 = 8;
-            let progress_high = std::sync::Arc::new(AtomicU64::new(0));
             let mut last_high: u64 = 0;
             let mut stall: u32 = 0;
             let mut attempt: u32 = 0;
@@ -4134,12 +4225,24 @@ fn send_friend_inner(
             ),
             // A cancel may surface as our own "canceled" bail OR as a
             // connection-closed error (we close the conn to unblock the write),
-            // so trust the flag too.
+            // so trust the flag too. Whether that stop was a cancel or a PAUSE is
+            // whatever the command recorded; either way the partials stay on disk,
+            // so a paused send resumes from where it stopped.
             Err(e) if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") => {
-                emit_canceled(&app, &id, Direction::Send)
+                emit_stopped(
+                    &app,
+                    &id,
+                    Direction::Send,
+                    cleanup.take_reason(&id),
+                    progress_high.load(Ordering::SeqCst),
+                    total,
+                )
             }
             Err(e) => emit_failed(&app, &id, Direction::Send, &e.to_string()),
         }
+        // A finished transfer can't be paused any more (a pause raced in after the
+        // send ended would otherwise linger and mislabel a later stop).
+        cleanup.paused.lock().unwrap().remove(&id);
         cleanup.cancels.lock().unwrap().remove(&id);
         cleanup.conns.lock().unwrap().remove(&id);
         // Drop any "send over relay anyway" override for this finished transfer so
@@ -8165,6 +8268,29 @@ async fn receive_location_headless_progress<F: Fn(u64, u64)>(conn: &Connection, 
 
 #[cfg(test)]
 mod tests {
+    /// A paused stop must never read as a cancel — the card offers Resume off the
+    /// Paused state, and the partials it keeps are only reachable from there.
+    #[test]
+    fn pause_reason_reports_paused_and_cancel_reports_canceled() {
+        use super::*;
+        assert_eq!(stopped_state(CancelReason::Pause), TransferState::Paused);
+        assert_eq!(stopped_state(CancelReason::Cancel), TransferState::Canceled);
+
+        // The reason is one-shot: taking it twice must not keep reporting a pause.
+        let state = IrohState::default();
+        assert_eq!(state.take_reason("nothing"), CancelReason::Cancel);
+        state.paused.lock().unwrap().insert("t1".into());
+        assert_eq!(state.take_reason("t1"), CancelReason::Pause);
+        assert_eq!(state.take_reason("t1"), CancelReason::Cancel);
+        // An unknown id is a no-op either way and leaves no mark behind.
+        assert!(matches!(state.cancel_with("t2", CancelReason::Pause), CancelKind::Unknown));
+        assert_eq!(state.take_reason("t2"), CancelReason::Pause);
+        // A cancel clears a pending pause mark rather than inheriting it.
+        state.paused.lock().unwrap().insert("t3".into());
+        assert!(matches!(state.cancel_with("t3", CancelReason::Cancel), CancelKind::Unknown));
+        assert_eq!(state.take_reason("t3"), CancelReason::Cancel);
+    }
+
     #[test]
     fn friend_landed_requires_regular_file_size_and_mtime() {
         use super::*;

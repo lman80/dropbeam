@@ -21,16 +21,23 @@ export function normalizeChatMessage(m: ChatMessage): ChatMessage {
 }
 
 export function normalizeTransfer(u: TransferUpdate, prev?: TransferUpdate): TransferUpdate {
-  const bytesTotal = nonnegative(u.bytesTotal)
-  const bytesDone = nonnegative(u.bytesDone)
-  const percent = Number.isFinite(u.percent) ? u.percent
+  // Pause is a waypoint, not an ending: the engine's Paused snapshot is minimal
+  // (a staged send never moved a byte, so it carries neither counts nor a
+  // recipient), so carry the card's own numbers forward. They're what the Paused
+  // badge shows and what Resume replays.
+  const held = u.state === 'paused' ? prev : undefined
+  const bytesTotal = nonnegative(u.bytesTotal) || nonnegative(held?.bytesTotal ?? 0)
+  const bytesDone = nonnegative(u.bytesDone) || nonnegative(held?.bytesDone ?? 0)
+  let percent = Number.isFinite(u.percent) ? u.percent
     : bytesTotal > 0 ? bytesDone / bytesTotal * 100 : 0
+  if (held && percent === 0 && bytesTotal > 0) percent = bytesDone / bytesTotal * 100
   return {
     ...u,
     integrity: integrityRows(u.integrity),
     locationSkipped: u.locationSkipped ?? prev?.locationSkipped,
     fileNames: strings(u.fileNames ?? prev?.fileNames ?? []),
-    fileCount: nonnegative(u.fileCount),
+    fileCount: nonnegative(u.fileCount) || nonnegative(held?.fileCount ?? 0),
+    friendName: u.friendName ?? held?.friendName ?? null,
     bytesTotal,
     bytesDone,
     percent: Math.max(0, Math.min(100, percent)),

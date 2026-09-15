@@ -339,6 +339,50 @@ function deleteRetryPayload(id: string): void {
     /* best-effort */
   }
 }
+// Surviving a restart is the whole point of Pause ("stop before I leave this
+// Wi-Fi, finish it tomorrow"), and the transfer list itself is in-memory only —
+// so paused CARDS are mirrored to localStorage next to their retry payloads and
+// seeded back at startup. Only a send with a payload is kept: without one Resume
+// would be a dead button.
+const PAUSED_KEY = 'dropbeam-paused-transfers'
+function loadPausedTransfers(): Record<string, TransferUpdate> {
+  const out: Record<string, TransferUpdate> = {}
+  try {
+    const raw = JSON.parse(localStorage.getItem(PAUSED_KEY) || '{}') as Record<string, TransferUpdate>
+    const payloads = loadRetryPayloads()
+    for (const [id, u] of Object.entries(raw)) {
+      if (!u || typeof u !== 'object') continue
+      if (u.id !== id || u.direction !== 'send' || u.state !== 'paused') continue
+      if (!payloads[id]) continue
+      out[id] = normalizeTransfer(u)
+    }
+  } catch {
+    /* invalid JSON or unavailable storage — just start with no paused cards */
+  }
+  return out
+}
+function savePausedTransfer(u: TransferUpdate): void {
+  try {
+    const all = loadPausedTransfers()
+    all[u.id] = u
+    const ids = Object.keys(all)
+    if (ids.length > 20) for (const k of ids.slice(0, ids.length - 20)) delete all[k]
+    localStorage.setItem(PAUSED_KEY, JSON.stringify(all))
+  } catch {
+    /* best-effort — the live card still works this session */
+  }
+}
+function clearPausedTransfer(id: string): void {
+  try {
+    const all = JSON.parse(localStorage.getItem(PAUSED_KEY) || '{}') as Record<string, unknown>
+    if (id in all) {
+      delete all[id]
+      localStorage.setItem(PAUSED_KEY, JSON.stringify(all))
+    }
+  } catch {
+    /* best-effort */
+  }
+}
 // In-flight receives by ticket, so pasting the same code twice can't start two
 // pulls of the same files racing each other into "name (1)" duplicates.
 const activeReceives = new Map<string, string>()
@@ -385,13 +429,16 @@ function deleteChatFileXfer(id: string): void {
   }
 }
 
+const restoredPaused = loadPausedTransfers()
+
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
   view: 'send',
   settings: null,
   chatTransfers: loadChatTransfers(),
-  transfers: {},
-  order: [],
+  // Paused sends come back exactly where they stopped, Resume button and all.
+  transfers: restoredPaused,
+  order: Object.keys(restoredPaused),
   transferSummaries: {},
   installHint: null,
   dragHovering: false,
@@ -947,6 +994,13 @@ export const useStore = create<AppStore>((set, get) => ({
         }
       }
     }
+    // A paused card has to outlive the app run — mirror it to storage, and drop
+    // the mirror the moment the same transfer moves on (resumed, canceled, done).
+    if (u.state === 'paused' && u.direction === 'send') {
+      savePausedTransfer(u)
+      // A resume is a NEW transfer id, so this one's timer will never be read.
+      transferStart.delete(u.id)
+    } else if (prev?.state === 'paused') clearPausedTransfer(u.id)
     set((s) => ({
       transfers: { ...s.transfers, [u.id]: u },
       order: s.order.includes(u.id) ? s.order : [...s.order, u.id],
@@ -957,6 +1011,7 @@ export const useStore = create<AppStore>((set, get) => ({
     // Dismissing the transfer list card must not disable Retry in its chat card.
     // The shared retry cache is already bounded to 50 payloads.
     if (!Object.values(get().chatTransfers).some((t) => t.id === id)) deleteRetryPayload(id)
+    clearPausedTransfer(id)
     set((s) => {
       const next = { ...s.transfers }
       delete next[id]
@@ -968,8 +1023,9 @@ export const useStore = create<AppStore>((set, get) => ({
     const payload = loadRetryPayloads()[id]
     if (!payload) return
     const t = get().transfers[id]
-    // Only retry a card that actually failed — never re-send an in-flight one.
-    if (t && t.state !== 'failed') return
+    // Only replay a card that actually stopped — a failure, or a pause the user is
+    // resuming. Never re-send an in-flight one.
+    if (t && t.state !== 'failed' && t.state !== 'paused') return
     if (payload.kind === 'location') {
       try {
         const next = await locationsApi.upload(payload.id, payload.locationId, payload.relPath, payload.paths)
