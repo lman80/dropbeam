@@ -77,6 +77,10 @@ pub struct TransferUpdate {
     pub integrity: Vec<FileIntegrity>,
     #[serde(default)]
     pub location_skipped: Option<u64>,
+    /// Files the Location host published beside an existing, different file of
+    /// the same name (as `name (2).ext`) instead of failing the upload.
+    #[serde(default)]
+    pub location_conflicts: Option<u64>,
     #[serde(default)]
     pub chat_transfer: Option<ChatTransferLink>,
     pub id: String,
@@ -140,6 +144,7 @@ impl TransferUpdate {
         TransferUpdate {
             integrity: vec![],
             location_skipped: None,
+            location_conflicts: None,
             chat_transfer: None,
             id,
             direction,

@@ -19,6 +19,10 @@ tokio::task_local! {
     pub static ITEM_OFFSET: u64;
     static REHASH: AtomicU64;
     static ACTIVITY_HOOK: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>;
+    // Location uploads that had to publish beside an existing, different file.
+    // Host side: filled after publication, read by `terminal` for the reply.
+    // Sender side: filled from that reply, read for the transfer's UI counter.
+    static CONFLICTS: Mutex<Vec<String>>;
 }
 pub fn item_offset() -> u64 { ITEM_OFFSET.try_with(|n| *n).unwrap_or(0) }
 pub fn rehash_activity() -> u64 { REHASH.try_with(|n| n.load(Ordering::Relaxed)).unwrap_or(0) }
@@ -30,7 +34,22 @@ pub fn set_activity_hook(hook: Arc<dyn Fn(u64) + Send + Sync>) {
     let _ = ACTIVITY_HOOK.try_with(|h| *h.lock().unwrap() = Some(hook));
 }
 pub async fn scope<T>(future: impl std::future::Future<Output = T>) -> T {
-    ACTIVITY_HOOK.scope(Mutex::new(None), REHASH.scope(AtomicU64::new(0), REPORTS.scope(Mutex::new(vec![]), future))).await
+    CONFLICTS.scope(Mutex::new(vec![]),
+        ACTIVITY_HOOK.scope(Mutex::new(None), REHASH.scope(AtomicU64::new(0), REPORTS.scope(Mutex::new(vec![]), future)))).await
+}
+/// Record the names files were actually published under, de-duplicated so a
+/// resumed push cannot double-count a conflict it already reported. Returns
+/// only the names that were not already known.
+pub fn conflicted(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    CONFLICTS.try_with(|c| {
+        let mut c = c.lock().unwrap();
+        let mut fresh = vec![];
+        for name in names { if !c.contains(&name) { c.push(name.clone()); fresh.push(name); } }
+        fresh
+    }).unwrap_or_default()
+}
+pub fn conflicts() -> Vec<String> {
+    CONFLICTS.try_with(|c| c.lock().unwrap().clone()).unwrap_or_default()
 }
 pub async fn ensure_scope<T>(future: impl std::future::Future<Output = T>) -> T {
     if REPORTS.try_with(|_| ()).is_ok() { future.await } else { scope(future).await }
@@ -55,6 +74,12 @@ pub fn ready(header: &serde_json::Value, mut reply: serde_json::Value) -> serde_
 pub fn terminal(mut frame: serde_json::Value) -> serde_json::Value {
     let rows = reports();
     if !rows.is_empty() { frame["integrity"] = serde_json::json!(rows); }
+    // Additive: an older sender ignores both fields and still sees a plain ok.
+    let conflicts = conflicts();
+    if !conflicts.is_empty() {
+        frame["conflicts"] = serde_json::json!(conflicts.len());
+        frame["conflict_names"] = serde_json::json!(conflicts);
+    }
     frame
 }
 
@@ -600,6 +625,27 @@ mod tests {
         assert!(receipt(&serde_json::json!({"integrity": rows}), &[local.clone()]).is_err());
         rows[0].verified = false;
         assert!(receipt(&serde_json::json!({"integrity": rows}), &[local]).unwrap_err().to_string().contains(FAILED));
+    }
+
+    // The Location conflict report rides the SAME terminal frame as the receipt,
+    // additively: a host that never conflicts writes exactly what it wrote before.
+    #[tokio::test]
+    async fn location_conflicts_ride_the_terminal_frame_and_never_double_count() {
+        scope(async {
+            let plain = terminal(serde_json::json!({"ok": true, "landed": 10}));
+            assert!(plain.get("conflicts").is_none() && plain.get("conflict_names").is_none());
+            assert_eq!(conflicted(["a (2).bin".to_string(), "b (2).bin".to_string()]).len(), 2);
+            // A resumed push re-reports a landing it already named: count it once.
+            assert!(conflicted(["a (2).bin".to_string()]).is_empty());
+            assert_eq!(conflicted(["c (3).bin".to_string()]), vec!["c (3).bin".to_string()]);
+            let frame = terminal(serde_json::json!({"ok": true, "landed": 10}));
+            assert_eq!(frame["conflicts"], 3);
+            assert_eq!(frame["conflict_names"], serde_json::json!(["a (2).bin", "b (2).bin", "c (3).bin"]));
+            assert_eq!(frame["ok"], true);
+        }).await;
+        // Outside a transfer scope the counters are inert, never global state.
+        assert!(conflicted(["x".to_string()]).is_empty());
+        assert!(conflicts().is_empty());
     }
 
     #[tokio::test]
