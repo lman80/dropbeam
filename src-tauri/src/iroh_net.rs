@@ -72,6 +72,10 @@ pub struct IrohState {
     /// cancel. Marked before the flag flips, so the send loop that unwinds on the
     /// cancel can report Paused (and keep every partial) instead of Canceled.
     paused: Mutex<HashSet<String>>,
+    /// Location uploads in flight, keyed by (peer, location, rel path, source
+    /// paths) → transfer id, so the same folder is never uploaded twice at once
+    /// (a Retry click and a scripted restart raced into two parallel sends).
+    active_uploads: Mutex<HashMap<String, String>>,
     /// Live connections for in-flight transfers, keyed by transfer id. A cancel
     /// CLOSES the connection so a send stuck on QUIC flow-control unblocks at
     /// once — the flag alone only takes effect between chunks, which is why a
@@ -3773,6 +3777,17 @@ fn send_friend_inner(
     } else { gather_items_with(&pathbufs, location.as_ref().is_some_and(|l| l.target.is_some())).map_err(|e| e.to_string())? };
     let names = if items.is_empty() { directories.clone() } else { items.iter().map(|i| i.1.clone()).collect() };
     let id = uuid::Uuid::new_v4().to_string();
+    if let Some(target) = location.as_ref().and_then(|l| l.target.as_ref()) {
+        let mut sorted = paths.clone(); sorted.sort();
+        let key = format!("{endpoint_id}|{}|{}|{}", target.location_id, target.rel_path, sorted.join("\n"));
+        let mut active = state.active_uploads.lock().unwrap();
+        if let Some(running) = active.get(&key) {
+            if state.cancels.lock().unwrap().contains_key(running) {
+                return Err("This upload is already running — let it finish, or cancel it first.".into());
+            }
+        }
+        active.insert(key, id.clone());
+    }
     let chat_id = chat_transfer_id.unwrap_or_else(|| id.clone());
     let generation = chat_attempt.unwrap_or(1).max(crate::chat::now_ms());
     // Freeze offsets before retries; a removed earlier source must not renumber
@@ -4267,6 +4282,7 @@ fn send_friend_inner(
         // A finished transfer can't be paused any more (a pause raced in after the
         // send ended would otherwise linger and mislabel a later stop).
         cleanup.paused.lock().unwrap().remove(&id);
+        cleanup.active_uploads.lock().unwrap().retain(|_, running| running != &id);
         cleanup.cancels.lock().unwrap().remove(&id);
         cleanup.conns.lock().unwrap().remove(&id);
         // Drop any "send over relay anyway" override for this finished transfer so
