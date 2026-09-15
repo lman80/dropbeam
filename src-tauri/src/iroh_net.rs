@@ -6772,6 +6772,16 @@ fn gather_items_with(paths: &[PathBuf], include_hidden: bool) -> Result<(Vec<(Pa
 /// the receiver recreates that structure too — files alone can't represent it
 /// (GitHub #22). Returns true iff `dir` (or something under it) contained a file, so
 /// a parent can decide whether IT is empty.
+/// Operating-system bookkeeping files that every backup tool leaves out: the
+/// OS rewrites them whenever a folder is merely viewed, so copying them makes a
+/// retry collide with its own earlier copy ("a different file with this name
+/// already exists") and never represents the user's data.
+pub(crate) fn os_junk_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(lower.as_str(), ".ds_store" | "thumbs.db" | "desktop.ini" | ".localized" | ".spotlight-v100" | ".fseventsd" | ".trashes" | ".temporaryitems" | "ehthumbs.db")
+        || (name.starts_with("._") && name.len() > 2)
+}
+
 fn collect_dir_items(
     dir: &Path,
     prefix: &str,
@@ -6789,7 +6799,7 @@ fn collect_dir_items(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.to_ascii_lowercase().starts_with(".dropbeam-") || (!include_hidden && name.starts_with('.')) {
+        if name.to_ascii_lowercase().starts_with(".dropbeam-") || os_junk_name(&name) || (!include_hidden && name.starts_with('.')) {
             continue;
         }
         let Ok(ft) = entry.file_type() else { continue };
@@ -9046,8 +9056,9 @@ mod hidden_items_tests {
         let mut items = vec![]; let mut dirs = vec![];
         collect_dir_items(&root, "Lib", &mut items, &mut dirs, true);
         let mut names: Vec<_> = items.iter().map(|i| i.1.clone()).collect(); names.sort();
-        assert_eq!(names, vec!["Lib/.DS_Store", "Lib/.trash/rec/old.mov", "Lib/a.txt"]);
+        assert_eq!(names, vec!["Lib/.trash/rec/old.mov", "Lib/a.txt"], "OS junk like .DS_Store is never copied");
         assert_eq!(dirs, vec!["Lib/.empty-hidden"]);
+        assert!(super::os_junk_name("._photo.jpg") && super::os_junk_name("Thumbs.db") && !super::os_junk_name(".hidden.txt"));
     }
 }
 
