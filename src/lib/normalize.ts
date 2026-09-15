@@ -35,6 +35,7 @@ export function normalizeTransfer(u: TransferUpdate, prev?: TransferUpdate): Tra
     ...u,
     integrity: integrityRows(u.integrity),
     locationSkipped: u.locationSkipped ?? prev?.locationSkipped,
+    locationConflicts: u.locationConflicts ?? prev?.locationConflicts,
     fileNames: strings(u.fileNames ?? prev?.fileNames ?? []),
     fileCount: nonnegative(u.fileCount) || nonnegative(held?.fileCount ?? 0),
     friendName: u.friendName ?? held?.friendName ?? null,

@@ -800,6 +800,16 @@ async fn read_landed_progress_with_work<F: Fn(u64, u64)>(
         if let Some(error) = v["error"].as_str() {
             anyhow::bail!("receiver: {error}");
         }
+        // A Location host that found a DIFFERENT file of the same name publishes
+        // ours beside it instead of failing the push. Additive fields: a host
+        // that doesn't send them simply reports no conflicts.
+        if v["conflicts"].as_u64().is_some_and(|n| n > 0) {
+            let names = v["conflict_names"].as_array().map(|names|
+                names.iter().filter_map(|n| n.as_str()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+            for name in integrity::conflicted(names) {
+                log::info!("location upload: a different file of that name was already there — saved as {name:?}");
+            }
+        }
         // Clamp instead of failing: a receiver that fell back to the classic body
         // after advertising resume coverage restarts its landed count at 0.
         let done = v["landed"].as_u64().context("missing landed byte count")?.max(previous);
@@ -3685,7 +3695,8 @@ fn plan_location_pushes(items: &[SendItem], landed: &[bool]) -> Vec<std::ops::Ra
 impl LocationBatch {
     async fn send_attempt(&mut self, conn: &Connection, location: &LocationSend, cancel: &AtomicBool,
         name: &str, engaged: &AtomicBool, activity: &AtomicU64, state: Option<&IrohState>,
-        progress: impl Fn(u64, u64), skipped: impl Fn(usize), boundary: impl Fn() -> Result<()>) -> Result<u64> {
+        progress: impl Fn(u64, u64), skipped: impl Fn(usize), conflicts: impl Fn(usize),
+        boundary: impl Fn() -> Result<()>) -> Result<u64> {
         require_locations(conn).await?;
         let stat_paths: Vec<_> = self.items.iter().map(|i| i.1.clone()).chain(self.dirs.iter().cloned()).collect();
         let existing = location_stat(conn, location.target.as_ref().context("Missing upload target")?, &stat_paths).await?;
@@ -3709,6 +3720,10 @@ impl LocationBatch {
             self.dirs_pending = false;
             dirs.clear();
             sent_push = true;
+            // The host's reply for this push named every file it had to publish
+            // beside an existing, different one. Report the running total.
+            let seen = integrity::conflicts().len();
+            if seen > 0 { conflicts(seen); }
         }
         // A terminal push always follows: it publishes EVERY directory again
         // (ensure_dirs is idempotent), so an empty folder whose creation was
@@ -3723,6 +3738,8 @@ impl LocationBatch {
                     engaged, activity, state, None, Some(location)))).await?;
             self.dirs_pending = false;
         }
+        let seen = integrity::conflicts().len();
+        if seen > 0 { conflicts(seen); }
         progress(total, total);
         Ok(total)
     }
@@ -4094,6 +4111,13 @@ fn send_friend_inner(
                             notice.bytes_total = total;
                             notice.friend_name = Some(friend_name.clone());
                             notice.location_skipped = Some(count as u64);
+                            emit(&app, &notice);
+                        }, |count| {
+                            let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            notice.state = TransferState::Transferring;
+                            notice.bytes_total = total;
+                            notice.friend_name = Some(friend_name.clone());
+                            notice.location_conflicts = Some(count as u64);
                             emit(&app, &notice);
                         }, || recovery.lock().unwrap().check(&conn, true, &redial_requested)).await
                 } else if linked {
@@ -8214,7 +8238,7 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
         anyhow::ensure!(items.len() == paths.len(), "Incomplete location download");
         if header["location_hash_v"] == 2 {
             crate::locations::verified_digests(&header, &rows)?;
-            return Ok(paths);
+            return Ok(crate::locations::Landing { paths, conflicts: vec![] });
         }
         let mut base = 0;
         for (item, path) in items.iter().zip(&paths) {
@@ -8222,7 +8246,7 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
             anyhow::ensure!(item["sha256"].as_str() == Some(&hash), "Location download SHA-256 mismatch");
             base += item["size"].as_u64().context("Invalid file size")?;
         }
-        Ok(paths)
+        Ok(crate::locations::Landing { paths, conflicts: vec![] })
     });
     // Reserve the last 10% of a location upload for verified publication on the
     // NAS. Real copy progress keeps the normal send watchdog alive on slow mounts.
@@ -8230,9 +8254,12 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
     loop {
         tokio::select! {
             result = &mut finalize => {
-                let paths = result??;
+                let landing = result??;
+                // Back in the receive task, so the terminal reply this stream
+                // writes can carry the conflict count and the names used.
+                integrity::conflicted(landing.conflicts.iter().map(|c| c.landed.clone()));
                 progress(total, total);
-                return Ok(paths);
+                return Ok(landing.paths);
             }
             _ = ticks.tick() => {
                 let n = copied.load(Ordering::Relaxed).min(total);
@@ -8259,7 +8286,8 @@ async fn receive_location_headless_progress<F: Fn(u64, u64)>(conn: &Connection, 
         cancel, &AtomicBool::new(false), progress).await?;
     let finish_header = header.clone();
     let rows = integrity::reports();
-    tokio::task::spawn_blocking(move || upload.finish_verified_progress(&finish_header, paths, &rows, &AtomicBool::new(false), |_| {})).await??;
+    let landing = tokio::task::spawn_blocking(move || upload.finish_verified_progress(&finish_header, paths, &rows, &AtomicBool::new(false), |_| {})).await??;
+    integrity::conflicted(landing.conflicts.iter().map(|c| c.landed.clone()));
     Ok(())
     }.await;
     if integrity::enabled(header) {
@@ -11920,7 +11948,7 @@ mod location_loopback_tests {
                             r.since = Some(Instant::now() - Duration::from_secs(61));
                             r.check(&conn, false, &requested).unwrap();
                         }
-                    }, |_| {}, || recovery.lock().unwrap().check(&conn, true, &requested)).await;
+                    }, |_| {}, |_| {}, || recovery.lock().unwrap().check(&conn, true, &requested)).await;
                 if requested.load(Ordering::SeqCst) {
                     assert!(result.is_err());
                     assert_eq!(batch.next_file, 1, "redial only after first receipt");
@@ -11977,7 +12005,7 @@ mod location_loopback_tests {
             transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None };
         let sent = tokio::time::timeout(Duration::from_secs(60), batch.send_attempt(
             &conn, &options, &AtomicBool::new(false), "Mac", &AtomicBool::new(false),
-            &AtomicU64::new(0), None, |_, _| {}, |_| {}, || Ok(()))).await.unwrap().unwrap();
+            &AtomicU64::new(0), None, |_, _| {}, |_| {}, |_| {}, || Ok(()))).await.unwrap().unwrap();
         assert_eq!(sent, total);
         assert_eq!(batch.next_file, 26);
         for item in &batch.items {
