@@ -62,8 +62,8 @@
       {
         "label": "receive",
         "url": "index.html",
-        "width": 214,
-        "height": 213,
+        "width": 190,
+        "height": 184,
         "minWidth": 180,
         "minHeight": 170,
         "resizable": true,

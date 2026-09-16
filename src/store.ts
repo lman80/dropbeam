@@ -28,7 +28,7 @@ import {
   type TransferUpdate,
 } from './lib/api'
 import { setSpeedUnit } from './lib/format'
-import { LandedEta } from './lib/eta'
+import { LandedEta, TransferRate, etaAt } from './lib/eta'
 import { chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTransfers } from './lib/chatTransfer'
 import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
@@ -39,6 +39,42 @@ let updateWatchersWired = false
 let presenceWatchersWired = false
 const presenceProbes = new Map<string, Promise<ConnDetail | null>>()
 const etaSpeeds = new Map<string, LandedEta>()
+// Live/average rate per transfer, fed from successive bytesDone frames. A card
+// that stops (paused/failed) and later resumes gets a fresh tracker, so the
+// average always describes the run on screen.
+const rateTrackers = new Map<string, TransferRate>()
+
+/** What the card shows for speed and time left, in both modes. */
+export interface TransferRates {
+  liveBps: number | null
+  avgBps: number | null
+  liveEta: number | null
+  avgEta: number | null
+  /** Milliseconds since this run started reporting — under 3s the card is still
+   *  "calculating…" rather than falling back to something jumpy. */
+  ageMs: number
+  /** Below two samples the engine's own speedBps/etaSeconds stand in. */
+  samples: number
+}
+
+// The two display toggles are GLOBAL (not per card) and outlive a restart.
+const SPEED_MODE_KEY = 'dropbeam-speed-mode'
+const ETA_MODE_KEY = 'dropbeam-eta-mode'
+function loadMode<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key) as T | null
+    return raw && allowed.includes(raw) ? raw : fallback
+  } catch {
+    return fallback
+  }
+}
+function saveMode(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    /* private mode / disabled storage — the toggle just won't persist */
+  }
+}
 
 const DEFAULT_SETTINGS: Settings = {
   downloadDir: '',
@@ -123,6 +159,15 @@ interface AppStore {
   order: string[]
   /** Final stats per completed transfer: how long it took + average speed. */
   transferSummaries: Record<string, { durationMs: number; avgBps: number }>
+  /** Live + whole-transfer-average speed and time left, per active transfer. */
+  transferRates: Record<string, TransferRates>
+  /** Which speed a card shows by default: the last few seconds, or the run's
+   *  average. Global (every card agrees) and remembered across restarts. */
+  speedMode: 'live' | 'avg'
+  /** Which rate the time left is based on. */
+  etaMode: 'avg' | 'live'
+  toggleSpeedMode: () => void
+  toggleEtaMode: () => void
   /** macOS: warning if the app is installed/running in a way that breaks folder
    * permissions every launch (null = fine / non-macOS). */
   installHint: string | null
@@ -440,6 +485,19 @@ export const useStore = create<AppStore>((set, get) => ({
   transfers: restoredPaused,
   order: Object.keys(restoredPaused),
   transferSummaries: {},
+  transferRates: {},
+  speedMode: loadMode(SPEED_MODE_KEY, ['live', 'avg'] as const, 'live'),
+  etaMode: loadMode(ETA_MODE_KEY, ['avg', 'live'] as const, 'avg'),
+  toggleSpeedMode: () => {
+    const speedMode = get().speedMode === 'live' ? 'avg' : 'live'
+    saveMode(SPEED_MODE_KEY, speedMode)
+    set({ speedMode })
+  },
+  toggleEtaMode: () => {
+    const etaMode = get().etaMode === 'avg' ? 'live' : 'avg'
+    saveMode(ETA_MODE_KEY, etaMode)
+    set({ etaMode })
+  },
   installHint: null,
   dragHovering: false,
   history: [],
@@ -912,14 +970,33 @@ export const useStore = create<AppStore>((set, get) => ({
     const prev = get().transfers[u.id]
     u = normalizeTransfer(u, prev)
     // Use recent progress bytes, not the backend's whole-transfer average.
+    let rates: TransferRates | null = null
     if (u.state === 'transferring' && u.bytesTotal > 0) {
-      let estimator = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
-        ? etaSpeeds.get(u.id) : undefined
+      const now = performance.now()
+      const continuing = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
+      let estimator = continuing ? etaSpeeds.get(u.id) : undefined
       estimator ??= new LandedEta()
       etaSpeeds.set(u.id, estimator)
-      u = { ...u, etaSeconds: estimator.update(performance.now(), u.bytesDone, u.bytesTotal) }
+      u = { ...u, etaSeconds: estimator.update(now, u.bytesDone, u.bytesTotal) }
+      // The card's own live/average rates. A run that just restarted (resumed
+      // after Paused/Failed, or rewound) starts its clock again here.
+      let rate = continuing ? rateTrackers.get(u.id) : undefined
+      rate ??= new TransferRate()
+      rateTrackers.set(u.id, rate)
+      rate.update(now, u.bytesDone)
+      const liveBps = rate.live()
+      const avgBps = rate.average()
+      rates = {
+        liveBps,
+        avgBps,
+        liveEta: etaAt(u.bytesDone, u.bytesTotal, liveBps),
+        avgEta: etaAt(u.bytesDone, u.bytesTotal, avgBps),
+        ageMs: rate.startedAt == null ? 0 : now - rate.startedAt,
+        samples: rate.count,
+      }
     } else {
       etaSpeeds.delete(u.id)
+      rateTrackers.delete(u.id)
     }
     if (u.chatTransfer) {
       const key = u.chatTransfer.id
@@ -1001,10 +1078,16 @@ export const useStore = create<AppStore>((set, get) => ({
       // A resume is a NEW transfer id, so this one's timer will never be read.
       transferStart.delete(u.id)
     } else if (prev?.state === 'paused') clearPausedTransfer(u.id)
-    set((s) => ({
-      transfers: { ...s.transfers, [u.id]: u },
-      order: s.order.includes(u.id) ? s.order : [...s.order, u.id],
-    }))
+    set((s) => {
+      const transferRates = { ...s.transferRates }
+      if (rates) transferRates[u.id] = rates
+      else delete transferRates[u.id]
+      return {
+        transfers: { ...s.transfers, [u.id]: u },
+        order: s.order.includes(u.id) ? s.order : [...s.order, u.id],
+        transferRates,
+      }
+    })
   },
 
   removeTransfer: (id) => {
@@ -1012,10 +1095,13 @@ export const useStore = create<AppStore>((set, get) => ({
     // The shared retry cache is already bounded to 50 payloads.
     if (!Object.values(get().chatTransfers).some((t) => t.id === id)) deleteRetryPayload(id)
     clearPausedTransfer(id)
+    rateTrackers.delete(id)
     set((s) => {
       const next = { ...s.transfers }
       delete next[id]
-      return { transfers: next, order: s.order.filter((x) => x !== id) }
+      const transferRates = { ...s.transferRates }
+      delete transferRates[id]
+      return { transfers: next, order: s.order.filter((x) => x !== id), transferRates }
     })
   },
 

@@ -1,21 +1,22 @@
 // Display formatting helpers. Bytes use decimal units (1000) to match croc.
 
-export function formatBytes(bytes: number, decimals = 1): string {
+// Above 1 GB this keeps TWO decimals, so a slow multi-GB transfer visibly ticks
+// (5.11 GB → 5.12 GB of 56.65 GB) instead of sitting on a frozen "5.1 GB"
+// (GitHub #25). Below 1 GB the usual one decimal is plenty. Pass `decimals` to
+// override (whole bytes are always shown without a fraction).
+export function formatBytes(bytes: number, decimals?: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
   const k = 1000
   const units = ['B', 'kB', 'MB', 'GB', 'TB', 'PB']
   const i = Math.max(0, Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1))
   const v = bytes / Math.pow(k, i)
-  return `${v.toFixed(i === 0 ? 0 : decimals)} ${units[i]}`
+  const places = decimals ?? (i >= 3 ? 2 : 1)
+  return `${v.toFixed(i === 0 ? 0 : places)} ${units[i]}`
 }
 
-// Live transfer counter: keep TWO decimals once we're into GB+ so a slow multi-GB
-// transfer visibly ticks (5.11 → 5.22 GB) instead of sitting on a frozen "5.1 GB"
-// (GitHub #25). Sub-GB stays at the usual one decimal.
+/** The live transfer counter — the same formatting, named for where it's used. */
 export function formatBytesLive(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  const i = Math.floor(Math.log(bytes) / Math.log(1000))
-  return formatBytes(bytes, i >= 3 ? 2 : 1)
+  return formatBytes(bytes)
 }
 
 // Whether to show speeds in megaBITS/sec (Mbps) vs megaBYTES/sec (MB/s). Set
@@ -33,7 +34,8 @@ export function formatSpeed(bytesPerSec: number, megabits = SPEED_IN_MEGABITS): 
     const mbps = (bytesPerSec * 8) / 1_000_000
     return `${mbps.toFixed(mbps < 10 ? 1 : 0)} Mbps`
   }
-  return `${formatBytes(bytesPerSec)}/s`
+  // Speeds stay at one decimal: a GB/s rate doesn't need hundredths.
+  return `${formatBytes(bytesPerSec, 1)}/s`
 }
 
 export function formatEta(seconds: number | null | undefined): string {

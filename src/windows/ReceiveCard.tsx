@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { currentMonitor, getCurrentWindow, LogicalPosition } from '@tauri-apps/api/window'
+import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from '@tauri-apps/api/window'
 import { desktopDir, documentDir, downloadDir, homeDir } from '@tauri-apps/api/path'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
@@ -13,6 +13,7 @@ import {
   Send as SendIcon,
 } from 'lucide-react'
 import { HAS_TAURI, api, type TransferUpdate } from '../lib/api'
+import { formatEta, formatSpeed } from '../lib/format'
 import { useStore } from '../store'
 
 // Pick a file-type glyph from the extension (audio waveform, image, video…).
@@ -31,8 +32,10 @@ function initialOf(name: string | null | undefined): string {
   return n ? n[0]!.toUpperCase() : '?'
 }
 
-// Truncate a long filename in the MIDDLE so the extension stays visible.
-function midTruncate(s: string, max = 34): string {
+// Truncate a long filename in the MIDDLE so the extension stays visible. The
+// card is fixed-width and centered, so the name is cut to fit rather than being
+// allowed to stretch the layout off-centre (CSS can only ellipsize the end).
+function midTruncate(s: string, max = 26): string {
   if (s.length <= max) return s
   const keep = Math.floor((max - 1) / 2)
   return `${s.slice(0, keep)}…${s.slice(s.length - keep)}`
@@ -48,8 +51,12 @@ const SENDING_STATES = ['starting', 'waitingForPeer', 'connecting', 'transferrin
 // Card window size (logical px). The window has native macOS traffic-light
 // controls (titleBarStyle Overlay) — yellow minimizes it into the Dock, red
 // dismisses it — so there's no custom minimize/close chrome anymore.
-const FULL_W = 214
-const FULL_H = 213
+// As small as the content allows: the progress card carries name, %, speed and
+// time left, and only an offer (Accept / Decline / Save to…) needs the taller
+// frame, so the window is sized per state instead of to the biggest one.
+const FULL_W = 190
+const FULL_H = 184
+const OFFER_H = 200
 
 /**
  * The floating Blip-style transfer card (bottom-right, near Downloads).
@@ -130,7 +137,8 @@ export function ReceiveCard() {
   // file directly on the main Send page — is handled there, not here.
   const sendCandidate = outgoing ?? justSent
 
-  usePositionBottomRight()
+  // An offer needs room for its buttons; everything else is the compact card.
+  useCardFrame(incoming?.state === 'waitingForAccept' ? OFFER_H : FULL_H)
 
   const [saveDirs, setSaveDirs] = useState<SaveDir[]>([{ label: 'Default folder', path: '' }])
   const [menuOpen, setMenuOpen] = useState(false)
@@ -253,6 +261,9 @@ export function ReceiveCard() {
 
   // ── Render data for whichever card is active ──────────────────────────────
   const t = visible ? active : null
+  const rates = useStore((s) => (t ? s.transferRates[t.id] : undefined))
+  const speedMode = useStore((s) => s.speedMode)
+  const etaMode = useStore((s) => s.etaMode)
   const sending = !incoming && showSend
   const done = sending && !outgoing && !!justSent // a send that just completed
 
@@ -278,6 +289,24 @@ export function ReceiveCard() {
     if (done) return friendName ? `Sent to ${friendName}` : 'Sent'
     return friendName ? `Sending to ${friendName}…` : 'Sending…'
   })()
+  // The one live line the compact card has room for: how far, how fast, how long
+  // left — the same live/average bases the in-app card uses.
+  const meter =
+    t?.state === 'transferring'
+      ? [
+          `${Math.round(pct)}%`,
+          formatSpeed(
+            (speedMode === 'live' ? rates?.liveBps ?? rates?.avgBps : rates?.avgBps ?? rates?.liveBps) ??
+              t.speedBps,
+          ),
+          formatEta(
+            (etaMode === 'avg' ? rates?.avgEta ?? rates?.liveEta : rates?.liveEta ?? rates?.avgEta) ??
+              t.etaSeconds,
+          ) + ' left',
+        ]
+          .filter((part) => !part.startsWith('—'))
+          .join(' · ')
+      : null
 
   return (
     <div className="rc-root">
@@ -368,7 +397,7 @@ export function ReceiveCard() {
                 Done
               </button>
             ) : (
-              <div className="rc-status">{incoming ? sub : `${Math.round(pct)}%`}</div>
+              <div className="rc-status">{meter ?? (incoming ? sub : `${Math.round(pct)}%`)}</div>
             )}
           </motion.div>
         )}
@@ -377,14 +406,17 @@ export function ReceiveCard() {
   )
 }
 
-/** Park the card in the bottom-right corner, near the Dock's Downloads stack. */
-function usePositionBottomRight() {
-  const done = useRef(false)
+/** Size the card to what it is showing and park it in the bottom-right corner,
+ *  near the Dock's Downloads stack. Re-runs when the card changes shape (an
+ *  offer needs its buttons; a live transfer needs only its three figures), so
+ *  the window is never bigger than its contents. */
+function useCardFrame(height: number) {
   useEffect(() => {
-    if (!HAS_TAURI || done.current) return
-    done.current = true
+    if (!HAS_TAURI) return
     void (async () => {
       try {
+        const win = getCurrentWindow()
+        await win.setSize(new LogicalSize(FULL_W, height))
         const mon = await currentMonitor()
         if (!mon) return
         const scale = mon.scaleFactor
@@ -392,14 +424,12 @@ function usePositionBottomRight() {
         const screenH = mon.size.height / scale
         const originX = mon.position.x / scale
         const originY = mon.position.y / scale
-        const w = FULL_W
-        const h = FULL_H
-        const x = originX + Math.max(8, screenW - w - 20)
-        const y = originY + Math.max(8, screenH - h - 70) // above the Dock
-        await getCurrentWindow().setPosition(new LogicalPosition(x, y))
+        const x = originX + Math.max(8, screenW - FULL_W - 20)
+        const y = originY + Math.max(8, screenH - height - 70) // above the Dock
+        await win.setPosition(new LogicalPosition(x, y))
       } catch {
         /* best-effort */
       }
     })()
-  }, [])
+  }, [height])
 }

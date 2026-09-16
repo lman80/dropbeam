@@ -42,6 +42,11 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
   const respondToOffer = useStore((s) => s.respondToOffer)
   const toast = useStore((s) => s.toast)
   const summary = useStore((s) => s.transferSummaries[t.id])
+  const rates = useStore((s) => s.transferRates[t.id])
+  const speedMode = useStore((s) => s.speedMode)
+  const etaMode = useStore((s) => s.etaMode)
+  const toggleSpeedMode = useStore((s) => s.toggleSpeedMode)
+  const toggleEtaMode = useStore((s) => s.toggleEtaMode)
   const [copied, setCopied] = useState(false)
 
   const active = isActive(t.state)
@@ -77,6 +82,35 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
   }
 
   const DirIcon = t.direction === 'send' ? Send : ArrowDownToLine
+
+  // By default the SPEED is live (what the link is doing right now) and the TIME
+  // LEFT is based on the whole-transfer average (which doesn't swing with every
+  // hiccup). Clicking either swaps its basis; both choices are global and stick.
+  const engineBps = t.speedBps > 0 ? t.speedBps : null
+  const shownBps =
+    (speedMode === 'live' ? rates?.liveBps ?? rates?.avgBps : rates?.avgBps ?? rates?.liveBps) ??
+    engineBps
+  const shownEta =
+    (etaMode === 'avg' ? rates?.avgEta ?? rates?.liveEta : rates?.liveEta ?? rates?.avgEta) ??
+    t.etaSeconds
+  // Neither figure blinks between frames: the live rate holds its last reading
+  // across a frame it can't measure, and a stall is named rather than shown as a
+  // dash. Only the first few seconds say "calculating…".
+  const settling = (rates?.ageMs ?? 0) < 3000
+  const speedText =
+    shownBps == null
+      ? settling
+        ? 'calculating…'
+        : '—'
+      : shownBps > 0
+        ? `${formatSpeed(shownBps)} ${speedMode}`
+        : 'stalled'
+  const etaText =
+    shownEta == null
+      ? settling
+        ? 'calculating…'
+        : '— left'
+      : `${formatEta(shownEta)} left · ${etaMode}`
 
   return (
     <motion.div
@@ -301,17 +335,29 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             </span>
           </div>
           <ProgressBar percent={t.percent} />
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              marginTop: 6,
-              fontSize: 12,
-              color: 'var(--text-muted)',
-            }}
-          >
-            <span>{formatSpeed(t.speedBps)}</span>
-            <span>{formatEta(t.etaSeconds)} left</span>
+          <div className="xfer-meters">
+            <button
+              className="xfer-meter"
+              onClick={toggleSpeedMode}
+              title={
+                speedMode === 'live'
+                  ? 'Speed over the last few seconds — click for the whole-transfer average'
+                  : 'Average speed for the whole transfer — click for the live rate'
+              }
+            >
+              {speedText}
+            </button>
+            <button
+              className="xfer-meter"
+              onClick={toggleEtaMode}
+              title={
+                etaMode === 'avg'
+                  ? 'Based on the whole-transfer average — click to base it on the live rate'
+                  : 'Based on the live rate — click to base it on the whole-transfer average'
+              }
+            >
+              {etaText}
+            </button>
           </div>
         </div>
       )}
@@ -381,14 +427,17 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
                 // folder"); multiple → just open the folder. Match the folder's own
                 // path separator so it works on Windows + macOS.
                 const sep = t.outDir!.includes('\\') ? '\\' : '/'
-                if (t.fileNames.length === 1) {
+                // A folder card carries ONE display name standing for many files
+                // (fileCount), so only a genuinely single-file card reveals a file.
+                if (t.fileCount === 1 && t.fileNames.length === 1) {
                   api.revealPath(`${t.outDir}${sep}${t.fileNames[0]}`).catch(() => {})
                 } else {
                   api.openPath(t.outDir!).catch(() => {})
                 }
               }}
             >
-              <FolderOpen size={15} /> {t.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
+              <FolderOpen size={15} />{' '}
+              {t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
             </button>
           )}
         </div>
