@@ -247,10 +247,18 @@ fn room(l: &Location) -> (bool, Option<u64>, Option<u64>) {
     if !fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
         || !l.marker.as_ref().is_none_or(|m| path.join(m).exists()) { return (false, None, None); }
     match volume_bytes(path) {
-        Some((free, total)) => (true, Some(free), Some(total)),
+        Some((free, total)) if plausible_volume(total) => (true, Some(free), Some(total)),
+        // Reachable, but the numbers can't be trusted: an sshfs mount to a NAS
+        // whose SFTP server lacks the statvfs extension reports a few MB.
+        Some(_) => (true, None, None),
         None => (false, None, None),
     }
 }
+
+/// statvfs figures below 1 GiB on a shared location are not a real volume
+/// (sshfs without the SFTP statvfs extension reports ~54 MB); show nothing
+/// rather than a wrong "32 MB free".
+pub(crate) fn plausible_volume(total_bytes: u64) -> bool { total_bytes >= 1 << 30 }
 
 /// Validate before normalizing: Path::components would silently remove `.`.
 /// Unix permits colon and backslash in filenames; Windows does not.
@@ -1234,7 +1242,7 @@ pub fn hosted_status(config: &Path, id: &str) -> Result<HostedStatus> {
     }
     Ok(status)
 }
-fn free_bytes(path: &Path) -> u64 { volume_bytes(path).map_or(0, |(free, _)| free) }
+fn free_bytes(path: &Path) -> u64 { volume_bytes(path).map_or(0, |(free, total)| if plausible_volume(total) { free } else { 0 }) }
 /// (free, total) bytes on the volume `path` lives on; `None` when the mount is
 /// gone (or on a platform without statvfs).
 pub(crate) fn volume_bytes(path: &Path) -> Option<(u64, u64)> {
@@ -2056,6 +2064,12 @@ mod tests {
     /// 300 GB upload starts, and must NOT quote the host's boot disk when the
     /// NAS is unmounted — only the folder's own volume, never its path.
     #[test]
+    #[test]
+    fn implausibly_small_volumes_report_unknown_room() {
+        assert!(!plausible_volume(54 * 1024 * 1024));
+        assert!(plausible_volume(4_000_000_000_000));
+    }
+
     fn shared_list_reports_room_on_the_volume_and_an_unmounted_root() {
         let f = Fixture::new();
         let list = shared(&f.config, "owner-device").unwrap();
