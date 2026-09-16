@@ -461,6 +461,97 @@ fn normalized_receive_offset(header: &serde_json::Value) -> Result<u64> {
     incoming_chat_link(header, "").map(|link| link.item_offset)
         .context("invalid chat batch manifest")
 }
+
+/// One folder arrives as MANY pushes (one per big file, one per small-file
+/// batch, plus a terminal directory push). The sender shows the whole folder on
+/// a single card, so the receiver must too: every push of one logical transfer
+/// renders as the SAME card, with the whole transfer's name, byte total and a
+/// byte base of everything that landed in earlier pushes.
+#[derive(Debug, Clone, PartialEq)]
+struct ReceiveCard {
+    /// Stable across every push (and every retry) of the same logical transfer.
+    id: String,
+    /// What the card is called: the top folder plus how many files it holds.
+    label: String,
+    files: usize,
+    bytes_total: u64,
+    /// Bytes that landed in EARLIER pushes. The sender counts files it skipped
+    /// (already on the far side) here too, so a retry resumes where it left off.
+    bytes_base: u64,
+    /// The final push — only then does the card go to Completed.
+    last: bool,
+}
+
+/// The one folder every item sits under, if they share one.
+fn folder_label<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut top: Option<&str> = None;
+    for name in names {
+        let head = name.split(['/', '\\']).next().unwrap_or("");
+        if head.is_empty() || head.len() == name.len() { return None; }
+        match top {
+            None => top = Some(head),
+            Some(seen) if seen == head => {}
+            Some(_) => return None,
+        }
+    }
+    top.map(str::to_string)
+}
+
+fn card_label(folder: Option<String>, files: usize) -> String {
+    let count = if files == 1 { "1 file".to_string() } else { format!("{files} files") };
+    match folder {
+        Some(folder) => format!("{folder} · {count}"),
+        None => count,
+    }
+}
+
+/// Pure: which logical card this push belongs to. `peer` namespaces the id, so
+/// a peer can never address (or collide with) another peer's card. `None` = the
+/// push IS the whole transfer, which keeps its own one-off card.
+fn receive_card(header: &serde_json::Value, peer: &str) -> Option<ReceiveCard> {
+    let items = header["items"].as_array().map_or(0, |a| a.len()) as u64;
+    if let Some(transfer) = header["location_transfer"].as_str() {
+        // A location UPLOAD (not a download): it carries the batch's shape.
+        let total_items = header["location_total_items"].as_u64()?;
+        let offset = header["location_item_offset"].as_u64()?;
+        uuid::Uuid::parse_str(transfer).ok()?;
+        if offset.checked_add(items)? > total_items { return None; }
+        if offset == 0 && items == total_items { return None; }
+        // Only a sender that states the batch's byte span aggregates: an older
+        // one keeps today's card-per-push behavior rather than getting a card
+        // that could never reach 100%.
+        let bytes_total = header["location_bytes_total"].as_u64()?;
+        return Some(ReceiveCard {
+            id: incoming_chat_id(peer, transfer),
+            label: card_label(
+                header["location_folder"].as_str().filter(|f| !f.is_empty()).map(str::to_string),
+                total_items as usize,
+            ),
+            files: total_items as usize,
+            bytes_base: header["location_bytes_offset"].as_u64().unwrap_or(0).min(bytes_total),
+            bytes_total,
+            // An upload always ends with a terminal push carrying the directories
+            // and no items — THAT is the one that completes the card (the last
+            // file push is still followed by it).
+            last: items == 0 && offset == total_items,
+        });
+    }
+    // A friend send: the chat link carries the immutable whole-transfer manifest
+    // (and is already validated against this push's slice).
+    let link = incoming_chat_link(header, peer)?;
+    if link.item_offset == 0 && link.last && link.manifest.len() as u64 == items { return None; }
+    Some(ReceiveCard {
+        id: link.id.clone(),
+        label: card_label(
+            folder_label(link.manifest.iter().map(|f| f.name.as_str())),
+            link.manifest.len(),
+        ),
+        files: link.manifest.len(),
+        bytes_base: link.offset.min(link.total),
+        bytes_total: link.total,
+        last: link.last,
+    })
+}
 struct ChatBatch {
     link: crate::models::ChatTransferLink,
     landed: std::collections::BTreeMap<String, String>,
@@ -484,7 +575,10 @@ impl ChatBatch {
         self.touched = Instant::now();
         let done: u64 = self.link.manifest.iter().enumerate().filter(|(i, f)| self.landed.contains_key(&chat_item_key(*i as u64, &f.name))).map(|(_, f)| f.size).sum();
         let complete = u.state == TransferState::Completed && self.link.manifest.iter().enumerate().all(|(i, f)| self.landed.contains_key(&chat_item_key(i as u64, &f.name))) && link.directories.iter().all(|d| self.landed.contains_key(&chat_dir_key(d))) && done == self.link.total;
-        self.link.bytes_done = if complete { done } else { self.link.bytes_done.max(done).max(link.offset.saturating_add(u.bytes_done).min(self.link.total)) };
+        // `u.bytes_done` is the WHOLE transfer's progress (a multi-push receive
+        // reports on one card, from a base of everything earlier pushes landed),
+        // so it must not be offset a second time.
+        self.link.bytes_done = if complete { done } else { self.link.bytes_done.max(done).max(u.bytes_done.min(self.link.total)) };
         self.link.completed_files = self.landed.keys().cloned().collect();
         self.link.completed_paths = self.landed.clone();
         self.link.batch_state = Some(if complete { TransferState::Completed } else if u.state == TransferState::Completed { TransferState::Transferring } else { u.state });
@@ -864,7 +958,10 @@ async fn read_landed_progress_with_work<F: Fn(u64, u64)>(
     }
 }
 
-/// A time-throttled UI callback shared by sends and receives.
+/// A time-throttled UI callback shared by sends and receives. `files` is how
+/// many files the CARD covers — the same as `names` except on a folder card,
+/// whose one display name stands for the whole batch.
+#[allow(clippy::too_many_arguments)]
 fn progress_cb(
     app: AppHandle,
     id: String,
@@ -872,6 +969,7 @@ fn progress_cb(
     names: Vec<String>,
     friend: Option<String>,
     conn: Connection,
+    files: usize,
 ) -> impl Fn(u64, u64) {
     let start = Instant::now();
     // (when we last emitted, and what we emitted) — both halves matter.
@@ -895,6 +993,7 @@ fn progress_cb(
         drop(previous);
         let secs = start.elapsed().as_secs_f64().max(0.001);
         let mut u = TransferUpdate::new(id.clone(), dir, names.clone());
+        u.file_count = files.max(u.file_count);
         u.state = TransferState::Transferring;
         u.bytes_done = done;
         u.bytes_total = total;
@@ -930,8 +1029,12 @@ fn emit_completed(
     locality: crate::models::Locality,
     friend: Option<String>,
     out_dir: Option<String>,
+    // How many files the card covers (a folder card names the folder, not each
+    // file). 0 = as many as `names`.
+    files: usize,
 ) {
     let mut u = completed_update(id, dir, names.clone(), total);
+    u.file_count = files.max(u.file_count);
     u.locality = locality;
     u.friend_name = friend.clone();
     u.out_dir = out_dir.clone();
@@ -1950,6 +2053,7 @@ async fn serve_stream_inner(
                         p.names.clone(),
                         None,
                         conn.clone(),
+                        0,
                     );
                     // Get onto a direct p2p path before pushing bytes — otherwise a
                     // small file finishes over the rate-limited relay before hole-
@@ -2024,6 +2128,7 @@ async fn serve_stream_inner(
                                     conn_locality(conn),
                                     None,
                                     None,
+                                    0,
                                 )
                             } else {
                                 unconfirmed_err = Some(
@@ -2217,7 +2322,18 @@ async fn serve_stream_inner(
                         .collect()
                 })
                 .unwrap_or_default();
-            let id = uuid::Uuid::new_v4().to_string();
+            // A folder arrives as many pushes. They all belong to ONE card: the
+            // logical transfer's id, name and byte span, so the receiver shows the
+            // folder with an overall %, exactly like the sender does.
+            let card = receive_card(&req, &who);
+            let id = card.as_ref().map_or_else(
+                || uuid::Uuid::new_v4().to_string(),
+                |c| c.id.clone(),
+            );
+            let card_names = card.as_ref().map_or_else(|| names.clone(), |c| vec![c.label.clone()]);
+            let card_files = card.as_ref().map_or(names.len(), |c| c.files);
+            let card_total = card.as_ref().map_or(total, |c| c.bytes_total);
+            let card_base = card.as_ref().map_or(0, |c| c.bytes_base);
             let mut item_offset = normalized_receive_offset(&req)?;
             if req.get("chatTransfer").is_some() {
                 let link = incoming_chat_link(&req, &who).ok_or_else(|| anyhow::anyhow!("invalid chat batch manifest"))?;
@@ -2367,10 +2483,11 @@ async fn serve_stream_inner(
             // user's decision (resolved by the respond_to_offer command). On
             // decline we drop the streams, which stops the sender's push.
             if !auto_accept && !resume_accept {
-                let mut wu = TransferUpdate::new(id.clone(), Direction::Receive, names.clone());
+                let mut wu = TransferUpdate::new(id.clone(), Direction::Receive, card_names.clone());
+                wu.file_count = card_files.max(wu.file_count);
                 wu.state = TransferState::WaitingForAccept;
                 wu.friend_name = sender.clone();
-                wu.bytes_total = total;
+                wu.bytes_total = card_total;
                 emit(&app, &wu);
                 let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
@@ -2413,10 +2530,13 @@ async fn serve_stream_inner(
                 }
             }
 
-            let mut u0 = TransferUpdate::new(id.clone(), Direction::Receive, names.clone());
+            let mut u0 = TransferUpdate::new(id.clone(), Direction::Receive, card_names.clone());
+            u0.file_count = card_files.max(u0.file_count);
             u0.state = TransferState::Transferring;
             u0.friend_name = sender.clone();
-            u0.bytes_total = total;
+            u0.bytes_done = card_base.min(card_total);
+            u0.bytes_total = card_total;
+            u0.percent = if card_total > 0 { u0.bytes_done as f64 / card_total as f64 * 100.0 } else { 0.0 };
             u0.locality = conn_locality(conn);
             u0.conn_detail = Some(conn_detail(conn));
             u0.location_id = location_upload.as_ref().map(|u| u.location_id().to_string());
@@ -2425,10 +2545,20 @@ async fn serve_stream_inner(
                 app.clone(),
                 id.clone(),
                 Direction::Receive,
-                names.clone(),
+                card_names.clone(),
                 sender.clone(),
                 conn.clone(),
+                card_files,
             );
+            // Report this push's bytes as the WHOLE transfer's progress: earlier
+            // pushes (including files the sender skipped because they were already
+            // there) are the base this one counts up from.
+            let cb = {
+                let (base, span, folder) = (card_base, card_total, card.is_some());
+                move |done: u64, total: u64| {
+                    if folder { cb(base.saturating_add(done).min(span), span) } else { cb(done, total) }
+                }
+            };
             // Native Dock download-progress for a single incoming file (same as
             // Quick Send), so a friend-sent file shows a live ring in Downloads.
             let dl = if names.len() == 1 {
@@ -2620,16 +2750,35 @@ async fn serve_stream_inner(
                     for (index, (name, path)) in names.iter().zip(&paths).enumerate() {
                         chat_file_landed(state, &id, Some(received_item_index(item_offset, index)), name, path);
                     }
-                    emit_completed(
-                        &app,
-                        &id,
-                        Direction::Receive,
-                        names,
-                        total,
-                        conn_locality(conn),
-                        sender,
-                        Some(location_upload.as_ref().map(|u| &u.destination).unwrap_or(&dest).to_string_lossy().to_string()),
-                    );
+                    let landed_in = location_upload.as_ref().map(|u| &u.destination).unwrap_or(&dest)
+                        .to_string_lossy().to_string();
+                    if card.as_ref().is_some_and(|c| !c.last) {
+                        // More pushes of this folder follow: hold the ONE card at the
+                        // bytes landed so far instead of flashing a completed card
+                        // (and a History row, and a notification) per file.
+                        let mut u = TransferUpdate::new(id.clone(), Direction::Receive, card_names);
+                        u.file_count = card_files.max(u.file_count);
+                        u.state = TransferState::Transferring;
+                        u.bytes_done = card_base.saturating_add(total).min(card_total);
+                        u.bytes_total = card_total;
+                        u.percent = if card_total > 0 { u.bytes_done as f64 / card_total as f64 * 100.0 } else { 0.0 };
+                        u.friend_name = sender;
+                        u.locality = conn_locality(conn);
+                        u.out_dir = Some(landed_in);
+                        emit(&app, &u);
+                    } else {
+                        emit_completed(
+                            &app,
+                            &id,
+                            Direction::Receive,
+                            card_names,
+                            card_total,
+                            conn_locality(conn),
+                            sender,
+                            Some(landed_in),
+                            card_files,
+                        );
+                    }
                     if !progress_mode {
                         let _ = send.write_all(b"ok").await;
                     }
@@ -2648,7 +2797,15 @@ async fn serve_stream_inner(
                 }
                 Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
             }
-            state.cancels.lock().unwrap().remove(&id);
+            {
+                // Pushes of one folder share the card's id, so only retire the
+                // registration this push actually made — a late-finishing earlier
+                // push must not disarm the Cancel button of the one now running.
+                let mut cancels = state.cancels.lock().unwrap();
+                if cancels.get(&id).is_some_and(|c| Arc::ptr_eq(c, &cancel)) {
+                    cancels.remove(&id);
+                }
+            }
         }
         Some("friend-hello") => {
             // A peer is introducing themselves: learn their stable EndpointId +
@@ -3524,6 +3681,7 @@ pub fn start_receive(
                         Vec::new(),
                         None,
                         conn.clone(),
+                        0,
                     );
                     let ph = progress_high.clone();
                     let cb = move |done: u64, total: u64| {
@@ -3605,7 +3763,7 @@ pub fn start_receive(
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
                     .sum();
-                emit_completed(&app, &id, Direction::Receive, names, total, loc, None, Some(out_dir));
+                emit_completed(&app, &id, Direction::Receive, names, total, loc, None, Some(out_dir), 0);
             }
             Err(e) if e.to_string().contains("canceled") => {
                 emit_canceled(&app, &id, Direction::Receive)
@@ -3643,6 +3801,13 @@ struct LocationPush {
     dirs: Vec<String>,
     total_items: u64,
     offset: u64,
+    /// The whole batch's byte total, and how many of them earlier pushes covered
+    /// (files skipped because they were already there included) — the receiver
+    /// shows one card for the folder and needs the WHOLE transfer's span.
+    bytes_total: u64,
+    bytes_offset: u64,
+    /// Top folder of the batch, for that card's name ("" = no shared folder).
+    folder: String,
 }
 tokio::task_local! { static LOCATION_PUSH: LocationPush; }
 
@@ -3802,7 +3967,9 @@ async fn send_friend_batch(conn: &Connection, items: &[SendItem], dirs: &[String
         boundary()?;
         anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
         let push = LocationPush { items: items[r.clone()].to_vec(), dirs: dirs.to_vec(),
-            total_items: items.len() as u64, offset: r.start as u64 };
+            total_items: items.len() as u64, offset: r.start as u64, bytes_total: total,
+            bytes_offset: items[..r.start].iter().map(|i| i.2).sum(),
+            folder: folder_label(items.iter().map(|i| i.1.as_str())).unwrap_or_default() };
         let file_link = crate::models::ChatTransferLink { item_offset: r.start as u64,
             offset: items[..r.start].iter().map(|i| i.2).sum(), last: index + 1 == pushes.len(), ..link.clone() };
         engaged.store(false, Ordering::SeqCst);
@@ -3862,6 +4029,7 @@ impl LocationBatch {
         let landed: Vec<_> = self.items.iter().map(|item| existing.get(&item.1) == Some(&(false, item.2))).collect();
         skipped(landed.iter().filter(|&&v| v).count());
         let total: u64 = self.items.iter().map(|i| i.2).sum();
+        let folder = folder_label(self.items.iter().map(|i| i.1.as_str())).unwrap_or_default();
         let mut dirs: Vec<_> = if self.dirs_pending { self.dirs.iter()
             .filter(|d| !existing.get(*d).is_some_and(|e| e.0)).cloned().collect() } else { vec![] };
         let mut sent_push = false;
@@ -3870,7 +4038,8 @@ impl LocationBatch {
             anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
             let base: u64 = self.items[..r.start].iter().map(|i| i.2).sum();
             let push = LocationPush { items: self.items[r.clone()].to_vec(), dirs: dirs.clone(),
-                total_items: self.items.len() as u64, offset: r.start as u64 };
+                total_items: self.items.len() as u64, offset: r.start as u64,
+                bytes_total: total, bytes_offset: base, folder: folder.clone() };
             engaged.store(false, Ordering::SeqCst);
             integrity::ITEM_OFFSET.scope(r.start as u64, LOCATION_PUSH.scope(push,
                 send_files_linked(conn, &[], cancel, |d, _| progress(base + d, total), name,
@@ -3891,7 +4060,8 @@ impl LocationBatch {
         let _ = (sent_push, dirs);
         {
             let push = LocationPush { items: vec![], dirs: self.dirs.clone(), total_items: self.items.len() as u64,
-                offset: self.items.len() as u64 };
+                offset: self.items.len() as u64, bytes_total: total, bytes_offset: total,
+                folder: folder.clone() };
             integrity::ITEM_OFFSET.scope(push.offset, LOCATION_PUSH.scope(push,
                 send_files_linked(conn, &[], cancel, |_, _| progress(total, total), name,
                     engaged, activity, state, None, Some(location)))).await?;
@@ -4099,6 +4269,7 @@ fn send_friend_inner(
                     names.clone(),
                     Some(friend_name.clone()),
                     conn.clone(),
+                    0,
                 );
                 // Wrap the progress callback to track the high-water mark of confirmed
                 // bytes across ALL attempts — the retry loop uses it to tell "this
@@ -4436,6 +4607,7 @@ fn send_friend_inner(
                     loc,
                     Some(friend_name),
                     None,
+                    0,
                 )
             }
             // A cancel may surface as our own "canceled" bail OR as a
@@ -7572,6 +7744,13 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
         if location.target.is_some() {
             header["location_total_items"] = serde_json::json!(push.as_ref().map_or(items.len() as u64, |p| p.total_items));
             header["location_item_offset"] = serde_json::json!(push.as_ref().map_or(0, |p| p.offset));
+            // One card for the whole upload on the far side: its byte span, how
+            // much of it earlier pushes already covered, and what to call it.
+            header["location_bytes_total"] = serde_json::json!(push.as_ref().map_or(total, |p| p.bytes_total));
+            header["location_bytes_offset"] = serde_json::json!(push.as_ref().map_or(0, |p| p.bytes_offset));
+            let folder = push.as_ref().map(|p| p.folder.clone())
+                .unwrap_or_else(|| folder_label(items.iter().map(|i| i.1.as_str())).unwrap_or_default());
+            if !folder.is_empty() { header["location_folder"] = serde_json::json!(folder); }
         }
     }
     if let Some(snapshot) = location.and_then(|l| l.snapshot.as_ref()) { snapshot.check_access(&peer_id)?; }
@@ -8818,6 +8997,80 @@ mod tests {
         let mut big = items.clone(); big[0].2 = PARALLEL_MIN;
         assert!(!friend_split(&big));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// One folder = one receive card: every push resolves to the same id, and
+    /// each one's byte base is everything the pushes before it covered.
+    #[test]
+    fn folder_pushes_resolve_to_one_receive_card() {
+        use super::*;
+        let transfer = uuid::Uuid::new_v4().to_string();
+        let peer = "peer-1";
+        let upload = |offset: u64, items: usize, bytes_offset: u64| serde_json::json!({
+            "kind": "files",
+            "items": (0..items).map(|i| serde_json::json!({"name": format!("Vases/{i}.jpg"), "size": 10}))
+                .collect::<Vec<_>>(),
+            "total": items as u64 * 10,
+            "location_transfer": transfer,
+            "location_total_items": 3,
+            "location_item_offset": offset,
+            "location_bytes_total": 30,
+            "location_bytes_offset": bytes_offset,
+            "location_folder": "Vases",
+        });
+        let cards: Vec<_> = [(0, 1, 0), (1, 2, 10), (3, 0, 30)].iter()
+            .map(|&(offset, items, base)| receive_card(&upload(offset, items, base), peer)
+                .expect("every push of a batched upload belongs to a card"))
+            .collect();
+        assert_eq!(cards.iter().map(|c| c.id.clone()).collect::<std::collections::BTreeSet<_>>().len(), 1);
+        assert_eq!(cards[0].id, incoming_chat_id(peer, &transfer));
+        assert_ne!(cards[0].id, receive_card(&upload(0, 1, 0), "peer-2").unwrap().id);
+        assert_eq!(cards[0].label, "Vases · 3 files");
+        assert_eq!(cards.iter().map(|c| c.bytes_base).collect::<Vec<_>>(), vec![0, 10, 30]);
+        assert!(cards.iter().all(|c| c.bytes_total == 30 && c.files == 3));
+        // Only the terminal push (directories, no items) completes the card.
+        assert_eq!(cards.iter().map(|c| c.last).collect::<Vec<_>>(), vec![false, false, true]);
+        // A sender that never states the batch span keeps a card per push.
+        let mut old = upload(1, 2, 10);
+        old.as_object_mut().unwrap().remove("location_bytes_total");
+        assert_eq!(receive_card(&old, peer), None);
+        // A single-push send is its own card, and a forged id is refused.
+        assert_eq!(receive_card(&upload(0, 3, 0), peer), None);
+        let mut forged = upload(0, 1, 0);
+        forged["location_transfer"] = serde_json::json!("../../etc/passwd");
+        assert_eq!(receive_card(&forged, peer), None);
+        let mut past_end = upload(2, 2, 20);
+        past_end["location_item_offset"] = serde_json::json!(2);
+        assert_eq!(receive_card(&past_end, peer), None);
+
+        // A friend folder send carries the same shape on its chat link.
+        let id = uuid::Uuid::new_v4().to_string();
+        let manifest = serde_json::json!([{"name":"Trip/a.mov","size":7},{"name":"Trip/b.mov","size":5}]);
+        let push = |item_offset: u64, offset: u64, items: serde_json::Value, last: bool| serde_json::json!({
+            "kind": "files", "items": items.clone(),
+            "total": items.as_array().unwrap().iter().map(|i| i["size"].as_u64().unwrap()).sum::<u64>(),
+            "chatTransfer": {"id": id, "attempt": 1, "manifest": manifest, "directories": [],
+                "itemOffset": item_offset, "offset": offset, "total": 12, "last": last},
+        });
+        let first = receive_card(&push(0, 0, serde_json::json!([{"name":"Trip/a.mov","size":7}]), false), peer).unwrap();
+        let second = receive_card(&push(1, 7, serde_json::json!([{"name":"Trip/b.mov","size":5}]), true), peer).unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!((first.bytes_base, second.bytes_base), (0, 7));
+        assert_eq!((first.last, second.last), (false, true));
+        assert_eq!(second.label, "Trip · 2 files");
+        assert!(receive_card(&push(0, 0, manifest.clone(), true), peer).is_none(), "a one-push send keeps its own card");
+    }
+
+    #[test]
+    fn folder_label_only_names_a_shared_top_folder() {
+        use super::*;
+        assert_eq!(folder_label(["Vases/a", "Vases/b/c"]), Some("Vases".into()));
+        assert_eq!(folder_label(["Vases/a", "Bowls/b"]), None);
+        assert_eq!(folder_label(["loose.txt"]), None);
+        assert_eq!(folder_label(["", "Vases/a"]), None);
+        assert_eq!(folder_label(["Vases\\a", "Vases\\b"]), Some("Vases".into()));
+        assert_eq!(card_label(Some("Vases".into()), 3), "Vases · 3 files");
+        assert_eq!(card_label(None, 1), "1 file");
     }
 
     fn planned(sizes: &[u64], landed: &[bool]) -> Vec<std::ops::Range<usize>> {
@@ -12631,6 +12884,8 @@ mod integrity_round2_tests {
         let dest = dir.join("dest"); let target = dest.clone();
         let server = endpoint().await; let client = endpoint().await; let srv = server.clone();
         let received = Arc::new(Mutex::new(Vec::<String>::new())); let recorded = received.clone();
+        // Every push of this folder must resolve to ONE receive card.
+        let cards = Arc::new(Mutex::new(Vec::<ReceiveCard>::new())); let carded = cards.clone();
         let receiver = tokio::spawn(async move {
             let conn = srv.accept().await.unwrap().await.unwrap();
             loop {
@@ -12642,6 +12897,7 @@ mod integrity_round2_tests {
                     write_frame(&mut send, &reply).await.unwrap(); send.finish().unwrap();
                 } else {
                     assert!(incoming_chat_link(&header, &conn.remote_id().to_string()).is_some());
+                    carded.lock().unwrap().extend(receive_card(&header, &conn.remote_id().to_string()));
                     recorded.lock().unwrap().extend(header["items"].as_array().unwrap().iter()
                         .map(|i| i["name"].as_str().unwrap().to_string()));
                     integrity::scope(read_files_negotiated(&conn, &mut send, &mut recv, &header, &target,
@@ -12674,6 +12930,17 @@ mod integrity_round2_tests {
         assert_eq!(notice.lock().unwrap().location_skipped, Some(if old_peer { 0 } else { 1 }));
         assert_eq!(progress.lock().unwrap()[0], if old_peer { 0 } else { PARALLEL_MIN });
         assert_eq!(*received.lock().unwrap(), items.iter().map(|i| i.1.clone()).collect::<Vec<_>>());
+        // One card across all of them: same id, same whole-folder span, each push
+        // based on the bytes the earlier ones covered, exactly one final push.
+        let cards = cards.lock().unwrap().clone();
+        assert!(cards.len() > 1, "a three-file folder is sent as several pushes");
+        assert_eq!(cards.iter().map(|c| c.id.clone()).collect::<std::collections::BTreeSet<_>>().len(), 1);
+        assert!(cards.iter().all(|c| c.bytes_total == total && c.files == items.len()
+            && c.label == format!("folder · {} files", items.len())));
+        assert_eq!(cards.iter().filter(|c| c.last).count(), 1, "only the final push completes the card");
+        assert_eq!(cards.first().unwrap().bytes_base, 0);
+        assert!(cards.iter().any(|c| c.bytes_base > 0), "a later push resumes from what landed before it");
+        assert!(cards.iter().all(|c| c.bytes_base < total));
         for item in &items { assert_eq!(std::fs::read(&item.0).unwrap(), std::fs::read(dest.join(&item.1)).unwrap()); }
         assert_eq!(std::fs::read_dir(dest.join("folder")).unwrap().count(), 3, "no collision duplicates");
         conn.close(0u32.into(), b"done"); receiver.await.unwrap();

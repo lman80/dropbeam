@@ -1,5 +1,5 @@
 import type { ChatMessage, TransferUpdate } from './api'
-import { integrityRows } from './integrity.ts'
+import { integrityRows, mergeIntegrity } from './integrity.ts'
 
 const nonnegative = (n: number): number => Number.isFinite(n) && n >= 0 ? n : 0
 const strings = (value: string[]): string[] =>
@@ -33,7 +33,10 @@ export function normalizeTransfer(u: TransferUpdate, prev?: TransferUpdate): Tra
   if (held && percent === 0 && bytesTotal > 0) percent = bytesDone / bytesTotal * 100
   return {
     ...u,
-    integrity: integrityRows(u.integrity),
+    // A folder arrives as several pushes on ONE card, each reporting only the
+    // files it carried, so the card's checksum list accumulates (a re-verified
+    // file replaces its earlier row) instead of being replaced push by push.
+    integrity: mergeIntegrity(prev?.integrity, integrityRows(u.integrity)),
     locationSkipped: u.locationSkipped ?? prev?.locationSkipped,
     locationConflicts: u.locationConflicts ?? prev?.locationConflicts,
     // A verify report outlives the update that carried it: later progress ticks
