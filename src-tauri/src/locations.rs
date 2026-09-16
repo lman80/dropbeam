@@ -671,6 +671,22 @@ mod unix {
                 Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 }))
             }).collect())
         }
+        /// SHA-256 of one entry, opened descriptor-relative with O_NOFOLLOW at
+        /// every component — a symlink is never followed and only a regular file
+        /// is hashed. `None` means absent, not a regular file, or unreadable:
+        /// "Verify copy" reports that as a missing copy rather than failing the
+        /// whole run over one bad file on a flaky mount.
+        pub fn hash_entry(&self, raw: &str, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<Option<String>> {
+            let rel = relative(raw)?;
+            let Ok(file) = self.open_rel(&rel, false) else { return Ok(None); };
+            if !file.metadata().map(|m| m.is_file()).unwrap_or(false) { return Ok(None); }
+            match sha256_file_progress(file, cancel, progress) {
+                Ok(digest) => Ok(Some(digest)),
+                // A cancel is the caller's own doing — propagate it.
+                Err(e) if e.to_string().contains("canceled") => Err(e),
+                Err(_) => Ok(None),
+            }
+        }
         pub fn listing(&self, raw: &str) -> Result<Vec<Entry>> {
             self.resolve(raw)?;
             let dir = self.open_rel(&relative(raw)?, true)?;
@@ -939,6 +955,7 @@ mod unix {
 impl Root {
     pub fn stat_entry(&self, _: &str) -> Result<Option<(bool, u64)>> { bail!("Hosting unavailable") }
     pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64)>>> { bail!("Hosting unavailable") }
+    pub fn hash_entry(&self, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64)) -> Result<Option<String>> { bail!("Hosting unavailable") }
     pub fn listing(&self, _: &str) -> Result<Vec<Entry>> { bail!("Hosting unavailable") }
     pub fn new_folder(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
     pub fn rename_item(&self, _: &str, _: &str) -> Result<()> { bail!("Hosting unavailable") }
@@ -951,6 +968,43 @@ impl Root {
     pub fn gc_stages(&self) -> Result<()> { Ok(()) }
     pub fn land_verified(&self, _: &str, _: &Path, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> { bail!("Hosting unavailable") }
     pub fn select(&self, _: &str, _: &str, _: &mut Budget, _: usize, _: &mut Vec<String>, _: &mut Vec<(PathBuf, String, u64, u64)>, _: &mut Vec<String>) -> Result<()> { bail!("Hosting unavailable") }
+}
+
+/// `locations.verify`: hash the copies this host holds for an uploaded batch.
+///
+/// Gated exactly like `locations.stat` — the caller must be a friend this
+/// location is shared with — and streamed by the caller: `hashed` carries the
+/// running byte count out to the progress frames, `cancel` stops a 56 GB read
+/// the moment the requester gives up. Reading a 1000-file chunk is slow enough
+/// (a NAS mount manages ~10 MB/s) that this NEVER runs on the async runtime;
+/// `iroh_net::serve_verify` puts it on a blocking thread.
+pub fn verify_digests(config: &Path, endpoint: &str, request: &Value,
+    cancel: &std::sync::atomic::AtomicBool, hashed: &std::sync::atomic::AtomicU64) -> Result<Vec<Option<String>>> {
+    use std::sync::atomic::Ordering;
+    ensure!(request["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
+    let (mut l, friend) = authorize(config, endpoint, text(request, "id")?, Access::Read)?;
+    limit_request(config, &friend, "ls", Instant::now())?;
+    let raw = text(request, "rel_path")?;
+    let items = request["items"].as_array().context("Missing verify items")?;
+    ensure!(items.len() <= 1000, "Too many verify items");
+    validate_root(config, Path::new(&l.path))?;
+    let root = Root::for_location(&mut l)?;
+    let mut digests = Vec::with_capacity(items.len());
+    let mut base = 0u64;
+    for item in items {
+        ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        let name = item["name"].as_str().context("Invalid verify name")?;
+        let size = item["size"].as_u64().unwrap_or(0);
+        let joined = format!("{raw}/{name}");
+        digests.push(root.hash_entry(joined.trim_matches('/'), cancel,
+            |n| { hashed.fetch_max(base + n, Ordering::Relaxed); })?);
+        // Advance by the DECLARED size even when nothing was hashed, so the
+        // requester's progress bar still reaches the end on a folder whose copy
+        // is partly missing.
+        base += size;
+        hashed.fetch_max(base, Ordering::Relaxed);
+    }
+    Ok(digests)
 }
 
 pub fn dispatch(config: &Path, endpoint: &str, request: &Value) -> Result<Value> {
@@ -1922,6 +1976,54 @@ mod tests {
         save(&f.config, None, Some("nas")).unwrap();
         record_activity(&f.config, "nas", &f.friend, "upload", 1);
         assert!(load_last_activity(&f.config).is_empty(), "stopping a location drops its row");
+    /// `locations.verify` on the host: hash the copies it holds, refuse the same
+    /// things `locations.stat` refuses, and never follow a symlink off the root.
+    #[cfg(unix)]
+    #[test]
+    fn verify_digests_hashes_the_hosts_copies_and_keeps_the_stat_gate() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let f = Fixture::new();
+        fs::create_dir_all(f.root.join("drop/clips")).unwrap();
+        fs::write(f.root.join("drop/clips/a.mp4"), b"same bytes").unwrap();
+        fs::write(f.root.join("drop/clips/b.mp4"), b"different").unwrap();
+        // The sibling a conflicting upload lands as: "Verify copy" asks for it by
+        // name when the requested name's digest doesn't match.
+        fs::write(f.root.join("drop/clips/b (2).mp4"), b"same bytes").unwrap();
+        std::os::unix::fs::symlink(f.config.join("locations.json"), f.root.join("drop/clips/link.mp4")).unwrap();
+        let items = json!([{"name":"clips/a.mp4","size":10},{"name":"clips/b.mp4","size":9},
+            {"name":"clips/gone.mp4","size":4},{"name":"clips/link.mp4","size":4}]);
+        let request = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
+            "rel_path":"drop","items":items});
+        let cancel = AtomicBool::new(false);
+        let hashed = AtomicU64::new(0);
+        let digests = verify_digests(&f.config, "owner-device", &request, &cancel, &hashed).unwrap();
+        assert_eq!(digests[0], Some(sha256(&f.root.join("drop/clips/a.mp4")).unwrap()));
+        assert_ne!(digests[1], digests[0], "different content must not hash the same");
+        assert_eq!(digests[2], None, "a copy the host doesn't hold is null");
+        assert_eq!(digests[3], None, "a symlink is never followed");
+        // Declared bytes advance even where nothing was hashed.
+        assert_eq!(hashed.load(Ordering::Relaxed), 10 + 9 + 4 + 4);
+
+        let sibling = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
+            "rel_path":"drop","items":[{"name":"clips/b (2).mp4","size":10}]});
+        assert_eq!(verify_digests(&f.config, "owner-device", &sibling, &cancel, &hashed).unwrap()[0],
+            digests[0], "the (2) sibling holds the bytes we sent");
+
+        // Same gate as locations.stat: an endpoint this location isn't shared
+        // with gets nothing, and neither does a traversal or an oversized batch.
+        assert!(verify_digests(&f.config, "stranger-device", &request, &cancel, &hashed).is_err());
+        let escape = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
+            "rel_path":"drop","items":[{"name":"../../outside","size":0}]});
+        assert!(verify_digests(&f.config, "owner-device", &escape, &cancel, &hashed).is_err());
+        let many: Vec<_> = (0..1001).map(|i| json!({"name":format!("f{i}"),"size":0})).collect();
+        let oversized = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
+            "rel_path":"drop","items":many});
+        assert!(verify_digests(&f.config, "owner-device", &oversized, &cancel, &hashed).is_err());
+        let stale = json!({"kind":"locations.verify","locations_v":VERSION + 99,"id":"nas",
+            "rel_path":"drop","items":[]});
+        assert!(verify_digests(&f.config, "owner-device", &stale, &cancel, &hashed).is_err());
+        // A cancel stops the read instead of reporting a partial verdict.
+        assert!(verify_digests(&f.config, "owner-device", &request, &AtomicBool::new(true), &hashed).is_err());
     }
 
     #[test]

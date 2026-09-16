@@ -1012,7 +1012,10 @@ export const useStore = create<AppStore>((set, get) => ({
     } else if (!transferStart.has(u.id)) {
       transferStart.set(u.id, Date.now()) // fallback: first time we saw it
     }
-    if (u.state === 'completed' && u.bytesTotal > 0) {
+    // Only the FIRST completion times the transfer: a later emit on the same
+    // card (a verify report, say) would otherwise restart the clock and show a
+    // one-millisecond "average speed".
+    if (u.state === 'completed' && u.bytesTotal > 0 && !get().transferSummaries[u.id]) {
       const start = transferStart.get(u.id)
       if (start) {
         const durationMs = Math.max(1, Date.now() - start)

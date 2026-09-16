@@ -90,6 +90,11 @@ pub struct TransferUpdate {
     /// Only that first snapshot carries it; the view remembers it per transfer id.
     #[serde(default)]
     pub location_id: Option<String>,
+    /// The last "Verify copy" run for this card: a full SHA-256 comparison of
+    /// every file in the send against the copy that landed on the peer. `None`
+    /// until the user asks for one.
+    #[serde(default)]
+    pub verify: Option<crate::verify::VerifyReport>,
     #[serde(default)]
     pub chat_transfer: Option<ChatTransferLink>,
     pub id: String,
@@ -155,6 +160,7 @@ impl TransferUpdate {
             location_skipped: None,
             location_conflicts: None,
             location_id: None,
+            verify: None,
             chat_transfer: None,
             id,
             direction,
