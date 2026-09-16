@@ -14,6 +14,7 @@ import type {
   PairUpdate,
   Settings,
   TransferUpdate,
+  VerifyReport,
   VerifyResult,
 } from './api'
 
@@ -170,6 +171,10 @@ function base(id: string, direction: 'send' | 'receive', names: string[]): Trans
 /** Simulated transfers still ticking, so the dev mock can pause one mid-flight. */
 const running = new Map<string, { t: TransferUpdate; iv: ReturnType<typeof setInterval> }>()
 
+/** Completed simulated transfers, so the preview can run "Verify copy" on one. */
+const finished = new Map<string, TransferUpdate>()
+const verifying = new Map<string, ReturnType<typeof setInterval>>()
+
 function simulate(t: TransferUpdate, total: number) {
   t.bytesTotal = total
   t.peer = '192.168.1.55:51022'
@@ -188,6 +193,7 @@ function simulate(t: TransferUpdate, total: number) {
       running.delete(t.id)
       setTimeout(() => {
         t.state = 'completed'
+        finished.set(t.id, t)
         emit('transfer://update', { ...t })
         history.unshift({
           id: t.id,
@@ -336,6 +342,45 @@ export const mockApi = {
     live.t.etaSeconds = null
     live.t.detail = 'Paused — resume any time'
     emit('transfer://update', { ...live.t })
+  },
+  verifyTransfer: async (id: string): Promise<void> => {
+    const t = finished.get(id)
+    if (!t || verifying.has(id)) return
+    const total = Math.max(t.fileCount, 1)
+    const bytesTotal = t.bytesTotal || 1
+    const report = (state: VerifyReport['state'], checked: number): VerifyReport => ({
+      state,
+      checked,
+      total,
+      bytesHashed: Math.round((bytesTotal * checked) / total),
+      bytesTotal,
+      mismatched: [],
+      missing: [],
+      error: null,
+    })
+    let checked = 0
+    t.verify = report('running', 0)
+    emit('transfer://update', { ...t })
+    const iv = setInterval(() => {
+      checked = Math.min(total, checked + Math.max(1, Math.ceil(total / 8)))
+      const done = checked >= total
+      if (done) {
+        clearInterval(iv)
+        verifying.delete(id)
+      }
+      t.verify = report(done ? 'done' : 'running', checked)
+      emit('transfer://update', { ...t })
+    }, 500)
+    verifying.set(id, iv)
+  },
+  cancelVerify: async (id: string): Promise<void> => {
+    const iv = verifying.get(id)
+    const t = finished.get(id)
+    if (!iv || !t?.verify) return
+    clearInterval(iv)
+    verifying.delete(id)
+    t.verify = { ...t.verify, state: 'canceled' }
+    emit('transfer://update', { ...t })
   },
   getSettings: async (): Promise<Settings> => settings,
   updateSettings: async (s: Settings): Promise<Settings> => {

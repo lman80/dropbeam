@@ -1900,6 +1900,22 @@ pub async fn location_request(state: State<'_, Arc<AppState>>, iroh: State<'_, A
     }
     crate::iroh_net::location_request(&iroh, &endpoint, request).await.map_err(|e| format!("{e:#}"))
 }
+/// "Verify copy": re-check a completed SEND by hashing every file on both
+/// devices. Runs in the background and reports on the transfer's own card; the
+/// files and the destination come from the record the send itself left behind,
+/// exactly like the frontend's retry payload.
+#[tauri::command]
+pub fn verify_transfer(app: AppHandle, iroh: State<'_, Arc<crate::iroh_net::IrohState>>, id: String) -> Result<(), String> {
+    crate::iroh_net::start_verify(app, iroh.inner().clone(), id)
+}
+
+/// Stop a running "Verify copy" — the card reports Canceled and the peer drops
+/// its hashing as soon as it can no longer report progress.
+#[tauri::command]
+pub fn cancel_verify(iroh: State<'_, Arc<crate::iroh_net::IrohState>>, id: String) {
+    crate::iroh_net::cancel_verify(&iroh, &id);
+}
+
 #[tauri::command]
 pub async fn upload_to_location(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     friend_id: String, target: crate::locations::Target, paths: Vec<String>) -> Result<TransferUpdate, String> {

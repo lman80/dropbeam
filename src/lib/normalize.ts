@@ -36,6 +36,9 @@ export function normalizeTransfer(u: TransferUpdate, prev?: TransferUpdate): Tra
     integrity: integrityRows(u.integrity),
     locationSkipped: u.locationSkipped ?? prev?.locationSkipped,
     locationConflicts: u.locationConflicts ?? prev?.locationConflicts,
+    // A verify report outlives the update that carried it: later progress ticks
+    // (and any other emit on this card) must not blank the verdict.
+    verify: u.verify ?? prev?.verify,
     fileNames: strings(u.fileNames ?? prev?.fileNames ?? []),
     fileCount: nonnegative(u.fileCount) || nonnegative(held?.fileCount ?? 0),
     friendName: u.friendName ?? held?.friendName ?? null,

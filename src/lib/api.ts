@@ -52,9 +52,26 @@ export interface FileIntegrity {
   verified: boolean
 }
 
+/** The last "Verify copy" run on a completed send: a full SHA-256 comparison of
+ *  every file against the copy that landed on the peer. */
+export interface VerifyReport {
+  state: 'running' | 'done' | 'failed' | 'canceled'
+  /** Files whose verdict is settled so far. */
+  checked: number
+  total: number
+  /** Bytes hashed, averaged across the two devices (both read every byte). */
+  bytesHashed: number
+  bytesTotal: number
+  mismatched: string[]
+  missing: string[]
+  error: string | null
+}
+
 export interface TransferUpdate {
   locationSkipped?: number | null
   locationConflicts?: number | null
+  /** Result (or live progress) of "Verify copy" on this card. */
+  verify?: VerifyReport | null
   integrity?: FileIntegrity[]
   chatTransfer?: {
     id: string
@@ -374,6 +391,13 @@ const realApi = {
   cancelTransfer: (id: string) => invoke<void>('cancel_transfer', { id }),
   /** Stop a send but keep its progress — the card flips to Paused and offers Resume. */
   pauseTransfer: (id: string) => invoke<void>('pause_transfer', { id }),
+
+  /** Re-check a completed send: hash every file here and on the peer, then
+   *  compare. Progress and the verdict arrive on the transfer's own card. */
+  verifyTransfer: (id: string) => invoke<void>('verify_transfer', { id }),
+
+  /** Stop a running "Verify copy". */
+  cancelVerify: (id: string) => invoke<void>('cancel_verify', { id }),
   /** Write a line into the native app log file (for diagnosing remote issues). */
   frontendLog: (msg: string) => invoke<void>('frontend_log', { msg }),
   /** A file the app was launched to send (Windows "Send with DropBeam"). */

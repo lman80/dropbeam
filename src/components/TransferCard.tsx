@@ -396,6 +396,104 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
 
       <IntegrityDetails rows={t.integrity} total={t.bytesTotal} completed={t.state === 'completed'} />
 
+      {/* Verify copy: a full SHA-256 comparison of every file in this send against
+          the copy that actually landed on the peer. Only a finished SEND has both
+          sides to compare, and the peer reads at its own pace (a NAS manages
+          ~10 MB/s), so a big folder shows live progress and can be canceled. */}
+      {t.direction === 'send' && t.state === 'completed' && (
+        <div style={{ marginTop: 10 }}>
+          {t.verify?.state === 'running' ? (
+            <>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'baseline',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                  marginBottom: 6,
+                }}
+              >
+                <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
+                  Verifying… {t.verify.checked.toLocaleString()} /{' '}
+                  {t.verify.total.toLocaleString()} files
+                  {t.verify.bytesTotal > 0
+                    ? ` · ${formatBytes(t.verify.bytesHashed)} / ${formatBytes(t.verify.bytesTotal)}`
+                    : ''}
+                </span>
+                <button
+                  className="btn btn-ghost"
+                  style={{ padding: '2px 8px', fontSize: 12.5, flexShrink: 0 }}
+                  onClick={() => void api.cancelVerify(t.id)}
+                >
+                  Cancel
+                </button>
+              </div>
+              <ProgressBar
+                percent={
+                  t.verify.bytesTotal > 0
+                    ? (t.verify.bytesHashed / t.verify.bytesTotal) * 100
+                    : 0
+                }
+              />
+            </>
+          ) : t.verify?.state === 'done' &&
+            t.verify.mismatched.length + t.verify.missing.length === 0 ? (
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--green)' }}
+            >
+              <CheckCircle2 size={15} /> All {t.verify.total.toLocaleString()} files identical
+            </div>
+          ) : t.verify?.state === 'done' ? (
+            <details>
+              <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--red)' }}>
+                {(t.verify.mismatched.length + t.verify.missing.length).toLocaleString()} of{' '}
+                {t.verify.total.toLocaleString()} files don’t match
+              </summary>
+              <div
+                className="selectable"
+                style={{
+                  marginTop: 6,
+                  maxHeight: 150,
+                  overflowY: 'auto',
+                  fontSize: 12,
+                  color: 'var(--text-muted)',
+                  lineHeight: 1.5,
+                }}
+              >
+                {t.verify.mismatched.map((name) => (
+                  <div key={`different:${name}`}>Different: {name}</div>
+                ))}
+                {t.verify.missing.map((name) => (
+                  <div key={`missing:${name}`}>Missing: {name}</div>
+                ))}
+              </div>
+            </details>
+          ) : (
+            <>
+              {t.verify?.state === 'failed' && (
+                <div style={{ fontSize: 12.5, color: 'var(--red)', marginBottom: 8, lineHeight: 1.45 }}>
+                  {t.verify.error ?? 'Could not verify the copy.'}
+                </div>
+              )}
+              {t.verify?.state === 'canceled' && (
+                <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 8 }}>
+                  Verification canceled.
+                </div>
+              )}
+              <button
+                className="btn btn-ghost"
+                style={{ width: '100%' }}
+                onClick={() => {
+                  void api.verifyTransfer(t.id).catch((e) => toast('error', String(e)))
+                }}
+              >
+                <Check size={15} /> Verify copy
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {/* failed */}
       {t.state === 'failed' && (
         <div style={{ marginTop: 12 }}>

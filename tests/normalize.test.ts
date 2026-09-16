@@ -60,3 +60,26 @@ test('Location conflict count survives sparse progress and completion updates', 
   assert.equal(both.locationSkipped, 2)
   assert.equal(both.locationConflicts, 3)
 })
+
+test('A verify report sticks to its card across later updates', () => {
+  const running = normalizeTransfer({
+    id: 'nas',
+    verify: { state: 'running', checked: 4, total: 9, bytesHashed: 40, bytesTotal: 90, mismatched: [], missing: [], error: null },
+  } as TransferUpdate)
+  assert.equal(running.verify?.checked, 4)
+  // An unrelated emit on the same card (a summary, a conflict count) must not
+  // blank the verdict the user is reading.
+  const quiet = normalizeTransfer({ id: 'nas', state: 'completed', locationConflicts: 1 } as TransferUpdate, running)
+  assert.equal(quiet.verify?.state, 'running')
+  assert.equal(quiet.verify?.bytesHashed, 40)
+  // The next verify emit replaces it wholesale, lists and all.
+  const done = normalizeTransfer({
+    id: 'nas',
+    verify: { state: 'done', checked: 9, total: 9, bytesHashed: 90, bytesTotal: 90, mismatched: ['b'], missing: ['c'], error: null },
+  } as TransferUpdate, quiet)
+  assert.equal(done.verify?.state, 'done')
+  assert.deepEqual(done.verify?.mismatched, ['b'])
+  assert.deepEqual(done.verify?.missing, ['c'])
+  // A card that has never been verified stays undefined, not an empty report.
+  assert.equal(normalizeTransfer({ id: 'fresh' } as TransferUpdate).verify, undefined)
+})

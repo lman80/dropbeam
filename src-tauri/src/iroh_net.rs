@@ -85,6 +85,18 @@ pub struct IrohState {
     friend_conns: Mutex<HashMap<String, CachedFriendConnection>>,
     /// Progress protocol learned from authenticated hello/ready frames.
     progress_versions: Mutex<HashMap<String, u64>>,
+    /// Finished SENDS that "Verify copy" can still re-check: what was pushed,
+    /// where it went, and the completed card to re-emit the report on. Bounded
+    /// (oldest evicted) by `verify::remember`.
+    verify_records: Mutex<Vec<(String, Arc<VerifyEntry>)>>,
+}
+
+/// A finished send, kept verifiable. The card is stored alongside the record so
+/// a verify report re-emits the SAME completed card instead of a stripped one
+/// that would drop its locality badge and integrity rows.
+pub(crate) struct VerifyEntry {
+    pub record: crate::verify::VerifyRecord,
+    pub card: Mutex<TransferUpdate>,
 }
 
 struct CachedFriendConnection {
@@ -314,6 +326,29 @@ impl IrohState {
         } else {
             CancelReason::Cancel
         }
+    }
+
+    /// Remember a send so the user can verify its copy after it finishes.
+    fn remember_verify(&self, id: &str, record: crate::verify::VerifyRecord, card: TransferUpdate) {
+        let entry = Arc::new(VerifyEntry { record, card: Mutex::new(card) });
+        crate::verify::remember(&mut self.verify_records.lock().unwrap(), id, entry);
+    }
+
+    /// Replace the card a later verify report is emitted on — called with the
+    /// real completed update, so the report keeps everything that card shows.
+    fn note_verify_card(&self, id: &str, card: TransferUpdate) {
+        if let Some(entry) = self.verify_entry(id) {
+            *entry.card.lock().unwrap() = card;
+        }
+    }
+
+    fn verify_entry(&self, id: &str) -> Option<Arc<VerifyEntry>> {
+        self.verify_records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(existing, _)| existing == id)
+            .map(|(_, entry)| entry.clone())
     }
 }
 
@@ -1815,6 +1850,22 @@ async fn serve_stream_inner(
         Some(kind) if kind.starts_with("locations.") => {
             let who = conn.remote_id().to_string();
             let config = location_config(state)?;
+            // "Verify copy" for a Location upload. Streamed rather than answered
+            // in one frame: hashing 56 GB off a NAS mount takes over an hour, so
+            // the requester needs a moving bar and a working Cancel.
+            if kind == "locations.verify" {
+                let (cfg, peer, request) = (config.clone(), who.clone(), req.clone());
+                let served = serve_verify(send, move |cancel, hashed| {
+                    crate::locations::verify_digests(&cfg, &peer, &request, &cancel, &hashed)
+                })
+                .await;
+                if let Err(e) = served {
+                    let _ = write_frame(send, &serde_json::json!({"ok": false,
+                        "error": crate::telemetry::redact_paths_only(&format!("{e:#}"))})).await;
+                    let _ = send.finish();
+                }
+                return Ok(());
+            }
             let result: Result<serde_json::Value> = async {
                 if kind == "locations.download" {
                     let cfg = config.clone(); let peer = who.clone(); let request = req.clone();
@@ -2055,6 +2106,35 @@ async fn serve_stream_inner(
             let reply = result.unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}));
             write_frame(send, &reply).await?;
             send.finish()?;
+        }
+        Some("files.verify") => {
+            // "Verify copy": the friend who sent us these files wants a full
+            // SHA-256 of what actually landed. Same known-friend gate and same
+            // destination resolution as files.stat.
+            let prepared: Result<(PathBuf, serde_json::Value)> = async {
+                let app = state.app.get().context("Application is not ready")?;
+                let (config, configured) = app.try_state::<Arc<crate::AppState>>()
+                    .map(|st| (st.config_dir.clone(), st.settings.lock().unwrap().download_dir.clone()))
+                    .context("Application is not ready")?;
+                let who = conn.remote_id().to_string();
+                anyhow::ensure!(crate::friends::load(&config).iter()
+                    .any(|f| f.endpoint_id.as_deref() == Some(who.as_str())), "Friend access denied");
+                let dest = if configured.trim().is_empty() {
+                    app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                } else { PathBuf::from(configured) };
+                Ok((dest, req.clone()))
+            }.await;
+            let served = match prepared {
+                Ok((dest, request)) => serve_verify(send, move |cancel, hashed| {
+                    friend_verify_reply(&dest, &request, &cancel, &hashed)
+                }).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = served {
+                let _ = write_frame(send, &serde_json::json!({"ok": false,
+                    "error": crate::telemetry::redact_paths_only(&format!("{e:#}"))})).await;
+                let _ = send.finish();
+            }
         }
         Some("files") => {
             // A friend pushed files straight to us. Receive into the download
@@ -3603,6 +3683,74 @@ fn friend_stat_reply(dest: &Path, req: &serde_json::Value) -> Result<serde_json:
     Ok(serde_json::json!({"ok":true,"landed":landed}))
 }
 
+/// Serve one `*.verify` request: hash on a blocking thread while streaming
+/// `{"progress": <bytes hashed>}` about once a second, then the final
+/// `{"ok":true,"digests":[…]}`. Dropping this future (a dead stream, a closed
+/// connection, a requester that gave up) flips the worker's cancel flag, so an
+/// hour-long NAS read never outlives the request that asked for it.
+async fn serve_verify<F>(send: &mut SendStream, work: F) -> Result<()>
+where
+    F: FnOnce(Arc<AtomicBool>, Arc<AtomicU64>) -> Result<Vec<Option<String>>> + Send + 'static,
+{
+    let cancel = Arc::new(AtomicBool::new(false));
+    let hashed = Arc::new(AtomicU64::new(0));
+    struct StopWork(Arc<AtomicBool>);
+    impl Drop for StopWork {
+        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    let _stop = StopWork(cancel.clone());
+    let (worker_cancel, worker_hashed) = (cancel.clone(), hashed.clone());
+    let mut worker = tokio::task::spawn_blocking(move || work(worker_cancel, worker_hashed));
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.tick().await; // the first tick completes immediately
+    let digests = loop {
+        tokio::select! {
+            done = &mut worker => break done??,
+            _ = ticks.tick() => write_frame(send,
+                &serde_json::json!({"progress": hashed.load(Ordering::Relaxed)})).await?,
+        }
+    };
+    write_frame(send, &serde_json::json!({"ok": true, "digests": digests})).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Friend side of `files.verify`: SHA-256 of each landed copy in the download
+/// folder, in request order. `None` = absent, not a regular file (a symlink is
+/// never followed, and never hashed), or unreadable — one bad file reports as a
+/// missing copy instead of failing the whole run.
+fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool,
+    hashed: &AtomicU64) -> Result<Vec<Option<String>>> {
+    anyhow::ensure!(req["files_v"] == 1, "Unsupported files verify version");
+    let items = req["items"].as_array().context("Invalid verify items")?;
+    anyhow::ensure!(items.len() <= crate::verify::MAX_ITEMS, "Too many verify items");
+    let mut digests = Vec::with_capacity(items.len());
+    let mut base = 0u64;
+    for item in items {
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        let name = item["name"].as_str().context("Invalid verify name")?;
+        let size = item["size"].as_u64().unwrap_or(0);
+        let path = dest.join(sanitize_rel(name));
+        let mut digest = None;
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
+            if let Ok(file) = std::fs::File::open(&path) {
+                match crate::locations::sha256_file_progress(file, cancel,
+                    |n| { hashed.fetch_max(base + n, Ordering::Relaxed); }) {
+                    Ok(hex) => digest = Some(hex),
+                    Err(e) if e.to_string().contains("canceled") => return Err(e),
+                    Err(_) => {}
+                }
+            }
+        }
+        // Advance by the declared size even when nothing was hashed, so the
+        // requester's bar still reaches the end on a partly missing copy.
+        base += size;
+        hashed.fetch_max(base, Ordering::Relaxed);
+        digests.push(digest);
+    }
+    Ok(digests)
+}
+
 /// Capability probe and stat in one stream. Unsupported or malformed replies
 /// are deliberately equivalent to an empty result, including transport errors.
 async fn friend_stat(conn: &Connection, items: &[SendItem]) -> Vec<bool> {
@@ -3801,6 +3949,17 @@ fn send_friend_inner(
     let upload_items = items.clone();
     let upload_dirs = directories.clone();
     let is_upload = location.as_ref().is_some_and(|l| l.target.is_some());
+    // A finished send stays verifiable: the SAME items and the SAME destination
+    // the send used, so "Verify copy" re-checks exactly what was pushed rather
+    // than re-walking a folder that may have changed since. A NAS→friend relay
+    // (`snapshot`) is excluded: those source bytes live on the host, not here.
+    if location.as_ref().is_none_or(|l| l.target.is_some()) {
+        state.remember_verify(&id, crate::verify::VerifyRecord {
+            endpoint_id: endpoint_id.clone(),
+            target: location.as_ref().and_then(|l| l.target.clone()),
+            items: items.iter().map(|(path, name, size, _)| (path.clone(), name.clone(), *size)).collect(),
+        }, TransferUpdate::new(id.clone(), Direction::Send, names.clone()));
+    }
     let manifest: Vec<crate::models::ChatFile> = items.into_iter()
         .map(|(_, name, size, _)| crate::models::ChatFile { name, size }).collect();
     let mut chat_link = crate::models::ChatTransferLink { id: chat_id.clone(), attempt: generation, manifest, directories, batch_state: None, bytes_done: 0, completed_files: vec![], completed_paths: Default::default(), item_offset: 0, offset: 0, total, last: true };
@@ -4252,16 +4411,26 @@ fn send_friend_inner(
         }
         .await;
         match outcome {
-            Ok(loc) => emit_completed(
-                &app,
-                &id,
-                Direction::Send,
-                names,
-                total,
-                loc,
-                Some(friend_name),
-                None,
-            ),
+            Ok(loc) => {
+                // Snapshot the finished card so a later "Verify copy" report is
+                // emitted on THIS card — locality badge, integrity rows and all
+                // (the verify task runs outside the integrity scope).
+                let mut card = completed_update(&id, Direction::Send, names.clone(), total);
+                card.locality = loc;
+                card.friend_name = Some(friend_name.clone());
+                card.integrity = integrity::reports();
+                cleanup.note_verify_card(&id, card);
+                emit_completed(
+                    &app,
+                    &id,
+                    Direction::Send,
+                    names,
+                    total,
+                    loc,
+                    Some(friend_name),
+                    None,
+                )
+            }
             // A cancel may surface as our own "canceled" bail OR as a
             // connection-closed error (we close the conn to unblock the write),
             // so trust the flag too. Whether that stop was a cancel or a PAUSE is
@@ -8169,20 +8338,23 @@ async fn require_locations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub async fn location_request(state: &IrohState, endpoint: &str, mut request: serde_json::Value) -> Result<serde_json::Value> {
+/// The connection to reach a friend on: the cached one while it's alive, else a
+/// fresh dial that is registered for reuse AND served, so their replies land.
+pub(crate) async fn friend_connection(state: &IrohState, endpoint: &str) -> Result<Connection> {
     let ep = state.get().context("DropBeam is still connecting")?;
-    let cached = state.cached_friend_conn(endpoint, None);
-    let conn = match cached {
-        Some(conn) => conn,
-        None => {
-            let conn = tokio::time::timeout(Duration::from_secs(15), ep.connect(dial_addr(endpoint.parse()?), ALPN)).await??;
-            if let Some(st) = state.app.get().and_then(|a| a.try_state::<Arc<IrohState>>()) {
-                state.friend_conns.lock().unwrap().insert(endpoint.into(), CachedFriendConnection::new(conn.clone()));
-                tauri::async_runtime::spawn(handle_conn(conn.clone(), st.inner().clone()));
-            }
-            conn
-        }
-    };
+    if let Some(conn) = state.cached_friend_conn(endpoint, None) {
+        return Ok(conn);
+    }
+    let conn = tokio::time::timeout(Duration::from_secs(15), ep.connect(dial_addr(endpoint.parse()?), ALPN)).await??;
+    if let Some(st) = state.app.get().and_then(|a| a.try_state::<Arc<IrohState>>()) {
+        state.friend_conns.lock().unwrap().insert(endpoint.into(), CachedFriendConnection::new(conn.clone()));
+        tauri::async_runtime::spawn(handle_conn(conn.clone(), st.inner().clone()));
+    }
+    Ok(conn)
+}
+
+pub async fn location_request(state: &IrohState, endpoint: &str, mut request: serde_json::Value) -> Result<serde_json::Value> {
+    let conn = friend_connection(state, endpoint).await?;
     require_locations(&conn).await?;
     request["locations_v"] = serde_json::json!(crate::locations::VERSION);
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -8191,6 +8363,263 @@ pub async fn location_request(state: &IrohState, endpoint: &str, mut request: se
     let reply = tokio::time::timeout(Duration::from_secs(timeout), read_frame_cap(&mut recv, 2_000_000)).await??;
     anyhow::ensure!(reply["ok"] == true, "{}", reply["error"].as_str().unwrap_or("Location request failed"));
     Ok(reply["data"].clone())
+}
+
+// ── "Verify copy" ────────────────────────────────────────────────────────────
+//
+// A finished SEND can be re-checked end to end: this device hashes its source
+// files while the peer hashes the copies that landed, and the card reports what
+// differs. One bi-stream per request, at most `verify::MAX_ITEMS` files each:
+//
+//   → {"kind":"files.verify","files_v":1,"items":[{"name","size"},…]}
+//   → {"kind":"locations.verify","locations_v":N,"id":…,"rel_path":…,"items":[…]}
+//   ← {"progress": <bytes hashed>}            repeated, at most ~1/s
+//   ← {"ok":true,"digests":[hex|null,…]}      null = missing / not a regular file
+//
+// A build without this feature answers the friend frame with a bare
+// {"kind":"ok"} and the Locations frame with {"ok":false,"error":"Unknown
+// location operation"} — either way the first chunk fails and the card says the
+// other device needs an update.
+
+const VERIFY_NEEDS_UPDATE: &str = "The other device needs an update to verify.";
+
+/// The cancel-registry key for a verification, derived from its transfer id so
+/// it can never collide with the transfer itself.
+fn verify_key(id: &str) -> String {
+    format!("{id}:verify")
+}
+
+fn emit_verify(app: &AppHandle, entry: &VerifyEntry, report: &crate::verify::VerifyReport) {
+    let mut card = entry.card.lock().unwrap().clone();
+    card.verify = Some(report.clone());
+    let _ = app.emit("transfer://update", &card);
+}
+
+fn verify_progress(total: u64, bytes_total: u64, checked: &AtomicU64, local: &AtomicU64,
+    remote: &AtomicU64) -> crate::verify::VerifyReport {
+    let mut report = crate::verify::VerifyReport::running(total, bytes_total);
+    report.checked = checked.load(Ordering::Relaxed).min(total);
+    // Both devices read every byte, so the mean of the two counters is a true
+    // fraction of the whole job while the total stays the size the user knows.
+    let both = local.load(Ordering::Relaxed).saturating_add(remote.load(Ordering::Relaxed));
+    report.bytes_hashed = (both / 2).min(bytes_total);
+    report
+}
+
+/// Start a full SHA-256 comparison of a completed send against the peer's copy.
+/// Progress and the final verdict ride the transfer's own card.
+pub fn start_verify(app: AppHandle, state: Arc<IrohState>, id: String) -> Result<(), String> {
+    let entry = state
+        .verify_entry(&id)
+        .ok_or("This send can't be verified any more — send it again to check the copy.")?;
+    if entry.card.lock().unwrap().state != TransferState::Completed {
+        return Err("Wait for this send to finish, then verify the copy.".into());
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut cancels = state.cancels.lock().unwrap();
+        if cancels.contains_key(&verify_key(&id)) {
+            return Err("This copy is already being verified.".into());
+        }
+        cancels.insert(verify_key(&id), cancel.clone());
+    }
+    tauri::async_runtime::spawn(async move {
+        let total = entry.record.items.len() as u64;
+        let bytes_total = entry.record.bytes_total();
+        let mut report = crate::verify::VerifyReport::running(total, bytes_total);
+        emit_verify(&app, &entry, &report);
+        let outcome = run_verify(&state, &entry, &cancel, |live| emit_verify(&app, &entry, live)).await;
+        match outcome {
+            Ok((mismatched, missing)) => {
+                report.state = crate::verify::VerifyState::Done;
+                report.checked = total;
+                report.bytes_hashed = bytes_total;
+                report.mismatched = mismatched;
+                report.missing = missing;
+            }
+            Err(_) if cancel.load(Ordering::SeqCst) => {
+                report.state = crate::verify::VerifyState::Canceled;
+            }
+            Err(e) => {
+                log::warn!("verify copy failed: {e:#}");
+                report.state = crate::verify::VerifyState::Failed;
+                report.error = Some(crate::telemetry::redact_paths_only(&format!("{e:#}")));
+            }
+        }
+        state.cancels.lock().unwrap().remove(&verify_key(&id));
+        emit_verify(&app, &entry, &report);
+    });
+    Ok(())
+}
+
+/// Stop a running verification. The hashing loops check the same flag, and the
+/// peer's own hashing stops as soon as its progress frame fails to send.
+pub fn cancel_verify(state: &IrohState, id: &str) {
+    state.cancel(&verify_key(id));
+}
+
+/// Hash locally and remotely at once, then compare. Returns (mismatched, missing).
+async fn run_verify(state: &IrohState, entry: &VerifyEntry, cancel: &Arc<AtomicBool>,
+    on_progress: impl Fn(&crate::verify::VerifyReport)) -> Result<(Vec<String>, Vec<String>)> {
+    let record = &entry.record;
+    let total = record.items.len() as u64;
+    let bytes_total = record.bytes_total();
+    let local_bytes = Arc::new(AtomicU64::new(0));
+    let remote_bytes = AtomicU64::new(0);
+    let checked = AtomicU64::new(0);
+
+    // The local hash runs on a blocking thread that outlives a dropped future,
+    // so give it its own stop flag: the guard trips when `run_verify` returns for
+    // ANY reason (a remote failure, a cancel, the task being dropped), and the
+    // progress tick below mirrors the user's cancel into it.
+    let stop = Arc::new(AtomicBool::new(cancel.load(Ordering::SeqCst)));
+    struct StopHash(Arc<AtomicBool>);
+    impl Drop for StopHash {
+        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    let _stop_hash = StopHash(stop.clone());
+
+    let local = {
+        let (items, cancel, progress) = (record.items.clone(), stop.clone(), local_bytes.clone());
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut base = 0u64;
+                let mut digests = Vec::with_capacity(items.len());
+                for (path, _, size) in &items {
+                    anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+                    let mut digest = None;
+                    // Regular files only: a symlink is never followed, here or
+                    // on the peer.
+                    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
+                        if let Ok(file) = std::fs::File::open(path) {
+                            match crate::locations::sha256_file_progress(file, &cancel,
+                                |n| { progress.fetch_max(base + n, Ordering::Relaxed); }) {
+                                Ok(hex) => digest = Some(hex),
+                                Err(e) if e.to_string().contains("canceled") => return Err(e),
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    base += size;
+                    progress.fetch_max(base, Ordering::Relaxed);
+                    digests.push(digest);
+                }
+                Ok(digests)
+            })
+            .await?
+        }
+    };
+    let wanted: Vec<(String, u64)> =
+        record.items.iter().map(|(_, name, size)| (name.clone(), *size)).collect();
+    let remote = remote_digests(state, record, &wanted, &remote_bytes, cancel, &checked);
+
+    let work = async { tokio::try_join!(local, remote) };
+    tokio::pin!(work);
+    let mut ticks = tokio::time::interval(Duration::from_millis(500));
+    ticks.tick().await;
+    let (locals, remotes) = loop {
+        tokio::select! {
+            done = &mut work => break done?,
+            _ = ticks.tick() => {
+                stop.store(cancel.load(Ordering::SeqCst), Ordering::SeqCst);
+                on_progress(&verify_progress(total, bytes_total, &checked, &local_bytes, &remote_bytes));
+            }
+        }
+    };
+
+    let mut rows: Vec<crate::verify::VerifyRow> = record
+        .items
+        .iter()
+        .zip(locals)
+        .zip(remotes)
+        .map(|(((_, name, _), local), remote)| crate::verify::VerifyRow::new(name, local, remote))
+        .collect();
+    // A Location host publishes a file whose content changed BESIDE the existing
+    // one as "name (2).ext" rather than failing the upload — so a row that looks
+    // wrong may simply have landed next door. Only the unresolved rows pay for
+    // that second probe.
+    if record.target.is_some() {
+        let pending = crate::verify::unresolved(&rows);
+        if !pending.is_empty() {
+            let alts: Vec<(String, u64)> = pending
+                .iter()
+                .map(|&i| (crate::verify::alt_name(&rows[i].name), record.items[i].2))
+                .collect();
+            // Its own counters: the sibling probe must not move the bar again.
+            let (bytes, seen) = (AtomicU64::new(0), AtomicU64::new(0));
+            let probed = remote_digests(state, record, &alts, &bytes, cancel, &seen).await?;
+            for (&i, digest) in pending.iter().zip(probed) {
+                rows[i].alt = digest;
+            }
+        }
+    }
+    Ok(crate::verify::compare(&rows))
+}
+
+/// Ask the peer for its digest of each `(name, size)`, in chunks of at most
+/// `verify::MAX_ITEMS`, over the cached friend connection.
+async fn remote_digests(state: &IrohState, record: &crate::verify::VerifyRecord,
+    items: &[(String, u64)], bytes: &AtomicU64, cancel: &AtomicBool, checked: &AtomicU64)
+    -> Result<Vec<Option<String>>> {
+    let conn = friend_connection(state, &record.endpoint_id).await?;
+    let mut digests = Vec::with_capacity(items.len());
+    let mut base = 0u64;
+    for range in crate::verify::chunks(items.len()) {
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        let chunk = &items[range];
+        let rows: Vec<_> = chunk.iter()
+            .map(|(name, size)| serde_json::json!({"name": name, "size": size})).collect();
+        let request = match &record.target {
+            Some(target) => serde_json::json!({"kind": "locations.verify",
+                "locations_v": crate::locations::VERSION, "id": target.location_id,
+                "rel_path": target.rel_path, "items": rows}),
+            None => serde_json::json!({"kind": "files.verify", "files_v": 1, "items": rows}),
+        };
+        let chunk_bytes: u64 = chunk.iter().map(|(_, size)| size).sum();
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &request).await?;
+        send.finish()?;
+        let reply = read_verify_reply(&mut recv, chunk.len(), cancel,
+            |done| { bytes.fetch_max(base + done.min(chunk_bytes), Ordering::Relaxed); }).await?;
+        base += chunk_bytes;
+        bytes.fetch_max(base, Ordering::Relaxed);
+        checked.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        digests.extend(reply);
+    }
+    Ok(digests)
+}
+
+/// Read one verify reply: progress frames until the peer finishes, then its
+/// digests. A peer that doesn't know this request is named as such.
+async fn read_verify_reply(recv: &mut RecvStream, count: usize, cancel: &AtomicBool,
+    on_progress: impl Fn(u64)) -> Result<Vec<Option<String>>> {
+    loop {
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        // Progress frames arrive about once a second while the peer hashes, so
+        // two minutes of silence means the peer (or the path) is gone.
+        let frame = tokio::time::timeout(Duration::from_secs(120),
+            read_frame_cap(recv, 4_000_000)).await??;
+        if let Some(done) = frame["progress"].as_u64() {
+            on_progress(done);
+            continue;
+        }
+        if frame["ok"] == true {
+            if let Some(list) = frame.get("digests") {
+                let digests: Vec<Option<String>> = serde_json::from_value(list.clone())?;
+                anyhow::ensure!(digests.len() == count, "Invalid verify reply");
+                anyhow::ensure!(digests.iter().flatten()
+                    .all(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())),
+                    "Invalid verify digest");
+                return Ok(digests);
+            }
+        }
+        let message = frame["error"].as_str().unwrap_or("");
+        anyhow::bail!("{}", if message.is_empty() || message.contains("Unknown location operation") {
+            VERIFY_NEEDS_UPDATE
+        } else {
+            message
+        });
+    }
 }
 
 async fn location_hashes(paths: Vec<PathBuf>, cancel: &AtomicBool, activity: &AtomicU64) -> Result<Vec<String>> {
@@ -9203,6 +9632,88 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_dir_all(&dest);
         println!("iroh accept-loop Quick Send OK");
+    }
+}
+
+#[cfg(test)]
+mod verify_reply_tests {
+    use super::*;
+
+    fn sha(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// The friend side of `files.verify`: hash what landed, report null for what
+    /// didn't, and never follow a symlink out of the download folder.
+    #[test]
+    fn friend_verify_hashes_landed_copies_and_never_follows_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-verify-{}", uuid::Uuid::new_v4()));
+        let dest = dir.join("Downloads");
+        std::fs::create_dir_all(dest.join("folder")).unwrap();
+        std::fs::write(dest.join("folder/same.bin"), b"identical payload").unwrap();
+        std::fs::write(dest.join("folder/changed.bin"), b"other payload!!!!").unwrap();
+        let outside = dir.join("secret.txt");
+        std::fs::write(&outside, b"not yours").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dest.join("folder/link.bin")).unwrap();
+        // A directory standing where a file is expected is not a regular file.
+        std::fs::create_dir(dest.join("folder/adir.bin")).unwrap();
+
+        let req = serde_json::json!({"kind":"files.verify","files_v":1,"items":[
+            {"name":"folder/same.bin","size":17},
+            {"name":"folder/changed.bin","size":17},
+            {"name":"folder/gone.bin","size":9},
+            {"name":"folder/link.bin","size":9},
+            {"name":"folder/adir.bin","size":0}]});
+        let hashed = AtomicU64::new(0);
+        let digests = friend_verify_reply(&dest, &req, &AtomicBool::new(false), &hashed).unwrap();
+        assert_eq!(digests[0].as_deref(), Some(sha(b"identical payload").as_str()));
+        assert_eq!(digests[1].as_deref(), Some(sha(b"other payload!!!!").as_str()));
+        assert_ne!(digests[0], digests[1], "a changed copy must not hash the same");
+        assert_eq!(digests[2], None, "a missing copy is null, not an error");
+        #[cfg(unix)]
+        assert_eq!(digests[3], None, "a symlink is never followed");
+        assert_eq!(digests[4], None, "a directory is not a regular file");
+        // Progress covers every DECLARED byte, hashed or not, so the requester's
+        // bar still reaches the end on a partly missing copy.
+        assert_eq!(hashed.load(Ordering::Relaxed), 17 + 17 + 9 + 9 + 0);
+
+        // A cancel stops the run rather than reporting half a verdict.
+        assert!(friend_verify_reply(&dest, &req, &AtomicBool::new(true), &AtomicU64::new(0)).is_err());
+        // Version and batch bounds are enforced before any disk work.
+        let empty = serde_json::json!({"files_v":2,"items":[]});
+        assert!(friend_verify_reply(&dest, &empty, &AtomicBool::new(false), &AtomicU64::new(0)).is_err());
+        let many: Vec<_> = (0..crate::verify::MAX_ITEMS + 1)
+            .map(|i| serde_json::json!({"name": format!("f{i}"), "size": 0})).collect();
+        let oversized = serde_json::json!({"files_v":1,"items":many});
+        assert!(friend_verify_reply(&dest, &oversized, &AtomicBool::new(false), &AtomicU64::new(0)).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card that can still be verified is the LAST send of that id, and the
+    /// report re-emits the completed card rather than a stripped one.
+    #[test]
+    fn a_verify_record_keeps_the_completed_card_it_reports_on() {
+        let state = IrohState::default();
+        let record = || crate::verify::VerifyRecord {
+            endpoint_id: "peer".into(), target: None,
+            items: vec![(PathBuf::from("/tmp/a"), "a".into(), 4)],
+        };
+        assert!(state.verify_entry("gone").is_none());
+        state.remember_verify("t1", record(), TransferUpdate::new("t1".into(), Direction::Send, vec![]));
+        let entry = state.verify_entry("t1").unwrap();
+        assert_eq!(entry.card.lock().unwrap().state, TransferState::Starting);
+        assert_eq!(entry.record.bytes_total(), 4);
+
+        let mut card = completed_update("t1", Direction::Send, vec!["a".into()], 4);
+        card.locality = crate::models::Locality::Local;
+        state.note_verify_card("t1", card);
+        // The SAME entry the card was stored under sees the update — the running
+        // verify task holds this Arc and must emit the finished card.
+        assert_eq!(entry.card.lock().unwrap().state, TransferState::Completed);
+        assert_eq!(entry.card.lock().unwrap().locality, crate::models::Locality::Local);
+        state.note_verify_card("unknown", completed_update("x", Direction::Send, vec![], 0));
     }
 }
 
@@ -12169,6 +12680,107 @@ mod integrity_round2_tests {
     #[tokio::test]
     #[ignore = "requires loopback socket binds"]
     async fn friend_folder_old_stat_peer_sends_everything() { friend_batch_loopback(true).await; }
+
+    /// The whole "Verify copy" round trip over a real loopback connection: send a
+    /// 3-file folder, hash both sides, and report exactly what differs.
+    #[tokio::test]
+    #[ignore = "requires loopback socket binds"]
+    async fn friend_folder_verify_round_trip_reports_every_difference() {
+        let dir = fixture();
+        let folder = dir.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a.bin"), b"first file").unwrap();
+        std::fs::write(folder.join("b.bin"), b"second file").unwrap();
+        std::fs::write(folder.join("c.bin"), b"third file").unwrap();
+        let (mut items, dirs, total) = gather_items(&[folder]).unwrap();
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+        let link: crate::models::ChatTransferLink = serde_json::from_value(serde_json::json!({
+            "id":uuid::Uuid::new_v4().to_string(),"attempt":1,
+            "manifest":items.iter().map(|i| serde_json::json!({"name":i.1,"size":i.2})).collect::<Vec<_>>(),
+            "directories":dirs,"offset":0,"total":total,"last":true})).unwrap();
+        let dest = dir.join("dest");
+        let target = dest.clone();
+        let server = endpoint().await;
+        let client = endpoint().await;
+        let srv = server.clone();
+        let receiver = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            loop {
+                let Ok((mut send, mut recv)) = conn.accept_bi().await else { break; };
+                let header = read_frame(&mut recv).await.unwrap();
+                // The production arms gate on a known friend first; the gate is
+                // covered by files.stat's own tests, so the loopback exercises the
+                // protocol itself.
+                match header["kind"].as_str().unwrap_or("").to_string().as_str() {
+                    "files.stat" => {
+                        let reply = friend_stat_reply(&target, &header).unwrap();
+                        write_frame(&mut send, &reply).await.unwrap();
+                        send.finish().unwrap();
+                    }
+                    "files.verify" => {
+                        let landed = target.clone();
+                        serve_verify(&mut send, move |cancel, hashed| {
+                            friend_verify_reply(&landed, &header, &cancel, &hashed)
+                        }).await.unwrap();
+                    }
+                    _ => {
+                        integrity::scope(read_files_negotiated(&conn, &mut send, &mut recv, &header,
+                            &target, &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}))
+                            .await.unwrap();
+                    }
+                }
+            }
+        });
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let state = IrohState::default();
+        state.learn_progress(&server.id().to_string(), 1);
+        // Reuse the live loopback connection the way a real verify reuses the
+        // cached friend connection.
+        state.endpoint.set(client.clone()).ok();
+        state.friend_conns.lock().unwrap()
+            .insert(server.id().to_string(), CachedFriendConnection::new(conn.clone()));
+
+        let cancel = AtomicBool::new(false);
+        let engaged = AtomicBool::new(false);
+        let activity = AtomicU64::new(0);
+        integrity::scope(send_friend_batch(&conn, &items, &dirs, &link, &cancel, "friend",
+            &engaged, &activity, Some(&state), |_, _| {}, |_| {}, || Ok(()))).await.unwrap();
+
+        let entry = VerifyEntry {
+            record: crate::verify::VerifyRecord {
+                endpoint_id: server.id().to_string(),
+                target: None,
+                items: items.iter().map(|(p, n, s, _)| (p.clone(), n.clone(), *s)).collect(),
+            },
+            card: Mutex::new(TransferUpdate::new("card".into(), Direction::Send, vec![])),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Mutex::new(Vec::new());
+        let verdict = run_verify(&state, &entry, &stop, |live| seen.lock().unwrap().push(live.clone()))
+            .await.unwrap();
+        assert_eq!(verdict, (vec![], vec![]), "a freshly landed folder is identical");
+        assert!(seen.lock().unwrap().iter().all(|r| r.total == 3 && r.bytes_total == total));
+
+        // Now break the copy: one file rewritten to the SAME length (so a size
+        // check would still pass), one deleted outright.
+        let changed = dest.join(&items[1].1);
+        assert_eq!(std::fs::read(&changed).unwrap().len(), b"second file".len());
+        std::fs::write(&changed, b"SECOND file").unwrap();
+        std::fs::remove_file(dest.join(&items[2].1)).unwrap();
+        let (mismatched, missing) = run_verify(&state, &entry, &stop, |_| {}).await.unwrap();
+        assert_eq!(mismatched, vec![items[1].1.clone()]);
+        assert_eq!(missing, vec![items[2].1.clone()]);
+
+        // A canceled verify reports the cancel instead of a bogus all-clear.
+        stop.store(true, Ordering::SeqCst);
+        assert!(run_verify(&state, &entry, &stop, |_| {}).await.is_err());
+
+        conn.close(0u32.into(), b"done");
+        receiver.await.unwrap();
+        client.close().await;
+        server.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn link(size: u64) -> crate::models::ChatTransferLink {
         serde_json::from_value(serde_json::json!({"id": uuid::Uuid::new_v4().to_string(), "attempt":1,

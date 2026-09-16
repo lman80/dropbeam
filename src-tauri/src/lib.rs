@@ -26,6 +26,7 @@ mod sync;
 mod telemetry;
 #[cfg(target_os = "macos")]
 mod tray_drag;
+mod verify;
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -717,6 +718,8 @@ pub fn run() {
             commands::save_location,
             commands::location_request,
             commands::upload_to_location,
+            commands::verify_transfer,
+            commands::cancel_verify,
             commands::iroh_node_id,
             commands::iroh_selftest,
             commands::iroh_send,
