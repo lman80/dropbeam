@@ -943,6 +943,15 @@ async fn read_landed_progress_with_work<F: Fn(u64, u64)>(
                 log::info!("location upload: a different file of that name was already there — saved as {name:?}");
             }
         }
+        // "Newest wins" (`replace_existing`): the host published our copy AT the
+        // requested name and moved the previous version to its trash.
+        if v["replaced"].as_u64().is_some_and(|n| n > 0) {
+            let names = v["replaced_names"].as_array().map(|names|
+                names.iter().filter_map(|n| n.as_str()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+            for name in integrity::replaced_names(names) {
+                log::info!("location upload: replaced {name:?}; the previous version is recoverable from the location's trash");
+            }
+        }
         // Clamp instead of failing: a receiver that fell back to the classic body
         // after advertising resume coverage restarts its landed count at 0.
         let done = v["landed"].as_u64().context("missing landed byte count")?.max(previous);
@@ -1987,7 +1996,7 @@ async fn serve_stream_inner(
                     let skipped = snapshot.skipped.clone();
                     if paths.is_empty() { return Ok(serde_json::json!({"transferId": null, "skipped": skipped})); }
                     let update = send_location_to_friend(app, shared, friend.name, who, paths,
-                        LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot) })
+                        LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot), replace_existing: false })
                         .map_err(anyhow::Error::msg)?;
                     return Ok(serde_json::json!({"transferId": update.id, "skipped": skipped}));
                 }
@@ -4022,7 +4031,7 @@ impl LocationBatch {
     async fn send_attempt(&mut self, conn: &Connection, location: &LocationSend, cancel: &AtomicBool,
         name: &str, engaged: &AtomicBool, activity: &AtomicU64, state: Option<&IrohState>,
         progress: impl Fn(u64, u64), skipped: impl Fn(usize), conflicts: impl Fn(usize),
-        boundary: impl Fn() -> Result<()>) -> Result<u64> {
+        replaced: impl Fn(usize), boundary: impl Fn() -> Result<()>) -> Result<u64> {
         require_locations(conn).await?;
         let stat_paths: Vec<_> = self.items.iter().map(|i| i.1.clone()).chain(self.dirs.iter().cloned()).collect();
         let existing = location_stat(conn, location.target.as_ref().context("Missing upload target")?, &stat_paths).await?;
@@ -4052,6 +4061,8 @@ impl LocationBatch {
             // beside an existing, different one. Report the running total.
             let seen = integrity::conflicts().len();
             if seen > 0 { conflicts(seen); }
+            let swapped = integrity::replaced().len();
+            if swapped > 0 { replaced(swapped); }
         }
         // A terminal push always follows: it publishes EVERY directory again
         // (ensure_dirs is idempotent), so an empty folder whose creation was
@@ -4069,6 +4080,8 @@ impl LocationBatch {
         }
         let seen = integrity::conflicts().len();
         if seen > 0 { conflicts(seen); }
+        let swapped = integrity::replaced().len();
+        if swapped > 0 { replaced(swapped); }
         progress(total, total);
         Ok(total)
     }
@@ -4078,6 +4091,11 @@ pub struct LocationSend {
     pub target: Option<crate::locations::Target>,
     pub transfer_id: String,
     pub snapshot: Option<crate::locations::Snapshot>,
+    /// "Newest wins": ask the host to publish each file AT its requested name,
+    /// moving any different previous version into the location's recoverable
+    /// trash instead of landing beside it as "name (2)". Only a continuously
+    /// synced folder sets this; an ordinary upload leaves it false.
+    pub replace_existing: bool,
 }
 pub fn send_location_to_friend(app: AppHandle, state: Arc<IrohState>, friend_name: String,
     endpoint_id: String, paths: Vec<String>, location: LocationSend) -> Result<TransferUpdate, String> {
@@ -4470,6 +4488,13 @@ fn send_friend_inner(
                             notice.bytes_total = total;
                             notice.friend_name = Some(friend_name.clone());
                             notice.location_conflicts = Some(count as u64);
+                            emit(&app, &notice);
+                        }, |count| {
+                            let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            notice.state = TransferState::Transferring;
+                            notice.bytes_total = total;
+                            notice.friend_name = Some(friend_name.clone());
+                            notice.location_replaced = Some(count as u64);
                             emit(&app, &notice);
                         }, || recovery.lock().unwrap().check(&conn, true, &redial_requested)).await
                 } else if linked {
@@ -7742,6 +7767,9 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
         else { header["location_download"] = serde_json::json!(true); }
         header["location_hash_v"] = serde_json::json!(2);
         if location.target.is_some() {
+            // Additive: a host that predates "newest wins" ignores the flag and
+            // keeps landing changed files beside their neighbour.
+            if location.replace_existing { header["replace_existing"] = serde_json::json!(true); }
             header["location_total_items"] = serde_json::json!(push.as_ref().map_or(items.len() as u64, |p| p.total_items));
             header["location_item_offset"] = serde_json::json!(push.as_ref().map_or(0, |p| p.offset));
             // One card for the whole upload on the far side: its byte span, how
@@ -8869,7 +8897,7 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
         anyhow::ensure!(items.len() == paths.len(), "Incomplete location download");
         if header["location_hash_v"] == 2 {
             crate::locations::verified_digests(&header, &rows)?;
-            return Ok(crate::locations::Landing { paths, conflicts: vec![] });
+            return Ok(crate::locations::Landing { paths, conflicts: vec![], replaced: vec![] });
         }
         let mut base = 0;
         for (item, path) in items.iter().zip(&paths) {
@@ -8877,7 +8905,7 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
             anyhow::ensure!(item["sha256"].as_str() == Some(&hash), "Location download SHA-256 mismatch");
             base += item["size"].as_u64().context("Invalid file size")?;
         }
-        Ok(crate::locations::Landing { paths, conflicts: vec![] })
+        Ok(crate::locations::Landing { paths, conflicts: vec![], replaced: vec![] })
     });
     // Reserve the last 10% of a location upload for verified publication on the
     // NAS. Real copy progress keeps the normal send watchdog alive on slow mounts.
@@ -12713,7 +12741,7 @@ mod location_loopback_tests {
             let mut batch = LocationBatch { items, dirs, next_file:0, dirs_pending:true };
             let options = LocationSend { target:Some(crate::locations::Target {
                 location_id:"nas".into(), rel_path:"".into() }),
-                transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None };
+                transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false };
             let recovery = std::sync::Mutex::new(RelayRecovery {
                 forced_locality:Some(crate::models::Locality::Internet), ..Default::default()
             });
@@ -12735,7 +12763,7 @@ mod location_loopback_tests {
                             r.since = Some(Instant::now() - Duration::from_secs(61));
                             r.check(&conn, false, &requested).unwrap();
                         }
-                    }, |_| {}, |_| {}, || recovery.lock().unwrap().check(&conn, true, &requested)).await;
+                    }, |_| {}, |_| {}, |_| {}, || recovery.lock().unwrap().check(&conn, true, &requested)).await;
                 if requested.load(Ordering::SeqCst) {
                     assert!(result.is_err());
                     assert_eq!(batch.next_file, 1, "redial only after first receipt");
@@ -12789,10 +12817,10 @@ mod location_loopback_tests {
         let mut batch = LocationBatch { items, dirs, next_file: 0, dirs_pending: true };
         let options = LocationSend { target: Some(crate::locations::Target {
             location_id: "family".into(), rel_path: "".into() }),
-            transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None };
+            transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: false };
         let sent = tokio::time::timeout(Duration::from_secs(60), batch.send_attempt(
             &conn, &options, &AtomicBool::new(false), "Mac", &AtomicBool::new(false),
-            &AtomicU64::new(0), None, |_, _| {}, |_| {}, |_| {}, || Ok(()))).await.unwrap().unwrap();
+            &AtomicU64::new(0), None, |_, _| {}, |_| {}, |_| {}, |_| {}, || Ok(()))).await.unwrap().unwrap();
         assert_eq!(sent, total);
         assert_eq!(batch.next_file, 26);
         for item in &batch.items {
@@ -12832,7 +12860,7 @@ mod location_loopback_tests {
         let list = rpc(&conn, serde_json::json!({"kind":"locations.list","locations_v":1})).await;
         assert_eq!(list["data"][0]["name"], "Family NAS"); assert!(list["data"][0].get("path").is_none());
         let source = base.join("旅行.txt"); std::fs::write(&source, b"loopback NAS bytes").unwrap();
-        let options = LocationSend { target:Some(crate::locations::Target { location_id:"family".into(), rel_path:"".into() }), transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None };
+        let options = LocationSend { target:Some(crate::locations::Target { location_id:"family".into(), rel_path:"".into() }), transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false };
         let total = send_files_linked(&conn, &[source.clone()], &AtomicBool::new(false), |_, _| {}, "Mac", &AtomicBool::new(false), &AtomicU64::new(0), None, None, Some(&options)).await.unwrap();
         assert_eq!(total, 18); assert_eq!(std::fs::read(nas.join("旅行.txt")).unwrap(), b"loopback NAS bytes");
         let ls = rpc(&conn, serde_json::json!({"kind":"locations.ls","locations_v":1,"id":"family","rel_path":"","page":0})).await;

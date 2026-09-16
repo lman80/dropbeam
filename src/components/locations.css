@@ -108,3 +108,22 @@
   .location-editor { padding: 14px; }
   .location-host-row .location-grow { flex-basis: 70%; }
 }
+
+/* Add-a-location wizard: one question per step, mounts as one-click answers. */
+.location-wizard .location-heading { margin-bottom: 12px; }
+.location-wizard-choices { display: flex; flex-direction: column; gap: 8px; margin: 14px 0 18px; }
+.location-wizard-choice { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 12px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 11px; cursor: pointer; font: inherit; }
+.location-wizard-choice:hover, .location-wizard-choice:focus-visible { border-color: var(--accent); }
+.location-wizard-choice .location-drive-icon { width: 38px; height: 38px; border-radius: 11px; flex-shrink: 0; }
+.location-wizard-choice strong { display: block; font-size: 13.5px; }
+.location-wizard-choice small { display: block; color: var(--text-muted); font-size: 11.5px; margin-top: 2px; }
+.location-wizard-choice > svg { color: var(--text-muted); flex-shrink: 0; }
+.location-wizard-access { align-items: flex-start; }
+.location-wizard-access input { margin-top: 3px; }
+.location-wizard-access strong { display: block; font-weight: 600; }
+.location-wizard-access small { display: block; color: var(--text-muted); font-size: 11.5px; margin-top: 2px; }
+.location-wizard-advanced { margin: 4px 0 0; font-size: 12px; color: var(--text-muted); }
+.location-wizard-advanced summary { cursor: pointer; padding: 5px 0; }
+.location-host-row-new { border-color: var(--accent); }
+.location-wizard-advanced label { display: block; font-size: 12px; font-weight: 600; margin: 10px 0 0; }
+.location-wizard-advanced label input { display: block; width: 100%; max-width: 220px; margin-top: 7px; }

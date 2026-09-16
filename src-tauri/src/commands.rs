@@ -1938,8 +1938,10 @@ pub fn cancel_verify(iroh: State<'_, Arc<crate::iroh_net::IrohState>>, id: Strin
 
 #[tauri::command]
 pub async fn upload_to_location(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
-    friend_id: String, target: crate::locations::Target, paths: Vec<String>) -> Result<TransferUpdate, String> {
-    start_location_upload(app, state.inner().clone(), iroh.inner().clone(), friend_id, target, paths).await
+    friend_id: String, target: crate::locations::Target, paths: Vec<String>,
+    replace_existing: Option<bool>) -> Result<TransferUpdate, String> {
+    start_location_upload_replacing(app, state.inner().clone(), iroh.inner().clone(), friend_id, target,
+        paths, replace_existing.unwrap_or(false)).await
 }
 
 /// Shared by the UI command and the `--location-upload` launch argument (a
@@ -1947,6 +1949,16 @@ pub async fn upload_to_location(app: AppHandle, state: State<'_, Arc<AppState>>,
 /// queue an upload without the GUI).
 pub async fn start_location_upload(app: AppHandle, state: Arc<AppState>, iroh: Arc<crate::iroh_net::IrohState>,
     friend_id: String, target: crate::locations::Target, paths: Vec<String>) -> Result<TransferUpdate, String> {
+    start_location_upload_replacing(app, state, iroh, friend_id, target, paths, false).await
+}
+
+/// The same upload with "newest wins" available: with `replace_existing` the
+/// host publishes each file AT its requested name and moves any different
+/// previous version into that location's recoverable trash, instead of landing
+/// the new copy beside it as "name (2)". Only a folder that is continuously
+/// synced to the location asks for this.
+pub async fn start_location_upload_replacing(app: AppHandle, state: Arc<AppState>, iroh: Arc<crate::iroh_net::IrohState>,
+    friend_id: String, target: crate::locations::Target, paths: Vec<String>, replace_existing: bool) -> Result<TransferUpdate, String> {
     if paths.is_empty() { return Err("No files selected".into()); }
     crate::locations::relative(&target.rel_path).map_err(|e| e.to_string())?;
     let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found")?;
@@ -1958,5 +1970,5 @@ pub async fn start_location_upload(app: AppHandle, state: Arc<AppState>, iroh: A
         return Err("This location is not shared with upload permission".into());
     }
     crate::iroh_net::send_location_to_friend(app, iroh, friend.name, endpoint, paths,
-        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None })
+        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing })
 }

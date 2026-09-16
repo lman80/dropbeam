@@ -23,6 +23,10 @@ tokio::task_local! {
     // Host side: filled after publication, read by `terminal` for the reply.
     // Sender side: filled from that reply, read for the transfer's UI counter.
     static CONFLICTS: Mutex<Vec<String>>;
+    // Location uploads that asked for "newest wins" (`replace_existing`) and
+    // whose previous version the host moved to its recoverable trash. Same two
+    // sides, and the same name-based de-duplication, as CONFLICTS above.
+    static REPLACED: Mutex<Vec<String>>;
 }
 pub fn item_offset() -> u64 { ITEM_OFFSET.try_with(|n| *n).unwrap_or(0) }
 pub fn rehash_activity() -> u64 { REHASH.try_with(|n| n.load(Ordering::Relaxed)).unwrap_or(0) }
@@ -34,8 +38,8 @@ pub fn set_activity_hook(hook: Arc<dyn Fn(u64) + Send + Sync>) {
     let _ = ACTIVITY_HOOK.try_with(|h| *h.lock().unwrap() = Some(hook));
 }
 pub async fn scope<T>(future: impl std::future::Future<Output = T>) -> T {
-    CONFLICTS.scope(Mutex::new(vec![]),
-        ACTIVITY_HOOK.scope(Mutex::new(None), REHASH.scope(AtomicU64::new(0), REPORTS.scope(Mutex::new(vec![]), future)))).await
+    REPLACED.scope(Mutex::new(vec![]), CONFLICTS.scope(Mutex::new(vec![]),
+        ACTIVITY_HOOK.scope(Mutex::new(None), REHASH.scope(AtomicU64::new(0), REPORTS.scope(Mutex::new(vec![]), future))))).await
 }
 /// Record the names files were actually published under, de-duplicated so a
 /// resumed push cannot double-count a conflict it already reported. Returns
@@ -50,6 +54,19 @@ pub fn conflicted(names: impl IntoIterator<Item = String>) -> Vec<String> {
 }
 pub fn conflicts() -> Vec<String> {
     CONFLICTS.try_with(|c| c.lock().unwrap().clone()).unwrap_or_default()
+}
+/// The same, for files published at their requested name over a previous
+/// version that went to the location's trash ("newest wins").
+pub fn replaced_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    REPLACED.try_with(|c| {
+        let mut c = c.lock().unwrap();
+        let mut fresh = vec![];
+        for name in names { if !c.contains(&name) { c.push(name.clone()); fresh.push(name); } }
+        fresh
+    }).unwrap_or_default()
+}
+pub fn replaced() -> Vec<String> {
+    REPLACED.try_with(|c| c.lock().unwrap().clone()).unwrap_or_default()
 }
 pub async fn ensure_scope<T>(future: impl std::future::Future<Output = T>) -> T {
     if REPORTS.try_with(|_| ()).is_ok() { future.await } else { scope(future).await }
@@ -79,6 +96,11 @@ pub fn terminal(mut frame: serde_json::Value) -> serde_json::Value {
     if !conflicts.is_empty() {
         frame["conflicts"] = serde_json::json!(conflicts.len());
         frame["conflict_names"] = serde_json::json!(conflicts);
+    }
+    let replaced = replaced();
+    if !replaced.is_empty() {
+        frame["replaced"] = serde_json::json!(replaced.len());
+        frame["replaced_names"] = serde_json::json!(replaced);
     }
     frame
 }

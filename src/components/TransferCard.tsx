@@ -160,7 +160,7 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
             {title(t)}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 3 }}>
-            <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>{statusLabel(t)}{t.locationSkipped ? ` · ${t.locationSkipped} ${t.locationSkipped === 1 ? 'file' : 'files'} already there` : ''}{t.locationConflicts ? ` · ${t.locationConflicts} ${t.locationConflicts === 1 ? 'file' : 'files'} already existed with different content — saved next to them as ‘… (2)’` : ''}</span>
+            <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>{statusLabel(t)}{t.locationSkipped ? ` · ${t.locationSkipped} ${t.locationSkipped === 1 ? 'file' : 'files'} already there` : ''}{t.locationConflicts ? ` · ${t.locationConflicts} ${t.locationConflicts === 1 ? 'file' : 'files'} already existed with different content — saved next to them as ‘… (2)’` : ''}{t.locationReplaced ? ` · ${t.locationReplaced} ${t.locationReplaced === 1 ? 'file' : 'files'} updated — the older version is in the folder’s Trash` : ''}</span>
             {t.connDetail ? (
               <ConnInspector detail={t.connDetail} compact />
             ) : (

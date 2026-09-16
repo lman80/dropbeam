@@ -159,7 +159,11 @@ export function LocationsView() {
   }, [refresh, friendKey, presenceKey])
   useEffect(() => {
     const ids = new Set(friends.map(f => f.id))
-    try { localStorage.setItem('dropbeam.locations', JSON.stringify(Object.fromEntries(Object.entries(shared).filter(([id]) => ids.has(id))))) } catch { /* cache is optional */ }
+    // Cache the folders, never how much room they had: a remembered "1.2 TB
+    // free" from last week would read as live. The next reply brings it back.
+    const keep = Object.entries(shared).filter(([id]) => ids.has(id))
+      .map(([id, list]) => [id, list.map(({ id: lid, name, rights }) => ({ id: lid, name, rights }))] as const)
+    try { localStorage.setItem('dropbeam.locations', JSON.stringify(Object.fromEntries(keep))) } catch { /* cache is optional */ }
   }, [friends, shared])
   useEffect(() => {
     const drop = () => { if (!active) useStore.getState().toast('info', 'Open a location to upload files there.') }
@@ -181,7 +185,15 @@ export function LocationsView() {
         const presence = friendPresence(f.name, seen, statuses)
         return <button className="card location-tile" key={`${f.id}:${l.id}`} onClick={() => setActive({ friend: f.id, location: l.id })}>
           <div className="location-tile-top"><span className="location-drive-icon"><HardDrive size={24} /></span><span className={`location-presence ${presence.status}`}><i />{presenceLabel(presence)}</span></div>
-          <h2>{l.name}</h2><p>{f.name}</p><div className="location-tile-bottom"><span>Browse & download{l.rights.upload ? ' · Upload' : ''}{l.rights.manage ? ' · Manage' : ''}</span><ArrowRight size={17} /></div>
+          <h2>{l.name}</h2><p>{f.name}</p>
+          {/* How much room is left on the far side, so a 300 GB upload isn't
+              started into a full NAS. Hosts older than this simply don't say. */}
+          {l.reachable !== undefined && <div className={`location-reach ${l.reachable ? 'ok' : 'warn'}`}>
+            {l.reachable
+              ? (l.freeBytes != null && l.totalBytes ? <><Check size={13} /> {formatBytes(l.freeBytes)} free of {formatBytes(l.totalBytes)}</> : <><Check size={13} /> Ready</>)
+              : <><AlertTriangle size={13} /> Not reachable right now</>}
+          </div>}
+          <div className="location-tile-bottom"><span>Browse & download{l.rights.upload ? ' · Upload' : ''}{l.rights.manage ? ' · Manage' : ''}</span><ArrowRight size={17} /></div>
           {errors[f.id] && <small className="location-muted">Last known location · Open to retry</small>}
         </button>
       }))}</div>

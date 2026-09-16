@@ -18,6 +18,8 @@ pub mod labkit;
 #[cfg(target_os = "macos")]
 mod mac_service;
 mod models;
+// What is mounted right now (NAS shares, external disks), for the Add-a-location wizard.
+mod mounts;
 mod pairing;
 mod panic_log;
 mod provenance;
@@ -719,6 +721,7 @@ pub fn run() {
             commands::save_location,
             commands::location_request,
             commands::upload_to_location,
+            mounts::list_mount_candidates,
             commands::verify_transfer,
             commands::cancel_verify,
             commands::iroh_node_id,

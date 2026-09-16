@@ -85,6 +85,11 @@ pub struct TransferUpdate {
     /// the same name (as `name (2).ext`) instead of failing the upload.
     #[serde(default)]
     pub location_conflicts: Option<u64>,
+    /// Files the host published AT their requested name for a folder kept
+    /// continuously in sync (`replace_existing`), moving the previous version
+    /// into that location's recoverable trash.
+    #[serde(default)]
+    pub location_replaced: Option<u64>,
     /// Set on the FIRST receive update of an incoming Location upload so the
     /// host's "Shared from this device" card can say which folder is filling up.
     /// Only that first snapshot carries it; the view remembers it per transfer id.
@@ -159,6 +164,7 @@ impl TransferUpdate {
             integrity: vec![],
             location_skipped: None,
             location_conflicts: None,
+            location_replaced: None,
             location_id: None,
             verify: None,
             chat_transfer: None,

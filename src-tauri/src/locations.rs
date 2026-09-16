@@ -77,11 +77,13 @@ pub struct Entry { pub name: String, pub is_dir: bool, pub size: u64, pub modifi
 pub struct Conflict { pub name: String, pub landed: String }
 /// The outcome of landing ONE uploaded file.
 #[derive(Clone, Debug)]
-pub struct Landed { pub path: PathBuf, pub conflict: bool }
-/// The outcome of landing one push: the published paths, plus every item that
-/// had to be published under a collision-safe sibling name.
+pub struct Landed { pub path: PathBuf, pub conflict: bool, pub replaced: bool }
+/// The outcome of landing one push: the published paths, every item that had to
+/// be published under a collision-safe sibling name, and — for a continuously
+/// synced folder that asked for "newest wins" — every location-relative path
+/// whose previous version was moved to the location's recoverable trash.
 #[derive(Clone, Debug, Default)]
-pub struct Landing { pub paths: Vec<PathBuf>, pub conflicts: Vec<Conflict> }
+pub struct Landing { pub paths: Vec<PathBuf>, pub conflicts: Vec<Conflict>, pub replaced: Vec<String> }
 /// Same bound as a friend receive's `unique_path`: at most this many names
 /// are probed before an upload item gives up.
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -226,7 +228,28 @@ pub fn shared(config: &Path, endpoint: &str) -> Result<Value> {
     let friend = crate::friends::load(config).into_iter()
         .find(|f| f.endpoint_id.as_deref() == Some(endpoint)).context("Location access denied")?;
     Ok(json!(load(config)?.iter().filter(|l| l.friend_ids.contains(&friend.id))
-        .map(|l| json!({"id": l.id, "name": l.name, "rights": l.rights})).collect::<Vec<_>>()))
+        .map(|l| {
+            // Additive room report, so the friend's card can say "1.2 TB free of
+            // 4 TB" BEFORE they start a 300 GB upload. The path itself is never
+            // disclosed. An older host simply omits all three fields.
+            let (reachable, free, total) = room(l);
+            json!({"id": l.id, "name": l.name, "rights": l.rights,
+                "reachable": reachable, "free_bytes": free, "total_bytes": total})
+        }).collect::<Vec<_>>()))
+}
+/// Whether this location's volume is mounted right now, and its free/total
+/// bytes. One statvfs plus one marker stat — cheap enough for `locations.list`.
+fn room(l: &Location) -> (bool, Option<u64>, Option<u64>) {
+    let path = Path::new(&l.path);
+    // The mount marker lives ON the shared volume. An unmounted NAS usually
+    // leaves its (empty) mountpoint behind, so without this check the boot
+    // disk's free space would be reported as the NAS's.
+    if !fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+        || !l.marker.as_ref().is_none_or(|m| path.join(m).exists()) { return (false, None, None); }
+    match volume_bytes(path) {
+        Some((free, total)) => (true, Some(free), Some(total)),
+        None => (false, None, None),
+    }
 }
 
 /// Validate before normalizing: Path::components would silently remove `.`.
@@ -789,7 +812,7 @@ mod unix {
         }
         /// The integrity receipt already verified the streamed v2 payload.
         /// Publish its inode directly; v1 alone uses land's hash-while-copy.
-        pub fn land_verified(&self, raw: &str, staged: &Path, digest: &str, cancel: &std::sync::atomic::AtomicBool,
+        pub fn land_verified(&self, raw: &str, staged: &Path, digest: &str, replace: bool, cancel: &std::sync::atomic::AtomicBool,
             progress: impl Fn(u64), publish: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> {
             let rel = staged.strip_prefix(self.path.join(".dropbeam-staging"))
                 .context("Upload not verified: stage is outside location staging")?;
@@ -814,6 +837,41 @@ mod unix {
             // that exists with DIFFERENT content is never an upload-wide
             // failure: it is published beside its neighbour as "name (2).ext",
             // so one changed file can no longer strand the other 140.
+            //
+            // A folder the sender keeps continuously synced asks for the other
+            // rule — newest wins — with `replace_existing`. The previous version
+            // is moved to this location's recoverable trash and the upload takes
+            // its name. Identical content is still "already landed", and a
+            // directory (or a symlink/FIFO/device node) at that name is still
+            // refused rather than swept into the trash wholesale.
+            if replace {
+                if exists_at(&parent, &name)? {
+                    let existing = child(&parent, &name, false).context("An item with this name already exists")?;
+                    let meta = existing.metadata()?;
+                    ensure!(meta.is_file(), "An item with this name already exists");
+                    if meta.len() == size {
+                        let existing_id = crate::iroh_net::receive_stage::Identity::of(&existing)?;
+                        if sha256_file_progress(existing, cancel, &progress)? == digest {
+                            publish(&mut || {
+                                ensure!(crate::iroh_net::receive_stage::Identity::of(&child(&parent, &name, false)?)? == existing_id,
+                                    "Destination changed during verification");
+                                Ok(())
+                            })?;
+                            return Ok(Landed { path: self.path.join(&rel), conflict: false, replaced: false });
+                        }
+                    }
+                }
+                // Trash and publish inside ONE publish action: the location is
+                // re-authorized and the mount re-checked before the move, and
+                // nothing can take the freed name in between.
+                let replaced = std::cell::Cell::new(false);
+                publish(&mut || {
+                    replaced.set(false);
+                    if exists_at(&parent, &name)? { self.trash_name(&parent, &name)?; replaced.set(true); }
+                    super::unix::publish(&from, stage_name, &parent, &name, Some(identity))
+                })?;
+                return Ok(Landed { path: self.path.join(&rel), conflict: false, replaced: replaced.get() });
+            }
             for index in 0..LAND_NAME_LIMIT {
                 let candidate = sibling_name(&name, index);
                 let landed = self.path.join(sibling_rel(&rel, &candidate)?);
@@ -836,10 +894,10 @@ mod unix {
                             "Destination changed during verification");
                         Ok(())
                     })?;
-                    return Ok(Landed { path: landed, conflict: index > 0 });
+                    return Ok(Landed { path: landed, conflict: index > 0, replaced: false });
                 }
                 match publish(&mut || super::unix::publish(&from, stage_name, &parent, &candidate, Some(identity))) {
-                    Ok(()) => return Ok(Landed { path: landed, conflict: index > 0 }),
+                    Ok(()) => return Ok(Landed { path: landed, conflict: index > 0, replaced: false }),
                     // Someone took the name between the probe and the publish.
                     Err(e) if already_exists(&e) => continue,
                     Err(e) => return Err(e),
@@ -849,15 +907,19 @@ mod unix {
         }
         /// Copy from private transfer staging, hash-check, fsync, then publish
         /// using the probed native/reservation capability. Failed copies never publish.
-        pub fn land(&self, raw: &str, staged: &Path, digest: &str, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64), publish: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> {
+        pub fn land(&self, raw: &str, staged: &Path, digest: &str, replace: bool, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64), publish: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> {
             let expected = fs::metadata(staged)?.len();
             let rel = relative(raw)?;
             publish(&mut || self.ensure_dirs(&rel.parent().unwrap_or(Path::new("")).to_string_lossy()))?;
             let (parent, name) = self.parent(raw)?;
             // Find a free name, or an existing copy that IS this upload. A
             // destination holding different content is published beside rather
-            // than refused, so one changed file cannot fail a whole folder.
+            // than refused, so one changed file cannot fail a whole folder —
+            // unless the sender asked for "newest wins" (`replace_existing`),
+            // in which case the different previous version goes to this
+            // location's recoverable trash and the upload takes its name.
             let mut index = 0usize;
+            let mut replacing = false;
             loop {
                 ensure!(index < LAND_NAME_LIMIT, "Upload destination name space exhausted ({LAND_NAME_LIMIT} candidates)");
                 let candidate = sibling_name(&name, index);
@@ -871,13 +933,25 @@ mod unix {
                 };
                 let meta = existing.metadata()?;
                 ensure!(meta.is_file() || index > 0, "An item with this name already exists");
+                // "Newest wins": an identical destination is still already
+                // landed; a DIFFERENT one is trashed at publication time (below)
+                // instead of the upload taking a sibling name. A leftover empty
+                // reservation is recoverable from the trash too, so it no longer
+                // has to block the push.
+                if replace && index == 0 && meta.is_file() {
+                    if identical(existing, staged, digest, cancel, &progress)? {
+                        publish(&mut || Ok(()))?;
+                        return Ok(Landed { path: self.path.join(landed_rel), conflict: false, replaced: false });
+                    }
+                    replacing = true; break;
+                }
                 if index == 0 && meta.is_file() && meta.len() == 0 && expected > 0 {
                     log::warn!("Location upload blocked by empty destination {raw:?} dev={} ino={}; possible leftover reservation, ownership cannot be proven; preserved for owner review", meta.dev(), meta.ino());
                     bail!("An empty destination already exists (possibly a leftover reservation); ownership cannot be proven. Ask the owner to move it to trash before retrying");
                 }
                 if meta.is_file() && identical(existing, staged, digest, cancel, &progress)? {
                     publish(&mut || Ok(()))?;
-                    return Ok(Landed { path: self.path.join(landed_rel), conflict: index > 0 });
+                    return Ok(Landed { path: self.path.join(landed_rel), conflict: index > 0, replaced: false });
                 }
                 index += 1;
             }
@@ -897,6 +971,17 @@ mod unix {
                 ensure!(hex::encode(hash.finalize()) == digest, "Upload not verified: SHA-256 verification mismatch; upload was not published");
                 f.sync_all()?;
                 ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
+                if replacing {
+                    // Trash the previous version and publish inside ONE publish
+                    // action: the location is re-authorized and the mount
+                    // re-checked before the move, and nothing can take the
+                    // freed name in between.
+                    publish(&mut || {
+                        if exists_at(&parent, &name)? { self.trash_name(&parent, &name)?; }
+                        rename(self.native, &parent, &tmp, &parent, &name)
+                    })?;
+                    return Ok(self.path.join(sibling_rel(&rel, &name)?));
+                }
                 loop {
                     ensure!(index < LAND_NAME_LIMIT, "Upload destination name space exhausted ({LAND_NAME_LIMIT} candidates)");
                     let candidate = sibling_name(&name, index);
@@ -910,7 +995,7 @@ mod unix {
                 }
             })();
             if result.is_err() { let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), c(&tmp)?.as_ptr(), 0) }; }
-            Ok(Landed { path: result?, conflict: index > 0 })
+            Ok(Landed { path: result?, conflict: index > 0 && !replacing, replaced: replacing })
         }
         pub(super) fn selection_bytes(&self, raw: &str, budget: &mut Budget, depth: usize) -> Result<()> {
             ensure!(depth < 64 && budget.entries > 0, "Selection too large or deeply nested"); budget.entries -= 1;
@@ -961,12 +1046,12 @@ impl Root {
     pub fn rename_item(&self, _: &str, _: &str) -> Result<()> { bail!("Hosting unavailable") }
     pub fn trash(&self, _: &str) -> Result<String> { bail!("Hosting unavailable") }
     pub fn ensure_dirs(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
-    pub fn land(&self, _: &str, _: &Path, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> { bail!("Hosting unavailable") }
+    pub fn land(&self, _: &str, _: &Path, _: &str, _: bool, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> { bail!("Hosting unavailable") }
     fn selection_bytes(&self, _: &str, _: &mut Budget, _: usize) -> Result<()> { bail!("Hosting unavailable") }
     pub fn create_stage(&self, _: &str) -> Result<PathBuf> { bail!("Hosting unavailable") }
     pub fn remove_stage(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
     pub fn gc_stages(&self) -> Result<()> { Ok(()) }
-    pub fn land_verified(&self, _: &str, _: &Path, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> { bail!("Hosting unavailable") }
+    pub fn land_verified(&self, _: &str, _: &Path, _: &str, _: bool, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> { bail!("Hosting unavailable") }
     pub fn select(&self, _: &str, _: &str, _: &mut Budget, _: usize, _: &mut Vec<String>, _: &mut Vec<(PathBuf, String, u64, u64)>, _: &mut Vec<String>) -> Result<()> { bail!("Hosting unavailable") }
 }
 
@@ -1149,16 +1234,20 @@ pub fn hosted_status(config: &Path, id: &str) -> Result<HostedStatus> {
     }
     Ok(status)
 }
-fn free_bytes(path: &Path) -> u64 {
+fn free_bytes(path: &Path) -> u64 { volume_bytes(path).map_or(0, |(free, _)| free) }
+/// (free, total) bytes on the volume `path` lives on; `None` when the mount is
+/// gone (or on a platform without statvfs).
+pub(crate) fn volume_bytes(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)] {
         use std::{os::unix::ffi::OsStrExt, ffi::CString};
-        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else { return 0 };
+        let path = CString::new(path.as_os_str().as_bytes()).ok()?;
         let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return 0; }
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return None; }
         let stat = unsafe { stat.assume_init() };
-        (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+        let frsize = stat.f_frsize as u64;
+        Some(((stat.f_bavail as u64).saturating_mul(frsize), (stat.f_blocks as u64).saturating_mul(frsize)))
     }
-    #[cfg(not(unix))] { let _ = path; 0 }
+    #[cfg(not(unix))] { let _ = path; None }
 }
 
 pub struct Budget { remaining: u64, entries: usize }
@@ -1372,6 +1461,11 @@ impl Upload {
     }
     pub fn finish_verified_progress(&self, header: &Value, paths: Vec<PathBuf>, rows: &[crate::models::FileIntegrity], cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<Landing> {
         let digests = if header["location_hash_v"] == 2 { Some(verified_digests(header, rows)?) } else { None };
+        // "Newest wins" for a folder the sender keeps continuously synced: the
+        // upload is published AT the requested name and the previous version
+        // moves to this location's recoverable trash. Opt-in and additive — a
+        // sender that doesn't ask still gets the never-overwrite sibling rule.
+        let replace = header["replace_existing"] == true;
         let root = &self.root;
         let l = &self.location;
         let friend = &self._friend.0.1;
@@ -1411,14 +1505,18 @@ impl Upload {
             ensure!(fs::metadata(&staged)?.len() == item["size"].as_u64().context("Invalid file size")?, "Staged file size differs from manifest");
             let landed = if let Some(digests) = &digests {
                 ensure!(staged.starts_with(&self.staging), "Upload not verified: stage is outside transfer staging");
-                root.land_verified(&raw, &staged, digests[index], cancel, |n| progress(base + n), &publish)?
-            } else { root.land(&raw, &staged, text(item, "sha256")?, cancel, |n| progress(base + n), &publish)? };
+                root.land_verified(&raw, &staged, digests[index], replace, cancel, |n| progress(base + n), &publish)?
+            } else { root.land(&raw, &staged, text(item, "sha256")?, replace, cancel, |n| progress(base + n), &publish)? };
             // Keep the source's modification time so the copy is a faithful backup.
             crate::iroh_net::set_mtime_secs(&landed.path, item["mtime"].as_u64().unwrap_or(0));
             if landed.conflict {
                 let at = landed.path.strip_prefix(&root.path).unwrap_or(&landed.path).to_string_lossy().into_owned();
                 log::info!("locations upload conflict friend={friend} location={} path={raw:?} landed={at:?}", l.id);
                 out.conflicts.push(Conflict { name, landed: at });
+            } else if landed.replaced {
+                let at = landed.path.strip_prefix(&root.path).unwrap_or(&landed.path).to_string_lossy().into_owned();
+                log::info!("locations upload replaced friend={friend} location={} path={raw:?}; previous version moved to .dropbeam-trash", l.id);
+                out.replaced.push(at);
             } else {
                 log::info!("locations upload friend={friend} location={} path={raw:?}", l.id);
             }
@@ -1954,6 +2052,110 @@ mod tests {
         assert!(!f.root.join("locations-activity.json").exists());
     }
 
+    /// The friend's card must be able to say "1.2 TB free of 4 TB" before a
+    /// 300 GB upload starts, and must NOT quote the host's boot disk when the
+    /// NAS is unmounted — only the folder's own volume, never its path.
+    #[test]
+    fn shared_list_reports_room_on_the_volume_and_an_unmounted_root() {
+        let f = Fixture::new();
+        let list = shared(&f.config, "owner-device").unwrap();
+        let first = &list[0];
+        assert_eq!(first["name"], "Family NAS");
+        assert!(first.get("path").is_none(), "the host's path is never disclosed");
+        assert_eq!(first["reachable"], true);
+        let free = first["free_bytes"].as_u64().expect("statvfs reports free space on a temp volume");
+        let total = first["total_bytes"].as_u64().expect("statvfs reports the volume size");
+        assert!(free > 0 && total >= free, "free {free} of total {total}");
+        // An unmounted NAS usually leaves its (empty) mountpoint behind. The
+        // mount marker lives on the volume, so its absence is what tells us the
+        // numbers would be the boot disk's, not the NAS's.
+        let marker = load(&f.config).unwrap()[0].marker.clone().expect("save writes a mount marker");
+        fs::remove_file(f.root.join(&marker)).unwrap();
+        let empty = &shared(&f.config, "owner-device").unwrap()[0];
+        assert_eq!(empty["reachable"], false);
+        assert!(empty["free_bytes"].is_null() && empty["total_bytes"].is_null(), "{empty}");
+        // Still names the folder, so the card stays useful while the NAS sleeps.
+        assert_eq!(empty["name"], "Family NAS");
+        assert_eq!(empty["rights"]["upload"], true);
+        fs::remove_dir_all(&f.root).unwrap();
+        assert_eq!(shared(&f.config, "owner-device").unwrap()[0]["reachable"], false);
+    }
+
+    /// A folder kept continuously in sync asks for "newest wins": the upload is
+    /// published AT its name, the version it replaces stays recoverable in the
+    /// location's trash, an identical file is still a no-op, and no sibling
+    /// "name (2)" copy is ever created.
+    #[test]
+    fn replace_on_upload_trashes_the_previous_version_and_skips_identical_files() {
+        let f = Fixture::new();
+        let head = |replace: bool| json!({"locations_v":VERSION,"location_hash_v":2,"integrity_v":1,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":uuid::Uuid::new_v4().to_string(),
+            "replace_existing": replace,
+            "items":[{"name":"clips/a.mp4","size":6}],"dirs":[],"total":6});
+        let land = |bytes: &[u8], replace: bool| -> Landing {
+            let header = head(replace);
+            let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            let staged = upload.staging.join("received");
+            fs::write(&staged, bytes).unwrap();
+            let rows = [crate::models::FileIntegrity { index:0, name:"clips/a.mp4".into(), size:6,
+                algorithm:"test".into(), digest:"a".repeat(64), peer_digest:"a".repeat(64),
+                verified:true, acknowledged:false, sha256:Some(sha256(&staged).unwrap()) }];
+            upload.finish_verified_progress(&header, vec![staged], &rows,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap()
+        };
+        let trashed = || -> Vec<PathBuf> {
+            let mut found = vec![];
+            for bucket in fs::read_dir(f.root.join(".dropbeam-trash")).into_iter().flatten().flatten() {
+                for item in fs::read_dir(bucket.path()).into_iter().flatten().flatten() { found.push(item.path()); }
+            }
+            found
+        };
+
+        // A first upload has nothing to replace.
+        let first = land(b"first!", true);
+        assert!(first.replaced.is_empty() && first.conflicts.is_empty(), "{first:?}");
+        assert_eq!(fs::read(f.root.join("clips/a.mp4")).unwrap(), b"first!");
+        assert!(!f.root.join(".dropbeam-trash").exists(), "nothing was replaced, nothing was trashed");
+
+        // The same bytes again: already landed, no copy, no trash churn.
+        let same = land(b"first!", true);
+        assert!(same.replaced.is_empty() && same.conflicts.is_empty(), "{same:?}");
+        assert_eq!(same.paths, vec![f.root.join("clips/a.mp4")]);
+        assert!(!f.root.join(".dropbeam-trash").exists());
+        assert!(!f.root.join("clips/a (2).mp4").exists());
+
+        // Changed bytes: the new version takes the name, the old one is safe.
+        let newer = land(b"second", true);
+        assert_eq!(newer.replaced, vec!["clips/a.mp4".to_string()]);
+        assert!(newer.conflicts.is_empty(), "{newer:?}");
+        assert_eq!(newer.paths, vec![f.root.join("clips/a.mp4")]);
+        assert_eq!(fs::read(f.root.join("clips/a.mp4")).unwrap(), b"second");
+        assert!(!f.root.join("clips/a (2).mp4").exists(), "newest wins never leaves a sibling");
+        let recoverable = trashed();
+        assert_eq!(recoverable.len(), 1, "{recoverable:?}");
+        assert_eq!(recoverable[0].file_name().unwrap(), "a.mp4");
+        assert_eq!(fs::read(&recoverable[0]).unwrap(), b"first!");
+
+        // Without the flag the never-overwrite rule is untouched.
+        let beside = land(b"third!", false);
+        assert_eq!(beside.conflicts, vec![Conflict { name: "clips/a.mp4".into(), landed: "clips/a (2).mp4".into() }]);
+        assert!(beside.replaced.is_empty());
+        assert_eq!(fs::read(f.root.join("clips/a.mp4")).unwrap(), b"second");
+        assert_eq!(trashed().len(), 1, "a sibling landing trashes nothing");
+
+        // The hash-while-copy path (a sender without location_hash_v=2) obeys
+        // the same flag.
+        let (upload, mut header, source) = f.upload("legacy.bin", b"new");
+        fs::write(f.root.join("legacy.bin"), b"old").unwrap();
+        header["replace_existing"] = json!(true);
+        let landing = upload.finish(&header, vec![source]).unwrap();
+        assert_eq!(landing.replaced, vec!["legacy.bin".to_string()]);
+        assert_eq!(fs::read(f.root.join("legacy.bin")).unwrap(), b"new");
+        assert!(!f.root.join("legacy.bin (2)").exists());
+        assert!(trashed().iter().any(|p| p.file_name().unwrap() == "legacy.bin"
+            && fs::read(p).unwrap() == b"old"));
+    }
+
     /// An unmounted (or deleted) root must report itself as unreachable with a
     /// reason instead of erroring the whole view, and stopping a location must
     /// not leave its friend id behind in the activity file.
@@ -2215,7 +2417,7 @@ mod tests {
         std::os::unix::fs::symlink(f.root.join("occupied"), f.root.join("link")).unwrap();
         io_kind(root.rename_item("source", "link"), std::io::ErrorKind::AlreadyExists);
         let staged_link = f.dir.join("link-staged"); fs::write(&staged_link, b"replacement").unwrap();
-        assert!(root.land("link", &staged_link, &sha256(&staged_link).unwrap(), &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).is_err());
+        assert!(root.land("link", &staged_link, &sha256(&staged_link).unwrap(), false, &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).is_err());
         assert_eq!(fs::read(f.root.join("occupied")).unwrap(), b"precious");
         assert!(fs::symlink_metadata(f.root.join("link")).unwrap().is_symlink());
         root.rename_item("source", "renamed").unwrap();
@@ -2225,7 +2427,7 @@ mod tests {
         let trash = root.trash("renamed").unwrap();
         assert_eq!(fs::read(f.root.join(trash)).unwrap(), b"source");
         let staged = f.dir.join("staged"); fs::write(&staged, b"bytes").unwrap();
-        root.land("uploaded", &staged, &sha256(&staged).unwrap(), &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).unwrap();
+        root.land("uploaded", &staged, &sha256(&staged).unwrap(), false, &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).unwrap();
         assert_eq!(fs::read(f.root.join("uploaded")).unwrap(), b"bytes");
     }
     #[test]

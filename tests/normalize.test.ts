@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import type { TransferUpdate } from '../src/lib/api.ts'
-import { normalizeTransfer } from '../src/lib/normalize.ts'
+import { normalizeSharedLocations, normalizeTransfer } from '../src/lib/normalize.ts'
 
 test('Location skipped count survives sparse progress and completion updates', () => {
   const initial = normalizeTransfer({ id: 'nas', locationSkipped: 12 } as TransferUpdate)
@@ -82,4 +82,33 @@ test('A verify report sticks to its card across later updates', () => {
   assert.deepEqual(done.verify?.missing, ['c'])
   // A card that has never been verified stays undefined, not an empty report.
   assert.equal(normalizeTransfer({ id: 'fresh' } as TransferUpdate).verify, undefined)
+})
+
+test('Replaced count survives sparse updates and stays independent of conflicts', () => {
+  const initial = normalizeTransfer({ id: 'nas', locationReplaced: 4 } as TransferUpdate)
+  const progress = normalizeTransfer({ id: 'nas', state: 'transferring', locationReplaced: null } as TransferUpdate, initial)
+  const complete = normalizeTransfer({ id: 'nas', state: 'completed' } as TransferUpdate, progress)
+  assert.equal(complete.locationReplaced, 4)
+  // A host that never replaces anything must read as "no such report", not 0.
+  assert.equal(normalizeTransfer({ id: 'old' } as TransferUpdate).locationReplaced, undefined)
+  const both = normalizeTransfer({ id: 'nas', locationConflicts: 1 } as TransferUpdate, complete)
+  assert.equal(both.locationConflicts, 1)
+  assert.equal(both.locationReplaced, 4)
+})
+
+test('A friend location list reads free space defensively, and older hosts stay usable', () => {
+  const [nas, drive] = normalizeSharedLocations([
+    { id: 'a', name: 'Buddy NAS', rights: { upload: true, manage: false }, reachable: true, free_bytes: 1_200_000_000_000, total_bytes: 4_000_000_000_000 },
+    { id: 'b', name: 'Old host', rights: { upload: false, manage: false } },
+  ])
+  assert.deepEqual(nas, { id: 'a', name: 'Buddy NAS', rights: { upload: true, manage: false }, reachable: true, freeBytes: 1_200_000_000_000, totalBytes: 4_000_000_000_000 })
+  // No room report at all: the card shows the folder, just not how full it is.
+  assert.equal(drive.reachable, undefined)
+  assert.equal(drive.freeBytes, null)
+  assert.equal(drive.rights.upload, false)
+  // Junk from the wire never reaches the view.
+  assert.deepEqual(normalizeSharedLocations(null), [])
+  assert.deepEqual(normalizeSharedLocations([null, { name: 'no id' }, { id: 7 }]), [])
+  const [odd] = normalizeSharedLocations([{ id: 'c', name: 'Weird', reachable: 'yes', free_bytes: -5, total_bytes: 'lots' }])
+  assert.deepEqual(odd, { id: 'c', name: 'Weird', rights: { upload: false, manage: false }, reachable: undefined, freeBytes: null, totalBytes: null })
 })
