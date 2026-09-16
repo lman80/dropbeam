@@ -1,9 +1,10 @@
+import { useEffect } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { ChevronRight, QrCode, Users, X } from 'lucide-react'
 import { useStore } from '../store'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from './FriendAvatar'
-import { friendOnlineState } from '../lib/presence'
+import { claimPresenceChecks, friendOnlineState } from '../lib/presence'
 
 function baseName(p: string): string {
   return p.split('/').pop() || p
@@ -21,6 +22,15 @@ export function SendToChooser() {
 
   const open = !!files && files.length > 0
   const close = () => setPendingSend(null)
+
+  // #34: the sheet is where a stale "offline" hurts most — it's the moment you
+  // pick who to send to. Opening it actively re-checks everyone who doesn't
+  // already read as online (rate-limited inside claimPresenceChecks).
+  useEffect(() => {
+    if (!open) return
+    const s = useStore.getState()
+    for (const id of claimPresenceChecks(s.friends, s.friendSeen, s.folderStatuses)) void s.pingFriend(id)
+  }, [open])
 
   const title =
     files && files.length === 1

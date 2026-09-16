@@ -756,7 +756,10 @@ html.overlay-window #root {
   font-size: 13.5px;
   line-height: 1.45;
   /* On a computer you copy text out of messages all the time (GitHub #26). The
-     app root sets user-select:none; opt message text back in. */
+     app root sets user-select:none; opt message text back in. The -webkit- prefix
+     is not optional: the macOS WKWebView only honors the unprefixed property from
+     Safari 17.4, so without it a bubble stays dead to the cursor on older Macs. */
+  -webkit-user-select: text;
   user-select: text;
   cursor: text;
 }
@@ -764,6 +767,7 @@ html.overlay-window #root {
    keep them non-selectable so a drag is a click, not a text selection. */
 .chat-bubble.media,
 .chat-bubble.deleted {
+  -webkit-user-select: none;
   user-select: none;
   cursor: pointer;
 }
@@ -1187,6 +1191,11 @@ html.overlay-window #root {
   padding: 4px;
   min-width: 132px;
 }
+/* Flipped below the bubble when the thread's top edge would clip it (#26). */
+.chat-menu.down {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
 .chat-menu button {
   display: flex;
   align-items: center;
@@ -1267,6 +1276,10 @@ html.overlay-window #root {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 320px;
+  /* A reply quote is message text too — copyable for the same reason (#26). */
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
 }
 
 /* "new messages" pill */

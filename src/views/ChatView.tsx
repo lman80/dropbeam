@@ -6,6 +6,7 @@ import {
   Check,
   CheckCheck,
   Clock,
+  Copy,
   CornerUpLeft,
   File as FileIcon,
   FileText,
@@ -35,6 +36,7 @@ import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { FileIcon as TypeIcon, fileKind as typeKind } from '../components/FileIcon'
 import { formatBytes } from '../lib/format'
+import { linkify } from '../lib/linkify'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 
 /** Stable empty array so the messages selector doesn't return a fresh ref each render. */
@@ -1035,39 +1037,15 @@ const FolderSyncRow = memo(function FolderSyncRow({
   )
 })
 
-/** Matches http(s) URLs in a message. Conservative on purpose: only http/https
- *  (the only schemes the hardened `open_url` command will open), and we trim a
- *  trailing ), ., , ! ? : that's almost always sentence punctuation, not the URL. */
-const URL_RE = /\bhttps?:\/\/[^\s<]+/gi
-function trimTrailingPunct(url: string): { url: string; trailing: string } {
-  const m = url.match(/[).,!?:;'"]+$/)
-  if (!m) return { url, trailing: '' }
-  // Keep a closing ) when it balances an opening ( inside the URL (e.g. Wikipedia).
-  let cut = m[0]
-  if (cut.endsWith(')') && (url.match(/\(/g)?.length ?? 0) > (url.match(/\)/g)?.length ?? 0)) {
-    cut = cut.slice(0, -1)
-  }
-  return { url: url.slice(0, url.length - cut.length), trailing: cut }
-}
-
-/** Render message text with http(s) URLs as real clickable links. Clicking opens
- *  the URL externally via the hardened `open_url` command (http/https only — it
- *  rejects file://, custom schemes, etc.). Preserves plain text + whitespace. */
+/** Render message text with http(s) URLs as real clickable links (#17). The
+ *  matching itself lives in lib/linkify — pure and unit-tested, http/https only
+ *  (the only schemes the hardened `open_url` command will open), never a bare
+ *  "www." it upgrades for you. Segments are React children, never HTML, so a
+ *  message can't inject markup. The anchor NEVER navigates this webview: we
+ *  preventDefault and hand the URL to the OS browser (window.open is the
+ *  `vite dev` fallback, where there is no Tauri to invoke). */
 function Linkified({ text }: { text: string }) {
-  const parts = useMemo(() => {
-    const out: Array<{ t: 'text'; v: string } | { t: 'link'; v: string }> = []
-    let last = 0
-    for (const match of text.matchAll(URL_RE)) {
-      const start = match.index ?? 0
-      if (start > last) out.push({ t: 'text', v: text.slice(last, start) })
-      const { url, trailing } = trimTrailingPunct(match[0])
-      out.push({ t: 'link', v: url })
-      if (trailing) out.push({ t: 'text', v: trailing })
-      last = start + match[0].length
-    }
-    if (last < text.length) out.push({ t: 'text', v: text.slice(last) })
-    return out
-  }, [text])
+  const parts = useMemo(() => linkify(text), [text])
   return (
     <>
       {parts.map((p, i) =>
@@ -1076,9 +1054,11 @@ function Linkified({ text }: { text: string }) {
             key={i}
             href={p.v}
             className="chat-link"
+            rel="noopener noreferrer"
             onClick={(e) => {
               e.preventDefault()
-              api.openUrl(p.v).catch(() => {})
+              if (HAS_TAURI) api.openUrl(p.v).catch(() => {})
+              else window.open(p.v, '_blank', 'noopener,noreferrer')
             }}
           >
             {p.v}
@@ -1089,6 +1069,32 @@ function Linkified({ text }: { text: string }) {
       )}
     </>
   )
+}
+
+/** Copy a message to the clipboard (#26). navigator.clipboard is the happy path;
+ *  it rejects (or is missing) in a non-secure context or when the webview denies
+ *  the permission, so fall back to the old hidden-textarea + execCommand trick,
+ *  which still works in WKWebView/WebView2. Rejects when neither route works, so
+ *  the caller can say so instead of silently "succeeding". */
+async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text)
+    return
+  } catch {
+    /* fall through to the legacy path */
+  }
+  const ta = document.createElement('textarea')
+  ta.value = text
+  // Off-screen but still focusable — display:none would make the copy a no-op.
+  ta.setAttribute('readonly', '')
+  ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0'
+  document.body.appendChild(ta)
+  try {
+    ta.select()
+    if (!document.execCommand('copy')) throw new Error('copy rejected')
+  } finally {
+    ta.remove()
+  }
 }
 
 /** One line of text representing a message, for reply quotes. */
@@ -1123,6 +1129,19 @@ const MessageRow = memo(function MessageRow({
   const del = useStore((s) => s.deleteChatMessage)
   const [tray, setTray] = useState(false)
   const [menu, setMenu] = useState(false)
+  // The menu opens upward, which the scroll container clips for the topmost
+  // message — it used to hide half of a 2-item menu and would have hidden Copy
+  // outright. Measure on open and flip it below the bubble when there's no room.
+  const [menuDown, setMenuDown] = useState(false)
+  const actionsRef = useRef<HTMLDivElement>(null)
+  const toast = useStore((s) => s.toast)
+  const toggleMenu = () => {
+    const box = actionsRef.current?.getBoundingClientRect()
+    const thread = actionsRef.current?.closest('.chat-thread')?.getBoundingClientRect()
+    // 3 rows + padding ≈ 120px; flip rather than clip.
+    if (box && thread) setMenuDown(box.top - thread.top < 128)
+    setMenu((v) => !v)
+  }
 
   // Collapse reactions to one chip per emoji; mark the ones we added.
   const reactionChips = useMemo(() => {
@@ -1145,6 +1164,18 @@ const MessageRow = memo(function MessageRow({
   const doReact = (emoji: string) => {
     setTray(false)
     void react(friend.id, m.id, emoji)
+  }
+
+  // Copying a message out is a per-message action, not an owner action (#26), so
+  // the "More" menu now opens on THEIR bubbles too — with Edit/Unsend still yours
+  // alone. Only real text is copyable; a GIF or file card has no text to take.
+  const copyable = !m.deleted && m.kind === 'text' && !m.gif && m.text.trim().length > 0
+  const doCopy = () => {
+    setMenu(false)
+    void copyText(m.text).then(
+      () => toast('success', 'Message copied'),
+      () => toast('error', 'Could not copy to clipboard'),
+    )
   }
 
   return (
@@ -1194,15 +1225,15 @@ const MessageRow = memo(function MessageRow({
           </motion.div>
 
           {!m.deleted && (
-            <div className="chat-actions">
+            <div className="chat-actions" ref={actionsRef}>
               <button className="chat-act" title="React" onClick={() => setTray((v) => !v)}>
                 <Smile size={15} />
               </button>
               <button className="chat-act" title="Reply" onClick={() => onReply(m)}>
                 <CornerUpLeft size={15} />
               </button>
-              {mine && (
-                <button className="chat-act" title="More" onClick={() => setMenu((v) => !v)}>
+              {(mine || copyable) && (
+                <button className="chat-act" title="More" onClick={toggleMenu}>
                   <MoreHorizontal size={15} />
                 </button>
               )}
@@ -1215,9 +1246,14 @@ const MessageRow = memo(function MessageRow({
                   ))}
                 </div>
               )}
-              {menu && mine && (
-                <div className="chat-menu" onMouseDown={(e) => e.stopPropagation()}>
-                  {m.kind === 'text' && !m.gif && (
+              {menu && (mine || copyable) && (
+                <div className={`chat-menu${menuDown ? ' down' : ''}`} onMouseDown={(e) => e.stopPropagation()}>
+                  {copyable && (
+                    <button onClick={doCopy}>
+                      <Copy size={14} /> Copy
+                    </button>
+                  )}
+                  {mine && m.kind === 'text' && !m.gif && (
                     <button
                       onClick={() => {
                         setMenu(false)
@@ -1227,15 +1263,17 @@ const MessageRow = memo(function MessageRow({
                       <Pencil size={14} /> Edit
                     </button>
                   )}
-                  <button
-                    className="danger"
-                    onClick={() => {
-                      setMenu(false)
-                      void del(friend.id, m.id)
-                    }}
-                  >
-                    <Trash2 size={14} /> Unsend
-                  </button>
+                  {mine && (
+                    <button
+                      className="danger"
+                      onClick={() => {
+                        setMenu(false)
+                        void del(friend.id, m.id)
+                      }}
+                    >
+                      <Trash2 size={14} /> Unsend
+                    </button>
+                  )}
                 </div>
               )}
             </div>

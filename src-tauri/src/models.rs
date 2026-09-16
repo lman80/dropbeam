@@ -85,6 +85,11 @@ pub struct TransferUpdate {
     /// the same name (as `name (2).ext`) instead of failing the upload.
     #[serde(default)]
     pub location_conflicts: Option<u64>,
+    /// Set on the FIRST receive update of an incoming Location upload so the
+    /// host's "Shared from this device" card can say which folder is filling up.
+    /// Only that first snapshot carries it; the view remembers it per transfer id.
+    #[serde(default)]
+    pub location_id: Option<String>,
     #[serde(default)]
     pub chat_transfer: Option<ChatTransferLink>,
     pub id: String,
@@ -149,6 +154,7 @@ impl TransferUpdate {
             integrity: vec![],
             location_skipped: None,
             location_conflicts: None,
+            location_id: None,
             chat_transfer: None,
             id,
             direction,

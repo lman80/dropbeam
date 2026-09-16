@@ -1715,6 +1715,12 @@ fn handle_conn(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
         let who = conn.remote_id();
+        // #34: an ACCEPTED connection is proof of life right now — the remote id
+        // is the authenticated transport identity, so a friend who reappears is
+        // online the instant they dial us, not up to 45 s later when the first
+        // presence tick fires. Without this a friend could read "offline" until
+        // the app was restarted.
+        emit_friend_presence(&state, &who.to_string());
         let mut presence_tick = tokio::time::interval(Duration::from_secs(45));
         presence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // iroh's 5s QUIC keep-alives advance received datagrams even when chat is
@@ -2333,6 +2339,7 @@ async fn serve_stream_inner(
             u0.bytes_total = total;
             u0.locality = conn_locality(conn);
             u0.conn_detail = Some(conn_detail(conn));
+            u0.location_id = location_upload.as_ref().map(|u| u.location_id().to_string());
             emit(&app, &u0);
             let cb = progress_cb(
                 app.clone(),

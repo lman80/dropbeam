@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -102,6 +102,12 @@ struct StatusSnapshot {
     locality: Locality,
     /// The peer told us they removed/stopped sharing this folder.
     peer_unshared: bool,
+    /// The local folder itself is gone (renamed, trashed, or on a drive that isn't
+    /// mounted) — the filesystem watch couldn't be registered because the path does
+    /// not exist. Set at start_pair, cleared when the watch succeeds. Surfaced to
+    /// the user through `detail` so the card says WHY nothing is syncing instead of
+    /// the truth living only in a log line.
+    folder_missing: bool,
     /// How many files the peer reported in its last reconcile snapshot — so the UI
     /// can show "both have N files, in sync" and the user can SEE the folders match.
     peer_files: u32,
@@ -127,6 +133,7 @@ impl Default for StatusSnapshot {
             peer_name: None,
             locality: Locality::Unknown,
             peer_unshared: false,
+            folder_missing: false,
             peer_files: 0,
             session_total_files: 0,
             session_done_files: 0,
@@ -583,12 +590,28 @@ impl SyncManager {
             }) {
                 Ok(mut w) => {
                     use notify::Watcher;
-                    if let Err(e) =
-                        w.watch(Path::new(&folder), notify::RecursiveMode::Recursive)
-                    {
-                        log::warn!("watch failed for {folder}: {e}");
-                    } else {
-                        watcher = Some(w);
+                    match w.watch(Path::new(&folder), notify::RecursiveMode::Recursive) {
+                        Ok(()) => {
+                            // Watching again — forget the failure so a folder that
+                            // disappears a SECOND time is reported afresh.
+                            clear_watch_failure(&folder);
+                            watcher = Some(w);
+                        }
+                        Err(e) => {
+                            // Log once per folder per process: start_pair re-runs on
+                            // every structural change, and a folder that's simply gone
+                            // fails identically every time (74 copies of one line in
+                            // the diagnostics digest). The condition itself is not
+                            // swallowed — it goes into the pair's status below.
+                            if note_watch_failure(&folder) {
+                                log::warn!("watch failed for {folder}: {e}");
+                            }
+                            if !Path::new(&folder).exists() {
+                                if let Ok(mut s) = status.lock() {
+                                    s.folder_missing = true;
+                                }
+                            }
+                        }
                     }
                 }
                 Err(e) => log::warn!("watcher init failed: {e}"),
@@ -2117,22 +2140,7 @@ impl SyncManager {
         //    empty dir we have if the peer tombstoned it (remove_dir only removes
         //    it when it's actually empty, so a dir that's since gained files is
         //    never touched). Never deletes data.
-        for rel in &rec.empty_dirs {
-            let norm = norm_rel(rel);
-            if norm.is_empty()
-                || norm.starts_with('/')
-                || norm.split('/').any(|c| c == ".." || c.starts_with('.'))
-            {
-                continue;
-            }
-            if my_tomb.contains_key(&norm) || rec.tombstones.contains_key(&norm) {
-                continue; // deleted somewhere — don't recreate
-            }
-            let abs = Path::new(folder).join(&norm);
-            if !abs.exists() {
-                let _ = std::fs::create_dir_all(&abs);
-            }
-        }
+        apply_empty_dirs(folder, &rec.empty_dirs, &my_tomb, &rec.tombstones);
         // Honor a peer's directory delete: remove an empty dir the peer tombstoned.
         // Gated on apply_peer_deletes so a read-only VIEWER can't erase our folder
         // structure; freshness-guarded so a just-created (still-empty) dir isn't
@@ -2607,6 +2615,16 @@ impl SyncManager {
             .and_then(|e| friends::label_for_endpoint(&self.config_dir, e))
         {
             s.peer_name = Some(label);
+        }
+        // A folder that isn't on disk outranks every other detail: nothing can sync
+        // until it's back, so say so rather than showing a hopeful "Waiting for …".
+        // Carried on the existing `detail` string (no new wire field, so the
+        // frontend contract is unchanged).
+        if s.folder_missing {
+            s.detail = Some(
+                "Folder not found — it was moved, renamed, or is on a drive that isn't connected."
+                    .to_string(),
+            );
         }
         let status = FolderStatus {
             pair_id: pair_id.to_string(),
@@ -3887,6 +3905,45 @@ fn live_empty_dirs(folder: &str) -> Vec<String> {
     dirs.into_iter().filter(|d| !has_files.contains(d)).collect()
 }
 
+/// The receive half of the [`live_empty_dirs`] round trip: create every file-less
+/// directory the peer reported that we don't have yet, NESTED ones included (the
+/// peer sends `a` and `a/b` as separate rels, and `create_dir_all` handles either
+/// order). Purely additive — it never removes anything.
+///
+/// Skips a rel tombstoned on either side, checking every ANCESTOR too: creating
+/// `a/b` would otherwise silently resurrect a deleted `a`.
+fn apply_empty_dirs(
+    folder: &str,
+    empty_dirs: &[String],
+    my_tomb: &HashMap<String, u64>,
+    peer_tomb: &HashMap<String, u64>,
+) {
+    for rel in empty_dirs {
+        let norm = norm_rel(rel);
+        if norm.is_empty()
+            || norm.starts_with('/')
+            || norm.split('/').any(|c| c == ".." || c.starts_with('.'))
+        {
+            continue;
+        }
+        let mut prefix = String::new();
+        let deleted = norm.split('/').any(|c| {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(c);
+            my_tomb.contains_key(&prefix) || peer_tomb.contains_key(&prefix)
+        });
+        if deleted {
+            continue; // deleted somewhere — don't recreate
+        }
+        let abs = Path::new(folder).join(&norm);
+        if !abs.exists() {
+            let _ = std::fs::create_dir_all(&abs);
+        }
+    }
+}
+
 /// What a reconcile pass decided to do to OUR folder, given the peer's snapshot.
 #[derive(Default, Debug, PartialEq)]
 struct ReconcilePlan {
@@ -4104,6 +4161,33 @@ fn compute_verify(
 fn friend_sig(f: &Friend) -> String {
     // auto_accept is included so flipping it restarts the listener in the new mode.
     format!("{}|{:?}|{}|{}", f.id, f.role, f.secret, f.auto_accept)
+}
+
+/// Folders whose filesystem-watch registration has already been logged as failing.
+/// `start_pair` re-runs whenever a pair's structural signature changes, and a folder
+/// that is missing fails the same way every time — so without this the identical
+/// "watch failed for …" line piles up in the log and the diagnostics digest.
+fn watch_failures() -> &'static Mutex<HashSet<String>> {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Returns true the FIRST time this folder's watch fails (i.e. "log it"), false for
+/// every repeat until [`clear_watch_failure`] forgets it.
+fn note_watch_failure(folder: &str) -> bool {
+    watch_failures()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(folder.to_string())
+}
+
+/// The watch succeeded — forget any earlier failure so a folder that goes missing
+/// again later is logged again rather than silently swallowed.
+fn clear_watch_failure(folder: &str) {
+    watch_failures()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(folder);
 }
 
 fn structural_sig(p: &Pair) -> String {
@@ -4956,6 +5040,64 @@ mod tests {
             "only truly file-less dirs; 'has' and 'has/sub' contain a file"
         );
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn nested_empty_dir_round_trips_to_the_peer() {
+        // GitHub #22 — "a shared folder containing a nested EMPTY subfolder failed to
+        // send". Exercises the real send path (live_empty_dirs), the real wire shape
+        // (the `emptyDirs` JSON array the control beacon carries), and the real
+        // receive path (apply_empty_dirs), end to end.
+        let src = temp_dir("emptyrt-src");
+        let dst = temp_dir("emptyrt-dst");
+        std::fs::create_dir_all(src.join("a/b")).unwrap(); // `a` holds only `b`; `b` is empty
+        std::fs::create_dir_all(src.join("docs/drafts")).unwrap(); // empty, under a populated dir
+        std::fs::write(src.join("docs/read.txt"), b"x").unwrap();
+
+        let mut dirs = live_empty_dirs(&src.to_string_lossy());
+        dirs.sort();
+        assert_eq!(
+            dirs,
+            vec!["a".to_string(), "a/b".to_string(), "docs/drafts".to_string()],
+            "the nested empty dir must be discovered, not just its parent"
+        );
+
+        // Exactly what rides the beacon (iroh_net encodes `emptyDirs` as a string
+        // array and decodes it back), so serialization is part of the round trip.
+        let wire = serde_json::to_string(&dirs).unwrap();
+        let received: Vec<String> = serde_json::from_str(&wire).unwrap();
+
+        apply_empty_dirs(&dst.to_string_lossy(), &received, &HashMap::new(), &HashMap::new());
+        assert!(dst.join("a").is_dir(), "the parent empty dir must land");
+        assert!(dst.join("a/b").is_dir(), "the NESTED empty dir must land");
+        assert!(dst.join("docs/drafts").is_dir(), "empty dir under a populated one must land");
+
+        // A tombstoned ancestor must NOT be resurrected by its nested child.
+        let dst2 = temp_dir("emptyrt-tomb");
+        let mut tomb = HashMap::new();
+        tomb.insert("a".to_string(), 1u64);
+        apply_empty_dirs(&dst2.to_string_lossy(), &received, &tomb, &HashMap::new());
+        assert!(!dst2.join("a").exists(), "a deleted parent must not come back via a/b");
+        assert!(dst2.join("docs/drafts").is_dir(), "unrelated empty dirs still land");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+        let _ = std::fs::remove_dir_all(&dst2);
+    }
+
+    #[test]
+    fn watch_failure_is_logged_once_until_the_watch_succeeds() {
+        // The "watch failed for <path>: No path was found" x74 spam: start_pair is
+        // re-entered on every structural change, so the same missing folder must
+        // only be reported once — and again if it goes missing a second time.
+        let folder = "/dropbeam-test/never-exists-watch-dedup";
+        clear_watch_failure(folder);
+        assert!(note_watch_failure(folder), "first failure logs");
+        assert!(!note_watch_failure(folder), "repeats are suppressed");
+        assert!(!note_watch_failure(folder));
+        clear_watch_failure(folder); // the watch came back
+        assert!(note_watch_failure(folder), "a later disappearance logs again");
+        clear_watch_failure(folder);
     }
 
     #[test]

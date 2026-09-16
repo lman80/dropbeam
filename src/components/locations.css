@@ -74,6 +74,24 @@
 .location-check { display: flex; align-items: center; gap: 9px; font-size: 13px; padding: 6px 0; }
 .location-friend-list { max-height: 180px; overflow-y: auto; }
 .location-check input, .location-table input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+/* "Shared from this device": the host's own gateway cards. */
+.location-divider { border: 0; border-top: 1px solid var(--border); margin: 34px 0 26px; }
+.location-hosted .location-empty-small { text-align: left; padding: 22px; }
+.location-hosted .location-empty-small h3 { margin: 0 0 6px; font-size: 15px; }
+.location-hosted .location-empty-small .btn { margin-top: 12px; }
+.location-gateway { cursor: default; display: flex; flex-direction: column; gap: 10px; }
+.location-gateway:hover { border-color: var(--border); transform: none; }
+.location-gateway h2 { margin: 14px 0 0; }
+.location-gateway .location-path { margin: 0; }
+.location-gateway .location-tile-bottom { margin-top: auto; }
+.location-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); border-radius: 999px; padding: 4px 9px; }
+.location-reach, .location-live, .location-last { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-muted); overflow-wrap: anywhere; }
+.location-reach > svg, .location-live > svg, .location-last > svg { flex-shrink: 0; }
+.location-reach.ok { color: #32b789; }
+.location-reach.warn { color: var(--red, #e47474); }
+.location-live { color: var(--accent); font-weight: 600; }
+.location-members { display: flex; flex-wrap: wrap; gap: 6px; }
+.location-chip { font-size: 11px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-muted); }
 .location-spin { animation: location-spin 1.2s linear infinite; }
 @keyframes location-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .location-spin { animation: none; } .location-tile { transition: none; } }

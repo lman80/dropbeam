@@ -1,6 +1,6 @@
 //! Runs diagnostics independently of filesystem calls blocked by macOS TCC.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -35,11 +35,20 @@ fn monitor() -> &'static mpsc::Sender<Event> {
 
 fn monitor_walks(rx: mpsc::Receiver<Event>, mut warn: impl FnMut(&str, &Path)) {
     let mut pending = HashMap::new();
+    // ONE warning per (operation, path) per process. The same folders are walked on
+    // every sync round, so a folder that is permanently slow (an unanswered TCC
+    // prompt, a disconnected network share) used to repeat the identical line dozens
+    // of times per launch — pure log + diagnostics noise that told us nothing new.
+    let mut warned: HashSet<(String, PathBuf)> = HashSet::new();
     let mut warn_if_slow = |at: Instant, op: &str, dir: &Path| {
         if at.elapsed() < SLOW_WALK {
             return false;
         }
-        warn(op, dir);
+        // Still returns true (this walk leaves `pending` either way) — only the
+        // log line is suppressed, never the bookkeeping.
+        if warned.insert((op.to_owned(), dir.to_owned())) {
+            warn(op, dir);
+        }
         true
     };
     loop {
@@ -108,5 +117,28 @@ mod tests {
         drop(tx);
         worker.join().unwrap();
         assert!(observed.try_recv().is_err());
+    }
+
+    #[test]
+    fn same_slow_path_warns_once_but_another_path_still_warns() {
+        let (tx, rx) = mpsc::channel();
+        let (warnings, observed) = mpsc::channel();
+        let worker = std::thread::spawn(move || monitor_walks(rx, move |op, dir| {
+            warnings.send((op.to_owned(), dir.to_owned())).unwrap();
+        }));
+        let long_ago = Instant::now() - SLOW_WALK;
+        tx.send(Event::Started(1, long_ago, "scan", "Downloads".into())).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ("scan".into(), PathBuf::from("Downloads")));
+        // Same operation + same path, still slow: must NOT warn a second time.
+        tx.send(Event::Started(2, long_ago, "scan", "Downloads".into())).unwrap();
+        // A DIFFERENT path is new information, so it still warns. Receiving this
+        // one (and nothing before it) proves the repeat above was suppressed.
+        tx.send(Event::Started(3, long_ago, "scan", "Desktop".into())).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ("scan".into(), PathBuf::from("Desktop")));
+        drop(tx);
+        worker.join().unwrap();
+        assert!(observed.try_recv().is_err(), "exactly one warning per (op, path)");
     }
 }

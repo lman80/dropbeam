@@ -1020,6 +1020,93 @@ pub fn activity(config: &Path) -> Vec<Value> {
     ACTIVITY.lock().unwrap_or_else(|p| p.into_inner()).get(config).map(|v| v.iter().rev().cloned().collect()).unwrap_or_default()
 }
 
+// ── The HOST's own view of a location it shares ──────────────────────────────
+// The device hosting a NAS folder never browses it through DropBeam, so it has
+// no signal that it is the gateway. `hosted_status` answers the three questions
+// the gateway card asks — is the folder there, how much room is left, and when
+// did a friend last touch it — without ever walking the tree. Last activity is
+// persisted next to locations.json (NOT inside the shared folder) because the
+// card is opened long after the transfer that produced it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastActivity {
+    pub at: u64,
+    pub friend_id: String,
+    /// "upload" — a friend put files here; "download" — we served files out.
+    pub direction: String,
+    pub bytes: u64,
+}
+fn activity_file(config: &Path) -> PathBuf { config.join("locations-activity.json") }
+fn load_last_activity(config: &Path) -> HashMap<String, LastActivity> {
+    fs::read(activity_file(config)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+/// Remember who last used a hosted location. Best effort throughout: a failed
+/// write costs the card a timestamp, never the transfer that produced it.
+pub fn record_activity(config: &Path, location_id: &str, friend_id: &str, direction: &str, bytes: u64) {
+    if location_id.is_empty() { return; }
+    let _lock = CONFIG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let hosted: Vec<String> = load(config).unwrap_or_default().into_iter().map(|l| l.id).collect();
+    let mut rows = load_last_activity(config);
+    rows.insert(location_id.into(), LastActivity { at: crate::chat::now_ms(), friend_id: friend_id.into(), direction: direction.into(), bytes });
+    // A stopped location must not keep a row — or a friend id — forever.
+    rows.retain(|id, _| hosted.iter().any(|h| h == id));
+    let _ = (|| -> Result<()> {
+        use std::io::Write;
+        fs::create_dir_all(config)?;
+        let tmp = config.join(format!(".locations-activity-{}.tmp", uuid::Uuid::new_v4()));
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let written = (|| -> Result<()> { f.write_all(&serde_json::to_vec(&rows)?)?; f.sync_all()?; Ok(()) })();
+        if written.is_err() { let _ = fs::remove_file(&tmp); }
+        written?;
+        fs::rename(&tmp, activity_file(config))?;
+        Ok(())
+    })();
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedStatus {
+    pub id: String,
+    /// The folder opens as a location root right now (NAS mounted and readable).
+    pub reachable: bool,
+    /// Free space on the volume the location lives on; 0 when unknown.
+    pub free_bytes: u64,
+    /// The persisted mount marker is present and matches — this is the SAME
+    /// volume the location was saved against, not a fresh empty mountpoint.
+    pub marker_ok: bool,
+    /// Why it isn't usable, for the card's second line.
+    pub error: Option<String>,
+    pub last_activity: Option<LastActivity>,
+}
+/// Cheap reachability probe for one hosted location (view open + every 30 s).
+/// Touches only the root directory: an open, the marker read, one statvfs.
+pub fn hosted_status(config: &Path, id: &str) -> Result<HostedStatus> {
+    let mut location = load(config)?.into_iter().find(|l| l.id == id).context("Location not found")?;
+    let mut status = HostedStatus { id: id.into(), reachable: false, free_bytes: 0, marker_ok: false,
+        error: None, last_activity: load_last_activity(config).remove(id) };
+    match Root::open(Path::new(&location.path)) {
+        Ok(root) => { status.reachable = true; status.free_bytes = free_bytes(&root.path); }
+        // Unmounted NAS / deleted folder: report that, don't probe the marker too.
+        Err(e) => { status.error = Some(format!("{e:#}")); return Ok(status); }
+    }
+    match Root::for_location(&mut location) {
+        Ok(_) => status.marker_ok = true,
+        Err(e) => status.error = Some(format!("{e:#}")),
+    }
+    Ok(status)
+}
+fn free_bytes(path: &Path) -> u64 {
+    #[cfg(unix)] {
+        use std::{os::unix::ffi::OsStrExt, ffi::CString};
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else { return 0 };
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return 0; }
+        let stat = unsafe { stat.assume_init() };
+        (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+    }
+    #[cfg(not(unix))] { let _ = path; 0 }
+}
+
 pub struct Budget { remaining: u64, entries: usize }
 impl Budget {
     fn check(&self, bytes: u64) -> Result<()> { ensure!(bytes <= self.remaining, LocationError::Quota); Ok(()) }
@@ -1215,6 +1302,9 @@ impl Upload {
         Budget { remaining: upload.byte_cap, entries: 0 }.check(retained.checked_add(manifest_total).context("Stage byte count overflow")?)?;
         Ok(upload)
     }
+    /// Which hosted location this push is landing in — the receive-side transfer
+    /// update carries it so the host's gateway card can show it live.
+    pub fn location_id(&self) -> &str { &self.target.location_id }
     fn cleanup(&self) {
         if self.staging.starts_with(self.root.path.join(".dropbeam-staging")) {
             if let Some(key) = self.staging.file_name().and_then(|s| s.to_str()) { let _ = self.root.remove_stage(key); }
@@ -1289,6 +1379,9 @@ impl Upload {
         let offset = header["location_item_offset"].as_u64().unwrap_or(0);
         let total = header["location_total_items"].as_u64().unwrap_or(items.len() as u64);
         if offset + items.len() as u64 == total { self.cleanup(); }
+        // The host's gateway card reads this; a batched upload records each batch
+        // so a long multi-batch push keeps the card's "last activity" live.
+        record_activity(&self.config, &self.target.location_id, friend, "upload", actual);
         Ok(out)
     }
 }
@@ -1520,6 +1613,10 @@ fn download_snapshot_at(config: &Path, endpoint: &str, request: &Value, now: Ins
     ensure!(current.path == l.path, "Location changed during download preparation");
     ensure!(current.marker == l.marker, LocationError::MountChanged);
     source.root.recheck(&current)?;
+    // Serving a download is recorded when the selection is pinned: that is the
+    // last point the HOST controls (the bytes then stream out of Root::open).
+    let served = snapshot.source.items.iter().map(|i| i.2).sum();
+    record_activity(config, &l.id, &friend, "download", served);
     Ok(snapshot)
 }
 
@@ -1779,6 +1876,54 @@ mod tests {
         }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.dir); } }
+
+    /// The gateway card is the host's only window onto a folder it shares: a
+    /// mounted root reads as reachable with the marker we wrote, and a landed
+    /// upload leaves a persisted "who touched this last" row behind.
+    #[test]
+    fn hosted_status_reports_a_mounted_root_and_the_upload_that_landed_in_it() {
+        let f = Fixture::new();
+        let before = hosted_status(&f.config, "nas").unwrap();
+        assert!(before.reachable && before.marker_ok, "{before:?}");
+        assert!(before.error.is_none() && before.last_activity.is_none(), "{before:?}");
+        assert!(before.free_bytes > 0, "statvfs should report room on a temp volume");
+        assert!(hosted_status(&f.config, "missing-id").is_err());
+
+        let (upload, header, source) = f.upload("report.pdf", b"nine bytes");
+        upload.finish(&header, vec![source]).unwrap();
+        let after = hosted_status(&f.config, "nas").unwrap();
+        let last = after.last_activity.expect("a landed upload records activity");
+        assert_eq!((last.friend_id.as_str(), last.direction.as_str(), last.bytes), (f.friend.as_str(), "upload", 10));
+        assert!(last.at > 0);
+        // Persisted beside locations.json, never inside the shared folder itself.
+        assert!(f.config.join("locations-activity.json").is_file());
+        assert!(!f.root.join("locations-activity.json").exists());
+    }
+
+    /// An unmounted (or deleted) root must report itself as unreachable with a
+    /// reason instead of erroring the whole view, and stopping a location must
+    /// not leave its friend id behind in the activity file.
+    #[test]
+    fn hosted_status_survives_a_missing_root_and_forgets_stopped_locations() {
+        let f = Fixture::new();
+        record_activity(&f.config, "nas", &f.friend, "download", 4096);
+        assert_eq!(load_last_activity(&f.config).get("nas").map(|a| a.bytes), Some(4096));
+        // An id we don't host is never written, so a stale row can't be planted.
+        record_activity(&f.config, "not-hosted", &f.friend, "download", 1);
+        assert!(!load_last_activity(&f.config).contains_key("not-hosted"));
+
+        fs::remove_dir_all(&f.root).unwrap();
+        let gone = hosted_status(&f.config, "nas").unwrap();
+        assert!(!gone.reachable && !gone.marker_ok, "{gone:?}");
+        assert!(gone.error.is_some(), "an unmounted root explains itself");
+        assert_eq!(gone.last_activity.map(|a| a.bytes), Some(4096), "history outlives the mount");
+
+        fs::create_dir_all(&f.root).unwrap();
+        save(&f.config, None, Some("nas")).unwrap();
+        record_activity(&f.config, "nas", &f.friend, "upload", 1);
+        assert!(load_last_activity(&f.config).is_empty(), "stopping a location drops its row");
+    }
+
     #[test]
     fn v2_upload_requires_verified_rows_and_root_local_stage() {
         let f = Fixture::new();

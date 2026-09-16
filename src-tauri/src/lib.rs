@@ -714,6 +714,7 @@ pub fn run() {
             commands::send_to_friend,
             commands::location_activity,
             commands::list_locations,
+            commands::hosted_location_status,
             commands::save_location,
             commands::location_request,
             commands::upload_to_location,

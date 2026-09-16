@@ -21,11 +21,19 @@ import { useStore } from '../store'
 import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
 import { ConnInspector } from '../components/ConnInspector'
 import { avatarGradient, initials } from '../lib/avatar'
-import { friendPresence, presenceLabel } from '../lib/presence'
+import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/presence'
 
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
   const [adding, setAdding] = useState(false)
+
+  // #34: presence must recover without a restart. Opening Friends actively
+  // re-checks everyone who doesn't already read as online, instead of waiting
+  // out the control beacon's 60/120/300 s backoff.
+  useEffect(() => {
+    const s = useStore.getState()
+    for (const id of claimPresenceChecks(s.friends, s.friendSeen, s.folderStatuses)) void s.pingFriend(id)
+  }, [])
 
   return (
     <div style={{ maxWidth: 640, margin: '0 auto', padding: '8px 28px 40px' }}>

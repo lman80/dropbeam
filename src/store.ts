@@ -99,6 +99,41 @@ function loadFriendSeen(): Record<string, number> {
   } catch { return {} }
 }
 
+/** Per-friend unread counts, persisted the same way friendSeen is (#27). Without
+ *  this the map started empty on every launch, so a badge you had just cleared came
+ *  back the moment anything re-counted, and a real backlog vanished on reload. */
+const CHAT_UNREAD_KEY = 'dropbeam-chat-unread'
+/** Shape-validated so a corrupt/hand-edited entry can't produce a NaN badge. */
+export function parseChatUnread(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  return Object.fromEntries(Object.entries(raw as Record<string, unknown>)
+    .filter((entry): entry is [string, number] =>
+      typeof entry[1] === 'number' && Number.isSafeInteger(entry[1]) && entry[1] > 0))
+}
+export const unreadTotal = (unread: Record<string, number>) =>
+  Object.values(unread).reduce((a, b) => a + b, 0)
+/** Drop counts for friends who no longer exist — a removed friend must not keep
+ *  inflating the Dock badge forever. */
+export const pruneChatUnread = (unread: Record<string, number>, ids: Set<string>) =>
+  Object.fromEntries(Object.entries(unread).filter(([id]) => ids.has(id)))
+function loadChatUnread(): Record<string, number> {
+  try { return parseChatUnread(JSON.parse(localStorage.getItem(CHAT_UNREAD_KEY) || '{}')) }
+  catch { return {} }
+}
+/** The single write point for unread: storage and the OS Dock/taskbar badge move
+ *  together, so the sidebar pill, the persisted map and the badge can't drift.
+ *  The popover/HUD webviews share this code but not the chat — their copy of the
+ *  map is frozen at their own startup, so letting them write would resurrect a
+ *  count the main window has since cleared. Checked lazily: the overlay class is
+ *  added in main.tsx, after this module is evaluated. */
+function saveChatUnread(chatUnread: Record<string, number>): Record<string, number> {
+  if (typeof document !== 'undefined' &&
+      document.documentElement.classList.contains('overlay-window')) return chatUnread
+  try { localStorage.setItem(CHAT_UNREAD_KEY, JSON.stringify(chatUnread)) } catch { /* storage unavailable */ }
+  void api.setUnreadBadge(unreadTotal(chatUnread))
+  return chatUnread
+}
+
 interface UpdateState {
   version: string
   notes: string
@@ -455,7 +490,7 @@ export const useStore = create<AppStore>((set, get) => ({
   chats: {},
   chatOverview: [],
   chatDraftFiles: [],
-  chatUnread: {},
+  chatUnread: loadChatUnread(),
   activeChatId: null,
   chatTyping: {},
   windowFocused: true,
@@ -497,7 +532,11 @@ export const useStore = create<AppStore>((set, get) => ({
     const folderStatuses: Record<string, FolderStatus> = {}
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
     Object.assign(folderStatuses, liveStatuses)
-    set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })
+    // Restore the unread map against the friends that actually still exist, then
+    // push the OS badge once — otherwise a restored backlog showed in the sidebar
+    // while the Dock stayed at 0 until the next message arrived (#27).
+    const chatUnread = pruneChatUnread(get().chatUnread, new Set(friends.map((f) => f.id)))
+    set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true, chatUnread })
 
     // Probe independently of mounted views, including while iroh starts up.
     // Each webview has its own store; successful probes feed the same presence input.
@@ -634,6 +673,10 @@ export const useStore = create<AppStore>((set, get) => ({
     // listen for live messages (from friends, and our own echoed sends).
     if (!isOverlay) {
       get().loadChats()
+      // Re-assert the Dock/taskbar badge from the RESTORED counts. Without this a
+      // backlog showed in the sidebar while the Dock sat at 0 until the next
+      // message, and a badge cleared before quitting came back at 0 too late (#27).
+      saveChatUnread(get().chatUnread)
       // macOS: warn if we're running translocated / from Downloads (folder perms
       // won't stick). Null on a proper install or other platforms.
       api
@@ -1104,11 +1147,11 @@ export const useStore = create<AppStore>((set, get) => ({
     set((s) => ({
       friends, chatOverview,
       chats: Object.fromEntries(Object.entries(s.chats).filter(([id]) => ids.has(id))),
-      chatUnread: Object.fromEntries(Object.entries(s.chatUnread).filter(([id]) => ids.has(id))),
+      chatUnread: pruneChatUnread(s.chatUnread, ids),
       activeChatId: s.activeChatId && ids.has(s.activeChatId) ? s.activeChatId : null,
     }))
     void api.setActiveChat(get().activeChatId)
-    void api.setUnreadBadge(Object.values(get().chatUnread).reduce((a, b) => a + b, 0))
+    saveChatUnread(get().chatUnread)
     for (const f of friends) void get().probeFriend(f.id).catch(() => {})
   },
 
@@ -1180,12 +1223,17 @@ export const useStore = create<AppStore>((set, get) => ({
   // the read-receipts privacy toggle on the Rust side).
   markChatRead: (friendId) => {
     const s = get()
-    if (!s.windowFocused || s.view !== 'chat' || s.activeChatId !== friendId) return
-    if ((s.chatUnread[friendId] ?? 0) > 0) {
-      const chatUnread = { ...s.chatUnread, [friendId]: 0 }
-      set({ chatUnread })
-      void api.setUnreadBadge(Object.values(chatUnread).reduce((a, b) => a + b, 0))
+    // Two different questions, so two different gates (#27). CLEARING THE LOCAL
+    // BADGE only needs you to have explicitly opened this thread — the old shared
+    // guard also required window focus, so opening a conversation while the webview
+    // wasn't reporting focus (a focus event the OS swallowed, a detached/menu-bar
+    // window, a restored session) left "17 new" stuck forever.
+    if (s.view === 'chat' && s.activeChatId === friendId && (s.chatUnread[friendId] ?? 0) > 0) {
+      set({ chatUnread: saveChatUnread({ ...s.chatUnread, [friendId]: 0 }) })
     }
+    // TELLING THE FRIEND "I read it" keeps the stricter gate: a read receipt must
+    // mean the thread was genuinely on screen in a focused window.
+    if (!s.windowFocused || s.view !== 'chat' || s.activeChatId !== friendId) return
     const thread = s.chats[friendId] ?? []
     const newest = thread.reduce((ts, m) => m.fromMe ? ts : Math.max(ts, m.ts), 0)
     if (newest > 0) void api.sendReadReceipt(friendId, newest)
@@ -1329,10 +1377,7 @@ export const useStore = create<AppStore>((set, get) => ({
       } else if (inOpenThread && (s.chatUnread[m.peerId] ?? 0) > 0) {
         chatUnread = { ...s.chatUnread, [m.peerId]: 0 }
       }
-      if (chatUnread !== s.chatUnread) {
-        const total = Object.values(chatUnread).reduce((a, b) => a + b, 0)
-        void api.setUnreadBadge(total)
-      }
+      if (chatUnread !== s.chatUnread) saveChatUnread(chatUnread)
       return { chats: { ...s.chats, [m.peerId]: nextThread }, chatOverview, chatUnread }
     })
   },

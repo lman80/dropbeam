@@ -55,6 +55,9 @@ export interface FileIntegrity {
 export interface TransferUpdate {
   locationSkipped?: number | null
   locationConflicts?: number | null
+  /** On the FIRST update of an incoming Location upload: which hosted folder it
+   *  is landing in. Later progress updates omit it, so consumers remember it. */
+  locationId?: string | null
   integrity?: FileIntegrity[]
   chatTransfer?: {
     id: string
@@ -685,11 +688,16 @@ export function isActive(state: TransferState): boolean {
 export interface LocationRights { upload: boolean; manage: boolean }
 export interface HostedLocation { id: string; name: string; path: string; friendIds: string[]; rights: LocationRights; byteCap?: number; device?: number; marker?: string; safePublish?: string }
 export interface SharedLocation { id: string; name: string; rights: LocationRights }
+/** Who last used a folder THIS device hosts — the gateway card's "last activity". */
+export interface LocationLastActivity { at: number; friendId: string; direction: string; bytes: number }
+/** Live state of a folder this device hosts: mount reachable, room left, marker intact. */
+export interface HostedLocationStatus { id: string; reachable: boolean; freeBytes: number; markerOk: boolean; error: string | null; lastActivity: LocationLastActivity | null }
 export interface LocationEntry { name: string; isDir: boolean; size: number; modified: number }
 export interface LocationPage { entries: LocationEntry[]; page?: number; hasMore: boolean; cursor?: string; nextCursor?: string; total?: number }
 export const locationsApi = {
   activity: () => HAS_TAURI ? invoke<LocationActivity[]>('location_activity') : Promise.resolve([]),
   listHosted: () => HAS_TAURI ? invoke<HostedLocation[]>('list_locations') : Promise.resolve([]),
+  hostedStatus: (id: string) => invoke<HostedLocationStatus>('hosted_location_status', { id }),
   save: (location: HostedLocation) => invoke<HostedLocation[]>('save_location', { location, removeId: null }),
   remove: (removeId: string) => invoke<HostedLocation[]>('save_location', { location: null, removeId }),
   request: <T,>(friendId: string, request: Record<string, unknown>) => invoke<T>('location_request', { friendId, request }),

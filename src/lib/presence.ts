@@ -65,3 +65,47 @@ export function presenceLabel(p: Presence): string {
   const days = Math.floor(hrs / 24)
   return `Last seen ${days}d ago`
 }
+
+/**
+ * Presence recovery (#34). Nothing used to re-check a friend who had gone quiet:
+ * the control beacon backs off to 60/120/300 s and a friend who came back could
+ * read as "offline" until the app was restarted. Any view that shows presence
+ * claims a check when it OPENS, and the friend is actively pinged.
+ *
+ * The cooldown is the safety rail: opening Friends, the Send sheet and Locations
+ * in quick succession must not turn into a dial storm, and a friend who really
+ * is offline must not be re-dialled on every render.
+ */
+const RECHECK_COOLDOWN_MS = 20_000
+const checkedAt = new Map<string, number>()
+
+/**
+ * Friend ids worth actively pinging right now — those with a device address
+ * that don't already read as online and haven't been checked in the cooldown.
+ * Claiming STAMPS them, so two views opening together only ping once.
+ */
+export function claimPresenceChecks(
+  friends: readonly { id: string; name: string; endpointId?: string | null }[],
+  friendSeen: Record<string, number>,
+  folderStatuses: Record<string, FolderStatus>,
+  now: number = Date.now(),
+): string[] {
+  const due: string[] = []
+  for (const f of friends) {
+    if (!f.endpointId) continue // paired pre-Direct-mode: there's nothing to dial
+    if (friendPresence(f.name, friendSeen, folderStatuses).status === 'online') continue
+    if (now - (checkedAt.get(f.id) ?? -Infinity) < RECHECK_COOLDOWN_MS) continue
+    checkedAt.set(f.id, now)
+    due.push(f.id)
+  }
+  // A friend who was removed must not keep a slot in the cooldown map forever
+  // (and re-adding them should be checkable at once). Callers always pass the
+  // whole friend list, so anything not in it is gone.
+  for (const id of [...checkedAt.keys()]) if (!friends.some((f) => f.id === id)) checkedAt.delete(id)
+  return due
+}
+
+/** Test seam: forget every cooldown stamp. */
+export function resetPresenceChecks(): void {
+  checkedAt.clear()
+}

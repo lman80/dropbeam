@@ -162,11 +162,22 @@ pub async fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
         app.run_on_main_thread(move || {
             use objc2_app_kit::{NSModalResponseOK, NSModalResponseCancel, NSOpenPanel, NSWindow};
             use objc2_foundation::MainThreadMarker;
-            let Some(mtm) = MainThreadMarker::new() else {
+            let Some(_mtm) = MainThreadMarker::new() else {
                 let _ = tx.send(Err("Picker requires the main thread".to_string()));
                 return;
             };
-            let panel = NSOpenPanel::openPanel(mtm);
+            // `NSOpenPanel::openPanel(mtm)` PANICS ("unexpected NULL returned
+            // from +[NSOpenPanel openPanel]") when AppKit declines to vend a
+            // panel — it has done so in the wild when the app is mid-launch or
+            // the window server connection isn't ready. A panic here unwinds
+            // through the Objective-C main-thread dispatch and takes the app
+            // down, so send the message ourselves and treat nil as an error.
+            let panel: Option<objc2::rc::Retained<NSOpenPanel>> =
+                unsafe { objc2::msg_send![objc2::class!(NSOpenPanel), openPanel] };
+            let Some(panel) = panel else {
+                let _ = tx.send(Err("The file picker could not be opened. Try again in a moment.".to_string()));
+                return;
+            };
             panel.setCanChooseFiles(true);
             panel.setCanChooseDirectories(true);
             panel.setAllowsMultipleSelection(true);
@@ -1878,6 +1889,15 @@ pub fn location_activity(state: State<'_, Arc<AppState>>) -> Vec<serde_json::Val
 pub async fn list_locations(state: State<'_, Arc<AppState>>) -> Result<Vec<crate::locations::Location>, String> {
     let config = state.config_dir.clone();
     tokio::task::spawn_blocking(move || crate::locations::hosted(&config)).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))
+}
+/// Live state of ONE folder this device hosts, for the "Shared from this device"
+/// gateway card: is the path reachable, is the mount marker still ours, how much
+/// room is left, and who last used it. Cheap enough to poll every 30 s.
+#[tauri::command]
+pub async fn hosted_location_status(state: State<'_, Arc<AppState>>, id: String) -> Result<crate::locations::HostedStatus, String> {
+    let config = state.config_dir.clone();
+    tokio::task::spawn_blocking(move || crate::locations::hosted_status(&config, &id))
+        .await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))
 }
 #[tauri::command]
 pub async fn save_location(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
