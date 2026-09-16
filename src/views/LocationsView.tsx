@@ -6,6 +6,7 @@ import { incomingByLocation, trackLocationTransfers } from '../lib/hostedLocatio
 import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/presence'
 import { useStore } from '../store'
 import { FileBrowser } from '../components/FileBrowser'
+import { SyncFolderToolbar, SyncedFolders } from '../components/SyncedFolders'
 import '../components/locations.css'
 
 type SharedByFriend = Record<string, SharedLocation[]>
@@ -176,6 +177,8 @@ export function LocationsView() {
     {active ? <><button className="btn btn-ghost location-back" onClick={() => setActive(null)}><ArrowLeft size={16} />All locations</button>
       {friend && location ? <><div className="location-host-label"><HardDrive size={16} /><strong>{friend.name}</strong><span> / {location.name}</span><span className="location-grow" /><button className="btn btn-ghost" onClick={() => setView('send')}>Send & Receive<ArrowRight size={14} /></button></div>
         <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} online={presenceLabel(friendPresence(friend.name, seen, statuses))} /></> : <div className="card location-empty-small">This location is no longer shared with this device.</div>}</> : <>
+      <SyncedFolders shared={shared} />
+      {!!count && <SyncFolderToolbar />}
       {!count && <div className="card location-empty"><HardDrive size={46} strokeWidth={1.1} /><h2>{busy ? 'Looking for shared locations…' : 'A place for everything'}</h2><p>When a friend shares a folder with this device, it appears here.<br/>To share your NAS or a local folder, add it in Settings → Locations.</p><button className="btn btn-primary" onClick={() => setView('settings')}>Set up a location<ArrowRight size={15} /></button></div>}
       <div className="location-grid">{friends.flatMap(f => (shared[f.id] || []).map(l => {
         const presence = friendPresence(f.name, seen, statuses)

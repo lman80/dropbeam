@@ -1,3 +1,4 @@
+mod location_sync;
 mod locations;
 mod chat;
 mod commands;
@@ -120,7 +121,7 @@ fn spawn_upload_queue_consumer(app: tauri::AppHandle, config_dir: PathBuf) {
                 use tauri::Manager;
                 let state = app.state::<Arc<AppState>>().inner().clone();
                 let iroh = app.state::<Arc<iroh_net::IrohState>>().inner().clone();
-                match commands::start_location_upload(app.clone(), state, iroh, friend, target, paths.clone()).await {
+                match commands::start_location_upload(app.clone(), state, iroh, friend, target, paths.clone(), false).await {
                     Ok(t) => log::info!("upload-queue: started {} ({} path(s))", t.id, paths.len()),
                     Err(e) => log::warn!("upload-queue: refused {:?}: {e}", paths),
                 }
@@ -257,7 +258,7 @@ pub fn run() {
                 let state = app.state::<Arc<AppState>>().inner().clone();
                 let iroh = app.state::<Arc<iroh_net::IrohState>>().inner().clone();
                 let (friend, target, paths) = req;
-                match commands::start_location_upload(app.clone(), state, iroh, friend, target, paths).await {
+                match commands::start_location_upload(app.clone(), state, iroh, friend, target, paths, false).await {
                     Ok(t) => log::info!("launch-arg location upload started: {}", t.id),
                     Err(e) => log::warn!("launch-arg location upload refused: {e}"),
                 }
@@ -512,6 +513,10 @@ pub fn run() {
             let iroh_state = Arc::new(iroh_net::IrohState::default());
             locations::spawn_gc(config_dir.clone());
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
+            // Synced folders: a local folder this device keeps copied into a
+            // friend's Location. Starts its own reconcile a few seconds in, once
+            // iroh has had a chance to bind.
+            location_sync::start(app.handle().clone(), config_dir.clone(), iroh_state.clone());
             // Keep retrying undelivered chat messages until they land (reliable chat).
             iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
             // Background diagnostics: periodically upload a REDACTED error/perf digest
@@ -719,6 +724,12 @@ pub fn run() {
             commands::save_location,
             commands::location_request,
             commands::upload_to_location,
+            location_sync::list_synced_folders,
+            location_sync::synced_folder_statuses,
+            location_sync::add_synced_folder,
+            location_sync::update_synced_folder,
+            location_sync::remove_synced_folder,
+            location_sync::sync_folder_now,
             commands::verify_transfer,
             commands::cancel_verify,
             commands::iroh_node_id,

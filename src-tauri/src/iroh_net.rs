@@ -1987,7 +1987,7 @@ async fn serve_stream_inner(
                     let skipped = snapshot.skipped.clone();
                     if paths.is_empty() { return Ok(serde_json::json!({"transferId": null, "skipped": skipped})); }
                     let update = send_location_to_friend(app, shared, friend.name, who, paths,
-                        LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot) })
+                        LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot), replace_existing: false })
                         .map_err(anyhow::Error::msg)?;
                     return Ok(serde_json::json!({"transferId": update.id, "skipped": skipped}));
                 }
@@ -4078,6 +4078,11 @@ pub struct LocationSend {
     pub target: Option<crate::locations::Target>,
     pub transfer_id: String,
     pub snapshot: Option<crate::locations::Snapshot>,
+    /// Publish a CHANGED file at its own name (the host moves the version it
+    /// already has to the location's trash) instead of landing it beside the
+    /// old one as "name (2)". Synced folders set this; a one-off upload never
+    /// does, so a manual push can't quietly overwrite someone else's file.
+    pub replace_existing: bool,
 }
 pub fn send_location_to_friend(app: AppHandle, state: Arc<IrohState>, friend_name: String,
     endpoint_id: String, paths: Vec<String>, location: LocationSend) -> Result<TransferUpdate, String> {
@@ -7738,6 +7743,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     if let Some(location) = location {
         header["locations_v"] = serde_json::json!(crate::locations::VERSION);
         header["location_transfer"] = serde_json::json!(location.transfer_id);
+        header["replace_existing"] = serde_json::json!(location.replace_existing);
         if let Some(target) = &location.target { header["location"] = serde_json::to_value(target)?; }
         else { header["location_download"] = serde_json::json!(true); }
         header["location_hash_v"] = serde_json::json!(2);
@@ -12713,7 +12719,7 @@ mod location_loopback_tests {
             let mut batch = LocationBatch { items, dirs, next_file:0, dirs_pending:true };
             let options = LocationSend { target:Some(crate::locations::Target {
                 location_id:"nas".into(), rel_path:"".into() }),
-                transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None };
+                transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false };
             let recovery = std::sync::Mutex::new(RelayRecovery {
                 forced_locality:Some(crate::models::Locality::Internet), ..Default::default()
             });
@@ -12789,7 +12795,7 @@ mod location_loopback_tests {
         let mut batch = LocationBatch { items, dirs, next_file: 0, dirs_pending: true };
         let options = LocationSend { target: Some(crate::locations::Target {
             location_id: "family".into(), rel_path: "".into() }),
-            transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None };
+            transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: false };
         let sent = tokio::time::timeout(Duration::from_secs(60), batch.send_attempt(
             &conn, &options, &AtomicBool::new(false), "Mac", &AtomicBool::new(false),
             &AtomicU64::new(0), None, |_, _| {}, |_| {}, |_| {}, || Ok(()))).await.unwrap().unwrap();
@@ -12832,7 +12838,7 @@ mod location_loopback_tests {
         let list = rpc(&conn, serde_json::json!({"kind":"locations.list","locations_v":1})).await;
         assert_eq!(list["data"][0]["name"], "Family NAS"); assert!(list["data"][0].get("path").is_none());
         let source = base.join("旅行.txt"); std::fs::write(&source, b"loopback NAS bytes").unwrap();
-        let options = LocationSend { target:Some(crate::locations::Target { location_id:"family".into(), rel_path:"".into() }), transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None };
+        let options = LocationSend { target:Some(crate::locations::Target { location_id:"family".into(), rel_path:"".into() }), transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false };
         let total = send_files_linked(&conn, &[source.clone()], &AtomicBool::new(false), |_, _| {}, "Mac", &AtomicBool::new(false), &AtomicU64::new(0), None, None, Some(&options)).await.unwrap();
         assert_eq!(total, 18); assert_eq!(std::fs::read(nas.join("旅行.txt")).unwrap(), b"loopback NAS bytes");
         let ls = rpc(&conn, serde_json::json!({"kind":"locations.ls","locations_v":1,"id":"family","rel_path":"","page":0})).await;

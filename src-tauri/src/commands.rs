@@ -1939,14 +1939,18 @@ pub fn cancel_verify(iroh: State<'_, Arc<crate::iroh_net::IrohState>>, id: Strin
 #[tauri::command]
 pub async fn upload_to_location(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     friend_id: String, target: crate::locations::Target, paths: Vec<String>) -> Result<TransferUpdate, String> {
-    start_location_upload(app, state.inner().clone(), iroh.inner().clone(), friend_id, target, paths).await
+    start_location_upload(app, state.inner().clone(), iroh.inner().clone(), friend_id, target, paths, false).await
 }
 
 /// Shared by the UI command and the `--location-upload` launch argument (a
 /// second launch forwards its arguments to the running app, so a script can
 /// queue an upload without the GUI).
+/// `replace_existing` is the SYNCED-FOLDER contract: a changed file is published
+/// at its own name (the host moves the copy it already has to the location's
+/// trash) instead of landing beside it as "name (2)". A manual upload passes
+/// false, so it can never quietly overwrite what someone else put there.
 pub async fn start_location_upload(app: AppHandle, state: Arc<AppState>, iroh: Arc<crate::iroh_net::IrohState>,
-    friend_id: String, target: crate::locations::Target, paths: Vec<String>) -> Result<TransferUpdate, String> {
+    friend_id: String, target: crate::locations::Target, paths: Vec<String>, replace_existing: bool) -> Result<TransferUpdate, String> {
     if paths.is_empty() { return Err("No files selected".into()); }
     crate::locations::relative(&target.rel_path).map_err(|e| e.to_string())?;
     let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found")?;
@@ -1958,5 +1962,5 @@ pub async fn start_location_upload(app: AppHandle, state: Arc<AppState>, iroh: A
         return Err("This location is not shared with upload permission".into());
     }
     crate::iroh_net::send_location_to_friend(app, iroh, friend.name, endpoint, paths,
-        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None })
+        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing })
 }
