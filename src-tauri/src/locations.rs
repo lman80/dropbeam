@@ -1976,6 +1976,8 @@ mod tests {
         save(&f.config, None, Some("nas")).unwrap();
         record_activity(&f.config, "nas", &f.friend, "upload", 1);
         assert!(load_last_activity(&f.config).is_empty(), "stopping a location drops its row");
+    }
+
     /// `locations.verify` on the host: hash the copies it holds, refuse the same
     /// things `locations.stat` refuses, and never follow a symlink off the root.
     #[cfg(unix)]
