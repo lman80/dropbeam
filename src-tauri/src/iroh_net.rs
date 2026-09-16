@@ -7763,6 +7763,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     if let Some(location) = location {
         header["locations_v"] = serde_json::json!(crate::locations::VERSION);
         header["location_transfer"] = serde_json::json!(location.transfer_id);
+        header["replace_existing"] = serde_json::json!(location.replace_existing);
         if let Some(target) = &location.target { header["location"] = serde_json::to_value(target)?; }
         else { header["location_download"] = serde_json::json!(true); }
         header["location_hash_v"] = serde_json::json!(2);

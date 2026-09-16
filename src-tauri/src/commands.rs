@@ -1947,6 +1947,10 @@ pub async fn upload_to_location(app: AppHandle, state: State<'_, Arc<AppState>>,
 /// Shared by the UI command and the `--location-upload` launch argument (a
 /// second launch forwards its arguments to the running app, so a script can
 /// queue an upload without the GUI).
+/// `replace_existing` is the SYNCED-FOLDER contract: a changed file is published
+/// at its own name (the host moves the copy it already has to the location's
+/// trash) instead of landing beside it as "name (2)". A manual upload passes
+/// false, so it can never quietly overwrite what someone else put there.
 pub async fn start_location_upload(app: AppHandle, state: Arc<AppState>, iroh: Arc<crate::iroh_net::IrohState>,
     friend_id: String, target: crate::locations::Target, paths: Vec<String>) -> Result<TransferUpdate, String> {
     start_location_upload_replacing(app, state, iroh, friend_id, target, paths, false).await

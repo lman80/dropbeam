@@ -4,7 +4,7 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { mockApi, mockListen } from './mock'
+import { mockApi, mockListen, mockSharedLocations, mockSyncedFolders } from './mock'
 import { normalizeSharedLocations } from './normalize'
 
 /** True when running inside the real Tauri app (vs. a plain browser preview). */
@@ -737,12 +737,59 @@ export const locationsApi = {
   request: <T,>(friendId: string, request: Record<string, unknown>) => invoke<T>('location_request', { friendId, request }),
   list: (friendId: string) => HAS_TAURI
     ? invoke<unknown[]>('location_request', { friendId, request: { kind: 'locations.list' } }).then(normalizeSharedLocations)
-    : Promise.resolve([]),
+    : mockSharedLocations(friendId),
   /** The wizard's first step: NAS shares and external disks this device can see. */
   mountCandidates: () => HAS_TAURI ? invoke<MountCandidate[]>('list_mount_candidates') : Promise.resolve([]),
   upload: (friendId: string, locationId: string, relPath: string, paths: string[], replaceExisting = false) =>
     invoke<TransferUpdate>('upload_to_location', { friendId, target: { location_id: locationId, rel_path: relPath }, paths, replaceExisting }),
 }
+
+// ── Synced folders: a folder on THIS device copied into a friend's location ──
+/** What the last check did, in words the card can show as-is. */
+export interface SyncedFolderResult { ok: boolean; message: string }
+export interface SyncedFolder {
+  id: string
+  friendId: string
+  locationId: string
+  /** Folder INSIDE the location the files land in ('' = its top level). */
+  relPath: string
+  localPath: string
+  enabled: boolean
+  /** Off by default: deleting a file here leaves the copy on the NAS alone. */
+  deleteRemote: boolean
+  createdAt: number
+  lastCheckAt: number
+  lastResult: SyncedFolderResult | null
+}
+export type SyncedFolderState = 'idle' | 'scanning' | 'uploading' | 'waiting' | 'paused' | 'error'
+export interface SyncedFolderStatus {
+  id: string
+  state: SyncedFolderState
+  pendingFiles: number
+  lastCheckAt: number
+  message: string
+  transferId: string | null
+}
+export const syncedFoldersApi = {
+  list: () => HAS_TAURI ? invoke<SyncedFolder[]>('list_synced_folders') : mockSyncedFolders.list(),
+  statuses: () => HAS_TAURI ? invoke<Record<string, SyncedFolderStatus>>('synced_folder_statuses') : mockSyncedFolders.statuses(),
+  add: (friendId: string, locationId: string, relPath: string, localPath: string, deleteRemote: boolean) =>
+    HAS_TAURI
+      ? invoke<SyncedFolder[]>('add_synced_folder', { friendId, locationId, relPath, localPath, deleteRemote })
+      : mockSyncedFolders.add(friendId, locationId, relPath, localPath, deleteRemote),
+  update: (id: string, changes: { enabled?: boolean; deleteRemote?: boolean }) =>
+    HAS_TAURI
+      ? invoke<SyncedFolder[]>('update_synced_folder', { id, enabled: changes.enabled ?? null, deleteRemote: changes.deleteRemote ?? null })
+      : mockSyncedFolders.update(id, changes),
+  /** Stops copying. Never touches the local folder or anything already on the NAS. */
+  remove: (id: string) => HAS_TAURI ? invoke<SyncedFolder[]>('remove_synced_folder', { id }) : mockSyncedFolders.remove(id),
+  syncNow: (id: string) => HAS_TAURI ? invoke<void>('sync_folder_now', { id }) : mockSyncedFolders.syncNow(id),
+}
+export function onSyncedFolderStatus(cb: (s: SyncedFolderStatus) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('location-sync://status', (p) => cb(p as SyncedFolderStatus))
+  return listen<SyncedFolderStatus>('location-sync://status', (e) => cb(e.payload))
+}
+
 export interface LocationActivity { friendId: string; locationId: string; operation: string; item: string; to?: string; at: number }
 export function onLocationActivity(cb: (activity: LocationActivity) => void): Promise<UnlistenFn> {
   return HAS_TAURI ? listen<LocationActivity>('locations://changed', e => { if (e.payload?.operation) cb(e.payload) }) : Promise.resolve(() => {})

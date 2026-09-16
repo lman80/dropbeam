@@ -17,6 +17,7 @@ import type {
   VerifyReport,
   VerifyResult,
 } from './api'
+import type { SyncedFolder as MockSyncedFolder, SyncedFolderStatus as MockSyncedFolderStatus } from './api'
 
 type Cb = (payload: unknown) => void
 const buses: Record<string, Set<Cb>> = {}
@@ -142,7 +143,7 @@ const folderHistory: Record<string, HistoryItem[]> = {
 }
 
 let friends: Friend[] = [
-  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true, endpointId: null, avatar: null },
+  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true, endpointId: 'mock-endpoint-alex', avatar: null },
   { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: Date.now() - 2 * 86400_000, autoAccept: false, endpointId: null, avatar: null },
 ]
 let friendCounter = 2
@@ -252,6 +253,69 @@ if (typeof window !== 'undefined') {
   const w = window as unknown as { __mockIncoming?: (m: boolean) => void; __mockSend?: (to?: string) => void }
   w.__mockIncoming = mockIncoming
   w.__mockSend = mockSend
+}
+
+// ── Synced folders (dev preview) ─────────────────────────────────────────────
+// Enough behaviour to exercise every card state: a healthy folder, one whose
+// host is asleep, and whatever the preview adds.
+let mockFolders: MockSyncedFolder[] = [
+  {
+    id: 'sf1', friendId: 'f1', locationId: 'loc1', relPath: 'Travel',
+    localPath: '/Users/you/Pictures/Travel', enabled: true, deleteRemote: false,
+    createdAt: Date.now() - 86_400_000, lastCheckAt: Date.now() - 120_000,
+    lastResult: { ok: true, message: 'Up to date' },
+  },
+  {
+    id: 'sf2', friendId: 'f1', locationId: 'loc1', relPath: '',
+    localPath: '/Users/you/Documents/Scans', enabled: false, deleteRemote: true,
+    createdAt: Date.now() - 400_000_000, lastCheckAt: Date.now() - 7_200_000,
+    lastResult: { ok: true, message: 'Up to date' },
+  },
+]
+let mockStatuses: Record<string, MockSyncedFolderStatus> = {
+  sf1: { id: 'sf1', state: 'idle', pendingFiles: 0, lastCheckAt: Date.now() - 120_000, message: 'Up to date', transferId: null },
+  sf2: { id: 'sf2', state: 'paused', pendingFiles: 0, lastCheckAt: Date.now() - 7_200_000, message: 'Paused — nothing is being copied', transferId: null },
+}
+function pushStatus(id: string, patch: Partial<MockSyncedFolderStatus>) {
+  const next = { ...mockStatuses[id], ...patch, id } as MockSyncedFolderStatus
+  mockStatuses = { ...mockStatuses, [id]: next }
+  emit('location-sync://status', next)
+}
+/** Folders "Alex" shares with this device, so the preview can exercise the picker. */
+export const mockSharedLocations = async (friendId: string) =>
+  friendId === 'f1'
+    ? [
+        { id: 'loc1', name: 'Buddy NAS', rights: { upload: true, manage: true } },
+        { id: 'loc2', name: 'Alex Photo Archive', rights: { upload: false, manage: false } },
+      ]
+    : []
+
+export const mockSyncedFolders = {
+  list: async (): Promise<MockSyncedFolder[]> => mockFolders,
+  statuses: async (): Promise<Record<string, MockSyncedFolderStatus>> => mockStatuses,
+  add: async (friendId: string, locationId: string, relPath: string, localPath: string, deleteRemote: boolean) => {
+    const id = `synced-${++counter}`
+    mockFolders = [...mockFolders, { id, friendId, locationId, relPath, localPath, enabled: true, deleteRemote, createdAt: Date.now(), lastCheckAt: 0, lastResult: null }]
+    pushStatus(id, { state: 'scanning', pendingFiles: 0, lastCheckAt: 0, message: 'Checking this folder…', transferId: null })
+    setTimeout(() => pushStatus(id, { state: 'uploading', pendingFiles: 12, message: 'Copying to Buddy NAS…' }), 900)
+    setTimeout(() => pushStatus(id, { state: 'idle', pendingFiles: 0, lastCheckAt: Date.now(), message: 'Up to date' }), 3200)
+    return mockFolders
+  },
+  update: async (id: string, changes: { enabled?: boolean; deleteRemote?: boolean }) => {
+    mockFolders = mockFolders.map((f) => (f.id === id ? { ...f, ...changes } : f))
+    if (changes.enabled === false) pushStatus(id, { state: 'paused', pendingFiles: 0, message: 'Paused — nothing is being copied' })
+    if (changes.enabled === true) pushStatus(id, { state: 'scanning', message: 'Checking this folder…' })
+    return mockFolders
+  },
+  remove: async (id: string) => {
+    mockFolders = mockFolders.filter((f) => f.id !== id)
+    return mockFolders
+  },
+  syncNow: async (id: string) => {
+    pushStatus(id, { state: 'scanning', message: 'Checking this folder…' })
+    setTimeout(() => pushStatus(id, { state: 'waiting', message: 'Waiting for Linux Box' }), 1200)
+    setTimeout(() => pushStatus(id, { state: 'idle', lastCheckAt: Date.now(), message: 'Up to date' }), 3600)
+  },
 }
 
 export const mockApi = {

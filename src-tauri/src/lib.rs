@@ -1,3 +1,4 @@
+mod location_sync;
 mod locations;
 mod chat;
 mod commands;
@@ -514,6 +515,10 @@ pub fn run() {
             let iroh_state = Arc::new(iroh_net::IrohState::default());
             locations::spawn_gc(config_dir.clone());
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
+            // Synced folders: a local folder this device keeps copied into a
+            // friend's Location. Starts its own reconcile a few seconds in, once
+            // iroh has had a chance to bind.
+            location_sync::start(app.handle().clone(), config_dir.clone(), iroh_state.clone());
             // Keep retrying undelivered chat messages until they land (reliable chat).
             iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
             // Background diagnostics: periodically upload a REDACTED error/perf digest
@@ -722,6 +727,12 @@ pub fn run() {
             commands::location_request,
             commands::upload_to_location,
             mounts::list_mount_candidates,
+            location_sync::list_synced_folders,
+            location_sync::synced_folder_statuses,
+            location_sync::add_synced_folder,
+            location_sync::update_synced_folder,
+            location_sync::remove_synced_folder,
+            location_sync::sync_folder_now,
             commands::verify_transfer,
             commands::cancel_verify,
             commands::iroh_node_id,
