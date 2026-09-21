@@ -97,8 +97,11 @@ fn device(st: &AppState, net: &IrohState) -> Result<LinkResult, String> {
 #[tauri::command]
 pub fn my_device_info(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>) -> Result<DeviceInfo, String> {
     let device = device(&state, &iroh)?;
-    let account_pub = hex::encode(account(&state.config_dir)?.public().as_bytes());
-    let linked_devices = friends::load(&state.config_dir).iter().filter(|f| f.account_pub.as_deref() == Some(&account_pub)).count();
+    // Never mint a key just to answer a query: a fresh device must stay unlinked
+    // until it either links a new device (link_device_send) or receives an offer,
+    // otherwise its own throwaway key would block adopting the real account.
+    let account_pub = { let _guard = ACCOUNT_LOCK.lock().unwrap(); read_key(&state.config_dir)?.map(|k| hex::encode(k.public().as_bytes())).unwrap_or_default() };
+    let linked_devices = if account_pub.is_empty() { 0 } else { friends::load(&state.config_dir).iter().filter(|f| f.account_pub.as_deref() == Some(&account_pub)).count() };
     Ok(DeviceInfo { device, account_pub, linked_devices })
 }
 #[tauri::command]
@@ -191,7 +194,14 @@ fn receive(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<Valu
     }
     let chats: HashMap<String, Vec<ChatMessage>> = serde_json::from_value(req["chats"].clone()).map_err(|_| "invalid chats")?;
     let _guard = ACCOUNT_LOCK.lock().unwrap();
-    if read_key(&st.config_dir)?.is_some_and(|old| old.to_bytes() != seed) && !friends::load(&st.config_dir).is_empty() { return Err("already linked to another account".into()); }
+    // Refuse only when this device already belongs to an account that other
+    // devices share; a key nobody else references is simply replaced.
+    if let Some(old) = read_key(&st.config_dir)? {
+        if old.to_bytes() != seed {
+            let old_pub = hex::encode(old.public().as_bytes());
+            if friends::load(&st.config_dir).iter().any(|f| f.account_pub.as_deref() == Some(&old_pub)) { return Err("already linked to another account".into()); }
+        }
+    }
     write_key(&st.config_dir, &key)?;
     for (f, avatar) in validated {
         let eid = f.endpoint_id.as_deref();
@@ -326,6 +336,8 @@ mod receive_tests {
     fn receiver_refuses_other_account_and_wrong_sender_without_overwrite() {
         let st = state(); let old = account(&st.config_dir).unwrap();
         friends::upsert_by_endpoint(&st.config_dir, "existing", "Existing");
+        // "Existing" is a device that shares this account, so the account is in use.
+        friends::set_device_info(&st.config_dir, "existing", Some("laptop"), Some(&hex::encode(old.public().as_bytes())));
         let key = iroh::SecretKey::generate(); let who = iroh::SecretKey::generate().public().to_string();
         let req = offer(&key, &who);
         assert_eq!(receive(&st, me(), &who, &req).unwrap_err(), "already linked to another account");
@@ -352,6 +364,19 @@ mod receive_tests {
         assert!(f.account_pub.is_none()); assert_eq!(f.device_kind.as_deref(), Some("tablet"));
         let msgs = chat::messages(&st.config_dir, &existing.id);
         assert_eq!(msgs.len(), 1); assert!(msgs[0].path.is_none()); assert_eq!(msgs[0].status.as_deref(), Some("read"));
+        std::fs::remove_dir_all(st.config_dir).unwrap();
+    }
+    #[test]
+    fn receiver_adopts_offer_when_its_own_key_is_unshared() {
+        // A device that minted a key nobody references (e.g. by opening Settings)
+        // must still be linkable: the offered account replaces the throwaway key.
+        let st = state(); let old = account(&st.config_dir).unwrap();
+        friends::upsert_by_endpoint(&st.config_dir, "someone", "Someone");
+        let key = iroh::SecretKey::generate(); let who = iroh::SecretKey::generate().public().to_string();
+        let req = offer(&key, &who);
+        assert_eq!(receive(&st, me(), &who, &req).unwrap()["kind"], "link-ok");
+        let now = read_key(&st.config_dir).unwrap().unwrap();
+        assert_eq!(now.to_bytes(), key.to_bytes()); assert_ne!(now.to_bytes(), old.to_bytes());
         std::fs::remove_dir_all(st.config_dir).unwrap();
     }
 }
