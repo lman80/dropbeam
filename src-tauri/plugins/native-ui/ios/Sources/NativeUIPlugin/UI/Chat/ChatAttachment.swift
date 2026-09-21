@@ -42,7 +42,7 @@ struct ChatAttachment: View {
                     HStack(spacing: 10) {
                         Image(systemName: Formatters.symbol(name)).font(.system(size: 28)).frame(width: 36, height: 44)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text((message.files?.count ?? 0) > 1 ? "\(message.files!.count) files" : name).font(.subheadline.weight(.semibold)).lineLimit(1).truncationMode(.middle)
+                            Text((message.files?.count ?? 0) > 1 ? "\(message.files?.count ?? 0) files" : name).font(.subheadline.weight(.semibold)).lineLimit(1).truncationMode(.middle)
                             Text("\(Formatters.bytes(message.bytes)) · \(status)").font(.caption).opacity(0.8).fixedSize(horizontal: false, vertical: true)
                         }
                         if active { progressRing }

@@ -18,3 +18,22 @@ export function changedSnapshots(previous: Map<string, string>, values: Record<s
     return [{ key, value: JSON.parse(json) as unknown }]
   })
 }
+
+/** Re-push authoritative native state only after Swift receives the reply. */
+export async function deliverNativeReply<T>(reply: T, deliver: (reply: T) => Promise<unknown>, resnapshot: () => void) {
+  await deliver(reply)
+  resnapshot()
+}
+
+/** Native UI must bypass api.pickPhotos/pickFiles, which open a web source chooser. */
+export async function pickNativeMedia(source: 'photos' | 'files', invoke: (command: string) => Promise<unknown>): Promise<string[]> {
+  const result = await invoke(source === 'photos' ? 'pick_photos' : 'plugin:native-ui|pick_files')
+  const paths = source === 'photos' ? result : (result as { paths?: unknown } | null)?.paths
+  if (!Array.isArray(paths) || !paths.every(path => typeof path === 'string')) throw new Error('The picker returned invalid file paths. Please try again.')
+  return paths
+}
+
+export function nativeAvatarPath(path: string): string {
+  if (!/\.(png|jpe?g|gif|webp|hei[cf]|avif|bmp|tiff?)$/i.test(path)) throw new Error('Choose a photo for your profile picture.')
+  return path
+}

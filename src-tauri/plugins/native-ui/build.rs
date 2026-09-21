@@ -1,4 +1,4 @@
-const COMMANDS: &[&str] = &["activate", "reply", "state", "event", "pick_folder"];
+const COMMANDS: &[&str] = &["activate", "reply", "state", "event", "pick_folder", "pick_files"];
 
 fn main() {
     // Direct `cargo check --target ...` does not get Xcode's deployment setting.

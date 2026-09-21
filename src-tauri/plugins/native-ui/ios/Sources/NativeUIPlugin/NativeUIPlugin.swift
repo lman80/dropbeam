@@ -5,6 +5,7 @@ import Tauri
 
 class NativeUIPlugin: Plugin {
     private weak var webview: WKWebView?
+    private static var feedbackStarted = false
     private var host: UIHostingController<AnyView>?
 
     override func load(webview: WKWebView) { self.webview = webview }
@@ -31,10 +32,32 @@ class NativeUIPlugin: Plugin {
                 host.didMove(toParent: root)
                 self.host = host
             }
+            webview.resignFirstResponder()
+            webview.scrollView.isScrollEnabled = false
             webview.alpha = 0
             webview.isUserInteractionEnabled = false
             webview.accessibilityElementsHidden = true
+            if !Self.feedbackStarted {
+                Self.feedbackStarted = true
+                SuperFeedback.configure(.init(
+                    backendURL: URL(string: "https://superfeedback.ashton-mcp-worker.workers.dev")!,
+                    repo: "lman80/dropbeam", app: "DropBeam", trigger: .floating,
+                    position: .rightCenter, captureLogs: false, captureCrashes: true,
+                    meta: ["version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+                           "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""]
+                ))
+                SuperFeedback.setContext(["screen": Bridge.shared.selectedTab])
+                SuperFeedback.start()
+            }
             invoke.resolve()
+        }
+    }
+    @objc func pickFiles(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            Task { @MainActor in
+                do { let paths = try await NativeFolderPicker.shared.pickFiles(); invoke.resolve(["paths": paths]) }
+                catch { invoke.reject(error.localizedDescription) }
+            }
         }
     }
     @objc func pickFolder(_ invoke: Invoke) {

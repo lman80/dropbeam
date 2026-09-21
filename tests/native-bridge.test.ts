@@ -30,3 +30,54 @@ test('concurrent native calls keep their original IDs when replies finish out of
   finish('first')
   assert.deepEqual(await slow, { id: 7, ok: true, value: 'first' })
 })
+
+
+test('picker resnapshot waits for native reply and preserves staged files after resume', async () => {
+  const { deliverNativeReply } = await import('../src/lib/nativeBridgeProtocol.ts')
+  const events: string[] = []
+  let complete!: () => void
+  const delivery = new Promise<void>(resolve => { complete = resolve })
+  const state = { chatDraftFiles: [] as string[] }
+  const pending = deliverNativeReply({ id: 1, ok: true, value: ['/photo.heic'] }, async () => {
+    events.push('reply'); await delivery
+  }, () => { events.push('snapshot'); assert.deepEqual(state.chatDraftFiles, ['/photo.heic']) })
+  assert.deepEqual(events, ['reply'])
+  state.chatDraftFiles = ['/photo.heic']
+  complete(); await pending
+  assert.deepEqual(events, ['reply', 'snapshot'])
+})
+
+test('a lost picker reply does not run post-reply work', async () => {
+  const { deliverNativeReply } = await import('../src/lib/nativeBridgeProtocol.ts')
+  let pushed = false
+  await assert.rejects(deliverNativeReply(null, async () => { throw new Error('webview closed') }, () => { pushed = true }))
+  assert.equal(pushed, false)
+})
+
+
+test('native media routing invokes Photos and Files directly without a hidden web chooser', async () => {
+  const { pickNativeMedia } = await import('../src/lib/nativeBridgeProtocol.ts')
+  const commands: string[] = []
+  const invoke = async (command: string) => {
+    commands.push(command)
+    return command === 'pick_photos' ? ['/current.heic'] : { paths: ['/document.pdf'] }
+  }
+  assert.deepEqual(await pickNativeMedia('photos', invoke), ['/current.heic'])
+  assert.deepEqual(await pickNativeMedia('files', invoke), ['/document.pdf'])
+  assert.deepEqual(commands, ['pick_photos', 'plugin:native-ui|pick_files'])
+})
+
+test('native media cancellation, provider errors and malformed paths remain distinguishable', async () => {
+  const { pickNativeMedia } = await import('../src/lib/nativeBridgeProtocol.ts')
+  assert.deepEqual(await pickNativeMedia('photos', async () => []), [])
+  assert.deepEqual(await pickNativeMedia('files', async () => ({ paths: [] })), [])
+  await assert.rejects(pickNativeMedia('photos', async () => { throw new Error('iCloud download failed') }), /iCloud download failed/)
+  await assert.rejects(pickNativeMedia('files', async () => ({ paths: [42] })), /invalid file paths/)
+})
+
+
+test('native avatars preserve image formats and reject a selected video before updating the profile', async () => {
+  const { nativeAvatarPath } = await import('../src/lib/nativeBridgeProtocol.ts')
+  for (const path of ['/photo.HEIC', '/photo.heif', '/photo.png', '/photo.jpeg']) assert.equal(nativeAvatarPath(path), path)
+  for (const path of ['/video.mov', '/video.mp4', '/unknown.img']) assert.throws(() => nativeAvatarPath(path), /Choose a photo/)
+})

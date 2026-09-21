@@ -37,6 +37,13 @@ struct SettingsView: View {
                         Divider(); NavigationLink { DiagnosticsView() } label: { SettingsLinkLabel(title: "Diagnostics", symbol: "waveform.path.ecg") }
                         Divider(); NavigationLink { RecoverySettingsView() } label: { SettingsLinkLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath") }
                     }
+                    SettingsGroup(title: "Feedback") {
+                        SuperFeedbackSettingsToggle().frame(minHeight: 44)
+                        Divider()
+                        SuperFeedbackSettingsRow().frame(minHeight: 44)
+                        Divider()
+                        settingsButton("Send Feedback", symbol: "bubble.left.and.bubble.right") { SuperFeedback.present() }
+                    }
                     SettingsGroup(title: "About") { HStack { Text("Version"); Spacer(); Text(version.isEmpty ? "…" : version).foregroundStyle(.secondary) }.frame(minHeight: 44) }
                     Text("DropBeam · Direct, end-to-end encrypted transfers").font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
                 }.padding(20)
@@ -50,7 +57,7 @@ struct SettingsView: View {
     private var profile: some View {
         GlassCard {
             HStack(spacing: 18) {
-                Button { bridge.perform { try await bridge.action("setAvatar") } } label: { MyAvatar(size: 72) }.buttonStyle(.plain).accessibilityLabel("Change profile picture")
+                Button { bridge.perform { try await bridge.pickAvatar() } } label: { MyAvatar(size: 72) }.buttonStyle(.plain).accessibilityLabel("Change profile picture")
                 NavigationLink { ProfileView() } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 6) { Text(bridge.settings?.displayName ?? "Your Profile").font(.title2.bold()).foregroundStyle(.primary); Text("DropBeam code").font(.caption).foregroundStyle(.secondary) }
@@ -104,25 +111,30 @@ struct MyAvatar: View {
 struct ProfileView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var code = ""
+    @State private var codeError: String?
     @State private var name = ""
     @State private var editing = false
     var body: some View {
         ScrollView {
             VStack(spacing: 24) {
-                Button { bridge.perform { try await bridge.action("setAvatar") } } label: { MyAvatar(size: 112) }.buttonStyle(.plain).accessibilityLabel("Change profile picture")
+                Button { bridge.perform { try await bridge.pickAvatar() } } label: { MyAvatar(size: 112) }.buttonStyle(.plain).accessibilityLabel("Change profile picture")
                     .contextMenu { Button("Remove Picture", role: .destructive) { bridge.perform { try await bridge.action("clearAvatar") } } }
                 Button { name = bridge.settings?.displayName ?? ""; editing = true } label: { HStack { Text(bridge.settings?.displayName ?? "Your Name").font(.title2.bold()); Image(systemName: "pencil").font(.body) } }.frame(minHeight: 44)
                 GlassCard {
                     VStack(spacing: 20) {
                         Text("Your DropBeam code").font(.headline)
-                        if code.isEmpty { ProgressView() } else { InviteQRCode(code: code); Text(code).font(.caption.monospaced()).textSelection(.enabled) }
+                        if let codeError { Text(codeError).foregroundStyle(.secondary); Button("Try Again") { loadCode() } } else if code.isEmpty { ProgressView() } else { InviteQRCode(code: code); Text(code).font(.caption.monospaced()).textSelection(.enabled) }
                         ViewThatFits(in: .horizontal) { HStack(spacing: 12) { codeButtons }; VStack(spacing: 12) { codeButtons } }
                     }.frame(maxWidth: .infinity)
                 }
             }.padding(24)
         }.navigationTitle("Profile").navigationBarTitleDisplayMode(.inline).beamCanvas()
-            .task { bridge.perform { code = try await bridge.myInviteCode() } }
+            .task { loadCode() }
             .alert("Display Name", isPresented: $editing) { TextField("Name", text: $name); Button("Cancel", role: .cancel) {}; Button("Save") { bridge.perform { try await bridge.action("setDisplayName", ["name": name]) } }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
+    }
+    private func loadCode() {
+        codeError = nil
+        Task { do { code = try await bridge.myInviteCode() } catch { codeError = error.localizedDescription } }
     }
     @ViewBuilder private var codeButtons: some View {
         Button { UIPasteboard.general.string = code; Haptics.tap(); bridge.showToast("Code copied") } label: { Label("Copy Code", systemImage: "doc.on.doc").frame(minHeight: 44) }.beamButton().disabled(code.isEmpty)
@@ -228,26 +240,12 @@ struct DiagnosticsView: View {
                     Text("Extra network logs for reproducing issues. Close and reopen DropBeam to apply.").font(.footnote).foregroundStyle(.secondary)
                     Divider(); SettingToggle(title: "Share Background Diagnostics", key: "shareDiagnostics", value: bridge.settings?.shareDiagnostics)
                     Text("Sends a redacted error and performance summary about once a day. Never includes file names or contents.").font(.footnote).foregroundStyle(.secondary)
-                    if bridge.settings?.shareDiagnostics == true {
-                        Divider(); NavigationLink { TextSettingView(title: "Diagnostics Endpoint", key: "diagnosticsUrl", value: bridge.settings?.diagnosticsUrl ?? "", footer: "Leave blank for the built-in collector. Override only if you run your own. Use an https:// URL.") } label: { SettingsLinkLabel(title: "Diagnostics Endpoint", symbol: "network") }
-                        Button("Send Test") { test() }.beamButton().disabled(busy || invalidEndpoint)
-                    }
                     Divider(); Button("Export Logs") { busy = true; bridge.perform { defer { busy = false }; try await bridge.action("exportLogs") } }.beamButton().disabled(busy)
                     if let result { Text(result).font(.subheadline).textSelection(.enabled) }
-                }
-                SettingsGroup(title: "Lab Mode") {
-                    SettingToggle(title: "Enable Lab Mode", key: "labModeEnabled", value: bridge.settings?.labModeEnabled)
-                    Text("Allow one trusted developer device to run encrypted diagnostics. Only the operator ID below is accepted. Enable only when asked by the developer.").font(.footnote).foregroundStyle(.secondary)
-                    if bridge.settings?.labModeEnabled == true {
-                        Divider(); NavigationLink { TextSettingView(title: "Operator ID", key: "labOperatorId", value: bridge.settings?.labOperatorId ?? "", footer: "Only this device can run Lab Mode. Blank accepts no device.") } label: { SettingsLinkLabel(title: "Operator ID", symbol: "person.crop.circle.badge.checkmark") }
-                        Button("Copy This Device’s ID") { UIPasteboard.general.string = bridge.myDevice?.endpointId; Haptics.tap(); bridge.showToast("Device ID copied") }.beamButton().disabled(bridge.myDevice?.endpointId == nil)
-                    }
                 }
             }.padding(20)
         }.navigationTitle("Diagnostics").beamCanvas()
     }
-    private var invalidEndpoint: Bool { let url = bridge.settings?.diagnosticsUrl ?? ""; return !url.isEmpty && !url.hasPrefix("https://") }
-    private func test() { busy = true; bridge.perform { defer { busy = false }; result = try await bridge.call("diagnosticsTest") } }
 }
 struct ConnectionInfoView: View {
     @EnvironmentObject private var bridge: Bridge

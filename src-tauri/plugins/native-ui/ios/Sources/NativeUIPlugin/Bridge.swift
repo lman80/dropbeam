@@ -1,10 +1,23 @@
 import Foundation
 import Combine
 import WebKit
+import Network
 
 @MainActor
 final class Bridge: ObservableObject {
     static let shared = Bridge()
+    @Published var preparingMedia: String?
+    @Published var networkAvailable: Bool?
+    private let networkMonitor = NWPathMonitor()
+    private var mediaTask: Task<[String], Error>?
+    private var mediaToken: UUID?
+    private init() {
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            let available = path.status == .satisfied
+            Task { @MainActor in self?.networkAvailable = available }
+        }
+        networkMonitor.start(queue: DispatchQueue(label: "dropbeam.native.network"))
+    }
     @Published var history: [HistoryEntry] = []
     @Published var locations: [FriendLocations] = []
     @Published var needsName = false
@@ -32,7 +45,7 @@ final class Bridge: ObservableObject {
     }
     private var pending: [Int: Pending] = [:]
     private let decoder = JSONDecoder()
-    var unread: Int { chatUnread.values.reduce(0) { $0 + max(0, $1) } }
+    var unread: Int { chatUnread.values.reduce(0) { min(9999, $0 + min(9999, max(0, $1))) } }
     var sendTransfers: [Transfer] { transfers.filter { $0.chatOnly != true } }
 
     func call<T: Decodable>(_ name: String, _ args: [String: Any] = [:]) async throws -> T {
@@ -43,7 +56,9 @@ final class Bridge: ObservableObject {
         // interpolate user text or paths into executable JavaScript.
         let encoded = try JSONSerialization.data(withJSONObject: [id, name, args])
         let json = String(decoding: encoded, as: UTF8.self)
-        let data: Data = try await withCheckedThrowingContinuation { continuation in
+        let data: Data = try await withTaskCancellationHandler {
+          try Task.checkCancellation()
+          return try await withCheckedThrowingContinuation { continuation in
             let timeout = DispatchWorkItem { [weak self] in
                 self?.finish(id, .failure(self?.failure("This action timed out. Check its status before trying again.") ?? NSError(domain: "NativeUI", code: 1)))
             }
@@ -53,7 +68,11 @@ final class Bridge: ObservableObject {
             webview.evaluateJavaScript("window.__dbBridge.call(...\(json)); void 0") { [weak self] _, error in
                 if let error { self?.finish(id, .failure(error)) }
             }
+          }
+        } onCancel: {
+            Task { @MainActor in self.finish(id, .failure(CancellationError())) }
         }
+        try Task.checkCancellation()
         return try decoder.decode(T.self, from: data)
     }
     private func finish(_ id: Int, _ result: Result<Data, Error>) {
@@ -70,18 +89,18 @@ final class Bridge: ObservableObject {
     func update(key: String, value: Any) throws {
         let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
         switch key {
-        case "history": history = try decoder.decode([HistoryEntry].self, from: data)
-        case "locations": locations = try decoder.decode([FriendLocations].self, from: data)
+        case "history": history = try decoder.decode(LossyArray<HistoryEntry>.self, from: data).values
+        case "locations": locations = try decoder.decode(LossyArray<FriendLocations>.self, from: data).values
         case "needsName": needsName = try decoder.decode(Bool.self, from: data)
-        case "pendingSend": pendingSend = try decoder.decode([String].self, from: data)
-        case "friends": friends = try decoder.decode([Friend].self, from: data)
+        case "pendingSend": pendingSend = try decoder.decode(LossyArray<String>.self, from: data).values
+        case "friends": friends = try decoder.decode(LossyArray<Friend>.self, from: data).values
         case "myDevice": myDevice = try decoder.decode(MyDevice?.self, from: data)
-        case "transfers": transfers = try decoder.decode([Transfer].self, from: data)
+        case "transfers": transfers = try decoder.decode(LossyArray<Transfer>.self, from: data).values
         case "settings": settings = try decoder.decode(Settings?.self, from: data)
-        case "chatOverview": chatOverview = try decoder.decode([ChatOverview].self, from: data)
+        case "chatOverview": chatOverview = try decoder.decode(LossyArray<ChatOverview>.self, from: data).values
         case "chatUnread": chatUnread = try decoder.decode([String: Int].self, from: data)
         case "chatTyping": chatTyping = try decoder.decode([String: Bool].self, from: data)
-        case "chatDraftFiles": chatDraftFiles = try decoder.decode([String].self, from: data)
+        case "chatDraftFiles": chatDraftFiles = try decoder.decode(LossyArray<String>.self, from: data).values
         case "thread":
             if let thread = try decoder.decode(ChatThread?.self, from: data) { threads[thread.friendId] = thread.messages }
         case "presence": presence = try decoder.decode([String: Bool].self, from: data)
@@ -105,14 +124,23 @@ final class Bridge: ObservableObject {
     }
     func perform(_ action: @escaping @MainActor () async throws -> Void) {
         Haptics.tap()
-        Task { do { try await action() } catch { errorMessage = error.localizedDescription } }
+        Task {
+            do { try await action() }
+            catch is CancellationError {}
+            catch {
+                // A picker can report failure before its dismissal animation ends.
+                let reason = error.localizedDescription
+                try? await NativePresentation.waitForPickerDismissal()
+                errorMessage = reason
+            }
+        }
     }
     private func failure(_ message: String) -> NSError { NSError(domain: "DropBeam.NativeUI", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
     func action(_ name: String, _ args: [String: Any] = [:]) async throws {
         let _: IgnoredResult = try await call(name, args)
     }
     func pickAndSend(source: String, friendId: String? = nil) async throws {
-        let paths: [String] = try await call("pickFiles", ["source": source])
+        let paths = try await pickFiles(source: source)
         guard !paths.isEmpty else { return }
         try await NativePresentation.waitForPickerDismissal()
         if let friendId { try await sendToFriend(friendId: friendId, paths: paths) }
@@ -138,7 +166,42 @@ final class Bridge: ObservableObject {
         if let replyTo { args["replyTo"] = replyTo }
         try await action("sendChatText", args)
     }
-    func sendChatFiles(friendId: String, source: String) async throws { try await action("sendChatFiles", ["friendId": friendId, "source": source]) }
+    func sendChatFiles(friendId: String, source: String) async throws {
+        let paths = try await pickFiles(source: source)
+        guard !paths.isEmpty, chatPath.last == friendId else { return }
+        // Staging is a separate action AFTER the picker reply, including resume.
+        try await action("stageChatFiles", ["friendId": friendId, "paths": paths])
+    }
+    func pickFiles(source: String) async throws -> [String] {
+        guard mediaTask == nil else { throw failure("A selection is still finishing. Please try again in a moment.") }
+        let token = UUID(); mediaToken = token
+        preparingMedia = source == "photos" ? "Preparing photo…" : "Preparing files…"
+        let task = Task<[String], Error> {
+            try await NativePresentation.waitForPickerDismissal()
+            return try await call("pickFiles", ["source": source])
+        }
+        mediaTask = task
+        defer { if mediaToken == token { mediaTask = nil; preparingMedia = nil; mediaToken = nil } }
+        return try await task.value
+    }
+    func cancelMediaPreparation() {
+        mediaTask?.cancel()
+        preparingMedia = nil
+    }
+    func pickAvatar() async throws {
+        let paths = try await pickFiles(source: "photos")
+        guard let path = paths.first else { return }
+        try await action("setAvatar", ["path": path])
+    }
+    func browserUpload(_ args: [String: Any]) async throws {
+        var request = args
+        if let source = args["source"] as? String, source != "folder" {
+            let paths = try await pickFiles(source: source)
+            guard !paths.isEmpty else { return }
+            request["paths"] = paths
+        }
+        try await action("browserUpload", request)
+    }
     func removeChatDraftFile(path: String) async throws { try await action("removeChatDraftFile", ["path": path]) }
     func reactToMessage(friendId: String, messageId: String, emoji: String) async throws { try await action("reactToMessage", ["friendId": friendId, "messageId": messageId, "emoji": emoji]) }
     func editMessage(friendId: String, messageId: String, text: String) async throws { try await action("editMessage", ["friendId": friendId, "messageId": messageId, "text": text]) }

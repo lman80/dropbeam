@@ -1,3 +1,7 @@
+Beta review preparation (2026-09-21) is documented in [BETA-REVIEW.md](BETA-REVIEW.md), including validation, privacy audit, changed files and remaining device checks.
+
+Current picker protocol supersedes the historical `sendChatFiles` flow below: Swift awaits `pickFiles`, then calls `stageChatFiles({friendId, paths})`; native snapshots are re-pushed after replies and foregrounding. Photos invokes the Rust command directly, bypassing the web chooser. Files uses `plugin:native-ui|pick_files` (Swift `pickFiles`, result `{paths: string[]}`) with security-scoped coordinated imports. Swift owns cancellable preparation state. SuperFeedback is configured once during native activation with its floating right-center trigger and Settings controls.
+
 # Native iOS UI — phase 3
 
 SwiftUI now owns all five tabs and their workflows. The React MobileApp remains

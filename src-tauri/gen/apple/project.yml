@@ -64,8 +64,8 @@ targets:
         NSLocalNetworkUsageDescription: DropBeam looks for your other devices on this Wi-Fi network so files transfer directly between them, instead of going out over the internet.
         NSBonjourServices:
           - _irohv1._udp
-        NSPhotoLibraryUsageDescription: DropBeam needs access to your photos so you can send them to a friend or use one as your profile picture.
-        NSPhotoLibraryAddUsageDescription: DropBeam saves photos and videos your friends send you into your photo library.
+        NSCameraUsageDescription: DropBeam uses the camera to scan friend, device, and shared-folder QR codes.
+        NSPhotoLibraryAddUsageDescription: DropBeam saves photos you choose to keep from a chat to your library.
         # Received files land in the app's Documents dir; these two make that
         # directory visible in the Files app (On My iPhone -> DropBeam).
         UIFileSharingEnabled: true
@@ -79,6 +79,7 @@ targets:
         RUST_LOG: info
     settings:
       base:
+        TARGETED_DEVICE_FAMILY: "1"
         ENABLE_BITCODE: false
         ARCHS: [arm64]
         VALID_ARCHS: arm64 

@@ -80,7 +80,7 @@ struct ChatMessage: Decodable, Identifiable, Equatable {
     var fileXferId: String?
     var fileXferFailed: Bool?
     var date: Date { Date(timeIntervalSince1970: ts / 1000) }
-    var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? text! : files?.joined(separator: ", ") ?? "Attachment" }
+    var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? (text ?? "") : files?.joined(separator: ", ") ?? "Attachment" }
 }
 struct ChatReaction: Decodable, Equatable {
     var emoji: String?
@@ -224,4 +224,318 @@ struct FolderInvite: Decodable, Identifiable {
     let code: String
     let folderName: String
     let fromName: String
+}
+
+
+// Malformed optional values must not discard a whole screen. Required identity
+// keys still reject an individual record; collections skip only that record.
+private struct BridgeKey: CodingKey {
+    let stringValue: String
+    let intValue: Int? = nil
+    init(_ value: String) { stringValue = value }
+    init?(stringValue: String) { self.init(stringValue) }
+    init?(intValue: Int) { return nil }
+}
+struct LossyArray<Element: Decodable>: Decodable {
+    let values: [Element]
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var result: [Element] = []
+        while !container.isAtEnd {
+            let item = try container.superDecoder()
+            if let value = try? Element(from: item) { result.append(value) }
+        }
+        values = result
+    }
+}
+extension Friend {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Unknown"
+        self.endpointId = (try? c.decode(String.self, forKey: BridgeKey("endpointId")))
+        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar")))
+        self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
+        self.accountPub = (try? c.decode(String.self, forKey: BridgeKey("accountPub")))
+        self.autoAccept = (try? c.decode(Bool.self, forKey: BridgeKey("autoAccept")))
+    }
+}
+
+extension MyDevice {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name")))
+        self.endpointId = (try? c.decode(String.self, forKey: BridgeKey("endpointId")))
+        self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
+        self.accountPub = (try? c.decode(String.self, forKey: BridgeKey("accountPub")))
+        self.linkedDevices = (try? c.decode(Int.self, forKey: BridgeKey("linkedDevices")))
+    }
+}
+
+extension Transfer {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.direction = (try? c.decode(String.self, forKey: BridgeKey("direction")))
+        self.state = (try? c.decode(String.self, forKey: BridgeKey("state")))
+        self.fileNames = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("fileNames")))?.values
+        self.fileCount = (try? c.decode(Int.self, forKey: BridgeKey("fileCount")))
+        self.bytesTotal = (try? c.decode(Double.self, forKey: BridgeKey("bytesTotal"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.bytesDone = (try? c.decode(Double.self, forKey: BridgeKey("bytesDone"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.percent = (try? c.decode(Double.self, forKey: BridgeKey("percent"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.speedBps = (try? c.decode(Double.self, forKey: BridgeKey("speedBps"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.etaSeconds = (try? c.decode(Double.self, forKey: BridgeKey("etaSeconds"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.friendName = (try? c.decode(String.self, forKey: BridgeKey("friendName")))
+        self.peer = (try? c.decode(String.self, forKey: BridgeKey("peer")))
+        self.code = (try? c.decode(String.self, forKey: BridgeKey("code")))
+        self.error = (try? c.decode(String.self, forKey: BridgeKey("error")))
+        self.outDir = (try? c.decode(String.self, forKey: BridgeKey("outDir")))
+        self.locality = (try? c.decode(String.self, forKey: BridgeKey("locality")))
+        self.detail = (try? c.decode(String.self, forKey: BridgeKey("detail")))
+        self.sharePaths = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("sharePaths")))?.values
+        self.chatOnly = (try? c.decode(Bool.self, forKey: BridgeKey("chatOnly")))
+        self.chatTransfer = (try? c.decode(ChatTransferDetail.self, forKey: BridgeKey("chatTransfer")))
+    }
+}
+
+extension ChatTransferDetail {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = (try? c.decode(String.self, forKey: BridgeKey("id")))
+        self.completedPaths = (try? c.decode([String: String].self, forKey: BridgeKey("completedPaths")))
+    }
+}
+
+extension ChatMessage {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.peerId = try c.decode(String.self, forKey: BridgeKey("peerId"))
+        self.fromMe = (try? c.decode(Bool.self, forKey: BridgeKey("fromMe"))) ?? false
+        self.ts = (try? c.decode(Double.self, forKey: BridgeKey("ts"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil } ?? 0
+        self.kind = (try? c.decode(String.self, forKey: BridgeKey("kind")))
+        self.text = (try? c.decode(String.self, forKey: BridgeKey("text")))
+        self.files = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("files")))?.values
+        self.bytes = (try? c.decode(Double.self, forKey: BridgeKey("bytes"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.path = (try? c.decode(String.self, forKey: BridgeKey("path")))
+        self.status = (try? c.decode(String.self, forKey: BridgeKey("status")))
+        self.seq = (try? c.decode(Double.self, forKey: BridgeKey("seq"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.replyTo = (try? c.decode(String.self, forKey: BridgeKey("replyTo")))
+        self.replyPreview = (try? c.decode(String.self, forKey: BridgeKey("replyPreview")))
+        self.reactions = (try? c.decode(LossyArray<ChatReaction>.self, forKey: BridgeKey("reactions")))?.values
+        self.edited = (try? c.decode(Bool.self, forKey: BridgeKey("edited")))
+        self.deleted = (try? c.decode(Bool.self, forKey: BridgeKey("deleted")))
+        self.gif = (try? c.decode(ChatGif.self, forKey: BridgeKey("gif")))
+        self.fileXferId = (try? c.decode(String.self, forKey: BridgeKey("fileXferId")))
+        self.fileXferFailed = (try? c.decode(Bool.self, forKey: BridgeKey("fileXferFailed")))
+    }
+}
+
+extension ChatReaction {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.emoji = (try? c.decode(String.self, forKey: BridgeKey("emoji")))
+        self.fromMe = (try? c.decode(Bool.self, forKey: BridgeKey("fromMe")))
+    }
+}
+
+extension ChatGif {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.url = (try? c.decode(String.self, forKey: BridgeKey("url")))
+        self.w = (try? c.decode(Double.self, forKey: BridgeKey("w"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.h = (try? c.decode(Double.self, forKey: BridgeKey("h"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+    }
+}
+
+extension ChatThread {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.friendId = try c.decode(String.self, forKey: BridgeKey("friendId"))
+        self.messages = (try? c.decode(LossyArray<ChatMessage>.self, forKey: BridgeKey("messages")))?.values ?? []
+    }
+}
+
+extension GifResult {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.title = (try? c.decode(String.self, forKey: BridgeKey("title")))
+        self.thumbUrl = (try? c.decode(String.self, forKey: BridgeKey("thumbUrl")))
+    }
+}
+
+extension Settings {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.downloadDir = (try? c.decode(String.self, forKey: BridgeKey("downloadDir")))
+        self.displayName = (try? c.decode(String.self, forKey: BridgeKey("displayName")))
+        self.theme = (try? c.decode(String.self, forKey: BridgeKey("theme")))
+        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar")))
+        self.showMegabits = (try? c.decode(Bool.self, forKey: BridgeKey("showMegabits")))
+        self.playSounds = (try? c.decode(Bool.self, forKey: BridgeKey("playSounds")))
+        self.notifyOnComplete = (try? c.decode(Bool.self, forKey: BridgeKey("notifyOnComplete")))
+        self.notifyOnMessage = (try? c.decode(Bool.self, forKey: BridgeKey("notifyOnMessage")))
+        self.sendReadReceipts = (try? c.decode(Bool.self, forKey: BridgeKey("sendReadReceipts")))
+        self.directMode = (try? c.decode(Bool.self, forKey: BridgeKey("directMode")))
+        self.preferDirectP2p = (try? c.decode(Bool.self, forKey: BridgeKey("preferDirectP2p")))
+        self.requireDirect = (try? c.decode(Bool.self, forKey: BridgeKey("requireDirect")))
+        self.waitForDirect = (try? c.decode(Bool.self, forKey: BridgeKey("waitForDirect")))
+        self.parallelStreams = (try? c.decode(Bool.self, forKey: BridgeKey("parallelStreams")))
+        self.uploadLimitMbps = (try? c.decode(Double.self, forKey: BridgeKey("uploadLimitMbps"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.minimizeToTray = (try? c.decode(Bool.self, forKey: BridgeKey("minimizeToTray")))
+        self.launchAtLogin = (try? c.decode(Bool.self, forKey: BridgeKey("launchAtLogin")))
+        self.customRelay = (try? c.decode(String.self, forKey: BridgeKey("customRelay")))
+        self.customRelayPass = (try? c.decode(String.self, forKey: BridgeKey("customRelayPass")))
+        self.giphyApiKey = (try? c.decode(String.self, forKey: BridgeKey("giphyApiKey")))
+        self.verboseLogging = (try? c.decode(Bool.self, forKey: BridgeKey("verboseLogging")))
+        self.showSyncPopup = (try? c.decode(Bool.self, forKey: BridgeKey("showSyncPopup")))
+        self.shareDiagnostics = (try? c.decode(Bool.self, forKey: BridgeKey("shareDiagnostics")))
+        self.diagnosticsUrl = (try? c.decode(String.self, forKey: BridgeKey("diagnosticsUrl")))
+        self.labModeEnabled = (try? c.decode(Bool.self, forKey: BridgeKey("labModeEnabled")))
+        self.labOperatorId = (try? c.decode(String.self, forKey: BridgeKey("labOperatorId")))
+        self.folderHistoryKeepDays = (try? c.decode(Int.self, forKey: BridgeKey("folderHistoryKeepDays")))
+        self.folderHistoryBudgetBytes = (try? c.decode(Double.self, forKey: BridgeKey("folderHistoryBudgetBytes"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+    }
+}
+
+extension ChatOverview {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.peerId = (try? c.decode(String.self, forKey: BridgeKey("peerId")))
+        self.lastText = (try? c.decode(String.self, forKey: BridgeKey("lastText")))
+        self.lastTs = (try? c.decode(Double.self, forKey: BridgeKey("lastTs"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+        self.lastFromMe = (try? c.decode(Bool.self, forKey: BridgeKey("lastFromMe")))
+        self.count = (try? c.decode(Int.self, forKey: BridgeKey("count")))
+        self.unread = (try? c.decode(Int.self, forKey: BridgeKey("unread")))
+    }
+}
+
+extension ConnectionCheck {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.online = (try? c.decode(Bool.self, forKey: BridgeKey("online")))
+        self.path = (try? c.decode(String.self, forKey: BridgeKey("path")))
+        self.rttMs = (try? c.decode(Double.self, forKey: BridgeKey("rttMs"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+    }
+}
+
+extension LinkResult {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.endpointId = (try? c.decode(String.self, forKey: BridgeKey("endpointId")))
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name")))
+        self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
+    }
+}
+
+extension HistoryEntry {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.direction = (try? c.decode(String.self, forKey: BridgeKey("direction"))) ?? ""
+        self.fileNames = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("fileNames")))?.values ?? []
+        self.bytesTotal = (try? c.decode(Double.self, forKey: BridgeKey("bytesTotal"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil } ?? 0
+        self.timestampMs = (try? c.decode(Double.self, forKey: BridgeKey("timestampMs"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil } ?? 0
+        self.peer = (try? c.decode(String.self, forKey: BridgeKey("peer")))
+        self.locality = (try? c.decode(String.self, forKey: BridgeKey("locality")))
+        self.state = (try? c.decode(String.self, forKey: BridgeKey("state")))
+        self.outDir = (try? c.decode(String.self, forKey: BridgeKey("outDir")))
+        self.error = (try? c.decode(String.self, forKey: BridgeKey("error")))
+    }
+}
+
+extension RecoverySummary {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.pairId = try c.decode(String.self, forKey: BridgeKey("pairId"))
+        self.folderName = (try? c.decode(String.self, forKey: BridgeKey("folderName"))) ?? ""
+        self.bytes = (try? c.decode(Double.self, forKey: BridgeKey("bytes"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil } ?? 0
+        self.itemCount = (try? c.decode(Int.self, forKey: BridgeKey("itemCount"))) ?? 0
+    }
+}
+
+extension RecoveryItem {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.relPath = (try? c.decode(String.self, forKey: BridgeKey("relPath"))) ?? ""
+        self.size = (try? c.decode(Double.self, forKey: BridgeKey("size"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil } ?? 0
+        self.timestampMs = (try? c.decode(Double.self, forKey: BridgeKey("timestampMs"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil } ?? 0
+    }
+}
+
+extension LocationRights {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.upload = (try? c.decode(Bool.self, forKey: BridgeKey("upload"))) ?? false
+        self.manage = (try? c.decode(Bool.self, forKey: BridgeKey("manage"))) ?? false
+    }
+}
+
+extension SharedLocation {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Unknown"
+        self.rights = (try? c.decode(LocationRights.self, forKey: BridgeKey("rights"))) ?? LocationRights(upload: false, manage: false)
+        self.reachable = (try? c.decode(Bool.self, forKey: BridgeKey("reachable")))
+    }
+}
+
+extension FriendLocations {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.friendId = try c.decode(String.self, forKey: BridgeKey("friendId"))
+        self.friendName = (try? c.decode(String.self, forKey: BridgeKey("friendName"))) ?? ""
+        self.online = (try? c.decode(Bool.self, forKey: BridgeKey("online"))) ?? false
+        self.locations = (try? c.decode(LossyArray<SharedLocation>.self, forKey: BridgeKey("locations")))?.values ?? []
+        self.error = (try? c.decode(String.self, forKey: BridgeKey("error")))
+    }
+}
+
+extension BrowserEntry {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Unknown"
+        self.isDir = (try? c.decode(Bool.self, forKey: BridgeKey("isDir"))) ?? false
+        self.size = (try? c.decode(Double.self, forKey: BridgeKey("size"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil } ?? 0
+        self.modified = (try? c.decode(Double.self, forKey: BridgeKey("modified"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil } ?? 0
+    }
+}
+
+extension BrowserPage {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.entries = (try? c.decode(LossyArray<BrowserEntry>.self, forKey: BridgeKey("entries")))?.values ?? []
+        self.hasMore = (try? c.decode(Bool.self, forKey: BridgeKey("hasMore"))) ?? false
+        self.cursor = (try? c.decode(String.self, forKey: BridgeKey("cursor")))
+        self.total = (try? c.decode(Int.self, forKey: BridgeKey("total")))
+    }
+}
+
+extension TrashResult {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Unknown"
+        self.error = (try? c.decode(String.self, forKey: BridgeKey("error")))
+        self.trashPath = (try? c.decode(String.self, forKey: BridgeKey("trashPath")))
+    }
+}
+
+extension DownloadResult {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.transferId = (try? c.decode(String.self, forKey: BridgeKey("transferId")))
+        self.skipped = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("skipped")))?.values
+    }
+}
+
+extension FolderInvite {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.code = try c.decode(String.self, forKey: BridgeKey("code"))
+        self.folderName = (try? c.decode(String.self, forKey: BridgeKey("folderName"))) ?? ""
+        self.fromName = (try? c.decode(String.self, forKey: BridgeKey("fromName"))) ?? ""
+    }
 }

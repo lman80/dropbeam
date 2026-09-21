@@ -6,7 +6,7 @@ import { MOBILE_UI } from './platform'
 import { friendOnlineState } from './presence'
 import { transferSharePaths } from './mobilePick'
 import { setNativeShellActive } from './nativeShell'
-import { changedSnapshots, dispatchNativeCall, type BridgeArgs, type BridgeHandlers } from './nativeBridgeProtocol'
+import { changedSnapshots, dispatchNativeCall, deliverNativeReply, pickNativeMedia, nativeAvatarPath, type BridgeArgs, type BridgeHandlers } from './nativeBridgeProtocol'
 import { nativeReply, nativeChatSource, nativeTransfers, nativeThread } from './nativeChatBridge'
 import { withMobileFileSource } from '../components/MobileFileSheet'
 import { restoredChatTransfer } from './chatTransfer'
@@ -29,7 +29,7 @@ const paths = (a: BridgeArgs) => {
 const handlers: BridgeHandlers = {
   pickFiles: a => {
     const source = nativeChatSource(a)
-    return withMobileFileSource(source, source === 'photos' ? api.pickPhotos : api.pickFiles)
+    return pickNativeMedia(source, invoke)
   },
   sendToFriend: async a => { await storeAction(() => st().sendToFriend(string(a, 'friendId'), paths(a))); st().setPendingSend(null) },
   quickSend: async a => { await storeAction(() => st().sendPaths(paths(a))); st().setPendingSend(null) },
@@ -67,12 +67,11 @@ const handlers: BridgeHandlers = {
       await st().shareFilesInChat(id, files, text.trim())
     } else await st().sendChat(id, text, reply)
   },
-  sendChatFiles: async a => {
-    const id = string(a, 'friendId'), source = nativeChatSource(a)
-    if (st().activeChatId !== id) throw new Error('Open the conversation first.')
-    const picked = await withMobileFileSource(source, source === 'photos' ? api.pickPhotos : api.pickFiles)
-    // A picker can outlive a navigation change. Never attach to the next peer.
-    if (st().activeChatId === id) st().stageChatFiles(picked)
+  stageChatFiles: a => {
+    const id = string(a, 'friendId')
+    // Picking has already replied to Swift. Cancellation never reaches staging.
+    if (st().activeChatId !== id) throw new Error('Open the conversation again to attach these files.')
+    st().stageChatFiles(paths(a))
   },
   removeChatDraftFile: a => st().unstageChatFile(string(a, 'path')),
   reactToMessage: a => st().reactToMessage(string(a, 'friendId'), string(a, 'messageId'), string(a, 'emoji')),
@@ -104,6 +103,7 @@ const handlers: BridgeHandlers = {
     nativeFocused = a.bool
     useStore.setState({ windowFocused: a.bool })
     if (a.bool && st().activeChatId) st().markChatRead(st().activeChatId!)
+    if (a.bool) resnapshot?.(true)
   },
   retryChatFile: a => {
     const id = string(a, 'friendId'), messageId = string(a, 'messageId')
@@ -183,7 +183,7 @@ const handlers: BridgeHandlers = {
     const source = string(a, 'source')
     let picked: string[]
     if (source === 'folder') { const folder = await pickNativeFolder(); picked = folder ? [folder] : [] }
-    else { const src = nativeChatSource(a); picked = await withMobileFileSource(src, src === 'photos' ? api.pickPhotos : api.pickFiles) }
+    else { nativeChatSource(a); picked = paths(a) }
     if (!picked.length) return null
     checkLocation(a, 'upload')
     const update = await locationsApi.upload(friendId, locationId, path, picked)
@@ -219,7 +219,7 @@ const handlers: BridgeHandlers = {
   setAvatar: async a => {
     // Use the existing mobile avatar picker/store action when no path is supplied.
     if (typeof a.path === 'string') {
-      const saved = await invoke<Settings>('set_profile_avatar', { path: a.path })
+      const saved = await invoke<Settings>('set_profile_avatar', { path: nativeAvatarPath(a.path) })
       useStore.setState({ settings: saved })
     } else await withMobileFileSource('photos', async () => { await storeAction(() => st().pickAvatar()); return [] })
   },
@@ -242,7 +242,7 @@ try {
 } catch { /* optional cache */ }
 let locationErrors: Record<string, string> = {}
 let refreshing: Promise<void> | undefined
-let resnapshot: (() => void) | undefined
+let resnapshot: ((force?: boolean) => void) | undefined
 const needsName = () => !!st().settings && (!st().settings!.displayName.trim() || !localStorage.getItem('dropbeam.namedSelf'))
 const deviceSnapshot = () => { const d = st().myDevice; return d ? { name: d.name, endpointId: d.endpoint_id, deviceKind: d.device_kind, accountPub: d.account_pub, linkedDevices: d.linked_devices } : null }
 const locationSnapshot = () => st().friends.map(f => ({ friendId: f.id, friendName: f.name, online: friendOnlineState(f.name, st().friendSeen, st().folderStatuses) === true, locations: shared[f.id] ?? [], error: locationErrors[f.id] ?? null }))
@@ -308,7 +308,9 @@ async function start() {
   window.__dbBridge = { call: async (id, name, args) => {
     const reply = await dispatchNativeCall(handlers, id, name, args)
     // A reloaded/destroyed WebView can no longer deliver; Swift times out safely.
-    await invoke('plugin:native-ui|reply', reply).catch(() => {})
+    await deliverNativeReply(reply, value => invoke('plugin:native-ui|reply', value), () => {
+      if (['pickFiles', 'stageChatFiles', 'nativeChatFocus'].includes(name)) resnapshot?.(true)
+    }).catch(() => {})
   } }
   try {
     await invoke('plugin:native-ui|activate')
@@ -320,7 +322,8 @@ async function start() {
   let view = ''
   let lastToast = ''
   let activeChat: string | null = null
-  const sync = () => {
+  const sync = (force = false) => {
+    if (force) previous.clear()
     const s = st()
     // WKWebView is deliberately hidden. Its DOM blur/focus cannot describe the
     // native scene; keep the existing receipt/notification gates scene-driven.
@@ -362,7 +365,7 @@ async function start() {
     }
   }
   resnapshot = sync
-  stops.push(useStore.subscribe(sync))
+  stops.push(useStore.subscribe(() => sync()))
   sync() // Full initial snapshot, even when init is still in progress.
   void st().refreshMyDevice().catch(() => {})
   const timer = window.setInterval(sync, 15_000) // Presence must expire without a store mutation.

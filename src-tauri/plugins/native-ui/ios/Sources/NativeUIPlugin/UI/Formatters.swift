@@ -2,7 +2,7 @@ import Foundation
 
 enum Formatters {
     static func bytes(_ value: Double?) -> String {
-        let n = max(0, value?.isFinite == true ? value! : 0)
+        let n = max(0, value?.isFinite == true ? (value ?? 0) : 0)
         let units = ["B", "KB", "MB", "GB", "TB"]
         var scaled = n
         var index = 0

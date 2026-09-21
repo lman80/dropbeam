@@ -30,7 +30,11 @@
         <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
 <key>NSCameraUsageDescription</key>
-  <string>DropBeam uses the camera only to scan a friend or device QR code. No photos are taken or stored.</string>
+  <string>DropBeam uses the camera to scan friend, device, and shared-folder QR codes.</string>
+<key>NSPhotoLibraryAddUsageDescription</key>
+  <string>DropBeam saves photos you choose to keep from a chat to your library.</string>
+<key>NSBonjourServices</key>
+  <array><string>_irohv1._udp</string></array>
 <key>NSLocalNetworkUsageDescription</key>
   <string>DropBeam finds your friends' devices on the same network so files transfer directly between them at full local speed.</string>
 

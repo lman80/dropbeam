@@ -148,7 +148,7 @@ struct OnboardingSheet: View {
                     VStack(alignment: .leading, spacing: 16) {
                         Text("What should people call you?").font(.headline)
                         TextField("Your name", text: $name).textContentType(.name).textInputAutocapitalization(.words).padding(14).background(.quaternary, in: RoundedRectangle(cornerRadius: 14))
-                        Text("Friends see this name when you send files and chat. You can change it anytime in Settings.").foregroundStyle(.secondary)
+                        Text("Friends see this name when you send files and chat. You can change it anytime in Settings. You can finish setup without a network connection.").foregroundStyle(.secondary)
                     }
                 }
                 if let error { Text(error).foregroundStyle(.red) }

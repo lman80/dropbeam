@@ -195,7 +195,7 @@ struct BrowserView: View {
     }
     private func upload(_ source: String) {
         var request = args; request["source"] = source
-        run { try await bridge.action("browserUpload", request); await load() }
+        run { try await bridge.browserUpload(request); await load() }
     }
     private func download() {
         var request = args; request["names"] = Array(selected)

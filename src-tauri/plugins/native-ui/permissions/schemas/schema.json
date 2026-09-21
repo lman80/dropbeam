@@ -319,6 +319,18 @@
           "markdownDescription": "Denies the event command without any pre-configured scope."
         },
         {
+          "description": "Enables the pick_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-files",
+          "markdownDescription": "Enables the pick_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-files",
+          "markdownDescription": "Denies the pick_files command without any pre-configured scope."
+        },
+        {
           "description": "Enables the pick_folder command without any pre-configured scope.",
           "type": "string",
           "const": "allow-pick-folder",
@@ -355,10 +367,10 @@
           "markdownDescription": "Denies the state command without any pre-configured scope."
         },
         {
-          "description": "Connect the native iOS shell to the existing web data bridge.\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-reply`\n- `allow-state`\n- `allow-event`\n- `allow-pick-folder`",
+          "description": "Connect the native iOS shell to the existing web data bridge.\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-reply`\n- `allow-state`\n- `allow-event`\n- `allow-pick-folder`\n- `allow-pick-files`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Connect the native iOS shell to the existing web data bridge.\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-reply`\n- `allow-state`\n- `allow-event`\n- `allow-pick-folder`"
+          "markdownDescription": "Connect the native iOS shell to the existing web data bridge.\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-reply`\n- `allow-state`\n- `allow-event`\n- `allow-pick-folder`\n- `allow-pick-files`"
         }
       ]
     }

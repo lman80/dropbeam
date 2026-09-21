@@ -107,9 +107,9 @@ struct ConversationView: View {
     private func messageRow(_ message: ChatMessage, index: Int) -> some View {
         let previous = index > 0 ? messages[index - 1] : nil
         let next = index + 1 < messages.count ? messages[index + 1] : nil
-        let newDay = previous == nil || !Calendar.current.isDate(previous!.date, inSameDayAs: message.date)
+        let newDay = previous.map { !Calendar.current.isDate($0.date, inSameDayAs: message.date) } ?? true
         let newRun = newDay || previous?.fromMe != message.fromMe || message.ts - (previous?.ts ?? 0) > 300_000
-        let lastInRun = next == nil || next?.fromMe != message.fromMe || (next?.ts ?? 0) - message.ts > 300_000 || !Calendar.current.isDate(next!.date, inSameDayAs: message.date)
+        let lastInRun = next == nil || next?.fromMe != message.fromMe || (next?.ts ?? 0) - message.ts > 300_000 || (next.map { !Calendar.current.isDate($0.date, inSameDayAs: message.date) } ?? true)
         let lastMine = message.fromMe && message.id == messages.last(where: { $0.fromMe })?.id
         return VStack(spacing: 0) {
             if newDay { Text(ChatDates.divider(message.date)).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.vertical, 18) }
@@ -153,8 +153,8 @@ struct ConversationView: View {
         HStack {
             Text(matches.isEmpty ? "No matches" : "\(matchIndex + 1) of \(matches.count)").font(.caption).foregroundStyle(.secondary)
             Spacer()
-            Button { matchIndex = max(0, matchIndex - 1); scrollToMatch(proxy) } label: { Image(systemName: "chevron.up").frame(width: 44, height: 44) }.disabled(matchIndex == 0 || matches.isEmpty)
-            Button { matchIndex = min(matches.count - 1, matchIndex + 1); scrollToMatch(proxy) } label: { Image(systemName: "chevron.down").frame(width: 44, height: 44) }.disabled(matches.isEmpty || matchIndex >= matches.count - 1)
+            Button { matchIndex = max(0, matchIndex - 1); scrollToMatch(proxy) } label: { Image(systemName: "chevron.up").frame(width: 44, height: 44) }.accessibilityLabel("Previous search result").disabled(matchIndex == 0 || matches.isEmpty)
+            Button { matchIndex = min(matches.count - 1, matchIndex + 1); scrollToMatch(proxy) } label: { Image(systemName: "chevron.down").frame(width: 44, height: 44) }.accessibilityLabel("Next search result").disabled(matches.isEmpty || matchIndex >= matches.count - 1)
         }.padding(.horizontal, 20).background(.regularMaterial)
     }
 }
