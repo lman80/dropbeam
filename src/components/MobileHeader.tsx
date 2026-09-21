@@ -15,7 +15,7 @@ export function MobileHeader({ title, subtitle, actions }: { title: string; subt
     return () => observer.disconnect()
   }, [])
   return <>
-    <div ref={compact} className={`mobile-header-compact glass${collapsed ? ' visible' : ''}`} aria-hidden={!collapsed} inert={!collapsed}>
+    <div ref={compact} className={`mobile-header-compact${collapsed ? ' visible' : ''}`} aria-hidden={!collapsed} inert={!collapsed}>
       <span>{title}</span><div className="mobile-header-actions">{collapsed && actions}</div>
     </div>
     <header className="mobile-header">

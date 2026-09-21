@@ -163,7 +163,7 @@ export function ChatView() {
 
   const online = (f: Friend) => friendOnlineState(f.name, friendSeen, folderStatuses) === true
 
-  if (MOBILE_UI) return activeChatId ? <div className="mobile-page mobile-conversation"><Conversation key={activeChatId} friendId={activeChatId} /></div> : <div className="mobile-page mobile-chats"><MobileHeader title="Chats" /><div className="ios-list glass glass-card">{rows.map(({ friend, last }) => {
+  if (MOBILE_UI) return activeChatId ? <div className="mobile-page mobile-conversation"><Conversation key={activeChatId} friendId={activeChatId} /></div> : <div className="mobile-page mobile-chats"><MobileHeader title="Chats" /><div className="ios-list">{rows.map(({ friend, last }) => {
     const recent = chats[friend.id]?.at(-1)
     const ts = overview.find(o => o.peerId === friend.id)?.lastTs ?? recent?.ts
     const count = unread[friend.id] ?? 0
@@ -631,7 +631,7 @@ function Conversation({ friendId }: { friendId: string }) {
 
   return (
     <>
-      {MOBILE_UI ? <header className="mobile-header-compact visible glass mobile-conversation-header"><button className="ios-icon" aria-label="Back to chats" onClick={() => useStore.getState().closeChat()}><ChevronLeft /></button><span className="mobile-chat-avatar compact"><FriendAvatar friend={friend} /></span><div className="mobile-grow"><h1 className="ios-headline mobile-ellipsis">{friend.name}</h1><p className="ios-footnote">{typing ? 'typing…' : presenceText}</p></div><button className="ios-icon" aria-label="Search conversation" onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}><Search size={20} /></button></header> : <div
+      {MOBILE_UI ? <header className="mobile-header-compact visible mobile-conversation-header"><button className="ios-button mobile-back" aria-label="Back to chats" onClick={() => useStore.getState().closeChat()}><ChevronLeft />Chats</button><span className="mobile-chat-avatar compact"><FriendAvatar friend={friend} /></span><div className="mobile-grow"><h1 className="ios-headline mobile-ellipsis">{friend.name}</h1><p className="ios-footnote">{typing ? 'typing…' : presenceText}</p></div><button className="ios-icon" aria-label="Search conversation" onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}><Search size={20} /></button></header> : <div
         className="titlebar-drag chat-header"
         style={{
           display: 'flex',
@@ -847,7 +847,7 @@ function Conversation({ friendId }: { friendId: string }) {
         </div>
       )}
 
-      <div className={MOBILE_UI ? "chat-composer glass mobile-composer" : "chat-composer"}>
+      <div className={MOBILE_UI ? "chat-composer mobile-composer" : "chat-composer"}>
         {showGif && (
           <GifPicker
             apiKey={giphyKey}
@@ -925,11 +925,11 @@ function Conversation({ friendId }: { friendId: string }) {
         />
         <button
           aria-label={editing ? 'Save message' : 'Send message'}
-          className={MOBILE_UI ? `ios-icon glass-pill${text.trim() ? " ios-primary" : ""}` : "btn btn-primary chat-send"}
+          className={MOBILE_UI ? "ios-icon mobile-send-button" : "btn btn-primary chat-send"}
           onClick={submit}
           disabled={editing ? !text.trim() : !text.trim() && stagedFiles.length === 0}
         >
-          {editing ? <Check size={16} /> : <SendIcon size={16} />}
+          {MOBILE_UI ? <ArrowUp size={20} /> : editing ? <Check size={16} /> : <SendIcon size={16} />}
         </button>
       </div>
 

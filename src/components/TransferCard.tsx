@@ -122,7 +122,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
     const show = t.state === 'completed' && (!!t.outDir || !!onShow)
     const retry = t.state === 'failed' && t.direction === 'send'
     const action = show ? 'Show' : retry ? 'Retry' : active ? 'Cancel' : 'Dismiss'
-    return <article className="glass glass-card mobile-transfer">
+    return <article className="mobile-transfer">
       <div className="mobile-transfer-heading"><span className="mobile-tinted-icon"><FileIcon name={t.fileNames[0] ?? ''} size={22} /></span>
         <div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{title(t)}</h3><p className="ios-footnote mobile-ellipsis">{formatBytes(t.bytesTotal)} · {t.friendName ?? t.peer ?? 'Peer'}</p></div>
         {showAction && <button className="ios-icon" aria-label={action} onClick={() => {
@@ -137,11 +137,11 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
       {t.state === 'completed' ? <p className="ios-footnote">{t.direction === 'send' ? 'Delivered' : 'Saved'}{route && ` · ${route}`} · {verified}</p> : <>
         <div className="mobile-progress" role="progressbar" aria-label="Transfer progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(t.percent)}><span style={{ width: `${Math.max(0, Math.min(100, t.percent))}%` }} /></div>
         <div className="mobile-transfer-stats ios-footnote"><button className="xfer-meter" onClick={toggleSpeedMode}>{formatBytesLive(t.bytesDone)} of {formatBytesLive(t.bytesTotal)} · {speedText}</button><button className="xfer-meter" onClick={toggleEtaMode}>{etaText}</button></div>
-        <div className="mobile-transfer-badges">{route && <span className="glass glass-pill">{route}</span>}{verified === 'Verified' && <span className="glass glass-pill">Verified</span>}</div>
+        <div className="mobile-transfer-badges">{route && <span className="ios-caption">{route}</span>}{verified === 'Verified' && <span className="ios-caption">Verified</span>}</div>
         {t.state !== 'transferring' && <p className="ios-footnote">{t.error ?? t.detail ?? statusLabel(t)}</p>}
       </>}
       {isOffer && <button className="ios-button ios-primary" onClick={() => respondToOffer(t.id, true)}>Accept files</button>}
-      {isSendWaiting && <div className="mobile-stack"><code className="mobile-transfer-code">{t.code}</code><button className="ios-button glass glass-pill" onClick={copyCode}>{copied ? 'Copied' : 'Copy code'}</button><div className="mobile-qr"><QRCodeSVG value={t.code!} size={116} /></div></div>}
+      {isSendWaiting && <div className="mobile-stack"><code className="mobile-transfer-code">{t.code}</code><button className="ios-button" onClick={copyCode}>{copied ? 'Copied' : 'Copy code'}</button><div className="mobile-qr"><QRCodeSVG value={t.code!} size={116} /></div></div>}
       {t.detail && t.state === 'waitingForPeer' && <button className="ios-button" onClick={() => void api.forceRelay(t.id)}>Send over relay anyway</button>}
     </article>
   }

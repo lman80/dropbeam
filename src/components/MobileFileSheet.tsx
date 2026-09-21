@@ -36,7 +36,7 @@ function MobileFileSheet({ finish }: { finish: (source: Source | null) => void }
   const dialog = useRef<HTMLDialogElement>(null)
   useEffect(() => { dialog.current?.showModal() }, [])
   return (
-    <dialog ref={dialog} className="mobile-file-sheet glass" aria-labelledby="file-sheet-title"
+    <dialog ref={dialog} className="mobile-file-sheet" aria-labelledby="file-sheet-title"
       onCancel={(event) => { event.preventDefault(); finish(null) }}
       onClick={(event) => { if (event.target === event.currentTarget) finish(null) }}>
       <div className="mobile-file-sheet-body">
