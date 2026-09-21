@@ -340,3 +340,9 @@ html.mobile :is(.mobile-conversation-header, .mobile-browser-header) > .mobile-g
 html.mobile :is(.mobile-conversation-header, .mobile-browser-header) > .mobile-grow + button { margin-left: auto; }
 html.mobile { background: var(--bg); }
 html.mobile .chat-divider span { font-size: 11px; font-weight: 600; color: var(--text-muted); background: transparent; border: 0; border-radius: 0; padding: 0; }
+/* With the native UITabBar installed, the root view controller's additional safe
+   area already reserves the bar's 49pt, so the DOM must not pad for it again. */
+html.mobile.native-tabbar .mobile-main, html.mobile.native-tabbar .mobile-main-chat { padding-bottom: env(safe-area-inset-bottom); }
+html.mobile.native-tabbar .mobile-browser-actions { bottom: calc(12px + env(safe-area-inset-bottom)); }
+html.mobile.native-tabbar .app-toasts { bottom: calc(16px + env(safe-area-inset-bottom)) !important; }
+html.mobile.native-tabbar .mobile-composer { padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom)); }
