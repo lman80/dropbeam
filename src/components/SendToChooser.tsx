@@ -1,3 +1,7 @@
+import { Sheet, Section, Row, IconSquare } from '../mobile/kit'
+import { FriendAvatar as MobileAvatar } from '../mobile/shared'
+import { presenceText } from '../mobile/helpers'
+import { friendPresence } from '../lib/presence'
 import { Fragment } from 'react'
 import { groupDevices } from '../lib/deviceIcons'
 import { DeviceBadge } from './DeviceBadge'
@@ -52,6 +56,11 @@ export function SendToChooser() {
     if (files) sendPaths(files)
     close()
   }
+
+  if (MOBILE_UI) return open ? <Sheet title="Send to" onClose={close}>
+    {[{ title: 'My Devices', items: myDevices }, { title: 'Friends', items: others }].map(group => <Section key={group.title} title={group.title} footer={!group.items.length ? (group.title === 'My Devices' ? 'Your linked devices appear here.' : 'Add a friend to send by name.') : undefined}>{group.items.map(friend => <Row key={friend.id} avatar={<MobileAvatar friend={friend} />} title={friend.name} subtitle={presenceText(friendPresence(friend.name, friendSeen, folderStatuses))} onPress={() => toFriend(friend.id)} />)}</Section>)}
+    <Section title="Or"><Row icon={<IconSquare><QrCode /></IconSquare>} title="Quick Send (code)" accessory="chevron" onPress={withCode} /></Section>
+  </Sheet> : null
 
   return (
     <AnimatePresence>

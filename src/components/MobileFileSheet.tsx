@@ -1,9 +1,16 @@
-import { useEffect, useRef } from 'react'
 import { createRoot } from 'react-dom/client'
-import { File, Images } from 'lucide-react'
+import { ActionSheet } from '../mobile/kit'
 
 type Source = 'photos' | 'files'
 let picking = false
+let requestedSource: Source | null = null
+
+/** Send's explicit source rows bypass only the chooser, using the same backend pickers. */
+export async function withMobileFileSource(source: Source, pick: () => Promise<string[]>): Promise<string[]> {
+  if (picking) return []
+  requestedSource = source
+  try { return await pick() } finally { requestedSource = null }
+}
 
 /** One modal for every file-picking entry point; native pickers keep ownership
  * of permissions and return durable local paths through the existing commands. */
@@ -13,6 +20,9 @@ export async function pickMobileFiles(pickers: Record<Source, () => Promise<stri
   const previous = document.activeElement
   if (previous instanceof HTMLElement) previous.blur()
   try {
+    const preset = requestedSource
+    requestedSource = null
+    if (preset) return await pickers[preset]()
     const source = await new Promise<Source | null>((resolve) => {
       const host = document.createElement('div')
       document.body.append(host)
@@ -32,19 +42,9 @@ export async function pickMobileFiles(pickers: Record<Source, () => Promise<stri
   }
 }
 
-function MobileFileSheet({ finish }: { finish: (source: Source | null) => void }) {
-  const dialog = useRef<HTMLDialogElement>(null)
-  useEffect(() => { dialog.current?.showModal() }, [])
-  return (
-    <dialog ref={dialog} className="mobile-file-sheet" aria-labelledby="file-sheet-title"
-      onCancel={(event) => { event.preventDefault(); finish(null) }}
-      onClick={(event) => { if (event.target === event.currentTarget) finish(null) }}>
-      <div className="mobile-file-sheet-body">
-        <h2 id="file-sheet-title">Choose photos or files</h2>
-        <button className="btn btn-primary" onClick={() => finish('photos')}><Images size={24} /> Photos <span>Photos and videos</span></button>
-        <button className="btn btn-ghost" onClick={() => finish('files')}><File size={24} /> Files <span>Documents and other files</span></button>
-        <button className="btn btn-ghost" onClick={() => finish(null)}>Cancel</button>
-      </div>
-    </dialog>
-  )
+export function MobileFileSheet({ finish }: { finish: (source: Source | null) => void }) {
+  return <ActionSheet dismissOnAction={false} title="Choose Files" onClose={() => finish(null)} actions={[
+    { label: 'Photos and Videos', onPress: () => finish('photos') },
+    { label: 'Files', onPress: () => finish('files') },
+  ]} />
 }

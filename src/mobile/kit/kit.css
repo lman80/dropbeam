@@ -1,0 +1,140 @@
+/* Public tokens and components are gated by the platform's html.mobile class. */
+html.mobile {
+  --mk-bg: #F2F2F7; --mk-cell: #FFF; --mk-fill: rgba(120,120,128,.12);
+  --mk-separator: rgba(60,60,67,.29); --mk-label: #000; --mk-secondary: rgba(60,60,67,.6); --mk-tertiary: rgba(60,60,67,.3);
+  --mk-green: #34C759; --mk-red: #FF3B30; --mk-blue: #007AFF; --mk-orange: #FF9500; --mk-gray: #8E8E93;
+  --accent: #5B5BF0; --mk-bottom: calc(49px + env(safe-area-inset-bottom));
+  --mk-body: calc(17px * var(--ui-font-scale, 1)); --mk-sub: calc(15px * var(--ui-font-scale, 1)); --mk-foot: calc(13px * var(--ui-font-scale, 1));
+}
+html.mobile.dark { --mk-bg: #000; --mk-cell: #1C1C1E; --mk-fill: rgba(120,120,128,.24); --mk-separator: rgba(84,84,88,.65); --mk-label: #FFF; --mk-secondary: rgba(235,235,245,.6); --mk-tertiary: rgba(235,235,245,.3); --accent: #7C7CFF; --mk-green: #30D158; --mk-red: #FF453A; --mk-blue: #0A84FF; }
+html.mobile.native-tabbar { --mk-bottom: env(safe-area-inset-bottom); }
+html.mobile.keyboard-visible { --mk-bottom: 0px; }
+html.mobile :is(.mk-screen,.mk-modal,.mk-legacy) { font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: var(--mk-body); line-height: calc(22px * var(--ui-font-scale, 1)); color: var(--mk-label); }
+html.mobile :is(.mk-screen,.mk-modal) * { box-sizing: border-box; min-width: 0; }
+html.mobile :is(.mk-screen,.mk-modal) :is(button,input) { font: inherit; }
+html.mobile :is(.mk-screen,.mk-modal) button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+html.mobile :is(.mk-screen,.mk-modal) button:disabled { opacity: .4; cursor: default; }
+html.mobile :is(.mk-screen,.mk-modal) :focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+html.mobile .mk-screen { height: 100%; display: flex; flex-direction: column; overflow: hidden; background: var(--mk-bg); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
+html.mobile .mk-navbar { position: sticky; top: 0; z-index: 2; flex: 0 0 auto; padding: env(safe-area-inset-top) 8px 0; min-height: calc(44px + env(safe-area-inset-top)); display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1.5fr) minmax(0,1fr); align-items: center; background: var(--mk-bg); }
+html.mobile .mk-navbar.is-compact { background: color-mix(in srgb, var(--mk-bg) 85%, transparent); backdrop-filter: blur(20px) saturate(1.8); -webkit-backdrop-filter: blur(20px) saturate(1.8); border-bottom: .5px solid var(--mk-separator); margin-bottom: -.5px; }
+html.mobile .mk-bar-title { font-weight: 600; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html.mobile .mk-bar-leading { justify-self: start; max-width: 100%; }
+html.mobile .mk-bar-trailing { justify-self: end; display: flex; }
+html.mobile .mk-bar-leading .mk-button { max-width: 100%; padding-left: 0; gap: 0; }
+html.mobile .mk-bar-leading .mk-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html.mobile .mk-scroll { flex: 1; overflow-y: auto; overscroll-behavior-y: contain; padding: 0 0 24px; scroll-padding-top: 12px; }
+html.mobile.mk-modal-open .mk-scroll { overflow: hidden; }
+html.mobile .mk-large-title { font-size: calc(34px * var(--ui-font-scale, 1)); line-height: calc(41px * var(--ui-font-scale, 1)); font-weight: 700; letter-spacing: -.6px; margin: 2px 16px 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html.mobile .mk-section { margin: 24px 16px 0; }
+html.mobile .mk-large-title + .mk-section { margin-top: 0; }
+html.mobile .mk-section-title { margin: 0 16px 7px; color: var(--mk-secondary); font-size: var(--mk-foot); line-height: calc(18px * var(--ui-font-scale, 1)); font-weight: 400; text-transform: uppercase; }
+html.mobile .mk-section-footer { margin: 7px 16px 0; color: var(--mk-secondary); font-size: var(--mk-foot); line-height: calc(18px * var(--ui-font-scale, 1)); overflow-wrap: anywhere; }
+html.mobile .mk-list { background: var(--mk-cell); border-radius: 10px; overflow: hidden; }
+html.mobile .mk-row { display: flex; align-items: center; position: relative; --mk-inset: 16px; color: var(--mk-label); }
+html.mobile .mk-row-with-image { --mk-inset: 57px; }
+html.mobile .mk-row:has(.mk-avatar) { --mk-inset: 68px; }
+html.mobile .mk-row:not(:last-child)::after { content: ''; position: absolute; bottom: 0; right: 0; left: var(--mk-inset); height: .5px; background: var(--mk-separator); pointer-events: none; }
+html.mobile .mk-row-main { display: flex; align-items: center; gap: 12px; flex: 1; width: 100%; min-height: 44px; border: 0; background: transparent; color: inherit; text-align: left; padding: 8px 16px; }
+html.mobile button.mk-row-main:active { background: var(--mk-fill); }
+html.mobile .mk-row-text { flex: 1; display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
+html.mobile .mk-row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html.mobile .mk-row-subtitle { color: var(--mk-secondary); font-size: var(--mk-sub); line-height: calc(20px * var(--ui-font-scale, 1)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html.mobile .mk-row-value { color: var(--mk-secondary); max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html.mobile .mk-row-image { display: flex; align-items: center; flex: 0 0 auto; }
+html.mobile .mk-icon-square { width: 29px; height: 29px; border-radius: 7px; display: grid; place-items: center; color: white; flex: 0 0 29px; }
+html.mobile .mk-icon-square svg { width: 19px; height: 19px; }
+html.mobile .mk-chevron { color: var(--mk-tertiary); flex-shrink: 0; }
+html.mobile .mk-check { color: var(--accent); flex-shrink: 0; }
+html.mobile .mk-button { background: transparent; border: 0; color: var(--accent); display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 44px; min-height: 44px; padding: 6px 8px; font-size: var(--mk-body); line-height: 22px; text-align: center; }
+html.mobile .mk-button:active { opacity: .5; }
+html.mobile .mk-button svg { flex-shrink: 0; }
+html.mobile .mk-filled { background: var(--accent); color: #FFF; min-height: 50px; border-radius: 12px; width: 100%; font-weight: 600; }
+html.mobile .mk-destructive { color: var(--mk-red); }
+html.mobile .mk-tint { color: var(--accent); }
+html.mobile .mk-row-trailing { flex-shrink: 0; padding-right: 8px; }
+html.mobile .mk-row > .mk-switch { margin-right: 16px; }
+html.mobile .mk-switch { width: 51px; min-width: 51px; height: 44px; padding: 0; border: 0; background: transparent; display: grid; place-items: center; }
+html.mobile .mk-switch > span { width: 51px; height: 31px; border-radius: 16px; background: var(--mk-fill); display: block; padding: 2px; transition: background .15s; }
+html.mobile .mk-switch i { display: block; width: 27px; height: 27px; border-radius: 50%; background: #FFF; transition: transform .15s; }
+html.mobile .mk-switch[aria-checked=true] > span { background: var(--mk-green); }
+html.mobile .mk-switch[aria-checked=true] i { transform: translateX(20px); }
+html.mobile .mk-search { height: 36px; margin: 0 16px 16px; display: flex; align-items: center; gap: 6px; padding: 0 8px; border-radius: 10px; color: var(--mk-secondary); background: var(--mk-fill); }
+html.mobile .mk-search input { min-height: 36px; width: 100%; padding: 0; border: 0; background: transparent; color: var(--mk-label); outline: none; }
+html.mobile .mk-search svg { flex-shrink: 0; }
+html.mobile .mk-field { display: flex; align-items: center; min-height: 44px; padding: 0 16px; gap: 8px; }
+html.mobile .mk-field input { width: 100%; min-height: 44px; border: 0; background: transparent; padding: 10px 0; color: var(--mk-label); border-radius: 0; }
+html.mobile .mk-field span { flex: 1 0 55%; }
+html.mobile .mk-field input[type=number] { text-align: right; }
+html.mobile :is(.mk-field,.mk-search) input::placeholder { color: var(--mk-secondary); opacity: 1; }
+html.mobile .mk-segmented { display: flex; padding: 2px; background: var(--mk-fill); border-radius: 9px; min-height: 44px; }
+html.mobile .mk-segmented button { flex: 1; border: 0; background: transparent; border-radius: 7px; color: var(--mk-label); font-size: var(--mk-foot); min-height: 44px; padding: 4px; }
+html.mobile .mk-segmented button[aria-pressed=true] { background: var(--mk-cell); font-weight: 600; }
+html.mobile .mk-avatar { position: relative; display: inline-flex; flex-shrink: 0; font-weight: 500; line-height: 1; }
+html.mobile .mk-avatar-picture { overflow: hidden; border-radius: 50%; background: #8E8E93; color: white; width: 100%; height: 100%; display: grid; place-items: center; }
+html.mobile .mk-avatar img { width: 100%; height: 100%; object-fit: cover; }
+html.mobile .mk-device-badge { position: absolute; right: -1px; bottom: -1px; width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; color: var(--mk-secondary); background: var(--mk-cell); outline: 2px solid var(--mk-cell); }
+html.mobile .mk-device-badge svg { width: 12px; height: 12px; }
+html.mobile .mk-badge { background: var(--mk-red); color: #FFF; font-size: calc(12px * var(--ui-font-scale, 1)); line-height: 16px; padding: 1px 5px; min-width: 18px; text-align: center; border-radius: 20px; }
+html.mobile .mk-empty { padding: 48px 24px; color: var(--mk-secondary); text-align: center; }
+html.mobile .mk-empty > span svg { width: 40px; height: 40px; }
+html.mobile .mk-empty h2 { margin: 12px 0 4px; font-size: var(--mk-body); line-height: 22px; font-weight: 600; }
+html.mobile .mk-empty p { margin: 0; font-size: var(--mk-sub); line-height: 20px; }
+html.mobile .mk-progress { display: block; height: 2px; margin-top: 6px; background: var(--mk-fill); overflow: hidden; }
+html.mobile .mk-progress i { height: 100%; display: block; background: var(--accent); }
+html.mobile .mk-modal { position: fixed; inset: var(--mobile-viewport-top, 0px) 0 auto; width: 100%; max-width: 100%; height: var(--mobile-viewport-height, 100dvh); max-height: none; margin: 0; padding: calc(env(safe-area-inset-top) + 8px) env(safe-area-inset-right) 0 env(safe-area-inset-left); border: 0; background: transparent; overflow: hidden; }
+html.mobile .mk-modal[open] { display: flex; align-items: flex-end; justify-content: center; }
+html.mobile .mk-modal::backdrop { background: rgba(0,0,0,.4); }
+html.mobile .mk-modal-surface { max-width: 100%; max-height: 100%; width: 100%; overflow: hidden; background: var(--mk-bg); border-radius: 10px 10px 0 0; display: flex; flex-direction: column; }
+html.mobile .mk-sheet-medium .mk-modal-surface { min-height: min(50dvh, 420px); }
+html.mobile .mk-sheet-large .mk-modal-surface { height: 100%; }
+html.mobile .mk-grabber { width: 36px; height: 5px; flex-shrink: 0; border-radius: 3px; background: var(--mk-tertiary); margin: 8px auto 3px; }
+html.mobile .mk-sheet-bar { display: grid; grid-template-columns: minmax(65px,1fr) minmax(0,3fr) minmax(65px,1fr); align-items: center; min-height: 44px; padding: 0 8px; flex-shrink: 0; }
+html.mobile .mk-sheet-bar h2 { font-size: var(--mk-body); line-height: 22px; font-weight: 600; margin: 0; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html.mobile .mk-sheet-bar > div:last-child { text-align: right; }
+html.mobile .mk-sheet-bar > div:last-child .mk-button { font-weight: 600; }
+html.mobile .mk-sheet-content { overflow-y: auto; overscroll-behavior: contain; padding-bottom: max(20px, env(safe-area-inset-bottom)); flex: 1; }
+html.mobile.keyboard-visible .mk-sheet-content { padding-bottom: 16px; }
+html.mobile .mk-sheet-content > .mk-section:first-child { margin-top: 20px; }
+html.mobile .mk-action-sheet { padding-bottom: max(8px,env(safe-area-inset-bottom)); padding-left: max(8px,env(safe-area-inset-left)); padding-right: max(8px,env(safe-area-inset-right)); }
+html.mobile .mk-action-sheet .mk-modal-surface { background: transparent; gap: 8px; border-radius: 0; overflow-y: auto; }
+html.mobile .mk-action-group { background: var(--mk-cell); border-radius: 13px; overflow: hidden; flex-shrink: 0; }
+html.mobile .mk-action-group .mk-button { display: flex; width: 100%; min-height: 57px; font-size: calc(20px * var(--ui-font-scale, 1)); }
+html.mobile .mk-action-group .mk-button + .mk-button { border-top: .5px solid var(--mk-separator); }
+html.mobile .mk-action-group:last-child .mk-button { font-weight: 600; }
+html.mobile .mk-action-message { font-size: var(--mk-foot); line-height: 18px; text-align: center; padding: 16px; margin: 0; color: var(--mk-secondary); border-bottom: .5px solid var(--mk-separator); }
+html.mobile .mk-alert[open] { align-items: center; padding: 16px; }
+html.mobile .mk-alert .mk-modal-surface { width: 270px; border-radius: 14px; background: var(--mk-cell); }
+html.mobile .mk-alert-body { padding: 20px 16px 16px; text-align: center; }
+html.mobile .mk-alert h2 { font-size: var(--mk-body); font-weight: 600; margin: 0 0 4px; }
+html.mobile .mk-alert p { font-size: var(--mk-foot); line-height: 18px; margin: 0 0 12px; }
+html.mobile .mk-alert .mk-field { border: .5px solid var(--mk-separator); padding: 0 8px; border-radius: 5px; background: var(--mk-bg); margin-top: 12px; }
+html.mobile .mk-alert-actions { display: flex; border-top: .5px solid var(--mk-separator); }
+html.mobile .mk-alert-actions .mk-button { flex: 1; }
+html.mobile .mk-alert-actions .mk-button + .mk-button { border-left: .5px solid var(--mk-separator); font-weight: 600; }
+html.mobile .mk-context-trigger { min-height: 44px; }
+html.mobile .mk-context-menu .mk-modal-surface { position: absolute; width: 250px; border-radius: 12px; background: var(--mk-cell); overflow-y: auto; }
+html.mobile .mk-context-menu .mk-button { width: 100%; justify-content: space-between; color: var(--mk-label); padding: 10px 16px; border-bottom: .5px solid var(--mk-separator); }
+html.mobile .mk-context-menu .mk-destructive { color: var(--mk-red); }
+html.mobile .mk-context-menu::backdrop { background: rgba(0,0,0,.15); }
+html.mobile .mk-profile { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px 16px 0; text-align: center; }
+html.mobile .mk-profile h2 { margin: 4px 0 0; font-size: calc(22px * var(--ui-font-scale, 1)); line-height: 28px; font-weight: 700; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html.mobile .mk-profile p { color: var(--mk-secondary); font-size: var(--mk-sub); margin: 0; }
+html.mobile .mk-profile .mk-button { padding: 0; border-radius: 50%; }
+html.mobile .mk-qr { padding: 20px; display: flex; justify-content: center; }
+html.mobile .mk-qr > svg { background: #FFF; border-radius: 12px; padding: 12px; width: min(240px, 100%); height: auto; }
+html.mobile .mk-sheet-cta { margin: 24px 16px; }
+html.mobile .mk-error { color: var(--mk-red); overflow-wrap: anywhere; }
+html.mobile .mk-file-icon { width: 29px; height: 29px; display: grid; place-items: center; }
+html.mobile .mk-camera { position: relative; margin: 16px; height: min(45dvh, 380px); overflow: hidden; border-radius: 10px; background: #000; }
+html.mobile .mk-camera video { width: 100%; height: 100%; object-fit: cover; }
+html.mobile .mk-camera::after { content: ''; position: absolute; inset: 20%; border: 2px solid white; border-radius: 12px; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) { html.mobile :is(.mk-screen,.mk-modal) * { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }
+@media (prefers-reduced-transparency: reduce) { html.mobile .mk-navbar.is-compact { background: var(--mk-bg); backdrop-filter: none; -webkit-backdrop-filter: none; } }
+html.mobile .mk-headline { font-weight: 600; }
+html.mobile .mk-list > .mk-field { position: relative; }
+html.mobile .mk-list > .mk-field:not(:last-child)::after { content: ''; position: absolute; left: 16px; right: 0; bottom: 0; height: .5px; background: var(--mk-separator); }
+/* Override the shared desktop stylesheet's fixed input size for Dynamic Type. */
+html.mobile :is(.mk-field,.mk-search) input { font-size: var(--mk-body) !important; }
+html.mobile .mk-scroll { scrollbar-width: none; }
+html.mobile .mk-scroll::-webkit-scrollbar { display: none; }

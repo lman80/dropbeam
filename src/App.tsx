@@ -22,6 +22,8 @@ import { LocationsView } from './views/LocationsView'
 import { FoldersView } from './views/FoldersView'
 import { FriendsView } from './views/FriendsView'
 import { ChatView } from './views/ChatView'
+import { MobileApp } from './mobile/MobileApp'
+import { MobileOnboarding } from './mobile/Onboarding'
 
 export default function App() {
   const nativeTabBar = useStore((s) => s.nativeTabBar)
@@ -149,7 +151,7 @@ export default function App() {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <ErrorBoundary region="window controls">
-        {!(MOBILE_UI && ['send', 'friends', 'settings', 'chat', 'history', 'locations'].includes(view)) && <TitleBar />}
+        {!MOBILE_UI && <TitleBar />}
         <InstallBanner />
         <LocalNetworkBanner />
       </ErrorBoundary>
@@ -174,7 +176,7 @@ export default function App() {
           <ErrorBoundary region={`content:${view}`} key={view}>
             {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
                 so it never deadlocks on a view that has its own AnimatePresence. */}
-            <motion.div
+            {MOBILE_UI ? <MobileApp /> : <motion.div
               initial={MOBILE_UI ? false : { opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.18 }}
@@ -187,7 +189,7 @@ export default function App() {
               {view === 'locations' && <LocationsView />}
               {view === 'history' && <HistoryView />}
               {view === 'settings' && <SettingsView />}
-            </motion.div>
+            </motion.div>}
           </ErrorBoundary>
         </main>
       </div>
@@ -198,7 +200,7 @@ export default function App() {
       )}
       <ErrorBoundary region="overlays" fallbackStyle={{ position: 'fixed', bottom: 12, left: 12, zIndex: 201 }}>
         <SendToChooser />
-        <NameSetupModal />
+        {MOBILE_UI ? <MobileOnboarding /> : <NameSetupModal />}
         <FolderInviteModal />
       </ErrorBoundary>
       <ErrorBoundary region="toasts" fallbackStyle={{ position: 'fixed', bottom: 12, right: 12, zIndex: 101 }}>

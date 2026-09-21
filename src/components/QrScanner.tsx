@@ -1,3 +1,4 @@
+import { Button, Row, Section, Sheet, TextField } from '../mobile/kit'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import jsQR from 'jsqr'
@@ -8,6 +9,7 @@ export function QrScanner({ onResult, onClose, hint }: { onResult: (text: string
   const canvas = useRef<HTMLCanvasElement>(null)
   const stream = useRef<MediaStream | null>(null)
   const done = useRef(false)
+  const cameraEnabled = useRef(true)
   const result = useRef(onResult)
   useEffect(() => { result.current = onResult }, [onResult])
   const [error, setError] = useState('')
@@ -37,7 +39,7 @@ export function QrScanner({ onResult, onClose, hint }: { onResult: (text: string
     }
     if (!navigator.mediaDevices?.getUserMedia) fail(new Error('Unavailable'))
     else void navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false }).then(async media => {
-      if (!alive || done.current) { media.getTracks().forEach(track => track.stop()); return }
+      if (!alive || done.current || !cameraEnabled.current) { media.getTracks().forEach(track => track.stop()); return }
       stream.current = media
       if (video.current) { video.current.srcObject = media; await video.current.play() }
     }).catch(fail)
@@ -58,6 +60,11 @@ export function QrScanner({ onResult, onClose, hint }: { onResult: (text: string
     }, 100)
     return () => { alive = false; clearInterval(timer); stop() }
   }, [finish, stop])
+  if (MOBILE_UI) return <Sheet title="Scan QR Code" size="large" onClose={close} primary={paste ? <Button disabled={!code.trim()} onClick={() => finish(code)}>Done</Button> : undefined}>
+    <div className="mk-camera"><video ref={video} autoPlay muted playsInline /></div><canvas ref={canvas} hidden />
+    <Section footer={hint}><Row title="Paste a Code Instead" tint onPress={() => { cameraEnabled.current = false; stop(); setPaste(true) }} />{paste && <form onSubmit={e => { e.preventDefault(); finish(code) }}><TextField label="Paste a code" placeholder="Code" autoFocus value={code} onChange={e => setCode(e.target.value)} /></form>}</Section>
+    {error && <Section footer={<span className="mk-error" role="alert">{error}</span>} />}
+  </Sheet>
   return createPortal(<div className="dialog-overlay qr-overlay" onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); close() } }}>
     <div className={`${MOBILE_UI ? 'dialog mobile-sheet' : 'card dialog'} qr-scanner`} role="dialog" aria-modal="true" aria-label="Scan QR code">
       <video ref={video} autoPlay muted playsInline className="qr-video" />

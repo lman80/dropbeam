@@ -1,3 +1,4 @@
+import { Button, Row, Section, Sheet } from '../mobile/kit'
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { listen } from '@tauri-apps/api/event'
@@ -24,6 +25,7 @@ export function LinkNewDeviceModal({ onClose }: { onClose: () => void }) {
     finally { setBusy(false) }
   }
   if (scanning) return <QrScanner hint="Scan the code shown on your new device." onResult={code => void send(code)} onClose={onClose} />
+  if (MOBILE_UI) return <Sheet title="Link a New Device" onClose={onClose}><Section footer={<span role={busy ? 'status' : 'alert'}>{busy ? 'Linking device…' : error}</span>}>{!busy && <Row title="Try Again" tint onPress={() => { setError(''); setScanning(true) }} />}</Section></Sheet>
   return <LinkDialog title="Link a new device"><p role="status">{busy ? 'Linking device…' : error}</p>{!busy && <><button className="btn btn-primary" onClick={() => { setError(''); setScanning(true) }}>Try again</button><button className="btn btn-ghost" onClick={onClose}>Close</button></>}</LinkDialog>
 }
 
@@ -63,6 +65,12 @@ export function LinkDeviceModal({ onClose }: { onClose: () => void }) {
     }
     return () => { alive = false; unlisten?.(); if (begun && !complete) void api.linkDeviceCancel().catch(() => {}) }
   }, [])
+  if (MOBILE_UI) return <Sheet title="Link This Device" size="large" onClose={() => { if (!canceling) void cancelRef.current() }} primary={<Button disabled={canceling} onClick={() => void cancelRef.current()}>{canceling ? 'Canceling…' : 'Done'}</Button>}>
+    <Section title="Link This Device to Another Account" footer="On a device you already use, open Settings → Profile → Link a New Device and scan this code.">
+      {code ? <><div className="mk-qr"><QRCodeSVG value={code} size={240} level="M" /></div><Row title={copied ? 'Copied' : 'Copy Code'} tint onPress={() => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => setError('Could not copy the code.'))} /></> : <Row title={error ? 'Code unavailable' : 'Creating code…'} />}
+    </Section>
+    {error && <Section footer={<span className="mk-error" role="alert">{error}</span>} />}
+  </Sheet>
   return <LinkDialog title="Link this device to my account">
     <p>On the device you already use, open Settings &gt; Devices &gt; Link a new device and scan this code.</p>
     {code ? <><div className="link-qr"><QRCodeSVG value={code} size={240} level="M" /></div><textarea className="input" aria-label="Device linking code" readOnly value={code} /><button className="btn btn-primary" onClick={() => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => setError('Could not copy the code. Select and copy the text instead.'))}>{copied ? 'Copied' : 'Copy'}</button></> : !error && <p role="status">Creating code…</p>}
