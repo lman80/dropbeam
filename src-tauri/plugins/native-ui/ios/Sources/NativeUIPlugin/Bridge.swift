@@ -10,6 +10,11 @@ final class Bridge: ObservableObject {
     @Published var transfers: [Transfer] = []
     @Published var settings: Settings?
     @Published var chatOverview: [ChatOverview] = []
+    @Published var chatUnread: [String: Int] = [:]
+    @Published var chatTyping: [String: Bool] = [:]
+    @Published var threads: [String: [ChatMessage]] = [:]
+    @Published var chatDraftFiles: [String] = []
+    @Published var chatPath: [String] = []
     @Published var presence: [String: Bool] = [:]
     @Published var selectedTab = "send"
     @Published var errorMessage: String?
@@ -21,7 +26,8 @@ final class Bridge: ObservableObject {
     }
     private var pending: [Int: Pending] = [:]
     private let decoder = JSONDecoder()
-    var unread: Int { chatOverview.reduce(0) { $0 + max(0, $1.unread ?? 0) } }
+    var unread: Int { chatUnread.values.reduce(0) { $0 + max(0, $1) } }
+    var sendTransfers: [Transfer] { transfers.filter { $0.chatOnly != true } }
 
     func call<T: Decodable>(_ name: String, _ args: [String: Any] = [:]) async throws -> T {
         guard let webview else { throw failure("The app bridge is not ready.") }
@@ -62,6 +68,11 @@ final class Bridge: ObservableObject {
         case "transfers": transfers = try decoder.decode([Transfer].self, from: data)
         case "settings": settings = try decoder.decode(Settings?.self, from: data)
         case "chatOverview": chatOverview = try decoder.decode([ChatOverview].self, from: data)
+        case "chatUnread": chatUnread = try decoder.decode([String: Int].self, from: data)
+        case "chatTyping": chatTyping = try decoder.decode([String: Bool].self, from: data)
+        case "chatDraftFiles": chatDraftFiles = try decoder.decode([String].self, from: data)
+        case "thread":
+            if let thread = try decoder.decode(ChatThread?.self, from: data) { threads[thread.friendId] = thread.messages }
         case "presence": presence = try decoder.decode([String: Bool].self, from: data)
         default: break // Forward-compatible snapshots.
         }
@@ -71,6 +82,10 @@ final class Bridge: ObservableObject {
         if name == "view", let tab = object["name"] as? String,
            ["send", "friends", "chat", "history", "settings"].contains(tab) { selectedTab = tab }
         if name == "error" { errorMessage = object["message"] as? String }
+        if name == "chatOpen" {
+            if let id = object["friendId"] as? String { chatPath = [id]; selectedTab = "chat" }
+            else { chatPath = [] }
+        }
         // Tauri events remain available to subsequent native chat/presence views;
         // authoritative published data always comes from the store snapshots.
         NotificationCenter.default.post(name: Notification.Name("DropBeam.\(name)"), object: nil, userInfo: ["payload": payload])
@@ -93,7 +108,29 @@ final class Bridge: ObservableObject {
     func cancelTransfer(id: String) async throws { try await action("cancelTransfer", ["id": id]) }
     func retryTransfer(id: String) async throws { try await action("retryTransfer", ["id": id]) }
     func openChat(friendId: String) async throws { try await action("openChat", ["friendId": friendId]); selectedTab = "chat" }
-    func sendChatText(friendId: String, text: String) async throws { try await action("sendChatText", ["friendId": friendId, "text": text]) }
+    func chatThread(friendId: String) async throws {
+        // Snapshot pushes are authoritative: an older reply must not overwrite a
+        // newer reaction/read-receipt arriving while this request is in flight.
+        let _: [ChatMessage] = try await call("chatThread", ["friendId": friendId])
+    }
+    func closeChat(friendId: String) async throws { try await action("closeChat", ["friendId": friendId]) }
+    func sendChatText(friendId: String, text: String, replyTo: String? = nil) async throws {
+        var args: [String: Any] = ["friendId": friendId, "text": text]
+        if let replyTo { args["replyTo"] = replyTo }
+        try await action("sendChatText", args)
+    }
+    func sendChatFiles(friendId: String, source: String) async throws { try await action("sendChatFiles", ["friendId": friendId, "source": source]) }
+    func removeChatDraftFile(path: String) async throws { try await action("removeChatDraftFile", ["path": path]) }
+    func reactToMessage(friendId: String, messageId: String, emoji: String) async throws { try await action("reactToMessage", ["friendId": friendId, "messageId": messageId, "emoji": emoji]) }
+    func editMessage(friendId: String, messageId: String, text: String) async throws { try await action("editMessage", ["friendId": friendId, "messageId": messageId, "text": text]) }
+    func deleteMessage(friendId: String, messageId: String) async throws { try await action("deleteMessage", ["friendId": friendId, "messageId": messageId]) }
+    func markChatRead(friendId: String) async throws { try await action("markChatRead", ["friendId": friendId]) }
+    func setTyping(friendId: String, on: Bool) async throws { try await action("setTyping", ["friendId": friendId, "bool": on]) }
+    func nativeChatFocus(_ focused: Bool) async throws { try await action("nativeChatFocus", ["bool": focused]) }
+    func retryChatFile(friendId: String, messageId: String) async throws { try await action("retryChatFile", ["friendId": friendId, "messageId": messageId]) }
+    func openChatFile(path: String) async throws { try await action("openChatFile", ["path": path]) }
+    func chatGifs(query: String) async throws -> [GifResult] { try await call("chatGifs", ["query": query]) }
+    func sendChatGif(friendId: String, id: String) async throws { try await action("sendChatGif", ["friendId": friendId, "id": id]) }
     func setView(name: String) async throws { try await action("setView", ["name": name]) }
     func pingFriend(id: String) async throws -> ConnectionCheck { try await call("pingFriend", ["id": id]) }
     func removeFriend(id: String) async throws { try await action("removeFriend", ["id": id]) }

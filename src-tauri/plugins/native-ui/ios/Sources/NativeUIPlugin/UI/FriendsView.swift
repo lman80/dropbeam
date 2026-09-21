@@ -22,6 +22,7 @@ struct FriendsView: View {
                     }
                 }.padding(20)
             }
+            .contentMargins(.bottom, 24, for: .scrollContent)
             .navigationTitle("Friends").beamCanvas()
             .searchable(text: $search, prompt: "Find a friend or device")
             .toolbar { ToolbarItem(placement: .topBarTrailing) {

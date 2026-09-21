@@ -1,4 +1,108 @@
-# Native iOS UI — phase 1 handoff
+# Native iOS UI — phase 2 handoff
+
+## Phase 2: native Chat
+
+Chat now uses a native conversation list, friend picker, pushed thread, keyboard-safe
+composer, reply/edit banners, staged attachments, Tapback context menus, local search,
+typing, unread badges, file transfer progress/retry, image zoom/share and AVPlayer.
+iOS 26 glass is availability-guarded with material fallbacks on iOS 17. The Send,
+Friends and placeholder tab roots remain scrolling views directly inside their
+NavigationStacks, with an additional 24pt bottom scroll-content margin. Only the
+background ignores safe areas. Receive-code placeholders use the proportional body
+font; entered codes use monospaced body text.
+
+### Chat handler additions / changes
+
+All handlers use the existing store actions/API. Void replies are JSON null.
+
+| Handler | Args | Result / behavior |
+| --- | --- | --- |
+| `chatThread` | `{ friendId: string }` | `ChatMessage[]`; opens when necessary, loads overview, returns store history; subsequent pushes remain authoritative |
+| `openChat` | `{ friendId: string }` | Store openChat sets activeChatId and engine active thread; `chatOpen` drives native navigation |
+| `closeChat` | `{ friendId?: string }` | Store closeChat; optional ID prevents an old destination closing a new peer |
+| `sendChatText` | `{ friendId, text, replyTo?: string }` | Reply ID resolved against store messages; store sendChat, or shareFilesInChat with the staged paths and caption |
+| `sendChatFiles` | `{ friendId, source: 'photos' \| 'files' }` | Native picker → store stageChatFiles; attachments are sent with the next composer send, just like the web composer; discards late picker results after switching peers |
+| `removeChatDraftFile` | `{ path: string }` | Store unstageChatFile |
+| `reactToMessage` | `{ friendId, messageId, emoji }` | Store reaction toggle |
+| `editMessage` | `{ friendId, messageId, text }` | Store editChatMessage |
+| `deleteMessage` | `{ friendId, messageId }` | Store deleteChatMessage (unsend) |
+| `markChatRead` | `{ friendId }` | Store markChatRead; the list action briefly opens/closes through the store without pushing a native destination |
+| `setTyping` | `{ friendId, bool: boolean }` | Existing api.sendTyping; first keystroke, heartbeat while typing, off after 3 seconds idle / send / leave |
+| `retryChatFile` | `{ friendId, messageId }` | Resolve fileXferId and call store resendChatFile; received failures ask the sender to retry |
+| `openChatFile` | `{ path: string }` | Existing native api.shareFiles, including system preview/save/share actions |
+| `nativeChatFocus` | `{ bool: boolean }` | Native scene drives store windowFocused and existing receipt gates; hidden DOM focus cannot override it |
+| `chatGifs` | `{ query: string }` | Existing Giphy provider → `GifResult[]`; only enabled with a settings key |
+| `sendChatGif` | `{ friendId, id: string }` | Existing store sendGif using a previously returned result |
+
+There is no delete-for-me or delete-conversation store/API operation. Neither is
+shown or implemented locally. File messages use the existing caption send path,
+which does not support quoted attachments; selecting an attachment clears Reply.
+
+### Chat snapshots and events
+
+All snapshots are diffed by serialized JSON, including edits/reactions/receipts:
+
+- `chatOverview`: existing `ChatOverview[]` with additive `unread`.
+- `chatUnread`: `{ [friendId: string]: number }`; its nonnegative sum is the tab badge.
+- `chatTyping`: `{ [friendId: string]: boolean }`.
+- `thread`: `{ friendId: string, messages: ChatMessage[] } | null`; only the active
+  thread is pushed. Swift caches threads by peer and never overwrites a newer push
+  with an older request reply.
+- `chatDraftFiles`: `string[]` of staged local paths.
+- `transfers`: existing transfer array, with additive `chatOnly: boolean`.
+  Chat batch entries use the shared `fileXferId` as `id`; they include existing
+  `chatTransfer.completedPaths` and completed `sharePaths`. Swift joins these to
+  messages; Send filters out chat-only entries. Existing restoredChatTransfer
+  supplies durable outcomes when a live batch is absent. A chat-note delivery
+  receipt does not override an explicit failed transfer.
+- `chatOpen` event: `{ friendId: string | null }` drives push/pop, including opens
+  from Friends or an existing notification action.
+- `chat://message` remains forwarded unchanged. Transfer progress comes through
+  the existing diffed transfers snapshot; no second transfer event implementation.
+
+The Swift ChatMessage has only four required fields: `id: String`, `peerId: String`,
+`fromMe: Bool`, `ts: Double` (milliseconds). Optional fields mirror the API:
+`kind`, `text`, `files: [String]`, `bytes`, `path`, `status`, `seq`, `replyTo`,
+`replyPreview`, `reactions: [{ emoji, fromMe }]`, `edited`, `deleted`,
+`gif: { url, w, h }`, `fileXferId`, `fileXferFailed`. Unknown fields/status values
+are tolerated. Received media previews use local files only.
+
+### Phase 2 files and verification
+
+- `src/lib/nativeBridge.ts`: handlers, focus/navigation coordination and snapshots.
+- `src/lib/nativeChatBridge.ts`: pure reply/source/thread/transfer adapters.
+- `tests/native-chat-bridge.test.ts`: five regression tests for those adapters,
+  including reply validation, peer isolation, shared transfer IDs and message diffs.
+- `ios/Sources/NativeUIPlugin/Bridge.swift`, `Models.swift`: native protocol models,
+  subscriptions, navigation and calls.
+- `ios/Sources/NativeUIPlugin/UI/Chat/ChatsView.swift`: list, friend picker, glass and dates.
+- `ios/Sources/NativeUIPlugin/UI/Chat/ConversationView.swift`: thread, grouping,
+  scrolling, search, receipts and typing indicator.
+- `ios/Sources/NativeUIPlugin/UI/Chat/ChatBubble.swift`: bubble rendering, quotes,
+  highlights, Tapbacks and context menus.
+- `ios/Sources/NativeUIPlugin/UI/Chat/ChatComposer.swift`: typing, staging,
+  reply/edit, send and native GIF picker (using the existing provider).
+- `ios/Sources/NativeUIPlugin/UI/Chat/ChatAttachment.swift`: transfer joins,
+  local thumbnails, retry, multiple-file chooser, zoom, AVPlayer and share.
+- `UI/RootView.swift`, `SendView.swift`, `FriendsView.swift`: tab integration,
+  scene lifecycle and scrolling/placeholder fixes.
+
+Offline checks: simulator-target Cargo check (including the actual Swift package),
+full-source Swift typechecks with the built Tauri modules at iOS 17 and iOS 26,
+TypeScript root and app configs, and 76 Node tests (71 existing + 5 new).
+The pre-existing validation-only `/tmp/dropbeam-native-tools/swift` wrapper disables
+SwiftPM package resolution/updates; Git allows only local-file transport. Cargo
+emits the existing 40 Rust warnings. No new dependency, commit, push, version change,
+store/API implementation change, or React MobileApp edit.
+
+The orchestrator still needs to build/run the iPhone 17 Pro simulator: review tab
+insets on long Send/Friends/Chat lists, iOS 26 glass and context-menu layout,
+keyboard/picker transitions, pinch zoom/video/share, light/dark and accessibility
+text sizes, plus real peer receipts/typing/progress/retry. Network-dependent GIF
+search/send was not exercised during this offline work. This handoff does not
+claim simulator visual QA or a linked application build.
+
+## Phase 1 shell reference
 
 SwiftUI owns the iOS screen. The existing React MobileApp, Zustand store, Tauri commands and Rust transfer engine remain alive underneath it. No existing app/package versions were changed, and no commit or push was made. No new registry dependency was added; the new local plugin uses dependencies already in the Cargo lock/cache. Desktop execution stays behind the existing MOBILE_UI and iOS target gates.
 
@@ -94,7 +198,7 @@ Swift typechecks used `-module-cache-path ~/Library/Caches/dropbeam-swift` and `
 
 No full application link, simulator launch, screenshot review, native picker/chooser interaction, or device-to-device transfer was performed here. The orchestrator must run the actual simulator app to verify glass rendering, controller presentation, safe areas, rotation, light/dark appearance and Dynamic Type. Compilation alone does not establish those runtime results.
 
-Chat, History and Settings are intentionally styled placeholders. QR scanning is an explicit placeholder. Recipient selection remains the existing web chooser. Native profile/onboarding, device-linking screens, chat history/composer and settings controls remain for later phases, although their requested bridge operations exist. A first installation continues using the engine's default device name until native profile controls are added.
+History and Settings remain styled placeholders. Chat is implemented in phase 2 above. QR scanning is an explicit placeholder. Recipient selection remains the existing web chooser. Native profile/onboarding, device-linking screens and settings controls remain for later phases, although their requested bridge operations exist. A first installation continues using the engine's default device name until native profile controls are added.
 
 Suggested simulator checks: cold launch and repeated bridge activation (one glass tab bar); search/add/rename/remove/auto-accept/check a friend; Photos and Files sends with and without a target friend; cancel the chooser and restore native navigation; receive by code and accept an incoming offer; cancel/retry/share completed transfers; switch tabs and verify unread updates; review light/dark and accessibility text sizes.
 

@@ -35,6 +35,8 @@ struct Transfer: Decodable, Identifiable {
     var locality: String?
     var detail: String?
     var sharePaths: [String]?
+    var chatOnly: Bool?
+    var chatTransfer: ChatTransferDetail?
     var active: Bool { ["starting", "waitingForPeer", "connecting", "waitingForAccept", "transferring"].contains(state ?? "") }
     var title: String { (fileCount ?? 0) > 1 ? "\(fileCount ?? 0) files" : fileNames?.first ?? "Files" }
     var status: String {
@@ -51,6 +53,52 @@ struct Transfer: Decodable, Identifiable {
         default: return "Preparing"
         }
     }
+}
+struct ChatTransferDetail: Decodable {
+    var id: String?
+    var completedPaths: [String: String]?
+}
+
+struct ChatMessage: Decodable, Identifiable, Equatable {
+    let id: String
+    let peerId: String
+    let fromMe: Bool
+    let ts: Double
+    var kind: String?
+    var text: String?
+    var files: [String]?
+    var bytes: Double?
+    var path: String?
+    var status: String?
+    var seq: Double?
+    var replyTo: String?
+    var replyPreview: String?
+    var reactions: [ChatReaction]?
+    var edited: Bool?
+    var deleted: Bool?
+    var gif: ChatGif?
+    var fileXferId: String?
+    var fileXferFailed: Bool?
+    var date: Date { Date(timeIntervalSince1970: ts / 1000) }
+    var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? text! : files?.joined(separator: ", ") ?? "Attachment" }
+}
+struct ChatReaction: Decodable, Equatable {
+    var emoji: String?
+    var fromMe: Bool?
+}
+struct ChatGif: Decodable, Equatable {
+    var url: String?
+    var w: Double?
+    var h: Double?
+}
+struct ChatThread: Decodable {
+    let friendId: String
+    let messages: [ChatMessage]
+}
+struct GifResult: Decodable, Identifiable {
+    let id: String
+    var title: String?
+    var thumbUrl: String?
 }
 struct Settings: Decodable {
     var downloadDir: String?

@@ -41,16 +41,17 @@ struct SendView: View {
                         }
                     }
                     Text("Transfers").font(.title2.weight(.semibold))
-                    if bridge.transfers.isEmpty { emptyState }
+                    if bridge.sendTransfers.isEmpty { emptyState }
                     else {
                         GlassGroup {
                             LazyVStack(spacing: 16) {
-                                ForEach(bridge.transfers) { transfer in TransferCard(transfer: transfer) }
+                                ForEach(bridge.sendTransfers) { transfer in TransferCard(transfer: transfer) }
                             }
                         }
                     }
                 }.padding(20)
-            }.navigationTitle("Send").beamCanvas()
+            }.contentMargins(.bottom, 24, for: .scrollContent)
+                .navigationTitle("Send").beamCanvas()
         }
     }
     @ViewBuilder private var pickButtons: some View {
@@ -67,7 +68,8 @@ struct SendView: View {
         }.beamButton(prominent: source == "photos").disabled(picking)
     }
     private var receiveField: some View {
-        TextField("Paste a receive code", text: $code).font(.body.monospaced()).textInputAutocapitalization(.never)
+        TextField("", text: $code, prompt: Text("Paste a receive code").font(.body))
+            .font(code.isEmpty ? .body : .body.monospaced()).textInputAutocapitalization(.never)
             .autocorrectionDisabled().submitLabel(.go).onSubmit(receive)
             .padding(.vertical, 10).accessibilityLabel("Receive code")
     }

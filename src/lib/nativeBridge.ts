@@ -7,6 +7,10 @@ import { friendOnlineState } from './presence'
 import { pickAndSend, transferSharePaths } from './mobilePick'
 import { setNativeShellActive } from './nativeShell'
 import { changedSnapshots, dispatchNativeCall, type BridgeArgs, type BridgeHandlers } from './nativeBridgeProtocol'
+import { nativeReply, nativeChatSource, nativeTransfers, nativeThread } from './nativeChatBridge'
+import { withMobileFileSource } from '../components/MobileFileSheet'
+import { restoredChatTransfer } from './chatTransfer'
+import { searchGifs, type GifResult } from './gif'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -40,7 +44,80 @@ const handlers: BridgeHandlers = {
     return st().retryTransfer(string(a, 'id'))
   },
   openChat: a => st().openChat(string(a, 'friendId')),
-  sendChatText: a => st().sendChat(string(a, 'friendId'), string(a, 'text')),
+  chatThread: async a => {
+    const id = string(a, 'friendId')
+    if (st().activeChatId !== id) await st().openChat(id)
+    await st().loadChats()
+    return st().chats[id] ?? []
+  },
+  closeChat: a => { if (!a.friendId || st().activeChatId === a.friendId) st().closeChat() },
+  sendChatText: async a => {
+    const id = string(a, 'friendId'), text = string(a, 'text')
+    const reply = nativeReply(st().chats[id] ?? [], a.replyTo)
+    const files = st().activeChatId === id ? [...st().chatDraftFiles] : []
+    if (files.length) {
+      st().clearChatDraftFiles()
+      await st().shareFilesInChat(id, files, text.trim())
+    } else await st().sendChat(id, text, reply)
+  },
+  sendChatFiles: async a => {
+    const id = string(a, 'friendId'), source = nativeChatSource(a)
+    if (st().activeChatId !== id) throw new Error('Open the conversation first.')
+    const picked = await withMobileFileSource(source, source === 'photos' ? api.pickPhotos : api.pickFiles)
+    // A picker can outlive a navigation change. Never attach to the next peer.
+    if (st().activeChatId === id) st().stageChatFiles(picked)
+  },
+  removeChatDraftFile: a => st().unstageChatFile(string(a, 'path')),
+  reactToMessage: a => st().reactToMessage(string(a, 'friendId'), string(a, 'messageId'), string(a, 'emoji')),
+  editMessage: a => st().editChatMessage(string(a, 'friendId'), string(a, 'messageId'), string(a, 'text')),
+  deleteMessage: a => st().deleteChatMessage(string(a, 'friendId'), string(a, 'messageId')),
+  markChatRead: async a => {
+    const id = string(a, 'friendId')
+    if (st().activeChatId === id) return st().markChatRead(id)
+    // The store intentionally requires an open thread to clear persisted unread.
+    // Suppress navigation for this explicit list action, retaining that policy.
+    if (markingRead) return
+    markingRead = id
+    const previous = st().activeChatId
+    try { await st().openChat(id); st().markChatRead(id) }
+    finally {
+      if (st().activeChatId === id) {
+        if (previous) await st().openChat(previous)
+        else st().closeChat()
+      }
+      markingRead = null
+    }
+  },
+  setTyping: a => {
+    if (typeof a.bool !== 'boolean') throw new Error('Invalid typing value')
+    return api.sendTyping(string(a, 'friendId'), a.bool)
+  },
+  nativeChatFocus: a => {
+    if (typeof a.bool !== 'boolean') throw new Error('Invalid focus value')
+    nativeFocused = a.bool
+    useStore.setState({ windowFocused: a.bool })
+    if (a.bool && st().activeChatId) st().markChatRead(st().activeChatId!)
+  },
+  retryChatFile: a => {
+    const id = string(a, 'friendId'), messageId = string(a, 'messageId')
+    const message = st().chats[id]?.find(m => m.id === messageId)
+    if (!message?.fileXferId || !message.fromMe) throw new Error('This file cannot be retried here.')
+    return st().resendChatFile(id, messageId, message.fileXferId)
+  },
+  openChatFile: a => api.shareFiles([string(a, 'path')]),
+  chatGifs: async a => {
+    const key = st().settings?.giphyApiKey.trim()
+    if (!key) throw new Error('Add a Giphy key in Settings first.')
+    const results = await searchGifs(key, string(a, 'query'))
+    if (gifResults.size > 200) gifResults.clear()
+    results.forEach(g => gifResults.set(g.id, g))
+    return results
+  },
+  sendChatGif: a => {
+    const gif = gifResults.get(string(a, 'id'))
+    if (!gif) throw new Error('Search for the GIF again.')
+    return st().sendGif(string(a, 'friendId'), { provider: 'giphy', id: gif.id, url: gif.sendUrl, page: gif.pageUrl, w: gif.w, h: gif.h })
+  },
   setView: a => {
     const name = string(a, 'name')
     if (!['send', 'friends', 'chat', 'history', 'settings'].includes(name)) throw new Error('Invalid view')
@@ -76,6 +153,9 @@ const handlers: BridgeHandlers = {
   respondToOffer: a => st().respondToOffer(string(a, 'id'), a.accept === true),
 }
 let startup: Promise<void> | undefined
+let markingRead: string | null = null
+let nativeFocused: boolean | undefined
+const gifResults = new Map<string, GifResult>()
 let cleanup: (() => void) | undefined
 export function startNativeBridge(): Promise<void> {
   if (!MOBILE_UI || !HAS_TAURI) return Promise.resolve()
@@ -108,20 +188,38 @@ async function start() {
   let overlay = false
   let view = ''
   let lastToast = ''
+  let activeChat: string | null = null
   const sync = () => {
     const s = st()
+    // WKWebView is deliberately hidden. Its DOM blur/focus cannot describe the
+    // native scene; keep the existing receipt/notification gates scene-driven.
+    if (nativeFocused !== undefined && s.windowFocused !== nativeFocused) {
+      useStore.setState({ windowFocused: nativeFocused })
+      return
+    }
     const d = s.myDevice
     const snapshots = {
       friends: s.friends.map(({ secret: _secret, ...friend }) => friend),
-      transfers: s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
-        .filter(t => !(t.state === 'canceled' && !t.fileNames.length))
-        .map(t => ({ ...t, sharePaths: t.state === 'completed' ? transferSharePaths(t) : [] })),
+      transfers: nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
+        .filter(t => !(t.state === 'canceled' && !t.fileNames.length)),
+        Object.assign({}, ...(s.activeChatId ? s.chats[s.activeChatId] ?? [] : []).map(m => {
+          const restored = restoredChatTransfer(m, s.history)
+          return restored && m.fileXferId ? { [m.fileXferId]: restored } : {}
+        }), s.chatTransfers)).map(t => ({ ...t, sharePaths: t.state === 'completed' ? transferSharePaths(t) : [] })),
       settings: s.settings,
       chatOverview: s.chatOverview.map(o => ({ ...o, unread: s.chatUnread[o.peerId] ?? 0 })),
+      chatUnread: s.chatUnread,
+      chatTyping: s.chatTyping,
+      thread: nativeThread(s.activeChatId, s.chats),
+      chatDraftFiles: s.chatDraftFiles,
       presence: Object.fromEntries(s.friends.map(f => [f.id, friendOnlineState(f.name, s.friendSeen, s.folderStatuses) === true])),
       myDevice: d ? { name: d.name, endpointId: d.endpoint_id, deviceKind: d.device_kind, accountPub: d.account_pub, linkedDevices: d.linked_devices } : null,
     }
     for (const change of changedSnapshots(previous, snapshots)) send('state', change)
+    if (s.activeChatId !== activeChat) {
+      activeChat = s.activeChatId
+      if (!markingRead || (activeChat && activeChat !== markingRead)) send('event', { name: 'chatOpen', payload: { friendId: activeChat } })
+    }
     const show = !!s.pendingSend?.length
     if (show !== overlay) { overlay = show; send('event', { name: 'webOverlay', payload: { visible: show } }) }
     if (s.view !== view) { view = s.view; send('event', { name: 'view', payload: { name: view } }) }

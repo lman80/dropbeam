@@ -2,11 +2,12 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject private var bridge: Bridge
+    @Environment(\.scenePhase) private var scenePhase
     var body: some View {
         TabView(selection: $bridge.selectedTab) {
             SendView().tabItem { Label("Send", systemImage: "paperplane.fill") }.tag("send")
             FriendsView().tabItem { Label("Friends", systemImage: "person.2.fill") }.tag("friends")
-            PlaceholderView(title: "Chat", symbol: "bubble.left.and.bubble.right.fill", headline: "A little closer, wherever you are.", detail: "Your conversations are connected. Native messages and attachments are coming next.")
+            ChatsView()
                 .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right.fill") }.tag("chat").badge(bridge.unread)
             PlaceholderView(title: "History", symbol: "clock.arrow.circlepath", headline: "Every arrival has a story.", detail: "Your transfer history is safely kept. A native timeline is coming next.")
                 .tabItem { Label("History", systemImage: "clock.fill") }.tag("history")
@@ -15,7 +16,11 @@ struct RootView: View {
         }
         .tint(.beam)
         .preferredColorScheme(bridge.settings?.theme == "dark" ? .dark : bridge.settings?.theme == "light" ? .light : nil)
+        .task { try? await bridge.nativeChatFocus(scenePhase == .active) }
         .onChange(of: bridge.selectedTab) { _, tab in bridge.perform { try await bridge.setView(name: tab) } }
+        .onChange(of: scenePhase) { _, phase in
+            Task { try? await bridge.nativeChatFocus(phase == .active) }
+        }
         .alert("Couldn’t complete that", isPresented: Binding(get: { bridge.errorMessage != nil }, set: { if !$0 { bridge.errorMessage = nil } })) {
             Button("OK", role: .cancel) { bridge.errorMessage = nil }
         } message: { Text(bridge.errorMessage ?? "Please try again.") }
@@ -37,7 +42,7 @@ struct PlaceholderView: View {
                         Text("COMING NEXT").font(.caption.weight(.semibold)).tracking(2).foregroundStyle(.secondary)
                     }.padding(.vertical, 12)
                 }.padding(20)
-            }.navigationTitle(title).beamCanvas()
+            }.contentMargins(.bottom, 24, for: .scrollContent).navigationTitle(title).beamCanvas()
         }
     }
 }
