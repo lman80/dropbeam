@@ -49,14 +49,14 @@ thread_local! {
 
 // Same key-window/root lookup as ios_media::presenter; a presented sheet does
 // not prevent installing navigation underneath it.
-unsafe fn presenter() -> Result<Retained<AnyObject>, String> {
+unsafe fn presenter() -> Result<(Retained<AnyObject>, Retained<AnyObject>), String> {
     let app: Retained<AnyObject> = msg_send![class!(UIApplication), sharedApplication];
     let windows: Retained<NSArray<AnyObject>> = msg_send![&*app, windows];
     for window in windows.iter() {
         let key: bool = msg_send![&*window, isKeyWindow];
         if !key { continue; }
         let root: Option<Retained<AnyObject>> = msg_send![&*window, rootViewController];
-        if let Some(root) = root { return Ok(root); }
+        if let Some(root) = root { return Ok((window.clone(), root)); }
     }
     Err("No active iOS window.".into())
 }
@@ -80,10 +80,14 @@ pub async fn native_tabbar_install(app: AppHandle) -> Result<f64, String> {
     on_main(&app, move || TAB_BAR.with(|slot| unsafe {
         let mut slot = slot.borrow_mut();
         if slot.is_some() { return Ok(TAB_HEIGHT); }
-        let root = presenter()?;
-        let view: Retained<AnyObject> = msg_send![&*root, view];
+        let (window, root) = presenter()?;
+        // The bar lives on the window, not the root view: Tauri's webview is a
+        // sibling added later than any root-view subview would be, so it would
+        // otherwise cover the bar.
+        let view: Retained<AnyObject> = window.clone();
         let bounds: NSRect = msg_send![&*view, bounds];
         let safe: UIEdgeInsets = msg_send![&*view, safeAreaInsets];
+        log::info!("native tab bar: window bounds {:?}x{:?} safe bottom {}", bounds.size.width, bounds.size.height, safe.bottom);
         let height = TAB_HEIGHT + safe.bottom;
         let frame = NSRect::new(
             NSPoint::new(bounds.origin.x, bounds.origin.y + bounds.size.height - height),
@@ -119,6 +123,7 @@ pub async fn native_tabbar_install(app: AppHandle) -> Result<f64, String> {
         let delegate: Retained<DropBeamTabBarDelegate> = msg_send![super(delegate), init];
         let _: () = msg_send![&*bar, setDelegate: &*delegate];
         let _: () = msg_send![&*view, addSubview: &*bar];
+        let _: () = msg_send![&*view, bringSubviewToFront: &*bar];
         let _: () = msg_send![&*root, setAdditionalSafeAreaInsets: insets(TAB_HEIGHT)];
         *slot = Some(NativeTabBar { bar, root, items, _delegate: delegate });
         Ok(TAB_HEIGHT)
