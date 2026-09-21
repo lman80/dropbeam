@@ -27,7 +27,9 @@
        machines on the same Wi-Fi find each other and transfer at full local speed.
        (If LAN discovery still fails: System Settings -> Privacy & Security ->
        Local Network -> enable DropBeam.) -->
-    <key>NSCameraUsageDescription</key>
+        <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+<key>NSCameraUsageDescription</key>
   <string>DropBeam uses the camera only to scan a friend or device QR code. No photos are taken or stored.</string>
 <key>NSLocalNetworkUsageDescription</key>
   <string>DropBeam finds your friends' devices on the same network so files transfer directly between them at full local speed.</string>
