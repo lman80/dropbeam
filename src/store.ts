@@ -21,6 +21,7 @@ import {
   type FolderComplete,
   type FolderStatus,
   type Friend,
+  type MyDeviceInfo,
   type GifMeta,
   type HistoryEntry,
   type Pair,
@@ -214,6 +215,8 @@ interface AppStore {
   pairs: Pair[]
   /** This device's own iroh endpoint id (null until iroh is up). Owner check. */
   myEid: string | null
+  myDevice: MyDeviceInfo | null
+  refreshMyDevice: () => Promise<void>
   friends: Friend[]
   folderStatuses: Record<string, FolderStatus>
   /** When each folder pair last synced a file (ms) — for the "synced 2m ago" label. */
@@ -542,6 +545,8 @@ export const useStore = create<AppStore>((set, get) => ({
   history: [],
   pairs: [],
   myEid: null,
+  myDevice: null,
+  refreshMyDevice: async () => { set({ myDevice: await api.myDeviceInfo() }) },
   friends: [],
   folderStatuses: {},
   folderLastSynced: {},
@@ -1237,6 +1242,7 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   reloadFriends: async () => {
+    await get().refreshMyDevice().catch(() => {})
     const friends = await api.listFriends()
     const ids = new Set(friends.map((f) => f.id))
     const chatOverview = (await api.listChats()).filter((o) => ids.has(o.peerId))

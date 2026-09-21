@@ -1,3 +1,6 @@
+import { Fragment } from 'react'
+import { groupDevices } from '../lib/deviceIcons'
+import { DeviceBadge } from './DeviceBadge'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -14,6 +17,8 @@ function baseName(p: string): string {
 export function SendToChooser() {
   const files = useStore((s) => s.pendingSend)
   const friends = useStore((s) => s.friends)
+  const myDevice = useStore(s => s.myDevice)
+  const { myDevices, others } = groupDevices(friends, myDevice?.account_pub)
   const friendSeen = useStore((s) => s.friendSeen)
   const folderStatuses = useStore((s) => s.folderStatuses)
   const sendToFriend = useStore((s) => s.sendToFriend)
@@ -29,6 +34,7 @@ export function SendToChooser() {
   // already read as online (rate-limited inside claimPresenceChecks).
   useEffect(() => {
     if (!open) return
+    void useStore.getState().refreshMyDevice().catch(() => {})
     const s = useStore.getState()
     for (const id of claimPresenceChecks(s.friends, s.friendSeen, s.folderStatuses)) void s.pingFriend(id)
   }, [open])
@@ -102,7 +108,7 @@ export function SendToChooser() {
                   <Users size={16} /> Add a friend to send by name
                 </button>
               ) : (
-                friends.map((f) => {
+                [ { title: 'My devices', items: myDevices }, { title: 'Friends', items: others } ].filter(group => group.items.length).map(group => <Fragment key={group.title}><h3>{group.title}</h3>{group.items.map((f) => {
                   const online = friendOnlineState(f.name, friendSeen, folderStatuses)
                   return (
                     <button key={f.id} className="chooser-row" onClick={() => toFriend(f.id)}>
@@ -121,13 +127,13 @@ export function SendToChooser() {
                           background: avatarGradient(f.id),
                         }}
                       >
-                        <FriendAvatar friend={f} />
+                        <FriendAvatar friend={f} /><DeviceBadge kind={f.deviceKind} />
                         <span
                           title={online ? 'Online' : 'Status unknown'}
                           style={{
                             position: 'absolute',
                             right: -1,
-                            bottom: -1,
+                            top: -1,
                             width: 11,
                             height: 11,
                             borderRadius: 999,
@@ -147,7 +153,7 @@ export function SendToChooser() {
                       <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
                     </button>
                   )
-                })
+                })}</Fragment>)
               )}
             </div>
 

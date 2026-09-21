@@ -1,3 +1,4 @@
+import { QrScanner } from './QrScanner'
 import { MOBILE_UI } from '../lib/platform'
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -19,6 +20,7 @@ export function PairingModal({
   const reloadFriends = useStore((s) => s.reloadFriends)
   const toast = useStore((s) => s.toast)
   const friends = useStore((s) => s.friends)
+  const [scanning, setScanning] = useState(false)
   const [folder, setFolder] = useState('')
   const [syncMode, setSyncMode] = useState<'mirror' | 'twoway' | 'oneway'>('twoway')
   const [peerName, setPeerName] = useState('')
@@ -101,6 +103,7 @@ export function PairingModal({
       toast('error', 'Paste the invite code from the other person.')
       return
     }
+    if (!/^dropbeam1:/i.test(inviteInput.trim())) { toast('error', 'This is not a shared folder invite.'); return }
     if (!folder) {
       toast('error', 'Choose a folder for the shared files.')
       return
@@ -130,6 +133,12 @@ export function PairingModal({
   }
 
   const folderName = folder ? folder.split('/').pop() || folder : ''
+
+  if (scanning) return <QrScanner hint="Scan the shared folder invite." onClose={() => setScanning(false)} onResult={text => {
+    setScanning(false)
+    if (!/^dropbeam1:/i.test(text.trim())) { toast('error', 'This is not a shared folder invite.'); return }
+    setInviteInput(text.trim())
+  }} />
 
   return (
     <AnimatePresence>
@@ -251,6 +260,7 @@ export function PairingModal({
                   <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
                     Invite code
                   </label>
+                  <button className="btn btn-ghost" onClick={() => setScanning(true)}>Scan QR code</button>
                   <textarea
                     className="input"
                     style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'calc(12px * var(--ui-font-scale, 1))', resize: 'none' }}

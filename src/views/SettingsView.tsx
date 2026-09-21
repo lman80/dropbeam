@@ -1,3 +1,5 @@
+import { deviceKindLabel } from '../lib/deviceIcons'
+import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { useEffect, useState, type ReactNode } from 'react'
 import { CheckCircle2, Download, FolderOpen, HardDrive, RefreshCw, Trash2 } from 'lucide-react'
 import { api, type Settings } from '../lib/api'
@@ -108,6 +110,12 @@ export function SettingsView() {
     if (d) save({ downloadDir: d })
   }
 
+  const myDevice = useStore(s => s.myDevice)
+  const [linkMode, setLinkMode] = useState<'new' | 'this' | null>(null)
+  useEffect(() => { void useStore.getState().refreshMyDevice().catch(e => useStore.getState().toast('error', String(e))) }, [])
+  const deviceModals = <>{linkMode === 'new' && <LinkNewDeviceModal onClose={() => setLinkMode(null)} />}{linkMode === 'this' && <LinkDeviceModal onClose={() => setLinkMode(null)} />}</>
+  const deviceDescription = myDevice ? `This device: ${settings.displayName || myDevice.name} · ${deviceKindLabel(myDevice.device_kind)}` : 'Loading this device…'
+  const linkedDescription = myDevice ? `${myDevice.linked_devices} linked device${myDevice.linked_devices === 1 ? '' : 's'}` : ''
   const toast = useStore((s) => s.toast)
   const [clearing, setClearing] = useState(false)
   const clearCache = async () => {
@@ -177,6 +185,8 @@ export function SettingsView() {
     const field = (key: 'displayName' | 'giphyApiKey' | 'customRelay' | 'diagnosticsUrl' | 'labOperatorId', label: string, placeholder = '') => <input className="input" aria-label={label} autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" placeholder={placeholder} value={settings[key]} onChange={e => save({ [key]: e.target.value })} />
     return <div className="mobile-page mobile-settings">
       <MobileHeader title="Settings" />
+      {deviceModals}
+      <MobileSection title="Devices"><MobileSetting title={deviceDescription} desc={linkedDescription} /><div className="ios-row"><button className="ios-button" onClick={() => setLinkMode('new')}>Link a new device</button></div><div className="ios-row"><button className="ios-button" onClick={() => setLinkMode('this')}>Link this device to my account</button></div></MobileSection>
       <MobileSection title="Profile"><MobileSetting title="Display name" desc="The name your friends see.">{field('displayName', 'Display name')}</MobileSetting></MobileSection>
       <MobileSection title="Downloads"><MobileSetting title="Clear transfer cache" desc="Remove interrupted transfer leftovers. Old leftovers are cleaned automatically after a week." destructive><button className="ios-button ios-destructive" disabled={clearing} onClick={clearCache}>{clearing ? <Spinner size={18} /> : 'Clear now'}</button></MobileSetting></MobileSection>
       <MobileSection title="Appearance"><MobileSetting title="Theme"><div className="mobile-theme" role="group" aria-label="Theme">{(['system', 'light', 'dark'] as const).map(t => <button key={t} aria-pressed={settings.theme === t} onClick={() => save({ theme: t })}>{t}</button>)}</div></MobileSetting></MobileSection>
@@ -236,6 +246,8 @@ export function SettingsView() {
       <h1 className="titlebar-drag" style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: '0 0 16px' }}>
         Settings
       </h1>
+      {deviceModals}
+      <section className="card" style={{ padding: 18, marginBottom: 16 }}><h2>Devices</h2><Row title={deviceDescription} desc={linkedDescription} /><div className="device-link-actions"><button className="btn btn-ghost" onClick={() => setLinkMode('new')}>Link a new device</button><button className="btn btn-ghost" onClick={() => setLinkMode('this')}>Link this device to my account</button></div></section>
       {!MOBILE_UI && <LocationSettings />}
 
       <SectionTitle>Profile</SectionTitle>

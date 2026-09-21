@@ -1,3 +1,7 @@
+import { groupDevices } from '../lib/deviceIcons'
+import { DeviceBadge } from '../components/DeviceBadge'
+import { QrScanner } from '../components/QrScanner'
+import { LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -31,6 +35,14 @@ import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/prese
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
   const [adding, setAdding] = useState(false)
+  const [linking, setLinking] = useState(false)
+  const myDevice = useStore(s => s.myDevice)
+  const { myDevices, others } = groupDevices(friends, myDevice?.account_pub)
+  useEffect(() => { void useStore.getState().refreshMyDevice().catch(() => {}) }, [])
+  const devices = <section><div className="device-section-heading"><h2 className={MOBILE_UI ? 'ios-section-title' : ''}>My devices</h2><button className={MOBILE_UI ? 'ios-button' : 'btn btn-ghost'} onClick={() => setLinking(true)}>Link a device</button></div>
+    {myDevices.length ? <div className={MOBILE_UI ? 'ios-list' : 'device-list'}>{myDevices.map(f => <FriendCard key={f.id} friend={f} />)}</div> : <p className={MOBILE_UI ? 'mobile-inset ios-footnote' : ''}>Link your phone or another computer</p>}
+    {linking && <LinkNewDeviceModal onClose={() => setLinking(false)} />}
+  </section>
 
   // #34: presence must recover without a restart. Opening Friends actively
   // re-checks everyone who doesn't already read as online, instead of waiting
@@ -42,13 +54,14 @@ export function FriendsView() {
 
   if (MOBILE_UI) return <div className="mobile-page mobile-friends">
     <MobileHeader title="Friends" actions={<button className="ios-icon" aria-label="Add friend" onClick={() => setAdding(true)}><Plus size={22} /></button>} />
+    {devices}
     <h2 className="ios-section-title">You</h2><YouCard />
-    <h2 className="ios-section-title">{friends.length ? `Friends · ${friends.length}` : 'Friends'}</h2>
+    <h2 className="ios-section-title">{others.length ? `Friends · ${others.length}` : 'Friends'}</h2>
     <div className="ios-list">
       <button className="ios-row mobile-location-row" onClick={() => useStore.getState().setView('locations')}><span>Browse friends’ Locations</span><ChevronRight size={18} /></button>
-      {friends.map(f => <FriendCard key={f.id} friend={f} />)}
+      {others.map(f => <FriendCard key={f.id} friend={f} />)}
     </div>
-    {friends.length === 0 && <div className="mobile-inset mobile-empty"><Users size={28} /><h2 className="ios-headline">No friends yet</h2><p className="ios-sub">Add a friend to send files and chat.</p><button className="ios-button ios-primary" onClick={() => setAdding(true)}>Add a friend</button></div>}
+    {others.length === 0 && <div className="mobile-inset mobile-empty"><Users size={28} /><h2 className="ios-headline">No friends yet</h2><p className="ios-sub">Add a friend to send files and chat.</p><button className="ios-button ios-primary" onClick={() => setAdding(true)}>Add a friend</button></div>}
     {adding && <AddFriendModal onClose={() => setAdding(false)} />}
   </div>
 
@@ -72,13 +85,14 @@ export function FriendsView() {
 
       {MOBILE_UI && <button className="btn btn-ghost" onClick={() => useStore.getState().setView('locations')}>Browse friends’ Locations</button>}
 
+      {devices}
       {/* ── You ─────────────────────────────────────────────── */}
       <SectionLabel>You</SectionLabel>
       <YouCard />
 
       {/* ── Friends ─────────────────────────────────────────── */}
-      <SectionLabel>{friends.length ? `Friends · ${friends.length}` : 'Friends'}</SectionLabel>
-      {friends.length === 0 ? (
+      <SectionLabel>{others.length ? `Friends · ${others.length}` : 'Friends'}</SectionLabel>
+      {others.length === 0 ? (
         <div className="card" style={{ padding: '6px 0 0' }}>
           <EmptyState
             icon={<Users size={24} />}
@@ -94,7 +108,7 @@ export function FriendsView() {
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <AnimatePresence initial={false}>
-            {friends.map((f) => (
+            {others.map((f) => (
               <FriendCard key={f.id} friend={f} />
             ))}
           </AnimatePresence>
@@ -462,7 +476,7 @@ function FriendCard({ friend }: { friend: Friend }) {
   if (MOBILE_UI) return <>
     <div className="ios-row mobile-friend-row">
       <button className="mobile-friend-open" onClick={() => setSheetOpen(true)} aria-label={`Manage ${friend.name}`}>
-        <Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={40} radius={12} />
+        <span className="device-avatar"><Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={40} radius={12} /><DeviceBadge kind={friend.deviceKind} /></span>
         <span className="mobile-grow"><span className="ios-headline mobile-friend-name">{friend.name}</span><span className="ios-footnote mobile-presence"><i className={isOnline ? 'online' : ''} />{presenceLabel(presence)}</span></span>
       </button>
       <button className="ios-icon" aria-label={`Send to ${friend.name}`} onClick={send} disabled={busy}>{busy ? <Spinner size={20} /> : <Send size={20} />}</button>
@@ -489,13 +503,13 @@ function FriendCard({ friend }: { friend: Friend }) {
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <div style={{ position: 'relative', flexShrink: 0 }}>
-          <Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={44} radius={14} />
+          <Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={44} radius={14} /><DeviceBadge kind={friend.deviceKind} />
           <span
             title={presenceLabel(presence)}
             style={{
               position: 'absolute',
               right: -2,
-              bottom: -2,
+              top: -2,
               width: 13,
               height: 13,
               borderRadius: 999,
@@ -727,13 +741,14 @@ function InvitePanel({
 function AddFriendModal({ onClose }: { onClose: () => void }) {
   const acceptFriend = useStore((s) => s.acceptFriend)
   const addFriendByCode = useStore((s) => s.addFriendByCode)
+  const [scanning, setScanning] = useState(false)
   const [error, setError] = useState('')
   const [codeInput, setCodeInput] = useState('')
   const [busy, setBusy] = useState(false)
 
-  const submit = async () => {
+  const submit = async (value = codeInput) => {
     setError('')
-    const code = codeInput.trim()
+    const code = value.trim()
     if (!code) {
       setError("Paste your friend's code first.")
       return
@@ -753,6 +768,8 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
       setBusy(false)
     }
   }
+
+  if (scanning) return <QrScanner hint="Scan your friend's DropBeam code." onClose={() => setScanning(false)} onResult={text => { setScanning(false); setCodeInput(text); void submit(text) }} />
 
   return (
     <AnimatePresence>
@@ -792,6 +809,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
             <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
               Your friend's code
             </label>
+            <button className="btn btn-ghost" disabled={busy} onClick={() => setScanning(true)}><QrCode size={16} />Scan QR code</button>
             <textarea
               className="input"
               style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'calc(12px * var(--ui-font-scale, 1))', resize: 'none' }}
@@ -812,7 +830,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
             <button
               className="btn btn-primary"
               style={{ width: '100%', marginTop: 12 }}
-              onClick={submit}
+              onClick={() => void submit()}
               disabled={busy}
             >
               {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend

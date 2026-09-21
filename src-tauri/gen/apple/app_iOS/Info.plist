@@ -28,9 +28,9 @@
 	<array>
 		<string>_irohv1._udp</string>
 	</array>
-		<key>NSCameraUsageDescription</key>
+	<key>NSCameraUsageDescription</key>
 	<string>DropBeam uses the camera only to scan a friend or device QR code. No photos are taken or stored.</string>
-<key>NSLocalNetworkUsageDescription</key>
+	<key>NSLocalNetworkUsageDescription</key>
 	<string>DropBeam finds your friends&apos; devices on the same network so files transfer directly between them at full local speed.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>DropBeam saves photos and videos your friends send you into your photo library.</string>
