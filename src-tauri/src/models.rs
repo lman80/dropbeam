@@ -213,6 +213,8 @@ pub struct HistoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    #[serde(default)]
+    pub device_kind: String,
     /// Where received Quick Send files are saved.
     pub download_dir: String,
     /// The name peers see you as.
@@ -335,6 +337,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            device_kind: String::new(),
             download_dir: String::new(),
             display_name: String::new(),
             theme: "system".into(),
@@ -506,6 +509,10 @@ pub struct FolderHistorySummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Friend {
+    #[serde(default)]
+    pub device_kind: Option<String>,
+    #[serde(default)]
+    pub account_pub: Option<String>,
     pub id: String,
     pub role: PairRole,
     pub name: String,

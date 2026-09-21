@@ -44,6 +44,8 @@ fn read_raw(config_dir: &Path) -> Vec<Friend> {
         .map(|mut f| {
             if f.endpoint_id.as_deref().is_some_and(|e| e.trim().is_empty()) {
                 f.endpoint_id = None;
+                f.account_pub = None;
+                f.device_kind = None;
             }
             f
         })
@@ -116,6 +118,8 @@ pub fn create(
         avatar: None,
         name_custom: false,
         progress_v: None,
+        device_kind: None,
+        account_pub: None,
     };
     let invite = Invite {
         v: 1,
@@ -159,6 +163,8 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         avatar: None,
         name_custom: false,
         progress_v: None,
+        device_kind: None,
+        account_pub: None,
     };
     let detached = detached_threads(config_dir)?;
     friends.push(friend.clone());
@@ -206,6 +212,8 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         avatar: None,
         name_custom: false,
         progress_v: None,
+        device_kind: None,
+        account_pub: None,
     });
     let _ = save(config_dir, &friends);
 }
@@ -294,6 +302,10 @@ pub fn plan_reconcile(
         if survivor.endpoint_id.is_none() {
             survivor.endpoint_id = loser.endpoint_id.clone();
         }
+        if survivor.endpoint_id.is_some() && survivor.endpoint_id == loser.endpoint_id {
+            if survivor.account_pub.is_none() { survivor.account_pub = loser.account_pub.clone(); }
+            if survivor.device_kind.is_none() { survivor.device_kind = loser.device_kind.clone(); }
+        }
         if survivor.avatar.is_none() {
             survivor.avatar = loser.avatar.clone();
         }
@@ -375,6 +387,8 @@ pub fn set_endpoint_id(config_dir: &Path, id: &str, endpoint_id: String) -> bool
     let mut changed = false;
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
         if f.endpoint_id.as_deref() != Some(endpoint_id.as_str()) {
+            f.account_pub = None;
+            f.device_kind = None;
             f.endpoint_id = Some(endpoint_id);
             changed = true;
         }
@@ -436,6 +450,10 @@ fn decode_user_code(code: &str) -> Result<UserCode, String> {
 /// The stable EndpointId IS the identity, so this NEVER duplicates a friend (or
 /// loses their chat history) across app updates or re-pairs. Returns the friend.
 pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> Friend {
+    upsert_with_id(config_dir, endpoint_id, name, None)
+}
+
+pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, offered_id: Option<&str>) -> Friend {
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     let name = name.trim();
@@ -452,12 +470,12 @@ pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> F
         return out;
     }
     let friend = Friend {
-        id: detached_threads(config_dir).unwrap_or_else(|e| {
+        id: offered_id.filter(|id| !id.is_empty() && !friends.iter().any(|f| f.id == *id)).map(str::to_owned).or_else(|| detached_threads(config_dir).unwrap_or_else(|e| {
             log::error!("could not read detached chat identity: {e}");
             Default::default()
         }).get(endpoint_id)
             .filter(|id| !friends.iter().any(|f| &f.id == *id))
-            .cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            .cloned()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         role: PairRole::B,
         name: clean_name(name, "Friend"),
         secret: random_secret(),
@@ -467,6 +485,8 @@ pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> F
         avatar: None,
         name_custom: false,
         progress_v: None,
+        device_kind: None,
+        account_pub: None,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -525,6 +545,8 @@ pub fn self_heal_chat_sender(
     // 2) An invite-friend filed under the claimed id but not yet keyed → key it.
     if let Some(id) = claimed_id.filter(|id| !id.is_empty()) {
         if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
+            f.account_pub = None;
+            f.device_kind = None;
             f.endpoint_id = Some(endpoint_id.to_string());
             if !name.is_empty() && !f.name_custom && f.name != name {
                 f.name = name.to_string();
@@ -565,6 +587,8 @@ pub fn self_heal_chat_sender(
             if !(claimed_has_chat && cand_has_chat) {
                 // Key the existing record to the sender's cryptographic endpoint id so
                 // replies dial back AND future messages resolve by eid (step 1).
+                friends[i].account_pub = None;
+                friends[i].device_kind = None;
                 friends[i].endpoint_id = Some(endpoint_id.to_string());
                 if !friends[i].name_custom && friends[i].name != name {
                     friends[i].name = name.to_string();
@@ -599,6 +623,8 @@ pub fn self_heal_chat_sender(
         avatar: None,
         name_custom: false,
         progress_v: None,
+        device_kind: None,
+        account_pub: None,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -620,6 +646,8 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
             if let Some(f) = friends.iter_mut().find(|f| f.id == friend_id) {
                 let mut changed = false;
                 if f.endpoint_id.as_deref() != Some(endpoint_id) {
+                    f.account_pub = None;
+                    f.device_kind = None;
                     f.endpoint_id = Some(endpoint_id.to_string());
                     changed = true;
                 }
@@ -808,6 +836,8 @@ mod tests {
             avatar: None,
             name_custom: false,
             progress_v: None,
+            device_kind: None,
+            account_pub: None,
         }
     }
 
@@ -833,6 +863,8 @@ mod tests {
             avatar: None,
             name_custom: false,
             progress_v: None,
+            device_kind: None,
+            account_pub: None,
         }
     }
 
@@ -1262,4 +1294,98 @@ mod code_tests {
         assert!(decode_user_code("other:invalid").is_err());
         assert!(decode_user_code("Dropbeam:invalid").is_err());
     }
+}
+
+/// account_pub must already have been authenticated by the caller.
+pub fn set_device_info(config_dir: &Path, endpoint_id: &str, device_kind: Option<&str>, account_pub: Option<&str>) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        f.device_kind = device_kind.map(str::to_owned);
+        if let Some(key) = account_pub { f.account_pub = Some(key.to_owned()); }
+    }
+    let _ = save(config_dir, &friends);
+}
+
+pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &serde_json::Value) {
+    let key = req["account_pub"].as_str().filter(|key| {
+        crate::link::verify_account(key, req["account_sig"].as_str().unwrap_or(""), endpoint_id)
+    });
+    set_device_info(config_dir, endpoint_id, req["device_kind"].as_str(), key);
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    #[test]
+    fn hello_account_requires_valid_endpoint_signature() {
+        let dir = std::env::temp_dir().join(format!("db-device-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = iroh::SecretKey::generate();
+        let public = hex::encode(key.public().as_bytes());
+        upsert_by_endpoint(&dir, "endpoint", "Phone");
+        let mut hello = serde_json::json!({"device_kind":"phone", "account_pub":public, "account_sig":"invalid"});
+        apply_device_hello(&dir, "endpoint", &hello);
+        let f = load(&dir).remove(0);
+        assert!(f.account_pub.is_none()); assert_eq!(f.device_kind.as_deref(), Some("phone"));
+        hello["account_sig"] = serde_json::json!(hex::encode(key.sign(b"endpoint").to_bytes()));
+        apply_device_hello(&dir, "endpoint", &hello);
+        assert_eq!(load(&dir)[0].account_pub.as_deref(), Some(public.as_str()));
+        hello["account_sig"] = serde_json::json!(hex::encode(key.sign(b"imposter").to_bytes()));
+        hello["device_kind"] = serde_json::json!("tablet");
+        apply_device_hello(&dir, "endpoint", &hello);
+        assert_eq!(load(&dir)[0].account_pub.as_deref(), Some(public.as_str()));
+        assert_eq!(load(&dir)[0].device_kind.as_deref(), Some("tablet"));
+        let id = load(&dir)[0].id.clone();
+        set_endpoint_id(&dir, &id, "replacement".into());
+        assert!(load(&dir)[0].account_pub.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn imported_ids_preserve_existing_identity_and_avoid_collisions() {
+        let dir = std::env::temp_dir().join(format!("db-device-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = upsert_with_id(&dir, "a", "A", Some("thread"));
+        assert_eq!(a.id, "thread");
+        assert_eq!(upsert_with_id(&dir, "a", "A", Some("different")).id, a.id);
+        assert_ne!(upsert_with_id(&dir, "b", "B", Some("thread")).id, a.id);
+        let mut legacy = a.clone();
+        legacy.id = "legacy-thread".into();
+        legacy.endpoint_id = None;
+        legacy.account_pub = Some("unverified".into());
+        let imported = import_link_friend(&dir, &legacy);
+        assert_eq!(imported.id, legacy.id);
+        assert!(imported.secret.is_empty() && imported.account_pub.is_none());
+        assert_eq!(import_link_friend(&dir, &legacy).id, imported.id);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// Preserve legacy, endpoint-less contacts too; their shared secret is never copied.
+pub(crate) fn import_link_friend(config_dir: &Path, offered: &Friend) -> Friend {
+    if let Some(eid) = offered.endpoint_id.as_deref() {
+        return upsert_with_id(config_dir, eid, &offered.name, Some(&offered.id));
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    if let Some(existing) = friends.iter().find(|f| f.id == offered.id && f.endpoint_id.is_none()) {
+        return existing.clone();
+    }
+    let mut friend = offered.clone();
+    if friend.id.is_empty() || friends.iter().any(|f| f.id == friend.id) {
+        friend.id = uuid::Uuid::new_v4().to_string();
+    }
+    friend.secret.clear();
+    friend.account_pub = None;
+    friend.avatar = None;
+    friends.push(friend.clone());
+    let _ = save(config_dir, &friends);
+    friend
+}
+
+pub(crate) fn set_link_avatar(config_dir: &Path, id: &str, path: String) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    if let Some(f) = friends.iter_mut().find(|f| f.id == id) { f.avatar = Some(path); }
+    let _ = save(config_dir, &friends);
 }
