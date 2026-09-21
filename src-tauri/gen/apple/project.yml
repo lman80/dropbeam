@@ -12,6 +12,7 @@ settingGroups:
     base:
       PRODUCT_NAME: DropBeam
       PRODUCT_BUNDLE_IDENTIFIER: com.ashtonmiller.dropbeam
+      DEVELOPMENT_TEAM: R2RDA8476R
 targetTemplates:
   app:
     type: application
@@ -31,6 +32,7 @@ targets:
       - path: Sources
       - path: Assets.xcassets
       - path: Externals
+        buildPhase: none
       - path: app_iOS
       - path: assets
         buildPhase: resources
