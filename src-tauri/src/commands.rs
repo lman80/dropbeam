@@ -29,6 +29,34 @@ pub fn cancel_transfer(
     }
 }
 
+/// Stop an in-flight SEND but keep everything it already delivered: the receiver's
+/// per-file partials and any landed Location files stay put, and the frontend keeps
+/// the card's retry record, so Resume (`retryTransfer`) replays the same send and
+/// the stat probes skip what already arrived. Same machinery as `cancel_transfer`,
+/// only the reported outcome differs.
+#[tauri::command]
+pub fn pause_transfer(
+    app: AppHandle,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    id: String,
+) {
+    use crate::iroh_net::{CancelKind, CancelReason};
+    match iroh.cancel_with(&id, CancelReason::Pause) {
+        // A staged send isn't running a loop, so report Paused here — and consume
+        // the pause mark, since no loop will.
+        CancelKind::Staged => {
+            iroh.take_reason(&id);
+            crate::iroh_net::emit_paused_send(&app, &id);
+        }
+        // An in-flight send reports Paused from its own loop, which reads the mark.
+        CancelKind::Active => {}
+        // Not a known iroh transfer — nothing to pause; drop the mark again.
+        CancelKind::Unknown => {
+            iroh.take_reason(&id);
+        }
+    }
+}
+
 /// Settings "Clear transfer cache": delete every abandoned resumable partial
 /// (paused/failed transfer leftovers) that isn't actively being written.
 /// Returns the number of bytes freed so the UI can show it.
@@ -135,11 +163,22 @@ pub async fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
         app.run_on_main_thread(move || {
             use objc2_app_kit::{NSModalResponseOK, NSModalResponseCancel, NSOpenPanel, NSWindow};
             use objc2_foundation::MainThreadMarker;
-            let Some(mtm) = MainThreadMarker::new() else {
+            let Some(_mtm) = MainThreadMarker::new() else {
                 let _ = tx.send(Err("Picker requires the main thread".to_string()));
                 return;
             };
-            let panel = NSOpenPanel::openPanel(mtm);
+            // `NSOpenPanel::openPanel(mtm)` PANICS ("unexpected NULL returned
+            // from +[NSOpenPanel openPanel]") when AppKit declines to vend a
+            // panel — it has done so in the wild when the app is mid-launch or
+            // the window server connection isn't ready. A panic here unwinds
+            // through the Objective-C main-thread dispatch and takes the app
+            // down, so send the message ourselves and treat nil as an error.
+            let panel: Option<objc2::rc::Retained<NSOpenPanel>> =
+                unsafe { objc2::msg_send![objc2::class!(NSOpenPanel), openPanel] };
+            let Some(panel) = panel else {
+                let _ = tx.send(Err("The file picker could not be opened. Try again in a moment.".to_string()));
+                return;
+            };
             panel.setCanChooseFiles(true);
             panel.setCanChooseDirectories(true);
             panel.setAllowsMultipleSelection(true);
@@ -1874,6 +1913,15 @@ pub async fn list_locations(state: State<'_, Arc<AppState>>) -> Result<Vec<crate
     let config = state.config_dir.clone();
     tokio::task::spawn_blocking(move || crate::locations::hosted(&config)).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))
 }
+/// Live state of ONE folder this device hosts, for the "Shared from this device"
+/// gateway card: is the path reachable, is the mount marker still ours, how much
+/// room is left, and who last used it. Cheap enough to poll every 30 s.
+#[tauri::command]
+pub async fn hosted_location_status(state: State<'_, Arc<AppState>>, id: String) -> Result<crate::locations::HostedStatus, String> {
+    let config = state.config_dir.clone();
+    tokio::task::spawn_blocking(move || crate::locations::hosted_status(&config, &id))
+        .await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))
+}
 #[tauri::command]
 pub async fn save_location(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     location: Option<crate::locations::Location>, remove_id: Option<String>) -> Result<Vec<crate::locations::Location>, String> {
@@ -1895,9 +1943,49 @@ pub async fn location_request(state: State<'_, Arc<AppState>>, iroh: State<'_, A
     }
     crate::iroh_net::location_request(&iroh, &endpoint, request).await.map_err(|e| format!("{e:#}"))
 }
+/// "Verify copy": re-check a completed SEND by hashing every file on both
+/// devices. Runs in the background and reports on the transfer's own card; the
+/// files and the destination come from the record the send itself left behind,
+/// exactly like the frontend's retry payload.
+#[tauri::command]
+pub fn verify_transfer(app: AppHandle, iroh: State<'_, Arc<crate::iroh_net::IrohState>>, id: String) -> Result<(), String> {
+    crate::iroh_net::start_verify(app, iroh.inner().clone(), id)
+}
+
+/// Stop a running "Verify copy" — the card reports Canceled and the peer drops
+/// its hashing as soon as it can no longer report progress.
+#[tauri::command]
+pub fn cancel_verify(iroh: State<'_, Arc<crate::iroh_net::IrohState>>, id: String) {
+    crate::iroh_net::cancel_verify(&iroh, &id);
+}
+
 #[tauri::command]
 pub async fn upload_to_location(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    friend_id: String, target: crate::locations::Target, paths: Vec<String>,
+    replace_existing: Option<bool>) -> Result<TransferUpdate, String> {
+    start_location_upload_replacing(app, state.inner().clone(), iroh.inner().clone(), friend_id, target,
+        paths, replace_existing.unwrap_or(false)).await
+}
+
+/// Shared by the UI command and the `--location-upload` launch argument (a
+/// second launch forwards its arguments to the running app, so a script can
+/// queue an upload without the GUI).
+/// `replace_existing` is the SYNCED-FOLDER contract: a changed file is published
+/// at its own name (the host moves the copy it already has to the location's
+/// trash) instead of landing beside it as "name (2)". A manual upload passes
+/// false, so it can never quietly overwrite what someone else put there.
+pub async fn start_location_upload(app: AppHandle, state: Arc<AppState>, iroh: Arc<crate::iroh_net::IrohState>,
     friend_id: String, target: crate::locations::Target, paths: Vec<String>) -> Result<TransferUpdate, String> {
+    start_location_upload_replacing(app, state, iroh, friend_id, target, paths, false).await
+}
+
+/// The same upload with "newest wins" available: with `replace_existing` the
+/// host publishes each file AT its requested name and moves any different
+/// previous version into that location's recoverable trash, instead of landing
+/// the new copy beside it as "name (2)". Only a folder that is continuously
+/// synced to the location asks for this.
+pub async fn start_location_upload_replacing(app: AppHandle, state: Arc<AppState>, iroh: Arc<crate::iroh_net::IrohState>,
+    friend_id: String, target: crate::locations::Target, paths: Vec<String>, replace_existing: bool) -> Result<TransferUpdate, String> {
     if paths.is_empty() { return Err("No files selected".into()); }
     crate::locations::relative(&target.rel_path).map_err(|e| e.to_string())?;
     let friend = friends::get(&state.config_dir, &friend_id).ok_or("Friend not found")?;
@@ -1908,6 +1996,6 @@ pub async fn upload_to_location(app: AppHandle, state: State<'_, Arc<AppState>>,
     if !shared.as_array().into_iter().flatten().any(|l| l["id"] == target.location_id && l["rights"]["upload"] == true) {
         return Err("This location is not shared with upload permission".into());
     }
-    crate::iroh_net::send_location_to_friend(app, iroh.inner().clone(), friend.name, endpoint, paths,
-        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None })
+    crate::iroh_net::send_location_to_friend(app, iroh, friend.name, endpoint, paths,
+        crate::iroh_net::LocationSend { target: Some(target), transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing })
 }

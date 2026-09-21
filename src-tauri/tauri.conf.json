@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "DropBeam",
   "mainBinaryName": "DropBeam",
-  "version": "0.48.0",
+  "version": "0.52.1",
   "identifier": "com.dropbeam.app",
   "build": {
     "frontendDist": "../dist",
@@ -62,8 +62,8 @@
       {
         "label": "receive",
         "url": "index.html",
-        "width": 214,
-        "height": 213,
+        "width": 190,
+        "height": 184,
         "minWidth": 180,
         "minHeight": 170,
         "resizable": true,

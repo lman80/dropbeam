@@ -31,6 +31,10 @@ pub enum TransferState {
     Failed,
     /// User canceled.
     Canceled,
+    /// User paused. Everything already moved is KEPT (per-file partials on the
+    /// receiver, landed files on a Location), so resuming replays the same send
+    /// and skips what already arrived.
+    Paused,
 }
 
 /// Which channel the active connection is using — so the UI can tell the user
@@ -75,6 +79,27 @@ pub struct ConnDetail {
 pub struct TransferUpdate {
     #[serde(default)]
     pub integrity: Vec<FileIntegrity>,
+    #[serde(default)]
+    pub location_skipped: Option<u64>,
+    /// Files the Location host published beside an existing, different file of
+    /// the same name (as `name (2).ext`) instead of failing the upload.
+    #[serde(default)]
+    pub location_conflicts: Option<u64>,
+    /// Files the host published AT their requested name for a folder kept
+    /// continuously in sync (`replace_existing`), moving the previous version
+    /// into that location's recoverable trash.
+    #[serde(default)]
+    pub location_replaced: Option<u64>,
+    /// Set on the FIRST receive update of an incoming Location upload so the
+    /// host's "Shared from this device" card can say which folder is filling up.
+    /// Only that first snapshot carries it; the view remembers it per transfer id.
+    #[serde(default)]
+    pub location_id: Option<String>,
+    /// The last "Verify copy" run for this card: a full SHA-256 comparison of
+    /// every file in the send against the copy that landed on the peer. `None`
+    /// until the user asks for one.
+    #[serde(default)]
+    pub verify: Option<crate::verify::VerifyReport>,
     #[serde(default)]
     pub chat_transfer: Option<ChatTransferLink>,
     pub id: String,
@@ -137,6 +162,11 @@ impl TransferUpdate {
         let file_count = file_names.len();
         TransferUpdate {
             integrity: vec![],
+            location_skipped: None,
+            location_conflicts: None,
+            location_replaced: None,
+            location_id: None,
+            verify: None,
             chat_transfer: None,
             id,
             direction,
@@ -614,6 +644,8 @@ pub struct VerifyResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileIntegrity {
+    #[serde(default)]
+    pub sha256: Option<String>,
     #[serde(default)]
     pub index: u64,
     #[serde(default)]

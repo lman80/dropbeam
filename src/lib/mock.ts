@@ -14,8 +14,10 @@ import type {
   PairUpdate,
   Settings,
   TransferUpdate,
+  VerifyReport,
   VerifyResult,
 } from './api'
+import type { SyncedFolder as MockSyncedFolder, SyncedFolderStatus as MockSyncedFolderStatus } from './api'
 
 type Cb = (payload: unknown) => void
 const buses: Record<string, Set<Cb>> = {}
@@ -141,7 +143,7 @@ const folderHistory: Record<string, HistoryItem[]> = {
 }
 
 let friends: Friend[] = [
-  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true, endpointId: null, avatar: null },
+  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true, endpointId: 'mock-endpoint-alex', avatar: null },
   { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: Date.now() - 2 * 86400_000, autoAccept: false, endpointId: null, avatar: null },
 ]
 let friendCounter = 2
@@ -167,12 +169,19 @@ function base(id: string, direction: 'send' | 'receive', names: string[]): Trans
   }
 }
 
+/** Simulated transfers still ticking, so the dev mock can pause one mid-flight. */
+const running = new Map<string, { t: TransferUpdate; iv: ReturnType<typeof setInterval> }>()
+
+/** Completed simulated transfers, so the preview can run "Verify copy" on one. */
+const finished = new Map<string, TransferUpdate>()
+const verifying = new Map<string, ReturnType<typeof setInterval>>()
+
 function simulate(t: TransferUpdate, total: number) {
   t.bytesTotal = total
   t.peer = '192.168.1.55:51022'
   t.locality = 'local'
   let pct = 0
-  const iv = setInterval(() => {
+  const iv: ReturnType<typeof setInterval> = setInterval(() => {
     pct += 6 + Math.random() * 9
     if (pct >= 100) {
       t.state = 'transferring'
@@ -182,8 +191,10 @@ function simulate(t: TransferUpdate, total: number) {
       t.etaSeconds = 0
       emit('transfer://update', { ...t })
       clearInterval(iv)
+      running.delete(t.id)
       setTimeout(() => {
         t.state = 'completed'
+        finished.set(t.id, t)
         emit('transfer://update', { ...t })
         history.unshift({
           id: t.id,
@@ -209,6 +220,7 @@ function simulate(t: TransferUpdate, total: number) {
     t.etaSeconds = (100 - pct) / 11
     emit('transfer://update', { ...t })
   }, 550)
+  running.set(t.id, { t, iv })
 }
 
 // Dev helper to preview incoming transfers: window.__mockIncoming(true) for a
@@ -241,6 +253,69 @@ if (typeof window !== 'undefined') {
   const w = window as unknown as { __mockIncoming?: (m: boolean) => void; __mockSend?: (to?: string) => void }
   w.__mockIncoming = mockIncoming
   w.__mockSend = mockSend
+}
+
+// ── Synced folders (dev preview) ─────────────────────────────────────────────
+// Enough behaviour to exercise every card state: a healthy folder, one whose
+// host is asleep, and whatever the preview adds.
+let mockFolders: MockSyncedFolder[] = [
+  {
+    id: 'sf1', friendId: 'f1', locationId: 'loc1', relPath: 'Travel',
+    localPath: '/Users/you/Pictures/Travel', enabled: true, deleteRemote: false,
+    createdAt: Date.now() - 86_400_000, lastCheckAt: Date.now() - 120_000,
+    lastResult: { ok: true, message: 'Up to date' },
+  },
+  {
+    id: 'sf2', friendId: 'f1', locationId: 'loc1', relPath: '',
+    localPath: '/Users/you/Documents/Scans', enabled: false, deleteRemote: true,
+    createdAt: Date.now() - 400_000_000, lastCheckAt: Date.now() - 7_200_000,
+    lastResult: { ok: true, message: 'Up to date' },
+  },
+]
+let mockStatuses: Record<string, MockSyncedFolderStatus> = {
+  sf1: { id: 'sf1', state: 'idle', pendingFiles: 0, lastCheckAt: Date.now() - 120_000, message: 'Up to date', transferId: null },
+  sf2: { id: 'sf2', state: 'paused', pendingFiles: 0, lastCheckAt: Date.now() - 7_200_000, message: 'Paused — nothing is being copied', transferId: null },
+}
+function pushStatus(id: string, patch: Partial<MockSyncedFolderStatus>) {
+  const next = { ...mockStatuses[id], ...patch, id } as MockSyncedFolderStatus
+  mockStatuses = { ...mockStatuses, [id]: next }
+  emit('location-sync://status', next)
+}
+/** Folders "Alex" shares with this device, so the preview can exercise the picker. */
+export const mockSharedLocations = async (friendId: string) =>
+  friendId === 'f1'
+    ? [
+        { id: 'loc1', name: 'Buddy NAS', rights: { upload: true, manage: true } },
+        { id: 'loc2', name: 'Alex Photo Archive', rights: { upload: false, manage: false } },
+      ]
+    : []
+
+export const mockSyncedFolders = {
+  list: async (): Promise<MockSyncedFolder[]> => mockFolders,
+  statuses: async (): Promise<Record<string, MockSyncedFolderStatus>> => mockStatuses,
+  add: async (friendId: string, locationId: string, relPath: string, localPath: string, deleteRemote: boolean) => {
+    const id = `synced-${++counter}`
+    mockFolders = [...mockFolders, { id, friendId, locationId, relPath, localPath, enabled: true, deleteRemote, createdAt: Date.now(), lastCheckAt: 0, lastResult: null }]
+    pushStatus(id, { state: 'scanning', pendingFiles: 0, lastCheckAt: 0, message: 'Checking this folder…', transferId: null })
+    setTimeout(() => pushStatus(id, { state: 'uploading', pendingFiles: 12, message: 'Copying to Buddy NAS…' }), 900)
+    setTimeout(() => pushStatus(id, { state: 'idle', pendingFiles: 0, lastCheckAt: Date.now(), message: 'Up to date' }), 3200)
+    return mockFolders
+  },
+  update: async (id: string, changes: { enabled?: boolean; deleteRemote?: boolean }) => {
+    mockFolders = mockFolders.map((f) => (f.id === id ? { ...f, ...changes } : f))
+    if (changes.enabled === false) pushStatus(id, { state: 'paused', pendingFiles: 0, message: 'Paused — nothing is being copied' })
+    if (changes.enabled === true) pushStatus(id, { state: 'scanning', message: 'Checking this folder…' })
+    return mockFolders
+  },
+  remove: async (id: string) => {
+    mockFolders = mockFolders.filter((f) => f.id !== id)
+    return mockFolders
+  },
+  syncNow: async (id: string) => {
+    pushStatus(id, { state: 'scanning', message: 'Checking this folder…' })
+    setTimeout(() => pushStatus(id, { state: 'waiting', message: 'Waiting for Linux Box' }), 1200)
+    setTimeout(() => pushStatus(id, { state: 'idle', lastCheckAt: Date.now(), message: 'Up to date' }), 3600)
+  },
 }
 
 export const mockApi = {
@@ -321,6 +396,56 @@ export const mockApi = {
   },
   irohSelftest: async (): Promise<string> => 'ok · node a1b2c3…f7e8',
   cancelTransfer: async (_id: string): Promise<void> => {},
+  pauseTransfer: async (id: string): Promise<void> => {
+    const live = running.get(id)
+    if (!live) return
+    clearInterval(live.iv)
+    running.delete(id)
+    live.t.state = 'paused'
+    live.t.speedBps = 0
+    live.t.etaSeconds = null
+    live.t.detail = 'Paused — resume any time'
+    emit('transfer://update', { ...live.t })
+  },
+  verifyTransfer: async (id: string): Promise<void> => {
+    const t = finished.get(id)
+    if (!t || verifying.has(id)) return
+    const total = Math.max(t.fileCount, 1)
+    const bytesTotal = t.bytesTotal || 1
+    const report = (state: VerifyReport['state'], checked: number): VerifyReport => ({
+      state,
+      checked,
+      total,
+      bytesHashed: Math.round((bytesTotal * checked) / total),
+      bytesTotal,
+      mismatched: [],
+      missing: [],
+      error: null,
+    })
+    let checked = 0
+    t.verify = report('running', 0)
+    emit('transfer://update', { ...t })
+    const iv = setInterval(() => {
+      checked = Math.min(total, checked + Math.max(1, Math.ceil(total / 8)))
+      const done = checked >= total
+      if (done) {
+        clearInterval(iv)
+        verifying.delete(id)
+      }
+      t.verify = report(done ? 'done' : 'running', checked)
+      emit('transfer://update', { ...t })
+    }, 500)
+    verifying.set(id, iv)
+  },
+  cancelVerify: async (id: string): Promise<void> => {
+    const iv = verifying.get(id)
+    const t = finished.get(id)
+    if (!iv || !t?.verify) return
+    clearInterval(iv)
+    verifying.delete(id)
+    t.verify = { ...t.verify, state: 'canceled' }
+    emit('transfer://update', { ...t })
+  },
   getSettings: async (): Promise<Settings> => settings,
   updateSettings: async (s: Settings): Promise<Settings> => {
     settings = s

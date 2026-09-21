@@ -8,6 +8,7 @@ export function chatTransferLabel(t?: TransferUpdate): string {
   return !t ? 'Waiting for confirmation…'
     : t.state === 'completed' ? (t.direction === 'send' ? 'Delivered' : 'Saved')
     : t.state === 'failed' ? 'Not delivered' : t.state === 'canceled' ? 'Canceled'
+    : t.state === 'paused' ? 'Paused'
     : t.state === 'waitingForAccept' ? 'Waiting for acceptance'
     : t.state === 'transferring' ? (t.direction === 'send' ? 'Sending' : 'Receiving') : 'Connecting…'
 }
@@ -89,7 +90,7 @@ export function loadChatTransfers(): Record<string, ChatTransfer> {
       if (!record(v) || typeof v.id !== 'string' || !['send', 'receive'].includes(String(v.direction))) continue
       const l = v.chatTransfer
       if (!record(l) || l.id !== id || !Number.isSafeInteger(l.attempt) || !number(l.attempt) || !number(l.total)) continue
-      if (!['starting', 'waitingForPeer', 'connecting', 'waitingForAccept', 'transferring', 'completed', 'failed', 'canceled'].includes(String(v.state))) continue
+      if (!['starting', 'waitingForPeer', 'connecting', 'waitingForAccept', 'transferring', 'completed', 'failed', 'canceled', 'paused'].includes(String(v.state))) continue
       // Old caches cannot prove completion. In-flight attempts restore as interrupted,
       // retaining their own generation instead of resurrecting a previous failure.
       let state = v.state as TransferUpdate['state']

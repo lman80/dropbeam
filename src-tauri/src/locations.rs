@@ -25,7 +25,7 @@ fn operation(config: &Path, id: &str) -> Arc<Operation> {
         locks.insert((config.into(), id.into()), Arc::downgrade(&lock)); lock
     })
 }
-pub fn default_byte_cap() -> u64 { 20_000_000_000 }
+pub fn default_byte_cap() -> u64 { 500_000_000_000 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocationError { Quota, UnsafeRoot, MirrorOverlap, MountChanged, Permission, Busy, RateLimit }
@@ -69,6 +69,46 @@ pub struct Target { pub location_id: String, pub rel_path: String }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry { pub name: String, pub is_dir: bool, pub size: u64, pub modified: u64 }
+
+/// One file published beside an existing, DIFFERENT file of the same name.
+/// `name` is the upload's manifest name; `landed` is the location-relative
+/// path it was actually published at (for example `clips/a (2).mp4`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Conflict { pub name: String, pub landed: String }
+/// The outcome of landing ONE uploaded file.
+#[derive(Clone, Debug)]
+pub struct Landed { pub path: PathBuf, pub conflict: bool, pub replaced: bool }
+/// The outcome of landing one push: the published paths, every item that had to
+/// be published under a collision-safe sibling name, and — for a continuously
+/// synced folder that asked for "newest wins" — every location-relative path
+/// whose previous version was moved to the location's recoverable trash.
+#[derive(Clone, Debug, Default)]
+pub struct Landing { pub paths: Vec<PathBuf>, pub conflicts: Vec<Conflict>, pub replaced: Vec<String> }
+/// Same bound as a friend receive's `unique_path`: at most this many names
+/// are probed before an upload item gives up.
+#[cfg_attr(not(unix), allow(dead_code))]
+const LAND_NAME_LIMIT: usize = 100_000;
+/// Candidate 0 is the requested name, candidate 1 is `a (2).mp4`, then
+/// `a (3).mp4`… — the shape iroh_net::unique_path gives a friend receive,
+/// numbered so the copy reads as the second file of that name.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn sibling_name(name: &std::ffi::OsStr, index: usize) -> std::ffi::OsString {
+    if index == 0 { return name.to_owned(); }
+    let path = Path::new(name);
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    std::ffi::OsString::from(format!("{stem} ({}){ext}", index + 1))
+}
+/// The sibling's location-relative path, re-validated exactly like the
+/// requested one (reserved prefixes, length, components).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn sibling_rel(rel: &Path, candidate: &std::ffi::OsStr) -> Result<PathBuf> {
+    relative(&rel.with_file_name(candidate).to_string_lossy())
+}
+#[cfg_attr(not(unix), allow(dead_code))]
+fn already_exists(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().map(|e| e.kind()) == Some(std::io::ErrorKind::AlreadyExists)
+}
 
 pub fn load(config: &Path) -> Result<Vec<Location>> {
     // Phones are clients only, even if desktop configuration was imported.
@@ -191,8 +231,37 @@ pub fn shared(config: &Path, endpoint: &str) -> Result<Value> {
     let friend = crate::friends::load(config).into_iter()
         .find(|f| f.endpoint_id.as_deref() == Some(endpoint)).context("Location access denied")?;
     Ok(json!(load(config)?.iter().filter(|l| l.friend_ids.contains(&friend.id))
-        .map(|l| json!({"id": l.id, "name": l.name, "rights": l.rights})).collect::<Vec<_>>()))
+        .map(|l| {
+            // Additive room report, so the friend's card can say "1.2 TB free of
+            // 4 TB" BEFORE they start a 300 GB upload. The path itself is never
+            // disclosed. An older host simply omits all three fields.
+            let (reachable, free, total) = room(l);
+            json!({"id": l.id, "name": l.name, "rights": l.rights,
+                "reachable": reachable, "free_bytes": free, "total_bytes": total})
+        }).collect::<Vec<_>>()))
 }
+/// Whether this location's volume is mounted right now, and its free/total
+/// bytes. One statvfs plus one marker stat — cheap enough for `locations.list`.
+fn room(l: &Location) -> (bool, Option<u64>, Option<u64>) {
+    let path = Path::new(&l.path);
+    // The mount marker lives ON the shared volume. An unmounted NAS usually
+    // leaves its (empty) mountpoint behind, so without this check the boot
+    // disk's free space would be reported as the NAS's.
+    if !fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+        || !l.marker.as_ref().is_none_or(|m| path.join(m).exists()) { return (false, None, None); }
+    match volume_bytes(path) {
+        Some((free, total)) if plausible_volume(total) => (true, Some(free), Some(total)),
+        // Reachable, but the numbers can't be trusted: an sshfs mount to a NAS
+        // whose SFTP server lacks the statvfs extension reports a few MB.
+        Some(_) => (true, None, None),
+        None => (false, None, None),
+    }
+}
+
+/// statvfs figures below 1 GiB on a shared location are not a real volume
+/// (sshfs without the SFTP statvfs extension reports ~54 MB); show nothing
+/// rather than a wrong "32 MB free".
+pub(crate) fn plausible_volume(total_bytes: u64) -> bool { total_bytes >= 1 << 30 }
 
 /// Validate before normalizing: Path::components would silently remove `.`.
 /// Unix permits colon and backslash in filenames; Windows does not.
@@ -317,8 +386,14 @@ pub(crate) fn gc_receive_probes(config: &Path, dir: &Path) {
     #[cfg(unix)] unix::gc_probes(dir, std::time::SystemTime::now());
 }
 pub(crate) fn receive_sweep_allowed(config: &Path, dir: &Path) -> bool {
+    // Keep location payload staging out of ordinary receive recovery even after
+    // the owner stops sharing the location (and it disappears from config).
+    let staging = |path: &Path| path.components().any(|part|
+        part.as_os_str().to_string_lossy().eq_ignore_ascii_case(".dropbeam-staging"));
+    if staging(dir) { return false; }
     let Ok(locations) = load(config) else { return false; };
     let Ok(path) = fs::canonicalize(dir) else { return false; };
+    if staging(&path) { return false; }
     for l in locations {
         let Ok(root) = canonical_missing(Path::new(&l.path)) else { return false; };
         if path.starts_with(root) { return false; }
@@ -480,6 +555,34 @@ mod unix {
     pub(super) fn rename(native: bool, from: &fs::File, old: &std::ffi::OsStr, to: &fs::File, new: &std::ffi::OsStr) -> Result<()> {
         rename_owned(native, from, old, to, new, None)
     }
+    /// Descriptor-relative existence probe that never follows a symlink and
+    /// never opens the entry, so a dangling link, a FIFO or a device node is
+    /// still reported as "occupied" (and therefore skipped, never published over).
+    fn exists_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result<bool> {
+        let name = c(name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstatat(parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } == 0 { return Ok(true); }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound { Ok(false) } else { Err(e.into()) }
+    }
+    /// True when `existing` is byte-for-byte the staged upload. Verifies the
+    /// staged payload's SHA-256 only once the bytes matched, so a merely
+    /// DIFFERENT neighbour costs one scan and no error.
+    fn identical(mut existing: fs::File, staged: &Path, digest: &str, cancel: &std::sync::atomic::AtomicBool, progress: &impl Fn(u64)) -> Result<bool> {
+        use sha2::{Digest, Sha256}; use std::io::Read;
+        let mut source = fs::File::open(staged)?;
+        if source.metadata()?.len() != existing.metadata()?.len() { return Ok(false); }
+        let mut hash = Sha256::new(); let mut b = vec![0; 1 << 20]; let mut other = vec![0; 1 << 20]; let mut done = 0;
+        loop {
+            ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
+            let n = source.read(&mut b)?; if n == 0 { break; }
+            existing.read_exact(&mut other[..n])?;
+            if b[..n] != other[..n] { return Ok(false); }
+            hash.update(&b[..n]); done += n as u64; progress(done);
+        }
+        ensure!(hex::encode(hash.finalize()) == digest, "Upload not verified: SHA-256 verification mismatch");
+        Ok(true)
+    }
     fn rename_owned(native: bool, from: &fs::File, old: &std::ffi::OsStr, to: &fs::File, new: &std::ffi::OsStr, expected: Option<crate::iroh_net::receive_stage::Identity>) -> Result<()> {
         if native { return native_rename(from, old, to, new); }
         let source = child(from, old, false)?;
@@ -579,6 +682,46 @@ mod unix {
             self.resolve(&parent.to_string_lossy())?;
             Ok((self.open_rel(parent, true)?, name))
         }
+        pub fn stat_entry(&self, raw: &str) -> Result<Option<(bool, u64)>> {
+            let rel = relative(raw)?;
+            // Descriptor-relative, O_NOFOLLOW at every component, just like ls.
+            let file = match self.open_rel(&rel, false) {
+                Ok(file) => file,
+                Err(_) => return Ok(None),
+            };
+            let meta = file.metadata()?;
+            Ok(Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 })))
+        }
+        /// Stat many leaves of ONE parent directory: the parent is walked once
+        /// (descriptor-relative, O_NOFOLLOW) and each leaf costs a single open.
+        /// A 17,000-file upload used to stat every path from the root, six
+        /// network round trips each on a mounted NAS, and outran the sender's
+        /// patience. A missing or unreadable parent means every leaf is absent.
+        pub fn stat_many(&self, raw_parent: &str, leaves: &[String]) -> Result<Vec<Option<(bool, u64)>>> {
+            let rel = relative(raw_parent)?;
+            let Ok(dir) = self.open_rel(&rel, true) else { return Ok(vec![None; leaves.len()]); };
+            Ok(leaves.iter().map(|leaf| {
+                let file = child(&dir, std::ffi::OsStr::new(leaf), false).ok()?;
+                let meta = file.metadata().ok()?;
+                Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 }))
+            }).collect())
+        }
+        /// SHA-256 of one entry, opened descriptor-relative with O_NOFOLLOW at
+        /// every component — a symlink is never followed and only a regular file
+        /// is hashed. `None` means absent, not a regular file, or unreadable:
+        /// "Verify copy" reports that as a missing copy rather than failing the
+        /// whole run over one bad file on a flaky mount.
+        pub fn hash_entry(&self, raw: &str, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<Option<String>> {
+            let rel = relative(raw)?;
+            let Ok(file) = self.open_rel(&rel, false) else { return Ok(None); };
+            if !file.metadata().map(|m| m.is_file()).unwrap_or(false) { return Ok(None); }
+            match sha256_file_progress(file, cancel, progress) {
+                Ok(digest) => Ok(Some(digest)),
+                // A cancel is the caller's own doing — propagate it.
+                Err(e) if e.to_string().contains("canceled") => Err(e),
+                Err(_) => Ok(None),
+            }
+        }
         pub fn listing(&self, raw: &str) -> Result<Vec<Entry>> {
             self.resolve(raw)?;
             let dir = self.open_rel(&relative(raw)?, true)?;
@@ -635,38 +778,198 @@ mod unix {
             }
             Ok(())
         }
+        pub fn create_stage(&self, key: &str) -> Result<PathBuf> {
+            ensure!(key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()), "Invalid stage key");
+            let name = std::ffi::OsStr::new(".dropbeam-staging");
+            if let Err(e) = mkdir(&self.dir, name) {
+                if child(&self.dir, name, true).is_err() { return Err(e); }
+            }
+            let parent = child(&self.dir, name, true)?;
+            let key_name = std::ffi::OsStr::new(key);
+            if let Err(e) = mkdir(&parent, key_name) {
+                if child(&parent, key_name, true).is_err() { return Err(e); }
+            }
+            child(&parent, key_name, true)?;
+            Ok(self.path.join(name).join(key))
+        }
+        pub fn remove_stage(&self, key: &str) -> Result<()> {
+            ensure!(key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()), "Invalid stage key");
+            fn remove(parent: &fs::File, name: &std::ffi::OsStr) -> Result<()> {
+                if let Ok(dir) = child(parent, name, true) {
+                    names(&dir, |entry| { remove(&dir, entry)?; Ok(true) })?;
+                    unlink(parent, name, true)
+                } else { unlink(parent, name, false) }
+            }
+            let parent = child(&self.dir, std::ffi::OsStr::new(".dropbeam-staging"), true)?;
+            remove(&parent, std::ffi::OsStr::new(key))?;
+            let _ = unlink(&self.dir, std::ffi::OsStr::new(".dropbeam-staging"), true);
+            Ok(())
+        }
+        pub fn gc_stages(&self) -> Result<()> {
+            // Keep interrupted transfers for a day; active leases always win.
+            let Ok(parent) = child(&self.dir, std::ffi::OsStr::new(".dropbeam-staging"), true) else { return Ok(()); };
+            names(&parent, |name| {
+                let Some(key) = name.to_str() else { return Ok(true); };
+                if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) { return Ok(true); }
+                let path = self.path.join(".dropbeam-staging").join(key);
+                let _lease = {
+                    let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
+                    if leases.contains(&path) { return Ok(true); }
+                    leases.push(path.clone()); UploadLease(path)
+                };
+                if !stage_expired(&self.path.join(".dropbeam-staging").join(key)) { return Ok(true); }
+                if let Err(e) = self.remove_stage(key) { log::warn!("Location staging GC: {e:#}"); }
+                Ok(true)
+            })
+        }
+        /// The integrity receipt already verified the streamed v2 payload.
+        /// Publish its inode directly; v1 alone uses land's hash-while-copy.
+        pub fn land_verified(&self, raw: &str, staged: &Path, digest: &str, replace: bool, cancel: &std::sync::atomic::AtomicBool,
+            progress: impl Fn(u64), publish: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> {
+            let rel = staged.strip_prefix(self.path.join(".dropbeam-staging"))
+                .context("Upload not verified: stage is outside location staging")?;
+            ensure!(rel.components().count() >= 2 && rel.components().all(|c| matches!(c, Component::Normal(_))),
+                "Upload not verified: invalid stage path");
+            let source_rel = staged.strip_prefix(&self.path)?;
+            let source = self.open_rel(source_rel, false)?;
+            ensure!(source.metadata()?.is_file(), "Invalid stage type");
+            let identity = crate::iroh_net::receive_stage::Identity::of(&source)?;
+            let from = self.open_rel(source_rel.parent().context("Missing stage parent")?, true)?;
+            source.sync_all()?;
+            progress(source.metadata()?.len());
+            ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
+            let rel = relative(raw)?;
+            publish(&mut || self.ensure_dirs(&rel.parent().unwrap_or(Path::new("")).to_string_lossy()))?;
+            let (parent, name) = self.parent(raw)?;
+            let stage_name = staged.file_name().context("Missing stage name")?;
+            let size = source.metadata()?.len();
+            // A retry can encounter files published before an interrupted final
+            // receipt. Verify only the existing destination in that case; new
+            // files never incur a second payload read or copy. A destination
+            // that exists with DIFFERENT content is never an upload-wide
+            // failure: it is published beside its neighbour as "name (2).ext",
+            // so one changed file can no longer strand the other 140.
+            //
+            // A folder the sender keeps continuously synced asks for the other
+            // rule — newest wins — with `replace_existing`. The previous version
+            // is moved to this location's recoverable trash and the upload takes
+            // its name. Identical content is still "already landed", and a
+            // directory (or a symlink/FIFO/device node) at that name is still
+            // refused rather than swept into the trash wholesale.
+            if replace {
+                if exists_at(&parent, &name)? {
+                    let existing = child(&parent, &name, false).context("An item with this name already exists")?;
+                    let meta = existing.metadata()?;
+                    ensure!(meta.is_file(), "An item with this name already exists");
+                    if meta.len() == size {
+                        let existing_id = crate::iroh_net::receive_stage::Identity::of(&existing)?;
+                        if sha256_file_progress(existing, cancel, &progress)? == digest {
+                            publish(&mut || {
+                                ensure!(crate::iroh_net::receive_stage::Identity::of(&child(&parent, &name, false)?)? == existing_id,
+                                    "Destination changed during verification");
+                                Ok(())
+                            })?;
+                            return Ok(Landed { path: self.path.join(&rel), conflict: false, replaced: false });
+                        }
+                    }
+                }
+                // Trash and publish inside ONE publish action: the location is
+                // re-authorized and the mount re-checked before the move, and
+                // nothing can take the freed name in between.
+                let replaced = std::cell::Cell::new(false);
+                publish(&mut || {
+                    replaced.set(false);
+                    if exists_at(&parent, &name)? { self.trash_name(&parent, &name)?; replaced.set(true); }
+                    super::unix::publish(&from, stage_name, &parent, &name, Some(identity))
+                })?;
+                return Ok(Landed { path: self.path.join(&rel), conflict: false, replaced: replaced.get() });
+            }
+            for index in 0..LAND_NAME_LIMIT {
+                let candidate = sibling_name(&name, index);
+                let landed = self.path.join(sibling_rel(&rel, &candidate)?);
+                if exists_at(&parent, &candidate)? {
+                    let existing = match child(&parent, &candidate, false) {
+                        Ok(existing) => existing,
+                        // A symlink, FIFO or device node: never publish over it.
+                        Err(e) if index == 0 => return Err(e).context("An item with this name already exists"),
+                        Err(_) => continue,
+                    };
+                    let meta = existing.metadata()?;
+                    ensure!(meta.is_file() || index > 0, "An item with this name already exists");
+                    if !meta.is_file() || meta.len() != size { continue; }
+                    let existing_id = crate::iroh_net::receive_stage::Identity::of(&existing)?;
+                    if sha256_file_progress(existing, cancel, &progress)? != digest { continue; }
+                    // Already landed (this name, or a copy an earlier attempt
+                    // made beside it): never publish a second identical copy.
+                    publish(&mut || {
+                        ensure!(crate::iroh_net::receive_stage::Identity::of(&child(&parent, &candidate, false)?)? == existing_id,
+                            "Destination changed during verification");
+                        Ok(())
+                    })?;
+                    return Ok(Landed { path: landed, conflict: index > 0, replaced: false });
+                }
+                match publish(&mut || super::unix::publish(&from, stage_name, &parent, &candidate, Some(identity))) {
+                    Ok(()) => return Ok(Landed { path: landed, conflict: index > 0, replaced: false }),
+                    // Someone took the name between the probe and the publish.
+                    Err(e) if already_exists(&e) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            bail!("Upload destination name space exhausted ({LAND_NAME_LIMIT} candidates)")
+        }
         /// Copy from private transfer staging, hash-check, fsync, then publish
         /// using the probed native/reservation capability. Failed copies never publish.
-        pub fn land(&self, raw: &str, staged: &Path, digest: &str, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64), publish: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<PathBuf> {
+        pub fn land(&self, raw: &str, staged: &Path, digest: &str, replace: bool, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64), publish: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> {
             let expected = fs::metadata(staged)?.len();
             let rel = relative(raw)?;
             publish(&mut || self.ensure_dirs(&rel.parent().unwrap_or(Path::new("")).to_string_lossy()))?;
             let (parent, name) = self.parent(raw)?;
-            if let Ok(mut existing) = child(&parent, &name, false) {
-                ensure!(existing.metadata()?.is_file(), "An item with this name already exists");
-                if existing.metadata()?.len() == 0 && expected > 0 {
-                    let m = existing.metadata()?;
-                    log::warn!("Location upload blocked by empty destination {raw:?} dev={} ino={}; possible leftover reservation, ownership cannot be proven; preserved for owner review", m.dev(), m.ino());
+            // Find a free name, or an existing copy that IS this upload. A
+            // destination holding different content is published beside rather
+            // than refused, so one changed file cannot fail a whole folder —
+            // unless the sender asked for "newest wins" (`replace_existing`),
+            // in which case the different previous version goes to this
+            // location's recoverable trash and the upload takes its name.
+            let mut index = 0usize;
+            let mut replacing = false;
+            loop {
+                ensure!(index < LAND_NAME_LIMIT, "Upload destination name space exhausted ({LAND_NAME_LIMIT} candidates)");
+                let candidate = sibling_name(&name, index);
+                let landed_rel = sibling_rel(&rel, &candidate)?;
+                if !exists_at(&parent, &candidate)? { break; }
+                let existing = match child(&parent, &candidate, false) {
+                    Ok(existing) => existing,
+                    // A symlink, FIFO or device node: never publish over it.
+                    Err(e) if index == 0 => return Err(e).context("An item with this name already exists"),
+                    Err(_) => { index += 1; continue; }
+                };
+                let meta = existing.metadata()?;
+                ensure!(meta.is_file() || index > 0, "An item with this name already exists");
+                // "Newest wins": an identical destination is still already
+                // landed; a DIFFERENT one is trashed at publication time (below)
+                // instead of the upload taking a sibling name. A leftover empty
+                // reservation is recoverable from the trash too, so it no longer
+                // has to block the push.
+                if replace && index == 0 && meta.is_file() {
+                    if identical(existing, staged, digest, cancel, &progress)? {
+                        publish(&mut || Ok(()))?;
+                        return Ok(Landed { path: self.path.join(landed_rel), conflict: false, replaced: false });
+                    }
+                    replacing = true; break;
+                }
+                if index == 0 && meta.is_file() && meta.len() == 0 && expected > 0 {
+                    log::warn!("Location upload blocked by empty destination {raw:?} dev={} ino={}; possible leftover reservation, ownership cannot be proven; preserved for owner review", meta.dev(), meta.ino());
                     bail!("An empty destination already exists (possibly a leftover reservation); ownership cannot be proven. Ask the owner to move it to trash before retrying");
                 }
-                use sha2::{Digest, Sha256}; use std::io::Read;
-                let mut source = fs::File::open(staged)?;
-                ensure!(source.metadata()?.len() == existing.metadata()?.len(), "A different file with this name already exists; rename your upload first");
-                let mut hash = Sha256::new(); let mut b = vec![0; 1 << 20]; let mut other = vec![0; 1 << 20]; let mut done = 0;
-                loop {
-                    ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
-                    let n = source.read(&mut b)?; if n == 0 { break; }
-                    existing.read_exact(&mut other[..n])?;
-                    ensure!(b[..n] == other[..n], "A different file with this name already exists; rename your upload first");
-                    hash.update(&b[..n]); done += n as u64; progress(done);
+                if meta.is_file() && identical(existing, staged, digest, cancel, &progress)? {
+                    publish(&mut || Ok(()))?;
+                    return Ok(Landed { path: self.path.join(landed_rel), conflict: index > 0, replaced: false });
                 }
-                ensure!(hex::encode(hash.finalize()) == digest, "SHA-256 mismatch");
-                publish(&mut || Ok(()))?;
-                return Ok(self.path.join(rel));
+                index += 1;
             }
             let tmp = std::ffi::OsString::from(format!(".dropbeam-upload-{}.part", uuid::Uuid::new_v4()));
             let mut f = file(unsafe { libc::openat(parent.as_raw_fd(), c(&tmp)?.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode(&parent, false)? as libc::c_uint) })?;
-            let result = (|| -> Result<()> {
+            let result = (|| -> Result<PathBuf> {
                 use sha2::{Digest, Sha256}; use std::io::{Read, Write};
                 let mut src = fs::File::open(staged)?;
                 let mut hash = Sha256::new(); let mut buf = vec![0; 1 << 20];
@@ -677,13 +980,34 @@ mod unix {
                     ensure!(done + n as u64 <= expected, LocationError::Quota);
                     hash.update(&buf[..n]); f.write_all(&buf[..n])?; done += n as u64; progress(done);
                 }
-                ensure!(hex::encode(hash.finalize()) == digest, "SHA-256 mismatch; upload was not published");
+                ensure!(hex::encode(hash.finalize()) == digest, "Upload not verified: SHA-256 verification mismatch; upload was not published");
                 f.sync_all()?;
                 ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
-                publish(&mut || rename(self.native, &parent, &tmp, &parent, &name))
+                if replacing {
+                    // Trash the previous version and publish inside ONE publish
+                    // action: the location is re-authorized and the mount
+                    // re-checked before the move, and nothing can take the
+                    // freed name in between.
+                    publish(&mut || {
+                        if exists_at(&parent, &name)? { self.trash_name(&parent, &name)?; }
+                        rename(self.native, &parent, &tmp, &parent, &name)
+                    })?;
+                    return Ok(self.path.join(sibling_rel(&rel, &name)?));
+                }
+                loop {
+                    ensure!(index < LAND_NAME_LIMIT, "Upload destination name space exhausted ({LAND_NAME_LIMIT} candidates)");
+                    let candidate = sibling_name(&name, index);
+                    let landed_rel = sibling_rel(&rel, &candidate)?;
+                    match publish(&mut || rename(self.native, &parent, &tmp, &parent, &candidate)) {
+                        Ok(()) => return Ok(self.path.join(landed_rel)),
+                        // Someone took the name between the probe and the publish.
+                        Err(e) if already_exists(&e) => index += 1,
+                        Err(e) => return Err(e),
+                    }
+                }
             })();
             if result.is_err() { let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), c(&tmp)?.as_ptr(), 0) }; }
-            result?; Ok(self.path.join(rel))
+            Ok(Landed { path: result?, conflict: index > 0 && !replacing, replaced: replacing })
         }
         pub(super) fn selection_bytes(&self, raw: &str, budget: &mut Budget, depth: usize) -> Result<()> {
             ensure!(depth < 64 && budget.entries > 0, "Selection too large or deeply nested"); budget.entries -= 1;
@@ -696,60 +1020,88 @@ mod unix {
             })?; }
             Ok(())
         }
-        pub fn snapshot(&self, raw: &str, dest: &Path, budget: &mut Budget, depth: usize, skipped: &mut Vec<String>) -> Result<bool> {
+        pub fn select(&self, raw: &str, wire: &str, budget: &mut Budget, depth: usize,
+            skipped: &mut Vec<String>, items: &mut Vec<(PathBuf, String, u64, u64)>, dirs: &mut Vec<String>) -> Result<()> {
             ensure!(depth < 64 && budget.entries > 0, "Selection too large or deeply nested"); budget.entries -= 1;
             let rel = relative(raw)?;
-            let mut source = match self.open_rel(&rel, false) {
+            let source = match self.open_rel(&rel, false) {
                 Ok(f) => f,
-                Err(e) => { skipped.push(format!("{raw}: {}", crate::telemetry::redact_paths_only(&format!("{e:#}")))); return Ok(false); }
+                Err(e) => { skipped.push(format!("{raw}: {}", crate::telemetry::redact_paths_only(&format!("{e:#}")))); return Ok(()); }
             };
-            if source.metadata()?.is_file() {
-                use std::io::{Read, Write};
-                use std::os::unix::fs::OpenOptionsExt;
-                check_space(dest.parent().context("Missing snapshot parent")?, source.metadata()?.len())?;
-                budget.check(source.metadata()?.len())?;
-                let mut out = match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dest) {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { skipped.push(format!("{raw}: staged name collides with another selected item")); return Ok(false); }
-                    Err(e) => return Err(e.into()),
-                };
-                let mut buf = vec![0; 1 << 20];
-                loop { let n = source.read(&mut buf)?; if n == 0 { break; } budget.consume(n as u64)?; out.write_all(&buf[..n])?; }
-                out.sync_all()?;
+            let meta = source.metadata()?;
+            if meta.is_file() {
+                budget.consume(meta.len())?;
+                items.push((self.path.join(rel), wire.into(), meta.len(),
+                    meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)));
             } else {
-                // Exclusive mkdir prevents case/normalization twins from being
-                // silently merged in the staging filesystem.
-                use std::os::unix::fs::DirBuilderExt;
-                match fs::DirBuilder::new().mode(0o700).create(dest) {
-                    Ok(()) => {},
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { skipped.push(format!("{raw}: staged name collides with another selected item")); return Ok(false); }
-                    Err(e) => return Err(e.into()),
-                }
+                dirs.push(wire.into());
                 names(&source, |name| {
                     let Some(name) = name.to_str() else { skipped.push(format!("{raw}: non-Unicode filename")); return Ok(true); };
                     if name.to_ascii_lowercase().starts_with(".dropbeam-") { return Ok(true); }
-                    let next = if raw.is_empty() { name.to_string() } else { format!("{raw}/{name}") };
-                    self.snapshot(&next, &dest.join(name), budget, depth + 1, skipped)?;
+                    self.select(&format!("{raw}/{name}"), &format!("{wire}/{name}"), budget, depth + 1, skipped, items, dirs)?;
                     Ok(true)
                 })?;
             }
-            Ok(true)
+            Ok(())
         }
-
     }
 }
 
 // Fail closed on platforms without descriptor-relative filesystem protection.
 #[cfg(not(unix))]
 impl Root {
+    pub fn stat_entry(&self, _: &str) -> Result<Option<(bool, u64)>> { bail!("Hosting unavailable") }
+    pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64)>>> { bail!("Hosting unavailable") }
+    pub fn hash_entry(&self, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64)) -> Result<Option<String>> { bail!("Hosting unavailable") }
     pub fn listing(&self, _: &str) -> Result<Vec<Entry>> { bail!("Hosting unavailable") }
     pub fn new_folder(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
     pub fn rename_item(&self, _: &str, _: &str) -> Result<()> { bail!("Hosting unavailable") }
     pub fn trash(&self, _: &str) -> Result<String> { bail!("Hosting unavailable") }
     pub fn ensure_dirs(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
-    pub fn land(&self, _: &str, _: &Path, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<PathBuf> { bail!("Hosting unavailable") }
+    pub fn land(&self, _: &str, _: &Path, _: &str, _: bool, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> { bail!("Hosting unavailable") }
     fn selection_bytes(&self, _: &str, _: &mut Budget, _: usize) -> Result<()> { bail!("Hosting unavailable") }
-    pub fn snapshot(&self, _: &str, _: &Path, _: &mut Budget, _: usize, _: &mut Vec<String>) -> Result<bool> { bail!("Hosting unavailable") }
+    pub fn create_stage(&self, _: &str) -> Result<PathBuf> { bail!("Hosting unavailable") }
+    pub fn remove_stage(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
+    pub fn gc_stages(&self) -> Result<()> { Ok(()) }
+    pub fn land_verified(&self, _: &str, _: &Path, _: &str, _: bool, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64), _: impl Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>) -> Result<Landed> { bail!("Hosting unavailable") }
+    pub fn select(&self, _: &str, _: &str, _: &mut Budget, _: usize, _: &mut Vec<String>, _: &mut Vec<(PathBuf, String, u64, u64)>, _: &mut Vec<String>) -> Result<()> { bail!("Hosting unavailable") }
+}
+
+/// `locations.verify`: hash the copies this host holds for an uploaded batch.
+///
+/// Gated exactly like `locations.stat` — the caller must be a friend this
+/// location is shared with — and streamed by the caller: `hashed` carries the
+/// running byte count out to the progress frames, `cancel` stops a 56 GB read
+/// the moment the requester gives up. Reading a 1000-file chunk is slow enough
+/// (a NAS mount manages ~10 MB/s) that this NEVER runs on the async runtime;
+/// `iroh_net::serve_verify` puts it on a blocking thread.
+pub fn verify_digests(config: &Path, endpoint: &str, request: &Value,
+    cancel: &std::sync::atomic::AtomicBool, hashed: &std::sync::atomic::AtomicU64) -> Result<Vec<Option<String>>> {
+    use std::sync::atomic::Ordering;
+    ensure!(request["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
+    let (mut l, friend) = authorize(config, endpoint, text(request, "id")?, Access::Read)?;
+    limit_request(config, &friend, "ls", Instant::now())?;
+    let raw = text(request, "rel_path")?;
+    let items = request["items"].as_array().context("Missing verify items")?;
+    ensure!(items.len() <= 1000, "Too many verify items");
+    validate_root(config, Path::new(&l.path))?;
+    let root = Root::for_location(&mut l)?;
+    let mut digests = Vec::with_capacity(items.len());
+    let mut base = 0u64;
+    for item in items {
+        ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        let name = item["name"].as_str().context("Invalid verify name")?;
+        let size = item["size"].as_u64().unwrap_or(0);
+        let joined = format!("{raw}/{name}");
+        digests.push(root.hash_entry(joined.trim_matches('/'), cancel,
+            |n| { hashed.fetch_max(base + n, Ordering::Relaxed); })?);
+        // Advance by the DECLARED size even when nothing was hashed, so the
+        // requester's progress bar still reaches the end on a folder whose copy
+        // is partly missing.
+        base += size;
+        hashed.fetch_max(base, Ordering::Relaxed);
+    }
+    Ok(digests)
 }
 
 pub fn dispatch(config: &Path, endpoint: &str, request: &Value) -> Result<Value> {
@@ -759,7 +1111,7 @@ fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> 
     ensure!(request["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
     let kind = text(request, "kind")?;
     if kind == "locations.list" { return shared(config, endpoint); }
-    let access = if kind == "locations.ls" { Access::Read } else { Access::Manage };
+    let access = if matches!(kind, "locations.ls" | "locations.stat") { Access::Read } else { Access::Manage };
     let (mut l, friend) = authorize(config, endpoint, text(request, "id")?, access)?;
     limit_request(config, &friend, if matches!(access, Access::Read) { "ls" } else { "manage" }, now)?;
     let lock = operation(config, text(request, "id")?);
@@ -771,6 +1123,31 @@ fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> 
     validate_root(config, Path::new(&l.path))?;
     let root = Root::for_location(&mut l)?;
     let result = match kind {
+        "locations.stat" => {
+            let paths = request["paths"].as_array().context("Missing stat paths")?;
+            ensure!(paths.len() <= 1000, "Too many stat paths");
+            // Group by parent directory so each directory is walked once and
+            // every leaf costs one open (see Root::stat_many).
+            let mut groups: std::collections::BTreeMap<String, Vec<(String, String)>> = std::collections::BTreeMap::new();
+            for path in paths {
+                let rel = path.as_str().context("Invalid stat path")?;
+                let rel_path = relative(rel)?;
+                let leaf = rel_path.file_name().context("Invalid stat path")?.to_string_lossy().into_owned();
+                let parent = rel_path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let full_parent = format!("{raw}/{parent}").trim_matches('/').to_string();
+                groups.entry(full_parent).or_default().push((rel.to_string(), leaf));
+            }
+            let mut entries = Vec::new();
+            for (parent, items) in &groups {
+                let leaves: Vec<String> = items.iter().map(|(_, leaf)| leaf.clone()).collect();
+                for ((rel, _), found) in items.iter().zip(root.stat_many(parent, &leaves)?) {
+                    if let Some((is_dir, size)) = found {
+                        entries.push(json!({"rel_path":rel,"size":size,"is_dir":is_dir}));
+                    }
+                }
+            }
+            Ok(json!({"entries":entries}))
+        },
         "locations.ls" => cached_listing(config, &friend, &l.id, &root, raw, request),
         "locations.mkdir" => root.new_folder(raw).map(|_| json!({})),
         "locations.rename" => root.rename_item(raw, text(request, "to")?).map(|_| json!({})),
@@ -794,6 +1171,97 @@ pub fn activity(config: &Path) -> Vec<Value> {
     ACTIVITY.lock().unwrap_or_else(|p| p.into_inner()).get(config).map(|v| v.iter().rev().cloned().collect()).unwrap_or_default()
 }
 
+// ── The HOST's own view of a location it shares ──────────────────────────────
+// The device hosting a NAS folder never browses it through DropBeam, so it has
+// no signal that it is the gateway. `hosted_status` answers the three questions
+// the gateway card asks — is the folder there, how much room is left, and when
+// did a friend last touch it — without ever walking the tree. Last activity is
+// persisted next to locations.json (NOT inside the shared folder) because the
+// card is opened long after the transfer that produced it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastActivity {
+    pub at: u64,
+    pub friend_id: String,
+    /// "upload" — a friend put files here; "download" — we served files out.
+    pub direction: String,
+    pub bytes: u64,
+}
+fn activity_file(config: &Path) -> PathBuf { config.join("locations-activity.json") }
+fn load_last_activity(config: &Path) -> HashMap<String, LastActivity> {
+    fs::read(activity_file(config)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+/// Remember who last used a hosted location. Best effort throughout: a failed
+/// write costs the card a timestamp, never the transfer that produced it.
+pub fn record_activity(config: &Path, location_id: &str, friend_id: &str, direction: &str, bytes: u64) {
+    if location_id.is_empty() { return; }
+    let _lock = CONFIG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let hosted: Vec<String> = load(config).unwrap_or_default().into_iter().map(|l| l.id).collect();
+    let mut rows = load_last_activity(config);
+    rows.insert(location_id.into(), LastActivity { at: crate::chat::now_ms(), friend_id: friend_id.into(), direction: direction.into(), bytes });
+    // A stopped location must not keep a row — or a friend id — forever.
+    rows.retain(|id, _| hosted.iter().any(|h| h == id));
+    let _ = (|| -> Result<()> {
+        use std::io::Write;
+        fs::create_dir_all(config)?;
+        let tmp = config.join(format!(".locations-activity-{}.tmp", uuid::Uuid::new_v4()));
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let written = (|| -> Result<()> { f.write_all(&serde_json::to_vec(&rows)?)?; f.sync_all()?; Ok(()) })();
+        if written.is_err() { let _ = fs::remove_file(&tmp); }
+        written?;
+        fs::rename(&tmp, activity_file(config))?;
+        Ok(())
+    })();
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedStatus {
+    pub id: String,
+    /// The folder opens as a location root right now (NAS mounted and readable).
+    pub reachable: bool,
+    /// Free space on the volume the location lives on; 0 when unknown.
+    pub free_bytes: u64,
+    /// The persisted mount marker is present and matches — this is the SAME
+    /// volume the location was saved against, not a fresh empty mountpoint.
+    pub marker_ok: bool,
+    /// Why it isn't usable, for the card's second line.
+    pub error: Option<String>,
+    pub last_activity: Option<LastActivity>,
+}
+/// Cheap reachability probe for one hosted location (view open + every 30 s).
+/// Touches only the root directory: an open, the marker read, one statvfs.
+pub fn hosted_status(config: &Path, id: &str) -> Result<HostedStatus> {
+    let mut location = load(config)?.into_iter().find(|l| l.id == id).context("Location not found")?;
+    let mut status = HostedStatus { id: id.into(), reachable: false, free_bytes: 0, marker_ok: false,
+        error: None, last_activity: load_last_activity(config).remove(id) };
+    match Root::open(Path::new(&location.path)) {
+        Ok(root) => { status.reachable = true; status.free_bytes = free_bytes(&root.path); }
+        // Unmounted NAS / deleted folder: report that, don't probe the marker too.
+        Err(e) => { status.error = Some(format!("{e:#}")); return Ok(status); }
+    }
+    match Root::for_location(&mut location) {
+        Ok(_) => status.marker_ok = true,
+        Err(e) => status.error = Some(format!("{e:#}")),
+    }
+    Ok(status)
+}
+fn free_bytes(path: &Path) -> u64 { volume_bytes(path).map_or(0, |(free, total)| if plausible_volume(total) { free } else { 0 }) }
+/// (free, total) bytes on the volume `path` lives on; `None` when the mount is
+/// gone (or on a platform without statvfs).
+pub(crate) fn volume_bytes(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)] {
+        use std::{os::unix::ffi::OsStrExt, ffi::CString};
+        let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return None; }
+        let stat = unsafe { stat.assume_init() };
+        let frsize = stat.f_frsize as u64;
+        Some(((stat.f_bavail as u64).saturating_mul(frsize), (stat.f_blocks as u64).saturating_mul(frsize)))
+    }
+    #[cfg(not(unix))] { let _ = path; None }
+}
+
 pub struct Budget { remaining: u64, entries: usize }
 impl Budget {
     fn check(&self, bytes: u64) -> Result<()> { ensure!(bytes <= self.remaining, LocationError::Quota); Ok(()) }
@@ -812,7 +1280,14 @@ fn stage_bytes(path: &Path, entries: &mut usize) -> Result<u64> {
     }
     Ok(bytes)
 }
+#[cfg(test)]
+thread_local! { static SPACE_OVERRIDE: std::cell::RefCell<Option<(PathBuf, u64)>> = const { std::cell::RefCell::new(None) }; }
 fn check_space(path: &Path, bytes: u64) -> Result<()> {
+    #[cfg(test)]
+    if let Some(free) = SPACE_OVERRIDE.with(|v| v.borrow().as_ref().filter(|(p, _)| p == path).map(|(_, free)| *free)) {
+        ensure!(free >= bytes.saturating_add(64 * 1024 * 1024), "Insufficient free space for location transfer");
+        return Ok(());
+    }
     #[cfg(unix)] {
         use std::{os::unix::ffi::OsStrExt, ffi::CString};
         let path = CString::new(path.as_os_str().as_bytes())?;
@@ -901,7 +1376,7 @@ fn cached_listing(config: &Path, friend: &str, location: &str, root: &Root, raw:
 
 /// Private staging avoids ever giving the legacy receive engine a NAS path.
 /// Stable across retries, including manual retries, and scoped by authenticated
-/// endpoint + location + destination + content manifest. A per-target lease prevents concurrent use.
+/// endpoint + location + destination + transfer id. A per-target lease prevents concurrent use.
 pub struct Upload {
     config: PathBuf, endpoint: String, target: Target, pub staging: PathBuf,
     pub destination: PathBuf, _lease: UploadLease, _friend: FriendLease, byte_cap: u64,
@@ -910,18 +1385,30 @@ pub struct Upload {
 static UPLOADS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 struct UploadLease(PathBuf);
 impl Drop for UploadLease { fn drop(&mut self) { UPLOADS.lock().unwrap_or_else(|p| p.into_inner()).retain(|p| p != &self.0); } }
+// Per-config counters isolate loopback assertions from concurrently running tests.
+#[cfg(test)]
+pub(crate) static UPLOAD_PREPARE_COUNTS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 impl Upload {
     pub fn prepare(config: &Path, endpoint: &str, header: &Value) -> Result<Self> {
+        #[cfg(test)]
+        if let Some(count) = UPLOAD_PREPARE_COUNTS.lock().unwrap().get(config) {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         ensure!(header["locations_v"].as_u64() == Some(VERSION), "Unsupported Locations capability");
         let target: Target = serde_json::from_value(header["location"].clone())?;
         let (mut location, friend) = authorize(config, endpoint, &target.location_id, Access::Upload)?;
-        let friend_lease = FriendLease::acquire(config, &friend)?;
         validate_root(config, Path::new(&location.path))?;
         let root = Root::for_location(&mut location)?;
         let destination = root.resolve(&target.rel_path)?;
         ensure!(destination.is_dir(), "Upload destination must be a folder");
         let items = header["items"].as_array().context("Missing file manifest")?;
         ensure!(items.len() <= 100_000, "Too many files");
+        if header.get("location_total_items").is_some() || header.get("location_item_offset").is_some() {
+            let total = header["location_total_items"].as_u64().context("Invalid batch total")?;
+            let offset = header["location_item_offset"].as_u64().context("Invalid batch offset")?;
+            ensure!(total <= 100_000 && offset.checked_add(items.len() as u64).is_some_and(|end| end <= total), "Invalid upload batch shape");
+        }
         let dirs = header["dirs"].as_array().context("Missing directory manifest")?;
         ensure!(dirs.len() <= 100_000, "Too many directories");
         let manifest_total = items.iter().try_fold(0u64, |total, item| -> Result<u64> {
@@ -929,36 +1416,68 @@ impl Upload {
         })?;
         ensure!(header["total"].as_u64() == Some(manifest_total), "Manifest byte total mismatch");
         Budget { remaining: location.byte_cap, entries: 0 }.check(manifest_total)?;
-        check_space(config, manifest_total)?;
         check_space(&root.path, manifest_total)?;
         let mut seen = std::collections::HashSet::new();
         for item in items {
             let name = text(item, "name")?;
             ensure!(seen.insert(relative(name)?), "Duplicate file path");
             ensure!(!relative(name)?.as_os_str().is_empty(), "Empty file name");
-            let digest = text(item, "sha256")?;
-            ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()), "Missing SHA-256");
+            if header["location_hash_v"] != 2 {
+                let digest = text(item, "sha256")?;
+                ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()), "Missing SHA-256");
+            }
         }
         for d in dirs { relative(d.as_str().context("Invalid directory")?)?; }
         use sha2::{Digest, Sha256};
         let id = text(header, "location_transfer")?;
         ensure!(!id.is_empty() && id.len() <= 100, "Invalid transfer id");
-        let key = hex::encode(Sha256::digest(serde_json::to_vec(&(endpoint, &target, items, dirs))?));
-        let staging = config.join("location-transfers").join(key);
-        let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
-        ensure!(!leases.contains(&staging), "This location upload is already in progress; retry shortly");
-        leases.push(staging.clone());
-        drop(leases);
-        let lease = UploadLease(staging.clone());
-        private_directory(&staging)?;
-        let retained = stage_bytes(&staging, &mut 200_000)?;
-        Budget { remaining: location.byte_cap, entries: 0 }.check(retained.checked_add(manifest_total).context("Stage byte count overflow")?)?;
-        Ok(Self { config: config.into(), endpoint: endpoint.into(), target, destination, staging, _lease: lease, _friend: friend_lease, byte_cap: location.byte_cap, root, location })
+        let key = hex::encode(Sha256::digest(serde_json::to_vec(&(endpoint, &target.location_id, &target.rel_path, id))?));
+        let staging = if header["location_hash_v"] == 2 { root.path.join(".dropbeam-staging").join(&key) }
+            else { config.join("location-transfers").join(&key) };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let lease = loop {
+            {
+                let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
+                if !leases.contains(&staging) {
+                    leases.push(staging.clone());
+                    break UploadLease(staging.clone());
+                }
+            }
+            ensure!(Instant::now() < deadline, "This location upload is already in progress; retry shortly");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        // Wait for the previous same-key handler before consuming a friend slot.
+        let friend_lease = FriendLease::acquire(config, &friend)?;
+        if header["location_hash_v"] == 2 {
+            root.create_stage(&key)?;
+            adopt_abandoned_partials(&root.path.join(".dropbeam-staging"), &staging, endpoint, items);
+        } else { private_directory(&staging)?; }
+        let upload = Self { config: config.into(), endpoint: endpoint.into(), target, destination, staging, _lease: lease, _friend: friend_lease, byte_cap: location.byte_cap, root, location };
+        let retained = stage_bytes(&upload.staging, &mut 200_000)?;
+        Budget { remaining: upload.byte_cap, entries: 0 }.check(retained.checked_add(manifest_total).context("Stage byte count overflow")?)?;
+        Ok(upload)
     }
-    pub fn finish(&self, header: &Value, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    /// Which hosted location this push is landing in — the receive-side transfer
+    /// update carries it so the host's gateway card can show it live.
+    pub fn location_id(&self) -> &str { &self.target.location_id }
+    fn cleanup(&self) {
+        if self.staging.starts_with(self.root.path.join(".dropbeam-staging")) {
+            if let Some(key) = self.staging.file_name().and_then(|s| s.to_str()) { let _ = self.root.remove_stage(key); }
+        } else { let _ = fs::remove_dir_all(&self.staging); }
+    }
+    pub fn finish(&self, header: &Value, paths: Vec<PathBuf>) -> Result<Landing> {
         self.finish_progress(header, paths, &std::sync::atomic::AtomicBool::new(false), |_| {})
     }
-    pub fn finish_progress(&self, header: &Value, paths: Vec<PathBuf>, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<Vec<PathBuf>> {
+    pub fn finish_progress(&self, header: &Value, paths: Vec<PathBuf>, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<Landing> {
+        self.finish_verified_progress(header, paths, &[], cancel, progress)
+    }
+    pub fn finish_verified_progress(&self, header: &Value, paths: Vec<PathBuf>, rows: &[crate::models::FileIntegrity], cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<Landing> {
+        let digests = if header["location_hash_v"] == 2 { Some(verified_digests(header, rows)?) } else { None };
+        // "Newest wins" for a folder the sender keeps continuously synced: the
+        // upload is published AT the requested name and the previous version
+        // moves to this location's recoverable trash. Opt-in and additive — a
+        // sender that doesn't ask still gets the never-overwrite sibling rule.
+        let replace = header["replace_existing"] == true;
         let root = &self.root;
         let l = &self.location;
         let friend = &self._friend.0.1;
@@ -989,15 +1508,31 @@ impl Upload {
         publish(&mut || Ok(()))?;
         let actual = paths.iter().try_fold(0u64, |n, p| -> Result<u64> { n.checked_add(fs::metadata(p)?.len()).context("Stage byte count overflow") })?;
         Budget { remaining: self.byte_cap, entries: 0 }.check(actual)?;
-        check_space(&root.path, actual)?;
-        let mut out = Vec::new();
+        check_space(&root.path, if digests.is_some() { 0 } else { actual })?;
+        let mut out = Landing::default();
         let mut base = 0;
-        for (item, staged) in items.iter().zip(paths) {
-            let raw = format!("{}/{}", self.target.rel_path, text(item, "name")?).trim_start_matches('/').to_string();
+        for (index, (item, staged)) in items.iter().zip(paths).enumerate() {
+            let name = text(item, "name")?.to_string();
+            let raw = format!("{}/{}", self.target.rel_path, name).trim_start_matches('/').to_string();
             ensure!(fs::metadata(&staged)?.len() == item["size"].as_u64().context("Invalid file size")?, "Staged file size differs from manifest");
-            let landed = root.land(&raw, &staged, text(item, "sha256")?, cancel, |n| progress(base + n), &publish)?;
-            log::info!("locations upload friend={friend} location={} path={raw:?}", l.id);
-            out.push(landed);
+            let landed = if let Some(digests) = &digests {
+                ensure!(staged.starts_with(&self.staging), "Upload not verified: stage is outside transfer staging");
+                root.land_verified(&raw, &staged, digests[index], replace, cancel, |n| progress(base + n), &publish)?
+            } else { root.land(&raw, &staged, text(item, "sha256")?, replace, cancel, |n| progress(base + n), &publish)? };
+            // Keep the source's modification time so the copy is a faithful backup.
+            crate::iroh_net::set_mtime_secs(&landed.path, item["mtime"].as_u64().unwrap_or(0));
+            if landed.conflict {
+                let at = landed.path.strip_prefix(&root.path).unwrap_or(&landed.path).to_string_lossy().into_owned();
+                log::info!("locations upload conflict friend={friend} location={} path={raw:?} landed={at:?}", l.id);
+                out.conflicts.push(Conflict { name, landed: at });
+            } else if landed.replaced {
+                let at = landed.path.strip_prefix(&root.path).unwrap_or(&landed.path).to_string_lossy().into_owned();
+                log::info!("locations upload replaced friend={friend} location={} path={raw:?}; previous version moved to .dropbeam-trash", l.id);
+                out.replaced.push(at);
+            } else {
+                log::info!("locations upload friend={friend} location={} path={raw:?}", l.id);
+            }
+            out.paths.push(landed.path);
             base += item["size"].as_u64().context("Invalid file size")?;
         }
         ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
@@ -1005,13 +1540,92 @@ impl Upload {
             let raw = format!("{}/{}", self.target.rel_path, dir.as_str().context("Invalid directory")?).trim_start_matches('/').to_string();
             publish(&mut || root.ensure_dirs(&raw))?;
         }
-        let _ = fs::remove_dir_all(&self.staging);
+        let offset = header["location_item_offset"].as_u64().unwrap_or(0);
+        let total = header["location_total_items"].as_u64().unwrap_or(items.len() as u64);
+        if offset + items.len() as u64 == total { self.cleanup(); }
+        // The host's gateway card reads this; a batched upload records each batch
+        // so a long multi-batch push keeps the card's "last activity" live.
+        record_activity(&self.config, &self.target.location_id, friend, "upload", actual);
         Ok(out)
     }
 }
 
+// Failed pushes retain partials and integrity sidecars for the next attempt.
+
+/// Bytes a partial's sidecar says are already on disk.
+fn covered_bytes(sidecar: &Path) -> u64 {
+    fs::read(sidecar).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["coverage"]["ranges"].as_array().map(|r| r.iter().filter_map(|x| {
+            let a = x.get(0)?.as_u64()?; let b = x.get(1)?.as_u64()?; Some(b.saturating_sub(a))
+        }).sum()))
+        .unwrap_or(0)
+}
+
+/// A re-dragged file arrives under a new transfer id and therefore a new stage
+/// key; the bytes its earlier attempt staged would be orphaned and the file
+/// would restart from zero (an 11.8 GB file was found staged three times, each
+/// attempt starting over). Move the partial for the same fingerprint out of any
+/// abandoned (unleased) stage into this one so the receive engine resumes it,
+/// keeping whichever copy covers the most bytes. Empty abandoned stages are
+/// removed; the rest wait for the 24 h GC.
+fn adopt_abandoned_partials(staging_root: &Path, stage: &Path, endpoint: &str, items: &[Value]) {
+    let fps: Vec<String> = items.iter().filter_map(|it| {
+        let raw = it["name"].as_str()?; let size = it["size"].as_u64()?; let mtime = it["mtime"].as_u64().unwrap_or(0);
+        let rel = crate::iroh_net::sanitize_rel(raw);
+        Some(crate::iroh_net::transfer_fingerprint(endpoint, &rel.to_string_lossy(), size, mtime))
+    }).collect();
+    if fps.is_empty() { return; }
+    let Ok(dirs) = fs::read_dir(staging_root) else { return; };
+    for entry in dirs.flatten() {
+        let other = entry.path();
+        if other == stage { continue; }
+        let Some(name) = other.file_name().and_then(|n| n.to_str()) else { continue; };
+        if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) { continue; }
+        if !fs::symlink_metadata(&other).is_ok_and(|m| m.is_dir()) { continue; }
+        // Only stages nobody is writing to; hold their lease while we move files.
+        let _lease = {
+            let mut leases = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
+            if leases.contains(&other) { continue; }
+            leases.push(other.clone()); UploadLease(other.clone())
+        };
+        // One directory listing per stage: a 400-item batch must not cost
+        // 400 x N stat calls over a network mount (that pushed the host's
+        // ready reply past the sender's patience).
+        let present: std::collections::HashSet<String> = match fs::read_dir(&other) {
+            Ok(rd) => rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .filter_map(|e| e.file_name().to_str().map(str::to_owned)).collect(),
+            Err(_) => continue,
+        };
+        for fp in &fps {
+            let (json_name, part_name) = (format!(".dropbeam-partial-{fp}.json"), format!(".dropbeam-partial-{fp}.part"));
+            if !present.contains(&json_name) || !present.contains(&part_name) { continue; }
+            let src_json = other.join(&json_name);
+            let src_part = other.join(&part_name);
+            let is_file = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_file());
+            let dst_json = stage.join(format!(".dropbeam-partial-{fp}.json"));
+            let dst_part = stage.join(format!(".dropbeam-partial-{fp}.part"));
+            let (src_cov, dst_cov) = (covered_bytes(&src_json), if is_file(&dst_json) { covered_bytes(&dst_json) } else { 0 });
+            if src_cov <= dst_cov { let _ = fs::remove_file(&src_part); let _ = fs::remove_file(&src_json); continue; }
+            let _ = fs::remove_file(&dst_part); let _ = fs::remove_file(&dst_json);
+            match fs::rename(&src_part, &dst_part).and_then(|_| fs::rename(&src_json, &dst_json)) {
+                Ok(()) => log::info!("locations upload: resuming {fp} from an abandoned stage ({src_cov} bytes already landed)"),
+                Err(e) => { log::warn!("locations upload: could not adopt abandoned partial {fp}: {e}"); let _ = fs::remove_file(&dst_part); let _ = fs::remove_file(&dst_json); }
+            }
+        }
+        if fs::read_dir(&other).map(|mut d| d.next().is_none()).unwrap_or(false) { let _ = fs::remove_dir(&other); }
+    }
+}
+
+fn stage_expired(path: &Path) -> bool {
+    fs::symlink_metadata(path).and_then(|m| m.modified()).ok()
+        .and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= Duration::from_secs(24 * 60 * 60))
+}
+
 /// Only our private cache directories are eligible. Never traverse or GC NAS trash.
 pub fn gc(config: &Path) -> Result<()> {
+    for mut location in load(config)? {
+        if let Ok(root) = Root::for_location(&mut location) { root.gc_stages()?; }
+    }
     let active = UPLOADS.lock().unwrap_or_else(|p| p.into_inner()).clone();
     for category in ["location-snapshots", "location-transfers"] {
         let parent = config.join(category);
@@ -1032,6 +1646,7 @@ pub fn gc(config: &Path) -> Result<()> {
                 if leases.contains(&path) { continue; }
                 leases.push(path.clone()); UploadLease(path.clone())
             };
+            if !stage_expired(&path) { continue; }
             let result = (|| -> Result<()> {
                 let kind = entry.file_type()?;
                 if kind.is_dir() { fs::remove_dir_all(&path)?; }
@@ -1053,13 +1668,31 @@ pub fn spawn_gc(config: PathBuf) {
     });
 }
 
+/// Require this transfer's verified manifest before any location publication.
+pub fn verified_digests<'a>(header: &Value, rows: &'a [crate::models::FileIntegrity]) -> Result<Vec<&'a str>> {
+    ensure!(header["integrity_v"] == 1, "Upload not verified: integrity negotiation required");
+    let items = header["items"].as_array().context("Upload not verified: missing manifest")?;
+    let offset = header["location_item_offset"].as_u64().or_else(|| header["chatTransfer"]["itemOffset"].as_u64()).unwrap_or(0);
+    items.iter().enumerate().map(|(i, item)| {
+        let row = rows.iter().find(|r| r.index == offset + i as u64 && Some(r.name.as_str()) == item["name"].as_str())
+            .context("Upload not verified: missing verification row")?;
+        ensure!(row.verified && Some(row.size) == item["size"].as_u64(), "Upload not verified: verification failed");
+        let digest = row.sha256.as_deref().context("Upload not verified: missing SHA-256")?;
+        ensure!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()), "Upload not verified: invalid SHA-256");
+        Ok(digest)
+    }).collect()
+}
+
 #[cfg(test)]
 pub fn sha256(path: &Path) -> Result<String> {
     sha256_progress(path, &std::sync::atomic::AtomicBool::new(false), |_| {})
 }
 pub fn sha256_progress(path: &Path, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<String> {
+    sha256_file_progress(fs::File::open(path)?, cancel, progress)
+}
+pub(crate) fn sha256_file_progress(mut f: fs::File, cancel: &std::sync::atomic::AtomicBool, progress: impl Fn(u64)) -> Result<String> {
     use sha2::{Digest, Sha256}; use std::io::Read;
-    let mut hash = Sha256::new(); let mut f = fs::File::open(path)?; let mut b = vec![0; 1 << 20]; let mut done = 0;
+    let mut hash = Sha256::new(); let mut b = vec![0; 1 << 20]; let mut done = 0;
     loop {
         ensure!(!cancel.load(std::sync::atomic::Ordering::SeqCst), "canceled");
         let n = f.read(&mut b)?; if n == 0 { break; }
@@ -1077,9 +1710,24 @@ fn private_directory(path: &Path) -> Result<()> {
     builder.create(path)?; Ok(())
 }
 
-/// Keep snapshots alive throughout normal friend-send retries, then remove only
-/// this private generated directory. Never delete anything from a location.
-pub struct Snapshot { pub directory: PathBuf, pub paths: Vec<String>, pub skipped: Vec<String>, _friend: FriendLease, _lease: UploadLease, config: PathBuf, endpoint: String, location_id: String, root_path: String }
+/// A pinned download selection retained throughout friend-send retries; owns no payload copies.
+pub struct Snapshot { pub directory: PathBuf, pub paths: Vec<String>, pub skipped: Vec<String>, _friend: FriendLease, pub(crate) source: std::sync::Arc<DownloadSource>, config: PathBuf, endpoint: String, location_id: String, root_path: String }
+pub(crate) struct DownloadSource {
+    root: Root,
+    pub items: Vec<(PathBuf, String, u64, u64)>,
+    pub dirs: Vec<String>,
+}
+impl DownloadSource {
+    pub fn open(&self, path: &Path) -> Result<fs::File> {
+        let item = self.items.iter().find(|i| i.0 == path).context("File is outside download selection")?;
+        #[cfg(unix)] {
+            let file = self.root.open_rel(&relative(&path.strip_prefix(&self.root.path)?.to_string_lossy())?, false)?;
+            ensure!(file.metadata()?.is_file() && file.metadata()?.len() == item.2, "Download source size or type changed");
+            Ok(file)
+        }
+        #[cfg(not(unix))] { let _ = item; bail!("Hosting unavailable") }
+    }
+}
 impl Snapshot {
     pub fn check_access(&self, endpoint: &str) -> Result<()> {
         ensure!(endpoint == self.endpoint, "Download recipient changed");
@@ -1087,14 +1735,10 @@ impl Snapshot {
         ensure!(l.path == self.root_path, "Location changed during download");
         validate_root(&self.config, Path::new(&l.path))?;
         let _ = Root::for_location(&mut l)?;
+        self.source.root.recheck(&l)?;
         Ok(())
     }
 }
-fn remove_private_async(path: PathBuf) {
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() { runtime.spawn_blocking(move || { let _ = fs::remove_dir_all(path); }); }
-    else { std::thread::spawn(move || { let _ = fs::remove_dir_all(path); }); }
-}
-impl Drop for Snapshot { fn drop(&mut self) { remove_private_async(self.directory.clone()); } }
 pub fn download_snapshot(config: &Path, endpoint: &str, request: &Value) -> Result<Snapshot> {
     download_snapshot_at(config, endpoint, request, Instant::now())
 }
@@ -1109,27 +1753,34 @@ fn download_snapshot_at(config: &Path, endpoint: &str, request: &Value, now: Ins
     ensure!(!paths.is_empty() && paths.len() <= 500, "Select 1–500 items");
     let mut preflight = Budget { remaining: l.byte_cap, entries: 100_000 };
     for raw in paths { root.selection_bytes(raw.as_str().context("Invalid path")?, &mut preflight, 0)?; }
-    check_space(config, l.byte_cap - preflight.remaining)?;
-    let directory = config.join("location-snapshots").join(uuid::Uuid::new_v4().to_string());
-    let lease = {
-        let mut active = UPLOADS.lock().unwrap_or_else(|p| p.into_inner());
-        active.push(directory.clone()); UploadLease(directory.clone())
-    };
-    private_directory(&directory)?;
-    let mut snapshot = Snapshot { directory, paths: vec![], skipped: vec![], _friend: friend_lease, _lease: lease, config: config.into(), endpoint: endpoint.into(), location_id: l.id.clone(), root_path: l.path.clone() };
+    let directory = root.path.clone();
+    let mut snapshot = Snapshot { directory, paths: vec![], skipped: vec![], _friend: friend_lease,
+        source: std::sync::Arc::new(DownloadSource { root, items: vec![], dirs: vec![] }),
+        config: config.into(), endpoint: endpoint.into(), location_id: l.id.clone(), root_path: l.path.clone() };
+    let source = std::sync::Arc::get_mut(&mut snapshot.source).unwrap();
     let mut budget = Budget { remaining: l.byte_cap, entries: 100_000 };
+    let mut names = std::collections::HashSet::new();
     for raw in paths {
         let raw = raw.as_str().context("Invalid path")?;
         let rel = relative(raw)?;
-        let leaf = rel.file_name().context("Select items inside the location")?;
-        let dest = snapshot.directory.join(leaf);
-        if root.snapshot(raw, &dest, &mut budget, 0, &mut snapshot.skipped)? { snapshot.paths.push(dest.to_string_lossy().into_owned()); }
+        let leaf = rel.file_name().context("Select items inside the location")?.to_string_lossy();
+        use unicode_normalization::UnicodeNormalization;
+        if !names.insert(leaf.nfc().collect::<String>().to_lowercase()) { snapshot.skipped.push(format!("{raw}: name collides with another selected item")); continue; }
+        let before = snapshot.skipped.len();
+        source.root.select(raw, &leaf, &mut budget, 0, &mut snapshot.skipped, &mut source.items, &mut source.dirs)?;
+        if snapshot.skipped.len() == before || source.root.resolve(raw).is_ok() {
+            snapshot.paths.push(source.root.path.join(rel).to_string_lossy().into_owned());
+        }
     }
-    // Recheck after a potentially long snapshot, before releasing any bytes.
+    // Recheck after selection traversal, before releasing any bytes.
     let (current, _) = authorize(config, endpoint, &l.id, Access::Read)?;
     ensure!(current.path == l.path, "Location changed during download preparation");
     ensure!(current.marker == l.marker, LocationError::MountChanged);
-    root.recheck(&current)?;
+    source.root.recheck(&current)?;
+    // Serving a download is recorded when the selection is pinned: that is the
+    // last point the HOST controls (the bytes then stream out of Root::open).
+    let served = snapshot.source.items.iter().map(|i| i.2).sum();
+    record_activity(config, &l.id, &friend, "download", served);
     Ok(snapshot)
 }
 
@@ -1164,12 +1815,217 @@ mod tests {
         assert!(probe.join().unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn root_stage_ignores_config_capacity_moves_inode_and_hides_control_data() {
+        use std::os::unix::fs::MetadataExt;
+        let f = Fixture::new();
+        SPACE_OVERRIDE.with(|v| *v.borrow_mut() = Some((f.config.clone(), 1)));
+        assert!(check_space(&f.config, 4096).is_err());
+        let header = json!({"locations_v":VERSION,"location_hash_v":2,"integrity_v":1,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":"root-stage",
+            "items":[{"name":"folder/data","size":4096}],"dirs":[],"total":4096});
+        for fallback in [false, true] {
+            FORCE_HARD_LINK.with(|v| v.set(fallback));
+            let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            assert_eq!(upload.staging.parent().unwrap(), f.root.join(".dropbeam-staging"));
+            assert!(!f.config.join("location-transfers").exists());
+            let staged = upload.staging.join("received");
+            fs::write(&staged, vec![42; 4096]).unwrap();
+            let before = fs::metadata(&staged).unwrap();
+            let rows = [crate::models::FileIntegrity { index:0, name:"folder/data".into(), size:4096,
+                algorithm:"test".into(), digest:"a".repeat(64), peer_digest:"a".repeat(64),
+                verified:true, acknowledged:false, sha256:Some(sha256(&staged).unwrap()) }];
+            assert!(!upload.root.listing("").unwrap().iter().any(|e| e.name.starts_with(".dropbeam-")));
+            assert!(!receive_sweep_allowed(&f.config, &upload.staging));
+            assert!(!receive_sweep_allowed(&f.dir.join("unconfigured"), &upload.staging));
+            assert!(upload.root.trash(".dropbeam-staging").is_err());
+            assert!(upload.root.rename_item(".dropbeam-staging", "exposed").is_err());
+            upload.finish_verified_progress(&header, vec![staged], &rows,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+            let after = fs::metadata(f.root.join("folder/data")).unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert!(!upload.staging.exists());
+            drop(upload);
+            let retry = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            let staged = retry.staging.join("retry");
+            fs::write(&staged, vec![42; 4096]).unwrap();
+            // (a) An identical destination is already landed: no copy, no conflict.
+            let landing = retry.finish_verified_progress(&header, vec![staged], &rows,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+            assert!(landing.conflicts.is_empty());
+            let retried = fs::metadata(f.root.join("folder/data")).unwrap();
+            assert_eq!((retried.dev(), retried.ino()), (after.dev(), after.ino()));
+            assert!(!retry.staging.exists());
+            assert!(!f.root.join("folder/data (2)").exists());
+            drop(retry);
+            // (b) A destination with DIFFERENT content never fails the upload:
+            // it lands beside it and the original is left byte-for-byte alone.
+            let different = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            let staged = different.staging.join("different");
+            fs::write(&staged, vec![43; 4096]).unwrap();
+            let changed = [crate::models::FileIntegrity { sha256:Some(sha256(&staged).unwrap()), ..rows[0].clone() }];
+            let landing = different.finish_verified_progress(&header, vec![staged], &changed,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+            assert_eq!(landing.conflicts, vec![Conflict { name: "folder/data".into(), landed: "folder/data (2)".into() }]);
+            assert_eq!(landing.paths, vec![f.root.join("folder/data (2)")]);
+            assert_eq!(fs::read(f.root.join("folder/data")).unwrap(), vec![42; 4096]);
+            assert_eq!(fs::read(f.root.join("folder/data (2)")).unwrap(), vec![43; 4096]);
+            let kept = fs::metadata(f.root.join("folder/data")).unwrap();
+            assert_eq!((kept.dev(), kept.ino()), (after.dev(), after.ino()));
+            drop(different);
+            // A repeat of the SAME changed file finds its own copy and stops there.
+            let again = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            let staged = again.staging.join("again");
+            fs::write(&staged, vec![43; 4096]).unwrap();
+            let landing = again.finish_verified_progress(&header, vec![staged], &changed,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+            assert_eq!(landing.conflicts, vec![Conflict { name: "folder/data".into(), landed: "folder/data (2)".into() }]);
+            assert!(!f.root.join("folder/data (3)").exists());
+            drop(again);
+            // (c) A second, different file takes the next free name.
+            let third = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            let staged = third.staging.join("third");
+            fs::write(&staged, vec![44; 4096]).unwrap();
+            let rows = [crate::models::FileIntegrity { sha256:Some(sha256(&staged).unwrap()), ..rows[0].clone() }];
+            let landing = third.finish_verified_progress(&header, vec![staged], &rows,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap();
+            assert_eq!(landing.conflicts, vec![Conflict { name: "folder/data".into(), landed: "folder/data (3)".into() }]);
+            assert_eq!(fs::read(f.root.join("folder/data (3)")).unwrap(), vec![44; 4096]);
+            assert_eq!(fs::read(f.root.join("folder/data")).unwrap(), vec![42; 4096]);
+            drop(third);
+            for name in ["folder/data", "folder/data (2)", "folder/data (3)"] { fs::remove_file(f.root.join(name)).unwrap(); }
+        }
+        FORCE_HARD_LINK.with(|v| v.set(false));
+        SPACE_OVERRIDE.with(|v| *v.borrow_mut() = None);
+    }
+    fn age_stage(path: &Path) {
+        fs::File::open(path).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600)).unwrap();
+    }
+    #[test]
+    fn stat_uses_listing_auth_rate_limit_and_safe_paths() {
+        let mut f = Fixture::new();
+        fs::create_dir_all(f.root.join("folder/empty")).unwrap();
+        fs::write(f.root.join("folder/file"), b"data").unwrap();
+        std::os::unix::fs::symlink(&f.config, f.root.join("escape")).unwrap();
+        let mut request = f.req("stat", "");
+        request["paths"] = json!(["folder/file", "folder/empty", "absent", "escape/friends.json"]);
+        let now = Instant::now();
+        error_message(dispatch_at(&f.config, "stranger", &request, now), "Location access denied");
+        let reply = dispatch_at(&f.config, "owner-device", &request, now).unwrap();
+        assert_eq!(reply["entries"], json!([
+            {"rel_path":"folder/file","is_dir":false,"size":4},
+            {"rel_path":"folder/empty","is_dir":true,"size":0}]));
+        for _ in 0..9 { dispatch_at(&f.config, "owner-device", &f.req("ls", ""), now).unwrap(); }
+        error_kind(dispatch_at(&f.config, "owner-device", &request, now), LocationError::RateLimit);
+        request["paths"] = json!(["../config"]);
+        assert!(dispatch_at(&f.config, "owner-device", &request, now + Duration::from_secs(1)).is_err());
+        f.location.friend_ids.clear();
+        save(&f.config, Some(f.location.clone()), None).unwrap();
+        error_message(dispatch(&f.config, "owner-device", &request), "Location access denied");
+    }
+    #[test]
+    fn redragged_upload_adopts_the_abandoned_partial_with_most_coverage() {
+        let f = Fixture::new();
+        let staging = f.root.join(".dropbeam-staging");
+        let old_a = staging.join("a".repeat(64)); let old_b = staging.join("b".repeat(64));
+        fs::create_dir_all(&old_a).unwrap(); fs::create_dir_all(&old_b).unwrap();
+        let fp = crate::iroh_net::transfer_fingerprint("owner-device", "big.bin", 1000, 5);
+        for (dir, cov) in [(&old_a, 100u64), (&old_b, 600u64)] {
+            fs::write(dir.join(format!(".dropbeam-partial-{fp}.part")), vec![0u8; 1000]).unwrap();
+            fs::write(dir.join(format!(".dropbeam-partial-{fp}.json")), json!({"v":1,"fp":fp,"total":1000,"coverage":{"ranges":[[0,cov]]}}).to_string()).unwrap();
+        }
+        // An unrelated partial in an abandoned stage is left alone.
+        fs::write(old_a.join(".dropbeam-partial-ffff.part"), b"x").unwrap();
+        let header = json!({"kind":"files","locations_v":VERSION,"location_hash_v":2,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":"fresh",
+            "items":[{"name":"big.bin","size":1000,"mtime":5}],"dirs":[],"total":1000});
+        let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+        assert_eq!(covered_bytes(&upload.staging.join(format!(".dropbeam-partial-{fp}.json"))), 600);
+        assert!(upload.staging.join(format!(".dropbeam-partial-{fp}.part")).is_file());
+        assert!(!old_b.exists(), "emptied abandoned stage is removed");
+        assert!(old_a.join(".dropbeam-partial-ffff.part").is_file());
+        assert!(!old_a.join(format!(".dropbeam-partial-{fp}.part")).exists(), "the smaller duplicate is dropped");
+    }
+
+    #[test]
+    fn upload_transfer_key_survives_push_changes_and_waits_for_previous_lease() {
+        let f = Fixture::new();
+        let header = json!({"locations_v":VERSION,"location_hash_v":2,"integrity_v":1,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":"stable",
+            "location_total_items":3,"location_item_offset":0,
+            "items":[{"name":"first","size":4}],"dirs":["empty"],"total":4});
+        let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+        let staging = upload.staging.clone();
+        fs::write(staging.join("partial-sidecar"), b"keep").unwrap();
+        let mut second = header.clone();
+        second["items"][0]["name"] = json!("second"); second["dirs"] = json!([]); second["location_item_offset"] = json!(1);
+        let config = f.config.clone();
+        let worker = std::thread::spawn(move || Upload::prepare(&config, "owner-device", &second).unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+        drop(upload);
+        let retry = worker.join().unwrap();
+        assert_eq!(retry.staging, staging);
+        assert_eq!(fs::read(staging.join("partial-sidecar")).unwrap(), b"keep");
+        drop(retry);
+        let mut different = header.clone(); different["location_transfer"] = json!("different");
+        assert_ne!(Upload::prepare(&f.config, "owner-device", &different).unwrap().staging, staging);
+    }
+    #[test]
+    fn failed_root_stage_and_gc_never_follow_symlinks_or_touch_visible_files() {
+        let f = Fixture::new();
+        let header = json!({"locations_v":VERSION,"location_hash_v":2,"integrity_v":1,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":"failed",
+            "items":[{"name":"file","size":4}],"dirs":[],"total":4});
+        let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+        let staging = upload.staging.clone();
+        fs::write(f.root.join("keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&f.root, staging.join("escape")).unwrap();
+        assert!(upload.finish(&header, vec![]).is_err());
+        drop(upload);
+        assert!(staging.exists());
+        assert_eq!(fs::read(f.root.join("keep")).unwrap(), b"keep");
+        assert!(!f.config.join("location-transfers").exists());
+        fs::write(staging.join("orphan"), b"old").unwrap();
+        gc(&f.config).unwrap();
+        assert!(staging.exists(), "recent failed push must survive GC");
+        age_stage(&staging);
+        gc(&f.config).unwrap();
+        assert!(!staging.exists());
+        assert!(f.root.join("keep").exists());
+    }
+    #[test]
+    fn download_pins_root_paths_budget_and_rejects_changed_sources() {
+        let mut f = Fixture::new();
+        fs::create_dir_all(f.root.join("folder/.dropbeam-staging")).unwrap();
+        fs::write(f.root.join("folder/.dropbeam-staging/hidden"), vec![0; 1024]).unwrap();
+        fs::write(f.root.join("folder/data"), b"data").unwrap();
+        f.location.byte_cap = 4;
+        save(&f.config, Some(f.location.clone()), None).unwrap();
+        let snapshot = download_snapshot(&f.config, "owner-device",
+            &json!({"locations_v":VERSION,"id":"nas","paths":["folder"]})).unwrap();
+        assert_eq!(snapshot.paths, vec![f.root.join("folder").to_string_lossy().into_owned()]);
+        assert_eq!(snapshot.source.items.len(), 1);
+        let path = f.root.join("folder/data");
+        assert_eq!(snapshot.source.items[0].0, path);
+        snapshot.source.open(&path).unwrap();
+        assert!(!f.config.join("location-snapshots").exists());
+        fs::write(&path, b"grown").unwrap();
+        assert!(snapshot.source.open(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(snapshot.source.open(&path).is_err());
+        std::os::unix::fs::symlink(f.config.join("locations.json"), &path).unwrap();
+        assert!(snapshot.source.open(&path).is_err());
+        drop(snapshot);
+        assert!(f.root.exists());
+    }
     struct Fixture { dir: PathBuf, config: PathBuf, root: PathBuf, friend: String, location: Location }
     impl Fixture {
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!("dropbeam-location-test-{}", uuid::Uuid::new_v4()));
             let root = dir.join("NAS"); let config = dir.join("config");
             fs::create_dir_all(&root).unwrap(); fs::create_dir_all(&config).unwrap();
+            let dir = fs::canonicalize(dir).unwrap();
+            let root = dir.join("NAS"); let config = dir.join("config");
             let friend = crate::friends::upsert_by_endpoint(&config, "owner-device", "Friend").id;
             let location = Location { id: "nas".into(), name: "Family NAS".into(), path: root.to_string_lossy().into_owned(), friend_ids: vec![friend.clone()], rights: Rights { upload: true, manage: true }, byte_cap: default_byte_cap(), device: None, marker: None, safe_publish: None };
             save(&config, Some(location.clone()), None).unwrap();
@@ -1184,6 +2040,242 @@ mod tests {
         }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.dir); } }
+
+    /// The gateway card is the host's only window onto a folder it shares: a
+    /// mounted root reads as reachable with the marker we wrote, and a landed
+    /// upload leaves a persisted "who touched this last" row behind.
+    #[test]
+    fn hosted_status_reports_a_mounted_root_and_the_upload_that_landed_in_it() {
+        let f = Fixture::new();
+        let before = hosted_status(&f.config, "nas").unwrap();
+        assert!(before.reachable && before.marker_ok, "{before:?}");
+        assert!(before.error.is_none() && before.last_activity.is_none(), "{before:?}");
+        assert!(before.free_bytes > 0, "statvfs should report room on a temp volume");
+        assert!(hosted_status(&f.config, "missing-id").is_err());
+
+        let (upload, header, source) = f.upload("report.pdf", b"nine bytes");
+        upload.finish(&header, vec![source]).unwrap();
+        let after = hosted_status(&f.config, "nas").unwrap();
+        let last = after.last_activity.expect("a landed upload records activity");
+        assert_eq!((last.friend_id.as_str(), last.direction.as_str(), last.bytes), (f.friend.as_str(), "upload", 10));
+        assert!(last.at > 0);
+        // Persisted beside locations.json, never inside the shared folder itself.
+        assert!(f.config.join("locations-activity.json").is_file());
+        assert!(!f.root.join("locations-activity.json").exists());
+    }
+
+    /// The friend's card must be able to say "1.2 TB free of 4 TB" before a
+    /// 300 GB upload starts, and must NOT quote the host's boot disk when the
+    /// NAS is unmounted — only the folder's own volume, never its path.
+    #[test]
+    #[test]
+    fn implausibly_small_volumes_report_unknown_room() {
+        assert!(!plausible_volume(54 * 1024 * 1024));
+        assert!(plausible_volume(4_000_000_000_000));
+    }
+
+    fn shared_list_reports_room_on_the_volume_and_an_unmounted_root() {
+        let f = Fixture::new();
+        let list = shared(&f.config, "owner-device").unwrap();
+        let first = &list[0];
+        assert_eq!(first["name"], "Family NAS");
+        assert!(first.get("path").is_none(), "the host's path is never disclosed");
+        assert_eq!(first["reachable"], true);
+        let free = first["free_bytes"].as_u64().expect("statvfs reports free space on a temp volume");
+        let total = first["total_bytes"].as_u64().expect("statvfs reports the volume size");
+        assert!(free > 0 && total >= free, "free {free} of total {total}");
+        // An unmounted NAS usually leaves its (empty) mountpoint behind. The
+        // mount marker lives on the volume, so its absence is what tells us the
+        // numbers would be the boot disk's, not the NAS's.
+        let marker = load(&f.config).unwrap()[0].marker.clone().expect("save writes a mount marker");
+        fs::remove_file(f.root.join(&marker)).unwrap();
+        let empty = &shared(&f.config, "owner-device").unwrap()[0];
+        assert_eq!(empty["reachable"], false);
+        assert!(empty["free_bytes"].is_null() && empty["total_bytes"].is_null(), "{empty}");
+        // Still names the folder, so the card stays useful while the NAS sleeps.
+        assert_eq!(empty["name"], "Family NAS");
+        assert_eq!(empty["rights"]["upload"], true);
+        fs::remove_dir_all(&f.root).unwrap();
+        assert_eq!(shared(&f.config, "owner-device").unwrap()[0]["reachable"], false);
+    }
+
+    /// A folder kept continuously in sync asks for "newest wins": the upload is
+    /// published AT its name, the version it replaces stays recoverable in the
+    /// location's trash, an identical file is still a no-op, and no sibling
+    /// "name (2)" copy is ever created.
+    #[test]
+    fn replace_on_upload_trashes_the_previous_version_and_skips_identical_files() {
+        let f = Fixture::new();
+        let head = |replace: bool| json!({"locations_v":VERSION,"location_hash_v":2,"integrity_v":1,
+            "location":{"location_id":"nas","rel_path":""},"location_transfer":uuid::Uuid::new_v4().to_string(),
+            "replace_existing": replace,
+            "items":[{"name":"clips/a.mp4","size":6}],"dirs":[],"total":6});
+        let land = |bytes: &[u8], replace: bool| -> Landing {
+            let header = head(replace);
+            let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+            let staged = upload.staging.join("received");
+            fs::write(&staged, bytes).unwrap();
+            let rows = [crate::models::FileIntegrity { index:0, name:"clips/a.mp4".into(), size:6,
+                algorithm:"test".into(), digest:"a".repeat(64), peer_digest:"a".repeat(64),
+                verified:true, acknowledged:false, sha256:Some(sha256(&staged).unwrap()) }];
+            upload.finish_verified_progress(&header, vec![staged], &rows,
+                &std::sync::atomic::AtomicBool::new(false), |_| {}).unwrap()
+        };
+        let trashed = || -> Vec<PathBuf> {
+            let mut found = vec![];
+            for bucket in fs::read_dir(f.root.join(".dropbeam-trash")).into_iter().flatten().flatten() {
+                for item in fs::read_dir(bucket.path()).into_iter().flatten().flatten() { found.push(item.path()); }
+            }
+            found
+        };
+
+        // A first upload has nothing to replace.
+        let first = land(b"first!", true);
+        assert!(first.replaced.is_empty() && first.conflicts.is_empty(), "{first:?}");
+        assert_eq!(fs::read(f.root.join("clips/a.mp4")).unwrap(), b"first!");
+        assert!(!f.root.join(".dropbeam-trash").exists(), "nothing was replaced, nothing was trashed");
+
+        // The same bytes again: already landed, no copy, no trash churn.
+        let same = land(b"first!", true);
+        assert!(same.replaced.is_empty() && same.conflicts.is_empty(), "{same:?}");
+        assert_eq!(same.paths, vec![f.root.join("clips/a.mp4")]);
+        assert!(!f.root.join(".dropbeam-trash").exists());
+        assert!(!f.root.join("clips/a (2).mp4").exists());
+
+        // Changed bytes: the new version takes the name, the old one is safe.
+        let newer = land(b"second", true);
+        assert_eq!(newer.replaced, vec!["clips/a.mp4".to_string()]);
+        assert!(newer.conflicts.is_empty(), "{newer:?}");
+        assert_eq!(newer.paths, vec![f.root.join("clips/a.mp4")]);
+        assert_eq!(fs::read(f.root.join("clips/a.mp4")).unwrap(), b"second");
+        assert!(!f.root.join("clips/a (2).mp4").exists(), "newest wins never leaves a sibling");
+        let recoverable = trashed();
+        assert_eq!(recoverable.len(), 1, "{recoverable:?}");
+        assert_eq!(recoverable[0].file_name().unwrap(), "a.mp4");
+        assert_eq!(fs::read(&recoverable[0]).unwrap(), b"first!");
+
+        // Without the flag the never-overwrite rule is untouched.
+        let beside = land(b"third!", false);
+        assert_eq!(beside.conflicts, vec![Conflict { name: "clips/a.mp4".into(), landed: "clips/a (2).mp4".into() }]);
+        assert!(beside.replaced.is_empty());
+        assert_eq!(fs::read(f.root.join("clips/a.mp4")).unwrap(), b"second");
+        assert_eq!(trashed().len(), 1, "a sibling landing trashes nothing");
+
+        // The hash-while-copy path (a sender without location_hash_v=2) obeys
+        // the same flag.
+        let (upload, mut header, source) = f.upload("legacy.bin", b"new");
+        fs::write(f.root.join("legacy.bin"), b"old").unwrap();
+        header["replace_existing"] = json!(true);
+        let landing = upload.finish(&header, vec![source]).unwrap();
+        assert_eq!(landing.replaced, vec!["legacy.bin".to_string()]);
+        assert_eq!(fs::read(f.root.join("legacy.bin")).unwrap(), b"new");
+        assert!(!f.root.join("legacy.bin (2)").exists());
+        assert!(trashed().iter().any(|p| p.file_name().unwrap() == "legacy.bin"
+            && fs::read(p).unwrap() == b"old"));
+    }
+
+    /// An unmounted (or deleted) root must report itself as unreachable with a
+    /// reason instead of erroring the whole view, and stopping a location must
+    /// not leave its friend id behind in the activity file.
+    #[test]
+    fn hosted_status_survives_a_missing_root_and_forgets_stopped_locations() {
+        let f = Fixture::new();
+        record_activity(&f.config, "nas", &f.friend, "download", 4096);
+        assert_eq!(load_last_activity(&f.config).get("nas").map(|a| a.bytes), Some(4096));
+        // An id we don't host is never written, so a stale row can't be planted.
+        record_activity(&f.config, "not-hosted", &f.friend, "download", 1);
+        assert!(!load_last_activity(&f.config).contains_key("not-hosted"));
+
+        fs::remove_dir_all(&f.root).unwrap();
+        let gone = hosted_status(&f.config, "nas").unwrap();
+        assert!(!gone.reachable && !gone.marker_ok, "{gone:?}");
+        assert!(gone.error.is_some(), "an unmounted root explains itself");
+        assert_eq!(gone.last_activity.map(|a| a.bytes), Some(4096), "history outlives the mount");
+
+        fs::create_dir_all(&f.root).unwrap();
+        save(&f.config, None, Some("nas")).unwrap();
+        record_activity(&f.config, "nas", &f.friend, "upload", 1);
+        assert!(load_last_activity(&f.config).is_empty(), "stopping a location drops its row");
+    }
+
+    /// `locations.verify` on the host: hash the copies it holds, refuse the same
+    /// things `locations.stat` refuses, and never follow a symlink off the root.
+    #[cfg(unix)]
+    #[test]
+    fn verify_digests_hashes_the_hosts_copies_and_keeps_the_stat_gate() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let f = Fixture::new();
+        fs::create_dir_all(f.root.join("drop/clips")).unwrap();
+        fs::write(f.root.join("drop/clips/a.mp4"), b"same bytes").unwrap();
+        fs::write(f.root.join("drop/clips/b.mp4"), b"different").unwrap();
+        // The sibling a conflicting upload lands as: "Verify copy" asks for it by
+        // name when the requested name's digest doesn't match.
+        fs::write(f.root.join("drop/clips/b (2).mp4"), b"same bytes").unwrap();
+        std::os::unix::fs::symlink(f.config.join("locations.json"), f.root.join("drop/clips/link.mp4")).unwrap();
+        let items = json!([{"name":"clips/a.mp4","size":10},{"name":"clips/b.mp4","size":9},
+            {"name":"clips/gone.mp4","size":4},{"name":"clips/link.mp4","size":4}]);
+        let request = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
+            "rel_path":"drop","items":items});
+        let cancel = AtomicBool::new(false);
+        let hashed = AtomicU64::new(0);
+        let digests = verify_digests(&f.config, "owner-device", &request, &cancel, &hashed).unwrap();
+        assert_eq!(digests[0], Some(sha256(&f.root.join("drop/clips/a.mp4")).unwrap()));
+        assert_ne!(digests[1], digests[0], "different content must not hash the same");
+        assert_eq!(digests[2], None, "a copy the host doesn't hold is null");
+        assert_eq!(digests[3], None, "a symlink is never followed");
+        // Declared bytes advance even where nothing was hashed.
+        assert_eq!(hashed.load(Ordering::Relaxed), 10 + 9 + 4 + 4);
+
+        let sibling = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
+            "rel_path":"drop","items":[{"name":"clips/b (2).mp4","size":10}]});
+        assert_eq!(verify_digests(&f.config, "owner-device", &sibling, &cancel, &hashed).unwrap()[0],
+            digests[0], "the (2) sibling holds the bytes we sent");
+
+        // Same gate as locations.stat: an endpoint this location isn't shared
+        // with gets nothing, and neither does a traversal or an oversized batch.
+        assert!(verify_digests(&f.config, "stranger-device", &request, &cancel, &hashed).is_err());
+        let escape = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
+            "rel_path":"drop","items":[{"name":"../../outside","size":0}]});
+        assert!(verify_digests(&f.config, "owner-device", &escape, &cancel, &hashed).is_err());
+        let many: Vec<_> = (0..1001).map(|i| json!({"name":format!("f{i}"),"size":0})).collect();
+        let oversized = json!({"kind":"locations.verify","locations_v":VERSION,"id":"nas",
+            "rel_path":"drop","items":many});
+        assert!(verify_digests(&f.config, "owner-device", &oversized, &cancel, &hashed).is_err());
+        let stale = json!({"kind":"locations.verify","locations_v":VERSION + 99,"id":"nas",
+            "rel_path":"drop","items":[]});
+        assert!(verify_digests(&f.config, "owner-device", &stale, &cancel, &hashed).is_err());
+        // A cancel stops the read instead of reporting a partial verdict.
+        assert!(verify_digests(&f.config, "owner-device", &request, &AtomicBool::new(true), &hashed).is_err());
+    }
+
+    #[test]
+    fn v2_upload_requires_verified_rows_and_root_local_stage() {
+        let f = Fixture::new();
+        let (old, mut header, source) = f.upload("verified.bin", b"streamed payload");
+        drop(old);
+        header["location_hash_v"] = json!(2);
+        header["integrity_v"] = json!(1);
+        header["items"][0].as_object_mut().unwrap().remove("sha256");
+        let upload = Upload::prepare(&f.config, "owner-device", &header).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let row = crate::models::FileIntegrity { index: 0, name: "verified.bin".into(), size: 16, algorithm: "test".into(), digest: "a".repeat(64), peer_digest: "a".repeat(64), verified: true, acknowledged: false, sha256: Some("0".repeat(64)) };
+        for rows in [vec![], vec![row.clone()], vec![crate::models::FileIntegrity { verified: false, ..row.clone() }], vec![crate::models::FileIntegrity { index: 1, ..row.clone() }], vec![crate::models::FileIntegrity { name: "wrong".into(), ..row.clone() }]] {
+            let error = upload.finish_verified_progress(&header, vec![source.clone()], &rows, &cancel, |_| {}).unwrap_err();
+            assert!(error.to_string().contains("Upload not verified"), "{error}");
+            assert!(!f.root.join("verified.bin").exists());
+            assert!(upload.staging.exists());
+        }
+        let rows = [crate::models::FileIntegrity { sha256: Some(sha256(&source).unwrap()), ..row }];
+        header.as_object_mut().unwrap().remove("integrity_v");
+        assert!(upload.finish_verified_progress(&header, vec![source.clone()], &rows, &cancel, |_| {}).unwrap_err().to_string().contains("Upload not verified"));
+        assert!(!f.root.join("verified.bin").exists());
+        header["integrity_v"] = json!(1);
+        let staged = upload.staging.join("payload");
+        fs::rename(source, &staged).unwrap();
+        upload.finish_verified_progress(&header, vec![staged], &rows, &cancel, |_| {}).unwrap();
+        assert_eq!(fs::read(f.root.join("verified.bin")).unwrap(), b"streamed payload");
+    }
+
     #[test]
     fn root_binding_rejects_parent_absolute_reserved_and_symlink_escapes() {
         use std::os::unix::fs::symlink;
@@ -1246,14 +2338,31 @@ mod tests {
     fn upload_verifies_hash_revocation_and_never_clobbers_existing_data() {
         let mut f = Fixture::new();
         fs::write(f.root.join("existing"), b"precious").unwrap();
+        // A different file of the same name is published BESIDE it, never over
+        // it and never as a whole-upload failure (one changed file used to
+        // strand every other file in the same retry).
         let (u, h, src) = f.upload("existing", b"replacement");
-        error_message(u.finish(&h, vec![src]), "A different file with this name already exists");
-        assert_eq!(fs::read(f.root.join("existing")).unwrap(), b"precious"); drop(u);
+        let landing = u.finish(&h, vec![src]).unwrap();
+        assert_eq!(landing.conflicts, vec![Conflict { name: "existing".into(), landed: "existing (2)".into() }]);
+        assert_eq!(landing.paths, vec![f.root.join("existing (2)")]);
+        assert_eq!(fs::read(f.root.join("existing")).unwrap(), b"precious");
+        assert_eq!(fs::read(f.root.join("existing (2)")).unwrap(), b"replacement"); drop(u);
+        // Identical content is still treated as landed: no copy, no conflict.
+        let (u, h, src) = f.upload("existing", b"precious");
+        assert!(u.finish(&h, vec![src]).unwrap().conflicts.is_empty());
+        assert!(!f.root.join("existing (3)").exists()); drop(u);
+        // A second, DIFFERENT file takes the next free sibling name.
+        let (u, h, src) = f.upload("existing", b"third copy");
+        assert_eq!(u.finish(&h, vec![src]).unwrap().conflicts,
+            vec![Conflict { name: "existing".into(), landed: "existing (3)".into() }]);
+        assert_eq!(fs::read(f.root.join("existing (3)")).unwrap(), b"third copy");
+        assert_eq!(fs::read(f.root.join("existing")).unwrap(), b"precious");
+        assert_eq!(fs::read(f.root.join("existing (2)")).unwrap(), b"replacement"); drop(u);
         let (u, h, src) = f.upload("nested/文件.txt", b"hello NAS");
         assert!(!f.root.join("nested/文件.txt").exists());
         u.finish(&h, vec![src]).unwrap(); assert_eq!(fs::read(f.root.join("nested/文件.txt")).unwrap(), b"hello NAS"); drop(u);
         let (u, h, src) = f.upload("bad-hash", b"good"); fs::write(&src, b"evil").unwrap();
-        error_message(u.finish(&h, vec![src]), "SHA-256 mismatch"); assert!(!f.root.join("bad-hash").exists()); drop(u);
+        error_message(u.finish(&h, vec![src]), "Upload not verified: SHA-256 verification mismatch"); assert!(!f.root.join("bad-hash").exists()); drop(u);
         let (u, h, src) = f.upload("revoked", b"hello");
         f.location.rights.upload = false; save(&f.config, Some(f.location.clone()), None).unwrap();
         error_kind(u.finish(&h, vec![src]), LocationError::Permission); assert!(!f.root.join("revoked").exists());
@@ -1276,8 +2385,9 @@ mod tests {
         let snapshot = download_snapshot(&f.config, "owner-device", &req).unwrap();
         assert_eq!(fs::read(&snapshot.paths[0]).unwrap(), b"x");
         let dir = snapshot.directory.clone(); drop(snapshot);
-        for _ in 0..100 { if !dir.exists() { break; } std::thread::sleep(Duration::from_millis(10)); }
-        assert!(!dir.exists());
+        assert_eq!(dir, f.root);
+        assert!(dir.exists());
+        assert!(!f.config.join("location-snapshots").exists());
         std::os::unix::fs::symlink(f.dir.join("config"), f.root.join("link")).unwrap();
         let skipped = download_snapshot(&f.config, "owner-device", &json!({"locations_v":VERSION,"id":"nas","paths":["link"]})).unwrap();
         assert!(skipped.paths.is_empty()); assert!(skipped.skipped[0].starts_with("link:"));
@@ -1292,7 +2402,7 @@ mod tests {
         error_message(upload.finish_progress(&header, vec![source.clone()], &cancel, |_| { cancel.store(true, std::sync::atomic::Ordering::SeqCst); }), "canceled");
         assert!(!f.root.join("canceled.bin").exists());
         drop(upload);
-        let mut retry = header.clone(); retry["location_transfer"] = json!(uuid::Uuid::new_v4().to_string());
+        let retry = header.clone();
         let upload = Upload::prepare(&f.config, "owner-device", &retry).unwrap();
         assert_eq!(upload.staging, staging);
         upload.finish(&retry, vec![source]).unwrap();
@@ -1325,7 +2435,7 @@ mod tests {
         std::os::unix::fs::symlink(f.root.join("occupied"), f.root.join("link")).unwrap();
         io_kind(root.rename_item("source", "link"), std::io::ErrorKind::AlreadyExists);
         let staged_link = f.dir.join("link-staged"); fs::write(&staged_link, b"replacement").unwrap();
-        assert!(root.land("link", &staged_link, &sha256(&staged_link).unwrap(), &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).is_err());
+        assert!(root.land("link", &staged_link, &sha256(&staged_link).unwrap(), false, &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).is_err());
         assert_eq!(fs::read(f.root.join("occupied")).unwrap(), b"precious");
         assert!(fs::symlink_metadata(f.root.join("link")).unwrap().is_symlink());
         root.rename_item("source", "renamed").unwrap();
@@ -1335,7 +2445,7 @@ mod tests {
         let trash = root.trash("renamed").unwrap();
         assert_eq!(fs::read(f.root.join(trash)).unwrap(), b"source");
         let staged = f.dir.join("staged"); fs::write(&staged, b"bytes").unwrap();
-        root.land("uploaded", &staged, &sha256(&staged).unwrap(), &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).unwrap();
+        root.land("uploaded", &staged, &sha256(&staged).unwrap(), false, &std::sync::atomic::AtomicBool::new(false), |_| {}, |action| action()).unwrap();
         assert_eq!(fs::read(f.root.join("uploaded")).unwrap(), b"bytes");
     }
     #[test]
@@ -1448,6 +2558,8 @@ mod tests {
         error_kind(FriendLease::acquire(&f.config, &f.friend), LocationError::Busy);
         gc(&f.config).unwrap(); assert!(a.staging.exists()); assert!(b.staging.exists());
         let orphan = a.staging.clone(); drop(a); gc(&f.config).unwrap();
+        assert!(orphan.exists());
+        age_stage(&orphan); gc(&f.config).unwrap();
         assert!(!orphan.exists()); assert!(b.staging.exists());
         let root = Root::open(&f.root).unwrap(); root.new_folder("keep").unwrap();
         let trash = root.trash("keep").unwrap(); gc(&f.config).unwrap(); assert!(f.root.join(trash).is_dir());
@@ -1470,6 +2582,7 @@ mod tests {
         let mut f = Fixture::new();
         let (upload, header, _) = f.upload("file", b"1234");
         let staging = upload.staging.clone(); drop(upload);
+        fs::create_dir_all(&staging).unwrap(); // Simulate leftovers from a crashed older host.
         fs::write(staging.join("retained"), b"1234").unwrap();
         f.location.byte_cap = 7; save(&f.config, Some(f.location.clone()), None).unwrap();
         error_kind(Upload::prepare(&f.config, "owner-device", &header), LocationError::Quota);
@@ -1493,7 +2606,7 @@ mod tests {
         // Eviction must not matter to a verified upload's retained Root.
         unix::forget_probe(&f.root);
         let before = unix::PROBE_CALLS.with(|n| n.get());
-        let paths = upload.finish(&header, vec![src; 32]).unwrap();
+        let paths = upload.finish(&header, vec![src; 32]).unwrap().paths;
         assert_eq!(unix::PROBE_CALLS.with(|n| n.get()), before);
         assert_eq!(paths.len(), 32);
         assert!(paths.iter().all(|p| p.starts_with(fs::canonicalize(&f.root).unwrap())));
@@ -1520,7 +2633,7 @@ mod tests {
     }
 
     #[test]
-    fn download_staging_collisions_skip_files_and_directories_without_aborting() {
+    fn download_wire_collisions_skip_files_and_directories_without_aborting() {
         let f = Fixture::new();
         for parent in ["left", "right"] {
             fs::create_dir_all(f.root.join(parent).join("folder")).unwrap();
@@ -1529,13 +2642,13 @@ mod tests {
         fs::write(f.root.join("good"), b"keep").unwrap();
         let snapshot = download_snapshot(&f.config, "owner-device", &json!({"locations_v":VERSION,"id":"nas","paths":["left/same","right/same","left/folder","right/folder","good"]})).unwrap();
         assert_eq!(snapshot.paths.len(), 3); assert_eq!(snapshot.skipped.len(), 2);
-        assert_eq!(fs::read(snapshot.directory.join("same")).unwrap(), b"left");
+        assert_eq!(fs::read(&snapshot.paths[0]).unwrap(), b"left");
         assert_eq!(fs::read(snapshot.directory.join("good")).unwrap(), b"keep");
-        assert!(snapshot.skipped.iter().all(|s| s.contains("staged name collides")));
+        assert!(snapshot.skipped.iter().all(|s| s.contains("name collides")));
     }
 
     #[test]
-    fn download_case_and_unicode_twins_follow_staging_filesystem_semantics() {
+    fn download_twins_preserve_source_paths_and_skip_case_collisions() {
         let f = Fixture::new();
         fs::create_dir(f.root.join("left")).unwrap(); fs::create_dir(f.root.join("right")).unwrap();
         for (a, b) in [("Case", "case"), ("é", "e\u{301}")] {
@@ -1543,11 +2656,8 @@ mod tests {
             fs::write(f.root.join("right").join(b), b"right").unwrap();
             let snapshot = download_snapshot(&f.config, "owner-device", &json!({"locations_v":VERSION,"id":"nas","paths":[format!("left/{a}"),format!("right/{b}")]})).unwrap();
             assert_eq!(snapshot.paths.len() + snapshot.skipped.len(), 2);
-            assert_eq!(fs::read(snapshot.directory.join(a)).unwrap(), b"left");
-            #[cfg(target_os = "macos")]
-            if snapshot.directory.join(a) == snapshot.directory.join(b) || fs::canonicalize(snapshot.directory.join(a)).unwrap() == fs::canonicalize(snapshot.directory.join(b)).unwrap() {
-                assert_eq!(snapshot.skipped.len(), 1);
-            }
+            assert_eq!(fs::read(&snapshot.paths[0]).unwrap(), b"left");
+            if a.to_lowercase() == b.to_lowercase() { assert_eq!(snapshot.skipped.len(), 1); }
         }
     }
 

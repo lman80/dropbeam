@@ -68,22 +68,155 @@ pub struct IrohState {
     pending: Mutex<HashMap<String, PendingSend>>,
     /// Cancellation flags for in-flight transfers, keyed by transfer id.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The REASON alongside the cancel flag: ids whose stop was a PAUSE, not a
+    /// cancel. Marked before the flag flips, so the send loop that unwinds on the
+    /// cancel can report Paused (and keep every partial) instead of Canceled.
+    paused: Mutex<HashSet<String>>,
+    /// Location uploads in flight, keyed by (peer, location, rel path, source
+    /// paths) → transfer id, so the same folder is never uploaded twice at once
+    /// (a Retry click and a scripted restart raced into two parallel sends).
+    active_uploads: Mutex<HashMap<String, String>>,
     /// Live connections for in-flight transfers, keyed by transfer id. A cancel
     /// CLOSES the connection so a send stuck on QUIC flow-control unblocks at
     /// once — the flag alone only takes effect between chunks, which is why a
     /// sender couldn't cancel a stalled transfer.
     conns: Mutex<HashMap<String, Connection>>,
     /// Reusable outgoing chat connections; presence never dials.
-    friend_conns: Mutex<HashMap<String, Connection>>,
-    /// Fingerprints of resumable partial files currently being written, so two
-    /// concurrent receives of the same file never share one partial (the loser
-    /// falls back to a throwaway, non-resumable temp).
-    partials: Mutex<std::collections::HashSet<String>>,
+    friend_conns: Mutex<HashMap<String, CachedFriendConnection>>,
     /// Progress protocol learned from authenticated hello/ready frames.
     progress_versions: Mutex<HashMap<String, u64>>,
+    /// Finished SENDS that "Verify copy" can still re-check: what was pushed,
+    /// where it went, and the completed card to re-emit the report on. Bounded
+    /// (oldest evicted) by `verify::remember`.
+    verify_records: Mutex<Vec<(String, Arc<VerifyEntry>)>>,
+}
+
+/// A finished send, kept verifiable. The card is stored alongside the record so
+/// a verify report re-emits the SAME completed card instead of a stripped one
+/// that would drop its locality badge and integrity rows.
+pub(crate) struct VerifyEntry {
+    pub record: crate::verify::VerifyRecord,
+    pub card: Mutex<TransferUpdate>,
+}
+
+struct CachedFriendConnection {
+    conn: Connection,
+    created_at: Instant,
+    relay_with_direct_since: Option<Instant>,
+}
+
+impl CachedFriendConnection {
+    fn new(conn: Connection) -> Self {
+        Self { conn, created_at: Instant::now(), relay_with_direct_since: None }
+    }
+}
+
+/// Pure decision logic using continuous observed relay time.
+fn friend_rotation_reason(
+    age: Duration,
+    locality: crate::models::Locality,
+    has_direct_addrs: bool,
+    relay_duration: Option<Duration>,
+) -> Option<&'static str> {
+    if age > Duration::from_secs(30 * 60) {
+        Some("connection older than 30 minutes")
+    } else if matches!(locality, crate::models::Locality::Internet)
+        && has_direct_addrs
+        && relay_duration.is_some_and(|elapsed| elapsed > Duration::from_secs(60))
+    {
+        Some("relay-only with cached direct addresses for over 60 seconds")
+    } else {
+        None
+    }
+}
+
+/// Per-transfer recovery state. A relay-only replacement gets to keep sending;
+/// observing a direct path re-arms recovery, subject to the global cooldown.
+#[derive(Default)]
+struct RelayRecovery {
+    since: Option<Instant>,
+    last_redial: Option<Instant>,
+    awaiting_direct: bool,
+    #[cfg(test)]
+    forced_locality: Option<crate::models::Locality>,
+}
+impl RelayRecovery {
+    fn observe(&mut self, now: Instant, locality: crate::models::Locality, direct: bool) -> Option<Duration> {
+        use crate::models::Locality;
+        if matches!(locality, Locality::Local | Locality::Direct) {
+            self.awaiting_direct = false;
+        }
+        if !matches!(locality, Locality::Internet) || !direct {
+            self.since = None;
+            return None;
+        }
+        let elapsed = now.duration_since(*self.since.get_or_insert(now));
+        if !self.awaiting_direct && elapsed > Duration::from_secs(60)
+            && self.last_redial.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60)) {
+            Some(elapsed)
+        } else { None }
+    }
+
+    fn check(&mut self, conn: &Connection, safe: bool, requested: &AtomicBool) -> Result<()> {
+        let locality = conn_locality(conn);
+        #[cfg(test)]
+        let locality = self.forced_locality.unwrap_or(locality);
+        let direct = peer_addrs().lock().ok()
+            .and_then(|a| a.get(&conn.remote_id().to_string()).map(|a| !a.is_empty()))
+            .unwrap_or(false);
+        let now = Instant::now();
+        if let Some(elapsed) = self.observe(now, locality, direct) {
+            if safe {
+                self.last_redial = Some(now);
+                self.awaiting_direct = true;
+                self.since = None;
+                requested.store(true, Ordering::SeqCst);
+                log::info!("friend-send: relay-stuck for {}s with direct address known — redialing", elapsed.as_secs());
+                conn.close(0u32.into(), b"relay-stuck redial");
+                anyhow::bail!("relay-stuck redial");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl IrohState {
+    /// Check on reuse and presence ticks; the monitor never dials. The expected
+    /// id prevents an old dispatcher from rotating a replacement connection.
+    fn cached_friend_conn(&self, endpoint: &str, expected_id: Option<usize>) -> Option<Connection> {
+        let has_direct_addrs = peer_addrs().lock().ok()
+            .and_then(|addrs| addrs.get(endpoint).map(|a| !a.is_empty()))
+            .unwrap_or(false);
+        let mut connections = self.friend_conns.lock().ok()?;
+        let cached = connections.get_mut(endpoint)?;
+        if expected_id.is_some_and(|id| id != cached.conn.stable_id()) {
+            return None;
+        }
+        if cached.conn.close_reason().is_some() {
+            connections.remove(endpoint);
+            return None;
+        }
+        let now = Instant::now();
+        let locality = conn_locality(&cached.conn);
+        if matches!(locality, crate::models::Locality::Internet) && has_direct_addrs {
+            cached.relay_with_direct_since.get_or_insert(now);
+        } else {
+            cached.relay_with_direct_since = None;
+        }
+        let reason = friend_rotation_reason(
+            now.duration_since(cached.created_at), locality, has_direct_addrs,
+            cached.relay_with_direct_since.map(|since| now.duration_since(since)),
+        );
+        if let Some(reason) = reason {
+            log::info!("iroh: rotating friend connection {endpoint}: {reason}");
+            cached.conn.close(0u32.into(), b"friend connection rotation");
+            connections.remove(endpoint);
+            None
+        } else {
+            Some(cached.conn.clone())
+        }
+    }
+
     fn learn_progress(&self, endpoint: &str, version: u64) {
         let changed = match self.progress_versions.lock() {
             Ok(mut versions) => versions.insert(endpoint.to_owned(), version) != Some(version),
@@ -127,6 +260,25 @@ impl IrohState {
     /// Signal cancellation for a transfer id. Drops a still-staged send so it
     /// can't be pulled, and flips the in-flight flag for a running transfer.
     pub fn cancel(&self, id: &str) -> CancelKind {
+        self.cancel_with(id, CancelReason::Cancel)
+    }
+
+    /// Stop a transfer, recording WHY. `CancelReason::Pause` stops it exactly like
+    /// a cancel (the partials are kept either way — see `recv_ranges`) but marks
+    /// the id so the unwinding send loop reports Paused, leaving the card's retry
+    /// record intact for a one-tap Resume.
+    pub fn cancel_with(&self, id: &str, reason: CancelReason) -> CancelKind {
+        // Mark BEFORE anything flips the flag, or a fast loop could unwind and
+        // read the reason before it was recorded.
+        match reason {
+            CancelReason::Pause => {
+                self.paused.lock().unwrap().insert(id.to_owned());
+            }
+            // A cancel after a pause request wins: never resurrect a stale mark.
+            CancelReason::Cancel => {
+                self.paused.lock().unwrap().remove(id);
+            }
+        }
         let was_staged = {
             let mut p = self.pending.lock().unwrap();
             let before = p.len();
@@ -164,6 +316,39 @@ impl IrohState {
         } else {
             CancelKind::Unknown
         }
+    }
+
+    /// Why did this transfer stop? One-shot: the mark is consumed, so a later
+    /// failure of the same id can't masquerade as a pause.
+    pub fn take_reason(&self, id: &str) -> CancelReason {
+        if self.paused.lock().unwrap().remove(id) {
+            CancelReason::Pause
+        } else {
+            CancelReason::Cancel
+        }
+    }
+
+    /// Remember a send so the user can verify its copy after it finishes.
+    fn remember_verify(&self, id: &str, record: crate::verify::VerifyRecord, card: TransferUpdate) {
+        let entry = Arc::new(VerifyEntry { record, card: Mutex::new(card) });
+        crate::verify::remember(&mut self.verify_records.lock().unwrap(), id, entry);
+    }
+
+    /// Replace the card a later verify report is emitted on — called with the
+    /// real completed update, so the report keeps everything that card shows.
+    fn note_verify_card(&self, id: &str, card: TransferUpdate) {
+        if let Some(entry) = self.verify_entry(id) {
+            *entry.card.lock().unwrap() = card;
+        }
+    }
+
+    fn verify_entry(&self, id: &str) -> Option<Arc<VerifyEntry>> {
+        self.verify_records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(existing, _)| existing == id)
+            .map(|(_, entry)| entry.clone())
     }
 }
 
@@ -271,9 +456,101 @@ fn received_item_index(item_offset: u64, index: usize) -> u64 {
     item_offset + index as u64
 }
 fn normalized_receive_offset(header: &serde_json::Value) -> Result<u64> {
+    if let Some(offset) = header["location_item_offset"].as_u64() { return Ok(offset); }
     if header.get("chatTransfer").is_none() { return Ok(0); }
     incoming_chat_link(header, "").map(|link| link.item_offset)
         .context("invalid chat batch manifest")
+}
+
+/// One folder arrives as MANY pushes (one per big file, one per small-file
+/// batch, plus a terminal directory push). The sender shows the whole folder on
+/// a single card, so the receiver must too: every push of one logical transfer
+/// renders as the SAME card, with the whole transfer's name, byte total and a
+/// byte base of everything that landed in earlier pushes.
+#[derive(Debug, Clone, PartialEq)]
+struct ReceiveCard {
+    /// Stable across every push (and every retry) of the same logical transfer.
+    id: String,
+    /// What the card is called: the top folder plus how many files it holds.
+    label: String,
+    files: usize,
+    bytes_total: u64,
+    /// Bytes that landed in EARLIER pushes. The sender counts files it skipped
+    /// (already on the far side) here too, so a retry resumes where it left off.
+    bytes_base: u64,
+    /// The final push — only then does the card go to Completed.
+    last: bool,
+}
+
+/// The one folder every item sits under, if they share one.
+fn folder_label<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut top: Option<&str> = None;
+    for name in names {
+        let head = name.split(['/', '\\']).next().unwrap_or("");
+        if head.is_empty() || head.len() == name.len() { return None; }
+        match top {
+            None => top = Some(head),
+            Some(seen) if seen == head => {}
+            Some(_) => return None,
+        }
+    }
+    top.map(str::to_string)
+}
+
+fn card_label(folder: Option<String>, files: usize) -> String {
+    let count = if files == 1 { "1 file".to_string() } else { format!("{files} files") };
+    match folder {
+        Some(folder) => format!("{folder} · {count}"),
+        None => count,
+    }
+}
+
+/// Pure: which logical card this push belongs to. `peer` namespaces the id, so
+/// a peer can never address (or collide with) another peer's card. `None` = the
+/// push IS the whole transfer, which keeps its own one-off card.
+fn receive_card(header: &serde_json::Value, peer: &str) -> Option<ReceiveCard> {
+    let items = header["items"].as_array().map_or(0, |a| a.len()) as u64;
+    if let Some(transfer) = header["location_transfer"].as_str() {
+        // A location UPLOAD (not a download): it carries the batch's shape.
+        let total_items = header["location_total_items"].as_u64()?;
+        let offset = header["location_item_offset"].as_u64()?;
+        uuid::Uuid::parse_str(transfer).ok()?;
+        if offset.checked_add(items)? > total_items { return None; }
+        if offset == 0 && items == total_items { return None; }
+        // Only a sender that states the batch's byte span aggregates: an older
+        // one keeps today's card-per-push behavior rather than getting a card
+        // that could never reach 100%.
+        let bytes_total = header["location_bytes_total"].as_u64()?;
+        return Some(ReceiveCard {
+            id: incoming_chat_id(peer, transfer),
+            label: card_label(
+                header["location_folder"].as_str().filter(|f| !f.is_empty()).map(str::to_string),
+                total_items as usize,
+            ),
+            files: total_items as usize,
+            bytes_base: header["location_bytes_offset"].as_u64().unwrap_or(0).min(bytes_total),
+            bytes_total,
+            // An upload always ends with a terminal push carrying the directories
+            // and no items — THAT is the one that completes the card (the last
+            // file push is still followed by it).
+            last: items == 0 && offset == total_items,
+        });
+    }
+    // A friend send: the chat link carries the immutable whole-transfer manifest
+    // (and is already validated against this push's slice).
+    let link = incoming_chat_link(header, peer)?;
+    if link.item_offset == 0 && link.last && link.manifest.len() as u64 == items { return None; }
+    Some(ReceiveCard {
+        id: link.id.clone(),
+        label: card_label(
+            folder_label(link.manifest.iter().map(|f| f.name.as_str())),
+            link.manifest.len(),
+        ),
+        files: link.manifest.len(),
+        bytes_base: link.offset.min(link.total),
+        bytes_total: link.total,
+        last: link.last,
+    })
 }
 struct ChatBatch {
     link: crate::models::ChatTransferLink,
@@ -298,7 +575,10 @@ impl ChatBatch {
         self.touched = Instant::now();
         let done: u64 = self.link.manifest.iter().enumerate().filter(|(i, f)| self.landed.contains_key(&chat_item_key(*i as u64, &f.name))).map(|(_, f)| f.size).sum();
         let complete = u.state == TransferState::Completed && self.link.manifest.iter().enumerate().all(|(i, f)| self.landed.contains_key(&chat_item_key(i as u64, &f.name))) && link.directories.iter().all(|d| self.landed.contains_key(&chat_dir_key(d))) && done == self.link.total;
-        self.link.bytes_done = if complete { done } else { self.link.bytes_done.max(done).max(link.offset.saturating_add(u.bytes_done).min(self.link.total)) };
+        // `u.bytes_done` is the WHOLE transfer's progress (a multi-push receive
+        // reports on one card, from a base of everything earlier pushes landed),
+        // so it must not be offset a second time.
+        self.link.bytes_done = if complete { done } else { self.link.bytes_done.max(done).max(u.bytes_done.min(self.link.total)) };
         self.link.completed_files = self.landed.keys().cloned().collect();
         self.link.completed_paths = self.landed.clone();
         self.link.batch_state = Some(if complete { TransferState::Completed } else if u.state == TransferState::Completed { TransferState::Transferring } else { u.state });
@@ -588,18 +868,36 @@ async fn read_landed_progress_hashed<F: Fn(u64, u64)>(
     recv: &mut RecvStream, total: u64, base: u64, cancel: &AtomicBool,
     on_progress: &F, hashes: Option<&Mutex<Vec<integrity::FileHash>>>, activity: Option<&AtomicU64>,
 ) -> Result<()> {
+    read_landed_progress_with_work(recv, total, base, cancel, on_progress, hashes, activity, None).await
+}
+
+async fn read_landed_progress_with_work<F: Fn(u64, u64)>(
+    recv: &mut RecvStream, total: u64, base: u64, cancel: &AtomicBool,
+    on_progress: &F, hashes: Option<&Mutex<Vec<integrity::FileHash>>>,
+    activity: Option<&AtomicU64>, sent: Option<&AtomicU64>,
+) -> Result<()> {
     anyhow::ensure!(base <= total, "invalid resume base");
     let mut previous = base;
     let mut rehash = 0;
     let mut receipt_rows = vec![];
     let mut receipt_complete = false;
-    let mut deadline = integrity::Inactivity::new(activity);
+    let mut deadline = integrity::ReceiverInactivity::new(activity);
+    let mut reported_work = 0;
     on_progress(base, total);
     loop {
         let frame = read_frame(recv);
         tokio::pin!(frame);
         let mut v = loop {
-            deadline.check(activity)?;
+            // Preserve cumulative activity for the outer/UI observers without
+            // feeding transport back into this receiver-owned deadline.
+            if let (Some(work), Some(shared)) = (activity, sent) {
+                if !std::ptr::eq(work, shared) {
+                    let current = work.load(Ordering::SeqCst);
+                    shared.fetch_add(current.saturating_sub(reported_work), Ordering::SeqCst);
+                    reported_work = current;
+                }
+            }
+            deadline.check(sent, activity)?;
             tokio::select! {
                 result = &mut frame => break result.context("read receiver landed progress")?,
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
@@ -635,13 +933,32 @@ async fn read_landed_progress_hashed<F: Fn(u64, u64)>(
         if let Some(error) = v["error"].as_str() {
             anyhow::bail!("receiver: {error}");
         }
+        // A Location host that found a DIFFERENT file of the same name publishes
+        // ours beside it instead of failing the push. Additive fields: a host
+        // that doesn't send them simply reports no conflicts.
+        if v["conflicts"].as_u64().is_some_and(|n| n > 0) {
+            let names = v["conflict_names"].as_array().map(|names|
+                names.iter().filter_map(|n| n.as_str()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+            for name in integrity::conflicted(names) {
+                log::info!("location upload: a different file of that name was already there — saved as {name:?}");
+            }
+        }
+        // "Newest wins" (`replace_existing`): the host published our copy AT the
+        // requested name and moved the previous version to its trash.
+        if v["replaced"].as_u64().is_some_and(|n| n > 0) {
+            let names = v["replaced_names"].as_array().map(|names|
+                names.iter().filter_map(|n| n.as_str()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+            for name in integrity::replaced_names(names) {
+                log::info!("location upload: replaced {name:?}; the previous version is recoverable from the location's trash");
+            }
+        }
         // Clamp instead of failing: a receiver that fell back to the classic body
         // after advertising resume coverage restarts its landed count at 0.
         let done = v["landed"].as_u64().context("missing landed byte count")?.max(previous);
         anyhow::ensure!(done >= previous && done <= total, "invalid landed byte count");
         let ok = v["ok"].as_bool() == Some(true);
         anyhow::ensure!(!ok || done == total, "incomplete receiver confirmation");
-        if done > previous { deadline.progress(); }
+        deadline.landed(done > previous);
         previous = done;
         on_progress(done, total);
         if ok {
@@ -650,7 +967,10 @@ async fn read_landed_progress_hashed<F: Fn(u64, u64)>(
     }
 }
 
-/// A time-throttled UI callback shared by sends and receives.
+/// A time-throttled UI callback shared by sends and receives. `files` is how
+/// many files the CARD covers — the same as `names` except on a folder card,
+/// whose one display name stands for the whole batch.
+#[allow(clippy::too_many_arguments)]
 fn progress_cb(
     app: AppHandle,
     id: String,
@@ -658,6 +978,7 @@ fn progress_cb(
     names: Vec<String>,
     friend: Option<String>,
     conn: Connection,
+    files: usize,
 ) -> impl Fn(u64, u64) {
     let start = Instant::now();
     // (when we last emitted, and what we emitted) — both halves matter.
@@ -681,6 +1002,7 @@ fn progress_cb(
         drop(previous);
         let secs = start.elapsed().as_secs_f64().max(0.001);
         let mut u = TransferUpdate::new(id.clone(), dir, names.clone());
+        u.file_count = files.max(u.file_count);
         u.state = TransferState::Transferring;
         u.bytes_done = done;
         u.bytes_total = total;
@@ -716,8 +1038,12 @@ fn emit_completed(
     locality: crate::models::Locality,
     friend: Option<String>,
     out_dir: Option<String>,
+    // How many files the card covers (a folder card names the folder, not each
+    // file). 0 = as many as `names`.
+    files: usize,
 ) {
     let mut u = completed_update(id, dir, names.clone(), total);
+    u.file_count = files.max(u.file_count);
     u.locality = locality;
     u.friend_name = friend.clone();
     u.out_dir = out_dir.clone();
@@ -832,9 +1158,64 @@ fn emit_canceled(app: &AppHandle, id: &str, dir: Direction) {
     emit(app, &u);
 }
 
+/// What the user asked for when a transfer was stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Stop for good — the card goes to Canceled.
+    Cancel,
+    /// Stop but keep everything — the card goes to Paused and offers Resume.
+    Pause,
+}
+
+/// Shown on a paused card so it reads as a waypoint, not a failure.
+pub const PAUSE_NOTE: &str = "Paused — resume any time";
+
+/// Which terminal state a user-stopped transfer reports. Pure so the mapping is
+/// unit-testable without a running endpoint.
+pub fn stopped_state(reason: CancelReason) -> TransferState {
+    match reason {
+        CancelReason::Pause => TransferState::Paused,
+        CancelReason::Cancel => TransferState::Canceled,
+    }
+}
+
+/// Report a user-stopped transfer. A pause carries its byte counts so the card
+/// can say how far it got (and the retry record stays put for Resume).
+fn emit_stopped(
+    app: &AppHandle,
+    id: &str,
+    dir: Direction,
+    reason: CancelReason,
+    bytes_done: u64,
+    bytes_total: u64,
+) {
+    let state = stopped_state(reason);
+    if state != TransferState::Paused {
+        emit_canceled(app, id, dir);
+        return;
+    }
+    let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
+    u.state = state;
+    u.bytes_done = bytes_done.min(bytes_total.max(bytes_done));
+    u.bytes_total = bytes_total;
+    u.percent = if bytes_total > 0 {
+        (bytes_done as f64 / bytes_total as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    u.detail = Some(PAUSE_NOTE.to_string());
+    emit(app, &u);
+}
+
 /// Tell the UI a staged (not-yet-pulled) send was canceled.
 pub fn emit_canceled_send(app: &AppHandle, id: &str) {
     emit_canceled(app, id, Direction::Send);
+}
+
+/// Tell the UI a staged (not-yet-pulled) send was paused — nothing had moved, so
+/// there are no bytes to report, but Resume re-stages the same files.
+pub fn emit_paused_send(app: &AppHandle, id: &str) {
+    emit_stopped(app, id, Direction::Send, CancelReason::Pause, 0, 0);
 }
 
 /// What `IrohState::cancel` found for an id.
@@ -860,108 +1241,125 @@ pub enum CancelKind {
 // via their shared PUBLIC IP (hairpin NAT, often broken) or a distant relay —
 // finicky and slow. So: every time a connection has working direct addresses,
 // remember them per peer (persisted across restarts), and seed every future
-// dial with them. Stale entries are harmless — iroh races all addresses plus
-// discovery and uses whichever answers first.
+// dial with a recent, bounded set. Stale ports consume concurrent path slots
+// and can crowd out the live direct address.
 
-static PEER_ADDRS: std::sync::OnceLock<Mutex<HashMap<String, Vec<std::net::SocketAddr>>>> =
-    std::sync::OnceLock::new();
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct PeerAddr {
+    addr: std::net::SocketAddr,
+    #[serde(default = "peer_addr_now")]
+    last_seen: u64,
+    #[serde(default)]
+    observed_working: bool,
+}
+fn peer_addr_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+fn private_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || (u32::from(ip) & 0xffc0_0000 == 0x6440_0000),
+        std::net::IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+fn prune_peer_addrs(addrs: &mut Vec<PeerAddr>, now: u64, subnets: &[netwatch::interfaces::IpNet]) {
+    addrs.retain(|a| now.saturating_sub(a.last_seen) <= 24 * 60 * 60
+        && (a.observed_working || !private_addr(a.addr.ip()) || on_local_subnet(a.addr.ip(), subnets)));
+    addrs.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    let mut seen = std::collections::HashSet::new();
+    addrs.retain(|a| seen.insert(a.addr));
+    addrs.truncate(3);
+}
+fn decode_peer_addrs(bytes: &[u8], now: u64) -> Result<HashMap<String, Vec<PeerAddr>>> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Entry { Timed(PeerAddr), Flat(std::net::SocketAddr) }
+    let map: HashMap<String, Vec<Entry>> = serde_json::from_slice(bytes)?;
+    Ok(map.into_iter().map(|(peer, entries)| (peer, entries.into_iter().map(|e| match e {
+        Entry::Timed(a) => a,
+        Entry::Flat(addr) => PeerAddr { addr, last_seen: now, observed_working: false },
+    }).collect())).collect())
+}
+static PEER_ADDRS: std::sync::OnceLock<Mutex<HashMap<String, Vec<PeerAddr>>>> = std::sync::OnceLock::new();
 static PEER_ADDRS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-fn peer_addrs() -> &'static Mutex<HashMap<String, Vec<std::net::SocketAddr>>> {
+fn peer_addrs() -> &'static Mutex<HashMap<String, Vec<PeerAddr>>> {
     PEER_ADDRS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
-/// Load the persisted cache (called once at endpoint startup).
 fn load_peer_addrs(config_dir: &Path) {
     let path = config_dir.join("peer-addrs.json");
     if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(map) = serde_json::from_slice::<HashMap<String, Vec<std::net::SocketAddr>>>(&bytes)
-        {
+        if let Ok(map) = decode_peer_addrs(&bytes, peer_addr_now()) {
             *peer_addrs().lock().unwrap() = map;
         }
     }
     let _ = PEER_ADDRS_PATH.set(path);
+    save_peer_addrs();
 }
-
 fn save_peer_addrs() {
+    // Serialize writes under the cache lock so concurrent observations cannot
+    // overwrite newer timestamps via the shared temporary file.
+    let mut map = peer_addrs().lock().unwrap();
+    let subnets = LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner());
+    for entries in map.values_mut() { prune_peer_addrs(entries, peer_addr_now(), &subnets); }
     if let Some(path) = PEER_ADDRS_PATH.get() {
-        let map = peer_addrs().lock().unwrap().clone();
-        if let Ok(json) = serde_json::to_vec(&map) {
+        if let Ok(json) = serde_json::to_vec(&*map) {
             let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() { let _ = std::fs::rename(tmp, path); }
+            if std::fs::write(&tmp, json).is_ok() { let _ = std::fs::rename(tmp, path); }
         }
     }
 }
-
-/// Remember every live direct (IP) address of this connection for its peer —
-/// newest first, capped, deduped. Called when a direct path forms, when a
-/// transfer completes, and shortly after accepting an inbound connection, so
-/// BOTH sides learn each other.
-fn remember_conn_addrs(conn: &Connection) {
-    use iroh::Watcher as _;
-    let eid = conn.remote_id().to_string();
-    let mut watcher = conn.paths();
-    let addrs: Vec<std::net::SocketAddr> = watcher
-        .get()
-        .iter()
-        .filter_map(|p| match p.remote_addr() {
-            iroh::TransportAddr::Ip(s) => Some(*s),
-            _ => None,
-        })
-        .collect();
-    if addrs.is_empty() {
-        return;
-    }
-    let mut changed = false;
+fn remember_working_addr(peer: String, addr: std::net::SocketAddr) {
+    let now = peer_addr_now();
     {
         let mut map = peer_addrs().lock().unwrap();
-        let entry = map.entry(eid).or_default();
-        for a in addrs {
-            if entry.first() != Some(&a) {
-                entry.retain(|x| x != &a);
-                entry.insert(0, a);
-                entry.truncate(6);
-                changed = true;
-            }
+        let entries = map.entry(peer).or_default();
+        if entries.iter().any(|a| a.addr == addr && a.observed_working && a.last_seen == now) { return; }
+        entries.retain(|a| a.addr != addr);
+        entries.insert(0, PeerAddr { addr, last_seen: now, observed_working: true });
+    }
+    save_peer_addrs();
+}
+/// A selected, open direct path is evidence of a working address. Candidate
+/// paths alone (including ones still being probed) must never enter the cache.
+fn remember_conn_addrs(conn: &Connection) {
+    if conn.close_reason().is_some() { return; }
+    for path in conn.paths().iter().filter(|p| p.is_selected() && path_is_validated_direct(p)) {
+        if let iroh::TransportAddr::Ip(addr) = path.remote_addr() {
+            remember_working_addr(conn.remote_id().to_string(), *addr);
         }
     }
-    if changed {
-        save_peer_addrs();
-    }
 }
-
-/// The address to dial for `id`: the bare EndpointId (discovery) PLUS every
-/// direct address that has worked before — so a repeat send on the same LAN
-/// connects instantly even when discovery is blind.
 fn dial_addr(id: iroh::EndpointId) -> iroh::EndpointAddr {
-    let cached = peer_addrs()
-        .lock()
-        .unwrap()
-        .get(&id.to_string())
-        .cloned()
-        .unwrap_or_default();
-    iroh::EndpointAddr::from(id).with_addrs(cached.into_iter().map(iroh::TransportAddr::Ip))
+    let mut map = peer_addrs().lock().unwrap();
+    let entries = map.entry(id.to_string()).or_default();
+    prune_peer_addrs(entries, peer_addr_now(), &LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner()));
+    iroh::EndpointAddr::from(id).with_addrs(entries.iter().map(|a| iroh::TransportAddr::Ip(a.addr)))
 }
 
-/// Is this `remote_addr` Debug string a private/link-local IP (i.e. same LAN)?
-/// `PathInfo::remote_addr()` Debug-formats as e.g. `Ip(192.168.1.5:54321)` (seen in
-/// our PERF logs). Best-effort string match; an unrecognized format degrades to
-/// "not LAN" → labeled DIRECT, which is still truthful for a non-relay path.
+static LOCAL_SUBNETS: std::sync::RwLock<Vec<netwatch::interfaces::IpNet>> = std::sync::RwLock::new(Vec::new());
+
+fn on_local_subnet(peer: std::net::IpAddr, subnets: &[netwatch::interfaces::IpNet]) -> bool {
+    use netwatch::interfaces::IpNet;
+    // Tailscale/CGNAT is always Direct, even if its interface advertises /10.
+    if let std::net::IpAddr::V4(ip) = peer {
+        if u32::from(ip) & 0xffc0_0000 == 0x6440_0000 { return false; }
+    }
+    subnets.iter().any(|subnet| match (subnet, peer) {
+        (IpNet::V4(net), std::net::IpAddr::V4(ip)) => net.contains(&ip),
+        (IpNet::V6 { net, .. }, std::net::IpAddr::V6(ip)) => net.contains(&ip),
+        _ => false,
+    })
+}
+
 fn addr_is_lan(dbg: &str) -> bool {
-    dbg.contains("Ip(10.")
-        || dbg.contains("Ip(192.168.")
-        || dbg.contains("Ip(127.")
-        || dbg.contains("Ip(169.254.") // link-local
-        || dbg.contains("Ip([fe80") // IPv6 link-local
-        || dbg.contains("Ip([::1]") // IPv6 loopback
-        || (dbg.contains("Ip(172.")
-            && dbg
-                .split("Ip(172.")
-                .nth(1)
-                .and_then(|s| s.split('.').next())
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|o| (16..=31).contains(&o)) // 172.16/12
-                .unwrap_or(false))
+    let Some(addr) = dbg.strip_prefix("Ip(").and_then(|s| s.strip_suffix(')'))
+        .and_then(|s| s.parse::<std::net::SocketAddr>().ok()) else { return false; };
+    on_local_subnet(addr.ip(), &LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner()))
+}
+
+async fn refresh_local_subnets() {
+    let state = netwatch::interfaces::State::new().await;
+    let subnets = state.interfaces.values().filter(|i| i.is_up()).flat_map(|i| i.addrs()).collect();
+    *LOCAL_SUBNETS.write().unwrap_or_else(|p| p.into_inner()) = subnets;
 }
 
 /// Which channel the live connection is using: relayed (slow), a direct LAN path,
@@ -984,16 +1382,59 @@ pub fn lan_path_blocked() -> bool {
         && !EVER_LOCAL.load(Ordering::Relaxed)
 }
 
+/// Which path a connection is really using, as (is_relay, remote addr).
+///
+/// `is_selected` mirrors the peer-level path choice across connections. While
+/// that path is being established on this connection, it can have no selected
+/// path. Preserve the fallback to this connection's established direct path,
+/// or its relay, so the badge and relay recovery do not get stuck on Unknown.
+/// (selected, relay, closed, validated, addr) per path → (is_relay, addr).
+/// Order: the selected path, else a validated direct path, else an open relay.
+fn locality_evidence(paths: impl Iterator<Item = (bool, bool, bool, bool, String)>) -> Option<(bool, String)> {
+    let paths: Vec<_> = paths.filter(|(_, relay, closed, validated, _)| !closed && (*relay || *validated)).collect();
+    if let Some((_, relay, _, _, addr)) = paths.iter().find(|(selected, _, _, _, _)| *selected) {
+        return Some((*relay, addr.clone()));
+    }
+    if let Some((_, _, _, _, addr)) = paths.iter().find(|(_, relay, _, validated, _)| !relay && *validated) {
+        return Some((false, addr.clone()));
+    }
+    paths.iter().find(|(_, relay, _, _, _)| *relay)
+        .map(|(_, relay, _, _, addr)| (*relay, addr.clone()))
+}
+/// Wait up to `budget` for an established non-relay path. Iroh 1.2 excludes
+/// NAT-traversal candidates from the snapshot until peer traffic arrives.
+async fn conn_has_direct_path(conn: &Connection, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if conn.close_reason().is_some() { return false; }
+        let has = conn.paths().iter().any(|p| path_is_validated_direct(&p));
+        if has { return true; }
+        if Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+fn path_is_validated_direct(p: &iroh::endpoint::Path<'_>) -> bool {
+    // In iroh 1.2, PathList only contains paths registered after noq's
+    // Established event (peer traffic received); probing candidates are absent.
+    !p.is_relay()
+}
+/// One-line summary of a connection's paths for the log.
+fn describe_paths(conn: &Connection) -> String {
+    let closed = conn.close_reason().is_some();
+    conn.paths().iter().map(|p| format!("{}{}{}{:?}",
+        if p.is_selected() { "*" } else { "" },
+        if closed { "x" } else { "" },
+        if !closed && path_is_validated_direct(&p) { "v" } else { "" },
+        p.remote_addr())).collect::<Vec<_>>().join(" ")
+}
 fn conn_locality(conn: &Connection) -> crate::models::Locality {
     use crate::models::Locality;
-    use iroh::Watcher as _; // brings `.get()` into scope for the path watcher
-    let mut watcher = conn.paths();
-    let paths = watcher.get();
+    // A final snapshot can outlive connection closure in iroh 1.2.
+    if conn.close_reason().is_some() { return Locality::Unknown; }
+    let paths = conn.paths();
     // Extract owned (is_relay, addr) up front so the borrow of `paths` ends here.
-    let selected = paths
-        .iter()
-        .find(|p| p.is_selected())
-        .map(|p| (p.is_relay(), format!("{:?}", p.remote_addr())));
+    let selected = locality_evidence(paths.iter().map(|p| (p.is_selected(), p.is_relay(), false, path_is_validated_direct(&p), format!("{:?}", p.remote_addr()))));
+    remember_conn_addrs(conn);
     let loc = match selected {
         Some((true, _)) => Locality::Internet, // relayed = the slow path
         // Direct peer-to-peer — distinguish same-LAN from a hole-punched WAN path by
@@ -1014,14 +1455,12 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
 /// and whether a direct upgrade is forming. Reads the QUIC multipath set.
 pub fn conn_detail(conn: &Connection) -> crate::models::ConnDetail {
     use crate::models::ConnDetail;
-    use iroh::Watcher as _;
-    let mut watcher = conn.paths();
-    let paths = watcher.get();
-    let selected = paths.iter().find(|p| p.is_selected());
-    // A direct upgrade is "forming" when we're on the relay but a non-selected,
-    // non-closed IP (direct) candidate path exists — QUIC is validating it.
-    let upgrading = selected.map(|p| p.is_relay()).unwrap_or(false)
-        && paths.iter().any(|p| p.is_ip() && !p.is_selected() && !p.is_closed());
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected() && conn.close_reason().is_none());
+    // A direct upgrade is ready when an established IP path is present but
+    // the relay is still selected. Probing paths are not exposed in iroh 1.2.
+    let upgrading = selected.as_ref().map(|p| p.is_relay()).unwrap_or(false)
+        && paths.iter().any(|p| p.is_ip() && !p.is_selected());
     match selected {
         Some(p) => {
             let addr_dbg = format!("{:?}", p.remote_addr());
@@ -1034,7 +1473,7 @@ pub fn conn_detail(conn: &Connection) -> crate::models::ConnDetail {
             };
             ConnDetail {
                 path,
-                rtt_ms: p.rtt().map(|r| r.as_millis() as u64),
+                rtt_ms: Some(p.rtt().as_millis() as u64),
                 upgrading,
                 relay,
             }
@@ -1078,19 +1517,15 @@ fn log_transfer_perf(
     bytes: u64,
     elapsed: std::time::Duration,
 ) {
-    use iroh::Watcher as _;
     let secs = elapsed.as_secs_f64();
     let mb = bytes as f64 / 1_000_000.0;
     let mbps = if secs > 0.0 { mb / secs } else { 0.0 };
-    let mut watcher = conn.paths();
-    let paths = watcher.get();
+    let paths = conn.paths();
     let selected = paths.iter().find(|p| p.is_selected());
     let (path_kind, rtt, addr) = match selected {
         Some(p) => (
             if p.is_relay() { "RELAY/internet" } else { "DIRECT/p2p" },
-            p.rtt()
-                .map(|r| format!("{}ms", r.as_millis()))
-                .unwrap_or_else(|| "?".into()),
+            format!("{}ms", p.rtt().as_millis()),
             format!("{:?}", p.remote_addr()),
         ),
         None => ("unknown", "?".into(), "?".into()),
@@ -1116,7 +1551,6 @@ fn log_transfer_perf(
 /// rather than blocking forever. Returns immediately on a LAN where mDNS already
 /// gave us a direct path.
 async fn wait_for_direct_path(conn: &Connection, max: std::time::Duration) -> bool {
-    use iroh::Watcher as _;
     // Per-peer memory of hole-punch failure. A relay-only peer (symmetric
     // NAT/CGNAT) used to cost the FULL window on every single transfer — +5-12s
     // of dead waiting per file, forever, even after the first file proved the
@@ -1131,21 +1565,16 @@ async fn wait_for_direct_path(conn: &Connection, max: std::time::Duration) -> bo
     } else {
         max
     };
-    let mut watcher = conn.paths();
+    use n0_future::StreamExt as _;
+    let mut paths = conn.paths_stream();
     let res = tokio::time::timeout(max, async {
-        loop {
-            if watcher
-                .get()
-                .iter()
-                .any(|p| p.is_selected() && !p.is_relay())
-            {
+        while let Some(snapshot) = paths.next().await {
+            if conn.close_reason().is_some() { return false; }
+            if snapshot.iter().any(|p| p.is_selected() && path_is_validated_direct(&p)) {
                 return true;
             }
-            // Block until the path set changes; bail if the connection drops.
-            if watcher.updated().await.is_err() {
-                return false;
-            }
         }
+        false // The stream ends when the connection closes.
     })
     .await;
     let timed_out = res.is_err();
@@ -1248,9 +1677,56 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Prefer established direct paths, with relay as fallback regardless of RTT.
+/// Keep iroh's IPv6 bias and same-tier hysteresis to avoid path flapping.
+#[derive(Debug)]
+pub(crate) struct DirectPathSelector;
+
+fn path_preference_key(is_relay: bool, is_ipv6: bool, rtt: Duration) -> (bool, i128) {
+    (is_relay, rtt.as_nanos() as i128 - if is_ipv6 { 3_000_000 } else { 0 })
+}
+
+fn should_switch_path(current: Option<(bool, i128)>, best: (bool, i128)) -> bool {
+    current.is_none_or(|current| current.0 != best.0 || best.1 + 5_000_000 <= current.1)
+}
+
+impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
+    fn select(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>) -> iroh::endpoint::transports::PathSelection {
+        use iroh::endpoint::transports::{AddrKind, PathSelection};
+        let mut best = None;
+        let mut current_key = None;
+        // Iroh supplies established paths only, and removes abandoned paths.
+        for path in ctx.paths() {
+            let Some(stats) = path.stats() else { continue; };
+            let tuple = path.network_path();
+            let key = path_preference_key(tuple.is_relay(), tuple.addr_kind() == AddrKind::IpV6, stats.rtt);
+            if Some(tuple) == ctx.current() && current_key.is_none_or(|current| key < current) {
+                current_key = Some(key);
+            }
+            if best.as_ref().is_none_or(|(_, best_key)| key < *best_key) {
+                best = Some((path, key));
+            }
+        }
+        let mut selection = PathSelection::none();
+        if let Some((path, key)) = best {
+            if should_switch_path(current_key, key) {
+                selection.set(&path);
+            }
+        }
+        selection
+    }
+}
+
 /// Build and bind the endpoint with our persistent identity. Uses iroh's default
 /// (n0) relays + discovery for now; Phase 5 swaps in self-hosted infrastructure.
 pub async fn start(config_dir: &Path) -> Result<Endpoint> {
+    refresh_local_subnets().await;
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            refresh_local_subnets().await;
+        }
+    });
     let secret = load_or_create_secret(config_dir);
     // Seed the known-address cache so the FIRST dial after a relaunch already
     // carries every peer address that worked before.
@@ -1273,12 +1749,19 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // usable for everything else during a transfer.
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
-        noq_proto::congestion::BbrConfig::default(),
+        noq_proto::congestion::Bbr3Config::default(),
     ));
+    // Field incident (2026-09-12): 14 advertised IPv4 addresses (11 Docker
+    // gateways) plus address churn exhausted the default 13 path ids, producing
+    // MaxPathIdReached and permanently relay-only connections. Both peers need
+    // headroom; iroh 0.98.2 also defaults to only 12 remote NAT addresses.
+    tcfg = tcfg.max_concurrent_multipath_paths(256u32);
+    tcfg = tcfg.max_remote_nat_traversal_addresses(32u8);
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
 
     let mut builder = Endpoint::builder(presets::N0)
+        .path_selector(Arc::new(DirectPathSelector))
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
         .transport_config(tcfg.build());
@@ -1316,7 +1799,7 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // through the relay. Best-effort — a failure here just means we fall back to
     // the default relay+DNS discovery.
     {
-        use iroh::address_lookup::MdnsAddressLookup;
+        use iroh_mdns_address_lookup::MdnsAddressLookup;
         match MdnsAddressLookup::builder().build(ep.id()) {
             Ok(mdns) => match ep.address_lookup() {
                 Ok(al) => {
@@ -1379,6 +1862,12 @@ fn handle_conn(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
         let who = conn.remote_id();
+        // #34: an ACCEPTED connection is proof of life right now — the remote id
+        // is the authenticated transport identity, so a friend who reappears is
+        // online the instant they dial us, not up to 45 s later when the first
+        // presence tick fires. Without this a friend could read "offline" until
+        // the app was restarted.
+        emit_friend_presence(&state, &who.to_string());
         let mut presence_tick = tokio::time::interval(Duration::from_secs(45));
         presence_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // iroh's 5s QUIC keep-alives advance received datagrams even when chat is
@@ -1398,6 +1887,7 @@ fn handle_conn(
             let stream = tokio::select! {
                 stream = conn.accept_bi() => stream,
                 _ = presence_tick.tick() => {
+                    state.cached_friend_conn(&who.to_string(), Some(conn.stable_id()));
                     if refresh_presence(&conn, &mut received, || {
                         emit_friend_presence(&state, &who.to_string());
                     }).is_err() {
@@ -1426,7 +1916,7 @@ fn handle_conn(
         // replacement connection installed concurrently for this same endpoint.
         if let Ok(mut connections) = state.friend_conns.lock() {
             let key = who.to_string();
-            if connections.get(&key).is_some_and(|c| c.stable_id() == conn.stable_id()) {
+            if connections.get(&key).is_some_and(|c| c.conn.stable_id() == conn.stable_id()) {
                 connections.remove(&key);
             }
         }
@@ -1478,6 +1968,22 @@ async fn serve_stream_inner(
         Some(kind) if kind.starts_with("locations.") => {
             let who = conn.remote_id().to_string();
             let config = location_config(state)?;
+            // "Verify copy" for a Location upload. Streamed rather than answered
+            // in one frame: hashing 56 GB off a NAS mount takes over an hour, so
+            // the requester needs a moving bar and a working Cancel.
+            if kind == "locations.verify" {
+                let (cfg, peer, request) = (config.clone(), who.clone(), req.clone());
+                let served = serve_verify(send, move |cancel, hashed| {
+                    crate::locations::verify_digests(&cfg, &peer, &request, &cancel, &hashed)
+                })
+                .await;
+                if let Err(e) = served {
+                    let _ = write_frame(send, &serde_json::json!({"ok": false,
+                        "error": crate::telemetry::redact_paths_only(&format!("{e:#}"))})).await;
+                    let _ = send.finish();
+                }
+                return Ok(());
+            }
             let result: Result<serde_json::Value> = async {
                 if kind == "locations.download" {
                     let cfg = config.clone(); let peer = who.clone(); let request = req.clone();
@@ -1490,7 +1996,7 @@ async fn serve_stream_inner(
                     let skipped = snapshot.skipped.clone();
                     if paths.is_empty() { return Ok(serde_json::json!({"transferId": null, "skipped": skipped})); }
                     let update = send_location_to_friend(app, shared, friend.name, who, paths,
-                        LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot) })
+                        LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot), replace_existing: false })
                         .map_err(anyhow::Error::msg)?;
                     return Ok(serde_json::json!({"transferId": update.id, "skipped": skipped}));
                 }
@@ -1556,6 +2062,7 @@ async fn serve_stream_inner(
                         p.names.clone(),
                         None,
                         conn.clone(),
+                        0,
                     );
                     // Get onto a direct p2p path before pushing bytes — otherwise a
                     // small file finishes over the rate-limited relay before hole-
@@ -1630,6 +2137,7 @@ async fn serve_stream_inner(
                                     conn_locality(conn),
                                     None,
                                     None,
+                                    0,
                                 )
                             } else {
                                 unconfirmed_err = Some(
@@ -1698,6 +2206,54 @@ async fn serve_stream_inner(
             if p.gen.load(Ordering::SeqCst) == my_gen {
                 state.cancels.lock().unwrap().remove(&p.transfer_id);
                 state.conns.lock().unwrap().remove(&p.transfer_id);
+            }
+        }
+        Some("files.stat") => {
+            let result: Result<serde_json::Value> = async {
+                let app = state.app.get().context("Application is not ready")?;
+                let (config, configured) = app.try_state::<Arc<crate::AppState>>()
+                    .map(|st| (st.config_dir.clone(), st.settings.lock().unwrap().download_dir.clone()))
+                    .context("Application is not ready")?;
+                let who = conn.remote_id().to_string();
+                anyhow::ensure!(crate::friends::load(&config).iter()
+                    .any(|f| f.endpoint_id.as_deref() == Some(who.as_str())), "Friend access denied");
+                let dest = if configured.trim().is_empty() {
+                    app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                } else { PathBuf::from(configured) };
+                let request = req.clone();
+                tokio::task::spawn_blocking(move || friend_stat_reply(&dest, &request)).await?
+            }.await;
+            let reply = result.unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}));
+            write_frame(send, &reply).await?;
+            send.finish()?;
+        }
+        Some("files.verify") => {
+            // "Verify copy": the friend who sent us these files wants a full
+            // SHA-256 of what actually landed. Same known-friend gate and same
+            // destination resolution as files.stat.
+            let prepared: Result<(PathBuf, serde_json::Value)> = async {
+                let app = state.app.get().context("Application is not ready")?;
+                let (config, configured) = app.try_state::<Arc<crate::AppState>>()
+                    .map(|st| (st.config_dir.clone(), st.settings.lock().unwrap().download_dir.clone()))
+                    .context("Application is not ready")?;
+                let who = conn.remote_id().to_string();
+                anyhow::ensure!(crate::friends::load(&config).iter()
+                    .any(|f| f.endpoint_id.as_deref() == Some(who.as_str())), "Friend access denied");
+                let dest = if configured.trim().is_empty() {
+                    app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
+                } else { PathBuf::from(configured) };
+                Ok((dest, req.clone()))
+            }.await;
+            let served = match prepared {
+                Ok((dest, request)) => serve_verify(send, move |cancel, hashed| {
+                    friend_verify_reply(&dest, &request, &cancel, &hashed)
+                }).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = served {
+                let _ = write_frame(send, &serde_json::json!({"ok": false,
+                    "error": crate::telemetry::redact_paths_only(&format!("{e:#}"))})).await;
+                let _ = send.finish();
             }
         }
         Some("files") => {
@@ -1775,8 +2331,19 @@ async fn serve_stream_inner(
                         .collect()
                 })
                 .unwrap_or_default();
-            let id = uuid::Uuid::new_v4().to_string();
-            let mut item_offset = 0;
+            // A folder arrives as many pushes. They all belong to ONE card: the
+            // logical transfer's id, name and byte span, so the receiver shows the
+            // folder with an overall %, exactly like the sender does.
+            let card = receive_card(&req, &who);
+            let id = card.as_ref().map_or_else(
+                || uuid::Uuid::new_v4().to_string(),
+                |c| c.id.clone(),
+            );
+            let card_names = card.as_ref().map_or_else(|| names.clone(), |c| vec![c.label.clone()]);
+            let card_files = card.as_ref().map_or(names.len(), |c| c.files);
+            let card_total = card.as_ref().map_or(total, |c| c.bytes_total);
+            let card_base = card.as_ref().map_or(0, |c| c.bytes_base);
+            let mut item_offset = normalized_receive_offset(&req)?;
             if req.get("chatTransfer").is_some() {
                 let link = incoming_chat_link(&req, &who).ok_or_else(|| anyhow::anyhow!("invalid chat batch manifest"))?;
                 item_offset = link.item_offset;
@@ -1925,10 +2492,11 @@ async fn serve_stream_inner(
             // user's decision (resolved by the respond_to_offer command). On
             // decline we drop the streams, which stops the sender's push.
             if !auto_accept && !resume_accept {
-                let mut wu = TransferUpdate::new(id.clone(), Direction::Receive, names.clone());
+                let mut wu = TransferUpdate::new(id.clone(), Direction::Receive, card_names.clone());
+                wu.file_count = card_files.max(wu.file_count);
                 wu.state = TransferState::WaitingForAccept;
                 wu.friend_name = sender.clone();
-                wu.bytes_total = total;
+                wu.bytes_total = card_total;
                 emit(&app, &wu);
                 let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
@@ -1971,21 +2539,35 @@ async fn serve_stream_inner(
                 }
             }
 
-            let mut u0 = TransferUpdate::new(id.clone(), Direction::Receive, names.clone());
+            let mut u0 = TransferUpdate::new(id.clone(), Direction::Receive, card_names.clone());
+            u0.file_count = card_files.max(u0.file_count);
             u0.state = TransferState::Transferring;
             u0.friend_name = sender.clone();
-            u0.bytes_total = total;
+            u0.bytes_done = card_base.min(card_total);
+            u0.bytes_total = card_total;
+            u0.percent = if card_total > 0 { u0.bytes_done as f64 / card_total as f64 * 100.0 } else { 0.0 };
             u0.locality = conn_locality(conn);
             u0.conn_detail = Some(conn_detail(conn));
+            u0.location_id = location_upload.as_ref().map(|u| u.location_id().to_string());
             emit(&app, &u0);
             let cb = progress_cb(
                 app.clone(),
                 id.clone(),
                 Direction::Receive,
-                names.clone(),
+                card_names.clone(),
                 sender.clone(),
                 conn.clone(),
+                card_files,
             );
+            // Report this push's bytes as the WHOLE transfer's progress: earlier
+            // pushes (including files the sender skipped because they were already
+            // there) are the base this one counts up from.
+            let cb = {
+                let (base, span, folder) = (card_base, card_total, card.is_some());
+                move |done: u64, total: u64| {
+                    if folder { cb(base.saturating_add(done).min(span), span) } else { cb(done, total) }
+                }
+            };
             // Native Dock download-progress for a single incoming file (same as
             // Quick Send), so a friend-sent file shows a live ring in Downloads.
             let dl = if names.len() == 1 {
@@ -2032,8 +2614,8 @@ async fn serve_stream_inner(
                 );
                 // One resumable partial per fingerprint at a time; a concurrent
                 // duplicate of the same file gets a throwaway temp instead.
-                let mut resumable = state.partials.lock().unwrap().insert(fp.clone());
-                if !resumable {
+                let mut owner = claim_partial_now(&fp);
+                if owner.is_none() {
                     // Common cause: the PREVIOUS attempt's dying handler is still
                     // flushing its final sidecar persist (an fsync of gigabytes of
                     // dirty pages can take many seconds) and unregisters the
@@ -2051,15 +2633,11 @@ async fn serve_stream_inner(
                     } else {
                         Duration::from_secs(4)
                     };
-                    let t0 = std::time::Instant::now();
-                    while t0.elapsed() < budget {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        if state.partials.lock().unwrap().insert(fp.clone()) {
-                            resumable = true;
-                            break;
-                        }
-                    }
+                    owner = claim_partial(&fp, budget).await;
                 }
+                // Ownership lasts until `owner` drops below — every removal of the
+                // fingerprint's partial/sidecar happens while we still hold it.
+                let resumable = owner.is_some();
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
                     prepare_partial_async(&dest, &fp, total).await
                 } else {
@@ -2110,6 +2688,7 @@ async fn serve_stream_inner(
                                             FinalizeDest::UniqueIn(
                                                 dest.clone(),
                                                 receive_rel(&name).to_string_lossy().into_owned(),
+                                                item0["mtime"].as_u64().unwrap_or(0),
                                             ),
                                             total, part, rc, cov, first, &cancel, |d, t| cb(location_receive_progress(&req, d), t), &req, item_offset, recv,
                                         ).await.map(|p| vec![p]) })
@@ -2146,9 +2725,7 @@ async fn serve_stream_inner(
                     }
                     Err(e) => Err(e),
                 };
-                if resumable {
-                    state.partials.lock().unwrap().remove(&fp);
-                }
+                drop(owner);
                 res
             } else {
                 // Keep handshake errors in `body` so terminal UI emission and
@@ -2182,16 +2759,35 @@ async fn serve_stream_inner(
                     for (index, (name, path)) in names.iter().zip(&paths).enumerate() {
                         chat_file_landed(state, &id, Some(received_item_index(item_offset, index)), name, path);
                     }
-                    emit_completed(
-                        &app,
-                        &id,
-                        Direction::Receive,
-                        names,
-                        total,
-                        conn_locality(conn),
-                        sender,
-                        Some(location_upload.as_ref().map(|u| &u.destination).unwrap_or(&dest).to_string_lossy().to_string()),
-                    );
+                    let landed_in = location_upload.as_ref().map(|u| &u.destination).unwrap_or(&dest)
+                        .to_string_lossy().to_string();
+                    if card.as_ref().is_some_and(|c| !c.last) {
+                        // More pushes of this folder follow: hold the ONE card at the
+                        // bytes landed so far instead of flashing a completed card
+                        // (and a History row, and a notification) per file.
+                        let mut u = TransferUpdate::new(id.clone(), Direction::Receive, card_names);
+                        u.file_count = card_files.max(u.file_count);
+                        u.state = TransferState::Transferring;
+                        u.bytes_done = card_base.saturating_add(total).min(card_total);
+                        u.bytes_total = card_total;
+                        u.percent = if card_total > 0 { u.bytes_done as f64 / card_total as f64 * 100.0 } else { 0.0 };
+                        u.friend_name = sender;
+                        u.locality = conn_locality(conn);
+                        u.out_dir = Some(landed_in);
+                        emit(&app, &u);
+                    } else {
+                        emit_completed(
+                            &app,
+                            &id,
+                            Direction::Receive,
+                            card_names,
+                            card_total,
+                            conn_locality(conn),
+                            sender,
+                            Some(landed_in),
+                            card_files,
+                        );
+                    }
                     if !progress_mode {
                         let _ = send.write_all(b"ok").await;
                     }
@@ -2210,7 +2806,15 @@ async fn serve_stream_inner(
                 }
                 Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
             }
-            state.cancels.lock().unwrap().remove(&id);
+            {
+                // Pushes of one folder share the card's id, so only retire the
+                // registration this push actually made — a late-finishing earlier
+                // push must not disarm the Cancel button of the one now running.
+                let mut cancels = state.cancels.lock().unwrap();
+                if cancels.get(&id).is_some_and(|c| Arc::ptr_eq(c, &cancel)) {
+                    cancels.remove(&id);
+                }
+            }
         }
         Some("friend-hello") => {
             // A peer is introducing themselves: learn their stable EndpointId +
@@ -2426,8 +3030,8 @@ async fn serve_stream_inner(
                 let who = conn.remote_id().to_string();
                 let fp = transfer_fingerprint(&who, &rel.to_string_lossy(), total, mtime);
                 let partial_dir = config_dir.join("folder-partials");
-                let mut resumable = state.partials.lock().unwrap().insert(fp.clone());
-                if !resumable {
+                let mut owner = claim_partial_now(&fp);
+                if owner.is_none() {
                     // The sender's 45s stall watchdog retries ~2s after abandoning
                     // a wedged send — while OUR previous handler for this same file
                     // is often still unwinding (final sidecar fsync, QUIC teardown)
@@ -2435,15 +3039,9 @@ async fn serve_stream_inner(
                     // throwaway temp here silently restarts a multi-GB file from
                     // byte 0 — on a flapping link, forever. Wait briefly for the
                     // handoff (the sender's ready-window gives us ~6s).
-                    let t0 = std::time::Instant::now();
-                    while t0.elapsed() < Duration::from_secs(5) {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        if state.partials.lock().unwrap().insert(fp.clone()) {
-                            resumable = true;
-                            break;
-                        }
-                    }
+                    owner = claim_partial(&fp, Duration::from_secs(5)).await;
                 }
+                let resumable = owner.is_some();
                 // A concurrent receive of the same fingerprint must never share the
                 // partial — the loser writes into a throwaway temp instead.
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
@@ -2507,9 +3105,7 @@ async fn serve_stream_inner(
                     }
                     Err(e) => Err(e),
                 };
-                if resumable {
-                    state.partials.lock().unwrap().remove(&fp);
-                }
+                drop(owner);
                 res
             } else {
                 read_folder_body(recv, &req, &staging, &cancel, cb).await
@@ -2931,14 +3527,12 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
                 // TCC may block a Downloads/Desktop read until the user answers.
                 // Never await this sweep or put it on a network runtime worker.
                 let cleanup_dir = config_dir.clone();
-                let cleanup_state = state.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
                         let dir = cleanup_dir.clone();
-                        let state = cleanup_state.clone();
                         // Run once at startup, then sweep registered nested
                         // receive destinations hourly. Never overlap sweeps.
-                        let _ = tokio::task::spawn_blocking(move || startup_cleanup(&dir, &state)).await;
+                        let _ = tokio::task::spawn_blocking(move || startup_cleanup(&dir)).await;
                         tokio::time::sleep(Duration::from_secs(3600)).await;
                     }
                 });
@@ -3096,6 +3690,7 @@ pub fn start_receive(
                         Vec::new(),
                         None,
                         conn.clone(),
+                        0,
                     );
                     let ph = progress_high.clone();
                     let cb = move |done: u64, total: u64| {
@@ -3113,7 +3708,6 @@ pub fn start_receive(
                         &dest,
                         &cancel,
                         &engaged_ever,
-                        Some(&cleanup.partials),
                         cb,
                     )
                     .await?;
@@ -3178,7 +3772,7 @@ pub fn start_receive(
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
                     .sum();
-                emit_completed(&app, &id, Direction::Receive, names, total, loc, None, Some(out_dir));
+                emit_completed(&app, &id, Direction::Receive, names, total, loc, None, Some(out_dir), 0);
             }
             Err(e) if e.to_string().contains("canceled") => {
                 emit_canceled(&app, &id, Direction::Receive)
@@ -3209,10 +3803,299 @@ pub fn send_to_friend(
     send_friend_inner(app, state, friend_name, endpoint_id, paths, chat_transfer_id, chat_attempt, None)
 }
 
+type SendItem = (PathBuf, String, u64, u64);
+#[derive(Clone)]
+struct LocationPush {
+    items: Vec<SendItem>,
+    dirs: Vec<String>,
+    total_items: u64,
+    offset: u64,
+    /// The whole batch's byte total, and how many of them earlier pushes covered
+    /// (files skipped because they were already there included) — the receiver
+    /// shows one card for the folder and needs the WHOLE transfer's span.
+    bytes_total: u64,
+    bytes_offset: u64,
+    /// Top folder of the batch, for that card's name ("" = no shared folder).
+    folder: String,
+}
+tokio::task_local! { static LOCATION_PUSH: LocationPush; }
+
+async fn location_stat(conn: &Connection, target: &crate::locations::Target, paths: &[String])
+    -> Result<std::collections::HashMap<String, (bool, u64)>> {
+    let mut entries = std::collections::HashMap::new();
+    for (i, paths) in paths.chunks(1000).enumerate() {
+        if i > 0 { tokio::time::sleep(Duration::from_millis(120)).await; }
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &serde_json::json!({"kind":"locations.stat", "locations_v":crate::locations::VERSION,
+            "id":target.location_id,"rel_path":target.rel_path,"paths":paths})).await?;
+        send.finish()?;
+        // A NAS host answering over a network mount can take a while for a
+        // 1000-path chunk; the sender shows "Connecting…" meanwhile. Three
+        // minutes is generous even for a cold mount and still fails clearly.
+        let reply = tokio::time::timeout(Duration::from_secs(180), read_frame_cap(&mut recv, 2_000_000)).await??;
+        anyhow::ensure!(reply["ok"] == true, "{}", reply["error"].as_str().unwrap_or("Location stat failed"));
+        for entry in reply["data"]["entries"].as_array().context("Invalid stat response")? {
+            entries.insert(entry["rel_path"].as_str().context("Invalid stat path")?.to_string(),
+                (entry["is_dir"].as_bool().context("Invalid stat type")?, entry["size"].as_u64().context("Invalid stat size")?));
+        }
+    }
+    Ok(entries)
+}
+
+/// Only exact regular-file matches are safe to skip; preserve normal landing
+/// (including collision naming) for every other destination.
+fn friend_file_landed(dest: &Path, name: &str, size: u64, mtime: u64) -> bool {
+    std::fs::symlink_metadata(dest.join(sanitize_rel(name))).is_ok_and(|meta|
+        meta.file_type().is_file() && meta.len() == size
+            && (mtime == 0 || mtime_secs(&meta) == mtime))
+}
+
+fn friend_stat_reply(dest: &Path, req: &serde_json::Value) -> Result<serde_json::Value> {
+    anyhow::ensure!(req["files_v"] == 1, "Unsupported files stat version");
+    let items = req["items"].as_array().context("Invalid stat items")?;
+    anyhow::ensure!(items.len() <= 1000, "Too many stat items");
+    let mut landed = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let name = item["name"].as_str().context("Invalid stat name")?;
+        let size = item["size"].as_u64().context("Invalid stat size")?;
+        let mtime = item["mtime"].as_u64().context("Invalid stat mtime")?;
+        if friend_file_landed(dest, name, size, mtime) { landed.push(index); }
+    }
+    Ok(serde_json::json!({"ok":true,"landed":landed}))
+}
+
+/// Serve one `*.verify` request: hash on a blocking thread while streaming
+/// `{"progress": <bytes hashed>}` about once a second, then the final
+/// `{"ok":true,"digests":[…]}`. Dropping this future (a dead stream, a closed
+/// connection, a requester that gave up) flips the worker's cancel flag, so an
+/// hour-long NAS read never outlives the request that asked for it.
+async fn serve_verify<F>(send: &mut SendStream, work: F) -> Result<()>
+where
+    F: FnOnce(Arc<AtomicBool>, Arc<AtomicU64>) -> Result<Vec<Option<String>>> + Send + 'static,
+{
+    let cancel = Arc::new(AtomicBool::new(false));
+    let hashed = Arc::new(AtomicU64::new(0));
+    struct StopWork(Arc<AtomicBool>);
+    impl Drop for StopWork {
+        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    let _stop = StopWork(cancel.clone());
+    let (worker_cancel, worker_hashed) = (cancel.clone(), hashed.clone());
+    let mut worker = tokio::task::spawn_blocking(move || work(worker_cancel, worker_hashed));
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.tick().await; // the first tick completes immediately
+    let digests = loop {
+        tokio::select! {
+            done = &mut worker => break done??,
+            _ = ticks.tick() => write_frame(send,
+                &serde_json::json!({"progress": hashed.load(Ordering::Relaxed)})).await?,
+        }
+    };
+    write_frame(send, &serde_json::json!({"ok": true, "digests": digests})).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Friend side of `files.verify`: SHA-256 of each landed copy in the download
+/// folder, in request order. `None` = absent, not a regular file (a symlink is
+/// never followed, and never hashed), or unreadable — one bad file reports as a
+/// missing copy instead of failing the whole run.
+fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool,
+    hashed: &AtomicU64) -> Result<Vec<Option<String>>> {
+    anyhow::ensure!(req["files_v"] == 1, "Unsupported files verify version");
+    let items = req["items"].as_array().context("Invalid verify items")?;
+    anyhow::ensure!(items.len() <= crate::verify::MAX_ITEMS, "Too many verify items");
+    let mut digests = Vec::with_capacity(items.len());
+    let mut base = 0u64;
+    for item in items {
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        let name = item["name"].as_str().context("Invalid verify name")?;
+        let size = item["size"].as_u64().unwrap_or(0);
+        let path = dest.join(sanitize_rel(name));
+        let mut digest = None;
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
+            if let Ok(file) = std::fs::File::open(&path) {
+                match crate::locations::sha256_file_progress(file, cancel,
+                    |n| { hashed.fetch_max(base + n, Ordering::Relaxed); }) {
+                    Ok(hex) => digest = Some(hex),
+                    Err(e) if e.to_string().contains("canceled") => return Err(e),
+                    Err(_) => {}
+                }
+            }
+        }
+        // Advance by the declared size even when nothing was hashed, so the
+        // requester's bar still reaches the end on a partly missing copy.
+        base += size;
+        hashed.fetch_max(base, Ordering::Relaxed);
+        digests.push(digest);
+    }
+    Ok(digests)
+}
+
+/// Capability probe and stat in one stream. Unsupported or malformed replies
+/// are deliberately equivalent to an empty result, including transport errors.
+async fn friend_stat(conn: &Connection, items: &[SendItem]) -> Vec<bool> {
+    let mut landed = vec![false; items.len()];
+    for (chunk, items) in items.chunks(1000).enumerate() {
+        let result: Result<Vec<usize>> = async {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let rows: Vec<_> = items.iter().map(|i| serde_json::json!({"name":i.1,"size":i.2,"mtime":i.3})).collect();
+            write_frame(&mut send, &serde_json::json!({"kind":"files.stat","files_v":1,"items":rows})).await?;
+            send.finish()?;
+            let reply = read_frame_cap(&mut recv, 2_000_000).await?;
+            anyhow::ensure!(reply["ok"] == true && reply.get("error").is_none(), "Unsupported files stat");
+            let indexes: Vec<usize> = serde_json::from_value(reply["landed"].clone())?;
+            anyhow::ensure!(indexes.iter().all(|&i| i < items.len()), "Invalid stat index");
+            Ok(indexes)
+        }.await;
+        match result {
+            Ok(indexes) => for index in indexes { landed[chunk * 1000 + index] = true; },
+            Err(_) => return vec![false; landed.len()],
+        }
+    }
+    landed
+}
+
+fn friend_split(items: &[SendItem]) -> bool { items.len() > 1 }
+
+async fn send_friend_batch(conn: &Connection, items: &[SendItem], dirs: &[String],
+    link: &crate::models::ChatTransferLink, cancel: &AtomicBool, name: &str,
+    engaged: &AtomicBool, activity: &AtomicU64, state: Option<&IrohState>,
+    progress: impl Fn(u64, u64), skipped: impl Fn(usize), boundary: impl Fn() -> Result<()>) -> Result<u64> {
+    let landed = tokio::time::timeout(Duration::from_secs(45), friend_stat(conn, items)).await
+        .unwrap_or_else(|_| vec![false; items.len()]);
+    skipped(landed.iter().filter(|&&v| v).count());
+    let total = items.iter().map(|i| i.2).sum();
+    let mut done: u64 = items.iter().zip(&landed).filter(|(_, landed)| **landed).map(|(i, _)| i.2).sum();
+    progress(done, total);
+    anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+    let mut pushes = plan_location_pushes(items, &landed);
+    // Even an all-skipped folder may contain empty directories to recreate.
+    if pushes.is_empty() && !dirs.is_empty() { pushes.push(items.len()..items.len()); }
+    for (index, r) in pushes.iter().enumerate() {
+        boundary()?;
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        let push = LocationPush { items: items[r.clone()].to_vec(), dirs: dirs.to_vec(),
+            total_items: items.len() as u64, offset: r.start as u64, bytes_total: total,
+            bytes_offset: items[..r.start].iter().map(|i| i.2).sum(),
+            folder: folder_label(items.iter().map(|i| i.1.as_str())).unwrap_or_default() };
+        let file_link = crate::models::ChatTransferLink { item_offset: r.start as u64,
+            offset: items[..r.start].iter().map(|i| i.2).sum(), last: index + 1 == pushes.len(), ..link.clone() };
+        engaged.store(false, Ordering::SeqCst);
+        integrity::ITEM_OFFSET.scope(push.offset, LOCATION_PUSH.scope(push,
+            send_files_linked(conn, &[], cancel, |d, _| progress(done + d, total), name,
+                engaged, activity, state, Some(&file_link), None))).await?;
+        done += items[r.clone()].iter().map(|i| i.2).sum::<u64>();
+    }
+    progress(total, total);
+    Ok(total)
+}
+
+struct LocationBatch {
+    items: Vec<SendItem>,
+    dirs: Vec<String>,
+    next_file: usize,
+    dirs_pending: bool,
+}
+const SMALL_FILE_LIMIT: u64 = 4 * 1024 * 1024;
+const BATCH_BYTES: u64 = 32 * 1024 * 1024;
+const BATCH_ITEMS: usize = 400;
+
+/// Plan contiguous pushes without landed files, preserving global integrity indices.
+/// Retries use location_stat to skip landed files. An interrupted small-file batch
+/// is re-sent on the next attempt (at most 32 MiB of rework); large files retain
+/// their existing single-file parallel streams and byte-range resume.
+fn plan_location_pushes(items: &[SendItem], landed: &[bool]) -> Vec<std::ops::Range<usize>> {
+    assert_eq!(items.len(), landed.len());
+    let mut pushes = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        if landed[i] { i += 1; continue; }
+        let start = i;
+        if items[i].2 >= SMALL_FILE_LIMIT {
+            i += 1;
+        } else {
+            let mut bytes = 0;
+            while i < items.len() && !landed[i] && items[i].2 < SMALL_FILE_LIMIT
+                && i - start < BATCH_ITEMS && bytes + items[i].2 <= BATCH_BYTES {
+                bytes += items[i].2;
+                i += 1;
+            }
+        }
+        pushes.push(start..i);
+    }
+    pushes
+}
+
+impl LocationBatch {
+    async fn send_attempt(&mut self, conn: &Connection, location: &LocationSend, cancel: &AtomicBool,
+        name: &str, engaged: &AtomicBool, activity: &AtomicU64, state: Option<&IrohState>,
+        progress: impl Fn(u64, u64), skipped: impl Fn(usize), conflicts: impl Fn(usize),
+        replaced: impl Fn(usize), boundary: impl Fn() -> Result<()>) -> Result<u64> {
+        require_locations(conn).await?;
+        let stat_paths: Vec<_> = self.items.iter().map(|i| i.1.clone()).chain(self.dirs.iter().cloned()).collect();
+        let existing = location_stat(conn, location.target.as_ref().context("Missing upload target")?, &stat_paths).await?;
+        let landed: Vec<_> = self.items.iter().map(|item| existing.get(&item.1) == Some(&(false, item.2))).collect();
+        skipped(landed.iter().filter(|&&v| v).count());
+        let total: u64 = self.items.iter().map(|i| i.2).sum();
+        let folder = folder_label(self.items.iter().map(|i| i.1.as_str())).unwrap_or_default();
+        let mut dirs: Vec<_> = if self.dirs_pending { self.dirs.iter()
+            .filter(|d| !existing.get(*d).is_some_and(|e| e.0)).cloned().collect() } else { vec![] };
+        let mut sent_push = false;
+        for r in plan_location_pushes(&self.items, &landed) {
+            boundary()?;
+            anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+            let base: u64 = self.items[..r.start].iter().map(|i| i.2).sum();
+            let push = LocationPush { items: self.items[r.clone()].to_vec(), dirs: dirs.clone(),
+                total_items: self.items.len() as u64, offset: r.start as u64,
+                bytes_total: total, bytes_offset: base, folder: folder.clone() };
+            engaged.store(false, Ordering::SeqCst);
+            integrity::ITEM_OFFSET.scope(r.start as u64, LOCATION_PUSH.scope(push,
+                send_files_linked(conn, &[], cancel, |d, _| progress(base + d, total), name,
+                    engaged, activity, state, None, Some(location)))).await?;
+            self.next_file = r.end;
+            self.dirs_pending = false;
+            dirs.clear();
+            sent_push = true;
+            // The host's reply for this push named every file it had to publish
+            // beside an existing, different one. Report the running total.
+            let seen = integrity::conflicts().len();
+            if seen > 0 { conflicts(seen); }
+            let swapped = integrity::replaced().len();
+            if swapped > 0 { replaced(swapped); }
+        }
+        // A terminal push always follows: it publishes EVERY directory again
+        // (ensure_dirs is idempotent), so an empty folder whose creation was
+        // lost with the first push is still recreated, and it removes retained
+        // staging after a trailing skipped file or an all-skipped/empty batch.
+        let _ = (sent_push, dirs);
+        {
+            let push = LocationPush { items: vec![], dirs: self.dirs.clone(), total_items: self.items.len() as u64,
+                offset: self.items.len() as u64, bytes_total: total, bytes_offset: total,
+                folder: folder.clone() };
+            integrity::ITEM_OFFSET.scope(push.offset, LOCATION_PUSH.scope(push,
+                send_files_linked(conn, &[], cancel, |_, _| progress(total, total), name,
+                    engaged, activity, state, None, Some(location)))).await?;
+            self.dirs_pending = false;
+        }
+        let seen = integrity::conflicts().len();
+        if seen > 0 { conflicts(seen); }
+        let swapped = integrity::replaced().len();
+        if swapped > 0 { replaced(swapped); }
+        progress(total, total);
+        Ok(total)
+    }
+}
+
 pub struct LocationSend {
     pub target: Option<crate::locations::Target>,
     pub transfer_id: String,
     pub snapshot: Option<crate::locations::Snapshot>,
+    /// "Newest wins": ask the host to publish each file AT its requested name,
+    /// moving any different previous version into the location's recoverable
+    /// trash instead of landing beside it as "name (2)". Only a continuously
+    /// synced folder sets this; an ordinary upload leaves it false.
+    pub replace_existing: bool,
 }
 pub fn send_location_to_friend(app: AppHandle, state: Arc<IrohState>, friend_name: String,
     endpoint_id: String, paths: Vec<String>, location: LocationSend) -> Result<TransferUpdate, String> {
@@ -3231,13 +4114,25 @@ fn send_friend_inner(
     let parsed: iroh::EndpointId = endpoint_id
         .parse()
         .map_err(|_| "This friend's direct address is invalid.".to_string())?;
-    let addr = dial_addr(parsed);
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let (names, total) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
+    let (items, directories, total) = if let Some(snapshot) = location.as_ref().and_then(|l| l.snapshot.as_ref()) {
+        (snapshot.source.items.clone(), snapshot.source.dirs.clone(), snapshot.source.items.iter().map(|i| i.2).sum())
+    } else { gather_items_with(&pathbufs, location.as_ref().is_some_and(|l| l.target.is_some())).map_err(|e| e.to_string())? };
+    let names = if items.is_empty() { directories.clone() } else { items.iter().map(|i| i.1.clone()).collect() };
     let id = uuid::Uuid::new_v4().to_string();
+    if let Some(target) = location.as_ref().and_then(|l| l.target.as_ref()) {
+        let mut sorted = paths.clone(); sorted.sort();
+        let key = format!("{endpoint_id}|{}|{}|{}", target.location_id, target.rel_path, sorted.join("\n"));
+        let mut active = state.active_uploads.lock().unwrap();
+        if let Some(running) = active.get(&key) {
+            if state.cancels.lock().unwrap().contains_key(running) {
+                return Err("This upload is already running — let it finish, or cancel it first.".into());
+            }
+        }
+        active.insert(key, id.clone());
+    }
     let chat_id = chat_transfer_id.unwrap_or_else(|| id.clone());
     let generation = chat_attempt.unwrap_or(1).max(crate::chat::now_ms());
-    let (items, directories, _) = gather_items(&pathbufs).map_err(|e| e.to_string())?;
     // Freeze offsets before retries; a removed earlier source must not renumber
     // the integrity identity of a later split.
     let mut next_index = 0u64;
@@ -3246,6 +4141,20 @@ fn send_friend_inner(
         next_index += items.iter().filter(|item| item.0 == *path || item.0.starts_with(path)).count() as u64;
         offset
     }).collect();
+    let upload_items = items.clone();
+    let upload_dirs = directories.clone();
+    let is_upload = location.as_ref().is_some_and(|l| l.target.is_some());
+    // A finished send stays verifiable: the SAME items and the SAME destination
+    // the send used, so "Verify copy" re-checks exactly what was pushed rather
+    // than re-walking a folder that may have changed since. A NAS→friend relay
+    // (`snapshot`) is excluded: those source bytes live on the host, not here.
+    if location.as_ref().is_none_or(|l| l.target.is_some()) {
+        state.remember_verify(&id, crate::verify::VerifyRecord {
+            endpoint_id: endpoint_id.clone(),
+            target: location.as_ref().and_then(|l| l.target.clone()),
+            items: items.iter().map(|(path, name, size, _)| (path.clone(), name.clone(), *size)).collect(),
+        }, TransferUpdate::new(id.clone(), Direction::Send, names.clone()));
+    }
     let manifest: Vec<crate::models::ChatFile> = items.into_iter()
         .map(|(_, name, size, _)| crate::models::ChatFile { name, size }).collect();
     let mut chat_link = crate::models::ChatTransferLink { id: chat_id.clone(), attempt: generation, manifest, directories, batch_state: None, bytes_done: 0, completed_files: vec![], completed_paths: Default::default(), item_offset: 0, offset: 0, total, last: true };
@@ -3268,22 +4177,24 @@ fn send_friend_inner(
         .unwrap_or_default();
     tauri::async_runtime::spawn(integrity::scope(async move {
         let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
+        // High-water mark of confirmed bytes across ALL attempts. Declared out here
+        // (the retry loop below borrows it) so a PAUSE can report how far the send
+        // actually got.
+        let progress_high = std::sync::Arc::new(AtomicU64::new(0));
         let outcome: Result<crate::models::Locality> = async {
             // A parallel transfer that was UNDERWAY and died is almost always a
             // network blip / sleep — so we auto-reconnect up to 2 extra times, and
             // the resume handshake picks up from the receiver's partial instead of
             // byte zero. The retry is gated on the receiver having replied
-            // {ready:true} THIS attempt: that proves an auto-accept parallel receive
-            // engaged, so the error can't be a manual-accept DECLINE (retrying one
-            // of those would re-prompt the recipient), and classic multi-file sends
-            // keep fail-fast so a retry can't duplicate files.
+            // {ready:true} THIS attempt for single pushes. Linked friend batches
+            // and Location uploads also resume through per-attempt stat probes.
+            // Explicit declines and cancellations remain terminal.
             // Retry budget is PROGRESS-based, not a fixed count: as long as each
             // resume pushes new bytes we keep going — so a huge file that loses its
             // path many times (or has to re-holepunch for a direct link) still
             // finishes. We only give up after several CONSECUTIVE attempts that move
             // zero new bytes. This is what lets a 6 GB / 1 TB send survive a flaky LAN.
             const MAX_STALL: u32 = 8;
-            let progress_high = std::sync::Arc::new(AtomicU64::new(0));
             let mut last_high: u64 = 0;
             let mut stall: u32 = 0;
             let mut attempt: u32 = 0;
@@ -3301,12 +4212,15 @@ fn send_friend_inner(
             // index of the first file NOT yet confirmed delivered. Survives across
             // retry attempts so a reconnect never re-sends finished files.
             let mut next_file: usize = 0;
-            let split = pathbufs.len() > 1
+            let mut upload_batch = LocationBatch { items: upload_items, dirs: upload_dirs, next_file: 0, dirs_pending: true };
+            let linked = location.is_none() && friend_split(&upload_batch.items);
+            let split = location.is_some() && location.as_ref().is_none_or(|l| l.snapshot.is_none()) && pathbufs.len() > 1
                 && pathbufs.iter().any(|p| {
                     std::fs::metadata(p)
                         .map(|m| m.len() >= PARALLEL_MIN)
                         .unwrap_or(false)
                 });
+            let recovery = Arc::new(std::sync::Mutex::new(RelayRecovery::default()));
             let mut generation_attempt = 0;
             loop {
                 if attempt != generation_attempt {
@@ -3324,17 +4238,38 @@ fn send_friend_inner(
                 // "Connecting" meanwhile, and a cancel breaks out immediately.
                 let conn = {
                     let started = std::time::Instant::now();
+                    // Retain the bounded direct-address retry used with iroh
+                    // 0.98. Iroh 1.2 can also upgrade relay-born connections in
+                    // place, but a known working address still gets a couple of
+                    // chances before this transfer settles for the relay.
+                    let mut direct_tries: u32 = 0;
                     loop {
                         if cancel.load(Ordering::SeqCst) {
                             anyhow::bail!("canceled");
                         }
                         match tokio::time::timeout(
                             Duration::from_secs(20),
-                            ep.connect(addr.clone(), ALPN),
+                            ep.connect(dial_addr(parsed), ALPN),
                         )
                         .await
                         {
-                            Ok(Ok(c)) => break c,
+                            Ok(Ok(c)) => {
+                                let known_direct = peer_addrs().lock().ok()
+                                    .and_then(|a| a.get(&parsed.to_string()).map(|a| a.iter().any(|x| x.observed_working)))
+                                    .unwrap_or(false);
+                                if known_direct && direct_tries < 2
+                                    && !conn_has_direct_path(&c, Duration::from_millis(1500)).await
+                                {
+                                    direct_tries += 1;
+                                    log::info!("friend-send: connection came up relay-only while a direct address is known — redialing ({direct_tries}/2)");
+                                    c.close(0u32.into(), b"direct-first redial");
+                                    tokio::time::sleep(Duration::from_millis(400)).await;
+                                    continue;
+                                }
+                                log::info!("friend-send: dialed {} → {:?} paths=[{}] known_direct={known_direct}",
+                                    &endpoint_id[..10.min(endpoint_id.len())], conn_locality(&c), describe_paths(&c));
+                                break c;
+                            }
                             _ => {
                                 if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
                                     anyhow::bail!("Couldn't reach this friend — make sure their DropBeam is running and online.");
@@ -3344,6 +4279,7 @@ fn send_friend_inner(
                         }
                     }
                 };
+                recovery.lock().unwrap().since = None;
                 let base_cb = progress_cb(
                     app.clone(),
                     id.clone(),
@@ -3351,6 +4287,7 @@ fn send_friend_inner(
                     names.clone(),
                     Some(friend_name.clone()),
                     conn.clone(),
+                    0,
                 );
                 // Wrap the progress callback to track the high-water mark of confirmed
                 // bytes across ALL attempts — the retry loop uses it to tell "this
@@ -3414,6 +4351,7 @@ fn send_friend_inner(
                 // upgrade reach `got_direct` long before the deadline.
                 if !got_direct
                     && wait_for_direct_mode()
+                    && !recovery.lock().unwrap().awaiting_direct
                     && !require_direct()
                     && !is_force_relay(&id)
                     && !cancel.load(Ordering::SeqCst)
@@ -3460,27 +4398,18 @@ fn send_friend_inner(
                 // retry AND the degradation watchdog. Shared (Arc) so the watchdog
                 // can read it live.
                 let engaged = std::sync::Arc::new(AtomicBool::new(false));
-                // Field-confirmed failure mode: a direct path collapses under
-                // sustained load, iroh fails over to the rate-limited RELAY, the
-                // transfer crawls until a stall guard kills it, and the attempt is
-                // wasted. The cure: if this transfer sits on relay for >8s,
-                // proactively close the connection — the retry loop reconnects
-                // (fresh hole-punch → direct again) and RESUMES.
-                //
-                // CRITICAL: only do this once `engaged` is true (the receiver did
-                // the resumable handshake). A classic single-stream transfer (old
-                // receiver, or a manual-accept that missed the 6s window) CANNOT be
-                // retried — closing its connection just kills it with no safety net.
-                // (A real 2 GB send died exactly this way: watchdog fired, transfer
-                // was classic, retry was blocked, instant fail.)
+                // Observe relay duration even while bytes trickle. Split sends
+                // rotate only between files; single pushes require fast-resume.
+                let redial_requested = Arc::new(AtomicBool::new(false));
                 let transport_activity = Arc::new(AtomicU64::new(0));
                 let watchdog = {
                     let c = conn.clone();
                     let eng = engaged.clone();
                     let watchdog_activity = transport_activity.clone();
-                    let started_direct = got_direct;
+                    let recovery = recovery.clone();
+                    let requested = redial_requested.clone();
+                    let per_file = (is_upload && upload_batch.items.len() > 1) || split || linked;
                     tauri::async_runtime::spawn(async move {
-                        let mut relay_since: Option<Instant> = None;
                         let mut last_p = watchdog_activity.load(Ordering::SeqCst);
                         let mut last_frames = transport_stream_frames(&c);
                         let mut last_change = Instant::now();
@@ -3506,7 +4435,7 @@ fn send_friend_inner(
                                 last_p = p;
                                 last_change = Instant::now();
                             }
-                            let stall_budget = if eng.load(Ordering::SeqCst) {
+                            let stall_budget = if linked || eng.load(Ordering::SeqCst) {
                                 // Generous enough for the receiver's end-game (join
                                 // workers + final fsync of a huge file) after the
                                 // last progress tick.
@@ -3522,28 +4451,14 @@ fn send_friend_inner(
                                 c.close(1u32.into(), b"stalled");
                                 break;
                             }
-                            // ── direct→relay degradation guard ───────────────────
-                            // Resume-capable transfers only — never force-close a
-                            // classic one (it has no retry to catch it).
-                            if !started_direct || !eng.load(Ordering::SeqCst) {
-                                relay_since = None;
-                                continue;
-                            }
-                            let on_relay = matches!(
-                                conn_locality(&c),
-                                crate::models::Locality::Internet
-                            );
-                            match (on_relay, relay_since) {
-                                (true, Some(t)) if t.elapsed() > Duration::from_secs(8) => {
-                                    log::warn!(
-                                        "transfer degraded direct→relay — reconnecting to re-holepunch"
-                                    );
-                                    c.close(1u32.into(), b"degraded-reconnect");
-                                    break;
-                                }
-                                (true, None) => relay_since = Some(Instant::now()),
-                                (false, _) => relay_since = None,
-                                _ => {}
+                            // Split uploads finish the current file first. Only a
+                            // negotiated resumable single push may be interrupted.
+                            // Location uploads resume per file from the NAS-side
+                            // stage, so a relay-stuck multi-GB file need not finish
+                            // on the relay before we try for a direct path.
+                            if recovery.lock().unwrap().check(&c,
+                                (is_upload || !per_file) && eng.load(Ordering::SeqCst), &requested).is_err() {
+                                break;
                             }
                         }
                     })
@@ -3556,12 +4471,52 @@ fn send_friend_inner(
                 // transfer over the same connection: every big file gets parallel
                 // streams + the {hold} handshake + per-file resume, and files
                 // confirmed in earlier attempts are never re-sent (no duplicates).
-                // Small-only batches keep the proven one-push classic body.
-                let outcome = if split {
+                // Friend batches share the Location planner, including small-only
+                // selections and folders expanded from a single dropped path.
+                let outcome = if is_upload {
+                    upload_batch.send_attempt(&conn, location.as_ref().unwrap(), &cancel,
+                        &my_name, &engaged, &transport_activity, Some(&state), |d, t| cb(d, t), |count| {
+                            let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            notice.state = TransferState::Transferring;
+                            notice.bytes_total = total;
+                            notice.friend_name = Some(friend_name.clone());
+                            notice.location_skipped = Some(count as u64);
+                            emit(&app, &notice);
+                        }, |count| {
+                            let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            notice.state = TransferState::Transferring;
+                            notice.bytes_total = total;
+                            notice.friend_name = Some(friend_name.clone());
+                            notice.location_conflicts = Some(count as u64);
+                            emit(&app, &notice);
+                        }, |count| {
+                            let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            notice.state = TransferState::Transferring;
+                            notice.bytes_total = total;
+                            notice.friend_name = Some(friend_name.clone());
+                            notice.location_replaced = Some(count as u64);
+                            emit(&app, &notice);
+                        }, || recovery.lock().unwrap().check(&conn, true, &redial_requested)).await
+                } else if linked {
+                    send_friend_batch(&conn, &upload_batch.items, &upload_batch.dirs, &chat_link,
+                        &cancel, &my_name, &engaged, &transport_activity, Some(&state),
+                        |d, t| cb(d, t), |count| {
+                            let mut notice = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                            notice.state = TransferState::Transferring;
+                            notice.bytes_total = total;
+                            notice.friend_name = Some(friend_name.clone());
+                            notice.location_skipped = Some(count as u64);
+                            emit(&app, &notice);
+                        }, || recovery.lock().unwrap().check(&conn, true, &redial_requested)).await
+                } else if split {
                     let mut res: Result<u64> = Ok(0);
                     while next_file < pathbufs.len() {
                         if cancel.load(Ordering::SeqCst) {
                             res = Err(anyhow::anyhow!("canceled"));
+                            break;
+                        }
+                        if let Err(e) = recovery.lock().unwrap().check(&conn, true, &redial_requested) {
+                            res = Err(e);
                             break;
                         }
                         let i = next_file;
@@ -3595,8 +4550,14 @@ fn send_friend_inner(
                     send_files_linked(&conn, &pathbufs, &cancel, move |d, t| c(d, t), &my_name, &engaged, &transport_activity, Some(&state), if location.is_none() { Some(&chat_link) } else { None }, location.as_ref())
                         .await
                 };
-                let was_engaged = engaged.load(Ordering::SeqCst);
+                let was_engaged = is_upload || linked || engaged.load(Ordering::SeqCst);
                 watchdog.abort();
+                if redial_requested.load(Ordering::SeqCst) && !cancel.load(Ordering::SeqCst)
+                    && outcome.as_ref().is_err_and(|e| !e.to_string().contains(integrity::FAILED)
+                        && !e.to_string().contains("declined") && !e.to_string().contains("canceled")) {
+                    attempt += 1;
+                    continue;
+                }
                 match outcome {
                     Ok(_) => {
                         log_transfer_perf(&conn, "friend-send", "send", total, __t0.elapsed());
@@ -3653,24 +4614,48 @@ fn send_friend_inner(
         }
         .await;
         match outcome {
-            Ok(loc) => emit_completed(
-                &app,
-                &id,
-                Direction::Send,
-                names,
-                total,
-                loc,
-                Some(friend_name),
-                None,
-            ),
+            Ok(loc) => {
+                // Snapshot the finished card so a later "Verify copy" report is
+                // emitted on THIS card — locality badge, integrity rows and all
+                // (the verify task runs outside the integrity scope).
+                let mut card = completed_update(&id, Direction::Send, names.clone(), total);
+                card.locality = loc;
+                card.friend_name = Some(friend_name.clone());
+                card.integrity = integrity::reports();
+                cleanup.note_verify_card(&id, card);
+                emit_completed(
+                    &app,
+                    &id,
+                    Direction::Send,
+                    names,
+                    total,
+                    loc,
+                    Some(friend_name),
+                    None,
+                    0,
+                )
+            }
             // A cancel may surface as our own "canceled" bail OR as a
             // connection-closed error (we close the conn to unblock the write),
-            // so trust the flag too.
+            // so trust the flag too. Whether that stop was a cancel or a PAUSE is
+            // whatever the command recorded; either way the partials stay on disk,
+            // so a paused send resumes from where it stopped.
             Err(e) if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") => {
-                emit_canceled(&app, &id, Direction::Send)
+                emit_stopped(
+                    &app,
+                    &id,
+                    Direction::Send,
+                    cleanup.take_reason(&id),
+                    progress_high.load(Ordering::SeqCst),
+                    total,
+                )
             }
             Err(e) => emit_failed(&app, &id, Direction::Send, &e.to_string()),
         }
+        // A finished transfer can't be paused any more (a pause raced in after the
+        // send ended would otherwise linger and mislabel a later stop).
+        cleanup.paused.lock().unwrap().remove(&id);
+        cleanup.active_uploads.lock().unwrap().retain(|_, running| running != &id);
         cleanup.cancels.lock().unwrap().remove(&id);
         cleanup.conns.lock().unwrap().remove(&id);
         // Drop any "send over relay anyway" override for this finished transfer so
@@ -4050,9 +5035,7 @@ pub async fn send_chat(
     let addr = dial_addr(parsed);
     // Only reuse outgoing connections: older peers may not accept streams on
     // connections they initiated. The monitor itself never opens streams or dials.
-    let cached = state.friend_conns.lock().ok()
-        .and_then(|connections| connections.get(endpoint_id).cloned())
-        .filter(|c| c.close_reason().is_none());
+    let cached = state.cached_friend_conn(endpoint_id, None);
     let conn = if let Some(conn) = cached {
         conn
     } else {
@@ -4062,7 +5045,7 @@ pub async fn send_chat(
         if let Some(st) = state.app.get().and_then(|app| app.try_state::<Arc<IrohState>>()) {
             let st = st.inner().clone();
             if let Ok(mut connections) = st.friend_conns.lock() {
-                connections.insert(endpoint_id.to_owned(), conn.clone());
+                connections.insert(endpoint_id.to_owned(), CachedFriendConnection::new(conn.clone()));
             }
             tauri::async_runtime::spawn(handle_conn(conn.clone(), st));
         }
@@ -4550,7 +5533,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
 
 /// Stamp a file's modified-time to a specific epoch-seconds value, so a synced
 /// file carries the SAME mtime on every member (stable signatures, no storm).
-fn set_mtime_secs(path: &Path, secs: u64) {
+pub(crate) fn set_mtime_secs(path: &Path, secs: u64) {
     if secs == 0 {
         return;
     }
@@ -4558,6 +5541,11 @@ fn set_mtime_secs(path: &Path, secs: u64) {
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
         let _ = file.set_modified(when);
     }
+}
+
+// Task-local download capabilities also travel explicitly into range workers.
+tokio::task_local! {
+    static LOCATION_SOURCE: Option<Arc<crate::locations::DownloadSource>>;
 }
 
 /// Open a source file for sending, riding out a TRANSIENT disappearance before
@@ -4573,6 +5561,10 @@ fn set_mtime_secs(path: &Path, secs: u64) {
 /// normal delete path, so the next reconcile converges (the vanished file is dropped
 /// from that round's manifest). A non-NotFound IO error surfaces immediately.
 async fn open_for_send(path: &Path) -> Result<tokio::fs::File> {
+    if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() {
+        let path = path.to_path_buf();
+        return Ok(tokio::fs::File::from_std(tokio::task::spawn_blocking(move || source.open(&path)).await??));
+    }
     let mut last: Option<std::io::Error> = None;
     for attempt in 0..3u32 {
         match tokio::fs::File::open(path).await {
@@ -5011,6 +6003,15 @@ fn receive_candidates(natural: &Path, limit: usize) -> impl Iterator<Item = Path
         natural.with_file_name(format!("{stem} ({i}){ext}"))
     })
 }
+/// Split a receive name into (parent dir under `dir`, leaf name) using the
+/// same sanitising as every other landing path; never escapes `dir`.
+fn unique_in_parts(dir: &Path, name: &str) -> (PathBuf, String) {
+    let rel = sanitize_rel(name);
+    let safe = rel.file_name().map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty()).unwrap_or_else(|| "file".to_string());
+    let parent = rel.parent().map(|p| dir.join(p)).unwrap_or_else(|| dir.to_path_buf());
+    (parent, safe)
+}
 fn unique_path(dir: &Path, name: &str) -> Result<PathBuf> {
     let natural = dir.join(name);
     for candidate in receive_candidates(&natural, RECEIVE_NAME_LIMIT) {
@@ -5423,7 +6424,7 @@ struct ResumeCtx {
 /// Identity of a transfer for resume purposes: same sender + name + size + mtime
 /// = same bytes (the rsync-style heuristic). An edited file changes mtime/size →
 /// different fingerprint → fresh transfer, never a corrupt mix.
-fn transfer_fingerprint(sender: &str, name: &str, size: u64, mtime: u64) -> String {
+pub(crate) fn transfer_fingerprint(sender: &str, name: &str, size: u64, mtime: u64) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(sender.as_bytes());
@@ -5433,6 +6434,43 @@ fn transfer_fingerprint(sender: &str, name: &str, size: u64, mtime: u64) -> Stri
     h.update(size.to_be_bytes());
     h.update(mtime.to_be_bytes());
     hex::encode(&h.finalize()[..8])
+}
+
+/// Fingerprints of resumable partials currently being written. ONE process-wide
+/// registry: every receive path claims here, so a retry can never adopt — and a
+/// dying attempt can never unlink — a partial another attempt still owns.
+static PARTIALS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+fn partials() -> &'static Mutex<HashSet<String>> { &PARTIALS }
+
+/// Single-writer ownership of one fingerprint's partial + sidecar, held for the
+/// WHOLE attempt: preparation, body, verification, publication and cleanup.
+/// Released by Drop, so even a cancelled receive task hands the fingerprint back
+/// instead of wedging every later attempt into a throwaway temp.
+struct PartialOwner(String);
+impl Drop for PartialOwner {
+    fn drop(&mut self) { partials().lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0); }
+}
+fn claim_partial_now(fp: &str) -> Option<PartialOwner> {
+    partials().lock().unwrap_or_else(|p| p.into_inner())
+        .insert(fp.to_owned())
+        .then(|| PartialOwner(fp.to_owned()))
+}
+/// Claim `fp`, WAITING up to `budget` for the previous attempt's handoff rather
+/// than racing it. The old handler is routinely still unwinding (final sidecar
+/// fsync, verification, QUIC teardown) when the sender's retry arrives: adopting
+/// its partial let its publication rename the file out from under us — the next
+/// range worker then died on a bare "No such file or directory" — while dropping
+/// straight to a throwaway temp silently restarts a multi-GB resume from byte 0.
+/// `None` = the wait expired; the caller uses a throwaway temp.
+async fn claim_partial(fp: &str, budget: Duration) -> Option<PartialOwner> {
+    if let Some(owner) = claim_partial_now(fp) { return Some(owner); }
+    let t0 = Instant::now();
+    while t0.elapsed() < budget {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Some(owner) = claim_partial_now(fp) { return Some(owner); }
+    }
+    None
 }
 
 fn partial_paths(dir: &Path, fp: &str) -> (PathBuf, PathBuf) {
@@ -5486,14 +6524,12 @@ fn load_sidecar(path: &Path, fp: &str, total: u64) -> Option<Coverage> {
 /// transfer "tomorrow", short enough not to hoard disk.
 const PARTIAL_TTL_SECS: u64 = 7 * 24 * 3600;
 
-fn gc_stale_partials(dir: &Path, state: Option<&IrohState>) {
-    let config = PARTIAL_DIRS_PATH.get().and_then(|p| p.parent())
-        .or_else(|| state.and_then(|s| s.location_config.get()).map(PathBuf::as_path));
+fn gc_stale_partials(dir: &Path) {
     // Without configuration we cannot prove this isn't a shared Location.
-    let Some(config) = config else { return; };
-    gc_stale_partials_at(dir, state, config);
+    let Some(config) = PARTIAL_DIRS_PATH.get().and_then(|p| p.parent()) else { return; };
+    gc_stale_partials_at(dir, config);
 }
-fn gc_stale_partials_at(dir: &Path, state: Option<&IrohState>, config: &Path) {
+fn gc_stale_partials_at(dir: &Path, config: &Path) {
     if !crate::locations::receive_sweep_allowed(config, dir) { return; }
     crate::locations::gc_receive_probes(config, dir);
     let _walk = crate::fs_walk::Watch::new("gc_stale_partials", dir);
@@ -5515,13 +6551,15 @@ fn gc_stale_partials_at(dir: &Path, state: Option<&IrohState>, config: &Path) {
             .map(|d| d.as_secs() > PARTIAL_TTL_SECS)
             .unwrap_or(false);
         if stale {
-            // Startup cleanup now overlaps receives. Hold the single-writer
-            // registry through removal so a resumed old partial cannot be deleted.
-            let active = state.map(|s| s.partials.lock().unwrap());
+            // Startup cleanup and every fresh receive's sweep overlap live
+            // receives. Hold the single-writer registry through removal so a
+            // partial another attempt owns can never be deleted — including the
+            // sweep `prepare_partial` itself runs, which used to see no registry.
+            let active = partials().lock().unwrap_or_else(|p| p.into_inner());
             let name = e.file_name().to_string_lossy().to_string();
             let fp = name.trim_start_matches(".dropbeam-partial-")
                 .trim_end_matches(".part").trim_end_matches(".json");
-            if active.as_ref().is_some_and(|set| set.contains(fp)) {
+            if active.contains(fp) {
                 continue;
             }
             let _ = std::fs::remove_file(e.path());
@@ -5576,7 +6614,7 @@ fn staging_prefix() -> &'static str {
 }
 
 /// Best-effort crash cleanup, on a blocking worker after endpoint publication.
-fn startup_cleanup(config_dir: &Path, state: &IrohState) {
+fn startup_cleanup(config_dir: &Path) {
     {
         let _walk = crate::fs_walk::Watch::new("startup staging cleanup", config_dir);
         if let Ok(rd) = crate::fs_walk::read_dir(config_dir) {
@@ -5590,9 +6628,9 @@ fn startup_cleanup(config_dir: &Path, state: &IrohState) {
             }
         }
     }
-    gc_stale_partials_at(&config_dir.join("folder-partials"), Some(state), config_dir);
+    gc_stale_partials_at(&config_dir.join("folder-partials"), config_dir);
     for d in load_partial_dirs() {
-        gc_stale_partials_at(&d, Some(state), config_dir);
+        gc_stale_partials_at(&d, config_dir);
     }
 }
 
@@ -5602,7 +6640,7 @@ impl IrohState {
     /// one. Returns bytes freed. Clearing a partial only costs a future resume
     /// — the next send of that file simply starts from zero.
     pub fn clear_transfer_cache(&self, config_dir: &Path) -> u64 {
-        let active = self.partials.lock().unwrap().clone();
+        let active = partials().lock().unwrap_or_else(|p| p.into_inner()).clone();
         let mut dirs = load_partial_dirs();
         dirs.push(config_dir.join("folder-partials"));
         let mut freed: u64 = 0;
@@ -5655,7 +6693,7 @@ async fn prepare_partial_async(dir: &Path, fp: &str, total: u64) -> Result<(Path
 
 fn prepare_partial(dir: &Path, fp: &str, total: u64) -> Result<(PathBuf, Coverage)> {
     std::fs::create_dir_all(dir)?;
-    gc_stale_partials(dir, None);
+    gc_stale_partials(dir);
     note_partial_dir(dir);
     let (part, side) = partial_paths(dir, fp);
     let mut options = std::fs::OpenOptions::new();
@@ -5782,7 +6820,8 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
         let path = path.to_path_buf();
         let progress = progress.clone();
         let leaves = leaves.clone();
-        set.spawn(async move {
+        let source = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten();
+        set.spawn(LOCATION_SOURCE.scope(source, async move {
             let mut hash = leaves.map(|l| integrity::Blocks::new(start, l)).transpose()?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut uni = conn.open_uni().await?;
@@ -5812,13 +6851,14 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
                     remaining -= k as u64;
                 }
             }
+            if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(&path)?; }
             if let Some(hash) = hash { hash.finish(); }
             uni.finish()?;
             // Keep the stream alive until the peer has acked the segment, so the
             // last bytes aren't dropped by an early reset when the task ends.
             let _ = uni.stopped().await;
             Ok(())
-        });
+        }));
     }
     if !set.is_empty() {
         drain_with_progress(set, &progress, total, cancel, &on_progress).await?;
@@ -5921,7 +6961,7 @@ enum FinalizeDest {
     Retain,
     /// Collision-safe name in a directory (friend sends, Quick Send): the final
     /// path is picked at COMPLETION time via `unique_path`.
-    UniqueIn(PathBuf, String),
+    UniqueIn(PathBuf, String, u64),
     /// An exact path + the origin mtime to stamp (folder sync: `staging/rel`,
     /// where the mtime keeps file signatures identical across the group).
     Exact(PathBuf, u64),
@@ -6120,13 +7160,9 @@ fn finalize_received(finalize: FinalizeDest, part: PathBuf, resume: Option<&Resu
         // and drop the freshly-received copy instead of minting a "name (1)" dup.
         // Folder-sync sends use FinalizeDest::Exact and are handled by reconcile, so
         // only the UniqueIn (collision-named) path needs this.
-        if let FinalizeDest::UniqueIn(dir, name) = &finalize {
-            let safe = Path::new(name)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "file".to_string());
-            let natural = dir.join(&safe);
+        if let FinalizeDest::UniqueIn(dir, name, _) = &finalize {
+            let (parent, safe) = unique_in_parts(dir, name);
+            let natural = parent.join(&safe);
             if std::fs::symlink_metadata(&natural).is_ok_and(|m| m.is_file()) && files_identical(&part, &natural).unwrap_or(false) {
                 let _ = std::fs::remove_file(&part);
                 if let Some(rc) = &resume {
@@ -6136,13 +7172,13 @@ fn finalize_received(finalize: FinalizeDest, part: PathBuf, resume: Option<&Resu
             }
         }
         let (dest, stamp) = match &finalize {
-            FinalizeDest::UniqueIn(dir, name) => {
-                let safe = Path::new(name)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "file".to_string());
-                (unique_path(dir, &safe)?, 0)
+            FinalizeDest::UniqueIn(dir, name, mtime) => {
+                // Land under the sender's relative path (a folder push keeps its
+                // tree) with a collision-safe leaf name, stamped with the origin
+                // mtime so a later files.stat recognises the file as landed.
+                let (parent, safe) = unique_in_parts(dir, name);
+                std::fs::create_dir_all(&parent)?;
+                (unique_path(&parent, &safe)?, *mtime)
             }
             FinalizeDest::Retain => return Ok(part),
             FinalizeDest::Exact(path, mtime) => {
@@ -6186,6 +7222,13 @@ fn send_summary(paths: &[PathBuf]) -> Result<(Vec<String>, u64)> {
 
 /// Gather (path, name, size, mtime) for each file to send, plus the byte total.
 fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>, u64)> {
+    gather_items_with(paths, false)
+}
+
+/// `include_hidden` copies dot-files and dot-directories too (Location uploads:
+/// the NAS copy must be a complete backup). DropBeam's own `.dropbeam-*` names
+/// are always left out, and symlinks are still never followed.
+fn gather_items_with(paths: &[PathBuf], include_hidden: bool) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>, u64)> {
     let mut items = Vec::new();
     // Relative paths of EMPTY directories under any dropped folder — carried in the
     // manifest's optional `dirs` field so the receiver recreates them too (GitHub
@@ -6222,7 +7265,7 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
             // If the dropped folder (and everything under it) holds no files, record
             // the folder itself as empty so the peer still recreates it — otherwise a
             // user sending a brand-new empty folder would send literally nothing.
-            let had_file = collect_dir_items(p, &base, &mut items, &mut dirs);
+            let had_file = collect_dir_items(p, &base, &mut items, &mut dirs, include_hidden);
             if !had_file {
                 dirs.push(base);
             }
@@ -6247,11 +7290,22 @@ fn gather_items(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, 
 /// the receiver recreates that structure too — files alone can't represent it
 /// (GitHub #22). Returns true iff `dir` (or something under it) contained a file, so
 /// a parent can decide whether IT is empty.
+/// Operating-system bookkeeping files that every backup tool leaves out: the
+/// OS rewrites them whenever a folder is merely viewed, so copying them makes a
+/// retry collide with its own earlier copy ("a different file with this name
+/// already exists") and never represents the user's data.
+pub(crate) fn os_junk_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(lower.as_str(), ".ds_store" | "thumbs.db" | "desktop.ini" | ".localized" | ".spotlight-v100" | ".fseventsd" | ".trashes" | ".temporaryitems" | "ehthumbs.db")
+        || (name.starts_with("._") && name.len() > 2)
+}
+
 fn collect_dir_items(
     dir: &Path,
     prefix: &str,
     out: &mut Vec<(PathBuf, String, u64, u64)>,
     empty_out: &mut Vec<String>,
+    include_hidden: bool,
 ) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else {
         // Unreadable dir: never fail the whole send — treat as "no files here". The
@@ -6263,7 +7317,7 @@ fn collect_dir_items(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
+        if name.to_ascii_lowercase().starts_with(".dropbeam-") || os_junk_name(&name) || (!include_hidden && name.starts_with('.')) {
             continue;
         }
         let Ok(ft) = entry.file_type() else { continue };
@@ -6285,7 +7339,7 @@ fn collect_dir_items(
             // Recurse; if the subtree held no files, record the subfolder itself as
             // empty so the peer recreates it. A subtree WITH files needs no entry —
             // its files already imply every ancestor directory.
-            let sub_had_file = collect_dir_items(&path, &rel, out, empty_out);
+            let sub_had_file = collect_dir_items(&path, &rel, out, empty_out, include_hidden);
             if sub_had_file {
                 had_file = true;
             } else {
@@ -6368,7 +7422,7 @@ fn files_header(
 async fn write_files_body<F: Fn(u64, u64)>(send: &mut SendStream,
     items: &[(PathBuf, String, u64, u64)], total: u64, cancel: &AtomicBool,
     pace: bool, on_progress: &F) -> Result<u64> {
-    write_files_body_hashed(send, items, total, cancel, pace, on_progress, None).await
+    write_files_body_hashed(send, items, total, cancel, pace, on_progress, None, false).await
 }
 
 async fn write_files_body_hashed<F: Fn(u64, u64)>(
@@ -6379,6 +7433,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
     pace: bool,
     on_progress: &F,
     mut hashes: Option<&mut Vec<integrity::FileHash>>,
+    location_hash: bool,
 ) -> Result<u64> {
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
@@ -6386,6 +7441,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
         let mut f = open_for_send(path).await?;
         let leaves = integrity::Leaves::default();
         let mut hash = hashes.is_some().then(|| integrity::Blocks::new(0, leaves.clone())).transpose()?;
+        let mut plain = location_hash.then(|| ring::digest::Context::new(&ring::digest::SHA256));
         // The receiver consumes EXACTLY the advertised size per item, so the
         // stream must match the header byte-for-byte. A file that GROWS between
         // stat and send (still downloading/copying, a live log) must be cut at
@@ -6403,6 +7459,7 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
                 anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
             }
             if let Some(hash) = &mut hash { hash.update(&buf[..n]); }
+            if let Some(plain) = &mut plain { plain.update(&buf[..n]); }
             if pace {
                 pace_bytes(n as u64).await;
             }
@@ -6413,9 +7470,10 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
             .await?;
             remaining -= n as u64;
         }
+        if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(path)?; }
         if let Some(hash) = hash {
             hash.finish();
-            hashes.as_mut().unwrap().push(integrity::FileHash { leaves: integrity::snapshot_leaves(&leaves), index: integrity::item_offset() + index as u64, name: name.clone(), size: *size, digest: integrity::combine(*size, &leaves)? });
+            hashes.as_mut().unwrap().push(integrity::FileHash { sha256: plain.map(|h| hex::encode(h.finish())), leaves: integrity::snapshot_leaves(&leaves), index: integrity::item_offset() + index as u64, name: name.clone(), size: *size, digest: integrity::combine(*size, &leaves)? });
         }
     }
     Ok(sent)
@@ -6593,7 +7651,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
         }
         if let Some(hash) = hash {
             hash.finish();
-            hashes.push(integrity::FileHash { leaves: integrity::snapshot_leaves(&leaves), index: received_item_index(item_offset, index), name: raw.into(), size, digest: integrity::combine(size, &leaves)? });
+            hashes.push(integrity::FileHash { sha256: None, leaves: integrity::snapshot_leaves(&leaves), index: received_item_index(item_offset, index), name: raw.into(), size, digest: integrity::combine(size, &leaves)? });
         }
         on_landed(received_item_index(item_offset, index), raw, &landed);
         out.push(landed);
@@ -6601,7 +7659,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
     if negotiated {
         on_progress(got, total);
     }
-    if integrity::enabled(header) { integrity::verify_received_indexed(recv, &hashes, cancel, header.get("chatTransfer").is_some()).await?; }
+    if integrity::enabled(header) { integrity::verify_received_indexed(recv, &hashes, cancel, header.get("chatTransfer").is_some() || header.get("location_item_offset").is_some()).await?; }
     Ok(out)
 }
 
@@ -6658,8 +7716,13 @@ async fn send_files_linked<F: Fn(u64, u64)>(
     chat_link: Option<&crate::models::ChatTransferLink>,
     location: Option<&LocationSend>,
 ) -> Result<u64> {
-    integrity::ensure_scope(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
-        parallel_engaged, activity, friend_state, chat_link, location)).await
+    let source = location.and_then(|l| l.snapshot.as_ref()).map(|s| s.source.clone());
+    let result = LOCATION_SOURCE.scope(source, integrity::ensure_scope(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
+        parallel_engaged, activity, friend_state, chat_link, location))).await;
+    if result.as_ref().is_err_and(|e| e.to_string().contains("inactivity timeout")) {
+        conn.close(1u32.into(), b"receiver stalled");
+    }
+    result
 }
 
 async fn send_files_linked_inner<F: Fn(u64, u64)>(
@@ -6682,7 +7745,14 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     let known_capable = friend_state.and_then(|s| s.progress_version(&peer_id)) == Some(PROGRESS_V);
     if location.is_some() { require_locations(conn).await?; }
     let (mut send, mut recv) = conn.open_bi().await?;
-    let (items, dirs, total) = gather_items(paths)?;
+    let push = LOCATION_PUSH.try_with(Clone::clone).ok();
+    let (items, dirs, total) = if let Some(push) = &push {
+        (push.items.clone(), push.dirs.clone(), push.items.iter().map(|i| i.2).sum())
+    } else if let Some(snapshot) = location.and_then(|l| l.snapshot.as_ref()) {
+        snapshot.check_access(&peer_id)?;
+        let source = &snapshot.source;
+        (source.items.clone(), source.dirs.clone(), source.items.iter().map(|i| i.2).sum())
+    } else { gather_items(paths)? };
     let n = parallel_stream_count(items.len(), total);
     // Rate-limit only INTERNET sends — a LAN transfer doesn't touch the uplink, so
     // it stays full speed regardless of the cap.
@@ -6695,19 +7765,38 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     if let Some(location) = location {
         header["locations_v"] = serde_json::json!(crate::locations::VERSION);
         header["location_transfer"] = serde_json::json!(location.transfer_id);
+        header["replace_existing"] = serde_json::json!(location.replace_existing);
         if let Some(target) = &location.target { header["location"] = serde_json::to_value(target)?; }
         else { header["location_download"] = serde_json::json!(true); }
-        let sources: Vec<_> = items.iter().map(|(p, _, _, _)| p.clone()).collect();
-        let hashes = location_hashes(sources, cancel, activity).await?;
-        for (item, hash) in header["items"].as_array_mut().unwrap().iter_mut().zip(hashes) { item["sha256"] = serde_json::json!(hash); }
+        header["location_hash_v"] = serde_json::json!(2);
+        if location.target.is_some() {
+            // Additive: a host that predates "newest wins" ignores the flag and
+            // keeps landing changed files beside their neighbour.
+            if location.replace_existing { header["replace_existing"] = serde_json::json!(true); }
+            header["location_total_items"] = serde_json::json!(push.as_ref().map_or(items.len() as u64, |p| p.total_items));
+            header["location_item_offset"] = serde_json::json!(push.as_ref().map_or(0, |p| p.offset));
+            // One card for the whole upload on the far side: its byte span, how
+            // much of it earlier pushes already covered, and what to call it.
+            header["location_bytes_total"] = serde_json::json!(push.as_ref().map_or(total, |p| p.bytes_total));
+            header["location_bytes_offset"] = serde_json::json!(push.as_ref().map_or(0, |p| p.bytes_offset));
+            let folder = push.as_ref().map(|p| p.folder.clone())
+                .unwrap_or_else(|| folder_label(items.iter().map(|i| i.1.as_str())).unwrap_or_default());
+            if !folder.is_empty() { header["location_folder"] = serde_json::json!(folder); }
+        }
     }
     if let Some(snapshot) = location.and_then(|l| l.snapshot.as_ref()) { snapshot.check_access(&peer_id)?; }
+    #[cfg(test)]
+    if location.is_some() {
+        assert_eq!(header["location_hash_v"], 2);
+        assert!(header["items"].as_array().unwrap().iter().all(|item| item.get("sha256").is_none()));
+    }
+    if location.is_some() { on_progress(0, total); }
     write_frame(&mut send, &header).await?;
 
-    // This file's count is also used for legacy display; the shared watchdog
-    // count is cumulative across all files in the attempt. It counts both
-    // accepted writes and advancing landed bytes. The watchdog also samples the
-    // connection's transmitted STREAM frames (never ACKs — see transport_stream_frames).
+    // Keep transport/display activity separate from verification work. The
+    // landed reader enforces its own receiver-only deadline, independent of the
+    // outer watchdog's STREAM sampling (which includes retransmissions).
+    let verification_activity = AtomicU64::new(0);
     let file_activity = AtomicU64::new(0);
     let transport = |done, _total| {
         let previous = file_activity.fetch_max(done, Ordering::SeqCst);
@@ -6734,8 +7823,12 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     // sends a ready frame at all, so an unbounded await deadlocked the send at
     // "Transferring 0%" with not one body byte written. On timeout we CORRECT the
     // record and drop to the legacy path exactly like an unknown peer does.
-    let reply = if known_capable || n > 0 {
-        match tokio::time::timeout(Duration::from_secs(6), &mut pending).await {
+    // A Location host always answers, but preparing a 400-item batch on a
+    // network-mounted NAS can take longer than the six-second legacy fallback,
+    // and there is no legacy path for Locations anyway: give it a minute.
+    let ready_patience = Duration::from_secs(if location.is_some() { 60 } else { 6 });
+    let reply = if known_capable || n > 0 || location.is_some() {
+        match tokio::time::timeout(ready_patience, &mut pending).await {
             Ok(r) => Some(r?),
             Err(_) if held.load(Ordering::SeqCst) => {
                 Some(
@@ -6759,12 +7852,14 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     } else {
         None
     };
+    anyhow::ensure!(location.is_none() || reply.is_some(), "Upload not verified: integrity negotiation required");
     if let Some((reply, mut recv)) = reply {
         drop(pending);
         if let Some(error) = reply["error"].as_str() {
             anyhow::bail!("receiver: {error}");
         }
         anyhow::ensure!(reply["declined"].as_bool() != Some(true), "the recipient declined the transfer");
+        anyhow::ensure!(location.is_none() || integrity::enabled(&reply), "Upload not verified: integrity negotiation required");
         if reply["legacy_ok"].as_bool() == Some(true) {
             // A legacy peer with a zero-byte body can finish (raw `ok`) before we
             // write anything — that is a completed receive, not a protocol error.
@@ -6787,6 +7882,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                 );
             }
             if integrity::enabled(&reply) {
+                let verification_activity = if v1 { &verification_activity } else { activity };
                 let hashes = Mutex::new(vec![]);
                 let base = if n > 0 { parse_resume_reply(Some(&reply), total, n).0 } else { 0 };
                 file_activity.store(base, Ordering::SeqCst);
@@ -6795,10 +7891,21 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                 let write = async {
                     let local = if n > 0 {
                         parallel_engaged.store(true, Ordering::SeqCst);
-                        integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, activity).await?
+                        if location.is_some() {
+                            // Ranges can arrive out of order: overlap the plain digest
+                            // read with sending, then join before writing the manifest.
+                            let (mut rows, digests) = tokio::try_join!(
+                                integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, verification_activity),
+                                location_hashes(vec![items[0].0.clone()], cancel, verification_activity)
+                            )?;
+                            // Preserve the frozen upload batch identity across reconnects.
+                            rows[0].index = integrity::item_offset();
+                            rows[0].sha256 = Some(digests[0].clone());
+                            rows
+                        } else { integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &transport, verification_activity).await? }
                     } else {
                         let mut local = vec![];
-                        write_files_body_hashed(&mut send, &items, total, cancel, pace, &transport, Some(&mut local)).await?;
+                        write_files_body_hashed(&mut send, &items, total, cancel, pace, &transport, Some(&mut local), location.is_some()).await?;
                         local
                     };
                     *hashes.lock().unwrap() = local.clone();
@@ -6806,7 +7913,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                     Ok(total)
                 };
                 let sent = write_and_receipt(write,
-                    read_landed_progress_hashed(&mut recv, total, progress_base, cancel, &landed, Some(&hashes), Some(activity))).await?;
+                    read_landed_progress_with_work(&mut recv, total, progress_base, cancel, &landed, Some(&hashes), Some(verification_activity), Some(activity))).await?;
                 integrity::send_ack(&mut send).await?;
                 return Ok(sent);
             }
@@ -6875,7 +7982,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
             }
         };
         let mut local = vec![];
-        let result = write_files_body_hashed(&mut send, &items, total, cancel, pace, &cb, if decision.load(Ordering::SeqCst) == 2 { None } else { Some(&mut local) }).await;
+        let result = write_files_body_hashed(&mut send, &items, total, cancel, pace, &cb, if decision.load(Ordering::SeqCst) == 2 { None } else { Some(&mut local) }, location.is_some()).await;
         match result {
             Ok(sent) => {
                 *hashes.lock().unwrap() = local.clone();
@@ -6948,7 +8055,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                 if let Some(state) = friend_state {
                     state.learn_progress(&peer_id, PROGRESS_V);
                 }
-                return read_landed_progress_hashed(&mut recv, total, 0, cancel, &|done, total| {
+                return read_landed_progress_with_work(&mut recv, total, 0, cancel, &|done, total| {
                     // Receipts always refresh delivery activity for the watchdogs,
                     // whichever counter the UI is currently showing.
                     let previous = landed_activity.fetch_max(done, Ordering::SeqCst);
@@ -6967,7 +8074,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                         );
                     }
                     on_progress(done, total);
-                }, verify.then_some(&hashes), Some(activity)).await;
+                }, verify.then_some(&hashes), Some(if speaks_progress_v1(&reply) { &verification_activity } else { activity }), Some(activity)).await;
             }
             if reply["ready"].as_bool() == Some(true) {
                 if let Some(state) = friend_state { state.learn_progress(&peer_id, 0); }
@@ -6997,7 +8104,7 @@ pub async fn recv_files<F: Fn(u64, u64)>(
     // A progress-capable parallel push needs the negotiated receive path.
     let out = if progress_mode {
         read_files_negotiated(conn, &mut send, &mut recv, &header, dest_dir, cancel,
-            &AtomicBool::new(false), None, on_progress).await?
+            &AtomicBool::new(false), on_progress).await?
     } else {
         read_body(&mut recv, &header, dest_dir, cancel, on_progress).await?
     };
@@ -7037,7 +8144,6 @@ pub async fn recv_files_negotiated<F: Fn(u64, u64)>(
         dest_dir,
         cancel,
         engaged,
-        None,
         on_progress,
     )
     .await?;
@@ -7100,7 +8206,7 @@ pub async fn pull_files<F: Fn(u64, u64)>(
     write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1 })).await?;
     let header = read_frame(&mut recv).await?;
     read_pull_files_negotiated(&conn, &mut send, &mut recv, &header, dest_dir,
-        cancel, &AtomicBool::new(false), None, on_progress).await
+        cancel, &AtomicBool::new(false), on_progress).await
 }
 
 /// Quick Send's pull protocol uses a raw trailing `ok`, including when an older
@@ -7115,11 +8221,10 @@ async fn read_pull_files_negotiated<F: Fn(u64, u64)>(
     dest_dir: &Path,
     cancel: &AtomicBool,
     engaged: &AtomicBool,
-    partials: Option<&Mutex<HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     integrity::ensure_scope(Box::pin(read_pull_files_negotiated_inner(conn, send, recv, header, dest_dir,
-        cancel, engaged, partials, on_progress))).await
+        cancel, engaged, on_progress))).await
 }
 
 async fn read_pull_files_negotiated_inner<F: Fn(u64, u64)>(
@@ -7130,13 +8235,12 @@ async fn read_pull_files_negotiated_inner<F: Fn(u64, u64)>(
     dest_dir: &Path,
     cancel: &AtomicBool,
     engaged: &AtomicBool,
-    partials: Option<&Mutex<HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let mut header = header.clone();
     header.as_object_mut().context("invalid Quick Send header")?.remove("progress_v");
     let result = read_files_negotiated(conn, send, recv, &header, dest_dir,
-        cancel, engaged, partials, on_progress).await;
+        cancel, engaged, on_progress).await;
     if integrity::enabled(&header) {
         let frame = match &result {
             Ok(_) => integrity::terminal(serde_json::json!({"ok": true, "landed": header["total"]})),
@@ -7179,11 +8283,10 @@ async fn read_files_negotiated<F: Fn(u64, u64)>(
     dest_dir: &Path,
     cancel: &AtomicBool,
     engaged: &AtomicBool,
-    partials: Option<&Mutex<std::collections::HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let result = integrity::ensure_scope(Box::pin(read_files_negotiated_inner(
-        conn, bsend, recv, header, dest_dir, cancel, engaged, partials, on_progress,
+        conn, bsend, recv, header, dest_dir, cancel, engaged, on_progress,
     )))
     .await;
     if let Err(e) = &result {
@@ -7202,7 +8305,6 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
     dest_dir: &Path,
     cancel: &AtomicBool,
     engaged: &AtomicBool,
-    partials: Option<&Mutex<std::collections::HashSet<String>>>,
     on_progress: F,
 ) -> Result<Vec<PathBuf>> {
     let progress_mode = speaks_progress_v1(header);
@@ -7221,11 +8323,13 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
         let who = conn.remote_id().to_string();
         let fp = transfer_fingerprint(&who, &name, total, mtime);
         // Single-writer guard (same as the friend + folder paths): two concurrent
-        // receives of the same file must never share one partial — the loser
-        // writes into a throwaway, non-resumable temp.
-        let owns_partial = partials
-            .map(|set| set.lock().unwrap().insert(fp.clone()))
-            .unwrap_or(true);
+        // receives of the same file must never share one partial. Wait briefly for
+        // a previous attempt's handoff — bounded well inside the sender's ~6s
+        // ready window — and only then fall back to a throwaway, non-resumable
+        // temp. This is never optional: adopting a partial whose owner is still
+        // finalizing let that owner's publication rename the file away mid-receive.
+        let owner = claim_partial(&fp, Duration::from_secs(4)).await;
+        let owns_partial = owner.is_some();
         let prep: Result<(PathBuf, Coverage)> = if owns_partial {
             prepare_partial_async(dest_dir, &fp, total).await
         } else {
@@ -7266,6 +8370,7 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
                                     FinalizeDest::UniqueIn(
                                         dest_dir.to_path_buf(),
                                         receive_rel(&name).to_string_lossy().into_owned(),
+                                        mtime,
                                     ),
                                     total,
                                     part,
@@ -7324,11 +8429,7 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
             }
             Err(e) => Err(e),
         };
-        if owns_partial {
-            if let Some(set) = partials {
-                set.lock().unwrap().remove(&fp);
-            }
-        }
+        drop(owner);
         res
     } else {
         if progress_mode || integrity::enabled(header) {
@@ -7368,7 +8469,7 @@ async fn serve_pull_verified<F: Fn(u64, u64)>(conn: &Connection, send: &mut Send
             integrity::send_parallel(conn, &items[0], &reply, n, cancel, pace, &progress, &activity).await?
         } else {
             let mut local = vec![];
-            write_files_body_hashed(send, &items, total, cancel, pace, &progress, Some(&mut local)).await?;
+            write_files_body_hashed(send, &items, total, cancel, pace, &progress, Some(&mut local), false).await?;
             local
         };
         *hashes.lock().unwrap() = local.clone();
@@ -7454,21 +8555,23 @@ async fn require_locations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub async fn location_request(state: &IrohState, endpoint: &str, mut request: serde_json::Value) -> Result<serde_json::Value> {
+/// The connection to reach a friend on: the cached one while it's alive, else a
+/// fresh dial that is registered for reuse AND served, so their replies land.
+pub(crate) async fn friend_connection(state: &IrohState, endpoint: &str) -> Result<Connection> {
     let ep = state.get().context("DropBeam is still connecting")?;
-    let cached = state.friend_conns.lock().ok().and_then(|c| c.get(endpoint).cloned())
-        .filter(|c| c.close_reason().is_none());
-    let conn = match cached {
-        Some(conn) => conn,
-        None => {
-            let conn = tokio::time::timeout(Duration::from_secs(15), ep.connect(dial_addr(endpoint.parse()?), ALPN)).await??;
-            if let Some(st) = state.app.get().and_then(|a| a.try_state::<Arc<IrohState>>()) {
-                state.friend_conns.lock().unwrap().insert(endpoint.into(), conn.clone());
-                tauri::async_runtime::spawn(handle_conn(conn.clone(), st.inner().clone()));
-            }
-            conn
-        }
-    };
+    if let Some(conn) = state.cached_friend_conn(endpoint, None) {
+        return Ok(conn);
+    }
+    let conn = tokio::time::timeout(Duration::from_secs(15), ep.connect(dial_addr(endpoint.parse()?), ALPN)).await??;
+    if let Some(st) = state.app.get().and_then(|a| a.try_state::<Arc<IrohState>>()) {
+        state.friend_conns.lock().unwrap().insert(endpoint.into(), CachedFriendConnection::new(conn.clone()));
+        tauri::async_runtime::spawn(handle_conn(conn.clone(), st.inner().clone()));
+    }
+    Ok(conn)
+}
+
+pub async fn location_request(state: &IrohState, endpoint: &str, mut request: serde_json::Value) -> Result<serde_json::Value> {
+    let conn = friend_connection(state, endpoint).await?;
     require_locations(&conn).await?;
     request["locations_v"] = serde_json::json!(crate::locations::VERSION);
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -7479,15 +8582,279 @@ pub async fn location_request(state: &IrohState, endpoint: &str, mut request: se
     Ok(reply["data"].clone())
 }
 
+// ── "Verify copy" ────────────────────────────────────────────────────────────
+//
+// A finished SEND can be re-checked end to end: this device hashes its source
+// files while the peer hashes the copies that landed, and the card reports what
+// differs. One bi-stream per request, at most `verify::MAX_ITEMS` files each:
+//
+//   → {"kind":"files.verify","files_v":1,"items":[{"name","size"},…]}
+//   → {"kind":"locations.verify","locations_v":N,"id":…,"rel_path":…,"items":[…]}
+//   ← {"progress": <bytes hashed>}            repeated, at most ~1/s
+//   ← {"ok":true,"digests":[hex|null,…]}      null = missing / not a regular file
+//
+// A build without this feature answers the friend frame with a bare
+// {"kind":"ok"} and the Locations frame with {"ok":false,"error":"Unknown
+// location operation"} — either way the first chunk fails and the card says the
+// other device needs an update.
+
+const VERIFY_NEEDS_UPDATE: &str = "The other device needs an update to verify.";
+
+/// The cancel-registry key for a verification, derived from its transfer id so
+/// it can never collide with the transfer itself.
+fn verify_key(id: &str) -> String {
+    format!("{id}:verify")
+}
+
+fn emit_verify(app: &AppHandle, entry: &VerifyEntry, report: &crate::verify::VerifyReport) {
+    let mut card = entry.card.lock().unwrap().clone();
+    card.verify = Some(report.clone());
+    let _ = app.emit("transfer://update", &card);
+}
+
+fn verify_progress(total: u64, bytes_total: u64, checked: &AtomicU64, local: &AtomicU64,
+    remote: &AtomicU64) -> crate::verify::VerifyReport {
+    let mut report = crate::verify::VerifyReport::running(total, bytes_total);
+    report.checked = checked.load(Ordering::Relaxed).min(total);
+    // Both devices read every byte, so the mean of the two counters is a true
+    // fraction of the whole job while the total stays the size the user knows.
+    let both = local.load(Ordering::Relaxed).saturating_add(remote.load(Ordering::Relaxed));
+    report.bytes_hashed = (both / 2).min(bytes_total);
+    report
+}
+
+/// Start a full SHA-256 comparison of a completed send against the peer's copy.
+/// Progress and the final verdict ride the transfer's own card.
+pub fn start_verify(app: AppHandle, state: Arc<IrohState>, id: String) -> Result<(), String> {
+    let entry = state
+        .verify_entry(&id)
+        .ok_or("This send can't be verified any more — send it again to check the copy.")?;
+    if entry.card.lock().unwrap().state != TransferState::Completed {
+        return Err("Wait for this send to finish, then verify the copy.".into());
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut cancels = state.cancels.lock().unwrap();
+        if cancels.contains_key(&verify_key(&id)) {
+            return Err("This copy is already being verified.".into());
+        }
+        cancels.insert(verify_key(&id), cancel.clone());
+    }
+    tauri::async_runtime::spawn(async move {
+        let total = entry.record.items.len() as u64;
+        let bytes_total = entry.record.bytes_total();
+        let mut report = crate::verify::VerifyReport::running(total, bytes_total);
+        emit_verify(&app, &entry, &report);
+        let outcome = run_verify(&state, &entry, &cancel, |live| emit_verify(&app, &entry, live)).await;
+        match outcome {
+            Ok((mismatched, missing)) => {
+                report.state = crate::verify::VerifyState::Done;
+                report.checked = total;
+                report.bytes_hashed = bytes_total;
+                report.mismatched = mismatched;
+                report.missing = missing;
+            }
+            Err(_) if cancel.load(Ordering::SeqCst) => {
+                report.state = crate::verify::VerifyState::Canceled;
+            }
+            Err(e) => {
+                log::warn!("verify copy failed: {e:#}");
+                report.state = crate::verify::VerifyState::Failed;
+                report.error = Some(crate::telemetry::redact_paths_only(&format!("{e:#}")));
+            }
+        }
+        state.cancels.lock().unwrap().remove(&verify_key(&id));
+        emit_verify(&app, &entry, &report);
+    });
+    Ok(())
+}
+
+/// Stop a running verification. The hashing loops check the same flag, and the
+/// peer's own hashing stops as soon as its progress frame fails to send.
+pub fn cancel_verify(state: &IrohState, id: &str) {
+    state.cancel(&verify_key(id));
+}
+
+/// Hash locally and remotely at once, then compare. Returns (mismatched, missing).
+async fn run_verify(state: &IrohState, entry: &VerifyEntry, cancel: &Arc<AtomicBool>,
+    on_progress: impl Fn(&crate::verify::VerifyReport)) -> Result<(Vec<String>, Vec<String>)> {
+    let record = &entry.record;
+    let total = record.items.len() as u64;
+    let bytes_total = record.bytes_total();
+    let local_bytes = Arc::new(AtomicU64::new(0));
+    let remote_bytes = AtomicU64::new(0);
+    let checked = AtomicU64::new(0);
+
+    // The local hash runs on a blocking thread that outlives a dropped future,
+    // so give it its own stop flag: the guard trips when `run_verify` returns for
+    // ANY reason (a remote failure, a cancel, the task being dropped), and the
+    // progress tick below mirrors the user's cancel into it.
+    let stop = Arc::new(AtomicBool::new(cancel.load(Ordering::SeqCst)));
+    struct StopHash(Arc<AtomicBool>);
+    impl Drop for StopHash {
+        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    let _stop_hash = StopHash(stop.clone());
+
+    let local = {
+        let (items, cancel, progress) = (record.items.clone(), stop.clone(), local_bytes.clone());
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut base = 0u64;
+                let mut digests = Vec::with_capacity(items.len());
+                for (path, _, size) in &items {
+                    anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+                    let mut digest = None;
+                    // Regular files only: a symlink is never followed, here or
+                    // on the peer.
+                    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
+                        if let Ok(file) = std::fs::File::open(path) {
+                            match crate::locations::sha256_file_progress(file, &cancel,
+                                |n| { progress.fetch_max(base + n, Ordering::Relaxed); }) {
+                                Ok(hex) => digest = Some(hex),
+                                Err(e) if e.to_string().contains("canceled") => return Err(e),
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    base += size;
+                    progress.fetch_max(base, Ordering::Relaxed);
+                    digests.push(digest);
+                }
+                Ok(digests)
+            })
+            .await?
+        }
+    };
+    let wanted: Vec<(String, u64)> =
+        record.items.iter().map(|(_, name, size)| (name.clone(), *size)).collect();
+    let remote = remote_digests(state, record, &wanted, &remote_bytes, cancel, &checked);
+
+    let work = async { tokio::try_join!(local, remote) };
+    tokio::pin!(work);
+    let mut ticks = tokio::time::interval(Duration::from_millis(500));
+    ticks.tick().await;
+    let (locals, remotes) = loop {
+        tokio::select! {
+            done = &mut work => break done?,
+            _ = ticks.tick() => {
+                stop.store(cancel.load(Ordering::SeqCst), Ordering::SeqCst);
+                on_progress(&verify_progress(total, bytes_total, &checked, &local_bytes, &remote_bytes));
+            }
+        }
+    };
+
+    let mut rows: Vec<crate::verify::VerifyRow> = record
+        .items
+        .iter()
+        .zip(locals)
+        .zip(remotes)
+        .map(|(((_, name, _), local), remote)| crate::verify::VerifyRow::new(name, local, remote))
+        .collect();
+    // A Location host publishes a file whose content changed BESIDE the existing
+    // one as "name (2).ext" rather than failing the upload — so a row that looks
+    // wrong may simply have landed next door. Only the unresolved rows pay for
+    // that second probe.
+    if record.target.is_some() {
+        let pending = crate::verify::unresolved(&rows);
+        if !pending.is_empty() {
+            let alts: Vec<(String, u64)> = pending
+                .iter()
+                .map(|&i| (crate::verify::alt_name(&rows[i].name), record.items[i].2))
+                .collect();
+            // Its own counters: the sibling probe must not move the bar again.
+            let (bytes, seen) = (AtomicU64::new(0), AtomicU64::new(0));
+            let probed = remote_digests(state, record, &alts, &bytes, cancel, &seen).await?;
+            for (&i, digest) in pending.iter().zip(probed) {
+                rows[i].alt = digest;
+            }
+        }
+    }
+    Ok(crate::verify::compare(&rows))
+}
+
+/// Ask the peer for its digest of each `(name, size)`, in chunks of at most
+/// `verify::MAX_ITEMS`, over the cached friend connection.
+async fn remote_digests(state: &IrohState, record: &crate::verify::VerifyRecord,
+    items: &[(String, u64)], bytes: &AtomicU64, cancel: &AtomicBool, checked: &AtomicU64)
+    -> Result<Vec<Option<String>>> {
+    let conn = friend_connection(state, &record.endpoint_id).await?;
+    let mut digests = Vec::with_capacity(items.len());
+    let mut base = 0u64;
+    for range in crate::verify::chunks(items.len()) {
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        let chunk = &items[range];
+        let rows: Vec<_> = chunk.iter()
+            .map(|(name, size)| serde_json::json!({"name": name, "size": size})).collect();
+        let request = match &record.target {
+            Some(target) => serde_json::json!({"kind": "locations.verify",
+                "locations_v": crate::locations::VERSION, "id": target.location_id,
+                "rel_path": target.rel_path, "items": rows}),
+            None => serde_json::json!({"kind": "files.verify", "files_v": 1, "items": rows}),
+        };
+        let chunk_bytes: u64 = chunk.iter().map(|(_, size)| size).sum();
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_frame(&mut send, &request).await?;
+        send.finish()?;
+        let reply = read_verify_reply(&mut recv, chunk.len(), cancel,
+            |done| { bytes.fetch_max(base + done.min(chunk_bytes), Ordering::Relaxed); }).await?;
+        base += chunk_bytes;
+        bytes.fetch_max(base, Ordering::Relaxed);
+        checked.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        digests.extend(reply);
+    }
+    Ok(digests)
+}
+
+/// Read one verify reply: progress frames until the peer finishes, then its
+/// digests. A peer that doesn't know this request is named as such.
+async fn read_verify_reply(recv: &mut RecvStream, count: usize, cancel: &AtomicBool,
+    on_progress: impl Fn(u64)) -> Result<Vec<Option<String>>> {
+    loop {
+        anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+        // Progress frames arrive about once a second while the peer hashes, so
+        // two minutes of silence means the peer (or the path) is gone.
+        let frame = tokio::time::timeout(Duration::from_secs(120),
+            read_frame_cap(recv, 4_000_000)).await??;
+        if let Some(done) = frame["progress"].as_u64() {
+            on_progress(done);
+            continue;
+        }
+        if frame["ok"] == true {
+            if let Some(list) = frame.get("digests") {
+                let digests: Vec<Option<String>> = serde_json::from_value(list.clone())?;
+                anyhow::ensure!(digests.len() == count, "Invalid verify reply");
+                anyhow::ensure!(digests.iter().flatten()
+                    .all(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())),
+                    "Invalid verify digest");
+                return Ok(digests);
+            }
+        }
+        let message = frame["error"].as_str().unwrap_or("");
+        anyhow::bail!("{}", if message.is_empty() || message.contains("Unknown location operation") {
+            VERIFY_NEEDS_UPDATE
+        } else {
+            message
+        });
+    }
+}
+
 async fn location_hashes(paths: Vec<PathBuf>, cancel: &AtomicBool, activity: &AtomicU64) -> Result<Vec<String>> {
     let hashed = Arc::new(AtomicU64::new(0));
     let worker_progress = hashed.clone();
     let stopped = Arc::new(AtomicBool::new(cancel.load(Ordering::SeqCst)));
     let worker_cancel = stopped.clone();
+    struct StopHash(Arc<AtomicBool>);
+    impl Drop for StopHash { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+    let _stop_hash = StopHash(stopped.clone());
+    let mut deadline = integrity::Inactivity::new(Some(activity));
+    let source = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten();
     let mut worker = tokio::task::spawn_blocking(move || {
         let mut base = 0;
         paths.iter().map(|path| {
-            let hash = crate::locations::sha256_progress(path, &worker_cancel, |n| { worker_progress.fetch_max(base + n, Ordering::Relaxed); })?;
+            let file = if let Some(source) = &source { source.open(path)? } else { std::fs::File::open(path)? };
+            let hash = crate::locations::sha256_file_progress(file, &worker_cancel, |n| { worker_progress.fetch_max(base + n, Ordering::Relaxed); })?;
+            if let Some(source) = &source { source.open(path)?; }
             base = worker_progress.load(Ordering::Relaxed);
             Ok(hash)
         }).collect::<Result<Vec<_>>>()
@@ -7502,6 +8869,8 @@ async fn location_hashes(paths: Vec<PathBuf>, cancel: &AtomicBool, activity: &At
                 let done = hashed.load(Ordering::Relaxed);
                 activity.fetch_add(done.saturating_sub(last), Ordering::SeqCst);
                 last = done;
+                anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
+                deadline.check(Some(activity))?;
             }
         }
     }
@@ -7518,22 +8887,28 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
 ) -> Result<Vec<PathBuf>> {
     let paths = body.await?;
     if upload.is_none() && header["location_download"] != true { return Ok(paths); }
+    // Capture in the receive task; spawn_blocking cannot access task-local reports.
+    let rows = integrity::reports();
     let total = header["total"].as_u64().unwrap_or(0);
     let copied = Arc::new(AtomicU64::new(0));
     let copy_counter = copied.clone();
     let mut finalize = tokio::task::spawn_blocking(move || {
         if let Some(upload) = upload {
-            return upload.finish_progress(&header, paths, &cancel, |n| { copy_counter.fetch_max(n, Ordering::Relaxed); });
+            return upload.finish_verified_progress(&header, paths, &rows, &cancel, |n| { copy_counter.fetch_max(n, Ordering::Relaxed); });
         }
         let items = header["items"].as_array().context("Missing download manifest")?;
         anyhow::ensure!(items.len() == paths.len(), "Incomplete location download");
+        if header["location_hash_v"] == 2 {
+            crate::locations::verified_digests(&header, &rows)?;
+            return Ok(crate::locations::Landing { paths, conflicts: vec![], replaced: vec![] });
+        }
         let mut base = 0;
         for (item, path) in items.iter().zip(&paths) {
             let hash = crate::locations::sha256_progress(path, &cancel, |n| { copy_counter.fetch_max(base + n, Ordering::Relaxed); })?;
             anyhow::ensure!(item["sha256"].as_str() == Some(&hash), "Location download SHA-256 mismatch");
             base += item["size"].as_u64().context("Invalid file size")?;
         }
-        Ok(paths)
+        Ok(crate::locations::Landing { paths, conflicts: vec![], replaced: vec![] })
     });
     // Reserve the last 10% of a location upload for verified publication on the
     // NAS. Real copy progress keeps the normal send watchdog alive on slow mounts.
@@ -7541,9 +8916,12 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
     loop {
         tokio::select! {
             result = &mut finalize => {
-                let paths = result??;
+                let landing = result??;
+                // Back in the receive task, so the terminal reply this stream
+                // writes can carry the conflict count and the names used.
+                integrity::conflicted(landing.conflicts.iter().map(|c| c.landed.clone()));
                 progress(total, total);
-                return Ok(paths);
+                return Ok(landing.paths);
             }
             _ = ticks.tick() => {
                 let n = copied.load(Ordering::Relaxed).min(total);
@@ -7555,15 +8933,23 @@ async fn finish_location_receive<F: Fn(u64, u64)>(
 
 async fn receive_location_headless(conn: &Connection, send: &mut SendStream, recv: &mut RecvStream,
     header: &serde_json::Value, upload: Arc<crate::locations::Upload>, cancel: &AtomicBool) -> Result<()> {
+    receive_location_headless_progress(conn, send, recv, header, upload, cancel, |_, _| {}).await
+}
+
+async fn receive_location_headless_progress<F: Fn(u64, u64)>(conn: &Connection, send: &mut SendStream,
+    recv: &mut RecvStream, header: &serde_json::Value, upload: Arc<crate::locations::Upload>,
+    cancel: &AtomicBool, progress: F) -> Result<()> {
     // The normal negotiated engine owns resume and body framing; defer its
     // terminal receipt until publication on the location has succeeded.
     let mut body_header = header.clone();
     body_header.as_object_mut().unwrap().remove("progress_v");
     let result = async {
     let paths = read_files_negotiated(conn, send, recv, &body_header, &upload.staging,
-        cancel, &AtomicBool::new(false), None, |_, _| {}).await?;
+        cancel, &AtomicBool::new(false), progress).await?;
     let finish_header = header.clone();
-    tokio::task::spawn_blocking(move || upload.finish(&finish_header, paths)).await??;
+    let rows = integrity::reports();
+    let landing = tokio::task::spawn_blocking(move || upload.finish_verified_progress(&finish_header, paths, &rows, &AtomicBool::new(false), |_| {})).await??;
+    integrity::conflicted(landing.conflicts.iter().map(|c| c.landed.clone()));
     Ok(())
     }.await;
     if integrity::enabled(header) {
@@ -7582,6 +8968,236 @@ async fn receive_location_headless(conn: &Connection, send: &mut SendStream, rec
 
 #[cfg(test)]
 mod tests {
+    /// A paused stop must never read as a cancel — the card offers Resume off the
+    /// Paused state, and the partials it keeps are only reachable from there.
+    #[test]
+    fn pause_reason_reports_paused_and_cancel_reports_canceled() {
+        use super::*;
+        assert_eq!(stopped_state(CancelReason::Pause), TransferState::Paused);
+        assert_eq!(stopped_state(CancelReason::Cancel), TransferState::Canceled);
+
+        // The reason is one-shot: taking it twice must not keep reporting a pause.
+        let state = IrohState::default();
+        assert_eq!(state.take_reason("nothing"), CancelReason::Cancel);
+        state.paused.lock().unwrap().insert("t1".into());
+        assert_eq!(state.take_reason("t1"), CancelReason::Pause);
+        assert_eq!(state.take_reason("t1"), CancelReason::Cancel);
+        // An unknown id is a no-op either way and leaves no mark behind.
+        assert!(matches!(state.cancel_with("t2", CancelReason::Pause), CancelKind::Unknown));
+        assert_eq!(state.take_reason("t2"), CancelReason::Pause);
+        // A cancel clears a pending pause mark rather than inheriting it.
+        state.paused.lock().unwrap().insert("t3".into());
+        assert!(matches!(state.cancel_with("t3", CancelReason::Cancel), CancelKind::Unknown));
+        assert_eq!(state.take_reason("t3"), CancelReason::Cancel);
+    }
+
+    #[test]
+    fn friend_landed_requires_regular_file_size_and_mtime() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("dropbeam-stat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), b"abc").unwrap();
+        set_mtime_secs(&dir.join("file"), 1_700_000_000);
+        assert!(friend_file_landed(&dir, "file", 3, 1_700_000_000));
+        assert!(!friend_file_landed(&dir, "file", 4, 1_700_000_000));
+        assert!(!friend_file_landed(&dir, "file", 3, 1_700_000_001));
+        assert!(friend_file_landed(&dir, "file", 3, 0));
+        assert!(!friend_file_landed(&dir, "missing", 0, 0));
+        std::fs::create_dir(dir.join("folder")).unwrap();
+        let size = std::fs::metadata(dir.join("folder")).unwrap().len();
+        assert!(!friend_file_landed(&dir, "folder", size, 0));
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(dir.join("file"), dir.join("symlink")).unwrap();
+            assert!(!friend_file_landed(&dir, "symlink", 3, 0));
+        }
+        assert!(friend_stat_reply(&dir, &serde_json::json!({"files_v":2,"items":[]})).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn friend_split_uses_expanded_folder_items() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("dropbeam-split-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a", "b", "c"] { std::fs::write(dir.join(name), b"small").unwrap(); }
+        let (items, _, _) = gather_items(&[dir.clone()]).unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(friend_split(&items));
+        let (items, _, _) = gather_items(&[dir.join("a")]).unwrap();
+        assert!(!friend_split(&items));
+        let mut big = items.clone(); big[0].2 = PARALLEL_MIN;
+        assert!(!friend_split(&big));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// One folder = one receive card: every push resolves to the same id, and
+    /// each one's byte base is everything the pushes before it covered.
+    #[test]
+    fn folder_pushes_resolve_to_one_receive_card() {
+        use super::*;
+        let transfer = uuid::Uuid::new_v4().to_string();
+        let peer = "peer-1";
+        let upload = |offset: u64, items: usize, bytes_offset: u64| serde_json::json!({
+            "kind": "files",
+            "items": (0..items).map(|i| serde_json::json!({"name": format!("Vases/{i}.jpg"), "size": 10}))
+                .collect::<Vec<_>>(),
+            "total": items as u64 * 10,
+            "location_transfer": transfer,
+            "location_total_items": 3,
+            "location_item_offset": offset,
+            "location_bytes_total": 30,
+            "location_bytes_offset": bytes_offset,
+            "location_folder": "Vases",
+        });
+        let cards: Vec<_> = [(0, 1, 0), (1, 2, 10), (3, 0, 30)].iter()
+            .map(|&(offset, items, base)| receive_card(&upload(offset, items, base), peer)
+                .expect("every push of a batched upload belongs to a card"))
+            .collect();
+        assert_eq!(cards.iter().map(|c| c.id.clone()).collect::<std::collections::BTreeSet<_>>().len(), 1);
+        assert_eq!(cards[0].id, incoming_chat_id(peer, &transfer));
+        assert_ne!(cards[0].id, receive_card(&upload(0, 1, 0), "peer-2").unwrap().id);
+        assert_eq!(cards[0].label, "Vases · 3 files");
+        assert_eq!(cards.iter().map(|c| c.bytes_base).collect::<Vec<_>>(), vec![0, 10, 30]);
+        assert!(cards.iter().all(|c| c.bytes_total == 30 && c.files == 3));
+        // Only the terminal push (directories, no items) completes the card.
+        assert_eq!(cards.iter().map(|c| c.last).collect::<Vec<_>>(), vec![false, false, true]);
+        // A sender that never states the batch span keeps a card per push.
+        let mut old = upload(1, 2, 10);
+        old.as_object_mut().unwrap().remove("location_bytes_total");
+        assert_eq!(receive_card(&old, peer), None);
+        // A single-push send is its own card, and a forged id is refused.
+        assert_eq!(receive_card(&upload(0, 3, 0), peer), None);
+        let mut forged = upload(0, 1, 0);
+        forged["location_transfer"] = serde_json::json!("../../etc/passwd");
+        assert_eq!(receive_card(&forged, peer), None);
+        let mut past_end = upload(2, 2, 20);
+        past_end["location_item_offset"] = serde_json::json!(2);
+        assert_eq!(receive_card(&past_end, peer), None);
+
+        // A friend folder send carries the same shape on its chat link.
+        let id = uuid::Uuid::new_v4().to_string();
+        let manifest = serde_json::json!([{"name":"Trip/a.mov","size":7},{"name":"Trip/b.mov","size":5}]);
+        let push = |item_offset: u64, offset: u64, items: serde_json::Value, last: bool| serde_json::json!({
+            "kind": "files", "items": items.clone(),
+            "total": items.as_array().unwrap().iter().map(|i| i["size"].as_u64().unwrap()).sum::<u64>(),
+            "chatTransfer": {"id": id, "attempt": 1, "manifest": manifest, "directories": [],
+                "itemOffset": item_offset, "offset": offset, "total": 12, "last": last},
+        });
+        let first = receive_card(&push(0, 0, serde_json::json!([{"name":"Trip/a.mov","size":7}]), false), peer).unwrap();
+        let second = receive_card(&push(1, 7, serde_json::json!([{"name":"Trip/b.mov","size":5}]), true), peer).unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!((first.bytes_base, second.bytes_base), (0, 7));
+        assert_eq!((first.last, second.last), (false, true));
+        assert_eq!(second.label, "Trip · 2 files");
+        assert!(receive_card(&push(0, 0, manifest.clone(), true), peer).is_none(), "a one-push send keeps its own card");
+    }
+
+    #[test]
+    fn folder_label_only_names_a_shared_top_folder() {
+        use super::*;
+        assert_eq!(folder_label(["Vases/a", "Vases/b/c"]), Some("Vases".into()));
+        assert_eq!(folder_label(["Vases/a", "Bowls/b"]), None);
+        assert_eq!(folder_label(["loose.txt"]), None);
+        assert_eq!(folder_label(["", "Vases/a"]), None);
+        assert_eq!(folder_label(["Vases\\a", "Vases\\b"]), Some("Vases".into()));
+        assert_eq!(card_label(Some("Vases".into()), 3), "Vases · 3 files");
+        assert_eq!(card_label(None, 1), "1 file");
+    }
+
+    fn planned(sizes: &[u64], landed: &[bool]) -> Vec<std::ops::Range<usize>> {
+        let items: Vec<super::SendItem> = sizes.iter().enumerate()
+            .map(|(i, &size)| (std::path::PathBuf::new(), i.to_string(), size, 0)).collect();
+        super::plan_location_pushes(&items, landed)
+    }
+
+    #[test]
+    fn location_push_plan_small() {
+        assert_eq!(planned(&[1024; 10], &[false; 10]), vec![0..10]);
+    }
+    #[test]
+    fn location_push_plan_large() {
+        assert_eq!(planned(&[1, super::SMALL_FILE_LIMIT, 1, 1], &[false; 4]), vec![0..1, 1..2, 2..4]);
+        assert_eq!(planned(&[20 * 1024 * 1024; 3], &[false; 3]), vec![0..1, 1..2, 2..3]);
+    }
+    #[test]
+    fn location_push_plan_landed_gap() {
+        assert_eq!(planned(&[1; 4], &[false, false, true, false]), vec![0..2, 3..4]);
+    }
+    #[test]
+    fn location_push_plan_byte_cap() {
+        // 12 MiB items would be singletons under the 4 MiB large-file rule.
+        assert_eq!(planned(&[3 * 1024 * 1024; 11], &[false; 11]), vec![0..10, 10..11]);
+        let mut sizes = vec![3 * 1024 * 1024; 10];
+        sizes.extend([2 * 1024 * 1024, 1]);
+        assert_eq!(planned(&sizes, &[false; 12]), vec![0..11, 11..12]);
+    }
+    #[test]
+    fn location_push_plan_item_cap() {
+        assert_eq!(planned(&[1; 401], &[false; 401]), vec![0..400, 400..401]);
+    }
+    #[test]
+    fn location_push_plan_all_landed() {
+        assert!(planned(&[1; 4], &[true; 4]).is_empty());
+        assert!(planned(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn local_label_requires_our_actual_subnet_and_excludes_tailscale() {
+        use netwatch::interfaces::IpNet;
+        let subnets = [IpNet::V4("192.168.1.8/24".parse().unwrap()),
+            IpNet::V4("10.2.4.8/23".parse().unwrap()), IpNet::V4("100.90.1.2/10".parse().unwrap())];
+        for (peer, expected) in [("192.168.1.9", true), ("192.168.2.9", false),
+            ("10.2.5.9", true), ("10.2.6.9", false), ("172.16.0.1", false),
+            ("100.100.1.1", false), ("8.8.8.8", false), ("127.0.0.1", false)] {
+            assert_eq!(super::on_local_subnet(peer.parse().unwrap(), &subnets), expected, "{peer}");
+        }
+        assert!(!super::on_local_subnet("192.168.1.9".parse().unwrap(), &[]));
+    }
+    #[test]
+    fn relay_recovery_duration_reset_and_cooldown() {
+        use crate::models::Locality::*;
+        let start = Instant::now();
+        let at = |s| start + Duration::from_secs(s);
+        let mut r = RelayRecovery::default();
+        assert!(r.observe(at(0), Internet, true).is_none());
+        assert!(r.observe(at(60), Internet, true).is_none());
+        assert!(r.observe(at(61), Internet, true).is_some());
+        for locality in [Local, Direct, Unknown] {
+            assert!(r.observe(at(62), locality, true).is_none());
+            assert!(r.observe(at(63), Internet, true).is_none());
+        }
+        assert!(r.observe(at(130), Internet, false).is_none());
+        assert!(r.observe(at(131), Internet, true).is_none());
+        assert!(r.observe(at(192), Internet, true).is_some());
+        r.last_redial = Some(at(192)); r.awaiting_direct = true; r.since = None;
+        assert!(r.observe(at(193), Internet, true).is_none());
+        assert!(r.observe(at(900), Internet, true).is_none(), "relay replacement must keep sending");
+        assert!(r.observe(at(901), Direct, true).is_none());
+        assert!(r.observe(at(902), Internet, true).is_none());
+        r.last_redial = Some(at(950));
+        assert!(r.observe(at(963), Internet, true).is_none(), "cooldown");
+        assert!(r.observe(at(1010), Internet, true).is_some());
+    }
+
+    #[test]
+    fn friend_connection_rotation_decision() {
+        use crate::models::Locality;
+        let decision = |age, locality, direct, relay: Option<u64>| super::friend_rotation_reason(
+            Duration::from_secs(age), locality, direct, relay.map(Duration::from_secs),
+        );
+        assert!(decision(1800, Locality::Direct, true, None).is_none());
+        for locality in [Locality::Local, Locality::Direct, Locality::Internet, Locality::Unknown] {
+            assert!(decision(1801, locality, false, None).is_some());
+        }
+        assert!(decision(120, Locality::Internet, true, Some(61)).is_some());
+        assert!(decision(120, Locality::Internet, true, Some(60)).is_none());
+        assert!(decision(120, Locality::Internet, true, None).is_none());
+        assert!(decision(120, Locality::Internet, false, Some(61)).is_none());
+        for locality in [Locality::Local, Locality::Direct, Locality::Unknown] {
+            assert!(decision(120, locality, true, Some(61)).is_none());
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -7603,9 +9219,8 @@ mod tests {
                 file.set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
             }
         }
-        let state = IrohState::default();
-        state.partials.lock().unwrap().insert("active".into());
-        startup_cleanup(&dir, &state);
+        let _owner = claim_partial_now("active").expect("claim the live fingerprint");
+        startup_cleanup(&dir);
         assert!(!old_staging.exists());
         assert_eq!(std::fs::read(live_staging.join("receiving")).unwrap(), b"live");
         for ext in ["part", "json"] {
@@ -7948,7 +9563,7 @@ mod tests {
             let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp).1, fp };
             recv_file_resumable(
                 &conn,
-                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into()),
+                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into(), 0),
                 total, part, Some(rc), cov, first,
                 &AtomicBool::new(false), |_, _| {},
             )
@@ -8020,7 +9635,7 @@ mod tests {
             let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp).1, fp };
             let dest = recv_file_resumable(
                 &conn,
-                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into()),
+                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into(), 0),
                 total, part, Some(rc), cov, first, &AtomicBool::new(false), |_, _| {},
             )
             .await
@@ -8113,7 +9728,7 @@ mod tests {
             let rc = ResumeCtx { side: partial_paths(&dest_dir_c, &fp_c).1, fp: fp_c.clone() };
             let dest = recv_file_resumable(
                 &conn,
-                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into()),
+                FinalizeDest::UniqueIn(dest_dir_c.clone(), "blob.bin".into(), 0),
                 total, part, Some(rc), cov, first,
                 &AtomicBool::new(false), |_, _| {},
             )
@@ -8312,6 +9927,165 @@ mod tests {
 }
 
 #[cfg(test)]
+mod verify_reply_tests {
+    use super::*;
+
+    fn sha(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// The friend side of `files.verify`: hash what landed, report null for what
+    /// didn't, and never follow a symlink out of the download folder.
+    #[test]
+    fn friend_verify_hashes_landed_copies_and_never_follows_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-verify-{}", uuid::Uuid::new_v4()));
+        let dest = dir.join("Downloads");
+        std::fs::create_dir_all(dest.join("folder")).unwrap();
+        std::fs::write(dest.join("folder/same.bin"), b"identical payload").unwrap();
+        std::fs::write(dest.join("folder/changed.bin"), b"other payload!!!!").unwrap();
+        let outside = dir.join("secret.txt");
+        std::fs::write(&outside, b"not yours").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dest.join("folder/link.bin")).unwrap();
+        // A directory standing where a file is expected is not a regular file.
+        std::fs::create_dir(dest.join("folder/adir.bin")).unwrap();
+
+        let req = serde_json::json!({"kind":"files.verify","files_v":1,"items":[
+            {"name":"folder/same.bin","size":17},
+            {"name":"folder/changed.bin","size":17},
+            {"name":"folder/gone.bin","size":9},
+            {"name":"folder/link.bin","size":9},
+            {"name":"folder/adir.bin","size":0}]});
+        let hashed = AtomicU64::new(0);
+        let digests = friend_verify_reply(&dest, &req, &AtomicBool::new(false), &hashed).unwrap();
+        assert_eq!(digests[0].as_deref(), Some(sha(b"identical payload").as_str()));
+        assert_eq!(digests[1].as_deref(), Some(sha(b"other payload!!!!").as_str()));
+        assert_ne!(digests[0], digests[1], "a changed copy must not hash the same");
+        assert_eq!(digests[2], None, "a missing copy is null, not an error");
+        #[cfg(unix)]
+        assert_eq!(digests[3], None, "a symlink is never followed");
+        assert_eq!(digests[4], None, "a directory is not a regular file");
+        // Progress covers every DECLARED byte, hashed or not, so the requester's
+        // bar still reaches the end on a partly missing copy.
+        assert_eq!(hashed.load(Ordering::Relaxed), 17 + 17 + 9 + 9 + 0);
+
+        // A cancel stops the run rather than reporting half a verdict.
+        assert!(friend_verify_reply(&dest, &req, &AtomicBool::new(true), &AtomicU64::new(0)).is_err());
+        // Version and batch bounds are enforced before any disk work.
+        let empty = serde_json::json!({"files_v":2,"items":[]});
+        assert!(friend_verify_reply(&dest, &empty, &AtomicBool::new(false), &AtomicU64::new(0)).is_err());
+        let many: Vec<_> = (0..crate::verify::MAX_ITEMS + 1)
+            .map(|i| serde_json::json!({"name": format!("f{i}"), "size": 0})).collect();
+        let oversized = serde_json::json!({"files_v":1,"items":many});
+        assert!(friend_verify_reply(&dest, &oversized, &AtomicBool::new(false), &AtomicU64::new(0)).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A card that can still be verified is the LAST send of that id, and the
+    /// report re-emits the completed card rather than a stripped one.
+    #[test]
+    fn a_verify_record_keeps_the_completed_card_it_reports_on() {
+        let state = IrohState::default();
+        let record = || crate::verify::VerifyRecord {
+            endpoint_id: "peer".into(), target: None,
+            items: vec![(PathBuf::from("/tmp/a"), "a".into(), 4)],
+        };
+        assert!(state.verify_entry("gone").is_none());
+        state.remember_verify("t1", record(), TransferUpdate::new("t1".into(), Direction::Send, vec![]));
+        let entry = state.verify_entry("t1").unwrap();
+        assert_eq!(entry.card.lock().unwrap().state, TransferState::Starting);
+        assert_eq!(entry.record.bytes_total(), 4);
+
+        let mut card = completed_update("t1", Direction::Send, vec!["a".into()], 4);
+        card.locality = crate::models::Locality::Local;
+        state.note_verify_card("t1", card);
+        // The SAME entry the card was stored under sees the update — the running
+        // verify task holds this Arc and must emit the finished card.
+        assert_eq!(entry.card.lock().unwrap().state, TransferState::Completed);
+        assert_eq!(entry.card.lock().unwrap().locality, crate::models::Locality::Local);
+        state.note_verify_card("unknown", completed_update("x", Direction::Send, vec![], 0));
+    }
+}
+
+#[cfg(test)]
+mod hidden_items_tests {
+    use super::collect_dir_items;
+    #[test]
+    fn uploads_include_hidden_entries_but_never_dropbeam_markers() {
+        let root = std::env::temp_dir().join(format!("dropbeam-hidden-{}", uuid::Uuid::new_v4())).join("Lib");
+        std::fs::create_dir_all(root.join(".trash/rec")).unwrap();
+        std::fs::create_dir_all(root.join(".empty-hidden")).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join(".DS_Store"), b"d").unwrap();
+        std::fs::write(root.join(".trash/rec/old.mov"), b"m").unwrap();
+        std::fs::write(root.join(".dropbeam-staging-x"), b"x").unwrap();
+        let mut items = vec![]; let mut dirs = vec![];
+        collect_dir_items(&root, "Lib", &mut items, &mut dirs, false);
+        let names: Vec<_> = items.iter().map(|i| i.1.clone()).collect();
+        assert_eq!(names, vec!["Lib/a.txt"]);
+        assert!(dirs.is_empty());
+        let mut items = vec![]; let mut dirs = vec![];
+        collect_dir_items(&root, "Lib", &mut items, &mut dirs, true);
+        let mut names: Vec<_> = items.iter().map(|i| i.1.clone()).collect(); names.sort();
+        assert_eq!(names, vec!["Lib/.trash/rec/old.mov", "Lib/a.txt"], "OS junk like .DS_Store is never copied");
+        assert_eq!(dirs, vec!["Lib/.empty-hidden"]);
+        assert!(super::os_junk_name("._photo.jpg") && super::os_junk_name("Thumbs.db") && !super::os_junk_name(".hidden.txt"));
+    }
+}
+
+#[cfg(test)]
+mod locality_evidence_tests {
+    use super::locality_evidence;
+    #[test]
+    fn unselected_relay_only_connection_counts_as_relay_and_direct_paths_win() {
+        let relay_only = vec![(false, true, false, false, "Relay(x)".to_string())];
+        assert_eq!(locality_evidence(relay_only.into_iter()), Some((true, "Relay(x)".into())));
+        let mixed_unselected = vec![(false, true, false, false, "Relay(x)".to_string()), (false, false, false, true, "Ip(100.79.126.13:1)".to_string())];
+        assert_eq!(locality_evidence(mixed_unselected.into_iter()), Some((false, "Ip(100.79.126.13:1)".into())));
+        // A probing candidate (no packets received yet) must not read as direct.
+        let probing = vec![(false, true, false, false, "Relay(x)".to_string()), (false, false, false, false, "Ip(100.79.126.13:1)".to_string())];
+        assert_eq!(locality_evidence(probing.into_iter()), Some((true, "Relay(x)".into())));
+        for selected in [false, true] {
+            let probing_only = [(selected, false, false, false, "Ip(1.2.3.4:1)".into())];
+            assert_eq!(locality_evidence(probing_only.into_iter()), None);
+        }
+        let selected_relay = vec![(true, true, false, false, "Relay(x)".to_string()), (false, false, false, true, "Ip(1.2.3.4:1)".to_string())];
+        assert_eq!(locality_evidence(selected_relay.into_iter()), Some((true, "Relay(x)".into())));
+        let closed_direct = vec![(false, false, true, true, "Ip(1.2.3.4:1)".to_string()), (false, true, false, false, "Relay(x)".to_string())];
+        assert_eq!(locality_evidence(closed_direct.into_iter()), Some((true, "Relay(x)".into())));
+        assert_eq!(locality_evidence(std::iter::empty()), None);
+    }
+}
+
+#[cfg(test)]
+mod path_preference_tests {
+    use super::{path_preference_key, should_switch_path};
+    use std::time::Duration;
+
+    #[test]
+    fn direct_beats_faster_relay_and_relay_recovers_when_direct_disappears() {
+        let direct = path_preference_key(false, false, Duration::from_secs(1));
+        let relay = path_preference_key(true, false, Duration::from_millis(1));
+        assert!(direct < relay);
+        assert!(should_switch_path(Some(relay), direct));
+        // When the direct path is abandoned it is absent from ctx.paths(),
+        // so the current key is None and the remaining relay must be selected.
+        assert!(should_switch_path(None, relay));
+    }
+
+    #[test]
+    fn direct_paths_keep_ipv6_bias_and_five_ms_hysteresis() {
+        let v4 = path_preference_key(false, false, Duration::from_millis(20));
+        let v6 = path_preference_key(false, true, Duration::from_millis(22));
+        assert!(v6 < v4);
+        assert!(!should_switch_path(Some(v4), v6));
+        assert!(!should_switch_path(Some(v4), path_preference_key(false, false, Duration::from_millis(16))));
+        assert!(should_switch_path(Some(v4), path_preference_key(false, false, Duration::from_millis(15))));
+    }
+}
+
+#[cfg(test)]
 mod loopback_tests {
     //! Deterministic, in-process LOOPBACK integration tests for the transfer
     //! engine — NOT marked `#[ignore]` (unlike the `tests` module's E2E cases,
@@ -8346,7 +10120,7 @@ mod loopback_tests {
                     let header = read_frame(&mut recv).await.unwrap();
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     let paths = read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest,
-                        &AtomicBool::new(false), &AtomicBool::new(false), None, |_, _| {}).await.unwrap();
+                        &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}).await.unwrap();
                     assert_eq!(!integrity::reports().is_empty(), verified, "both sides must agree on verification (delay {delay} ms)");
                     assert!(integrity::reports().iter().all(|r| r.verified && r.acknowledged));
                     paths
@@ -8366,7 +10140,7 @@ mod loopback_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn integrity_five_thousand_file_manifest_receipt_roundtrip() {
         integrity::scope(async {
-            let hashes: Vec<_> = (0..5000).map(|i| integrity::FileHash { leaves: Default::default(), index: i, name: format!("file-{i}.bin"), size: 0, digest: "a".repeat(64) }).collect();
+            let hashes: Vec<_> = (0..5000).map(|i| integrity::FileHash { sha256: None, leaves: Default::default(), index: i, name: format!("file-{i}.bin"), size: 0, digest: "a".repeat(64) }).collect();
             let server = loopback_endpoint(true).await; let client = loopback_endpoint(false).await;
             let srv = server.clone(); let remote = hashes.clone();
             let receiver = tokio::spawn(integrity::scope(async move {
@@ -8397,7 +10171,7 @@ mod loopback_tests {
             let receiver = tokio::spawn(integrity::scope(async move {
                 let conn = srv.accept().await.unwrap().await.unwrap();
                 let (_, mut recv) = conn.accept_bi().await.unwrap();
-                let hash = integrity::FileHash { leaves: Default::default(), index: 0, name: "saved".into(), size: 0, digest: "a".repeat(64) };
+                let hash = integrity::FileHash { sha256: None, leaves: Default::default(), index: 0, name: "saved".into(), size: 0, digest: "a".repeat(64) };
                 integrity::record(integrity::compare(&[hash.clone()], &[hash]).unwrap());
                 integrity::receive_ack(&mut recv).await;
                 assert!(integrity::reports()[0].verified);
@@ -8427,7 +10201,7 @@ mod loopback_tests {
                 let (mut send, mut recv) = conn.accept_bi().await.unwrap();
                 let header = read_frame(&mut recv).await.unwrap();
                 let paths = read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest,
-                    &AtomicBool::new(false), &AtomicBool::new(false), None, |d, _| {
+                    &AtomicBool::new(false), &AtomicBool::new(false), |d, _| {
                         if d == total && integrity::rehash_activity() < total {
                             assert!(rx_part.exists() && rx_side.exists(), "rehash must retain partial and sidecar");
                         }
@@ -8503,7 +10277,7 @@ mod loopback_tests {
                         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
                         let header = read_frame(&mut recv).await.unwrap();
                         assert!(header["items"][0].get("index").is_none());
-                        read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest, &AtomicBool::new(false), &AtomicBool::new(false), None, |_, _| {}).await.unwrap();
+                        read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest, &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}).await.unwrap();
                         assert!(integrity::reports()[0].acknowledged);
                     }).await;
                 }
@@ -8579,7 +10353,7 @@ mod loopback_tests {
                 assert!(integrity::enabled(&header));
                 if legacy { header.as_object_mut().unwrap().remove("integrity_v"); }
                 let result = read_files_negotiated(&conn, &mut send, &mut recv, &header, &rx_dest,
-                    &AtomicBool::new(false), &AtomicBool::new(false), None, |_, _| {}).await;
+                    &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}).await;
                 let _ = send.finish();
                 let _ = send.stopped().await;
                 (result, integrity::reports())
@@ -8684,6 +10458,128 @@ mod loopback_tests {
         }
     }
 
+    /// Poll a cheap filesystem/flag predicate instead of sleeping a fixed time.
+    async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !ready() {
+            assert!(start.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    fn range_header(offset: u64, len: u64) -> Vec<u8> {
+        [offset.to_be_bytes(), len.to_be_bytes()].concat()
+    }
+    fn block_digest(bytes: &[u8]) -> String {
+        let leaves = integrity::Leaves::default();
+        let mut blocks = integrity::Blocks::new(0, leaves.clone()).unwrap();
+        blocks.update(bytes);
+        blocks.finish();
+        integrity::combine(bytes.len() as u64, &leaves).unwrap()
+    }
+
+    /// A first attempt whose verification is parked (the field case: a macOS
+    /// Files-and-Folders permission stall) still owns the hidden partial. When the
+    /// user re-sends the same file, the retry used to ADOPT that partial — and the
+    /// moment the old attempt's verification finally passed, its publication
+    /// renamed the partial away and the retry died on a bare
+    /// "No such file or directory (os error 2)" from the next range worker.
+    /// Ownership must survive the whole first attempt, and the retry must then
+    /// dedup against the published file instead of failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_survives_a_parked_attempt_publishing_the_partial() {
+        let dir = scratch("retry-adopt");
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let total: u64 = 6 * integrity::BLOCK; // > PARALLEL_MIN → negotiated/resumable
+        let bytes = payload(total as usize, 5);
+        let source = dir.join("big.bin");
+        std::fs::write(&source, &bytes).unwrap();
+        let mtime = mtime_secs(&std::fs::metadata(&source).unwrap());
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let header = serde_json::json!({"kind":"files","items":[{"name":"big.bin","size":total,"mtime":mtime}],
+            "dirs":[],"total":total,"parallel":4,"resumable":true,"fromName":"retry","integrity_v":1});
+        let manifest = serde_json::json!({"kind":"integrity","integrity_v":1,
+            "files":[{"name":"big.bin","size":total,"digest":block_digest(&bytes)}]});
+        let (part, side) = partial_paths(&dest, &transfer_fingerprint(
+            &client.id().to_string(), "big.bin", total, mtime));
+
+        // Production receive wiring for recv_files / pull_files / headless location
+        // uploads: no registry handed in, so the engine must supply its own.
+        let receive = |srv: Endpoint, dest: PathBuf, landed: Arc<AtomicBool>| {
+            tokio::spawn(integrity::scope(async move {
+                let conn = srv.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let header = read_frame(&mut recv).await.unwrap();
+                read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest,
+                    &AtomicBool::new(false), &AtomicBool::new(false),
+                    move |d, t| if t > 0 && d >= t { landed.store(true, Ordering::SeqCst) }).await
+            }))
+        };
+
+        // ── attempt 1: the body lands, then verification parks (no manifest yet).
+        let landed = Arc::new(AtomicBool::new(false));
+        let first = receive(server.clone(), dest.clone(), landed.clone());
+        let conn1 = client.connect(server.addr(), ALPN).await.unwrap();
+        let (mut s1, mut r1) = conn1.open_bi().await.unwrap();
+        write_frame(&mut s1, &header).await.unwrap();
+        assert_eq!(read_frame(&mut r1).await.unwrap()["ready"], true);
+        let mut u1 = conn1.open_uni().await.unwrap();
+        u1.write_all(&range_header(0, total)).await.unwrap();
+        u1.write_all(&bytes).await.unwrap();
+        u1.finish().unwrap();
+        until("the first attempt's body", || landed.load(Ordering::SeqCst)).await;
+        until("verification to park", || part.is_file() && !side.exists()).await;
+
+        // ── the user re-sends while that attempt is still parked. The first
+        // range stream goes out from its own task: a receiver that (correctly)
+        // waits for the handoff hasn't accepted it yet, and a blocking write here
+        // would deadlock the test against QUIC flow control.
+        let second = receive(server.clone(), dest.clone(), Arc::new(AtomicBool::new(false)));
+        let conn2 = client.connect(server.addr(), ALPN).await.unwrap();
+        let (mut s2, mut r2) = conn2.open_bi().await.unwrap();
+        write_frame(&mut s2, &header).await.unwrap();
+        let (head, tail) = bytes.split_at(integrity::BLOCK as usize);
+        let (uni, head) = (conn2.clone(), head.to_vec());
+        let first_range = tokio::spawn(async move {
+            let mut u = uni.open_uni().await.unwrap();
+            let _ = u.write_all(&range_header(0, integrity::BLOCK)).await;
+            let _ = u.write_all(&head).await;
+            let _ = u.finish();
+        });
+        // A receiver that answers now has ADOPTED the live partial (the bug); one
+        // that holds its answer is waiting for the fingerprint's owner to finish.
+        let early = tokio::time::timeout(Duration::from_millis(300), read_frame(&mut r2)).await;
+
+        // ── attempt 1 finally verifies and publishes, consuming the partial.
+        write_frame(&mut s1, &manifest).await.unwrap();
+        s1.finish().unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), vec![dest.join("big.bin")]);
+        assert!(!part.exists(), "publication consumed the partial");
+
+        // ── the retry must still land, byte-exact, with no duplicate copy.
+        let ready = match early {
+            Ok(frame) => frame.unwrap(),
+            Err(_) => read_frame(&mut r2).await.unwrap(),
+        };
+        assert_eq!(ready["ready"], true);
+        first_range.await.unwrap();
+        let mut ub = conn2.open_uni().await.unwrap();
+        // Writes into a receive that has already died are reported as stream
+        // resets; assert on the RECEIVER's outcome, which names the real failure.
+        let _ = ub.write_all(&range_header(integrity::BLOCK, total - integrity::BLOCK)).await;
+        let _ = ub.write_all(tail).await;
+        let _ = ub.finish();
+        let _ = write_frame(&mut s2, &manifest).await;
+        let _ = s2.finish();
+        let paths = second.await.unwrap()
+            .expect("a retry must never be killed by the previous attempt's cleanup");
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+        assert_eq!(std::fs::read(dest.join("big.bin")).unwrap(), bytes);
+        assert!(!dest.join("big (2).bin").exists(), "the retry must dedup, not pile up copies");
+        client.close().await; server.close().await; std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A unique scratch dir under the OS temp dir, namespaced by pid + a label so
     /// parallel test binaries never collide. Removed by the caller at the end.
     fn scratch(label: &str) -> PathBuf {
@@ -8717,6 +10613,7 @@ mod loopback_tests {
     /// any `address_lookup`, so nothing is ever published or resolved off-box.
     async fn loopback_endpoint(accept: bool) -> Endpoint {
         let mut b = Endpoint::builder(presets::Minimal)
+            .path_selector(Arc::new(super::DirectPathSelector))
             .relay_mode(RelayMode::Disabled)
             .bind_addr("127.0.0.1:0")
             .expect("127.0.0.1:0 is a valid bind address");
@@ -8724,6 +10621,40 @@ mod loopback_tests {
             b = b.alpns(vec![ALPN.to_vec()]);
         }
         b.bind().await.expect("bind loopback iroh endpoint")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn established_direct_path_snapshot_and_stream() {
+        use n0_future::StreamExt as _;
+        let server = loopback_endpoint(true).await;
+        let client = loopback_endpoint(false).await;
+        let (outgoing, incoming) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client.connect(server.addr(), ALPN), async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        }).await.unwrap();
+        let conn = outgoing.unwrap();
+        assert!(conn_has_direct_path(&conn, Duration::from_secs(2)).await);
+        let mut snapshots = conn.paths_stream();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = snapshots.next().await.expect("connection remains open");
+                if snapshot.iter().any(|p| p.is_selected() && path_is_validated_direct(&p)) {
+                    break;
+                }
+            }
+        }).await.unwrap();
+        assert!(matches!(conn_detail(&conn).path.as_str(), "direct" | "local"));
+        assert!(describe_paths(&conn).contains("*vIp("));
+        conn.close(0u32.into(), b"test complete");
+        assert!(!conn_has_direct_path(&conn, Duration::ZERO).await);
+        assert!(matches!(conn_locality(&conn), crate::models::Locality::Unknown));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while snapshots.next().await.is_some() {}
+        }).await.expect("path stream ends when the connection closes");
+        drop(incoming);
+        client.close().await;
+        server.close().await;
     }
 
     /// Exercise the ticket and the production pull sender/receiver, and require
@@ -8790,7 +10721,7 @@ mod loopback_tests {
         let parallel = header["parallel"].as_u64().unwrap_or(0) > 0;
         let engaged = AtomicBool::new(false);
         let got = read_pull_files_negotiated(&conn, &mut send, &mut recv, &header,
-            &dest, &AtomicBool::new(false), &engaged, None, |_, _| {}).await.unwrap();
+            &dest, &AtomicBool::new(false), &engaged, |_, _| {}).await.unwrap();
         // Production drops its pull connection immediately on returning Saved.
         drop(conn);
         assert_eq!(engaged.load(Ordering::SeqCst), parallel);
@@ -8848,7 +10779,7 @@ mod loopback_tests {
                 .expect("refresh must stop after close").expect("presence task must not panic");
             let state = Arc::new(IrohState::default());
             let key = conn.remote_id().to_string();
-            state.friend_conns.lock().unwrap().insert(key.clone(), conn.clone());
+            state.friend_conns.lock().unwrap().insert(key.clone(), CachedFriendConnection::new(conn.clone()));
             tokio::time::timeout(Duration::from_secs(5), handle_conn(conn, state.clone()))
                 .await.expect("closed dispatcher must exit");
             assert!(!state.friend_conns.lock().unwrap().contains_key(&key));
@@ -10063,7 +11994,7 @@ mod loopback_tests {
             let rc = ResumeCtx { side: partial_paths(&dest_c, &fp_c).1, fp: fp_c.clone() };
             let dest = recv_file_resumable(
                 &conn,
-                FinalizeDest::UniqueIn(dest_c.clone(), "blob.bin".into()),
+                FinalizeDest::UniqueIn(dest_c.clone(), "blob.bin".into(), 0),
                 total,
                 part,
                 Some(rc),
@@ -10744,6 +12675,167 @@ mod chat_transfer_link_tests {
 mod location_loopback_tests {
     use super::*;
     #[tokio::test]
+    async fn location_download_sender_opens_pinned_root_and_rejects_symlink_swap() {
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("dropbeam-download-open-{}", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(base.clone());
+        let config = base.join("config"); let nas = base.join("nas");
+        std::fs::create_dir_all(&config).unwrap(); std::fs::create_dir_all(nas.join("folder")).unwrap();
+        std::fs::write(nas.join("folder/data"), b"NAS bytes").unwrap();
+        let friend = crate::friends::upsert_by_endpoint(&config, "reader", "Reader");
+        crate::locations::save(&config, Some(crate::locations::Location {
+            id:"nas".into(), name:"NAS".into(), path:nas.to_string_lossy().into_owned(),
+            friend_ids:vec![friend.id], rights:crate::locations::Rights::default(),
+            byte_cap:crate::locations::default_byte_cap(), device:None, marker:None, safe_publish:None
+        }), None).unwrap();
+        let snapshot = crate::locations::download_snapshot(&config, "reader",
+            &serde_json::json!({"locations_v":1,"id":"nas","paths":["folder"]})).unwrap();
+        let path = snapshot.source.items[0].0.clone();
+        LOCATION_SOURCE.scope(Some(snapshot.source.clone()), async {
+            let mut file = open_for_send(&path).await.unwrap();
+            let metadata = file.metadata().await.unwrap();
+            let expected = std::fs::metadata(&path).unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), (expected.dev(), expected.ino()));
+            let mut data = vec![];
+            tokio::io::AsyncReadExt::read_to_end(&mut file, &mut data).await.unwrap();
+            assert_eq!(data, b"NAS bytes");
+            assert_eq!(location_hashes(vec![path.clone()], &AtomicBool::new(false), &AtomicU64::new(0)).await.unwrap(),
+                vec![crate::locations::sha256(&path).unwrap()]);
+            std::fs::rename(nas.join("folder"), nas.join("moved")).unwrap();
+            std::os::unix::fs::symlink(nas.join("moved"), nas.join("folder")).unwrap();
+            assert!(open_for_send(&path).await.is_err());
+            assert!(location_hashes(vec![path.clone()], &AtomicBool::new(false), &AtomicU64::new(0)).await.is_err());
+        }).await;
+        assert!(!config.join("location-snapshots").exists());
+    }
+    #[tokio::test]
+    async fn loopback_relay_stuck_upload_redials_at_file_boundary() {
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let base = std::env::temp_dir().join(format!("dropbeam-redial-{}", uuid::Uuid::new_v4()));
+            struct Cleanup(PathBuf, String);
+            impl Drop for Cleanup { fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+                peer_addrs().lock().unwrap().remove(&self.1);
+            } }
+            let host = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+                .alpns(vec![ALPN.to_vec()]).relay_mode(iroh::RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+            let client = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+                .relay_mode(iroh::RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+            let _cleanup = Cleanup(base.clone(), host.id().to_string());
+            let config = base.join("config"); let nas = base.join("nas");
+            std::fs::create_dir_all(&config).unwrap(); std::fs::create_dir_all(&nas).unwrap();
+            let friend = crate::friends::upsert_by_endpoint(&config, &client.id().to_string(), "Sender");
+            crate::locations::save(&config, Some(crate::locations::Location {
+                id:"nas".into(), name:"NAS".into(), path:nas.to_string_lossy().into_owned(),
+                friend_ids:vec![friend.id], rights:crate::locations::Rights::default(),
+                byte_cap:crate::locations::default_byte_cap(), device:None, marker:None, safe_publish:None
+            }), None).unwrap();
+            let state = Arc::new(IrohState::default()); state.location_config.set(config).unwrap();
+            let listener = tokio::spawn(accept_loop(host.clone(), state));
+            peer_addrs().lock().unwrap().insert(host.id().to_string(), host.addr().ip_addrs().map(|addr| PeerAddr { addr: *addr, last_seen: peer_addr_now(), observed_working: true }).collect());
+            let paths: Vec<_> = (0..3).map(|i| {
+                let p = base.join(format!("file{i}.bin"));
+                std::fs::write(&p, vec![i as u8 + 17; if i == 0 { SMALL_FILE_LIMIT as usize } else { 4096 }]).unwrap(); p
+            }).collect();
+            let (items, dirs, _) = gather_items(&paths).unwrap();
+            let mut batch = LocationBatch { items, dirs, next_file:0, dirs_pending:true };
+            let options = LocationSend { target:Some(crate::locations::Target {
+                location_id:"nas".into(), rel_path:"".into() }),
+                transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false };
+            let recovery = std::sync::Mutex::new(RelayRecovery {
+                forced_locality:Some(crate::models::Locality::Internet), ..Default::default()
+            });
+            let requested = AtomicBool::new(false);
+            let cancel = AtomicBool::new(false); let engaged = AtomicBool::new(false);
+            let activity = AtomicU64::new(0); let mut redials = 0;
+            let mut previous = None;
+            loop {
+                let conn = client.connect(dial_addr(host.id()), ALPN).await.unwrap();
+                if let Some(old) = previous { assert_ne!(old, conn.stable_id()); }
+                previous = Some(conn.stable_id());
+                requested.store(false, Ordering::SeqCst);
+                let result = batch.send_attempt(&conn, &options, &cancel, "Sender", &engaged,
+                    &activity, None, |done, _| {
+                        // Simulate 61s of relay while the first file is in flight.
+                        // Time injection keeps this network test fast and deterministic.
+                        if done > 0 && redials == 0 {
+                            let mut r = recovery.lock().unwrap();
+                            r.since = Some(Instant::now() - Duration::from_secs(61));
+                            r.check(&conn, false, &requested).unwrap();
+                        }
+                    }, |_| {}, |_| {}, |_| {}, || recovery.lock().unwrap().check(&conn, true, &requested)).await;
+                if requested.load(Ordering::SeqCst) {
+                    assert!(result.is_err());
+                    assert_eq!(batch.next_file, 1, "redial only after first receipt");
+                    assert_eq!(std::fs::read(nas.join("file0.bin")).unwrap(), std::fs::read(&paths[0]).unwrap());
+                    redials += 1; assert_eq!(redials, 1); continue;
+                }
+                result.unwrap(); conn.close(0u32.into(), b"done"); break;
+            }
+            assert_eq!(redials, 1); assert_eq!(batch.next_file, 3);
+            for path in paths { assert_eq!(std::fs::read(nas.join(path.file_name().unwrap())).unwrap(), std::fs::read(path).unwrap()); }
+            listener.abort(); client.close().await; host.close().await;
+        }).await.expect("relay recovery must complete");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback socket binding; run explicitly outside the sandbox"]
+    async fn loopback_locations_batched_small_files() {
+        use iroh::RelayMode;
+        let base = std::env::temp_dir().join(format!("dropbeam-location-loopback-{}", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) {
+            crate::locations::UPLOAD_PREPARE_COUNTS.lock().unwrap().remove(&self.0.join("config"));
+            let _ = std::fs::remove_dir_all(&self.0);
+        } }
+        let _cleanup = Cleanup(base.clone());
+        let config = base.join("config"); let nas = base.join("nas");
+        std::fs::create_dir_all(&config).unwrap(); std::fs::create_dir_all(&nas).unwrap();
+        let host = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let client = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let friend = crate::friends::upsert_by_endpoint(&config, &client.id().to_string(), "Mac");
+        let location = crate::locations::Location { id:"family".into(), name:"Family NAS".into(), path:nas.to_string_lossy().into_owned(), friend_ids:vec![friend.id], rights:crate::locations::Rights::default(), byte_cap:crate::locations::default_byte_cap(), device:None, marker:None, safe_publish:None };
+        crate::locations::save(&config, Some(location.clone()), None).unwrap();
+        let state = Arc::new(IrohState::default()); state.location_config.set(config.clone()).unwrap();
+        let listener = tokio::spawn(accept_loop(host.clone(), state));
+        let addr = host.addr();
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::locations::UPLOAD_PREPARE_COUNTS.lock().unwrap().insert(config.clone(), count.clone());
+        let folder = base.join("corpus");
+        std::fs::create_dir_all(folder.join("empty")).unwrap();
+        for i in 0..25 {
+            std::fs::write(folder.join(format!("small-{i:02}.bin")), vec![i as u8; 4096 + i]).unwrap();
+        }
+        std::fs::write(folder.join("large.bin"), vec![37; SMALL_FILE_LIMIT as usize]).unwrap();
+        let (mut items, dirs, total) = gather_items(&[folder.clone()]).unwrap();
+        // Put the large file between two small batches to verify nonzero offsets.
+        items.sort_by_key(|item| if item.2 >= SMALL_FILE_LIMIT { "small-12a".to_string() }
+            else { item.0.file_name().unwrap().to_string_lossy().into_owned() });
+        let mut batch = LocationBatch { items, dirs, next_file: 0, dirs_pending: true };
+        let options = LocationSend { target: Some(crate::locations::Target {
+            location_id: "family".into(), rel_path: "".into() }),
+            transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: false };
+        let sent = tokio::time::timeout(Duration::from_secs(60), batch.send_attempt(
+            &conn, &options, &AtomicBool::new(false), "Mac", &AtomicBool::new(false),
+            &AtomicU64::new(0), None, |_, _| {}, |_| {}, |_| {}, |_| {}, || Ok(()))).await.unwrap().unwrap();
+        assert_eq!(sent, total);
+        assert_eq!(batch.next_file, 26);
+        for item in &batch.items {
+            assert_eq!(std::fs::read(nas.join(&item.1)).unwrap(), std::fs::read(&item.0).unwrap(), "{}", item.1);
+        }
+        assert!(nas.join("corpus/empty").is_dir());
+        let pushes = count.load(Ordering::SeqCst);
+        assert!(pushes > 0 && pushes <= 4, "expected two small batches, one large file, and terminal push; saw {pushes}");
+        conn.close(0u32.into(), b"done"); listener.abort(); client.close().await; host.close().await;
+    }
+
+    #[tokio::test]
     async fn loopback_locations_list_upload_hash_and_permission_denial() {
         use iroh::RelayMode;
         let base = std::env::temp_dir().join(format!("dropbeam-location-loopback-{}", uuid::Uuid::new_v4()));
@@ -10771,7 +12863,7 @@ mod location_loopback_tests {
         let list = rpc(&conn, serde_json::json!({"kind":"locations.list","locations_v":1})).await;
         assert_eq!(list["data"][0]["name"], "Family NAS"); assert!(list["data"][0].get("path").is_none());
         let source = base.join("旅行.txt"); std::fs::write(&source, b"loopback NAS bytes").unwrap();
-        let options = LocationSend { target:Some(crate::locations::Target { location_id:"family".into(), rel_path:"".into() }), transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None };
+        let options = LocationSend { target:Some(crate::locations::Target { location_id:"family".into(), rel_path:"".into() }), transfer_id:uuid::Uuid::new_v4().to_string(), snapshot:None, replace_existing:false };
         let total = send_files_linked(&conn, &[source.clone()], &AtomicBool::new(false), |_, _| {}, "Mac", &AtomicBool::new(false), &AtomicU64::new(0), None, None, Some(&options)).await.unwrap();
         assert_eq!(total, 18); assert_eq!(std::fs::read(nas.join("旅行.txt")).unwrap(), b"loopback NAS bytes");
         let ls = rpc(&conn, serde_json::json!({"kind":"locations.ls","locations_v":1,"id":"family","rel_path":"","page":0})).await;
@@ -10808,6 +12900,193 @@ mod integrity_round2_tests {
         Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Disabled)
             .alpns(vec![ALPN.to_vec()]).bind_addr("127.0.0.1:0").unwrap().bind().await.expect("bind loopback")
     }
+    async fn friend_batch_loopback(old_peer: bool) {
+        let dir = fixture();
+        let folder = dir.join("folder"); std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a-big"), vec![37u8; PARALLEL_MIN as usize]).unwrap();
+        std::fs::write(folder.join("b-small"), b"second").unwrap();
+        std::fs::write(folder.join("c-small"), b"third").unwrap();
+        let (mut items, dirs, total) = gather_items(&[folder]).unwrap();
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+        let link: crate::models::ChatTransferLink = serde_json::from_value(serde_json::json!({
+            "id":uuid::Uuid::new_v4().to_string(),"attempt":1,
+            "manifest":items.iter().map(|i| serde_json::json!({"name":i.1,"size":i.2})).collect::<Vec<_>>(),
+            "directories":dirs,"offset":0,"total":total,"last":true})).unwrap();
+        let dest = dir.join("dest"); let target = dest.clone();
+        let server = endpoint().await; let client = endpoint().await; let srv = server.clone();
+        let received = Arc::new(Mutex::new(Vec::<String>::new())); let recorded = received.clone();
+        // Every push of this folder must resolve to ONE receive card.
+        let cards = Arc::new(Mutex::new(Vec::<ReceiveCard>::new())); let carded = cards.clone();
+        let receiver = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            loop {
+                let Ok((mut send, mut recv)) = conn.accept_bi().await else { break; };
+                let header = read_frame(&mut recv).await.unwrap();
+                if header["kind"] == "files.stat" {
+                    let reply = if old_peer { serde_json::json!({"error":"unknown kind"}) }
+                        else { friend_stat_reply(&target, &header).unwrap() };
+                    write_frame(&mut send, &reply).await.unwrap(); send.finish().unwrap();
+                } else {
+                    assert!(incoming_chat_link(&header, &conn.remote_id().to_string()).is_some());
+                    carded.lock().unwrap().extend(receive_card(&header, &conn.remote_id().to_string()));
+                    recorded.lock().unwrap().extend(header["items"].as_array().unwrap().iter()
+                        .map(|i| i["name"].as_str().unwrap().to_string()));
+                    integrity::scope(read_files_negotiated(&conn, &mut send, &mut recv, &header, &target,
+                        &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {})).await.unwrap();
+                }
+            }
+        });
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let state = IrohState::default(); state.learn_progress(&server.id().to_string(), 1);
+        let cancel = AtomicBool::new(false);
+        let engaged = AtomicBool::new(false); let activity = AtomicU64::new(0);
+        let notice = Mutex::new(TransferUpdate::new("test".into(), Direction::Send, vec![]));
+        if !old_peer {
+            let boundaries = AtomicU64::new(0);
+            let result = integrity::scope(send_friend_batch(&conn, &items, &dirs, &link, &cancel, "friend",
+                &engaged, &activity, Some(&state), |_, _| {}, |_| {}, || {
+                    // The first push has its terminal receipt before the next boundary.
+                    if boundaries.fetch_add(1, Ordering::SeqCst) == 1 { cancel.store(true, Ordering::SeqCst); }
+                    Ok(())
+                })).await;
+            assert!(result.unwrap_err().to_string().contains("canceled"));
+            assert_eq!(*received.lock().unwrap(), vec![items[0].1.clone()]);
+            assert_eq!(friend_stat(&conn, &items).await, vec![true, false, false]);
+            cancel.store(false, Ordering::SeqCst);
+        }
+        let progress = Mutex::new(Vec::new());
+        integrity::scope(send_friend_batch(&conn, &items, &dirs, &link, &cancel, "friend",
+            &engaged, &activity, Some(&state), |d, _| progress.lock().unwrap().push(d),
+            |count| notice.lock().unwrap().location_skipped = Some(count as u64), || Ok(()))).await.unwrap();
+        assert_eq!(notice.lock().unwrap().location_skipped, Some(if old_peer { 0 } else { 1 }));
+        assert_eq!(progress.lock().unwrap()[0], if old_peer { 0 } else { PARALLEL_MIN });
+        assert_eq!(*received.lock().unwrap(), items.iter().map(|i| i.1.clone()).collect::<Vec<_>>());
+        // One card across all of them: same id, same whole-folder span, each push
+        // based on the bytes the earlier ones covered, exactly one final push.
+        let cards = cards.lock().unwrap().clone();
+        assert!(cards.len() > 1, "a three-file folder is sent as several pushes");
+        assert_eq!(cards.iter().map(|c| c.id.clone()).collect::<std::collections::BTreeSet<_>>().len(), 1);
+        assert!(cards.iter().all(|c| c.bytes_total == total && c.files == items.len()
+            && c.label == format!("folder · {} files", items.len())));
+        assert_eq!(cards.iter().filter(|c| c.last).count(), 1, "only the final push completes the card");
+        assert_eq!(cards.first().unwrap().bytes_base, 0);
+        assert!(cards.iter().any(|c| c.bytes_base > 0), "a later push resumes from what landed before it");
+        assert!(cards.iter().all(|c| c.bytes_base < total));
+        for item in &items { assert_eq!(std::fs::read(&item.0).unwrap(), std::fs::read(dest.join(&item.1)).unwrap()); }
+        assert_eq!(std::fs::read_dir(dest.join("folder")).unwrap().count(), 3, "no collision duplicates");
+        conn.close(0u32.into(), b"done"); receiver.await.unwrap();
+        client.close().await; server.close().await; std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback socket binds"]
+    async fn friend_folder_cancel_resend_skips_landed() { friend_batch_loopback(false).await; }
+
+    #[tokio::test]
+    #[ignore = "requires loopback socket binds"]
+    async fn friend_folder_old_stat_peer_sends_everything() { friend_batch_loopback(true).await; }
+
+    /// The whole "Verify copy" round trip over a real loopback connection: send a
+    /// 3-file folder, hash both sides, and report exactly what differs.
+    #[tokio::test]
+    #[ignore = "requires loopback socket binds"]
+    async fn friend_folder_verify_round_trip_reports_every_difference() {
+        let dir = fixture();
+        let folder = dir.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a.bin"), b"first file").unwrap();
+        std::fs::write(folder.join("b.bin"), b"second file").unwrap();
+        std::fs::write(folder.join("c.bin"), b"third file").unwrap();
+        let (mut items, dirs, total) = gather_items(&[folder]).unwrap();
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+        let link: crate::models::ChatTransferLink = serde_json::from_value(serde_json::json!({
+            "id":uuid::Uuid::new_v4().to_string(),"attempt":1,
+            "manifest":items.iter().map(|i| serde_json::json!({"name":i.1,"size":i.2})).collect::<Vec<_>>(),
+            "directories":dirs,"offset":0,"total":total,"last":true})).unwrap();
+        let dest = dir.join("dest");
+        let target = dest.clone();
+        let server = endpoint().await;
+        let client = endpoint().await;
+        let srv = server.clone();
+        let receiver = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            loop {
+                let Ok((mut send, mut recv)) = conn.accept_bi().await else { break; };
+                let header = read_frame(&mut recv).await.unwrap();
+                // The production arms gate on a known friend first; the gate is
+                // covered by files.stat's own tests, so the loopback exercises the
+                // protocol itself.
+                match header["kind"].as_str().unwrap_or("").to_string().as_str() {
+                    "files.stat" => {
+                        let reply = friend_stat_reply(&target, &header).unwrap();
+                        write_frame(&mut send, &reply).await.unwrap();
+                        send.finish().unwrap();
+                    }
+                    "files.verify" => {
+                        let landed = target.clone();
+                        serve_verify(&mut send, move |cancel, hashed| {
+                            friend_verify_reply(&landed, &header, &cancel, &hashed)
+                        }).await.unwrap();
+                    }
+                    _ => {
+                        integrity::scope(read_files_negotiated(&conn, &mut send, &mut recv, &header,
+                            &target, &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}))
+                            .await.unwrap();
+                    }
+                }
+            }
+        });
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let state = IrohState::default();
+        state.learn_progress(&server.id().to_string(), 1);
+        // Reuse the live loopback connection the way a real verify reuses the
+        // cached friend connection.
+        state.endpoint.set(client.clone()).ok();
+        state.friend_conns.lock().unwrap()
+            .insert(server.id().to_string(), CachedFriendConnection::new(conn.clone()));
+
+        let cancel = AtomicBool::new(false);
+        let engaged = AtomicBool::new(false);
+        let activity = AtomicU64::new(0);
+        integrity::scope(send_friend_batch(&conn, &items, &dirs, &link, &cancel, "friend",
+            &engaged, &activity, Some(&state), |_, _| {}, |_| {}, || Ok(()))).await.unwrap();
+
+        let entry = VerifyEntry {
+            record: crate::verify::VerifyRecord {
+                endpoint_id: server.id().to_string(),
+                target: None,
+                items: items.iter().map(|(p, n, s, _)| (p.clone(), n.clone(), *s)).collect(),
+            },
+            card: Mutex::new(TransferUpdate::new("card".into(), Direction::Send, vec![])),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Mutex::new(Vec::new());
+        let verdict = run_verify(&state, &entry, &stop, |live| seen.lock().unwrap().push(live.clone()))
+            .await.unwrap();
+        assert_eq!(verdict, (vec![], vec![]), "a freshly landed folder is identical");
+        assert!(seen.lock().unwrap().iter().all(|r| r.total == 3 && r.bytes_total == total));
+
+        // Now break the copy: one file rewritten to the SAME length (so a size
+        // check would still pass), one deleted outright.
+        let changed = dest.join(&items[1].1);
+        assert_eq!(std::fs::read(&changed).unwrap().len(), b"second file".len());
+        std::fs::write(&changed, b"SECOND file").unwrap();
+        std::fs::remove_file(dest.join(&items[2].1)).unwrap();
+        let (mismatched, missing) = run_verify(&state, &entry, &stop, |_| {}).await.unwrap();
+        assert_eq!(mismatched, vec![items[1].1.clone()]);
+        assert_eq!(missing, vec![items[2].1.clone()]);
+
+        // A canceled verify reports the cancel instead of a bogus all-clear.
+        stop.store(true, Ordering::SeqCst);
+        assert!(run_verify(&state, &entry, &stop, |_| {}).await.is_err());
+
+        conn.close(0u32.into(), b"done");
+        receiver.await.unwrap();
+        client.close().await;
+        server.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn link(size: u64) -> crate::models::ChatTransferLink {
         serde_json::from_value(serde_json::json!({"id": uuid::Uuid::new_v4().to_string(), "attempt":1,
             "manifest":[{"name":"same.bin", "size":size},{"name":"same.bin", "size":size}],
@@ -10904,7 +13183,7 @@ mod integrity_round2_tests {
                 let receiver = tokio::spawn(async move {
                     let conn = srv.accept().await.unwrap().await.unwrap();
                     let (_send, mut recv) = conn.accept_bi().await.unwrap();
-                    let hashes: Vec<_> = (0..2).map(|index| integrity::FileHash { leaves: Default::default(), index,
+                    let hashes: Vec<_> = (0..2).map(|index| integrity::FileHash { sha256: None, leaves: Default::default(), index,
                         name: format!("{index}"), size: 0, digest: "a".repeat(64) }).collect();
                     let cancel = AtomicBool::new(false);
                     let error = integrity::STALL_BUDGET.scope(Duration::from_millis(100), async {
@@ -11042,14 +13321,14 @@ mod integrity_round2_tests {
             let (_guard, file) = ReceiveStage::create(stage.clone(), 4, "test-transfer").unwrap();
             use std::io::Write;
             (&file).write_all(b"body").unwrap();
-            gc_stale_partials_at(&nested, None, &dir); assert!(stage.exists(), "do not sweep an active receive");
+            gc_stale_partials_at(&nested, &dir); assert!(stage.exists(), "do not sweep an active receive");
             std::fs::write(nested.join("occupied"), b"keep").unwrap();
             assert!(publish_unique_limit(&stage, &nested.join("occupied"), 1).unwrap_err().to_string().contains("exhausted"));
         }
         assert!(!stage.exists(), "failed publication must clean its stage");
         std::fs::write(&stage, b"crash litter").unwrap();
         let unrelated = nested.join(".dropbeam-recv-user.part"); std::fs::write(&unrelated, b"keep").unwrap();
-        gc_stale_partials_at(&nested, None, &dir); assert!(stage.exists(), "unregistered UUID names are not proof of ownership"); assert!(unrelated.exists());
+        gc_stale_partials_at(&nested, &dir); assert!(stage.exists(), "unregistered UUID names are not proof of ownership"); assert!(unrelated.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -11079,5 +13358,39 @@ mod integrity_round2_tests {
         assert_eq!(publish_unique_limit(&part, &natural, 5).unwrap(), dir.join("same (4).bin"));
         for path in receive_candidates(&natural, 4) { assert_eq!(std::fs::read(path).unwrap(), b"keep"); }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod peer_cache_tests {
+    use super::*;
+    #[test]
+    fn migration_and_timestamp_roundtrip() {
+        let old = br#"{"peer":["8.8.8.8:10","192.168.1.177:43705"]}"#;
+        let map = decode_peer_addrs(old, 100_000).unwrap();
+        assert!(map["peer"].iter().all(|a| a.last_seen == 100_000 && !a.observed_working));
+        assert_eq!(decode_peer_addrs(&serde_json::to_vec(&map).unwrap(), 200_000).unwrap(), map);
+        let unknown = decode_peer_addrs(br#"{"peer":[{"addr":"8.8.8.8:10"}]}"#, 0).unwrap();
+        assert!(unknown["peer"][0].last_seen.abs_diff(peer_addr_now()) <= 1);
+    }
+    #[test]
+    fn pruning_orders_caps_expires_and_filters_subnets() {
+        let subnets = vec![netwatch::interfaces::IpNet::V4("192.168.1.0/24".parse().unwrap())];
+        let entry = |addr: &str, last_seen, observed_working| PeerAddr { addr: addr.parse().unwrap(), last_seen, observed_working };
+        let mut entries = vec![
+            entry("8.8.8.8:1", 99_990, false),
+            entry("192.168.1.177:2", 99_995, false),
+            entry("10.2.3.4:3", 100_000, false),
+            entry("10.2.3.4:4", 99_999, true),
+            entry("100.79.126.13:5", 99_998, true),
+            entry("100.79.126.13:6", 100_000, false),
+            entry("8.8.4.4:7", 1, true),
+            entry("[fd00::1]:8", 100_000, false),
+            entry("10.2.3.4:4", 99_997, true),
+        ];
+        prune_peer_addrs(&mut entries, 100_000, &subnets);
+        assert_eq!(entries.iter().map(|a| a.addr.port()).collect::<Vec<_>>(), vec![4, 5, 2]);
+        prune_peer_addrs(&mut entries, 200_000, &subnets);
+        assert!(entries.is_empty());
     }
 }

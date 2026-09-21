@@ -29,7 +29,7 @@ import {
   type TransferUpdate,
 } from './lib/api'
 import { setSpeedUnit } from './lib/format'
-import { LandedEta } from './lib/eta'
+import { LandedEta, TransferRate, etaAt } from './lib/eta'
 import { chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTransfers } from './lib/chatTransfer'
 import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
@@ -41,6 +41,42 @@ let updateWatchersWired = false
 let presenceWatchersWired = false
 const presenceProbes = new Map<string, Promise<ConnDetail | null>>()
 const etaSpeeds = new Map<string, LandedEta>()
+// Live/average rate per transfer, fed from successive bytesDone frames. A card
+// that stops (paused/failed) and later resumes gets a fresh tracker, so the
+// average always describes the run on screen.
+const rateTrackers = new Map<string, TransferRate>()
+
+/** What the card shows for speed and time left, in both modes. */
+export interface TransferRates {
+  liveBps: number | null
+  avgBps: number | null
+  liveEta: number | null
+  avgEta: number | null
+  /** Milliseconds since this run started reporting — under 3s the card is still
+   *  "calculating…" rather than falling back to something jumpy. */
+  ageMs: number
+  /** Below two samples the engine's own speedBps/etaSeconds stand in. */
+  samples: number
+}
+
+// The two display toggles are GLOBAL (not per card) and outlive a restart.
+const SPEED_MODE_KEY = 'dropbeam-speed-mode'
+const ETA_MODE_KEY = 'dropbeam-eta-mode'
+function loadMode<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key) as T | null
+    return raw && allowed.includes(raw) ? raw : fallback
+  } catch {
+    return fallback
+  }
+}
+function saveMode(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    /* private mode / disabled storage — the toggle just won't persist */
+  }
+}
 
 const DEFAULT_SETTINGS: Settings = {
   downloadDir: '',
@@ -101,6 +137,41 @@ function loadFriendSeen(): Record<string, number> {
   } catch { return {} }
 }
 
+/** Per-friend unread counts, persisted the same way friendSeen is (#27). Without
+ *  this the map started empty on every launch, so a badge you had just cleared came
+ *  back the moment anything re-counted, and a real backlog vanished on reload. */
+const CHAT_UNREAD_KEY = 'dropbeam-chat-unread'
+/** Shape-validated so a corrupt/hand-edited entry can't produce a NaN badge. */
+export function parseChatUnread(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  return Object.fromEntries(Object.entries(raw as Record<string, unknown>)
+    .filter((entry): entry is [string, number] =>
+      typeof entry[1] === 'number' && Number.isSafeInteger(entry[1]) && entry[1] > 0))
+}
+export const unreadTotal = (unread: Record<string, number>) =>
+  Object.values(unread).reduce((a, b) => a + b, 0)
+/** Drop counts for friends who no longer exist — a removed friend must not keep
+ *  inflating the Dock badge forever. */
+export const pruneChatUnread = (unread: Record<string, number>, ids: Set<string>) =>
+  Object.fromEntries(Object.entries(unread).filter(([id]) => ids.has(id)))
+function loadChatUnread(): Record<string, number> {
+  try { return parseChatUnread(JSON.parse(localStorage.getItem(CHAT_UNREAD_KEY) || '{}')) }
+  catch { return {} }
+}
+/** The single write point for unread: storage and the OS Dock/taskbar badge move
+ *  together, so the sidebar pill, the persisted map and the badge can't drift.
+ *  The popover/HUD webviews share this code but not the chat — their copy of the
+ *  map is frozen at their own startup, so letting them write would resurrect a
+ *  count the main window has since cleared. Checked lazily: the overlay class is
+ *  added in main.tsx, after this module is evaluated. */
+function saveChatUnread(chatUnread: Record<string, number>): Record<string, number> {
+  if (typeof document !== 'undefined' &&
+      document.documentElement.classList.contains('overlay-window')) return chatUnread
+  try { localStorage.setItem(CHAT_UNREAD_KEY, JSON.stringify(chatUnread)) } catch { /* storage unavailable */ }
+  void api.setUnreadBadge(unreadTotal(chatUnread))
+  return chatUnread
+}
+
 interface UpdateState {
   version: string
   notes: string
@@ -125,6 +196,15 @@ interface AppStore {
   order: string[]
   /** Final stats per completed transfer: how long it took + average speed. */
   transferSummaries: Record<string, { durationMs: number; avgBps: number }>
+  /** Live + whole-transfer-average speed and time left, per active transfer. */
+  transferRates: Record<string, TransferRates>
+  /** Which speed a card shows by default: the last few seconds, or the run's
+   *  average. Global (every card agrees) and remembered across restarts. */
+  speedMode: 'live' | 'avg'
+  /** Which rate the time left is based on. */
+  etaMode: 'avg' | 'live'
+  toggleSpeedMode: () => void
+  toggleEtaMode: () => void
   /** macOS: warning if the app is installed/running in a way that breaks folder
    * permissions every launch (null = fine / non-macOS). */
   installHint: string | null
@@ -341,6 +421,50 @@ function deleteRetryPayload(id: string): void {
     /* best-effort */
   }
 }
+// Surviving a restart is the whole point of Pause ("stop before I leave this
+// Wi-Fi, finish it tomorrow"), and the transfer list itself is in-memory only —
+// so paused CARDS are mirrored to localStorage next to their retry payloads and
+// seeded back at startup. Only a send with a payload is kept: without one Resume
+// would be a dead button.
+const PAUSED_KEY = 'dropbeam-paused-transfers'
+function loadPausedTransfers(): Record<string, TransferUpdate> {
+  const out: Record<string, TransferUpdate> = {}
+  try {
+    const raw = JSON.parse(localStorage.getItem(PAUSED_KEY) || '{}') as Record<string, TransferUpdate>
+    const payloads = loadRetryPayloads()
+    for (const [id, u] of Object.entries(raw)) {
+      if (!u || typeof u !== 'object') continue
+      if (u.id !== id || u.direction !== 'send' || u.state !== 'paused') continue
+      if (!payloads[id]) continue
+      out[id] = normalizeTransfer(u)
+    }
+  } catch {
+    /* invalid JSON or unavailable storage — just start with no paused cards */
+  }
+  return out
+}
+function savePausedTransfer(u: TransferUpdate): void {
+  try {
+    const all = loadPausedTransfers()
+    all[u.id] = u
+    const ids = Object.keys(all)
+    if (ids.length > 20) for (const k of ids.slice(0, ids.length - 20)) delete all[k]
+    localStorage.setItem(PAUSED_KEY, JSON.stringify(all))
+  } catch {
+    /* best-effort — the live card still works this session */
+  }
+}
+function clearPausedTransfer(id: string): void {
+  try {
+    const all = JSON.parse(localStorage.getItem(PAUSED_KEY) || '{}') as Record<string, unknown>
+    if (id in all) {
+      delete all[id]
+      localStorage.setItem(PAUSED_KEY, JSON.stringify(all))
+    }
+  } catch {
+    /* best-effort */
+  }
+}
 // In-flight receives by ticket, so pasting the same code twice can't start two
 // pulls of the same files racing each other into "name (1)" duplicates.
 const activeReceives = new Map<string, string>()
@@ -387,14 +511,30 @@ function deleteChatFileXfer(id: string): void {
   }
 }
 
+const restoredPaused = loadPausedTransfers()
+
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
   view: 'send',
   settings: null,
   chatTransfers: loadChatTransfers(),
-  transfers: {},
-  order: [],
+  // Paused sends come back exactly where they stopped, Resume button and all.
+  transfers: restoredPaused,
+  order: Object.keys(restoredPaused),
   transferSummaries: {},
+  transferRates: {},
+  speedMode: loadMode(SPEED_MODE_KEY, ['live', 'avg'] as const, 'live'),
+  etaMode: loadMode(ETA_MODE_KEY, ['avg', 'live'] as const, 'avg'),
+  toggleSpeedMode: () => {
+    const speedMode = get().speedMode === 'live' ? 'avg' : 'live'
+    saveMode(SPEED_MODE_KEY, speedMode)
+    set({ speedMode })
+  },
+  toggleEtaMode: () => {
+    const etaMode = get().etaMode === 'avg' ? 'live' : 'avg'
+    saveMode(ETA_MODE_KEY, etaMode)
+    set({ etaMode })
+  },
   installHint: null,
   dragHovering: false,
   history: [],
@@ -410,7 +550,7 @@ export const useStore = create<AppStore>((set, get) => ({
   chats: {},
   chatOverview: [],
   chatDraftFiles: [],
-  chatUnread: {},
+  chatUnread: loadChatUnread(),
   activeChatId: null,
   chatTyping: {},
   windowFocused: true,
@@ -452,7 +592,11 @@ export const useStore = create<AppStore>((set, get) => ({
     const folderStatuses: Record<string, FolderStatus> = {}
     statuses.forEach((s) => (folderStatuses[s.pairId] = s))
     Object.assign(folderStatuses, liveStatuses)
-    set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true })
+    // Restore the unread map against the friends that actually still exist, then
+    // push the OS badge once — otherwise a restored backlog showed in the sidebar
+    // while the Dock stayed at 0 until the next message arrived (#27).
+    const chatUnread = pruneChatUnread(get().chatUnread, new Set(friends.map((f) => f.id)))
+    set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true, chatUnread })
     void listenForChatNotifications((peerId) => get().openChat(peerId))
 
     // Probe independently of mounted views, including while iroh starts up.
@@ -590,6 +734,10 @@ export const useStore = create<AppStore>((set, get) => ({
     // listen for live messages (from friends, and our own echoed sends).
     if (!isOverlay) {
       get().loadChats()
+      // Re-assert the Dock/taskbar badge from the RESTORED counts. Without this a
+      // backlog showed in the sidebar while the Dock sat at 0 until the next
+      // message, and a badge cleared before quitting came back at 0 too late (#27).
+      saveChatUnread(get().chatUnread)
       // macOS: warn if we're running translocated / from Downloads (folder perms
       // won't stick). Null on a proper install or other platforms.
       api
@@ -870,14 +1018,33 @@ export const useStore = create<AppStore>((set, get) => ({
     const prev = get().transfers[u.id]
     u = normalizeTransfer(u, prev)
     // Use recent progress bytes, not the backend's whole-transfer average.
+    let rates: TransferRates | null = null
     if (u.state === 'transferring' && u.bytesTotal > 0) {
-      let estimator = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
-        ? etaSpeeds.get(u.id) : undefined
+      const now = performance.now()
+      const continuing = prev?.state === 'transferring' && u.bytesDone >= prev.bytesDone
+      let estimator = continuing ? etaSpeeds.get(u.id) : undefined
       estimator ??= new LandedEta()
       etaSpeeds.set(u.id, estimator)
-      u = { ...u, etaSeconds: estimator.update(performance.now(), u.bytesDone, u.bytesTotal) }
+      u = { ...u, etaSeconds: estimator.update(now, u.bytesDone, u.bytesTotal) }
+      // The card's own live/average rates. A run that just restarted (resumed
+      // after Paused/Failed, or rewound) starts its clock again here.
+      let rate = continuing ? rateTrackers.get(u.id) : undefined
+      rate ??= new TransferRate()
+      rateTrackers.set(u.id, rate)
+      rate.update(now, u.bytesDone)
+      const liveBps = rate.live()
+      const avgBps = rate.average()
+      rates = {
+        liveBps,
+        avgBps,
+        liveEta: etaAt(u.bytesDone, u.bytesTotal, liveBps),
+        avgEta: etaAt(u.bytesDone, u.bytesTotal, avgBps),
+        ageMs: rate.startedAt == null ? 0 : now - rate.startedAt,
+        samples: rate.count,
+      }
     } else {
       etaSpeeds.delete(u.id)
+      rateTrackers.delete(u.id)
     }
     if (u.chatTransfer) {
       const key = u.chatTransfer.id
@@ -927,7 +1094,10 @@ export const useStore = create<AppStore>((set, get) => ({
     } else if (!transferStart.has(u.id)) {
       transferStart.set(u.id, Date.now()) // fallback: first time we saw it
     }
-    if (u.state === 'completed' && u.bytesTotal > 0) {
+    // Only the FIRST completion times the transfer: a later emit on the same
+    // card (a verify report, say) would otherwise restart the clock and show a
+    // one-millisecond "average speed".
+    if (u.state === 'completed' && u.bytesTotal > 0 && !get().transferSummaries[u.id]) {
       const start = transferStart.get(u.id)
       if (start) {
         const durationMs = Math.max(1, Date.now() - start)
@@ -952,20 +1122,37 @@ export const useStore = create<AppStore>((set, get) => ({
         }
       }
     }
-    set((s) => ({
-      transfers: { ...s.transfers, [u.id]: u },
-      order: s.order.includes(u.id) ? s.order : [...s.order, u.id],
-    }))
+    // A paused card has to outlive the app run — mirror it to storage, and drop
+    // the mirror the moment the same transfer moves on (resumed, canceled, done).
+    if (u.state === 'paused' && u.direction === 'send') {
+      savePausedTransfer(u)
+      // A resume is a NEW transfer id, so this one's timer will never be read.
+      transferStart.delete(u.id)
+    } else if (prev?.state === 'paused') clearPausedTransfer(u.id)
+    set((s) => {
+      const transferRates = { ...s.transferRates }
+      if (rates) transferRates[u.id] = rates
+      else delete transferRates[u.id]
+      return {
+        transfers: { ...s.transfers, [u.id]: u },
+        order: s.order.includes(u.id) ? s.order : [...s.order, u.id],
+        transferRates,
+      }
+    })
   },
 
   removeTransfer: (id) => {
     // Dismissing the transfer list card must not disable Retry in its chat card.
     // The shared retry cache is already bounded to 50 payloads.
     if (!Object.values(get().chatTransfers).some((t) => t.id === id)) deleteRetryPayload(id)
+    clearPausedTransfer(id)
+    rateTrackers.delete(id)
     set((s) => {
       const next = { ...s.transfers }
       delete next[id]
-      return { transfers: next, order: s.order.filter((x) => x !== id) }
+      const transferRates = { ...s.transferRates }
+      delete transferRates[id]
+      return { transfers: next, order: s.order.filter((x) => x !== id), transferRates }
     })
   },
 
@@ -973,8 +1160,9 @@ export const useStore = create<AppStore>((set, get) => ({
     const payload = loadRetryPayloads()[id]
     if (!payload) return
     const t = get().transfers[id]
-    // Only retry a card that actually failed — never re-send an in-flight one.
-    if (t && t.state !== 'failed') return
+    // Only replay a card that actually stopped — a failure, or a pause the user is
+    // resuming. Never re-send an in-flight one.
+    if (t && t.state !== 'failed' && t.state !== 'paused') return
     if (payload.kind === 'location') {
       try {
         const next = await locationsApi.upload(payload.id, payload.locationId, payload.relPath, payload.paths)
@@ -1053,11 +1241,11 @@ export const useStore = create<AppStore>((set, get) => ({
     set((s) => ({
       friends, chatOverview,
       chats: Object.fromEntries(Object.entries(s.chats).filter(([id]) => ids.has(id))),
-      chatUnread: Object.fromEntries(Object.entries(s.chatUnread).filter(([id]) => ids.has(id))),
+      chatUnread: pruneChatUnread(s.chatUnread, ids),
       activeChatId: s.activeChatId && ids.has(s.activeChatId) ? s.activeChatId : null,
     }))
     void api.setActiveChat(get().activeChatId)
-    void api.setUnreadBadge(Object.values(get().chatUnread).reduce((a, b) => a + b, 0))
+    saveChatUnread(get().chatUnread)
     for (const f of friends) void get().probeFriend(f.id).catch(() => {})
   },
 
@@ -1129,12 +1317,17 @@ export const useStore = create<AppStore>((set, get) => ({
   // the read-receipts privacy toggle on the Rust side).
   markChatRead: (friendId) => {
     const s = get()
-    if (!s.windowFocused || s.view !== 'chat' || s.activeChatId !== friendId) return
-    if ((s.chatUnread[friendId] ?? 0) > 0) {
-      const chatUnread = { ...s.chatUnread, [friendId]: 0 }
-      set({ chatUnread })
-      void api.setUnreadBadge(Object.values(chatUnread).reduce((a, b) => a + b, 0))
+    // Two different questions, so two different gates (#27). CLEARING THE LOCAL
+    // BADGE only needs you to have explicitly opened this thread — the old shared
+    // guard also required window focus, so opening a conversation while the webview
+    // wasn't reporting focus (a focus event the OS swallowed, a detached/menu-bar
+    // window, a restored session) left "17 new" stuck forever.
+    if (s.view === 'chat' && s.activeChatId === friendId && (s.chatUnread[friendId] ?? 0) > 0) {
+      set({ chatUnread: saveChatUnread({ ...s.chatUnread, [friendId]: 0 }) })
     }
+    // TELLING THE FRIEND "I read it" keeps the stricter gate: a read receipt must
+    // mean the thread was genuinely on screen in a focused window.
+    if (!s.windowFocused || s.view !== 'chat' || s.activeChatId !== friendId) return
     const thread = s.chats[friendId] ?? []
     const newest = thread.reduce((ts, m) => m.fromMe ? ts : Math.max(ts, m.ts), 0)
     if (newest > 0) void api.sendReadReceipt(friendId, newest)
@@ -1278,10 +1471,7 @@ export const useStore = create<AppStore>((set, get) => ({
       } else if (inOpenThread && (s.chatUnread[m.peerId] ?? 0) > 0) {
         chatUnread = { ...s.chatUnread, [m.peerId]: 0 }
       }
-      if (chatUnread !== s.chatUnread) {
-        const total = Object.values(chatUnread).reduce((a, b) => a + b, 0)
-        void api.setUnreadBadge(total)
-      }
+      if (chatUnread !== s.chatUnread) saveChatUnread(chatUnread)
       return { chats: { ...s.chats, [m.peerId]: nextThread }, chatOverview, chatUnread }
     })
   },

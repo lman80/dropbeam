@@ -13,6 +13,9 @@ import {
   Copy,
   FolderOpen,
   Loader2,
+  Pause,
+  PauseCircle,
+  Play,
   RotateCw,
   Send,
   X,
@@ -43,6 +46,11 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   const respondToOffer = useStore((s) => s.respondToOffer)
   const toast = useStore((s) => s.toast)
   const summary = useStore((s) => s.transferSummaries[t.id])
+  const rates = useStore((s) => s.transferRates[t.id])
+  const speedMode = useStore((s) => s.speedMode)
+  const etaMode = useStore((s) => s.etaMode)
+  const toggleSpeedMode = useStore((s) => s.toggleSpeedMode)
+  const toggleEtaMode = useStore((s) => s.toggleEtaMode)
   const [copied, setCopied] = useState(false)
 
   const active = isActive(t.state)
@@ -53,6 +61,14 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
     (t.state === 'waitingForPeer' || t.state === 'starting') &&
     !!t.code &&
     !t.friendName
+  // Pause is for SENDS we're driving: stopping keeps every byte already delivered,
+  // so you can leave the network now and finish later from the same card.
+  const canPause =
+    t.direction === 'send' &&
+    (t.state === 'starting' ||
+      t.state === 'waitingForPeer' ||
+      t.state === 'connecting' ||
+      t.state === 'transferring')
   const isFriendPending =
     t.direction === 'send' &&
     !!t.friendName &&
@@ -70,6 +86,35 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   }
 
   const DirIcon = t.direction === 'send' ? Send : ArrowDownToLine
+
+  // By default the SPEED is live (what the link is doing right now) and the TIME
+  // LEFT is based on the whole-transfer average (which doesn't swing with every
+  // hiccup). Clicking either swaps its basis; both choices are global and stick.
+  const engineBps = t.speedBps > 0 ? t.speedBps : null
+  const shownBps =
+    (speedMode === 'live' ? rates?.liveBps ?? rates?.avgBps : rates?.avgBps ?? rates?.liveBps) ??
+    engineBps
+  const shownEta =
+    (etaMode === 'avg' ? rates?.avgEta ?? rates?.liveEta : rates?.liveEta ?? rates?.avgEta) ??
+    t.etaSeconds
+  // Neither figure blinks between frames: the live rate holds its last reading
+  // across a frame it can't measure, and a stall is named rather than shown as a
+  // dash. Only the first few seconds say "calculating…".
+  const settling = (rates?.ageMs ?? 0) < 3000
+  const speedText =
+    shownBps == null
+      ? settling
+        ? 'calculating…'
+        : '—'
+      : shownBps > 0
+        ? `${formatSpeed(shownBps)} ${speedMode}`
+        : 'stalled'
+  const etaText =
+    shownEta == null
+      ? settling
+        ? 'calculating…'
+        : '— left'
+      : `${formatEta(shownEta)} left · ${etaMode}`
 
   if (MOBILE_UI) {
     const route = t.connDetail?.path === 'relay' || t.locality === 'internet' ? 'Relay' : t.connDetail?.path === 'direct' || t.connDetail?.path === 'local' || t.locality === 'direct' || t.locality === 'local' ? 'Direct' : ''
@@ -91,7 +136,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
       </div>
       {t.state === 'completed' ? <p className="ios-footnote">{t.direction === 'send' ? 'Delivered' : 'Saved'}{route && ` · ${route}`} · {verified}</p> : <>
         <div className="mobile-progress" role="progressbar" aria-label="Transfer progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(t.percent)}><span style={{ width: `${Math.max(0, Math.min(100, t.percent))}%` }} /></div>
-        <div className="mobile-transfer-stats ios-footnote"><span>{formatBytesLive(t.bytesDone)} of {formatBytesLive(t.bytesTotal)} · {formatSpeed(t.speedBps)}</span><span>{formatEta(t.etaSeconds)}</span></div>
+        <div className="mobile-transfer-stats ios-footnote"><button className="xfer-meter" onClick={toggleSpeedMode}>{formatBytesLive(t.bytesDone)} of {formatBytesLive(t.bytesTotal)} · {speedText}</button><button className="xfer-meter" onClick={toggleEtaMode}>{etaText}</button></div>
         <div className="mobile-transfer-badges">{route && <span className="glass glass-pill">{route}</span>}{verified === 'Verified' && <span className="glass glass-pill">Verified</span>}</div>
         {t.state !== 'transferring' && <p className="ios-footnote">{t.error ?? t.detail ?? statusLabel(t)}</p>}
       </>}
@@ -129,6 +174,8 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             <CheckCircle2 size={17} />
           ) : t.state === 'failed' ? (
             <AlertCircle size={17} />
+          ) : t.state === 'paused' ? (
+            <PauseCircle size={17} />
           ) : (
             <DirIcon size={16} />
           )}
@@ -147,7 +194,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             {title(t)}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 3 }}>
-            <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>{statusLabel(t)}</span>
+            <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>{statusLabel(t)}{t.locationSkipped ? ` · ${t.locationSkipped} ${t.locationSkipped === 1 ? 'file' : 'files'} already there` : ''}{t.locationConflicts ? ` · ${t.locationConflicts} ${t.locationConflicts === 1 ? 'file' : 'files'} already existed with different content — saved next to them as ‘… (2)’` : ''}{t.locationReplaced ? ` · ${t.locationReplaced} ${t.locationReplaced === 1 ? 'file' : 'files'} updated — the older version is in the folder’s Trash` : ''}</span>
             {t.connDetail ? (
               <ConnInspector detail={t.connDetail} compact />
             ) : (
@@ -155,6 +202,15 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             )}
           </div>
         </div>
+        {canPause && (
+          <button
+            className="icon-btn"
+            title="Pause — keeps what's already been sent"
+            onClick={() => void api.pauseTransfer(t.id)}
+          >
+            <Pause size={15} />
+          </button>
+        )}
         <button
           className="icon-btn"
           title={isOffer ? 'Decline' : active ? 'Cancel' : 'Dismiss'}
@@ -313,17 +369,29 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             </span>
           </div>
           <ProgressBar percent={t.percent} />
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              marginTop: 6,
-              fontSize: 'calc(12px * var(--ui-font-scale, 1))',
-              color: 'var(--text-muted)',
-            }}
-          >
-            <span>{formatSpeed(t.speedBps)}</span>
-            <span>{formatEta(t.etaSeconds)} left</span>
+          <div className="xfer-meters">
+            <button
+              className="xfer-meter"
+              onClick={toggleSpeedMode}
+              title={
+                speedMode === 'live'
+                  ? 'Speed over the last few seconds — click for the whole-transfer average'
+                  : 'Average speed for the whole transfer — click for the live rate'
+              }
+            >
+              {speedText}
+            </button>
+            <button
+              className="xfer-meter"
+              onClick={toggleEtaMode}
+              title={
+                etaMode === 'avg'
+                  ? 'Based on the whole-transfer average — click to base it on the live rate'
+                  : 'Based on the live rate — click to base it on the whole-transfer average'
+              }
+            >
+              {etaText}
+            </button>
           </div>
         </div>
       )}
@@ -396,20 +464,121 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                 // folder"); multiple → just open the folder. Match the folder's own
                 // path separator so it works on Windows + macOS.
                 const sep = t.outDir!.includes('\\') ? '\\' : '/'
-                if (t.fileNames.length === 1) {
+                // A folder card carries ONE display name standing for many files
+                // (fileCount), so only a genuinely single-file card reveals a file.
+                if (t.fileCount === 1 && t.fileNames.length === 1) {
                   api.revealPath(`${t.outDir}${sep}${t.fileNames[0]}`).catch(() => {})
                 } else {
                   api.openPath(t.outDir!).catch(() => {})
                 }
               }}
             >
-              <FolderOpen size={15} /> {t.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
+              <FolderOpen size={15} />{' '}
+              {t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
             </button>
           )}
         </div>
       )}
 
       <IntegrityDetails rows={t.integrity} total={t.bytesTotal} completed={t.state === 'completed'} />
+
+      {/* Verify copy: a full SHA-256 comparison of every file in this send against
+          the copy that actually landed on the peer. Only a finished SEND has both
+          sides to compare, and the peer reads at its own pace (a NAS manages
+          ~10 MB/s), so a big folder shows live progress and can be canceled. */}
+      {t.direction === 'send' && t.state === 'completed' && (
+        <div style={{ marginTop: 10 }}>
+          {t.verify?.state === 'running' ? (
+            <>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'baseline',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                  marginBottom: 6,
+                }}
+              >
+                <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
+                  Verifying… {t.verify.checked.toLocaleString()} /{' '}
+                  {t.verify.total.toLocaleString()} files
+                  {t.verify.bytesTotal > 0
+                    ? ` · ${formatBytes(t.verify.bytesHashed)} / ${formatBytes(t.verify.bytesTotal)}`
+                    : ''}
+                </span>
+                <button
+                  className="btn btn-ghost"
+                  style={{ padding: '2px 8px', fontSize: 12.5, flexShrink: 0 }}
+                  onClick={() => void api.cancelVerify(t.id)}
+                >
+                  Cancel
+                </button>
+              </div>
+              <ProgressBar
+                percent={
+                  t.verify.bytesTotal > 0
+                    ? (t.verify.bytesHashed / t.verify.bytesTotal) * 100
+                    : 0
+                }
+              />
+            </>
+          ) : t.verify?.state === 'done' &&
+            t.verify.mismatched.length + t.verify.missing.length === 0 ? (
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--green)' }}
+            >
+              <CheckCircle2 size={15} /> All {t.verify.total.toLocaleString()} files identical
+            </div>
+          ) : t.verify?.state === 'done' ? (
+            <details>
+              <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--red)' }}>
+                {(t.verify.mismatched.length + t.verify.missing.length).toLocaleString()} of{' '}
+                {t.verify.total.toLocaleString()} files don’t match
+              </summary>
+              <div
+                className="selectable"
+                style={{
+                  marginTop: 6,
+                  maxHeight: 150,
+                  overflowY: 'auto',
+                  fontSize: 12,
+                  color: 'var(--text-muted)',
+                  lineHeight: 1.5,
+                }}
+              >
+                {t.verify.mismatched.map((name) => (
+                  <div key={`different:${name}`}>Different: {name}</div>
+                ))}
+                {t.verify.missing.map((name) => (
+                  <div key={`missing:${name}`}>Missing: {name}</div>
+                ))}
+              </div>
+            </details>
+          ) : (
+            <>
+              {t.verify?.state === 'failed' && (
+                <div style={{ fontSize: 12.5, color: 'var(--red)', marginBottom: 8, lineHeight: 1.45 }}>
+                  {t.verify.error ?? 'Could not verify the copy.'}
+                </div>
+              )}
+              {t.verify?.state === 'canceled' && (
+                <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 8 }}>
+                  Verification canceled.
+                </div>
+              )}
+              <button
+                className="btn btn-ghost"
+                style={{ width: '100%' }}
+                onClick={() => {
+                  void api.verifyTransfer(t.id).catch((e) => toast('error', String(e)))
+                }}
+              >
+                <Check size={15} /> Verify copy
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       {/* failed */}
       {t.state === 'failed' && (
@@ -440,6 +609,48 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
         </div>
       )}
 
+      {/* paused: how far it got + one-tap Resume (replays the same send; everything
+          already delivered is skipped). Cancel/Dismiss stays in the header. */}
+      {t.state === 'paused' && (
+        <div style={{ marginTop: 12 }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              fontSize: 13,
+              color: 'var(--text-muted)',
+              background: 'var(--surface-2)',
+              borderRadius: 11,
+              padding: '10px 12px',
+              lineHeight: 1.45,
+            }}
+          >
+            <PauseCircle size={15} style={{ flexShrink: 0 }} />
+            <span>
+              {t.detail ?? 'Paused — resume any time'}
+              {t.bytesTotal > 0
+                ? ` · ${formatBytes(t.bytesDone)} of ${formatBytes(t.bytesTotal)} done`
+                : ''}
+            </span>
+          </div>
+          {t.bytesTotal > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <ProgressBar percent={t.percent} />
+            </div>
+          )}
+          {t.direction === 'send' && (
+            <button
+              className="btn btn-ghost"
+              style={{ marginTop: 10, width: '100%' }}
+              onClick={() => void retryTransfer(t.id)}
+            >
+              <Play size={15} /> Resume
+            </button>
+          )}
+        </div>
+      )}
+
       {t.state === 'canceled' && (
         <div style={{ marginTop: 12, fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
           Transfer canceled.
@@ -453,6 +664,7 @@ function stateColor(t: TransferUpdate): string {
   if (t.state === 'completed') return 'var(--green)'
   if (t.state === 'failed') return 'var(--red)'
   if (t.state === 'canceled') return 'var(--text-faint)'
+  if (t.state === 'paused') return 'var(--text-muted)'
   return 'var(--accent)'
 }
 
@@ -476,5 +688,7 @@ function statusLabel(t: TransferUpdate): string {
       return 'Failed'
     case 'canceled':
       return !send && fn ? 'Declined' : 'Canceled'
+    case 'paused':
+      return fn ? `Paused — sending to ${fn}` : 'Paused'
   }
 }

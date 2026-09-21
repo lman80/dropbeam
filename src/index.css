@@ -756,7 +756,10 @@ html.overlay-window #root {
   font-size: calc(13.5px * var(--ui-font-scale, 1));
   line-height: 1.45;
   /* On a computer you copy text out of messages all the time (GitHub #26). The
-     app root sets user-select:none; opt message text back in. */
+     app root sets user-select:none; opt message text back in. The -webkit- prefix
+     is not optional: the macOS WKWebView only honors the unprefixed property from
+     Safari 17.4, so without it a bubble stays dead to the cursor on older Macs. */
+  -webkit-user-select: text;
   user-select: text;
   cursor: text;
 }
@@ -764,6 +767,7 @@ html.overlay-window #root {
    keep them non-selectable so a drag is a click, not a text selection. */
 .chat-bubble.media,
 .chat-bubble.deleted {
+  -webkit-user-select: none;
   user-select: none;
   cursor: pointer;
 }
@@ -1187,6 +1191,11 @@ html.overlay-window #root {
   padding: 4px;
   min-width: 132px;
 }
+/* Flipped below the bubble when the thread's top edge would clip it (#26). */
+.chat-menu.down {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
 .chat-menu button {
   display: flex;
   align-items: center;
@@ -1267,6 +1276,10 @@ html.overlay-window #root {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 320px;
+  /* A reply quote is message text too — copyable for the same reason (#26). */
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
 }
 
 /* "new messages" pill */
@@ -1662,7 +1675,7 @@ html.overlay-window #root {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 4px 16px 14px;
+  padding: 2px 12px 10px;
   background: var(--surface);
   color: var(--text);
 }
@@ -1753,8 +1766,8 @@ html.overlay-window #root {
   margin-bottom: 8px;
 }
 .rc-page {
-  width: 64px;
-  height: 82px;
+  width: 52px;
+  height: 66px;
   border-radius: 10px;
   background: #fff;
   color: #8a8f98;
@@ -1816,7 +1829,12 @@ html.overlay-window #root {
   font-weight: 650;
   text-align: center;
   line-height: 1.3;
-  max-width: 100%;
+  /* Fixed width + centered: a long name is cut in the middle (in JS, so the
+     extension survives) and can never stretch the card off-centre. */
+  align-self: stretch;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   margin-top: 6px;
 }
 .rc-from {
@@ -1867,9 +1885,14 @@ html.overlay-window #root {
   border-bottom-left-radius: 3px;
 }
 .rc-status {
-  margin-top: 10px;
-  font-size: calc(12px * var(--ui-font-scale, 1));
+  align-self: stretch;
+  margin-top: 8px;
+  font-size: calc(11.5px * var(--ui-font-scale, 1));
   font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text-muted);
 }
 .rc-done {
@@ -2179,6 +2202,34 @@ html.mobile .chat-input { font-size: 16px; }
   padding-top: 12px;
   background: var(--surface);
   z-index: 1;
+}
+
+/* Transfer card meters: the speed and the time left are BUTTONS — clicking the
+   speed swaps live ↔ average, clicking the time swaps which rate it is based on
+   (both choices are global and remembered). */
+.xfer-meters {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 6px;
+}
+.xfer-meter {
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-radius: 7px;
+  padding: 2px 5px;
+  margin: -2px -5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.xfer-meter:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
 }
 
 /* Legacy mobile controls; Slice A typography lives in mobile.css. */

@@ -26,11 +26,19 @@ import { MobileHeader } from '../components/MobileHeader'
 import { createPortal } from 'react-dom'
 import { ConnInspector } from '../components/ConnInspector'
 import { avatarGradient, initials } from '../lib/avatar'
-import { friendPresence, presenceLabel } from '../lib/presence'
+import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/presence'
 
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
   const [adding, setAdding] = useState(false)
+
+  // #34: presence must recover without a restart. Opening Friends actively
+  // re-checks everyone who doesn't already read as online, instead of waiting
+  // out the control beacon's 60/120/300 s backoff.
+  useEffect(() => {
+    const s = useStore.getState()
+    for (const id of claimPresenceChecks(s.friends, s.friendSeen, s.folderStatuses)) void s.pingFriend(id)
+  }, [])
 
   if (MOBILE_UI) return <div className="mobile-page mobile-friends">
     <MobileHeader title="Friends" actions={<button className="ios-icon glass glass-pill" aria-label="Add friend" onClick={() => setAdding(true)}><Plus size={22} /></button>} />

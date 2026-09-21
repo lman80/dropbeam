@@ -243,7 +243,7 @@ mod tests {
             let partial = parent.join(".dropbeam-partial-test.part");
             let file = File::create(&partial).unwrap();
             file.set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(PARTIAL_TTL_SECS + 1))).unwrap();
-            super::super::gc_stale_partials_at(parent, None, &config);
+            super::super::gc_stale_partials_at(parent, &config);
             assert_eq!(IrohState::default().clear_transfer_cache(&config), 0);
             assert!(path.exists()); assert!(partial.exists()); assert!(sidecar(&path).exists());
         }

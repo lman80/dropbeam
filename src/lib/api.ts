@@ -4,7 +4,8 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { mockApi, mockListen } from './mock'
+import { mockApi, mockListen, mockSharedLocations, mockSyncedFolders } from './mock'
+import { normalizeSharedLocations } from './normalize'
 import { MOBILE_UI } from './platform'
 import { pickMobileFiles } from '../components/MobileFileSheet'
 
@@ -27,6 +28,8 @@ export type TransferState =
   | 'completed'
   | 'failed'
   | 'canceled'
+  /** Stopped by the user, everything already transferred kept — Resume replays it. */
+  | 'paused'
 export type Locality = 'unknown' | 'local' | 'direct' | 'internet'
 
 /** Live detail of how two peers are connected — the connection inspector data. */
@@ -52,7 +55,32 @@ export interface FileIntegrity {
   verified: boolean
 }
 
+/** The last "Verify copy" run on a completed send: a full SHA-256 comparison of
+ *  every file against the copy that landed on the peer. */
+export interface VerifyReport {
+  state: 'running' | 'done' | 'failed' | 'canceled'
+  /** Files whose verdict is settled so far. */
+  checked: number
+  total: number
+  /** Bytes hashed, averaged across the two devices (both read every byte). */
+  bytesHashed: number
+  bytesTotal: number
+  mismatched: string[]
+  missing: string[]
+  error: string | null
+}
+
 export interface TransferUpdate {
+  locationSkipped?: number | null
+  locationConflicts?: number | null
+  /** Files the host published AT their name for a continuously synced folder,
+   *  moving the previous version into that location's recoverable trash. */
+  locationReplaced?: number | null
+  /** On the FIRST update of an incoming Location upload: which hosted folder it
+   *  is landing in. Later progress updates omit it, so consumers remember it. */
+  locationId?: string | null
+  /** Result (or live progress) of "Verify copy" on this card. */
+  verify?: VerifyReport | null
   integrity?: FileIntegrity[]
   chatTransfer?: {
     id: string
@@ -370,6 +398,15 @@ const realApi = {
   irohReceive: (ticket: string) => invoke<TransferUpdate>('iroh_receive', { ticket }),
   irohSelftest: () => invoke<string>('iroh_selftest'),
   cancelTransfer: (id: string) => invoke<void>('cancel_transfer', { id }),
+  /** Stop a send but keep its progress — the card flips to Paused and offers Resume. */
+  pauseTransfer: (id: string) => invoke<void>('pause_transfer', { id }),
+
+  /** Re-check a completed send: hash every file here and on the peer, then
+   *  compare. Progress and the verdict arrive on the transfer's own card. */
+  verifyTransfer: (id: string) => invoke<void>('verify_transfer', { id }),
+
+  /** Stop a running "Verify copy". */
+  cancelVerify: (id: string) => invoke<void>('cancel_verify', { id }),
   /** Write a line into the native app log file (for diagnosing remote issues). */
   frontendLog: (msg: string) => invoke<void>('frontend_log', { msg }),
   /** A file the app was launched to send (Windows "Send with DropBeam"). */
@@ -694,21 +731,81 @@ export function isActive(state: TransferState): boolean {
 
 export interface LocationRights { upload: boolean; manage: boolean }
 export interface HostedLocation { id: string; name: string; path: string; friendIds: string[]; rights: LocationRights; byteCap?: number; device?: number; marker?: string; safePublish?: string }
-export interface SharedLocation { id: string; name: string; rights: LocationRights }
+/** A folder a FRIEND hosts, as their `locations.list` describes it. `reachable`
+ *  and the two byte counts are additive: a host that predates them sends
+ *  neither, and the card simply doesn't show how much room is left. */
+export interface SharedLocation { id: string; name: string; rights: LocationRights; reachable?: boolean; freeBytes?: number | null; totalBytes?: number | null }
+/** Who last used a folder THIS device hosts — the gateway card's "last activity". */
+export interface LocationLastActivity { at: number; friendId: string; direction: string; bytes: number }
+/** Live state of a folder this device hosts: mount reachable, room left, marker intact. */
+export interface HostedLocationStatus { id: string; reachable: boolean; freeBytes: number; markerOk: boolean; error: string | null; lastActivity: LocationLastActivity | null }
+/** A mount this device can already see — offered as a one-click choice when
+ *  adding a location. `kind` is 'network' (a NAS) or 'removable' (a disk). */
+export interface MountCandidate { label: string; path: string; fstype: string; kind: string; freeBytes?: number | null; totalBytes?: number | null }
 export interface LocationEntry { name: string; isDir: boolean; size: number; modified: number }
 export interface LocationPage { entries: LocationEntry[]; page?: number; hasMore: boolean; cursor?: string; nextCursor?: string; total?: number }
 export const locationsApi = {
   activity: () => HAS_TAURI ? invoke<LocationActivity[]>('location_activity') : Promise.resolve([]),
   listHosted: () => HAS_TAURI ? invoke<HostedLocation[]>('list_locations') : Promise.resolve([]),
+  hostedStatus: (id: string) => invoke<HostedLocationStatus>('hosted_location_status', { id }),
   save: (location: HostedLocation) => invoke<HostedLocation[]>('save_location', { location, removeId: null }),
   remove: (removeId: string) => invoke<HostedLocation[]>('save_location', { location: null, removeId }),
   request: <T,>(friendId: string, request: Record<string, unknown>) => invoke<T>('location_request', { friendId, request }),
   list: (friendId: string) => HAS_TAURI
-    ? invoke<SharedLocation[]>('location_request', { friendId, request: { kind: 'locations.list' } })
-    : Promise.resolve([]),
-  upload: (friendId: string, locationId: string, relPath: string, paths: string[]) =>
-    invoke<TransferUpdate>('upload_to_location', { friendId, target: { location_id: locationId, rel_path: relPath }, paths }),
+    ? invoke<unknown[]>('location_request', { friendId, request: { kind: 'locations.list' } }).then(normalizeSharedLocations)
+    : mockSharedLocations(friendId),
+  /** The wizard's first step: NAS shares and external disks this device can see. */
+  mountCandidates: () => HAS_TAURI ? invoke<MountCandidate[]>('list_mount_candidates') : Promise.resolve([]),
+  upload: (friendId: string, locationId: string, relPath: string, paths: string[], replaceExisting = false) =>
+    invoke<TransferUpdate>('upload_to_location', { friendId, target: { location_id: locationId, rel_path: relPath }, paths, replaceExisting }),
 }
+
+// ── Synced folders: a folder on THIS device copied into a friend's location ──
+/** What the last check did, in words the card can show as-is. */
+export interface SyncedFolderResult { ok: boolean; message: string }
+export interface SyncedFolder {
+  id: string
+  friendId: string
+  locationId: string
+  /** Folder INSIDE the location the files land in ('' = its top level). */
+  relPath: string
+  localPath: string
+  enabled: boolean
+  /** Off by default: deleting a file here leaves the copy on the NAS alone. */
+  deleteRemote: boolean
+  createdAt: number
+  lastCheckAt: number
+  lastResult: SyncedFolderResult | null
+}
+export type SyncedFolderState = 'idle' | 'scanning' | 'uploading' | 'waiting' | 'paused' | 'error'
+export interface SyncedFolderStatus {
+  id: string
+  state: SyncedFolderState
+  pendingFiles: number
+  lastCheckAt: number
+  message: string
+  transferId: string | null
+}
+export const syncedFoldersApi = {
+  list: () => HAS_TAURI ? invoke<SyncedFolder[]>('list_synced_folders') : mockSyncedFolders.list(),
+  statuses: () => HAS_TAURI ? invoke<Record<string, SyncedFolderStatus>>('synced_folder_statuses') : mockSyncedFolders.statuses(),
+  add: (friendId: string, locationId: string, relPath: string, localPath: string, deleteRemote: boolean) =>
+    HAS_TAURI
+      ? invoke<SyncedFolder[]>('add_synced_folder', { friendId, locationId, relPath, localPath, deleteRemote })
+      : mockSyncedFolders.add(friendId, locationId, relPath, localPath, deleteRemote),
+  update: (id: string, changes: { enabled?: boolean; deleteRemote?: boolean }) =>
+    HAS_TAURI
+      ? invoke<SyncedFolder[]>('update_synced_folder', { id, enabled: changes.enabled ?? null, deleteRemote: changes.deleteRemote ?? null })
+      : mockSyncedFolders.update(id, changes),
+  /** Stops copying. Never touches the local folder or anything already on the NAS. */
+  remove: (id: string) => HAS_TAURI ? invoke<SyncedFolder[]>('remove_synced_folder', { id }) : mockSyncedFolders.remove(id),
+  syncNow: (id: string) => HAS_TAURI ? invoke<void>('sync_folder_now', { id }) : mockSyncedFolders.syncNow(id),
+}
+export function onSyncedFolderStatus(cb: (s: SyncedFolderStatus) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('location-sync://status', (p) => cb(p as SyncedFolderStatus))
+  return listen<SyncedFolderStatus>('location-sync://status', (e) => cb(e.payload))
+}
+
 export interface LocationActivity { friendId: string; locationId: string; operation: string; item: string; to?: string; at: number }
 export function onLocationActivity(cb: (activity: LocationActivity) => void): Promise<UnlistenFn> {
   return HAS_TAURI ? listen<LocationActivity>('locations://changed', e => { if (e.payload?.operation) cb(e.payload) }) : Promise.resolve(() => {})
