@@ -121,7 +121,7 @@ libc = "0.2"
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["block2"] }
-objc2-ui-kit = { version = "0.3", default-features = false, features = ["UIDevice"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["UIDevice", "UIGeometry", "objc2-core-foundation"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

@@ -6,6 +6,7 @@ import { api, onFileDrop } from './lib/api'
 import { setTaskbarProgress } from './lib/taskbar'
 import { useStore } from './store'
 import { MOBILE_UI } from './lib/platform'
+import { installNativeTabBar } from './lib/nativeTabBar'
 import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
 import { MobileTabBar } from './components/MobileTabBar'
@@ -23,11 +24,16 @@ import { FriendsView } from './views/FriendsView'
 import { ChatView } from './views/ChatView'
 
 export default function App() {
+  const nativeTabBar = useStore((s) => s.nativeTabBar)
   const ready = useStore((s) => s.ready)
   const view = useStore((s) => s.view)
   const init = useStore((s) => s.init)
   const setPendingSend = useStore((s) => s.setPendingSend)
   const setDragHovering = useStore((s) => s.setDragHovering)
+
+  useEffect(() => {
+    if (MOBILE_UI) void installNativeTabBar()
+  }, [])
 
   useLayoutEffect(() => {
     if (!MOBILE_UI) return
@@ -185,7 +191,7 @@ export default function App() {
           </ErrorBoundary>
         </main>
       </div>
-      {MOBILE_UI && (
+      {MOBILE_UI && !nativeTabBar && (
         <ErrorBoundary region="mobile navigation">
           <MobileTabBar />
         </ErrorBoundary>

@@ -190,6 +190,7 @@ export interface Toast {
 interface AppStore {
   ready: boolean
   view: View
+  nativeTabBar: boolean
   settings: Settings | null
   chatTransfers: Record<string, TransferUpdate>
   transfers: Record<string, TransferUpdate>
@@ -516,6 +517,7 @@ const restoredPaused = loadPausedTransfers()
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
   view: 'send',
+  nativeTabBar: false,
   settings: null,
   chatTransfers: loadChatTransfers(),
   // Paused sends come back exactly where they stopped, Resume button and all.

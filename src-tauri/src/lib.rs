@@ -5,6 +5,8 @@ mod chat;
 mod commands;
 #[cfg(target_os = "ios")]
 mod ios_media;
+#[cfg(target_os = "ios")]
+mod ios_tabbar;
 mod download_progress;
 mod file_protocol;
 mod folder_history;
@@ -716,6 +718,14 @@ pub fn run() {
             ios_media::pick_photos,
             #[cfg(target_os = "ios")]
             ios_media::share_files,
+            #[cfg(target_os = "ios")]
+            ios_tabbar::native_tabbar_install,
+            #[cfg(target_os = "ios")]
+            ios_tabbar::native_tabbar_select,
+            #[cfg(target_os = "ios")]
+            ios_tabbar::native_tabbar_badge,
+            #[cfg(target_os = "ios")]
+            ios_tabbar::native_tabbar_hidden,
             commands::pick_directory,
             commands::set_profile_avatar,
             commands::clear_profile_avatar,
