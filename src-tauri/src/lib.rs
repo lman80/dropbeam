@@ -1,4 +1,5 @@
 mod codes;
+mod link;
 mod location_sync;
 mod locations;
 mod chat;
@@ -194,6 +195,7 @@ fn set_popover_rows(rows: Vec<JsRowRect>) {
 
 /// Shared application state, managed by Tauri as `Arc<AppState>`.
 pub struct AppState {
+    pub pending_link: Mutex<Option<link::PendingLink>>,
     /// ~/Library/Application Support/com.dropbeam.app (or platform equivalent).
     pub config_dir: PathBuf,
     pub settings: Mutex<Settings>,
@@ -424,6 +426,10 @@ pub fn run() {
                 .unwrap_or_default();
             let default_name = default_display_name();
             let mut loaded = settings::load(&config_dir, &default_download, &default_name);
+            if loaded.device_kind.is_empty() {
+                loaded.device_kind = default_device_kind().into();
+                settings::save(&config_dir, &loaded).map_err(std::io::Error::other)?;
+            }
             // Sandbox container paths can change across iOS installs.
             #[cfg(target_os = "ios")]
             if loaded.download_dir != default_download {
@@ -486,6 +492,7 @@ pub fn run() {
             }
 
             app.manage(Arc::new(AppState {
+                pending_link: Mutex::new(None),
                 config_dir: config_dir.clone(),
                 settings: Mutex::new(loaded),
                 transfers: Mutex::new(HashMap::new()),
@@ -739,6 +746,10 @@ pub fn run() {
             commands::remove_pair,
             commands::set_member_role,
             commands::my_endpoint_id,
+            link::link_device_begin,
+            link::link_device_cancel,
+            link::link_device_send,
+            link::my_device_info,
             commands::verify_folders,
             commands::verify_folder,
             commands::stop_folder_transfer,
@@ -968,4 +979,32 @@ fn quit_app(app: &AppHandle) {
         state.force_quit.store(true, Ordering::SeqCst);
     }
     app.exit(0);
+}
+
+fn default_device_kind() -> &'static str {
+    #[cfg(target_os = "ios")]
+    return objc2::MainThreadMarker::new().map(|mtm| {
+        let device = objc2_ui_kit::UIDevice::currentDevice(mtm);
+        let idiom: isize = unsafe { objc2::msg_send![&*device, userInterfaceIdiom] };
+        if idiom == 1 { "tablet" } else { "phone" }
+    }).unwrap_or("phone");
+    #[cfg(target_os = "macos")]
+    return if std::process::Command::new("pmset").args(["-g", "batt"]).output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("InternalBattery")) { "laptop" } else { "desktop" };
+    #[cfg(target_os = "linux")]
+    return if std::fs::read_dir("/sys/class/power_supply").is_ok_and(|entries|
+        entries.flatten().any(|e| e.file_name().to_string_lossy().starts_with("BAT"))) { "laptop" } else { "desktop" };
+    #[cfg(target_os = "windows")]
+    {
+        // The existing windows dependency does not enable Win32_System_Power.
+        // Use its ABI types with the native API without changing Cargo features.
+        #[repr(C)]
+        struct Power { ac: u8, flag: u8, percent: u8, reserved: u8, life: u32, full: u32 }
+        #[link(name = "kernel32")]
+        extern "system" { fn GetSystemPowerStatus(status: *mut Power) -> i32; }
+        let mut p = Power { ac: 0, flag: 128, percent: 0, reserved: 0, life: 0, full: 0 };
+        return if unsafe { GetSystemPowerStatus(&mut p) } != 0 && p.flag != 128 { "laptop" } else { "desktop" };
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "linux", target_os = "windows")))]
+    "desktop"
 }

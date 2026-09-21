@@ -238,8 +238,14 @@ export interface HistoryItem {
   timestampMs: number
 }
 
+/** A successfully linked device; command and link wire fields use snake_case. */
+export interface LinkResult { endpoint_id: string; name: string; device_kind: string }
+export interface MyDeviceInfo extends LinkResult { account_pub: string; linked_devices: number }
+
 /** A named peer you can send to directly — no code, no QR. */
 export interface Friend {
+  deviceKind?: string | null
+  accountPub?: string | null
   id: string
   role: PairRole
   name: string
@@ -493,6 +499,10 @@ const realApi = {
     invoke<number>('clear_folder_history', { pairId }),
   /** Wipe recoverable copies across every shared folder. Returns bytes freed. */
   clearAllFolderHistory: () => invoke<number>('clear_all_folder_history'),
+  linkDeviceBegin: () => invoke<string>('link_device_begin'),
+  linkDeviceCancel: () => invoke<void>('link_device_cancel'),
+  linkDeviceSend: (code: string) => invoke<LinkResult>('link_device_send', { code }),
+  myDeviceInfo: () => invoke<MyDeviceInfo>('my_device_info'),
   // Friends — named peers you send to directly.
   createFriend: (friendName: string) =>
     invoke<{ friend: Friend; invite: string }>('create_friend', { friendName }),
@@ -575,7 +585,16 @@ const realApi = {
   setUnreadBadge: (count: number) => invoke<void>('set_unread_badge', { count }),
 }
 
-const backend: typeof realApi = HAS_TAURI ? realApi : (mockApi as typeof realApi)
+// Keep browser-only link placeholders in this bridge, within the backend slice.
+const backend: typeof realApi = HAS_TAURI ? realApi : ({
+  ...mockApi,
+  linkDeviceBegin: async () => 'dropbeamlink1:preview',
+  linkDeviceCancel: async () => {},
+  linkDeviceSend: async () => ({ endpoint_id: 'preview', name: 'My phone', device_kind: 'phone' }),
+  myDeviceInfo: async () => ({
+    endpoint_id: 'preview', name: 'My computer', device_kind: 'desktop', account_pub: '', linked_devices: 0,
+  }),
+} as typeof realApi)
 const mobilePick = () => pickMobileFiles({ photos: backend.pickPhotos, files: backend.pickFiles })
 export const api: typeof realApi = MOBILE_UI ? {
   ...backend,
@@ -674,7 +693,9 @@ export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {
 
 export function onFriendsChanged(cb: () => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('friends://changed', () => cb())
-  return listen('friends://changed', () => cb())
+  // reloadFriends also reloads the chat overview; history is fetched on openChat.
+  return Promise.all([listen('friends://changed', () => cb()), listen('chat://changed', () => cb())])
+    .then((stops) => () => stops.forEach((stop) => stop()))
 }
 
 /** A second launch (Windows "Send with DropBeam") forwarded a file to send. */

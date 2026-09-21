@@ -1328,7 +1328,7 @@ fn remember_conn_addrs(conn: &Connection) {
         }
     }
 }
-fn dial_addr(id: iroh::EndpointId) -> iroh::EndpointAddr {
+pub(crate) fn dial_addr(id: iroh::EndpointId) -> iroh::EndpointAddr {
     let mut map = peer_addrs().lock().unwrap();
     let entries = map.entry(id.to_string()).or_default();
     prune_peer_addrs(entries, peer_addr_now(), &LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner()));
@@ -1959,7 +1959,9 @@ async fn serve_stream(
 async fn serve_stream_inner(
     conn: &Connection, send: &mut SendStream, recv: &mut RecvStream, state: &IrohState,
 ) -> Result<()> {
-    let req = read_frame(recv).await?;
+    let linking = state.app.get().and_then(|a| a.try_state::<Arc<crate::AppState>>())
+        .is_some_and(|st| crate::link::pending_active(&st));
+    let req = tokio::time::timeout(Duration::from_secs(20), read_frame_cap(recv, if linking { crate::link::MAX_OFFER } else { MAX_HEADER })).await??;
     match req.get("kind").and_then(|k| k.as_str()) {
         Some("ping") => {
             write_frame(send, &serde_json::json!({ "kind": "pong", "locations_v": crate::locations::VERSION })).await?;
@@ -2816,6 +2818,10 @@ async fn serve_stream_inner(
                 }
             }
         }
+        Some("link-offer") => {
+            crate::link::serve(state, &conn.remote_id().to_string(), &req, send).await?;
+        }
+        Some("link-ok" | "link-error") => {}
         Some("friend-hello") => {
             // A peer is introducing themselves: learn their stable EndpointId +
             // name. `friend_id` (if present) matches the classic invite flow;
@@ -2829,6 +2835,7 @@ async fn serve_stream_inner(
             if let Some(app) = state.app.get() {
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
                     crate::friends::apply_hello(&st.config_dir, friend_id, &who, name);
+                    crate::friends::apply_device_hello(&st.config_dir, &who, &req);
                     // Cache their profile picture (if they sent one) and point the
                     // friend record at it.
                     if let Some(b64) = avatar_b64 {
@@ -4735,10 +4742,11 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
     let addr = dial_addr(parsed);
     let avatar = state.app.get().and_then(my_avatar_thumb_b64);
     tauri::async_runtime::spawn(async move {
-        let hello = serde_json::json!({
+        let mut hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": friend_id, "endpoint_id": my_id, "name": my_name,
             "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_changed": true,
         });
+        hello.as_object_mut().unwrap().extend(crate::link::profile(&state, &my_id).as_object().unwrap().clone());
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
         {
@@ -4768,10 +4776,11 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
     let addr = dial_addr(parsed);
     let avatar = state.app.get().and_then(my_avatar_thumb_b64);
     tauri::async_runtime::spawn(async move {
-        let hello = serde_json::json!({
+        let mut hello = serde_json::json!({
             "kind": "friend-hello", "friend_id": "", "endpoint_id": my_id, "name": my_name,
             "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_changed": true,
         });
+        hello.as_object_mut().unwrap().extend(crate::link::profile(&state, &my_id).as_object().unwrap().clone());
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
         {

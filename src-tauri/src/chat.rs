@@ -800,3 +800,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Merge an authenticated link snapshot using merge_threads' id dedup and cap.
+pub(crate) fn import_link_thread(config_dir: &Path, peer: &str, messages: Vec<ChatMessage>) {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let dest = all.entry(peer.to_owned()).or_default();
+    for mut m in messages {
+        if dest.iter().any(|x| x.id == m.id) { continue; }
+        m.peer_id = peer.to_owned();
+        m.path = None;
+        dest.push(m);
+    }
+    dest.sort_by_key(order_key);
+    if dest.len() > MAX_PER_PEER { dest.drain(..dest.len() - MAX_PER_PEER); }
+    save_all(config_dir, all);
+}

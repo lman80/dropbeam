@@ -84,6 +84,7 @@ pub fn update_settings(
     // unbounded name would bloat the control frame and could push past its header
     // limit. 64 chars is ample for a name.
     let mut settings = settings;
+    settings.device_kind = state.settings.lock().unwrap().device_kind.clone();
     settings.display_name = settings.display_name.trim().chars().take(64).collect();
 
     // Persist FIRST. If the disk write fails (e.g. Windows write contention), return
