@@ -65,7 +65,7 @@ struct ChatAttachment: View {
             }
             .fullScreenCover(isPresented: $viewer) {
                 if let path {
-                    ChatMediaViewer(path: path, name: name, video: isVideo).environmentObject(bridge)
+                    MediaViewer(path: path, name: name, video: isVideo).environmentObject(bridge)
                 }
             }
             .confirmationDialog("Files", isPresented: $choosingFile, titleVisibility: .visible) {
@@ -114,7 +114,7 @@ struct ChatAttachment: View {
     }
 }
 
-private struct ChatMediaViewer: View {
+struct MediaViewer: View {
     @EnvironmentObject private var bridge: Bridge
     @Environment(\.dismiss) private var dismiss
     let path: String
@@ -124,8 +124,8 @@ private struct ChatMediaViewer: View {
     var body: some View {
         NavigationStack {
             Group {
-                if video { VideoPlayer(player: player) }
-                else { ZoomableChatImage(path: path) }
+                if video { NativeVideoPlayer(player: player) }
+                else { ImageViewer(path: path) }
             }
             .background(.black).navigationTitle(name).navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -142,7 +142,7 @@ private struct ChatMediaViewer: View {
     }
 }
 
-private struct ZoomableChatImage: UIViewRepresentable {
+struct ImageViewer: UIViewRepresentable {
     let path: String
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeUIView(context: Context) -> UIScrollView {
@@ -173,5 +173,24 @@ private struct ZoomableChatImage: UIViewRepresentable {
                 contentSize = bounds.size
             }
         }
+    }
+}
+
+struct NativeVideoPlayer: UIViewControllerRepresentable {
+    let player: AVPlayer?
+    func makeUIViewController(context: Context) -> AVPlayerViewController { let controller = AVPlayerViewController(); controller.player = player; return controller }
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) { controller.player = player }
+    static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator: ()) { controller.player?.pause(); controller.player = nil }
+}
+struct LocalMedia: Identifiable {
+    let path: String
+    let name: String
+    let video: Bool
+    var id: String { path }
+    init?(path: String) {
+        let ext = (path as NSString).pathExtension.lowercased()
+        let video = ["mp4", "mov", "m4v"].contains(ext)
+        guard video || ["jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "tiff", "bmp"].contains(ext) else { return nil }
+        self.path = path; self.name = (path as NSString).lastPathComponent; self.video = video
     }
 }

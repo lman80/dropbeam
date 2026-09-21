@@ -57,7 +57,7 @@ define_class!(
 #[link(name = "PhotosUI", kind = "framework")]
 unsafe extern "C" {}
 
-// Tauri owns a single foreground window. Refuse to stack native presentations.
+// Present above SwiftUI sheets/viewers while refusing an already active system picker.
 unsafe fn presenter() -> Result<Retained<AnyObject>, String> {
     let app: Retained<AnyObject> = msg_send![class!(UIApplication), sharedApplication];
     let windows: Retained<NSArray<AnyObject>> = msg_send![&*app, windows];
@@ -65,9 +65,16 @@ unsafe fn presenter() -> Result<Retained<AnyObject>, String> {
         let key: bool = msg_send![&*window, isKeyWindow];
         if !key { continue; }
         let root: Option<Retained<AnyObject>> = msg_send![&*window, rootViewController];
-        if let Some(root) = root {
-            let presented: Option<Retained<AnyObject>> = msg_send![&*root, presentedViewController];
-            if presented.is_some() { return Err("Close the current sheet first.".into()); }
+        if let Some(mut root) = root {
+            loop {
+                let presented: Option<Retained<AnyObject>> = msg_send![&*root, presentedViewController];
+                match presented { Some(next) => root = next, None => break }
+            }
+            let dismissing: bool = msg_send![&*root, isBeingDismissed];
+            let photo: bool = msg_send![&*root, isKindOfClass: class!(PHPickerViewController)];
+            let document: bool = msg_send![&*root, isKindOfClass: class!(UIDocumentPickerViewController)];
+            let sharing: bool = msg_send![&*root, isKindOfClass: class!(UIActivityViewController)];
+            if dismissing || photo || document || sharing { return Err("Finish the current picker or share sheet first.".into()); }
             return Ok(root);
         }
     }
@@ -148,11 +155,13 @@ pub async fn pick_photos(app: AppHandle) -> Result<Vec<String>, String> {
 #[tauri::command]
 pub async fn share_files(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
     if paths.is_empty() { return Err("No files to share.".into()); }
-    // Only share existing files from this app's Documents directory.
-    let documents = app.path().document_dir().map_err(|e| e.to_string())?.canonicalize().map_err(|e| e.to_string())?;
+    // Received files, imported picks and sent-chat media all live in our sandbox.
+    // Canonicalize both sides so a symlink cannot share a file outside it.
+    let documents = app.path().document_dir().map_err(|e| e.to_string())?;
+    let sandbox = documents.parent().ok_or("No app sandbox")?.canonicalize().map_err(|e| e.to_string())?;
     let paths: Vec<_> = paths.into_iter().map(|path| {
         let path = std::path::PathBuf::from(path).canonicalize().map_err(|e| e.to_string())?;
-        if !path.starts_with(&documents) || !path.is_file() { return Err("This received file is unavailable for sharing.".to_string()); }
+        if !path.starts_with(&sandbox) || !path.is_file() { return Err("This received file is unavailable for sharing.".to_string()); }
         Ok(path)
     }).collect::<Result<_, String>>()?;
     let (tx, rx) = oneshot::channel();

@@ -8,6 +8,7 @@ Connect the native iOS shell to the existing web data bridge.
 - `allow-reply`
 - `allow-state`
 - `allow-event`
+- `allow-pick-folder`
 
 ## Permission Table
 
@@ -66,6 +67,32 @@ Enables the event command without any pre-configured scope.
 <td>
 
 Denies the event command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-ui:allow-pick-folder`
+
+</td>
+<td>
+
+Enables the pick_folder command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`native-ui:deny-pick-folder`
+
+</td>
+<td>
+
+Denies the pick_folder command without any pre-configured scope.
 
 </td>
 </tr>

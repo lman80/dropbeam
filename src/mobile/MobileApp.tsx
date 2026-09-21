@@ -9,13 +9,14 @@ import { SettingsScreen, type SettingsPage } from './SettingsScreen'
 
 type Route = { kind: 'friend'; id: string } | { kind: 'settings'; page: SettingsPage }
 /** App's content ErrorBoundary is keyed by top-level view; each tab gets a fresh local stack.
- * Native tab events remain owned by installNativeTabBar -> store.setView. */
-export function MobileApp() {
+ * On iOS, SwiftUI owns navigation; this component retains only the hidden host. */
+export function MobileApp({ bridgeOnly = false }: { bridgeOnly?: boolean }) {
   const view = useStore(s => s.view)
   const [stack, setStack] = useState<Route[]>([])
   const top = stack[stack.length - 1]
   const push = (route: Route) => setStack(previous => [...previous, route])
   const back = () => setStack(previous => previous.slice(0, -1))
+  if (bridgeOnly) return <div className="mk-app" hidden aria-hidden="true" />
   return <div className="mk-app">
     {view === 'send' && <SendScreen />}
     {view === 'friends' && (top?.kind === 'friend' ? <FriendDetail key={top.id} id={top.id} back={back} /> : <FriendsScreen push={id => push({ kind: 'friend', id })} />)}

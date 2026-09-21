@@ -319,6 +319,18 @@
           "markdownDescription": "Denies the event command without any pre-configured scope."
         },
         {
+          "description": "Enables the pick_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-folder",
+          "markdownDescription": "Enables the pick_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-folder",
+          "markdownDescription": "Denies the pick_folder command without any pre-configured scope."
+        },
+        {
           "description": "Enables the reply command without any pre-configured scope.",
           "type": "string",
           "const": "allow-reply",
@@ -343,10 +355,10 @@
           "markdownDescription": "Denies the state command without any pre-configured scope."
         },
         {
-          "description": "Connect the native iOS shell to the existing web data bridge.\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-reply`\n- `allow-state`\n- `allow-event`",
+          "description": "Connect the native iOS shell to the existing web data bridge.\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-reply`\n- `allow-state`\n- `allow-event`\n- `allow-pick-folder`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Connect the native iOS shell to the existing web data bridge.\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-reply`\n- `allow-state`\n- `allow-event`"
+          "markdownDescription": "Connect the native iOS shell to the existing web data bridge.\n#### This default permission set includes:\n\n- `allow-activate`\n- `allow-reply`\n- `allow-state`\n- `allow-event`\n- `allow-pick-folder`"
         }
       ]
     }

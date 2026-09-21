@@ -4,6 +4,7 @@ struct FriendsView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var search = ""
     @State private var adding = false
+    @State private var folderScan = false
     @Namespace private var avatars
     private var filtered: [Friend] {
         bridge.friends.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
@@ -17,6 +18,9 @@ struct FriendsView: View {
             ScrollView {
                 GlassGroup {
                     VStack(alignment: .leading, spacing: 24) {
+                        NavigationLink { LocationsView() } label: {
+                            GlassCard { SettingsLinkLabel(title: "Locations", symbol: "externaldrive") }
+                        }.buttonStyle(.plain)
                         section("My Devices", friends: filtered.filter(isMine))
                         section("Friends", friends: filtered.filter { !isMine($0) })
                     }
@@ -26,9 +30,18 @@ struct FriendsView: View {
             .navigationTitle("Friends").beamCanvas()
             .searchable(text: $search, prompt: "Find a friend or device")
             .toolbar { ToolbarItem(placement: .topBarTrailing) {
-                Button { Haptics.tap(); adding = true } label: { Image(systemName: "plus") }
-                    .beamButton().accessibilityLabel("Add friend")
+                Menu {
+                    Button("Add Friend", systemImage: "person.badge.plus") { adding = true }
+                    Button("Join Shared Folder", systemImage: "qrcode.viewfinder") { folderScan = true }
+                } label: { Image(systemName: "plus").frame(width: 44, height: 44) }.accessibilityLabel("Add friend or folder")
             } }
+            .sheet(isPresented: $folderScan) {
+                QRScannerSheet(title: "Join Shared Folder") { code in
+                    let accepted: Bool = try await bridge.call("acceptFolderInvite", ["code": code])
+                    if !accepted { throw NSError(domain: "DropBeam", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose a folder to join, or cancel."]) }
+                    bridge.showToast("Joined shared folder")
+                }
+            }
             .sheet(isPresented: $adding) { AddFriendSheet().environmentObject(bridge) }
         }
     }
@@ -78,40 +91,11 @@ private extension View {
 
 struct AddFriendSheet: View {
     @EnvironmentObject private var bridge: Bridge
-    @Environment(\.dismiss) private var dismiss
-    @State private var code = ""
-    @State private var busy = false
-    @State private var scanInfo = false
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 20) {
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: 16) {
-                            Image(systemName: "person.crop.circle.badge.plus").font(.largeTitle).foregroundStyle(.tint)
-                            Text("One code. A new connection.").font(.title2.weight(.semibold))
-                            Text("Paste your friend’s DropBeam code to start sharing.").foregroundStyle(.secondary)
-                            TextField("Friend code", text: $code, axis: .vertical).textInputAutocapitalization(.never).autocorrectionDisabled()
-                                .padding(14).background(.quaternary, in: RoundedRectangle(cornerRadius: 14))
-                            Button { scanInfo = true } label: { Label("Scan QR Code", systemImage: "qrcode.viewfinder") }.beamButton()
-                        }
-                    }
-                    Button {
-                        busy = true
-                        bridge.perform {
-                            defer { busy = false }
-                            let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if trimmed.lowercased().hasPrefix("dropbeamf1:") { try await bridge.acceptFriend(code: trimmed) }
-                            else { try await bridge.addFriendByCode(code: trimmed) }
-                            dismiss()
-                        }
-                    } label: { Text(busy ? "Connecting…" : "Add Friend").frame(maxWidth: .infinity).padding(.vertical, 8) }
-                        .beamButton(prominent: true).disabled(busy || code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }.padding(20)
-            }.navigationTitle("Add Friend").navigationBarTitleDisplayMode(.inline).beamCanvas()
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
-                .alert("QR scanning is coming next", isPresented: $scanInfo) { Button("OK", role: .cancel) {} } message: { Text("For now, paste the code your friend shares with you.") }
-        }.tint(.beam)
+        QRScannerSheet(title: "Add Friend") { code in
+            if code.lowercased().hasPrefix("dropbeamf1:") { try await bridge.acceptFriend(code: code) }
+            else { try await bridge.addFriendByCode(code: code) }
+        }
     }
 }
 
@@ -154,6 +138,7 @@ struct FriendDetailView: View {
                         }
                     }
                 }
+                NavigationLink { LocationsView(friendID: friendID) } label: { GlassCard { SettingsLinkLabel(title: "Browse Locations", symbol: "externaldrive") } }.buttonStyle(.plain)
                 Button("Remove Friend", role: .destructive) { removing = true; Haptics.tap() }.beamButton()
             }.padding(20)
         }.navigationTitle("Friend").navigationBarTitleDisplayMode(.inline).beamCanvas()

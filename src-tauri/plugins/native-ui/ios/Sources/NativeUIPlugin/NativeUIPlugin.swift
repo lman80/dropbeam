@@ -31,8 +31,18 @@ class NativeUIPlugin: Plugin {
                 host.didMove(toParent: root)
                 self.host = host
             }
-            self.setWebOverlay(false)
+            webview.alpha = 0
+            webview.isUserInteractionEnabled = false
+            webview.accessibilityElementsHidden = true
             invoke.resolve()
+        }
+    }
+    @objc func pickFolder(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            Task { @MainActor in
+                do { let path = try await NativeFolderPicker.shared.pick(); invoke.resolve(["path": path as Any? ?? NSNull()]) }
+                catch { invoke.reject(error.localizedDescription) }
+            }
         }
     }
     @objc func reply(_ invoke: Invoke) {
@@ -51,9 +61,6 @@ class NativeUIPlugin: Plugin {
         onMain(invoke) { args in
             guard let name = args["name"] as? String else { throw self.invalidArgs() }
             let payload = args["payload"] ?? NSNull()
-            if name == "webOverlay", let object = payload as? [String: Any] {
-                self.setWebOverlay(object["visible"] as? Bool ?? false)
-            }
             Bridge.shared.event(name: name, payload: payload)
         }
     }
@@ -66,14 +73,6 @@ class NativeUIPlugin: Plugin {
                 invoke.resolve()
             } catch { invoke.reject(error.localizedDescription) }
         }
-    }
-    @MainActor private func setWebOverlay(_ visible: Bool) {
-        // Phase 1: existing React recipient chooser temporarily owns the screen.
-        // The WKWebView is never removed, so subscriptions and Rust IPC stay alive.
-        host?.view.isHidden = visible
-        webview?.alpha = visible ? 1 : 0
-        webview?.isUserInteractionEnabled = visible
-        webview?.accessibilityElementsHidden = !visible
     }
     private func invalidArgs() -> NSError { NSError(domain: "DropBeam.NativeUI", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid bridge arguments."]) }
 }

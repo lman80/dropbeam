@@ -1,3 +1,156 @@
+# Native iOS UI — phase 3
+
+SwiftUI now owns all five tabs and their workflows. The React MobileApp remains
+mounted as a hidden bridge host; its screens, onboarding, recipient chooser and
+folder-invite modal stop rendering after native activation. WKWebView is never
+revealed. There is no `webOverlay` protocol or legacy Rust UITabBar runtime.
+
+## Phase 3 screens and files
+
+All views use the unchanged `UI/Design.swift` mesh, GlassCard, GlassGroup and glass
+button modifiers; iOS 26 effects retain their iOS 17 material fallbacks.
+
+- `UI/HistoryView.swift`: searchable day-grouped recents, share/copy/remove,
+  clear confirmation, recoverable storage and per-folder restore/permanent-delete.
+- `UI/LocationsView.swift`: friend/presence groups and remote browser with pushed
+  folders, search, next-cursor paging, multiselect, rights-aware actions, upload,
+  rename/mkdir alerts, trash confirmations/results and loading/retry states.
+- `UI/SettingsView.swift`: profile/avatar/invite QR, devices/linking, appearance,
+  notification/sound/receipt controls, transfer preferences, upload limits,
+  connection test/help, relay, diagnostics/export, Lab Mode and recovery limits.
+- `UI/NativeSheets.swift`: VisionKit QR scanner with camera permission and paste
+  fallback, onboarding, native Send-to sheet and inbound shared-folder invites.
+- `UI/NativeFolderPicker.swift`: UIKit directory selection with security-scoped,
+  coordinated import; copies the selected
+  directory into `Documents/Imported Folders/<UUID>/<name>` for durable engine
+  access. Rejects copying an ancestor into itself. Folder sync uses that local
+  imported copy, not the external provider. Send-to waits for the system picker's
+  dismissal before presenting its own sheet.
+- `UI/Chat/ChatAttachment.swift`: shared `MediaViewer`, zoomable `ImageViewer`, and
+  `AVPlayerViewController` wrapper used by Chat and History.
+- `Bridge.swift`, `Models.swift`, `NativeUIPlugin.swift`, `RootView.swift`,
+  `FriendsView.swift`: state, navigation, native presentation and entry points.
+- `src/lib/nativeBridge.ts`, `nativePhase3.ts`: existing store/API adapters, JSON
+  snapshots, cursor normalization, filename validation and rights checks.
+- `src-tauri/src/history.rs`: iOS-only single-entry removal under the existing
+  history lock/atomic writer. `ios_media.rs`: present above native sheets and
+  share canonical local files within the app sandbox, including imported media.
+- `src/App.tsx`, `src/mobile/MobileApp.tsx`: hidden bridge-host integration. Desktop
+  screen branches are retained; store.ts and api.ts remain unchanged.
+- Deleted `src-tauri/src/ios_tabbar.rs`, its module/command registration,
+  `src/lib/nativeTabBar.ts`, `nativeTabBarModel.ts`, `tests/native-tabbar.test.ts`.
+- `tests/native-phase3.test.ts`: five regressions for paging, revoked permissions,
+  path traversal, completed history paths and same-length snapshot edits.
+
+## Phase 3 bridge additions
+
+All arguments/results are JSON values using the original correlated call/reply
+protocol below. Void replies are null. Store actions preserve their implementation;
+a consumed store error toast is propagated as a failed native action rather than
+silently dismissing a sheet. Paths are local sandbox paths.
+
+| Handler | Args | Result / existing pipeline |
+| --- | --- | --- |
+| `historyList` | `{}` | `HistoryEntry[]`; store.reloadHistory → api.getHistory |
+| `historyClear` | `{}` | null; api.clearHistory + store reload |
+| `historyRemove` | `{entryId}` | null; iOS-only remove_history_entry + reload |
+| `historyOpen` | `{entryId}` | null; completed `outDir/fileNames` → api.shareFiles |
+| `recoverableSummaries` | `{}` | `[{pairId,folderName,folder,bytes,itemCount,oldestMs}]` |
+| `recoverableItems` | `{folder: pairId}` | `[{id,relPath,size,reason,timestampMs}]` |
+| `recoverableRestore`, `recoverableForget` | `{item:{folder:pairId,id:itemId}}` | existing restoreFolderItem / forgetFolderItem result |
+| `recoverableEmpty` | `{folder:pairId}` | freed bytes via clearFolderHistory |
+| `recoverableEmptyAll` | `{}` | freed bytes via clearAllFolderHistory |
+| `locationsList`, `locationsRefresh` | `{}` | `[{friendId,friendName,online,locations:SharedLocation[],error:string|null}]` |
+| `browserList` | `{friendId,locationId,path,cursor?,query?}` | `{entries:[{name,isDir,size,modified}],hasMore,cursor:string|null,total}`; returned cursor is the **next** cursor |
+| `browserDownload` | `{friendId,locationId,path,names:string[]}` | `{transferId:string|null,skipped?:string[]}` |
+| `browserUpload` | `{friendId,locationId,path,source:'photos'|'files'|'folder'}` | TransferUpdate or null on picker cancel; locationsApi.upload + rememberLocationUpload + store upsert |
+| `browserMkdir` | `{friendId,locationId,path,name}` | existing locations.mkdir result |
+| `browserRename` | `{friendId,locationId,path,from,to}` | existing locations.rename result |
+| `browserTrash` | `{friendId,locationId,path,names:string[]}` | `[{name,trashPath?:string,error?:string}]`; each item can fail independently |
+| `clearTransferCache` | `{}` | bytes freed |
+| `exportLogs` | `{}` | exported path; existing exportDiagnostics then native share |
+| `diagnosticsTest`, `connectionTest` | `{}` | string via diagnosticsTest / irohSelftest |
+| `appVersion` | `{}` | string from store/updater appVersion |
+| `myDeviceInfo` | `{}` | refreshed normalized myDevice object |
+| `needsName` | `{}` | bool; settings loaded AND (empty name OR missing dropbeam.namedSelf) |
+| `setDisplayName` | `{name}` | null; trimmed nonempty name → saveSettings; namedSelf set only after successful persistence |
+| `setAvatar` | `{path?:string}` | null; existing avatar command for an explicit path or existing mobile photo picker/store action |
+| `clearAvatar` | `{}` | null; store.clearAvatar |
+| `pickFiles` | `{source:'photos'|'files'}` | `[localPath]`; native picker only, no recipient selection |
+| `sendToFriend` | `{friendId,paths:string[]}` | null; existing store send, then clear pendingSend |
+| `quickSend` | `{paths:string[]}` | null; store.sendPaths (same code flow as the React chooser) |
+| `dismissSend` | `{}` | null; clear pendingSend |
+| `refreshRecipients` | `{}` | null; refresh device identity and probe peer presence |
+| `acceptFolderInvite` | `{code}` | bool (false on cancel); native directory import → api.acceptPair → reloadPairs |
+
+Existing `updateSettings({patch})`, `myInviteCode()`, `linkDeviceBegin()` (code
+string), `linkDeviceCancel()` and `linkDeviceSend({code})` (normalized LinkResult)
+are reused. Appearance writes `settings.theme`. Linking this device cancels on
+dismiss, handles late begin replies, and closes when friends gain a matching
+accountPub device, including an existing friend becoming a linked device.
+Folder-invite dismissal consumes only the current queued invitation.
+Add Friend and both scanned/pasted folder invites use the
+same native scanner. Receiving files still uses the existing Send receive-code flow.
+
+Additional diffed JSON state keys:
+
+- `history`: unmodified store HistoryEntry array.
+- `locations`: the locationsList shape above, with live store presence. The existing
+  React Locations view owns its map locally, **not in Zustand**; the native adapter
+  reads/writes the same validated `dropbeam.locations` cache and calls locationsApi.
+  Only id/name/rights are cached; capacity and reachability are not persisted.
+- `needsName`: bool, using the same onboarding persistence condition.
+- `pendingSend`: string array, including engine/launch-file requests. Swift also
+  stages freshly picked paths locally until the user chooses a recipient.
+
+`folder-history://changed`, `locations://changed` and `folder-invite://incoming`
+are forwarded unchanged; recovery/browser views refresh and inbound invites queue
+natively. All existing Phase 2 state keys/events remain.
+
+Native plugin command addition: `plugin:native-ui|pick_folder`, args `{}`, reply
+`{path:string|null}`. Its Swift entry is pickFolder; generated command permissions
+are included in the iOS-only native-ui default capability. This supplies the
+missing iOS directory picker without changing the desktop or generic api wrapper.
+
+Timeouts: normal calls 30s, remote browser operations / locations refresh 180s, interactive pickers /
+folder import 30 minutes. Late replies cannot resolve an already-finished call.
+An expired call does not cancel its underlying engine action.
+
+## Phase 3 verification
+
+Verified offline on 2026-09-21 after completing the interrupted implementation:
+
+- `CARGO_TARGET_DIR=/Users/ashtonmiller/DropBeam-ios/src-tauri/target cargo check --offline --target aarch64-apple-ios-sim`: **passed**, including recompilation of the actual Swift package; 40 existing Rust warnings.
+- Full plugin Swift typechecks against the built Tauri/SwiftRs modules at
+  `arm64-apple-ios17.0-simulator` and `arm64-apple-ios26.0-simulator`: **passed**.
+- `npx --offline tsc --noEmit -p .`: **passed**; also checked
+  `-p tsconfig.app.json` because the root config contains project references.
+- `node --test tests/*.test.ts`: **78 passed, 0 failed, 0 skipped**, including
+  five phase-3 regressions. The three legacy tab-bar tests were removed with that module.
+- `git diff --check`: **passed**. `store.ts`, `api.ts`, desktop views/components,
+  `Design.swift`, package manifests/locks and version configuration are unchanged.
+  Shared App integration retains the desktop branches; Rust additions are iOS-only.
+
+The existing validation-only `/tmp/dropbeam-native-tools/swift` wrapper disables
+SwiftPM sandboxing, automatic resolution and package updates. Caches are under
+`~/Library/Caches`, Cargo uses the requested shared target directory, and
+`GIT_ALLOW_PROTOCOL=file` prevents remote SwiftPM transport. No new dependency,
+version change, commit or push was made.
+
+Logs: `/tmp/dropbeam-p3-cargo.log`, `/tmp/dropbeam-p3-tests.log`,
+`/tmp/dropbeam-p3-swift-17.0.log`, `/tmp/dropbeam-p3-swift-26.0.log`.
+
+Runtime verification remains: a linked app launch; light/dark and accessibility
+text-size review; physical-camera scanning; Files/provider import, avatar picking,
+media playback/share and sheet transitions; real peer device linking, remote file
+operations and transfer completion. These compile/test results do not claim that
+device or simulator interaction testing occurred. All requested phase-3 workflows
+are implemented; folder sync intentionally uses its imported sandbox copy.
+
+---
+
+# Historical phase 2 and phase 1 handoff (superseded where noted above)
+
 # Native iOS UI — phase 2 handoff
 
 ## Phase 2: native Chat

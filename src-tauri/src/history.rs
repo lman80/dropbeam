@@ -48,3 +48,14 @@ pub fn clear(config_dir: &Path) {
     let _guard = LOCK.lock().unwrap();
     let _ = fs::remove_file(history_path(config_dir));
 }
+
+/// Native iOS timeline removal uses the same lock and atomic persistence as append.
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub fn remove_history_entry(state: tauri::State<'_, std::sync::Arc<crate::AppState>>, id: String) -> Result<(), String> {
+    let _guard = LOCK.lock().map_err(|e| e.to_string())?;
+    let mut items = load(&state.config_dir);
+    items.retain(|entry| entry.id != id);
+    let text = serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
+    write_atomic(&history_path(&state.config_dir), text.as_bytes()).map_err(|e| e.to_string())
+}

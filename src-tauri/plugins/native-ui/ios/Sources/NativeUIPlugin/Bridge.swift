@@ -5,6 +5,12 @@ import WebKit
 @MainActor
 final class Bridge: ObservableObject {
     static let shared = Bridge()
+    @Published var history: [HistoryEntry] = []
+    @Published var locations: [FriendLocations] = []
+    @Published var needsName = false
+    @Published var pendingSend: [String] = []
+    @Published var folderInvites: [FolderInvite] = []
+    @Published var toast: String?
     @Published var friends: [Friend] = []
     @Published var myDevice: MyDevice?
     @Published var transfers: [Transfer] = []
@@ -42,7 +48,8 @@ final class Bridge: ObservableObject {
                 self?.finish(id, .failure(self?.failure("This action timed out. Check its status before trying again.") ?? NSError(domain: "NativeUI", code: 1)))
             }
             pending[id] = Pending(continuation: continuation, timeout: timeout)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: timeout)
+            let seconds: Double = ["pickFiles", "sendChatFiles", "setAvatar", "browserUpload", "acceptFolderInvite"].contains(name) ? 1800 : name.hasPrefix("browser") || name == "locationsRefresh" ? 180 : 30
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: timeout)
             webview.evaluateJavaScript("window.__dbBridge.call(...\(json)); void 0") { [weak self] _, error in
                 if let error { self?.finish(id, .failure(error)) }
             }
@@ -63,6 +70,10 @@ final class Bridge: ObservableObject {
     func update(key: String, value: Any) throws {
         let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
         switch key {
+        case "history": history = try decoder.decode([HistoryEntry].self, from: data)
+        case "locations": locations = try decoder.decode([FriendLocations].self, from: data)
+        case "needsName": needsName = try decoder.decode(Bool.self, from: data)
+        case "pendingSend": pendingSend = try decoder.decode([String].self, from: data)
         case "friends": friends = try decoder.decode([Friend].self, from: data)
         case "myDevice": myDevice = try decoder.decode(MyDevice?.self, from: data)
         case "transfers": transfers = try decoder.decode([Transfer].self, from: data)
@@ -86,6 +97,8 @@ final class Bridge: ObservableObject {
             if let id = object["friendId"] as? String { chatPath = [id]; selectedTab = "chat" }
             else { chatPath = [] }
         }
+        if name == "folder-invite://incoming", let data = try? JSONSerialization.data(withJSONObject: payload),
+           let invite = try? decoder.decode(FolderInvite.self, from: data), !folderInvites.contains(where: { $0.code == invite.code }) { folderInvites.append(invite) }
         // Tauri events remain available to subsequent native chat/presence views;
         // authoritative published data always comes from the store snapshots.
         NotificationCenter.default.post(name: Notification.Name("DropBeam.\(name)"), object: nil, userInfo: ["payload": payload])
@@ -95,13 +108,19 @@ final class Bridge: ObservableObject {
         Task { do { try await action() } catch { errorMessage = error.localizedDescription } }
     }
     private func failure(_ message: String) -> NSError { NSError(domain: "DropBeam.NativeUI", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
-    private func action(_ name: String, _ args: [String: Any] = [:]) async throws {
+    func action(_ name: String, _ args: [String: Any] = [:]) async throws {
         let _: IgnoredResult = try await call(name, args)
     }
     func pickAndSend(source: String, friendId: String? = nil) async throws {
-        var args: [String: Any] = ["source": source]
-        if let friendId { args["friendId"] = friendId }
-        try await action("pickAndSend", args)
+        let paths: [String] = try await call("pickFiles", ["source": source])
+        guard !paths.isEmpty else { return }
+        try await NativePresentation.waitForPickerDismissal()
+        if let friendId { try await sendToFriend(friendId: friendId, paths: paths) }
+        else { pendingSend = paths }
+    }
+    func showToast(_ message: String) {
+        toast = message
+        Task { try? await Task.sleep(for: .seconds(5)); if toast == message { toast = nil } }
     }
     func sendToFriend(friendId: String, paths: [String]) async throws { try await action("sendToFriend", ["friendId": friendId, "paths": paths]) }
     func receiveWithCode(code: String) async throws { try await action("receiveWithCode", ["code": code]) }

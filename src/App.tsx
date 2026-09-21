@@ -6,7 +6,6 @@ import { api, onFileDrop } from './lib/api'
 import { setTaskbarProgress } from './lib/taskbar'
 import { useStore } from './store'
 import { MOBILE_UI } from './lib/platform'
-import { installNativeTabBar } from './lib/nativeTabBar'
 import { startNativeBridge } from './lib/nativeBridge'
 import { nativeShellActive } from './lib/nativeShell'
 import { TitleBar } from './components/TitleBar'
@@ -29,7 +28,6 @@ import { MobileOnboarding } from './mobile/Onboarding'
 
 export default function App() {
   const [nativeShell, setNativeShell] = useState(false)
-  const nativeTabBar = useStore((s) => s.nativeTabBar)
   const ready = useStore((s) => s.ready)
   const view = useStore((s) => s.view)
   const init = useStore((s) => s.init)
@@ -39,7 +37,6 @@ export default function App() {
   useEffect(() => {
     if (MOBILE_UI) void startNativeBridge().then(() => {
       setNativeShell(nativeShellActive)
-      return installNativeTabBar()
     })
   }, [])
 
@@ -182,7 +179,7 @@ export default function App() {
           <ErrorBoundary region={`content:${view}`} key={view}>
             {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
                 so it never deadlocks on a view that has its own AnimatePresence. */}
-            {MOBILE_UI ? <MobileApp /> : <motion.div
+            {MOBILE_UI ? <MobileApp bridgeOnly={nativeShell} /> : <motion.div
               initial={MOBILE_UI ? false : { opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.18 }}
@@ -199,15 +196,15 @@ export default function App() {
           </ErrorBoundary>
         </main>
       </div>
-      {MOBILE_UI && !nativeTabBar && (
+      {MOBILE_UI && !nativeShell && (
         <ErrorBoundary region="mobile navigation">
           <MobileTabBar />
         </ErrorBoundary>
       )}
       <ErrorBoundary region="overlays" fallbackStyle={{ position: 'fixed', bottom: 12, left: 12, zIndex: 201 }}>
-        <SendToChooser />
+        {!nativeShell && <SendToChooser />}
         {MOBILE_UI ? (!nativeShell && <MobileOnboarding />) : <NameSetupModal />}
-        <FolderInviteModal />
+        {!nativeShell && <FolderInviteModal />}
       </ErrorBoundary>
       <ErrorBoundary region="toasts" fallbackStyle={{ position: 'fixed', bottom: 12, right: 12, zIndex: 101 }}>
         <Toasts />

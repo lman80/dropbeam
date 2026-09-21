@@ -155,3 +155,73 @@ struct LinkResult: Decodable {
 }
 // Accept any JSON result for actions whose return value the UI doesn't need.
 struct IgnoredResult: Decodable { init(from decoder: Decoder) throws {} }
+
+struct HistoryEntry: Decodable, Identifiable {
+    let id: String
+    let direction: String
+    let fileNames: [String]
+    let bytesTotal: Double
+    let timestampMs: Double
+    var peer: String?
+    var locality: String?
+    var state: String?
+    var outDir: String?
+    var error: String?
+    var date: Date { Date(timeIntervalSince1970: timestampMs / 1000) }
+    var title: String { fileNames.count > 1 ? "\(fileNames.count) files" : fileNames.first ?? "Files" }
+    var localPaths: [String] {
+        guard state == "completed", let outDir else { return [] }
+        return fileNames.filter { !$0.hasPrefix("/") && !$0.split(separator: "/").contains("..") }.map { URL(fileURLWithPath: outDir).appendingPathComponent($0).path }
+    }
+}
+struct RecoverySummary: Decodable, Identifiable {
+    var id: String { pairId }
+    let pairId: String
+    let folderName: String
+    let bytes: Double
+    let itemCount: Int
+}
+struct RecoveryItem: Decodable, Identifiable {
+    let id: String
+    let relPath: String
+    let size: Double
+    let timestampMs: Double
+    var date: Date { Date(timeIntervalSince1970: timestampMs / 1000) }
+}
+struct LocationRights: Decodable, Hashable { let upload: Bool; let manage: Bool }
+struct SharedLocation: Decodable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let rights: LocationRights
+    var reachable: Bool?
+}
+struct FriendLocations: Decodable, Identifiable {
+    var id: String { friendId }
+    let friendId: String
+    let friendName: String
+    let online: Bool
+    let locations: [SharedLocation]
+    var error: String?
+}
+struct BrowserEntry: Decodable, Identifiable {
+    var id: String { name }
+    let name: String
+    let isDir: Bool
+    let size: Double
+    let modified: Double
+    var date: Date { Date(timeIntervalSince1970: modified / 1000) }
+}
+struct BrowserPage: Decodable {
+    var entries: [BrowserEntry] = []
+    var hasMore = false
+    var cursor: String?
+    var total: Int?
+}
+struct TrashResult: Decodable { let name: String; var error: String?; var trashPath: String? }
+struct DownloadResult: Decodable { var transferId: String?; var skipped: [String]? }
+struct FolderInvite: Decodable, Identifiable {
+    var id: String { code }
+    let code: String
+    let folderName: String
+    let fromName: String
+}
