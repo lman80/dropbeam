@@ -141,7 +141,11 @@ fn copy_asset(provider: &NSItemProvider) -> oneshot::Receiver<Result<String, Str
 }
 
 fn asset_directory() -> Result<std::path::PathBuf, String> {
-    let dir = std::env::temp_dir().join("dropbeam-picked").join(uuid::Uuid::new_v4().to_string());
+    // Picked copies must outlive the pick: chat threads keep pointing at them, and iOS
+    // purges tmp/ freely. Application Support inside the container is durable.
+    let tmp = std::env::temp_dir();
+    let base = tmp.parent().map(|c| c.join("Library").join("Application Support").join("dropbeam-picked")).unwrap_or_else(|| tmp.join("dropbeam-picked"));
+    let dir = base.join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&dir).map_err(|e| format!("Could not prepare storage for the photo: {e}"))?;
     Ok(dir)
 }
