@@ -356,3 +356,5 @@ html.mobile .qr-viewfinder { top: 35%; }
 html.mobile .device-link-overlay { z-index: 250; }
 html.mobile .device-section-heading { margin: 8px var(--inset); }
 html.mobile .device-section-heading .ios-section-title { margin-left: 0; }
+/* The sheet grabber must stay first even when a primary button is ordered to the front. */
+html.mobile :is(.dialog-overlay > *, .mobile-file-sheet, .mobile-friend-sheet)::before { order: -10; }
