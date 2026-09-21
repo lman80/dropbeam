@@ -1,3 +1,4 @@
+import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { FolderSync, X } from 'lucide-react'
@@ -53,7 +54,7 @@ export function FolderInviteModal() {
           exit={{ opacity: 0 }}
           onClick={dismiss}
           className="dialog-overlay"
-          style={{
+          style={MOBILE_UI ? undefined : {
             position: 'fixed',
             inset: 0,
             zIndex: 60,
@@ -64,12 +65,12 @@ export function FolderInviteModal() {
           }}
         >
           <motion.div
-            initial={{ scale: 0.96, y: 8 }}
-            animate={{ scale: 1, y: 0 }}
-            exit={{ scale: 0.96, y: 8 }}
+            initial={MOBILE_UI ? false : { scale: 0.96, y: 8 }}
+            animate={MOBILE_UI ? { opacity: 1 } : { scale: 1, y: 0 }}
+            exit={MOBILE_UI ? { opacity: 0 } : { scale: 0.96, y: 8 }}
             onClick={(e) => e.stopPropagation()}
-            className="card dialog" role="dialog" aria-modal="true"
-            style={{ width: 'min(420px, 92vw)', padding: 22 }}
+            className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
+            style={MOBILE_UI ? undefined : { width: 'min(420px, 92vw)', padding: 22 }}
           >
             <div className="dialog-body">
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>

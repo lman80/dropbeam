@@ -868,7 +868,7 @@ function MobileSection({ title, children }: { title: string; children: ReactNode
 }
 
 function MobileSetting({ title, desc, children, destructive = false }: { title: string; desc?: string; children?: ReactNode; destructive?: boolean }) {
-  return <div className={`ios-row mobile-setting${destructive ? ' ios-destructive' : ''}`}>
+  return <div className={`ios-row mobile-setting${destructive ? ' mobile-setting-destructive' : ''}`}>
     <div className="mobile-grow"><div>{title}</div>{desc && <p className="ios-footnote">{desc}</p>}</div>
     {children && <div className="mobile-setting-control">{children}</div>}
   </div>

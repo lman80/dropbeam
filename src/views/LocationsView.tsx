@@ -1,3 +1,5 @@
+import { MobileHeader } from '../components/MobileHeader'
+import { ChevronRight } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, HardDrive, RefreshCw, Settings2 } from 'lucide-react'
@@ -66,6 +68,14 @@ export function LocationsView() {
   const friend = friends.find(f => f.id === active?.friend)
   const location = active && shared[active.friend]?.find(l => l.id === active.location)
   const count = friends.reduce((sum,f) => sum + (shared[f.id]?.length || 0), 0)
+  if (MOBILE_UI) return <div className="mobile-page mobile-locations">
+    {active && friend && location ? <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} online={presenceLabel(friendPresence(friend.name, seen, statuses))} onBack={() => setActive(null)} /> : <>
+      <MobileHeader title="Locations" actions={<button className="ios-icon" aria-label="Refresh locations" disabled={busy} onClick={() => void refresh()}><RefreshCw size={20} /></button>} />
+      <div className="ios-list glass glass-card">{friends.flatMap(f => (shared[f.id] || []).map(l => <button className="ios-row" key={`${f.id}:${l.id}`} onClick={() => setActive({ friend: f.id, location: l.id })}><span className="mobile-tinted-icon"><HardDrive size={24} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{l.name}</span><span className="ios-footnote mobile-presence"><i className={friendPresence(f.name, seen, statuses).status === 'online' ? 'online' : ''} />{f.name} · {presenceLabel(friendPresence(f.name, seen, statuses))}</span></span><ChevronRight size={18} /></button>))}</div>
+      {!count && <div className="mobile-empty"><HardDrive /><h2 className="ios-title2">A place for everything</h2><p className="ios-footnote">Folders shared by friends appear here.</p><button className="ios-button ios-primary" onClick={() => setView('friends')}>Find a friend</button></div>}
+      {!!Object.keys(errors).length && <p className="ios-footnote mobile-inset">Some devices are unavailable. Open a location to retry.</p>}
+    </>}
+  </div>
   return <div className="locations-view">
     {MOBILE_UI && <button className="btn btn-ghost location-back" onClick={() => setView('friends')}><ArrowLeft size={16} />Friends</button>}
     <div className="location-heading"><div><h1>Locations</h1><p>Your friends’ folders, within reach.</p></div><div className="location-toolbar">

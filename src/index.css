@@ -2065,35 +2065,6 @@ html.mobile .tabbar-badge {
   text-align: center;
 }
 
-/* Shared mobile dialog contract; inline desktop dimensions stay unchanged. */
-html.mobile .dialog-overlay {
-  --dialog-x: max(16px, env(safe-area-inset-left), env(safe-area-inset-right));
-  --dialog-top: max(16px, env(safe-area-inset-top));
-  --dialog-bottom: max(16px, env(safe-area-inset-bottom));
-  padding: var(--dialog-top) var(--dialog-x) var(--dialog-bottom) !important;
-  grid-template-columns: minmax(0, 1fr);
-  height: 100dvh;
-  box-sizing: border-box;
-}
-html.mobile .dialog-overlay > :is(.card, .dialog) {
-  min-width: 0;
-  max-width: calc(100vw - 2 * var(--dialog-x)) !important;
-  max-height: calc(100dvh - var(--dialog-top) - var(--dialog-bottom)) !important;
-  overflow: auto;
-  overscroll-behavior: contain;
-  overflow-wrap: anywhere;
-  box-sizing: border-box;
-}
-html.mobile .dialog-overlay .btn {
-  width: 100% !important;
-  flex: 1 1 100%;
-  white-space: normal;
-}
-html.mobile .dialog-overlay div:has(> .btn) { flex-wrap: wrap; }
-html.mobile .dialog-overlay input,
-html.mobile .dialog-overlay textarea { min-width: 0; max-width: 100%; font-size: 16px !important; }
-html.mobile .dialog-overlay .icon-btn { flex-shrink: 0; }
-
 html.mobile .gif-picker {
   max-width: calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right));
   max-height: calc(100dvh - 160px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
@@ -2101,19 +2072,11 @@ html.mobile .gif-picker {
 html.mobile div.sync-file { cursor: default; }
 
 /* Mobile Chat is a stack: activeChatId is also the notification/Friends route. */
-html.mobile .chat-list-pane { width: 100% !important; border-right: 0 !important; }
-html.mobile .chat-conversation-pane { display: none !important; }
-html.mobile .thread-open .chat-list-pane { display: none !important; }
-html.mobile .thread-open .chat-conversation-pane { display: flex !important; }
-html.mobile .chat-header { flex-shrink: 0; padding: 8px !important; gap: 8px !important; }
 html.mobile .chat-header > div { overflow-wrap: anywhere; }
 html.mobile .chat-header .icon-btn,
 html.mobile .chat-composer .icon-btn { flex-shrink: 0; }
-html.mobile .chat-composer { flex-shrink: 0; padding: 8px; gap: 4px; }
-html.mobile .chat-composer .chat-input { min-height: 44px; }
-html.mobile .chat-send { width: 44px; flex-shrink: 0; padding: 0; }
 html.mobile .chat-staged { max-height: 120px; overflow-y: auto; flex-shrink: 0; }
-html.mobile .chat-searchbar { flex-wrap: wrap; flex-shrink: 0; }
+html.mobile .chat-searchbar { flex-shrink: 0; }
 html.mobile .chat-searchbar input { min-width: 0; }
 html.mobile .emoji-pop { left: 8px; max-width: calc(100% - 16px); max-height: 35dvh; overflow-y: auto; }
 html.mobile .chat-line-body { min-width: 0; }
@@ -2136,10 +2099,6 @@ html.mobile main .toggle { flex-shrink: 0; }
 html.mobile main form > .input { flex: 1 1 100%; }
 html.mobile main .card svg { flex-shrink: 0; }
 html.mobile main .card svg[role="img"] { max-width: 100%; height: auto; }
-/* Desktop timestamps live beyond the thread edge; phones keep them in-flow. */
-html.mobile .chat-thread { padding: 12px !important; }
-html.mobile .chat-line { flex-wrap: wrap; }
-html.mobile .chat-time-gutter { position: static; margin: 0; flex: 0 0 100%; text-align: right; }
 
 /* The keyboard changes the visual viewport, not the document's scroll position.
    The flex shell gives remaining height to the thread and keeps its composer
@@ -2235,11 +2194,8 @@ html.mobile .toggle::before { content: ''; position: absolute; inset: 6px 0; bor
 html.mobile .toggle.on::before { background: var(--accent); }
 html.mobile .toggle::after { width: 26px; height: 26px; top: 9px; }
 html.mobile .toggle.on::after { transform: translateX(19px); }
-html.mobile :is(.chat-avatar, .friend-avatar, .chooser-avatar) { min-width: 48px; width: 48px; height: 48px; }
+html.mobile :is(.friend-avatar, .chooser-avatar) { min-width: 48px; width: 48px; height: 48px; }
 html.mobile .chooser-row { padding: 14px 12px; }
-html.mobile .chat-composer { padding: 12px 8px; gap: 4px; }
-html.mobile .chat-composer .chat-input { min-height: 50px; padding: 13px 10px; }
-html.mobile .chat-send { height: 50px; }
 html.mobile .tabbar-label { font-size: 12px; }
 html.mobile .emoji-pop { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 html.mobile .emoji-cell { padding: 5px 0; }
@@ -2249,8 +2205,6 @@ html.mobile button { flex-shrink: 0; }
 html.mobile.keyboard-visible :is(.app-toasts, [data-mobile-bottom-bar]) { display: none !important; }
 html.mobile .app-toasts { left: 16px; right: 16px !important; bottom: calc(80px + env(safe-area-inset-bottom)) !important; max-width: none !important; }
 html.mobile .dialog-overlay { top: var(--mobile-viewport-top, 0px); height: var(--mobile-viewport-height, 100dvh); }
-html.mobile .dialog-overlay > :is(.card, .dialog) { max-height: calc(var(--mobile-viewport-height, 100dvh) - var(--dialog-top) - var(--dialog-bottom)) !important; }
-html.mobile.keyboard-visible .dialog-overlay { --dialog-bottom: 12px; }
 
 html.mobile .mobile-file-sheet { position: fixed; inset: auto 0 0; margin: 0; width: 100%; max-width: none; max-height: 90dvh; padding: 0; border: 0; border-radius: 24px 24px 0 0; background: var(--surface); color: var(--text); }
 html.mobile .mobile-file-sheet::backdrop { background: rgb(0 0 0 / 45%); }
@@ -2258,5 +2212,4 @@ html.mobile .mobile-file-sheet-body { display: flex; flex-direction: column; gap
 html.mobile .mobile-file-sheet h2 { font-size: 20px; margin: 0 0 8px; }
 html.mobile .mobile-file-sheet .btn { justify-content: flex-start; flex-wrap: wrap; }
 html.mobile .mobile-file-sheet .btn span { flex-basis: 100%; text-align: left; color: var(--text-muted); font-size: 15px; }
-html.mobile .chat-send { padding: 0 !important; }
 html.mobile button > svg { flex-shrink: 0; }

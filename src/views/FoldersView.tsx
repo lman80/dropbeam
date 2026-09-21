@@ -1107,7 +1107,7 @@ function InviteModal({
     <div
       onClick={onClose}
       className="dialog-overlay"
-      style={{
+      style={MOBILE_UI ? undefined : {
         position: 'fixed',
         inset: 0,
         background: 'rgba(8, 9, 14, 0.5)',
@@ -1119,11 +1119,11 @@ function InviteModal({
       }}
     >
       <motion.div
-        initial={{ opacity: 0, scale: 0.96 }}
-        animate={{ opacity: 1, scale: 1 }}
+        initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96 }}
+        animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1 }}
         onClick={(e) => e.stopPropagation()}
-        className="card dialog" role="dialog" aria-modal="true"
-        style={{ width: 420, maxWidth: '100%', padding: 22, borderRadius: 20 }}
+        className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
+        style={MOBILE_UI ? undefined : { width: 420, maxWidth: '100%', padding: 22, borderRadius: 20 }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
           <div style={{ fontWeight: 750, fontSize: 'calc(16px * var(--ui-font-scale, 1))' }}>Invite for {folderName}</div>

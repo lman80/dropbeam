@@ -1,3 +1,4 @@
+import { ChevronLeft, Plus } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowDownToLine, ArrowUpFromLine, ChevronRight, File, Folder, FolderPlus, Home, Pencil, RefreshCw, Search, Trash2, X } from 'lucide-react'
@@ -8,8 +9,10 @@ import './locations.css'
 
 type Action = 'mkdir' | 'rename' | 'trash'
 const join = (parent: string, name: string) => parent ? `${parent}/${name}` : name
-export function FileBrowser({ friendId, location, online }: { friendId: string; location: SharedLocation; online: string }) {
+export function FileBrowser({ friendId, location, online, onBack }: { friendId: string; location: SharedLocation; online: string; onBack?: () => void }) {
   const toast = useStore(s => s.toast)
+  const [selecting, setSelecting] = useState(false)
+  const [actionsOpen, setActionsOpen] = useState(false)
   const [path, setPath] = useState('')
   const [page, setPage] = useState(0)
   const cursors = useRef<(string | undefined)[]>([undefined])
@@ -115,6 +118,33 @@ export function FileBrowser({ friendId, location, online }: { friendId: string; 
   const validName = name.trim() && name.trim() !== '.' && name.trim() !== '..' && !/[\/\0]/.test(name) && !name.toLowerCase().startsWith('.dropbeam-')
   const parts = path.split('/').filter(Boolean)
   const toggle = (item: LocationEntry) => setSelected(s => s.includes(item.name) ? s.filter(n => n !== item.name) : [...s, item.name])
+  const actionSheet = dialog && <div className="location-modal dialog-overlay"><form className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true" aria-labelledby="location-action-title" onSubmit={e => { e.preventDefault(); void run() }} onKeyDown={e => {
+        if (e.key === 'Escape' && !busy) setDialog(null)
+        if (e.key === 'Tab') {
+          const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)'))
+          const first = controls[0], last = controls[controls.length - 1]
+          if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus() }
+          if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus() }
+        }
+      }}>
+      <div className="location-heading"><h2 id="location-action-title">{dialog === 'trash' ? 'Move to trash?' : dialog === 'rename' ? 'Rename item' : 'New folder'}</h2><button type="button" className="icon-btn" aria-label="Close dialog" disabled={busy} onClick={() => setDialog(null)}><X size={18} /></button></div>
+      {dialog === 'trash' ? <><ul className="location-trash-items">{selectedEntries.map(e => <li key={e.name}>{e.name}</li>)}</ul><p>These items will move to <strong>{location.name}/.dropbeam-trash/&lt;timestamp&gt;/</strong>. They are not permanently deleted. The owner can restore them from that folder.</p></> : <label>{dialog === 'rename' ? `New name for “${selected[0]}”` : 'Folder name'}<input autoFocus required maxLength={200} value={name} onChange={e => setName(e.target.value)} /></label>}
+      {actionError && <p className="location-error" role="alert">{actionError}</p>}
+      {!!trashResults.length && <ul className="location-trash-items" aria-live="polite">{trashResults.map(r => <li key={r.name}><strong>{r.name}:</strong> {r.error ? `Failed — ${r.error}` : `Moved to ${r.trashPath}`}</li>)}</ul>}
+      <div className="dialog-actions location-toolbar"><button type="button" autoFocus={dialog === 'trash'} className="btn btn-ghost" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className="btn btn-primary" disabled={busy || (dialog !== 'trash' && !validName) || (dialog === 'trash' && !selectedEntries.length)}>{busy ? 'Working…' : dialog === 'trash' ? 'Move to trash' : dialog === 'mkdir' ? 'Create folder' : 'Rename'}</button></div>
+    </form></div>
+  if (MOBILE_UI) return <section className="mobile-browser" aria-label={`${location.name} file browser`}>
+    <header className="mobile-header-compact visible glass mobile-browser-header"><button className="ios-icon" aria-label="Back" disabled={busy} onClick={() => path ? navigate(parts.slice(0, -1).join('/')) : onBack?.()}><ChevronLeft /></button><h1 className="ios-headline mobile-grow mobile-ellipsis">{parts.at(-1) ?? location.name}</h1><button className="ios-button" onClick={() => { setSelecting(!selecting); setSelected([]) }}>{selecting ? 'Done' : 'Select'}</button><button className="ios-icon" aria-label="Folder actions" aria-expanded={actionsOpen} onClick={() => setActionsOpen(!actionsOpen)}><Plus /></button></header>
+    <div className="mobile-inset"><input className="mobile-search" aria-label="Search folder" placeholder="Search folder" value={query} onChange={e => { cursors.current = [undefined]; setPage(0); setQuery(e.target.value) }} /></div>
+    {error && <div className="mobile-inset ios-footnote" role="alert">{error}<button className="ios-button" onClick={restart}>Try again</button></div>}
+    {busy && <p className="mobile-inset ios-footnote" role="status">Preparing…</p>}
+    <div className="ios-list glass glass-card" aria-busy={loading}>{entries.map(entry => <div className="ios-row" key={entry.name}><button className="mobile-entry" disabled={busy || loading} onClick={() => selecting || !entry.isDir ? (setSelecting(true), toggle(entry)) : navigate(join(path, entry.name))}><span className="mobile-tinted-icon">{entry.isDir ? <Folder /> : <File />}</span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{entry.name}</span><span className="ios-footnote">{entry.isDir ? 'Folder' : formatBytes(entry.size)} · {entry.modified ? new Date(entry.modified).toLocaleDateString() : '—'}</span></span></button>{selecting ? <input type="checkbox" aria-label={`Select ${entry.name}`} disabled={busy || loading} checked={selected.includes(entry.name)} onChange={() => toggle(entry)} /> : entry.isDir && <ChevronRight size={18} />}</div>)}</div>
+    {loading && <p className="mobile-inset ios-footnote" role="status">Loading folder…</p>}
+    {!loading && !error && !entries.length && <div className="mobile-empty"><Folder /><h2 className="ios-title2">{query ? 'No matching items' : 'This folder is empty'}</h2><p className="ios-footnote">{query ? 'Try another file name.' : 'Files shared here appear in this folder.'}</p><button className="ios-button ios-primary" onClick={() => query ? setQuery('') : setActionsOpen(true)}>{query ? 'Clear search' : 'Folder actions'}</button></div>}
+    <footer className="mobile-inset mobile-browser-footer"><p className="ios-footnote">{online} · {data.total ?? entries.length} items · Page {page + 1}</p><div className="ios-row"><button className="ios-button" disabled={!page || loading || busy} onClick={() => { setPage(p => p - 1); setSelected([]) }}>Previous</button><button className="ios-button" disabled={!data.hasMore || loading || busy} onClick={() => { setPage(p => p + 1); setSelected([]) }}>Next</button></div></footer>
+    {(selected.length > 0 || actionsOpen) && <div className="glass glass-card mobile-browser-actions"><button className="ios-button" disabled={!selected.length || busy || loading || !!error} onClick={() => void download()}><ArrowDownToLine size={18} />Download</button>{location.rights.upload && <><button className="ios-button" disabled={busy || loading || !!error} onClick={() => void pick(false)}>Upload files</button><button className="ios-button" disabled={busy || loading || !!error} onClick={() => void pick(true)}>Upload folder</button></>}{location.rights.manage && <><button className="ios-button" disabled={busy || loading || !!error} onClick={() => openDialog('mkdir')}>New folder</button><button className="ios-button" disabled={selected.length !== 1 || busy || loading} onClick={() => openDialog('rename')}>Rename</button><button className="ios-button ios-destructive" disabled={!selected.length || busy || loading} onClick={() => openDialog('trash')}>Trash</button></>}<button className="ios-button" disabled={busy} onClick={() => { setActionsOpen(false); setSelected([]); setSelecting(false) }}>Done</button></div>}
+    {actionSheet}
+  </section>
   return <section className={`card file-browser${hover && location.rights.upload ? ' location-drag' : ''}`} aria-label={`${location.name} file browser`}>
     <nav className="location-breadcrumbs" aria-label="Folder path"><button disabled={busy} onClick={() => navigate('')}><Home size={15} />{location.name}</button>{parts.map((part, i) => <span key={i}><ChevronRight size={14} /><button disabled={busy} onClick={() => navigate(parts.slice(0,i+1).join('/'))}>{part}</button></span>)}</nav>
     <div className="location-toolbar location-actions">
@@ -137,21 +167,7 @@ export function FileBrowser({ friendId, location, online }: { friendId: string; 
       {!loading && !error && !entries.length && <div className="location-empty-small"><FolderOpenIllustration /><h3>{query ? 'No matching items' : 'This folder is empty'}</h3><p>{query ? 'Try another name in this folder.' : location.rights.upload ? (MOBILE_UI ? 'Upload photos or files here.' : 'Upload files or drop them here.') : 'Files shared here will appear in this folder.'}</p></div>}
     </div>
     <footer className="location-browser-footer"><span>{online} · {data.total ?? data.entries.length} items · Page {page+1}{location.rights.upload ? (MOBILE_UI ? ' · Upload available' : ' · Drop files here to upload') : ' · Read only'}</span><div className="location-toolbar"><button className="btn btn-ghost" disabled={page === 0 || loading || busy} onClick={() => { setPage(p => p-1); setSelected([]) }}>Previous</button><button className="btn btn-ghost" disabled={!data.hasMore || loading || busy} onClick={() => { setPage(p => p+1); setSelected([]) }}>Next</button></div></footer>
-    {dialog && <div className="location-modal dialog-overlay"><form className="card dialog" role="dialog" aria-modal="true" aria-labelledby="location-action-title" onSubmit={e => { e.preventDefault(); void run() }} onKeyDown={e => {
-        if (e.key === 'Escape' && !busy) setDialog(null)
-        if (e.key === 'Tab') {
-          const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)'))
-          const first = controls[0], last = controls[controls.length - 1]
-          if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus() }
-          if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus() }
-        }
-      }}>
-      <div className="location-heading"><h2 id="location-action-title">{dialog === 'trash' ? 'Move to trash?' : dialog === 'rename' ? 'Rename item' : 'New folder'}</h2><button type="button" className="icon-btn" aria-label="Close dialog" disabled={busy} onClick={() => setDialog(null)}><X size={18} /></button></div>
-      {dialog === 'trash' ? <><ul className="location-trash-items">{selectedEntries.map(e => <li key={e.name}>{e.name}</li>)}</ul><p>These items will move to <strong>{location.name}/.dropbeam-trash/&lt;timestamp&gt;/</strong>. They are not permanently deleted. The owner can restore them from that folder.</p></> : <label>{dialog === 'rename' ? `New name for “${selected[0]}”` : 'Folder name'}<input autoFocus required maxLength={200} value={name} onChange={e => setName(e.target.value)} /></label>}
-      {actionError && <p className="location-error" role="alert">{actionError}</p>}
-      {!!trashResults.length && <ul className="location-trash-items" aria-live="polite">{trashResults.map(r => <li key={r.name}><strong>{r.name}:</strong> {r.error ? `Failed — ${r.error}` : `Moved to ${r.trashPath}`}</li>)}</ul>}
-      <div className="dialog-actions location-toolbar"><button type="button" autoFocus={dialog === 'trash'} className="btn btn-ghost" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className="btn btn-primary" disabled={busy || (dialog !== 'trash' && !validName) || (dialog === 'trash' && !selectedEntries.length)}>{busy ? 'Working…' : dialog === 'trash' ? 'Move to trash' : dialog === 'mkdir' ? 'Create folder' : 'Rename'}</button></div>
-    </form></div>}
+    {actionSheet}
   </section>
 }
 function FolderOpenIllustration() { return <Folder size={38} strokeWidth={1.2} style={{ color: 'var(--accent)', margin: '8px auto' }} /> }

@@ -1,3 +1,4 @@
+import { MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
@@ -91,6 +92,8 @@ export function RecoverableFilesView() {
     )
   }
 
+  if (MOBILE_UI && summaries.length === 0) return <div className="mobile-empty"><HardDrive /><h2 className="ios-title2">Nothing to recover</h2><p className="ios-footnote">Saved copies of replaced files appear here.</p><button className="ios-button ios-primary" onClick={() => setView('locations')}>Browse locations</button></div>
+
   if (summaries.length === 0) {
     return (
       <div className="card">
@@ -106,7 +109,7 @@ export function RecoverableFilesView() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       {/* Storage gauge */}
-      <div className="card" style={{ padding: 18 }}>
+      <div className={MOBILE_UI ? "glass glass-card mobile-storage" : "card"} style={MOBILE_UI ? undefined : { padding: 18 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
           <div>
             <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>Saved copies are using ({budget > 0 ? `${formatBytes(budget)} limit per folder` : 'no storage limit'})</div>
@@ -134,7 +137,7 @@ export function RecoverableFilesView() {
         <div
           style={{
             display: 'flex',
-            height: 9,
+            height: MOBILE_UI ? 8 : 9,
             borderRadius: 999,
             overflow: 'hidden',
             background: 'var(--surface-2)',
@@ -262,6 +265,14 @@ function FolderRow({
       setItemBusy(null)
     }
   }
+
+  if (MOBILE_UI) return <section className="glass glass-card">
+    <div className="ios-row"><button className="mobile-entry" aria-expanded={isOpen} onClick={onToggle}><span className="mobile-tinted-icon"><HardDrive size={22} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{summary.folderName}</span><span className="ios-footnote">{formatBytes(summary.bytes)} · {summary.itemCount} items</span></span><ChevronRight size={18} /></button><button className="ios-icon ios-destructive" aria-label="Empty saved copies" disabled={busy} onClick={onAskEmpty}><Trash2 size={18} /></button></div>
+    {confirming && <div className="mobile-inset mobile-stack"><p className="ios-footnote">Delete this folder’s saved copies?</p><button className="ios-button ios-destructive" disabled={busy} onClick={onEmpty}>Empty saved copies</button><button className="ios-button" disabled={busy} onClick={onAskEmpty}>Cancel</button></div>}
+    {isOpen && <div aria-busy={items === null}>
+      {items === null ? <p className="mobile-inset ios-footnote">Loading saved copies…</p> : !items.length ? <p className="mobile-inset ios-footnote">Nothing saved here.</p> : items.map(item => <div className="ios-row" key={item.id}><span className="mobile-tinted-icon"><FileIcon name={item.relPath} size={22} /></span><div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{item.relPath.split('/').pop()}</h3><p className="ios-footnote">{formatBytes(item.size)} · {formatRelativeTime(item.timestampMs)}</p><div className="mobile-recovery-actions"><button className="ios-button" disabled={itemBusy === item.id} onClick={() => void restore(item)}>Restore</button><button className="ios-button ios-destructive" disabled={itemBusy === item.id} onClick={() => void forget(item)}>{confirmForget === item.id ? 'Delete forever?' : 'Forget'}</button></div></div></div>)}
+    </div>}
+  </section>
 
   return (
     <div className="card" style={{ padding: 0, overflow: 'hidden' }}>

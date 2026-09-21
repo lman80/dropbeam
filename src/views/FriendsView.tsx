@@ -40,7 +40,7 @@ export function FriendsView() {
       <button className="ios-row mobile-location-row" onClick={() => useStore.getState().setView('locations')}><span>Browse friends’ Locations</span><ChevronRight size={18} /></button>
       {friends.map(f => <FriendCard key={f.id} friend={f} />)}
     </div>
-    {friends.length === 0 && <div className="mobile-inset mobile-empty"><Users size={28} /><h2 className="ios-headline">No friends yet</h2><p className="ios-sub">Share your code or add a friend to send files and chat by name.</p><button className="ios-button ios-primary" onClick={() => setAdding(true)}>Add a friend</button></div>}
+    {friends.length === 0 && <div className="mobile-inset mobile-empty"><Users size={28} /><h2 className="ios-headline">No friends yet</h2><p className="ios-sub">Add a friend to send files and chat.</p><button className="ios-button ios-primary" onClick={() => setAdding(true)}>Add a friend</button></div>}
     {adding && <AddFriendModal onClose={() => setAdding(false)} />}
   </div>
 
@@ -466,7 +466,7 @@ function FriendCard({ friend }: { friend: Friend }) {
       <button className="ios-row" onClick={check} disabled={pinging}><Radar size={20} />{pinging ? 'Checking…' : 'Check presence'}</button>
       <button className="ios-row" onClick={showInvite} disabled={loadingInvite}><Copy size={20} />{invite ? 'Hide invite' : 'Show invite'}</button>
       {invite && <div className="mobile-inset mobile-stack"><p className="ios-footnote">Share this invite with {friend.name}.</p><button className="ios-button glass glass-pill" onClick={() => navigator.clipboard.writeText(invite).then(() => toast('success', 'Invite copied')).catch(() => toast('error', 'Could not copy'))}>Copy invite</button></div>}
-      {confirmRemove ? <div className="mobile-inset mobile-stack"><p className="ios-footnote">Remove {friend.name}? Chat history stays on this device.</p><div className="mobile-equal"><button className="ios-button" onClick={() => setConfirmRemove(false)}>Cancel</button><button className="ios-button ios-destructive" onClick={() => removeFriend(friend.id)}>Remove</button></div></div> : <button className="ios-row ios-destructive" onClick={() => setConfirmRemove(true)}><Trash2 size={20} />Remove friend</button>}
+      {confirmRemove ? <div className="mobile-inset mobile-stack"><p className="ios-footnote">Remove {friend.name}? Chat history stays on this device.</p><div className="mobile-equal"><button className="ios-button" onClick={() => setConfirmRemove(false)}>Cancel</button><button className="ios-button ios-destructive" onClick={() => removeFriend(friend.id)}>Remove</button></div></div> : <button className="ios-row" onClick={() => setConfirmRemove(true)}><Trash2 size={20} /><span className="mobile-grow">Remove friend</span><span className="ios-destructive">Remove</span></button>}
     </MobileFriendSheet>}
   </>
 
@@ -754,7 +754,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
         exit={{ opacity: 0 }}
         onClick={onClose}
         className="dialog-overlay"
-        style={{
+        style={MOBILE_UI ? undefined : {
           position: 'fixed',
           inset: 0,
           background: 'rgba(8, 9, 14, 0.5)',
@@ -766,13 +766,13 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
         }}
       >
         <motion.div
-          initial={{ opacity: 0, scale: 0.96, y: 8 }}
-          animate={{ opacity: 1, scale: 1, y: 0 }}
-          exit={{ opacity: 0, scale: 0.97 }}
+          initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96, y: 8 }}
+          animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
+          exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.97 }}
           transition={{ type: 'spring', stiffness: 320, damping: 28 }}
           onClick={(e) => e.stopPropagation()}
-          className="card dialog" role="dialog" aria-modal="true"
-          style={{ width: 440, maxWidth: '100%', padding: 22, borderRadius: 20 }}
+          className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
+          style={MOBILE_UI ? undefined : { width: 440, maxWidth: '100%', padding: 22, borderRadius: 20 }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
             <div style={{ fontSize: 'calc(17px * var(--ui-font-scale, 1))', fontWeight: 750 }}>Add a friend</div>

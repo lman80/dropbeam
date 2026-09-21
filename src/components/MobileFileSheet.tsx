@@ -36,12 +36,12 @@ function MobileFileSheet({ finish }: { finish: (source: Source | null) => void }
   const dialog = useRef<HTMLDialogElement>(null)
   useEffect(() => { dialog.current?.showModal() }, [])
   return (
-    <dialog ref={dialog} className="mobile-file-sheet" aria-labelledby="file-sheet-title"
+    <dialog ref={dialog} className="mobile-file-sheet glass" aria-labelledby="file-sheet-title"
       onCancel={(event) => { event.preventDefault(); finish(null) }}
       onClick={(event) => { if (event.target === event.currentTarget) finish(null) }}>
       <div className="mobile-file-sheet-body">
         <h2 id="file-sheet-title">Choose photos or files</h2>
-        <button className="btn btn-ghost" onClick={() => finish('photos')}><Images size={24} /> Photos <span>Photos and videos</span></button>
+        <button className="btn btn-primary" onClick={() => finish('photos')}><Images size={24} /> Photos <span>Photos and videos</span></button>
         <button className="btn btn-ghost" onClick={() => finish('files')}><File size={24} /> Files <span>Documents and other files</span></button>
         <button className="btn btn-ghost" onClick={() => finish(null)}>Cancel</button>
       </div>

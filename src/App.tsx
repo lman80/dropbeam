@@ -143,7 +143,7 @@ export default function App() {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <ErrorBoundary region="window controls">
-        {!(MOBILE_UI && ['send', 'friends', 'settings'].includes(view)) && <TitleBar />}
+        {!(MOBILE_UI && ['send', 'friends', 'settings', 'chat', 'history', 'locations'].includes(view)) && <TitleBar />}
         <InstallBanner />
         <LocalNetworkBanner />
       </ErrorBoundary>
@@ -228,7 +228,7 @@ function NameSetupModal() {
   return (
     <div
       className="dialog-overlay"
-      style={{
+      style={MOBILE_UI ? undefined : {
         position: 'fixed',
         inset: 0,
         zIndex: 1000,
@@ -238,10 +238,10 @@ function NameSetupModal() {
         backdropFilter: 'blur(3px)',
       }}
     >
-      <motion.div className="dialog" role="dialog" aria-modal="true"
-        initial={{ opacity: 0, scale: 0.96, y: 8 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        style={{
+      <motion.div className={MOBILE_UI ? "glass dialog mobile-sheet" : "dialog"} role="dialog" aria-modal="true"
+        initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96, y: 8 }}
+        animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
+        style={MOBILE_UI ? undefined : {
           width: 380,
           maxWidth: '90vw',
           background: 'var(--bg-elev)',

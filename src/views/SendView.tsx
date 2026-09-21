@@ -67,14 +67,22 @@ export function SendView() {
       <div className="mobile-inset mobile-stack">
         <DropZone hovering={dragHovering} picking={picking} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} />
         {!showReceive ? <button className="ios-button glass glass-pill" onClick={() => setShowReceive(true)}><ArrowDownToLine size={18} />Have a code? Receive files</button> :
-          <form className="mobile-receive glass glass-card" onSubmit={submitReceive}>
+          <div className="dialog-overlay"><form role="dialog" aria-modal="true" aria-label="Receive files" className="mobile-receive glass dialog" onSubmit={submitReceive} onKeyDown={e => {
+            if (e.key === 'Escape') setShowReceive(false)
+            if (e.key === 'Tab') {
+              const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('input, button:not(:disabled)'))
+              const first = controls[0], last = controls[controls.length - 1]
+              if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus() }
+              if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus() }
+            }
+          }}><h2 className="ios-title2">Receive files</h2>
             <input className="input" aria-label="Receive code" placeholder="Paste receive code" autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={code} autoFocus onChange={e => setCode(e.target.value)} />
             <div className="mobile-equal"><button className="ios-button ios-primary" disabled={!code.trim()}>Receive</button><button className="ios-button" type="button" onClick={() => { setShowReceive(false); setCode('') }}>Cancel</button></div>
-          </form>}
+          </form></div>}
       </div>
       <div className="mobile-inset mobile-transfers mobile-stack">
         <AnimatePresence initial={false}>{list.map(t => <TransferCard key={t.id} t={t} />)}</AnimatePresence>
-        {list.length === 0 && <div className="mobile-empty"><Inbox size={28} /><h2 className="ios-headline">Nothing here yet</h2><p className="ios-sub">Choose Photos or Files above. Files sent to you appear here automatically.</p></div>}
+        {list.length === 0 && <div className="mobile-empty"><Inbox size={28} /><h2 className="ios-headline">Nothing here yet</h2><p className="ios-sub">Send photos, videos or documents.</p><button className="ios-button ios-primary" onClick={() => void onPick()}>Send files</button></div>}
       </div>
     </div>
   )

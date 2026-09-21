@@ -1,3 +1,5 @@
+import { FileIcon } from './FileIcon'
+import { integrityLabel } from '../lib/integrity'
 import { ShareFilesButton } from './ShareFilesButton'
 import { MOBILE_UI } from '../lib/platform'
 import { memo, useState } from 'react'
@@ -33,7 +35,7 @@ function title(t: TransferUpdate): string {
 // framer-motion layout) on every progress tick.
 export const TransferCard = memo(TransferCardImpl)
 
-function TransferCardImpl({ t }: { t: TransferUpdate }) {
+function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: TransferUpdate; onRetry?: () => void; onShow?: () => void; showAction?: boolean }) {
   const showMegabits = useStore((s) => s.settings?.showMegabits ?? false)
   const formatSpeed = (bps: number) => formatSpeedValue(bps, showMegabits)
   const removeTransfer = useStore((s) => s.removeTransfer)
@@ -68,6 +70,36 @@ function TransferCardImpl({ t }: { t: TransferUpdate }) {
   }
 
   const DirIcon = t.direction === 'send' ? Send : ArrowDownToLine
+
+  if (MOBILE_UI) {
+    const route = t.connDetail?.path === 'relay' || t.locality === 'internet' ? 'Relay' : t.connDetail?.path === 'direct' || t.connDetail?.path === 'local' || t.locality === 'direct' || t.locality === 'local' ? 'Direct' : ''
+    const verified = integrityLabel(t.integrity ?? [], t.bytesTotal, t.state === 'completed')
+    const show = t.state === 'completed' && (!!t.outDir || !!onShow)
+    const retry = t.state === 'failed' && t.direction === 'send'
+    const action = show ? 'Show' : retry ? 'Retry' : active ? 'Cancel' : 'Dismiss'
+    return <article className="glass glass-card mobile-transfer">
+      <div className="mobile-transfer-heading"><span className="mobile-tinted-icon"><FileIcon name={t.fileNames[0] ?? ''} size={22} /></span>
+        <div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{title(t)}</h3><p className="ios-footnote mobile-ellipsis">{formatBytes(t.bytesTotal)} · {t.friendName ?? t.peer ?? 'Peer'}</p></div>
+        {showAction && <button className="ios-icon" aria-label={action} onClick={() => {
+          if (show && onShow) onShow()
+          else if (show) void api.shareFiles(t.fileNames.map(n => `${t.outDir}/${n}`)).catch(e => toast('error', String(e)))
+          else if (retry) { if (onRetry) onRetry(); else void retryTransfer(t.id) }
+          else if (isOffer) void respondToOffer(t.id, false)
+          else if (active) void api.cancelTransfer(t.id)
+          else removeTransfer(t.id)
+        }}>{show ? <FolderOpen size={21} /> : retry ? <RotateCw size={21} /> : <X size={21} />}</button>}
+      </div>
+      {t.state === 'completed' ? <p className="ios-footnote">{t.direction === 'send' ? 'Delivered' : 'Saved'}{route && ` · ${route}`} · {verified}</p> : <>
+        <div className="mobile-progress" role="progressbar" aria-label="Transfer progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(t.percent)}><span style={{ width: `${Math.max(0, Math.min(100, t.percent))}%` }} /></div>
+        <div className="mobile-transfer-stats ios-footnote"><span>{formatBytesLive(t.bytesDone)} of {formatBytesLive(t.bytesTotal)} · {formatSpeed(t.speedBps)}</span><span>{formatEta(t.etaSeconds)}</span></div>
+        <div className="mobile-transfer-badges">{route && <span className="glass glass-pill">{route}</span>}{verified === 'Verified' && <span className="glass glass-pill">Verified</span>}</div>
+        {t.state !== 'transferring' && <p className="ios-footnote">{t.error ?? t.detail ?? statusLabel(t)}</p>}
+      </>}
+      {isOffer && <button className="ios-button ios-primary" onClick={() => respondToOffer(t.id, true)}>Accept files</button>}
+      {isSendWaiting && <div className="mobile-stack"><code className="mobile-transfer-code">{t.code}</code><button className="ios-button glass glass-pill" onClick={copyCode}>{copied ? 'Copied' : 'Copy code'}</button><div className="mobile-qr"><QRCodeSVG value={t.code!} size={116} /></div></div>}
+      {t.detail && t.state === 'waitingForPeer' && <button className="ios-button" onClick={() => void api.forceRelay(t.id)}>Send over relay anyway</button>}
+    </article>
+  }
 
   return (
     <motion.div

@@ -1,3 +1,6 @@
+import { MobileHeader } from '../components/MobileHeader'
+import { TransferCard } from '../components/TransferCard'
+import { ChevronLeft } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -157,6 +160,13 @@ export function ChatView() {
   }, [activeChatId])
 
   const online = (f: Friend) => friendOnlineState(f.name, friendSeen, folderStatuses) === true
+
+  if (MOBILE_UI) return activeChatId ? <div className="mobile-page mobile-conversation"><Conversation key={activeChatId} friendId={activeChatId} /></div> : <div className="mobile-page mobile-chats"><MobileHeader title="Chats" /><div className="ios-list glass glass-card">{rows.map(({ friend, last }) => {
+    const recent = chats[friend.id]?.at(-1)
+    const ts = overview.find(o => o.peerId === friend.id)?.lastTs ?? recent?.ts
+    const count = unread[friend.id] ?? 0
+    return <button className="ios-row mobile-chat-row" key={friend.id} onClick={() => void openChat(friend.id)}><span className="mobile-chat-avatar"><FriendAvatar friend={friend} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{friend.name}</span><span className="ios-footnote mobile-ellipsis">{last ?? recent?.text ?? 'No messages yet'}</span></span><span className="mobile-chat-trailing"><time className="ios-footnote">{ts ? clock(ts) : ''}</time>{count > 0 && <span className="mobile-unread">{count > 99 ? '99+' : count}</span>}</span></button>
+  })}</div>{!rows.length && <div className="mobile-empty"><MessageCircle /><h2 className="ios-title2">No chats yet</h2><p className="ios-footnote">Add a friend to start a conversation.</p><button className="ios-button ios-primary" onClick={() => setView('friends')}>Add a friend</button></div>}</div>
 
   // Only show the "nobody to chat with" empty state when there are genuinely no
   // conversations AND no friends — never when a stored thread exists (otherwise a
@@ -391,7 +401,7 @@ function Conversation({ friendId }: { friendId: string }) {
   // ordered by time. Folder-sync rows are full-width "system" lines; the avatar/
   // tail run-grouping only applies to consecutive MESSAGE rows.
   const items = useMemo(() => {
-    const GAP = 30 * 60 * 1000 // 30 min
+    const GAP = (MOBILE_UI ? 5 : 30) * 60 * 1000 // 30 min
     type Row =
       | { kind: 'msg'; ts: number; m: ChatMessage }
       | { kind: 'activity'; ts: number; ev: FolderActivityEvent; folderName: string; folder: string }
@@ -419,7 +429,7 @@ function Conversation({ friendId }: { friendId: string }) {
     return rows.map((row, i) => {
       const prev = rows[i - 1]
       const next = rows[i + 1]
-      const divider = !prev || row.ts - prev.ts > GAP ? dayLabel(row.ts) : null
+      const divider = !prev || row.ts - prev.ts > GAP ? (MOBILE_UI ? `${dayLabel(row.ts)} · ${clock(row.ts)}` : dayLabel(row.ts)) : null
       if (row.kind !== 'msg') return { ...row, divider, firstOfRun: true, lastOfRun: true }
       const pm = prev && prev.kind === 'msg' ? prev.m : undefined
       const nm = next && next.kind === 'msg' ? next.m : undefined
@@ -619,7 +629,7 @@ function Conversation({ friendId }: { friendId: string }) {
 
   return (
     <>
-      <div
+      {MOBILE_UI ? <header className="mobile-header-compact visible glass mobile-conversation-header"><button className="ios-icon" aria-label="Back to chats" onClick={() => useStore.getState().closeChat()}><ChevronLeft /></button><span className="mobile-chat-avatar compact"><FriendAvatar friend={friend} /></span><div className="mobile-grow"><h1 className="ios-headline mobile-ellipsis">{friend.name}</h1><p className="ios-footnote">{typing ? 'typing…' : presenceText}</p></div><button className="ios-icon" aria-label="Search conversation" onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}><Search size={20} /></button></header> : <div
         className="titlebar-drag chat-header"
         style={{
           display: 'flex',
@@ -676,7 +686,7 @@ function Conversation({ friendId }: { friendId: string }) {
             <FolderOpen size={15} /> Shared folder
           </button>
         )}
-      </div>
+      </div>}
 
       {searchOpen && (
         <div className="chat-searchbar">
@@ -725,8 +735,7 @@ function Conversation({ friendId }: { friendId: string }) {
         atBottomRef.current = isAtBottom()
         if (atBottomRef.current && newCount) setNewCount(0)
       }}>
-        {items.length === 0 ? (
-          <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-faint)', paddingTop: 40 }}>
+        {items.length === 0 ? (MOBILE_UI ? <div className="mobile-empty"><MessageCircle /><h2 className="ios-title2">Say hi to {friend.name}</h2><p className="ios-footnote">{online ? 'Start your conversation here.' : 'Messages deliver when they return.'}</p><button className="ios-button ios-primary" onClick={() => taRef.current?.focus({ preventScroll: true })}>Write a message</button></div> : <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-faint)', paddingTop: 40 }}>
             <MessageCircle size={30} style={{ opacity: 0.5 }} />
             <div style={{ marginTop: 8, fontSize: 'calc(13px * var(--ui-font-scale, 1))' }}>Say hi to {friend.name} 👋</div>
             {!online && (
@@ -836,7 +845,7 @@ function Conversation({ friendId }: { friendId: string }) {
         </div>
       )}
 
-      <div className="chat-composer">
+      <div className={MOBILE_UI ? "chat-composer glass mobile-composer" : "chat-composer"}>
         {showGif && (
           <GifPicker
             apiKey={giphyKey}
@@ -869,7 +878,7 @@ function Conversation({ friendId }: { friendId: string }) {
         </button>
         {/* Settings promises "leave the key blank to hide" the GIF picker — honor
             it (an un-keyed picker only shows an error state anyway). */}
-        {giphyKey.trim() !== '' && (
+        {!MOBILE_UI && giphyKey.trim() !== '' && (
           <button
             className={`icon-btn${showGif ? ' on' : ''}`}
             title="Send a GIF"
@@ -882,7 +891,7 @@ function Conversation({ friendId }: { friendId: string }) {
             <Sparkles size={18} />
           </button>
         )}
-        <button
+        {!MOBILE_UI && <button
           className={`icon-btn${showEmoji ? ' on' : ''}`}
           title="Emoji"
           onClick={() => {
@@ -891,7 +900,7 @@ function Conversation({ friendId }: { friendId: string }) {
           }}
         >
           <Smile size={18} />
-        </button>
+        </button>}
         <textarea
           ref={taRef}
           className="chat-input"
@@ -914,7 +923,7 @@ function Conversation({ friendId }: { friendId: string }) {
         />
         <button
           aria-label={editing ? 'Save message' : 'Send message'}
-          className="btn btn-primary chat-send"
+          className={MOBILE_UI ? `ios-icon glass-pill${text.trim() ? " ios-primary" : ""}` : "btn btn-primary chat-send"}
           onClick={submit}
           disabled={editing ? !text.trim() : !text.trim() && stagedFiles.length === 0}
         >
@@ -1182,7 +1191,7 @@ const MessageRow = memo(function MessageRow({
         setMenu(false)
       }}
     >
-      {!mine && (
+      {!MOBILE_UI && !mine && (
         <span
           className="chat-line-avatar"
           style={{ visibility: lastOfRun ? 'visible' : 'hidden', background: avatarGradient(friend.id) }}
@@ -1287,7 +1296,7 @@ const MessageRow = memo(function MessageRow({
 
         {mine && lastOfRun && <DeliveryState status={m.status} />}
       </div>
-      <span className="chat-time-gutter">{clock(m.ts)}</span>
+      {!MOBILE_UI && <span className="chat-time-gutter">{clock(m.ts)}</span>}
     </div>
   )
 })
@@ -1379,6 +1388,25 @@ function FileMessage({
 
   const multi = m.files.length > 1
   const GlyphIcon = kind === 'video' ? Video : kind === 'audio' ? Music : kind === 'text' ? FileText : FileIcon
+
+  if (MOBILE_UI) {
+    const mobileTransfer = transfer ?? {
+      id: m.fileXferId ?? m.id, direction: mine ? 'send' as const : 'receive' as const,
+      state: m.fileXferFailed ? 'failed' as const : 'waitingForPeer' as const,
+      fileNames: m.files, fileCount: m.files.length, bytesTotal: m.bytes, bytesDone: 0,
+      percent: 0, speedBps: 0, etaSeconds: null, locality: 'unknown' as const,
+      peer: null, friendName: null, code: null, error: null, outDir: null,
+      detail: 'Waiting for confirmation…',
+    }
+    return <div className="chat-fileblock">
+      {m.text && <Linkified text={m.text} />}
+      {!multi && src && kind === 'image' && <img src={src} alt={name} className="chat-img" onClick={() => onLightbox(src)} onError={() => setBroken(true)} />}
+      {!multi && src && kind === 'video' && <video className="chat-media" src={src} controls preload="metadata" onError={() => setBroken(true)} />}
+      {!multi && src && kind === 'audio' && <audio className="chat-audio" src={src} controls preload="metadata" />}
+      <TransferCard t={mobileTransfer} showAction={!!transfer || !!m.fileXferFailed && !!m.fileXferId} onRetry={() => void resendChatFile(m.peerId, m.id, mobileTransfer.id)} onShow={openable ? () => { void api.shareFiles(completed.length ? completed.map(item => item.path) : [path!]).catch(e => useStore.getState().toast('error', String(e))) } : undefined} />
+      {transfer?.state !== 'completed' && completed.map(item => <button key={item.key} className="ios-button" onClick={() => void api.openPath(item.path).catch(() => {})}>{item.name} · Show</button>)}
+    </div>
+  }
 
   return (
     <div className="chat-fileblock">

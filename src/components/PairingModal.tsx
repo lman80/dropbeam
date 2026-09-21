@@ -1,3 +1,4 @@
+import { MOBILE_UI } from '../lib/platform'
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -138,7 +139,7 @@ export function PairingModal({
         exit={{ opacity: 0 }}
         onClick={onClose}
         className="dialog-overlay"
-        style={{
+        style={MOBILE_UI ? undefined : {
           position: 'fixed',
           inset: 0,
           background: 'rgba(8, 9, 14, 0.5)',
@@ -150,13 +151,13 @@ export function PairingModal({
         }}
       >
         <motion.div
-          initial={{ opacity: 0, scale: 0.96, y: 8 }}
-          animate={{ opacity: 1, scale: 1, y: 0 }}
-          exit={{ opacity: 0, scale: 0.97 }}
+          initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96, y: 8 }}
+          animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
+          exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.97 }}
           transition={{ type: 'spring', stiffness: 320, damping: 28 }}
           onClick={(e) => e.stopPropagation()}
-          className="card dialog" role="dialog" aria-modal="true" aria-label="Shared folder"
-          style={{ width: 460, maxWidth: '100%', padding: 22, borderRadius: 20 }}
+          className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true" aria-label="Shared folder"
+          style={MOBILE_UI ? undefined : { width: 460, maxWidth: '100%', padding: 22, borderRadius: 20 }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
             <div style={{ fontSize: 'calc(17px * var(--ui-font-scale, 1))', fontWeight: 750 }}>
