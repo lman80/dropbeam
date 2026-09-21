@@ -118,6 +118,7 @@ libc = "0.2"
 # popover open (Tauri keeps its tray's NSStatusItem private, so we go native).
 # Pinned to the same objc2 stack Tauri/tray-icon already use.
 [target.'cfg(target_os = "ios")'.dependencies]
+tauri-plugin-native-ui = { path = "plugins/native-ui" }
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["block2"] }

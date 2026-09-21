@@ -7,6 +7,8 @@ import { setTaskbarProgress } from './lib/taskbar'
 import { useStore } from './store'
 import { MOBILE_UI } from './lib/platform'
 import { installNativeTabBar } from './lib/nativeTabBar'
+import { startNativeBridge } from './lib/nativeBridge'
+import { nativeShellActive } from './lib/nativeShell'
 import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
 import { MobileTabBar } from './components/MobileTabBar'
@@ -26,6 +28,7 @@ import { MobileApp } from './mobile/MobileApp'
 import { MobileOnboarding } from './mobile/Onboarding'
 
 export default function App() {
+  const [nativeShell, setNativeShell] = useState(false)
   const nativeTabBar = useStore((s) => s.nativeTabBar)
   const ready = useStore((s) => s.ready)
   const view = useStore((s) => s.view)
@@ -34,7 +37,10 @@ export default function App() {
   const setDragHovering = useStore((s) => s.setDragHovering)
 
   useEffect(() => {
-    if (MOBILE_UI) void installNativeTabBar()
+    if (MOBILE_UI) void startNativeBridge().then(() => {
+      setNativeShell(nativeShellActive)
+      return installNativeTabBar()
+    })
   }, [])
 
   useLayoutEffect(() => {
@@ -200,7 +206,7 @@ export default function App() {
       )}
       <ErrorBoundary region="overlays" fallbackStyle={{ position: 'fixed', bottom: 12, left: 12, zIndex: 201 }}>
         <SendToChooser />
-        {MOBILE_UI ? <MobileOnboarding /> : <NameSetupModal />}
+        {MOBILE_UI ? (!nativeShell && <MobileOnboarding />) : <NameSetupModal />}
         <FolderInviteModal />
       </ErrorBoundary>
       <ErrorBoundary region="toasts" fallbackStyle={{ position: 'fixed', bottom: 12, right: 12, zIndex: 101 }}>

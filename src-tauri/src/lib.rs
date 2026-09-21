@@ -286,6 +286,9 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init());
+
+    #[cfg(target_os = "ios")]
+    let builder = builder.plugin(tauri_plugin_native_ui::init());
     // Desktop-only plugins. autostart (login items), updater (we ship .dmg/.msi
     // updates, the App Store/Xcode owns iOS updates) and process (relaunch) have
     // no mobile implementation at all in tauri v2.

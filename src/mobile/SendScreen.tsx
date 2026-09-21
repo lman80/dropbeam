@@ -7,6 +7,7 @@ import { useStore } from '../store'
 import { FileIcon } from '../components/FileIcon'
 import { Button, IconSquare, ProgressRow, Row, Screen, Section, Sheet, TextField } from './kit'
 import { useSend } from './useSend'
+import { transferSharePaths as sharePaths } from '../lib/mobilePick'
 import { copyText, reportError } from './shared'
 
 function statusLine(t: TransferUpdate) {
@@ -16,15 +17,6 @@ function statusLine(t: TransferUpdate) {
   if (t.state === 'canceled') return 'Canceled'
   if (t.state === 'transferring') return `${t.direction === 'send' ? `Sending${t.friendName ? ` to ${t.friendName}` : ''}` : 'Receiving'} · ${formatBytes(t.bytesDone)} of ${formatBytes(t.bytesTotal)} · ${formatSpeed(t.speedBps)}`
   return t.detail || ({ starting: 'Starting…', waitingForPeer: 'Waiting for a connection', connecting: 'Connecting…', waitingForAccept: 'Waiting for acceptance' }[t.state] ?? t.state)
-}
-/** The store retains original send paths for retry. Read that existing cache rather
- * than inventing paths from file names; completed receives already carry outDir. */
-function sharePaths(t: TransferUpdate): string[] {
-  if (t.outDir) return t.fileNames.map(name => `${t.outDir}/${name}`)
-  try {
-    const cached = JSON.parse(localStorage.getItem('dropbeam-retry-payloads') || '{}')?.[t.id]?.paths
-    return Array.isArray(cached) ? cached.filter((path): path is string => typeof path === 'string' && !!path) : []
-  } catch { return [] }
 }
 export function SendScreen() {
   const send = useSend()

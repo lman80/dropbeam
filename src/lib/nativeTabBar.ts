@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useStore } from '../store'
 import { MOBILE_UI } from './platform'
+import { nativeShellActive } from './nativeShell'
 import { NATIVE_TABS, nativeTabBarModel } from './nativeTabBarModel'
 
 export { nativeTabBarModel } from './nativeTabBarModel'
@@ -11,6 +12,7 @@ let installation: Promise<void> | undefined
 let dispose: (() => void) | undefined
 
 export async function installNativeTabBar(): Promise<void> {
+  if (nativeShellActive) return
   if (!MOBILE_UI || typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return
   installation ??= install()
   return installation

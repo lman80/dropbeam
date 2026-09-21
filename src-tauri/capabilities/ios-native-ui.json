@@ -1,0 +1,7 @@
+{
+  "identifier": "ios-native-ui",
+  "description": "Native SwiftUI shell data bridge on iOS only.",
+  "platforms": ["iOS"],
+  "windows": ["main"],
+  "permissions": ["native-ui:default"]
+}

@@ -1,7 +1,6 @@
 import { useMemo, useRef, useState } from 'react'
-import { api } from '../lib/api'
+import { pickAndSend } from '../lib/mobilePick'
 import { useStore } from '../store'
-import { withMobileFileSource } from '../components/MobileFileSheet'
 
 /** Mobile presentation adapter for SendView's picker/list/receive flow.
  * The store remains the sole implementation of sending, receiving and retrying. */
@@ -20,8 +19,7 @@ export function useSend() {
     if (pickingRef.current) return
     pickingRef.current = true; setPicking(true)
     try {
-      const paths = await withMobileFileSource(source, source === 'photos' ? api.pickPhotos : api.pickFiles)
-      if (paths.length) useStore.getState().setPendingSend(paths)
+      await pickAndSend(source)
     } catch (error) { useStore.getState().toast('error', String(error)) }
     finally { pickingRef.current = false; setPicking(false); useStore.getState().setDragHovering(false) }
   }

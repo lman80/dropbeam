@@ -43,6 +43,7 @@
 		3842AE2A64FB9933D0400EA4 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
 		39EEC6A55698228E08917A52 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		39F196D577817579BAFA9AB5 /* labkit.rs */ = {isa = PBXFileReference; path = labkit.rs; sourceTree = "<group>"; };
+		3BE9337AAC6F7B4835C5A46D /* link.rs */ = {isa = PBXFileReference; path = link.rs; sourceTree = "<group>"; };
 		4DDC17AC7FD6E2D6EAF940E6 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
 		4ED84DFEA2768BB78E03A21F /* lab.rs */ = {isa = PBXFileReference; path = lab.rs; sourceTree = "<group>"; };
 		5050E57A3F0E6DBA22C77BF1 /* tray_drag.rs */ = {isa = PBXFileReference; path = tray_drag.rs; sourceTree = "<group>"; };
@@ -69,6 +70,7 @@
 		E9415AC38490CB2A78AC1FE9 /* verify.rs */ = {isa = PBXFileReference; path = verify.rs; sourceTree = "<group>"; };
 		EB2B775C52293A9CDCF80009 /* integrity.rs */ = {isa = PBXFileReference; path = integrity.rs; sourceTree = "<group>"; };
 		F3673D372C5ABDD1AD6E7067 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		FAA8A4E4E47486F7154563E1 /* ios_tabbar.rs */ = {isa = PBXFileReference; path = ios_tabbar.rs; sourceTree = "<group>"; };
 		FBAA48B3DA509BAF6CC39B2B /* codes.rs */ = {isa = PBXFileReference; path = codes.rs; sourceTree = "<group>"; };
 		FBC720DFA1D01F55B0A32344 /* app_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = app_iOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -163,10 +165,12 @@
 				5550EA038F005A9D2E4D6DE8 /* fs_walk.rs */,
 				509B84E4384D38209EBF4ABE /* history.rs */,
 				252D255E1AC93C05FC5F377B /* ios_media.rs */,
+				FAA8A4E4E47486F7154563E1 /* ios_tabbar.rs */,
 				7BAFC636FC98BC527E8F5EA3 /* iroh_net.rs */,
 				4ED84DFEA2768BB78E03A21F /* lab.rs */,
 				39F196D577817579BAFA9AB5 /* labkit.rs */,
 				17B52554D60D361AFE791C3E /* lib.rs */,
+				3BE9337AAC6F7B4835C5A46D /* link.rs */,
 				2F2F58DB8D18AE5642AF94D1 /* location_sync.rs */,
 				9F1A1F3A757B8E63FA1AC808 /* locations.rs */,
 				7C8EE44E6025F78B4DFE3F20 /* mac_service.rs */,
@@ -236,7 +240,7 @@
 			path = app;
 			sourceTree = "<group>";
 		};
-		"TEMP_57124B4A-AD76-4E1C-8D4D-830C5CB2621A" /* x86_64 */ = {
+		"TEMP_ACBDF0C1-FE63-4BF7-8067-3383A7927F30" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -425,7 +429,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -519,7 +523,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
