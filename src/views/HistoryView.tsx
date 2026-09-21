@@ -64,7 +64,7 @@ export function HistoryView() {
   }
 
   if (MOBILE_UI) return <div className="mobile-page mobile-history"><MobileHeader title="History" actions={tab === 'recents' && history.length > 0 ? <button className="ios-icon ios-destructive" aria-label="Clear history list" onClick={clearAll}><Trash2 size={20} /></button> : undefined} />
-    <div className="mobile-inset glass glass-pill mobile-segmented">{(['recents', 'recoverable'] as const).map(value => <button key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>{value === 'recents' ? 'Recents' : 'Recoverable'}</button>)}</div>
+    <div className="mobile-inset mobile-segmented">{(['recents', 'recoverable'] as const).map(value => <button key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>{value === 'recents' ? 'Recents' : 'Recoverable'}</button>)}</div>
     {tab === 'recents' ? <Recents history={history} query={query} setQuery={setQuery} /> : <div className="mobile-inset"><RecoverableFilesView /></div>}
   </div>
 
@@ -140,7 +140,7 @@ function Recents({
 
   if (MOBILE_UI) return <>
     {history.length > 0 && <div className="mobile-inset"><input className="mobile-search" aria-label="Search history" placeholder="Search files & people" value={query} onChange={e => setQuery(e.target.value)} /></div>}
-    {groups.map(g => <section key={g.label}><h2 className="ios-section-title">{g.label}</h2><div className="ios-list glass glass-card">{g.entries.map(e => <RecentRow key={e.id} e={e} />)}</div></section>)}
+    {groups.map(g => <section key={g.label}><h2 className="ios-section-title">{g.label}</h2><div className="ios-list">{g.entries.map(e => <RecentRow key={e.id} e={e} />)}</div></section>)}
     {!groups.length && <div className="mobile-empty"><HistoryIcon /><h2 className="ios-title2">{query ? 'No matches' : 'No transfers yet'}</h2><p className="ios-footnote">{query ? 'Try another name.' : 'Your transfers appear here.'}</p><button className="ios-button ios-primary" onClick={() => query ? setQuery('') : useStore.getState().setView('send')}>{query ? 'Clear search' : 'Send files'}</button></div>}
   </>
 

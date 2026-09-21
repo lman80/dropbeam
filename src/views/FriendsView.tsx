@@ -41,10 +41,10 @@ export function FriendsView() {
   }, [])
 
   if (MOBILE_UI) return <div className="mobile-page mobile-friends">
-    <MobileHeader title="Friends" actions={<button className="ios-icon glass glass-pill" aria-label="Add friend" onClick={() => setAdding(true)}><Plus size={22} /></button>} />
+    <MobileHeader title="Friends" actions={<button className="ios-icon" aria-label="Add friend" onClick={() => setAdding(true)}><Plus size={22} /></button>} />
     <h2 className="ios-section-title">You</h2><YouCard />
     <h2 className="ios-section-title">{friends.length ? `Friends · ${friends.length}` : 'Friends'}</h2>
-    <div className="ios-list glass glass-card">
+    <div className="ios-list">
       <button className="ios-row mobile-location-row" onClick={() => useStore.getState().setView('locations')}><span>Browse friends’ Locations</span><ChevronRight size={18} /></button>
       {friends.map(f => <FriendCard key={f.id} friend={f} />)}
     </div>
@@ -215,7 +215,7 @@ function YouCard() {
     }
   }
 
-  if (MOBILE_UI) return <section className="mobile-you mobile-inset glass glass-card">
+  if (MOBILE_UI) return <section className="mobile-you mobile-inset">
     <div className="mobile-profile">
       <button className="mobile-avatar-button" aria-label="Change picture" onClick={() => void pickAvatar()}><Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={64} radius={20} /></button>
       <div className="mobile-grow">
@@ -225,8 +225,8 @@ function YouCard() {
     </div>
     {settings?.avatar && <button className="ios-button ios-destructive" onClick={() => void clearAvatar()}>Remove picture</button>}
     <div className="mobile-equal">
-      <button className="ios-button glass glass-pill" disabled={!code} onClick={() => setShowQR(v => !v)}><QrCode size={18} />{showQR ? 'Hide QR' : 'QR code'}</button>
-      <button className="ios-button glass glass-pill" disabled={!code} onClick={copyCode}>{copied ? <Check size={18} /> : <Copy size={18} />}{copied ? 'Copied' : 'Copy code'}</button>
+      <button className="ios-button" disabled={!code} onClick={() => setShowQR(v => !v)}><QrCode size={18} />{showQR ? 'Hide QR' : 'QR code'}</button>
+      <button className="ios-button" disabled={!code} onClick={copyCode}>{copied ? <Check size={18} /> : <Copy size={18} />}{copied ? 'Copied' : 'Copy code'}</button>
     </div>
     {showQR && code && <div className="mobile-qr"><QRCodeSVG value={code} size={160} level="M" /></div>}
     <p className="ios-footnote">Share this code once. Your friends stay connected across updates.</p>
@@ -473,7 +473,7 @@ function FriendCard({ friend }: { friend: Friend }) {
       <button className="ios-row" onClick={() => openChat(friend.id)}><MessageCircle size={20} />Message</button>
       <button className="ios-row" onClick={check} disabled={pinging}><Radar size={20} />{pinging ? 'Checking…' : 'Check presence'}</button>
       <button className="ios-row" onClick={showInvite} disabled={loadingInvite}><Copy size={20} />{invite ? 'Hide invite' : 'Show invite'}</button>
-      {invite && <div className="mobile-inset mobile-stack"><p className="ios-footnote">Share this invite with {friend.name}.</p><button className="ios-button glass glass-pill" onClick={() => navigator.clipboard.writeText(invite).then(() => toast('success', 'Invite copied')).catch(() => toast('error', 'Could not copy'))}>Copy invite</button></div>}
+      {invite && <div className="mobile-inset mobile-stack"><p className="ios-footnote">Share this invite with {friend.name}.</p><button className="ios-button" onClick={() => navigator.clipboard.writeText(invite).then(() => toast('success', 'Invite copied')).catch(() => toast('error', 'Could not copy'))}>Copy invite</button></div>}
       {confirmRemove ? <div className="mobile-inset mobile-stack"><p className="ios-footnote">Remove {friend.name}? Chat history stays on this device.</p><div className="mobile-equal"><button className="ios-button" onClick={() => setConfirmRemove(false)}>Cancel</button><button className="ios-button ios-destructive" onClick={() => removeFriend(friend.id)}>Remove</button></div></div> : <button className="ios-row" onClick={() => setConfirmRemove(true)}><Trash2 size={20} /><span className="mobile-grow">Remove friend</span><span className="ios-destructive">Remove</span></button>}
     </MobileFriendSheet>}
   </>
@@ -779,7 +779,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
           exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.97 }}
           transition={{ type: 'spring', stiffness: 320, damping: 28 }}
           onClick={(e) => e.stopPropagation()}
-          className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
+          className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
           style={MOBILE_UI ? undefined : { width: 440, maxWidth: '100%', padding: 22, borderRadius: 20 }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
@@ -832,7 +832,7 @@ function MobileFriendSheet({ title, children, onClose }: { title: string; childr
     dialog.current?.showModal()
     return () => { previous?.focus() }
   }, [])
-  return createPortal(<dialog ref={dialog} className="mobile-friend-sheet glass" aria-label={`Manage ${title}`} onCancel={onClose} onClick={e => { if (e.target === e.currentTarget) { const r = e.currentTarget.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) onClose() } }}>
+  return createPortal(<dialog ref={dialog} className="mobile-friend-sheet" aria-label={`Manage ${title}`} onCancel={onClose} onClick={e => { if (e.target === e.currentTarget) { const r = e.currentTarget.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) onClose() } }}>
     <div className="mobile-sheet-top"><h2 className="ios-title2">{title}</h2><button className="ios-button" onClick={onClose} autoFocus>Done</button></div>
     {children}
   </dialog>, document.body)

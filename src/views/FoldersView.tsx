@@ -1122,7 +1122,7 @@ function InviteModal({
         initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96 }}
         animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1 }}
         onClick={(e) => e.stopPropagation()}
-        className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
+        className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
         style={MOBILE_UI ? undefined : { width: 420, maxWidth: '100%', padding: 22, borderRadius: 20 }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>

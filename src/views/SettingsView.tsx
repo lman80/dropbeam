@@ -864,7 +864,7 @@ export function SettingsView() {
 }
 
 function MobileSection({ title, children }: { title: string; children: ReactNode }) {
-  return <section><h2 className="ios-section-title">{title}</h2><div className="ios-list glass glass-card">{children}</div></section>
+  return <section><h2 className="ios-section-title">{title}</h2><div className="ios-list">{children}</div></section>
 }
 
 function MobileSetting({ title, desc, children, destructive = false }: { title: string; desc?: string; children?: ReactNode; destructive?: boolean }) {

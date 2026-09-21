@@ -73,7 +73,7 @@ export function SendToChooser() {
             exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.97 }}
             transition={{ type: 'spring', stiffness: 320, damping: 28 }}
             onClick={(e) => e.stopPropagation()}
-            className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
+            className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
             style={MOBILE_UI ? undefined : { width: 440, maxWidth: '100%', padding: 22, borderRadius: 20, display: 'flex', flexDirection: 'column' }}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>

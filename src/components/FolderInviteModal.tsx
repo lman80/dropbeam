@@ -69,7 +69,7 @@ export function FolderInviteModal() {
             animate={MOBILE_UI ? { opacity: 1 } : { scale: 1, y: 0 }}
             exit={MOBILE_UI ? { opacity: 0 } : { scale: 0.96, y: 8 }}
             onClick={(e) => e.stopPropagation()}
-            className={MOBILE_UI ? "glass dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
+            className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
             style={MOBILE_UI ? undefined : { width: 'min(420px, 92vw)', padding: 22 }}
           >
             <div className="dialog-body">

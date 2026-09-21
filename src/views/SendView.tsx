@@ -66,8 +66,8 @@ export function SendView() {
       <MobileHeader title="Send" />
       <div className="mobile-inset mobile-stack">
         <DropZone hovering={dragHovering} picking={picking} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} />
-        {!showReceive ? <button className="ios-button glass glass-pill" onClick={() => setShowReceive(true)}><ArrowDownToLine size={18} />Have a code? Receive files</button> :
-          <div className="dialog-overlay"><form role="dialog" aria-modal="true" aria-label="Receive files" className="mobile-receive glass dialog" onSubmit={submitReceive} onKeyDown={e => {
+        {!showReceive ? <button className="ios-button" onClick={() => setShowReceive(true)}><ArrowDownToLine size={18} />Have a code? Receive files</button> :
+          <div className="dialog-overlay"><form role="dialog" aria-modal="true" aria-label="Receive files" className="mobile-receive dialog" onSubmit={submitReceive} onKeyDown={e => {
             if (e.key === 'Escape') setShowReceive(false)
             if (e.key === 'Tab') {
               const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('input, button:not(:disabled)'))

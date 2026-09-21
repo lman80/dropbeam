@@ -109,7 +109,7 @@ export function RecoverableFilesView() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       {/* Storage gauge */}
-      <div className={MOBILE_UI ? "glass glass-card mobile-storage" : "card"} style={MOBILE_UI ? undefined : { padding: 18 }}>
+      <div className={MOBILE_UI ? "mobile-storage" : "card"} style={MOBILE_UI ? undefined : { padding: 18 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10 }}>
           <div>
             <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>Saved copies are using ({budget > 0 ? `${formatBytes(budget)} limit per folder` : 'no storage limit'})</div>
@@ -266,7 +266,7 @@ function FolderRow({
     }
   }
 
-  if (MOBILE_UI) return <section className="glass glass-card">
+  if (MOBILE_UI) return <section className="ios-list">
     <div className="ios-row"><button className="mobile-entry" aria-expanded={isOpen} onClick={onToggle}><span className="mobile-tinted-icon"><HardDrive size={22} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{summary.folderName}</span><span className="ios-footnote">{formatBytes(summary.bytes)} · {summary.itemCount} items</span></span><ChevronRight size={18} /></button><button className="ios-icon ios-destructive" aria-label="Empty saved copies" disabled={busy} onClick={onAskEmpty}><Trash2 size={18} /></button></div>
     {confirming && <div className="mobile-inset mobile-stack"><p className="ios-footnote">Delete this folder’s saved copies?</p><button className="ios-button ios-destructive" disabled={busy} onClick={onEmpty}>Empty saved copies</button><button className="ios-button" disabled={busy} onClick={onAskEmpty}>Cancel</button></div>}
     {isOpen && <div aria-busy={items === null}>
