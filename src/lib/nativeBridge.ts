@@ -1,3 +1,4 @@
+import { loadLocations } from './locationsLoad'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { api, HAS_TAURI, type Settings, locationsApi, type SharedLocation, type LocationPage } from './api'
@@ -71,7 +72,9 @@ const handlers: BridgeHandlers = {
     const id = string(a, 'friendId')
     // Picking has already replied to Swift. Cancellation never reaches staging.
     if (st().activeChatId !== id) throw new Error('Open the conversation again to attach these files.')
-    st().stageChatFiles(paths(a))
+    // O(N) validation/dedup only. No stat/read/preview work on the JS thread;
+    // Swift lazily downsamples visible thumbnails after this action replies.
+    st().stageChatFiles([...new Set(paths(a))])
   },
   removeChatDraftFile: a => st().unstageChatFile(string(a, 'path')),
   reactToMessage: a => st().reactToMessage(string(a, 'friendId'), string(a, 'messageId'), string(a, 'emoji')),
@@ -173,8 +176,8 @@ const handlers: BridgeHandlers = {
   recoverableForget: a => { const item = recoveryItem(a); return api.forgetFolderItem(item.folder, item.id) },
   recoverableEmpty: a => api.clearFolderHistory(string(a, 'folder')),
   recoverableEmptyAll: () => api.clearAllFolderHistory(),
-  locationsList: () => locationSnapshot(),
-  locationsRefresh: async () => { await refreshLocations(); return locationSnapshot() },
+  locationsList: async () => { await refreshLocations(); return locationSnapshot() },
+  locationsRefresh: async () => { await refreshLocations(true); return locationSnapshot() },
   browserList: async a => nativeBrowserPage(await locationRequest<LocationPage>(a, 'ls', { cursor: a.cursor, query: a.query ?? '', sort: 'name' })),
   browserDownload: a => locationRequest(a, 'download', { paths: names(a).map(n => locationChild(string(a, 'path'), n)) }),
   browserUpload: async a => {
@@ -242,22 +245,37 @@ try {
 } catch { /* optional cache */ }
 let locationErrors: Record<string, string> = {}
 let refreshing: Promise<void> | undefined
+let locationRefreshQueued = false
 let resnapshot: ((force?: boolean) => void) | undefined
+let pushLocations: (() => void) | undefined
 const needsName = () => !!st().settings && (!st().settings!.displayName.trim() || !localStorage.getItem('dropbeam.namedSelf'))
 const deviceSnapshot = () => { const d = st().myDevice; return d ? { name: d.name, endpointId: d.endpoint_id, deviceKind: d.device_kind, accountPub: d.account_pub, linkedDevices: d.linked_devices } : null }
 const locationSnapshot = () => st().friends.map(f => ({ friendId: f.id, friendName: f.name, online: friendOnlineState(f.name, st().friendSeen, st().folderStatuses) === true, locations: shared[f.id] ?? [], error: locationErrors[f.id] ?? null }))
-function refreshLocations() {
-  refreshing ??= (async () => {
-    await Promise.allSettled(st().friends.filter(f => f.endpointId).map(async f => {
-      try {
-        if (friendOnlineState(f.name, st().friendSeen, st().folderStatuses) !== true && !await st().pingFriend(f.id)) return
-        shared[f.id] = await locationsApi.list(f.id); delete locationErrors[f.id]
-      } catch (e) { locationErrors[f.id] = String(e) }
-    }))
-    const ids = new Set(st().friends.map(f => f.id))
-    shared = Object.fromEntries(Object.entries(shared).filter(([id]) => ids.has(id)))
-    try { localStorage.setItem('dropbeam.locations', JSON.stringify(Object.fromEntries(Object.entries(shared).map(([id, list]) => [id, list.map(({ id, name, rights }) => ({ id, name, rights }))])))) } catch { /* optional cache */ }
-    resnapshot?.()
+function refreshLocations(force = false) {
+  if (refreshing) { locationRefreshQueued ||= force; return refreshing }
+  refreshing = (async () => {
+    do {
+      locationRefreshQueued = false
+      await loadLocations({
+        friends: st().friends,
+        online: f => friendOnlineState(f.name, st().friendSeen, st().folderStatuses) === true,
+        probe: id => st().pingFriend(id),
+        list: locationsApi.list,
+        cached: shared,
+        onResult: result => {
+          // Push each peer as it finishes: one offline peer cannot hide a Linux
+          // friend's successful locations behind its timeout.
+          shared[result.friendId] = result.locations
+          if (result.error) locationErrors[result.friendId] = result.error
+          else delete locationErrors[result.friendId]
+          pushLocations?.()
+        },
+      })
+      const ids = new Set(st().friends.map(f => f.id))
+      shared = Object.fromEntries(Object.entries(shared).filter(([id]) => ids.has(id)))
+      try { localStorage.setItem('dropbeam.locations', JSON.stringify(Object.fromEntries(Object.entries(shared).map(([id, list]) => [id, list.map(({ id, name, rights }) => ({ id, name, rights }))])))) } catch { /* optional cache */ }
+      pushLocations?.()
+    } while (locationRefreshQueued)
   })().finally(() => { refreshing = undefined })
   return refreshing
 }
@@ -338,7 +356,7 @@ async function start() {
         Object.assign({}, ...(s.activeChatId ? s.chats[s.activeChatId] ?? [] : []).map(m => {
           const restored = restoredChatTransfer(m, s.history)
           return restored && m.fileXferId ? { [m.fileXferId]: restored } : {}
-        }), s.chatTransfers)).map(t => ({ ...t, sharePaths: t.state === 'completed' ? transferSharePaths(t) : [] })),
+        }), s.chatTransfers)).map(t => ({ ...t, sharePaths: t.direction === 'send' || t.state === 'completed' ? transferSharePaths(t) : [] })),
       settings: s.settings,
       history: s.history,
       locations: locationSnapshot(),
@@ -364,14 +382,23 @@ async function start() {
       if (toast.kind === 'error') send('event', { name: 'error', payload: { message: toast.message } })
     }
   }
+  pushLocations = () => send('state', { key: 'locations', value: locationSnapshot() })
   resnapshot = sync
-  stops.push(useStore.subscribe(() => sync()))
+  // Store staging is path-only. Coalesce synchronous store notifications into
+  // the next turn so serialization cannot hold the picker/staging reply hostage.
+  let syncTimer: ReturnType<typeof setTimeout> | undefined
+  stops.push(useStore.subscribe(() => {
+    syncTimer ??= setTimeout(() => { syncTimer = undefined; if (running) sync() }, 0)
+  }))
   sync() // Full initial snapshot, even when init is still in progress.
   void st().refreshMyDevice().catch(() => {})
   const timer = window.setInterval(sync, 15_000) // Presence must expire without a store mutation.
-  cleanup = () => { resnapshot = undefined; running = false; stops.forEach(stop => stop()); clearInterval(timer) }
+  cleanup = () => { resnapshot = undefined; pushLocations = undefined; running = false; stops.forEach(stop => stop()); clearInterval(timer); clearTimeout(syncTimer) }
   for (const name of ['chat://message', 'friend://presence', 'folder-history://changed', 'folder-invite://incoming', 'locations://changed']) {
-    try { stops.push(await listen(name, ({ payload }) => send('event', { name, payload }))) } catch { /* optional event */ }
+    try { stops.push(await listen(name, ({ payload }) => {
+      send('event', { name, payload })
+      if (name === 'locations://changed') void refreshLocations(true)
+    })) } catch { /* optional event */ }
   }
   try { stops.push(await listen('friends://changed', () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
 }

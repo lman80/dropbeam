@@ -33,20 +33,22 @@ struct ChatComposer: View {
             }
             if !bridge.chatDraftFiles.isEmpty && editing == nil {
                 ScrollView(.horizontal) {
-                    HStack(spacing: 8) {
+                    LazyHStack(spacing: 10) {
                         ForEach(bridge.chatDraftFiles, id: \.self) { path in
-                            HStack(spacing: 6) {
-                                Image(systemName: Formatters.symbol(path))
-                                Text(URL(fileURLWithPath: path).lastPathComponent).font(.caption).lineLimit(1).frame(maxWidth: 150)
-                                Button { bridge.perform { try await bridge.removeChatDraftFile(path: path) } } label: {
-                                    Image(systemName: "xmark.circle.fill").frame(width: 44, height: 44)
-                                }.accessibilityLabel("Remove \(URL(fileURLWithPath: path).lastPathComponent)")
-                            }.padding(.leading, 12).background(.quaternary, in: Capsule())
+                            MediaThumbnail(path: path, width: 72, height: 72)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                                .overlay(alignment: .topTrailing) {
+                                    Button { bridge.perform { try await bridge.removeChatDraftFile(path: path) } } label: {
+                                        Image(systemName: "xmark.circle.fill").font(.system(size: 20))
+                                            .symbolRenderingMode(.palette).foregroundStyle(.white, .black.opacity(0.7))
+                                            .frame(width: 32, height: 32)
+                                    }.accessibilityLabel("Remove \(URL(fileURLWithPath: path).lastPathComponent)")
+                                }
                         }
                     }.padding(.horizontal, 12)
-                }.scrollIndicators(.hidden)
+                }.frame(height: 80).scrollIndicators(.hidden)
             }
-            HStack(alignment: .bottom, spacing: 4) {
+            HStack(alignment: .center, spacing: 4) {
                 Menu {
                     Button { pick("photos") } label: { Label("Photos and Videos", systemImage: "photo.on.rectangle") }
                     Button { pick("files") } label: { Label("Files", systemImage: "folder") }
@@ -59,7 +61,7 @@ struct ChatComposer: View {
                 }.disabled(picking || editing != nil).accessibilityLabel("Add attachment")
                 HStack(alignment: .bottom, spacing: 2) {
                     TextField("Message", text: $text, axis: .vertical)
-                        .font(.body).lineLimit(1...6).focused($focused)
+                        .font(.system(size: 17)).lineLimit(1...6).focused($focused)
                         .padding(.leading, 14).padding(.vertical, 11)
                         .onChange(of: text) { _, _ in onType() }
                     if canSend {
@@ -83,7 +85,15 @@ struct ChatComposer: View {
     }
     private func pick(_ source: String) {
         focused = false; picking = true; reply = nil
-        bridge.perform { defer { picking = false }; try await bridge.sendChatFiles(friendId: friendID, source: source) }
+        bridge.perform {
+            let paths: [String]
+            do { paths = try await bridge.pickFiles(source: source) }
+            catch { picking = false; throw error }
+            // Unlock + immediately on the picker reply, before any staging reply.
+            picking = false
+            guard !paths.isEmpty, bridge.chatPath.last == friendID else { return }
+            try await bridge.action("stageChatFiles", ["friendId": friendID, "paths": paths])
+        }
     }
     private func send() {
         guard canSend && !sending else { return }
@@ -133,7 +143,7 @@ private struct ChatGifPicker: View {
                         Button {
                             bridge.perform { try await bridge.sendChatGif(friendId: friendID, id: gif.id); dismiss() }
                         } label: {
-                            AsyncImage(url: URL(string: gif.thumbUrl ?? "")) { image in image.resizable().scaledToFit() } placeholder: { ProgressView() }
+                            MediaThumbnail(path: gif.thumbUrl ?? "", width: 140, height: 110, badges: false)
                                 .frame(minHeight: 100).clipShape(RoundedRectangle(cornerRadius: 14))
                         }.accessibilityLabel(gif.title ?? "Send GIF")
                     }

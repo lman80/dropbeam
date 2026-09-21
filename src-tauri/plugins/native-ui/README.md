@@ -1,3 +1,5 @@
+Owner-feedback fixes and current verification: [OWNER-REVIEW.md](OWNER-REVIEW.md). Photos/Files bridge calls now time out after 90 seconds; local UI media is downsampled asynchronously through ThumbnailProvider. SuperFeedback is draggable and only its panel/trigger owns touches.
+
 Beta review preparation (2026-09-21) is documented in [BETA-REVIEW.md](BETA-REVIEW.md), including validation, privacy audit, changed files and remaining device checks.
 
 Current picker protocol supersedes the historical `sendChatFiles` flow below: Swift awaits `pickFiles`, then calls `stageChatFiles({friendId, paths})`; native snapshots are re-pushed after replies and foregrounding. Photos invokes the Rust command directly, bypassing the web chooser. Files uses `plugin:native-ui|pick_files` (Swift `pickFiles`, result `{paths: string[]}`) with security-scoped coordinated imports. Swift owns cancellable preparation state. SuperFeedback is configured once during native activation with its floating right-center trigger and Settings controls.
@@ -116,8 +118,7 @@ Native plugin command addition: `plugin:native-ui|pick_folder`, args `{}`, reply
 are included in the iOS-only native-ui default capability. This supplies the
 missing iOS directory picker without changing the desktop or generic api wrapper.
 
-Timeouts: normal calls 30s, remote browser operations / locations refresh 180s, interactive pickers /
-folder import 30 minutes. Late replies cannot resolve an already-finished call.
+Timeouts: normal calls 30s, remote browser operations / locations loads 180s, Photos/Files pickers 90s, folder import 30 minutes. Late replies cannot resolve an already-finished call.
 An expired call does not cancel its underlying engine action.
 
 ## Phase 3 verification

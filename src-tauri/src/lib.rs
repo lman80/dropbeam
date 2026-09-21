@@ -27,6 +27,8 @@ mod models;
 mod mounts;
 mod pairing;
 mod panic_log;
+#[cfg(any(target_os = "ios", test))]
+mod ios_log_policy;
 mod provenance;
 mod settings;
 mod sync;
@@ -352,6 +354,11 @@ pub fn run() {
                     log::LevelFilter::Warn,
                 )
             };
+            // iOS always caps iroh/* and discovery at Warn, even in verbose
+            // diagnostics. app_lib stays Debug; transport logs must not rotate
+            // away the picker/bridge evidence every few seconds on a phone.
+            #[cfg(target_os = "ios")]
+            let iroh_level = ios_log_policy::transport_level(iroh_level);
             let mut log_targets = vec![
                 tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
                     file_name: Some("DropBeam".into()),
@@ -367,8 +374,20 @@ pub fn run() {
                     tauri_plugin_log::TargetKind::Stdout,
                 ));
             }
+            let log_builder = tauri_plugin_log::Builder::default();
+            #[cfg(target_os = "ios")]
+            let log_builder = log_builder
+                .level_for("iroh_gossip", iroh_level)
+                .level_for("iroh_blobs", iroh_level)
+                .level_for("iroh_base", iroh_level)
+                .level_for("iroh_metrics", iroh_level)
+                .level_for("iroh_mdns_address_lookup", iroh_level)
+                .level_for("iroh_dns", iroh_level)
+                .level_for("iroh_quinn", iroh_level)
+                .level_for("iroh_quinn_proto", iroh_level)
+                .level_for("swarm_discovery", iroh_level);
             let _ = app.handle().plugin(
-                tauri_plugin_log::Builder::default()
+                log_builder
                     .level(global_level)
                     .level_for("app_lib", app_level)
                     // iroh's transport internals: hole-punch, relay-vs-direct path
@@ -391,7 +410,9 @@ pub fn run() {
                 app.package_info().version,
                 std::env::consts::OS,
                 std::env::consts::ARCH,
-                if verbose {
+                if cfg!(target_os = "ios") && (verbose || diag) {
+                    "app-level (transport capped at warn)"
+                } else if verbose {
                     "full (app+iroh)"
                 } else if diag {
                     "app-level"

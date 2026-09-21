@@ -32,8 +32,10 @@ class NativeUIPlugin: Plugin {
                 host.didMove(toParent: root)
                 self.host = host
             }
+            if let host = self.host { root.view.bringSubviewToFront(host.view) }
             webview.resignFirstResponder()
             webview.scrollView.isScrollEnabled = false
+            webview.isHidden = true // JS bridge remains attached; no invisible touch surface.
             webview.alpha = 0
             webview.isUserInteractionEnabled = false
             webview.accessibilityElementsHidden = true
@@ -41,7 +43,7 @@ class NativeUIPlugin: Plugin {
                 Self.feedbackStarted = true
                 SuperFeedback.configure(.init(
                     backendURL: URL(string: "https://superfeedback.ashton-mcp-worker.workers.dev")!,
-                    repo: "lman80/dropbeam", app: "DropBeam", trigger: .floating,
+                    repo: "lman80/dropbeam", app: "DropBeam", trigger: .draggable,
                     position: .rightCenter, captureLogs: false, captureCrashes: true,
                     meta: ["version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
                            "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""]

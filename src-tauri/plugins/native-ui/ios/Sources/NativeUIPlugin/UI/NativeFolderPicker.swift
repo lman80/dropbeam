@@ -28,7 +28,8 @@ import PhotosUI
         try await NativePresentation.waitForPickerDismissal()
         guard var presenter = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).flatMap(\.windows).first(where: \.isKeyWindow)?.rootViewController else { throw failure("No active window.") }
         while let next = presenter.presentedViewController { presenter = next }
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: folder ? [.folder] : [.item], asCopy: false)
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: folder ? [.folder] : [.item], asCopy: !folder)
+        // Leave directoryURL unset: UIKit chooses Browse / Recents. Files import as copies.
         picker.delegate = self; picker.allowsMultipleSelection = !folder; picker.isModalInPresentation = true
         return try await withCheckedThrowingContinuation { continuation in self.continuation = continuation; presenter.present(picker, animated: true) }
     }

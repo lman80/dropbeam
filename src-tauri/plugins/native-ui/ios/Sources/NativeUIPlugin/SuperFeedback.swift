@@ -407,7 +407,8 @@ fileprivate final class SFSceneState: ObservableObject {
     var toastFrame: CGRect = .zero
     var draftID = UUID()
     var toastTask: Task<Void, Never>?
-    var sheetClosing = false
+    @Published var sheetClosing = false
+    private var dismissalFallback: DispatchWorkItem?
 
     init(scene: UIWindowScene, config: SuperFeedback.Config) {
         self.scene = scene; self.config = config
@@ -434,12 +435,27 @@ fileprivate final class SFSceneState: ObservableObject {
 
     func dismiss() {
         guard isPresented else { return }
-        sheetClosing = true
         isPresented = false
+        beginDismissal()
+    }
+
+    func beginDismissal() {
+        guard !isPresented else { return }
+        sheetClosing = true
         window?.endEditing(true)
+        dismissalFallback?.cancel()
+        let fallback = DispatchWorkItem { [weak self] in
+            guard let self, !self.isPresented else { return }
+            self.didDismiss()
+        }
+        dismissalFallback = fallback
+        // onDismiss normally completes cleanup. The timer covers interrupted
+        // UIKit transitions/backgrounding so sheetClosing can never latch shut.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: fallback)
     }
 
     func didDismiss() {
+        dismissalFallback?.cancel(); dismissalFallback = nil
         isPresented = false
         sheetClosing = false
         if window?.isKeyWindow == true { previousKeyWindow?.makeKey() }
@@ -505,8 +521,18 @@ fileprivate final class SFOverlayWindow: UIWindow {
         guard let state else { return nil }
         // The toast never owns a touch, even if it overlaps a button or a sheet.
         if state.toast != nil && state.toastFrame.contains(point) { return nil }
-        if state.isPresented || state.sheetClosing || rootViewController?.presentedViewController != nil {
-            return super.hitTest(point, with: event)
+        // Guarantee: transparent window space NEVER owns touches, including
+        // dismissal. Only the visible panel (or measured trigger) can hit-test.
+        // A stale presented controller/sheetClosing flag cannot cover friend rows.
+        if state.isPresented, var panel = rootViewController?.presentedViewController {
+            while let next = panel.presentedViewController { panel = next }
+            guard !panel.isBeingDismissed, let view = panel.viewIfLoaded, !view.isHidden else { return nil }
+            let frame = view.convert(view.bounds, to: self)
+            guard frame.contains(point) else { return nil }
+            // iOS 26 can route sheets through a separate floating container;
+            // UIWindow's hit is then not a descendant of the hosting view.
+            // Hit-test the actual panel locally, still bounded by its frame.
+            return view.hitTest(view.convert(point, from: self), with: event)
         }
         let frame = state.buttonFrame
         // AshTranslate's fail-open guard: a full-screen measurement must never freeze the app.
@@ -572,6 +598,9 @@ private struct SFOverlayView: View {
         }
         .ignoresSafeArea(.container)
         .tint(state.accent)
+        .sfOnChange(of: state.isPresented) { presented in
+            if !presented { state.beginDismissal() }
+        }
         .sheet(isPresented: $state.isPresented, onDismiss: { state.didDismiss() }) {
             SFPanel(state: state)
                 .presentationDetents([.medium, .large])

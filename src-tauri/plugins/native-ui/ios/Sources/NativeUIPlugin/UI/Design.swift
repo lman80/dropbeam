@@ -66,10 +66,11 @@ extension View {
 struct FriendAvatar: View {
     let friend: Friend
     var size: CGFloat = 52
+    @State private var avatar: UIImage?
     var body: some View {
         Group {
-            if let path = friend.avatar, let image = UIImage(contentsOfFile: path.hasPrefix("file://") ? URL(string: path)?.path ?? path : path) {
-                Image(uiImage: image).resizable().scaledToFill()
+            if let avatar {
+                Image(uiImage: avatar).resizable().scaledToFill()
             } else {
                 ZStack {
                     LinearGradient(colors: [.beam, .blue.opacity(0.8)], startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -79,6 +80,12 @@ struct FriendAvatar: View {
             }
         }
         .frame(width: size, height: size).clipShape(Circle()).accessibilityHidden(true)
+        .task(id: "\(friend.avatar ?? "")|\(size)") {
+            avatar = nil
+            guard let path = friend.avatar else { return }
+            let result = await ThumbnailProvider.shared.image(path: path, points: size)
+            if !Task.isCancelled { avatar = result?.image }
+        }
     }
 }
 struct PresenceLabel: View {

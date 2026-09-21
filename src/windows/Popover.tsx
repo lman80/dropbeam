@@ -3,10 +3,11 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ArrowDownToLine, Check, Copy, Power, Search, Send, Settings, UserPlus, X } from 'lucide-react'
+import { ArrowDownToLine, Check, Copy, Power, QrCode, Search, Send, Settings, UserPlus, X } from 'lucide-react'
 import { api, HAS_TAURI, isActive, type TransferUpdate } from '../lib/api'
 import { useStore } from '../store'
 import { Spinner } from '../components/bits'
+import { QrScanner } from '../components/QrScanner'
 import { Toasts } from '../components/Toasts'
 import { avatarGradient, initials } from '../lib/avatar'
 import { friendOnlineState } from '../lib/presence'
@@ -32,6 +33,7 @@ export function Popover() {
   const [pickingFor, setPickingFor] = useState<string | null>(null)
   const [code, setCode] = useState('')
   const [showReceive, setShowReceive] = useState(false)
+  const [scanning, setScanning] = useState(false)
   const [dragActive, setDragActive] = useState(false)
   const [dragHoverId, setDragHoverId] = useState<string | null>(null)
 
@@ -390,6 +392,7 @@ export function Popover() {
                 onChange={(e) => setCode(e.target.value)}
                 style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
               />
+              <button className="btn btn-ghost" type="button" aria-label="Scan QR" title="Scan QR" onClick={() => setScanning(true)}><QrCode size={15} /></button>
               <button className="btn btn-primary" type="submit" disabled={!code.trim()}>
                 <ArrowDownToLine size={15} />
               </button>
@@ -400,6 +403,7 @@ export function Popover() {
       {/* The popover runs its own store instance, so errors toasted here (failed
           drag-to-send, bad receive code, engine still starting) rendered NOWHERE
           without a local toast surface — files silently never sent. */}
+      {scanning && <QrScanner hint="Scan the sender’s receive code." onClose={() => setScanning(false)} onResult={value => { setCode(value); setScanning(false) }} />}
       <Toasts />
     </div>
   )

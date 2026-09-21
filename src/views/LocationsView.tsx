@@ -1,3 +1,4 @@
+import { loadLocations } from '../lib/locationsLoad'
 import { MobileHeader } from '../components/MobileHeader'
 import { MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -133,16 +134,20 @@ export function LocationsView() {
     if (inFlight.current) { queued.current = true; return }
     inFlight.current = true; setBusy(true)
     const state = useStore.getState()
-    await Promise.all(state.friends.filter(f => f.endpointId && friendPresence(f.name, state.friendSeen, state.folderStatuses).status === 'online').map(async f => {
-      try {
-        const locations = await locationsApi.list(f.id)
+    await loadLocations({
+      friends: state.friends.filter(f => friendPresence(f.name, state.friendSeen, state.folderStatuses).status === 'online'),
+      online: () => true,
+      list: locationsApi.list,
+      errorText: (_friend, error) => String(error),
+      onResult: result => {
         if (!mounted.current) return
-        setShared(prev => ({ ...prev, [f.id]: locations }))
-        setErrors(prev => { const next = { ...prev }; delete next[f.id]; return next })
-      } catch(e) {
-        if (mounted.current) setErrors(prev => ({ ...prev, [f.id]: String(e) }))
-      }
-    }))
+        if (result.error) setErrors(prev => ({ ...prev, [result.friendId]: result.error! }))
+        else {
+          setShared(prev => ({ ...prev, [result.friendId]: result.locations }))
+          setErrors(prev => { const next = { ...prev }; delete next[result.friendId]; return next })
+        }
+      },
+    })
     if (mounted.current) setBusy(false)
     inFlight.current = false
     if (mounted.current && queued.current) { queued.current = false; void reload() }

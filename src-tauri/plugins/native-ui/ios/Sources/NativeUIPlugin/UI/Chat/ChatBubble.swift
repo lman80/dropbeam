@@ -53,6 +53,15 @@ struct ChatBubble: View {
         if message.deleted == true {
             Text("Message deleted").italic().font(.body).foregroundStyle(.secondary)
                 .padding(.vertical, 8).padding(.horizontal, 12).overlay(shape.stroke(.secondary.opacity(0.3), lineWidth: 1))
+        } else if message.kind == "file" {
+            VStack(alignment: mine ? .trailing : .leading, spacing: 4) {
+                if let caption = message.text, !caption.isEmpty {
+                    highlighted(caption).padding(.horizontal, 12).padding(.vertical, 8)
+                        .foregroundStyle(mine ? Color.white : Color.primary)
+                        .background(mine ? Color.beam : Color(uiColor: .systemGray5), in: shape)
+                }
+                ChatAttachment(message: message)
+            }
         } else {
             VStack(alignment: .leading, spacing: 4) {
                 if let quote = message.replyPreview, !quote.isEmpty {
@@ -62,10 +71,7 @@ struct ChatBubble: View {
                     }.padding(8).background(mine ? Color.white.opacity(0.16) : Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
                         .padding([.horizontal, .top], 6)
                 }
-                if message.kind == "file" {
-                    ChatAttachment(message: message)
-                    if let caption = message.text, !caption.isEmpty { highlighted(caption).padding(.horizontal, 12).padding(.vertical, 8) }
-                } else { highlighted(message.text ?? "").padding(.vertical, 8).padding(.horizontal, 12) }
+                highlighted(message.text ?? "").padding(.vertical, 8).padding(.horizontal, 12)
             }
             .foregroundStyle(mine ? Color.white : Color.primary)
             .background {
@@ -86,6 +92,6 @@ struct ChatBubble: View {
                 start = range.upperBound
             }
         }
-        return Text(value).font(.body)
+        return Text(value).font(.system(size: 17))
     }
 }

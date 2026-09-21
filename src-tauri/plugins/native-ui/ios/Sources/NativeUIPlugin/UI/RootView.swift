@@ -3,7 +3,7 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject private var bridge: Bridge
     @Environment(\.scenePhase) private var scenePhase
-    var body: some View {
+    private var tabs: some View {
         TabView(selection: $bridge.selectedTab) {
             SendView().tabItem { Label("Send", systemImage: "paperplane.fill") }.tag("send")
             FriendsView().tabItem { Label("Friends", systemImage: "person.2.fill") }.tag("friends")
@@ -12,7 +12,14 @@ struct RootView: View {
             HistoryView().tabItem { Label("History", systemImage: "clock.fill") }.tag("history")
             SettingsView().tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag("settings")
         }
-        .tint(.beam)
+    }
+    private var showsError: Binding<Bool> {
+        Binding(get: { bridge.errorMessage != nil }, set: { presented in
+            if !presented { bridge.errorMessage = nil }
+        })
+    }
+    var body: some View {
+        tabs.tint(.beam)
         .overlay { MediaPreparationOverlay() }
         .safeAreaInset(edge: .top) {
             if bridge.networkAvailable == false {
@@ -39,7 +46,7 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             Task { try? await bridge.nativeChatFocus(phase == .active) }
         }
-        .alert("Couldn’t complete that", isPresented: Binding(get: { bridge.errorMessage != nil }, set: { if !$0 { bridge.errorMessage = nil } })) {
+        .alert("Couldn’t complete that", isPresented: showsError) {
             Button("OK", role: .cancel) { bridge.errorMessage = nil }
         } message: { Text(bridge.errorMessage ?? "Please try again.") }
     }

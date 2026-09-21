@@ -81,3 +81,14 @@ test('native avatars preserve image formats and reject a selected video before u
   for (const path of ['/photo.HEIC', '/photo.heif', '/photo.png', '/photo.jpeg']) assert.equal(nativeAvatarPath(path), path)
   for (const path of ['/video.mov', '/video.mp4', '/unknown.img']) assert.throws(() => nativeAvatarPath(path), /Choose a photo/)
 })
+
+test('14 selected assets including two videos cross the native picker reply unchanged', async () => {
+  const { pickNativeMedia, deliverNativeReply } = await import('../src/lib/nativeBridgeProtocol.ts')
+  const selected = Array.from({ length: 14 }, (_, i) => `/private/picked/${i}.${i < 12 ? 'heic' : 'mov'}`)
+  const result = await pickNativeMedia('photos', async () => selected)
+  let delivered = false
+  await deliverNativeReply({ id: 14, ok: true, value: result }, async reply => {
+    assert.deepEqual(reply.value, selected)
+    delivered = true
+  }, () => { assert.equal(delivered, true) })
+})

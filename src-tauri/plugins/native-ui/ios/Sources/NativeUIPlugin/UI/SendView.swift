@@ -7,6 +7,7 @@ struct SendView: View {
     @State private var code = ""
     @State private var picking = false
     @State private var receiving = false
+    @State private var scanning = false
     @State private var bounce = 0
     var body: some View {
         NavigationStack {
@@ -53,6 +54,9 @@ struct SendView: View {
             }.contentMargins(.bottom, 24, for: .scrollContent)
                 .navigationTitle("Send").beamCanvas()
         }
+        .sheet(isPresented: $scanning) {
+            QRScannerSheet(title: "Receive Files") { value in code = value.trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
     }
     @ViewBuilder private var pickButtons: some View {
         pickButton("Photos", symbol: "photo.on.rectangle", source: "photos")
@@ -68,10 +72,13 @@ struct SendView: View {
         }.beamButton(prominent: source == "photos").disabled(picking)
     }
     private var receiveField: some View {
+        HStack {
         TextField("", text: $code, prompt: Text("Paste a receive code").font(.body))
             .font(code.isEmpty ? .body : .body.monospaced()).textInputAutocapitalization(.never)
             .autocorrectionDisabled().submitLabel(.go).onSubmit(receive)
             .padding(.vertical, 10).accessibilityLabel("Receive code")
+        Button { scanning = true } label: { Image(systemName: "qrcode.viewfinder").frame(width: 44, height: 44) }.accessibilityLabel("Scan QR code")
+        }
     }
     private var receiveButton: some View {
         Button(receiving ? "Receiving…" : "Receive", action: receive).beamButton(prominent: true)

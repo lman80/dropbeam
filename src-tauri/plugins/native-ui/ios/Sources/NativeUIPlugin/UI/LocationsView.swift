@@ -4,6 +4,7 @@ struct LocationsView: View {
     @EnvironmentObject private var bridge: Bridge
     var friendID: String? = nil
     @State private var loading = false
+    @State private var refreshAgain = false
     @State private var error: String?
     private var groups: [FriendLocations] { bridge.locations.filter { friendID == nil || $0.friendId == friendID } }
     var body: some View {
@@ -11,7 +12,7 @@ struct LocationsView: View {
             VStack(alignment: .leading, spacing: 24) {
                 if loading { ProgressView().frame(maxWidth: .infinity) }
                 if let error { BeamError(message: error, retry: refresh) }
-                if !loading && groups.allSatisfy({ $0.locations.isEmpty }) { BeamEmpty(symbol: "externaldrive", title: "A place for everything.", detail: "Folders shared by friends appear here. Keep their device awake to browse.") }
+                if !loading && groups.allSatisfy({ $0.locations.isEmpty && $0.error == nil }) { BeamEmpty(symbol: "externaldrive", title: "A place for everything.", detail: "Folders shared by friends appear here. Keep their device awake to browse.") }
                 ForEach(groups) { friend in
                     VStack(alignment: .leading, spacing: 12) {
                         HStack { Text(friend.friendName).font(.title2.weight(.semibold)); Spacer(); PresenceLabel(online: friend.online) }
@@ -37,14 +38,20 @@ struct LocationsView: View {
         }.contentMargins(.bottom, 24, for: .scrollContent).navigationTitle("Locations").navigationBarTitleDisplayMode(.large).beamCanvas()
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button(action: refresh) { Image(systemName: "arrow.clockwise").frame(width: 44, height: 44) }.accessibilityLabel("Refresh locations").disabled(loading) } }
             .task { refresh() }
+            .onChange(of: bridge.friends.map(\.id)) { _, _ in refresh() }
+            .onChange(of: bridge.presence) { _, _ in refresh() }
             .refreshable { await reload() }
             .onReceive(NotificationCenter.default.publisher(for: .init("DropBeam.locations://changed"))) { _ in refresh() }
     }
-    private func refresh() { guard !loading else { return }; Haptics.tap(); Task { await reload() } }
+    private func refresh() { Task { await reload() } }
     private func reload() async {
+        guard !loading else { refreshAgain = true; return }
         loading = true; error = nil
         defer { loading = false }
-        do { try await bridge.action("locationsRefresh") } catch { self.error = error.localizedDescription }
+        repeat {
+            refreshAgain = false
+            do { try await bridge.action("locationsRefresh") } catch { self.error = error.localizedDescription }
+        } while refreshAgain
     }
 }
 

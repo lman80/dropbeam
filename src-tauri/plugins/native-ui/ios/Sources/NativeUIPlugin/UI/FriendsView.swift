@@ -71,6 +71,7 @@ struct FriendsView: View {
                             Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
                         }
                     }
+                    .contentShape(Rectangle())
                     .friendTransitionSource(id: friend.id, namespace: avatars)
                 }.buttonStyle(.plain)
             }

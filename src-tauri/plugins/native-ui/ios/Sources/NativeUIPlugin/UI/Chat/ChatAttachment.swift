@@ -1,162 +1,184 @@
 import SwiftUI
 import AVKit
-import ImageIO
 
 struct ChatAttachment: View {
     @EnvironmentObject private var bridge: Bridge
     let message: ChatMessage
-    @State private var thumbnail: UIImage?
-    @State private var viewer = false
-    @State private var choosingFile = false
-    private var transfer: Transfer? { bridge.transfers.first { $0.chatOnly == true && $0.id == message.fileXferId } }
-    private var name: String { message.files?.first ?? "Attachment" }
-    private var path: String? { Self.availablePaths(message, bridge: bridge).first }
-    private var fileExtension: String { (name as NSString).pathExtension.lowercased() }
-    private var isImage: Bool { ["jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "tiff"].contains(fileExtension) }
-    private var isVideo: Bool { ["mov", "mp4", "m4v"].contains(fileExtension) }
+    @State private var selected: LocalMedia?
+    private var transfer: Transfer? { bridge.transfers.first { $0.chatOnly == true && $0.id == message.fileXferId } ?? bridge.transfers.first { $0.id == message.fileXferId } }
+    private var paths: [String] { Self.availablePaths(message, bridge: bridge) }
     private var failed: Bool { message.fileXferFailed == true || ["failed", "canceled"].contains(transfer?.state ?? "") }
-    private var progress: Double { min(1, max(0, (transfer?.percent ?? 0) / 100)) }
-    private var active: Bool { !failed && (transfer?.active == true || (transfer == nil && message.fileXferId != nil && path == nil)) }
-    private var status: String {
-        if failed { return message.fromMe ? "Failed · Tap to retry" : "Failed · Ask sender to retry" }
-        if active { return "\(message.fromMe ? "Sending" : "Receiving") \(Int(progress * 100))%" }
-        if transfer?.state == "paused" { return "Paused" }
-        if transfer?.state == "completed" || path != nil { return message.fromMe ? "Sent" : "Received" }
-        return "Waiting for files…"
+    private var active: Bool { transfer?.active == true }
+    private struct Item: Identifiable {
+        let id: Int
+        let name: String
+        let path: String?
     }
+    private var items: [Item] {
+        var remaining = paths
+        return (message.files ?? []).enumerated().map { index, name in
+            let match = remaining.firstIndex { Self.fileURL($0).lastPathComponent == name }
+            let path = match.map { remaining.remove(at: $0) }
+            return Item(id: index, name: name, path: path)
+        }
+    }
+    private var media: [Item] { items.filter { LocalMedia(path: $0.name) != nil } }
+    private var documents: [Item] { items.filter { LocalMedia(path: $0.name) == nil } }
+    private var availableMedia: [LocalMedia] { media.compactMap { $0.path.flatMap(LocalMedia.init) } }
     var body: some View {
-        Button(action: open) {
-            VStack(alignment: .leading, spacing: 0) {
-                if let thumbnail, isImage || isVideo {
-                    Image(uiImage: thumbnail).resizable().scaledToFit().frame(maxWidth: 240, maxHeight: 280)
-                        .overlay {
-                            if isVideo { Image(systemName: "play.fill").font(.title).foregroundStyle(.white).padding(16).background(.ultraThinMaterial, in: Circle()) }
-                        }
-                        .overlay(alignment: .bottom) {
-                            if active || failed {
-                                HStack { Text(status).font(.caption); Spacer(); if active { progressRing } }
-                                    .foregroundStyle(.primary).padding(8).background(.regularMaterial)
-                            }
-                        }
-                } else {
-                    HStack(spacing: 10) {
-                        Image(systemName: Formatters.symbol(name)).font(.system(size: 28)).frame(width: 36, height: 44)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text((message.files?.count ?? 0) > 1 ? "\(message.files?.count ?? 0) files" : name).font(.subheadline.weight(.semibold)).lineLimit(1).truncationMode(.middle)
-                            Text("\(Formatters.bytes(message.bytes)) · \(status)").font(.caption).opacity(0.8).fixedSize(horizontal: false, vertical: true)
-                        }
-                        if active { progressRing }
-                    }.padding(12).frame(maxWidth: 240, alignment: .leading)
-                    if active { ProgressView(value: progress).tint(message.fromMe ? .white : .beam).frame(height: 2).padding(.horizontal, 12).padding(.bottom, 8) }
-                }
+        VStack(alignment: .leading, spacing: 4) {
+            if !media.isEmpty { grid.clipShape(RoundedRectangle(cornerRadius: 18)) }
+            ForEach(documents) { item in
+                Button {
+                    if let path = item.path { bridge.perform { try await bridge.openChatFile(path: path) } }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: Formatters.symbol(item.name)).font(.title3)
+                        Text(item.name).font(.subheadline).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 0)
+                        Image(systemName: item.path == nil ? "clock" : "arrow.down.circle").font(.caption)
+                    }.padding(10).background(Color(uiColor: .systemGray5), in: RoundedRectangle(cornerRadius: 12))
+                }.buttonStyle(.plain).disabled(item.path == nil)
             }
-        }.buttonStyle(.plain).frame(minHeight: 44).accessibilityLabel("\(name), \(status)")
-            .task(id: path) {
-                thumbnail = nil
-                guard let path else { return }
-                if isImage {
-                    thumbnail = await Task.detached(priority: .utility) { Self.imageThumbnail(path) }.value
-                } else if isVideo {
-                    let generator = AVAssetImageGenerator(asset: AVURLAsset(url: Self.fileURL(path)))
-                    generator.appliesPreferredTrackTransform = true
-                    generator.maximumSize = CGSize(width: 720, height: 720)
-                    if let result = try? await generator.image(at: .zero) { thumbnail = UIImage(cgImage: result.image) }
-                }
+            if failed {
+                Button(message.fromMe ? "Not Delivered · Retry" : "Not Delivered · Ask sender to retry") {
+                    if message.fromMe { bridge.perform { try await bridge.retryChatFile(friendId: message.peerId, messageId: message.id) } }
+                }.font(.caption).foregroundStyle(.secondary).disabled(!message.fromMe)
+            } else if active {
+                ProgressView(value: min(1, max(0, (transfer?.percent ?? 0) / 100))).tint(.beam)
+                Text("\(message.fromMe ? "Sending" : "Receiving") \(Int(transfer?.percent ?? 0))%")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if items.contains(where: { $0.path == nil }) {
+                Text("Waiting for files…").font(.caption).foregroundStyle(.secondary)
             }
-            .fullScreenCover(isPresented: $viewer) {
-                if let path {
-                    MediaViewer(path: path, name: name, video: isVideo).environmentObject(bridge)
-                }
-            }
-            .confirmationDialog("Files", isPresented: $choosingFile, titleVisibility: .visible) {
-                ForEach(Self.availablePaths(message, bridge: bridge), id: \.self) { path in
-                    Button(Self.fileURL(path).lastPathComponent) { bridge.perform { try await bridge.openChatFile(path: path) } }
-                }
-                Button("Share All") { bridge.perform { try await bridge.shareFiles(paths: Self.availablePaths(message, bridge: bridge)) } }
-            }
+        }.frame(maxWidth: 240, alignment: .leading)
+        .fullScreenCover(item: $selected) { item in
+            PagedMediaViewer(items: availableMedia, initialPath: item.path).environmentObject(bridge)
+        }
     }
-    private var progressRing: some View {
-        ZStack {
-            Circle().stroke(.secondary.opacity(0.2), lineWidth: 2)
-            Circle().trim(from: 0, to: progress).stroke(message.fromMe ? Color.white : .beam, style: StrokeStyle(lineWidth: 2, lineCap: .round)).rotationEffect(.degrees(-90))
-        }.frame(width: 22, height: 22).accessibilityLabel("\(Int(progress * 100)) percent")
+    private var grid: some View {
+        Group {
+            if media.count == 1 { tile(media[0]) }
+            else if media.count == 2 {
+                HStack(spacing: 2) { tile(media[0]); tile(media[1]) }
+            } else if media.count == 3 {
+                HStack(spacing: 2) {
+                    tile(media[0])
+                    VStack(spacing: 2) { tile(media[1]); tile(media[2]) }
+                }
+            } else {
+                VStack(spacing: 2) {
+                    HStack(spacing: 2) { tile(media[0]); tile(media[1]) }
+                    HStack(spacing: 2) { tile(media[2]); tile(media[3], extra: media.count - 4) }
+                }
+            }
+        }.aspectRatio(media.count == 2 ? 2 : 1, contentMode: .fit)
     }
-    private func open() {
-        if failed && message.fromMe { bridge.perform { try await bridge.retryChatFile(friendId: message.peerId, messageId: message.id) }; return }
-        guard let path else { return }
-        Haptics.tap()
-        if (message.files?.count ?? 0) > 1 { choosingFile = true }
-        else if isImage || isVideo { viewer = true }
-        else { bridge.perform { try await bridge.openChatFile(path: path) } }
+    private func tile(_ item: Item, extra: Int = 0) -> some View {
+        GeometryReader { geo in
+            Button {
+                if let path = item.path { selected = LocalMedia(path: path) }
+            } label: {
+                MediaThumbnail(path: item.path ?? item.name, width: geo.size.width, height: geo.size.height)
+                    .overlay {
+                        if extra > 0 { Color.black.opacity(0.4); Text("+\(extra)").font(.title.weight(.semibold)).foregroundStyle(.white) }
+                    }
+            }.buttonStyle(.plain).disabled(item.path == nil).accessibilityLabel(item.name)
+        }
     }
     nonisolated static func fileURL(_ path: String) -> URL { path.hasPrefix("file://") ? URL(string: path) ?? URL(fileURLWithPath: path) : URL(fileURLWithPath: path) }
     @MainActor static func availablePaths(_ message: ChatMessage, bridge: Bridge) -> [String] {
-        let transfer = bridge.transfers.first { $0.chatOnly == true && $0.id == message.fileXferId }
+        let transfer = bridge.transfers.first { $0.chatOnly == true && $0.id == message.fileXferId } ?? bridge.transfers.first { $0.id == message.fileXferId }
         // Use the engine's explicit completed manifest; filenames alone cannot
         // prove arrival, and duplicate leaf names must stay independently openable.
         let completed = transfer?.chatTransfer?.completedPaths ?? [:]
-        var paths = completed.sorted { $0.key < $1.key }.map(\.value)
+        var paths = completed.sorted { $0.key.localizedStandardCompare($1.key) == .orderedAscending }.map(\.value)
         if message.fromMe { paths += transfer?.sharePaths ?? [] }
         if let path = message.path, message.fromMe || transfer == nil || transfer?.state == "completed" {
             paths.insert(path, at: 0)
         }
         var seen = Set<String>()
-        return paths.filter { seen.insert($0).inserted && FileManager.default.fileExists(atPath: fileURL($0).path) }
+        return paths.filter { seen.insert($0).inserted }
     }
-    nonisolated private static func imageThumbnail(_ path: String) -> UIImage? {
-        guard let source = CGImageSourceCreateWithURL(fileURL(path) as CFURL, nil),
-              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceThumbnailMaxPixelSize: 720,
-                kCGImageSourceCreateThumbnailWithTransform: true
-              ] as CFDictionary) else { return nil }
-        return UIImage(cgImage: image)
+}
+
+struct PagedMediaViewer: View {
+    @EnvironmentObject private var bridge: Bridge
+    @Environment(\.dismiss) private var dismiss
+    let items: [LocalMedia]
+    let initialPath: String
+    @State private var selection = ""
+    var body: some View {
+        NavigationStack {
+            TabView(selection: $selection) {
+                ForEach(items) { item in
+                    MediaPage(item: item, active: selection == item.path).tag(item.path)
+                }
+            }.tabViewStyle(.page(indexDisplayMode: items.count > 1 ? .always : .never))
+                .background(.black).navigationTitle(items.first { $0.path == selection }?.name ?? "Media")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button { bridge.perform { try await bridge.shareFiles(paths: [selection]) } } label: {
+                            Image(systemName: "square.and.arrow.up").frame(width: 44, height: 44)
+                        }.accessibilityLabel("Share").disabled(selection.isEmpty)
+                    }
+                }
+                .onAppear { selection = initialPath }
+        }.tint(.beam).preferredColorScheme(.dark)
     }
 }
 
 struct MediaViewer: View {
-    @EnvironmentObject private var bridge: Bridge
-    @Environment(\.dismiss) private var dismiss
     let path: String
     let name: String
     let video: Bool
-    @State private var player: AVPlayer?
     var body: some View {
-        NavigationStack {
-            Group {
-                if video { NativeVideoPlayer(player: player) }
-                else { ImageViewer(path: path) }
+        if let item = LocalMedia(path: path) { PagedMediaViewer(items: [item], initialPath: path) }
+    }
+}
+private struct MediaPage: View {
+    let item: LocalMedia
+    let active: Bool
+    @State private var player: AVPlayer?
+    @State private var image: UIImage?
+    @State private var unavailable = false
+    var body: some View {
+        Group {
+            if item.video { NativeVideoPlayer(player: player) }
+            else if let image { ImageViewer(image: image) }
+            else if unavailable { Text("This image is no longer available.").foregroundStyle(.white) }
+            else { ProgressView().tint(.white) }
+        }
+        .task(id: active) {
+            player?.pause(); player = nil; image = nil; unavailable = false
+            guard active else { return }
+            if item.video { player = AVPlayer(url: ChatAttachment.fileURL(item.path)); player?.play() }
+            else {
+                let preview = await ThumbnailProvider.shared.image(path: item.path, points: 400, fullSize: true)
+                if !Task.isCancelled { image = preview?.image; unavailable = preview == nil }
             }
-            .background(.black).navigationTitle(name).navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { bridge.perform { try await bridge.shareFiles(paths: [path]) } } label: {
-                        Image(systemName: "square.and.arrow.up").frame(width: 44, height: 44)
-                    }.accessibilityLabel("Share")
-                }
-            }
-            .onAppear { if video { player = AVPlayer(url: ChatAttachment.fileURL(path)); player?.play() } }
-            .onDisappear { player?.pause(); player = nil }
-        }.tint(.beam)
+        }
+        .onDisappear { player?.pause(); player = nil; image = nil }
     }
 }
 
 struct ImageViewer: UIViewRepresentable {
-    let path: String
+    let image: UIImage
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeUIView(context: Context) -> UIScrollView {
         let scroll = ImageScrollView()
         scroll.delegate = context.coordinator
         scroll.minimumZoomScale = 1; scroll.maximumZoomScale = 5
         scroll.showsVerticalScrollIndicator = false; scroll.showsHorizontalScrollIndicator = false
-        scroll.imageView.image = UIImage(contentsOfFile: ChatAttachment.fileURL(path).path)
+        scroll.imageView.image = image
         scroll.imageView.contentMode = .scaleAspectFit
         scroll.addSubview(scroll.imageView)
         context.coordinator.image = scroll.imageView
         return scroll
     }
-    func updateUIView(_ scroll: UIScrollView, context: Context) {}
+    func updateUIView(_ scroll: UIScrollView, context: Context) { context.coordinator.image?.image = image }
     final class Coordinator: NSObject, UIScrollViewDelegate {
         weak var image: UIImageView?
         func viewForZooming(in scrollView: UIScrollView) -> UIView? { image }
@@ -190,7 +212,7 @@ struct LocalMedia: Identifiable {
     init?(path: String) {
         let ext = (path as NSString).pathExtension.lowercased()
         let video = ["mp4", "mov", "m4v"].contains(ext)
-        guard video || ["jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "tiff", "bmp"].contains(ext) else { return nil }
+        guard video || ["jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "tiff", "tif", "bmp", "avif"].contains(ext) else { return nil }
         self.path = path; self.name = (path as NSString).lastPathComponent; self.video = video
     }
 }

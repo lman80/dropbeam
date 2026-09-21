@@ -30,7 +30,7 @@ struct ConversationView: View {
                             .id(message.id)
                     }
                     if bridge.chatTyping[friendID] == true {
-                        HStack { TypingBubble(); Spacer() }.padding(.top, 10)
+                        HStack(alignment: .bottom, spacing: 6) { FriendAvatar(friend: friend, size: 28); TypingBubble(); Spacer() }.padding(.top, 10)
                     }
                     Color.clear.frame(height: 12).id("thread-bottom")
                         .background { GeometryReader { geo in
@@ -115,9 +115,15 @@ struct ConversationView: View {
             if newDay { Text(ChatDates.divider(message.date)).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.vertical, 18) }
             HStack(alignment: .bottom, spacing: 0) {
                 if message.fromMe { Spacer(minLength: 0) }
+                if !message.fromMe {
+                    Group {
+                        if lastInRun { FriendAvatar(friend: friend, size: 28) }
+                        else { Color.clear.frame(width: 28, height: 28) }
+                    }.padding(.trailing, 6)
+                }
                 ChatBubble(message: message, lastInRun: lastInRun, query: query,
                     onReply: { reply = message; editing = nil }, onEdit: { editing = message; reply = nil })
-                    .frame(maxWidth: max(160, viewport.width * 0.75), alignment: message.fromMe ? .trailing : .leading)
+                    .frame(maxWidth: max(100, viewport.width * 0.75 - (message.fromMe ? 0 : 34)), alignment: message.fromMe ? .trailing : .leading)
                 if !message.fromMe { Spacer(minLength: 0) }
             }.padding(.top, newRun ? 10 : 2)
                 .padding(.top, message.reactions?.isEmpty == false ? 18 : 0)

@@ -53,7 +53,9 @@ struct HistoryView: View {
     }
     private func historyRow(_ entry: HistoryEntry) -> some View {
         HStack(spacing: 14) {
-            FileGlyph(name: entry.fileNames.first ?? "")
+            if let path = entry.localPaths.first, LocalMedia(path: path) != nil {
+                MediaThumbnail(path: path, width: 48, height: 48).clipShape(RoundedRectangle(cornerRadius: 10))
+            } else { FileGlyph(name: entry.fileNames.first ?? "") }
             VStack(alignment: .leading, spacing: 5) {
                 Text(entry.title).font(.headline)
                 Text("\(Formatters.bytes(entry.bytesTotal)) · \(entry.direction == "send" ? "To" : "From") \(entry.peer ?? "a device") · \(route(entry.locality))").font(.subheadline).foregroundStyle(.secondary)

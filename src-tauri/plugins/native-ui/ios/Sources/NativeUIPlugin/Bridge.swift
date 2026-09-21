@@ -41,6 +41,7 @@ final class Bridge: ObservableObject {
     private var nextID = 0
     private struct Pending {
         let continuation: CheckedContinuation<Data, Error>
+        let name: String
         let timeout: DispatchWorkItem
     }
     private var pending: [Int: Pending] = [:]
@@ -62,8 +63,8 @@ final class Bridge: ObservableObject {
             let timeout = DispatchWorkItem { [weak self] in
                 self?.finish(id, .failure(self?.failure("This action timed out. Check its status before trying again.") ?? NSError(domain: "NativeUI", code: 1)))
             }
-            pending[id] = Pending(continuation: continuation, timeout: timeout)
-            let seconds: Double = ["pickFiles", "sendChatFiles", "setAvatar", "browserUpload", "acceptFolderInvite"].contains(name) ? 1800 : name.hasPrefix("browser") || name == "locationsRefresh" ? 180 : 30
+            pending[id] = Pending(continuation: continuation, name: name, timeout: timeout)
+            let seconds: Double = ["pickFiles", "sendChatFiles"].contains(name) ? 90 : ["setAvatar", "browserUpload", "acceptFolderInvite"].contains(name) ? 1800 : name.hasPrefix("browser") || ["locationsList", "locationsRefresh"].contains(name) ? 180 : 30
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: timeout)
             webview.evaluateJavaScript("window.__dbBridge.call(...\(json)); void 0") { [weak self] _, error in
                 if let error { self?.finish(id, .failure(error)) }
@@ -78,6 +79,9 @@ final class Bridge: ObservableObject {
     private func finish(_ id: Int, _ result: Result<Data, Error>) {
         guard let item = pending.removeValue(forKey: id) else { return }
         item.timeout.cancel()
+        // Drop the touch-blocking preparation overlay in the reply itself,
+        // before decoding/staging or waiting for the calling task to resume.
+        if item.name == "pickFiles" { preparingMedia = nil }
         item.continuation.resume(with: result)
     }
     func reply(id: Int, ok: Bool, value: Any) {
