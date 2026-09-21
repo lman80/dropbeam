@@ -23,7 +23,7 @@ struct SettingsView: View {
                         settingsButton("Link This Device", symbol: "link") { linkThis = true }
                     }
                     SettingsGroup(title: "General") {
-                        Picker("Appearance", selection: settingString("theme", bridge.settings?.theme ?? "system")) { Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark") }.pickerStyle(.menu).frame(minHeight: 44)
+                        HStack { Text("Appearance"); Spacer(); Picker("Appearance", selection: settingString("theme", bridge.settings?.theme ?? "system")) { Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark") }.pickerStyle(.menu).labelsHidden() }.frame(minHeight: 44)
                         Divider(); SettingToggle(title: "Sounds", key: "playSounds", value: bridge.settings?.playSounds)
                         Divider(); SettingToggle(title: "File Notifications", key: "notifyOnComplete", value: bridge.settings?.notifyOnComplete)
                         Divider(); SettingToggle(title: "Chat Notifications", key: "notifyOnMessage", value: bridge.settings?.notifyOnMessage)
