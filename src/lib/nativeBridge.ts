@@ -15,6 +15,7 @@ import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRi
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
 import { ownDeviceLabels, personGroups } from './deviceIcons'
+import { nativeFolders, folderLinks } from './nativeFolders'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -250,6 +251,49 @@ const handlers: BridgeHandlers = {
     return true
   },
   respondToOffer: a => st().respondToOffer(string(a, 'id'), a.accept === true),
+  // Shared Folders (same engine commands/store actions as desktop FoldersView).
+  foldersRefresh: async () => {
+    await st().reloadPairs()
+    if (!st().myEid) { const eid = await api.myEndpointId().catch(() => null); if (eid) useStore.setState({ myEid: eid }) }
+    return folderSnapshot()
+  },
+  folderSetPaused: async a => {
+    if (typeof a.bool !== 'boolean') throw new Error('Invalid pause value')
+    await api.setFolderPaused(folderLinks(st().pairs, string(a, 'folderId'))[0].id, a.bool)
+    await st().reloadPairs()
+  },
+  folderStop: async a => { for (const link of folderLinks(st().pairs, string(a, 'folderId'))) await api.stopFolderTransfer(link.id).catch(() => {}) },
+  folderVerify: a => api.verifyFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id),
+  folderLeave: async a => {
+    for (const link of folderLinks(st().pairs, string(a, 'folderId'))) await storeAction(() => st().removePair(link.id))
+  },
+  folderRemoveMember: a => storeAction(() => st().removePair(folderMember(a).id)),
+  folderSetRole: async a => {
+    if (typeof a.bool !== 'boolean') throw new Error('Invalid role value')
+    const member = folderMember(a)
+    if (!!member.peerIsViewer === a.bool) return
+    await api.setMemberRole(member.id, a.bool)
+    await st().reloadPairs()
+  },
+  /** The code of a pending (not yet accepted) invite link, to show again. */
+  folderShowInvite: a => api.pairInvite(folderMember(a).id),
+  /** A fresh invite code for one more person (desktop "Add person"). */
+  folderAddPerson: async a => {
+    const code = await api.folderAddPerson(folderLinks(st().pairs, string(a, 'folderId'))[0].id)
+    await st().reloadPairs()
+    return code
+  },
+  folderInviteFriend: async a => {
+    await api.inviteFriendToFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id, string(a, 'friendId'))
+    await st().reloadPairs()
+  },
+}
+const folderSnapshot = () => { const s = st(); return nativeFolders(s.pairs, s.folderStatuses, s.folderSummaries, s.folderLastSynced, s.myEid, s.friends) }
+/** A member link, checked to belong to the named folder (never act on a stale id). */
+function folderMember(a: BridgeArgs) {
+  const link = folderLinks(st().pairs, string(a, 'folderId')).find(p => p.id === string(a, 'pairId'))
+  if (!link) throw new Error('That person is no longer in this folder.')
+  return link
 }
 // The web Locations view owns its map locally; native uses the same cache and
 // locationsApi, without mounting a hidden browser or duplicating engine logic.
@@ -412,6 +456,7 @@ async function start() {
       chatDraftFiles: s.chatDraftFiles,
       presence: presenceSnapshot(s),
       myDevice: deviceSnapshot(),
+      folders: folderSnapshot(),
     }
     for (const change of changedSnapshots(previous, snapshots)) send('state', change)
     if (s.activeChatId !== activeChat) {
