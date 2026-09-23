@@ -7,7 +7,7 @@ struct FriendsView: View {
     @State private var folderScan = false
     @Namespace private var avatars
     private var filtered: [Friend] {
-        bridge.friends.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.displayName.localizedCaseInsensitiveContains(search) }
+        bridge.friends.filter { $0.groupedUnder == nil }.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.displayName.localizedCaseInsensitiveContains(search) }
     }
     private func isMine(_ friend: Friend) -> Bool {
         guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return false }
@@ -122,9 +122,10 @@ struct FriendDetailView: View {
         ScrollView {
             VStack(spacing: 24) {
                 VStack(spacing: 14) {
-                    FriendAvatar(friend: friend, size: 96).padding(9).background(.ultraThinMaterial, in: Circle())
+                    ContactAvatar(friend: friend, size: 96).padding(9).background(.ultraThinMaterial, in: Circle())
                         .overlay(Circle().strokeBorder(.white.opacity(0.35), lineWidth: 1))
-                    Text(friend.name).font(.largeTitle.bold()).multilineTextAlignment(.center)
+                    Text(friend.displayName).font(.largeTitle.bold()).multilineTextAlignment(.center)
+                    if friend.ownDevice { Text(friend.name).font(.subheadline).foregroundStyle(.secondary) }
                     PresenceLabel(online: bridge.presence[friendID] == true)
                 }.padding(.vertical, 12)
                 GlassGroup {
@@ -146,7 +147,7 @@ struct FriendDetailView: View {
                     }
                 }
                 NavigationLink { LocationsView(friendID: friendID) } label: { GlassCard { SettingsLinkLabel(title: "Browse Locations", symbol: "externaldrive") } }.buttonStyle(.plain)
-                Button("Remove Friend", role: .destructive) { removing = true; Haptics.tap() }.beamButton()
+                Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", role: .destructive) { removing = true; Haptics.tap() }.beamButton()
             }.padding(20)
         }.navigationTitle("Friend").navigationBarTitleDisplayMode(.inline).beamCanvas()
             .onChange(of: bridge.friends.map(\.id)) { _, ids in if !ids.contains(friendID) { dismiss() } }

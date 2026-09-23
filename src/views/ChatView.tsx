@@ -40,6 +40,7 @@ import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { useOwnDeviceLabels } from '../lib/ownDevices'
+import { personGroups } from '../lib/deviceIcons'
 import { FileIcon as TypeIcon, fileKind as typeKind } from '../components/FileIcon'
 import { formatBytes } from '../lib/format'
 import { linkify } from '../lib/linkify'
@@ -122,10 +123,12 @@ export function ChatView() {
   const friendSeen = useStore((s) => s.friendSeen)
   const folderStatuses = useStore((s) => s.folderStatuses)
 
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
   const rows = useMemo(() => {
     const byId = new Map(friends.map((f) => [f.id, f]))
     const ordered: { friend: Friend; last?: string }[] = []
-    const seen = new Set<string>()
+    // A friend's extra devices speak in the person's thread — never their own row.
+    const seen = new Set<string>(Object.keys(personGroups(friends, myAccount)))
     // Only current friends can create visible rows. Detached transcripts and
     // stale file-note caches must not resurrect an Unknown contact.
     for (const o of overview) {
@@ -146,7 +149,7 @@ export function ChatView() {
     // 3) Friends with no conversation yet, so you can start one.
     for (const f of friends) if (!seen.has(f.id)) ordered.push({ friend: f })
     return ordered
-  }, [friends, overview, chats])
+  }, [friends, overview, chats, myAccount])
 
   useEffect(() => {
     if (MOBILE_UI || activeChatId) return

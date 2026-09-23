@@ -46,3 +46,24 @@ export function ownDeviceLabels<T extends { id: string; name: string; deviceKind
   devices.forEach((d, i) => { out[d.id] = nouns.filter(n => n === nouns[i]).length > 1 ? d.name : `Your ${nouns[i]}` })
   return out
 }
+
+/**
+ * A friend's extra devices (records sharing someone ELSE's verified account)
+ * fold into the person's oldest record — the one that owns the conversation
+ * (mirrors friends::owner_in in Rust). Returns member id → owner id, for the
+ * extra devices only.
+ */
+export function personGroups<T extends { id: string; createdAt: number; accountPub?: string | null; endpointId?: string | null }>(friends: readonly T[], myAccount?: string | null): Record<string, string> {
+  const owners = new Map<string, T>()
+  for (const f of friends) {
+    if (!f.accountPub || f.accountPub === myAccount || !f.endpointId) continue
+    const cur = owners.get(f.accountPub)
+    if (!cur || f.createdAt < cur.createdAt || (f.createdAt === cur.createdAt && f.id < cur.id)) owners.set(f.accountPub, f)
+  }
+  const out: Record<string, string> = {}
+  for (const f of friends) {
+    const owner = f.accountPub && f.accountPub !== myAccount ? owners.get(f.accountPub) : undefined
+    if (owner && owner.id !== f.id) out[f.id] = owner.id
+  }
+  return out
+}

@@ -11,7 +11,7 @@ struct ChatsView: View {
     private func hasThread(_ friend: Friend) -> Bool { overview(friend) != nil || !(bridge.threads[friend.id] ?? []).isEmpty }
     private var conversations: [Friend] {
         bridge.friends.filter { friend in
-            hasThread(friend) && (search.isEmpty || ChatRow.title(for: friend).localizedCaseInsensitiveContains(search) ||
+            friend.groupedUnder == nil && hasThread(friend) && (search.isEmpty || ChatRow.title(for: friend).localizedCaseInsensitiveContains(search) ||
                 overview(friend)?.lastText?.localizedCaseInsensitiveContains(search) == true)
         }.sorted { (overview($0)?.lastTs ?? 0) > (overview($1)?.lastTs ?? 0) }
     }
@@ -98,11 +98,11 @@ struct ChatRow: View {
     let overview: ChatOverview?
     let unread: Bool
     var fallback: String?
-    static func title(for friend: Friend) -> String { friend.name }
+    static func title(for friend: Friend) -> String { friend.displayName }
     static func subtitle(for friend: Friend, overview: ChatOverview?, fallback: String?) -> String {
         overview?.lastText ?? fallback ?? "No messages yet"
     }
-    @ViewBuilder static func avatar(for friend: Friend, size: CGFloat) -> some View { FriendAvatar(friend: friend, size: size) }
+    @ViewBuilder static func avatar(for friend: Friend, size: CGFloat) -> some View { ContactAvatar(friend: friend, size: size) }
     var body: some View {
         HStack(alignment: .center, spacing: 0) {
             Circle().fill(unread ? ChatPalette.sent : .clear).frame(width: 10, height: 10)
@@ -164,7 +164,7 @@ private struct ChatFriendPicker: View {
     @State private var search = ""
     var body: some View {
         NavigationStack {
-            List(bridge.friends.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }) { friend in
+            List(bridge.friends.filter { $0.groupedUnder == nil && (search.isEmpty || $0.displayName.localizedCaseInsensitiveContains(search)) }) { friend in
                 Button {
                     dismiss()
                     bridge.perform { try await bridge.openChat(friendId: friend.id) }

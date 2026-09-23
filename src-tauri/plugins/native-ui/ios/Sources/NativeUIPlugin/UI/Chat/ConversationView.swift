@@ -37,7 +37,7 @@ struct ConversationView: View {
                             .id(message.id)
                     }
                     if bridge.chatTyping[friendID] == true {
-                        HStack(alignment: .bottom, spacing: 6) { FriendAvatar(friend: friend, size: 28); TypingBubble(); Spacer() }
+                        HStack(alignment: .bottom, spacing: 6) { ContactAvatar(friend: friend, size: 28); TypingBubble(); Spacer() }
                             .padding(.top, 10).transition(.scale(scale: 0.6, anchor: .bottomLeading).combined(with: .opacity))
                     }
                     Color.clear.frame(height: 10).id("thread-bottom")
@@ -130,15 +130,15 @@ struct ConversationView: View {
     private var header: some View {
         Button { Haptics.tap(); showDetail = true } label: {
             VStack(spacing: 3) {
-                FriendAvatar(friend: friend, size: 34)
+                ContactAvatar(friend: friend, size: 34)
                 HStack(spacing: 2) {
-                    Text(friend.name).font(.caption.weight(.semibold)).lineLimit(1)
+                    Text(friend.displayName).font(.caption.weight(.semibold)).lineLimit(1)
                     Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
                 }.foregroundStyle(.primary)
             }
         }.buttonStyle(.plain)
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(friend.name).accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
+            .accessibilityLabel(friend.displayName).accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
     }
 
     @ViewBuilder private func messageRow(_ message: ChatMessage, index: Int) -> some View {
@@ -155,14 +155,14 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity).padding(.top, index == 0 ? 6 : 16).padding(.bottom, 6)
             }
             if message.deleted == true {
-                Text(message.fromMe ? "You unsent a message." : "\(friend.name) unsent a message.")
+                Text(message.fromMe ? "You unsent a message." : "\(friend.displayName) unsent a message.")
                     .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity).padding(.vertical, 8)
             } else {
                 HStack(alignment: .bottom, spacing: 0) {
                     if message.fromMe { Spacer(minLength: 0) }
                     if !message.fromMe {
                         Group {
-                            if lastInRun { FriendAvatar(friend: friend, size: 28) }
+                            if lastInRun { ContactAvatar(friend: friend, size: 28) }
                             else { Color.clear.frame(width: 28, height: 28) }
                         }.padding(.trailing, 2)
                     }

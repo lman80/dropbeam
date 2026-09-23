@@ -1,4 +1,4 @@
-import { groupDevices } from '../lib/deviceIcons'
+import { groupDevices, personGroups } from '../lib/deviceIcons'
 import { DeviceBadge } from '../components/DeviceBadge'
 import { AddDeviceModal } from '../components/DevicesPanel'
 import { useOwnDeviceLabels } from '../lib/ownDevices'
@@ -39,7 +39,8 @@ export function FriendsView() {
   const [adding, setAdding] = useState(false)
   const [linking, setLinking] = useState(false)
   const myDevice = useStore(s => s.myDevice)
-  const { myDevices, others } = groupDevices(friends, myDevice?.account_pub)
+  const grouped = personGroups(friends, myDevice?.account_pub)
+  const { myDevices, others } = groupDevices(friends.filter(f => !grouped[f.id]), myDevice?.account_pub)
   useEffect(() => { void useStore.getState().refreshMyDevice().catch(() => {}) }, [])
   const devices = <section><div className="device-section-heading"><h2 className={MOBILE_UI ? 'ios-section-title' : ''}>My devices</h2><button className={MOBILE_UI ? 'ios-button' : 'btn btn-ghost'} onClick={() => setLinking(true)}>Add a device</button></div>
     {myDevices.length ? <div className={MOBILE_UI ? 'ios-list' : 'device-list'}>{myDevices.map(f => <FriendCard key={f.id} friend={f} />)}</div> : <p className={MOBILE_UI ? 'mobile-inset ios-footnote' : ''}>Link your phone or another computer</p>}

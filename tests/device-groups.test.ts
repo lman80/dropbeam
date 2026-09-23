@@ -24,3 +24,16 @@ test('own devices read "Your Mac"/"Your iPhone" and fall back to names when two 
   assert.deepEqual(ownDeviceLabels([{ id: 'a', name: 'Work Mac', deviceOs: 'macos' }, { id: 'b', name: 'Home Mac', deviceOs: 'macos' }, { id: 'c', name: 'Phone', deviceKind: 'phone', deviceOs: 'ios' }]),
     { a: 'Work Mac', b: 'Home Mac', c: 'Your iPhone' })
 })
+
+test("a friend's extra devices fold under their oldest record; own devices never do", async () => {
+  const { personGroups } = await import('../src/lib/deviceIcons.ts')
+  const f = [
+    { id: 'mac', createdAt: 1, accountPub: 'ashton', endpointId: 'e1' },
+    { id: 'phone', createdAt: 5, accountPub: 'ashton', endpointId: 'e2' },
+    { id: 'mine1', createdAt: 0, accountPub: 'me', endpointId: 'e3' },
+    { id: 'mine2', createdAt: 9, accountPub: 'me', endpointId: 'e4' },
+    { id: 'solo', createdAt: 2, accountPub: null, endpointId: 'e5' },
+  ]
+  assert.deepEqual(personGroups(f, 'me'), { phone: 'mac' })
+  assert.deepEqual(personGroups(f, null), { phone: 'mac', mine2: 'mine1' })
+})

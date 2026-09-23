@@ -96,7 +96,7 @@ struct SendToSheet: View {
     let paths: [String]
     @State private var busy = false
     @State private var error: String?
-    private func mine(_ friend: Friend) -> Bool { guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return false }; return friend.accountPub == account }
+    private func mine(_ friend: Friend) -> Bool { if friend.ownDevice { return true }; guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return false }; return friend.accountPub == account }
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -118,7 +118,7 @@ struct SendToSheet: View {
             if friends.isEmpty { GlassCard { Text(title == "My Devices" ? "Your linked devices appear here." : "Add a friend to send by name.").foregroundStyle(.secondary) } }
             ForEach(friends) { friend in
                 Button { send(friend.id) } label: {
-                    GlassCard { HStack(spacing: 14) { FriendAvatar(friend: friend); VStack(alignment: .leading, spacing: 5) { Text(friend.name).font(.headline).foregroundStyle(.primary); PresenceLabel(online: bridge.presence[friend.id] == true) }; Spacer(); Image(systemName: "chevron.right").foregroundStyle(.tertiary) } }
+                    GlassCard { HStack(spacing: 14) { ContactAvatar(friend: friend); VStack(alignment: .leading, spacing: 5) { Text(friend.displayName).font(.headline).foregroundStyle(.primary); PresenceLabel(online: bridge.presence[friend.id] == true) }; Spacer(); Image(systemName: "chevron.right").foregroundStyle(.tertiary) } }
                 }.buttonStyle(.plain)
             }
         }

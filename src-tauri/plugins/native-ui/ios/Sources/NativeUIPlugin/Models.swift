@@ -12,6 +12,9 @@ struct Friend: Decodable, Identifiable {
     /// One of the user's own devices (same account) — shown as "Your Mac" etc.
     var ownDevice: Bool = false
     var ownLabel: String?
+    /// Set on a friend's extra device (same account as an older record): it is
+    /// shown and chatted with as part of that person, never as its own row.
+    var groupedUnder: String?
     /// The name to show: "Your iPhone" for an own device, else the friend's name.
     var displayName: String { ownDevice ? (ownLabel ?? name) : name }
 }
@@ -282,6 +285,7 @@ extension Friend {
         self.deviceOs = (try? c.decode(String.self, forKey: BridgeKey("deviceOs")))
         self.ownDevice = (try? c.decode(Bool.self, forKey: BridgeKey("ownDevice"))) ?? false
         self.ownLabel = (try? c.decode(String.self, forKey: BridgeKey("ownLabel")))
+        self.groupedUnder = (try? c.decode(String.self, forKey: BridgeKey("groupedUnder")))
     }
 }
 extension AccountDevice {

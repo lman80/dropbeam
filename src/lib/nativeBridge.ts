@@ -14,7 +14,7 @@ import { restoredChatTransfer } from './chatTransfer'
 import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRight } from './nativePhase3'
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
-import { ownDeviceLabels } from './deviceIcons'
+import { ownDeviceLabels, personGroups } from './deviceIcons'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -270,7 +270,14 @@ const deviceSnapshot = () => {
 const friendSnapshot = (friends: Friend[], accountPub?: string | null) => {
   const own = friends.filter(f => accountPub && f.accountPub === accountPub)
   const labels = ownDeviceLabels(own)
-  return friends.map(({ secret: _secret, ...friend }) => ({ ...friend, ownDevice: friend.id in labels, ownLabel: labels[friend.id] ?? null }))
+  const groups = personGroups(friends, accountPub)
+  return friends.map(({ secret: _secret, ...friend }) => ({ ...friend, ownDevice: friend.id in labels, ownLabel: labels[friend.id] ?? null, groupedUnder: groups[friend.id] ?? null }))
+}
+/** Presence per friend; a person reads online when ANY of their devices is. */
+const presenceSnapshot = (s: ReturnType<typeof st>) => {
+  const out: Record<string, boolean> = Object.fromEntries(s.friends.map(f => [f.id, friendOnlineState(f.name, s.friendSeen, s.folderStatuses) === true]))
+  for (const [member, owner] of Object.entries(personGroups(s.friends, s.myDevice?.account_pub))) if (out[member]) out[owner] = true
+  return out
 }
 const locationSnapshot = () => st().friends.map(f => ({ friendId: f.id, friendName: f.name, online: friendOnlineState(f.name, st().friendSeen, st().folderStatuses) === true, locations: shared[f.id] ?? [], error: locationErrors[f.id] ?? null }))
 function refreshLocations(force = false) {
@@ -389,7 +396,7 @@ async function start() {
       chatTyping: s.chatTyping,
       thread: nativeThread(s.activeChatId, s.chats),
       chatDraftFiles: s.chatDraftFiles,
-      presence: Object.fromEntries(s.friends.map(f => [f.id, friendOnlineState(f.name, s.friendSeen, s.folderStatuses) === true])),
+      presence: presenceSnapshot(s),
       myDevice: deviceSnapshot(),
     }
     for (const change of changedSnapshots(previous, snapshots)) send('state', change)
