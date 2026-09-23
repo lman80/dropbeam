@@ -25,7 +25,9 @@ struct HistoryView: View {
                 .confirmationDialog("Clear all transfer history? Your files stay where they are.", isPresented: $clearing, titleVisibility: .visible) {
                     Button("Clear History", role: .destructive) { bridge.perform { try await bridge.action("historyClear") } }
                 }
-                .task { bridge.perform { try await bridge.action("historyList") } }
+                .task { // Tab appearance must not fire a haptic (perform taps); keep the error alert.
+                    do { try await bridge.action("historyList") } catch is CancellationError {} catch { bridge.errorMessage = error.localizedDescription }
+                }
                 .fullScreenCover(item: $media) { item in MediaViewer(path: item.path, name: item.name, video: item.video) }
         }
     }

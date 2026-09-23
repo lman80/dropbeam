@@ -26,18 +26,22 @@ export function FolderInviteModal() {
     }
   }, [])
 
-  const dismiss = () => setQueue((q) => q.slice(1))
+  // Remove a SPECIFIC invite: an accept that finishes after the user already
+  // closed the prompt must not pop the NEXT queued invite unseen.
+  const drop = (code: string) => setQueue((q) => q.filter((x) => x.code !== code))
+  const dismiss = () => { if (!busy && invite) drop(invite.code) }
 
   const accept = async () => {
-    if (!invite) return
+    if (!invite || busy) return
+    const current = invite
     const folder = await api.pickDirectory()
     if (!folder) return // user cancelled the folder picker — keep the prompt open
     setBusy(true)
     try {
-      await api.acceptPair(invite.code, folder)
+      await api.acceptPair(current.code, folder)
       await reloadPairs()
-      toast('success', `Joined “${invite.folderName || 'shared folder'}”. Files will sync here.`)
-      dismiss()
+      toast('success', `Joined “${current.folderName || 'shared folder'}”. Files will sync here.`)
+      drop(current.code)
     } catch (e) {
       toast('error', String(e))
     } finally {
@@ -95,7 +99,7 @@ export function FolderInviteModal() {
                     <b>“{invite.folderName || 'a folder'}”</b> with you.
                   </div>
                 </div>
-                <button className="icon-btn" onClick={dismiss} aria-label="Decline">
+                <button className="icon-btn" onClick={dismiss} disabled={busy} aria-label="Decline">
                   <X size={16} />
                 </button>
               </div>

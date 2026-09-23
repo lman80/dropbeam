@@ -12,9 +12,9 @@ pub fn settings_path(config_dir: &Path) -> PathBuf {
 /// Load settings, filling in runtime-derived defaults (download dir, name) when
 /// they're blank.
 pub fn load(config_dir: &Path, default_download: &str, default_name: &str) -> Settings {
-    let mut s = match fs::read_to_string(settings_path(config_dir)) {
-        Ok(txt) => serde_json::from_str::<Settings>(&txt).unwrap_or_default(),
-        Err(_) => Settings::default(),
+    let mut s = match read_json_store::<Settings>(&settings_path(config_dir)) {
+        StoreRead::Loaded(s) => s,
+        StoreRead::Missing | StoreRead::Unreadable => Settings::default(),
     };
     if s.download_dir.trim().is_empty() {
         s.download_dir = default_download.to_string();
@@ -29,6 +29,68 @@ pub fn save(config_dir: &Path, settings: &Settings) -> Result<(), String> {
     let _ = fs::create_dir_all(config_dir);
     let txt = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     write_atomic(&settings_path(config_dir), txt.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// Result of [`read_json_store`].
+pub enum StoreRead<T> {
+    /// No file yet — a genuine first run.
+    Missing,
+    Loaded(T),
+    /// Present but unreadable after retries, or not valid JSON for `T`. A copy was
+    /// set aside (best-effort) so the caller's next save can't destroy the only one.
+    Unreadable,
+}
+
+/// Read a whole-file JSON store (settings.json, chats.json, history.json…).
+///
+/// The old `read_to_string(..).unwrap_or_default()` treated ANY failure as "empty",
+/// and the next save then overwrote the real file — one Windows AV/indexer/OneDrive
+/// lock at launch, or one torn write, silently erased every chat or setting. So:
+/// retry transient read errors briefly, treat only `NotFound` as empty, and before
+/// reporting `Unreadable` copy the file to `<name>.corrupt-<ms>` for recovery.
+pub fn read_json_store<T: serde::de::DeserializeOwned>(path: &Path) -> StoreRead<T> {
+    let mut why = String::new();
+    for attempt in 0..4u64 {
+        match fs::read_to_string(path) {
+            Ok(txt) => match serde_json::from_str::<T>(&txt) {
+                Ok(v) => return StoreRead::Loaded(v),
+                Err(e) => {
+                    why = format!("invalid JSON: {e}");
+                    break;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StoreRead::Missing,
+            Err(e) => {
+                why = format!("read failed: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1)));
+            }
+        }
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let aside = path.with_file_name(format!("{name}.corrupt-{ms}"));
+    // One copy per distinct bad file: a store that's re-read (history on every
+    // list) must not pile up identical copies until the next save repairs it.
+    let len = fs::metadata(path).map(|m| m.len()).ok();
+    let prefix = format!("{name}.corrupt-");
+    let already = path.parent().and_then(|d| fs::read_dir(d).ok()).is_some_and(|rd| {
+        rd.flatten().any(|e| {
+            e.file_name().to_string_lossy().starts_with(&prefix)
+                && e.metadata().ok().map(|m| m.len()) == len
+        })
+    });
+    if already {
+        log::error!("{name} {why} — a copy was already kept, starting empty");
+        return StoreRead::Unreadable;
+    }
+    match fs::copy(path, &aside) {
+        Ok(_) => log::error!("{name} {why} — kept a copy at {aside:?}, starting empty"),
+        Err(e) => log::error!("{name} {why} — could not keep a copy ({e}), starting empty"),
+    }
+    StoreRead::Unreadable
 }
 
 /// Read a JSON-array file (friends.json / pairs.json) resiliently.
@@ -147,6 +209,25 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("dropbeam-settings-test-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn json_store_keeps_a_copy_of_a_corrupt_file_instead_of_silently_emptying() {
+        let dir = tmp("store");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("chats.json");
+        assert!(matches!(read_json_store::<Vec<u32>>(&p), StoreRead::Missing));
+        fs::write(&p, b"[1,2]").unwrap();
+        assert!(matches!(read_json_store::<Vec<u32>>(&p), StoreRead::Loaded(v) if v == vec![1, 2]));
+        fs::write(&p, b"[1,2").unwrap(); // torn write
+        assert!(matches!(read_json_store::<Vec<u32>>(&p), StoreRead::Unreadable));
+        let kept: Vec<_> = fs::read_dir(&dir).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("chats.json.corrupt-"))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read(kept[0].path()).unwrap(), b"[1,2");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

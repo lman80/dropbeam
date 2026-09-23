@@ -2996,7 +2996,9 @@ async fn serve_stream_inner(
                             arr.iter()
                                 .filter_map(|it| {
                                     let raw = it.get("name").and_then(|n| n.as_str())?;
-                                    let rel = sanitize_rel(raw);
+                                    // Same mapping as the landing path (keeps colons /
+                                    // hidden names; never a control path).
+                                    let rel = folder_receive_rel(raw)?;
                                     let ph = Path::new(&folder)
                                         .join(format!("{}.dropbeam-incoming", rel.to_string_lossy()));
                                     if let Some(parent) = ph.parent() {
@@ -3039,7 +3041,13 @@ async fn serve_stream_inner(
             let result = if parallel_n > 0 && single && total >= PARALLEL_MIN {
                 let item0 = &req["items"][0];
                 let raw = item0["name"].as_str().unwrap_or("file");
-                let rel = sanitize_rel(raw);
+                // Mirror sync must land the EXACT name, like the classic body path
+                // (read_folder_body → folder_receive_rel). sanitize_rel dropped any
+                // component with ':' — a ≥16 MB "Meeting 9:23.mov" landed as "file",
+                // so reconcile saw it missing and re-sent it forever.
+                let Some(rel) = folder_receive_rel(raw) else {
+                    anyhow::bail!("folder receive: refusing control/degenerate path {raw:?}");
+                };
                 let mtime = item0["mtime"].as_u64().unwrap_or(0);
                 let who = conn.remote_id().to_string();
                 let fp = transfer_fingerprint(&who, &rel.to_string_lossy(), total, mtime);
@@ -3149,6 +3157,8 @@ async fn serve_stream_inner(
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&staging);
                     clear_placeholders();
+                    // Don't leave the folder frozen on "Receiving N%".
+                    sm.note_folder_receive_ended(&pair_id);
                     anyhow::bail!("folder receive failed: {e}");
                 }
             }
@@ -3406,7 +3416,10 @@ async fn serve_stream_inner(
                                     } else {
                                         PathBuf::from(configured)
                                     };
-                                    dir.join(name).to_string_lossy().to_string()
+                                    // The receive-safe landing name: a peer-supplied
+                                    // absolute/"../" name must never point this card
+                                    // (which the UI previews + opens) outside Downloads.
+                                    dir.join(receive_rel(name)).to_string_lossy().to_string()
                                 })
                             } else {
                                 None
@@ -3861,7 +3874,7 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
 /// Only exact regular-file matches are safe to skip; preserve normal landing
 /// (including collision naming) for every other destination.
 fn friend_file_landed(dest: &Path, name: &str, size: u64, mtime: u64) -> bool {
-    std::fs::symlink_metadata(dest.join(sanitize_rel(name))).is_ok_and(|meta|
+    std::fs::symlink_metadata(dest.join(receive_rel(name))).is_ok_and(|meta|
         meta.file_type().is_file() && meta.len() == size
             && (mtime == 0 || mtime_secs(&meta) == mtime))
 }
@@ -3927,7 +3940,7 @@ fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool
         anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
         let name = item["name"].as_str().context("Invalid verify name")?;
         let size = item["size"].as_u64().unwrap_or(0);
-        let path = dest.join(sanitize_rel(name));
+        let path = dest.join(receive_rel(name)); // where recv_files landed it
         let mut digest = None;
         if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
             if let Ok(file) = std::fs::File::open(&path) {
@@ -4972,7 +4985,12 @@ pub async fn send_folder_reconcile(
         .await?;
     write_frame(&mut send, reconcile).await?;
     send.finish()?;
-    let _ = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(64)).await;
+    // `finish` only queues the data; returning drops `conn`, which abandons
+    // whatever is still in flight. A big folder's manifest (MBs) over a relay can
+    // take well past 5s to arrive — so it was cut off every cycle and self-heal
+    // never ran for large folders. The peer acks only after reading it, so wait
+    // (bounded) for that ack.
+    let _ = tokio::time::timeout(Duration::from_secs(60), recv.read_to_end(64)).await;
     Ok(())
 }
 
@@ -5075,13 +5093,28 @@ pub async fn send_chat(
     // Read the peer's ack and RETURN it, so the durable op-outbox can tell whether an
     // edit/unsend/reaction actually applied (a new peer answers {"kind":"ok","applied":
     // bool}; an old peer just {"kind":"ok"}). Use read_frame_cap, NOT a raw read — the
-    // ack is length-prefixed by write_frame, so raw bytes wouldn't parse. Best-effort:
-    // a missing/slow ack returns Null and the caller falls back. Messages ignore it.
-    let ack = match tokio::time::timeout(Duration::from_secs(5), read_frame_cap(&mut recv, 4096)).await {
-        Ok(Ok(v)) => v,
-        _ => serde_json::Value::Null,
-    };
-    Ok(ack)
+    // ack is length-prefixed by write_frame, so raw bytes wouldn't parse.
+    //
+    // Every receiver version answers a chat frame with an ok frame, so NO ack means
+    // "not confirmed": after a friend sleeps or drops off, the cached connection
+    // still looks open for ~30s and open_bi/write/finish all succeed locally. The
+    // old best-effort Null made that a false "delivered" and the message was lost.
+    // Fail instead so the outbox retries (the receiver dedups by id), and forget
+    // that connection so the retry dials fresh.
+    match tokio::time::timeout(Duration::from_secs(10), read_frame_cap(&mut recv, 4096)).await {
+        Ok(Ok(ack)) => Ok(ack),
+        outcome => {
+            if let Ok(mut conns) = state.friend_conns.lock() {
+                if conns.get(endpoint_id).is_some_and(|c| c.conn.stable_id() == conn.stable_id()) {
+                    conns.remove(endpoint_id);
+                }
+            }
+            match outcome {
+                Ok(Err(e)) => Err(e.context("chat not acknowledged")),
+                _ => Err(anyhow::anyhow!("chat not acknowledged (timed out)")),
+            }
+        }
+    }
 }
 
 /// Build the wire frame for a chat message (shared by the send command + the
@@ -6033,7 +6066,10 @@ fn receive_candidates(natural: &Path, limit: usize) -> impl Iterator<Item = Path
 /// Split a receive name into (parent dir under `dir`, leaf name) using the
 /// same sanitising as every other landing path; never escapes `dir`.
 fn unique_in_parts(dir: &Path, name: &str) -> (PathBuf, String) {
-    let rel = sanitize_rel(name);
+    // `name` is already receive_rel'd by the caller; receive_rel is idempotent.
+    // (sanitize_rel here dropped any component containing ':' — a big parallel
+    // "Meeting 9:23.mov" landed as a bare "file".)
+    let rel = receive_rel(name);
     let safe = rel.file_name().map(|s| s.to_string_lossy().to_string())
         .filter(|s| !s.is_empty()).unwrap_or_else(|| "file".to_string());
     let parent = rel.parent().map(|p| dir.join(p)).unwrap_or_else(|| dir.to_path_buf());
@@ -6156,7 +6192,7 @@ fn files_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
 
 /// Recreate the empty directories a sender advertised in the manifest's optional
 /// `dirs` field (GitHub #22). Purely additive — only ever calls `create_dir_all`,
-/// never removes anything — and each rel is run through the SAME `sanitize_rel`
+/// never removes anything — and each rel is run through the SAME `receive_rel`
 /// traversal guard as a received file, so a peer can't `mkdir` outside `dest_dir`
 /// or land an invisible dot-dir. A dir that fails to create (e.g. an ancestor is a
 /// FILE → ENOTDIR) is logged and skipped: a missing empty folder must NEVER fail
@@ -6167,8 +6203,11 @@ fn recreate_empty_dirs(header: &serde_json::Value, dest_dir: &Path) {
     };
     for d in arr {
         let Some(raw) = d.as_str() else { continue };
-        let rel = sanitize_rel(raw);
-        // sanitize_rel("") → "file"; an empty/degenerate dir entry would create a
+        // The same mapping files use when they land (recv_files → receive_rel), so
+        // "Notes 9:23/" isn't recreated as a junk "file/" and the chat card's
+        // dir-landed check finds it.
+        let rel = receive_rel(raw);
+        // receive_rel("") → "file"; an empty/degenerate dir entry would create a
         // junk "file" directory — skip anything that didn't survive as a real rel.
         if rel.as_os_str().is_empty() || raw.trim().is_empty() {
             continue;
@@ -9309,6 +9348,24 @@ mod tests {
         assert_eq!(windows_safe_component("..."), "_");
         // Normal names pass through untouched.
         assert_eq!(windows_safe_component("사진 모음.jpg"), "사진 모음.jpg");
+    }
+
+    #[test]
+    fn unique_in_parts_keeps_colon_names_and_subfolders() {
+        use std::path::Path;
+        let dir = Path::new("/dl");
+        #[cfg(not(windows))]
+        assert_eq!(
+            unique_in_parts(dir, &receive_rel("Meeting 9:23.mov").to_string_lossy()),
+            (dir.to_path_buf(), "Meeting 9:23.mov".to_string()),
+            "a big (parallel) colon file must not land as a bare 'file'"
+        );
+        assert_eq!(
+            unique_in_parts(dir, &receive_rel("Project/clips/a.mp4").to_string_lossy()),
+            (dir.join("Project/clips"), "a.mp4".to_string())
+        );
+        // Idempotent on already-mapped names; traversal still can't escape.
+        assert_eq!(unique_in_parts(dir, "../../etc/passwd"), (dir.join("etc"), "passwd".to_string()));
     }
 
     #[test]

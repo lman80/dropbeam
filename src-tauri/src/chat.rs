@@ -136,9 +136,11 @@ fn chats_path(config_dir: &Path) -> PathBuf {
 
 /// Disk read — used only by `store_mut` to fill the cache on a dir's first touch.
 fn load_all(config_dir: &Path) -> HashMap<String, Vec<ChatMessage>> {
-    match fs::read_to_string(chats_path(config_dir)) {
-        Ok(txt) => serde_json::from_str(&txt).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+    // A locked/torn chats.json must not read as "no chats": the next save would
+    // overwrite every conversation. read_json_store retries and keeps a copy.
+    match crate::settings::read_json_store(&chats_path(config_dir)) {
+        crate::settings::StoreRead::Loaded(all) => all,
+        _ => HashMap::new(),
     }
 }
 
@@ -426,9 +428,9 @@ fn ops_path(config_dir: &Path) -> PathBuf {
     config_dir.join("chat_ops.json")
 }
 fn load_ops(config_dir: &Path) -> Vec<ChatOp> {
-    match fs::read_to_string(ops_path(config_dir)) {
-        Ok(txt) => serde_json::from_str(&txt).unwrap_or_default(),
-        Err(_) => Vec::new(),
+    match crate::settings::read_json_store(&ops_path(config_dir)) {
+        crate::settings::StoreRead::Loaded(ops) => ops,
+        _ => Vec::new(),
     }
 }
 fn save_ops(config_dir: &Path, ops: &[ChatOp]) {

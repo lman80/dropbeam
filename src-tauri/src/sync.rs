@@ -32,6 +32,11 @@ pub struct SyncManager {
     config_dir: PathBuf,
     handles: Mutex<HashMap<String, PairHandle>>,
     friend_handles: Mutex<HashMap<String, FriendHandle>>,
+    /// Serializes `reconcile()`. It runs from the startup thread, beacon handlers
+    /// and commands; two overlapping runs could both see "no handle" for a pair and
+    /// both `start_pair` it — the second insert orphaned the first worker, which
+    /// then ignored Pause/remove and kept syncing until restart.
+    reconcile_lock: Mutex<()>,
 }
 
 struct FriendHandle {
@@ -168,12 +173,14 @@ impl SyncManager {
             config_dir,
             handles: Mutex::new(HashMap::new()),
             friend_handles: Mutex::new(HashMap::new()),
+            reconcile_lock: Mutex::new(()),
         })
     }
 
     /// Bring running folders in line with what's persisted on disk.
     /// Synchronous filesystem work: async callers must use spawn_blocking.
     pub fn reconcile(self: &Arc<Self>) {
+        let _serial = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         let desired = pairing::load(&self.config_dir);
         let desired_ids: HashSet<String> = desired.iter().map(|p| p.id.clone()).collect();
 
@@ -699,7 +706,13 @@ impl SyncManager {
             skip_current,
             _watcher: watcher,
         };
-        self.handles.lock().unwrap().insert(pair.id.clone(), handle);
+        let replaced = self.handles.lock().unwrap().insert(pair.id.clone(), handle);
+        if let Some(old) = replaced {
+            // Never leave a superseded worker running unowned (see reconcile_lock).
+            old.stopped.store(true, Ordering::SeqCst);
+            old.stop_notify.notify_waiters();
+            old.wake.notify_waiters();
+        }
         self.emit_status(&pair.id);
     }
 
@@ -2148,6 +2161,11 @@ impl SyncManager {
         if apply_peer_deletes {
             for (rel, _) in &rec.tombstones {
                 let norm = norm_rel(rel);
+                // "" would be the folder ROOT itself; "../x" or an absolute rel
+                // would reach outside the shared folder.
+                if !rel_stays_inside(&norm) {
+                    continue;
+                }
                 let abs = Path::new(folder).join(&norm);
                 if abs.is_dir() && !file_is_fresh(&abs, DELETE_GRACE_MS) {
                     self_deleted
@@ -2350,6 +2368,24 @@ impl SyncManager {
         self.emit_status(pair_id);
     }
 
+    /// A folder receive ended WITHOUT landing files (failed, or dropped because the
+    /// folder is paused): drop the "Receiving 43%" status back to Idle. Otherwise a
+    /// receive-only link (viewer / one-way) — which has no sender loop to overwrite
+    /// its status — shows a frozen progress bar until the next transfer.
+    pub fn note_folder_receive_ended(&self, pair_id: &str) {
+        if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
+            if let Ok(mut s) = h.status.lock() {
+                if !matches!(s.state, FolderState::Receiving) {
+                    return; // a sender state took over meanwhile — leave it be
+                }
+                s.state = FolderState::Idle;
+                s.percent = 0.0;
+                s.sending_file = None;
+            }
+        }
+        self.emit_status(pair_id);
+    }
+
     /// Land iroh-received folder files: move them from the private staging dir into
     /// the shared folder using the EXACT same loop-protection / mirror / history
     /// rules as the croc path (shared `inbound` + `self_deleted` guards), then
@@ -2363,6 +2399,8 @@ impl SyncManager {
             // Paused → don't land incoming files (the staging copy is just dropped).
             // The sender won't send while paused; this covers a brief propagation lag.
             if h.paused.load(Ordering::Relaxed) {
+                drop(handles);
+                self.note_folder_receive_ended(pair_id);
                 return Vec::new();
             }
             (h.config.clone(), h.inbound.clone(), h.self_deleted.clone())
@@ -2713,16 +2751,15 @@ fn is_sendable_candidate(path: &str, folder: &str, inbound: &Arc<Mutex<HashSet<S
     // Skip the staging dir and dotfiles / temp files anywhere in the relative
     // path, plus DropBeam's own control paths (incl. the VISIBLE `dropbeam-history`
     // leaked by the old receive de-dot bug — dotless, so the dot check misses it).
-    if let Ok(rel) = p.strip_prefix(folder) {
-        for comp in rel.components() {
-            let name = comp.as_os_str().to_string_lossy();
-            if name.starts_with('.') {
-                return false;
-            }
-        }
-        if crate::iroh_net::is_control_rel(&rel.to_string_lossy().replace('\\', "/")) {
-            return false;
-        }
+    // `folder_rel` also roots aliased event paths (macOS firmlink
+    // /System/Volumes/Data/..., /var vs /private/var, a symlinked root) — a bare
+    // strip_prefix missed those, so `.DS_Store` & history-archive files got queued.
+    // A path that can't be rooted is never sent anyway (the sender skips it).
+    let Some(rel) = crate::iroh_net::folder_rel(p, folder) else {
+        return false;
+    };
+    if rel.split('/').any(|c| c.starts_with('.')) || crate::iroh_net::is_control_rel(&rel) {
+        return false;
     }
     let fname = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     if fname.ends_with(".crdownload") || fname.ends_with(".download") || fname.ends_with(".part") || fname.ends_with(".tmp") || fname.ends_with(".dropbeam-incoming") {
@@ -3144,6 +3181,20 @@ pub(crate) fn norm_rel(rel: &str) -> String {
     rel.replace('\\', "/").nfc().collect()
 }
 
+/// True when a peer-supplied (already `norm_rel`'d) path names something INSIDE
+/// the shared folder: non-empty, relative, no `..`, and no Windows drive/UNC
+/// prefix (`Path::join("C:/x")` or even `join("C:")` REPLACES the folder base on
+/// Windows, so the old `starts_with('/')` check alone let a peer escape there).
+fn rel_stays_inside(rel_norm: &str) -> bool {
+    use std::path::Component;
+    !rel_norm.is_empty()
+        && !rel_norm.starts_with('/')
+        && !rel_norm.split('/').any(|c| c == "..")
+        && Path::new(rel_norm)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 fn rel_path_of(abs: &str, folder: &str) -> Option<String> {
     let p = Path::new(abs);
     let norm = |r: &Path| norm_rel(&r.to_string_lossy());
@@ -3181,7 +3232,7 @@ fn apply_remote_delete(
 ) -> bool {
     let rel_norm = norm_rel(rel);
     // Never let a peer reach outside the folder.
-    if rel_norm.is_empty() || rel_norm.starts_with('/') || rel_norm.split('/').any(|c| c == "..") {
+    if !rel_stays_inside(&rel_norm) {
         return false;
     }
     let dest = Path::new(folder).join(&rel_norm);
@@ -3649,8 +3700,7 @@ fn apply_remote_move(
 ) -> bool {
     let from = norm_rel(from_rel);
     let to = norm_rel(to_rel);
-    let bad = |r: &str| r.is_empty() || r.starts_with('/') || r.split('/').any(|c| c == "..");
-    if bad(&from) || bad(&to) || from == to {
+    if !rel_stays_inside(&from) || !rel_stays_inside(&to) || from == to {
         return false;
     }
     let from_abs = Path::new(folder).join(&from);
@@ -4286,6 +4336,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn rel_stays_inside_rejects_root_escape_and_absolute() {
+        assert!(rel_stays_inside("a.txt"));
+        assert!(rel_stays_inside("sub/dir/a.txt"));
+        assert!(rel_stays_inside("dots..in..name.txt"));
+        assert!(!rel_stays_inside("")); // the folder root itself
+        assert!(!rel_stays_inside("../Other"));
+        assert!(!rel_stays_inside("sub/../../x"));
+        assert!(!rel_stays_inside("/Users/me/Desktop/Empty"));
+        #[cfg(windows)]
+        {
+            assert!(!rel_stays_inside("C:/Users/x/Documents"));
+            assert!(!rel_stays_inside("C:"));
+        }
+    }
+
+    /// A peer tombstone of "" / "../x" must not remove the (empty) shared folder
+    /// root or an empty dir beside it via the reconcile empty-dir sweep.
+    #[test]
+    fn remote_delete_never_touches_root_or_outside() {
+        let base = temp_dir("inside");
+        let folder = base.join("share");
+        let outside = base.join("Other");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let mut applied = Vec::new();
+        let f = folder.to_str().unwrap();
+        assert!(!apply_remote_delete(f, "", &sd, &mut applied, 0));
+        assert!(!apply_remote_delete(f, "../Other", &sd, &mut applied, 0));
+        assert!(folder.is_dir() && outside.is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The watcher can report an aliased path (/private/var vs /var, firmlinks,
+    /// a symlinked root). Dotfiles and DropBeam's own history archive must still be
+    /// recognized as unsendable instead of slipping past a bare strip_prefix.
+    #[cfg(unix)]
+    #[test]
+    fn sendable_candidate_filters_dotfiles_on_aliased_paths() {
+        let base = temp_dir("alias");
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join(".dropbeam-history/data")).unwrap();
+        std::fs::write(real.join(".DS_Store"), b"x").unwrap();
+        std::fs::write(real.join(".dropbeam-history/data/abc"), b"x").unwrap();
+        std::fs::write(real.join("photo.jpg"), b"x").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        let folder = link.to_str().unwrap(); // configured via the alias…
+        let ev = |n: &str| real.join(n).to_string_lossy().to_string(); // …events via the real path
+        assert!(!is_sendable_candidate(&ev(".DS_Store"), folder, &inbound));
+        assert!(!is_sendable_candidate(&ev(".dropbeam-history/data/abc"), folder, &inbound));
+        assert!(is_sendable_candidate(&ev("photo.jpg"), folder, &inbound));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn write_with_mtime(path: &Path, content: &[u8], mtime: u64) {

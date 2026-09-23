@@ -277,7 +277,9 @@ interface AppStore {
   updatePair: (u: PairUpdate) => Promise<void>
   removePair: (id: string) => Promise<void>
   reloadFriends: () => Promise<void>
-  sendToFriend: (id: string, paths: string[]) => Promise<void>
+  /** Resolves true once a transfer actually started (false: nothing to send, a
+   *  de-duped double-fire, or an error already toasted). */
+  sendToFriend: (id: string, paths: string[]) => Promise<boolean>
   createFriend: (name: string) => Promise<string>
   acceptFriend: (invite: string) => Promise<void>
   addFriendByCode: (code: string) => Promise<void>
@@ -1322,12 +1324,12 @@ export const useStore = create<AppStore>((set, get) => ({
 
   sendToFriend: async (id, paths) => {
     paths = paths.filter(Boolean)
-    if (!paths.length) return
+    if (!paths.length) return false
     // De-dupe a double-fired send of the same files to the same friend within
     // ~1.5s (a doubled OS drop event would otherwise transfer everything twice).
     const sig = `${id}|${paths.join('|')}`
     const now = Date.now()
-    if (sig === lastFriendSig && now - lastFriendAt < 1500) return
+    if (sig === lastFriendSig && now - lastFriendAt < 1500) return false
     lastFriendSig = sig
     lastFriendAt = now
     set({ view: 'send' })
@@ -1351,8 +1353,10 @@ export const useStore = create<AppStore>((set, get) => ({
       } catch {
         /* note is best-effort */
       }
+      return true
     } catch (e) {
       get().toast('error', String(e))
+      return false
     }
   },
 

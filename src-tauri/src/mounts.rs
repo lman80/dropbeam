@@ -171,8 +171,12 @@ fn candidates() -> Vec<MountCandidate> {
 
 /// Step 1 of the wizard: the network shares and external disks this device can
 /// see. Empty is fine — the wizard always offers "Choose another folder…".
+/// Async + blocking pool: a sync command runs on the MAIN thread, and statfs on a
+/// disconnected network share can block indefinitely — freezing the whole UI.
 #[tauri::command]
-pub fn list_mount_candidates() -> Vec<MountCandidate> { candidates() }
+pub async fn list_mount_candidates() -> Vec<MountCandidate> {
+    tauri::async_runtime::spawn_blocking(candidates).await.unwrap_or_default()
+}
 
 #[cfg(test)]
 mod tests {

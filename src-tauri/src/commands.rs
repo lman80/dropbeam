@@ -478,11 +478,19 @@ fn chrono_lite_stamp() -> String {
 /// (version, OS, settings, friend/folder counts) into ONE text file in the
 /// Downloads folder, and return its path. The user sends that single file back —
 /// over DropBeam itself or AirDrop — for analysis. No secrets are included.
+/// Off the main thread (sync commands run there): this reads tens of MB of logs.
 #[tauri::command]
-pub fn export_diagnostics(
+pub async fn export_diagnostics(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || export_diagnostics_blocking(app, &state))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn export_diagnostics_blocking(app: AppHandle, state: &Arc<AppState>) -> Result<String, String> {
     use std::fmt::Write as _;
     let log_dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
     let now_ms = std::time::SystemTime::now()
@@ -1743,11 +1751,20 @@ fn folder_display_name(folder: &str) -> String {
 }
 
 /// Per-folder rollup of recovery-history disk usage, for the storage view.
+// The folder-history commands below walk / delete up to the history budget
+// (GBs, often on a NAS) — async + blocking pool keeps the main thread (UI) free.
 #[tauri::command]
-pub fn folder_history_summary(
+pub async fn folder_history_summary(
     state: State<'_, Arc<AppState>>,
-) -> Vec<crate::models::FolderHistorySummary> {
-    mirror_folders(state.inner())
+) -> Result<Vec<crate::models::FolderHistorySummary>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || folder_history_summary_blocking(&state))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn folder_history_summary_blocking(state: &Arc<AppState>) -> Vec<crate::models::FolderHistorySummary> {
+    mirror_folders(state)
         .into_iter()
         .map(|(pair_id, folder)| {
             let items = folder_history::load(&folder);
@@ -1768,28 +1785,38 @@ pub fn folder_history_summary(
 
 /// Wipe one folder's recovery history (every saved copy). Returns bytes freed.
 #[tauri::command]
-pub fn clear_folder_history(
+pub async fn clear_folder_history(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     pair_id: String,
-) -> u64 {
-    let freed = match folder_for(state.inner(), &pair_id) {
-        Some(folder) => folder_history::clear_all(&folder),
-        None => 0,
-    };
-    let _ = app.emit("folder-history://changed", &pair_id);
-    freed
+) -> Result<u64, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let freed = match folder_for(&state, &pair_id) {
+            Some(folder) => folder_history::clear_all(&folder),
+            None => 0,
+        };
+        let _ = app.emit("folder-history://changed", &pair_id);
+        freed
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Wipe recovery history across ALL mirror folders. Returns total bytes freed.
 #[tauri::command]
-pub fn clear_all_folder_history(app: AppHandle, state: State<'_, Arc<AppState>>) -> u64 {
-    let mut freed = 0u64;
-    for (pair_id, folder) in mirror_folders(state.inner()) {
-        freed += folder_history::clear_all(&folder);
-        let _ = app.emit("folder-history://changed", &pair_id);
-    }
-    freed
+pub async fn clear_all_folder_history(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<u64, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut freed = 0u64;
+        for (pair_id, folder) in mirror_folders(&state) {
+            freed += folder_history::clear_all(&folder);
+            let _ = app.emit("folder-history://changed", &pair_id);
+        }
+        freed
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Apply current retention to every mirror folder (used at startup + when the

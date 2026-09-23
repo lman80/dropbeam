@@ -36,12 +36,12 @@ export function GifPicker({
     const ctrl = new AbortController()
     setLoading(true)
     setError(false)
-    const run = query.trim()
-      ? searchGifs(apiKey, query, ctrl.signal)
-      : trendingGifs(apiKey, ctrl.signal)
+    // Start the request INSIDE the timer: starting it first made every keystroke
+    // hit Giphy (burning the free key's rate limit) and left aborted promises
+    // with no handler attached (unhandled AbortError rejections).
     const t = setTimeout(
       () => {
-        run
+        ;(query.trim() ? searchGifs(apiKey, query, ctrl.signal) : trendingGifs(apiKey, ctrl.signal))
           .then((r) => {
             setResults(r)
             setLoading(false)

@@ -1,4 +1,5 @@
 import { deviceKindLabel } from '../lib/deviceIcons'
+import { folderName } from '../lib/syncedFolders'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { DevicesPanel } from '../components/DevicesPanel'
 import { useEffect, useState, type ReactNode } from 'react'
@@ -258,12 +259,7 @@ export function SettingsView() {
       <SectionTitle>Profile</SectionTitle>
       <Card>
         <Row title="Display name" desc={MOBILE_UI ? "The name your friends see." : "What paired devices see you as."}>
-          <input
-            className="input"
-            style={{ width: 200 }}
-            value={settings.displayName}
-            onChange={(e) => save({ displayName: e.target.value })}
-          />
+          <DisplayNameInput value={settings.displayName} onSave={(displayName) => void save({ displayName })} />
         </Row>
       </Card>
 
@@ -281,7 +277,7 @@ export function SettingsView() {
                   whiteSpace: 'nowrap',
                 }}
               >
-                {settings.downloadDir.split('/').pop() || settings.downloadDir}
+                {folderName(settings.downloadDir)}
               </span>
             </button>
           </Row>
@@ -905,4 +901,29 @@ function MobileSetting({ title, desc, children, destructive = false }: { title: 
     <div className="mobile-grow"><div>{title}</div>{desc && <p className="ios-footnote">{desc}</p>}</div>
     {children && <div className="mobile-setting-control">{children}</div>}
   </div>
+}
+
+/** Edit a local draft and save on blur/Enter. Saving per keystroke round-tripped
+ * through the engine, which trims the name — so a typed space vanished at once
+ * ("John Smith" became "JohnSmith") and every keystroke re-broadcast the profile. */
+function DisplayNameInput({ value, onSave }: { value: string; onSave: (name: string) => void }) {
+  // null = not editing: show the saved value (so outside changes still appear).
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = () => {
+    const name = (draft ?? '').trim()
+    if (name && name !== value) onSave(name)
+    setDraft(null)
+  }
+  return (
+    <input
+      className="input"
+      style={{ width: 200 }}
+      value={draft ?? value}
+      maxLength={64}
+      onFocus={() => setDraft(value)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+    />
+  )
 }

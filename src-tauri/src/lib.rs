@@ -122,16 +122,19 @@ fn spawn_upload_queue_consumer(app: tauri::AppHandle, config_dir: PathBuf) {
         let path = config_dir.join("upload-queue.json");
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            use tauri::Manager;
+            // Started before setup finishes managing state: `state()` would panic
+            // (killing this task for the session) — wait until both exist, and only
+            // then consume the queue file.
+            let (Some(state), Some(iroh)) = (app.try_state::<Arc<AppState>>(), app.try_state::<Arc<iroh_net::IrohState>>()) else { continue };
+            let (state, iroh) = (state.inner().clone(), iroh.inner().clone());
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let _ = std::fs::remove_file(&path);
             let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { log::warn!("upload-queue.json: not valid JSON"); continue };
             let reqs: Vec<_> = v.as_array().into_iter().flatten().filter_map(parse_location_upload).collect();
             log::info!("upload-queue: {} request(s)", reqs.len());
             for (friend, target, paths) in reqs {
-                use tauri::Manager;
-                let state = app.state::<Arc<AppState>>().inner().clone();
-                let iroh = app.state::<Arc<iroh_net::IrohState>>().inner().clone();
-                match commands::start_location_upload(app.clone(), state, iroh, friend, target, paths.clone()).await {
+                match commands::start_location_upload(app.clone(), state.clone(), iroh.clone(), friend, target, paths.clone()).await {
                     Ok(t) => log::info!("upload-queue: started {} ({} path(s))", t.id, paths.len()),
                     Err(e) => log::warn!("upload-queue: refused {:?}: {e}", paths),
                 }
@@ -462,13 +465,19 @@ pub fn run() {
             let mut loaded = settings::load(&config_dir, &default_download, &default_name);
             if loaded.device_kind.is_empty() {
                 loaded.device_kind = default_device_kind().into();
-                settings::save(&config_dir, &loaded).map_err(std::io::Error::other)?;
+                // Never abort launch over a settings write (disk full, locked or
+                // read-only config dir): the in-memory value still applies.
+                if let Err(e) = settings::save(&config_dir, &loaded) {
+                    log::error!("could not persist device kind at startup: {e}");
+                }
             }
             // Sandbox container paths can change across iOS installs.
             #[cfg(target_os = "ios")]
             if loaded.download_dir != default_download {
                 loaded.download_dir = default_download.clone();
-                settings::save(&config_dir, &loaded).map_err(std::io::Error::other)?;
+                if let Err(e) = settings::save(&config_dir, &loaded) {
+                    log::error!("could not persist the iOS download dir at startup: {e}");
+                }
             }
             // One-time "always ready in the background" migration: existing installs
             // had launch-at-login OFF, so a closed app couldn't receive. Turn it ON
