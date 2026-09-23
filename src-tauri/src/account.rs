@@ -276,8 +276,7 @@ fn this_device(st: &AppState, me: &str) -> DeviceRec {
         os: Some(std::env::consts::OS.to_owned()) }
 }
 
-fn gather(st: &AppState, account: &str, me: &str) -> Local {
-    let dir = &st.config_dir;
+fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
     let book = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(dir, account) };
     let all = friends::load(dir);
     let mut devices = vec![];
@@ -310,7 +309,7 @@ fn gather(st: &AppState, account: &str, me: &str) -> Local {
         account: account.to_owned(),
         me: me.to_owned(),
         meta: Meta {
-            roster: Roster { me: this_device(st, me), devices, linked: book.linked, removed: book.removed_devices },
+            roster: Roster { me: device.clone(), devices, linked: book.linked, removed: book.removed_devices },
             friends: recs,
             removed_friends: book.removed_friends,
         },
@@ -585,54 +584,131 @@ fn sign(dir: &Path, me: &str) -> Option<String> {
     crate::link::sign_endpoint(dir, me)
 }
 
-/// Dialer side: run one full exchange with own device `eid`.
-async fn sync_with(app: &AppHandle, net: &Arc<IrohState>, eid: &str) -> anyhow::Result<()> {
-    let st = app.state::<Arc<AppState>>();
-    let dir = st.config_dir.clone();
-    let me = net.get().ok_or_else(|| anyhow::anyhow!("network not ready"))?.id().to_string();
-    let account = my_pub(&dir).ok_or_else(|| anyhow::anyhow!("no account"))?;
-    let local = gather(&st, &account, &me);
+/// Who this device is, for one exchange (kept free of the app handle so the
+/// wire protocol can be exercised over real loopback connections in tests).
+pub(crate) struct Ctx {
+    dir: std::path::PathBuf,
+    me: String,
+    device: DeviceRec,
+}
+
+impl Ctx {
+    fn from_app(app: &AppHandle, net: &IrohState) -> anyhow::Result<Ctx> {
+        let st = app.try_state::<Arc<AppState>>().ok_or_else(|| anyhow::anyhow!("app unavailable"))?;
+        let me = net.get().ok_or_else(|| anyhow::anyhow!("network not ready"))?.id().to_string();
+        Ok(Ctx { dir: st.config_dir.clone(), device: this_device(&st, &me), me })
+    }
+    fn gather(&self, account: &str) -> Local {
+        gather(&self.dir, account, &self.me, &self.device)
+    }
+}
+
+/// What one exchange changed locally.
+struct Outcome {
+    applied: Applied,
+    chats: usize,
+}
+
+/// Dialer side of one exchange over an open bi-stream to own device `eid`.
+async fn client_exchange(ctx: &Ctx, eid: &str, send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Outcome> {
+    let dir = &ctx.dir;
+    let account = my_pub(dir).ok_or_else(|| anyhow::anyhow!("no account"))?;
+    let local = ctx.gather(&account);
     let hello = json!({
         "kind": "account-sync", "v": SYNC_V, "account": account,
-        "sig": sign(&dir, &me).ok_or_else(|| anyhow::anyhow!("no account key"))?,
-        "meta": local.meta, "summaries": summaries(&dir, &local),
+        "sig": sign(dir, &ctx.me).ok_or_else(|| anyhow::anyhow!("no account key"))?,
+        "meta": local.meta, "summaries": summaries(dir, &local),
     });
-    let conn = iroh_net::friend_connection(net, eid).await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    iroh_net::write_frame(&mut send, &hello).await?;
+    iroh_net::write_frame(send, &hello).await?;
     let t = Duration::from_secs(60);
-    let reply = tokio::time::timeout(t, iroh_net::read_frame_cap(&mut recv, FRAME_CAP)).await??;
+    let reply = tokio::time::timeout(t, iroh_net::read_frame_cap(recv, FRAME_CAP)).await??;
     match reply["kind"].as_str() {
         Some("account-sync-ok") => {}
         Some("account-sync-removed") => {
             // The other device removed this one from the account.
-            leave_account(&dir, &account);
-            let _ = app.emit("account://left", ());
-            let _ = app.emit("friends://changed", ());
-            anyhow::bail!("removed from account");
+            leave_account(dir, &account);
+            let applied = Applied { new_friends: vec![], want_avatars: vec![], left_account: true, changed: true };
+            return Ok(Outcome { applied, chats: 0 });
         }
         other => anyhow::bail!("account sync refused ({})", other.unwrap_or("?")),
     }
     let meta: Meta = serde_json::from_value(reply["meta"].clone())?;
-    let applied = apply_meta(&dir, &local, eid, &meta);
+    let applied = apply_meta(dir, &local, eid, &meta);
     if applied.left_account {
-        announce(app, net, &applied, 0);
-        return Ok(());
+        return Ok(Outcome { applied, chats: 0 });
     }
-    let local = gather(&st, &account, &me);
+    let local = ctx.gather(&account);
     let lists: HashMap<String, Vec<(String, String)>> = serde_json::from_value(reply["lists"].clone()).unwrap_or_default();
-    let (messages, want) = plan(&dir, &local, &lists);
+    let (messages, want) = plan(dir, &local, &lists);
     let their_wants: Vec<String> = serde_json::from_value(reply["want_avatars"].clone()).unwrap_or_default();
-    iroh_net::write_frame(&mut send, &json!({
+    iroh_net::write_frame(send, &json!({
         "messages": messages, "want": want,
         "avatars": avatars_for(&local, &their_wants), "want_avatars": applied.want_avatars,
     })).await?;
     send.finish()?;
-    let last = tokio::time::timeout(t, iroh_net::read_frame_cap(&mut recv, FRAME_CAP)).await??;
-    let chats = apply_messages(&dir, &last["messages"]);
-    let avatars = apply_avatars(&dir, &last["avatars"]);
-    let applied = Applied { changed: applied.changed || avatars, ..applied };
-    announce(app, net, &applied, chats);
+    let last = tokio::time::timeout(t, iroh_net::read_frame_cap(recv, FRAME_CAP)).await??;
+    let chats = apply_messages(dir, &last["messages"]);
+    let avatars = apply_avatars(dir, &last["avatars"]);
+    Ok(Outcome { applied: Applied { changed: applied.changed || avatars, ..applied }, chats })
+}
+
+/// Listener side of one exchange started by `who` (its first frame is `req`).
+/// Ok(None) = refused (not our account, or a removed device).
+async fn server_exchange(ctx: &Ctx, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Option<Outcome>> {
+    let dir = &ctx.dir;
+    let account = my_pub(dir);
+    let verified = account.as_deref().is_some_and(|a| req["account"].as_str() == Some(a)
+        && crate::link::verify_account(a, req["sig"].as_str().unwrap_or(""), who));
+    let Some(account) = account.filter(|_| verified) else {
+        iroh_net::write_frame(send, &json!({"kind": "account-sync-denied"})).await?;
+        send.finish()?;
+        return Ok(None);
+    };
+    let removed = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(dir, &account).is_removed(who) };
+    if removed {
+        iroh_net::write_frame(send, &json!({"kind": "account-sync-removed"})).await?;
+        send.finish()?;
+        return Ok(None);
+    }
+    let local = ctx.gather(&account);
+    let meta: Meta = serde_json::from_value(req["meta"].clone())?;
+    let applied = apply_meta(dir, &local, who, &meta);
+    if applied.left_account {
+        iroh_net::write_frame(send, &json!({"kind": "account-sync-denied"})).await?;
+        send.finish()?;
+        return Ok(Some(Outcome { applied, chats: 0 }));
+    }
+    let local = ctx.gather(&account);
+    let theirs: HashMap<String, String> = serde_json::from_value(req["summaries"].clone()).unwrap_or_default();
+    iroh_net::write_frame(send, &json!({
+        "kind": "account-sync-ok", "meta": local.meta,
+        "lists": differing_lists(dir, &local, &theirs), "want_avatars": applied.want_avatars,
+    })).await?;
+    let t = Duration::from_secs(60);
+    let third = tokio::time::timeout(t, iroh_net::read_frame_cap(recv, FRAME_CAP)).await??;
+    let chats = apply_messages(dir, &third["messages"]);
+    let avatars = apply_avatars(dir, &third["avatars"]);
+    let their_wants: Vec<String> = serde_json::from_value(third["want_avatars"].clone()).unwrap_or_default();
+    let local = ctx.gather(&account);
+    iroh_net::write_frame(send, &json!({
+        "messages": wanted_messages(dir, &local, &third["want"]),
+        "avatars": avatars_for(&local, &their_wants),
+    })).await?;
+    send.finish()?;
+    let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
+    Ok(Some(Outcome { applied: Applied { changed: applied.changed || avatars, ..applied }, chats }))
+}
+
+/// Dialer side: run one full exchange with own device `eid`.
+async fn sync_with(app: &AppHandle, net: &Arc<IrohState>, eid: &str) -> anyhow::Result<()> {
+    let ctx = Ctx::from_app(app, net)?;
+    let conn = iroh_net::friend_connection(net, eid).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let out = client_exchange(&ctx, eid, &mut send, &mut recv).await?;
+    announce(app, net, &out.applied, out.chats);
+    anyhow::ensure!(!out.applied.left_account, "removed from account");
     Ok(())
 }
 
@@ -641,58 +717,14 @@ pub(crate) async fn serve(state: &IrohState, who: &str, req: &Value,
     send: &mut iroh::endpoint::SendStream, recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<()> {
     let app = state.app.get().ok_or_else(|| anyhow::anyhow!("app unavailable"))?.clone();
     let net = app.try_state::<Arc<IrohState>>().ok_or_else(|| anyhow::anyhow!("network unavailable"))?.inner().clone();
-    let net = &net;
-    let st = app.state::<Arc<AppState>>();
-    let dir = st.config_dir.clone();
-    let me = net.get().ok_or_else(|| anyhow::anyhow!("network not ready"))?.id().to_string();
-    let account = my_pub(&dir);
-    let verified = account.as_deref().is_some_and(|a| req["account"].as_str() == Some(a)
-        && crate::link::verify_account(a, req["sig"].as_str().unwrap_or(""), who));
-    let Some(account) = account.filter(|_| verified) else {
-        iroh_net::write_frame(send, &json!({"kind": "account-sync-denied"})).await?;
-        send.finish()?;
-        return Ok(());
-    };
-    let removed = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(&dir, &account).is_removed(who) };
-    if removed {
-        iroh_net::write_frame(send, &json!({"kind": "account-sync-removed"})).await?;
-        send.finish()?;
-        return Ok(());
-    }
-    let local = gather(&st, &account, &me);
-    let meta: Meta = serde_json::from_value(req["meta"].clone())?;
-    let applied = apply_meta(&dir, &local, who, &meta);
-    if applied.left_account {
-        iroh_net::write_frame(send, &json!({"kind": "account-sync-denied"})).await?;
-        send.finish()?;
-        announce(&app, net, &applied, 0);
-        return Ok(());
-    }
-    let local = gather(&st, &account, &me);
-    let theirs: HashMap<String, String> = serde_json::from_value(req["summaries"].clone()).unwrap_or_default();
-    iroh_net::write_frame(send, &json!({
-        "kind": "account-sync-ok", "meta": local.meta,
-        "lists": differing_lists(&dir, &local, &theirs), "want_avatars": applied.want_avatars,
-    })).await?;
-    let t = Duration::from_secs(60);
-    let third = tokio::time::timeout(t, iroh_net::read_frame_cap(recv, FRAME_CAP)).await??;
-    let chats = apply_messages(&dir, &third["messages"]);
-    let avatars = apply_avatars(&dir, &third["avatars"]);
-    let their_wants: Vec<String> = serde_json::from_value(third["want_avatars"].clone()).unwrap_or_default();
-    let local = gather(&st, &account, &me);
-    iroh_net::write_frame(send, &json!({
-        "messages": wanted_messages(&dir, &local, &third["want"]),
-        "avatars": avatars_for(&local, &their_wants),
-    })).await?;
-    send.finish()?;
-    let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
-    {
+    let ctx = Ctx::from_app(&app, &net)?;
+    let Some(out) = server_exchange(&ctx, who, req, send, recv).await? else { return Ok(()) };
+    if !out.applied.left_account {
         let mut s = status().lock().unwrap();
         s.last_ok.insert(who.to_owned(), chat::now_ms());
         s.backoff.remove(who);
     }
-    let applied = Applied { changed: applied.changed || avatars, ..applied };
-    announce(&app, net, &applied, chats);
+    announce(&app, &net, &out.applied, out.chats);
     let _ = app.emit("account://synced", who);
     Ok(())
 }
@@ -704,7 +736,8 @@ async fn round(app: &AppHandle, net: &Arc<IrohState>, force: bool) {
     let dir = st.config_dir.clone();
     let Some(account) = my_pub(&dir) else { return };
     let Some(me) = net.get().map(|e| e.id().to_string()) else { return };
-    let fp = fingerprint(&dir, &gather(&st, &account, &me));
+    let device = this_device(&st, &me);
+    let fp = fingerprint(&dir, &gather(&dir, &account, &me, &device));
     let devices: Vec<String> = own_devices(&dir).into_iter().filter_map(|f| f.endpoint_id).collect();
     let targets: Vec<String> = {
         let mut s = status().lock().unwrap();
@@ -721,7 +754,7 @@ async fn round(app: &AppHandle, net: &Arc<IrohState>, force: bool) {
         picked
     };
     let jobs = targets.into_iter().map(|eid| {
-        let (app, net, dir, account, me) = (app.clone(), net.clone(), dir.clone(), account.clone(), me.clone());
+        let (app, net, dir, account, me, device) = (app.clone(), net.clone(), dir.clone(), account.clone(), me.clone(), device.clone());
         async move {
             let res = tokio::time::timeout(Duration::from_secs(150), sync_with(&app, &net, &eid)).await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
@@ -729,7 +762,7 @@ async fn round(app: &AppHandle, net: &Arc<IrohState>, force: bool) {
             s.running.remove(&eid);
             match res {
                 Ok(()) => {
-                    let fp = app.try_state::<Arc<AppState>>().map(|st| fingerprint(&dir, &gather(&st, &account, &me))).unwrap_or_default();
+                    let fp = fingerprint(&dir, &gather(&dir, &account, &me, &device));
                     s.in_step.insert(eid.clone(), (fp, Instant::now()));
                     s.last_ok.insert(eid.clone(), chat::now_ms());
                     s.backoff.remove(&eid);
@@ -867,8 +900,7 @@ mod tests {
         iroh::SecretKey::generate().public().to_string()
     }
     fn local(dir: &Path, account: &str, me: &str) -> Local {
-        let st = AppState::for_tests(dir.to_path_buf());
-        gather(&st, account, me)
+        gather(dir, account, me, &DeviceRec { eid: me.to_owned(), name: "Test".into(), kind: Some("laptop".into()), os: Some("macos".into()) })
     }
     fn text(id: &str, peer: &str, from_me: bool, ts: u64) -> chat::ChatMessage {
         serde_json::from_value(json!({"id": id, "peerId": peer, "fromMe": from_me, "kind": "text",
@@ -985,5 +1017,81 @@ mod tests {
         assert!(applied.left_account);
         assert!(my_pub(&p).is_none());
         for d in [a, b, p] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    /// The whole 4-frame exchange over a real (loopback) iroh connection.
+    #[tokio::test]
+    async fn wire_exchange_converges_over_loopback() {
+        use iroh::endpoint::presets;
+        let (a, b) = (dir(), dir());
+        let key = iroh::SecretKey::generate();
+        for d in [&a, &b] { crate::link::adopt_key_for_tests(d, &key); }
+        let server = iroh::Endpoint::builder(presets::N0).alpns(vec![iroh_net::ALPN.to_vec()]).bind().await.unwrap();
+        let client = iroh::Endpoint::bind(presets::N0).await.unwrap();
+        let (me_a, me_b) = (client.id().to_string(), server.id().to_string());
+        let (f1, f2) = (eid(), eid());
+        let fa = friends::upsert_by_endpoint(&a, &f1, "Mong");
+        for i in 0..30 { chat::append(&a, &text(&format!("a{i}"), &fa.id, i % 2 == 0, i)); }
+        let fb = friends::upsert_by_endpoint(&b, &f2, "Ethan");
+        chat::append(&b, &text("b1", &fb.id, false, 3));
+        let dev = |me: &str, name: &str| DeviceRec { eid: me.to_owned(), name: name.into(), kind: Some("laptop".into()), os: Some("macos".into()) };
+        let ctx_a = Ctx { dir: a.clone(), me: me_a.clone(), device: dev(&me_a, "Mac") };
+        let ctx_b = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone") };
+        let addr = server.addr();
+        let srv = server.clone();
+        let served = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let who = conn.remote_id().to_string();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let req = iroh_net::read_frame(&mut recv).await.unwrap();
+            assert_eq!(req["kind"], "account-sync");
+            let out = server_exchange(&ctx_b, &who, &req, &mut send, &mut recv).await.unwrap().unwrap();
+            out.chats
+        });
+        let conn = client.connect(addr, iroh_net::ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let out = client_exchange(&ctx_a, &me_b, &mut send, &mut recv).await.unwrap();
+        let server_chats = served.await.unwrap();
+        assert_eq!(server_chats, 30, "B received A's whole thread");
+        assert_eq!(out.chats, 1, "A received B's thread");
+        let account = my_pub(&a).unwrap();
+        let (la, lb) = (local(&a, &account, &me_a), local(&b, &account, &me_b));
+        assert_eq!(summaries(&a, &la), summaries(&b, &lb));
+        // Each side lists the other as an own device, labelled from the roster.
+        let mac_on_b = friends::load(&b).into_iter().find(|f| f.endpoint_id.as_deref() == Some(me_a.as_str())).unwrap();
+        assert_eq!(mac_on_b.account_pub.as_deref(), Some(account.as_str()));
+        assert_eq!(mac_on_b.device_os.as_deref(), Some("macos"));
+        // A second exchange has nothing left to move.
+        let srv = server.clone();
+        let ctx_b2 = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone") };
+        let served = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let who = conn.remote_id().to_string();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let req = iroh_net::read_frame(&mut recv).await.unwrap();
+            server_exchange(&ctx_b2, &who, &req, &mut send, &mut recv).await.unwrap().unwrap().chats
+        });
+        let conn = client.connect(server.addr(), iroh_net::ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        assert_eq!(client_exchange(&ctx_a, &me_b, &mut send, &mut recv).await.unwrap().chats, 0);
+        assert_eq!(served.await.unwrap(), 0);
+        // A device with a different account key is refused.
+        let c = dir();
+        crate::link::adopt_key_for_tests(&c, &iroh::SecretKey::generate());
+        let ctx_c = Ctx { dir: c.clone(), me: me_a.clone(), device: dev(&me_a, "Stranger") };
+        let srv = server.clone();
+        let ctx_b3 = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone") };
+        let served = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let who = conn.remote_id().to_string();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let req = iroh_net::read_frame(&mut recv).await.unwrap();
+            server_exchange(&ctx_b3, &who, &req, &mut send, &mut recv).await.unwrap().is_none()
+        });
+        let conn = client.connect(server.addr(), iroh_net::ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        assert!(client_exchange(&ctx_c, &me_b, &mut send, &mut recv).await.is_err());
+        assert!(served.await.unwrap(), "stranger refused");
+        for d in [a, b, c] { let _ = std::fs::remove_dir_all(d); }
     }
 }
