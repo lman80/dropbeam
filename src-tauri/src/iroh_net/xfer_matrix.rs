@@ -1078,3 +1078,18 @@ async fn matrix_big_source_shrinks_mid_send_fails_promptly_then_retry_lands() {
         assert_eq!(sha(&dest.join("clip.mov")), sha(&big), "{via:?}");
     }
 }
+
+/// Per-file receive bookkeeping cost (run with --ignored --nocapture). Was
+/// ~9 ms/file on macOS with F_FULLFSYNC; ~1 ms with fsync(2).
+#[test]
+#[ignore = "benchmark"]
+fn bench_receive_stage_create() {
+    let d = scratch("stagebench");
+    let t = Instant::now();
+    for i in 0..200 {
+        let (mut st, _f) = ReceiveStage::create(d.0.join(format!(".dropbeam-recv-{i}.part")), 10, "bench").unwrap();
+        st.remove().unwrap();
+    }
+    eprintln!("200 stage create+remove: {:?} ({:?}/file)", t.elapsed(), t.elapsed() / 200);
+}
+

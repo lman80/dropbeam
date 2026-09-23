@@ -54,6 +54,22 @@ struct Ownership {
     transfer_id: String,
 }
 fn sidecar(path: &Path) -> PathBuf { path.with_extension("owner.json") }
+/// Durable enough for a cleanup record: survives an app crash or kill (the
+/// case recovery exists for). On macOS `sync_all` is F_FULLFSYNC — a full
+/// drive-cache flush costing ~4 ms, twice per received file: 1,500 small files
+/// spent ~13 s on bookkeeping alone. A lost record after a POWER cut only
+/// leaves a hidden stage file untouched (logged), never loses data, so plain
+/// fsync(2) is the right trade there. Other platforms keep `sync_all`.
+fn flush_to_disk(file: &File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 { return Ok(()); }
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    file.sync_all()
+}
 pub(super) fn is_receive_stage(name: &str) -> bool {
     // Include malformed/lookalike names so unknown files are logged too.
     name.starts_with(".dropbeam-recv-") && name.ends_with(".part")
@@ -80,9 +96,9 @@ impl ReceiveStage {
         let mut registry = OpenOptions::new().read(true).write(true).create_new(true).open(sidecar(&stage.path))?;
         stage.registry = Some((registry.try_clone()?, Identity::of(&registry)?));
         registry.write_all(&serde_json::to_vec(&record)?)?;
-        registry.sync_all()?;
+        flush_to_disk(&registry)?;
         if let Some(dir) = stage.path.parent() {
-            #[cfg(unix)] File::open(dir)?.sync_all()?;
+            #[cfg(unix)] flush_to_disk(&File::open(dir)?)?;
             note_partial_dir(dir);
         }
         Ok((stage, file))

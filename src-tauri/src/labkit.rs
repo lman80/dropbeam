@@ -18,11 +18,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::presets;
-use iroh::{EndpointAddr, TransportAddr};
+use iroh::TransportAddr;
+pub use iroh::EndpointAddr;
 use sha2::{Digest, Sha256};
 
 pub use crate::iroh_net::{
-    conn_detail, recv_files, recv_files_negotiated, send_files, set_parallel_streams, ALPN,
+    conn_detail, lab_landed_rel, lab_manifest, recv_files, recv_files_negotiated, send_files,
+    send_like_friend, serve_friend_conn, set_parallel_streams, ALPN,
 };
 pub use iroh::endpoint::Connection;
 pub use iroh::Endpoint;
@@ -88,6 +90,23 @@ pub async fn lab_endpoint(accept: bool) -> Result<Endpoint> {
 /// survives self-update restarts. Used by `serve`.
 pub async fn lab_endpoint_persistent(accept: bool, state_dir: &Path) -> Result<Endpoint> {
     lab_endpoint_inner(accept, Some(state_dir)).await
+}
+
+/// A SENDER endpoint for one dial mode. `relay` removes every IP transport, so
+/// the connection can't hole-punch its way off the relay mid-run (filtering the
+/// peer's addrs alone still lets iroh upgrade to direct) — every byte provably
+/// rides the public relay, the path a user behind a hostile NAT gets.
+pub async fn lab_endpoint_for(mode: &str) -> Result<Endpoint> {
+    if mode != "relay" { return lab_endpoint(false).await; }
+    let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
+    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(noq_proto::congestion::Bbr3Config::default()));
+    tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
+    tcfg = tcfg.send_window(8 * 1024 * 1024);
+    Endpoint::builder(presets::N0)
+        .clear_ip_transports()
+        .path_selector(std::sync::Arc::new(crate::iroh_net::DirectPathSelector))
+        .transport_config(tcfg.build())
+        .bind().await.context("bind relay-only lab endpoint")
 }
 
 async fn lab_endpoint_inner(accept: bool, state_dir: Option<&Path>) -> Result<Endpoint> {
@@ -228,6 +247,95 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
+/// One landed (or expected) file: `/`-separated rel, sha256, size, mtime secs.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct FileReport { pub rel: String, pub sha256: String, pub size: u64, pub mtime: u64 }
+
+/// Every regular file under `root` — hidden ones too (a stray stage/partial is
+/// a finding), symlinks NOT followed — with its hash, size and mtime.
+pub fn tree_report(root: &Path) -> Result<Vec<FileReport>> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<FileReport>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            let p = entry.path();
+            if ft.is_dir() { walk(&p, root, out)?; continue; }
+            if !ft.is_file() { continue; }
+            let meta = entry.metadata()?;
+            let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string();
+            // A '\\' is a legal name character on macOS/Linux, a separator only on Windows.
+            #[cfg(windows)]
+            let rel = rel.replace('\\', "/");
+            use unicode_normalization::UnicodeNormalization;
+            out.push(FileReport { rel: rel.nfc().collect(), sha256: sha256_file(&p)?, size: meta.len(), mtime: lab_mtime(&meta) });
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    if root.exists() { walk(root, root, &mut out)?; }
+    out.sort();
+    Ok(out)
+}
+use crate::iroh_net::lab_mtime;
+
+/// Every directory under `root` (NFC, `/`-separated) — lets the runner check
+/// that advertised empty folders were recreated.
+pub fn dir_report(root: &Path) -> Vec<String> {
+    use unicode_normalization::UnicodeNormalization;
+    fn walk(d: &Path, root: &Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let rel = e.path().strip_prefix(root).unwrap_or(&e.path()).to_string_lossy().to_string();
+                #[cfg(windows)]
+                let rel = rel.replace('\\', "/");
+                out.push(rel.nfc().collect());
+                walk(&e.path(), root, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// What a macOS/Linux receiver must end up with for `paths`: the engine's own
+/// manifest, each rel mapped through the receiver's landing rule, hashed from
+/// the source. Symlinks, dotfiles and OS junk the engine skips are absent here
+/// too — so a sender↔receiver difference is a real bug, not corpus noise.
+pub fn expected_report(paths: &[PathBuf]) -> Result<(Vec<FileReport>, Vec<String>)> {
+    use unicode_normalization::UnicodeNormalization;
+    let (items, dirs) = lab_manifest(paths)?;
+    let mut out = Vec::new();
+    for (src, rel, size, mtime) in items {
+        out.push(FileReport { rel: lab_landed_rel(&rel).nfc().collect(), sha256: sha256_file(&src)?, size, mtime });
+    }
+    out.sort();
+    Ok((out, dirs.iter().map(|d| lab_landed_rel(d)).collect()))
+}
+
+/// Write `len` bytes of the deterministic `payload` pattern WITHOUT holding it
+/// in memory (multi-GB fixtures), then stamp a fixed past mtime.
+pub fn write_payload_file(path: &Path, len: u64, seed: u64) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let mut f = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(path)?);
+    let mut buf = vec![0u8; 8 << 20];
+    let mut i: u64 = 0;
+    while i < len {
+        let n = (len - i).min(buf.len() as u64) as usize;
+        for (k, b) in buf[..n].iter_mut().enumerate() {
+            *b = ((i + k as u64).wrapping_mul(2654435761).wrapping_add(seed) % 251) as u8;
+        }
+        f.write_all(&buf[..n])?;
+        i += n as u64;
+    }
+    f.flush()?;
+    drop(f);
+    crate::iroh_net::set_mtime_secs(path, 1_600_000_000 + seed * 7919);
+    Ok(())
+}
+
 /// sha256 of every FILE under `root` (recursive), keyed by rel path with `/`
 /// separators — so sender corpus and receiver output compare across machines.
 pub fn sha256_tree(root: &Path) -> Result<Vec<(String, String)>> {
@@ -265,180 +373,234 @@ pub fn payload(len: usize, seed: u64) -> Vec<u8> {
 }
 
 /// One named test case: the paths to send (files and/or folders) rooted in `dir`.
+/// `loose`: names may legitimately land differently on a case-insensitive or
+/// name-colliding receiver ("README (1).md"), so the verdict compares the
+/// multiset of (sha256, size, mtime) instead of exact names.
 pub struct LabCase {
     pub name: &'static str,
     pub paths: Vec<PathBuf>,
+    pub loose: bool,
 }
 
-/// Build the corpus for a suite under `dir`. Cases cover the shapes that have
-/// historically broken: single files, many-small batches, a big parallel-streams
-/// file, unicode/odd names, empty files, and a nested folder tree.
+fn case(name: &'static str, paths: Vec<PathBuf>) -> LabCase { LabCase { name, paths, loose: false } }
+
+/// Build the corpus for a suite under `dir`. Suites:
+///  quick — the everyday shapes (single, 60 small, odd names, nested tree)
+///  full  — quick + a 256 MiB parallel file
+///  big   — full + 1 GiB;  huge — one streamed multi-GB file (LAB_HUGE_GIB, default 3)
+///  edge  — every size boundary + hostile-name case the engine must survive,
+///          each VERIFIED against the receiver (names, bytes, mtimes, no strays)
+///  many / mixed / torture2 — scale + collision discovery
 pub fn build_corpus(dir: &Path, suite: &str) -> Result<Vec<LabCase>> {
+    // Fresh every run: a leftover file from an older corpus would be sent too.
+    let _ = make_writable(dir);
+    let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir)?;
     let mut cases: Vec<LabCase> = Vec::new();
     let file = |rel: &str, len: usize, seed: u64| -> Result<PathBuf> {
         let p = dir.join(rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&p, payload(len, seed))?;
+        write_payload_file(&p, len as u64, seed)?;
         Ok(p)
     };
 
-    // quick + full
-    cases.push(LabCase { name: "single-1mib", paths: vec![file("single.bin", 1 << 20, 1)?] });
-    cases.push(LabCase {
-        name: "batch-60-small",
-        paths: (0..60)
-            .map(|i| file(&format!("small/f{i:03}.bin"), 4096 + i * 13, 100 + i as u64))
-            .collect::<Result<Vec<_>>>()?,
-    });
-    cases.push(LabCase {
-        name: "odd-names",
-        paths: vec![
+    if matches!(suite, "quick" | "full" | "big") {
+        cases.push(case("single-1mib", vec![file("single.bin", 1 << 20, 1)?]));
+        cases.push(case("batch-60-small",
+            (0..60).map(|i| file(&format!("small/f{i:03}.bin"), 4096 + i * 13, 100 + i as u64)).collect::<Result<Vec<_>>>()?));
+        cases.push(case("odd-names", vec![
             file("héllo wörld 🚀.bin", 8192, 7)?,
             file("name with  spaces.txt", 5000, 8)?,
             file("empty.bin", 0, 9)?,
-        ],
-    });
-    // A folder WITH nested structure, sent as one folder path (exercises
-    // gather_items recursion + empty-dir recreation).
-    let tree = dir.join("Tree");
-    std::fs::create_dir_all(tree.join("sub/deep"))?;
-    std::fs::create_dir_all(tree.join("empty-dir"))?;
-    file("Tree/root.bin", 65536, 20)?;
-    file("Tree/sub/mid.bin", 131072, 21)?;
-    file("Tree/sub/deep/leaf.bin", 32768, 22)?;
-    cases.push(LabCase { name: "folder-tree", paths: vec![tree] });
-
+        ]));
+        let tree = dir.join("Tree");
+        std::fs::create_dir_all(tree.join("sub/deep"))?;
+        std::fs::create_dir_all(tree.join("empty-dir"))?;
+        file("Tree/root.bin", 65536, 20)?;
+        file("Tree/sub/mid.bin", 131072, 21)?;
+        file("Tree/sub/deep/leaf.bin", 32768, 22)?;
+        cases.push(case("folder-tree", vec![tree]));
+    }
     if suite == "full" || suite == "big" {
-        // Big single file → the parallel-streams path (threshold-dependent).
-        cases.push(LabCase { name: "big-256mib", paths: vec![file("big.bin", 256 << 20, 42)?] });
+        cases.push(case("big-256mib", vec![file("big.bin", 256 << 20, 42)?]));
     }
     if suite == "big" {
-        cases.push(LabCase { name: "huge-1gib", paths: vec![file("huge.bin", 1 << 30, 43)?] });
+        cases.push(case("huge-1gib", vec![file("huge.bin", 1 << 30, 43)?]));
+    }
+    if suite == "huge" {
+        let gib: u64 = std::env::var("LAB_HUGE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let p = dir.join(format!("huge-{gib}gib.bin"));
+        write_payload_file(&p, gib << 30, 44)?;
+        cases.push(case("huge-streamed", vec![p]));
     }
 
-    // "edge" = hostile-input discovery suite. Sender hashes describe what's on
-    // the sender's disk; receiver hashes show what actually landed — DIFFERENCES
-    // ARE THE FINDINGS (renames, drops, collisions), not automatic failures.
     if suite == "edge" {
-        cases.clear();
-        // Explicitly-sent dotfile: receiver sanitize_rel strips the leading dot.
-        cases.push(LabCase { name: "dotfile-direct", paths: vec![file(".secrets.bin", 4096, 50)?] });
-        // Dot-named FOLDER sent explicitly (children are normal names).
+        use unicode_normalization::UnicodeNormalization;
+        const MIB: usize = 1 << 20;
+        // Sizes: empty, 1 byte, the 1 MiB I/O chunk ±1, the 4 MiB integrity
+        // block / small-file limit ±1 — one batch (friend packing path).
+        cases.push(case("sizes-boundaries", vec![
+            file("sizes/empty.bin", 0, 60)?, file("sizes/one.bin", 1, 61)?,
+            file("sizes/chunk-1.bin", MIB - 1, 62)?, file("sizes/chunk.bin", MIB, 63)?, file("sizes/chunk+1.bin", MIB + 1, 64)?,
+            file("sizes/block-1.bin", 4 * MIB - 1, 65)?, file("sizes/block.bin", 4 * MIB, 66)?, file("sizes/block+1.bin", 4 * MIB + 1, 67)?,
+        ]));
+        cases.push(case("empty-alone", vec![file("alone/empty-alone.bin", 0, 68)?]));
+        // The 16 MiB parallel threshold, each file alone (classic vs parallel).
+        cases.push(case("parallel-under", vec![file("par/under.bin", 16 * MIB - 1, 69)?]));
+        cases.push(case("parallel-exact", vec![file("par/exact.bin", 16 * MIB, 70)?]));
+        cases.push(case("parallel-over", vec![file("par/over.bin", 16 * MIB + 1, 71)?]));
+        // Unicode: NFD (what macOS hands a sender), emoji, RTL, whitespace.
+        let nfd: String = "Café 한국어 ñ.txt".nfd().collect();
+        cases.push(case("names-unicode", vec![
+            file(&format!("uni/{nfd}"), 4096, 72)?, file("uni/🚀📦 emoji.bin", 4097, 73)?,
+            file("uni/مرحبا بالعالم.txt", 4098, 74)?, file("uni/שלום.txt", 4099, 75)?,
+            file("uni/  leading spaces.txt", 100, 76)?, file("uni/trailing space .txt", 101, 77)?,
+            file("uni/tab\there.txt", 102, 78)?, file("uni/new\nline.txt", 103, 79)?,
+        ]));
+        // Names Windows can't hold (a Mac/Linux receiver keeps them verbatim).
+        cases.push(case("names-windows-illegal", vec![
+            file("win/Report 7:3.pdf", 200, 80)?, file("win/star*.txt", 201, 81)?, file("win/q?.txt", 202, 82)?,
+            file("win/quote\".txt", 203, 83)?, file("win/lt<gt>.txt", 204, 84)?, file("win/pipe|.txt", 205, 85)?,
+            file("win/back\\slash.txt", 206, 86)?, file("win/CON", 207, 87)?, file("win/NUL.txt", 208, 88)?,
+            file("win/COM1.tar.gz", 209, 89)?, file("win/trailing dot.", 210, 90)?,
+        ]));
+        // Max-length names (255 bytes ASCII, 254 bytes multibyte).
+        cases.push(case("long-names", vec![
+            file(&format!("long/{}.bin", "L".repeat(251)), 4096, 91)?,
+            file(&format!("long/{}.bin", "é".repeat(125)), 4096, 92)?,
+        ]));
+        // 50 levels deep with empty dirs; a long (but locally legal) path.
+        let mut deep = String::from("Nest");
+        for i in 0..50 { deep.push_str(&format!("/lvl{i:02}")); }
+        file(&format!("{deep}/bottom.bin"), 8192, 93)?;
+        std::fs::create_dir_all(dir.join(format!("{deep}/empty-bottom")))?;
+        std::fs::create_dir_all(dir.join("Nest/lvl00/empty-mid"))?;
+        cases.push(case("deep-nest-50", vec![dir.join("Nest")]));
+        let room = if cfg!(target_os = "macos") { 1000usize.saturating_sub(2 * dir.as_os_str().len()) } else { 1400 };
+        let mut lp = String::from("LongPath");
+        while lp.len() + 210 < room { lp.push('/'); lp.push_str(&"P".repeat(200)); }
+        file(&format!("{lp}/leaf.bin"), 5000, 94)?;
+        cases.push(case("long-path", vec![dir.join("LongPath")]));
+        // Hidden + OS junk inside a folder: only the visible file travels.
+        for (rel, n) in [("Dots/visible.txt", 95u64), ("Dots/.env", 96), ("Dots/.git/config", 97), ("Dots/.DS_Store", 98),
+                         ("Dots/._visible.txt", 99), ("Dots/Thumbs.db", 100), ("Dots/desktop.ini", 101)] {
+            file(rel, 300 + n as usize, n)?;
+        }
+        cases.push(case("dotfiles-folder", vec![dir.join("Dots")]));
+        cases.push(case("dotfile-direct", vec![file(".secrets.bin", 4096, 102)?]));
         let dotdir = dir.join(".configdir");
-        std::fs::create_dir_all(&dotdir)?;
-        file(".configdir/inner.bin", 4096, 51)?;
-        cases.push(LabCase { name: "dotfolder", paths: vec![dotdir] });
-        // Colon names — what a Finder name like "Report 7/3" becomes on disk.
-        // TWO of them so a sanitize-to-same-name collision shows up too.
-        cases.push(LabCase {
-            name: "colon-names",
-            paths: vec![file("Report 7:3.bin", 5000, 52)?, file("Data 1:2.bin", 6000, 53)?],
-        });
-        // NFD-decomposed Korean filename (what macOS's file system reports).
-        {
-            use unicode_normalization::UnicodeNormalization;
-            let nfd: String = "한국어파일.bin".nfd().collect();
-            cases.push(LabCase { name: "korean-nfd", paths: vec![file(&nfd, 4096, 54)?] });
-        }
-        // 254-byte filename (APFS limit is 255).
-        let long = format!("{}.bin", "L".repeat(250));
-        cases.push(LabCase { name: "long-name", paths: vec![file(&long, 4096, 55)?] });
-        // Newline inside a filename (legal on macOS).
-        cases.push(LabCase { name: "newline-name", paths: vec![file("two\nlines.bin", 4096, 56)?] });
-        // 20-deep nesting with an empty dir mid-tree.
-        let mut deep = String::from("Deep");
-        for i in 0..20 {
-            deep.push_str(&format!("/level{i:02}"));
-        }
-        file(&format!("{deep}/bottom.bin"), 8192, 57)?;
-        std::fs::create_dir_all(dir.join("Deep/level00/empty-here"))?;
-        cases.push(LabCase { name: "deep-nest", paths: vec![dir.join("Deep")] });
-        // Symlinks INSIDE a sent folder: one live (to a sibling), one dangling.
+        file(".configdir/inner.bin", 4096, 103)?;
+        cases.push(case("dotfolder", vec![dotdir]));
+        // Packages are directories (exec bit must survive).
+        let tool = file("Pkg/Tool.app/Contents/MacOS/Tool", 5000, 104)?;
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))?; }
+        file("Pkg/Tool.app/Contents/Info.plist", 300, 105)?;
+        file("Pkg/Lib.photoslibrary/database/Photos.sqlite", 7000, 106)?;
+        std::fs::create_dir_all(dir.join("Pkg/Lib.photoslibrary/resources/empty"))?;
+        cases.push(case("packages", vec![dir.join("Pkg/Tool.app"), dir.join("Pkg/Lib.photoslibrary")]));
+        // Read-only source.
+        let ro = file("ro/locked.txt", 4000, 107)?;
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o444))?; }
+        cases.push(case("read-only", vec![ro]));
+        // Symlinks inside a folder are never followed; a directly-chosen link
+        // sends what it points at.
         #[cfg(unix)]
         {
-            let sl = dir.join("Symlinks");
-            std::fs::create_dir_all(&sl)?;
-            file("Symlinks/real.bin", 4096, 58)?;
-            // Absolute targets: a relative target would resolve against the LINK's
-            // dir and dangle, testing our corpus instead of the engine.
             let abs = std::fs::canonicalize(dir)?;
-            let _ = std::os::unix::fs::symlink(
-                abs.join("Symlinks/real.bin"),
-                sl.join("alias-to-real"),
-            );
-            let _ =
-                std::os::unix::fs::symlink(abs.join("Symlinks/gone.bin"), sl.join("dangling"));
-            cases.push(LabCase { name: "symlink-folder", paths: vec![sl] });
-            // A symlink passed DIRECTLY as the dropped path.
-            file("linktarget.bin", 4096, 59)?;
+            file("outside/secret.txt", 99, 108)?;
+            file("Links/real.txt", 50, 109)?;
+            let _ = std::os::unix::fs::symlink(abs.join("outside/secret.txt"), dir.join("Links/file-link"));
+            let _ = std::os::unix::fs::symlink(abs.join("outside"), dir.join("Links/dir-link"));
+            let _ = std::os::unix::fs::symlink(abs.join("gone"), dir.join("Links/dangling"));
+            let _ = std::os::unix::fs::symlink("..", dir.join("Links/loop"));
+            cases.push(case("symlinks-in-folder", vec![dir.join("Links")]));
+            file("linktarget.bin", 4096, 110)?;
             let link = dir.join("direct-link.bin");
             let _ = std::os::unix::fs::symlink(abs.join("linktarget.bin"), &link);
-            cases.push(LabCase { name: "symlink-direct", paths: vec![link] });
+            cases.push(case("symlink-direct", vec![link]));
         }
-        // 8 MiB of zeros — degenerate content.
-        let z = dir.join("zeros.bin");
-        std::fs::write(&z, vec![0u8; 8 << 20])?;
-        cases.push(LabCase { name: "zeros-8mib", paths: vec![z] });
+        // A file and a folder with the same stem side by side.
+        file("TypeClash/thing/inside.bin", 4096, 111)?;
+        file("TypeClash/thing.bin", 4096, 112)?;
+        cases.push(case("type-clash", vec![dir.join("TypeClash")]));
+        // Collisions: the SAME landed name from two sources. Names can differ on
+        // a case-insensitive receiver ("README (1).md"); bytes may not.
+        cases.push(LabCase { name: "collide-same-leaf", loose: true, paths: vec![
+            file("c1/report.pdf", 1000, 113)?, file("c2/report.pdf", 2000, 114)?] });
+        cases.push(LabCase { name: "collide-case-only", loose: true, paths: vec![
+            file("c3/README.md", 1100, 115)?, file("c4/readme.md", 1200, 116)?] });
+        cases.push(LabCase { name: "collide-dotstrip", loose: true, paths: vec![
+            file(".config.bin", 4096, 117)?, file("config.bin", 5000, 118)?] });
+        // Scale: 1500 tiny files over 37 folders + an empty one.
+        for i in 0..1500u64 { file(&format!("Tiny/d{:02}/f{i:04}.txt", i % 37), (i % 97) as usize, 1000 + i)?; }
+        std::fs::create_dir_all(dir.join("Tiny/zz-empty"))?;
+        cases.push(case("tiny-1500", vec![dir.join("Tiny")]));
+        cases.push(case("zeros-8mib", vec![{ let z = dir.join("zeros.bin"); std::fs::write(&z, vec![0u8; 8 << 20])?; z }]));
     }
 
-    // "many" = per-file overhead: 400 small files in one folder.
     if suite == "many" {
-        cases.clear();
         let many = dir.join("Many");
-        std::fs::create_dir_all(&many)?;
-        for i in 0..400 {
-            file(&format!("Many/doc{i:04}.bin"), 1024 + (i % 16) * 1024, 200 + i as u64)?;
-        }
-        cases.push(LabCase { name: "many-400", paths: vec![many] });
+        for i in 0..400 { file(&format!("Many/doc{i:04}.bin"), 1024 + (i % 16) * 1024, 200 + i as u64)?; }
+        cases.push(case("many-400", vec![many]));
     }
-
-    // "torture2" = second-wave collision/boundary discovery. As with edge, a
-    // sender↔receiver hash difference is a FINDING to inspect, not a hard fail.
     if suite == "torture2" {
-        cases.clear();
-        // Two DISTINCT files whose names collide only after the receiver strips a
-        // leading dot (".config" + "config", different content). Realistic when a
-        // folder holds both; both must survive — the loser must never silently
-        // clobber the winner. (An NFC/NFD pair can't be tested here: APFS itself
-        // collapses those to one file, so the corpus would only hold one.)
-        cases.push(LabCase {
-            name: "dotstrip-collision",
-            paths: vec![file(".config.bin", 4096, 70)?, file("config.bin", 5000, 71)?],
-        });
-        // Exactly PARALLEL_MIN (16 MiB) — the parallel-threshold boundary.
-        cases.push(LabCase { name: "boundary-16mib", paths: vec![file("edge16.bin", 16 * 1024 * 1024, 72)?] });
-        // One byte under the threshold — must take the classic path.
-        cases.push(LabCase { name: "boundary-under", paths: vec![file("under16.bin", 16 * 1024 * 1024 - 1, 73)?] });
-        // A folder holding a file and a subdir that share a name at the SAME level
-        // (legal on disk; a naive receiver could treat one as the other).
-        let tc = dir.join("TypeClash");
-        std::fs::create_dir_all(tc.join("thing"))?;
+        cases.push(LabCase { name: "dotstrip-collision", loose: true, paths: vec![file(".config.bin", 4096, 70)?, file("config.bin", 5000, 71)?] });
+        cases.push(case("boundary-16mib", vec![file("edge16.bin", 16 * 1024 * 1024, 72)?]));
+        cases.push(case("boundary-under", vec![file("under16.bin", 16 * 1024 * 1024 - 1, 73)?]));
         file("TypeClash/thing/inside.bin", 4096, 74)?;
         file("TypeClash/thing.bin", 4096, 75)?;
-        cases.push(LabCase { name: "type-clash", paths: vec![tc] });
-        // 2000-file scale batch in one folder.
-        let big = dir.join("Scale2000");
-        std::fs::create_dir_all(&big)?;
-        for i in 0..2000 {
-            file(&format!("Scale2000/s{i:04}.bin"), 512 + (i % 8) * 256, 400 + i as u64)?;
-        }
-        cases.push(LabCase { name: "scale-2000", paths: vec![big] });
+        cases.push(case("type-clash", vec![dir.join("TypeClash")]));
+        for i in 0..2000 { file(&format!("Scale2000/s{i:04}.bin"), 512 + (i % 8) * 256, 400 + i as u64)?; }
+        cases.push(case("scale-2000", vec![dir.join("Scale2000")]));
     }
-
-    // "mixed" = one big file + many smalls in a single batch: multi-item batches
-    // never go parallel, so this measures the classic path carrying bulk.
     if suite == "mixed" {
-        cases.clear();
         let mut paths = vec![file("mixed-big.bin", 300 << 20, 60)?];
-        for i in 0..50 {
-            paths.push(file(&format!("mixed-small-{i:02}.bin"), 4096 + i * 7, 300 + i as u64)?);
-        }
-        cases.push(LabCase { name: "mixed-batch", paths });
+        for i in 0..50 { paths.push(file(&format!("mixed-small-{i:02}.bin"), 4096 + i * 7, 300 + i as u64)?); }
+        cases.push(case("mixed-batch", paths));
     }
+    anyhow::ensure!(!cases.is_empty(), "unknown suite {suite:?} (quick|full|big|huge|edge|many|mixed|torture2)");
     Ok(cases)
+}
+
+/// Make a corpus tree writable again so a re-run can delete read-only fixtures.
+pub fn make_writable(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() { return Ok(()); }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(if meta.is_dir() { 0o755 } else { 0o644 }))?;
+        if meta.is_dir() { for e in std::fs::read_dir(dir)?.flatten() { let _ = make_writable(&e.path()); } }
+    }
+    Ok(())
+}
+
+/// Compare what landed with what had to land. Returns the problems (empty =
+/// PASS). `loose` compares content only (names may be collision-renamed).
+pub fn verdict(expected: &[FileReport], dirs: &[String], landed: &[FileReport], dirs_present: impl Fn(&str) -> bool, loose: bool) -> Vec<String> {
+    let mut problems = Vec::new();
+    if loose {
+        let key = |f: &FileReport| (f.sha256.clone(), f.size, f.mtime);
+        let mut want: Vec<_> = expected.iter().map(key).collect();
+        let mut got: Vec<_> = landed.iter().map(key).collect();
+        want.sort(); got.sort();
+        if want != got { problems.push(format!("content mismatch: expected {} files, landed {:?}", want.len(), landed.iter().map(|f| &f.rel).collect::<Vec<_>>())); }
+    } else {
+        for w in expected {
+            match landed.iter().find(|l| l.rel == w.rel) {
+                None => problems.push(format!("missing: {:?}", w.rel)),
+                Some(l) if l.sha256 != w.sha256 || l.size != w.size => problems.push(format!("bytes differ: {:?}", w.rel)),
+                Some(l) if l.mtime != w.mtime => problems.push(format!("mtime {} != {}: {:?}", l.mtime, w.mtime, w.rel)),
+                _ => {}
+            }
+        }
+        for l in landed {
+            if !expected.iter().any(|w| w.rel == l.rel) { problems.push(format!("unexpected: {:?}", l.rel)); }
+        }
+    }
+    for d in dirs { if !dirs_present(d) { problems.push(format!("empty dir missing: {d:?}")); } }
+    problems
 }
 
 /// A controllable Locations HOST for testing a client (e.g. the iOS simulator)

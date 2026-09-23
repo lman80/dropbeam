@@ -8315,6 +8315,80 @@ pub async fn recv_files_negotiated<F: Fn(u64, u64)>(
     Ok(out)
 }
 
+/// Lab surface (dropbeam-lab): a friend send shaped exactly like
+/// `send_friend_inner` — chat-linked, one file as a single push, several as the
+/// split `send_friend_batch` (files.stat resume skip, packed small-file pushes,
+/// one resumable push per big file). Lets a two-machine run exercise the path
+/// users actually take, not just the one-shot push primitive.
+pub async fn send_like_friend<F: Fn(u64, u64)>(
+    conn: &Connection,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+    progress: F,
+    my_name: &str,
+    engaged: &AtomicBool,
+) -> Result<u64> {
+    let (items, dirs, total) = gather_items(paths)?;
+    let link = crate::models::ChatTransferLink {
+        id: uuid::Uuid::new_v4().to_string(), attempt: 1,
+        manifest: items.iter().map(|i| crate::models::ChatFile { name: i.1.clone(), size: i.2 }).collect(),
+        directories: dirs.clone(), batch_state: None, bytes_done: 0, completed_files: vec![],
+        completed_paths: Default::default(), item_offset: 0, offset: 0, total, last: true,
+    };
+    let state = IrohState::default();
+    let activity = AtomicU64::new(0);
+    integrity::scope(async {
+        if friend_split(&items) {
+            send_friend_batch(conn, &items, &dirs, &link, cancel, my_name, engaged, &activity,
+                Some(&state), progress, |_| {}, || Ok(())).await
+        } else {
+            send_files_linked(conn, paths, cancel, progress, my_name, engaged, &activity,
+                Some(&state), Some(&link), None).await
+        }
+    }).await
+}
+
+/// Lab surface: serve every stream of ONE incoming connection the way the app
+/// serves a known friend — `files.stat` (resume skip) and `files` (negotiated
+/// receive, parallel/resumable for a big single file) — until the peer closes.
+/// Returns every landed path; the first receive error ends the connection.
+pub async fn serve_friend_conn<F: Fn(u64, u64)>(
+    conn: &Connection,
+    dest: &Path,
+    engaged: &AtomicBool,
+    on_progress: F,
+) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let header = read_frame(&mut recv).await?;
+        if header["kind"] == "files.stat" {
+            write_frame(&mut send, &friend_stat_reply(dest, &header)?).await?;
+            send.finish()?;
+            continue;
+        }
+        anyhow::ensure!(header["kind"] == "files", "unexpected stream kind {}", header["kind"]);
+        let got = integrity::scope(read_files_negotiated(conn, &mut send, &mut recv, &header, dest,
+            &AtomicBool::new(false), engaged, &on_progress)).await?;
+        if !speaks_progress_v1(&header) {
+            let _ = send.write_all(b"ok").await;
+        }
+        let _ = send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
+        out.extend(got);
+    }
+    Ok(out)
+}
+
+/// Lab surface: the engine's own send manifest for `paths` — (source, wire rel,
+/// size, mtime) per file plus the empty dirs — and the name a macOS/Linux
+/// receiver lands each rel under.
+pub fn lab_manifest(paths: &[PathBuf]) -> Result<(Vec<(PathBuf, String, u64, u64)>, Vec<String>)> {
+    let (items, dirs, _) = gather_items(paths)?;
+    Ok((items, dirs))
+}
+pub fn lab_landed_rel(rel: &str) -> String { receive_rel_wire(rel) }
+pub fn lab_mtime(meta: &std::fs::Metadata) -> u64 { mtime_secs(meta) }
+
 // ── Quick Send (pull model) ──────────────────────────────────────────────────
 //
 // The sender publishes a *ticket* (its EndpointAddr + a one-time token). The

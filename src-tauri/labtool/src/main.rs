@@ -182,26 +182,18 @@ async fn serve(args: &[String]) -> Result<()> {
                 // Clean any stale files first: conn numbering resets each launch,
                 // so without this a prior session's conn-001 contents leak into a
                 // new receive and the runner's hash tree compares garbage.
+                let _ = labkit::make_writable(&dest);
                 let _ = std::fs::remove_dir_all(&dest);
                 std::fs::create_dir_all(&dest)?;
-                // Negotiated receive = the same path the app's handlers run, so a
-                // parallel-advertised big file takes the real resumable route.
+                // Serve the connection exactly like the app serves a friend:
+                // files.stat + every (negotiated, maybe parallel) push until the
+                // sender closes. A one-shot push is just a single stream.
                 let engaged = AtomicBool::new(false);
-                let got = labkit::recv_files_negotiated(
-                    &conn,
-                    &dest,
-                    &AtomicBool::new(false),
-                    &engaged,
-                    |_, _| {},
-                )
-                .await?;
+                let got = labkit::serve_friend_conn(&conn, &dest, &engaged, |_, _| {}).await?;
                 let ms = started.elapsed().as_millis() as u64;
-                let hashes = labkit::sha256_tree(&dest)?;
-                let bytes: u64 = hashes
-                    .iter()
-                    .filter_map(|(rel, _)| std::fs::metadata(dest.join(rel)).ok())
-                    .map(|m| m.len())
-                    .sum();
+                let files = labkit::tree_report(&dest)?;
+                let bytes: u64 = files.iter().map(|f| f.size).sum();
+                let dirs = labkit::dir_report(&dest);
                 Ok(json!({
                     "event": "received",
                     "conn": idx,
@@ -209,7 +201,8 @@ async fn serve(args: &[String]) -> Result<()> {
                     "bytes": bytes,
                     "ms": ms,
                     "parallelEngaged": engaged.load(std::sync::atomic::Ordering::Relaxed),
-                    "hashes": hashes.iter().map(|(rel, h)| json!({"rel": rel, "sha256": h})).collect::<Vec<_>>(),
+                    "report": files,
+                    "dirs": dirs,
                 }))
             }
             .await;
@@ -218,7 +211,10 @@ async fn serve(args: &[String]) -> Result<()> {
                 Err(e) => json!({"event": "recv-error", "conn": idx, "error": e.to_string()}),
             };
             emit(line.clone());
-            if line["event"] != "results-served" {
+            // A dial that lost a happy-eyeballs race (several direct addrs) or
+            // was abandoned never carried a case — keep it out of the results.
+            let abandoned = line["event"] == "recv-error" && line["error"] == "accept connection";
+            if line["event"] != "results-served" && !abandoned {
                 results.lock().unwrap().push(line);
             }
         });
@@ -327,12 +323,27 @@ async fn push_update(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Pull the receiver's accumulated results over iroh; `reset` clears them.
+async fn pull_results(ep: &labkit::Endpoint, peer: &labkit::EndpointAddr, reset: bool) -> Result<Vec<serde_json::Value>> {
+    let conn = ep.connect(peer.clone(), labkit::LAB_RESULTS_ALPN).await.context("dial peer results channel")?;
+    let (mut s, mut r) = conn.open_bi().await?;
+    s.write_all(if reset { b"reset" } else { b"get" }).await?;
+    s.finish()?;
+    let body = r.read_to_end(256 * 1024 * 1024).await?;
+    conn.close(0u32.into(), b"ok");
+    Ok(serde_json::from_slice(&body)?)
+}
+
 async fn send(args: &[String]) -> Result<()> {
     let to = flag(args, "--to").context("--to <labADDR> is required")?;
     let mode = flag(args, "--mode").unwrap_or_else(|| "auto".into());
     let suite = flag(args, "--suite").unwrap_or_else(|| "quick".into());
+    // friend = the app's friend/chat path (chat-linked, files.stat, packed
+    // small-file pushes); push = the one-shot primitive.
+    let via = flag(args, "--via").unwrap_or_else(|| "friend".into());
     let parallel = flag(args, "--parallel").unwrap_or_else(|| "on".into()) != "off";
     let profile = args.iter().any(|a| a == "--profile");
+    let verify = !args.iter().any(|a| a == "--no-verify");
     let corpus_dir = flag(args, "--dir")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("dropbeam-lab-corpus"));
@@ -343,21 +354,27 @@ async fn send(args: &[String]) -> Result<()> {
         bail!("peer addr has no {mode} transport addresses — can't force that path");
     }
 
-    let ep = labkit::lab_endpoint(false).await?;
+    let ep = labkit::lab_endpoint_for(&mode).await?;
     let mut cases = labkit::build_corpus(&corpus_dir, &suite)?;
     if let Some(only) = flag(args, "--only") {
         cases.retain(|c| c.name == only);
     }
     emit(json!({
         "event": "start",
-        "mode": mode, "suite": suite, "parallel": parallel,
+        "mode": mode, "suite": suite, "via": via, "parallel": parallel, "verify": verify,
         "cases": cases.len(),
         "corpus": corpus_dir.display().to_string(),
     }));
 
     let mut failed = 0u32;
     for case in &cases {
+        if verify {
+            // Round boundary: the next result on the receiver is this case's.
+            pull_results(&ep, &peer, true).await.context("reset receiver results")?;
+        }
         let started = Instant::now();
+        let (expected, exp_dirs) = labkit::expected_report(&case.paths)?;
+        let expected_bytes: u64 = expected.iter().map(|f| f.size).sum();
         let result: Result<serde_json::Value> = async {
             let conn = ep
                 .connect(peer.clone(), labkit::ALPN)
@@ -368,38 +385,23 @@ async fn send(args: &[String]) -> Result<()> {
             // --profile: sample (elapsed_ms, bytes_confirmed) roughly every 2s so
             // a long transfer's rate-over-time shape is visible (decay vs sawtooth).
             let samples = Mutex::new(Vec::<(u64, u64)>::new());
-            let sent = labkit::send_files(
-                &conn,
-                &case.paths,
-                &AtomicBool::new(false),
-                |done, _| {
-                    if profile {
-                        let t = started.elapsed().as_millis() as u64;
-                        let mut s = samples.lock().unwrap();
-                        if s.last().map(|(lt, _)| t - lt >= 2000).unwrap_or(true) {
-                            s.push((t, done));
-                        }
+            let progress = |done, _| {
+                if profile {
+                    let t = started.elapsed().as_millis() as u64;
+                    let mut s = samples.lock().unwrap();
+                    if s.last().map(|(lt, _)| t - lt >= 2000).unwrap_or(true) {
+                        s.push((t, done));
                     }
-                },
-                "dropbeam-lab",
-                &engaged,
-            )
-            .await?;
-            let ms = started.elapsed().as_millis().max(1) as u64;
-            // Expected hashes: what the receiver's tree must contain for this case.
-            let mut hashes = Vec::new();
-            for p in &case.paths {
-                if p.is_dir() {
-                    let base = p.file_name().unwrap_or_default().to_string_lossy();
-                    for (rel, h) in labkit::sha256_tree(p)? {
-                        hashes.push((format!("{base}/{rel}"), h));
-                    }
-                } else {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy();
-                    hashes.push((name.into_owned(), labkit::sha256_file(p)?));
                 }
-            }
-            hashes.sort();
+            };
+            let sent = if via == "push" {
+                labkit::send_files(&conn, &case.paths, &AtomicBool::new(false), progress, "dropbeam-lab", &engaged).await?
+            } else {
+                labkit::send_like_friend(&conn, &case.paths, &AtomicBool::new(false), progress, "dropbeam-lab", &engaged).await?
+            };
+            let ms = started.elapsed().as_millis().max(1) as u64;
+            let path_end = labkit::conn_detail(&conn);
+            conn.close(0u32.into(), b"case done");
             Ok(json!({
                 "event": "sent",
                 "case": case.name,
@@ -410,21 +412,43 @@ async fn send(args: &[String]) -> Result<()> {
                 // Path the QUIC connection was on at dial time vs after the
                 // transfer — shows relay→direct upgrades and hairpin routes.
                 "pathStart": path_start,
-                "pathEnd": labkit::conn_detail(&conn),
+                "pathEnd": path_end,
                 "profile": *samples.lock().unwrap(),
-                "hashes": hashes.iter().map(|(rel, h)| json!({"rel": rel, "sha256": h})).collect::<Vec<_>>(),
             }))
         }
         .await;
-        match result {
-            Ok(v) => emit(v),
-            Err(e) => {
-                failed += 1;
-                emit(json!({"event": "send-error", "case": case.name, "error": e.to_string()}));
-            }
+        let mut line = match result {
+            Ok(v) => v,
+            Err(e) => json!({"event": "send-error", "case": case.name, "error": format!("{e:#}")}),
+        };
+        let mut pass = line["event"] == "sent";
+        if verify && pass {
+            // The receiver hashes what landed after acking; give it time.
+            let deadline = Instant::now() + std::time::Duration::from_secs(60 + expected_bytes / (20 << 20));
+            let got = loop {
+                let rs = pull_results(&ep, &peer, false).await.unwrap_or_default();
+                if let Some(r) = rs.into_iter().rev().find(|r| r["event"] == "received" || r["event"] == "recv-error") { break Some(r); }
+                if Instant::now() > deadline { break None; }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            };
+            let problems = match got {
+                None => vec!["receiver never reported this case".to_string()],
+                Some(r) if r["event"] == "recv-error" => vec![format!("receiver error: {}", r["error"])],
+                Some(r) => {
+                    let landed: Vec<labkit::FileReport> = serde_json::from_value(r["report"].clone()).unwrap_or_default();
+                    let dirs: Vec<String> = serde_json::from_value(r["dirs"].clone()).unwrap_or_default();
+                    labkit::verdict(&expected, &exp_dirs, &landed, |d| dirs.iter().any(|x| x == d), case.loose)
+                }
+            };
+            pass = problems.is_empty();
+            line["verdict"] = json!(if pass { "PASS" } else { "FAIL" });
+            line["problems"] = json!(problems);
         }
+        line["files"] = json!(expected.len());
+        if !pass { failed += 1; }
+        emit(line);
     }
-    emit(json!({"event": "done", "failed": failed}));
+    emit(json!({"event": "done", "failed": failed, "cases": cases.len()}));
     shutdown(&ep).await;
     if failed > 0 {
         std::process::exit(1);
