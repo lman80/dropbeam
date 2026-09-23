@@ -46,8 +46,8 @@ pub fn clear(config_dir: &Path) {
     let _ = fs::remove_file(history_path(config_dir));
 }
 
-/// Native iOS timeline removal uses the same lock and atomic persistence as append.
-#[cfg(target_os = "ios")]
+/// Remove ONE entry from the Recents list (iOS timeline + desktop History row).
+/// Same lock and atomic persistence as append; the files themselves are untouched.
 #[tauri::command]
 pub fn remove_history_entry(state: tauri::State<'_, std::sync::Arc<crate::AppState>>, id: String) -> Result<(), String> {
     let _guard = LOCK.lock().map_err(|e| e.to_string())?;

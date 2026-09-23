@@ -127,7 +127,7 @@ export function SendView() {
             />
           </>
         ) : (
-          <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 540, flexWrap: 'wrap' }}>
+          <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 540, flexWrap: 'wrap', justifyContent: 'center' }}>
             <input
               className="input"
               autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"

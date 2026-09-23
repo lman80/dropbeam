@@ -493,6 +493,10 @@ export const mockApi = {
   clearHistory: async (): Promise<void> => {
     history.length = 0
   },
+  removeHistoryEntry: async (id: string): Promise<void> => {
+    const i = history.findIndex((h) => h.id === id)
+    if (i >= 0) history.splice(i, 1)
+  },
   setProfileAvatar: async (): Promise<Settings> => settings,
   clearProfileAvatar: async (): Promise<Settings> => {
     settings = { ...settings, avatar: '' }

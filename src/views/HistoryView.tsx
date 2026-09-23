@@ -14,6 +14,7 @@ import {
   Send,
   Trash2,
   XCircle,
+  X,
 } from 'lucide-react'
 import { api, type HistoryEntry } from '../lib/api'
 import { useStore } from '../store'
@@ -287,6 +288,20 @@ function RecentRow({ e }: { e: HistoryEntry }) {
           }}
         >
           <FolderOpen size={15} />
+        </button>
+      )}
+      {!MOBILE_UI && (
+        <button
+          className="icon-btn icon-btn-danger history-row-remove"
+          title="Remove from this list — the files stay where they are"
+          aria-label={`Remove ${entryTitle(e)} from history`}
+          onClick={() => {
+            void api.removeHistoryEntry(e.id)
+              .then(() => useStore.getState().reloadHistory())
+              .catch((err) => useStore.getState().toast('error', String(err)))
+          }}
+        >
+          <X size={15} />
         </button>
       )}
     </motion.div>

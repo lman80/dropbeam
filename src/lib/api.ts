@@ -413,8 +413,6 @@ export interface PairUpdate {
 }
 
 const realApi = {
-  sendFiles: (paths: string[]) => invoke<TransferUpdate>('send_files', { paths }),
-  receiveFiles: (code: string) => invoke<TransferUpdate>('receive_files', { code }),
   // Direct engine (iroh) Quick Send — same UI, P2P transport.
   irohSend: (paths: string[]) => invoke<TransferUpdate>('iroh_send', { paths }),
   irohReceive: (ticket: string) => invoke<TransferUpdate>('iroh_receive', { ticket }),
@@ -436,6 +434,8 @@ const realApi = {
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (settings: Settings) => invoke<Settings>('update_settings', { settings }),
   getHistory: () => invoke<HistoryEntry[]>('get_history'),
+  /** Drop one row from Recents (the received files stay where they are). */
+  removeHistoryEntry: (id: string) => invoke<void>('remove_history_entry', { id }),
   clearHistory: () => invoke<void>('clear_history'),
   pickFiles: () => invoke<string[]>('pick_files'),
   pickPhotos: () => invoke<string[]>('pick_photos'),

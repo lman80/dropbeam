@@ -3008,6 +3008,10 @@ html.mobile .chat-input { font-size: 16px; }
   z-index: 1;
 }
 
+/* History rows: the remove (×) appears on hover/focus so the list stays calm. */
+.history-row-remove { opacity: 0; }
+.row-hover:hover .history-row-remove,
+.history-row-remove:focus-visible { opacity: 1; }
 /* Transfer card action row: secondary actions sit bottom-right, small. */
 .xfer-actions {
   display: flex;
@@ -3085,9 +3089,12 @@ html.mobile button > svg { flex-shrink: 0; }
 .device-list { display: flex; flex-direction: column; gap: 10px; }
 .device-link-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 /* Above the first-run name sheet (z 1000): "Already use DropBeam? Link it" opens these from it. */
-.qr-overlay, .device-link-overlay { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; background: rgb(0 0 0 / 50%); padding: 16px; }
+.qr-overlay, .device-link-overlay { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; background: var(--overlay); -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); padding: 16px; }
 .device-link-dialog { width: 440px; max-width: 100%; max-height: 90dvh; overflow: auto; padding: 22px; display: flex; flex-direction: column; gap: 12px; }
-.device-link-dialog h2 { font-size: 18px; margin: 0; }
+.device-link-dialog h2 { font-size: var(--font-xl); font-weight: 750; letter-spacing: -0.015em; margin: 0; }
+html:not(.mobile) .device-link-dialog { border-radius: var(--radius-2xl); background: var(--bg-elev); box-shadow: var(--shadow-lg); padding: 20px 22px 22px; }
+html:not(.mobile) .device-link-dialog ol { margin: 0; padding-left: 20px; color: var(--text-muted); line-height: 1.55; }
+html:not(.mobile) .device-link-dialog .device-link-actions { justify-content: flex-end; }
 .device-link-dialog p { margin: 0; }
 .link-qr { align-self: center; background: white; padding: 16px; border-radius: 12px; }
 .link-qr svg { display: block; max-width: 100%; height: auto; }

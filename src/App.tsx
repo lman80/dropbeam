@@ -235,6 +235,17 @@ function PopoverCodeHandoff() {
     const uns: Promise<UnlistenFn>[] = [
       listen<string>('dropbeam://open-code', (e) => { if (typeof e.payload === 'string') void openCode(e.payload) }),
       listen('dropbeam://scan-code', () => setScanning(true)),
+      // Tray-menu quick actions (the Linux tray has no popover, only this menu).
+      listen<string>('dropbeam://tray-action', (e) => {
+        const st = useStore.getState()
+        const action = e.payload
+        if (action === 'send') {
+          st.setView('send')
+          void api.pickFiles().then((paths) => { if (paths.length) st.setPendingSend(paths) }).catch((err) => st.toast('error', String(err)))
+        } else if (action === 'friends' || action === 'chat' || action === 'folders' || action === 'settings') {
+          st.setView(action)
+        }
+      }),
     ]
     return () => { uns.forEach((u) => void u.then((f) => f())) }
   }, [openCode])

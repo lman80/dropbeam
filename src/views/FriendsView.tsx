@@ -91,7 +91,7 @@ export function FriendsView() {
       <div className="section-row">
         <SectionLabel>{myDevices.length ? `My devices · ${myDevices.length}` : 'My devices'}</SectionLabel>
         <button className="btn btn-quiet btn-sm" onClick={() => setLinking(true)}>
-          <Plus size={14} /> Add a device
+          <Plus size={14} /> Link a device
         </button>
       </div>
       {myDevices.length ? (

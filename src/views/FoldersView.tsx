@@ -38,6 +38,8 @@ import { formatBytes, formatEta, formatRelativeTime, formatSpeed as formatSpeedV
 import { PairingModal } from '../components/PairingModal'
 import { Dialog } from '../components/Dialog'
 import { avatarGradient, initials } from '../lib/avatar'
+import { FriendAvatar } from '../components/FriendAvatar'
+import { friendOnlineState } from '../lib/presence'
 
 export function FoldersView() {
   const pairs = useStore((s) => s.pairs)
@@ -206,6 +208,8 @@ function FolderCard({
     members.forEach((m) => updatePair({ ...patch, id: m.id }))
   const removeGroup = () => members.forEach((m) => removePair(m.id))
   const [addingPerson, setAddingPerson] = useState(false)
+  const [pickingPerson, setPickingPerson] = useState(false)
+  // "Share an invite code" path: mint a fresh group invite anyone can use.
   const addPerson = async () => {
     setAddingPerson(true)
     try {
@@ -463,13 +467,24 @@ function FolderCard({
         ))}
         <button
           className="btn btn-ghost btn-sm"
-          onClick={addPerson}
+          onClick={() => setPickingPerson(true)}
           disabled={addingPerson}
-          title="Invite another person to this folder"
+          title="Invite a friend — or anyone, with a code — to this folder"
         >
           {addingPerson ? <Spinner size={13} /> : <UserPlus size={13} />} Add person
         </button>
       </div>
+      <AnimatePresence>
+        {pickingPerson && (
+          <AddPersonDialog
+            pair={pair}
+            members={members}
+            folderName={folderName}
+            onClose={() => setPickingPerson(false)}
+            onShareCode={() => { setPickingPerson(false); void addPerson() }}
+          />
+        )}
+      </AnimatePresence>
 
       {/* Confirm removing one member (or clearing a stuck pending invite). */}
       {memberToRemove && (
@@ -1090,6 +1105,97 @@ function SettingRow({
       </div>
       <div style={{ flexShrink: 0 }}>{children}</div>
     </div>
+  )
+}
+
+/** Add someone to an existing folder: pick a friend (they get an in-app prompt,
+ *  no code needed) or fall back to sharing an invite code with anyone. */
+function AddPersonDialog({
+  pair,
+  members,
+  folderName,
+  onClose,
+  onShareCode,
+}: {
+  pair: Pair
+  members: Pair[]
+  folderName: string
+  onClose: () => void
+  onShareCode: () => void
+}) {
+  const friends = useStore((s) => s.friends)
+  const friendSeen = useStore((s) => s.friendSeen)
+  const folderStatuses = useStore((s) => s.folderStatuses)
+  const reloadPairs = useStore((s) => s.reloadPairs)
+  const toast = useStore((s) => s.toast)
+  const [busy, setBusy] = useState<string | null>(null)
+  // Already in the folder = same device (endpoint id) or, for older links, same name.
+  const memberEids = new Set(members.map((m) => m.endpointId).filter(Boolean))
+  const memberNames = new Set(members.map((m) => (m.peerName ?? '').trim().toLowerCase()).filter(Boolean))
+  const candidates = friends.filter(
+    (f) => !(f.endpointId && memberEids.has(f.endpointId)) && !memberNames.has(f.name.trim().toLowerCase()),
+  )
+  const invite = async (friendId: string, name: string) => {
+    setBusy(friendId)
+    try {
+      await api.inviteFriendToFolder(pair.id, friendId, null)
+      await reloadPairs()
+      const online = friendOnlineState(name, friendSeen, folderStatuses) === true
+      toast(online ? 'success' : 'info', online
+        ? `Invited ${name} to “${folderName}”. They’ll pick where to save it.`
+        : `${name} looks offline — if the invite doesn’t reach them in a minute or so, share a code instead.`)
+      onClose()
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+  return (
+    <Dialog
+      title="Add someone"
+      subtitle={<>to “{folderName}”</>}
+      icon={<UserPlus size={18} />}
+      width={420}
+      onClose={onClose}
+      busy={!!busy}
+      bodyStyle={{ display: 'flex', flexDirection: 'column', gap: 2, margin: '0 -8px', padding: '0 8px' }}
+      footer={
+        <button className="chooser-row" style={{ margin: '0 -8px' }} disabled={!!busy} onClick={onShareCode}>
+          <span className="chooser-icon"><QrCode size={18} /></span>
+          <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+            <div className="chooser-name">Share an invite code</div>
+            <div className="chooser-sub">For anyone — they scan the QR or paste the code</div>
+          </div>
+        </button>
+      }
+    >
+      {candidates.length === 0 ? (
+        <p className="dialog-text" style={{ margin: '0 8px' }}>
+          {friends.length ? 'All your friends are already in this folder.' : 'You haven’t added any friends yet.'} Share an invite code instead.
+        </p>
+      ) : (
+        <>
+          <h3 className="section-title" style={{ margin: '2px 8px 4px' }}>Friends</h3>
+          {candidates.map((f) => {
+            const online = friendOnlineState(f.name, friendSeen, folderStatuses) === true
+            return (
+              <button key={f.id} className="chooser-row" disabled={!!busy} onClick={() => void invite(f.id, f.name)}>
+                <span className="chooser-avatar" style={{ background: avatarGradient(f.id) }}>
+                  <FriendAvatar friend={f} />
+                  <span className={`presence-dot${online ? ' online' : ''}`} />
+                </span>
+                <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+                  <div className="chooser-name truncate-1">{f.name}</div>
+                  <div className="chooser-sub" style={{ color: online ? 'var(--green)' : undefined }}>{online ? 'Online now' : 'Offline — the invite may not arrive'}</div>
+                </div>
+                {busy === f.id ? <Spinner size={15} /> : <UserPlus size={16} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />}
+              </button>
+            )
+          })}
+        </>
+      )}
+    </Dialog>
   )
 }
 
