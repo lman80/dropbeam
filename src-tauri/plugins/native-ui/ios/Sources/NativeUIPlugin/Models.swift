@@ -60,6 +60,9 @@ struct Transfer: Decodable, Identifiable {
     var sharePaths: [String]?
     var chatOnly: Bool?
     var chatTransfer: ChatTransferDetail?
+    var connDetail: ConnDetail?
+    var verify: VerifyReport?
+    var integrity: [FileIntegrity]?
     var active: Bool { ["starting", "waitingForPeer", "connecting", "waitingForAccept", "transferring"].contains(state ?? "") }
     var title: String { (fileCount ?? 0) > 1 ? "\(fileCount ?? 0) files" : fileNames?.first ?? "Files" }
     var status: String {
@@ -191,6 +194,7 @@ struct HistoryEntry: Decodable, Identifiable {
     var state: String?
     var outDir: String?
     var error: String?
+    var integrity: [FileIntegrity]?
     var date: Date { Date(timeIntervalSince1970: timestampMs / 1000) }
     var title: String { fileNames.count > 1 ? "\(fileNames.count) files" : fileNames.first ?? "Files" }
     var localPaths: [String] {
@@ -345,6 +349,9 @@ extension Transfer {
         self.sharePaths = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("sharePaths")))?.values
         self.chatOnly = (try? c.decode(Bool.self, forKey: BridgeKey("chatOnly")))
         self.chatTransfer = (try? c.decode(ChatTransferDetail.self, forKey: BridgeKey("chatTransfer")))
+        self.connDetail = (try? c.decode(ConnDetail.self, forKey: BridgeKey("connDetail")))
+        self.verify = (try? c.decode(VerifyReport.self, forKey: BridgeKey("verify")))
+        self.integrity = (try? c.decode(LossyArray<FileIntegrity>.self, forKey: BridgeKey("integrity")))?.values
     }
 }
 
@@ -492,6 +499,7 @@ extension HistoryEntry {
         self.state = (try? c.decode(String.self, forKey: BridgeKey("state")))
         self.outDir = (try? c.decode(String.self, forKey: BridgeKey("outDir")))
         self.error = (try? c.decode(String.self, forKey: BridgeKey("error")))
+        self.integrity = (try? c.decode(LossyArray<FileIntegrity>.self, forKey: BridgeKey("integrity")))?.values
     }
 }
 
@@ -595,6 +603,95 @@ extension FolderInvite {
     }
 }
 
+/// Live path of a transfer ("local" | "direct" | "relay" | "connecting").
+struct ConnDetail: Decodable, Equatable {
+    var path: String?
+    var rttMs: Double?
+    var upgrading: Bool
+    var relay: String?
+}
+/// "Verify copy": a full re-hash of every file here and on the peer.
+struct VerifyReport: Decodable, Equatable {
+    var state: String
+    var checked: Int
+    var total: Int
+    var mismatched: [String]
+    var missing: [String]
+    var error: String?
+}
+/// Per-file end-to-end integrity (hash checked on both ends).
+struct FileIntegrity: Decodable, Identifiable, Equatable {
+    var id: String { "\(index ?? -1)|\(name)" }
+    var index: Int?
+    var name: String
+    var size: Double?
+    var algorithm: String?
+    var digest: String?
+    var verified: Bool
+}
+/// What the Send screen's code field did with a code (see nativeBridge openAnyCode).
+struct OpenCodeResult: Decodable {
+    var kind: String
+    var code: String?
+    var name: String?
+}
+extension ConnDetail {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.path = (try? c.decode(String.self, forKey: BridgeKey("path")))
+        self.rttMs = (try? c.decode(Double.self, forKey: BridgeKey("rttMs"))).flatMap { $0.isFinite && $0 >= 0 && $0 < 1e9 ? $0 : nil }
+        self.upgrading = (try? c.decode(Bool.self, forKey: BridgeKey("upgrading"))) ?? false
+        self.relay = (try? c.decode(String.self, forKey: BridgeKey("relay")))
+    }
+}
+extension VerifyReport {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.state = (try? c.decode(String.self, forKey: BridgeKey("state"))) ?? "failed"
+        self.checked = (try? c.decode(Int.self, forKey: BridgeKey("checked"))) ?? 0
+        self.total = (try? c.decode(Int.self, forKey: BridgeKey("total"))) ?? 0
+        self.mismatched = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("mismatched")))?.values ?? []
+        self.missing = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("missing")))?.values ?? []
+        self.error = (try? c.decode(String.self, forKey: BridgeKey("error")))
+    }
+}
+extension FileIntegrity {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.name = try c.decode(String.self, forKey: BridgeKey("name"))
+        self.index = (try? c.decode(Int.self, forKey: BridgeKey("index")))
+        self.size = (try? c.decode(Double.self, forKey: BridgeKey("size"))).flatMap { $0.isFinite && $0 >= 0 && $0 < 9e18 ? $0 : nil }
+        self.algorithm = (try? c.decode(String.self, forKey: BridgeKey("algorithm")))
+        self.digest = (try? c.decode(String.self, forKey: BridgeKey("digest")))
+        self.verified = (try? c.decode(Bool.self, forKey: BridgeKey("verified"))) ?? false
+    }
+}
+extension OpenCodeResult {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.kind = (try? c.decode(String.self, forKey: BridgeKey("kind"))) ?? "unknown"
+        self.code = (try? c.decode(String.self, forKey: BridgeKey("code")))
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name")))
+    }
+}
+/// Plain-language transfer route (mirrors the desktop path badge).
+extension Transfer {
+    /// "Local" / "Direct" / "Relay" (+ RTT) once connected; nil before a route exists.
+    var routeLabel: String? {
+        let path = connDetail?.path ?? (locality == "internet" ? "relay" : locality)
+        let name: String
+        switch path {
+        case "local": name = "Local"
+        case "direct": name = "Direct"
+        case "relay", "internet": name = connDetail?.upgrading == true ? "Relay · going direct" : "Relay"
+        default: return nil
+        }
+        if let rtt = connDetail?.rttMs { return "\(name) · \(Int(rtt.rounded())) ms" }
+        return name
+    }
+    /// Every file's end-to-end check passed.
+    var integrityVerified: Bool { !(integrity ?? []).isEmpty && (integrity ?? []).allSatisfy(\.verified) }
+}
 // Shared Folders (snapshot key "folders", built by src/lib/nativeFolders.ts).
 struct FolderMember: Decodable, Identifiable, Hashable {
     var id: String { pairId }

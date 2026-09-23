@@ -12,8 +12,8 @@ struct SendFolderButton: View {
             picking = true
             bridge.perform { defer { picking = false }; try await bridge.pickAndSend(source: "folder") }
         } label: {
-            VStack(spacing: 12) { Image(systemName: "folder.fill").font(.title); Text("Folder").font(.headline) }
-                .frame(maxWidth: .infinity, minHeight: 90)
+            VStack(spacing: 10) { Image(systemName: "folder.fill").font(.title); Text("Folder").font(.headline) }
+                .frame(maxWidth: .infinity, minHeight: 88)
         }.beamButton().disabled(picking).accessibilityHint("Send a whole folder")
     }
 }

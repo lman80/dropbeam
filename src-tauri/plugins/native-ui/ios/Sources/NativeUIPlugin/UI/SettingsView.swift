@@ -1,59 +1,103 @@
 import SwiftUI
 import CoreImage.CIFilterBuiltins
 
+enum DropBeamLinks {
+    static let privacy = URL(string: "https://github.com/lman80/dropbeam/blob/main/PRIVACY.md")!
+    static let support = URL(string: "https://github.com/lman80/dropbeam/issues")!
+    static let relaySetup = URL(string: "https://github.com/lman80/dropbeam/blob/main/RELAY-SETUP.md")!
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var version = ""
     @State private var clearCache = false
+    @State private var feedbackButton = SuperFeedback.isEnabled
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    profile
-                    SettingsGroup(title: "Devices") {
-                        NavigationLink { DevicesView() } label: {
-                            HStack(spacing: 14) {
-                                HStack(spacing: -10) {
-                                    ForEach(Array((bridge.myDevice?.devices ?? []).prefix(3).enumerated()), id: \.element.id) { _, d in DeviceAvatar(kind: d.deviceKind, os: d.deviceOs, size: 38) }
-                                    if (bridge.myDevice?.devices ?? []).isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 38) }
-                                }
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text("My Devices").font(.headline).foregroundStyle(.primary)
-                                    Text(devicesSummary).font(.subheadline).foregroundStyle(.secondary)
-                                }
-                                Spacer(minLength: 0)
-                                Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.tertiary)
-                            }.frame(minHeight: 52).contentShape(Rectangle())
-                        }.buttonStyle(.plain)
+            List {
+                Section {
+                    NavigationLink { ProfileView() } label: {
+                        HStack(spacing: 16) {
+                            MyAvatar(size: 62)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(bridge.settings?.displayName ?? "Your Profile").font(.title3.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
+                                Text("Name, photo & DropBeam code").font(.subheadline).foregroundStyle(.secondary)
+                            }
+                        }.padding(.vertical, 4)
                     }
-                    SettingsGroup(title: "General") {
-                        HStack { Text("Appearance"); Spacer(); Picker("Appearance", selection: settingString("theme", bridge.settings?.theme ?? "system")) { Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark") }.pickerStyle(.menu).labelsHidden() }.frame(minHeight: 44)
-                        Divider(); SettingToggle(title: "Sounds", key: "playSounds", value: bridge.settings?.playSounds)
-                        Divider(); SettingToggle(title: "File Notifications", key: "notifyOnComplete", value: bridge.settings?.notifyOnComplete)
-                        Divider(); SettingToggle(title: "Chat Notifications", key: "notifyOnMessage", value: bridge.settings?.notifyOnMessage)
-                        Divider(); SettingToggle(title: "Read Receipts", key: "sendReadReceipts", value: bridge.settings?.sendReadReceipts)
-                        Text("Keep DropBeam open while transferring. Delivery can pause in the background.").font(.footnote).foregroundStyle(.secondary)
-                        Divider(); NavigationLink { TextSettingView(title: "Giphy Key", key: "giphyApiKey", value: bridge.settings?.giphyApiKey ?? "", footer: "Add a key from developers.giphy.com to enable GIFs. Leave blank to hide the picker.") } label: { SettingsLinkLabel(title: "Giphy Key", symbol: "photo.on.rectangle") }
+                    NavigationLink { DevicesView() } label: {
+                        HStack(spacing: 14) {
+                            HStack(spacing: -10) {
+                                ForEach(Array((bridge.myDevice?.devices ?? []).prefix(3).enumerated()), id: \.element.id) { _, d in DeviceAvatar(kind: d.deviceKind, os: d.deviceOs, size: 34) }
+                                if (bridge.myDevice?.devices ?? []).isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 34) }
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("My Devices").foregroundStyle(.primary).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
+                                Text(devicesSummary).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+                            }
+                        }
                     }
-                    transferSettings
-                    SettingsGroup(title: "Advanced") {
-                        NavigationLink { TextSettingView(title: "Custom Relay", key: "customRelay", value: bridge.settings?.customRelay ?? "", footer: "Use the same relay URL on both devices. Leave blank for public relays. Close and reopen DropBeam to apply changes. Setup: github.com/lman80/dropbeam → RELAY-SETUP.md") } label: { SettingsLinkLabel(title: "Custom Relay", symbol: "network") }
-                        Divider(); NavigationLink { DiagnosticsView() } label: { SettingsLinkLabel(title: "Diagnostics", symbol: "waveform.path.ecg") }
-                        Divider(); NavigationLink { RecoverySettingsView() } label: { SettingsLinkLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath") }
+                }
+                Section("General") {
+                    Picker(selection: settingString("theme", bridge.settings?.theme ?? "system")) {
+                        Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark")
+                    } label: { RowLabel(title: "Appearance", symbol: "circle.lefthalf.filled", color: .indigo) }
+                    SettingToggle(title: "Sounds", symbol: "speaker.wave.2.fill", color: .pink, key: "playSounds", value: bridge.settings?.playSounds)
+                }
+                Section {
+                    SettingToggle(title: "Files", symbol: "bell.badge.fill", color: .red, key: "notifyOnComplete", value: bridge.settings?.notifyOnComplete)
+                    SettingToggle(title: "Messages", symbol: "message.fill", color: .green, key: "notifyOnMessage", value: bridge.settings?.notifyOnMessage)
+                } header: { Text("Notifications") } footer: { Text("Keep DropBeam open while transferring — delivery can pause in the background.") }
+                Section {
+                    SettingToggle(title: "Read Receipts", symbol: "checkmark.message.fill", color: .blue, key: "sendReadReceipts", value: bridge.settings?.sendReadReceipts)
+                    NavigationLink { TextSettingView(title: "GIF Search", key: "giphyApiKey", value: bridge.settings?.giphyApiKey ?? "", placeholder: "Giphy API key", footer: "Add a free key from developers.giphy.com to search GIFs in chats. Leave blank to hide the GIF button.") } label: {
+                        RowLabel(title: "GIF Search", symbol: "sparkles.rectangle.stack.fill", color: .purple, value: (bridge.settings?.giphyApiKey ?? "").isEmpty ? "Off" : "On")
                     }
-                    SettingsGroup(title: "Feedback") {
-                        SuperFeedbackSettingsToggle().frame(minHeight: 44)
-                        Divider()
-                        SuperFeedbackSettingsRow().frame(minHeight: 44)
-                        Divider()
-                        settingsButton("Send Feedback", symbol: "bubble.left.and.bubble.right") { SuperFeedback.present() }
+                } header: { Text("Chat") } footer: { Text("Friends see when you’ve read their messages while Read Receipts is on.") }
+                Section {
+                    SettingToggle(title: "Direct Connections Only", symbol: "lock.shield.fill", color: .teal, key: "requireDirect", value: bridge.settings?.requireDirect)
+                    if bridge.settings?.waitForDirect != nil {
+                        SettingToggle(title: "Wait for a Direct Link", symbol: "hourglass", color: .orange, key: "waitForDirect", value: bridge.settings?.requireDirect == true ? false : bridge.settings?.waitForDirect)
+                            .disabled(bridge.settings?.requireDirect == true)
                     }
-                    SettingsGroup(title: "About") { HStack { Text("Version"); Spacer(); Text(version.isEmpty ? "…" : version).foregroundStyle(.secondary) }.frame(minHeight: 44) }
-                    Text("DropBeam · Direct, end-to-end encrypted transfers").font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
-                }.padding(20)
-            }.contentMargins(.bottom, 24, for: .scrollContent).navigationTitle("Settings").navigationBarTitleDisplayMode(.large).beamCanvas()
-                .task { version = (try? await bridge.call("appVersion")) ?? ""; try? await bridge.action("myDeviceInfo") }
-                .confirmationDialog("Clear interrupted transfer leftovers?", isPresented: $clearCache, titleVisibility: .visible) { Button("Clear Transfer Cache", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("clearTransferCache"); bridge.showToast(freed > 0 ? "Cleared \(Formatters.bytes(freed))" : "No transfer leftovers to clear") } } }
+                    NavigationLink { ConnectionInfoView() } label: { RowLabel(title: "How Transfers Connect", symbol: "antenna.radiowaves.left.and.right", color: .blue) }
+                } header: { Text("Connections") } footer: { Text("Direct Connections Only fails a send when no direct path can be made. Shared folders always use the best available path.") }
+                Section {
+                    SettingToggle(title: "Parallel Streams", symbol: "square.stack.3d.up.fill", color: .indigo, key: "parallelStreams", value: bridge.settings?.parallelStreams)
+                    NavigationLink { UploadLimitView() } label: {
+                        RowLabel(title: "Upload Limit", symbol: "speedometer", color: .orange, value: (bridge.settings?.uploadLimitMbps ?? 0) > 0 ? "\(Int(bridge.settings?.uploadLimitMbps ?? 0)) Mbps" : "None")
+                    }
+                    SettingToggle(title: "Show Speeds in Megabits", symbol: "gauge.with.dots.needle.67percent", color: .gray, key: "showMegabits", value: bridge.settings?.showMegabits)
+                } header: { Text("Speed") } footer: { Text("Parallel streams can speed up files over 16 MB. Turn off if transfers stall.") }
+                Section("Storage") {
+                    NavigationLink { RecoverySettingsView() } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }
+                    ActionRow(title: "Clear Transfer Cache", symbol: "trash.fill", color: .gray) { clearCache = true }
+                }
+                Section {
+                    NavigationLink { PrivacyView() } label: { RowLabel(title: "Privacy & Your Data", symbol: "hand.raised.fill", color: .blue) }
+                    NavigationLink { DiagnosticsView() } label: { RowLabel(title: "Diagnostics", symbol: "waveform.path.ecg", color: .red) }
+                    ActionRow(title: "Send Feedback", symbol: "bubble.left.and.bubble.right.fill", color: .beam) { SuperFeedback.present() }
+                    IconToggle(title: "Feedback Button", symbol: "hand.tap.fill", color: .gray, isOn: Binding(get: { feedbackButton }, set: { feedbackButton = $0; SuperFeedback.setEnabled($0) }))
+                    LinkRow(title: "Help & Support", symbol: "questionmark.circle.fill", color: .green, url: DropBeamLinks.support)
+                } header: { Text("Privacy & Support") } footer: { Text("The feedback button floats at the screen edge — drag it anywhere, or turn it off and use Send Feedback.") }
+                Section("Advanced") {
+                    NavigationLink { TextSettingView(title: "Custom Relay", key: "customRelay", value: bridge.settings?.customRelay ?? "", placeholder: "https://relay.example.com", footer: "Use the same relay URL on both devices. Leave blank to use the public relays. Close and reopen DropBeam to apply.", link: ("Relay setup guide", DropBeamLinks.relaySetup)) } label: {
+                        RowLabel(title: "Custom Relay", symbol: "server.rack", color: .gray, value: (bridge.settings?.customRelay ?? "").isEmpty ? "Off" : "On")
+                    }
+                }
+                Section {
+                    LabeledContent("Version", value: version.isEmpty ? "…" : version)
+                } footer: {
+                    Text("DropBeam · Direct, end-to-end encrypted transfers").frame(maxWidth: .infinity).padding(.top, 8)
+                }
+            }
+            .beamList()
+            .navigationTitle("Settings")
+            .task { version = (try? await bridge.call("appVersion")) ?? ""; try? await bridge.action("myDeviceInfo") }
+            .onAppear { feedbackButton = SuperFeedback.isEnabled }
+            .confirmationDialog("Clear interrupted transfer leftovers?", isPresented: $clearCache, titleVisibility: .visible) {
+                Button("Clear Transfer Cache", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("clearTransferCache"); bridge.showToast(freed > 0 ? "Cleared \(Formatters.bytes(freed))" : "No transfer leftovers to clear") } }
+            } message: { Text("Partly received files are removed. Finished files aren’t affected.") }
         }
     }
     private var devicesSummary: String {
@@ -61,54 +105,21 @@ struct SettingsView: View {
         if others.isEmpty { return "Link your other devices to share friends and chats" }
         return "This iPhone and " + ListFormatter.localizedString(byJoining: others.map { "your " + deviceNoun($0.deviceKind, os: $0.deviceOs) })
     }
-    private var profile: some View {
-        GlassCard {
-            HStack(spacing: 18) {
-                Button { bridge.perform { try await bridge.pickAvatar() } } label: { MyAvatar(size: 72) }.buttonStyle(.plain).accessibilityLabel("Change profile picture")
-                NavigationLink { ProfileView() } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 6) { Text(bridge.settings?.displayName ?? "Your Profile").font(.title2.bold()).foregroundStyle(.primary); Text("DropBeam code").font(.caption).foregroundStyle(.secondary) }
-                        Spacer(minLength: 0); Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                    }.frame(minHeight: 72)
-                }.buttonStyle(.plain)
-            }
-        }
-    }
-    private var transferSettings: some View {
-        SettingsGroup(title: "Transfers") {
-            SettingToggle(title: "Prefer Direct Connections", key: "preferDirectP2p", value: bridge.settings?.preferDirectP2p)
-            Divider(); SettingToggle(title: "Direct Connections Only", key: "requireDirect", value: bridge.settings?.requireDirect)
-            Text("Fail the send if a direct path cannot be made. Shared folders use the best available path.").font(.footnote).foregroundStyle(.secondary)
-            if bridge.settings?.waitForDirect != nil {
-                Divider(); SettingToggle(title: "Wait for a Direct Link", key: "waitForDirect", value: bridge.settings?.requireDirect == true ? false : bridge.settings?.waitForDirect).disabled(bridge.settings?.requireDirect == true)
-            }
-            Divider(); SettingToggle(title: "Parallel Streams", key: "parallelStreams", value: bridge.settings?.parallelStreams)
-            Text("Several connections can speed up files over 16 MB. Turn off if transfers stall.").font(.footnote).foregroundStyle(.secondary)
-            Divider(); NavigationLink { UploadLimitView() } label: { SettingsLinkLabel(title: "Upload Limit · \(Int(bridge.settings?.uploadLimitMbps ?? 0)) Mbps", symbol: "speedometer") }
-            Divider(); SettingToggle(title: "Speeds in Megabits", key: "showMegabits", value: bridge.settings?.showMegabits)
-            Divider(); NavigationLink { ConnectionInfoView() } label: { SettingsLinkLabel(title: "How Transfers Connect", symbol: "antenna.radiowaves.left.and.right") }
-            Divider(); Button("Clear Transfer Cache", role: .destructive) { clearCache = true }.frame(minHeight: 44)
-        }
-    }
     private func settingString(_ key: String, _ value: String) -> Binding<String> { Binding(get: { value }, set: { next in bridge.perform { try await bridge.updateSettings(patch: [key: next]) } }) }
-    private func settingsButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View { Button { Haptics.tap(); action() } label: { SettingsLinkLabel(title: title, symbol: symbol) } }
 }
-struct SettingsGroup<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-    var body: some View { VStack(alignment: .leading, spacing: 12) { Text(title).font(.title2.weight(.semibold)); GlassCard { VStack(alignment: .leading, spacing: 14) { content } } } }
-}
-struct SettingsLinkLabel: View {
-    let title: String
-    let symbol: String
-    var body: some View { HStack(spacing: 12) { Image(systemName: symbol).foregroundStyle(.tint).frame(width: 26); Text(title).foregroundStyle(.primary); Spacer(minLength: 0); Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.tertiary) }.frame(minHeight: 44).contentShape(Rectangle()) }
-}
+/// A settings toggle row that writes straight through to the engine.
 struct SettingToggle: View {
     @EnvironmentObject private var bridge: Bridge
     let title: String
+    var symbol: String? = nil
+    var color: Color = .beam
     let key: String
     let value: Bool?
-    var body: some View { Toggle(title, isOn: Binding(get: { value ?? false }, set: { next in bridge.perform { try await bridge.updateSettings(patch: [key: next]) } })).frame(minHeight: 44) }
+    var body: some View {
+        let binding = Binding(get: { value ?? false }, set: { next in bridge.perform { try await bridge.updateSettings(patch: [key: next]) } })
+        if let symbol { IconToggle(title: title, symbol: symbol, color: color, isOn: binding) }
+        else { Toggle(title, isOn: binding) }
+    }
 }
 struct MyAvatar: View {
     @EnvironmentObject private var bridge: Bridge
@@ -117,35 +128,69 @@ struct MyAvatar: View {
 }
 struct ProfileView: View {
     @EnvironmentObject private var bridge: Bridge
-    @State private var code = ""
-    @State private var codeError: String?
     @State private var name = ""
     @State private var editing = false
     var body: some View {
-        ScrollView {
-            VStack(spacing: 24) {
-                Button { bridge.perform { try await bridge.pickAvatar() } } label: { MyAvatar(size: 112) }.buttonStyle(.plain).accessibilityLabel("Change profile picture")
-                    .contextMenu { Button("Remove Picture", role: .destructive) { bridge.perform { try await bridge.action("clearAvatar") } } }
-                Button { name = bridge.settings?.displayName ?? ""; editing = true } label: { HStack { Text(bridge.settings?.displayName ?? "Your Name").font(.title2.bold()); Image(systemName: "pencil").font(.body) } }.frame(minHeight: 44)
-                GlassCard {
-                    VStack(spacing: 20) {
-                        Text("Your DropBeam code").font(.headline)
-                        if let codeError { Text(codeError).foregroundStyle(.secondary); Button("Try Again") { loadCode() } } else if code.isEmpty { ProgressView() } else { InviteQRCode(code: code); Text(code).font(.caption.monospaced()).textSelection(.enabled) }
-                        ViewThatFits(in: .horizontal) { HStack(spacing: 12) { codeButtons }; VStack(spacing: 12) { codeButtons } }
-                    }.frame(maxWidth: .infinity)
-                }
-            }.padding(24)
-        }.navigationTitle("Profile").navigationBarTitleDisplayMode(.inline).beamCanvas()
-            .task { loadCode() }
-            .alert("Display Name", isPresented: $editing) { TextField("Name", text: $name); Button("Cancel", role: .cancel) {}; Button("Save") { bridge.perform { try await bridge.action("setDisplayName", ["name": name]) } }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
+        List {
+            Section {
+                VStack(spacing: 12) {
+                    Menu {
+                        Button("Choose Photo", systemImage: "photo") { bridge.perform { try await bridge.pickAvatar() } }
+                        if bridge.settings?.avatar != nil { Button("Remove Photo", systemImage: "trash", role: .destructive) { bridge.perform { try await bridge.action("clearAvatar") } } }
+                    } label: {
+                        MyAvatar(size: 116).overlay(alignment: .bottomTrailing) {
+                            Image(systemName: "camera.fill").font(.footnote.weight(.semibold)).foregroundStyle(.white)
+                                .frame(width: 32, height: 32).background(Color.beam, in: Circle())
+                                .overlay(Circle().stroke(Color(uiColor: .systemGroupedBackground), lineWidth: 3))
+                        }
+                    }.accessibilityLabel("Change profile photo")
+                    Button { name = bridge.settings?.displayName ?? ""; editing = true } label: {
+                        HStack(spacing: 6) { Text(bridge.settings?.displayName ?? "Your Name").font(.title.bold()).foregroundStyle(.primary); Image(systemName: "pencil").font(.body).foregroundStyle(.tint) }
+                    }.buttonStyle(.plain).accessibilityLabel("Edit name, \(bridge.settings?.displayName ?? "")")
+                    Text("Friends see this name and photo.").font(.subheadline).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity)
+            }.clearRow()
+            MyCodeSection()
+        }
+        .beamList()
+        .navigationTitle("Profile").navigationBarTitleDisplayMode(.inline)
+        .alert("Display Name", isPresented: $editing) {
+            TextField("Name", text: $name).textContentType(.name)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") { bridge.perform { try await bridge.action("setDisplayName", ["name": name]) } }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } message: { Text("Friends see this name when you send files and chat.") }
     }
-    private func loadCode() {
+}
+/// "Your DropBeam code": QR + code + Share/Copy. Shared by Profile and Friends → My Code.
+struct MyCodeSection: View {
+    @EnvironmentObject private var bridge: Bridge
+    @State private var code = ""
+    @State private var codeError: String?
+    var body: some View {
+        Section {
+            VStack(spacing: 16) {
+                if let codeError {
+                    ContentUnavailableView { Label("Couldn’t Load Your Code", systemImage: "qrcode") } description: { Text(codeError) } actions: { Button("Try Again", action: load).beamButton() }
+                } else if code.isEmpty { ProgressView().frame(height: 240) }
+                else {
+                    InviteQRCode(code: code)
+                    Text(code).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(3).multilineTextAlignment(.center)
+                }
+                HStack(spacing: 12) {
+                    Button { UIPasteboard.general.string = code; Haptics.success(); bridge.showToast("Code copied") } label: { Label("Copy", systemImage: "doc.on.doc").frame(maxWidth: .infinity, minHeight: 32) }
+                        .beamButton().disabled(code.isEmpty)
+                    ShareLink(item: code, subject: Text("Add me on DropBeam"), message: Text("Add me on DropBeam with this code:")) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity, minHeight: 32) }
+                        .beamButton(prominent: true).disabled(code.isEmpty)
+                }
+            }.frame(maxWidth: .infinity).padding(.vertical, 12)
+        } header: { Text("Your DropBeam Code") } footer: {
+            Text("A friend scans this in DropBeam (Friends → + → Add Friend) or pastes the code to add you.")
+        }
+        .task { load() }
+    }
+    private func load() {
         codeError = nil
         Task { do { code = try await bridge.myInviteCode() } catch { codeError = error.localizedDescription } }
-    }
-    @ViewBuilder private var codeButtons: some View {
-        Button { UIPasteboard.general.string = code; Haptics.tap(); bridge.showToast("Code copied") } label: { Label("Copy Code", systemImage: "doc.on.doc").frame(minHeight: 44) }.beamButton().disabled(code.isEmpty)
-        ShareLink(item: code) { Label("Share Code", systemImage: "square.and.arrow.up").frame(minHeight: 44) }.beamButton(prominent: true).disabled(code.isEmpty)
     }
 }
 struct InviteQRCode: View {
@@ -157,7 +202,9 @@ struct InviteQRCode: View {
     }
     var body: some View {
         Group { if let image { Image(uiImage: image).interpolation(.none).resizable().scaledToFit() } else { Image(systemName: "qrcode").resizable().scaledToFit() } }
-            .padding(20).frame(maxWidth: 280).background(.white, in: RoundedRectangle(cornerRadius: 16)).accessibilityLabel("DropBeam QR code")
+            .padding(16).frame(maxWidth: 240).background(.white, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
+            .accessibilityLabel("DropBeam QR code")
     }
 }
 struct LinkThisDeviceSheet: View {
@@ -170,25 +217,38 @@ struct LinkThisDeviceSheet: View {
     @State private var closed = false
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 24) {
-                    BeamEmpty(symbol: "link", title: "Bring your devices together.", detail: "On your other device, choose Link a New Device and scan this code.")
-                    GlassCard {
-                        VStack(spacing: 18) {
-                            if code.isEmpty && error == nil { ProgressView() }
-                            if !code.isEmpty { InviteQRCode(code: code); Text(code).font(.caption.monospaced()).textSelection(.enabled); Button("Copy Code") { UIPasteboard.general.string = code; Haptics.tap() }.beamButton() }
-                            if let error { Text(error).foregroundStyle(.red); Button("Try Again") { Task { await begin() } }.beamButton() }
-                        }.frame(maxWidth: .infinity)
-                    }
-                }.padding(20)
-            }.navigationTitle("Link This Device").navigationBarTitleDisplayMode(.inline).beamCanvas()
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
-                .task { await begin() }
-                .onChange(of: linkedIDs) { _, ids in
-                    if watching && !ids.subtracting(baseline).isEmpty { bridge.showToast("Device linked successfully"); dismiss() }
+            List {
+                Section {
+                    VStack(spacing: 10) {
+                        Image(systemName: "link.circle.fill").font(.system(size: 48)).foregroundStyle(.tint).accessibilityHidden(true)
+                        Text("Bring your devices together.").font(.title3.weight(.semibold))
+                        Text("On your other device, choose Link a New Device and scan this code.").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    }.frame(maxWidth: .infinity)
+                }.clearRow()
+                Section {
+                    VStack(spacing: 16) {
+                        if code.isEmpty && error == nil { ProgressView().frame(height: 240) }
+                        if !code.isEmpty {
+                            InviteQRCode(code: code)
+                            Text(code).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(3)
+                            Button { UIPasteboard.general.string = code; Haptics.success() } label: { Label("Copy Code", systemImage: "doc.on.doc") }.beamButton()
+                        }
+                        if let error {
+                            Text(error).foregroundStyle(.red).multilineTextAlignment(.center)
+                            Button("Try Again") { Task { await begin() } }.beamButton(prominent: true)
+                        }
+                    }.frame(maxWidth: .infinity).padding(.vertical, 12)
                 }
-                .onDisappear { closed = true; Task { try? await bridge.linkDeviceCancel() } }
-        }
+            }
+            .beamList()
+            .navigationTitle("Link This Device").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .task { await begin() }
+            .onChange(of: linkedIDs) { _, ids in
+                if watching && !ids.subtracting(baseline).isEmpty { Haptics.success(); bridge.showToast("Device linked successfully"); dismiss() }
+            }
+            .onDisappear { closed = true; Task { try? await bridge.linkDeviceCancel() } }
+        }.tint(.beam)
     }
     private var linkedIDs: Set<String> {
         guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return [] }
@@ -210,48 +270,96 @@ struct LinkThisDeviceSheet: View {
 }
 struct TextSettingView: View {
     @EnvironmentObject private var bridge: Bridge
+    @Environment(\.dismiss) private var dismiss
     let title: String
     let key: String
     let value: String
+    var placeholder = ""
     let footer: String
+    var link: (String, URL)? = nil
     @State private var draft = ""
     @State private var saving = false
+    private var changed: Bool { draft.trimmingCharacters(in: .whitespacesAndNewlines) != value }
     var body: some View {
-        ScrollView { GlassCard { VStack(alignment: .leading, spacing: 20) {
-            TextField(title, text: $draft, axis: .vertical).textInputAutocapitalization(.never).autocorrectionDisabled().padding(14).background(.quaternary, in: RoundedRectangle(cornerRadius: 14))
-            Text(footer).font(.subheadline).foregroundStyle(.secondary)
-            Button(saving ? "Saving…" : "Save") { saving = true; bridge.perform { defer { saving = false }; try await bridge.updateSettings(patch: [key: draft.trimmingCharacters(in: .whitespacesAndNewlines)]); bridge.showToast("Saved") } }.beamButton(prominent: true).disabled(saving)
-        } }.padding(20) }.navigationTitle(title).navigationBarTitleDisplayMode(.inline).beamCanvas().onAppear { draft = value }
+        Form {
+            Section {
+                TextField(placeholder.isEmpty ? title : placeholder, text: $draft, axis: .vertical)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled().font(.body.monospaced()).submitLabel(.done)
+                if !draft.isEmpty { Button("Clear", role: .destructive) { draft = "" } }
+            } footer: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(footer)
+                    if let link { Link(link.0, destination: link.1) }
+                }
+            }
+        }
+        .scrollContentBackground(.hidden).background { BeamBackground() }
+        .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .confirmationAction) {
+            Button(saving ? "Saving…" : "Save") {
+                saving = true
+                bridge.perform { defer { saving = false }; try await bridge.updateSettings(patch: [key: draft.trimmingCharacters(in: .whitespacesAndNewlines)]); Haptics.success(); bridge.showToast("Saved"); dismiss() }
+            }.disabled(saving || !changed)
+        } }
+        .onAppear { draft = value }
     }
 }
 struct UploadLimitView: View {
     @EnvironmentObject private var bridge: Bridge
+    @Environment(\.dismiss) private var dismiss
     @State private var limit = ""
+    private let presets = [0, 10, 25, 50, 100, 250]
+    private var current: Int { Int(bridge.settings?.uploadLimitMbps ?? 0) }
     var body: some View {
-        ScrollView { GlassCard { VStack(alignment: .leading, spacing: 18) {
-            TextField("Mbps", text: $limit).keyboardType(.numberPad).font(.title2).frame(minHeight: 44)
-            Text("0 means unlimited. Local transfers run at full speed. Start at 100 Mbps and adjust if your Wi-Fi stutters.").foregroundStyle(.secondary)
-            Button("Save") { bridge.perform { try await bridge.updateSettings(patch: ["uploadLimitMbps": min(100000, max(0, Int(limit) ?? 0))]); bridge.showToast("Upload limit saved") } }.beamButton(prominent: true).disabled(Int(limit) == nil)
-        } }.padding(20) }.navigationTitle("Upload Limit").beamCanvas().onAppear { limit = String(Int(bridge.settings?.uploadLimitMbps ?? 0)) }
+        Form {
+            Section {
+                ForEach(presets, id: \.self) { value in
+                    Button { save(value) } label: {
+                        HStack { Text(value == 0 ? "No Limit" : "\(value) Mbps").foregroundStyle(.primary); Spacer(); if current == value { Image(systemName: "checkmark").foregroundStyle(.tint).fontWeight(.semibold) } }
+                    }.accessibilityAddTraits(current == value ? .isSelected : [])
+                }
+            } footer: { Text("Local transfers always run at full speed. If your Wi-Fi stutters while sending, start at 100 Mbps and adjust.") }
+            Section("Custom") {
+                HStack {
+                    TextField("Mbps", text: $limit).keyboardType(.numberPad)
+                    Text("Mbps").foregroundStyle(.secondary)
+                    Button("Set") { save(min(100000, max(0, Int(limit) ?? 0))) }.beamButton().controlSize(.small).disabled(Int(limit) == nil)
+                }
+            }
+        }
+        .scrollContentBackground(.hidden).background { BeamBackground() }
+        .navigationTitle("Upload Limit").navigationBarTitleDisplayMode(.inline)
+        .onAppear { if !presets.contains(current) { limit = String(current) } }
+    }
+    private func save(_ value: Int) {
+        bridge.perform { try await bridge.updateSettings(patch: ["uploadLimitMbps": value]); Haptics.success() }
     }
 }
 struct DiagnosticsView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var busy = false
-    @State private var result: String?
+    @State private var testing = false
+    @State private var testResult: String?
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                SettingsGroup(title: "Diagnostics") {
-                    SettingToggle(title: "Detailed Logging", key: "verboseLogging", value: bridge.settings?.verboseLogging)
-                    Text("Extra network logs for reproducing issues. Close and reopen DropBeam to apply.").font(.footnote).foregroundStyle(.secondary)
-                    Divider(); SettingToggle(title: "Share Background Diagnostics", key: "shareDiagnostics", value: bridge.settings?.shareDiagnostics)
-                    Text("Sends a redacted error and performance summary about once a day. Never includes file names or contents.").font(.footnote).foregroundStyle(.secondary)
-                    Divider(); Button("Export Logs") { busy = true; bridge.perform { defer { busy = false }; try await bridge.action("exportLogs") } }.beamButton().disabled(busy)
-                    if let result { Text(result).font(.subheadline).textSelection(.enabled) }
-                }
-            }.padding(20)
-        }.navigationTitle("Diagnostics").beamCanvas()
+        Form {
+            Section {
+                SettingToggle(title: "Share Diagnostics", symbol: "chart.bar.doc.horizontal.fill", color: .blue, key: "shareDiagnostics", value: bridge.settings?.shareDiagnostics)
+                ActionRow(title: testing ? "Sending…" : "Send Test Report", symbol: "paperplane.fill", color: .green) {
+                    testing = true; testResult = nil
+                    bridge.perform { defer { testing = false }; let r: String = try await bridge.call("diagnosticsTest"); testResult = r; Haptics.success() }
+                }.disabled(testing || bridge.settings?.shareDiagnostics == false)
+                if let testResult { Text(testResult).font(.footnote).foregroundStyle(.secondary).textSelection(.enabled) }
+            } footer: { Text("Sends a redacted error and performance summary about once a day, plus crash reports, so bugs get fixed. Never includes file names, file contents, messages or contacts. Send Test Report checks that reports get through.") }
+            Section {
+                SettingToggle(title: "Detailed Logging", symbol: "doc.text.magnifyingglass", color: .gray, key: "verboseLogging", value: bridge.settings?.verboseLogging)
+                ActionRow(title: busy ? "Exporting…" : "Export Logs", symbol: "square.and.arrow.up.fill", color: .beam) {
+                    busy = true; bridge.perform { defer { busy = false }; try await bridge.action("exportLogs") }
+                }.disabled(busy)
+            } footer: { Text("Detailed logging records extra network detail for reproducing a problem. Close and reopen DropBeam to apply. Export Logs lets you choose where to share them.") }
+            Section { LinkRow(title: "Privacy Policy", symbol: "doc.text.fill", color: .blue, url: DropBeamLinks.privacy) }
+        }
+        .scrollContentBackground(.hidden).background { BeamBackground() }
+        .navigationTitle("Diagnostics").navigationBarTitleDisplayMode(.inline)
     }
 }
 struct ConnectionInfoView: View {
@@ -259,33 +367,81 @@ struct ConnectionInfoView: View {
     @State private var busy = false
     @State private var result: String?
     var body: some View {
-        ScrollView { VStack(spacing: 24) {
-            SettingsGroup(title: "Direct peer-to-peer") {
-                Text("End-to-end encrypted. Keep both devices open until transfers finish.").foregroundStyle(.secondary)
-                Button(busy ? "Testing…" : "Test Connection") { busy = true; bridge.perform { defer { busy = false }; result = try await bridge.call("connectionTest") } }.beamButton().disabled(busy)
-                if let result { Text(result).font(.subheadline).textSelection(.enabled) }
+        List {
+            Section {
+                Button { busy = true; bridge.perform { defer { busy = false }; result = try await bridge.call("connectionTest") } } label: {
+                    HStack { Text(busy ? "Testing…" : "Test Connection"); Spacer(); if busy { ProgressView() } }
+                }.disabled(busy)
+                if let result { Text(result).font(.subheadline).foregroundStyle(.secondary).textSelection(.enabled) }
+            } footer: { Text("Every transfer is end-to-end encrypted. Keep both devices open until transfers finish.") }
+            Section("Routes") {
+                route("Local", "wifi", .green, "Same Wi-Fi or network. Files go straight across your network, never over the internet.")
+                route("Direct", "arrow.left.arrow.right", .blue, "An encrypted peer-to-peer link across the internet.")
+                route("Relay", "cloud.fill", .orange, "When no direct path exists, an encrypted relay carries the data. It can’t read it, but may be slower.")
+                route("Connecting", "ellipsis", .gray, "Finding the best route to the other device.")
             }
-            SettingsGroup(title: "How transfers connect") {
-                Text("Local").font(.headline); Text("Same Wi-Fi or network. Files travel directly across your network, without the internet.")
-                Divider(); Text("Direct").font(.headline); Text("An encrypted peer-to-peer link across the internet connects both devices.")
-                Divider(); Text("Relay").font(.headline); Text("If a direct path is unavailable, an encrypted relay carries files. It cannot read them, but may be slower.")
-                Divider(); Text("Connecting").font(.headline); Text("Finding the best available route to the other device.")
+            Section {
+                Button("Open DropBeam Settings") { if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }
+            } header: { Text("Local Network Access") } footer: {
+                Text("If nearby transfers use the relay, make sure Local Network is on for DropBeam on both devices (iOS Settings → DropBeam, or Privacy & Security → Local Network).")
             }
-            SettingsGroup(title: "Local network access") { Text("If nearby transfers use the relay, enable DropBeam in iOS Settings → Privacy & Security → Local Network on both devices.").foregroundStyle(.secondary) }
-        }.padding(20) }.navigationTitle("Connections").beamCanvas()
+        }
+        .beamList()
+        .navigationTitle("How Transfers Connect").navigationBarTitleDisplayMode(.inline)
+    }
+    private func route(_ title: String, _ symbol: String, _ color: Color, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            RowIcon(symbol: symbol, color: color)
+            VStack(alignment: .leading, spacing: 3) { Text(title).font(.body.weight(.semibold)).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }; Text(detail).font(.subheadline).foregroundStyle(.secondary) }
+        }.padding(.vertical, 2).accessibilityElement(children: .combine)
     }
 }
 struct RecoverySettingsView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var clearing = false
     var body: some View {
-        ScrollView { SettingsGroup(title: "Saved copies") {
-            Picker("Keep copies for", selection: Binding(get: { bridge.settings?.folderHistoryKeepDays ?? 30 }, set: { n in bridge.perform { try await bridge.updateSettings(patch: ["folderHistoryKeepDays": n]) } })) { Text("7 days").tag(7); Text("30 days").tag(30); Text("90 days").tag(90); Text("Forever").tag(0) }.pickerStyle(.menu)
-            Divider()
-            Picker("Storage per folder", selection: Binding(get: { bridge.settings?.folderHistoryBudgetBytes ?? 2147483648 }, set: { n in bridge.perform { try await bridge.updateSettings(patch: ["folderHistoryBudgetBytes": n]) } })) { Text("500 MB").tag(524288000.0); Text("2 GB").tag(2147483648.0); Text("5 GB").tag(5368709120.0); Text("No limit").tag(0.0) }.pickerStyle(.menu)
-            Text("Deleted and replaced files are kept here until these limits remove the oldest copies. Live files are untouched.").font(.subheadline).foregroundStyle(.secondary)
-            Button("Free Up Space Now", role: .destructive) { clearing = true }.frame(minHeight: 44)
-        }.padding(20) }.navigationTitle("Recoverable Files").beamCanvas()
-            .confirmationDialog("Permanently delete all saved copies?", isPresented: $clearing, titleVisibility: .visible) { Button("Delete Saved Copies", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("recoverableEmptyAll"); bridge.showToast("Freed \(Formatters.bytes(freed))") } } }
+        Form {
+            Section {
+                Picker("Keep Copies For", selection: Binding(get: { bridge.settings?.folderHistoryKeepDays ?? 30 }, set: { n in bridge.perform { try await bridge.updateSettings(patch: ["folderHistoryKeepDays": n]) } })) { Text("7 Days").tag(7); Text("30 Days").tag(30); Text("90 Days").tag(90); Text("Forever").tag(0) }
+                Picker("Storage per Folder", selection: Binding(get: { bridge.settings?.folderHistoryBudgetBytes ?? 2147483648 }, set: { n in bridge.perform { try await bridge.updateSettings(patch: ["folderHistoryBudgetBytes": n]) } })) { Text("500 MB").tag(524288000.0); Text("2 GB").tag(2147483648.0); Text("5 GB").tag(5368709120.0); Text("No Limit").tag(0.0) }
+            } footer: { Text("When a file in a shared folder is deleted or replaced, DropBeam keeps a copy until these limits remove the oldest. Your live files are never touched. Browse copies in History → Recoverable.") }
+            Section { Button("Free Up Space Now", role: .destructive) { clearing = true } }
+        }
+        .scrollContentBackground(.hidden).background { BeamBackground() }
+        .navigationTitle("Recoverable Files").navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("Permanently delete all saved copies?", isPresented: $clearing, titleVisibility: .visible) { Button("Delete Saved Copies", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("recoverableEmptyAll"); bridge.showToast("Freed \(Formatters.bytes(freed))") } } }
+    }
+}
+/// Plain-language privacy summary + where your data lives and how to erase it
+/// (App Review 5.1.1: DropBeam has no server account — identity is a key on the device).
+struct PrivacyView: View {
+    @EnvironmentObject private var bridge: Bridge
+    var body: some View {
+        List {
+            Section {
+                point("person.crop.circle.badge.xmark", .blue, "No account with us", "There’s no sign-up. Your identity is a key created on this iPhone.")
+                point("lock.fill", .green, "End-to-end encrypted", "Files and messages go straight to the people you choose. Relays only pass along encrypted data.")
+                point("iphone", .gray, "Stored on your devices", "Friends, chats and history live on this iPhone and your linked devices — never on our servers.")
+                point("chart.bar.doc.horizontal.fill", .orange, "Diagnostics you control", "Redacted error summaries help fix bugs. Turn them off anytime in Diagnostics.")
+            }
+            Section {
+                LinkRow(title: "Privacy Policy", symbol: "doc.text.fill", color: .blue, url: DropBeamLinks.privacy)
+                NavigationLink { DiagnosticsView() } label: { RowLabel(title: "Diagnostics", symbol: "waveform.path.ecg", color: .red) }
+            }
+            Section {
+                NavigationLink { DevicesView() } label: { RowLabel(title: "Linked Devices", symbol: "laptopcomputer.and.iphone", color: .gray) }
+                NavigationLink { RecoverySettingsView() } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }
+            } header: { Text("Your Data") } footer: {
+                Text("Remove friends by swiping in Friends, clear transfers in History, and unlink this iPhone in Linked Devices. Deleting DropBeam erases everything it stored on this iPhone.")
+            }
+        }
+        .beamList()
+        .navigationTitle("Privacy & Your Data").navigationBarTitleDisplayMode(.inline)
+    }
+    private func point(_ symbol: String, _ color: Color, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            RowIcon(symbol: symbol, color: color)
+            VStack(alignment: .leading, spacing: 3) { Text(title).font(.body.weight(.semibold)).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }; Text(detail).font(.subheadline).foregroundStyle(.secondary) }
+        }.padding(.vertical, 2).accessibilityElement(children: .combine)
     }
 }

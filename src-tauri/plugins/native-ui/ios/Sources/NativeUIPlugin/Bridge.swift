@@ -121,7 +121,12 @@ final class Bridge: ObservableObject {
         case "friends": friends = try decoder.decode(LossyArray<Friend>.self, from: data).values
         case "myDevice": myDevice = try decoder.decode(MyDevice?.self, from: data)
         case "transfers": transfers = try decoder.decode(LossyArray<Transfer>.self, from: data).values
-        case "settings": settings = try decoder.decode(Settings?.self, from: data)
+        case "settings":
+            settings = try decoder.decode(Settings?.self, from: data)
+            if let share = settings?.shareDiagnostics {
+                UserDefaults.standard.set(share, forKey: NativeUIPlugin.diagnosticsKey)
+                SuperFeedback.setCrashReportingEnabled(share)
+            }
         case "chatOverview": chatOverview = try decoder.decode(LossyArray<ChatOverview>.self, from: data).values
         case "chatUnread": chatUnread = try decoder.decode([String: Int].self, from: data)
         case "chatTyping": chatTyping = try decoder.decode([String: Bool].self, from: data)
@@ -178,6 +183,19 @@ final class Bridge: ObservableObject {
     }
     func sendToFriend(friendId: String, paths: [String]) async throws { try await action("sendToFriend", ["friendId": friendId, "paths": paths]) }
     func receiveWithCode(code: String) async throws { try await action("receiveWithCode", ["code": code]) }
+    /// Any DropBeam code (Quick Send, friend, friend invite, folder invite, device link),
+    /// routed like desktop's "Have a code?". Folder invites open the folder picker here.
+    func openAnyCode(_ code: String) async throws {
+        let result: OpenCodeResult = try await call("openAnyCode", ["code": code])
+        switch result.kind {
+        case "friend": showToast("Friend added")
+        case "linked": showToast("Linked with \(result.name ?? "your device") — syncing friends and chats")
+        case "folderInvite":
+            let accepted: Bool = try await call("acceptFolderInvite", ["code": result.code ?? code])
+            if accepted { showToast("Joined shared folder") }
+        default: break
+        }
+    }
     func cancelTransfer(id: String) async throws { try await action("cancelTransfer", ["id": id]) }
     func retryTransfer(id: String) async throws { try await action("retryTransfer", ["id": id]) }
     func openChat(friendId: String) async throws { try await action("openChat", ["friendId": friendId]); selectedTab = "chat" }

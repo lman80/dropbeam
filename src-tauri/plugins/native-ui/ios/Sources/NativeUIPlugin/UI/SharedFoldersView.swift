@@ -10,32 +10,33 @@ struct SharedFoldersView: View {
     @State private var joining = false
     @State private var loading = false
     var body: some View {
-        ScrollView {
-            GlassGroup {
-                VStack(alignment: .leading, spacing: 24) {
-                    if bridge.folders.isEmpty {
-                        if loading { ProgressView("Loading shared folders…").frame(maxWidth: .infinity).padding(.vertical, 32) }
-                        else {
-                            ContentUnavailableView {
-                                Label("No shared folders yet", systemImage: "folder.badge.person.crop")
-                            } description: {
-                                Text("When a friend shares a folder with you from DropBeam on their computer, accept the invite here — or scan their invite code.")
-                            } actions: {
-                                Button { joining = true; Haptics.tap() } label: { Label("Join with a Code", systemImage: "qrcode.viewfinder") }.beamButton(prominent: true)
-                            }.padding(.top, 24)
-                        }
-                    }
+        List {
+            if !bridge.folders.isEmpty {
+                Section {
                     ForEach(bridge.folders) { folder in
-                        NavigationLink { SharedFolderDetailView(folderID: folder.id, initial: folder) } label: { FolderCard(folder: folder) }.buttonStyle(.plain)
+                        NavigationLink { SharedFolderDetailView(folderID: folder.id, initial: folder) } label: { FolderRow(folder: folder) }
                     }
-                    FolderIOSNote()
-                }.padding(20)
+                } footer: { FolderIOSNote() }
             }
         }
-        .contentMargins(.bottom, 24, for: .scrollContent)
-        .navigationTitle("Shared Folders").navigationBarTitleDisplayMode(.large).beamCanvas()
+        .beamList()
+        .overlay {
+            if bridge.folders.isEmpty {
+                if loading { ProgressView("Loading shared folders…") }
+                else {
+                    ContentUnavailableView {
+                        Label("No Shared Folders Yet", systemImage: "folder.badge.person.crop")
+                    } description: {
+                        Text("When a friend shares a folder with you from DropBeam on their computer, accept the invite here — or scan their invite code.")
+                    } actions: {
+                        Button { joining = true; Haptics.tap() } label: { Label("Join with a Code", systemImage: "qrcode.viewfinder") }.beamButton(prominent: true)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Shared Folders").navigationBarTitleDisplayMode(.large)
         .toolbar { ToolbarItem(placement: .topBarTrailing) {
-            Button { joining = true; Haptics.tap() } label: { Image(systemName: "plus").frame(width: 44, height: 44) }.accessibilityLabel("Join a shared folder")
+            Button { joining = true; Haptics.tap() } label: { Image(systemName: "plus") }.accessibilityLabel("Join a shared folder")
         } }
         .task { loading = bridge.folders.isEmpty; defer { loading = false }; await refresh() }
         .refreshable { await refresh() }
@@ -59,11 +60,7 @@ struct JoinFolderSheet: View {
 /// What iOS allows, said once, plainly.
 private struct FolderIOSNote: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("On iPhone", systemImage: "iphone").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
-            Text("Each shared folder is a copy in Files → On My iPhone → DropBeam. Syncing runs while DropBeam is open; iOS pauses it in the background, and changes catch up the next time you open the app. Create new shared folders in DropBeam on a computer.")
-                .font(.footnote).foregroundStyle(.secondary)
-        }.padding(.horizontal, 4)
+        Text("Each shared folder is a copy in Files → On My iPhone → DropBeam. Syncing runs while DropBeam is open; iOS pauses it in the background, and changes catch up the next time you open the app. Create new shared folders in DropBeam on a computer.")
     }
 }
 
@@ -96,25 +93,22 @@ private struct FolderStatusRow: View {
     }
 }
 
-private struct FolderCard: View {
+private struct FolderRow: View {
     let folder: SharedFolder
     var body: some View {
-        GlassCard {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 14) {
-                    FileGlyph(name: "", symbol: "folder.fill")
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(folder.name).font(.headline).foregroundStyle(.primary).lineLimit(2)
-                        Text(peopleLine(folder)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Spacer(minLength: 0)
-                    if folder.paused { Image(systemName: "pause.circle.fill").foregroundStyle(.orange).accessibilityLabel("Paused") }
-                    Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 14) {
+                FileGlyph(name: "", symbol: "folder.fill")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(folder.name).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(2).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
+                    Text(peopleLine(folder)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                 }
-                FolderStatusRow(folder: folder)
-                if folder.busy { ProgressView(value: folder.percent, total: 100).tint(.beam) }
+                Spacer(minLength: 0)
+                if folder.paused { Image(systemName: "pause.circle.fill").foregroundStyle(.orange).accessibilityLabel("Paused") }
             }
-        }.contentShape(Rectangle())
+            FolderStatusRow(folder: folder)
+            if folder.busy { ProgressView(value: folder.percent, total: 100).tint(.beam) }
+        }.padding(.vertical, 4)
     }
 }
 
@@ -132,29 +126,26 @@ struct SharedFolderDetailView: View {
     private var folder: SharedFolder { bridge.folders.first { $0.id == folderID } ?? initial }
     private var megabits: Bool { bridge.settings?.showMegabits == true }
     var body: some View {
-        ScrollView {
-            GlassGroup {
-                VStack(alignment: .leading, spacing: 24) {
-                    header
-                    statusCard
-                    actions
-                    if let verify { verifyCard(verify) }
-                    members
-                    if folder.mirror {
-                        NavigationLink { FolderRecoverableView(folderID: folder.id, pairID: folder.pairId, name: folder.name) } label: {
-                            GlassCard { SettingsLinkLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath") }
-                        }.buttonStyle(.plain)
-                    }
-                    Button(role: .destructive) { leaving = true; Haptics.tap() } label: { Label("Leave Folder", systemImage: "rectangle.portrait.and.arrow.right").frame(maxWidth: .infinity, minHeight: 36) }.beamButton().tint(.red)
-                        .confirmationDialog("Leave \(folder.name)?", isPresented: $leaving, titleVisibility: .visible) {
-                            Button("Leave Folder", role: .destructive) { run("leave") { try await bridge.action("folderLeave", ["folderId": folderID]); bridge.showToast("Left \(folder.name)"); dismiss() } }
-                        } message: { Text("It stops syncing with everyone. Files already on this iPhone stay in Files.") }
-                    Text("Leaving stops syncing on this iPhone and tells the others. Your copy stays in Files.").font(.footnote).foregroundStyle(.secondary)
-                }.padding(20)
+        List {
+            Section { header }.clearRow()
+            Section { actions }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 8, trailing: 20))
+            Section("Status") { statusCard }
+            if let verify { Section { verifyCard(verify) } }
+            members
+            if folder.mirror {
+                Section {
+                    NavigationLink { FolderRecoverableView(folderID: folder.id, pairID: folder.pairId, name: folder.name) } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }
+                }
             }
+            Section {
+                Button("Leave Folder", role: .destructive) { leaving = true; Haptics.warning() }.frame(maxWidth: .infinity)
+            } footer: { Text("Leaving stops syncing on this iPhone and tells the others. Your copy stays in Files.") }
         }
-        .contentMargins(.bottom, 24, for: .scrollContent)
-        .navigationTitle(folder.name).navigationBarTitleDisplayMode(.inline).beamCanvas()
+        .beamList()
+        .navigationTitle(folder.name).navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("Leave \(folder.name)?", isPresented: $leaving, titleVisibility: .visible) {
+            Button("Leave Folder", role: .destructive) { run("leave") { try await bridge.action("folderLeave", ["folderId": folderID]); bridge.showToast("Left \(folder.name)"); dismiss() } }
+        } message: { Text("It stops syncing with everyone. Files already on this iPhone stay in Files.") }
         .onChange(of: bridge.folders.map(\.id)) { _, ids in if !ids.contains(folderID) { dismiss() } }
         .confirmationDialog(removing.map { $0.pending ? "Cancel this invite?" : "Remove \($0.name)?" } ?? "", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible) {
             if let member = removing {
@@ -181,7 +172,7 @@ struct SharedFolderDetailView: View {
             .padding(.horizontal, 10).padding(.vertical, 5).background(tint.opacity(0.12), in: Capsule())
     }
     private var statusCard: some View {
-        GlassCard {
+        Group {
             VStack(alignment: .leading, spacing: 12) {
                 FolderStatusRow(folder: folder)
                 if folder.peerUnshared {
@@ -193,10 +184,10 @@ struct SharedFolderDetailView: View {
                 if folder.busy {
                     HStack(alignment: .firstTextBaseline) {
                         Text("\(Int(folder.percent))%").font(.title3.weight(.bold)).foregroundStyle(.tint)
-                        if let locality = folder.locality, locality != "unknown" { Text(locality == "internet" ? "Relay" : locality.capitalized).font(.caption.weight(.semibold)).foregroundStyle(.secondary) }
+                        if let locality = folder.locality, locality != "unknown" { RouteBadge(label: locality == "internet" ? "Relay" : locality.capitalized) }
                         Spacer()
                         if folder.state == "sending" {
-                            Button { run("stop") { try await bridge.action("folderStop", ["folderId": folderID]) } } label: { Label("Stop", systemImage: "xmark") }.font(.footnote).beamButton()
+                            Button { run("stop") { try await bridge.action("folderStop", ["folderId": folderID]) } } label: { Label("Stop", systemImage: "xmark") }.font(.footnote).beamButton().controlSize(.small)
                         }
                     }
                     ProgressView(value: folder.percent, total: 100).tint(.beam)
@@ -215,13 +206,15 @@ struct SharedFolderDetailView: View {
                     Text("\(s.direction == "send" ? "Sent" : "Received") \(s.files) file\(s.files == 1 ? "" : "s") · \(Formatters.bytes(s.bytes)) · \(Formatters.speed(s.avgBps, megabits: megabits)) avg")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-            }
+            }.padding(.vertical, 4)
         }
     }
     @ViewBuilder private var actions: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 10) { actionButtons }
-            VStack(spacing: 12) { actionButtons }
+        GlassGroup {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 10) { actionButtons }
+                VStack(spacing: 12) { actionButtons }
+            }
         }
     }
     @ViewBuilder private var actionButtons: some View {
@@ -240,12 +233,12 @@ struct SharedFolderDetailView: View {
     }
     private func action(_ label: String, symbol: String, tap: @escaping () -> Void) -> some View {
         Button(action: tap) {
-            VStack(spacing: 8) { Image(systemName: symbol).font(.title2); Text(label).font(.footnote.weight(.semibold)).lineLimit(1) }
-                .frame(maxWidth: .infinity).padding(.vertical, 10)
+            VStack(spacing: 6) { Image(systemName: symbol).font(.title3); Text(label).font(.footnote.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8) }
+                .frame(maxWidth: .infinity, minHeight: 54)
         }.beamButton().disabled(busy != nil)
     }
     private func verifyCard(_ r: FolderVerify) -> some View {
-        GlassCard {
+        Group {
             if !r.peerOnline || !r.compared {
                 Label("Couldn’t compare right now — the others need to be online. Try again when they are.", systemImage: "wifi.exclamationmark").font(.subheadline)
             } else if r.identical {
@@ -255,34 +248,29 @@ struct SharedFolderDetailView: View {
             }
         }
     }
-    private var members: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("People").font(.title2.weight(.semibold))
-            GlassCard {
-                VStack(spacing: 0) {
-                    HStack(spacing: 12) {
-                        MyAvatar(size: 40)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("\(bridge.settings?.displayName ?? "You") (you)").font(.headline)
-                            Text(folder.iAmViewer ? "Viewer" : folder.iAmOwner ? "Owner" : "Editor").font(.footnote).foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 0)
-                    }.frame(minHeight: 52)
-                    ForEach(folder.members) { member in
-                        Divider().padding(.leading, 52)
-                        memberRow(member)
-                    }
+    @ViewBuilder private var members: some View {
+        Section {
+            HStack(spacing: 12) {
+                MyAvatar(size: 40)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(bridge.settings?.displayName ?? "You") (you)").font(.body.weight(.semibold)).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
+                    Text(folder.iAmViewer ? "Viewer" : folder.iAmOwner ? "Owner" : "Editor").font(.footnote).foregroundStyle(.secondary)
                 }
-            }
+                Spacer(minLength: 0)
+            }.padding(.vertical, 2)
+            ForEach(folder.members) { member in memberRow(member) }
+        } header: { Text("People") } footer: {
             if !folder.members.contains(where: \.canSetRole) && folder.members.contains(where: { !$0.pending }) {
-                Text("Only the person who created this folder can change who can edit.").font(.footnote).foregroundStyle(.secondary).padding(.horizontal, 4)
+                Text("Only the person who created this folder can change who can edit.")
             }
-            if !folder.iAmViewer {
+        }
+        if !folder.iAmViewer {
+            Section {
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 10) { inviteButtons }
                     VStack(spacing: 10) { inviteButtons }
                 }
-            }
+            }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20))
         }
     }
     @ViewBuilder private var inviteButtons: some View {
@@ -303,7 +291,7 @@ struct SharedFolderDetailView: View {
                     .background(member.pending ? Color.secondary : Color.beam, in: Circle()).accessibilityHidden(true)
             }
             VStack(alignment: .leading, spacing: 3) {
-                Text(friend?.displayName ?? member.name).font(.headline).foregroundStyle(member.pending ? .secondary : .primary).lineLimit(1)
+                Text(friend?.displayName ?? member.name).font(.body.weight(.semibold)).foregroundStyle(member.pending ? .secondary : .primary).lineLimit(1).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
                 if member.pending { Text("Hasn’t accepted yet").font(.footnote).foregroundStyle(.secondary) }
                 else if member.canSetRole {
                     Picker("Role", selection: Binding(get: { member.viewer }, set: { viewer in
@@ -327,8 +315,9 @@ struct SharedFolderDetailView: View {
                     }
                 }
                 Button(member.pending ? "Cancel Invite" : "Remove from Folder", systemImage: "person.badge.minus", role: .destructive) { removing = member }
-            } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }.accessibilityLabel("Options for \(member.name)")
-        }.frame(minHeight: 60)
+            } label: { Image(systemName: "ellipsis.circle").font(.title3).frame(width: 44, height: 44) }.buttonStyle(.borderless).accessibilityLabel("Options for \(member.name)")
+        }.frame(minHeight: 56)
+        .swipeActions { Button(role: .destructive) { removing = member } label: { Label(member.pending ? "Cancel" : "Remove", systemImage: "person.badge.minus") } }
     }
     private func openInFiles() {
         let path = folder.path
@@ -354,17 +343,18 @@ struct InviteCodeSheet: View {
     @State private var copied = false
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 20) {
-                    Text("Send this to the person you want to invite. They scan or paste it in DropBeam to join \(invite.folderName).").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    QRCodeView(code: invite.code)
-                    Text(invite.code).font(.footnote.monospaced()).textSelection(.enabled).lineLimit(4).multilineTextAlignment(.center)
-                    HStack(spacing: 12) {
-                        Button { UIPasteboard.general.string = invite.code; copied = true; Haptics.tap() } label: { Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
-                        ShareLink(item: invite.code) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
-                    }
-                }.padding(20)
-            }.navigationTitle("Invite to Folder").navigationBarTitleDisplayMode(.inline).beamCanvas()
+            List {
+                Section {
+                    VStack(spacing: 16) {
+                        QRCodeView(code: invite.code, side: 220)
+                        Text(invite.code).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(4).multilineTextAlignment(.center)
+                        HStack(spacing: 12) {
+                            Button { UIPasteboard.general.string = invite.code; copied = true; Haptics.success() } label: { Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc").frame(maxWidth: .infinity, minHeight: 32) }.beamButton()
+                            ShareLink(item: invite.code) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity, minHeight: 32) }.beamButton(prominent: true)
+                        }
+                    }.frame(maxWidth: .infinity).padding(.vertical, 12)
+                } footer: { Text("Send this to the person you want to invite. They scan or paste it in DropBeam to join \(invite.folderName).") }
+            }.beamList().navigationTitle("Invite to Folder").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }.tint(.beam)
     }
@@ -384,29 +374,26 @@ struct InviteFriendsSheet: View {
     }
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("They’ll get a prompt to join \(folder.name) and choose where to keep it.").font(.subheadline).foregroundStyle(.secondary)
-                    if candidates.isEmpty {
-                        BeamEmpty(symbol: "person.2", title: "Everyone’s already here.", detail: "Add more friends from the Friends tab, or share an invite code instead.")
-                    }
+            List {
+                if let error { Section { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) } }
+                Section {
                     ForEach(candidates) { friend in
                         Button { invite(friend) } label: {
-                            GlassCard {
-                                HStack(spacing: 14) {
-                                    ContactAvatar(friend: friend)
-                                    VStack(alignment: .leading, spacing: 5) { Text(friend.displayName).font(.headline).foregroundStyle(.primary); PresenceLabel(online: bridge.presence[friend.id] == true) }
-                                    Spacer()
-                                    if sending == friend.id { ProgressView() }
-                                    else if sent.contains(friend.id) { Label("Invited", systemImage: "checkmark").font(.footnote.weight(.semibold)).foregroundStyle(.green) }
-                                    else { Image(systemName: "paperplane").foregroundStyle(.tint) }
-                                }
-                            }
+                            HStack(spacing: 14) {
+                                ContactAvatar(friend: friend, size: 42)
+                                VStack(alignment: .leading, spacing: 2) { Text(friend.displayName).font(.body.weight(.semibold)).foregroundStyle(.primary).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }; PresenceLabel(online: bridge.presence[friend.id] == true) }
+                                Spacer()
+                                if sending == friend.id { ProgressView() }
+                                else if sent.contains(friend.id) { Label("Invited", systemImage: "checkmark").font(.footnote.weight(.semibold)).foregroundStyle(.green) }
+                                else { Image(systemName: "paperplane.fill").foregroundStyle(.tint) }
+                            }.contentShape(Rectangle())
                         }.buttonStyle(.plain).disabled(sending != nil || sent.contains(friend.id))
                     }
-                    if let error { Text(error).foregroundStyle(.red).font(.subheadline) }
-                }.padding(20)
-            }.navigationTitle("Invite a Friend").navigationBarTitleDisplayMode(.inline).beamCanvas()
+                } footer: { Text("They’ll get a prompt to join \(folder.name) and choose where to keep it.") }
+            }
+            .beamList()
+            .overlay { if candidates.isEmpty { ContentUnavailableView("Everyone’s Already Here", systemImage: "person.2", description: Text("Add more friends from the Friends tab, or share an invite code instead.")) } }
+            .navigationTitle("Invite a Friend").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }.tint(.beam)
     }
@@ -431,36 +418,35 @@ struct FolderRecoverableView: View {
     @State private var error: String?
     @State private var deleting: RecoveryItem?
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                if let error { BeamError(message: error) { Task { await load() } } }
-                if loading && items.isEmpty { ProgressView().frame(maxWidth: .infinity).padding(.vertical, 24) }
-                else if items.isEmpty && error == nil { BeamEmpty(symbol: "clock.arrow.circlepath", title: "Nothing to recover.", detail: "When a file in \(name) is deleted or replaced, a copy waits here so you can bring it back.") }
-                if !items.isEmpty {
-                    GlassCard {
-                        VStack(spacing: 0) {
-                            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                                if index > 0 { Divider().padding(.leading, 56) }
-                                HStack(spacing: 12) {
-                                    FileGlyph(name: item.relPath)
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text((item.relPath as NSString).lastPathComponent).font(.headline).lineLimit(1)
-                                        Text("\(Formatters.bytes(item.size)) · \(item.date.formatted(.relative(presentation: .named)))").font(.subheadline).foregroundStyle(.secondary)
-                                    }
-                                    Spacer(minLength: 0)
-                                    Menu {
-                                        Button("Restore", systemImage: "arrow.uturn.backward") { mutate("recoverableRestore", item) }
-                                        Button("Delete Forever", systemImage: "trash", role: .destructive) { deleting = item }
-                                    } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }.accessibilityLabel("Options for \(item.relPath)")
-                                }.frame(minHeight: 56)
+        List {
+            if !items.isEmpty {
+                Section {
+                    ForEach(items) { item in
+                        HStack(spacing: 14) {
+                            FileGlyph(name: item.relPath)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text((item.relPath as NSString).lastPathComponent).font(.body.weight(.semibold)).lineLimit(1).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
+                                Text("\(Formatters.bytes(item.size)) · \(item.date.formatted(.relative(presentation: .named)))").font(.subheadline).foregroundStyle(.secondary)
                             }
+                            Spacer(minLength: 0)
+                            Menu {
+                                Button("Restore", systemImage: "arrow.uturn.backward") { mutate("recoverableRestore", item) }
+                                Button("Delete Forever", systemImage: "trash", role: .destructive) { deleting = item }
+                            } label: { Image(systemName: "ellipsis.circle").font(.title3).frame(width: 44, height: 44) }.buttonStyle(.borderless).accessibilityLabel("Options for \(item.relPath)")
                         }
+                        .swipeActions(edge: .leading) { Button { mutate("recoverableRestore", item) } label: { Label("Restore", systemImage: "arrow.uturn.backward") }.tint(.green) }
+                        .swipeActions(edge: .trailing) { Button(role: .destructive) { deleting = item } label: { Label("Delete", systemImage: "trash") } }
                     }
                 }
-            }.padding(20)
+            }
         }
-        .contentMargins(.bottom, 24, for: .scrollContent)
-        .navigationTitle("Recoverable Files").navigationBarTitleDisplayMode(.inline).beamCanvas()
+        .beamList()
+        .overlay {
+            if let error, items.isEmpty { BeamError(message: error) { Task { await load() } } }
+            else if loading && items.isEmpty { ProgressView() }
+            else if items.isEmpty { ContentUnavailableView("Nothing to Recover", systemImage: "clock.arrow.circlepath", description: Text("When a file in \(name) is deleted or replaced, a copy waits here so you can bring it back.")) }
+        }
+        .navigationTitle("Recoverable Files").navigationBarTitleDisplayMode(.inline)
         .task { await load() }
         .refreshable { await load() }
         .onReceive(NotificationCenter.default.publisher(for: .init("DropBeam.folder-history://changed"))) { _ in Task { await load() } }

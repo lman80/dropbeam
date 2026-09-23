@@ -4,6 +4,15 @@ import WebKit
 import Tauri
 
 class NativeUIPlugin: Plugin {
+    static let diagnosticsKey = "dropbeam.shareDiagnostics"
+    /// TestFlight, simulator and debug builds (not App Store installs).
+    static var isTestBuild: Bool {
+        #if DEBUG || targetEnvironment(simulator)
+        return true
+        #else
+        return Bundle.main.appStoreReceiptURL?.lastPathComponent == "sandboxReceipt"
+        #endif
+    }
     private weak var webview: WKWebView?
     private static var feedbackStarted = false
     private var host: UIHostingController<AnyView>?
@@ -41,13 +50,21 @@ class NativeUIPlugin: Plugin {
             webview.accessibilityElementsHidden = true
             if !Self.feedbackStarted {
                 Self.feedbackStarted = true
-                SuperFeedback.configure(.init(
+                var feedback = SuperFeedback.Config(
                     backendURL: URL(string: "https://superfeedback.ashton-mcp-worker.workers.dev")!,
                     repo: "lman80/dropbeam", app: "DropBeam", trigger: .draggable,
-                    position: .rightCenter, captureLogs: false, captureCrashes: true,
+                    position: .rightCenter, accent: .beam, captureLogs: false,
+                    // Crash reports follow Settings → Diagnostics → Share Diagnostics (opt-out).
+                    captureCrashes: UserDefaults.standard.object(forKey: Self.diagnosticsKey) as? Bool ?? true,
                     meta: ["version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
                            "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""]
-                ))
+                )
+                // The floating button is a tester tool: on by default in TestFlight/dev
+                // builds, off for App Store users (Settings → Send Feedback always works).
+                feedback.defaultEnabled = Self.isTestBuild
+                feedback.dockedToEdge = true
+                feedback.reservedInsets = UIEdgeInsets(top: 44, left: 0, bottom: 64, right: 0) // nav bar + tab bar
+                SuperFeedback.configure(feedback)
                 SuperFeedback.setContext(["screen": Bridge.shared.selectedTab])
                 SuperFeedback.start()
             }

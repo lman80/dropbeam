@@ -46,31 +46,29 @@ targets:
         UIStatusBarStyle: UIStatusBarStyleDefault
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
+        # iPhone-only, portrait (TARGETED_DEVICE_FAMILY 1): every screen is designed
+        # and App Store screenshots are taken in portrait.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
-        UISupportedInterfaceOrientations~ipad:
-          - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationPortraitUpsideDown
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 0.46.0
-        CFBundleVersion: "0.46.0"
+        CFBundleDisplayName: DropBeam
+        CFBundleShortVersionString: 0.52.2
+        CFBundleVersion: "0.52.2"
         # --- DropBeam additions (mirrored into app_iOS/Info.plist) ---
         # iroh's mDNS peer discovery advertises/browses `_irohv1._udp` (see
         # iroh::address_lookup::mdns N0_SERVICE_NAME). Without BOTH of these iOS
         # silently drops every multicast packet and LAN peers never appear.
-        NSLocalNetworkUsageDescription: DropBeam looks for your other devices on this Wi-Fi network so files transfer directly between them, instead of going out over the internet.
+        NSLocalNetworkUsageDescription: DropBeam looks for your devices and friends on this network so files go straight between them at full speed, without the internet.
         NSBonjourServices:
           - _irohv1._udp
-        NSCameraUsageDescription: DropBeam uses the camera to scan friend, device, and shared-folder QR codes.
-        NSPhotoLibraryAddUsageDescription: DropBeam saves photos you choose to keep from a chat to your library.
+        NSCameraUsageDescription: DropBeam uses the camera only to scan QR codes for adding friends, linking your devices and joining shared folders.
+        NSPhotoLibraryAddUsageDescription: DropBeam saves photos and videos you choose to keep to your photo library.
         # Received files land in the app's Documents dir; these two make that
         # directory visible in the Files app (On My iPhone -> DropBeam).
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        ITSAppUsesNonExemptEncryption: false
+        # DropBeam's own E2E crypto (iroh/rustls) isn't Apple-OS crypto → not exempt.
+        # See docs/APPSTORE.md → Export compliance.
+        ITSAppUsesNonExemptEncryption: true
     entitlements:
       path: app_iOS/app_iOS.entitlements
     scheme:

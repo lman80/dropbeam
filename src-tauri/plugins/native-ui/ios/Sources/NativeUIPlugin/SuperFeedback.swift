@@ -30,6 +30,13 @@ public enum SuperFeedback {
         public var captureLogs = true
         public var captureCrashes = true
         public var meta: [String: String] = [:]
+        /// Whether the floating button shows before the user has chosen in Settings.
+        public var defaultEnabled = true
+        /// Extra room the trigger keeps clear of (e.g. a tab bar), on top of the safe area.
+        public var reservedInsets: UIEdgeInsets = .zero
+        /// Rest the trigger half-tucked into the screen edge so it never sits over
+        /// row controls (chevrons, switches); it slides fully out while touched.
+        public var dockedToEdge = false
 
         public init(backendURL: URL, repo: String, app: String, appKey: String = "",
                     trigger: Trigger = .draggable, position: Position? = nil,
@@ -153,7 +160,24 @@ public enum SuperFeedback {
     }
 
     public static var isEnabled: Bool {
-        UserDefaults.standard.object(forKey: "superfeedback.enabled") as? Bool ?? true
+        UserDefaults.standard.object(forKey: "superfeedback.enabled") as? Bool ?? (config?.defaultEnabled ?? true)
+    }
+
+    /// Temporarily hide the trigger (e.g. on a screen whose edge holds fixed controls).
+    public static func setSuppressed(_ suppressed: Bool) {
+        for state in scenes.values where state.suppressed != suppressed {
+            state.suppressed = suppressed
+            if suppressed { state.buttonFrame = .zero }
+        }
+        suppressedByApp = suppressed
+    }
+    private static var suppressedByApp = false
+
+    /// Turn automatic crash reports on or off at runtime (follows the app's diagnostics opt-out).
+    public static func setCrashReportingEnabled(_ on: Bool) {
+        guard var current = config, current.captureCrashes != on else { return }
+        current.captureCrashes = on
+        configure(current)
     }
 
     public static func setEnabled(_ on: Bool) {
@@ -169,6 +193,7 @@ public enum SuperFeedback {
         let id = ObjectIdentifier(scene)
         guard scenes[id] == nil, let config else { return }
         let state = SFSceneState(scene: scene, config: config)
+        state.suppressed = suppressedByApp
         scenes[id] = state
         let window = SFOverlayWindow(windowScene: scene)
         window.state = state
@@ -387,6 +412,9 @@ fileprivate final class SFSceneState: ObservableObject {
     weak var previousKeyWindow: UIWindow?
     @Published var config: SuperFeedback.Config
     @Published var enabled = SuperFeedback.isEnabled
+    @Published var suppressed = false
+    @Published var keyboardVisible = false
+    private var keyboardObservers: [NSObjectProtocol] = []
     @Published var isPresented = false
     @Published var toast: String?
     @Published var message = ""
@@ -412,10 +440,20 @@ fileprivate final class SFSceneState: ObservableObject {
 
     init(scene: UIWindowScene, config: SuperFeedback.Config) {
         self.scene = scene; self.config = config
+        // The keyboard usually brings a text field + send button to the screen edge.
+        for (name, visible) in [(UIResponder.keyboardWillShowNotification, true), (UIResponder.keyboardWillHideNotification, false)] {
+            keyboardObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, !self.isPresented else { return }
+                    self.keyboardVisible = visible
+                    if visible { self.buttonFrame = .zero }
+                }
+            })
+        }
     }
 
     var accent: Color { config.accent ?? Color(red: 109 / 255, green: 94 / 255, blue: 252 / 255) }
-    var showsButton: Bool { enabled && config.trigger != .none && !isPresented && !sheetClosing }
+    var showsButton: Bool { enabled && !suppressed && !keyboardVisible && config.trigger != .none && !isPresented && !sheetClosing }
 
     func present() {
         guard !isPresented, !sheetClosing, let scene else { return }
@@ -499,6 +537,8 @@ fileprivate final class SFSceneState: ObservableObject {
 
     func tearDown() {
         toastTask?.cancel()
+        keyboardObservers.forEach(NotificationCenter.default.removeObserver)
+        keyboardObservers = []
         window?.isHidden = true
         window?.rootViewController = nil
         window = nil
@@ -616,7 +656,11 @@ private struct SFOverlayView: View {
         let position = state.config.trigger == .draggable
             ? (resting ?? SFButtonPosition(position: configuredPosition))
             : SFButtonPosition(position: configuredPosition)
-        let center = draggedCenter.map { clamp($0, to: bounds) } ?? position.center(in: bounds)
+        var center = draggedCenter.map { clamp($0, to: bounds) } ?? position.center(in: bounds)
+        if state.config.dockedToEdge && draggedCenter == nil && !pressed {
+            // Tuck about half the button past the edge while resting.
+            center.x += (position.side == "left" ? -1 : 1) * 30
+        }
         return Image(systemName: "bubble.left.and.bubble.right.fill")
             .font(.system(size: 17, weight: .semibold)).foregroundStyle(Color.primary.opacity(0.8))
             .frame(width: 40, height: 40)
@@ -659,6 +703,7 @@ private struct SFOverlayView: View {
                     }
                 })
             .position(center)
+            .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: pressed)
             .sfOnChange(of: pressed) { value in
                 if !value {
                     // Let onEnded use the latched movement threshold before clearing a cancelled gesture.
@@ -673,7 +718,8 @@ private struct SFOverlayView: View {
 
     private func resetDrag() { dragOrigin = nil; draggedCenter = nil; dragging = false }
     private func movementBounds(_ geometry: GeometryProxy) -> CGRect {
-        let insets = state.safeAreaInsets
+        let safe = state.safeAreaInsets, extra = state.config.reservedInsets
+        let insets = UIEdgeInsets(top: safe.top + extra.top, left: safe.left + extra.left, bottom: safe.bottom + extra.bottom, right: safe.right + extra.right)
         // 20pt radius plus the existing 12pt edge gap.
         let left = min(geometry.size.width / 2, insets.left + 32)
         let top = min(geometry.size.height / 2, insets.top + 32)
