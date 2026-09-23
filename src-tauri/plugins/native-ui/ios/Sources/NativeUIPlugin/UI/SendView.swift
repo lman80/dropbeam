@@ -155,7 +155,11 @@ struct TransferCard: View {
                 }
                 if transfer.state == "failed" || transfer.state == "paused" {
                     if let error = transfer.error { Text(error).font(.footnote).foregroundStyle(.secondary) }
-                    Button { bridge.perform { try await bridge.retryTransfer(id: transfer.id) } } label: { Label("Retry", systemImage: "arrow.clockwise") }.beamButton(prominent: true)
+                    // Only a send (original paths kept) or a code receive (ticket kept) can be
+                    // replayed; a friend's incoming offer has neither, so Retry would be a dead end.
+                    if transfer.direction == "send" || transfer.code?.isEmpty == false {
+                        Button { bridge.perform { try await bridge.retryTransfer(id: transfer.id) } } label: { Label(transfer.state == "paused" ? "Resume" : "Retry", systemImage: "arrow.clockwise") }.beamButton(prominent: true)
+                    }
                 }
             }
         }
