@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Dialog } from './Dialog'
 import {
   AlertTriangle, ArrowRight, Check, Clock, FolderOpen, FolderSync, HardDrive,
-  Pause, Play, Plus, RefreshCw, Trash2, Upload, X,
+  Pause, Play, Plus, RefreshCw, Trash2, Upload,
 } from 'lucide-react'
 import {
   api, syncedFoldersApi, onSyncedFolderStatus,
@@ -179,13 +180,16 @@ function SyncSheet({ shared, onClose, onDone }: { shared: SharedByFriend; onClos
     } catch (e) { toast('error', String(e)); setBusy(false) }
   }
 
-  return <div className="location-modal location-sync-sheet" role="dialog" aria-modal="true" aria-label="Sync a folder to a location"
-    onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-    <div className="card">
-      <div className="location-sheet-head">
-        <h2><FolderSync size={18} /> Sync a folder</h2>
-        <button className="btn btn-ghost" onClick={onClose} aria-label="Close"><X size={16} /></button>
-      </div>
+  const footer = step === 1
+    ? <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+    : step === 2
+      ? <><button className="btn btn-ghost" onClick={() => setStep(1)}>Back</button>
+        <button className="btn btn-primary" disabled={!choice} onClick={() => setStep(3)}>Next<ArrowRight size={15} /></button></>
+      : <><button className="btn btn-ghost" disabled={busy} onClick={() => setStep(2)}>Back</button>
+        <button className="btn btn-primary" disabled={busy || !choice} onClick={() => void save()}>
+          {busy ? 'Setting it up…' : 'Start syncing'}</button></>
+  return <Dialog title="Sync a folder" subtitle="Keep a folder on this device copied to a friend’s location."
+    icon={<FolderSync size={18} />} width={470} onClose={onClose} busy={busy} className="location-sync-dialog" footer={footer}>
       <ol className="location-steps">
         {['Choose the folder', 'Choose where it goes', 'Check it over'].map((label, i) => (
           <li key={label} className={step === i + 1 ? 'now' : step > i + 1 ? 'done' : ''}>
@@ -211,13 +215,9 @@ function SyncSheet({ shared, onClose, onDone }: { shared: SharedByFriend; onClos
             {choice?.locationId === o.locationId && choice?.friendId === o.friendId && <Check size={15} />}
           </button>
         ))}</div>
-        <label>Folder to put them in
-          <input value={relPath} onChange={e => setRelPath(e.target.value)} placeholder="Leave empty for the top level" />
+        <label className="field-label">Folder to put them in
+          <input className="input" style={{ marginTop: 6 }} value={relPath} onChange={e => setRelPath(e.target.value)} placeholder="Leave empty for the top level" />
         </label>
-        <div className="dialog-actions">
-          <button className="btn btn-ghost" onClick={() => setStep(1)}>Back</button>
-          <button className="btn btn-primary" disabled={!choice} onClick={() => setStep(3)}>Next<ArrowRight size={15} /></button>
-        </div>
       </div>}
 
       {step === 3 && choice && <div className="location-step">
@@ -231,12 +231,6 @@ function SyncSheet({ shared, onClose, onDone }: { shared: SharedByFriend; onClos
               <small className="location-muted"> — the copy goes to {choice.name}’s trash, where it can still be recovered.</small></span>
           </label>
         </details>
-        <div className="dialog-actions">
-          <button className="btn btn-ghost" onClick={() => setStep(2)}>Back</button>
-          <button className="btn btn-primary" disabled={busy} onClick={() => void save()}>
-            {busy ? 'Setting it up…' : 'Start syncing'}</button>
-        </div>
       </div>}
-    </div>
-  </div>
+  </Dialog>
 }

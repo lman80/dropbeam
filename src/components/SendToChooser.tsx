@@ -8,8 +8,9 @@ import { groupDevices } from '../lib/deviceIcons'
 import { DeviceBadge } from './DeviceBadge'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
-import { ChevronRight, QrCode, Users, X } from 'lucide-react'
+import { AnimatePresence } from 'framer-motion'
+import { ChevronRight, QrCode, Send, Users } from 'lucide-react'
+import { Dialog } from './Dialog'
 import { useStore } from '../store'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from './FriendAvatar'
@@ -66,136 +67,61 @@ export function SendToChooser() {
   return (
     <AnimatePresence>
       {open && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onClick={close}
-          className="dialog-overlay"
-          style={MOBILE_UI ? undefined : {
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(8, 9, 14, 0.5)',
-            backdropFilter: 'blur(4px)',
-            display: 'grid',
-            placeItems: 'center',
-            zIndex: 200,
-            padding: 20,
-          }}
-        >
-          <motion.div
-            initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96, y: 8 }}
-            animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
-            exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.97 }}
-            transition={{ type: 'spring', stiffness: 320, damping: 28 }}
-            onClick={(e) => e.stopPropagation()}
-            className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
-            style={MOBILE_UI ? undefined : { width: 440, maxWidth: '100%', padding: 22, borderRadius: 20, display: 'flex', flexDirection: 'column' }}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-              <div style={{ fontWeight: 750, fontSize: 'calc(16.5px * var(--ui-font-scale, 1))', minWidth: 0 }}>
-                Send{' '}
-                {/* inline-block + max-width, or the ellipsis never applies and a long
-                    name (a macOS screenshot) spills over the close button. */}
-                <span style={{ color: 'var(--accent)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-block', maxWidth: 'calc(100% - 5.5em)', verticalAlign: 'bottom' }}>
-                  {title}
-                </span>{' '}
-                to…
+        <Dialog
+          title="Send to…"
+          subtitle={<span className="truncate-1" style={{ display: 'block' }} title={files?.join('\n')}>{title}</span>}
+          icon={<Send size={17} />}
+          onClose={close}
+          bodyStyle={{ display: 'flex', flexDirection: 'column', gap: 2, margin: '0 -8px', padding: '0 8px' }}
+          footer={
+            <button className="chooser-row" onClick={withCode} style={{ margin: '0 -8px' }}>
+              <span className="chooser-icon"><QrCode size={18} /></span>
+              <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+                <div className="chooser-name">Share with a code or QR</div>
+                <div className="chooser-sub">For anyone — they scan the QR or paste the code</div>
               </div>
-              <button className="icon-btn" onClick={close}>
-                <X size={17} />
-              </button>
-            </div>
-
-            <div className="dialog-body" style={{ overflowY: 'auto', marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {friends.length === 0 ? (
-                <button
-                  className="btn btn-ghost"
-                  style={{ width: '100%', justifyContent: 'flex-start', padding: '12px 14px' }}
-                  onClick={() => {
-                    close()
-                    setView('friends')
-                  }}
-                >
-                  <Users size={16} /> Add a friend to send by name
-                </button>
-              ) : (
-                [ { title: 'My devices', items: myDevices }, { title: 'Friends', items: others } ].filter(group => group.items.length).map(group => <Fragment key={group.title}><h3>{group.title}</h3>{group.items.map((f) => {
-                  const online = friendOnlineState(f.name, friendSeen, folderStatuses)
-                  return (
-                    <button key={f.id} className="chooser-row" onClick={() => toFriend(f.id)}>
-                      <span
-                        style={{
-                          position: 'relative',
-                          width: 34,
-                          height: 34,
-                          borderRadius: 999,
-                          display: 'grid',
-                          placeItems: 'center',
-                          color: 'white',
-                          fontWeight: 700,
-                          fontSize: 'calc(12px * var(--ui-font-scale, 1))',
-                          flexShrink: 0,
-                          background: avatarGradient(f.id),
-                        }}
-                      >
-                        <FriendAvatar friend={f} /><DeviceBadge kind={f.deviceKind} />
-                        <span
-                          title={online ? 'Online' : 'Status unknown'}
-                          style={{
-                            position: 'absolute',
-                            right: -1,
-                            top: -1,
-                            width: 11,
-                            height: 11,
-                            borderRadius: 999,
-                            background: online ? 'var(--green)' : 'var(--text-faint)',
-                            border: '2.5px solid var(--surface)',
-                          }}
-                        />
-                      </span>
-                      <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-                        <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 650 }}>{f.name}</div>
-                        <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: online ? 'var(--green)' : 'var(--text-faint)' }}>
-                          {/* Honest: friend file sends retry ~90s then fail — there is
-                              no store-and-forward for files (chat messages DO queue). */}
-                          {online ? 'Online now' : 'Offline — a send keeps trying for ~2 minutes'}
-                        </div>
-                      </div>
-                      <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
-                    </button>
-                  )
-                })}</Fragment>)
-              )}
-            </div>
-
-            <div className="dialog-actions" style={{ borderTop: '1px solid var(--border)', marginTop: 12, paddingTop: 12 }}>
-              <button className="chooser-row" onClick={withCode}>
-                <span
-                  style={{
-                    width: 34,
-                    height: 34,
-                    borderRadius: 11,
-                    display: 'grid',
-                    placeItems: 'center',
-                    color: 'var(--accent)',
-                    background: 'var(--accent-soft)',
-                    flexShrink: 0,
-                  }}
-                >
-                  <QrCode size={18} />
-                </span>
-                <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-                  <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 650 }}>Share with a code or QR</div>
-                  <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)' }}>
-                    For anyone — they scan the QR or paste the code
+              <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
+            </button>
+          }
+        >
+          {friends.length === 0 ? (
+            <button
+              className="card empty-row"
+              onClick={() => {
+                close()
+                setView('friends')
+              }}
+            >
+              <span className="empty-row-icon"><Users size={16} /></span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span className="empty-row-title">Add a friend to send by name</span>
+                <span className="empty-row-sub">Friends get files in one click — no codes.</span>
+              </span>
+              <ChevronRight size={16} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
+            </button>
+          ) : (
+            [ { title: 'My devices', items: myDevices }, { title: 'Friends', items: others } ].filter(group => group.items.length).map((group, gi) => <Fragment key={group.title}><h3 className="section-title" style={{ margin: gi ? '12px 8px 4px' : '2px 8px 4px' }}>{group.title}</h3>{group.items.map((f) => {
+              const online = friendOnlineState(f.name, friendSeen, folderStatuses)
+              return (
+                <button key={f.id} className="chooser-row" onClick={() => toFriend(f.id)}>
+                  <span className="chooser-avatar" style={{ background: avatarGradient(f.id) }}>
+                    <FriendAvatar friend={f} /><DeviceBadge kind={f.deviceKind} />
+                    <span className={`presence-dot${online ? ' online' : ''}`} title={online ? 'Online' : 'Status unknown'} />
+                  </span>
+                  <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+                    <div className="chooser-name truncate-1">{f.name}</div>
+                    <div className="chooser-sub" style={{ color: online ? 'var(--green)' : undefined }}>
+                      {/* Honest: friend file sends retry ~90s then fail — there is
+                          no store-and-forward for files (chat messages DO queue). */}
+                      {online ? 'Online now' : 'Offline — a send keeps trying for ~2 minutes'}
+                    </div>
                   </div>
-                </div>
-                <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
-              </button>
-            </div>
-          </motion.div>
-        </motion.div>
+                  <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
+                </button>
+              )
+            })}</Fragment>)
+          )}
+        </Dialog>
       )}
     </AnimatePresence>
   )

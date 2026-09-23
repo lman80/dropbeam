@@ -6,12 +6,13 @@
 //   <ScanCodeButton onCode=… />— opens the camera scanner (with screenshot / paste
 //                              fallbacks) for every ENTERED code; values are
 //                              normalized exactly like pasted ones (lib/codes).
-import { useEffect, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { QRCodeSVG } from 'qrcode.react'
 import { Check, Copy, Maximize2, QrCode, Smartphone, X } from 'lucide-react'
 import { CODE_LABEL, parseCode, qrSpec, wrongCodeMessage, type CodeKind, type ParsedCode } from '../lib/codes'
 import { QrScanner } from './QrScanner'
+import { useEscape } from './Dialog'
 import { useStore } from '../store'
 
 const FG = '#0b0c12'
@@ -47,11 +48,7 @@ export function QrCodeView({ value, size: base = 200, hint = QR_HINT, label, enl
 }
 
 function QrEnlarged({ value, level, name, onClose }: { value: string; level: 'L' | 'M'; name: string; onClose: () => void }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); onClose() } }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  useEscape(onClose)
   return createPortal(
     <div className="dialog-overlay qr-overlay qr-enlarged-overlay" onClick={onClose}>
       <div className="qr-enlarged" role="dialog" aria-modal="true" aria-label={name} onClick={(e) => e.stopPropagation()}>
@@ -106,7 +103,7 @@ export function ShareCode({ code, instructions, footer, layout = 'row', size = 2
  *  field uses; a different DropBeam code goes to `onOther` (e.g. the universal
  *  router) or, without one, gets a clear "that's X — use it in Y" message and
  *  the scanner keeps looking. `onCode` gets the NORMALIZED code. */
-export function ScanCodeButton({ onCode, accept, onOther, hint, title, label = 'Scan QR code', className = 'btn btn-ghost', iconOnly = false, disabled, style }: {
+export function ScanCodeButton({ onCode, accept, onOther, hint, title, label = 'Scan QR code', className, small = false, iconOnly = false, disabled, style }: {
   onCode: (code: string, parsed: ParsedCode) => void
   accept: readonly CodeKind[]
   onOther?: (parsed: ParsedCode) => void
@@ -114,6 +111,8 @@ export function ScanCodeButton({ onCode, accept, onOther, hint, title, label = '
   title?: string
   label?: string
   className?: string
+  /** Compact (btn-sm) ghost button. */
+  small?: boolean
   iconOnly?: boolean
   disabled?: boolean
   style?: React.CSSProperties
@@ -126,8 +125,8 @@ export function ScanCodeButton({ onCode, accept, onOther, hint, title, label = '
   }
   return (
     <>
-      <button type="button" className={className} disabled={disabled} onClick={() => setOpen(true)} aria-label={label} title={iconOnly ? label : undefined} style={style}>
-        <QrCode size={15} />{!iconOnly && label}
+      <button type="button" className={className ?? (small ? 'btn btn-ghost btn-sm' : 'btn btn-ghost')} disabled={disabled} onClick={() => setOpen(true)} aria-label={label} title={iconOnly ? label : undefined} style={style}>
+        <QrCode size={small ? 14 : 15} />{!iconOnly && label}
       </button>
       {open && (
         <QrScanner

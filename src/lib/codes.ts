@@ -83,12 +83,14 @@ export const CODE_LABEL: Record<CodeKind, string> = {
 }
 
 /** Where each kind of code is used — for "that's X, use it in Y" messages. */
+/** Where each kind of code goes, worded for every platform (desktop and the
+ *  iPhone app name these screens slightly differently, so say what it's FOR). */
 const CODE_HOME: Record<CodeKind, string> = {
-  receive: 'Send & Receive → “Have a code?”',
-  friend: 'Friends → Add friend',
-  friendInvite: 'Friends → Add friend',
-  folderInvite: 'Shared Folders → Accept invite',
-  deviceLink: 'Settings → Devices',
+  receive: 'to receive files (“Have a code?” on Send & Receive)',
+  friend: 'to add a friend (Friends → Add friend)',
+  friendInvite: 'to add a friend (Friends → Add friend)',
+  folderInvite: 'to join a shared folder',
+  deviceLink: 'to link a device (Settings → Devices)',
 }
 
 /** Clear message for a code that isn't what this field takes (or isn't a
@@ -97,7 +99,7 @@ export function wrongCodeMessage(expected: readonly CodeKind[], got: ParsedCode 
   const want = expected.map((k) => CODE_LABEL[k].replace(/^an? /, '')).filter((v, i, a) => a.indexOf(v) === i).join(' or ')
   if (!got) return `That isn’t a DropBeam code. Scan or paste the ${want} exactly as it was shared.`
   const label = CODE_LABEL[got.kind]
-  return `That’s ${label}, not ${/^[aeiou]/i.test(want) ? 'an' : 'a'} ${want}. Use it in ${CODE_HOME[got.kind]}.`
+  return `That’s ${label}, not ${/^[aeiou]/i.test(want) ? 'an' : 'a'} ${want}. Use it ${CODE_HOME[got.kind]}.`
 }
 
 /** What a GENERIC code field (e.g. "Have a code? Receive files") does with a

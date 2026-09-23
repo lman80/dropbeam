@@ -153,8 +153,8 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, scale: 0.97, transition: { duration: 0.15 } }}
       transition={{ type: 'spring', stiffness: 320, damping: 28 }}
-      className="card"
-      style={{ padding: 13, overflow: 'hidden' }}
+      className="card xfer-card"
+      style={{ padding: 14, overflow: 'hidden' }}
     >
       {/* header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -162,7 +162,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           style={{
             width: 30,
             height: 30,
-            borderRadius: 9,
+            borderRadius: 'var(--radius-sm)',
             display: 'grid',
             placeItems: 'center',
             flexShrink: 0,
@@ -185,16 +185,17 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             className="selectable"
             style={{
               fontWeight: 650,
-              fontSize: 'calc(13.5px * var(--ui-font-scale, 1))',
+              fontSize: 'var(--font-base)',
               whiteSpace: 'nowrap',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
             }}
+            title={t.fileNames.join('\n') || undefined}
           >
             {title(t)}
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 3 }}>
-            <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>{statusLabel(t)}{t.locationSkipped ? ` · ${t.locationSkipped} ${t.locationSkipped === 1 ? 'file' : 'files'} already there` : ''}{t.locationConflicts ? ` · ${t.locationConflicts} ${t.locationConflicts === 1 ? 'file' : 'files'} already existed with different content — saved next to them as ‘… (2)’` : ''}{t.locationReplaced ? ` · ${t.locationReplaced} ${t.locationReplaced === 1 ? 'file' : 'files'} updated — the older version is in the folder’s Trash` : ''}</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '2px 8px', marginTop: 3, flexWrap: 'wrap', minWidth: 0 }}>
+            <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', minWidth: 0, overflowWrap: 'anywhere' }}>{statusLabel(t)}{t.locationSkipped ? ` · ${t.locationSkipped} ${t.locationSkipped === 1 ? 'file' : 'files'} already there` : ''}{t.locationConflicts ? ` · ${t.locationConflicts} ${t.locationConflicts === 1 ? 'file' : 'files'} already existed with different content — saved next to them as ‘… (2)’` : ''}{t.locationReplaced ? ` · ${t.locationReplaced} ${t.locationReplaced === 1 ? 'file' : 'files'} updated — the older version is in the folder’s Trash` : ''}</span>
             {t.connDetail ? (
               <ConnInspector detail={t.connDetail} compact />
             ) : (
@@ -206,6 +207,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           <button
             className="icon-btn"
             title="Pause — keeps what's already been sent"
+            aria-label="Pause"
             onClick={() => void api.pauseTransfer(t.id)}
           >
             <Pause size={15} />
@@ -214,6 +216,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
         <button
           className="icon-btn"
           title={isOffer ? 'Decline' : active ? 'Cancel' : 'Dismiss'}
+          aria-label={isOffer ? 'Decline' : active ? 'Cancel' : 'Dismiss'}
           onClick={() =>
             isOffer
               ? respondToOffer(t.id, false)
@@ -235,7 +238,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           <Loader2 size={14} className="spin" />
           <span style={{ flex: 1, minWidth: 0 }}>{t.detail}</span>
           {t.state === 'waitingForPeer' && (
-            <button className="btn btn-ghost" onClick={() => void api.forceRelay(t.id)}>
+            <button className="btn btn-ghost btn-sm" onClick={() => void api.forceRelay(t.id)}>
               Send over relay anyway
             </button>
           )}
@@ -245,7 +248,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
       {/* manual-accept offer from a friend */}
       {isOffer && (
         <div style={{ marginTop: 10 }}>
-          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
+          <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
             <b style={{ color: 'var(--text)' }}>{t.friendName ?? 'Someone'}</b> wants to send you{' '}
             <b style={{ color: 'var(--text)' }}>
               {t.fileNames.length ? t.fileNames[0] : 'files'}
@@ -279,7 +282,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             size={184}
             instructions={<>On the other device, open DropBeam → <b>Have a code?</b> and scan this QR code — or paste the code.</>}
             footer={
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>
                 <Spinner size={14} />
                 Waiting for the other device to connect…
               </div>
@@ -299,10 +302,10 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
               marginBottom: 6,
             }}
           >
-            <span style={{ fontSize: 'calc(16px * var(--ui-font-scale, 1))', fontWeight: 750 }} className="gradient-text">
+            <span style={{ fontSize: 'var(--font-lg)', fontWeight: 750 }} className="gradient-text">
               {Math.round(t.percent)}%
             </span>
-            <span style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
+            <span style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)' }}>
               {formatBytesLive(t.bytesDone)}
               {t.bytesTotal > 0 ? ` / ${formatBytesLive(t.bytesTotal)}` : ''}
             </span>
@@ -343,12 +346,12 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             alignItems: 'center',
             gap: 9,
             marginTop: 10,
-            fontSize: 'calc(13px * var(--ui-font-scale, 1))',
+            fontSize: 'var(--font-sm)',
             color: 'var(--text-muted)',
           }}
         >
           <Spinner size={15} />
-          Beaming to {t.friendName}…
+          Connecting to {t.friendName}’s device…
         </div>
       )}
 
@@ -361,7 +364,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
               alignItems: 'center',
               gap: 9,
               marginTop: 10,
-              fontSize: 'calc(13px * var(--ui-font-scale, 1))',
+              fontSize: 'var(--font-sm)',
               color: 'var(--text-muted)',
             }}
           >
@@ -381,13 +384,13 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             gap: 12,
           }}
         >
-          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
+          <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>
             <div>
               {t.direction === 'receive' ? 'Saved' : 'Delivered'}
               {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
             </div>
             {summary && (
-              <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', marginTop: 2 }}>
+              <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-faint)', marginTop: 2 }}>
                 {formatEta(summary.durationMs / 1000)} · {formatSpeed(summary.avgBps)} avg
               </div>
             )}
@@ -397,7 +400,8 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           )}
           {!MOBILE_UI && t.direction === 'receive' && t.outDir && (
             <button
-              className="btn btn-ghost"
+              className="btn btn-ghost btn-sm"
+              style={{ flexShrink: 0 }}
               onClick={() => {
                 // A single file → reveal it SELECTED in its folder ("Show in
                 // folder"); multiple → just open the folder. Match the folder's own
@@ -412,7 +416,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                 }
               }}
             >
-              <FolderOpen size={15} />{' '}
+              <FolderOpen size={14} />{' '}
               {t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
             </button>
           )}
@@ -438,7 +442,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                   marginBottom: 6,
                 }}
               >
-                <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
+                <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>
                   Verifying… {t.verify.checked.toLocaleString()} /{' '}
                   {t.verify.total.toLocaleString()} files
                   {t.verify.bytesTotal > 0
@@ -446,8 +450,8 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                     : ''}
                 </span>
                 <button
-                  className="btn btn-ghost"
-                  style={{ padding: '2px 8px', fontSize: 12.5, flexShrink: 0 }}
+                  className="btn btn-ghost btn-sm"
+                  style={{ flexShrink: 0 }}
                   onClick={() => void api.cancelVerify(t.id)}
                 >
                   Cancel
@@ -464,13 +468,13 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           ) : t.verify?.state === 'done' &&
             t.verify.mismatched.length + t.verify.missing.length === 0 ? (
             <div
-              style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--green)' }}
+              style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--font-sm)', color: 'var(--green)' }}
             >
               <CheckCircle2 size={15} /> All {t.verify.total.toLocaleString()} files identical
             </div>
           ) : t.verify?.state === 'done' ? (
             <details>
-              <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--red)' }}>
+              <summary style={{ cursor: 'pointer', fontSize: 'var(--font-sm)', color: 'var(--red)' }}>
                 {(t.verify.mismatched.length + t.verify.missing.length).toLocaleString()} of{' '}
                 {t.verify.total.toLocaleString()} files don’t match
               </summary>
@@ -480,7 +484,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                   marginTop: 6,
                   maxHeight: 150,
                   overflowY: 'auto',
-                  fontSize: 12,
+                  fontSize: 'var(--font-xs)',
                   color: 'var(--text-muted)',
                   lineHeight: 1.5,
                 }}
@@ -496,24 +500,26 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           ) : (
             <>
               {t.verify?.state === 'failed' && (
-                <div style={{ fontSize: 12.5, color: 'var(--red)', marginBottom: 8, lineHeight: 1.45 }}>
+                <div style={{ fontSize: 'var(--font-sm)', color: 'var(--red)', marginBottom: 8, lineHeight: 1.45 }}>
                   {t.verify.error ?? 'Could not verify the copy.'}
                 </div>
               )}
               {t.verify?.state === 'canceled' && (
-                <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 8 }}>
+                <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', marginBottom: 8 }}>
                   Verification canceled.
                 </div>
               )}
-              <button
-                className="btn btn-ghost"
-                style={{ width: '100%' }}
-                onClick={() => {
-                  void api.verifyTransfer(t.id).catch((e) => toast('error', String(e)))
-                }}
-              >
-                <Check size={15} /> Verify copy
-              </button>
+              <div className="xfer-actions" style={{ marginTop: 0 }}>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  title="Re-hash every file on both devices and compare (SHA-256)"
+                  onClick={() => {
+                    void api.verifyTransfer(t.id).catch((e) => toast('error', String(e)))
+                  }}
+                >
+                  <Check size={14} /> Verify copy
+                </button>
+              </div>
             </>
           )}
         </div>
@@ -524,10 +530,10 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
         <div style={{ marginTop: 12 }}>
           <div
             style={{
-              fontSize: 'calc(13px * var(--ui-font-scale, 1))',
+              fontSize: 'var(--font-sm)',
               color: 'var(--red)',
               background: 'var(--red-soft)',
-              borderRadius: 11,
+              borderRadius: 'var(--radius-md)',
               padding: '10px 12px',
               lineHeight: 1.45,
             }}
@@ -537,13 +543,11 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           {/* One-tap re-send, only on a failed SEND (a failed receive has no original
               paths/recipient to replay — retryTransfer is a no-op there). */}
           {t.direction === 'send' && (
-            <button
-              className="btn btn-ghost"
-              style={{ marginTop: 10, width: '100%' }}
-              onClick={() => void retryTransfer(t.id)}
-            >
-              <RotateCw size={15} /> Retry
-            </button>
+            <div className="xfer-actions">
+              <button className="btn btn-primary btn-sm" onClick={() => void retryTransfer(t.id)}>
+                <RotateCw size={14} /> Retry
+              </button>
+            </div>
           )}
         </div>
       )}
@@ -557,10 +561,10 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
               display: 'flex',
               alignItems: 'center',
               gap: 8,
-              fontSize: 13,
+              fontSize: 'var(--font-sm)',
               color: 'var(--text-muted)',
               background: 'var(--surface-2)',
-              borderRadius: 11,
+              borderRadius: 'var(--radius-md)',
               padding: '10px 12px',
               lineHeight: 1.45,
             }}
@@ -579,19 +583,17 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             </div>
           )}
           {t.direction === 'send' && (
-            <button
-              className="btn btn-ghost"
-              style={{ marginTop: 10, width: '100%' }}
-              onClick={() => void retryTransfer(t.id)}
-            >
-              <Play size={15} /> Resume
-            </button>
+            <div className="xfer-actions">
+              <button className="btn btn-primary btn-sm" onClick={() => void retryTransfer(t.id)}>
+                <Play size={14} /> Resume
+              </button>
+            </div>
           )}
         </div>
       )}
 
       {t.state === 'canceled' && (
-        <div style={{ marginTop: 12, fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
+        <div style={{ marginTop: 12, fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>
           Transfer canceled.
         </div>
       )}

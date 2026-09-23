@@ -56,14 +56,24 @@ export function ChannelBadge({
   locality,
   size = 12,
   showConnecting = false,
+  iconOnly = false,
 }: {
   locality: Locality
   size?: number
   showConnecting?: boolean
+  /** Just the tinted icon (tight spaces like the floating HUD); label in the tooltip. */
+  iconOnly?: boolean
 }) {
   if (locality === 'unknown' && !showConnecting) return null
   const c = CHANNELS[locality] ?? CHANNELS.unknown
   const Icon = c.icon
+  if (iconOnly) {
+    return (
+      <span className="chip chip-icon" title={`${c.label} — ${c.tip}`} aria-label={c.label} style={{ background: c.bg, color: c.fg }}>
+        <Icon size={size} className={locality === 'unknown' ? 'animate-spin-slow' : undefined} />
+      </span>
+    )
+  }
   return (
     <span className="chip" title={c.tip} style={{ background: c.bg, color: c.fg }}>
       <Icon size={size} className={locality === 'unknown' ? 'animate-spin-slow' : undefined} />{' '}
@@ -153,27 +163,14 @@ export function EmptyState({
       >
         {icon}
       </div>
-      <div style={{ fontWeight: 650, color: 'var(--text)', fontSize: 'calc(15px * var(--ui-font-scale, 1))' }}>{title}</div>
+      <div style={{ fontWeight: 650, color: 'var(--text)', fontSize: 'var(--font-md)' }}>{title}</div>
       {hint && (
-        <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', marginTop: 5, maxWidth: 320, lineHeight: 1.5 }}>{hint}</div>
+        <div style={{ fontSize: 'var(--font-sm)', marginTop: 5, maxWidth: 340, lineHeight: 1.55, textWrap: 'pretty' }}>{hint}</div>
       )}
     </div>
   )
 }
 
 export function SectionTitle({ children }: { children: ReactNode }) {
-  return (
-    <div
-      style={{
-        fontSize: 'calc(12px * var(--ui-font-scale, 1))',
-        fontWeight: 700,
-        letterSpacing: '0.04em',
-        textTransform: 'uppercase',
-        color: 'var(--text-faint)',
-        marginBottom: 10,
-      }}
-    >
-      {children}
-    </div>
-  )
+  return <h2 className="section-title">{children}</h2>
 }

@@ -4,7 +4,7 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { mockApi, mockListen, mockSharedLocations, mockSyncedFolders, emit as mockEmit } from './mock'
+import { mockApi, mockListen, mockLocationRequest, mockSharedLocations, mockSyncedFolders, emit as mockEmit } from './mock'
 import { normalizeSharedLocations } from './normalize'
 import { MOBILE_UI } from './platform'
 import { pickMobileFiles } from '../components/MobileFileSheet'
@@ -413,8 +413,6 @@ export interface PairUpdate {
 }
 
 const realApi = {
-  sendFiles: (paths: string[]) => invoke<TransferUpdate>('send_files', { paths }),
-  receiveFiles: (code: string) => invoke<TransferUpdate>('receive_files', { code }),
   // Direct engine (iroh) Quick Send — same UI, P2P transport.
   irohSend: (paths: string[]) => invoke<TransferUpdate>('iroh_send', { paths }),
   irohReceive: (ticket: string) => invoke<TransferUpdate>('iroh_receive', { ticket }),
@@ -436,6 +434,8 @@ const realApi = {
   getSettings: () => invoke<Settings>('get_settings'),
   updateSettings: (settings: Settings) => invoke<Settings>('update_settings', { settings }),
   getHistory: () => invoke<HistoryEntry[]>('get_history'),
+  /** Drop one row from Recents (the received files stay where they are). */
+  removeHistoryEntry: (id: string) => invoke<void>('remove_history_entry', { id }),
   clearHistory: () => invoke<void>('clear_history'),
   pickFiles: () => invoke<string[]>('pick_files'),
   pickPhotos: () => invoke<string[]>('pick_photos'),
@@ -819,7 +819,9 @@ export const locationsApi = {
   hostedStatus: (id: string) => invoke<HostedLocationStatus>('hosted_location_status', { id }),
   save: (location: HostedLocation) => invoke<HostedLocation[]>('save_location', { location, removeId: null }),
   remove: (removeId: string) => invoke<HostedLocation[]>('save_location', { location: null, removeId }),
-  request: <T,>(friendId: string, request: Record<string, unknown>) => invoke<T>('location_request', { friendId, request }),
+  request: <T,>(friendId: string, request: Record<string, unknown>) => HAS_TAURI
+    ? invoke<T>('location_request', { friendId, request })
+    : (mockLocationRequest(request) as Promise<T>),
   list: (friendId: string) => HAS_TAURI
     ? invoke<unknown[]>('location_request', { friendId, request: { kind: 'locations.list' } }).then(normalizeSharedLocations)
     : mockSharedLocations(friendId),

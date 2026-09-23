@@ -4,10 +4,10 @@ import { createPortal } from 'react-dom'
 import jsQR from 'jsqr'
 import { fileSrc } from '../lib/api'
 import { CameraOff, ClipboardPaste, ImageUp, ScanLine, X } from 'lucide-react'
-import { MOBILE_UI } from '../lib/platform'
+import { IS_LINUX, IS_MAC, MOBILE_UI } from '../lib/platform'
+import { useEscape } from './Dialog'
 import { decodeQrFromImage, imageFromTransfer, setScannerDrop } from '../lib/qrImage'
 
-const IS_MAC = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent)
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|heic|heif|bmp|tiff?)$/i
 
@@ -147,14 +147,17 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
     {(notice || error) && <Section footer={<span className="mk-error" role="alert">{notice || error}</span>} />}
   </Sheet>
 
-  return createPortal(<div className="dialog-overlay qr-overlay" onClick={close} onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); close() } }}>
+  return createPortal(<ScannerFrame close={close}>
     <div className="card dialog qrs" role="dialog" aria-modal="true" aria-label={title} onClick={e => e.stopPropagation()}
       onDragOver={e => { if (Array.from(e.dataTransfer.items).some(i => i.kind === 'file')) { e.preventDefault(); setDropping(true) } }}
       onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropping(false) }}
       onDrop={e => { e.preventDefault(); setDropping(false); const img = imageFromTransfer(e.dataTransfer); if (img) void readImage(img); else setNotice('Drop an image (PNG or JPEG) that shows the QR code.') }}>
-      <div className="qrs-head">
-        <div className="qrs-title"><ScanLine size={17} />{title}</div>
-        <button className="icon-btn" aria-label="Close" onClick={close}><X size={17} /></button>
+      <div className="dialog-head">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
+          <span className="dialog-icon"><ScanLine size={18} /></span>
+          <h2 className="dialog-title">{title}</h2>
+        </div>
+        <button className="icon-btn" aria-label="Close" title="Close (Esc)" onClick={close}><X size={17} /></button>
       </div>
       <div className="dialog-body qrs-body">
         <div className={`qrs-stage${dropping ? ' dropping' : ''}`}>
@@ -169,16 +172,23 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
         <p className="qrs-hint">{hint}</p>
         {notice && <p className="qrs-notice" role="alert">{notice}</p>}
         <div className="qrs-alt">
-          <button className="btn btn-ghost" type="button" disabled={reading} onClick={() => fileInput.current?.click()}><ImageUp size={15} />Scan from image…</button>
-          <button className="btn btn-ghost" type="button" onClick={() => setPaste(p => !p)}><ClipboardPaste size={15} />Paste the code</button>
+          <button className="btn btn-ghost btn-sm" type="button" disabled={reading} onClick={() => fileInput.current?.click()}><ImageUp size={14} />Scan from image…</button>
+          <button className="btn btn-ghost btn-sm" type="button" onClick={() => setPaste(p => !p)}><ClipboardPaste size={14} />Paste the code</button>
           <input ref={fileInput} type="file" accept="image/*" hidden onChange={e => { const f = e.target.files?.[0] ?? null; e.target.value = ''; void readImage(f) }} />
         </div>
         {paste && <form className="qrs-paste" onSubmit={e => { e.preventDefault(); e.stopPropagation(); rejected.current = ''; finish(code) }}>
           <input className="input" aria-label="Paste a code" placeholder="Paste the code…" autoFocus autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={code} onChange={e => { setCode(e.target.value); setNotice('') }} />
           <button className="btn btn-primary" disabled={!code.trim()}>Use code</button>
         </form>}
-        <p className="qrs-tip">No camera? Drop a screenshot of the QR here, or copy one ({IS_MAC ? '⇧⌘⌃4' : 'Win+Shift+S'}) and press {IS_MAC ? '⌘V' : 'Ctrl+V'}.</p>
+        <p className="qrs-tip">No camera? Drop a screenshot of the QR here, or copy one ({IS_MAC ? '⇧⌘⌃4' : IS_LINUX ? 'Ctrl+Shift+PrtSc' : 'Win+Shift+S'}) and press {IS_MAC ? '⌘V' : 'Ctrl+V'}.</p>
       </div>
     </div>
-  </div>, document.body)
+  </ScannerFrame>, document.body)
+}
+
+/** Backdrop for the desktop scanner: click outside or Esc closes it (it stacks
+ *  above any dialog that opened it, so Esc only closes the scanner). */
+function ScannerFrame({ close, children }: { close: () => void; children: React.ReactNode }) {
+  useEscape(close)
+  return <div className="dialog-overlay qr-overlay" onMouseDown={e => { if (e.target === e.currentTarget) close() }}>{children}</div>
 }

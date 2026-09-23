@@ -655,13 +655,23 @@ pub fn lan_network_blocked() -> bool {
 /// the user can enable DropBeam in one click (no scavenger hunt).
 #[tauri::command]
 pub fn open_local_network_settings(app: AppHandle) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_url(
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork",
-            None::<&str>,
-        )
-        .map_err(|e| e.to_string())
+    // macOS-only pane; the UI only offers this button there (Windows/Linux get
+    // firewall advice instead), so refuse rather than hand the OS a bogus URL.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        return Err("Local Network permission is a macOS setting".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .open_url(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork",
+                None::<&str>,
+            )
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// On macOS, return a one-line warning if the app is running from a spot that

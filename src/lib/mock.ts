@@ -249,10 +249,46 @@ function mockSend(to = 'Hui') {
   emit('transfer://update', { ...t })
   setTimeout(() => simulate(t, 2_400_000), 700)
 }
+// Dev helper for the UI sweep: window.__mockGallery() drops one transfer card in
+// EVERY state (plus long names) and seeds a varied chat thread with Alex, so the
+// whole design language can be reviewed without a second device.
+function mockGallery() {
+  const mk = (id: string, dir: 'send' | 'receive', names: string[], patch: Partial<TransferUpdate>) => {
+    const t = { ...base(id, dir, names), bytesTotal: 248_000_000, peer: '192.168.1.55:51022', ...patch }
+    emit('transfer://update', t)
+  }
+  mk('g1', 'send', ['Vacation Photos 2026 — the full, unedited, extremely long album name that keeps going.zip'], { state: 'transferring', percent: 42, bytesDone: 104_000_000, speedBps: 38_000_000, etaSeconds: 38, locality: 'direct', friendName: 'Alex', connDetail: { path: 'direct', rttMs: 14, upgrading: false, relay: null } })
+  mk('g2', 'receive', ['Q3 Report.pdf'], { state: 'waitingForAccept', friendName: 'Sam', bytesTotal: 18_400_000 })
+  mk('g3', 'send', ['design-system.fig', 'tokens.json', 'README.md'], { state: 'connecting', friendName: 'Sam', fileCount: 3 })
+  mk('g4', 'send', ['raw-footage.mov'], { state: 'transferring', percent: 8, bytesDone: 1_000_000_000, bytesTotal: 12_400_000_000, speedBps: 2_100_000, etaSeconds: 5400, locality: 'internet', friendName: 'Alex', connDetail: { path: 'relay', rttMs: 88, upgrading: true, relay: 'use1' }, detail: 'Waiting for a direct connection' })
+  mk('g5', 'send', ['Budget 2026.xlsx'], { state: 'paused', percent: 61, bytesDone: 5_100_000, bytesTotal: 8_400_000, friendName: 'Alex' })
+  mk('g6', 'send', ['Presentation.key'], { state: 'failed', percent: 23, error: 'The other side went offline before the transfer finished.', friendName: 'Sam' })
+  mk('g7', 'receive', ['IMG_0421.HEIC', 'IMG_0422.HEIC', 'IMG_0423.HEIC', 'IMG_0424.HEIC'], { state: 'completed', percent: 100, bytesDone: 42_000_000, bytesTotal: 42_000_000, fileCount: 4, locality: 'local', friendName: 'Alex', outDir: settings.downloadDir })
+  mk('g8', 'send', ['notes.txt'], { state: 'canceled', percent: 12, friendName: 'Sam' })
+  mk('g9', 'send', ['Quick send bundle.zip'], { state: 'waitingForPeer', code: 'dropbeam:MOCKquicksendcode0000aaaabbbbccccdddd', percent: 0 })
+  const now = Date.now()
+  const msg = (i: number, fromMe: boolean, text: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({
+    id: `gm${i}`, peerId: 'f1', fromMe, kind: 'text', text, files: [], bytes: 0, path: null,
+    status: fromMe ? 'read' : null, ts: now - (40 - i) * 60_000, seq: i, reactions: [], edited: false, deleted: false, ...extra,
+  })
+  const thread: ChatMessage[] = [
+    msg(1, false, 'Hey! Did the footage come through?'),
+    msg(2, true, 'Half of it — the relay was crawling. Trying again on the same Wi-Fi now 🙌'),
+    msg(3, false, 'Perfect. Here’s the link to the brief: https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', { reactions: [{ emoji: '👍', fromMe: true }] }),
+    msg(4, true, 'Got it', { replyTo: 'gm3', replyPreview: 'Here’s the link to the brief…', edited: true }),
+    msg(5, false, '', { kind: 'file', files: ['Q3 Report.pdf'], bytes: 18_400_000 }),
+    msg(6, true, 'This message was unsent', { deleted: true }),
+    msg(7, false, 'مرحبا — سلام — こんにちは — Ünïcödé names work too'),
+    msg(8, true, 'Sending the rest tonight.', { status: 'delivered' }),
+  ]
+  mockChats.f1 = thread
+  thread.forEach((m) => emit('chat://message', m))
+}
 if (typeof window !== 'undefined') {
   const w = window as unknown as { __mockIncoming?: (m: boolean) => void; __mockSend?: (to?: string) => void }
   w.__mockIncoming = mockIncoming
   w.__mockSend = mockSend
+  ;(window as unknown as { __mockGallery?: () => void }).__mockGallery = mockGallery
 }
 
 // ── Synced folders (dev preview) ─────────────────────────────────────────────
@@ -456,6 +492,10 @@ export const mockApi = {
   getHistory: async (): Promise<HistoryEntry[]> => [...history],
   clearHistory: async (): Promise<void> => {
     history.length = 0
+  },
+  removeHistoryEntry: async (id: string): Promise<void> => {
+    const i = history.findIndex((h) => h.id === id)
+    if (i >= 0) history.splice(i, 1)
   },
   setProfileAvatar: async (): Promise<Settings> => settings,
   clearProfileAvatar: async (): Promise<Settings> => {
@@ -877,4 +917,23 @@ export const mockApi = {
   },
   setActiveChat: async () => {},
   setUnreadBadge: async () => {},
+}
+
+/** Dev preview of browsing a friend's Location: a small, varied listing (folders,
+ *  long unicode names, big numbers) so the file table can be reviewed. */
+export function mockLocationRequest(request: Record<string, unknown>): Promise<unknown> {
+  const kind = String(request.kind ?? '')
+  if (kind !== 'locations.ls') return Promise.resolve({ ok: true })
+  const day = 86_400_000
+  let entries = [
+    { name: '2026 Photos', isDir: true, size: 0, modified: Date.now() - 2 * day },
+    { name: 'Backups', isDir: true, size: 0, modified: Date.now() - 40 * day },
+    { name: 'Family Videos — Summer at the lake house (the long edit, final final v3).mov', isDir: false, size: 14_200_000_000, modified: Date.now() - 3 * day },
+    { name: 'Rechnungen_Übersicht_März.pdf', isDir: false, size: 842_000, modified: Date.now() - 9 * day },
+    { name: 'تقرير-المشروع.docx', isDir: false, size: 120_400, modified: Date.now() - 12 * day },
+    { name: 'notes.md', isDir: false, size: 4_100, modified: Date.now() - 3_600_000 },
+  ]
+  const q = String(request.query ?? '').toLowerCase()
+  if (q) entries = entries.filter((e) => e.name.toLowerCase().includes(q))
+  return new Promise((r) => setTimeout(() => r({ entries, page: 0, hasMore: false, total: entries.length }), 250))
 }

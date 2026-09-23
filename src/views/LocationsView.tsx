@@ -1,6 +1,6 @@
 import { loadLocations } from '../lib/locationsLoad'
 import { MobileHeader } from '../components/MobileHeader'
-import { MOBILE_UI } from '../lib/platform'
+import { IS_WINDOWS, MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, ChevronRight, Download, HardDrive, Plus, RefreshCw, Settings2, Share2, Upload } from 'lucide-react'
 import { locationsApi, onLocationsChanged, type HostedLocation, type HostedLocationStatus, type SharedLocation } from '../lib/api'
@@ -189,17 +189,17 @@ export function LocationsView() {
       {!!Object.keys(errors).length && <p className="ios-footnote mobile-inset">Some devices are unavailable. Open a location to retry.</p>}
     </>}
   </div>
-  return <div className="locations-view">
+  return <div className="locations-view page page-wide">
     {MOBILE_UI && <button className="btn btn-ghost location-back" onClick={() => setView('friends')}><ArrowLeft size={16} />Friends</button>}
-    <div className="location-heading"><div><h1>Locations</h1><p>Your friends’ folders, within reach.</p></div><div className="location-toolbar">
+    <div className="page-header titlebar-drag"><div><h1 className="page-title">Locations</h1><p className="page-subtitle">Your friends’ folders, within reach.</p></div><div className="page-actions">
       <button className="btn btn-ghost" disabled={busy} onClick={() => { void refresh() }}><RefreshCw size={15} className={busy ? 'location-spin' : ''} />Refresh</button>
-      {!MOBILE_UI && <button className="btn btn-ghost" onClick={() => setView('settings')}><Settings2 size={15} />Share a folder</button>}</div></div>
+      {!MOBILE_UI && !IS_WINDOWS && <button className="btn btn-ghost" onClick={() => setView('settings')}><Settings2 size={15} />Share a folder</button>}</div></div>
     {active ? <><button className="btn btn-ghost location-back" onClick={() => setActive(null)}><ArrowLeft size={16} />All locations</button>
       {friend && location ? <><div className="location-host-label"><HardDrive size={16} /><strong>{friend.name}</strong><span> / {location.name}</span><span className="location-grow" /><button className="btn btn-ghost" onClick={() => setView('send')}>Send & Receive<ArrowRight size={14} /></button></div>
         <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} online={presenceLabel(friendPresence(friend.name, seen, statuses))} /></> : <div className="card location-empty-small">This location is no longer shared with this device.</div>}</> : <>
       <SyncedFolders shared={shared} />
       {!!count && <SyncFolderToolbar />}
-      {!count && <div className="card location-empty"><HardDrive size={46} strokeWidth={1.1} /><h2>{busy ? 'Looking for shared locations…' : 'A place for everything'}</h2><p>When a friend shares a folder with this device, it appears here.<br/>To share your NAS or a local folder, add it in Settings → Locations.</p><button className="btn btn-primary" onClick={() => setView('settings')}>Set up a location<ArrowRight size={15} /></button></div>}
+      {!count && <div className="card location-empty"><HardDrive size={46} strokeWidth={1.1} /><h2>{busy ? 'Looking for shared locations…' : 'A place for everything'}</h2>{IS_WINDOWS ? <p>When a friend shares a folder or NAS with this device, it appears here — ready to browse, download from and upload to.</p> : <><p>When a friend shares a folder with this device, it appears here.<br/>To share your NAS or a local folder, add it in Settings → Locations.</p><button className="btn btn-primary" onClick={() => setView('settings')}>Set up a location<ArrowRight size={15} /></button></>}</div>}
       <div className="location-grid">{friends.flatMap(f => (shared[f.id] || []).map(l => {
         const presence = friendPresence(f.name, seen, statuses)
         return <button className="card location-tile" key={`${f.id}:${l.id}`} onClick={() => setActive({ friend: f.id, location: l.id })}>
@@ -217,8 +217,8 @@ export function LocationsView() {
         </button>
       }))}</div>
       {!!Object.keys(errors).length && <details className="location-connection-details"><summary>{Object.keys(errors).length} device(s) unavailable or without Locations support</summary>{friends.filter(f => errors[f.id]).map(f => <p key={f.id}><strong>{f.name}:</strong> {errors[f.id]}</p>)}</details>}
-      <hr className="location-divider" />
-      <SharedFromThisDevice />
+      {!IS_WINDOWS && <><hr className="location-divider" />
+      <SharedFromThisDevice /></>}
     </>}
   </div>
 }

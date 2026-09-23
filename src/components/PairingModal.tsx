@@ -1,9 +1,9 @@
 import { ScanCodeButton, ShareCode } from './CodeQr'
 import { parseCode, wrongCodeMessage } from '../lib/codes'
-import { MOBILE_UI } from '../lib/platform'
 import { useState } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
-import { ArrowLeftRight, ArrowRight, Check, FolderOpen, FolderSync, X } from 'lucide-react'
+import { ArrowLeftRight, ArrowRight, Check, FolderOpen, FolderSync } from 'lucide-react'
+import { Dialog } from './Dialog'
+import { folderName as baseName } from '../lib/syncedFolders'
 import { api } from '../lib/api'
 import { useStore } from '../store'
 import { friendOnlineState } from '../lib/presence'
@@ -123,53 +123,39 @@ export function PairingModal({
     }
   }
 
-  const folderName = folder ? folder.split('/').pop() || folder : ''
+  const folderName = folder ? baseName(folder) || folder : ''
 
   return (
-    <AnimatePresence>
-      <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        onClick={onClose}
-        className="dialog-overlay"
-        style={MOBILE_UI ? undefined : {
-          position: 'fixed',
-          inset: 0,
-          background: 'rgba(8, 9, 14, 0.5)',
-          backdropFilter: 'blur(4px)',
-          display: 'grid',
-          placeItems: 'center',
-          zIndex: 200,
-          padding: 20,
-        }}
-      >
-        <motion.div
-          initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96, y: 8 }}
-          animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
-          exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.97 }}
-          transition={{ type: 'spring', stiffness: 320, damping: 28 }}
-          onClick={(e) => e.stopPropagation()}
-          className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true" aria-label="Shared folder"
-          style={MOBILE_UI ? undefined : { width: 460, maxWidth: '100%', padding: 22, borderRadius: 20 }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-            <div style={{ fontSize: 'calc(17px * var(--ui-font-scale, 1))', fontWeight: 750 }}>
-              {createdInvite
-                ? 'Share this invite'
-                : mode === 'create'
-                  ? 'New Shared Folder'
-                  : 'Accept an invite'}
-            </div>
-            <button className="icon-btn" onClick={onClose}>
-              <X size={17} />
-            </button>
-          </div>
-
+    <Dialog
+      title={createdInvite ? 'Share this invite' : mode === 'create' ? 'New shared folder' : 'Accept an invite'}
+      subtitle={createdInvite ? undefined : mode === 'create' ? 'Keep a folder in sync with friends, peer-to-peer.' : 'Join a folder someone shared with you.'}
+      icon={<FolderSync size={18} />}
+      width={470}
+      onClose={onClose}
+      busy={busy}
+      footer={
+            createdInvite ? (
+              <button className="btn btn-ghost btn-block" onClick={onClose}>Done</button>
+            ) : (
+              <button
+                className="btn btn-primary btn-block"
+                onClick={mode === 'create' ? doCreate : doAccept}
+                disabled={busy}
+              >
+                {busy ? <Spinner size={15} /> : null}
+                {mode === 'create'
+                  ? invitees.length > 0
+                    ? `Create & invite ${invitees.length}`
+                    : 'Create & get invite'
+                  : 'Pair folder'}
+              </button>
+            )
+      }
+    >
           {/* CREATE — invite reveal */}
           {createdInvite ? (
-            <div className="dialog-body">
-              <p style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 0 }}>
+            <div>
+              <p className="dialog-text">
                 Send this invite to the other person. In their DropBeam, they choose{' '}
                 <b>Accept invite</b>, scan this QR code (or paste the invite) and pick a folder. After that, anything dropped in{' '}
                 <b>{folderName}</b> beams over automatically.
@@ -177,15 +163,16 @@ export function PairingModal({
               <ShareCode code={createdInvite} layout="stack" copyLabel="Copy invite" />
             </div>
           ) : (
-            <div className="dialog-body">
+            <div>
               {/* folder picker */}
-              <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
+              <label className="field-label">
                 {mode === 'create' ? 'Folder to share' : 'Folder to receive into'}
               </label>
               <button
-                className="btn btn-ghost"
-                style={{ width: '100%', justifyContent: 'flex-start', marginTop: 6, padding: '11px 12px' }}
+                className="btn btn-ghost btn-block"
+                style={{ justifyContent: 'flex-start', padding: '10px 12px' }}
                 onClick={pickFolder}
+                title={folder || undefined}
               >
                 <FolderOpen size={16} />
                 <span
@@ -203,10 +190,11 @@ export function PairingModal({
               {mode === 'accept' && (
                 <div style={{ marginTop: 16 }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                    <label htmlFor="folder-invite-code" style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
+                    <label htmlFor="folder-invite-code" className="field-label" style={{ margin: 0 }}>
                       Invite code
                     </label>
                     <ScanCodeButton
+                      small
                       hint="Hold the folder invite QR code up to your camera."
                       title="Scan a folder invite"
                       accept={['folderInvite']}
@@ -216,7 +204,7 @@ export function PairingModal({
                   <textarea
                     id="folder-invite-code"
                     className="input"
-                    style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'calc(12px * var(--ui-font-scale, 1))', resize: 'none' }}
+                    style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'var(--font-sm)', resize: 'none', wordBreak: 'break-all' }}
                     autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
                     placeholder="Paste the dropbeam1:… invite, or scan its QR"
                     value={inviteInput}
@@ -227,17 +215,16 @@ export function PairingModal({
 
               {mode === 'create' && (
                 <div style={{ marginTop: 16 }}>
-                  <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
-                    Their name <span style={{ color: 'var(--text-faint)', fontWeight: 500 }}>(optional)</span>
+                  <label className="field-label">
+                    Their name <span className="optional">(optional)</span>
                   </label>
                   <input
                     className="input"
-                    style={{ marginTop: 6 }}
                     placeholder="e.g. Alex"
                     value={peerName}
                     onChange={(e) => setPeerName(e.target.value)}
                   />
-                  <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', marginTop: 6, lineHeight: 1.45 }}>
+                  <div className="field-hint">
                     Add a name and you'll be linked as friends automatically — then you can beam files
                     to each other without sharing a code again.
                   </div>
@@ -246,10 +233,10 @@ export function PairingModal({
 
               {mode === 'create' && (
                 <div style={{ marginTop: 16 }}>
-                  <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
+                  <label className="field-label">
                     Who can do what
                   </label>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                  <div role="radiogroup" aria-label="Who can do what" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                     <DirOption
                       active={syncMode === 'mirror'}
                       onClick={() => setSyncMode('mirror')}
@@ -277,17 +264,19 @@ export function PairingModal({
 
               {mode === 'create' && friends.length > 0 && (
                 <div style={{ marginTop: 16 }}>
-                  <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
+                  <label className="field-label">
                     Invite friends{' '}
-                    <span style={{ color: 'var(--text-faint)', fontWeight: 500 }}>(optional)</span>
+                    <span className="optional">(optional)</span>
                   </label>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                     {friends.map((f) => {
                       const on = invitees.includes(f.id)
                       return (
                         <button
                           key={f.id}
                           type="button"
+                          className={`pick-chip${on ? ' on' : ''}`}
+                          aria-pressed={on}
                           onClick={() =>
                             setInvitees((prev) =>
                               prev.includes(f.id)
@@ -295,35 +284,14 @@ export function PairingModal({
                                 : [...prev, f.id],
                             )
                           }
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 6,
-                            padding: '6px 11px',
-                            borderRadius: 999,
-                            fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
-                            fontWeight: 600,
-                            cursor: 'default',
-                            transition: 'all 0.14s',
-                            border: `1.5px solid ${on ? 'var(--accent)' : 'var(--border)'}`,
-                            background: on ? 'var(--accent-soft)' : 'var(--surface-2)',
-                            color: on ? 'var(--accent)' : 'var(--text)',
-                          }}
                         >
                           {on && <Check size={13} />}
-                          {f.name}
+                          <span className="truncate-1" style={{ maxWidth: 180 }}>{f.name}</span>
                         </button>
                       )
                     })}
                   </div>
-                  <div
-                    style={{
-                      fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
-                      color: 'var(--text-faint)',
-                      marginTop: 6,
-                      lineHeight: 1.45,
-                    }}
-                  >
+                  <div className="field-hint">
                     They’ll get a prompt to accept and choose where to save the folder. Or skip
                     this and share the invite code with anyone.
                   </div>
@@ -331,28 +299,7 @@ export function PairingModal({
               )}
             </div>
           )}
-          <div className="dialog-actions">
-            {createdInvite ? (
-              <button className="btn btn-ghost" style={{ width: '100%' }} onClick={onClose}>Done</button>
-            ) : (
-              <button
-                className="btn btn-primary"
-                style={{ width: '100%', marginTop: 0 }}
-                onClick={mode === 'create' ? doCreate : doAccept}
-                disabled={busy}
-              >
-                {busy ? <Spinner size={15} /> : null}
-                {mode === 'create'
-                  ? invitees.length > 0
-                    ? `Create & invite ${invitees.length}`
-                    : 'Create & get invite'
-                  : 'Pair folder'}
-              </button>
-            )}
-          </div>
-        </motion.div>
-      </motion.div>
-    </AnimatePresence>
+    </Dialog>
   )
 }
 
@@ -370,23 +317,11 @@ function DirOption({
   desc: string
 }) {
   return (
-    <button
-      onClick={onClick}
-      style={{
-        flex: 1,
-        textAlign: 'left',
-        padding: '11px 13px',
-        borderRadius: 13,
-        border: `1.5px solid ${active ? 'var(--accent)' : 'var(--border)'}`,
-        background: active ? 'var(--accent-soft)' : 'var(--surface-2)',
-        cursor: 'default',
-        transition: 'all 0.14s',
-      }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: active ? 'var(--accent)' : 'var(--text)', fontWeight: 650, fontSize: 'calc(13.5px * var(--ui-font-scale, 1))' }}>
+    <button type="button" role="radio" aria-checked={active} className={`option-card${active ? ' on' : ''}`} onClick={onClick}>
+      <div className="option-card-title">
         {icon} {title}
       </div>
-      <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 3 }}>{desc}</div>
+      <div className="option-card-desc">{desc}</div>
     </button>
   )
 }

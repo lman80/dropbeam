@@ -7,7 +7,7 @@ import { api, HAS_TAURI, onFileDrop } from './lib/api'
 import { setTaskbarProgress } from './lib/taskbar'
 import { useStore } from './store'
 import { parseCode } from './lib/codes'
-import { MOBILE_UI } from './lib/platform'
+import { IS_MAC, MOBILE_UI } from './lib/platform'
 import { startNativeBridge } from './lib/nativeBridge'
 import { nativeShellActive } from './lib/nativeShell'
 import { TitleBar } from './components/TitleBar'
@@ -19,6 +19,7 @@ import { FolderInviteModal } from './components/FolderInviteModal'
 import { QrScanner } from './components/QrScanner'
 import { routeDropToScanner } from './lib/qrImage'
 import { BeamLogo } from './components/bits'
+import { Dialog } from './components/Dialog'
 import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
 import { HistoryView } from './views/HistoryView'
@@ -160,7 +161,7 @@ export default function App() {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <ErrorBoundary region="window controls">
-        {!MOBILE_UI && <TitleBar />}
+        {!MOBILE_UI && IS_MAC && <TitleBar />}
         <InstallBanner />
         <LocalNetworkBanner />
       </ErrorBoundary>
@@ -234,6 +235,17 @@ function PopoverCodeHandoff() {
     const uns: Promise<UnlistenFn>[] = [
       listen<string>('dropbeam://open-code', (e) => { if (typeof e.payload === 'string') void openCode(e.payload) }),
       listen('dropbeam://scan-code', () => setScanning(true)),
+      // Tray-menu quick actions (the Linux tray has no popover, only this menu).
+      listen<string>('dropbeam://tray-action', (e) => {
+        const st = useStore.getState()
+        const action = e.payload
+        if (action === 'send') {
+          st.setView('send')
+          void api.pickFiles().then((paths) => { if (paths.length) st.setPendingSend(paths) }).catch((err) => st.toast('error', String(err)))
+        } else if (action === 'friends' || action === 'chat' || action === 'folders' || action === 'settings') {
+          st.setView(action)
+        }
+      }),
     ]
     return () => { uns.forEach((u) => void u.then((f) => f())) }
   }, [openCode])
@@ -269,88 +281,42 @@ function NameSetupModal() {
     setShow(false)
   }
   return (
-    <div
-      className="dialog-overlay"
-      style={MOBILE_UI ? undefined : {
-        position: 'fixed',
-        inset: 0,
-        zIndex: 1000,
-        display: 'grid',
-        placeItems: 'center',
-        background: 'color-mix(in srgb, black 45%, transparent)',
-        backdropFilter: 'blur(3px)',
-      }}
-    >
-      <motion.div className={MOBILE_UI ? "glass dialog mobile-sheet" : "dialog"} role="dialog" aria-modal="true"
-        initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96, y: 8 }}
-        animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
-        style={MOBILE_UI ? undefined : {
-          width: 380,
-          maxWidth: '90vw',
-          background: 'var(--bg-elev)',
-          border: '1px solid var(--border)',
-          borderRadius: 16,
-          padding: 22,
-          boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
-        }}
-      >
-        <div className="dialog-body">
-          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
-            <BeamLogo size={36} />
-          </div>
-          <h2 style={{ fontSize: 'calc(18px * var(--ui-font-scale, 1))', fontWeight: 750, textAlign: 'center', margin: '0 0 6px' }}>
-            What should people call you?
-          </h2>
-          <p
-            style={{
-              fontSize: 'calc(13px * var(--ui-font-scale, 1))',
-              color: 'var(--text-muted)',
-              textAlign: 'center',
-              margin: '0 0 16px',
-              lineHeight: 1.45,
-            }}
-          >
-            {MOBILE_UI
-              ? 'Friends see this name in chats and when you send photos or files. You can change it anytime in Settings.'
-              : 'This is the name friends see when you send files or share a folder. You can change it anytime in Settings.'}
-          </p>
-          {MOBILE_UI && <p style={{ lineHeight: 1.5, color: 'var(--text-muted)' }}>Keep DropBeam open while sending or receiving. Find received files in Files → On My iPhone → DropBeam.</p>}
-          <input
-            autoFocus
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && finish()}
-            placeholder="Your name"
-            maxLength={40}
-            style={{
-              width: '100%',
-              boxSizing: 'border-box',
-              padding: '11px 13px',
-              fontSize: 'calc(15px * var(--ui-font-scale, 1))',
-              borderRadius: 10,
-              border: '1px solid var(--border)',
-              background: 'var(--bg)',
-              color: 'var(--text)',
-              marginBottom: 14,
-            }}
-          />
+    <>
+      <Dialog width={400} ariaLabel="Choose your name" className="onboard-dialog">
+        <div style={{ display: 'flex', justifyContent: 'center', margin: '6px 0 14px' }}>
+          <BeamLogo size={44} />
         </div>
-        <div className="dialog-actions">
-          <button
-            className="btn btn-primary"
-            style={{ width: '100%', justifyContent: 'center', padding: '11px' }}
-            onClick={finish}
-            disabled={!name.trim()}
-          >
+        <h2 className="dialog-title" style={{ textAlign: 'center', marginBottom: 6 }}>
+          What should people call you?
+        </h2>
+        <p className="dialog-text" style={{ textAlign: 'center', marginBottom: 18 }}>
+          {MOBILE_UI
+            ? 'Friends see this name in chats and when you send photos or files. You can change it anytime in Settings.'
+            : 'This is the name friends see when you send files or share a folder. You can change it anytime in Settings.'}
+        </p>
+        {MOBILE_UI && <p style={{ lineHeight: 1.5, color: 'var(--text-muted)' }}>Keep DropBeam open while sending or receiving. Find received files in Files → On My iPhone → DropBeam.</p>}
+        <input
+          autoFocus
+          className="input"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && name.trim() && finish()}
+          placeholder="Your name"
+          aria-label="Your name"
+          maxLength={40}
+          style={{ fontSize: 'var(--font-md)', padding: '10px 13px' }}
+        />
+        <div className="dialog-actions" style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 16 }}>
+          <button className="btn btn-primary btn-lg btn-block" onClick={finish} disabled={!name.trim()}>
             Continue
           </button>
-          {!MOBILE_UI && <button className="btn btn-ghost" style={{ width: '100%', justifyContent: 'center', marginTop: 8 }} onClick={() => setJoining(true)}>
+          {!MOBILE_UI && <button className="btn btn-quiet btn-block" onClick={() => setJoining(true)}>
             Already use DropBeam on another device? Link it
           </button>}
         </div>
-      </motion.div>
+      </Dialog>
       {joining && <JoinAccountModal onClose={() => setJoining(false)} onShowCode={() => setJoining(false)} />}
-    </div>
+    </>
   )
 }
 
@@ -378,32 +344,17 @@ function LocalNetworkBanner() {
   }, [])
   if (!blocked || dismissed) return null
   return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 10,
-        padding: '8px 14px',
-        fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
-        lineHeight: 1.4,
-        background: 'var(--amber-soft)',
-        color: 'var(--amber)',
-        borderBottom: '1px solid var(--border)',
-      }}
-    >
+    <div className="app-banner warn" role="status">
       <AlertTriangle size={15} style={{ flexShrink: 0 }} />
       <span style={{ flex: 1 }}>
         DropBeam can’t reach a device on your network directly, so transfers are using a slow relay.
-        Enable DropBeam under <b>Local Network</b> — and check it on the <b>other</b> device too.
+        {IS_MAC ? <> Enable DropBeam under <b>Local Network</b> — and check it on the <b>other</b> device too.</>
+          : <> Check that your firewall allows DropBeam on private networks — on <b>both</b> devices.</>}
       </span>
-      <button
-        className="btn btn-ghost"
-        style={{ flexShrink: 0, padding: '4px 10px', fontSize: 'calc(12px * var(--ui-font-scale, 1))' }}
-        onClick={() => api.openLocalNetworkSettings().catch(() => {})}
-      >
+      {IS_MAC && <button className="btn btn-ghost btn-sm" style={{ flexShrink: 0 }} onClick={() => api.openLocalNetworkSettings().catch(() => {})}>
         Open Settings
-      </button>
-      <button className="icon-btn" onClick={() => setDismissed(true)} title="Dismiss">
+      </button>}
+      <button className="icon-btn icon-btn-sm" onClick={() => setDismissed(true)} title="Dismiss" aria-label="Dismiss">
         <X size={15} />
       </button>
     </div>
@@ -417,22 +368,10 @@ function InstallBanner() {
   const [dismissed, setDismissed] = useState(false)
   if (!hint || dismissed) return null
   return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 10,
-        padding: '8px 14px',
-        fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
-        lineHeight: 1.4,
-        background: 'var(--amber-soft)',
-        color: 'var(--amber)',
-        borderBottom: '1px solid var(--border)',
-      }}
-    >
+    <div className="app-banner warn" role="status">
       <AlertTriangle size={15} style={{ flexShrink: 0 }} />
       <span style={{ flex: 1 }}>{hint}</span>
-      <button className="icon-btn" onClick={() => setDismissed(true)} title="Dismiss">
+      <button className="icon-btn icon-btn-sm" onClick={() => setDismissed(true)} title="Dismiss" aria-label="Dismiss">
         <X size={15} />
       </button>
     </div>

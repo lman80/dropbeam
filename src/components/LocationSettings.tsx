@@ -4,6 +4,7 @@ import { api, locationsApi, onLocationActivity, type LocationActivity, type Host
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
 import './locations.css'
+import { IS_WINDOWS } from '../lib/platform'
 
 const DEFAULT_CAP = 500_000_000_000
 const empty = (): HostedLocation => ({ id: '', name: '', path: '', friendIds: [], rights: { upload: true, manage: false }, byteCap: DEFAULT_CAP })
@@ -158,6 +159,7 @@ export function LocationSettings() {
     void onLocationActivity(a => setActivity(rows => [a, ...rows].slice(0, 50))).then(fn => { if (alive) un = fn; else fn() })
     return () => { alive = false; un?.() }
   }, [])
+  const startAdding = () => { setError(''); setAdded(''); setDraft(null); setAdding(true) }
   const save = async () => {
     if (!draft || busy) return
     setBusy(true); setError('')
@@ -167,11 +169,20 @@ export function LocationSettings() {
   }
   return <section className="location-settings" aria-label="Locations settings">
     <div className="location-heading"><div><h2><HardDrive size={18} /> Locations</h2>
-      <p>Share a folder or mounted NAS with the friends you choose.</p></div>
-      <button className="btn btn-ghost" disabled={!loaded || busy || adding} onClick={() => { setError(''); setAdded(''); setDraft(null); setAdding(true) }}><Plus size={15} /> Add a location</button></div>
+      <p>{IS_WINDOWS ? 'Browse folders your friends share. Sharing a folder from Windows isn’t available yet.' : 'Share a folder or mounted NAS with the friends you choose.'}</p></div>
+      {!IS_WINDOWS && <button className="btn btn-ghost btn-sm" disabled={!loaded || busy || adding} onClick={startAdding}><Plus size={14} /> Add a location</button>}</div>
     {error && <p className="location-error" role="alert">{error}</p>}
     {!loaded && !error && <p className="location-muted">Loading locations…</p>}
-    {loaded && locations.length === 0 && !draft && !adding && <div className="card location-empty-small">No folders shared yet. A new location stays private until you pick friends for it.</div>}
+    {IS_WINDOWS && loaded && locations.length === 0 && <div className="card location-empty-small" style={{ padding: '16px 18px', textAlign: 'left' }}>
+      Hosting a Location (sharing a folder or NAS from this computer) works on macOS and Linux for now. You can still browse, download from and upload to Locations your friends share — find them under <b>Locations</b> in the sidebar.</div>}
+    {!IS_WINDOWS && loaded && locations.length === 0 && !draft && !adding && <button className="card empty-row" onClick={startAdding}>
+      <span className="empty-row-icon"><Plus size={16} /></span>
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span className="empty-row-title">Share a folder or NAS</span>
+        <span className="empty-row-sub">No folders shared yet. A new location stays private until you pick friends for it.</span>
+      </span>
+      <ChevronRight size={16} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
+    </button>}
     {locations.map(l => <div className={`card location-host-row${l.id === added ? ' location-host-row-new' : ''}`} key={l.id}>
       <HardDrive size={23} /><div className="location-grow"><strong>{l.name}</strong><div className="location-path">{l.path}</div>
         {l.id === added && <small className="location-reach ok"><Check size={13} /> Shared. Your friends will find it under Locations.</small>}
@@ -180,8 +191,8 @@ export function LocationSettings() {
           : 'Private · Nobody has access yet'}</small>
         <details className="location-wizard-advanced"><summary>Advanced</summary>
           <small>Largest single transfer: {(l.byteCap ?? DEFAULT_CAP) / 1_000_000_000} GB · Safe publish: {l.safePublish || 'save to probe'}</small></details></div>
-      <button className="btn btn-ghost" disabled={busy} onClick={() => { setError(''); setAdding(false); setDraft({ ...l, friendIds: [...l.friendIds], rights: { ...l.rights } }) }}>Edit</button>
-      <button className="btn btn-ghost" disabled={busy} onClick={async () => {
+      <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { setError(''); setAdding(false); setDraft({ ...l, friendIds: [...l.friendIds], rights: { ...l.rights } }) }}>Edit</button>
+      <button className="btn btn-danger btn-sm" disabled={busy} onClick={async () => {
         setBusy(true); setError('')
         try { setLocations(await locationsApi.remove(l.id)); if (draft?.id === l.id) setDraft(null) }
         catch(e) { setError(String(e)) } finally { setBusy(false) }
@@ -209,8 +220,8 @@ export function LocationSettings() {
       </fieldset>
       <div className="location-toolbar"><button className="btn btn-primary" disabled={busy || !draft.name.trim() || !draft.path.trim()}>{busy ? 'Saving…' : 'Save location'}</button><button type="button" className="btn btn-ghost" disabled={busy} onClick={() => setDraft(null)}>Cancel</button></div>
     </form>}
-    <div className="card location-editor"><h3>Recent activity</h3>{!activity.length && <p className="location-muted">Folder changes during this app session appear here (last 50).</p>}
+    {(locations.length > 0 || activity.length > 0) && <div className="card location-editor"><h3>Recent activity</h3>{!activity.length && <p className="location-muted">Folder changes during this app session appear here (last 50).</p>}
       {activity.map((a, i) => <div key={`${a.at}:${i}`}><small>{new Date(a.at).toLocaleTimeString()} · {friends.find(f => f.id === a.friendId)?.name || a.friendId} · {locations.find(l => l.id === a.locationId)?.name || a.locationId}</small><div>{a.operation.replace('locations.', '')}: {a.item}{a.to ? ` → ${a.to}` : ''}</div></div>)}
-    </div>
+    </div>}
   </section>
 }

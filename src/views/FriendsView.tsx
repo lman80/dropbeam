@@ -22,13 +22,13 @@ import {
   Trash2,
   UserPlus,
   Users,
-  X,
 } from 'lucide-react'
 import { api, fileSrc, HAS_TAURI, type ConnDetail, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { parseCode, wrongCodeMessage } from '../lib/codes'
 import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
 import { MobileHeader } from '../components/MobileHeader'
+import { Dialog } from '../components/Dialog'
 import { createPortal } from 'react-dom'
 import { ConnInspector } from '../components/ConnInspector'
 import { avatarGradient, initials } from '../lib/avatar'
@@ -42,6 +42,7 @@ export function FriendsView() {
   const grouped = personGroups(friends, myDevice?.account_pub)
   const { myDevices, others } = groupDevices(friends.filter(f => !grouped[f.id]), myDevice?.account_pub)
   useEffect(() => { void useStore.getState().refreshMyDevice().catch(() => {}) }, [])
+  // Phone layout only (the desktop page builds its own section below).
   const devices = <section><div className="device-section-heading"><h2 className={MOBILE_UI ? 'ios-section-title' : ''}>My devices</h2><button className={MOBILE_UI ? 'ios-button' : 'btn btn-ghost'} onClick={() => setLinking(true)}>Add a device</button></div>
     {myDevices.length ? <div className={MOBILE_UI ? 'ios-list' : 'device-list'}>{myDevices.map(f => <FriendCard key={f.id} friend={f} />)}</div> : <p className={MOBILE_UI ? 'mobile-inset ios-footnote' : ''}>Link your phone or another computer</p>}
     {linking && <AddDeviceModal onClose={() => setLinking(false)} />}
@@ -69,29 +70,43 @@ export function FriendsView() {
   </div>
 
   return (
-    <div style={{ maxWidth: 640, margin: '0 auto', padding: '8px 28px 40px' }}>
-      <div
-        className="titlebar-drag"
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          marginBottom: 16,
-          gap: 12,
-        }}
-      >
-        <h1 style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: 0 }}>Friends</h1>
-        <button className="btn btn-primary" onClick={() => setAdding(true)}>
-          <UserPlus size={15} /> Add friend
-        </button>
+    <div className="page">
+      <div className="page-header titlebar-drag">
+        <div>
+          <h1 className="page-title">Friends</h1>
+          <p className="page-subtitle">Send files and chat with people by name.</p>
+        </div>
+        <div className="page-actions">
+          <button className="btn btn-primary" onClick={() => setAdding(true)}>
+            <UserPlus size={15} /> Add friend
+          </button>
+        </div>
       </div>
 
-      {MOBILE_UI && <button className="btn btn-ghost" onClick={() => useStore.getState().setView('locations')}>Browse friends’ Locations</button>}
-
-      {devices}
       {/* ── You ─────────────────────────────────────────────── */}
-      <SectionLabel>You</SectionLabel>
+      <SectionLabel first>You</SectionLabel>
       <YouCard />
+
+      {/* ── Your other devices (multi-device account) ───────── */}
+      <div className="section-row">
+        <SectionLabel>{myDevices.length ? `My devices · ${myDevices.length}` : 'My devices'}</SectionLabel>
+        <button className="btn btn-quiet btn-sm" onClick={() => setLinking(true)}>
+          <Plus size={14} /> Link a device
+        </button>
+      </div>
+      {myDevices.length ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>{myDevices.map((f) => <FriendCard key={f.id} friend={f} />)}</div>
+      ) : (
+        <button className="card empty-row" onClick={() => setLinking(true)}>
+          <span className="empty-row-icon"><Plus size={16} /></span>
+          <span style={{ flex: 1, minWidth: 0 }}>
+            <span className="empty-row-title">Link your phone or another computer</span>
+            <span className="empty-row-sub">Your friends and chats follow you to every device you link.</span>
+          </span>
+          <ChevronRight size={16} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
+        </button>
+      )}
+      {linking && <AddDeviceModal onClose={() => setLinking(false)} />}
 
       {/* ── Friends ─────────────────────────────────────────── */}
       <SectionLabel>{others.length ? `Friends · ${others.length}` : 'Friends'}</SectionLabel>
@@ -118,26 +133,13 @@ export function FriendsView() {
         </div>
       )}
 
-      {adding && <AddFriendModal onClose={() => setAdding(false)} />}
+      <AnimatePresence>{adding && <AddFriendModal onClose={() => setAdding(false)} />}</AnimatePresence>
     </div>
   )
 }
 
-function SectionLabel({ children }: { children: ReactNode }) {
-  return (
-    <div
-      style={{
-        fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
-        fontWeight: 700,
-        letterSpacing: 0.5,
-        textTransform: 'uppercase',
-        color: 'var(--text-faint)',
-        margin: '18px 2px 9px',
-      }}
-    >
-      {children}
-    </div>
-  )
+function SectionLabel({ children, first }: { children: ReactNode; first?: boolean }) {
+  return <h2 className="section-title" style={{ margin: first ? '0 2px 9px' : '22px 2px 9px' }}>{children}</h2>
 }
 
 /** Reusable avatar: the user's chosen picture, or an initials monogram. */
@@ -259,7 +261,7 @@ function YouCard() {
           onClick={() => void pickAvatar()}
           style={{ position: 'relative', flexShrink: 0, padding: 0, border: 'none', background: 'none', cursor: 'pointer' }}
         >
-          <Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={56} radius={18} />
+          <Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={56} radius={999} />
           <span className="you-avatar-cam">
             <Camera size={13} />
           </span>
@@ -280,15 +282,16 @@ function YouCard() {
                 }
               }}
               onBlur={saveName}
-              style={{ fontSize: 'calc(15px * var(--ui-font-scale, 1))', fontWeight: 700, padding: '6px 10px', maxWidth: 260 }}
+              style={{ fontSize: 'var(--font-md)', fontWeight: 700, padding: '5px 10px', maxWidth: 280 }}
             />
           ) : (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ fontWeight: 750, fontSize: 'calc(17px * var(--ui-font-scale, 1))' }}>{displayName || 'You'}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+              <span className="truncate-1" style={{ fontWeight: 750, fontSize: 'var(--font-lg)' }}>{displayName || 'You'}</span>
               <button
                 className="icon-btn"
                 title="Edit your name"
-                style={{ width: 24, height: 24 }}
+                aria-label="Edit your name"
+                style={{ width: 24, height: 24, borderRadius: 6 }}
                 onClick={() => {
                   setName(displayName)
                   setEditing(true)
@@ -487,13 +490,13 @@ function FriendCard({ friend }: { friend: Friend }) {
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <div style={{ position: 'relative', flexShrink: 0 }}>
-          <Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={44} radius={14} /><DeviceBadge kind={friend.deviceKind} />
+          <Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={44} radius={999} /><DeviceBadge kind={friend.deviceKind} />
           <span
             title={presenceLabel(presence)}
             style={{
               position: 'absolute',
-              right: -2,
-              top: -2,
+              right: -1,
+              top: -1,
               width: 13,
               height: 13,
               borderRadius: 999,
@@ -517,16 +520,17 @@ function FriendCard({ friend }: { friend: Friend }) {
                 }
               }}
               onBlur={saveName}
-              style={{ fontSize: 'calc(14.5px * var(--ui-font-scale, 1))', fontWeight: 650, padding: '6px 10px', maxWidth: 240 }}
+              style={{ fontSize: 'var(--font-md)', fontWeight: 650, padding: '5px 10px', maxWidth: 260 }}
             />
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ fontWeight: 700, fontSize: 'calc(15px * var(--ui-font-scale, 1))' }}>{ownLabel ?? friend.name}</span>
-              {ownLabel && <span style={{ color: 'var(--text-faint)', fontSize: 'calc(12px * var(--ui-font-scale, 1))' }}>{friend.name}</span>}
+              <span className="truncate-1" style={{ fontWeight: 700, fontSize: 'var(--font-md)' }} title={ownLabel ?? friend.name}>{ownLabel ?? friend.name}</span>
+              {ownLabel && <span className="truncate-1" style={{ color: 'var(--text-faint)', fontSize: 'var(--font-xs)' }}>{friend.name}</span>}
               <button
                 className="icon-btn"
                 title="Rename"
-                style={{ width: 22, height: 22 }}
+                aria-label={`Rename ${friend.name}`}
+                style={{ width: 22, height: 22, borderRadius: 6 }}
                 onClick={() => {
                   setName(friend.name)
                   setEditing(true)
@@ -604,12 +608,13 @@ function FriendCard({ friend }: { friend: Friend }) {
         <button
           className="icon-btn"
           title={`Message ${friend.name}`}
+          aria-label={`Message ${friend.name}`}
           onClick={() => openChat(friend.id)}
-          style={{ flexShrink: 0, width: 38, height: 38 }}
+          style={{ width: 36, height: 36 }}
         >
           <MessageCircle size={18} />
         </button>
-        <button className="btn btn-primary" onClick={send} disabled={busy}>
+        <button className="btn btn-primary" onClick={send} disabled={busy} style={{ flexShrink: 0 }}>
           {busy ? <Spinner size={14} /> : <Send size={15} />} Send
         </button>
       </div>
@@ -627,27 +632,30 @@ function FriendCard({ friend }: { friend: Friend }) {
       >
         <button
           className={`toggle${friend.autoAccept ? ' on' : ''}`}
+          role="switch"
+          aria-checked={friend.autoAccept}
+          aria-label={`Auto-accept files from ${friend.name}`}
           title={friend.autoAccept ? 'Files save automatically' : 'You approve each file'}
           onClick={() => setFriendAutoAccept(friend.id, !friend.autoAccept)}
         />
-        <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', flex: 1 }}>
+        <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', flex: 1, minWidth: 0 }}>
           {friend.autoAccept ? 'Auto-accept files' : 'Approve files first'}
         </span>
-        <button className="btn btn-ghost" onClick={showInvite} disabled={loadingInvite}>
+        <button className="btn btn-ghost btn-sm" onClick={showInvite} disabled={loadingInvite}>
           {loadingInvite ? <Spinner size={13} /> : <Copy size={13} />} {invite ? 'Hide invite' : 'Invite'}
         </button>
         {confirmRemove ? (
           <>
-            <button className="btn btn-ghost" onClick={() => setConfirmRemove(false)}>
+            <button className="btn btn-ghost btn-sm" onClick={() => setConfirmRemove(false)}>
               Cancel
             </button>
-            <button className="btn btn-danger" onClick={() => removeFriend(friend.id)}>
-              <Trash2 size={14} /> Remove
+            <button className="btn btn-danger btn-sm" onClick={() => removeFriend(friend.id)}>
+              <Trash2 size={13} /> Remove
             </button>
           </>
         ) : (
-          <button className="icon-btn" title="Remove friend" onClick={() => setConfirmRemove(true)}>
-            <Trash2 size={14} />
+          <button className="icon-btn icon-btn-danger" title="Remove friend" aria-label={`Remove ${friend.name}`} onClick={() => setConfirmRemove(true)}>
+            <Trash2 size={15} />
           </button>
         )}
       </div>
@@ -727,83 +735,49 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <AnimatePresence>
-      <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        onClick={onClose}
-        className="dialog-overlay"
-        style={MOBILE_UI ? undefined : {
-          position: 'fixed',
-          inset: 0,
-          background: 'rgba(8, 9, 14, 0.5)',
-          backdropFilter: 'blur(4px)',
-          display: 'grid',
-          placeItems: 'center',
-          zIndex: 200,
-          padding: 20,
-        }}
-      >
-        <motion.div
-          initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96, y: 8 }}
-          animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
-          exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.97 }}
-          transition={{ type: 'spring', stiffness: 320, damping: 28 }}
-          onClick={(e) => e.stopPropagation()}
-          className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
-          style={MOBILE_UI ? undefined : { width: 440, maxWidth: '100%', padding: 22, borderRadius: 20 }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-            <div style={{ fontSize: 'calc(17px * var(--ui-font-scale, 1))', fontWeight: 750 }}>Add a friend</div>
-            <button className="icon-btn" onClick={onClose}>
-              <X size={17} />
-            </button>
-          </div>
-          <div className="dialog-body">
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-              <label htmlFor="add-friend-code" style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
-                Your friend's code
-              </label>
-              <ScanCodeButton
-                disabled={busy}
-                hint="Hold your friend’s QR code (Friends → You) up to your camera."
-                title="Scan a friend’s code"
-                accept={['friend', 'friendInvite']}
-                onCode={(code) => { setCodeInput(code); void submit(code) }}
-                onOther={(p) => { setCodeInput(p.code); void submit(p.code) }}
-              />
-            </div>
-            <textarea
-              id="add-friend-code"
-              className="input"
-              style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'calc(12px * var(--ui-font-scale, 1))', resize: 'none' }}
-              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-              placeholder="Paste their dropbeam:… code, or scan their QR"
-              value={codeInput}
-              autoFocus
-              onChange={(e) => setCodeInput(e.target.value)}
-            />
-            <p style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
-              Ask your friend for their code (Friends → <b>You</b>) — scan the QR on their screen or paste the code. Their
-              name fills in automatically and you’ll both be connected — no retyping names, no re-adding
-              after updates.
-            </p>
-            {error && <p role="alert" style={{ color: 'var(--red)', overflowWrap: 'anywhere' }}>{error}</p>}
-          </div>
-          <div className="dialog-actions">
-            <button
-              className="btn btn-primary"
-              style={{ width: '100%', marginTop: 12 }}
-              onClick={() => void submit()}
-              disabled={busy}
-            >
-              {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend
-            </button>
-          </div>
-        </motion.div>
-      </motion.div>
-    </AnimatePresence>
+    <Dialog
+      title="Add a friend"
+      subtitle="Scan their QR code or paste their DropBeam code."
+      icon={<UserPlus size={18} />}
+      onClose={onClose}
+      busy={busy}
+      footer={
+        <button className="btn btn-primary btn-block" onClick={() => void submit()} disabled={busy}>
+          {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend
+        </button>
+      }
+    >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 6 }}>
+        <label htmlFor="add-friend-code" className="field-label" style={{ margin: 0 }}>
+          Your friend's code
+        </label>
+        <ScanCodeButton
+          small
+          disabled={busy}
+          hint="Hold your friend’s QR code (Friends → You) up to your camera."
+          title="Scan a friend’s code"
+          accept={['friend', 'friendInvite']}
+          onCode={(code) => { setCodeInput(code); void submit(code) }}
+          onOther={(p) => { setCodeInput(p.code); void submit(p.code) }}
+        />
+      </div>
+      <textarea
+        id="add-friend-code"
+        className="input"
+        style={{ minHeight: 72, fontFamily: 'var(--font-mono)', fontSize: 'var(--font-sm)', resize: 'none', wordBreak: 'break-all' }}
+        autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
+        placeholder="Paste their dropbeam:… code, or scan their QR"
+        value={codeInput}
+        autoFocus
+        onChange={(e) => setCodeInput(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void submit() } }}
+      />
+      {error && <p role="alert" className="form-error">{error}</p>}
+      <p className="dialog-text" style={{ margin: '12px 0 0' }}>
+        Ask your friend for their code (Friends → <b>You</b>) — scan the QR on their screen or paste the code. Their
+        name fills in automatically and you’ll both be connected — no retyping names, no re-adding after updates.
+      </p>
+    </Dialog>
   )
 }
 

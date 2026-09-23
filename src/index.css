@@ -3,67 +3,136 @@
 /* Manual (class-based) dark mode so the user can override the OS setting. */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ==========================================================================
+   DropBeam design language — ONE token set for every desktop surface
+   (main window, menu-bar popover, HUD, receive card). Brand colour matches the
+   iOS app's `beam` (Design.swift): rgb(91,91,240) light / rgb(124,124,255) dark,
+   paired with the app icon's violet for gradients.
+   Platform classes on <html>: platform-mac / platform-windows / platform-linux.
+   ========================================================================== */
 @theme {
-  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    "Inter", Roboto, Helvetica, Arial, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo,
-    Consolas, monospace;
+  /* System UI font on every OS: SF on macOS, Segoe UI Variable on Windows,
+     the GTK/fontconfig UI font on Linux (Ubuntu, Cantarell, Inter, Noto…). */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text",
+    "Segoe UI", system-ui, "Inter", "Ubuntu", "Cantarell", "Noto Sans", Roboto,
+    "Helvetica Neue", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji";
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", "Ubuntu Mono",
+    "DejaVu Sans Mono", Menlo, Consolas, monospace;
 }
 
-/* ---- Semantic theme tokens (light) ---- */
 :root {
+  /* ---- Type scale (all honour the optional --ui-font-scale) ---- */
+  --font-2xs: calc(10.5px * var(--ui-font-scale, 1));
+  --font-xs: calc(11.5px * var(--ui-font-scale, 1));
+  --font-sm: calc(12.5px * var(--ui-font-scale, 1));
+  --font-base: calc(13.5px * var(--ui-font-scale, 1));
+  --font-md: calc(14.5px * var(--ui-font-scale, 1));
+  --font-lg: calc(16px * var(--ui-font-scale, 1));
+  --font-xl: calc(18px * var(--ui-font-scale, 1));
+  --font-title: calc(22px * var(--ui-font-scale, 1));
+
+  /* ---- Spacing (4px grid) ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* ---- Radii ---- */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;   /* buttons, inputs, list rows */
+  --radius-lg: 14px;   /* inner panels, popovers, menus */
+  --radius-xl: 16px;   /* cards */
+  --radius-2xl: 20px;  /* dialogs */
+  --radius-pill: 999px;
+
+  /* ---- Motion ---- */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 0.12s;
+  --dur: 0.18s;
+  --dur-slow: 0.28s;
+
+  /* ---- Layout ---- */
+  --page-max: 720px;
+  --page-max-wide: 1100px;
+  --titlebar-h: 46px;
+
+  /* ---- Colour: light ---- */
   --bg-grad-1: #eef0fb;
   --bg-grad-2: #f6f4fc;
+  --bg: #f4f5fb;              /* recessed wells: table headers, input backgrounds */
   --surface: #ffffff;
   --surface-2: #f7f8fc;
+  --surface-3: #eef0f7;
   --surface-hover: #f0f2f9;
-  /* Elevated/popover surface — resolves per theme via --surface (so it tracks
-     light/dark automatically). Used by dialogs, popovers, and avatar cutouts. */
+  /* Elevated/popover surface — resolves per theme via --surface. */
   --bg-elev: var(--surface);
   --border: #e6e8f0;
   --border-strong: #d3d7e4;
   --text: #15161d;
   --text-muted: #5d6173;
   --text-faint: #6c7185;
-  --accent: #5b5bf0;
-  --accent-2: #8b5cf6;
+  --text-dim: var(--text-muted);
+  --accent: #5b5bf0;          /* = iOS Color.beam (light) */
+  --accent-2: #8b5cf6;        /* icon violet — gradient partner */
   --accent-soft: #ececfe;
-  --shadow: 0 1px 2px rgba(20, 22, 40, 0.04), 0 8px 24px rgba(20, 22, 40, 0.06);
-  --shadow-lg: 0 4px 12px rgba(20, 22, 40, 0.08), 0 24px 48px rgba(20, 22, 40, 0.12);
+  --accent-text: #4b4be0;     /* accent as TEXT on light surfaces (AA on white) */
+  --on-accent: #ffffff;
   --green: #16a34a;
   --green-soft: #dcfce7;
   --red: #e11d48;
   --red-soft: #ffe4e9;
   --amber: #b45309;
   --amber-soft: #fef3c7;
+  --success: var(--green);
+  --danger: var(--red);
+  --overlay: rgba(10, 11, 20, 0.42);
+  --shadow-sm: 0 1px 2px rgba(20, 22, 40, 0.06);
+  --shadow: 0 1px 2px rgba(20, 22, 40, 0.04), 0 8px 24px rgba(20, 22, 40, 0.06);
+  --shadow-lg: 0 4px 12px rgba(20, 22, 40, 0.08), 0 24px 48px rgba(20, 22, 40, 0.12);
+  --shadow-pop: 0 2px 6px rgba(20, 22, 40, 0.08), 0 12px 32px rgba(20, 22, 40, 0.16);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+  color-scheme: light;
 }
 
 .dark {
   --bg-grad-1: #0c0d15;
   --bg-grad-2: #11101a;
+  --bg: #12131b;
   --surface: #16171f;
   --surface-2: #1c1e28;
+  --surface-3: #232533;
   --surface-hover: #20222e;
   --border: #262833;
   --border-strong: #363949;
   --text: #f1f2f7;
-  --text-muted: #9ea2b3;
-  --text-faint: #878ca0;
-  --accent: #7c7cff;
+  --text-muted: #a3a7b8;
+  --text-faint: #8a8fa3;
+  --accent: #7c7cff;          /* = iOS Color.beam (dark) */
   --accent-2: #a78bfa;
   --accent-soft: #221f3a;
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.4), 0 24px 48px rgba(0, 0, 0, 0.5);
+  --accent-text: #9d9dff;
   --green: #4ade80;
   --green-soft: #11271a;
   --red: #fb7185;
   --red-soft: #2a1119;
   --amber: #fbbf24;
   --amber-soft: #2a2110;
+  --overlay: rgba(0, 0, 0, 0.55);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.4), 0 24px 48px rgba(0, 0, 0, 0.5);
+  --shadow-pop: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 12px 32px rgba(0, 0, 0, 0.55);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent);
+  color-scheme: dark;
 }
 
 * {
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
 
@@ -76,13 +145,17 @@ body,
 
 body {
   font-family: var(--font-sans);
+  font-size: var(--font-base);
+  line-height: 1.45;
   color: var(--text);
   background:
     radial-gradient(1100px 560px at 88% -12%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 60%),
     radial-gradient(820px 480px at -12% 112%, color-mix(in srgb, var(--accent-2) 9%, transparent), transparent 55%),
     linear-gradient(180deg, var(--bg-grad-1), var(--bg-grad-2));
+  background-color: var(--bg-grad-1);
   background-attachment: fixed;
   overflow: hidden;
+  -webkit-user-select: none;
   user-select: none;
   cursor: default;
 }
@@ -90,8 +163,57 @@ body {
 input,
 textarea,
 .selectable {
+  -webkit-user-select: text;
   user-select: text;
   cursor: auto;
+}
+
+/* Headings: Tailwind's reset makes them body-weight; give them one consistent
+   weight so every section/modal title reads as a title. */
+h1, h2, h3, h4 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+h3, h4 { font-weight: 650; }
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* Native checkboxes/radios/ranges/progress pick up the brand colour. */
+input[type='checkbox'],
+input[type='radio'],
+input[type='range'],
+progress {
+  accent-color: var(--accent);
+}
+select {
+  color: var(--text);
+  background-color: var(--surface-2);
+}
+select option {
+  background: var(--surface);
+  color: var(--text);
+}
+
+/* One focus ring everywhere, keyboard-only (no ring on mouse click). */
+:where(button, a, summary, select, [role='button'], [role='tab'], [role='menuitem'], [tabindex]:not([tabindex='-1']),
+  input[type='checkbox'], input[type='radio']):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+:where(button, a, [role='button']):focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Reduced motion: keep feedback, drop movement. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* ---- Reusable component classes ---- */
@@ -101,36 +223,65 @@ textarea,
   box-shadow: var(--shadow);
 }
 
+/* Buttons: .btn + one of .btn-primary / .btn-ghost / .btn-danger / .btn-quiet,
+   optional size .btn-sm / .btn-lg and .btn-block. */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
+  gap: 7px;
+  font-family: inherit;
   font-weight: 600;
-  font-size: 0.875rem;
-  border-radius: 0.75rem;
-  padding: 0.55rem 0.95rem;
-  transition: filter 0.16s ease, background 0.16s ease, transform 0.08s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+  font-size: var(--font-base);
+  line-height: 18px;
+  border-radius: var(--radius-md);
+  padding: 8px 14px;
+  transition: filter var(--dur) ease, background var(--dur) ease, transform 0.08s ease,
+    box-shadow var(--dur) ease, border-color var(--dur) ease, color var(--dur) ease;
   cursor: default;
   white-space: nowrap;
   border: 1px solid transparent;
+  color: var(--text);
+  background: transparent;
+  -webkit-user-select: none;
+  user-select: none;
 }
+.btn > svg { flex-shrink: 0; }
 .btn:active {
-  transform: translateY(1px) scale(0.99);
+  transform: translateY(0.5px) scale(0.985);
+}
+.btn-sm {
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: var(--font-sm);
+  line-height: 16px;
+  border-radius: var(--radius-sm);
+}
+.btn-lg {
+  padding: 11px 18px;
+  font-size: var(--font-md);
+  line-height: 20px;
+  border-radius: 12px;
+}
+.btn-block {
+  width: 100%;
 }
 .btn-primary {
-  color: white;
+  color: var(--on-accent);
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  box-shadow: 0 4px 14px color-mix(in srgb, var(--accent) 38%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), 0 1px 2px rgba(20, 22, 40, 0.12),
+    0 4px 12px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 .btn-primary:hover {
-  filter: brightness(1.08);
-  box-shadow: 0 6px 20px color-mix(in srgb, var(--accent) 48%, transparent);
+  filter: brightness(1.07);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 2px rgba(20, 22, 40, 0.12),
+    0 6px 18px color-mix(in srgb, var(--accent) 40%, transparent);
 }
 .btn-ghost {
   color: var(--text);
   background: var(--surface-2);
   border-color: var(--border);
+  box-shadow: var(--shadow-sm);
 }
 .btn-ghost:hover {
   background: var(--surface-hover);
@@ -139,64 +290,328 @@ textarea,
 .btn-danger {
   color: var(--red);
   background: var(--red-soft);
+  border-color: color-mix(in srgb, var(--red) 18%, transparent);
 }
 .btn-danger:hover {
-  filter: brightness(1.05);
+  border-color: color-mix(in srgb, var(--red) 40%, transparent);
+  filter: brightness(1.03);
 }
-.btn:disabled {
+.btn-quiet {
+  color: var(--accent-text);
+  background: transparent;
+}
+.btn-quiet:hover {
+  background: var(--accent-soft);
+}
+.btn:disabled,
+.btn[aria-disabled='true'] {
   opacity: 0.5;
   pointer-events: none;
+  box-shadow: none;
+}
+.btn:focus-visible,
+.icon-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .input {
   width: 100%;
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
-  padding: 0.7rem 0.9rem;
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
   color: var(--text);
-  font-size: 0.95rem;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  font-family: inherit;
+  font-size: var(--font-base);
+  line-height: 18px;
+  transition: border-color var(--dur-fast), box-shadow var(--dur-fast), background var(--dur-fast);
   outline: none;
   box-sizing: border-box;
 }
+.input:hover {
+  border-color: var(--border-strong);
+}
 .input:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent);
+  background: var(--surface);
+  box-shadow: var(--focus-ring);
 }
-.input::placeholder {
+.input::placeholder,
+textarea::placeholder {
   color: var(--text-faint);
+  opacity: 1;
+}
+select.input {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a8fa3' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
 }
 
 .chip {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  font-size: 0.72rem;
+  font-size: var(--font-xs);
   font-weight: 600;
-  padding: 0.2rem 0.55rem;
-  border-radius: 999px;
+  line-height: 16px;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
   letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.chip-icon { padding: 3px; width: 20px; height: 20px; justify-content: center; box-sizing: border-box; }
+.chip-accent { background: var(--accent-soft); color: var(--accent-text); }
+.chip-green { background: var(--green-soft); color: var(--green); }
+.chip-amber { background: var(--amber-soft); color: var(--amber); }
+.chip-red { background: var(--red-soft); color: var(--red); }
+.chip-neutral { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
+/* Count badge (sidebar, tabs). */
+.count-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--font-2xs);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
 
-/* Scrollbars */
+/* Full-width notice strip under the title bar. */
+.app-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px 7px 16px;
+  font-size: var(--font-sm);
+  line-height: 1.4;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.app-banner.warn { background: var(--amber-soft); color: var(--amber); }
+.app-banner.warn .icon-btn { color: inherit; }
+.app-banner b { font-weight: 700; }
+
+/* ---- Page layout: every main view uses .page + .page-header ---- */
+.page {
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: 6px 32px 40px;
+  box-sizing: border-box;
+}
+.page-wide {
+  max-width: var(--page-max-wide);
+}
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-height: 40px;
+  margin: 4px 0 18px;
+}
+.page-header > :first-child {
+  min-width: 0;
+}
+.page-title {
+  font-size: var(--font-title);
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  margin: 0;
+}
+.page-subtitle {
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin: 3px 0 0;
+}
+.page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* Section heading inside a page (uppercase eyebrow). */
+.section-title {
+  font-size: var(--font-xs);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 0 0 10px 2px;
+}
+.section-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+}
+.section-row > .section-title { flex: 1; min-width: 0; }
+.section-row > .btn { margin-bottom: 4px; }
+/* A dashed call-to-action row used for "nothing here yet, add one" slots. */
+.empty-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 13px 14px;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface) 60%, transparent);
+  border-style: dashed;
+  border-color: var(--border-strong);
+  box-shadow: none;
+  cursor: default;
+  transition: background var(--dur-fast), border-color var(--dur-fast);
+}
+.empty-row:hover {
+  background: var(--surface);
+  border-color: var(--accent);
+}
+.empty-row-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-md);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.empty-row-title { display: block; font-weight: 650; font-size: var(--font-base); }
+.empty-row-sub { display: block; font-size: var(--font-xs); color: var(--text-muted); margin-top: 1px; }
+.search-field {
+  position: relative;
+  display: block;
+}
+.search-field > svg {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.search-field > .input {
+  padding-left: 34px;
+}
+.search-field > .input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+html:not(.mobile) .chat-list-pane {
+  width: 244px;
+  background: color-mix(in srgb, var(--surface) 38%, transparent);
+}
+@media (max-width: 1000px) {
+  html:not(.mobile) .chat-list-pane { width: 204px; }
+}
+html:not(.mobile) .chat-header > div { min-width: 0; }
+html:not(.mobile) .chat-header .conn-insp { min-width: 0; overflow: hidden; }
+.chat-list-title {
+  margin: 0;
+  padding: 12px 16px 8px;
+  font-size: var(--font-xl);
+  font-weight: 750;
+  letter-spacing: -0.015em;
+}
+/* ---- Settings rows (Settings page, folder drawers) ---- */
+.settings-card {
+  padding: 2px 16px;
+  margin-bottom: 18px;
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 2px;
+}
+.settings-row-title {
+  font-size: var(--font-base);
+  font-weight: 600;
+  line-height: 1.35;
+}
+.settings-row-desc {
+  font-size: var(--font-xs);
+  color: var(--text-muted);
+  margin-top: 3px;
+  line-height: 1.5;
+  max-width: 62ch;
+}
+.settings-row-control {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  max-width: 55%;
+}
+.settings-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 0 -16px;
+}
+/* Feature panels embedded at the top of Settings (Devices, Locations) share
+   one heading style: a 15px title + muted one-line description. */
+.settings-page .account-devices-head h2,
+.settings-page .location-settings .location-heading h2 {
+  font-size: var(--font-lg);
+  font-weight: 700;
+  margin: 0 0 3px;
+}
+.muted { color: var(--text-muted); }
+.faint { color: var(--text-faint); }
+.truncate-1 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Scrollbars. macOS keeps its native overlay scrollbars everywhere except the
+   main pane (.scroll-area); Linux/Windows get slim, themed bars on EVERY
+   scroller (WebKitGTK's default GTK bars are chunky and ignore dark mode). */
 .scroll-area {
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
 }
-.scroll-area::-webkit-scrollbar {
-  width: 9px;
+.scroll-area::-webkit-scrollbar,
+html:not(.platform-mac) ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+  background: transparent;
 }
-.scroll-area::-webkit-scrollbar-thumb {
+.scroll-area::-webkit-scrollbar-track,
+html:not(.platform-mac) ::-webkit-scrollbar-track,
+html:not(.platform-mac) ::-webkit-scrollbar-corner {
+  background: transparent;
+}
+.scroll-area::-webkit-scrollbar-thumb,
+html:not(.platform-mac) ::-webkit-scrollbar-thumb {
   background: var(--border-strong);
   border-radius: 999px;
   border: 2px solid transparent;
   background-clip: content-box;
+  min-height: 32px;
 }
-.scroll-area::-webkit-scrollbar-thumb:hover {
+.scroll-area::-webkit-scrollbar-thumb:hover,
+html:not(.platform-mac) ::-webkit-scrollbar-thumb:hover {
   background: var(--text-faint);
   background-clip: content-box;
+}
+html:not(.platform-mac) * {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
 /* Tauri overlay title bar drag region */
@@ -218,6 +633,39 @@ textarea,
 .titlebar-drag [role='button'] {
   -webkit-app-region: no-drag;
   app-region: no-drag;
+}
+.app-titlebar {
+  height: var(--titlebar-h);
+  min-height: var(--titlebar-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  /* macOS: clear the traffic lights (overlay title bar). */
+  padding: 0 12px 0 80px;
+  flex-shrink: 0;
+}
+/* Linux/Windows draw a native title bar above the webview, so there's no
+   in-app strip: the brand + appearance toggle sit atop the sidebar and every
+   page gets a little extra top room instead. */
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 2px 12px 8px;
+}
+html:not(.platform-mac):not(.mobile) .app-sidebar { padding-top: 14px; }
+html:not(.platform-mac):not(.mobile) .page { padding-top: 18px; }
+html:not(.platform-mac):not(.mobile) .chat-list-title { padding-top: 18px; }
+html:not(.platform-mac):not(.mobile) .chat-header { padding-top: 14px !important; }
+.app-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  pointer-events: none;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+  font-size: var(--font-md);
 }
 
 @keyframes beam-pulse {
@@ -246,38 +694,124 @@ textarea,
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 9px 11px;
-  border-radius: 10px;
-  font-size: calc(14px * var(--ui-font-scale, 1));
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  font-family: inherit;
+  font-size: var(--font-md);
   font-weight: 600;
+  line-height: 20px;
   color: var(--text-muted);
   cursor: default;
-  transition: background 0.14s, color 0.14s;
+  transition: background var(--dur-fast), color var(--dur-fast);
   width: 100%;
   text-align: left;
   border: none;
   background: transparent;
 }
+.nav-item > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .nav-item:hover {
-  background: var(--surface-hover);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
   color: var(--text);
 }
 .nav-item.active {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
+}
+.nav-item:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* ---- Sidebar ---- */
+.app-sidebar {
+  width: 216px;
+  padding: 6px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  transition: width var(--dur) var(--ease-out);
+}
+.nav-label { flex: 1; }
+.nav-item .count-badge { margin-left: auto; }
+.sidebar-me {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 8px 2px;
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  min-width: 0;
+}
+.sidebar-me-avatar {
+  position: relative;
+  overflow: hidden;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: var(--font-sm);
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  flex-shrink: 0;
+}
+.sidebar-me-text { min-width: 0; overflow: hidden; }
+/* Narrow windows: the sidebar collapses to an icon rail so content keeps room. */
+@media (max-width: 900px) {
+  html:not(.mobile) .app-sidebar {
+    width: 64px;
+    padding: 6px 10px 12px;
+    align-items: stretch;
+  }
+  html:not(.mobile) .app-sidebar .nav-item {
+    position: relative;
+    justify-content: center;
+    padding: 9px 0;
+  }
+  html:not(.mobile) .app-sidebar .nav-label,
+  html:not(.mobile) .app-sidebar .sidebar-me-text {
+    display: none;
+  }
+  html:not(.mobile) .app-sidebar .count-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 17px;
+    height: 17px;
+    padding: 0 4px;
+    font-size: 10px;
+    box-shadow: 0 0 0 2px var(--bg-grad-1);
+  }
+  html:not(.mobile) .sidebar-me {
+    justify-content: center;
+    padding: 10px 0 2px;
+  }
+  html:not(.mobile) .sidebar-brand {
+    flex-direction: column;
+    padding: 2px 0 10px;
+  }
 }
 
 .icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--radius-md);
   color: var(--text-muted);
   background: transparent;
   border: 1px solid transparent;
-  transition: all 0.14s;
+  transition: background var(--dur-fast), color var(--dur-fast), border-color var(--dur-fast);
   cursor: default;
   flex-shrink: 0;
 }
@@ -285,6 +819,20 @@ textarea,
   background: var(--surface-hover);
   color: var(--text);
   border-color: var(--border);
+}
+.icon-btn:disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+.icon-btn-sm {
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+}
+.icon-btn-danger:hover {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: color-mix(in srgb, var(--red) 25%, transparent);
 }
 /* Quit button (menu-bar popover): red tint on hover so it reads as "leave". */
 .icon-btn-quit:hover {
@@ -296,45 +844,56 @@ textarea,
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 18px;
+  border-radius: var(--radius-xl);
   box-shadow: var(--shadow);
 }
 
 .seg {
   display: inline-flex;
   padding: 3px;
-  background: var(--surface-2);
+  background: var(--surface-3);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 11px;
   gap: 2px;
 }
 .seg button {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
-  padding: 7px 16px;
-  border-radius: 9px;
-  font-size: calc(13.5px * var(--ui-font-scale, 1));
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: var(--font-sm);
   font-weight: 600;
+  line-height: 18px;
   color: var(--text-muted);
   background: transparent;
   border: none;
   cursor: default;
-  transition: all 0.15s;
+  transition: background var(--dur-fast), color var(--dur-fast), box-shadow var(--dur-fast);
+}
+.seg button:hover:not(.active) {
+  color: var(--text);
 }
 .seg button.active {
   background: var(--surface);
   color: var(--text);
-  box-shadow: var(--shadow);
+  box-shadow: 0 1px 2px rgba(20, 22, 40, 0.1), 0 1px 1px rgba(20, 22, 40, 0.04);
+}
+.dark .seg button.active {
+  background: var(--surface-hover);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
 }
 
 .toggle {
   position: relative;
-  width: 42px;
-  height: 25px;
+  width: 40px;
+  height: 24px;
+  padding: 0;
   border-radius: 999px;
   background: var(--border-strong);
-  transition: background 0.18s;
+  transition: background var(--dur);
   cursor: default;
   flex-shrink: 0;
   border: none;
@@ -347,25 +906,182 @@ textarea,
   position: absolute;
   top: 3px;
   left: 3px;
-  width: 19px;
-  height: 19px;
+  width: 18px;
+  height: 18px;
   border-radius: 999px;
   background: white;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-  transition: transform 0.18s;
+  transition: transform var(--dur) var(--ease-out);
 }
 .toggle.on::after {
-  transform: translateX(17px);
+  transform: translateX(16px);
+}
+.toggle:disabled {
+  opacity: 0.5;
+}
+.toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .row-hover {
-  transition: background 0.13s;
-  border-radius: 12px;
+  transition: background var(--dur-fast);
+  border-radius: var(--radius-md);
 }
 .row-hover:hover {
   background: var(--surface-2);
 }
 
+/* ---- Dialogs: one overlay + panel + header/footer pattern everywhere ---- */
+html:not(.mobile) .dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: var(--overlay);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+html:not(.mobile) .dialog-panel {
+  width: 440px;
+  padding: 20px 22px 22px;
+  border-radius: var(--radius-2xl);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+  box-sizing: border-box;
+}
+.dialog-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.dialog-title {
+  font-size: var(--font-xl);
+  font-weight: 750;
+  letter-spacing: -0.015em;
+  line-height: 1.3;
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.dialog-subtitle {
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  margin: 3px 0 0;
+  line-height: 1.45;
+}
+.dialog-head .icon-btn {
+  margin: -4px -6px 0 0;
+}
+.dialog-text {
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  line-height: 1.55;
+  margin: 0 0 12px;
+}
+.field-label {
+  display: block;
+  font-size: var(--font-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.dialog-icon {
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+html:not(.mobile) .dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 18px;
+  background: transparent;
+}
+html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
+.field-hint {
+  font-size: var(--font-xs);
+  color: var(--text-faint);
+  line-height: 1.45;
+  margin-top: 6px;
+}
+.optional { color: var(--text-faint); font-weight: 500; }
+/* Toggleable pill (pick friends, filters). */
+.pick-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: var(--radius-pill);
+  font: inherit;
+  font-size: var(--font-sm);
+  font-weight: 600;
+  line-height: 18px;
+  cursor: default;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  transition: background var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+}
+.pick-chip:hover { border-color: var(--border-strong); }
+.pick-chip.on {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+}
+/* Selectable option card (radio-style choice with a title + description). */
+.option-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  padding: 10px 13px;
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  cursor: default;
+  transition: background var(--dur-fast), border-color var(--dur-fast), box-shadow var(--dur-fast);
+}
+.option-card:hover { border-color: var(--border-strong); }
+.option-card.on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.option-card-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 650;
+  font-size: var(--font-base);
+}
+.option-card.on .option-card-title { color: var(--accent-text); }
+.option-card-desc {
+  font-size: var(--font-xs);
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin-top: 3px;
+}
+.form-error {
+  color: var(--red);
+  font-size: var(--font-sm);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  margin: 8px 0 0;
+}
 /* ===================================================================== */
 /* Overlay windows: the menu-bar popover and the floating transfer HUD.  */
 /* These windows are transparent, so the body must not paint a backdrop. */
@@ -638,9 +1354,19 @@ html.overlay-window #root {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.hud-pill .chip-icon {
+  background: rgba(255, 255, 255, 0.1) !important;
+  color: #b9b9ff !important;
+}
+.hud-ring small {
+  font-size: 0.72em;
+  font-weight: 650;
+  opacity: 0.7;
+  margin-left: 1px;
+}
 .hud-ring {
   flex-shrink: 0;
-  min-width: 28px;
+  min-width: 34px;
   text-align: right;
   font-size: calc(12px * var(--ui-font-scale, 1));
   font-weight: 750;
@@ -690,7 +1416,7 @@ html.overlay-window #root {
   position: relative;
   width: 36px;
   height: 36px;
-  border-radius: 11px;
+  border-radius: 999px;
   display: grid;
   place-items: center;
   color: #fff;
@@ -708,8 +1434,8 @@ html.overlay-window #root {
 }
 .chat-dot {
   position: absolute;
-  right: -2px;
-  bottom: -2px;
+  right: -1px;
+  bottom: -1px;
   width: 11px;
   height: 11px;
   border-radius: 999px;
@@ -748,6 +1474,10 @@ html.overlay-window #root {
   place-items: center;
 }
 .chat-bubble {
+  /* Each message picks its own direction from its first letter (Arabic/Hebrew
+     read right-to-left inside the bubble). */
+  unicode-bidi: plaintext;
+  text-align: start;
   padding: 8px 12px;
   border-radius: 14px;
   background: var(--surface-2);
@@ -852,6 +1582,13 @@ html.overlay-window #root {
 .chat-line.mine {
   flex-direction: row-reverse;
 }
+.chat-line.mine .chat-time-gutter {
+  margin-left: 0;
+  margin-right: auto;
+}
+.chat-line:hover .chat-time-gutter {
+  opacity: 1;
+}
 .chat-line.run-end {
   margin-bottom: 9px;
 }
@@ -865,7 +1602,7 @@ html.overlay-window #root {
   flex-shrink: 0;
   width: 26px;
   height: 26px;
-  border-radius: 9px;
+  border-radius: 999px;
   display: grid;
   place-items: center;
   color: #fff;
@@ -906,8 +1643,11 @@ html.overlay-window #root {
 }
 .chat-time-gutter {
   flex-shrink: 0;
-  align-self: flex-end;
-  padding-bottom: 6px;
+  align-self: center;
+  margin-left: auto;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity var(--dur-fast);
   white-space: nowrap;
   font-size: calc(10.5px * var(--ui-font-scale, 1));
   color: var(--text-faint);
@@ -1076,7 +1816,7 @@ html.overlay-window #root {
   color: inherit;
   text-decoration: underline;
   text-underline-offset: 2px;
-  word-break: break-all;
+  overflow-wrap: anywhere;
   cursor: pointer;
 }
 .chat-link:hover {
@@ -1129,16 +1869,31 @@ html.overlay-window #root {
   flex-direction: row-reverse;
 }
 .chat-actions {
-  position: relative;
+  /* Floats beside the bubble on hover without taking layout space — so the
+     bubble column (and its timestamp) doesn't carry an invisible gap. */
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   gap: 1px;
-  margin: 0 4px;
+  /* padding (not margin) bridges bubble → buttons so hover never drops. */
+  padding: 2px 2px 2px 6px;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 0.12s ease;
+  z-index: 5;
 }
-.chat-bubble-wrap:hover .chat-actions {
+.chat-line.mine .chat-actions {
+  left: auto;
+  right: 100%;
+  padding: 2px 6px 2px 2px;
+}
+.chat-bubble-wrap:hover .chat-actions,
+.chat-actions:focus-within {
   opacity: 1;
+  pointer-events: auto;
 }
 .chat-act {
   display: grid;
@@ -1648,16 +2403,61 @@ html.overlay-window #root {
   align-items: center;
   gap: 12px;
   width: 100%;
-  padding: 9px 11px;
+  padding: 8px 10px;
   border: none;
   background: transparent;
-  border-radius: 12px;
-  cursor: pointer;
-  transition: background 0.13s ease;
+  border-radius: var(--radius-md);
+  font: inherit;
+  color: var(--text);
+  cursor: default;
+  transition: background var(--dur-fast) ease;
 }
 .chooser-row:hover {
-  background: var(--surface-2);
+  background: var(--surface-hover);
 }
+.chooser-row:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.chooser-avatar {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: var(--font-sm);
+  flex-shrink: 0;
+}
+.chooser-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  background: var(--accent-soft);
+  flex-shrink: 0;
+}
+.chooser-name { font-size: var(--font-base); font-weight: 650; }
+.chooser-sub { font-size: var(--font-xs); color: var(--text-faint); }
+/* Presence dot on an avatar (top-right). */
+.presence-dot {
+  position: absolute;
+  right: -1px;
+  top: -1px;
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  background: var(--text-faint);
+  border: 2px solid var(--surface);
+  box-sizing: content-box;
+  width: 9px;
+  height: 9px;
+}
+.presence-dot.online { background: var(--green); }
 
 /* ── Blip-style receive card (the "receive" overlay window) ──────────────── */
 /* The card now fills a NORMAL macOS window (titleBarStyle Overlay): the OS draws
@@ -1842,6 +2642,10 @@ html.overlay-window #root {
   color: var(--text-muted);
   margin-top: 3px;
   text-align: center;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .rc-actions {
   position: relative;
@@ -2204,6 +3008,18 @@ html.mobile .chat-input { font-size: 16px; }
   z-index: 1;
 }
 
+/* History rows: the remove (×) appears on hover/focus so the list stays calm. */
+.history-row-remove { opacity: 0; }
+.row-hover:hover .history-row-remove,
+.history-row-remove:focus-visible { opacity: 1; }
+/* Transfer card action row: secondary actions sit bottom-right, small. */
+.xfer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
 /* Transfer card meters: the speed and the time left are BUTTONS — clicking the
    speed swaps live ↔ average, clicking the time swaps which rate it is based on
    (both choices are global and remembered). */
@@ -2273,9 +3089,12 @@ html.mobile button > svg { flex-shrink: 0; }
 .device-list { display: flex; flex-direction: column; gap: 10px; }
 .device-link-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 /* Above the first-run name sheet (z 1000): "Already use DropBeam? Link it" opens these from it. */
-.qr-overlay, .device-link-overlay { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; background: rgb(0 0 0 / 50%); padding: 16px; }
+.qr-overlay, .device-link-overlay { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; background: var(--overlay); -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); padding: 16px; }
 .device-link-dialog { width: 440px; max-width: 100%; max-height: 90dvh; overflow: auto; padding: 22px; display: flex; flex-direction: column; gap: 12px; }
-.device-link-dialog h2 { font-size: 18px; margin: 0; }
+.device-link-dialog h2 { font-size: var(--font-xl); font-weight: 750; letter-spacing: -0.015em; margin: 0; }
+html:not(.mobile) .device-link-dialog { border-radius: var(--radius-2xl); background: var(--bg-elev); box-shadow: var(--shadow-lg); padding: 20px 22px 22px; }
+html:not(.mobile) .device-link-dialog ol { margin: 0; padding-left: 20px; color: var(--text-muted); line-height: 1.55; }
+html:not(.mobile) .device-link-dialog .device-link-actions { justify-content: flex-end; }
 .device-link-dialog p { margin: 0; }
 .link-qr { align-self: center; background: white; padding: 16px; border-radius: 12px; }
 .link-qr svg { display: block; max-width: 100%; height: auto; }

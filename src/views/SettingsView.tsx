@@ -2,35 +2,41 @@ import { deviceKindLabel } from '../lib/deviceIcons'
 import { folderName } from '../lib/syncedFolders'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { DevicesPanel } from '../components/DevicesPanel'
-import { useEffect, useState, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
 import { CheckCircle2, Download, FolderOpen, HardDrive, QrCode, RefreshCw, Trash2 } from 'lucide-react'
 import { QrCodeView } from '../components/CodeQr'
 import { QrScanner } from '../components/QrScanner'
 import { api, type Settings } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
-import { MOBILE_UI } from '../lib/platform'
+import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
 import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
+
+/** The enclosing settings row's title — the default accessible name of its switch. */
+const RowTitle = createContext('')
 
 function Toggle({
   on,
   onChange,
   disabled,
+  label,
 }: {
   on: boolean
   onChange: (v: boolean) => void
   disabled?: boolean
+  label?: string
 }) {
+  const rowTitle = useContext(RowTitle)
   return (
     <button
       className={`toggle${on ? ' on' : ''}`}
+      role="switch"
+      aria-checked={on}
+      aria-label={label ?? (rowTitle || undefined)}
       onClick={() => !disabled && onChange(!on)}
-      aria-pressed={on}
-      aria-disabled={disabled}
       disabled={disabled}
-      style={disabled ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
     />
   )
 }
@@ -46,39 +52,25 @@ function Row({
   children?: ReactNode
 }) {
   return (
-    <div
-      className="settings-row"
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 16,
-        padding: '13px 4px',
-      }}
-    >
+    <div className="settings-row">
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 600 }}>{title}</div>
-        {desc && (
-          <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
-            {desc}
-          </div>
-        )}
+        <div className="settings-row-title">{title}</div>
+        {desc && <div className="settings-row-desc">{desc}</div>}
       </div>
-      <div style={{ flexShrink: 0 }}>{children}</div>
+      {children && <div className="settings-row-control"><RowTitle.Provider value={title}>{children}</RowTitle.Provider></div>}
     </div>
   )
 }
 
 function Card({ children }: { children: ReactNode }) {
   return (
-    <div className="card" style={{ padding: '6px 16px', marginBottom: 16 }}>
+    <div className="card settings-card">
       {children}
     </div>
   )
 }
 
-const SEP = (
-  <div style={{ height: 1, background: 'var(--border)', margin: '0 -16px' }} />
-)
+const SEP = <div className="settings-sep" role="separator" />
 
 export function SettingsView() {
   const settings = useStore((s) => s.settings) as Settings
@@ -242,23 +234,20 @@ export function SettingsView() {
   }
 
   return (
-    <div
-      style={{
-        maxWidth: 620,
-        margin: '0 auto',
-        padding: MOBILE_UI ? '4px 16px 28px' : '8px 28px 40px',
-      }}
-    >
-      <h1 className="titlebar-drag" style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: '0 0 16px' }}>
-        Settings
-      </h1>
+    <div className="page settings-page">
+      <div className="page-header titlebar-drag">
+        <div>
+          <h1 className="page-title">Settings</h1>
+          <p className="page-subtitle">Devices, locations, notifications and how transfers connect.</p>
+        </div>
+      </div>
       {deviceModals}
       <DevicesPanel />
       {!MOBILE_UI && <LocationSettings />}
 
       <SectionTitle>Profile</SectionTitle>
       <Card>
-        <Row title="Display name" desc={MOBILE_UI ? "The name your friends see." : "What paired devices see you as."}>
+        <Row title="Display name" desc="What friends see. Your name and photo apply to all your devices — they sync across your account.">
           <DisplayNameInput value={settings.displayName} onSave={(displayName) => void save({ displayName })} />
         </Row>
       </Card>
@@ -267,7 +256,7 @@ export function SettingsView() {
       <Card>
         {!MOBILE_UI && (
           <Row title="Save received files to">
-            <button className="btn btn-ghost" onClick={changeDir} title={settings.downloadDir}>
+            <button className="btn btn-ghost btn-sm" onClick={changeDir} title={settings.downloadDir}>
               <FolderOpen size={15} />
               <span
                 style={{
@@ -287,7 +276,7 @@ export function SettingsView() {
           title="Clear transfer cache"
           desc="Interrupted transfers keep their progress on disk so they can resume. Old leftovers are cleaned automatically after a week; this removes them now."
         >
-          <button className="btn btn-ghost" onClick={clearCache} disabled={clearing}>
+          <button className="btn btn-ghost btn-sm" onClick={clearCache} disabled={clearing}>
             {clearing ? <Spinner size={14} /> : <Trash2 size={15} />}
             <span>Clear now</span>
           </button>
@@ -320,14 +309,14 @@ export function SettingsView() {
           <>
             <Row
               title="Stay ready in the background"
-              desc="Start DropBeam automatically at login and keep it quietly in the menu bar, so files can arrive even when you haven’t opened it. Turn off and DropBeam only receives while it’s open."
+              desc={`Start DropBeam automatically at login and keep it quietly in the ${TRAY_NAME}, so files can arrive even when you haven’t opened it. Turn off and DropBeam only receives while it’s open.`}
             >
               <Toggle on={settings.launchAtLogin} onChange={(v) => save({ launchAtLogin: v })} />
             </Row>
             {SEP}
             <Row
               title="Keep running when you close the window"
-              desc="Closing the window tucks DropBeam into the menu bar instead of quitting, so it keeps receiving."
+              desc={`Closing the window tucks DropBeam into the ${TRAY_NAME} instead of quitting, so it keeps receiving.`}
             >
               <Toggle on={settings.minimizeToTray} onChange={(v) => save({ minimizeToTray: v })} />
             </Row>
@@ -395,14 +384,14 @@ export function SettingsView() {
           title="Direct peer-to-peer"
           desc={MOBILE_UI ? "Send to other devices with end-to-end encryption. Keep DropBeam open on both devices until the transfer finishes." : "Every transfer — Quick Send, friends, and shared folders — goes straight to the other computer, end-to-end encrypted, as fast as your network allows. Your firewall may ask once to allow DropBeam."}
         >
-          <span style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 650, color: 'var(--accent)' }}>On</span>
+          <span className="chip chip-green">On</span>
         </Row>
         {SEP}
         <Row
           title="Test direct connection"
           desc={testResult || (MOBILE_UI ? 'Check the connection on this device.' : 'Confirm the direct engine is running on this computer.')}
         >
-          <button className="btn btn-ghost" onClick={runDirectTest} disabled={testing}>
+          <button className="btn btn-ghost btn-sm" onClick={runDirectTest} disabled={testing}>
             {testing ? <Spinner size={14} /> : <RefreshCw size={15} />} Test
           </button>
         </Row>
@@ -412,18 +401,25 @@ export function SettingsView() {
             title="Local network access"
             desc="iOS asks once for permission to find devices on your Wi-Fi. If nearby transfers keep falling back to the slow relay, turn DropBeam on under Settings → Privacy & Security → Local Network — and check it on the other device too."
           />
-        ) : (
+        ) : IS_MAC ? (
           <Row
             title="Local network access"
             desc="macOS must allow DropBeam on your Local Network for fast same-Wi-Fi transfers. If transfers to a nearby device keep using the slow relay, enable DropBeam here — and check it on the other device too."
           >
             <button
-              className="btn btn-ghost"
+              className="btn btn-ghost btn-sm"
               onClick={() => api.openLocalNetworkSettings().catch(() => {})}
             >
               Open Settings
             </button>
           </Row>
+        ) : (
+          <Row
+            title="Local network access"
+            desc={IS_WINDOWS
+              ? 'For fast same-Wi-Fi transfers, allow DropBeam on Private networks when Windows Firewall asks (or in Windows Security → Firewall & network protection → Allow an app). Check the other device too.'
+              : 'For fast same-Wi-Fi transfers, make sure a firewall (ufw, firewalld…) isn’t blocking DropBeam on your local network. Check the other device too.'}
+          />
         )}
         {SEP}
         <Row
@@ -462,26 +458,18 @@ export function SettingsView() {
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
               <input
+                className="input"
                 type="number"
                 min={0}
                 max={100000}
+                aria-label="Upload limit in Mbps"
                 value={settings.uploadLimitMbps || 0}
                 onChange={(e) =>
                   save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })
                 }
-                style={{
-                  width: 72,
-                  fontSize: 'calc(13px * var(--ui-font-scale, 1))',
-                  fontWeight: 600,
-                  padding: '6px 8px',
-                  borderRadius: 8,
-                  border: '1px solid var(--border)',
-                  background: 'var(--bg-elev)',
-                  color: 'var(--text)',
-                  textAlign: 'right',
-                }}
+                style={{ width: 84, fontWeight: 600, padding: '6px 9px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}
               />
-              <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>Mbps</span>
+              <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>Mbps</span>
             </div>
             <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               {[
@@ -495,18 +483,11 @@ export function SettingsView() {
                 return (
                   <button
                     key={p.v}
+                    className={`pick-chip${on ? ' on' : ''}`}
+                    aria-pressed={on}
                     onClick={() => save({ uploadLimitMbps: p.v })}
                     title={p.rec ? 'Recommended starting point for most home routers' : undefined}
-                    style={{
-                      fontSize: 'calc(12px * var(--ui-font-scale, 1))',
-                      fontWeight: 600,
-                      padding: '4px 9px',
-                      borderRadius: 999,
-                      cursor: 'pointer',
-                      border: `1px solid ${on ? 'var(--accent)' : 'var(--border)'}`,
-                      background: on ? 'var(--accent-soft)' : 'var(--surface-2)',
-                      color: on ? 'var(--accent)' : 'var(--text-muted)',
-                    }}
+                    style={{ padding: '3px 9px', fontSize: 'var(--font-xs)' }}
                   >
                     {p.label}
                     {p.rec ? ' ★' : ''}
@@ -527,7 +508,7 @@ export function SettingsView() {
 
       <SectionTitle>How transfers connect</SectionTitle>
       <Card>
-        <div style={{ padding: '4px 2px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div style={{ padding: '12px 2px', display: 'flex', flexDirection: 'column', gap: 14 }}>
           {[
             {
               loc: 'local' as const,
@@ -550,12 +531,12 @@ export function SettingsView() {
               <div style={{ flexShrink: 0, marginTop: 1 }}>
                 <ChannelBadge locality={c.loc} showConnecting />
               </div>
-              <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', lineHeight: 1.5 }}>
                 {c.text}
               </span>
             </div>
           ))}
-          <span style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', lineHeight: 1.5 }}>
+          <span style={{ fontSize: 'var(--font-xs)', color: 'var(--text-faint)', lineHeight: 1.5 }}>
             The badge on each transfer shows which one it's using. Want to avoid the slow relay
             entirely? Turn on "Only send over direct connections" above.
           </span>
@@ -567,8 +548,8 @@ export function SettingsView() {
       <SectionTitle>Recoverable files</SectionTitle>
       <Card>
         <div style={{ padding: '12px 2px 4px' }}>
-          <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 600 }}>Deleted &amp; replaced files in shared folders</div>
-          <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
+          <div style={{ fontSize: 'var(--font-base)', fontWeight: 600 }}>Deleted &amp; replaced files in shared folders</div>
+          <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
             When something is deleted or overwritten in a shared folder, DropBeam keeps a copy so you can
             get it back. Old copies are cleaned up automatically so they never pile up.{' '}
             {historyUsage !== null && (
@@ -578,7 +559,7 @@ export function SettingsView() {
         </div>
 
         <div style={{ padding: '10px 2px' }}>
-          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 600, marginBottom: 8 }}>Keep copies for</div>
+          <div style={{ fontSize: 'var(--font-sm)', fontWeight: 600, marginBottom: 8 }}>Keep copies for</div>
           <div className="seg" style={{ display: 'flex', width: '100%' }}>
             {(
               [
@@ -601,7 +582,7 @@ export function SettingsView() {
         </div>
 
         <div style={{ padding: '10px 2px 14px' }}>
-          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 600, marginBottom: 8 }}>Storage limit per folder</div>
+          <div style={{ fontSize: 'var(--font-sm)', fontWeight: 600, marginBottom: 8 }}>Storage limit per folder</div>
           <div className="seg" style={{ display: 'flex', width: '100%' }}>
             {(
               [
@@ -628,7 +609,7 @@ export function SettingsView() {
           title="Free up space now"
           desc="Remove every saved copy across all your shared folders. Your live files aren’t touched."
         >
-          <button className="btn btn-ghost" onClick={freeHistory} disabled={freeingHistory}>
+          <button className="btn btn-ghost btn-sm" onClick={freeHistory} disabled={freeingHistory}>
             {freeingHistory ? <Spinner size={14} /> : <HardDrive size={15} />} Free up
           </button>
         </Row>
@@ -644,7 +625,7 @@ export function SettingsView() {
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             {MOBILE_UI ? <span style={{ color: 'var(--text-muted)' }}>Close and reopen DropBeam to apply changes.</span> : <button
-              className="btn btn-ghost"
+              className="btn btn-ghost btn-sm"
               onClick={() => api.restartApp().catch(() => {})}
               title="Restart DropBeam so the relay change takes effect"
             >
@@ -672,7 +653,7 @@ export function SettingsView() {
         ) : (
           <Row title="Version" desc={`DropBeam ${appVer || '…'}`}>
             <button
-              className="btn btn-ghost"
+              className="btn btn-ghost btn-sm"
               onClick={() => checkForUpdates(true)}
               disabled={checkingUpdate}
             >
@@ -686,14 +667,14 @@ export function SettingsView() {
             <div style={{ padding: '13px 4px' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <CheckCircle2 size={17} color="var(--green)" />
-                <span style={{ fontWeight: 650, fontSize: 'calc(14px * var(--ui-font-scale, 1))' }}>
+                <span style={{ fontWeight: 650, fontSize: 'var(--font-base)' }}>
                   Version {update.version} is available
                 </span>
               </div>
               {update.installing ? (
                 <div style={{ marginTop: 11 }}>
                   <ProgressBar percent={update.progress} />
-                  <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 7 }}>
+                  <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)', marginTop: 7 }}>
                     {update.progress < 100
                       ? `Downloading… ${update.progress}%`
                       : 'Installing — DropBeam will restart…'}
@@ -715,12 +696,12 @@ export function SettingsView() {
           <>
             {SEP}
             <div style={{ padding: '13px 4px' }}>
-              <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginBottom: 9, lineHeight: 1.5 }}>
+              <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', marginBottom: 9, lineHeight: 1.5 }}>
                 Couldn't reach the update server. If you're on a network that blocks
                 GitHub, download the latest installer manually:
               </div>
               <button
-                className="btn btn-ghost"
+                className="btn btn-ghost btn-sm"
                 onClick={() =>
                   api.openUrl('https://github.com/lman80/dropbeam/releases/latest').catch(() => {})
                 }
@@ -740,7 +721,7 @@ export function SettingsView() {
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             {MOBILE_UI ? <span style={{ color: 'var(--text-muted)' }}>Close and reopen DropBeam to apply changes.</span> : <button
-              className="btn btn-ghost"
+              className="btn btn-ghost btn-sm"
               onClick={() => api.restartApp().catch(() => {})}
               title="Restart DropBeam so the logging change takes effect"
             >
@@ -754,7 +735,7 @@ export function SettingsView() {
           title="Export logs"
           desc={MOBILE_UI ? "Save a diagnostics file in DropBeam’s folder in Files. You can share it to help troubleshoot an issue." : "Bundle the logs into one file in your Downloads folder (no passwords or file contents — just diagnostics). Send it over DropBeam (drop it on a friend) or AirDrop to get the issue diagnosed."}
         >
-          <button className="btn btn-ghost" onClick={exportLogs} disabled={exporting}>
+          <button className="btn btn-ghost btn-sm" onClick={exportLogs} disabled={exporting}>
             {exporting ? <Spinner size={14} /> : <Download size={15} />}
             <span>Export</span>
           </button>
@@ -776,14 +757,14 @@ export function SettingsView() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <input
                   className="input"
-                  style={{ minWidth: 240 }}
+                  style={{ width: 240 }}
                   autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
                   placeholder="Built-in (leave blank)"
                   value={settings.diagnosticsUrl}
                   onChange={(e) => save({ diagnosticsUrl: e.target.value })}
                 />
                 <button
-                  className="btn btn-ghost"
+                  className="btn btn-ghost btn-sm"
                   disabled={
                     testingDiag ||
                     (settings.diagnosticsUrl !== '' && !settings.diagnosticsUrl.startsWith('https://'))
@@ -828,13 +809,13 @@ export function SettingsView() {
               <div style={{ display: 'flex', gap: 6 }}>
                 <input
                   className="input"
-                  style={{ minWidth: 240 }}
+                  style={{ width: 240 }}
                   autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
                   placeholder="Paste operator ID"
                   value={settings.labOperatorId}
                   onChange={(e) => save({ labOperatorId: e.target.value.trim() })}
                 />
-                <button className="btn btn-ghost" aria-label="Scan operator ID QR code" title="Scan QR code" onClick={() => setScanOperator(true)}><QrCode size={15} /></button>
+                <button className="icon-btn" aria-label="Scan operator ID QR code" title="Scan QR code" onClick={() => setScanOperator(true)}><QrCode size={16} /></button>
               </div>
               {scanOperator && (
                 <QrScanner
@@ -853,7 +834,7 @@ export function SettingsView() {
             >
               <div style={{ display: 'flex', gap: 6 }}>
               <button
-                className="btn btn-ghost"
+                className="btn btn-ghost btn-sm"
                 disabled={!myEid}
                 onClick={async () => {
                   if (!myEid) return
@@ -867,7 +848,7 @@ export function SettingsView() {
               >
                 {myEid ? 'Copy ID' : 'Starting…'}
               </button>
-              <button className="btn btn-ghost" disabled={!myEid} aria-pressed={showEidQr} aria-label="Show device ID QR code" title="QR code" onClick={() => setShowEidQr((v) => !v)}><QrCode size={15} /></button>
+              <button className="icon-btn" disabled={!myEid} aria-pressed={showEidQr} aria-label="Show device ID QR code" title="QR code" onClick={() => setShowEidQr((v) => !v)}><QrCode size={16} /></button>
               </div>
             </Row>
             {showEidQr && myEid && <div style={{ display: 'grid', placeItems: 'center', padding: '4px 0 14px' }}><QrCodeView value={myEid} size={160} hint="Scan to read this device ID" /></div>}
@@ -878,7 +859,7 @@ export function SettingsView() {
       <div
         style={{
           textAlign: 'center',
-          fontSize: 'calc(12px * var(--ui-font-scale, 1))',
+          fontSize: 'var(--font-xs)',
           color: 'var(--text-faint)',
           marginTop: 18,
           lineHeight: 1.6,
@@ -917,7 +898,8 @@ function DisplayNameInput({ value, onSave }: { value: string; onSave: (name: str
   return (
     <input
       className="input"
-      style={{ width: 200 }}
+      aria-label="Display name"
+      style={{ width: 220 }}
       value={draft ?? value}
       maxLength={64}
       onFocus={() => setDraft(value)}

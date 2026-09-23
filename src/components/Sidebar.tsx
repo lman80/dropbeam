@@ -13,6 +13,8 @@ import { isActive } from '../lib/api'
 import { useStore, type View } from '../store'
 import { FriendAvatar } from './FriendAvatar'
 import { SuperFeedback } from '../vendor/superfeedback'
+import { IS_MAC } from '../lib/platform'
+import { SidebarBrand } from './TitleBar'
 
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
@@ -37,54 +39,26 @@ export function Sidebar() {
   )
 
   return (
-    <nav className="app-sidebar"
-      style={{
-        width: 218,
-        padding: '6px 12px 12px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 3,
-        flexShrink: 0,
-      }}
-    >
+    <nav className="app-sidebar" aria-label="Main">
+      {!IS_MAC && <SidebarBrand />}
       {NAV.map((item) => {
         const active = view === item.id
         const Icon = item.icon
+        const badge = item.id === 'send' ? activeCount : item.id === 'chat' ? unreadCount : 0
         return (
           <button
             key={item.id}
             data-testid={`nav-${item.id}`}
             className={`nav-item${active ? ' active' : ''}`}
+            aria-current={active ? 'page' : undefined}
+            title={item.label}
             onClick={() => setView(item.id)}
           >
-            <Icon size={18} strokeWidth={2.1} />
-            <span style={{ flex: 1 }}>{item.label}</span>
-            {item.id === 'send' && activeCount > 0 && (
-              <span
-                className="chip"
-                style={{
-                  background: 'var(--accent)',
-                  color: 'white',
-                  minWidth: 20,
-                  justifyContent: 'center',
-                  padding: '1px 6px',
-                }}
-              >
-                {activeCount}
-              </span>
-            )}
-            {item.id === 'chat' && unreadCount > 0 && (
-              <span
-                className="chip"
-                style={{
-                  background: 'var(--accent)',
-                  color: 'white',
-                  minWidth: 20,
-                  justifyContent: 'center',
-                  padding: '1px 6px',
-                }}
-              >
-                {unreadCount}
+            <Icon size={18} strokeWidth={2} style={{ flexShrink: 0 }} />
+            <span className="nav-label">{item.label}</span>
+            {badge > 0 && (
+              <span className="count-badge" aria-label={item.id === 'send' ? `${badge} active` : `${badge} unread`}>
+                {badge > 99 ? '99+' : badge}
               </span>
             )}
           </button>
@@ -92,54 +66,22 @@ export function Sidebar() {
       })}
 
       {/* Opens the SuperFeedback panel (no floating button — it overlapped Send). */}
-      <button className="nav-item sidebar-feedback" onClick={() => SuperFeedback.open()}>
-        <MessageSquarePlus size={18} strokeWidth={2.1} />
-        <span style={{ flex: 1 }}>Feedback</span>
+      <button className="nav-item sidebar-feedback" title="Send feedback" onClick={() => SuperFeedback.open()}>
+        <MessageSquarePlus size={18} strokeWidth={2} style={{ flexShrink: 0 }} />
+        <span className="nav-label">Feedback</span>
       </button>
 
       <div style={{ flex: 1 }} />
 
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 10,
-          padding: '10px',
-          marginTop: 8,
-          borderTop: '1px solid var(--border)',
-        }}
-      >
-        <div
-          style={{
-            position: 'relative',
-            overflow: 'hidden',
-            width: 34,
-            height: 34,
-            borderRadius: 10,
-            display: 'grid',
-            placeItems: 'center',
-            color: 'white',
-            fontWeight: 700,
-            fontSize: 'calc(13px * var(--ui-font-scale, 1))',
-            background: 'linear-gradient(135deg, var(--accent), var(--accent-2))',
-            flexShrink: 0,
-          }}
-        >
+      <div className="sidebar-me" title={name || 'This device'}>
+        <div className="sidebar-me-avatar">
           <FriendAvatar friend={{ name, avatar }} />
         </div>
-        <div style={{ overflow: 'hidden' }}>
-          <div
-            style={{
-              fontSize: 'calc(13px * var(--ui-font-scale, 1))',
-              fontWeight: 650,
-              whiteSpace: 'nowrap',
-              textOverflow: 'ellipsis',
-              overflow: 'hidden',
-            }}
-          >
+        <div className="sidebar-me-text">
+          <div className="truncate-1" style={{ fontSize: 'var(--font-sm)', fontWeight: 650 }}>
             {name || 'This device'}
           </div>
-          <div style={{ fontSize: 'calc(11px * var(--ui-font-scale, 1))', color: 'var(--text-faint)' }}>This device</div>
+          <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-faint)' }}>This device</div>
         </div>
       </div>
     </nav>

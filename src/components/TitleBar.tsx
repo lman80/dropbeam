@@ -5,17 +5,31 @@ import { BeamLogo } from './bits'
 
 const ORDER = ['system', 'light', 'dark'] as const
 
-export function TitleBar() {
+/** Cycles the appearance: match system → light → dark. */
+export function ThemeToggle() {
   const theme = useStore((s) => s.settings?.theme ?? 'system')
   const save = useStore((s) => s.saveSettings)
-
   const cycle = () => {
     const i = ORDER.indexOf(theme)
     save({ theme: ORDER[(i + 1) % ORDER.length] })
   }
-
   const Icon = theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor
+  return (
+    <button
+      className="icon-btn no-drag"
+      onClick={cycle}
+      title={`Appearance: ${theme === 'system' ? 'match system' : theme} (click to change)`}
+      aria-label={`Appearance: ${theme}. Click to change.`}
+    >
+      <Icon size={17} />
+    </button>
+  )
+}
 
+/** macOS window chrome: an overlay title bar strip that clears the traffic
+ *  lights and drags the window. (Linux/Windows draw a native title bar, so the
+ *  brand + appearance toggle live at the top of the sidebar there instead.) */
+export function TitleBar() {
   return (
     <div
       // Tauri v2's drag works off this ATTRIBUTE, not the CSS `app-region` (which
@@ -23,33 +37,34 @@ export function TitleBar() {
       // inner label has pointer-events:none so a drag started over the logo/title
       // still hits this region; the theme button stays clickable.
       data-tauri-drag-region
-      className="titlebar-drag"
-      style={{
-        // Desktop keeps the fixed 46px bar with room for the macOS traffic
-        // lights. iOS has neither, but does have a status bar / notch to clear.
-        height: MOBILE_UI ? undefined : 46,
-        minHeight: MOBILE_UI ? 'calc(46px + env(safe-area-inset-top))' : 46,
-        paddingTop: MOBILE_UI ? 'env(safe-area-inset-top)' : undefined,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        paddingLeft: MOBILE_UI ? 'calc(16px + env(safe-area-inset-left))' : 80,
-        paddingRight: MOBILE_UI ? 'calc(10px + env(safe-area-inset-right))' : 12,
-        flexShrink: 0,
-      }}
+      className="titlebar-drag app-titlebar"
+      style={MOBILE_UI ? {
+        // iOS has no traffic lights but does have a status bar / notch to clear.
+        height: 'auto',
+        minHeight: 'calc(46px + env(safe-area-inset-top))',
+        paddingTop: 'env(safe-area-inset-top)',
+        paddingLeft: 'calc(16px + env(safe-area-inset-left))',
+        paddingRight: 'calc(10px + env(safe-area-inset-right))',
+      } : undefined}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 9, pointerEvents: 'none' }}>
+      <div className="app-brand">
         <BeamLogo size={19} />
-        <span style={{ fontWeight: 750, letterSpacing: '-0.01em', fontSize: 'calc(15px * var(--ui-font-scale, 1))' }}>DropBeam</span>
+        <span>DropBeam</span>
       </div>
-      <button
-        className="icon-btn no-drag"
-        onClick={cycle}
-        title={`Appearance: ${theme}`}
-        aria-label="Toggle appearance"
-      >
-        <Icon size={17} />
-      </button>
+      <ThemeToggle />
+    </div>
+  )
+}
+
+/** Brand row at the top of the sidebar on Linux/Windows (no overlay title bar). */
+export function SidebarBrand() {
+  return (
+    <div className="sidebar-brand">
+      <div className="app-brand">
+        <BeamLogo size={20} />
+        <span className="nav-label">DropBeam</span>
+      </div>
+      <ThemeToggle />
     </div>
   )
 }

@@ -36,7 +36,10 @@ import { useStore } from '../store'
 import { EmptyState, LocalityBadge, ProgressBar, Spinner } from '../components/bits'
 import { formatBytes, formatEta, formatRelativeTime, formatSpeed as formatSpeedValue } from '../lib/format'
 import { PairingModal } from '../components/PairingModal'
+import { Dialog } from '../components/Dialog'
 import { avatarGradient, initials } from '../lib/avatar'
+import { FriendAvatar } from '../components/FriendAvatar'
+import { friendOnlineState } from '../lib/presence'
 
 export function FoldersView() {
   const pairs = useStore((s) => s.pairs)
@@ -49,19 +52,13 @@ export function FoldersView() {
   const [invite, setInvite] = useState<{ code: string; name: string } | null>(null)
 
   return (
-    <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
-      <div
-        className="titlebar-drag"
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          marginBottom: 18,
-          gap: 12,
-        }}
-      >
-        <h1 style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: 0 }}>Shared Folders</h1>
-        <div style={{ display: 'flex', gap: 8 }}>
+    <div className="page">
+      <div className="page-header titlebar-drag">
+        <div>
+          <h1 className="page-title">Shared Folders</h1>
+          <p className="page-subtitle">Folders that stay in sync with friends, automatically.</p>
+        </div>
+        <div className="page-actions">
           <button className="btn btn-ghost" onClick={() => setModal('accept')}>
             <Plus size={15} /> Accept invite
           </button>
@@ -211,6 +208,8 @@ function FolderCard({
     members.forEach((m) => updatePair({ ...patch, id: m.id }))
   const removeGroup = () => members.forEach((m) => removePair(m.id))
   const [addingPerson, setAddingPerson] = useState(false)
+  const [pickingPerson, setPickingPerson] = useState(false)
+  // "Share an invite code" path: mint a fresh group invite anyone can use.
   const addPerson = async () => {
     setAddingPerson(true)
     try {
@@ -319,17 +318,14 @@ function FolderCard({
           <FolderSync size={19} />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontWeight: 700, fontSize: 'calc(14.5px * var(--ui-font-scale, 1))' }}>{peer}</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+            <span className="truncate-1" style={{ fontWeight: 700, fontSize: 'var(--font-md)' }} title={peer}>{peer}</span>
             {pair.mirror ? (
-              <span className="chip" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>
+              <span className="chip chip-accent">
                 <FolderSync size={11} /> Total sync
               </span>
             ) : (
-              <span
-                className="chip"
-                style={{ background: 'var(--surface-2)', color: 'var(--text-muted)' }}
-              >
+              <span className="chip chip-neutral">
                 {pair.twoWay ? <ArrowLeftRight size={11} /> : <ArrowRight size={11} />}
                 {pair.twoWay
                   ? 'Two-way'
@@ -339,36 +335,38 @@ function FolderCard({
               </span>
             )}
             {pair.autoDelete && (
-              <span className="chip" style={{ background: 'var(--amber-soft)', color: 'var(--amber)' }}>
+              <span className="chip chip-amber">
                 Auto-delete
               </span>
             )}
             {status?.paused && (
-              <span className="chip" style={{ background: 'var(--amber-soft)', color: 'var(--amber)' }}>
+              <span className="chip chip-amber">
                 Paused
               </span>
             )}
           </div>
           <div
             style={{
-              fontSize: 'calc(12px * var(--ui-font-scale, 1))',
+              fontSize: 'var(--font-xs)',
               color: 'var(--text-faint)',
               marginTop: 2,
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
             }}
+            title={pair.folder}
           >
             {folderName}
           </div>
         </div>
-        {!MOBILE_UI && <button className="icon-btn" title="Open folder" onClick={() => api.openPath(pair.folder)}>
+        {!MOBILE_UI && <button className="icon-btn" title="Open folder" aria-label="Open folder" onClick={() => api.openPath(pair.folder)}>
           <FolderOpen size={16} />
         </button>}
         {pair.mirror && (
           <button
             className="icon-btn"
             title={status?.paused ? 'Resume syncing this folder' : 'Pause syncing this folder'}
+            aria-label={status?.paused ? 'Resume syncing' : 'Pause syncing'}
             onClick={() => void api.setFolderPaused(pair.id, !status?.paused)}
             style={{ color: status?.paused ? 'var(--amber)' : undefined }}
           >
@@ -378,6 +376,8 @@ function FolderCard({
         <button
           className="icon-btn"
           title="Folder settings"
+          aria-label="Folder settings"
+          aria-expanded={open}
           onClick={() =>
             setOpen((o) => {
               // Re-arm the destructive confirms fresh each time the drawer reopens.
@@ -406,11 +406,11 @@ function FolderCard({
             boxShadow: `0 0 0 3px color-mix(in srgb, ${info.color} 22%, transparent)`,
           }}
         />
-        <span style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>{info.label}</span>
+        <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', minWidth: 0, overflowWrap: 'anywhere' }}>{info.label}</span>
         {pair.role === 'a' && !pair.peerName && (
           <button
-            className="btn btn-ghost"
-            style={{ marginLeft: 'auto', padding: '5px 10px', fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
+            className="btn btn-ghost btn-sm"
+            style={{ marginLeft: 'auto', flexShrink: 0 }}
             onClick={showInvite}
             disabled={loadingInvite}
           >
@@ -466,15 +466,25 @@ function FolderCard({
           />
         ))}
         <button
-          className="btn btn-ghost"
-          style={{ padding: '5px 11px', fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
-          onClick={addPerson}
+          className="btn btn-ghost btn-sm"
+          onClick={() => setPickingPerson(true)}
           disabled={addingPerson}
-          title="Invite another person to this folder"
+          title="Invite a friend — or anyone, with a code — to this folder"
         >
           {addingPerson ? <Spinner size={13} /> : <UserPlus size={13} />} Add person
         </button>
       </div>
+      <AnimatePresence>
+        {pickingPerson && (
+          <AddPersonDialog
+            pair={pair}
+            members={members}
+            folderName={folderName}
+            onClose={() => setPickingPerson(false)}
+            onShareCode={() => { setPickingPerson(false); void addPerson() }}
+          />
+        )}
+      </AnimatePresence>
 
       {/* Confirm removing one member (or clearing a stuck pending invite). */}
       {memberToRemove && (
@@ -496,10 +506,10 @@ function FolderCard({
               ? `Remove ${memberToRemove.peerName} from this folder? They'll stop syncing it with you.`
               : 'Cancel this pending invite? Anyone you already sent the link to won’t be able to join with it.'}
           </span>
-          <button className="btn btn-ghost" style={{ padding: '5px 10px' }} onClick={() => setConfirmMember(null)}>
+          <button className="btn btn-ghost btn-sm" onClick={() => setConfirmMember(null)}>
             Cancel
           </button>
-          <button className="btn btn-danger" style={{ padding: '5px 10px' }} onClick={doRemoveMember}>
+          <button className="btn btn-danger btn-sm" onClick={doRemoveMember}>
             {memberToRemove.peerName ? 'Remove' : 'Cancel invite'}
           </button>
         </div>
@@ -555,9 +565,8 @@ function FolderCard({
               </span>
               {status.state === 'sending' && (
                 <button
-                  className="btn btn-ghost"
+                  className="btn btn-ghost btn-sm"
                   title="Stop this transfer (it won't be lost — it retries)"
-                  style={{ padding: '3px 9px', fontSize: 'calc(12px * var(--ui-font-scale, 1))' }}
                   onClick={() => api.stopFolderTransfer(pair.id)}
                 >
                   <X size={13} /> Stop
@@ -739,13 +748,14 @@ function FolderCard({
                   display: 'flex',
                   gap: 8,
                   justifyContent: 'flex-end',
+                  flexWrap: 'wrap',
                   marginTop: 12,
                   paddingBottom: 2,
                 }}
               >
                 {pair.mirror && (
                   <button
-                    className="btn btn-ghost"
+                    className="btn btn-ghost btn-sm"
                     style={{ marginRight: 'auto' }}
                     title="See & restore deleted or replaced files, and manage their storage"
                     onClick={() => focusFolderHistory(pair.id)}
@@ -755,7 +765,7 @@ function FolderCard({
                 )}
                 {pair.mirror && (
                   <button
-                    className="btn btn-ghost"
+                    className="btn btn-ghost btn-sm"
                     title="Re-check that both folders are identical and fix any difference"
                     disabled={verifying}
                     onClick={runVerify}
@@ -765,21 +775,21 @@ function FolderCard({
                   </button>
                 )}
                 {pair.role === 'a' && (
-                  <button className="btn btn-ghost" onClick={showInvite} disabled={loadingInvite}>
+                  <button className="btn btn-ghost btn-sm" onClick={showInvite} disabled={loadingInvite}>
                     <QrCode size={14} /> Show invite
                   </button>
                 )}
                 {confirmUnpair ? (
                   <>
-                    <button className="btn btn-ghost" onClick={() => setConfirmUnpair(false)}>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setConfirmUnpair(false)}>
                       Cancel
                     </button>
-                    <button className="btn btn-danger" onClick={removeGroup}>
+                    <button className="btn btn-danger btn-sm" onClick={removeGroup}>
                       <Unlink size={14} /> Confirm {isGroup ? 'leave' : 'unpair'}
                     </button>
                   </>
                 ) : (
-                  <button className="btn btn-danger" onClick={() => setConfirmUnpair(true)}>
+                  <button className="btn btn-danger btn-sm" onClick={() => setConfirmUnpair(true)}>
                     <Unlink size={14} /> Unpair
                   </button>
                 )}
@@ -862,7 +872,7 @@ function Member({
           />
         )}
       </span>
-      <span style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
+      <span className="truncate-1" style={{ maxWidth: 200, fontSize: 'var(--font-sm)', fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
         {you ? `${name} (you)` : name}
       </span>
       {/* Owner control: a clear two-option toggle that always shows BOTH roles with
@@ -928,6 +938,7 @@ function Member({
             onRemove()
           }}
           title={pending ? 'Cancel this invite' : `Remove ${name} from this folder`}
+          aria-label={pending ? 'Cancel this invite' : `Remove ${name} from this folder`}
           style={{
             display: 'grid',
             placeItems: 'center',
@@ -1061,10 +1072,10 @@ function Banner({
         gap: 10,
         marginTop: 12,
         padding: '10px 12px',
-        borderRadius: 10,
+        borderRadius: 'var(--radius-md)',
         background: bg,
         color,
-        fontSize: 'calc(13px * var(--ui-font-scale, 1))',
+        fontSize: 'var(--font-sm)',
         fontWeight: 600,
         lineHeight: 1.4,
       }}
@@ -1086,14 +1097,105 @@ function SettingRow({
 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '11px 2px' }}>
-      <div style={{ flex: 1 }}>
-        <div style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', fontWeight: 600 }}>{title}</div>
-        <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 'var(--font-base)', fontWeight: 600 }}>{title}</div>
+        <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
           {desc}
         </div>
       </div>
       <div style={{ flexShrink: 0 }}>{children}</div>
     </div>
+  )
+}
+
+/** Add someone to an existing folder: pick a friend (they get an in-app prompt,
+ *  no code needed) or fall back to sharing an invite code with anyone. */
+function AddPersonDialog({
+  pair,
+  members,
+  folderName,
+  onClose,
+  onShareCode,
+}: {
+  pair: Pair
+  members: Pair[]
+  folderName: string
+  onClose: () => void
+  onShareCode: () => void
+}) {
+  const friends = useStore((s) => s.friends)
+  const friendSeen = useStore((s) => s.friendSeen)
+  const folderStatuses = useStore((s) => s.folderStatuses)
+  const reloadPairs = useStore((s) => s.reloadPairs)
+  const toast = useStore((s) => s.toast)
+  const [busy, setBusy] = useState<string | null>(null)
+  // Already in the folder = same device (endpoint id) or, for older links, same name.
+  const memberEids = new Set(members.map((m) => m.endpointId).filter(Boolean))
+  const memberNames = new Set(members.map((m) => (m.peerName ?? '').trim().toLowerCase()).filter(Boolean))
+  const candidates = friends.filter(
+    (f) => !(f.endpointId && memberEids.has(f.endpointId)) && !memberNames.has(f.name.trim().toLowerCase()),
+  )
+  const invite = async (friendId: string, name: string) => {
+    setBusy(friendId)
+    try {
+      await api.inviteFriendToFolder(pair.id, friendId, null)
+      await reloadPairs()
+      const online = friendOnlineState(name, friendSeen, folderStatuses) === true
+      toast(online ? 'success' : 'info', online
+        ? `Invited ${name} to “${folderName}”. They’ll pick where to save it.`
+        : `${name} looks offline — if the invite doesn’t reach them in a minute or so, share a code instead.`)
+      onClose()
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+  return (
+    <Dialog
+      title="Add someone"
+      subtitle={<>to “{folderName}”</>}
+      icon={<UserPlus size={18} />}
+      width={420}
+      onClose={onClose}
+      busy={!!busy}
+      bodyStyle={{ display: 'flex', flexDirection: 'column', gap: 2, margin: '0 -8px', padding: '0 8px' }}
+      footer={
+        <button className="chooser-row" style={{ margin: '0 -8px' }} disabled={!!busy} onClick={onShareCode}>
+          <span className="chooser-icon"><QrCode size={18} /></span>
+          <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+            <div className="chooser-name">Share an invite code</div>
+            <div className="chooser-sub">For anyone — they scan the QR or paste the code</div>
+          </div>
+        </button>
+      }
+    >
+      {candidates.length === 0 ? (
+        <p className="dialog-text" style={{ margin: '0 8px' }}>
+          {friends.length ? 'All your friends are already in this folder.' : 'You haven’t added any friends yet.'} Share an invite code instead.
+        </p>
+      ) : (
+        <>
+          <h3 className="section-title" style={{ margin: '2px 8px 4px' }}>Friends</h3>
+          {candidates.map((f) => {
+            const online = friendOnlineState(f.name, friendSeen, folderStatuses) === true
+            return (
+              <button key={f.id} className="chooser-row" disabled={!!busy} onClick={() => void invite(f.id, f.name)}>
+                <span className="chooser-avatar" style={{ background: avatarGradient(f.id) }}>
+                  <FriendAvatar friend={f} />
+                  <span className={`presence-dot${online ? ' online' : ''}`} />
+                </span>
+                <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+                  <div className="chooser-name truncate-1">{f.name}</div>
+                  <div className="chooser-sub" style={{ color: online ? 'var(--green)' : undefined }}>{online ? 'Online now' : 'Offline — the invite may not arrive'}</div>
+                </div>
+                {busy === f.id ? <Spinner size={15} /> : <UserPlus size={16} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />}
+              </button>
+            )
+          })}
+        </>
+      )}
+    </Dialog>
   )
 }
 
@@ -1107,41 +1209,13 @@ function InviteModal({
   onClose: () => void
 }) {
   return (
-    <div
-      onClick={onClose}
-      className="dialog-overlay"
-      style={MOBILE_UI ? undefined : {
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(8, 9, 14, 0.5)',
-        backdropFilter: 'blur(4px)',
-        display: 'grid',
-        placeItems: 'center',
-        zIndex: 200,
-        padding: 20,
-      }}
-    >
-      <motion.div
-        initial={MOBILE_UI ? false : { opacity: 0, scale: 0.96 }}
-        animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1 }}
-        onClick={(e) => e.stopPropagation()}
-        className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
-        style={MOBILE_UI ? undefined : { width: 420, maxWidth: '100%', padding: 22, borderRadius: 20 }}
-      >
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-          <div style={{ fontWeight: 750, fontSize: 'calc(16px * var(--ui-font-scale, 1))' }}>Invite for {folderName}</div>
-          <button className="icon-btn" onClick={onClose}>
-            <X size={17} />
-          </button>
-        </div>
-        <div className="dialog-body">
-          <p style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.5 }}>
-            Send this to the other person. They open DropBeam → <b>Accept invite</b>, scan this QR
-            code (or paste the invite), and choose a folder.
-          </p>
-          <ShareCode code={code} layout="stack" copyLabel="Copy invite" />
-        </div>
-      </motion.div>
-    </div>
+    <Dialog title={`Invite to “${folderName}”`} icon={<UserPlus size={18} />} width={420} onClose={onClose}
+      footer={<button className="btn btn-ghost btn-block" onClick={onClose}>Done</button>}>
+      <p className="dialog-text">
+        Send this to the other person. They open DropBeam → <b>Accept invite</b>, scan this QR
+        code (or paste the invite), and choose a folder.
+      </p>
+      <ShareCode code={code} layout="stack" copyLabel="Copy invite" />
+    </Dialog>
   )
 }

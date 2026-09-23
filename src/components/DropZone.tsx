@@ -1,6 +1,6 @@
 import { motion } from 'framer-motion'
 import { FilePlus2, Upload } from 'lucide-react'
-import { MOBILE_UI } from '../lib/platform'
+import { IS_MAC, MOBILE_UI } from '../lib/platform'
 
 export function DropZone({
   hovering,
@@ -31,6 +31,8 @@ export function DropZone({
       disabled={MOBILE_UI ? undefined : picking}
       aria-busy={picking}
       data-testid="dropzone"
+      className="dropzone"
+      aria-label={MOBILE_UI ? undefined : 'Choose files to send'}
       animate={{ scale: hovering ? 1.012 : 1 }}
       transition={{ type: 'spring', stiffness: 400, damping: 25 }}
       style={{
@@ -39,7 +41,7 @@ export function DropZone({
         background: hovering
           ? 'color-mix(in srgb, var(--accent) 8%, var(--surface))'
           : 'var(--surface)',
-        borderRadius: 20,
+        borderRadius: 'var(--radius-2xl)',
         // A phone screen is short — a 46px-tall pad pushes the transfer list
         // below the fold.
         padding: MOBILE_UI ? '30px 20px' : '46px 24px',
@@ -59,7 +61,7 @@ export function DropZone({
         style={{
           width: 68,
           height: 68,
-          borderRadius: 20,
+          borderRadius: 'var(--radius-2xl)',
           display: 'grid',
           placeItems: 'center',
           color: 'white',
@@ -71,16 +73,16 @@ export function DropZone({
       </motion.div>
       <div style={{ textAlign: 'center' }}>
         {/* Phone users choose between the photo library and Files. */}
-        <div style={{ fontSize: 'calc(17px * var(--ui-font-scale, 1))', fontWeight: 700, color: 'var(--text)' }}>
+        <div style={{ fontSize: 'var(--font-xl)', fontWeight: 700, letterSpacing: '-0.01em', color: 'var(--text)' }}>
           {MOBILE_UI ? 'Choose files to send' : hovering ? 'Drop to send' : 'Drag files here to send'}
         </div>
-        <div style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 4 }}>
+        <div style={{ fontSize: 'var(--font-base)', color: 'var(--text-muted)', marginTop: 4 }}>
           {MOBILE_UI ? (
             'Pick photos, videos or documents, then choose who to send them to.'
           ) : (
             <>
-              or <span style={{ color: 'var(--accent)', fontWeight: 600 }}>click to choose</span>{' '}
-              files &amp; folders
+              or <span style={{ color: 'var(--accent-text)', fontWeight: 600 }}>click to choose</span>{' '}
+              {IS_MAC ? 'files & folders' : 'files'}
             </>
           )}
         </div>

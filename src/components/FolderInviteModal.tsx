@@ -1,7 +1,7 @@
-import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useState } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
-import { FolderSync, X } from 'lucide-react'
+import { AnimatePresence } from 'framer-motion'
+import { FolderSync } from 'lucide-react'
+import { Dialog } from './Dialog'
 import { api, onFolderInvite, type FolderInvite } from '../lib/api'
 import { useStore } from '../store'
 import { Spinner } from './bits'
@@ -52,75 +52,30 @@ export function FolderInviteModal() {
   return (
     <AnimatePresence>
       {invite && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onClick={dismiss}
-          className="dialog-overlay"
-          style={MOBILE_UI ? undefined : {
-            position: 'fixed',
-            inset: 0,
-            zIndex: 60,
-            display: 'grid',
-            placeItems: 'center',
-            background: 'rgba(0,0,0,0.45)',
-            backdropFilter: 'blur(3px)',
-          }}
+        <Dialog
+          title="Shared folder invite"
+          subtitle={<><b>{invite.fromName || 'A friend'}</b> wants to share <b>“{invite.folderName || 'a folder'}”</b> with you.</>}
+          icon={<FolderSync size={19} />}
+          width={420}
+          onClose={dismiss}
+          busy={busy}
+          footer={
+            <>
+              <button className="btn btn-ghost" onClick={dismiss} disabled={busy}>
+                Decline
+              </button>
+              <button className="btn btn-primary" onClick={accept} disabled={busy}>
+                {busy ? <Spinner size={15} /> : null}
+                Accept &amp; choose folder
+              </button>
+            </>
+          }
         >
-          <motion.div
-            initial={MOBILE_UI ? false : { scale: 0.96, y: 8 }}
-            animate={MOBILE_UI ? { opacity: 1 } : { scale: 1, y: 0 }}
-            exit={MOBILE_UI ? { opacity: 0 } : { scale: 0.96, y: 8 }}
-            onClick={(e) => e.stopPropagation()}
-            className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog"} role="dialog" aria-modal="true"
-            style={MOBILE_UI ? undefined : { width: 'min(420px, 92vw)', padding: 22 }}
-          >
-            <div className="dialog-body">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
-                <div
-                  style={{
-                    width: 38,
-                    height: 38,
-                    borderRadius: 12,
-                    display: 'grid',
-                    placeItems: 'center',
-                    background: 'var(--accent-soft)',
-                    color: 'var(--accent)',
-                    flexShrink: 0,
-                  }}
-                >
-                  <FolderSync size={20} />
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 'calc(15px * var(--ui-font-scale, 1))', fontWeight: 750 }}>Shared folder invite</div>
-                  <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
-                    <b>{invite.fromName || 'A friend'}</b> wants to share{' '}
-                    <b>“{invite.folderName || 'a folder'}”</b> with you.
-                  </div>
-                </div>
-                <button className="icon-btn" onClick={dismiss} disabled={busy} aria-label="Decline">
-                  <X size={16} />
-                </button>
-              </div>
-              <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)', marginBottom: 16, lineHeight: 1.45 }}>
-                Accept and choose a folder on this computer to keep in sync. Anything either of you
-                drops in will appear for both.
-              </div>
-            </div>
-            <div className="dialog-actions">
-              <div style={{ display: 'flex', gap: 10 }}>
-                <button className="btn btn-ghost" style={{ flex: 1 }} onClick={dismiss} disabled={busy}>
-                  Decline
-                </button>
-                <button className="btn btn-primary" style={{ flex: 1.4 }} onClick={accept} disabled={busy}>
-                  {busy ? <Spinner size={15} /> : null}
-                  Accept &amp; choose folder
-                </button>
-              </div>
-            </div>
-          </motion.div>
-        </motion.div>
+          <p className="dialog-text" style={{ margin: 0 }}>
+            Accept and choose a folder on this computer to keep in sync. Anything either of you
+            drops in will appear for both.
+          </p>
+        </Dialog>
       )}
     </AnimatePresence>
   )

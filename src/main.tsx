@@ -6,7 +6,7 @@ import { Popover } from './windows/Popover'
 import { Hud } from './windows/Hud'
 import { ReceiveCard } from './windows/ReceiveCard'
 import { api, HAS_TAURI } from './lib/api'
-import { MOBILE_UI } from './lib/platform'
+import { DESKTOP_OS, MOBILE_UI } from './lib/platform'
 import { SuperFeedback } from './vendor/superfeedback'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
@@ -40,6 +40,9 @@ if (label === 'popover' || label === 'hud' || label === 'receive') {
 // the desktop cascade is untouched. Set before the first paint (no reflow).
 if (MOBILE_UI) {
   document.documentElement.classList.add('mobile')
+} else {
+  // Desktop: one class picks platform chrome (titlebar inset, scrollbars, fonts).
+  document.documentElement.classList.add(`platform-${DESKTOP_OS}`)
 }
 
 // Apply the OS theme immediately to avoid a flash; App refines it from settings.

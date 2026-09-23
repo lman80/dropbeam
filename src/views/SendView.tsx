@@ -1,9 +1,9 @@
 import { useMemo, useState } from 'react'
 import { AnimatePresence } from 'framer-motion'
-import { ArrowDownToLine, Inbox } from 'lucide-react'
+import { ArrowDownToLine, FolderUp, Inbox } from 'lucide-react'
 import { api } from '../lib/api'
 import { useStore } from '../store'
-import { MOBILE_UI } from '../lib/platform'
+import { IS_MAC, MOBILE_UI } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { DropZone } from '../components/DropZone'
 import { TransferCard } from '../components/TransferCard'
@@ -92,34 +92,33 @@ export function SendView() {
   )
 
   return (
-    <div
-      style={{
-        maxWidth: 660,
-        margin: '0 auto',
-        padding: MOBILE_UI ? '4px 16px 24px' : '8px 28px 36px',
-      }}
-    >
+    <div className="page" style={MOBILE_UI ? { padding: '4px 16px 24px' } : undefined}>
+      <div className="page-header titlebar-drag">
+        <div>
+          <h1 className="page-title">Send &amp; Receive</h1>
+          <p className="page-subtitle">Beam files straight to a friend — or to anyone with a code.</p>
+        </div>
+      </div>
       <DropZone hovering={dragHovering} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} picking={picking} />
 
       {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
       <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        {!MOBILE_UI && !/Mac/i.test(navigator.userAgent) && (
-          <button className="btn btn-ghost" disabled={picking} onClick={() => void onPick('folder')} title="On Linux and Windows, folders use a separate picker. Send a folder and all its contents.">
-            Choose a folder
+        {!MOBILE_UI && !IS_MAC && (
+          <button className="btn btn-ghost btn-sm" disabled={picking} onClick={() => void onPick('folder')} title="Folders use a separate picker here. Sends the folder and everything in it.">
+            <FolderUp size={14} /> Choose a folder
           </button>
         )}
         {!showReceive ? (
           <>
             <button
-              className="btn btn-ghost"
-              style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
+              className="btn btn-ghost btn-sm"
               onClick={() => setShowReceive(true)}
             >
               <ArrowDownToLine size={14} /> Have a code? Receive files
             </button>
             <ScanCodeButton
               label="Scan a QR code"
-              style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
+              small
               hint="Hold the sender’s QR code up to your camera."
               title="Scan to receive"
               accept={['receive']}
@@ -128,7 +127,7 @@ export function SendView() {
             />
           </>
         ) : (
-          <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 540, flexWrap: 'wrap' }}>
+          <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 540, flexWrap: 'wrap', justifyContent: 'center' }}>
             <input
               className="input"
               autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
@@ -164,7 +163,7 @@ export function SendView() {
         )}
       </div>
 
-      <div style={{ marginTop: 22, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ marginTop: 22, display: 'flex', flexDirection: 'column', gap: 10 }}>
         <AnimatePresence initial={false}>
           {list.map((t) => (
             <TransferCard key={t.id} t={t} />
@@ -178,7 +177,7 @@ export function SendView() {
             hint={
               MOBILE_UI
                 ? 'Tap Photos or Files above, then pick who to send them to — a friend, or anyone with a code. Anything sent to you shows up here automatically.'
-                : 'Drag files onto the area above and pick who to send to — a friend, or anyone with a code. Whatever you receive shows up here automatically, too. Tip: you can also drop a file straight onto the DropBeam menu-bar icon to send it to a friend.'
+                : `Drag files onto the area above and pick who to send to — a friend, or anyone with a code. Whatever you receive shows up here automatically, too.${IS_MAC ? ' Tip: you can also drop a file straight onto the DropBeam menu-bar icon to send it to a friend.' : ''}`
             }
           />
         )}

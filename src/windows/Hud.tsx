@@ -133,13 +133,14 @@ export function Hud() {
               <span className="hud-title">{shown.title}</span>
               <span className="hud-sub">{shown.sub}</span>
             </span>
-            {shown.locality !== 'unknown' && <ChannelBadge locality={shown.locality} />}
-            <span className="hud-ring" aria-hidden>
-              {Math.round(shown.percent)}
+            {shown.locality !== 'unknown' && <ChannelBadge locality={shown.locality} iconOnly size={11} />}
+            <span className="hud-ring" aria-label={`${Math.round(shown.percent)} percent`}>
+              {Math.round(shown.percent)}<small>%</small>
             </span>
             <button
               className="hud-x"
               title="Dismiss"
+              aria-label="Dismiss"
               onClick={(e) => {
                 e.stopPropagation()
                 setDismissed(shown.key)

@@ -763,7 +763,6 @@ pub fn run() {
             commands::update_settings,
             commands::get_history,
             commands::clear_history,
-            #[cfg(target_os = "ios")]
             history::remove_history_entry,
             commands::pick_files,
             #[cfg(target_os = "ios")]
@@ -917,17 +916,48 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
     let open_i = MenuItem::with_id(app, "tray_open", "Open DropBeam", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "tray_quit", "Quit DropBeam", true, None::<&str>)?;
+    // Quick actions — the same things the macOS menu-bar popover offers. On Linux
+    // the tray's click events never arrive (AppIndicator only shows this menu),
+    // so without them the popover's shortcuts were unreachable there.
+    let send_i = MenuItem::with_id(app, "tray_send", "Send Files…", true, None::<&str>)?;
+    let scan_i = MenuItem::with_id(app, "tray_scan", "Scan a Code…", true, None::<&str>)?;
+    let friends_i = MenuItem::with_id(app, "tray_view_friends", "Friends", true, None::<&str>)?;
+    let chat_i = MenuItem::with_id(app, "tray_view_chat", "Chat", true, None::<&str>)?;
+    let folders_i = MenuItem::with_id(app, "tray_view_folders", "Shared Folders", true, None::<&str>)?;
+    let settings_i = MenuItem::with_id(app, "tray_view_settings", "Settings…", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open_i, &sep, &quit_i])?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let sep3 = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[&open_i, &sep, &send_i, &scan_i, &sep2, &friends_i, &chat_i, &folders_i, &settings_i, &sep3, &quit_i],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id("dropbeam-tray")
         .tooltip("DropBeam")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "tray_open" => show_main_window(app),
-            "tray_quit" => quit_app(app),
-            _ => {}
+        .on_menu_event(|app, event| {
+            use tauri::Emitter;
+            match event.id.as_ref() {
+                "tray_open" => show_main_window(app),
+                "tray_quit" => quit_app(app),
+                // The main window's UI acts on these (see App.tsx TrayActions).
+                "tray_send" => {
+                    show_main_window(app);
+                    let _ = app.emit_to("main", "dropbeam://tray-action", "send");
+                }
+                "tray_scan" => {
+                    show_main_window(app);
+                    let _ = app.emit_to("main", "dropbeam://scan-code", ());
+                }
+                id => {
+                    if let Some(view) = id.strip_prefix("tray_view_") {
+                        show_main_window(app);
+                        let _ = app.emit_to("main", "dropbeam://tray-action", view);
+                    }
+                }
+            }
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
