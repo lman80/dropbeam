@@ -356,8 +356,18 @@ async fn send(args: &[String]) -> Result<()> {
 
     let ep = labkit::lab_endpoint_for(&mode).await?;
     let mut cases = labkit::build_corpus(&corpus_dir, &suite)?;
+    // --only a,b / --except a,b (comma lists) and --max-mib N (skip cases whose
+    // payload is bigger — for slow uplinks) narrow a suite.
     if let Some(only) = flag(args, "--only") {
-        cases.retain(|c| c.name == only);
+        let keep: Vec<&str> = only.split(',').collect();
+        cases.retain(|c| keep.contains(&c.name));
+    }
+    if let Some(except) = flag(args, "--except") {
+        let drop: Vec<&str> = except.split(',').collect();
+        cases.retain(|c| !drop.contains(&c.name));
+    }
+    if let Some(max) = flag(args, "--max-mib").and_then(|m| m.parse::<u64>().ok()) {
+        cases.retain(|c| labkit::expected_report(&c.paths).map(|(f, _)| f.iter().map(|x| x.size).sum::<u64>() <= max << 20).unwrap_or(true));
     }
     emit(json!({
         "event": "start",

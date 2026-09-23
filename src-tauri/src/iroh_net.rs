@@ -3876,9 +3876,28 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
 /// Only exact regular-file matches are safe to skip; preserve normal landing
 /// (including collision naming) for every other destination.
 fn friend_file_landed(dest: &Path, name: &str, size: u64, mtime: u64) -> bool {
-    std::fs::symlink_metadata(dest.join(receive_rel(name))).is_ok_and(|meta|
+    occupied_siblings(&dest.join(receive_rel(name))).any(|(_, meta)|
         meta.file_type().is_file() && meta.len() == size
             && (mtime == 0 || mtime_secs(&meta) == mtime))
+}
+
+/// `natural` and its "name (n)" siblings, in landing order, for as long as they
+/// are OCCUPIED (stops at the first free name). A file that collided with an
+/// unrelated same-named one landed further down this run; resume (stat),
+/// re-send dedup and Verify copy all have to look there, not just at `natural`.
+fn occupied_siblings(natural: &Path) -> impl Iterator<Item = (PathBuf, std::fs::Metadata)> + '_ {
+    receive_candidates(natural, 1000)
+        .map_while(|c| std::fs::symlink_metadata(&c).ok().map(|m| (c, m)))
+}
+
+/// An already-landed regular file byte-identical to `part` at `natural` or one
+/// of its occupied siblings: a re-send reuses it instead of minting another
+/// "name (n)" copy. Bytes are compared only on an exact size match.
+fn identical_landed(part: &Path, natural: &Path) -> Option<PathBuf> {
+    let len = std::fs::metadata(part).ok()?.len();
+    occupied_siblings(natural)
+        .find(|(c, m)| m.is_file() && m.len() == len && files_identical(part, c).unwrap_or(false))
+        .map(|(c, _)| c)
 }
 
 fn friend_stat_reply(dest: &Path, req: &serde_json::Value) -> Result<serde_json::Value> {
@@ -3942,7 +3961,12 @@ fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool
         anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
         let name = item["name"].as_str().context("Invalid verify name")?;
         let size = item["size"].as_u64().unwrap_or(0);
-        let path = dest.join(receive_rel(name)); // where recv_files landed it
+        // Where recv_files landed it: the natural name, or — if that was taken
+        // by an unrelated file — the first collision sibling of the right size.
+        let natural = dest.join(receive_rel(name));
+        let sibling = occupied_siblings(&natural)
+            .find(|(_, m)| m.is_file() && m.len() == size).map(|(p, _)| p);
+        let path = sibling.unwrap_or(natural);
         let mut digest = None;
         if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
             if let Ok(file) = std::fs::File::open(&path) {
@@ -7286,12 +7310,12 @@ fn finalize_received(finalize: FinalizeDest, part: PathBuf, resume: Option<&Resu
         if let FinalizeDest::UniqueIn(dir, name, _) = &finalize {
             let (parent, safe) = unique_in_parts(dir, name);
             let natural = parent.join(&safe);
-            if std::fs::symlink_metadata(&natural).is_ok_and(|m| m.is_file()) && files_identical(&part, &natural).unwrap_or(false) {
+            if let Some(existing) = identical_landed(&part, &natural) {
                 let _ = std::fs::remove_file(&part);
                 if let Some(rc) = &resume {
                     let _ = std::fs::remove_file(&rc.side);
                 }
-                        return Ok(natural);
+                return Ok(existing);
             }
         }
         let (dest, stamp) = match &finalize {
@@ -7785,9 +7809,9 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             stage.remove()?;
             return Err(e);
         }
-        let landed = if files_identical(&dest, &natural).unwrap_or(false) {
+        let landed = if let Some(existing) = identical_landed(&dest, &natural) {
             stage.remove()?;
-            natural.clone()
+            existing
         } else {
             let landed = stage.publish(&natural)?;
             // Keep the sender's modified-time, exactly like the big-file

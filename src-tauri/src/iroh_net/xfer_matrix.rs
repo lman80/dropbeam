@@ -227,6 +227,12 @@ pub(super) fn friend_receiver_cb(server: Endpoint, dest: PathBuf, hook: Hook) ->
         loop {
             let Ok((mut send, mut recv)) = conn.accept_bi().await else { break };
             let Ok(header) = read_frame(&mut recv).await else { continue };
+            if header["kind"] == "ping" {
+                // A Location host checks the capability before a download push.
+                let _ = write_frame(&mut send, &serde_json::json!({"kind": "pong", "locations_v": crate::locations::VERSION})).await;
+                let _ = send.finish();
+                continue;
+            }
             if header["kind"] == "files.stat" {
                 let reply = friend_stat_reply(&dest, &header).unwrap();
                 let _ = write_frame(&mut send, &reply).await;
@@ -1093,3 +1099,88 @@ fn bench_receive_stage_create() {
     eprintln!("200 stage create+remove: {:?} ({:?}/file)", t.elapsed(), t.elapsed() / 200);
 }
 
+
+/// Location DOWNLOAD: the host pins a selection (`download_snapshot`) and
+/// pushes it from the pinned root to the requester (the app's
+/// `send_location_to_friend` with a snapshot). Everything selected must land
+/// byte-identical with the requester's naming rule and the host's mtimes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_location_download_lands_every_selected_file() {
+    let _gate = PACE_GATE.read().await;
+    use unicode_normalization::UnicodeNormalization;
+    let base = scratch("locdl");
+    let nas = base.0.join("nas");
+    let config = base.0.join("config");
+    let dest = base.0.join("dest");
+    std::fs::create_dir_all(&config).unwrap();
+    let nfd: String = "Résumé 한국.pdf".nfd().collect();
+    put(&nas, &nfd, 5000, 1);
+    put(&nas, "Photos/2024/IMG 0001.jpg", 300_000, 2);
+    put(&nas, "Photos/2024/🚀 launch.mov", PARALLEL_MIN as usize + 77, 3);
+    put(&nas, "Photos/a:b.txt", 10, 4);
+    std::fs::create_dir_all(nas.join("Photos/empty album")).unwrap();
+    put(&nas, "big alone.bin", PARALLEL_MIN as usize * 2 + 1, 5);
+    let host = endpoint(false).await; // the host DIALS the requester
+    let requester = endpoint(true).await;
+    let friend = crate::friends::upsert_by_endpoint(&config, &requester.id().to_string(), "Requester");
+    crate::locations::save(&config, Some(crate::locations::Location {
+        id: "nas".into(), name: "NAS".into(), path: nas.to_string_lossy().into_owned(),
+        friend_ids: vec![friend.id], rights: crate::locations::Rights::default(),
+        byte_cap: crate::locations::default_byte_cap(), device: None, marker: None, safe_publish: None,
+    }), None).unwrap();
+    let receiver = friend_receiver(requester.clone(), dest.clone());
+    let conn = dial(&host, &requester).await;
+    for selection in [vec![nfd.as_str(), "Photos"], vec!["big alone.bin"]] {
+        let snapshot = crate::locations::download_snapshot(&config, &requester.id().to_string(),
+            &serde_json::json!({"locations_v": crate::locations::VERSION, "id": "nas", "paths": selection})).unwrap();
+        assert!(snapshot.skipped.is_empty(), "{:?}", snapshot.skipped);
+        let items = snapshot.source.items.clone();
+        let options = LocationSend { target: None, transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: Some(snapshot), replace_existing: false };
+        tokio::time::timeout(QUICK, send_files_linked(&conn, &[], &AtomicBool::new(false), |_, _| {}, "Host",
+            &AtomicBool::new(false), &AtomicU64::new(0), None, None, Some(&options))).await.expect("download hung").unwrap();
+        for (src, rel, size, mtime) in &items {
+            let landed = dest.join(receive_rel(rel));
+            assert_eq!(std::fs::metadata(&landed).unwrap_or_else(|e| panic!("{rel}: {e} in {:?}", tree(&dest))).len(), *size);
+            assert_eq!(sha(&landed), sha(src), "{rel}");
+            assert_eq!(mtime_secs(&std::fs::metadata(&landed).unwrap()), *mtime, "{rel} mtime");
+        }
+    }
+    assert!(dest.join("Photos/empty album").is_dir(), "{:?}", tree(&dest));
+    assert!(leftovers(&dest).is_empty(), "{:?}", leftovers(&dest));
+    assert_eq!(tree(&dest).len(), 5, "{:?}", tree(&dest));
+    conn.close(0u32.into(), b"done");
+    for r in receiver.await.unwrap() { r.unwrap(); }
+    host.close().await;
+    requester.close().await;
+}
+
+/// Re-sending a file that had to land beside an unrelated same-named file
+/// ("notes (1).txt") must recognise its own earlier copy — not mint
+/// "notes (2).txt", "(3)"… on every retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_resend_after_collision_does_not_pile_up_copies() {
+    let _gate = PACE_GATE.read().await;
+    for via in [Via::Push, Via::Friend, Via::Quick] {
+        let src = scratch("recol");
+        let rx = scratch("recol-rx");
+        let dest = rx.0.join("dest");
+        let small = put(&src.0, "notes.txt", 3000, 1);
+        let big = put(&src.0, "movie.mov", PARALLEL_MIN as usize + 9, 2);
+        let folder = src.0.join("Trip");
+        put(&folder, "a.jpg", 1000, 3);
+        put(&folder, "b.jpg", 2000, 4);
+        put(&dest, "notes.txt", 111, 90);
+        put(&dest, "movie.mov", 222, 91);
+        put(&dest, "Trip/a.jpg", 333, 92);
+        for round in 0..3 {
+            for paths in [vec![small.clone()], vec![big.clone()], vec![folder.clone()]] {
+                transfer(via, &paths, &dest, QUICK).await.unwrap_or_else(|e| panic!("{via:?} round {round}: {e:#}"));
+            }
+        }
+        let mut names: Vec<String> = tree(&dest).iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["Trip/a (1).jpg", "Trip/a.jpg", "Trip/b.jpg", "movie (1).mov", "movie.mov", "notes (1).txt", "notes.txt"], "{via:?}");
+        assert_eq!(sha(&dest.join("notes (1).txt")), sha(&small));
+        assert_eq!(sha(&dest.join("movie (1).mov")), sha(&big));
+    }
+}
