@@ -193,15 +193,19 @@ pub async fn link_device_send(app: AppHandle, state: State<'_, Arc<AppState>>, i
 /// new device is an own device from now on, and every other own device hears
 /// about it on the next account sync.
 fn record_new_device(app: &AppHandle, st: &AppState, iroh: &Arc<IrohState>, key: &iroh::SecretKey, result: &LinkResult) {
+    record_new_device_data(st, iroh, key, result);
+    iroh_net::broadcast_profile(app.clone(), iroh.clone());
+    let _ = app.emit("friends://changed", ());
+    let _ = app.emit("link://linked", result);
+    crate::account::account_sync_now();
+}
+
+fn record_new_device_data(st: &AppState, iroh: &IrohState, key: &iroh::SecretKey, result: &LinkResult) {
     friends::upsert_by_endpoint(&st.config_dir, &result.endpoint_id, &result.name);
     friends::set_device_info(&st.config_dir, &result.endpoint_id, Some(&result.device_kind), Some(&hex::encode(key.public().as_bytes())));
     if let Some(os) = result.device_os.as_deref() { friends::set_device_os(&st.config_dir, &result.endpoint_id, os); }
     if let Some(me) = iroh.get().map(|e| e.id().to_string()) { crate::account::mark_linked(&st.config_dir, &me); }
     crate::account::mark_linked(&st.config_dir, &result.endpoint_id);
-    iroh_net::broadcast_profile(app.clone(), iroh.clone());
-    let _ = app.emit("friends://changed", ());
-    let _ = app.emit("link://linked", result);
-    crate::account::account_sync_now();
 }
 
 // ── Reverse flow: the device that HAS the account shows a code, the new one scans it.
@@ -226,21 +230,33 @@ pub async fn link_device_join(app: AppHandle, state: State<'_, Arc<AppState>>, i
     let code = parse_with(&code, JOIN_PREFIX)?;
     let me = device(&state, &iroh)?;
     if code.eid == me.endpoint_id { return Err("cannot link this device to itself".into()); }
-    let token: [u8; 16] = hex::decode(&code.token).ok().and_then(|v| v.try_into().ok()).ok_or("invalid link code")?;
     let ep = iroh.get().ok_or("network not ready")?.clone();
-    let host = code.eid.clone();
-    let dialed = tokio::time::timeout(Duration::from_secs(60), async {
-        let conn = ep.connect(iroh_net::dial_addr(host.parse()?), iroh_net::ALPN).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        iroh_net::write_frame(&mut send, &json!({"kind":"link-join", "v":1, "token":code.token, "device":me})).await?;
-        let offer = iroh_net::read_frame_cap(&mut recv, MAX_OFFER).await?;
-        anyhow::Ok((conn, send, offer))
+    let dialed = tokio::time::timeout(Duration::from_secs(20), async {
+        let conn = ep.connect(iroh_net::dial_addr(code.eid.parse()?), iroh_net::ALPN).await?;
+        let (send, recv) = conn.open_bi().await?;
+        anyhow::Ok((conn, send, recv))
     }).await;
-    let (_conn, mut send, offer) = match dialed {
+    let (_conn, mut send, mut recv) = match dialed {
         Ok(Ok(v)) => v,
         Ok(Err(_)) => return Err("Couldn't reach the other device. Make sure DropBeam is open on it.".into()),
         Err(_) => return Err("link timed out".into()),
     };
+    let host_info = join_over(&state, me, &code, &mut send, &mut recv).await?;
+    let _ = app.emit("friends://changed", ());
+    let _ = app.emit("chat://changed", ());
+    iroh_net::broadcast_profile(app.clone(), iroh.inner().clone());
+    crate::account::account_sync_now();
+    Ok(host_info)
+}
+
+/// New-device half of the join flow over an open stream to the host.
+async fn join_over(st: &AppState, me: LinkResult, code: &LinkCode, send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream) -> Result<LinkResult, String> {
+    let token: [u8; 16] = hex::decode(&code.token).ok().and_then(|v| v.try_into().ok()).ok_or("invalid link code")?;
+    iroh_net::write_frame(send, &json!({"kind":"link-join", "v":1, "token":code.token, "device":me}))
+        .await.map_err(|_| "link connection failed")?;
+    let offer = tokio::time::timeout(Duration::from_secs(60), iroh_net::read_frame_cap(recv, MAX_OFFER)).await
+        .map_err(|_| "link timed out")?.map_err(|_| "link connection failed")?;
     if offer["kind"] != "link-offer" {
         return Err(offer["reason"].as_str().unwrap_or("link rejected").to_owned());
     }
@@ -251,16 +267,12 @@ pub async fn link_device_join(app: AppHandle, state: State<'_, Arc<AppState>>, i
     let same = echoed.is_some_and(|e| ring::constant_time::verify_slices_are_equal(&e, &token).is_ok());
     if !same { return Err("invalid link offer".into()); }
     let host_info: LinkResult = serde_json::from_value(offer["sender"].clone()).map_err(|_| "invalid link offer")?;
-    let result = adopt_offer(&state, me, &host, &offer);
+    let result = adopt_offer(st, me, &code.eid, &offer);
     let reply = result.as_ref().cloned().unwrap_or_else(|e| json!({"kind":"link-error", "reason":e}));
-    let _ = iroh_net::write_frame(&mut send, &reply).await;
+    let _ = iroh_net::write_frame(send, &reply).await;
     let _ = send.finish();
     let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
     result?;
-    let _ = app.emit("friends://changed", ());
-    let _ = app.emit("chat://changed", ());
-    iroh_net::broadcast_profile(app.clone(), iroh.inner().clone());
-    crate::account::account_sync_now();
     Ok(host_info)
 }
 
@@ -270,6 +282,23 @@ pub(crate) async fn serve_join(net: &IrohState, who: &str, req: &Value, send: &m
     let app = net.app.get().ok_or_else(|| anyhow::anyhow!("app unavailable"))?.clone();
     let st = app.state::<Arc<AppState>>();
     let iroh = app.state::<Arc<IrohState>>().inner().clone();
+    match host_join_over(&st, net, who, req, send, recv).await? {
+        Ok((key, result)) => {
+            record_new_device_data(&st, net, &key, &result);
+            iroh_net::broadcast_profile(app.clone(), iroh.clone());
+            let _ = app.emit("friends://changed", ());
+            let _ = app.emit("link://linked", &result);
+            crate::account::account_sync_now();
+        }
+        Err(reason) => { let _ = app.emit("link://failed", reason); }
+    }
+    Ok(())
+}
+
+/// Host half of the join flow over an open stream (the first frame is `req`).
+/// Ok(Err(reason)) = the join was refused or failed on the new device.
+async fn host_join_over(st: &AppState, net: &IrohState, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Result<(iroh::SecretKey, LinkResult), String>> {
     let token = req["token"].as_str().unwrap_or("").to_owned();
     let prepared = (|| -> Result<(iroh::SecretKey, Value), String> {
         consume(&mut HOST_PENDING.lock().unwrap(), &token)?;
@@ -278,7 +307,7 @@ pub(crate) async fn serve_join(net: &IrohState, who: &str, req: &Value, send: &m
         if newcomer.endpoint_id != who { return Err("invalid device identity".into()); }
         let key = account(&st.config_dir)?;
         let code = LinkCode { v: 1, eid: who.to_owned(), name: newcomer.name, token: token.clone() };
-        let offer = offer(&st, net, &code, &key)?;
+        let offer = offer(st, net, &code, &key)?;
         if serde_json::to_vec(&offer).map_err(|_| "cannot encode link")?.len() > MAX_OFFER { return Err("link history exceeds 64 MiB".into()); }
         Ok((key, offer))
     })();
@@ -287,22 +316,20 @@ pub(crate) async fn serve_join(net: &IrohState, who: &str, req: &Value, send: &m
         Err(e) => {
             iroh_net::write_frame(send, &json!({"kind":"link-error", "reason":e})).await?;
             send.finish()?;
-            return Ok(());
+            return Ok(Err(e));
         }
     };
     iroh_net::write_frame(send, &offer).await?;
     send.finish()?;
     let reply = tokio::time::timeout(Duration::from_secs(60), iroh_net::read_frame(recv)).await??;
     if reply["kind"] != "link-ok" {
-        let _ = app.emit("link://failed", reply["reason"].as_str().unwrap_or("link rejected"));
-        return Ok(());
+        return Ok(Err(reply["reason"].as_str().unwrap_or("link rejected").to_owned()));
     }
     let result: LinkResult = serde_json::from_value(reply.clone())?;
     if result.endpoint_id != who || !verify_account(&hex::encode(key.public().as_bytes()), reply["account_sig"].as_str().unwrap_or(""), who) {
         anyhow::bail!("invalid link identity");
     }
-    record_new_device(&app, &st, &iroh, &key, &result);
-    Ok(())
+    Ok(Ok((key, result)))
 }
 
 fn receive(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<Value, String> {
@@ -525,5 +552,88 @@ mod receive_tests {
         let now = read_key(&st.config_dir).unwrap().unwrap();
         assert_eq!(now.to_bytes(), key.to_bytes()); assert_ne!(now.to_bytes(), old.to_bytes());
         std::fs::remove_dir_all(st.config_dir).unwrap();
+    }
+
+    /// The reverse (scan-the-host) flow end to end over a real loopback connection.
+    #[tokio::test]
+    async fn join_flow_over_loopback_links_both_ways_and_rejects_bad_tokens() {
+        use iroh::endpoint::presets;
+        let host_ep = iroh::Endpoint::builder(presets::N0).alpns(vec![iroh_net::ALPN.to_vec()]).bind().await.unwrap();
+        let new_ep = iroh::Endpoint::bind(presets::N0).await.unwrap();
+        let (h, n) = (Arc::new(AppState::for_tests(state().config_dir)), Arc::new(AppState::for_tests(state().config_dir)));
+        let host_net = Arc::new(IrohState::default());
+        let _ = host_net.endpoint.set(host_ep.clone());
+        // The host has a friend and a conversation to hand over.
+        let mong = iroh::SecretKey::generate().public().to_string();
+        let f = friends::upsert_by_endpoint(&h.config_dir, &mong, "Mong");
+        chat::append(&h.config_dir, &serde_json::from_value(json!({"id":"m1","peerId":f.id,"fromMe":true,"kind":"text",
+            "text":"hi","files":[],"bytes":0,"status":"read","ts":1})).unwrap());
+        let run = |token: [u8; 16], shown: [u8; 16]| {
+            let (h, n, host_net, host_ep, new_ep) = (h.clone(), n.clone(), host_net.clone(), host_ep.clone(), new_ep.clone());
+            async move {
+                *HOST_PENDING.lock().unwrap() = Some(PendingLink { token, created_at: Instant::now() });
+                let addr = host_ep.addr();
+                let host_id = host_ep.id().to_string();
+                let server = tokio::spawn(async move {
+                    let conn = host_ep.accept().await.unwrap().await.unwrap();
+                    let who = conn.remote_id().to_string();
+                    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                    let req = iroh_net::read_frame(&mut recv).await.unwrap();
+                    assert_eq!(req["kind"], "link-join");
+                    let out = host_join_over(&h, &host_net, &who, &req, &mut send, &mut recv).await.unwrap();
+                    if let Ok((key, result)) = &out { record_new_device_data(&h, &host_net, key, result); }
+                    out.map(|(_, r)| r.endpoint_id)
+                });
+                let conn = new_ep.connect(addr, iroh_net::ALPN).await.unwrap();
+                let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                let me = LinkResult { endpoint_id: new_ep.id().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: Some("ios".into()) };
+                let code = LinkCode { v: 1, eid: host_id, name: "Mac".into(), token: hex::encode(shown) };
+                let joined = join_over(&n, me, &code, &mut send, &mut recv).await;
+                (joined, server.await.unwrap())
+            }
+        };
+        // A code whose token the host never issued is refused; nothing is adopted.
+        let (joined, hosted) = run([1; 16], [2; 16]).await;
+        assert!(joined.is_err() && hosted.is_err());
+        assert!(account_pub(&n.config_dir).is_none());
+        // The real code links: same account, friends + chats moved, each side
+        // lists the other as its own device.
+        let (joined, hosted) = run([3; 16], [3; 16]).await;
+        joined.unwrap();
+        assert_eq!(hosted.unwrap(), new_ep.id().to_string());
+        let account = account_pub(&h.config_dir).unwrap();
+        assert_eq!(account_pub(&n.config_dir).as_deref(), Some(account.as_str()));
+        let mine = friends::load(&n.config_dir);
+        let m = mine.iter().find(|x| x.endpoint_id.as_deref() == Some(mong.as_str())).unwrap();
+        assert_eq!(chat::messages(&n.config_dir, &m.id).len(), 1);
+        assert!(mine.iter().any(|x| x.endpoint_id.as_deref() == Some(host_ep.id().to_string().as_str()) && x.account_pub.as_deref() == Some(account.as_str())));
+        let theirs = friends::load(&h.config_dir);
+        let phone = theirs.iter().find(|x| x.endpoint_id.as_deref() == Some(new_ep.id().to_string().as_str())).unwrap();
+        assert_eq!(phone.account_pub.as_deref(), Some(account.as_str()));
+        assert_eq!(phone.device_os.as_deref(), Some("ios"));
+        // One-time: the same code can't be replayed.
+        let (joined, _) = run_replay(&h, &host_net, &host_ep, &new_ep).await;
+        assert!(joined.is_err());
+        for d in [&h.config_dir, &n.config_dir] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    async fn run_replay(h: &Arc<AppState>, host_net: &Arc<IrohState>, host_ep: &iroh::Endpoint, new_ep: &iroh::Endpoint) -> (Result<LinkResult, String>, ()) {
+        let (h2, net2, hep) = (h.clone(), host_net.clone(), host_ep.clone());
+        let server = tokio::spawn(async move {
+            let conn = hep.accept().await.unwrap().await.unwrap();
+            let who = conn.remote_id().to_string();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let req = iroh_net::read_frame(&mut recv).await.unwrap();
+            let _ = host_join_over(&h2, &net2, &who, &req, &mut send, &mut recv).await;
+        });
+        let n = AppState::for_tests(state().config_dir);
+        let conn = new_ep.connect(host_ep.addr(), iroh_net::ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let me = LinkResult { endpoint_id: new_ep.id().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: None };
+        let code = LinkCode { v: 1, eid: host_ep.id().to_string(), name: "Mac".into(), token: hex::encode([3u8; 16]) };
+        let r = join_over(&n, me, &code, &mut send, &mut recv).await;
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&n.config_dir);
+        (r, ())
     }
 }
