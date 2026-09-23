@@ -15,6 +15,8 @@
 
 mod integrity;
 pub(crate) mod receive_stage;
+#[cfg(test)]
+mod xfer_matrix;
 use receive_stage::{ReceiveStage, is_receive_stage};
 
 use std::collections::{HashMap, HashSet};
@@ -2690,7 +2692,7 @@ async fn serve_stream_inner(
                                             // resume matching is unaffected).
                                             FinalizeDest::UniqueIn(
                                                 dest.clone(),
-                                                receive_rel(&name).to_string_lossy().into_owned(),
+                                                receive_rel_wire(&name),
                                                 item0["mtime"].as_u64().unwrap_or(0),
                                             ),
                                             total, part, rc, cov, first, &cancel, |d, t| cb(location_receive_progress(&req, d), t), &req, item_offset, recv,
@@ -5919,27 +5921,74 @@ pub(crate) fn windows_safe_component(comp: &str) -> String {
 /// arrived), NFC-normalize (same form the folder-sync receiver lands), and on
 /// Windows mangle uncreatable names instead of aborting the batch.
 pub(crate) fn receive_rel(raw: &str) -> PathBuf {
+    receive_parts(raw, cfg!(windows)).iter().collect()
+}
+
+/// `receive_rel` as a `/`-joined wire rel (idempotent under `receive_rel`) —
+/// for handing a landing name on to code that re-derives the path, without a
+/// platform separator that a second pass would read as part of a name.
+pub(crate) fn receive_rel_wire(raw: &str) -> String {
+    receive_parts(raw, cfg!(windows)).join("/")
+}
+
+/// The deterministic receive-name mapping, testable for BOTH platforms from any
+/// host. The wire separator is `/` only (every sender builds rels with `/`); a
+/// `\` inside a name is a CHARACTER — a Mac/Linux "a\b.txt" must land as one
+/// file, never as a folder "a" on Windows. Traversal (`.`/`..`/empty) is
+/// dropped, leading dots are stripped (a hidden received file looks like
+/// nothing arrived), names are NFC-normalized (macOS senders ship NFD), made
+/// creatable on Windows, and clamped to the 255-byte name limit (a Windows
+/// sender's 255-UTF-16-unit CJK name is up to 765 UTF-8 bytes — ENAMETOOLONG
+/// on macOS/Linux used to fail the whole batch).
+fn receive_parts(raw: &str, windows: bool) -> Vec<String> {
     use unicode_normalization::UnicodeNormalization;
-    let mut out = PathBuf::new();
-    for c in Path::new(raw).components() {
-        let std::path::Component::Normal(s) = c else {
+    let mut out = Vec::new();
+    for part in raw.split('/') {
+        if part == "." || part == ".." {
             continue;
-        };
-        let s = s.to_string_lossy();
-        let s = s.trim_start_matches('.');
+        }
+        let s = part.trim_start_matches('.');
         if s.is_empty() {
             continue;
         }
-        #[cfg(windows)]
-        let s = windows_safe_component(s);
-        #[cfg(windows)]
-        let s = s.as_str();
-        out.push(s.nfc().collect::<String>());
+        let s: String = s.nfc().collect();
+        let s = if windows { windows_safe_component(&s) } else { s };
+        let mut s = fit_name(&s, "");
+        if windows {
+            // Clamping can expose a trailing dot/space Explorer can't handle.
+            while s.len() > 1 && (s.ends_with('.') || s.ends_with(' ')) { s.pop(); }
+        }
+        out.push(s);
     }
-    if out.as_os_str().is_empty() {
-        out.push("file");
+    if out.is_empty() {
+        out.push("file".into());
     }
     out
+}
+
+/// Longest file-name component every receiving filesystem takes: APFS and
+/// ext4 cap names at 255 bytes, NTFS at 255 UTF-16 units (never fewer than the
+/// UTF-8 byte count allows).
+const NAME_MAX_BYTES: usize = 255;
+
+/// Split a leaf into (stem, ".ext"); a short trailing extension only, so a
+/// dotted sentence isn't mistaken for one.
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 && name.len() - i <= 16 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    }
+}
+
+/// `name` with `suffix` inserted before its extension, the stem shortened (on a
+/// char boundary) so the whole thing fits `NAME_MAX_BYTES`. Deterministic, so
+/// the same sent name always lands (and is re-recognised) under the same name.
+fn fit_name(name: &str, suffix: &str) -> String {
+    let (stem, ext) = split_ext(name);
+    let mut keep = NAME_MAX_BYTES.saturating_sub(suffix.len() + ext.len()).min(stem.len());
+    while !stem.is_char_boundary(keep) { keep -= 1; }
+    let stem = if keep == 0 && !stem.is_empty() { "file" } else { &stem[..keep] };
+    format!("{stem}{suffix}{ext}")
 }
 
 /// True if a shared-folder rel names one of DropBeam's OWN control/bookkeeping
@@ -6063,9 +6112,10 @@ const RECEIVE_NAME_LIMIT: usize = 100_000;
 fn receive_candidates(natural: &Path, limit: usize) -> impl Iterator<Item = PathBuf> + '_ {
     (0..limit).map(move |i| {
         if i == 0 { return natural.to_path_buf(); }
-        let stem = natural.file_stem().unwrap_or_default().to_string_lossy();
-        let ext = natural.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-        natural.with_file_name(format!("{stem} ({i}){ext}"))
+        // The " (n)" suffix must still fit the 255-byte name limit: a sibling
+        // of a max-length name used to fail with ENAMETOOLONG (whole batch).
+        let leaf = natural.file_name().unwrap_or_default().to_string_lossy();
+        natural.with_file_name(fit_name(&leaf, &format!(" ({i})")))
     })
 }
 /// Split a receive name into (parent dir under `dir`, leaf name) using the
@@ -6995,6 +7045,8 @@ fn spawn_range_reader(
             let want = (len - done).min(CHUNK as u64) as usize;
             match uni.read(&mut buf[..want]).await? {
                 Some(k) if k > 0 => {
+                    #[cfg(test)]
+                    xfer_matrix::throttle(&part).await;
                     f.write_all(&buf[..k]).await?;
                     if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
                     done += k as u64;
@@ -7503,6 +7555,30 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
     cancel: &AtomicBool,
     pace: bool,
     on_progress: &F,
+    hashes: Option<&mut Vec<integrity::FileHash>>,
+    location_hash: bool,
+) -> Result<u64> {
+    let result = write_files_body_inner(send, items, total, cancel, pace, on_progress, hashes, location_hash).await;
+    if result.is_err() {
+        // The receiver consumes exactly the advertised bytes and has no reason
+        // to give up on a live stream: a source that vanished / shrank / turned
+        // into a folder mid-send (or a cancel) used to leave it waiting while
+        // our side sat out its 65 s receipt grace — the send looked HUNG. Reset
+        // so the receiver drops its stage at once and returns its terminal
+        // error. (Idempotent: a stream already reset/finished just errors.)
+        let _ = send.reset(1u32.into());
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_files_body_inner<F: Fn(u64, u64)>(
+    send: &mut SendStream,
+    items: &[(PathBuf, String, u64, u64)],
+    total: u64,
+    cancel: &AtomicBool,
+    pace: bool,
+    on_progress: &F,
     mut hashes: Option<&mut Vec<integrity::FileHash>>,
     location_hash: bool,
 ) -> Result<u64> {
@@ -7510,6 +7586,10 @@ async fn write_files_body_hashed<F: Fn(u64, u64)>(
     let mut buf = vec![0u8; CHUNK];
     for (index, (path, name, size, _)) in items.iter().enumerate() {
         let mut f = open_for_send(path).await?;
+        // A file swapped for a FOLDER after the manifest was built opens fine on
+        // Unix and only fails on read with a bare "Is a directory (os error 21)".
+        anyhow::ensure!(f.metadata().await.map(|m| m.is_file()).unwrap_or(true),
+            "\"{name}\" is no longer a file (it was replaced while sending) — try again");
         let leaves = integrity::Leaves::default();
         let mut hash = hashes.is_some().then(|| integrity::Blocks::new(0, leaves.clone())).transpose()?;
         let mut plain = location_hash.then(|| ring::digest::Context::new(&ring::digest::SHA256));
@@ -7652,6 +7732,8 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             };
             match read {
                 Ok(Some(n)) if n > 0 => {
+                    #[cfg(test)]
+                    xfer_matrix::throttle(&dest).await;
                     if let Err(e) = f.write_all(&buf[..n]).await {
                         failed = Some(e.into());
                         break;
@@ -7707,7 +7789,14 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             stage.remove()?;
             natural.clone()
         } else {
-            stage.publish(&natural)?
+            let landed = stage.publish(&natural)?;
+            // Keep the sender's modified-time, exactly like the big-file
+            // (resumable) path already did: a received photo/document must not
+            // turn into "modified just now", and friend resume (`files.stat`)
+            // only recognises an already-landed file by size AND mtime — without
+            // this every small file of an interrupted folder was re-sent.
+            set_mtime_secs(&landed, item["mtime"].as_u64().unwrap_or(0));
+            landed
         };
         // Restore the sender's executable bit (optional manifest key; +x only —
         // never setuid/setgid, and only once the file is at its final name).
@@ -8440,7 +8529,7 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
                                     // the fingerprint so resume matching still works.
                                     FinalizeDest::UniqueIn(
                                         dest_dir.to_path_buf(),
-                                        receive_rel(&name).to_string_lossy().into_owned(),
+                                        receive_rel_wire(&name),
                                         mtime,
                                     ),
                                     total,
@@ -9586,6 +9675,7 @@ mod tests {
         // 16 Mbps = 2 MB/s. A 1 MB chunk must be grantable (cap >= CHUNK), and
         // pushing several chunks must take roughly bytes/rate — proving the cap
         // both throttles AND can never deadlock a full-chunk request at a low rate.
+        let _exclusive = super::xfer_matrix::PACE_GATE.write().await;
         set_upload_limit_mbps(16);
         let t0 = Instant::now();
         for _ in 0..4 {
