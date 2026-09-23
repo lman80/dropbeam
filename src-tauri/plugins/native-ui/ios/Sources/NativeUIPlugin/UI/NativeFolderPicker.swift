@@ -21,8 +21,25 @@ import PhotosUI
 @MainActor final class NativeFolderPicker: NSObject, UIDocumentPickerDelegate {
     static let shared = NativeFolderPicker()
     private var continuation: CheckedContinuation<[String], Error>?
+    private var outgoing = false
     func pick() async throws -> String? { try await select(folder: true).first }
     func pickFiles() async throws -> [String] { try await select(folder: false) }
+    /// A folder to SEND: copied into tmp (not Documents), so a one-off send never
+    /// leaves a second visible copy in Files. Copies older than 3 days are swept.
+    func pickFolderToSend() async throws -> String? {
+        guard continuation == nil else { throw failure("A file picker is already open.") }
+        Self.sweepOutgoing()
+        outgoing = true
+        defer { outgoing = false }
+        return try await select(folder: true).first
+    }
+    nonisolated static var outgoingRoot: URL { FileManager.default.temporaryDirectory.appendingPathComponent("Outgoing Folders", isDirectory: true) }
+    private static func sweepOutgoing() {
+        let fm = FileManager.default, cutoff = Date().addingTimeInterval(-3 * 24 * 3600)
+        for url in (try? fm.contentsOfDirectory(at: outgoingRoot, includingPropertiesForKeys: [.creationDateKey])) ?? [] {
+            if let created = try? url.resourceValues(forKeys: [.creationDateKey]).creationDate, created < cutoff { try? fm.removeItem(at: url) }
+        }
+    }
     private func select(folder: Bool) async throws -> [String] {
         guard continuation == nil else { throw failure("A file picker is already open.") }
         try await NativePresentation.waitForPickerDismissal()
@@ -36,6 +53,7 @@ import PhotosUI
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { finish(.success([])) }
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         guard !urls.isEmpty else { finish(.success([])); return }
+        let outgoing = outgoing
         // Coordinate provider access while its security scope is held, then keep
         // a copy in Documents for the engine after the picker is dismissed.
         Task {
@@ -48,7 +66,7 @@ import PhotosUI
                         defer { if access { source.stopAccessingSecurityScopedResource() } }
                         let fm = FileManager.default
                         let documents = try fm.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-                        let root = documents.appendingPathComponent("Imported Folders").appendingPathComponent(UUID().uuidString)
+                        let root = (outgoing ? NativeFolderPicker.outgoingRoot : documents.appendingPathComponent("Imported Folders")).appendingPathComponent(UUID().uuidString)
                         let sourcePath = source.resolvingSymlinksInPath().standardizedFileURL.path
                         let destinationPath = root.resolvingSymlinksInPath().standardizedFileURL.path
                         guard !destinationPath.hasPrefix(sourcePath + "/") else {

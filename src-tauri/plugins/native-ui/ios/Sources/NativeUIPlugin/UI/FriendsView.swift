@@ -21,6 +21,9 @@ struct FriendsView: View {
                         NavigationLink { LocationsView() } label: {
                             GlassCard { SettingsLinkLabel(title: "Locations", symbol: "externaldrive") }
                         }.buttonStyle(.plain)
+                        NavigationLink { SharedFoldersView() } label: {
+                            GlassCard { SettingsLinkLabel(title: "Shared Folders", symbol: "folder.badge.person.crop") }
+                        }.buttonStyle(.plain)
                         section("My Devices", friends: filtered.filter(isMine))
                         section("Friends", friends: filtered.filter { !isMine($0) })
                     }
