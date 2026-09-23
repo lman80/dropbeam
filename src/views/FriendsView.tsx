@@ -443,8 +443,8 @@ function FriendCard({ friend }: { friend: Friend }) {
     try {
       const paths = await api.pickFiles()
       if (paths.length) {
-        await sendToFriend(friend.id, paths)
-        toast('info', `Beaming to ${friend.name}…`)
+        // The store already toasted a failure; only confirm a send that started.
+        if (await sendToFriend(friend.id, paths)) toast('info', `Beaming to ${friend.name}…`)
       }
     } catch (e) {
       toast('error', String(e))

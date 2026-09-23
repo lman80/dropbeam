@@ -1,4 +1,5 @@
 import { Sheet, Section, Row, IconSquare } from '../mobile/kit'
+import { folderName } from '../lib/syncedFolders'
 import { FriendAvatar as MobileAvatar } from '../mobile/shared'
 import { presenceText } from '../mobile/helpers'
 import { friendPresence } from '../lib/presence'
@@ -15,7 +16,7 @@ import { FriendAvatar } from './FriendAvatar'
 import { claimPresenceChecks, friendOnlineState } from '../lib/presence'
 
 function baseName(p: string): string {
-  return p.split('/').pop() || p
+  return folderName(p) // splits on / and \ (Windows paths)
 }
 
 export function SendToChooser() {
@@ -94,7 +95,9 @@ export function SendToChooser() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
               <div style={{ fontWeight: 750, fontSize: 'calc(16.5px * var(--ui-font-scale, 1))', minWidth: 0 }}>
                 Send{' '}
-                <span style={{ color: 'var(--accent)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {/* inline-block + max-width, or the ellipsis never applies and a long
+                    name (a macOS screenshot) spills over the close button. */}
+                <span style={{ color: 'var(--accent)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-block', maxWidth: 'calc(100% - 5.5em)', verticalAlign: 'bottom' }}>
                   {title}
                 </span>{' '}
                 to…

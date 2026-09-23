@@ -1,4 +1,5 @@
 import { MOBILE_UI } from '../lib/platform'
+import { folderName as baseFolderName } from '../lib/syncedFolders'
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -93,7 +94,7 @@ export function FoldersView() {
                 members={g.members}
                 statuses={statuses}
                 onShowInvite={(code) =>
-                  setInvite({ code, name: g.rep.folder.split('/').pop() || '' })
+                  setInvite({ code, name: baseFolderName(g.rep.folder) })
                 }
               />
             ))}
@@ -161,10 +162,13 @@ function statusInfo(
       }
       return {
         color: 'var(--green)',
-        label: lastSynced ? `Up to date · synced ${formatRelativeTime(lastSynced)}` : 'Up to date',
+        label: lastSynced ? `Up to date · synced ${midSentence(formatRelativeTime(lastSynced))}` : 'Up to date',
       }
   }
 }
+
+/** "Just now" / "Today 3:42 PM" read as "synced just now" mid-sentence (month names keep their case). */
+const midSentence = (rel: string) => (/^(Just|Today|Yesterday)\b/.test(rel) ? rel[0].toLowerCase() + rel.slice(1) : rel)
 
 function FolderCard({
   pair,
@@ -265,7 +269,7 @@ function FolderCard({
   }
 
   const info = statusInfo(pair, status, lastSynced)
-  const folderName = pair.folder.split('/').pop() || pair.folder
+  const folderName = baseFolderName(pair.folder) // Windows paths use backslashes
   const peer = pair.peerName || 'Pending peer'
 
   const showInvite = async () => {

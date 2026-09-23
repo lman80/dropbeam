@@ -296,7 +296,7 @@ function recoveryItem(a: BridgeArgs) {
   const item = a.item as BridgeArgs
   return { folder: string(item, 'folder'), id: string(item, 'id') }
 }
-async function storeAction(action: () => Promise<void>) {
+async function storeAction(action: () => Promise<unknown>) {
   const before = st().toasts.at(-1)?.id
   await action()
   const after = st().toasts.at(-1)
