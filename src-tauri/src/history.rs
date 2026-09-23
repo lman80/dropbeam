@@ -16,18 +16,15 @@ pub fn history_path(config_dir: &Path) -> PathBuf {
 }
 
 pub fn load(config_dir: &Path) -> Vec<HistoryEntry> {
-    match fs::read_to_string(history_path(config_dir)) {
-        // Parse element-wise so one corrupt entry drops only itself instead of
-        // wiping the whole transfer history (plain from_str → unwrap_or_default
-        // would Err on a single bad element and lose them all).
-        Ok(txt) => serde_json::from_str::<Vec<serde_json::Value>>(&txt)
-            .map(|vals| {
-                vals.into_iter()
-                    .filter_map(|v| serde_json::from_value(v).ok())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
+    // Parse element-wise so one corrupt entry drops only itself instead of
+    // wiping the whole transfer history (plain from_str → unwrap_or_default
+    // would Err on a single bad element and lose them all). A locked or torn
+    // file is retried / kept aside rather than read as empty and overwritten.
+    match crate::settings::read_json_store::<Vec<serde_json::Value>>(&history_path(config_dir)) {
+        crate::settings::StoreRead::Loaded(vals) => {
+            vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect()
+        }
+        _ => Vec::new(),
     }
 }
 

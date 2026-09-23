@@ -101,10 +101,18 @@ fn index_path(folder: &str) -> PathBuf {
 }
 
 pub fn load(folder: &str) -> Vec<HistoryItem> {
-    fs::read_to_string(index_path(folder))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    load_checked(folder).unwrap_or_default()
+}
+
+/// `None` when index.json exists but can't be read/parsed (a NAS hiccup, a torn
+/// write). Callers that would REWRITE the index must skip then: saving the empty
+/// fallback would orphan every saved copy (data files kept, index entries gone).
+fn load_checked(folder: &str) -> Option<Vec<HistoryItem>> {
+    match crate::settings::read_json_store(&index_path(folder)) {
+        crate::settings::StoreRead::Loaded(items) => Some(items),
+        crate::settings::StoreRead::Missing => Some(Vec::new()),
+        crate::settings::StoreRead::Unreadable => None,
+    }
 }
 
 fn save(folder: &str, items: &[HistoryItem]) {
@@ -255,7 +263,9 @@ pub fn sweep_all(folders: &[String]) -> u64 {
         // Per-folder lock (not held across all folders) so a long folder list
         // can't stall an archive()/restore() on an unrelated folder for long.
         let _guard = io_guard();
-        let mut items = load(folder);
+        let Some(mut items) = load_checked(folder) else {
+            continue; // unreadable index — never overwrite it with []
+        };
         let before: u64 = items.iter().map(|i| i.size).sum();
         prune_with(folder, &mut items, policy);
         let after: u64 = items.iter().map(|i| i.size).sum();
