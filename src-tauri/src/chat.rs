@@ -656,6 +656,10 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
         }
         match thread.iter_mut().find(|x| x.id == m.id && x.from_me == m.from_me) {
             None => {
+                // `seq` is a per-device Lamport clock, so the other device's
+                // numbers mean nothing here: slot the message in by its time,
+                // right after the latest local message that isn't newer.
+                m.seq = thread.iter().filter(|x| x.ts <= m.ts).map(|x| x.seq).max().unwrap_or(0);
                 thread.push(m);
                 changed += 1;
             }

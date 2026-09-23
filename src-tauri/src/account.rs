@@ -967,6 +967,25 @@ mod tests {
     }
 
     #[test]
+    fn synced_messages_slot_in_by_time_not_by_the_other_devices_seq() {
+        let d = dir();
+        let mut local = text("mine", "p", true, 100);
+        local.seq = 3;
+        chat::append(&d, &local);
+        let mut later = text("later", "p", true, 300);
+        later.seq = 4;
+        chat::append(&d, &later);
+        // From a device whose clock for this thread is far ahead.
+        let mut theirs = text("theirs", "p", false, 200);
+        theirs.seq = 900;
+        chat::merge_synced(&d, "p", vec![theirs]);
+        let order: Vec<String> = chat::messages(&d, "p").into_iter().map(|m| m.id).collect();
+        assert_eq!(order, ["mine", "theirs", "later"]);
+        assert!(chat::next_seq(&d, "p") > 4);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn edits_win_by_rev_and_status_only_moves_forward() {
         let d = dir();
         let mut m = text("x", "p", true, 5);
