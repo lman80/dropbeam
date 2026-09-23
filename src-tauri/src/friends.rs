@@ -118,6 +118,7 @@ pub fn create(
         endpoint_id: None, // learned when they accept + say hello
         avatar: None,
         name_custom: false,
+        name_at: 0,
         progress_v: None,
         device_kind: None,
         account_pub: None,
@@ -148,6 +149,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         .map_err(|_| "The friend invite is malformed.".to_string())?;
     let invite: Invite =
         serde_json::from_slice(&bytes).map_err(|_| "The friend invite is malformed.".to_string())?;
+    let created_at = invite.endpoint_id.as_deref().map_or_else(now_ms, |e| fresh_created_at(config_dir, e));
 
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
@@ -159,11 +161,12 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         role: PairRole::B,
         name: clean_name(&invite.name, "Friend"),
         secret: invite.secret,
-        created_at: now_ms(),
+        created_at,
         auto_accept: true,
         endpoint_id: invite.endpoint_id, // the inviter's id, for direct sends
         avatar: None,
         name_custom: false,
+        name_at: 0,
         progress_v: None,
         device_kind: None,
         account_pub: None,
@@ -214,6 +217,7 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         endpoint_id: None,
         avatar: None,
         name_custom: false,
+        name_at: 0,
         progress_v: None,
         device_kind: None,
         account_pub: None,
@@ -437,6 +441,9 @@ pub fn my_code(my_name: &str, my_endpoint_id: &str) -> String {
 }
 
 fn decode_user_code(code: &str) -> Result<UserCode, String> {
+    if crate::link::is_device_code(code) {
+        return Err(crate::link::DEVICE_CODE_AS_FRIEND.into());
+    }
     let body = crate::codes::strip_prefix(code, USER_PREFIX)
         .ok_or("That doesn't look like a DropBeam code.")?;
     let bytes = URL_SAFE_NO_PAD
@@ -458,6 +465,8 @@ pub fn upsert_by_endpoint(config_dir: &Path, endpoint_id: &str, name: &str) -> F
 }
 
 pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, offered_id: Option<&str>) -> Friend {
+    // Read before taking LOCK (the account lock is taken inside it elsewhere).
+    let created_at = fresh_created_at(config_dir, endpoint_id);
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
     let name = name.trim();
@@ -483,11 +492,12 @@ pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, o
         role: PairRole::B,
         name: clean_name(name, "Friend"),
         secret: random_secret(),
-        created_at: now_ms(),
+        created_at,
         auto_accept: true,
         endpoint_id: Some(endpoint_id.to_string()),
         avatar: None,
         name_custom: false,
+        name_at: 0,
         progress_v: None,
         device_kind: None,
         account_pub: None,
@@ -496,6 +506,14 @@ pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, o
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
     friend
+}
+
+/// When a friend at `endpoint_id` is (re)added now: after any removal the
+/// user's devices recorded, so a re-add on a device whose clock runs behind
+/// isn't undone by the older removal when the devices sync.
+fn fresh_created_at(config_dir: &Path, endpoint_id: &str) -> u64 {
+    let now = now_ms();
+    crate::account::friend_removed_at(config_dir, endpoint_id).map_or(now, |t| now.max(t.saturating_add(1)))
 }
 
 /// Add a friend from their permanent personal code (dedup by EndpointId).
@@ -627,6 +645,7 @@ pub fn self_heal_chat_sender(
         endpoint_id: Some(endpoint_id.to_string()),
         avatar: None,
         name_custom: false,
+        name_at: 0,
         progress_v: None,
         device_kind: None,
         account_pub: None,
@@ -643,6 +662,12 @@ pub fn self_heal_chat_sender(
 /// share makes the friendship two-way.
 pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: &str) {
     if endpoint_id.trim().is_empty() {
+        return;
+    }
+    // One of the user's OWN devices: its record is kept by account sync (the
+    // device's own roster entry names it), not by the person-name it greets
+    // friends with — otherwise the two would overwrite each other forever.
+    if crate::account::is_own_device(config_dir, endpoint_id) {
         return;
     }
     if !friend_id.is_empty() {
@@ -677,7 +702,9 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
     }
     // A friend the user removed (on any of their devices) isn't re-added just
     // because they said hello; adding them again by code still works.
-    if crate::account::friend_removed(config_dir, endpoint_id)
+    // Likewise a device removed from (or that left) the user's account doesn't
+    // come back as a contact just by greeting us.
+    if (crate::account::friend_removed(config_dir, endpoint_id) || crate::account::device_was_removed(config_dir, endpoint_id))
         && !read_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
         return;
     }
@@ -710,6 +737,8 @@ pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
             f.name = name.trim().to_string();
             // Mark as user-chosen so an incoming profile broadcast won't override it.
             f.name_custom = true;
+            // Stamp it so the user's other devices adopt the newest rename.
+            f.name_at = now_ms().max(f.name_at.saturating_add(1));
         }
     }
     save(config_dir, &friends)
@@ -768,6 +797,24 @@ fn owner_in(all: &[Friend], f: Friend, mine: Option<&str>) -> Friend {
         .min_by_key(|o| o.endpoint_id.clone())
         .cloned()
         .unwrap_or(f)
+}
+
+/// Keep each person's conversation in ONE thread: any thread held by one of a
+/// friend's non-owner devices is folded (by time, no duplicates) into the
+/// owner's. Needed whenever grouping changes — a device proves its account, a
+/// device with a smaller id joins the person (it becomes the owner), or own
+/// devices share what they learned. Returns how many messages moved.
+pub(crate) fn fold_person_threads(config_dir: &Path) -> usize {
+    let all = read_raw(config_dir);
+    let mine = crate::account::my_pub(config_dir);
+    let mut moved = 0;
+    for f in &all {
+        let owner = owner_in(&all, f.clone(), mine.as_deref());
+        if owner.id != f.id {
+            moved += crate::chat::fold_thread(config_dir, &f.id, &owner.id);
+        }
+    }
+    moved
 }
 
 /// The thread owner for friend `id` (itself unless it's a person's extra device).
@@ -887,6 +934,7 @@ mod tests {
             endpoint_id: None,
             avatar: None,
             name_custom: false,
+            name_at: 0,
             progress_v: None,
             device_kind: None,
             account_pub: None,
@@ -915,6 +963,7 @@ mod tests {
             endpoint_id: eid.map(String::from),
             avatar: None,
             name_custom: false,
+            name_at: 0,
             progress_v: None,
             device_kind: None,
             account_pub: None,
@@ -1377,13 +1426,10 @@ pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &ser
         clear_account_for_endpoint(config_dir, endpoint_id);
     }
     // A friend's newly recognized extra device: fold any conversation it already
-    // had into the person's main thread so nothing disappears from view.
+    // had into the person's main thread so nothing disappears from view (and if
+    // it is now the person's owner record, the old owner's thread moves to it).
     if key.is_some() {
-        if let Some(me) = read_raw(config_dir).into_iter().find(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
-            if let Some(owner) = thread_owner(config_dir, &me.id).filter(|o| o.id != me.id) {
-                crate::chat::merge_threads(config_dir, &me.id, &owner.id);
-            }
-        }
+        fold_person_threads(config_dir);
     }
     if let Some(os) = req["device_os"].as_str().filter(|os| !os.is_empty() && os.len() <= 16) {
         set_device_os(config_dir, endpoint_id, os);
@@ -1433,6 +1479,7 @@ pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str
         endpoint_id: Some(endpoint_id.to_owned()),
         avatar: None,
         name_custom: false,
+        name_at: 0,
         progress_v: None,
         device_kind: kind.map(str::to_owned),
         account_pub: Some(account_pub.to_owned()),
@@ -1447,6 +1494,8 @@ pub(crate) struct SyncedFriend<'a> {
     pub endpoint_id: &'a str,
     pub name: &'a str,
     pub name_custom: bool,
+    /// When that device's user renamed the friend (0 = unknown / older build).
+    pub name_at: u64,
     pub created_at: u64,
     pub auto_accept: bool,
     pub device_kind: Option<&'a str>,
@@ -1454,17 +1503,29 @@ pub(crate) struct SyncedFriend<'a> {
     pub account_pub: Option<&'a str>,
 }
 
+/// Does a rename made on another own device (`name`, custom?, when) beat the
+/// local record? A rename beats "never renamed here"; between two renames the
+/// newer one wins (ties broken by the name itself, so every device agrees).
+pub(crate) fn rename_wins(f: &Friend, name: &str, custom: bool, at: u64) -> bool {
+    let name = name.trim();
+    if !custom || name.is_empty() || name == f.name {
+        return false;
+    }
+    !f.name_custom || (at, name) > (f.name_at, f.name.as_str())
+}
+
 /// Adopt a friend another own device knows. Returns (local friend, newly added).
 /// An existing record keeps its local choices, except that a rename the user
-/// made on the other device is adopted when this one was never renamed here.
+/// made on the other device is adopted when it is newer than any rename here.
 pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Friend, bool) {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(r.endpoint_id)) {
         let mut changed = false;
-        if r.name_custom && !f.name_custom && !r.name.trim().is_empty() {
-            f.name = clean_name(r.name, &f.name.clone());
+        if rename_wins(f, r.name, r.name_custom, r.name_at) {
+            f.name = r.name.trim().to_owned();
             f.name_custom = true;
+            f.name_at = f.name_at.max(r.name_at);
             changed = true;
         }
         if f.device_kind.is_none() && r.device_kind.is_some() { f.device_kind = r.device_kind.map(str::to_owned); changed = true; }
@@ -1488,6 +1549,7 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
         endpoint_id: Some(r.endpoint_id.to_owned()),
         avatar: None,
         name_custom: r.name_custom,
+        name_at: r.name_at,
         progress_v: None,
         device_kind: r.device_kind.map(str::to_owned),
         account_pub: r.account_pub.map(str::to_owned),
@@ -1577,6 +1639,19 @@ mod device_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn a_rename_on_another_device_wins_only_when_newer() {
+        let mut f = upsert_by_endpoint(&std::env::temp_dir().join(format!("db-rn-{}", uuid::Uuid::new_v4())), "e", "Mong");
+        assert!(!rename_wins(&f, "Mong", false, 0), "a broadcast name isn't a rename");
+        assert!(rename_wins(&f, "Mongo", true, 0), "any rename beats never renamed");
+        f.name = "Mongo".into(); f.name_custom = true; f.name_at = 50;
+        assert!(!rename_wins(&f, "M", true, 40), "older rename loses");
+        assert!(rename_wins(&f, "M", true, 60), "newer rename wins");
+        assert!(!rename_wins(&f, "Mongo", true, 90), "same name: nothing to do");
+        // A tie is settled the same way on every device.
+        assert_ne!(rename_wins(&f, "Z", true, 50), rename_wins(&Friend { name: "Z".into(), ..f.clone() }, "Mongo", true, 50));
+    }
+
+    #[test]
     fn imported_ids_preserve_existing_identity_and_avoid_collisions() {
         let dir = std::env::temp_dir().join(format!("db-device-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1599,7 +1674,26 @@ mod device_tests {
 /// Preserve legacy, endpoint-less contacts too; their shared secret is never copied.
 pub(crate) fn import_link_friend(config_dir: &Path, offered: &Friend) -> Friend {
     if let Some(eid) = offered.endpoint_id.as_deref() {
-        return upsert_with_id(config_dir, eid, &offered.name, Some(&offered.id));
+        let existed = read_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(eid));
+        let friend = upsert_with_id(config_dir, eid, &offered.name, Some(&offered.id));
+        // Carry what the user chose on the other device: a rename (as a rename,
+        // so a friend's broadcast name doesn't undo it), and for a friend new
+        // here, their auto-accept choice and when they were added.
+        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut friends = read_raw(config_dir);
+        let Some(f) = friends.iter_mut().find(|f| f.id == friend.id) else { return friend };
+        if rename_wins(f, &offered.name, offered.name_custom, offered.name_at) {
+            f.name = offered.name.trim().to_owned();
+            f.name_custom = true;
+            f.name_at = f.name_at.max(offered.name_at);
+        }
+        if !existed {
+            f.auto_accept = offered.auto_accept;
+            if offered.created_at > 0 { f.created_at = f.created_at.min(offered.created_at).max(1); }
+        }
+        let out = f.clone();
+        let _ = save(config_dir, &friends);
+        return out;
     }
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);

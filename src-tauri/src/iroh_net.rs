@@ -1318,6 +1318,16 @@ fn remember_working_addr(peer: String, addr: std::net::SocketAddr) {
     }
     save_peer_addrs();
 }
+/// Tests dial by endpoint id without discovery: seed the address cache.
+#[cfg(test)]
+pub(crate) fn remember_addrs_for_tests(addr: &iroh::EndpointAddr) {
+    // Loopback last, so it sorts first and survives the 3-address cap.
+    let mut all: Vec<_> = addr.ip_addrs().copied().collect();
+    all.sort_by_key(|a| a.ip().is_loopback());
+    for a in all {
+        remember_working_addr(addr.id.to_string(), a);
+    }
+}
 /// A selected, open direct path is evidence of a working address. Candidate
 /// paths alone (including ones still being probed) must never enter the cache.
 fn remember_conn_addrs(conn: &Connection) {
@@ -2841,6 +2851,11 @@ async fn serve_stream_inner(
             let who = conn.remote_id().to_string();
             if let Some(app) = state.app.get() {
                 if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+                    // A former own device saying it left this account (while this
+                    // device was offline): drop it before anything re-adds it.
+                    if let Some(left) = req.get("left_accounts") {
+                        crate::account::apply_left_notice(&st.config_dir, &who, left);
+                    }
                     crate::friends::apply_hello(&st.config_dir, friend_id, &who, name);
                     crate::friends::apply_device_hello(&st.config_dir, &who, &req);
                     // Cache their profile picture (if they sent one) and point the
@@ -4728,6 +4743,22 @@ fn my_avatar_thumb_b64(app: &AppHandle) -> Option<String> {
     b64
 }
 
+/// The profile picture as the user's OTHER devices should store it: the file
+/// itself when it is a small, widely readable image, else a 1024px JPEG.
+pub(crate) fn avatar_for_sync(path: &str) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok().filter(|b| !b.is_empty())?;
+    let common = matches!(image::guess_format(&bytes),
+        Ok(image::ImageFormat::Jpeg | image::ImageFormat::Png | image::ImageFormat::Gif | image::ImageFormat::WebP));
+    if common && bytes.len() <= 2 << 20 {
+        return Some(bytes);
+    }
+    let img = image::load_from_memory(&bytes).ok()?;
+    let small = image::DynamicImage::ImageRgb8(img.thumbnail(1024, 1024).to_rgb8());
+    let mut buf = std::io::Cursor::new(Vec::new());
+    small.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+    Some(buf.into_inner()).filter(|b| b.len() <= 2 << 20)
+}
+
 fn encode_avatar_thumb(path: &str) -> Option<String> {
     let img = image::open(path).ok()?;
     // JPEG has no alpha — flatten to RGB. `thumbnail` keeps the aspect ratio.
@@ -4745,6 +4776,8 @@ pub fn broadcast_profile(app: AppHandle, state: Arc<IrohState>) {
     let Some(st) = app.try_state::<Arc<crate::AppState>>() else {
         return;
     };
+    // The name/picture is shared by the user's own devices too: sync soon.
+    crate::account::note_change();
     let my_name = st.settings.lock().unwrap().display_name.clone();
     for f in crate::friends::load(&st.config_dir) {
         if let Some(eid) = f.endpoint_id {
@@ -5308,18 +5341,19 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 if deferred(&op.peer_id, &backoff) {
                     continue; // still backing off this offline peer — op stays queued
                 }
-                let Some(eid) = friends
-                    .iter()
-                    .find(|f| f.id == op.peer_id)
-                    .and_then(|f| f.endpoint_id.clone())
-                else {
+                if !friends.iter().any(|f| f.id == op.peer_id && f.endpoint_id.is_some()) {
                     continue;
-                };
+                }
+                // The op's thread may since have folded into the person's main
+                // thread (a friend's device grouped under them): follow it, and
+                // deliver to whichever of the person's devices has the target.
+                let thread = crate::friends::thread_owner(&config_dir, &op.peer_id).map_or(op.peer_id.clone(), |o| o.id);
+                let eids = crate::friends::person_endpoints(&config_dir, &thread);
                 if just_delivered.contains(&op.target_id) {
                     continue;
                 }
                 let target_ready =
-                    match crate::chat::message_status(&config_dir, &op.peer_id, &op.target_id) {
+                    match crate::chat::message_status(&config_dir, &thread, &op.target_id) {
                         Some(s) => matches!(s.as_str(), "delivered" | "read"),
                         // None = the target is the PEER's own message (they authored it,
                         // so they have it) or it aged out of our store — send anyway.
@@ -5349,11 +5383,10 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 // than the pre-outbox best-effort behavior. applied=false (the peer
                 // doesn't have the target yet) leaves the op queued to retry — the
                 // receiver's apply_* are idempotent, so at-least-once is safe.
-                if let Ok(ack) = send_chat(&state, &ep, &eid, payload).await {
-                    let applied = ack.get("applied").and_then(|v| v.as_bool()).unwrap_or(true);
-                    if applied {
-                        crate::chat::ack_op(&config_dir, &op.id);
-                    }
+                // send_chat_any moves on to the person's next device when one
+                // answers applied:false, so Ok here means some device applied it.
+                if send_chat_any(&state, &ep, &eids, payload).await.is_ok() {
+                    crate::chat::ack_op(&config_dir, &op.id);
                 }
             }
         }
