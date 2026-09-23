@@ -1289,15 +1289,16 @@ fn deliver_chat(
     // any) peer — clears the outbox's per-peer backoff so an earlier "failed"
     // message doesn't wait out a 300s tier while the user is actively chatting.
     crate::iroh_net::wake_chat_outbox();
-    if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
+    if let (Some(ep), Some(_)) = (iroh.get().cloned(), friend.endpoint_id.clone()) {
         let my_name = state.settings.lock().unwrap().display_name.clone();
         let payload = crate::iroh_net::chat_payload(msg, &friend.id, &my_name);
         let config_dir = state.config_dir.clone();
+        let eids = friends::person_endpoints(&config_dir, &friend.id);
         let (pid, mid) = (friend.id.clone(), msg.id.clone());
         let app = app.clone();
         let iroh = iroh.clone();
         tauri::async_runtime::spawn(async move {
-            let status = match crate::iroh_net::send_chat(&iroh, &ep, &eid, payload).await {
+            let status = match crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await {
                 Ok(_) => "delivered",
                 Err(e) => {
                     log::debug!("chat send failed: {e:#}");

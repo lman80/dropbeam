@@ -3465,7 +3465,8 @@ async fn serve_stream_inner(
                 // friend's typing/read state).
                 let friend = crate::friends::load(&config_dir)
                     .into_iter()
-                    .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()));
+                    .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
+                    .and_then(|f| crate::friends::thread_owner(&config_dir, &f.id));
                 if let Some(friend) = friend {
                     match req.get("signal").and_then(|s| s.as_str()).unwrap_or("") {
                         "typing" => {
@@ -5086,6 +5087,18 @@ pub async fn send_chat(
 /// Build the wire frame for a chat message (shared by the send command + the
 /// outbox retry so they stay identical). `v:2` = the versioned, extensible chat
 /// protocol (seq for ordering; optional reply/gif metadata old peers ignore).
+/// Deliver to the first of a person's devices that accepts (they sync the rest).
+pub async fn send_chat_any(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value) -> Result<serde_json::Value> {
+    let mut last = Err(anyhow::anyhow!("no reachable device"));
+    for eid in eids {
+        last = send_chat(state, ep, eid, payload.clone()).await;
+        if last.is_ok() {
+            break;
+        }
+    }
+    last
+}
+
 pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) -> serde_json::Value {
     let mut f = serde_json::json!({
         "kind": "chat", "v": 2, "friendId": peer_id, "fromName": my_name,
@@ -5204,16 +5217,13 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                     if deferred(&peer_id, &backoff) {
                         continue; // still backing off this offline peer
                     }
-                    let Some(eid) = friends
-                        .iter()
-                        .find(|f| f.id == peer_id)
-                        .and_then(|f| f.endpoint_id.clone())
-                    else {
+                    if !friends.iter().any(|f| f.id == peer_id && f.endpoint_id.is_some()) {
                         continue;
-                    };
+                    }
+                    let eids = crate::friends::person_endpoints(&config_dir, &peer_id);
                     for m in msgs {
                         let payload = chat_payload(&m, &peer_id, &my_name);
-                        match send_chat(&state, &ep, &eid, payload).await {
+                        match send_chat_any(&state, &ep, &eids, payload).await {
                             Ok(_) => {
                                 backoff.remove(&peer_id);
                                 just_delivered.insert(m.id.clone());

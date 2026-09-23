@@ -744,8 +744,46 @@ fn detached_threads(config_dir: &Path) -> Result<std::collections::HashMap<Strin
 /// Incoming chat frames may only resolve a currently trusted endpoint. A name
 /// or a sender-provided friend id is not proof of friendship.
 pub fn chat_sender(config_dir: &Path, endpoint_id: &str) -> Option<Friend> {
-    read_raw(config_dir).into_iter()
-        .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
+    let all = read_raw(config_dir);
+    let f = all.iter().find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))?.clone();
+    // A friend's second device (same verified account) talks in the SAME thread
+    // as their first: one person, one conversation.
+    Some(owner_in(&all, f, crate::account::my_pub(config_dir).as_deref()))
+}
+
+/// The record that owns `f`'s conversation: the oldest record sharing its
+/// account (someone else's account — the user's own devices stay separate).
+fn owner_in(all: &[Friend], f: Friend, mine: Option<&str>) -> Friend {
+    let Some(account) = f.account_pub.as_deref().filter(|a| Some(*a) != mine) else { return f };
+    all.iter()
+        .filter(|o| o.account_pub.as_deref() == Some(account) && o.endpoint_id.is_some())
+        .min_by_key(|o| (o.created_at, o.id.clone()))
+        .cloned()
+        .unwrap_or(f)
+}
+
+/// The thread owner for friend `id` (itself unless it's a person's extra device).
+pub fn thread_owner(config_dir: &Path, id: &str) -> Option<Friend> {
+    let all = read_raw(config_dir);
+    let f = all.iter().find(|f| f.id == id)?.clone();
+    Some(owner_in(&all, f, crate::account::my_pub(config_dir).as_deref()))
+}
+
+/// Every endpoint a message to `owner_id` may be delivered to: the owner's own
+/// device first, then the person's other devices (they sync among themselves).
+pub fn person_endpoints(config_dir: &Path, owner_id: &str) -> Vec<String> {
+    let all = read_raw(config_dir);
+    let Some(owner) = all.iter().find(|f| f.id == owner_id) else { return vec![] };
+    let mut out: Vec<String> = owner.endpoint_id.iter().cloned().collect();
+    let mine = crate::account::my_pub(config_dir);
+    if let Some(account) = owner.account_pub.as_deref().filter(|a| Some(*a) != mine.as_deref()) {
+        let mut others: Vec<&Friend> = all.iter()
+            .filter(|o| o.id != owner.id && o.account_pub.as_deref() == Some(account))
+            .collect();
+        others.sort_by_key(|o| o.created_at);
+        out.extend(others.into_iter().filter_map(|o| o.endpoint_id.clone()));
+    }
+    out
 }
 
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
@@ -1324,6 +1362,15 @@ pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &ser
     // though it still holds the key, until it is linked again.
     let key = key.filter(|k| !crate::account::is_removed_device(config_dir, k, endpoint_id));
     set_device_info(config_dir, endpoint_id, req["device_kind"].as_str(), key);
+    // A friend's newly recognized extra device: fold any conversation it already
+    // had into the person's main thread so nothing disappears from view.
+    if key.is_some() {
+        if let Some(me) = read_raw(config_dir).into_iter().find(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+            if let Some(owner) = thread_owner(config_dir, &me.id).filter(|o| o.id != me.id) {
+                crate::chat::merge_threads(config_dir, &me.id, &owner.id);
+            }
+        }
+    }
     if let Some(os) = req["device_os"].as_str().filter(|os| !os.is_empty() && os.len() <= 16) {
         set_device_os(config_dir, endpoint_id, os);
     }
@@ -1453,6 +1500,33 @@ pub(crate) fn clear_account(config_dir: &Path, account_pub: &str) {
 #[cfg(test)]
 mod device_tests {
     use super::*;
+    #[test]
+    fn a_friends_second_device_shares_their_thread_and_delivery() {
+        let dir = std::env::temp_dir().join(format!("db-person-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = iroh::SecretKey::generate();
+        let account = hex::encode(key.public().as_bytes());
+        let mac = upsert_by_endpoint(&dir, "mac-eid", "Ashton");
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let phone = upsert_by_endpoint(&dir, "phone-eid", "Ashton's iPhone");
+        crate::chat::append(&dir, &serde_json::from_value(serde_json::json!({"id":"p1","peerId":phone.id,"fromMe":false,
+            "kind":"text","text":"hi from phone","files":[],"bytes":0,"ts":5})).unwrap());
+        // Unverified: still two people.
+        assert_eq!(chat_sender(&dir, "phone-eid").unwrap().id, phone.id);
+        for (eid, f) in [("mac-eid", &mac), ("phone-eid", &phone)] {
+            let _ = f;
+            apply_device_hello(&dir, eid, &serde_json::json!({"device_kind":"phone","account_pub":account,
+                "account_sig":hex::encode(key.sign(eid.as_bytes()).to_bytes())}));
+        }
+        // Verified same account: the phone speaks in Ashton's thread…
+        assert_eq!(chat_sender(&dir, "phone-eid").unwrap().id, mac.id);
+        assert_eq!(thread_owner(&dir, &phone.id).unwrap().id, mac.id);
+        // …its earlier messages were folded in, and delivery can fall back to it.
+        assert!(crate::chat::messages(&dir, &mac.id).iter().any(|m| m.id == "p1"));
+        assert!(crate::chat::messages(&dir, &phone.id).is_empty());
+        assert_eq!(person_endpoints(&dir, &mac.id), vec!["mac-eid".to_string(), "phone-eid".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
     #[test]
     fn hello_account_requires_valid_endpoint_signature() {
         let dir = std::env::temp_dir().join(format!("db-device-{}", uuid::Uuid::new_v4()));
