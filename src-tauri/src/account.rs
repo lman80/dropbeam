@@ -196,8 +196,11 @@ pub(crate) fn device_name(kind: &str) -> String {
 /// Pro", "iPhone"). Such a name never spreads to the user's other devices.
 fn is_default_name(name: &str, kind: &str) -> bool {
     let n = name.trim();
-    let device_like = ["iPhone", "iPad", "MacBook", "iMac", "Mac mini", "Mac Studio", "Mac Pro", "My Computer"]
-        .iter().any(|d| n.contains(d)) || n.starts_with("DESKTOP-") || n.starts_with("LAPTOP-");
+    let lower = n.to_lowercase();
+    // Case-insensitive: people type "Ashton's Iphone" as often as "iPhone".
+    let device_like = ["iphone", "ipad", "macbook", "imac", "mac mini", "mac studio", "mac pro", "my computer",
+        "android", "galaxy", "pixel", "'s mac", "’s mac", "'s pc", "’s pc", "laptop", "desktop"]
+        .iter().any(|d| lower.contains(d)) || n.starts_with("DESKTOP-") || n.starts_with("LAPTOP-");
     n.is_empty() || n == device_name(kind) || device_like
 }
 
@@ -260,7 +263,12 @@ fn adopt_profile(st: &AppState, account: &str, theirs: &ProfileRec) -> ProfileAp
         let name = theirs.name.trim().chars().take(64).collect::<String>();
         // A default name (the other computer's own name) is never adopted: only
         // a name somebody chose travels between devices.
-        if !name.is_empty() && theirs.name_at > 0 && (theirs.name_at, name.as_str()) > (p.name_at, p.name.as_str()) {
+        // Two names both set before the devices met (stamp 1) are both the
+        // user's choice: keep ours rather than let an alphabetical tie-break
+        // rename this device. Only a real, timestamped rename (or replacing a
+        // default device name, stamp 0) travels.
+        let wins = theirs.name_at > p.name_at && (theirs.name_at > 1 || p.name_at == 0);
+        if !name.is_empty() && theirs.name_at > 0 && wins {
             if name != p.name {
                 s.display_name = name.clone();
                 save_settings(st, &s);
@@ -2168,5 +2176,14 @@ mod edge_tests {
         friends::add_by_code(&a.dir, &friends::my_code("Mong", &f)).unwrap();
         assert!(sync(&a, &b).await.client.is_ok());
         assert!(a.friend(&f).is_some() && b.friend(&f).is_some());
+    }
+
+    #[test]
+    fn device_like_names_are_case_insensitive_and_pre_link_names_never_overwrite() {
+        assert!(is_default_name("Ashton’s Iphone", "phone"));
+        assert!(is_default_name("ashtons macbook pro", "laptop"));
+        assert!(is_default_name("Ashton laptop", "laptop"));
+        assert!(!is_default_name("Ashton", "laptop"));
+        assert!(!is_default_name("Mong", "phone"));
     }
 }
