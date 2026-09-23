@@ -536,14 +536,10 @@ pub async fn run(app: AppHandle, config_dir: PathBuf, log_dir: Option<PathBuf>) 
             .unwrap_or((false, String::new()));
         let endpoint = endpoint_for(&configured);
         if enabled && endpoint.starts_with("https://") {
+            // Anonymous by design (PRIVACY.md): a random device id, never the user's name.
             let header = {
-                let name = app
-                    .try_state::<Arc<crate::AppState>>()
-                    .map(|st| st.settings.lock().unwrap().display_name.clone())
-                    .unwrap_or_default();
                 serde_json::json!({
                     "deviceId": device_id(&config_dir),
-                    "name": name,
                     "appVersion": app.package_info().version.to_string(),
                     "os": std::env::consts::OS,
                     "arch": std::env::consts::ARCH,
@@ -580,13 +576,13 @@ pub async fn run_once(app: &AppHandle, config_dir: &Path, log_dir: Option<&Path>
     let Some(log_dir) = log_dir else {
         return Err("No log directory available.".into());
     };
-    let (enabled, configured, name) = app
+    let (enabled, configured) = app
         .try_state::<Arc<crate::AppState>>()
         .map(|st| {
             let s = st.settings.lock().unwrap();
-            (s.share_diagnostics, s.diagnostics_url.clone(), s.display_name.clone())
+            (s.share_diagnostics, s.diagnostics_url.clone())
         })
-        .unwrap_or((false, String::new(), String::new()));
+        .unwrap_or((false, String::new()));
     if !enabled {
         return Err("Diagnostics sharing is turned off.".into());
     }
@@ -596,7 +592,6 @@ pub async fn run_once(app: &AppHandle, config_dir: &Path, log_dir: Option<&Path>
     }
     let header = serde_json::json!({
         "deviceId": device_id(config_dir),
-        "name": name,
         "appVersion": app.package_info().version.to_string(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
