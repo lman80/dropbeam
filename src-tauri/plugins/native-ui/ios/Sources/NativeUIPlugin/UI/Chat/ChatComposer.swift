@@ -16,72 +16,89 @@ struct ChatComposer: View {
     @State private var idleTask: Task<Void, Never>?
     @FocusState private var focused: Bool
     private var canSend: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (editing == nil && !bridge.chatDraftFiles.isEmpty) }
+    private var hasDrafts: Bool { !bridge.chatDraftFiles.isEmpty && editing == nil }
     var body: some View {
         VStack(spacing: 8) {
             if let target = editing ?? reply {
                 HStack(spacing: 10) {
-                    RoundedRectangle(cornerRadius: 2).fill(Color.beam).frame(width: 3)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(editing != nil ? "Edit Message" : "Reply").font(.caption.weight(.semibold)).foregroundStyle(.tint)
-                        Text(target.preview).font(.subheadline).lineLimit(2).foregroundStyle(.secondary)
+                    Image(systemName: editing != nil ? "pencil" : "arrowshape.turn.up.left.fill")
+                        .font(.footnote.weight(.semibold)).foregroundStyle(ChatPalette.sent).frame(width: 20)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(editing != nil ? "Editing Message" : "Replying").font(.caption.weight(.semibold)).foregroundStyle(ChatPalette.sent)
+                        Text(target.preview).font(.subheadline).lineLimit(1).foregroundStyle(.secondary)
                     }
-                    Spacer()
+                    Spacer(minLength: 0)
                     Button { if editing != nil { text = "" }; editing = nil; reply = nil } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).frame(width: 44, height: 44)
-                    }.accessibilityLabel("Cancel \(editing != nil ? "edit" : "reply")")
-                }.padding(.horizontal, 12).padding(.top, 8)
-            }
-            if !bridge.chatDraftFiles.isEmpty && editing == nil {
-                ScrollView(.horizontal) {
-                    LazyHStack(spacing: 10) {
-                        ForEach(bridge.chatDraftFiles, id: \.self) { path in
-                            MediaThumbnail(path: path, width: 72, height: 72)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .overlay(alignment: .topTrailing) {
-                                    Button { bridge.perform { try await bridge.removeChatDraftFile(path: path) } } label: {
-                                        Image(systemName: "xmark.circle.fill").font(.system(size: 20))
-                                            .symbolRenderingMode(.palette).foregroundStyle(.white, .black.opacity(0.7))
-                                            .frame(width: 32, height: 32)
-                                    }.accessibilityLabel("Remove \(URL(fileURLWithPath: path).lastPathComponent)")
-                                }
-                        }
-                    }.padding(.horizontal, 12)
-                }.frame(height: 80).scrollIndicators(.hidden)
-            }
-            HStack(alignment: .center, spacing: 4) {
-                Menu {
-                    Button { pick("photos") } label: { Label("Photos and Videos", systemImage: "photo.on.rectangle") }
-                    Button { pick("files") } label: { Label("Files", systemImage: "folder") }
-                    if bridge.settings?.giphyApiKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
-                        Button { focused = false; gifPicker = true } label: { Label("GIF", systemImage: "face.smiling") }
-                    }
-                } label: {
-                    Image(systemName: "plus").font(.title3.weight(.medium)).frame(width: 34, height: 34)
-                        .chatGlass(radius: 17).frame(width: 44, height: 44)
-                }.disabled(picking || editing != nil).accessibilityLabel("Add attachment")
-                HStack(alignment: .bottom, spacing: 2) {
-                    TextField("Message", text: $text, axis: .vertical)
-                        .font(.system(size: 17)).lineLimit(1...6).focused($focused)
-                        .padding(.leading, 14).padding(.vertical, 11)
-                        .onChange(of: text) { _, _ in onType() }
-                    if canSend {
-                        Button(action: send) {
-                            Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold)).foregroundStyle(.white)
-                                .frame(width: 28, height: 28).background(Color.beam.gradient, in: Circle())
-                                .frame(width: 44, height: 44)
-                        }.disabled(sending).transition(.scale.combined(with: .opacity))
-                            .accessibilityLabel(editing != nil ? "Save edit" : "Send message")
-                    } else { Spacer(minLength: 12).frame(width: 12) }
+                        Image(systemName: "xmark").font(.footnote.weight(.bold)).foregroundStyle(.secondary).frame(width: 36, height: 36)
+                    }.buttonStyle(.plain).accessibilityLabel("Cancel \(editing != nil ? "edit" : "reply")")
                 }
-                .overlay(RoundedRectangle(cornerRadius: 23).strokeBorder(.secondary.opacity(0.25), lineWidth: 0.5))
-                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: canSend)
-            }.padding(.horizontal, 8).padding(.bottom, 8).padding(.top, 4)
-        }.chatGlass(radius: 26).padding(.horizontal, 8).padding(.top, 6).padding(.bottom, 4)
+                .padding(.leading, 14).padding(.trailing, 4).padding(.vertical, 2)
+                .glassSurface(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(.leading, 46)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                    Menu {
+                        Button { pick("photos") } label: { Label("Photos", systemImage: "photo.on.rectangle.angled") }
+                        Button { pick("files") } label: { Label("Files", systemImage: "folder") }
+                        if bridge.settings?.giphyApiKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                            Button { focused = false; gifPicker = true } label: { Label("GIFs", systemImage: "magnifyingglass") }
+                        }
+                    } label: {
+                        Image(systemName: "plus").font(.system(size: 19, weight: .medium)).foregroundStyle(.primary)
+                            .frame(width: 38, height: 38).contentShape(Circle())
+                            .glassSurface(Circle(), interactive: true)
+                    }.tint(.primary).disabled(picking || editing != nil).accessibilityLabel("Add attachment")
+                    field
+            }
+        }
+        .padding(.horizontal, 12).padding(.top, 6).padding(.bottom, 8)
+        .animation(.spring(response: 0.3, dampingFraction: 0.82), value: editing?.id ?? reply?.id)
+        .animation(.spring(response: 0.3, dampingFraction: 0.82), value: bridge.chatDraftFiles)
             .sheet(isPresented: $gifPicker) { ChatGifPicker(friendID: friendID).environmentObject(bridge) }
             .onChange(of: editing?.id) { _, _ in if let editing { text = editing.text ?? ""; focused = true } }
             .onChange(of: reply?.id) { _, _ in if reply != nil { focused = true } }
             .onChange(of: scenePhase) { _, phase in if phase != .active { stopTyping() } }
             .onDisappear { stopTyping() }
+    }
+    /// The capsule text field; staged attachments ride inside it, above the text, like Messages.
+    private var field: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if hasDrafts {
+                ScrollView(.horizontal) {
+                    LazyHStack(spacing: 8) {
+                        ForEach(bridge.chatDraftFiles, id: \.self) { path in
+                            MediaThumbnail(path: path, width: 88, height: 88)
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .overlay(alignment: .topTrailing) {
+                                    Button { bridge.perform { try await bridge.removeChatDraftFile(path: path) } } label: {
+                                        Image(systemName: "xmark.circle.fill").font(.system(size: 20))
+                                            .symbolRenderingMode(.palette).foregroundStyle(.white, .black.opacity(0.55))
+                                            .frame(width: 32, height: 32)
+                                    }.accessibilityLabel("Remove \(URL(fileURLWithPath: path).lastPathComponent)")
+                                }
+                        }
+                    }.padding(.horizontal, 8)
+                }.frame(height: 88).scrollIndicators(.hidden).padding(.top, 8)
+            }
+            HStack(alignment: .bottom, spacing: 4) {
+                TextField(editing != nil ? "Edit message" : "Message", text: $text, axis: .vertical)
+                    .font(.body).lineLimit(1...6).focused($focused)
+                    .padding(.leading, 14).padding(.vertical, 8).frame(minHeight: 38)
+                    .onChange(of: text) { _, _ in onType() }
+                if canSend {
+                    Button(action: send) {
+                        Image(systemName: editing != nil ? "checkmark" : "arrow.up").font(.system(size: 15, weight: .bold)).foregroundStyle(.white)
+                            .frame(width: 30, height: 30).background(ChatPalette.sent, in: Circle())
+                    }.buttonStyle(.plain).padding(4).disabled(sending)
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        .accessibilityLabel(editing != nil ? "Save edit" : "Send message")
+                } else { Color.clear.frame(width: 10, height: 38) }
+            }
+        }
+        .animation(.spring(response: 0.28, dampingFraction: 0.7), value: canSend)
+        .glassSurface(RoundedRectangle(cornerRadius: 19, style: .continuous), interactive: true)
+        .contentShape(RoundedRectangle(cornerRadius: 19)).onTapGesture { focused = true }
     }
     private func pick(_ source: String) {
         focused = false; picking = true; reply = nil
@@ -151,7 +168,7 @@ private struct ChatGifPicker: View {
                 if loading { ProgressView().padding() }
                 if let error { Text(error).foregroundStyle(.secondary).padding() }
                 if !loading && error == nil && results.isEmpty { Text("No GIFs found").foregroundStyle(.secondary).padding() }
-            }.beamCanvas().navigationTitle("GIFs").navigationBarTitleDisplayMode(.inline)
+            }.navigationTitle("GIFs").navigationBarTitleDisplayMode(.inline)
                 .searchable(text: $query, prompt: "Search GIFs")
                 .safeAreaInset(edge: .bottom) { Text("Powered by GIPHY").font(.caption).padding().frame(maxWidth: .infinity).background(.regularMaterial) }
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }

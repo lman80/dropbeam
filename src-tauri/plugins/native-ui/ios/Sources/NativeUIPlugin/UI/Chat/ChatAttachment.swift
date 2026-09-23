@@ -27,17 +27,25 @@ struct ChatAttachment: View {
     private var availableMedia: [LocalMedia] { media.compactMap { $0.path.flatMap(LocalMedia.init) } }
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if !media.isEmpty { grid.clipShape(RoundedRectangle(cornerRadius: 18)) }
+            if !media.isEmpty { grid.clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous)) }
             ForEach(documents) { item in
                 Button {
                     if let path = item.path { bridge.perform { try await bridge.openChatFile(path: path) } }
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: Formatters.symbol(item.name)).font(.title3)
-                        Text(item.name).font(.subheadline).lineLimit(1).truncationMode(.middle)
+                    HStack(spacing: 10) {
+                        Image(systemName: Formatters.symbol(item.name)).font(.title2).frame(width: 30)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(1).truncationMode(.middle)
+                            if documents.count == 1 && media.isEmpty, let bytes = message.bytes, bytes > 0 {
+                                Text(Formatters.bytes(bytes)).font(.caption).opacity(0.75)
+                            }
+                        }
                         Spacer(minLength: 0)
-                        Image(systemName: item.path == nil ? "clock" : "arrow.down.circle").font(.caption)
-                    }.padding(10).background(Color(uiColor: .systemGray5), in: RoundedRectangle(cornerRadius: 12))
+                        Image(systemName: item.path == nil ? "clock" : "arrow.down.circle").font(.body).opacity(0.8)
+                    }
+                    .foregroundStyle(message.fromMe ? Color.white : Color.primary)
+                    .padding(.horizontal, 12).padding(.vertical, 10)
+                    .background(ChatPalette.fill(message.fromMe), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 }.buttonStyle(.plain).disabled(item.path == nil)
             }
             if failed {
@@ -45,7 +53,7 @@ struct ChatAttachment: View {
                     if message.fromMe { bridge.perform { try await bridge.retryChatFile(friendId: message.peerId, messageId: message.id) } }
                 }.font(.caption).foregroundStyle(.secondary).disabled(!message.fromMe)
             } else if active {
-                ProgressView(value: min(1, max(0, (transfer?.percent ?? 0) / 100))).tint(.beam)
+                ProgressView(value: min(1, max(0, (transfer?.percent ?? 0) / 100))).tint(ChatPalette.sent)
                 Text("\(message.fromMe ? "Sending" : "Receiving") \(Int(transfer?.percent ?? 0))%")
                     .font(.caption).foregroundStyle(.secondary)
             } else if items.contains(where: { $0.path == nil }) {
