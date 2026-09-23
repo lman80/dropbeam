@@ -1,10 +1,11 @@
 import { useEffect, useLayoutEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import { AlertTriangle, X } from 'lucide-react'
-import type { UnlistenFn } from '@tauri-apps/api/event'
-import { api, onFileDrop } from './lib/api'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { api, HAS_TAURI, onFileDrop } from './lib/api'
 import { setTaskbarProgress } from './lib/taskbar'
 import { useStore } from './store'
+import { parseCode } from './lib/codes'
 import { MOBILE_UI } from './lib/platform'
 import { startNativeBridge } from './lib/nativeBridge'
 import { nativeShellActive } from './lib/nativeShell'
@@ -14,6 +15,8 @@ import { MobileTabBar } from './components/MobileTabBar'
 import { Toasts } from './components/Toasts'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { FolderInviteModal } from './components/FolderInviteModal'
+import { QrScanner } from './components/QrScanner'
+import { routeDropToScanner } from './lib/qrImage'
 import { BeamLogo } from './components/bits'
 import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
@@ -114,6 +117,8 @@ export default function App() {
     let active = true
     onFileDrop(
       (paths) => {
+        // An open QR scanner takes the drop (a screenshot of a QR to decode).
+        if (routeDropToScanner(paths)) return
         // On the Chat page with a conversation open, a dropped file/folder is
         // STAGED in the composer (iMessage-style, GitHub #23) — it waits as a chip
         // so you can add a message and send them together — instead of firing off
@@ -205,6 +210,7 @@ export default function App() {
         {!nativeShell && <SendToChooser />}
         {MOBILE_UI ? (!nativeShell && <MobileOnboarding />) : <NameSetupModal />}
         {!nativeShell && <FolderInviteModal />}
+        {!MOBILE_UI && <PopoverCodeHandoff />}
       </ErrorBoundary>
       <ErrorBoundary region="toasts" fallbackStyle={{ position: 'fixed', bottom: 12, right: 12, zIndex: 101 }}>
         <Toasts />
@@ -216,6 +222,30 @@ export default function App() {
 /** First-run: ask the user what name people should see, so they're not shown as a
  * device default like "MacBook Air". Pre-filled with the current name; shown once
  * (tracked in localStorage), and always changeable later in Settings. */
+/** The menu-bar popover is a tiny, focus-sensitive panel (it hides when the
+ *  camera prompt or a file picker takes focus), so it hands codes that need the
+ *  full window — and QR scanning — to the main window. */
+function PopoverCodeHandoff() {
+  const openCode = useStore((s) => s.openCode)
+  const [scanning, setScanning] = useState(false)
+  useEffect(() => {
+    if (!HAS_TAURI) return
+    const uns: Promise<UnlistenFn>[] = [
+      listen<string>('dropbeam://open-code', (e) => { if (typeof e.payload === 'string') void openCode(e.payload) }),
+      listen('dropbeam://scan-code', () => setScanning(true)),
+    ]
+    return () => { uns.forEach((u) => void u.then((f) => f())) }
+  }, [openCode])
+  if (!scanning) return null
+  return <QrScanner
+    title="Scan a DropBeam code"
+    hint="Hold the QR code up to your camera — a Quick Send, friend or folder code."
+    validate={(text) => (parseCode(text) ? null : 'That QR code isn’t a DropBeam code.')}
+    onClose={() => setScanning(false)}
+    onResult={(text) => { setScanning(false); void openCode(text) }}
+  />
+}
+
 function NameSetupModal() {
   const settings = useStore((s) => s.settings)
   const save = useStore((s) => s.saveSettings)

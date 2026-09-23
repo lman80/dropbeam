@@ -1,6 +1,6 @@
 import { groupDevices } from '../lib/deviceIcons'
 import { DeviceBadge } from '../components/DeviceBadge'
-import { QrScanner } from '../components/QrScanner'
+import { ScanCodeButton, ShareCode } from '../components/CodeQr'
 import { LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
@@ -25,6 +25,7 @@ import {
 } from 'lucide-react'
 import { api, fileSrc, HAS_TAURI, type ConnDetail, type Friend } from '../lib/api'
 import { useStore } from '../store'
+import { parseCode, wrongCodeMessage } from '../lib/codes'
 import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
 import { MobileHeader } from '../components/MobileHeader'
 import { createPortal } from 'react-dom'
@@ -309,7 +310,7 @@ function YouCard() {
         </div>
       </div>
 
-      {/* Your permanent code */}
+      {/* Your permanent code: QR + text + Copy */}
       <div
         style={{
           marginTop: 14,
@@ -317,36 +318,16 @@ function YouCard() {
           borderTop: '1px solid var(--border)',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-          <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 650 }}>Your DropBeam code</div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <button className="btn btn-ghost" onClick={() => setShowQR((v) => !v)} disabled={!code}>
-              <QrCode size={14} /> {showQR ? 'Hide QR' : 'QR'}
-            </button>
-            <button className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} onClick={copyCode} disabled={!code}>
-              {copied ? <Check size={14} /> : <Copy size={14} />} {copied ? 'Copied' : 'Copy code'}
-            </button>
-          </div>
-        </div>
-        <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.5 }}>
-          Share this once. It never changes — friends who add you stay connected across every update.
-        </div>
-        <AnimatePresence>
-          {showQR && code && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-              style={{ overflow: 'hidden' }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 14 }}>
-                <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
-                  <QRCodeSVG value={code} size={132} level="M" fgColor="#15161d" bgColor="#fff" />
-                </div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+        <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 650, marginBottom: 10 }}>Your DropBeam code</div>
+        {code ? (
+          <ShareCode
+            code={code}
+            size={168}
+            instructions="Friends scan this QR in DropBeam (Friends → Add friend) or paste the code. Share it once — it never changes, so friends who add you stay connected across every update."
+          />
+        ) : (
+          <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>Your code appears once DropBeam has connected.</div>
+        )}
       </div>
     </div>
   )
@@ -689,50 +670,20 @@ function InvitePanel({
   friendName: string
   onClose: () => void
 }) {
-  const toast = useStore((s) => s.toast)
-  const [copied, setCopied] = useState(false)
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(invite)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1600)
-    } catch {
-      toast('error', 'Could not copy')
-    }
-  }
   return (
     <motion.div
       initial={{ opacity: 0, height: 0 }}
       animate={{ opacity: 1, height: 'auto' }}
       style={{ overflow: 'hidden', marginTop: 12 }}
     >
-      <div
-        style={{
-          borderTop: '1px solid var(--border)',
-          paddingTop: 14,
-          display: 'flex',
-          gap: 14,
-          alignItems: 'center',
-          flexWrap: 'wrap',
-        }}
-      >
-        <div style={{ background: '#fff', padding: 10, borderRadius: 12, border: '1px solid var(--border)' }}>
-          <QRCodeSVG value={invite} size={92} level="M" fgColor="#15161d" bgColor="#fff" />
-        </div>
-        <div style={{ flex: 1, minWidth: 200 }}>
-          <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.45 }}>
-            Send this to {friendName}. They open DropBeam → Friends → <b>Add friend</b>.
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} onClick={copy} style={{ flex: 1 }}>
-              {copied ? <Check size={14} /> : <Copy size={14} />}
-              {copied ? 'Copied' : 'Copy invite'}
-            </button>
-            <button className="btn btn-ghost" onClick={onClose}>
-              Hide
-            </button>
-          </div>
-        </div>
+      <div style={{ borderTop: '1px solid var(--border)', paddingTop: 14 }}>
+        <ShareCode
+          code={invite}
+          size={168}
+          copyLabel="Copy invite"
+          instructions={<>Send this to {friendName}. They open DropBeam → Friends → <b>Add friend</b> and scan this QR code or paste the invite.</>}
+          footer={<button className="btn btn-ghost" onClick={onClose}>Hide</button>}
+        />
       </div>
     </motion.div>
   )
@@ -741,26 +692,28 @@ function InvitePanel({
 function AddFriendModal({ onClose }: { onClose: () => void }) {
   const acceptFriend = useStore((s) => s.acceptFriend)
   const addFriendByCode = useStore((s) => s.addFriendByCode)
-  const [scanning, setScanning] = useState(false)
+  const openCode = useStore((s) => s.openCode)
   const [error, setError] = useState('')
   const [codeInput, setCodeInput] = useState('')
   const [busy, setBusy] = useState(false)
 
   const submit = async (value = codeInput) => {
     setError('')
-    const code = value.trim()
-    if (!code) {
-      setError("Paste your friend's code first.")
+    if (!value.trim()) {
+      setError("Paste your friend's code, or scan their QR code.")
+      return
+    }
+    const parsed = parseCode(value)
+    if (!parsed) {
+      setError(wrongCodeMessage(['friend'], null))
       return
     }
     setBusy(true)
     try {
-      if (/^dropbeamf1:/i.test(code)) await acceptFriend(code) // legacy invite
-      else if (/^dropbeam:/i.test(code)) await addFriendByCode(code)
-      else {
-        setError("That doesn't look like a DropBeam code.")
-        return
-      }
+      if (parsed.kind === 'friendInvite') await acceptFriend(parsed.code) // legacy invite
+      else if (parsed.kind === 'friend') await addFriendByCode(parsed.code)
+      // Some other DropBeam code (a Quick Send, a folder invite…): do what it's for.
+      else if (!(await openCode(parsed.code))) return
       onClose()
     } catch (e) {
       setError(String(e))
@@ -768,8 +721,6 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
       setBusy(false)
     }
   }
-
-  if (scanning) return <QrScanner hint="Scan your friend's DropBeam code." onClose={() => setScanning(false)} onResult={text => { setScanning(false); setCodeInput(text); void submit(text) }} />
 
   return (
     <AnimatePresence>
@@ -806,21 +757,31 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
             </button>
           </div>
           <div className="dialog-body">
-            <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
-              Your friend's code
-            </label>
-            <button className="btn btn-ghost" disabled={busy} onClick={() => setScanning(true)}><QrCode size={16} />Scan QR code</button>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+              <label htmlFor="add-friend-code" style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
+                Your friend's code
+              </label>
+              <ScanCodeButton
+                disabled={busy}
+                hint="Hold your friend’s QR code (Friends → You) up to your camera."
+                title="Scan a friend’s code"
+                accept={['friend', 'friendInvite']}
+                onCode={(code) => { setCodeInput(code); void submit(code) }}
+                onOther={(p) => { setCodeInput(p.code); void submit(p.code) }}
+              />
+            </div>
             <textarea
+              id="add-friend-code"
               className="input"
               style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'calc(12px * var(--ui-font-scale, 1))', resize: 'none' }}
               autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-              placeholder="Paste their dropbeam:… code here"
+              placeholder="Paste their dropbeam:… code, or scan their QR"
               value={codeInput}
               autoFocus
               onChange={(e) => setCodeInput(e.target.value)}
             />
             <p style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 10 }}>
-              Ask your friend for their code (Friends → <b>You</b> → Copy code) and paste it here. Their
+              Ask your friend for their code (Friends → <b>You</b>) — scan the QR on their screen or paste the code. Their
               name fills in automatically and you’ll both be connected — no retyping names, no re-adding
               after updates.
             </p>

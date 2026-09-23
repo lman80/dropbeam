@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { AnimatePresence, motion } from 'framer-motion'
 import { ArrowDownToLine, Check, Copy, Power, QrCode, Search, Send, Settings, UserPlus, X } from 'lucide-react'
 import { api, HAS_TAURI, isActive, type TransferUpdate } from '../lib/api'
 import { useStore } from '../store'
 import { Spinner } from '../components/bits'
 import { QrScanner } from '../components/QrScanner'
+import { QrCodeView } from '../components/CodeQr'
+import { parseCode } from '../lib/codes'
 import { Toasts } from '../components/Toasts'
 import { avatarGradient, initials } from '../lib/avatar'
 import { friendOnlineState } from '../lib/presence'
@@ -27,7 +29,7 @@ export function Popover() {
   const order = useStore((s) => s.order)
   const sendPaths = useStore((s) => s.sendPaths)
   const sendToFriend = useStore((s) => s.sendToFriend)
-  const receiveCode = useStore((s) => s.receiveCode)
+  const openCode = useStore((s) => s.openCode)
 
   const [query, setQuery] = useState('')
   const [pickingFor, setPickingFor] = useState<string | null>(null)
@@ -242,12 +244,32 @@ export function Popover() {
     // optimistically meant a bad/expired code vanished with no feedback — now the
     // code stays put to fix and the toast (rendered here since the popover got its
     // own toast surface) says what went wrong.
-    void receiveCode(code).then((ok) => {
-      if (ok) {
-        setCode('')
-        setShowReceive(false)
-      }
-    })
+    void submitCode(code)
+  }
+
+  // Receive codes and friend codes are handled right here; a folder invite or a
+  // device code needs the full window (a folder picker, Settings), so it's
+  // handed to the main window.
+  const submitCode = async (value: string) => {
+    const kind = parseCode(value)?.kind
+    let ok: boolean
+    if (HAS_TAURI && (kind === 'folderInvite' || kind === 'deviceLink')) {
+      await emit('dropbeam://open-code', parseCode(value)!.code).catch(() => {})
+      void openMain()
+      ok = true
+    } else ok = await openCode(value)
+    if (ok) {
+      setCode('')
+      setShowReceive(false)
+    }
+  }
+
+  // Scanning uses the camera prompt / a file picker, which steal focus and hide
+  // the popover — so the main window runs the scanner.
+  const startScan = () => {
+    if (!HAS_TAURI) { setScanning(true); return }
+    void emit('dropbeam://scan-code').catch(() => {})
+    void openMain()
   }
 
   const active = useMemo(
@@ -387,12 +409,13 @@ export function Popover() {
                 className="input"
                 autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
                 placeholder="Paste a code to receive"
+                aria-label="Receive code"
                 value={code}
                 autoFocus
                 onChange={(e) => setCode(e.target.value)}
                 style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
               />
-              <button className="btn btn-ghost" type="button" aria-label="Scan QR" title="Scan QR" onClick={() => setScanning(true)}><QrCode size={15} /></button>
+              <button className="btn btn-ghost" type="button" aria-label="Scan a QR code" title="Scan a QR code (opens DropBeam)" onClick={startScan}><QrCode size={15} /></button>
               <button className="btn btn-primary" type="submit" disabled={!code.trim()}>
                 <ArrowDownToLine size={15} />
               </button>
@@ -403,7 +426,7 @@ export function Popover() {
       {/* The popover runs its own store instance, so errors toasted here (failed
           drag-to-send, bad receive code, engine still starting) rendered NOWHERE
           without a local toast surface — files silently never sent. */}
-      {scanning && <QrScanner hint="Scan the sender’s receive code." onClose={() => setScanning(false)} onResult={value => { setCode(value); setScanning(false) }} />}
+      {scanning && <QrScanner hint="Hold the sender’s QR code up to your camera." validate={(text) => (parseCode(text) ? null : 'That QR code isn’t a DropBeam code.')} onClose={() => setScanning(false)} onResult={value => { setScanning(false); void submitCode(value) }} />}
       <Toasts />
     </div>
   )
@@ -414,6 +437,7 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
   const formatSpeed = (bps: number) => formatSpeedValue(bps, showMegabits)
 
   const [copied, setCopied] = useState(false)
+  const [showQr, setShowQr] = useState(false)
   const name = t.fileNames[0] ?? (t.direction === 'receive' ? 'Incoming' : 'Files')
   const isSendWaiting =
     t.direction === 'send' && t.state === 'waitingForPeer' && !!t.code && !t.friendName
@@ -476,15 +500,29 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
         {isSendWaiting && (
           <button
             className="icon-btn"
+            style={{ width: 26, height: 26, color: showQr ? 'var(--accent)' : undefined }}
+            onClick={() => setShowQr((v) => !v)}
+            title={showQr ? 'Hide QR code' : 'Show QR code'}
+            aria-label={showQr ? 'Hide QR code' : 'Show QR code'}
+            aria-pressed={showQr}
+          >
+            <QrCode size={13} />
+          </button>
+        )}
+        {isSendWaiting && (
+          <button
+            className="icon-btn"
             style={{ width: 26, height: 26 }}
             onClick={copy}
             title="Copy code"
+            aria-label="Copy code"
           >
             {copied ? <Check size={13} /> : <Copy size={13} />}
           </button>
         )}
       </div>
-      {isSendWaiting && <code className="popover-code selectable">{t.code}</code>}
+      {isSendWaiting && showQr && <div style={{ display: 'grid', placeItems: 'center', padding: '10px 0 4px' }}><QrCodeView value={t.code!} size={168} hint="Scan with DropBeam" enlarge={false} /></div>}
+      {isSendWaiting && !showQr && <code className="popover-code selectable">{t.code}</code>}
       {t.state === 'transferring' && (
         <div className="popover-progress">
           <div

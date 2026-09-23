@@ -5,12 +5,12 @@ import { MOBILE_UI } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
+import { ShareCode } from './CodeQr'
 import {
   AlertCircle,
   ArrowDownToLine,
   Check,
   CheckCircle2,
-  Copy,
   FolderOpen,
   Loader2,
   Pause,
@@ -271,81 +271,20 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
         </div>
       )}
 
-      {/* send waiting: code + QR */}
+      {/* send waiting: QR + code (anyone can scan it with DropBeam, or paste it) */}
       {isSendWaiting && (
-        <div
-          style={{
-            display: 'flex',
-            gap: 16,
-            marginTop: 12,
-            alignItems: 'center',
-            flexWrap: 'wrap',
-          }}
-        >
-          <div style={{ flex: 1, minWidth: 220 }}>
-            <div style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginBottom: 7 }}>
-              {(t.code?.length ?? 0) > 40
-                ? 'On their DropBeam → Send & Receive → “Have a code?”: scan the QR or paste this code:'
-                : 'On the other device, open DropBeam → Receive and enter:'}
-            </div>
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                background: 'var(--surface-2)',
-                border: '1px solid var(--border)',
-                borderRadius: 13,
-                padding: '10px 12px',
-              }}
-            >
-              <code
-                className="selectable"
-                style={{
-                  flex: 1,
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: (t.code?.length ?? 0) > 40 ? 10.5 : 18,
-                  lineHeight: (t.code?.length ?? 0) > 40 ? 1.45 : undefined,
-                  maxHeight: (t.code?.length ?? 0) > 40 ? 58 : undefined,
-                  overflowY: (t.code?.length ?? 0) > 40 ? 'auto' : undefined,
-                  fontWeight: 600,
-                  letterSpacing: '0.02em',
-                  color: 'var(--text)',
-                  wordBreak: 'break-all',
-                }}
-              >
-                {t.code}
-              </code>
-              <button className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} onClick={copyCode}>
-                {copied ? <Check size={15} /> : <Copy size={15} />}
-                {copied ? 'Copied' : 'Copy'}
-              </button>
-            </div>
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                marginTop: 12,
-                fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
-                color: 'var(--text-muted)',
-              }}
-            >
-              <Spinner size={14} />
-              Waiting for the other device to connect…
-            </div>
-          </div>
-          <div
-            style={{
-              background: '#ffffff',
-              padding: 12,
-              borderRadius: 14,
-              border: '1px solid var(--border)',
-              flexShrink: 0,
-            }}
-          >
-            <QRCodeSVG value={t.code!} size={116} level="M" fgColor="#15161d" bgColor="#ffffff" />
-          </div>
+        <div style={{ marginTop: 14 }}>
+          <ShareCode
+            code={t.code!}
+            size={184}
+            instructions={<>On the other device, open DropBeam → <b>Have a code?</b> and scan this QR code — or paste the code.</>}
+            footer={
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
+                <Spinner size={14} />
+                Waiting for the other device to connect…
+              </div>
+            }
+          />
         </div>
       )}
 

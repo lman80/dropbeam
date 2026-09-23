@@ -33,6 +33,7 @@ import { setSpeedUnit } from './lib/format'
 import { LandedEta, TransferRate, etaAt } from './lib/eta'
 import { chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTransfers } from './lib/chatTransfer'
 import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
+import { parseCode, routeCode, wrongCodeMessage } from './lib/codes'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 import { MOBILE_UI } from './lib/platform'
 
@@ -255,6 +256,14 @@ interface AppStore {
   clearAvatar: () => Promise<void>
   sendPaths: (paths: string[]) => Promise<void>
   receiveCode: (code: string) => Promise<boolean>
+  /** Any DropBeam code from a GENERIC field (Receive box, a scan): does the one
+   *  sensible thing for its kind — receive, add the friend, open the folder
+   *  invite, … — so a scanned friend code in "Receive" never just errors. */
+  openCode: (code: string) => Promise<boolean>
+  /** A shared-folder invite routed from elsewhere, waiting for Shared Folders →
+   *  Accept invite to pick it up (it still needs a folder chosen). */
+  pendingFolderInvite: string | null
+  setPendingFolderInvite: (code: string | null) => void
   upsertTransfer: (u: TransferUpdate) => void
   removeTransfer: (id: string) => void
   /** Re-run a failed friend/Quick Send with the same files + recipient (one tap).
@@ -910,6 +919,42 @@ export const useStore = create<AppStore>((set, get) => ({
 
   setPendingSend: (pendingSend) => set({ view: 'send', pendingSend }),
 
+  pendingFolderInvite: null,
+  setPendingFolderInvite: (pendingFolderInvite) => set({ pendingFolderInvite }),
+  openCode: async (raw) => {
+    const route = routeCode(raw)
+    try {
+      switch (route.action) {
+        case 'receive': {
+          const ok = await get().receiveCode(route.code)
+          if (ok && get().view !== 'send') get().setView('send')
+          return ok
+        }
+        case 'addFriend':
+          await get().addFriendByCode(route.code)
+          return true
+        case 'acceptFriendInvite':
+          await get().acceptFriend(route.code)
+          return true
+        case 'acceptFolderInvite':
+          // Accepting needs a local folder — hand it to the Accept invite dialog.
+          set({ pendingFolderInvite: route.code })
+          get().setView('folders')
+          get().toast('info', 'That’s a shared-folder invite — choose where to keep the folder to join it.')
+          return true
+        case 'linkDevice':
+          get().toast('info', 'That’s a device-linking code. To link that device, open Settings → Devices → Link a device and scan it there.')
+          return false
+        case 'invalid':
+          get().toast('error', route.message)
+          return false
+      }
+    } catch (e) {
+      get().toast('error', String(e))
+      return false
+    }
+  },
+
   markFriendSeen: (name) => {
     const key = name.trim().toLowerCase()
     if (key) {
@@ -941,18 +986,21 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  receiveCode: async (code) => {
-    code = code.trim()
-    if (!code) return false
+  receiveCode: async (raw) => {
+    if (!raw.trim()) return false
+    const parsed = parseCode(raw)
     try {
       // iroh-only: receives use the Direct ticket from the sender's link/QR.
-      if (!/^direct/i.test(code)) {
+      if (parsed?.kind !== 'receive') {
         get().toast(
           'error',
-          "That doesn't look like a DropBeam link. Paste the full link the sender shared, or scan their QR code to receive.",
+          parsed
+            ? wrongCodeMessage(['receive'], parsed)
+            : "That doesn't look like a DropBeam code. Paste the full code the sender shared, or scan their QR code to receive.",
         )
         return false
       }
+      const code = parsed.code
       // One receive per ticket at a time: a double-paste/double-click would
       // start two pulls of the same files racing each other into duplicates.
       const priorId = activeReceives.get(code)

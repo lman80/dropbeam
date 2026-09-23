@@ -1,7 +1,9 @@
 import { deviceKindLabel } from '../lib/deviceIcons'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { useEffect, useState, type ReactNode } from 'react'
-import { CheckCircle2, Download, FolderOpen, HardDrive, RefreshCw, Trash2 } from 'lucide-react'
+import { CheckCircle2, Download, FolderOpen, HardDrive, QrCode, RefreshCw, Trash2 } from 'lucide-react'
+import { QrCodeView } from '../components/CodeQr'
+import { QrScanner } from '../components/QrScanner'
 import { api, type Settings } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
@@ -80,6 +82,8 @@ export function SettingsView() {
   const settings = useStore((s) => s.settings) as Settings
   const save = useStore((s) => s.saveSettings)
   const myEid = useStore((s) => s.myEid)
+  const [showEidQr, setShowEidQr] = useState(false)
+  const [scanOperator, setScanOperator] = useState(false)
   const appVer = useStore((s) => s.appVer)
   const update = useStore((s) => s.update)
   const checkingUpdate = useStore((s) => s.checkingUpdate)
@@ -824,20 +828,33 @@ export function SettingsView() {
               title="Operator device ID"
               desc="Paste the ID the developer gives you. Only this device can drive Lab Mode. Blank = nothing is accepted."
             >
-              <input
-                className="input"
-                style={{ minWidth: 240 }}
-                autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-                placeholder="Paste operator ID"
-                value={settings.labOperatorId}
-                onChange={(e) => save({ labOperatorId: e.target.value.trim() })}
-              />
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input
+                  className="input"
+                  style={{ minWidth: 240 }}
+                  autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+                  placeholder="Paste operator ID"
+                  value={settings.labOperatorId}
+                  onChange={(e) => save({ labOperatorId: e.target.value.trim() })}
+                />
+                <button className="btn btn-ghost" aria-label="Scan operator ID QR code" title="Scan QR code" onClick={() => setScanOperator(true)}><QrCode size={15} /></button>
+              </div>
+              {scanOperator && (
+                <QrScanner
+                  title="Scan operator ID"
+                  hint="Scan the operator device ID QR code."
+                  validate={(t) => (/^[0-9a-f]{64}$/i.test(t.trim()) ? null : 'That QR code isn’t a device ID.')}
+                  onClose={() => setScanOperator(false)}
+                  onResult={(t) => { setScanOperator(false); void save({ labOperatorId: t.trim().toLowerCase() }) }}
+                />
+              )}
             </Row>
             {SEP}
             <Row
               title="This device's ID"
               desc="Send this to the developer so they can reach this device for testing."
             >
+              <div style={{ display: 'flex', gap: 6 }}>
               <button
                 className="btn btn-ghost"
                 disabled={!myEid}
@@ -853,7 +870,10 @@ export function SettingsView() {
               >
                 {myEid ? 'Copy ID' : 'Starting…'}
               </button>
+              <button className="btn btn-ghost" disabled={!myEid} aria-pressed={showEidQr} aria-label="Show device ID QR code" title="QR code" onClick={() => setShowEidQr((v) => !v)}><QrCode size={15} /></button>
+              </div>
             </Row>
+            {showEidQr && myEid && <div style={{ display: 'grid', placeItems: 'center', padding: '4px 0 14px' }}><QrCodeView value={myEid} size={160} hint="Scan to read this device ID" /></div>}
           </>
         )}
       </Card>
