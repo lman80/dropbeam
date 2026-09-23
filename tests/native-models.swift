@@ -21,6 +21,9 @@ import Foundation
         precondition(own[0].displayName == "Your Mac" && own[0].ownDevice && own[1].displayName == "Mong" && !own[1].ownDevice)
         let me = try decode(MyDevice.self, #"{"name":"Phone","accountPub":"abc","devices":[{"endpointId":"e1","name":"Phone","thisDevice":true},{"name":"no id"},{"endpointId":"e2","name":"Mac","deviceOs":"macos","lastSyncMs":1700000000000,"friendId":"mac"}]}"#)
         precondition(me.inAccount && me.devices.count == 2 && me.devices[0].thisDevice && me.devices[1].lastSyncMs == 1700000000000)
-        print("7 native model regression checks passed")
+        let rows = try decode(LossyArray<FriendLocations>.self, #"[{"friendId":"a","friendName":"A","online":true,"locations":[{"id":"n","name":"NAS","rights":{"upload":true},"freeBytes":5e9,"totalBytes":-1}],"status":"offline","checking":true,"checkedAt":1700000000000},{"friendId":"b","error":"x"}]"#).values
+        precondition(rows[0].status == "offline" && rows[0].checking && rows[0].checkedAt == 1_700_000_000_000 && rows[0].locations[0].freeBytes == 5e9 && rows[0].locations[0].totalBytes == nil)
+        precondition(rows[1].status == "error" && !rows[1].checking && rows[1].checkedAt == nil)
+        print("8 native model regression checks passed")
     }
 }
