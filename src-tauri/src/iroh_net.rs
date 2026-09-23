@@ -16,6 +16,18 @@
 mod integrity;
 pub(crate) mod receive_stage;
 #[cfg(test)]
+mod friendly_failure_tests {
+    use super::*;
+    #[test]
+    fn disk_full_reads_in_plain_words_for_either_side() {
+        assert!(friendly_failure(Direction::Receive, "write: No space left on device (os error 28)").starts_with("This device's disk is full"));
+        assert!(friendly_failure(Direction::Send, "peer: No space left on device (os error 28)").starts_with("The recipient's disk is full"));
+        assert_eq!(friendly_failure(Direction::Send, "their disk is full — once"), "their disk is full — once");
+        assert_eq!(friendly_failure(Direction::Send, "connection lost"), "connection lost");
+    }
+}
+
+#[cfg(test)]
 mod xfer_matrix;
 use receive_stage::{ReceiveStage, is_receive_stage};
 
@@ -1140,6 +1152,20 @@ fn emit_completed(
     }
 }
 
+/// Plain words for the failures people can act on; everything else verbatim.
+fn friendly_failure(dir: Direction, err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    let disk_full = lower.contains("no space left on device") || lower.contains("os error 28")
+        || lower.contains("not enough space on the disk") || lower.contains("os error 112");
+    if disk_full && !lower.contains("their disk is full") {
+        return match dir {
+            Direction::Receive => "This device's disk is full — free up space, then retry and it picks up where it stopped".into(),
+            _ => "The recipient's disk is full — once they free up space, retry and it picks up where it stopped".into(),
+        };
+    }
+    err.to_string()
+}
+
 fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
     // Log every failure so a transfer that "kept failing" on a machine we can't
     // reach leaves a trace in DropBeam.log (was invisible — failures only emitted
@@ -1151,7 +1177,7 @@ fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
     crate::telemetry::nudge_after_failure();
     let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
     u.state = TransferState::Failed;
-    u.error = Some(err.to_string());
+    u.error = Some(friendly_failure(dir, err));
     let rows = integrity::reports();
     if rows.iter().any(|r| !r.verified) {
         u.file_names = rows.iter().map(|r| r.name.clone()).collect();
