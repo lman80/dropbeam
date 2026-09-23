@@ -85,6 +85,10 @@ pub fn update_settings(
     // limit. 64 chars is ample for a name.
     let mut settings = settings;
     settings.device_kind = state.settings.lock().unwrap().device_kind.clone();
+    // The picture is owned by set/clear_profile_avatar (and synced from the
+    // user's other devices): a settings save from a window holding an older
+    // copy must not point it back at a replaced file.
+    settings.avatar = state.settings.lock().unwrap().avatar.clone();
     settings.display_name = settings.display_name.trim().chars().take(64).collect();
 
     // Persist FIRST. If the disk write fails (e.g. Windows write contention), return
@@ -1490,15 +1494,17 @@ pub async fn send_typing(
     on: bool,
 ) -> Result<(), String> {
     if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
-        if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id) {
+        if let (Some(ep), Some(_)) = (iroh.get().cloned(), friend.endpoint_id) {
             let my_name = state.settings.lock().unwrap().display_name.clone();
             let payload = serde_json::json!({
                 "kind": "chat-signal", "signal": "typing", "friendId": friend_id,
                 "fromName": my_name, "on": on,
             });
+            // A person with several devices: whichever of them answers.
+            let eids = friends::person_endpoints(&state.config_dir, &friend_id);
             let iroh = iroh.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = crate::iroh_net::send_chat(&iroh, &ep, &eid, payload).await;
+                let _ = crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await;
             });
         }
     }
@@ -1518,15 +1524,18 @@ pub async fn send_read_receipt(
         return Ok(());
     }
     if let Some(friend) = friends::get(&state.config_dir, &friend_id) {
-        if let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id) {
+        if let (Some(ep), Some(_)) = (iroh.get().cloned(), friend.endpoint_id) {
             let my_name = state.settings.lock().unwrap().display_name.clone();
             let payload = serde_json::json!({
                 "kind": "chat-signal", "signal": "read", "friendId": friend_id,
                 "fromName": my_name, "upTo": up_to,
             });
+            // Any one of the person's devices will do: their devices share
+            // read status among themselves.
+            let eids = friends::person_endpoints(&state.config_dir, &friend_id);
             let iroh = iroh.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = crate::iroh_net::send_chat(&iroh, &ep, &eid, payload).await;
+                let _ = crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await;
             });
         }
     }

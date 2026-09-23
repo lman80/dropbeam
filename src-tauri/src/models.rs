@@ -540,6 +540,11 @@ pub struct Friend {
     /// broadcast never overwrites a name the user deliberately chose.
     #[serde(default)]
     pub name_custom: bool,
+    /// When the user last renamed this friend (ms, 0 = never/unknown), so a
+    /// rename made on one of the user's devices wins over an older one made on
+    /// another (last writer wins) instead of each device keeping its own.
+    #[serde(default)]
+    pub name_at: u64,
     /// None until hello/ready negotiation; zero denotes a legacy peer.
     #[serde(default)]
     pub progress_v: Option<u64>,

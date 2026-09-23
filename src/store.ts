@@ -1,4 +1,5 @@
 import { emit, listen } from '@tauri-apps/api/event'
+import { contentSummary, linkedTitle } from './lib/deviceLink'
 import { create } from 'zustand'
 import { listenForChatNotifications } from './lib/chatNotifications'
 import {
@@ -945,10 +946,12 @@ export const useStore = create<AppStore>((set, get) => ({
           get().toast('info', 'That’s a shared-folder invite — choose where to keep the folder to join it.')
           return true
         case 'linkDevice': {
-          // Either direction works: a code shown by a device that has the account
-          // makes this device join it; one shown by a new device joins ours.
+          // Either code works whichever device scans it: the engine picks the
+          // direction (the account that already has devices wins) and refuses
+          // two different accounts before touching anything.
           const linked = /^dropbeamjoin1:/i.test(route.code) ? await api.linkDeviceJoin(route.code) : await api.linkDeviceSend(route.code)
-          get().toast('success', `Linked with ${linked.name} — your friends and chats now sync`)
+          const what = contentSummary(linked.friends, linked.messages)
+          get().toast('success', `${linkedTitle(linked)}${what ? ` — ${what} now on both` : ''}. Friends and chats stay in sync.`)
           void get().reloadFriends()
           return true
         }
