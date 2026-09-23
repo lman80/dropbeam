@@ -3142,6 +3142,8 @@ async fn serve_stream_inner(
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&staging);
                     clear_placeholders();
+                    // Don't leave the folder frozen on "Receiving N%".
+                    sm.note_folder_receive_ended(&pair_id);
                     anyhow::bail!("folder receive failed: {e}");
                 }
             }
