@@ -70,7 +70,8 @@ struct SendView: View {
     }
     @ViewBuilder private var pickButtons: some View {
         pickButton("Photos", symbol: "photo.on.rectangle.angled", source: "photos")
-        pickButton("Files", symbol: "folder", source: "files")
+        pickButton("Files", symbol: "doc.fill", source: "files")
+        SendFolderButton()
     }
     private func pickButton(_ title: String, symbol: String, source: String) -> some View {
         Button {

@@ -23,9 +23,10 @@ struct FriendsView: View {
                 if search.isEmpty {
                     Section {
                         NavigationLink { LocationsView() } label: { RowLabel(title: "Locations", symbol: "externaldrive.fill", color: .teal) }
+                        NavigationLink { SharedFoldersView() } label: { RowLabel(title: "Shared Folders", symbol: "folder.fill.badge.person.crop", color: .blue) }
                         Button { showingCode = true; Haptics.tap() } label: { RowLabel(title: "My DropBeam Code", symbol: "qrcode", color: .beam) }
                             .buttonStyle(.plain)
-                    } footer: { Text("Friends add you by scanning your code. Locations are folders and drives they share with you.") }
+                    } footer: { Text("Friends add you by scanning your code. Shared Folders stay in sync with friends; Locations are drives they let you browse.") }
                 }
                 let mine = filtered.filter(isMine)
                 let others = filtered.filter { !isMine($0) }
@@ -82,6 +83,7 @@ struct FriendsView: View {
             .confirmationDialog(sendingTo.map { "Send to \($0.displayName)" } ?? "", isPresented: Binding(get: { sendingTo != nil }, set: { if !$0 { sendingTo = nil } }), titleVisibility: .visible, presenting: sendingTo) { friend in
                 Button("Photos") { bridge.perform { try await bridge.pickAndSend(source: "photos", friendId: friend.id) } }
                 Button("Files") { bridge.perform { try await bridge.pickAndSend(source: "files", friendId: friend.id) } }
+                Button("Folder") { bridge.perform { try await bridge.pickAndSend(source: "folder", friendId: friend.id) } }
             }
         }
     }
@@ -112,7 +114,8 @@ struct FriendsView: View {
         }
         .contextMenu {
             Button("Send Photos", systemImage: "photo.on.rectangle") { bridge.perform { try await bridge.pickAndSend(source: "photos", friendId: friend.id) } }
-            Button("Send Files", systemImage: "folder") { bridge.perform { try await bridge.pickAndSend(source: "files", friendId: friend.id) } }
+            Button("Send Files", systemImage: "doc") { bridge.perform { try await bridge.pickAndSend(source: "files", friendId: friend.id) } }
+            Button("Send a Folder", systemImage: "folder") { bridge.perform { try await bridge.pickAndSend(source: "folder", friendId: friend.id) } }
             Button("Message", systemImage: "bubble.left") { bridge.perform { try await bridge.openChat(friendId: friend.id) } }
             Divider()
             Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", systemImage: "person.fill.xmark", role: .destructive) { removing = friend }
@@ -213,6 +216,7 @@ struct FriendDetailView: View {
         .confirmationDialog("Send to \(friend.displayName)", isPresented: $sendOptions, titleVisibility: .visible) {
             Button("Photos") { pick("photos") }
             Button("Files") { pick("files") }
+            Button("Folder") { pick("folder") }
         }
         .alert("Rename", isPresented: $renaming) {
             TextField("Name", text: $name)

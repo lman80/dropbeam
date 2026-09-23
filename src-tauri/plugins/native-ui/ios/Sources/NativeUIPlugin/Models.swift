@@ -692,3 +692,132 @@ extension Transfer {
     /// Every file's end-to-end check passed.
     var integrityVerified: Bool { !(integrity ?? []).isEmpty && (integrity ?? []).allSatisfy(\.verified) }
 }
+// Shared Folders (snapshot key "folders", built by src/lib/nativeFolders.ts).
+struct FolderMember: Decodable, Identifiable, Hashable {
+    var id: String { pairId }
+    let pairId: String
+    var name = "Waiting to join…"
+    var online = false
+    var pending = false
+    var viewer = false
+    var friendId: String?
+    var canSetRole = false
+}
+struct FolderSummary: Decodable, Hashable {
+    var direction = "receive"
+    var files = 0
+    var bytes: Double = 0
+    var durationMs: Double = 0
+    var avgBps: Double = 0
+}
+struct SharedFolder: Decodable, Identifiable {
+    let id: String
+    let pairId: String
+    var name = "Shared Folder"
+    var path = ""
+    /// "mirror", "twoWay", "sendOnly" or "receiveOnly".
+    var mode = "mirror"
+    var modeLabel = "Total sync"
+    var autoDelete = false
+    var iAmViewer = false
+    var iAmOwner = false
+    var paused = false
+    var peerUnshared = false
+    var state = "idle"
+    /// "ok", "busy", "warn", "error" or "offline".
+    var tone = "ok"
+    var label = ""
+    var percent: Double = 0
+    var bytesDone: Double = 0
+    var bytesTotal: Double = 0
+    var speedBps: Double = 0
+    var etaSeconds: Double?
+    var currentFile: String?
+    var queued = 0
+    var queuedFiles: [String] = []
+    var peerFiles: Int?
+    var inSync = false
+    var locality: String?
+    var pendingInvite: String?
+    var lastSyncedMs: Double?
+    var summary: FolderSummary?
+    var members: [FolderMember] = []
+    var busy: Bool { state == "sending" || state == "receiving" }
+    var mirror: Bool { mode == "mirror" }
+}
+struct FolderVerify: Decodable {
+    var peerOnline = false
+    var compared = false
+    var identical = false
+    var matched = 0
+    var differences = 0
+    var localFiles = 0
+    var peerFiles = 0
+}
+
+private func finite(_ c: KeyedDecodingContainer<BridgeKey>, _ key: String) -> Double? {
+    (try? c.decode(Double.self, forKey: BridgeKey(key))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+}
+extension FolderMember {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.pairId = try c.decode(String.self, forKey: BridgeKey("pairId"))
+        if let name = try? c.decode(String.self, forKey: BridgeKey("name")), !name.isEmpty { self.name = name }
+        self.online = (try? c.decode(Bool.self, forKey: BridgeKey("online"))) ?? false
+        self.pending = (try? c.decode(Bool.self, forKey: BridgeKey("pending"))) ?? false
+        self.viewer = (try? c.decode(Bool.self, forKey: BridgeKey("viewer"))) ?? false
+        self.friendId = (try? c.decode(String.self, forKey: BridgeKey("friendId")))
+        self.canSetRole = (try? c.decode(Bool.self, forKey: BridgeKey("canSetRole"))) ?? false
+    }
+}
+extension FolderSummary {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.direction = (try? c.decode(String.self, forKey: BridgeKey("direction"))) ?? "receive"
+        self.files = (try? c.decode(Int.self, forKey: BridgeKey("files"))) ?? 0
+        self.bytes = finite(c, "bytes") ?? 0
+        self.durationMs = finite(c, "durationMs") ?? 0
+        self.avgBps = finite(c, "avgBps") ?? 0
+    }
+}
+extension SharedFolder {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        let str = { (key: String) in try? c.decode(String.self, forKey: BridgeKey(key)) }
+        let bool = { (key: String) in (try? c.decode(Bool.self, forKey: BridgeKey(key))) ?? false }
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.pairId = try c.decode(String.self, forKey: BridgeKey("pairId"))
+        if let name = str("name"), !name.isEmpty { self.name = name }
+        self.path = str("path") ?? ""
+        self.mode = str("mode") ?? "mirror"
+        self.modeLabel = str("modeLabel") ?? (mode == "mirror" ? "Total sync" : "Two-way")
+        self.autoDelete = bool("autoDelete"); self.iAmViewer = bool("iAmViewer"); self.iAmOwner = bool("iAmOwner")
+        self.paused = bool("paused"); self.peerUnshared = bool("peerUnshared"); self.inSync = bool("inSync")
+        self.state = str("state") ?? "idle"
+        self.tone = str("tone") ?? "ok"
+        self.label = str("label") ?? ""
+        self.percent = min(100, max(0, finite(c, "percent") ?? 0))
+        self.bytesDone = finite(c, "bytesDone") ?? 0
+        self.bytesTotal = finite(c, "bytesTotal") ?? 0
+        self.speedBps = finite(c, "speedBps") ?? 0
+        self.etaSeconds = finite(c, "etaSeconds")
+        self.currentFile = str("currentFile")
+        self.queued = (try? c.decode(Int.self, forKey: BridgeKey("queued"))) ?? 0
+        self.queuedFiles = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("queuedFiles")))?.values ?? []
+        self.peerFiles = (try? c.decode(Int.self, forKey: BridgeKey("peerFiles")))
+        self.locality = str("locality")
+        self.pendingInvite = str("pendingInvite")
+        self.lastSyncedMs = finite(c, "lastSyncedMs").flatMap { $0 > 0 ? $0 : nil }
+        self.summary = (try? c.decode(FolderSummary.self, forKey: BridgeKey("summary")))
+        self.members = (try? c.decode(LossyArray<FolderMember>.self, forKey: BridgeKey("members")))?.values ?? []
+    }
+}
+extension FolderVerify {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        let bool = { (key: String) in (try? c.decode(Bool.self, forKey: BridgeKey(key))) ?? false }
+        let int = { (key: String) in (try? c.decode(Int.self, forKey: BridgeKey(key))) ?? 0 }
+        self.peerOnline = bool("peerOnline"); self.compared = bool("compared"); self.identical = bool("identical")
+        self.matched = int("matched"); self.differences = int("differences"); self.localFiles = int("localFiles"); self.peerFiles = int("peerFiles")
+    }
+}

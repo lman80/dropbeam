@@ -338,11 +338,18 @@ struct UploadLimitView: View {
 struct DiagnosticsView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var busy = false
+    @State private var testing = false
+    @State private var testResult: String?
     var body: some View {
         Form {
             Section {
                 SettingToggle(title: "Share Diagnostics", symbol: "chart.bar.doc.horizontal.fill", color: .blue, key: "shareDiagnostics", value: bridge.settings?.shareDiagnostics)
-            } footer: { Text("Sends a redacted error and performance summary about once a day, plus crash reports, so bugs get fixed. Never includes file names, file contents, messages or contacts.") }
+                ActionRow(title: testing ? "Sending…" : "Send Test Report", symbol: "paperplane.fill", color: .green) {
+                    testing = true; testResult = nil
+                    bridge.perform { defer { testing = false }; let r: String = try await bridge.call("diagnosticsTest"); testResult = r; Haptics.success() }
+                }.disabled(testing || bridge.settings?.shareDiagnostics == false)
+                if let testResult { Text(testResult).font(.footnote).foregroundStyle(.secondary).textSelection(.enabled) }
+            } footer: { Text("Sends a redacted error and performance summary about once a day, plus crash reports, so bugs get fixed. Never includes file names, file contents, messages or contacts. Send Test Report checks that reports get through.") }
             Section {
                 SettingToggle(title: "Detailed Logging", symbol: "doc.text.magnifyingglass", color: .gray, key: "verboseLogging", value: bridge.settings?.verboseLogging)
                 ActionRow(title: busy ? "Exporting…" : "Export Logs", symbol: "square.and.arrow.up.fill", color: .beam) {
