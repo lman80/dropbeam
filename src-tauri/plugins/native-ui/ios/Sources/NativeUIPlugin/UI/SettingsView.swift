@@ -75,10 +75,12 @@ struct SettingsView: View {
                 }
                 Section {
                     NavigationLink { PrivacyView() } label: { RowLabel(title: "Privacy & Your Data", symbol: "hand.raised.fill", color: .blue) }
+                    NavigationLink { BlockedView() } label: { RowLabel(title: "Blocked", symbol: "nosign", color: .gray, value: bridge.blocked.isEmpty ? nil : "\(bridge.blocked.count)") }
                     NavigationLink { DiagnosticsView() } label: { RowLabel(title: "Diagnostics", symbol: "waveform.path.ecg", color: .red) }
                     ActionRow(title: "Send Feedback", symbol: "bubble.left.and.bubble.right.fill", color: .beam) { SuperFeedback.present() }
                     IconToggle(title: "Feedback Button", symbol: "hand.tap.fill", color: .gray, isOn: Binding(get: { feedbackButton }, set: { feedbackButton = $0; SuperFeedback.setEnabled($0) }))
                     LinkRow(title: "Help & Support", symbol: "questionmark.circle.fill", color: .green, url: DropBeamLinks.support)
+                    ActionRow(title: "Report a Problem", symbol: "envelope.fill", color: .orange) { contact() }
                 } header: { Text("Privacy & Support") } footer: { Text("The feedback button floats at the screen edge — drag it anywhere, or turn it off and use Send Feedback.") }
                 Section("Advanced") {
                     NavigationLink { TextSettingView(title: "Custom Relay", key: "customRelay", value: bridge.settings?.customRelay ?? "", placeholder: "https://relay.example.com", footer: "Use the same relay URL on both devices. Leave blank to use the public relays. Close and reopen DropBeam to apply.", link: ("Relay setup guide", DropBeamLinks.relaySetup)) } label: {
@@ -98,6 +100,15 @@ struct SettingsView: View {
             .confirmationDialog("Clear interrupted transfer leftovers?", isPresented: $clearCache, titleVisibility: .visible) {
                 Button("Clear Transfer Cache", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("clearTransferCache"); bridge.showToast(freed > 0 ? "Cleared \(Formatters.bytes(freed))" : "No transfer leftovers to clear") } }
             } message: { Text("Partly received files are removed. Finished files aren’t affected.") }
+        }
+    }
+    /// Email the DropBeam team (the address lives in src/lib/report.ts).
+    private func contact() {
+        bridge.perform {
+            let mail = try await bridge.call("contactMail") as ReportMail
+            if let url = URL(string: mail.url), await UIApplication.shared.open(url) { return }
+            UIPasteboard.general.string = mail.to
+            bridge.showToast("No mail app set up — address copied: \(mail.to)")
         }
     }
     private var devicesSummary: String {

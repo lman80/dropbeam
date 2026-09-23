@@ -8,6 +8,8 @@ struct FriendsView: View {
     @State private var showingCode = false
     @State private var removing: Friend?
     @State private var sendingTo: Friend?
+    @State private var blocking: Friend?
+    @State private var reporting: ReportTarget?
     @Namespace private var avatars
     private var filtered: [Friend] {
         bridge.friends.filter { $0.groupedUnder == nil }.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.displayName.localizedCaseInsensitiveContains(search) }
@@ -80,6 +82,7 @@ struct FriendsView: View {
                     bridge.perform { try await bridge.removeFriend(id: friend.id) }
                 }
             } message: { friend in Text(friend.ownDevice ? "It stops syncing your friends and chats." : "You can add \(friend.name) again with their code.") }
+            .safetyPrompts(block: $blocking, report: $reporting)
             .confirmationDialog(sendingTo.map { "Send to \($0.displayName)" } ?? "", isPresented: Binding(get: { sendingTo != nil }, set: { if !$0 { sendingTo = nil } }), titleVisibility: .visible, presenting: sendingTo) { friend in
                 Button("Photos") { bridge.perform { try await bridge.pickAndSend(source: "photos", friendId: friend.id) } }
                 Button("Files") { bridge.perform { try await bridge.pickAndSend(source: "files", friendId: friend.id) } }
@@ -111,6 +114,7 @@ struct FriendsView: View {
         }
         .swipeActions(edge: .trailing) {
             Button(role: .destructive) { removing = friend } label: { Label("Remove", systemImage: "person.fill.xmark") }
+            if !isMine(friend) { Button { blocking = friend } label: { Label("Block", systemImage: "hand.raised.fill") }.tint(.orange) }
         }
         .contextMenu {
             Button("Send Photos", systemImage: "photo.on.rectangle") { bridge.perform { try await bridge.pickAndSend(source: "photos", friendId: friend.id) } }
@@ -118,6 +122,10 @@ struct FriendsView: View {
             Button("Send a Folder", systemImage: "folder") { bridge.perform { try await bridge.pickAndSend(source: "folder", friendId: friend.id) } }
             Button("Message", systemImage: "bubble.left") { bridge.perform { try await bridge.openChat(friendId: friend.id) } }
             Divider()
+            if !isMine(friend) {
+                Button("Report…", systemImage: "exclamationmark.bubble") { reporting = ReportTarget(friend: friend) }
+                Button("Block…", systemImage: "hand.raised", role: .destructive) { blocking = friend }
+            }
             Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", systemImage: "person.fill.xmark", role: .destructive) { removing = friend }
         }
     }
@@ -170,7 +178,14 @@ struct FriendDetailView: View {
     @State private var name = ""
     @State private var check: String?
     @State private var checking = false
+    @State private var blocking: Friend?
+    @State private var reporting: ReportTarget?
     private var friend: Friend { bridge.friends.first { $0.id == friendID } ?? initial }
+    private var isMine: Bool {
+        if friend.ownDevice { return true }
+        guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return false }
+        return friend.accountPub == account
+    }
     var body: some View {
         List {
             Section {
@@ -208,11 +223,18 @@ struct FriendDetailView: View {
                 Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", role: .destructive) { removing = true; Haptics.warning() }
                     .frame(maxWidth: .infinity)
             }
+            if !isMine {
+                Section {
+                    Button { reporting = ReportTarget(friend: friend) } label: { Label("Report \(friend.displayName)…", systemImage: "exclamationmark.bubble") }
+                    Button(role: .destructive) { blocking = friend; Haptics.warning() } label: { Label("Block \(friend.displayName)", systemImage: "hand.raised") }
+                } footer: { Text("Blocking stops their messages, files and invites on all your devices. They aren’t told.") }
+            }
         }
         .beamList()
         .navigationTitle(friend.displayName).navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .principal) { Text("").accessibilityHidden(true) } } // the header already shows the name
         .onChange(of: bridge.friends.map(\.id)) { _, ids in if !ids.contains(friendID) { dismiss() } }
+        .safetyPrompts(block: $blocking, report: $reporting)
         .confirmationDialog("Send to \(friend.displayName)", isPresented: $sendOptions, titleVisibility: .visible) {
             Button("Photos") { pick("photos") }
             Button("Files") { pick("files") }

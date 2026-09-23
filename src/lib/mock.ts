@@ -33,6 +33,10 @@ export function mockListen(event: string, cb: Cb): Promise<() => void> {
   })
 }
 
+let blocked: { id: string; name: string; at: number; endpointIds: string[] }[] = [
+  { id: 'mock-blocked-1', name: 'Spam Account', at: Date.now() - 3 * 86_400_000, endpointIds: ['mock-blocked-1'] },
+]
+
 let settings: Settings = {
   downloadDir: '/Users/you/Downloads',
   displayName: "Ashton's MacBook Pro",
@@ -712,6 +716,24 @@ export const mockApi = {
   },
   removeFriend: async (id: string): Promise<void> => {
     friends = friends.filter((f) => f.id !== id)
+  },
+  blockFriend: async (id: string): Promise<string[]> => {
+    const f = friends.find((x) => x.id === id)
+    if (!f) throw new Error('That friend no longer exists.')
+    const eid = f.endpointId || `mock-${f.id}`
+    blocked = [{ id: eid, name: f.name, at: Date.now(), endpointIds: [eid] }, ...blocked.filter((b) => b.id !== eid)]
+    friends = friends.filter((x) => x.id !== id)
+    setTimeout(() => emit('blocked://changed', null), 0)
+    return [eid]
+  },
+  unblockPerson: async (id: string): Promise<void> => {
+    blocked = blocked.filter((b) => !b.endpointIds.includes(id))
+    setTimeout(() => emit('blocked://changed', null), 0)
+  },
+  listBlocked: async () => [...blocked],
+  openMailto: async (url: string): Promise<void> => {
+    console.info('[mock] open mail:', url)
+    ;(window as unknown as { __lastMailto?: string }).__lastMailto = url
   },
   setFriendAutoAccept: async (id: string, autoAccept: boolean): Promise<void> => {
     const f = friends.find((x) => x.id === id)

@@ -16,6 +16,7 @@ import { MobileTabBar } from './components/MobileTabBar'
 import { Toasts } from './components/Toasts'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { FolderInviteModal } from './components/FolderInviteModal'
+import { SafetyDialogHost } from './components/SafetyDialogs'
 import { QrScanner } from './components/QrScanner'
 import { routeDropToScanner } from './lib/qrImage'
 import { BeamLogo } from './components/bits'
@@ -212,6 +213,7 @@ export default function App() {
         {!nativeShell && <SendToChooser />}
         {MOBILE_UI ? (!nativeShell && <MobileOnboarding />) : <NameSetupModal />}
         {!nativeShell && <FolderInviteModal />}
+        {!nativeShell && <SafetyDialogHost />}
         {!MOBILE_UI && <PopoverCodeHandoff />}
       </ErrorBoundary>
       <ErrorBoundary region="toasts" fallbackStyle={{ position: 'fixed', bottom: 12, right: 12, zIndex: 101 }}>

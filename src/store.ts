@@ -13,6 +13,7 @@ import {
   onFolderStatus,
   onFolderSynced,
   onFriendsChanged,
+  onBlockedChanged,
   onHistoryChanged,
   onOpenFileSend,
   onPairsChanged,
@@ -22,6 +23,7 @@ import {
   type FolderComplete,
   type FolderStatus,
   type Friend,
+  type BlockedPerson,
   type MyDeviceInfo,
   type GifMeta,
   type HistoryEntry,
@@ -182,6 +184,9 @@ interface UpdateState {
   progress: number
 }
 
+/** Block or Report a friend, or report one of their messages. */
+export type SafetyPrompt = { kind: 'block' | 'report'; friendId: string; messageId?: string }
+
 export type View = 'locations' | 'send' | 'friends' | 'folders' | 'chat' | 'history' | 'settings'
 
 export interface Toast {
@@ -286,6 +291,16 @@ interface AppStore {
   addFriendByCode: (code: string) => Promise<void>
   renameFriend: (id: string, name: string) => Promise<void>
   removeFriend: (id: string) => Promise<void>
+  /** People the user blocked (Settings → Blocked). */
+  blocked: BlockedPerson[]
+  /** The open Block / Report dialog, if any (one host renders it). */
+  safety: SafetyPrompt | null
+  openSafety: (p: SafetyPrompt) => void
+  closeSafety: () => void
+  reloadBlocked: () => Promise<void>
+  /** Block the person behind friend `id`; resolves true once blocked. */
+  blockFriend: (id: string) => Promise<boolean>
+  unblockPerson: (id: string) => Promise<void>
   setFriendAutoAccept: (id: string, autoAccept: boolean) => Promise<void>
   respondToOffer: (id: string, accept: boolean) => Promise<void>
   probeFriend: (id: string) => Promise<ConnDetail | null>
@@ -560,6 +575,10 @@ export const useStore = create<AppStore>((set, get) => ({
   myDevice: null,
   refreshMyDevice: async () => { set({ myDevice: await api.myDeviceInfo() }) },
   friends: [],
+  blocked: [],
+  safety: null,
+  openSafety: (p) => set({ safety: p }),
+  closeSafety: () => set({ safety: null }),
   folderStatuses: {},
   folderLastSynced: {},
   folderSummaries: {},
@@ -829,6 +848,8 @@ export const useStore = create<AppStore>((set, get) => ({
     // so the folder shows who's in it (and clears the stale "waiting" state).
     onPairsChanged(() => get().reloadPairs())
     onFriendsChanged(() => get().reloadFriends())
+    onBlockedChanged(() => void get().reloadBlocked())
+    void get().reloadBlocked()
 
     // "Send with DropBeam" (Windows right-click): open the send chooser for the
     // file the app was launched with (cold start) or that a second launch
@@ -1592,6 +1613,34 @@ export const useStore = create<AppStore>((set, get) => ({
     try {
       await api.removeFriend(id)
       await get().reloadFriends()
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+  },
+
+  reloadBlocked: async () => {
+    const blocked = await api.listBlocked().catch(() => null)
+    if (blocked) set({ blocked })
+  },
+
+  blockFriend: async (id) => {
+    const name = get().friends.find((f) => f.id === id)?.name ?? 'They'
+    try {
+      await api.blockFriend(id)
+      if (get().activeChatId === id) get().closeChat()
+      await Promise.all([get().reloadFriends(), get().reloadBlocked()])
+      get().toast('success', `${name} is blocked.`)
+      return true
+    } catch (e) {
+      get().toast('error', String(e))
+      return false
+    }
+  },
+
+  unblockPerson: async (id) => {
+    try {
+      await api.unblockPerson(id)
+      await get().reloadBlocked()
     } catch (e) {
       get().toast('error', String(e))
     }

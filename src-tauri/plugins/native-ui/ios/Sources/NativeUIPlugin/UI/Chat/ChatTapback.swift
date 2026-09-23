@@ -16,6 +16,8 @@ struct TapbackOverlay: View {
     let target: TapbackTarget
     var onReply: () -> Void
     var onEdit: () -> Void
+    /// Their message in a friend's chat: "Report…" (nil hides it).
+    var onReport: (() -> Void)? = nil
     var onClose: () -> Void
     @State private var shown = false
     @State private var moreEmoji = false
@@ -35,6 +37,9 @@ struct TapbackOverlay: View {
         if message.kind == "file" {
             let paths = ChatAttachment.availablePaths(message, bridge: bridge)
             if !paths.isEmpty { list.append(Action(title: "Save or Share", symbol: "square.and.arrow.up") { bridge.perform { try await bridge.shareFiles(paths: paths) } }) }
+        }
+        if !mine, let onReport {
+            list.append(Action(title: "Report…", symbol: "exclamationmark.bubble", destructive: true) { onReport() })
         }
         if mine {
             list.append(Action(title: "Undo Send", symbol: "arrow.uturn.backward", destructive: true) {

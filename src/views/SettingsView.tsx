@@ -3,10 +3,11 @@ import { folderName } from '../lib/syncedFolders'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { DevicesPanel } from '../components/DevicesPanel'
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
-import { CheckCircle2, Download, FolderOpen, HardDrive, QrCode, RefreshCw, Trash2 } from 'lucide-react'
+import { Ban, CheckCircle2, Download, FolderOpen, HardDrive, Mail, QrCode, RefreshCw, Trash2 } from 'lucide-react'
 import { QrCodeView } from '../components/CodeQr'
 import { QrScanner } from '../components/QrScanner'
 import { api, type Settings } from '../lib/api'
+import { contactMailto, platformLabel } from '../lib/report'
 import { formatBytes } from '../lib/format'
 import { useStore } from '../store'
 import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
@@ -617,6 +618,8 @@ export function SettingsView() {
         </>
       )}
 
+      {!MOBILE_UI && <SafetySection />}
+
       <SectionTitle>Custom relay (advanced)</SectionTitle>
       <Card>
         <Row
@@ -907,5 +910,68 @@ function DisplayNameInput({ value, onSave }: { value: string; onSave: (name: str
       onBlur={commit}
       onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
     />
+  )
+}
+
+/** Settings → Privacy & safety: the Blocked list (unblock) + Report a problem / Contact. */
+function SafetySection() {
+  const blocked = useStore((s) => s.blocked)
+  const unblock = useStore((s) => s.unblockPerson)
+  const appVer = useStore((s) => s.appVer)
+  const toast = useStore((s) => s.toast)
+  const [busy, setBusy] = useState<string | null>(null)
+  return (
+    <>
+      <SectionTitle>Privacy &amp; safety</SectionTitle>
+      <Card>
+        <Row
+          title="Blocked"
+          desc="Blocked people can't message you, send you files, invite you to folders or browse your Locations — and they aren't told. Blocks apply on all your linked devices. Block someone from their friend card or chat (⋯ → Block…)."
+        />
+        <div className="blocked-list" style={{ margin: '0 4px 12px' }}>
+          {blocked.length === 0 ? (
+            <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-faint)', padding: '2px 6px' }}>No one is blocked.</span>
+          ) : (
+            blocked.map((p) => (
+              <div className="blocked-row" key={p.id}>
+                <Ban size={15} color="var(--text-faint)" />
+                <span className="blocked-name truncate-1" title={p.name}>{p.name}</span>
+                <span className="blocked-when">
+                  {p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}blocked {new Date(p.at).toLocaleDateString()}
+                </span>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  disabled={busy === p.id}
+                  onClick={async () => {
+                    setBusy(p.id)
+                    await unblock(p.id)
+                    setBusy(null)
+                    toast('info', `${p.name} is unblocked. Add them again with their code if you want to.`)
+                  }}
+                >
+                  {busy === p.id ? <Spinner size={13} /> : null} Unblock
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+        {SEP}
+        <Row
+          title="Report a problem or contact us"
+          desc="Opens an email to the DropBeam team. To report a person or a message, use Report… on their friend card, in their chat, or on the message. We respond within 24 hours."
+        >
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() =>
+              api
+                .openMailto(contactMailto(appVer || null, platformLabel(navigator.userAgent)))
+                .catch((e) => toast('error', `Couldn’t open your mail app: ${String(e)}`))
+            }
+          >
+            <Mail size={15} /> Email us
+          </button>
+        </Row>
+      </Card>
+    </>
   )
 }

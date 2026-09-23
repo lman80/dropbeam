@@ -2003,6 +2003,42 @@ fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
     }
 }
 
+/// Stream kinds a blocked person is kept out of: introductions, chat, typing /
+/// read signals, file pushes (and their stat/verify), folder invites and
+/// Locations. Quick Send pulls (they hold a code the user gave them), pings and
+/// the user's own account traffic are unaffected.
+fn is_blockable_kind(kind: &str) -> bool {
+    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite")
+        || kind.starts_with("locations.")
+}
+
+/// Answer a blocked peer exactly as a stranger is answered, so nothing tells
+/// them they're blocked: a hello is acknowledged (and ignored), chat isn't
+/// applied (as for an unknown sender), a file push is declined, Locations and
+/// file checks are denied with the stranger's error.
+async fn serve_blocked(kind: &str, req: &serde_json::Value, send: &mut SendStream) -> Result<()> {
+    match kind {
+        "friend-hello" => {
+            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION })).await?;
+        }
+        "chat" => write_frame(send, &serde_json::json!({ "kind": "ok", "applied": false })).await?,
+        "files" if req.get("location").is_some() => {
+            send_receiver_error(send, &anyhow::anyhow!("Location access denied")).await;
+            return Ok(());
+        }
+        "files" => write_frame(send, &serde_json::json!({ "declined": true })).await?,
+        "files.stat" | "files.verify" => {
+            write_frame(send, &serde_json::json!({ "ok": false, "error": "Friend access denied" })).await?;
+        }
+        k if k.starts_with("locations.") => {
+            write_frame(send, &serde_json::json!({ "ok": false, "error": "Location access denied" })).await?;
+        }
+        _ => write_frame(send, &serde_json::json!({ "kind": "ok" })).await?,
+    }
+    let _ = send.finish();
+    Ok(())
+}
+
 /// Handle one incoming stream by its header `kind`:
 ///   "ping" → reply "pong" (self-test); "pull" → serve a staged Quick Send.
 async fn serve_stream(
@@ -2019,6 +2055,19 @@ async fn serve_stream_inner(
     let linking = state.app.get().and_then(|a| a.try_state::<Arc<crate::AppState>>())
         .is_some_and(|st| crate::link::pending_active(&st));
     let req = tokio::time::timeout(Duration::from_secs(20), read_frame_cap(recv, if linking { crate::link::MAX_OFFER } else { MAX_HEADER })).await??;
+    // Blocked people get exactly what a stranger gets, before any handler runs.
+    let kind = req.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if is_blockable_kind(kind) {
+        if let Ok(config) = location_config(state) {
+            let who = conn.remote_id().to_string();
+            let blocked = crate::block::is_blocked(&config, &who)
+                || (kind == "friend-hello" && crate::block::adopt_from_hello(&config, &who, &req));
+            if blocked {
+                log::debug!("refusing a {kind} stream from a blocked peer");
+                return serve_blocked(kind, &req, send).await;
+            }
+        }
+    }
     match req.get("kind").and_then(|k| k.as_str()) {
         Some("ping") => {
             write_frame(send, &serde_json::json!({ "kind": "pong", "locations_v": crate::locations::VERSION })).await?;
@@ -13114,6 +13163,89 @@ mod chat_transfer_link_tests {
         assert!(reply.get("error").is_some());
         receiver.await.unwrap();
         client.close().await; server.close().await;
+    }
+}
+
+/// Blocking over real QUIC: a blocked peer's hello, chat, file push, Location
+/// request and folder invite get the stranger's answer, a friend's don't, and a
+/// new device proving a blocked person's account is blocked on its first hello.
+#[cfg(test)]
+mod block_loopback_tests {
+    use super::*;
+
+    async fn ep() -> Endpoint {
+        Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()]).relay_mode(iroh::RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap()
+    }
+    async fn rpc(conn: &Connection, req: serde_json::Value) -> serde_json::Value {
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        write_frame(&mut send, &req).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), read_frame(&mut recv)).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_blocked_peer_is_refused_like_a_stranger() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let base = std::env::temp_dir().join(format!("dropbeam-block-{}", uuid::Uuid::new_v4()));
+            struct Cleanup(PathBuf);
+            impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+            let _cleanup = Cleanup(base.clone());
+            let (config, theirs) = (base.join("me"), base.join("spammer-account"));
+            std::fs::create_dir_all(&config).unwrap(); std::fs::create_dir_all(&theirs).unwrap();
+            let (host, spam, spam2, pal) = (ep().await, ep().await, ep().await, ep().await);
+            let (spam_id, spam2_id, pal_id) = (spam.id().to_string(), spam2.id().to_string(), pal.id().to_string());
+            // The spammer's account (they own two devices; we only know one).
+            crate::link::adopt_key_for_tests(&theirs, &SecretKey::generate());
+            let their_account = crate::link::account_pub(&theirs).unwrap();
+            let f = crate::friends::upsert_by_endpoint(&config, &spam_id, "Spam");
+            crate::friends::set_device_info(&config, &spam_id, Some("laptop"), Some(&their_account));
+            crate::friends::upsert_by_endpoint(&config, &pal_id, "Pal");
+            crate::block::block_friend(&config, &f.id).unwrap();
+
+            let state = Arc::new(IrohState::default()); state.location_config.set(config.clone()).unwrap();
+            let listener = tokio::spawn(accept_loop(host.clone(), state));
+            let blocked = spam.connect(host.addr(), ALPN).await.unwrap();
+            let friend = pal.connect(host.addr(), ALPN).await.unwrap();
+
+            // Chat: not applied (as for an unknown sender); a friend's is.
+            let chat = serde_json::json!({"kind":"chat","v":2,"friendId":"x","fromName":"Spam","id":"m1","text":"buy now","ts":1,"seq":1});
+            assert_eq!(rpc(&blocked, chat.clone()).await, serde_json::json!({"kind":"ok","applied":false}));
+            assert_eq!(rpc(&friend, chat).await["applied"], true);
+            // Hello: acknowledged exactly like any hello, and nothing is added.
+            let hello = rpc(&blocked, serde_json::json!({"kind":"friend-hello","friend_id":"","endpoint_id":spam_id,"name":"Spam"})).await;
+            assert_eq!(hello["kind"], "ok");
+            assert!(crate::friends::load(&config).iter().all(|f| f.endpoint_id.as_deref() != Some(spam_id.as_str())));
+            // A file push is declined before a byte is read.
+            let push = rpc(&blocked, serde_json::json!({"kind":"files","total":3,"items":[{"name":"x.bin","size":3}],
+                "fromName":"Spam","resumable":true,"parallel":1})).await;
+            assert_eq!(push["declined"], true);
+            // Locations, file checks and folder invites: the stranger's answers.
+            let loc = rpc(&blocked, serde_json::json!({"kind":"locations.list","locations_v":crate::locations::VERSION})).await;
+            assert_eq!((loc["ok"].as_bool(), loc["error"].as_str()), (Some(false), Some("Location access denied")));
+            assert_eq!(rpc(&blocked, serde_json::json!({"kind":"files.stat","items":[]})).await["error"], "Friend access denied");
+            assert_eq!(rpc(&blocked, serde_json::json!({"kind":"folder-invite","code":"dropbeamp1:x","folder":"F","from":"Spam"})).await["kind"], "ok");
+            assert_eq!(rpc(&blocked, serde_json::json!({"kind":"chat-signal","signal":"typing","on":true})).await["kind"], "ok");
+            // Their other device proves the blocked account on its first hello: blocked too.
+            assert!(!crate::block::is_blocked(&config, &spam2_id));
+            let second = spam2.connect(host.addr(), ALPN).await.unwrap();
+            let sig = crate::link::sign_endpoint(&theirs, &spam2_id).unwrap();
+            let hello = rpc(&second, serde_json::json!({"kind":"friend-hello","friend_id":"","endpoint_id":spam2_id,"name":"Spam",
+                "account_pub":their_account,"account_sig":sig,"device_kind":"phone","device_os":"ios"})).await;
+            assert_eq!(hello["kind"], "ok");
+            assert!(crate::block::is_blocked(&config, &spam2_id), "a new device of a blocked person is blocked");
+            assert_eq!(crate::block::list(&config).len(), 1, "still one person");
+            assert_eq!(rpc(&second, serde_json::json!({"kind":"chat","text":"hi again"})).await["applied"], false);
+            // A forged account claim (bad signature) proves nothing.
+            let pal_hello = rpc(&friend, serde_json::json!({"kind":"friend-hello","friend_id":"","endpoint_id":pal_id,"name":"Pal",
+                "account_pub":their_account,"account_sig":"00"})).await;
+            assert_eq!(pal_hello["kind"], "ok");
+            assert!(!crate::block::is_blocked(&config, &pal_id));
+            // Pings (and Quick Send pulls) are unaffected.
+            assert_eq!(rpc(&blocked, serde_json::json!({"kind":"ping"})).await["kind"], "pong");
+            listener.abort();
+            for e in [host, spam, spam2, pal] { e.close().await; }
+        }).await.unwrap();
     }
 }
 

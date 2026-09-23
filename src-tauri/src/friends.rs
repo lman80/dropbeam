@@ -34,6 +34,11 @@ pub fn load(config_dir: &Path) -> Vec<Friend> {
     read_raw(config_dir)
 }
 
+/// The friends list as stored, without `load`'s reconcile pass.
+pub(crate) fn load_raw(config_dir: &Path) -> Vec<Friend> {
+    read_raw(config_dir)
+}
+
 fn read_raw(config_dir: &Path) -> Vec<Friend> {
     // Resilient read (retry transient failures + recover from .bak), then parse
     // element-wise so one corrupt/forward-incompatible friend record drops only
@@ -149,6 +154,9 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         .map_err(|_| "The friend invite is malformed.".to_string())?;
     let invite: Invite =
         serde_json::from_slice(&bytes).map_err(|_| "The friend invite is malformed.".to_string())?;
+    if invite.endpoint_id.as_deref().is_some_and(|e| crate::block::is_blocked(config_dir, e)) {
+        return Err("You blocked this person. Unblock them in Settings → Blocked to add them again.".into());
+    }
     let created_at = invite.endpoint_id.as_deref().map_or_else(now_ms, |e| fresh_created_at(config_dir, e));
 
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -519,6 +527,9 @@ fn fresh_created_at(config_dir: &Path, endpoint_id: &str) -> u64 {
 /// Add a friend from their permanent personal code (dedup by EndpointId).
 pub fn add_by_code(config_dir: &Path, code: &str) -> Result<Friend, String> {
     let uc = decode_user_code(code)?;
+    if crate::block::is_blocked(config_dir, &uc.eid) {
+        return Err("You blocked this person. Unblock them in Settings → Blocked to add them again.".into());
+    }
     Ok(upsert_by_endpoint(config_dir, &uc.eid, &uc.name))
 }
 
@@ -545,7 +556,7 @@ pub fn self_heal_chat_sender(
     name: &str,
     claimed_id: Option<&str>,
 ) -> Option<Friend> {
-    if endpoint_id.trim().is_empty() {
+    if endpoint_id.trim().is_empty() || crate::block::is_blocked(config_dir, endpoint_id) {
         return None;
     }
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -661,7 +672,8 @@ pub fn self_heal_chat_sender(
 /// sender by their EndpointId (the permanent-code reverse direction) so one code
 /// share makes the friendship two-way.
 pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: &str) {
-    if endpoint_id.trim().is_empty() {
+    // A blocked person's hello never adds (or re-keys) them.
+    if endpoint_id.trim().is_empty() || crate::block::is_blocked(config_dir, endpoint_id) {
         return;
     }
     // One of the user's OWN devices: its record is kept by account sync (the
@@ -779,6 +791,9 @@ fn detached_threads(config_dir: &Path) -> Result<std::collections::HashMap<Strin
 /// Incoming chat frames may only resolve a currently trusted endpoint. A name
 /// or a sender-provided friend id is not proof of friendship.
 pub fn chat_sender(config_dir: &Path, endpoint_id: &str) -> Option<Friend> {
+    if crate::block::is_blocked(config_dir, endpoint_id) {
+        return None;
+    }
     let all = read_raw(config_dir);
     let f = all.iter().find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))?.clone();
     // A friend's second device (same verified account) talks in the SAME thread

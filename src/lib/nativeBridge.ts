@@ -19,6 +19,7 @@ import { routeCode } from './codes'
 import { nativeFolders, folderLinks } from './nativeFolders'
 import { linkedDetail, linkedTitle } from './deviceLink'
 import { linkWithCode } from '../components/LinkDeviceModal'
+import { nativeReportMail, REPORT_REASONS, contactMailto, REPORT_EMAIL } from './report'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -171,6 +172,24 @@ const handlers: BridgeHandlers = {
     return { online, path: detail?.path ?? null, rttMs: detail?.rttMs ?? null }
   },
   removeFriend: a => st().removeFriend(string(a, 'id')),
+  blockFriend: async a => { if (!await st().blockFriend(string(a, 'id'))) throw new Error(st().toasts.at(-1)?.message || 'Could not block') },
+  unblockPerson: a => st().unblockPerson(string(a, 'id')),
+  reportReasons: () => REPORT_REASONS.map(r => ({ id: r.id, label: r.label })),
+  // Only what the user chose rides the email: the message text when
+  // includeText is on (file NAMES for a file message), never the files.
+  reportMail: async a => {
+    const friendId = string(a, 'friendId')
+    const friend = st().friends.find(f => f.id === friendId)
+    if (!friend) throw new Error('That friend no longer exists.')
+    const messageId = typeof a.messageId === 'string' ? a.messageId : null
+    const message = messageId ? (st().chats[friendId] ?? []).find(m => m.id === messageId) : undefined
+    if (messageId && !message) throw new Error('That message is no longer available.')
+    return nativeReportMail({
+      friend, message, reason: string(a, 'reason'), includeText: a.includeText === true,
+      notes: typeof a.notes === 'string' ? a.notes : '', alsoBlock: a.alsoBlock === true, appVersion: await appVersion().catch(() => ''),
+    })
+  },
+  contactMail: async () => ({ url: contactMailto(await appVersion().catch(() => ''), 'iOS'), to: REPORT_EMAIL, subject: '', body: '' }),
   renameFriend: a => st().renameFriend(string(a, 'id'), string(a, 'name')),
   setAutoAccept: a => {
     if (typeof a.bool !== 'boolean') throw new Error('Invalid auto-accept value')
@@ -487,6 +506,7 @@ async function start() {
       presence: presenceSnapshot(s),
       myDevice: deviceSnapshot(),
       folders: folderSnapshot(),
+      blocked: s.blocked,
     }
     for (const change of changedSnapshots(previous, snapshots)) send('state', change)
     if (s.activeChatId !== activeChat) {

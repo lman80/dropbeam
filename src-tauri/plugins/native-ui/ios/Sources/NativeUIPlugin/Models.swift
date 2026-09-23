@@ -255,6 +255,26 @@ struct BrowserPage: Decodable {
 }
 struct TrashResult: Decodable { let name: String; var error: String?; var trashPath: String? }
 struct DownloadResult: Decodable { var transferId: String?; var skipped: [String]? }
+/// A person the user blocked (their devices folded together), for Settings → Blocked.
+struct BlockedPerson: Decodable, Identifiable, Equatable {
+    let id: String
+    let name: String
+    var at: Double = 0
+    var endpointIds: [String] = []
+}
+/// A report reason offered in the Report sheet (the list lives in src/lib/report.ts).
+struct ReportReason: Decodable, Identifiable, Hashable {
+    let id: String
+    let label: String
+}
+/// A ready-to-send report email built by the bridge (src/lib/report.ts).
+struct ReportMail: Decodable {
+    let url: String
+    let to: String
+    let subject: String
+    let body: String
+}
+
 struct FolderInvite: Decodable, Identifiable {
     var id: String { code }
     let code: String
@@ -298,6 +318,15 @@ extension Friend {
         self.ownDevice = (try? c.decode(Bool.self, forKey: BridgeKey("ownDevice"))) ?? false
         self.ownLabel = (try? c.decode(String.self, forKey: BridgeKey("ownLabel")))
         self.groupedUnder = (try? c.decode(String.self, forKey: BridgeKey("groupedUnder")))
+    }
+}
+extension BlockedPerson {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.id = try c.decode(String.self, forKey: BridgeKey("id"))
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))).flatMap { $0.isEmpty ? nil : $0 } ?? "Unknown"
+        self.at = (try? c.decode(Double.self, forKey: BridgeKey("at"))) ?? 0
+        self.endpointIds = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("endpointIds")))?.values ?? []
     }
 }
 extension AccountDevice {

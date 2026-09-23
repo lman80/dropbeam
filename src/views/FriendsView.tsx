@@ -2,6 +2,7 @@ import { groupDevices, personGroups } from '../lib/deviceIcons'
 import { DeviceBadge } from '../components/DeviceBadge'
 import { AddDeviceModal } from '../components/DevicesPanel'
 import { useOwnDeviceLabels } from '../lib/ownDevices'
+import { SafetyMenu } from '../components/SafetyDialogs'
 import { ScanCodeButton, ShareCode } from '../components/CodeQr'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
@@ -644,6 +645,7 @@ function FriendCard({ friend }: { friend: Friend }) {
         <button className="btn btn-ghost btn-sm" onClick={showInvite} disabled={loadingInvite}>
           {loadingInvite ? <Spinner size={13} /> : <Copy size={13} />} {invite ? 'Hide invite' : 'Invite'}
         </button>
+        {!ownLabel && !confirmRemove && <SafetyMenu friend={friend} />}
         {confirmRemove ? (
           <>
             <button className="btn btn-ghost btn-sm" onClick={() => setConfirmRemove(false)}>

@@ -17,6 +17,16 @@ struct ConversationView: View {
     @State private var scrollID: String?
     @State private var tapback: TapbackTarget?
     @State private var showDetail = false
+    @State private var blocking: Friend?
+    @State private var reporting: ReportTarget?
+    /// Report chosen in the Tapback menu: shown once the cover has closed.
+    @State private var pendingReport: ReportTarget?
+    /// A friend (not one of the user's own devices): Report / Block are offered.
+    private var reportable: Bool {
+        guard let f = bridge.friends.first(where: { $0.id == friendID }), !f.ownDevice else { return false }
+        guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return true }
+        return f.accountPub != account
+    }
     private var messages: [ChatMessage] { bridge.threads[friendID] ?? [] }
     private var friend: Friend { bridge.friends.first { $0.id == friendID } ?? Friend(id: friendID, name: "Friend") }
     private var matches: [String] {
@@ -102,16 +112,34 @@ struct ConversationView: View {
                     Image(systemName: searching ? "xmark" : "magnifyingglass")
                 }.accessibilityLabel(searching ? "Close search" : "Search conversation")
             }
+            if reportable {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button("Contact Info", systemImage: "person.crop.circle") { showDetail = true }
+                        Divider()
+                        Button("Report \(friend.displayName)…", systemImage: "exclamationmark.bubble") { reporting = ReportTarget(friend: friend) }
+                        Button("Block \(friend.displayName)…", systemImage: "hand.raised", role: .destructive) { blocking = friend }
+                    } label: { Image(systemName: "ellipsis") }.accessibilityLabel("More")
+                }
+            }
         }
         .modifier(ThreadSearch(enabled: searching, query: $query))
         .fullScreenCover(item: Binding(get: { tapback }, set: { value in instant { tapback = value } })) { target in
             TapbackOverlay(target: target,
                 onReply: { reply = target.message; editing = nil },
                 onEdit: { editing = target.message; reply = nil },
-                onClose: { instant { tapback = nil } })
+                onReport: reportable ? { pendingReport = ReportTarget(friend: friend, message: target.message) } : nil,
+                onClose: {
+                    instant { tapback = nil }
+                    if let next = pendingReport {
+                        pendingReport = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { reporting = next }
+                    }
+                })
                 .environmentObject(bridge)
                 .presentationBackground(.clear)
         }
+        .safetyPrompts(block: $blocking, report: $reporting)
         .sheet(isPresented: $showDetail) {
             NavigationStack {
                 FriendDetailView(friendID: friendID, initial: friend)

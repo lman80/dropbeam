@@ -14,6 +14,7 @@ import {
   Copy,
   CornerUpLeft,
   File as FileIcon,
+  Flag,
   FileText,
   FolderOpen,
   MessageCircle,
@@ -36,6 +37,7 @@ import { EmptyState } from '../components/bits'
 import { chatTransferLabel, completedChatItems, restoredChatTransfer } from '../lib/chatTransfer'
 import { ChatTransferProgress } from '../components/ChatTransferProgress'
 import { ConnInspector } from '../components/ConnInspector'
+import { SafetyMenu } from '../components/SafetyDialogs'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from '../components/FriendAvatar'
@@ -698,6 +700,7 @@ function Conversation({ friendId }: { friendId: string }) {
             <FolderOpen size={14} /> Shared folder
           </button>
         )}
+        {!ownLabel && !MOBILE_UI && <SafetyMenu friend={friend} />}
       </div>}
 
       {searchOpen && (
@@ -790,6 +793,7 @@ function Conversation({ friendId }: { friendId: string }) {
                     onReply={beginReply}
                     onEdit={beginEdit}
                     onLightbox={setLightbox}
+                    reportable={!ownLabel}
                   />
                 )}
               </div>
@@ -1160,6 +1164,7 @@ const MessageRow = memo(function MessageRow({
   onReply,
   onEdit,
   onLightbox,
+  reportable,
 }: {
   m: ChatMessage
   friend: Friend
@@ -1169,6 +1174,8 @@ const MessageRow = memo(function MessageRow({
   onReply: (m: ChatMessage) => void
   onEdit: (m: ChatMessage) => void
   onLightbox: (src: string) => void
+  /** Their message in a friend's chat (not one of your own devices): Report… */
+  reportable?: boolean
 }) {
   const mine = m.fromMe
   const react = useStore((s) => s.reactToMessage)
@@ -1216,6 +1223,9 @@ const MessageRow = memo(function MessageRow({
   // the "More" menu now opens on THEIR bubbles too — with Edit/Unsend still yours
   // alone. Only real text is copyable; a GIF or file card has no text to take.
   const copyable = !m.deleted && m.kind === 'text' && !m.gif && m.text.trim().length > 0
+  const canReport = !mine && !!reportable
+  const openSafety = useStore((s) => s.openSafety)
+  const hasMenu = mine || copyable || canReport
   const doCopy = () => {
     setMenu(false)
     void copyText(m.text).then(
@@ -1278,7 +1288,7 @@ const MessageRow = memo(function MessageRow({
               <button className="chat-act" title="Reply" onClick={() => onReply(m)}>
                 <CornerUpLeft size={15} />
               </button>
-              {(mine || copyable) && (
+              {hasMenu && (
                 <button className="chat-act" title="More" onClick={toggleMenu}>
                   <MoreHorizontal size={15} />
                 </button>
@@ -1292,7 +1302,7 @@ const MessageRow = memo(function MessageRow({
                   ))}
                 </div>
               )}
-              {menu && (mine || copyable) && (
+              {menu && hasMenu && (
                 <div className={`chat-menu${menuDown ? ' down' : ''}`} onMouseDown={(e) => e.stopPropagation()}>
                   {copyable && (
                     <button onClick={doCopy}>
@@ -1318,6 +1328,17 @@ const MessageRow = memo(function MessageRow({
                       }}
                     >
                       <Trash2 size={14} /> Unsend
+                    </button>
+                  )}
+                  {canReport && (
+                    <button
+                      className="danger"
+                      onClick={() => {
+                        setMenu(false)
+                        openSafety({ kind: 'report', friendId: friend.id, messageId: m.id })
+                      }}
+                    >
+                      <Flag size={14} /> Report…
                     </button>
                   )}
                 </div>

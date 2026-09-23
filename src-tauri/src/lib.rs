@@ -1,4 +1,5 @@
 mod account;
+mod block;
 mod codes;
 mod link;
 mod location_sync;
@@ -782,6 +783,7 @@ pub fn run() {
             commands::lan_network_blocked,
             commands::open_local_network_settings,
             commands::open_url,
+            commands::open_mailto,
             commands::open_main_window,
             commands::hide_popover,
             commands::get_default_download_dir,
@@ -824,6 +826,9 @@ pub fn run() {
             commands::list_friends,
             commands::rename_friend,
             commands::remove_friend,
+            commands::block_friend,
+            commands::unblock_person,
+            commands::list_blocked,
             commands::set_friend_auto_accept,
             commands::respond_to_offer,
             commands::ping_friend,

@@ -643,6 +643,19 @@ pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Open a pre-filled email (Report… / Contact) in the user's mail app. Only
+/// `mailto:` URLs; the generic `open_url` stays web-only.
+#[tauri::command]
+pub fn open_mailto(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let ok = url.len() <= 32_000 && url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:"))
+        && !url.chars().any(|c| c.is_control() || c == ' ');
+    if !ok {
+        return Err("Only an email link can be opened here.".into());
+    }
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
 /// True when transfers are stuck on the slow relay despite a peer being on the
 /// local network — the fingerprint of the macOS "Local Network" permission being
 /// off. Drives the in-app nudge. (See `iroh_net::lan_path_blocked`.)
@@ -1133,6 +1146,37 @@ pub fn remove_friend(
     // Soft-detach: friends::remove preserves the transcript and endpoint index.
     sync.reconcile_friends();
     Ok(())
+}
+
+/// Block the person behind friend `id`: removes them (and their other devices)
+/// on every own device and refuses their hellos, chat, files, folder invites and
+/// Location requests from now on. Returns the endpoint ids blocked.
+#[tauri::command]
+pub fn block_friend(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    id: String,
+) -> Result<Vec<String>, String> {
+    let blocked = crate::block::block_friend(&state.config_dir, &id)?;
+    sync.reconcile_friends();
+    let _ = app.emit("friends://changed", ());
+    let _ = app.emit("blocked://changed", ());
+    Ok(blocked)
+}
+
+/// Unblock a person from the Blocked list (`id` = any of their endpoint ids).
+/// They become a stranger again; adding them back is a separate, deliberate step.
+#[tauri::command]
+pub fn unblock_person(app: AppHandle, state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    crate::block::unblock(&state.config_dir, &id)?;
+    let _ = app.emit("blocked://changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_blocked(state: State<'_, Arc<AppState>>) -> Vec<crate::block::BlockedPerson> {
+    crate::block::list(&state.config_dir)
 }
 
 /// Toggle whether a friend's files arrive automatically (true) or require the

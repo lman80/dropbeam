@@ -241,6 +241,17 @@ Once one side adds the other, both see each other.
 
 > **Available:** macOS · Windows · Linux · iOS
 
+### Block and report
+**Block** someone to cut them off completely. They're removed from your friends on **all your linked devices** (the block syncs to them, and so does an unblock), and DropBeam then answers their messages, typing/read signals, file sends, folder invites and Location requests the way it answers a stranger — they aren't told they're blocked, and their hello can't add them back, even if they still have your code. If they use more than one device on a DropBeam account, every device of theirs is blocked, including ones you meet later. Your chat history with them stays on your device. Shared folders you're both in keep syncing until you leave them.
+
+**Report** a person, a message or a file when something is abusive or objectionable: pick a reason, choose whether to include the message's text (for a file, only its name — files are never attached), add optional details, and optionally block them too. DropBeam opens a pre-filled email to the DropBeam team in your mail app so you can review it before sending; reports are answered within 24 hours.
+
+- **Desktop:** a friend card's **⋯** or the conversation header's **⋯** → **Report…** / **Block…**; on a message, hover → **⋯** → **Report…**. Unblock in Settings → *Privacy & safety* → **Blocked**.
+- **iOS:** a friend's page → **Report…** / **Block**; long-press a friend in the list → **Report…** / **Block…** (or swipe left → **Block**); in a conversation, **⋯** → **Report…** / **Block…**, or long-press a message → **Report…**. Unblock in Settings → **Blocked**.
+- Adding a blocked person by their code asks you to unblock them first; unblocking doesn't re-add them as a friend.
+
+> **Available:** macOS · Windows · Linux · iOS
+
 ### Re-send an invite (desktop)
 Each friend card has **Invite**, which shows a one-time invite QR/code for that person — handy if they reinstalled and need to add you back.
 
@@ -254,7 +265,7 @@ A green dot / *"Online now"* means DropBeam can reach them right now. **Check** 
 > **Available:** macOS · Windows · Linux · iOS
 
 ### Friend page actions (iOS)
-Friends → a friend: **Send Files**, **Message**, **Check**, *Accept files automatically*, **Rename**, **Browse Locations** (their shared folders), **Remove Friend** (or *Remove from Account* for your own devices). Friends is searchable.
+Friends → a friend: **Send Files**, **Message**, **Check**, *Accept files automatically*, **Rename**, **Browse Locations** (their shared folders), **Remove Friend** (or *Remove from Account* for your own devices), **Report…** and **Block**. Friends is searchable.
 
 > **Available:** iOS (desktop has the same actions on the friend card)
 
@@ -288,7 +299,7 @@ Type and press Enter (Shift+Enter for a new line on desktop). Links are clickabl
 - **Unsend** (desktop) / **Undo Send** (iOS) removes your message for both of you — *"You unsent a message."*
 - **Copy** a message's text.
 
-Desktop: hover → ↩ Reply, or ⋯ → Copy / Edit / Unsend. iOS: long-press → Reply / Copy / Edit / Save or Share / Undo Send.
+Desktop: hover → ↩ Reply, or ⋯ → Copy / Edit / Unsend (and **Report…** on your friend's messages). iOS: long-press → Reply / Copy / Edit / Save or Share / Undo Send (or **Report…** on theirs). See [Block and report](#block-and-report).
 
 > **Available:** macOS · Windows · Linux · iOS
 
@@ -523,6 +534,8 @@ Desktop: sidebar → **Settings**. iOS: **Settings** tab. Settings are per devic
 | **Export logs** | Bundles logs into one file (desktop: Downloads; iOS: opens the Share sheet) | — | all |
 | **Share background diagnostics** | Sends a small redacted error/performance summary about once a day | On | all |
 | **Diagnostics endpoint** + **Send test** | Override where diagnostics go (advanced) | built-in | desktop |
+| **Blocked** | Everyone you blocked, with **Unblock** (blocks sync to your linked devices) | none | all (desktop: *Privacy & safety*) |
+| **Report a problem / Contact** | Opens an email to the DropBeam team | — | all (desktop: *Privacy & safety* → **Email us**; iOS: **Report a Problem**) |
 | **Lab Mode** | Lets one trusted developer device run tests and push builds to this device; only the entered Operator ID is accepted | Off | desktop |
 | **Feedback** | Send feedback / show the feedback button | — | desktop sidebar *Feedback*; iOS Settings → Feedback |
 
@@ -558,11 +571,13 @@ Per-folder and per-friend options live on the folder card (⚙) and friend card 
 - **No account server.** Your identity is a key on your device. Friends, chats and your device list sync *directly* between your own devices. There's nothing to sign up for and no cloud copy of your files or messages.
 - **Integrity checks.** Every file is SHA-256 fingerprinted on both ends.
 - **Only friends get in.** Friend sends, chats, shared folders and Locations accept only devices you've added. Location access is checked per friend and per right (browse / upload / manage), and a host's files can't be reached outside the shared folder.
+- **Blocking is enforced by your device.** A blocked person's messages, files, invites and Location requests are refused by the app itself, on every device you've linked — see [Block and report](#block-and-report). Reports are emails you send yourself; nothing is reported automatically.
 - **What stays on your device:** settings, friends, chats, transfer history, shared-folder and Location configuration, and your device key — in DropBeam's app-data folder (macOS `~/Library/Application Support/com.dropbeam.app`, Linux `~/.config/com.dropbeam.app`, Windows `%APPDATA%\com.dropbeam.app`, iOS the app's private storage).
 - **What does leave your device, and to whom:**
   - Files and messages → only to the friend/device you chose (possibly through an encrypted relay).
   - Background diagnostics (on by default, opt-out) → a redacted summary to the developer's collector.
   - Feedback you choose to send → the developer.
+  - Reports you choose to send → the developer, by email from your mail app (only what you included).
   - GIF searches → Giphy, using your key. A received GIF is downloaded from Giphy.
   - Update checks → GitHub (desktop).
 - **Lab Mode** is off by default and, when on, obeys only the single device ID you enter.

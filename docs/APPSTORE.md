@@ -36,11 +36,20 @@ portrait · iOS 17+ (Liquid Glass on iOS 26+, materials before).
 | 2.1 | Privacy policy link in the app | ✅ | Settings → Privacy & Support → Privacy & Your Data → Privacy Policy, and Diagnostics → Privacy Policy. URL: https://github.com/lman80/dropbeam/blob/main/PRIVACY.md |
 | 2.2 | Support link | ✅ | Settings → Help & Support → https://github.com/lman80/dropbeam/issues (also the ASC Support URL), plus Send Feedback. |
 | 2.3 | Account deletion (5.1.1(v)) | ✅ decision | **Not required, no button added.** DropBeam has no sign-up and no server-side account: identity is a key generated on the device, friends/chats live only on the user's own devices. Settings → *Privacy & Your Data* explains this and shows every way to remove data (remove friends, clear history, unlink this iPhone from linked devices, delete the app to erase everything). If Review still asks, add a Rust `erase_all_data` command (wipe the app-data dir + identity, then show onboarding) behind a destructive "Erase DropBeam on This iPhone" row in that screen. |
-| 2.4 | User-generated content (1.2) | ⚠️ | Chat and files only flow between people who exchanged codes (both sides consent). *Remove Friend* stops messages/files from that person (acts as block). Reporting = Send Feedback / support URL. Say this in the review notes; if Review insists on explicit Block/Report, add a "Block & Report" item to the friend detail + chat menus. GIFs use Giphy `rating=pg-13` and are off until the user adds their own key. |
+| 2.4 | User-generated content (1.2) | ✅ | See **§2a Moderation** below: **Block** (friend page, friend-list long-press/swipe, conversation ⋯ menu) and **Report** (friend page, conversation ⋯ menu, long-press on any received message or file) are built in, plus Settings → **Blocked** (unblock) and **Report a Problem**. Chat and files only flow between people who exchanged codes. GIFs use Giphy `rating=pg-13` and are off until the user adds their own key. |
 | 2.5 | Diagnostics are opt-out and honest | ✅⚠️ | Settings → Diagnostics → *Share Diagnostics* (default on, redacted daily digest + crash reports). Crash reports now follow that switch too (`SuperFeedback.setCrashReportingEnabled`). ⚠️ see §3. |
 | 2.6 | Floating feedback button | ✅ | On by default only in TestFlight/debug/simulator builds (App Store installs start with it off; Settings → Feedback Button turns it on). Docks half into the screen edge, keeps clear of nav/tab bars, hides with the keyboard and inside a conversation, never over row controls. |
 | 2.7 | Permissions asked in context | ✅ | Camera: only when a scanner opens (paste fallback + "Open Settings" if denied). Local Network: iOS prompts on first discovery. Notifications: requested by the notification plugin at first launch. Paste uses `PasteButton` (no "Allow Paste" prompt). |
 | 2.8 | Accessibility | ✅ | Every icon-only button has a label; Dynamic Type (verified at XXXL; rows wrap instead of truncating); VoiceOver rows combine; Reduce Motion stops the background drift; light + dark. |
+
+## 2a. Moderation (guideline 1.2) — how it works
+
+DropBeam has no server and no public content: chat and files only flow between two people who exchanged codes. Moderation tools:
+
+- **Block** — confirmation dialog explains the effect. Removes the person on all the user's linked devices (the blocked list syncs over the account sync, `account::Meta.blocked`; an unblock syncs too). Enforced **in the engine** (`src-tauri/src/block.rs`, gate in `iroh_net::serve_stream_inner`): the blocked person's hello can't re-add them, and their chat, typing/read signals, file pushes (+ stat/verify), folder invites and Location requests are answered exactly as a stranger's — they aren't told. Every device of theirs we know is blocked (grouped by their verified account), and a new device proving the same account is blocked on its first hello. Unblock: Settings → **Blocked**.
+- **Report** — on a person or on a single message/file. The user picks a reason (spam, harassment, hate/threats, sexual content, illegal/dangerous, impersonation/scam, other), chooses whether to include the message text (files are never attached — only the file name, if they choose), adds optional details and can block at the same time. It opens a pre-filled email to the developer (`REPORT_EMAIL` in `src/lib/report.ts` = imamiller64@gmail.com, the App Store contact) in the user's own mail app. If no mail app is set up, iOS offers to copy the report.
+- **Response commitment:** reports are reviewed **within 24 hours**. Because content never passes through a DropBeam server, the developer can't delete it remotely; the response is to contact the reporter, and ask them to block (if they haven't); repeat or illegal abuse is referred to the appropriate authorities. The app text promises the 24-hour response.
+- **Contact:** Settings → **Report a Problem** (iOS) / *Privacy & safety* → **Email us** (desktop) opens an email to the same address.
 
 ## 3. App Privacy (ASC → App Privacy) — answers that match the manifest
 
@@ -53,7 +62,7 @@ Data **not** collected: files, photos you send, messages, contacts, location, id
 | Name | Yes | Yes* | No | App Functionality | digest header includes the display name |
 | Device ID | Yes | Yes* | No | App Functionality | random per-install `diag-id` in the digest |
 | Crash Data | Yes | No | No | App Functionality | crash reports (follow Share Diagnostics) |
-| Customer Support | Yes | No | No | App Functionality | Send Feedback message + device info |
+| Customer Support | Yes | No | No | App Functionality | Send Feedback message + device info; a Report email the user sends (reason, their notes, optionally the reported message text, app version) |
 | Photos or Videos | Yes | No | No | App Functionality | optional screenshot/images attached to feedback |
 
 \* ⚠️ **Recommended fix (Rust, outside the iOS UI lane):** `src-tauri/src/telemetry.rs` puts `"name": display_name` in the digest header (two places, ~L541 and ~L597). PRIVACY.md calls the digest *anonymous*, which that contradicts. Drop the `name` field (the per-install `deviceId` already tells devices apart); then in the manifest and ASC change Other Diagnostic / Performance / Device ID to **not linked** and remove **Name**. Until then the manifest declares them as linked, which is accurate.
@@ -82,7 +91,9 @@ Expected result: **13+** under the 2025 age-rating system (messaging + UGC). �
 >
 > **Demo friend:** we keep a Mac running DropBeam online during review. Add it with **Friends → + → Add Friend → Enter Code Instead** and paste: `<REVIEW FRIEND CODE>`. It accepts files automatically and you can message it from **Chats**. (Please don't send large files.)
 >
-> Local Network access is used to find devices on the same Wi-Fi so transfers go directly; the camera is used only to scan QR codes. Transfers pause while the app is in the background (no background modes). Chat is only possible between people who exchanged codes; removing a friend blocks them. Feedback/support: Settings → Send Feedback or https://github.com/lman80/dropbeam/issues.
+> Local Network access is used to find devices on the same Wi-Fi so transfers go directly; the camera is used only to scan QR codes. Transfers pause while the app is in the background (no background modes). Chat is only possible between people who exchanged codes.
+>
+> **Blocking and reporting (1.2):** open a friend's page (Friends → the friend) or a conversation's **⋯** menu → **Block** / **Report…**; long-press any received message → **Report…**. Blocking removes the person on all the user's devices and the app refuses their messages, files and invites from then on (they aren't notified); Settings → **Blocked** lists and unblocks. A report opens a pre-filled email to us (reason, optional message text — never files) and can block at the same time. We review every report within 24 hours. Feedback/support: Settings → Report a Problem, Send Feedback, or https://github.com/lman80/dropbeam/issues.
 
 👤 Owner: set up a Mac as the review friend (a separate DropBeam install/identity named e.g. "DropBeam Review", auto-accept on, online during review), paste its friend code (Settings → Profile → Copy on the Mac) into the note, and add a contact phone/email.
 

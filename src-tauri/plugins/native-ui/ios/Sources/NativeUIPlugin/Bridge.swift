@@ -40,6 +40,7 @@ final class Bridge: ObservableObject {
     @Published var chatOverview: [ChatOverview] = []
     @Published var chatUnread: [String: Int] = [:] { didSet { updateAppBadge() } }
     @Published var folders: [SharedFolder] = []
+    @Published var blocked: [BlockedPerson] = []
     @Published var chatTyping: [String: Bool] = [:]
     @Published var threads: [String: [ChatMessage]] = [:]
     @Published var chatDraftFiles: [String] = []
@@ -135,6 +136,7 @@ final class Bridge: ObservableObject {
             if let thread = try decoder.decode(ChatThread?.self, from: data) { threads[thread.friendId] = thread.messages }
         case "presence": presence = try decoder.decode([String: Bool].self, from: data)
         case "folders": folders = try decoder.decode(LossyArray<SharedFolder>.self, from: data).values
+        case "blocked": blocked = try decoder.decode(LossyArray<BlockedPerson>.self, from: data).values
         default: break // Forward-compatible snapshots.
         }
     }
@@ -262,6 +264,12 @@ final class Bridge: ObservableObject {
     func setView(name: String) async throws { try await action("setView", ["name": name]) }
     func pingFriend(id: String) async throws -> ConnectionCheck { try await call("pingFriend", ["id": id]) }
     func removeFriend(id: String) async throws { try await action("removeFriend", ["id": id]) }
+    /// Block the person behind friend `id` (all their devices, on all your devices).
+    func blockFriend(id: String) async throws { try await action("blockFriend", ["id": id]) }
+    func unblockPerson(id: String) async throws { try await action("unblockPerson", ["id": id]) }
+    func reportReasons() async throws -> [ReportReason] { try await call("reportReasons") }
+    /// Build a report email: only the fields passed are included (never files).
+    func reportMail(_ args: [String: Any]) async throws -> ReportMail { try await call("reportMail", args) }
     func renameFriend(id: String, name: String) async throws { try await action("renameFriend", ["id": id, "name": name]) }
     func setAutoAccept(id: String, bool: Bool) async throws { try await action("setAutoAccept", ["id": id, "bool": bool]) }
     func myInviteCode() async throws -> String { try await call("myInviteCode") }

@@ -535,6 +535,12 @@ const realApi = {
   renameFriend: (id: string, name: string) =>
     invoke<void>('rename_friend', { id, name }),
   removeFriend: (id: string) => invoke<void>('remove_friend', { id }),
+  /** Block the person behind friend `id` (all their devices); returns the blocked endpoint ids. */
+  blockFriend: (id: string) => invoke<string[]>('block_friend', { id }),
+  unblockPerson: (id: string) => invoke<void>('unblock_person', { id }),
+  listBlocked: () => invoke<BlockedPerson[]>('list_blocked'),
+  /** Open a pre-filled email (Report… / Contact) in the mail app. */
+  openMailto: (url: string) => invoke<void>('open_mailto', { url }),
   pingFriend: (id: string) => invoke<boolean>('ping_friend', { id }),
   /** Probe how we're connected to a friend right now (connection inspector). */
   probeConnection: (friendId: string) =>
@@ -737,6 +743,14 @@ export function onChatTyping(cb: (t: ChatTyping) => void): Promise<UnlistenFn> {
 export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('pairs://changed', () => cb())
   return listen('pairs://changed', () => cb())
+}
+
+/** One blocked person (their devices folded together) for Settings → Blocked. */
+export type BlockedPerson = { id: string; name: string; at: number; endpointIds: string[] }
+
+export function onBlockedChanged(cb: () => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('blocked://changed', () => cb())
+  return listen('blocked://changed', () => cb())
 }
 
 export function onFriendsChanged(cb: () => void): Promise<UnlistenFn> {

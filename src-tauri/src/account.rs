@@ -587,6 +587,10 @@ struct Meta {
     /// The person's shared name + picture (absent from older builds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<ProfileRec>,
+    /// Blocked people by endpoint id, newest decision wins (absent from older
+    /// builds, which ignore it; they still drop the person via `removed_friends`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    blocked: HashMap<String, crate::block::BlockRec>,
 }
 
 /// Everything this device shares about the account, plus thread summaries.
@@ -649,6 +653,7 @@ fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
             friends: recs,
             removed_friends: book.removed_friends,
             profile: None,
+            blocked: crate::block::snapshot(dir),
         },
         threads,
         avatars,
@@ -685,6 +690,9 @@ fn fingerprint(dir: &Path, local: &Local) -> String {
     tombs.sort();
     h.update(serde_json::to_vec(&tombs).unwrap_or_default());
     h.update(serde_json::to_vec(&local.meta.profile).unwrap_or_default());
+    let mut blocks: Vec<_> = local.meta.blocked.iter().map(|(e, r)| (e, r.blocked, r.at)).collect();
+    blocks.sort();
+    h.update(serde_json::to_vec(&blocks).unwrap_or_default());
     hex::encode(&h.finalize()[..12])
 }
 
@@ -715,6 +723,10 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
     if book.is_removed(&local.me) {
         leave_account(dir, account, &local.me);
         return Applied::left();
+    }
+    // Blocks decided on another own device: adopt, and drop the person here.
+    if crate::block::merge(dir, &meta.blocked, clamp) | crate::block::purge_blocked_friends(dir) {
+        out.changed = true;
     }
     // 2. Devices: the sender itself and every device it lists.
     let mut devices = meta.roster.devices.clone();
@@ -755,6 +767,10 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
             continue;
         }
         if book.removed_friends.get(&r.eid).is_some_and(|t| *t >= r.created_at) {
+            continue;
+        }
+        // Someone blocked (on any own device) never comes back through sync.
+        if crate::block::is_blocked(dir, &r.eid) || r.account.as_deref().is_some_and(|a| crate::block::account_blocked(dir, a)) {
             continue;
         }
         // A device that left or was removed from the account isn't a friend.
@@ -928,6 +944,8 @@ fn announce(app: &AppHandle, net: &Arc<IrohState>, out: &Outcome) {
     let applied = &out.applied;
     if applied.changed || !applied.new_friends.is_empty() {
         let _ = app.emit("friends://changed", ());
+        // Cheap: the Blocked list re-reads a small file (blocks may have merged).
+        let _ = app.emit("blocked://changed", ());
     }
     if out.chats > 0 {
         let _ = app.emit("chat://changed", ());
@@ -1438,6 +1456,23 @@ mod tests {
         assert!(!book.is_removed("ipad"), "relink learned before the removed check");
         assert!(book.linked["evil"] <= chat::now_ms() + SKEW_MS, "far-future times are clamped");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Older builds send no `blocked` field (and ignore ours): both directions parse.
+    #[test]
+    fn meta_blocks_are_backward_compatible() {
+        let old: Meta = serde_json::from_value(json!({"roster": {"me": {"eid": "x"}}, "friends": [], "removed_friends": {}})).unwrap();
+        assert!(old.blocked.is_empty());
+        assert!(serde_json::to_value(&old).unwrap().get("blocked").is_none(), "nothing extra when nobody is blocked");
+        let mut new = Meta::default();
+        new.blocked.insert("e".into(), crate::block::BlockRec { name: "X".into(), account: None, blocked: true, at: 5 });
+        let v = serde_json::to_value(&new).unwrap();
+        assert_eq!(v["blocked"]["e"]["blocked"], true);
+        // An older build's Meta (no `blocked`) still reads a newer one.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldMeta { roster: Roster, #[serde(default)] friends: Vec<FriendRec> }
+        assert!(serde_json::from_value::<OldMeta>(v).is_ok());
     }
 
     #[test]
