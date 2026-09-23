@@ -290,6 +290,8 @@ function RecentRow({ e }: { e: HistoryEntry }) {
           <FolderOpen size={15} />
         </button>
       )}
+      {/* keep the status icons in one column whether or not a row has a folder button */}
+      {!MOBILE_UI && !(e.direction === 'receive' && e.outDir && ok) && <span aria-hidden style={{ width: 32, flexShrink: 0 }} />}
       {!MOBILE_UI && (
         <button
           className="icon-btn icon-btn-danger history-row-remove"
