@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args).await,
+        Some("host-location") => host_location(&args).await,
         Some("send") => send(&args).await,
         Some("results") => results(&args).await,
         Some("info") => info(&args).await,
@@ -64,6 +65,22 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// Host a scratch folder as a Locations share for ONE client endpoint (e.g. the
+/// iOS simulator) through the real app protocol; prints the friend code to add.
+///   dropbeam-lab host-location --dir <folder> --friend <client eid> [--state <dir>]
+async fn host_location(args: &[String]) -> Result<()> {
+    let dir = PathBuf::from(flag(args, "--dir").context("--dir <folder> required")?);
+    let friend = flag(args, "--friend").context("--friend <client endpoint id> required")?;
+    let state_dir = PathBuf::from(flag(args, "--state").unwrap_or_else(|| std::env::temp_dir().join("dropbeam-lab-host").display().to_string()));
+    std::fs::create_dir_all(&dir)?;
+    let ep = labkit::lab_endpoint_persistent(true, &state_dir).await?;
+    let _ = labkit::lab_addr_ready(&ep).await;
+    let code = labkit::host_location(&ep, &state_dir.join("config"), &dir, &friend, "Lab Host")?;
+    emit(json!({"event": "hosting", "id": ep.id().to_string(), "code": code, "dir": dir.display().to_string()}));
+    let _ep = ep; // serve until killed
+    loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
 }
 
 /// Exit code the supervisor script watches for: "I staged an update, swap the

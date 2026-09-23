@@ -194,6 +194,8 @@ struct SharedLocation: Decodable, Identifiable, Hashable {
     let name: String
     let rights: LocationRights
     var reachable: Bool?
+    var freeBytes: Double?
+    var totalBytes: Double?
 }
 struct FriendLocations: Decodable, Identifiable {
     var id: String { friendId }
@@ -202,6 +204,12 @@ struct FriendLocations: Decodable, Identifiable {
     let online: Bool
     let locations: [SharedLocation]
     var error: String?
+    /// "pending" (not checked yet), "ready", "offline", "error" or "unavailable".
+    var status = "pending"
+    /// This friend's list request is in flight right now.
+    var checking = false
+    /// When this friend was last asked (ms since 1970); nil = not this session.
+    var checkedAt: Double?
 }
 struct BrowserEntry: Decodable, Identifiable {
     var id: String { name }
@@ -480,6 +488,8 @@ extension SharedLocation {
         self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Unknown"
         self.rights = (try? c.decode(LocationRights.self, forKey: BridgeKey("rights"))) ?? LocationRights(upload: false, manage: false)
         self.reachable = (try? c.decode(Bool.self, forKey: BridgeKey("reachable")))
+        let bytes = { (key: String) in (try? c.decode(Double.self, forKey: BridgeKey(key))).flatMap { $0.isFinite && $0 >= 0 ? $0 : nil } }
+        self.freeBytes = bytes("freeBytes"); self.totalBytes = bytes("totalBytes")
     }
 }
 
@@ -491,6 +501,9 @@ extension FriendLocations {
         self.online = (try? c.decode(Bool.self, forKey: BridgeKey("online"))) ?? false
         self.locations = (try? c.decode(LossyArray<SharedLocation>.self, forKey: BridgeKey("locations")))?.values ?? []
         self.error = (try? c.decode(String.self, forKey: BridgeKey("error")))
+        self.status = (try? c.decode(String.self, forKey: BridgeKey("status"))) ?? (self.error == nil ? "ready" : "error")
+        self.checking = (try? c.decode(Bool.self, forKey: BridgeKey("checking"))) ?? false
+        self.checkedAt = (try? c.decode(Double.self, forKey: BridgeKey("checkedAt"))).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
     }
 }
 

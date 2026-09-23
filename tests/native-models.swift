@@ -17,6 +17,9 @@ import Foundation
         let emptyPage = try decode(BrowserPage.self, "{}")
         let rights = try decode(SharedLocation.self, #"{"id":"folder","rights":{"upload":"yes"}}"#).rights
         precondition(emptyPage.entries.isEmpty && !emptyPage.hasMore && !rights.upload && !rights.manage)
-        print("5 native model regression checks passed")
+        let rows = try decode(LossyArray<FriendLocations>.self, #"[{"friendId":"a","friendName":"A","online":true,"locations":[{"id":"n","name":"NAS","rights":{"upload":true},"freeBytes":5e9,"totalBytes":-1}],"status":"offline","checking":true,"checkedAt":1700000000000},{"friendId":"b","error":"x"}]"#).values
+        precondition(rows[0].status == "offline" && rows[0].checking && rows[0].checkedAt == 1_700_000_000_000 && rows[0].locations[0].freeBytes == 5e9 && rows[0].locations[0].totalBytes == nil)
+        precondition(rows[1].status == "error" && !rows[1].checking && rows[1].checkedAt == nil)
+        print("6 native model regression checks passed")
     }
 }

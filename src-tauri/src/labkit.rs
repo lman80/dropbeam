@@ -440,3 +440,30 @@ pub fn build_corpus(dir: &Path, suite: &str) -> Result<Vec<LabCase>> {
     }
     Ok(cases)
 }
+
+/// A controllable Locations HOST for testing a client (e.g. the iOS simulator)
+/// without touching anybody's real DropBeam config: `config` is a scratch config
+/// dir, `folder` the directory to share, `friend_eid` the client's endpoint id.
+/// Shares `folder` as "Lab NAS" (browse + upload + manage) with that friend only
+/// and serves the REAL app protocol (`accept_loop`) until the process exits.
+/// Downloads need the full app (they start a tracked send), so a lab host
+/// answers them with an error; list/ls/mkdir/rename/trash/upload are real.
+/// Returns this host's friend code for the client to add.
+pub fn host_location(ep: &Endpoint, config: &Path, folder: &Path, friend_eid: &str, host_name: &str) -> Result<String> {
+    std::fs::create_dir_all(config)?;
+    let friend = crate::friends::upsert_by_endpoint(config, friend_eid, "Lab client");
+    let path = std::fs::canonicalize(folder).context("shared folder")?;
+    let location = crate::locations::Location {
+        id: "lab-nas".into(), name: "Lab NAS".into(), path: path.to_string_lossy().into_owned(),
+        friend_ids: vec![friend.id], rights: crate::locations::Rights { upload: true, manage: true },
+        byte_cap: crate::locations::default_byte_cap(), device: None, marker: None, safe_publish: None,
+    };
+    crate::locations::save(config, Some(location), None)?;
+    // Advertise on the LAN like the app does, so a simulator/phone on this
+    // network finds the host without relay/DNS rendezvous.
+    if let (Ok(mdns), Ok(al)) = (iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(ep.id()), ep.address_lookup()) { al.add(mdns); }
+    let state = std::sync::Arc::new(crate::iroh_net::IrohState::default());
+    let _ = state.location_config.set(config.to_path_buf());
+    tokio::spawn(crate::iroh_net::accept_loop(ep.clone(), state));
+    Ok(crate::friends::my_code(host_name, &ep.id().to_string()))
+}

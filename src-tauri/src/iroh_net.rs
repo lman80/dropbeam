@@ -8579,14 +8579,71 @@ pub(crate) async fn friend_connection(state: &IrohState, endpoint: &str) -> Resu
     Ok(conn)
 }
 
+// Plain-language reasons a Locations request failed. The UI shows these as-is,
+// under the friend they concern: the raw causes ("deadline has elapsed", QUIC
+// close codes) explained nothing and read as "Locations is broken". The host's
+// OWN refusals ("Location access denied", "Too many requests") pass through.
+pub(crate) const LOCATIONS_UNREACHABLE: &str = "Couldn’t reach this device. Make sure DropBeam is open on it, then try again.";
+pub(crate) const LOCATIONS_NO_ANSWER: &str = "This device didn’t answer. It may be asleep or on a slow network.";
+pub(crate) const LOCATIONS_NEEDS_UPDATE: &str = "This device needs a DropBeam update to share Locations.";
+pub(crate) const LOCATIONS_SLOW: &str = "This device took too long to answer. Try again.";
+pub(crate) const LOCATIONS_DROPPED: &str = "The connection dropped. Try again.";
+
+/// The capability check's failure in words: an old build answers the ping
+/// without `locations_v`; anything else means the host never answered.
+fn capability_error(e: anyhow::Error) -> anyhow::Error {
+    if format!("{e}").contains("does not support Locations") { return anyhow::anyhow!(LOCATIONS_NEEDS_UPDATE); }
+    log::info!("locations: capability check failed: {e:#}");
+    if e.downcast_ref::<tokio::time::error::Elapsed>().is_some() { anyhow::anyhow!(LOCATIONS_NO_ANSWER) } else { anyhow::anyhow!(LOCATIONS_UNREACHABLE) }
+}
+
+/// A connection that has just proven it speaks Locations. A CACHED connection
+/// can be silently dead (the host slept, a NAT rebound, the phone changed
+/// networks): its streams then hang until the 10 s capability ping expires, and
+/// every request failed the same way until the app restarted. Nothing has been
+/// asked of the host at that point, so dial ONCE, fresh, and check again.
+async fn location_conn_with<F, Fut>(cached: Option<Connection>, dial: F) -> Result<Connection>
+where F: FnOnce(Option<usize>) -> Fut, Fut: std::future::Future<Output = Result<Connection>> {
+    let mut stale = None;
+    if let Some(conn) = cached {
+        match require_locations(&conn).await {
+            Ok(()) => return Ok(conn),
+            Err(e) if format!("{e}").contains("does not support Locations") => return Err(capability_error(e)),
+            Err(e) => {
+                log::info!("locations: cached connection to {} failed its capability check ({e:#}); dialing fresh", conn.remote_id());
+                stale = Some(conn.stable_id());
+            }
+        }
+    }
+    let conn = dial(stale).await.map_err(|e| {
+        log::info!("locations: dial failed: {e:#}");
+        if format!("{e}").contains("still connecting") { e } else { anyhow::anyhow!(LOCATIONS_UNREACHABLE) }
+    })?;
+    require_locations(&conn).await.map_err(capability_error)?;
+    Ok(conn)
+}
+
 pub async fn location_request(state: &IrohState, endpoint: &str, mut request: serde_json::Value) -> Result<serde_json::Value> {
-    let conn = friend_connection(state, endpoint).await?;
-    require_locations(&conn).await?;
+    let conn = location_conn_with(state.cached_friend_conn(endpoint, None), |stale| async move {
+        // Stop handing out the dead connection (only that one: a concurrent
+        // request may already have cached a healthy replacement).
+        if let Some(id) = stale {
+            let mut conns = state.friend_conns.lock().unwrap();
+            if conns.get(endpoint).is_some_and(|c| c.conn.stable_id() == id) { conns.remove(endpoint); }
+        }
+        friend_connection(state, endpoint).await
+    }).await?;
     request["locations_v"] = serde_json::json!(crate::locations::VERSION);
-    let (mut send, mut recv) = conn.open_bi().await?;
-    write_frame(&mut send, &request).await?; send.finish()?;
+    let dropped = |e: &dyn std::fmt::Display| { log::info!("locations: request stream failed: {e}"); anyhow::anyhow!(LOCATIONS_DROPPED) };
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| dropped(&e))?;
+    write_frame(&mut send, &request).await.map_err(|e| dropped(&e))?;
+    send.finish().map_err(|e| dropped(&e))?;
     let timeout = if request["kind"] == "locations.download" { 1800 } else { 45 };
-    let reply = tokio::time::timeout(Duration::from_secs(timeout), read_frame_cap(&mut recv, 2_000_000)).await??;
+    let reply = match tokio::time::timeout(Duration::from_secs(timeout), read_frame_cap(&mut recv, 2_000_000)).await {
+        Err(_) => anyhow::bail!(LOCATIONS_SLOW),
+        Ok(Err(e)) => return Err(dropped(&e)),
+        Ok(Ok(reply)) => reply,
+    };
     anyhow::ensure!(reply["ok"] == true, "{}", reply["error"].as_str().unwrap_or("Location request failed"));
     Ok(reply["data"].clone())
 }
@@ -12842,6 +12899,63 @@ mod location_loopback_tests {
         let pushes = count.load(Ordering::SeqCst);
         assert!(pushes > 0 && pushes <= 4, "expected two small batches, one large file, and terminal push; saw {pushes}");
         conn.close(0u32.into(), b"done"); listener.abort(); client.close().await; host.close().await;
+    }
+
+    /// A cached friend connection that silently stopped answering must not
+    /// fail every Locations request: the capability ping times out, the stale
+    /// connection is set aside, and ONE fresh dial serves the request. Dial
+    /// failures and old builds come back as plain-language reasons.
+    #[tokio::test]
+    async fn locations_redial_past_a_dead_cached_connection_and_explain_failures() {
+        use iroh::RelayMode;
+        let bind = |alpn: bool| {
+            let b = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate()).relay_mode(RelayMode::Disabled);
+            let b = if alpn { b.alpns(vec![ALPN.to_vec()]) } else { b };
+            async move { b.bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap() }
+        };
+        // `mute`: accepts streams, reads the ping, never answers (a dead path).
+        // `old`: answers the ping the way a pre-Locations build does.
+        let (mute, old, host, client) = (bind(true).await, bind(true).await, bind(true).await, bind(false).await);
+        let serve = |ep: Endpoint, answer: Option<serde_json::Value>| tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let _ = read_frame(&mut recv).await;
+                        match &answer {
+                            Some(reply) => { let _ = write_frame(&mut send, reply).await; let _ = send.finish(); }
+                            None => { tokio::time::sleep(Duration::from_secs(60)).await; }
+                        }
+                    }
+                });
+            }
+        });
+        let muted = serve(mute.clone(), None);
+        let legacy = serve(old.clone(), Some(serde_json::json!({"kind": "pong"})));
+        let listener = tokio::spawn(accept_loop(host.clone(), Arc::new(IrohState::default())));
+
+        let dead = client.connect(mute.addr(), ALPN).await.unwrap();
+        let dead_id = dead.stable_id();
+        let (c, host_addr) = (client.clone(), host.addr());
+        let started = Instant::now();
+        let fresh = location_conn_with(Some(dead), move |stale| async move {
+            assert_eq!(stale, Some(dead_id), "the caller learns which cached connection to drop");
+            Ok(c.connect(host_addr, ALPN).await?)
+        }).await.expect("a fresh dial replaces the dead cached connection");
+        assert_eq!(fresh.remote_id(), host.id());
+        assert!(started.elapsed() < Duration::from_secs(20), "one capability timeout, then a quick redial");
+
+        let unreachable = location_conn_with(None, |_| async { anyhow::bail!("deadline has elapsed") }).await.unwrap_err();
+        assert_eq!(unreachable.to_string(), LOCATIONS_UNREACHABLE);
+        let (c, old_addr) = (client.clone(), old.addr());
+        let outdated = location_conn_with(None, move |_| async move { Ok(c.connect(old_addr, ALPN).await?) }).await.unwrap_err();
+        assert_eq!(outdated.to_string(), LOCATIONS_NEEDS_UPDATE);
+        let still_starting = location_conn_with(None, |_| async { anyhow::bail!("DropBeam is still connecting") }).await.unwrap_err();
+        assert_eq!(still_starting.to_string(), "DropBeam is still connecting");
+
+        fresh.close(0u32.into(), b"done"); muted.abort(); legacy.abort(); listener.abort();
+        client.close().await; mute.close().await; old.close().await; host.close().await;
     }
 
     #[tokio::test]

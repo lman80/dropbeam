@@ -1,56 +1,171 @@
 import SwiftUI
 
+/// Friends' shared folders (NAS mounts, disks, local folders). Friends that
+/// share something get their own section; everyone else is summarised in one
+/// quiet card that says exactly why nothing is listed for them (nothing shared
+/// with this iPhone, offline, still checking, or what went wrong).
 struct LocationsView: View {
     @EnvironmentObject private var bridge: Bridge
     var friendID: String? = nil
     @State private var loading = false
     @State private var refreshAgain = false
-    @State private var error: String?
-    private var groups: [FriendLocations] { bridge.locations.filter { friendID == nil || $0.friendId == friendID } }
+    @State private var failure: String?
+    @State private var onlineBefore: Set<String> = []
+    private var rows: [FriendLocations] { bridge.locations.filter { friendID == nil || $0.friendId == friendID } }
+    private var sharing: [FriendLocations] { rows.filter { !$0.locations.isEmpty } }
+    private var others: [FriendLocations] { rows.filter { $0.locations.isEmpty } }
+    private var busy: Bool { loading || rows.contains(where: \.checking) }
+    private var settled: Bool { !rows.isEmpty && rows.allSatisfy { !$0.checking && $0.status != "pending" } }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                if loading { ProgressView().frame(maxWidth: .infinity) }
-                if let error { BeamError(message: error, retry: refresh) }
-                if !loading && groups.allSatisfy({ $0.locations.isEmpty && $0.error == nil }) { BeamEmpty(symbol: "externaldrive", title: "A place for everything.", detail: "Folders shared by friends appear here. Keep their device awake to browse.") }
-                ForEach(groups) { friend in
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack { Text(friend.friendName).font(.title2.weight(.semibold)); Spacer(); PresenceLabel(online: friend.online) }
-                        if let error = friend.error { BeamError(message: error, retry: refresh) }
-                        ForEach(friend.locations) { location in
-                            NavigationLink { BrowserView(friendID: friend.friendId, location: location, path: "") } label: {
-                                GlassCard {
-                                    HStack(spacing: 14) {
-                                        FileGlyph(name: "", symbol: "externaldrive")
-                                        VStack(alignment: .leading, spacing: 5) {
-                                            Text(location.name).font(.headline).foregroundStyle(.primary)
-                                            Text("\(friend.friendName) · \(friend.online ? "Online now" : "Offline")").font(.subheadline).foregroundStyle(.secondary)
-                                            if location.reachable == false { Text("Location unavailable").font(.caption).foregroundStyle(.secondary) }
-                                        }
-                                        Spacer(minLength: 0); Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                                    }
-                                }
-                            }.buttonStyle(.plain)
-                        }
+                if let failure { BeamError(message: failure, retry: refresh) }
+                if friendID != nil, let friend = rows.first, friend.locations.isEmpty { friendState(friend) }
+                else if bridge.friends.isEmpty && friendID == nil {
+                    ContentUnavailableView("No friends yet", systemImage: "person.2", description: Text("Add a friend who shares a folder or NAS, and it shows up here.")).padding(.top, 40)
+                } else if sharing.isEmpty {
+                    if settled {
+                        ContentUnavailableView("No shared locations", systemImage: "externaldrive", description: Text("When a friend shares a folder or NAS with this iPhone, it appears here. They set it up in DropBeam on their computer: Settings → Locations."))
+                    } else {
+                        ProgressView("Looking for shared folders…").frame(maxWidth: .infinity).padding(.vertical, 32)
                     }
                 }
+                ForEach(sharing) { friend in section(friend) }
+                if friendID == nil && !others.isEmpty && !bridge.friends.isEmpty { otherFriends }
             }.padding(20)
-        }.contentMargins(.bottom, 24, for: .scrollContent).navigationTitle("Locations").navigationBarTitleDisplayMode(.large).beamCanvas()
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button(action: refresh) { Image(systemName: "arrow.clockwise").frame(width: 44, height: 44) }.accessibilityLabel("Refresh locations").disabled(loading) } }
-            .task { refresh() }
+        }.contentMargins(.bottom, 24, for: .scrollContent).navigationTitle("Locations").navigationBarTitleDisplayMode(friendID == nil ? .large : .inline).beamCanvas()
+            .toolbar { ToolbarItem(placement: .topBarTrailing) {
+                if busy { ProgressView().frame(width: 44, height: 44).accessibilityLabel("Checking locations") }
+                else { Button(action: refresh) { Image(systemName: "arrow.clockwise").frame(width: 44, height: 44) }.accessibilityLabel("Refresh locations") }
+            } }
+            .task {
+                onlineBefore = Set(bridge.presence.filter(\.value).map(\.key))
+                // Coming back from a folder shouldn't re-check everyone; a stale
+                // or never-checked list should.
+                let now = Date().timeIntervalSince1970 * 1000
+                if rows.isEmpty || rows.contains(where: { $0.status == "pending" || $0.status == "error" || now - ($0.checkedAt ?? 0) > 30_000 }) { await reload() }
+            }
             .onChange(of: bridge.friends.map(\.id)) { _, _ in refresh() }
-            .onChange(of: bridge.presence) { _, _ in refresh() }
+            .onChange(of: bridge.presence) { _, presence in
+                // Only a friend COMING online changes what can be listed.
+                let online = Set(presence.filter(\.value).map(\.key))
+                let arrived = online.subtracting(onlineBefore)
+                onlineBefore = online
+                if rows.contains(where: { arrived.contains($0.friendId) && $0.status != "ready" }) { refresh() }
+            }
             .refreshable { await reload() }
             .onReceive(NotificationCenter.default.publisher(for: .init("DropBeam.locations://changed"))) { _ in refresh() }
+    }
+    private func section(_ friend: FriendLocations) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if friendID == nil {
+                HStack(alignment: .center) {
+                    Text(friend.friendName).font(.title3.weight(.semibold)).lineLimit(1)
+                    Spacer(minLength: 8)
+                    // After a failed request the error line below is the truth, not a stale "Online now".
+                    if friend.checking { ProgressView().controlSize(.small) } else if friend.status != "error" { PresenceLabel(online: friend.online) }
+                }.accessibilityElement(children: .combine).accessibilityAddTraits(.isHeader)
+            }
+            if friend.status == "offline" {
+                Label("Offline — showing the folders it shared last time.", systemImage: "moon.zzz").font(.footnote).foregroundStyle(.secondary)
+            } else if friend.status == "error", let error = friend.error {
+                problem(error)
+            }
+            ForEach(friend.locations) { location in card(location, friend: friend) }
+        }
+    }
+    private func card(_ location: SharedLocation, friend: FriendLocations) -> some View {
+        NavigationLink { BrowserView(friendID: friend.friendId, location: location, path: "") } label: {
+            GlassCard {
+                HStack(spacing: 14) {
+                    FileGlyph(name: "", symbol: "externaldrive")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(location.name).font(.headline).foregroundStyle(.primary)
+                        Text(rights(location)).font(.subheadline).foregroundStyle(.secondary)
+                        if location.reachable == false {
+                            Label("Not reachable on \(friend.friendName) right now", systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
+                        } else if friend.status == "ready", let free = location.freeBytes, let total = location.totalBytes, total > 0 {
+                            Text("\(Formatters.bytes(free)) free of \(Formatters.bytes(total))").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer(minLength: 0); Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                }
+            }
+        }.buttonStyle(.plain).opacity(friend.status == "offline" || friend.status == "error" ? 0.6 : 1).accessibilityHint("Browse this folder")
+    }
+    private func rights(_ location: SharedLocation) -> String {
+        location.rights.manage ? "Download, upload & manage" : location.rights.upload ? "Download & upload" : "View & download"
+    }
+    private func problem(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).accessibilityHidden(true)
+            Text(message).font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            Button("Retry", action: refresh).font(.footnote.weight(.semibold)).disabled(busy)
+        }
+    }
+    /// Why a friend has nothing listed, in one line.
+    private func reason(_ friend: FriendLocations) -> String {
+        if friend.checking && friend.status == "pending" { return "Checking…" }
+        switch friend.status {
+        case "ready": return "Hasn’t shared a folder with this iPhone"
+        case "offline": return "Offline — open DropBeam on it to check"
+        case "pending": return "Not checked yet"
+        default: return friend.error ?? "Couldn’t check"
+        }
+    }
+    private var otherFriends: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(sharing.isEmpty ? "Your friends" : "Other friends").font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase).padding(.horizontal, 4)
+            GlassCard {
+                VStack(spacing: 0) {
+                    ForEach(others) { friend in
+                        HStack(spacing: 12) {
+                            if let known = bridge.friends.first(where: { $0.id == friend.friendId }) { FriendAvatar(friend: known, size: 36) }
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(friend.friendName).font(.body.weight(.medium)).lineLimit(1)
+                                Text(reason(friend)).font(.footnote).foregroundStyle(friend.status == "error" ? Color.orange : .secondary).fixedSize(horizontal: false, vertical: true)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                            if friend.checking { ProgressView().controlSize(.small) }
+                            else if friend.status == "error" || friend.status == "offline" { Button("Retry", action: refresh).font(.footnote.weight(.semibold)).disabled(busy) }
+                        }.padding(.vertical, 10).accessibilityElement(children: .combine)
+                        if friend.id != others.last?.id { Divider() }
+                    }
+                }
+            }
+        }
+    }
+    /// One friend's page ("Browse Locations" on their card) with nothing listed.
+    @ViewBuilder private func friendState(_ friend: FriendLocations) -> some View {
+        let retry = Button("Try Again", action: refresh).beamButton().disabled(busy)
+        switch friend.status {
+        case "ready":
+            ContentUnavailableView { Label("Nothing shared yet", systemImage: "externaldrive") } description: { Text("\(friend.friendName) hasn’t shared a folder with this iPhone. They can share one in DropBeam on their computer: Settings → Locations.") } actions: { retry }.padding(.top, 40)
+        case "offline":
+            ContentUnavailableView { Label("\(friend.friendName) is offline", systemImage: "moon.zzz") } description: { Text("Open DropBeam on \(friend.friendName) to see the folders it shares.") } actions: { retry }.padding(.top, 40)
+        case "error", "unavailable":
+            ContentUnavailableView { Label("Couldn’t check", systemImage: "exclamationmark.triangle") } description: { Text(friend.error ?? "Something went wrong.") } actions: { retry }.padding(.top, 40)
+        default:
+            ProgressView("Looking for shared folders…").frame(maxWidth: .infinity).padding(.vertical, 40)
+        }
     }
     private func refresh() { Task { await reload() } }
     private func reload() async {
         guard !loading else { refreshAgain = true; return }
-        loading = true; error = nil
+        loading = true; failure = nil
         defer { loading = false }
         repeat {
             refreshAgain = false
-            do { try await bridge.action("locationsRefresh") } catch { self.error = error.localizedDescription }
+            do {
+                // The reply is the snapshot with every asked friend marked `checking`;
+                // results then stream in per friend. Wait for them (bounded) so
+                // pull-to-refresh ends when the list is actually fresh.
+                let started: LossyArray<FriendLocations> = try await bridge.call("locationsRefresh")
+                if !started.values.isEmpty { bridge.locations = started.values }
+                let deadline = Date().addingTimeInterval(90)
+                while bridge.locations.contains(where: \.checking), Date() < deadline, !Task.isCancelled {
+                    try await Task.sleep(for: .milliseconds(300))
+                }
+            } catch is CancellationError {} catch { failure = error.localizedDescription }
         } while refreshAgain
     }
 }
@@ -80,10 +195,14 @@ struct BrowserView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 18) {
-                if let banner { GlassCard { Text(banner).font(.subheadline).accessibilityAddTraits(.updatesFrequently) } }
-                if let error { BeamError(message: error) { Task { await load() } } }
-                if loading { ProgressView().frame(maxWidth: .infinity).padding() }
-                if !loading && error == nil && page.entries.isEmpty { BeamEmpty(symbol: "folder", title: query.isEmpty ? "This folder is empty." : "No matching files.", detail: query.isEmpty ? "Files shared here will appear in this folder." : "Try another name in this folder.") }
+                if let error, page.entries.isEmpty {
+                    ContentUnavailableView { Label("Couldn’t open this folder", systemImage: "exclamationmark.triangle") } description: { Text(error) } actions: { Button("Try Again") { Task { await load() } }.beamButton() }.padding(.top, 40)
+                } else if let error { BeamError(message: error) { Task { await load() } } }
+                if loading && page.entries.isEmpty { ProgressView().frame(maxWidth: .infinity).padding(.vertical, 40) }
+                if !loading && error == nil && page.entries.isEmpty {
+                    if query.isEmpty { ContentUnavailableView("Empty folder", systemImage: "folder", description: Text(rights.upload ? "Nothing here yet. Use ••• to upload photos or files." : "Nothing has been put in this folder yet.")).padding(.top, 40) }
+                    else { ContentUnavailableView.search(text: query) }
+                }
                 if !page.entries.isEmpty {
                     GlassCard {
                         LazyVStack(spacing: 0) {
@@ -100,6 +219,7 @@ struct BrowserView: View {
             }.padding(20)
         }.contentMargins(.bottom, 24, for: .scrollContent).navigationTitle(title).navigationBarTitleDisplayMode(.inline).beamCanvas()
             .searchable(text: $query, prompt: "Find in this folder")
+            .refreshable { await load() }
             .task(id: query) {
                 if !query.isEmpty { try? await Task.sleep(for: .milliseconds(250)) }
                 guard !Task.isCancelled else { return }
@@ -117,7 +237,13 @@ struct BrowserView: View {
                     Button("Refresh", systemImage: "arrow.clockwise") { Task { await load() } }
                 } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }.accessibilityLabel("Folder options").disabled(busy || loading)
             } }
-            .safeAreaInset(edge: .bottom) { if selecting { selectionBar.padding(.horizontal, 20).padding(.bottom, 8) } }
+            .safeAreaInset(edge: .bottom) {
+                VStack(spacing: 8) {
+                    // Floats above the list so rows never jump under a finger when it appears or times out.
+                    if let banner { GlassCard { Text(banner).font(.subheadline) }.accessibilityAddTraits(.updatesFrequently).transition(.move(edge: .bottom).combined(with: .opacity)) }
+                    if selecting { selectionBar }
+                }.padding(.horizontal, 20).padding(.bottom, 8).animation(.snappy, value: banner)
+            }
             .confirmationDialog(tapped?.name ?? "File", isPresented: Binding(get: { tapped != nil }, set: { if !$0 { tapped = nil } }), titleVisibility: .visible) {
                 if let entry = tapped {
                     Button("Download") { selected = [entry.name]; download() }

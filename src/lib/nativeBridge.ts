@@ -1,4 +1,4 @@
-import { loadLocations } from './locationsLoad'
+import { loadLocations, nativeLocationRows, type CheckedLoad } from './locationsLoad'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { api, HAS_TAURI, type Settings, locationsApi, type SharedLocation, type LocationPage } from './api'
@@ -177,7 +177,10 @@ const handlers: BridgeHandlers = {
   recoverableEmpty: a => api.clearFolderHistory(string(a, 'folder')),
   recoverableEmptyAll: () => api.clearAllFolderHistory(),
   locationsList: async () => { await refreshLocations(); return locationSnapshot() },
-  locationsRefresh: async () => { await refreshLocations(true); return locationSnapshot() },
+  // Starts (or queues) a check and answers at once with the rows marked
+  // `checking`: each friend's result streams in as its own snapshot push, so a
+  // slow or unreachable peer never holds the whole call to a bridge timeout.
+  locationsRefresh: () => { void refreshLocations(true).catch(() => {}); return locationSnapshot() },
   browserList: async a => nativeBrowserPage(await locationRequest<LocationPage>(a, 'ls', { cursor: a.cursor, query: a.query ?? '', sort: 'name' })),
   browserDownload: a => locationRequest(a, 'download', { paths: names(a).map(n => locationChild(string(a, 'path'), n)) }),
   browserUpload: async a => {
@@ -243,36 +246,47 @@ try {
   const cached = JSON.parse(localStorage.getItem('dropbeam.locations') || '{}')
   for (const [id, list] of Object.entries(cached)) if (Array.isArray(list)) shared[id] = list.filter(l => l && typeof l.id === 'string' && typeof l.name === 'string' && typeof l.rights?.upload === 'boolean' && typeof l.rights?.manage === 'boolean')
 } catch { /* optional cache */ }
-let locationErrors: Record<string, string> = {}
+let locationResults: Record<string, CheckedLoad> = {}
+const locationChecking = new Set<string>()
 let refreshing: Promise<void> | undefined
 let locationRefreshQueued = false
 let resnapshot: ((force?: boolean) => void) | undefined
 let pushLocations: (() => void) | undefined
 const needsName = () => !!st().settings && (!st().settings!.displayName.trim() || !localStorage.getItem('dropbeam.namedSelf'))
 const deviceSnapshot = () => { const d = st().myDevice; return d ? { name: d.name, endpointId: d.endpoint_id, deviceKind: d.device_kind, accountPub: d.account_pub, linkedDevices: d.linked_devices } : null }
-const locationSnapshot = () => st().friends.map(f => ({ friendId: f.id, friendName: f.name, online: friendOnlineState(f.name, st().friendSeen, st().folderStatuses) === true, locations: shared[f.id] ?? [], error: locationErrors[f.id] ?? null }))
+const presenceOf = (name: string) => friendOnlineState(name, st().friendSeen, st().folderStatuses) === true
+const locationSnapshot = () => nativeLocationRows(st().friends, { presence: f => presenceOf(f.name), results: locationResults, shared, checking: locationChecking, now: Date.now() })
+// Tauri command errors arrive as plain strings; the engine already words them
+// for people ("Couldn’t reach this device…"), and Swift shows them under the
+// friend's own heading, so no name prefix.
+const plainError = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^Error:\s*/, '') || 'Something went wrong. Try again.'
 function refreshLocations(force = false) {
   if (refreshing) { locationRefreshQueued ||= force; return refreshing }
   refreshing = (async () => {
     do {
       locationRefreshQueued = false
+      const friends = st().friends.filter(f => f.endpointId)
+      friends.forEach(f => locationChecking.add(f.id))
+      pushLocations?.()
       await loadLocations({
-        friends: st().friends,
-        online: f => friendOnlineState(f.name, st().friendSeen, st().folderStatuses) === true,
+        friends,
+        online: f => presenceOf(f.name),
         probe: id => st().pingFriend(id),
         list: locationsApi.list,
         cached: shared,
+        errorText: (_friend, e) => plainError(e),
         onResult: result => {
           // Push each peer as it finishes: one offline peer cannot hide a Linux
           // friend's successful locations behind its timeout.
           shared[result.friendId] = result.locations
-          if (result.error) locationErrors[result.friendId] = result.error
-          else delete locationErrors[result.friendId]
+          locationResults[result.friendId] = { ...result, at: Date.now() }
+          locationChecking.delete(result.friendId)
           pushLocations?.()
         },
-      })
+      }).finally(() => friends.forEach(f => locationChecking.delete(f.id)))
       const ids = new Set(st().friends.map(f => f.id))
       shared = Object.fromEntries(Object.entries(shared).filter(([id]) => ids.has(id)))
+      locationResults = Object.fromEntries(Object.entries(locationResults).filter(([id]) => ids.has(id)))
       try { localStorage.setItem('dropbeam.locations', JSON.stringify(Object.fromEntries(Object.entries(shared).map(([id, list]) => [id, list.map(({ id, name, rights }) => ({ id, name, rights }))])))) } catch { /* optional cache */ }
       pushLocations?.()
     } while (locationRefreshQueued)
