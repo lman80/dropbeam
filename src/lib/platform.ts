@@ -29,3 +29,22 @@ const FORCED =
  * controls, safe-area insets, and desktop-only features hidden.
  */
 export const MOBILE_UI: boolean = IS_IOS || FORCED
+
+/** Desktop OS the window runs on (for platform-specific chrome and copy). */
+export type DesktopOs = 'mac' | 'windows' | 'linux'
+export const DESKTOP_OS: DesktopOs = (() => {
+  if (typeof navigator === 'undefined') return 'mac'
+  // `?os=linux|windows|mac` previews another platform's chrome in a browser.
+  const forced = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('os') : null
+  if (forced === 'mac' || forced === 'windows' || forced === 'linux') return forced
+  const ua = navigator.userAgent
+  if (/Windows/i.test(ua)) return 'windows'
+  if (/Mac/i.test(ua)) return 'mac'
+  return 'linux'
+})()
+export const IS_MAC = DESKTOP_OS === 'mac'
+export const IS_WINDOWS = DESKTOP_OS === 'windows'
+export const IS_LINUX = DESKTOP_OS === 'linux'
+
+/** "menu bar" on macOS, the system tray elsewhere. */
+export const TRAY_NAME = IS_MAC ? 'menu bar' : 'system tray'

@@ -69,22 +69,26 @@ export function HistoryView() {
   </div>
 
   return (
-    <div style={{ maxWidth: 680, margin: '0 auto', padding: '8px 28px 36px' }}>
-      <div
-        className="titlebar-drag"
-        style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}
-      >
-        <h1 style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: 0 }}>History</h1>
+    <div className="page">
+      <div className="page-header titlebar-drag">
+        <div>
+          <h1 className="page-title">History</h1>
+          <p className="page-subtitle">Everything you’ve sent and received, plus files you can bring back.</p>
+        </div>
         {tab === 'recents' && history.length > 0 && (
-          <button className="btn btn-ghost" onClick={clearAll} title="Clears this list — your files aren't touched">
-            <Trash2 size={15} /> Clear list
-          </button>
+          <div className="page-actions">
+            <button className="btn btn-ghost" onClick={clearAll} title="Clears this list — your files aren't touched">
+              <Trash2 size={15} /> Clear list
+            </button>
+          </div>
         )}
       </div>
 
       {/* segmented tabs */}
-      <div className="seg" style={{ display: 'flex', width: '100%', marginBottom: 16 }}>
+      <div className="seg" role="tablist" aria-label="History" style={{ display: 'flex', width: '100%', marginBottom: 16, boxSizing: 'border-box' }}>
         <button
+          role="tab"
+          aria-selected={tab === 'recents'}
           className={tab === 'recents' ? 'active' : ''}
           style={{ flex: 1, justifyContent: 'center' }}
           onClick={() => setTab('recents')}
@@ -92,6 +96,8 @@ export function HistoryView() {
           Recents
         </button>
         <button
+          role="tab"
+          aria-selected={tab === 'recoverable'}
           className={tab === 'recoverable' ? 'active' : ''}
           style={{ flex: 1, justifyContent: 'center' }}
           onClick={() => setTab('recoverable')}
@@ -158,19 +164,18 @@ function Recents({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-      <div style={{ position: 'relative' }}>
-        <Search
-          size={15}
-          style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-faint)' }}
-        />
+      <label className="search-field">
+        <Search size={15} />
         <input
           className="input"
+          type="search"
+          aria-label="Search history"
           placeholder="Search files & people"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          style={{ padding: '9px 12px 9px 34px', fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', width: '100%' }}
+          onKeyDown={(e) => { if (e.key === 'Escape' && query) { e.preventDefault(); setQuery('') } }}
         />
-      </div>
+      </label>
 
       {groups.length === 0 ? (
         <div className="card">
@@ -179,18 +184,7 @@ function Recents({
       ) : (
         groups.map((g) => (
           <div key={g.label}>
-            <div
-              style={{
-                fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
-                fontWeight: 700,
-                letterSpacing: '0.04em',
-                textTransform: 'uppercase',
-                color: 'var(--text-faint)',
-                margin: '2px 4px 7px',
-              }}
-            >
-              {g.label}
-            </div>
+            <h2 className="section-title" style={{ margin: '2px 4px 7px' }}>{g.label}</h2>
             <div className="card" style={{ padding: 6 }}>
               <AnimatePresence initial={false}>
                 {g.entries.map((e) => (
@@ -219,7 +213,7 @@ function RecentRow({ e }: { e: HistoryEntry }) {
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       className="row-hover"
-      style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 9 }}
+      style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px' }}
     >
       <div style={{ position: 'relative', flexShrink: 0, width: 34, height: 34 }}>
         <div
@@ -255,11 +249,11 @@ function RecentRow({ e }: { e: HistoryEntry }) {
       </div>
 
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontWeight: 600, fontSize: 'calc(14px * var(--ui-font-scale, 1))', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        <div style={{ fontWeight: 600, fontSize: 'var(--font-base)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={e.fileNames.join('\n')}>
           {entryTitle(e)}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 2, fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
-          <span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '2px 7px', marginTop: 2, fontSize: 'var(--font-xs)', color: 'var(--text-muted)', flexWrap: 'wrap', minWidth: 0 }}>
+          <span className="truncate-1" style={{ maxWidth: '100%' }}>
             {e.direction === 'send' ? 'Sent' : 'Received'}
             {e.peer ? ` ${e.direction === 'send' ? 'to' : 'from'} ${e.peer}` : ''}
           </span>
@@ -282,6 +276,7 @@ function RecentRow({ e }: { e: HistoryEntry }) {
         <button
           className="icon-btn"
           title={e.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
+          aria-label={e.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
           onClick={() => {
             const sep = e.outDir!.includes('\\') ? '\\' : '/'
             if (e.fileNames.length === 1) {

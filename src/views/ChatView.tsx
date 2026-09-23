@@ -180,8 +180,13 @@ export function ChatView() {
   // lost friend record would hide a real conversation).
   if (rows.length === 0 && !activeChatId) {
     return (
-      <div style={{ maxWidth: 660, margin: '0 auto', padding: '8px 28px 36px' }}>
-        <h1 style={{ fontSize: 'calc(20px * var(--ui-font-scale, 1))', fontWeight: 750, margin: '0 0 16px' }}>Chat</h1>
+      <div className="page">
+        <div className="page-header titlebar-drag">
+          <div>
+            <h1 className="page-title">Chat</h1>
+            <p className="page-subtitle">Message friends and share files right in the conversation.</p>
+          </div>
+        </div>
         <div className="card">
           <EmptyState
             icon={<MessageCircle size={24} />}
@@ -203,7 +208,6 @@ export function ChatView() {
       <div
         className="chat-list-pane"
         style={{
-          width: 232,
           flexShrink: 0,
           borderRight: '1px solid var(--border)',
           display: 'flex',
@@ -211,9 +215,7 @@ export function ChatView() {
           minHeight: 0,
         }}
       >
-        <div className="titlebar-drag" style={{ padding: '10px 16px 8px', fontWeight: 750, fontSize: 'calc(17px * var(--ui-font-scale, 1))' }}>
-          Chat
-        </div>
+        <h1 className="titlebar-drag chat-list-title">Chat</h1>
         <div className="scroll-area" style={{ flex: 1, padding: '0 8px 8px', minHeight: 0 }}>
           {rows.map(({ friend, last }) => {
             const active = friend.id === activeChatId
@@ -243,8 +245,8 @@ export function ChatView() {
         {activeChatId ? (
           <Conversation key={activeChatId} friendId={activeChatId} />
         ) : (
-          <div style={{ flex: 1, display: 'grid', placeItems: 'center', color: 'var(--text-faint)' }}>
-            Select a conversation
+          <div style={{ flex: 1, display: 'grid', placeItems: 'center' }}>
+            <EmptyState icon={<MessageCircle size={24} />} title="Select a conversation" hint="Pick a friend on the left to see your messages." />
           </div>
         )}
       </div>
@@ -657,18 +659,19 @@ function Conversation({ friendId }: { friendId: string }) {
           {online && <span className="chat-dot" />}
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 700, fontSize: 'calc(14.5px * var(--ui-font-scale, 1))' }}>{ownLabel ?? friend.name}</div>
+          <div className="truncate-1" style={{ fontWeight: 700, fontSize: 'var(--font-md)' }} title={ownLabel ?? friend.name}>{ownLabel ?? friend.name}</div>
           <div
             style={{
               display: 'flex',
               alignItems: 'center',
               gap: 7,
-              fontSize: 'calc(12px * var(--ui-font-scale, 1))',
-              color: typing ? 'var(--accent)' : online ? 'var(--green)' : 'var(--text-faint)',
+              minWidth: 0,
+              fontSize: 'var(--font-xs)',
+              color: typing ? 'var(--accent-text)' : online ? 'var(--green)' : 'var(--text-faint)',
             }}
           >
             {/* Typing is a fresh peer signal, independent of the last-seen label. */}
-            <span>{typing ? 'typing…' : presenceText}</span>
+            <span style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>{typing ? 'typing…' : presenceText}</span>
             {online && conn && !typing && (
               <>
                 <span style={{ color: 'var(--border-strong)' }}>·</span>
@@ -687,11 +690,12 @@ function Conversation({ friendId }: { friendId: string }) {
         </button>
         {sharedFolder && !MOBILE_UI && (
           <button
-            className="btn btn-ghost"
+            className="btn btn-ghost btn-sm"
+            style={{ flexShrink: 0 }}
             onClick={() => api.openPath(sharedFolder.folder)}
             title="Open the folder you share with this friend"
           >
-            <FolderOpen size={15} /> Shared folder
+            <FolderOpen size={14} /> Shared folder
           </button>
         )}
       </div>}
@@ -718,22 +722,24 @@ function Conversation({ friendId }: { friendId: string }) {
             {searchQ.trim() ? (searchMatches.length ? `${searchIdx + 1} of ${searchMatches.length}` : 'No matches') : ''}
           </span>
           <button
-            className="icon-btn"
+            className="icon-btn icon-btn-sm"
             title="Previous match"
+            aria-label="Previous match"
             disabled={!searchMatches.length || searchIdx === 0}
             onClick={() => jumpToMatch(searchIdx - 1)}
           >
             <ArrowUp size={14} />
           </button>
           <button
-            className="icon-btn"
+            className="icon-btn icon-btn-sm"
             title="Next match"
+            aria-label="Next match"
             disabled={!searchMatches.length || searchIdx >= searchMatches.length - 1}
             onClick={() => jumpToMatch(searchIdx + 1)}
           >
             <ArrowDown size={14} />
           </button>
-          <button className="icon-btn" title="Close (Esc)" onClick={closeSearch}>
+          <button className="icon-btn icon-btn-sm" title="Close (Esc)" aria-label="Close search" onClick={closeSearch}>
             <X size={14} />
           </button>
         </div>
@@ -743,14 +749,12 @@ function Conversation({ friendId }: { friendId: string }) {
         atBottomRef.current = isAtBottom()
         if (atBottomRef.current && newCount) setNewCount(0)
       }}>
-        {items.length === 0 ? (MOBILE_UI ? <div className="mobile-empty"><MessageCircle /><h2 className="ios-title2">Say hi to {friend.name}</h2><p className="ios-footnote">{online ? 'Start your conversation here.' : 'Messages deliver when they return.'}</p><button className="ios-button ios-primary" onClick={() => taRef.current?.focus({ preventScroll: true })}>Write a message</button></div> : <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-faint)', paddingTop: 40 }}>
-            <MessageCircle size={30} style={{ opacity: 0.5 }} />
-            <div style={{ marginTop: 8, fontSize: 'calc(13px * var(--ui-font-scale, 1))' }}>Say hi to {friend.name} 👋</div>
-            {!online && (
-              <div style={{ marginTop: 4, fontSize: 'calc(12px * var(--ui-font-scale, 1))', opacity: 0.75 }}>
-                They’re offline — your message delivers when they’re back.
-              </div>
-            )}
+        {items.length === 0 ? (MOBILE_UI ? <div className="mobile-empty"><MessageCircle /><h2 className="ios-title2">Say hi to {friend.name}</h2><p className="ios-footnote">{online ? 'Start your conversation here.' : 'Messages deliver when they return.'}</p><button className="ios-button ios-primary" onClick={() => taRef.current?.focus({ preventScroll: true })}>Write a message</button></div> : <div style={{ margin: 'auto', paddingTop: 24 }}>
+            <EmptyState
+              icon={<MessageCircle size={24} />}
+              title={`Say hi to ${ownLabel ?? friend.name} 👋`}
+              hint={online ? 'Messages and files you send appear here.' : 'They’re offline — your message delivers when they’re back.'}
+            />
           </div>
         ) : (
           <div className="chat-track">

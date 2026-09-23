@@ -1034,6 +1034,13 @@ export const useStore = create<AppStore>((set, get) => ({
     const sysDark = window.matchMedia('(prefers-color-scheme: dark)').matches
     const dark = theme === 'dark' || (theme === 'system' && sysDark)
     root.classList.toggle('dark', dark)
+    // Match the NATIVE chrome too (Linux/Windows title bar, macOS traffic-light
+    // appearance), so a manual Light/Dark choice doesn't leave a mismatched frame.
+    if (HAS_TAURI && !MOBILE_UI) {
+      void import('@tauri-apps/api/window')
+        .then(({ getCurrentWindow }) => getCurrentWindow().setTheme(theme === 'system' ? null : theme))
+        .catch(() => {})
+    }
   },
 
   saveSettings: async (patch) => {
