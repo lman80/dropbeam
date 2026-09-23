@@ -127,9 +127,19 @@ Expected result: **13+** under the 2025 age-rating system (messaging + UGC). �
 
 ## 7. Screenshots
 
-✅ Generated from the simulator (iPhone 17 Pro Max, iOS 26.5) at **1320 × 2868** (6.9" display — ASC scales it for the smaller sizes), light mode, with demo content only (a second test identity, sample photos). Files: `~/DropBeam-wt/iosui-scratch/appstore/` (not committed — upload from there).
+✅ 7 screenshots at **1320 × 2868** (6.9" display size; ASC scales them down for smaller iPhones), light mode, opaque PNG, demo identity "Jamie Rivera" and sample photos only, clean 9:41 status bar. Location (not committed): `~/DropBeam-wt/iosui-scratch/appstore/`
 
-👤 Upload the 6.9" set in ASC → iPhone screenshots (up to 10; the first 3 show in search results). Optional: add captions/frames in a design tool.
+1. `01-send.png` — Send: Photos / Files / Folder + Have a Code
+2. `02-quick-send-code.png` — Quick Send QR + code for 3 photos
+3. `03-friends.png` — Friends: Locations, Shared Folders, My Code, friends list
+4. `04-friend.png` — Friend detail: Send / Message / Check (Local · 14 ms)
+5. `05-send-to.png` — Send To chooser (friends, devices, Quick Send)
+6. `06-my-code.png` — My DropBeam code (QR) to add friends
+7. `07-settings.png` — Settings
+
+How they were made: captured from the iPhone 17 Pro simulator (1206 × 2622) and Lanczos-scaled to 1320 × 2868 — the aspect ratios match to 0.07 %, so nothing is stretched. (A dedicated iPhone 17 Pro Max simulator was created for native captures but couldn't be driven by the automation, so it was deleted.) ⚠️ `05-send-to.png` shows the half-docked feedback handle at the right edge; retake it with Settings → Feedback Button off if you want it perfect. For pixel-native 6.9" captures, run the app on an iPhone 17 Pro Max simulator with the Feedback Button off and `xcrun simctl status_bar <udid> override --time 9:41`.
+
+👤 Upload them in ASC → iPhone 6.9" screenshots (the first 3 show in search results). Optional: add captions/device frames in a design tool.
 
 ## 8. Before submitting (owner)
 
