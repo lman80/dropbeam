@@ -37,13 +37,20 @@ export function deviceNoun(kind?: string | null, os?: string | null): string {
 
 /**
  * Labels for the user's OWN devices, Blip-style: "Your Mac", "Your iPhone".
- * When two devices would read the same ("Your Mac" twice), both fall back to
- * their device names so they stay tellable apart.
+ * When two devices would read the same ("Your Mac" twice), they fall back to
+ * their device names — or, when those don't tell them apart either (iPhones
+ * all report "iPhone"), to "Your iPhone 1" / "Your iPhone 2" in a stable order.
  */
 export function ownDeviceLabels<T extends { id: string; name: string; deviceKind?: string | null; deviceOs?: string | null }>(devices: readonly T[]): Record<string, string> {
   const nouns = devices.map(d => deviceNoun(d.deviceKind, d.deviceOs))
   const out: Record<string, string> = {}
-  devices.forEach((d, i) => { out[d.id] = nouns.filter(n => n === nouns[i]).length > 1 ? d.name : `Your ${nouns[i]}` })
+  devices.forEach((d, i) => {
+    const same = devices.filter((_, j) => nouns[j] === nouns[i])
+    if (same.length === 1) { out[d.id] = `Your ${nouns[i]}`; return }
+    const names = same.map(x => x.name.trim())
+    const tellable = new Set(names).size === names.length && names.every(n => n && n !== nouns[i])
+    out[d.id] = tellable ? d.name : `Your ${nouns[i]} ${[...same].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0).indexOf(d) + 1}`
+  })
   return out
 }
 

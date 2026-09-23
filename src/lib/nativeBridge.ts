@@ -1,7 +1,7 @@
 import { loadLocations, nativeLocationRows, type CheckedLoad } from './locationsLoad'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { api, HAS_TAURI, type Settings, type Friend, locationsApi, type SharedLocation, type LocationPage } from './api'
+import { api, HAS_TAURI, type Settings, type Friend, type LinkResult, locationsApi, type SharedLocation, type LocationPage } from './api'
 import { useStore, rememberLocationUpload, type View } from '../store'
 import { MOBILE_UI } from './platform'
 import { friendOnlineState } from './presence'
@@ -15,6 +15,8 @@ import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRi
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
 import { ownDeviceLabels, personGroups } from './deviceIcons'
+import { linkedDetail, linkedTitle } from './deviceLink'
+import { linkWithCode } from '../components/LinkDeviceModal'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -152,20 +154,10 @@ const handlers: BridgeHandlers = {
   shareFiles: a => api.shareFiles(paths(a)),
   linkDeviceBegin: () => api.linkDeviceBegin(),
   linkDeviceCancel: () => api.linkDeviceCancel(),
-  linkDeviceSend: async a => {
-    const result = await api.linkDeviceSend(string(a, 'code'))
-    await st().reloadFriends()
-    await st().refreshMyDevice()
-    return { endpointId: result.endpoint_id, name: result.name, deviceKind: result.device_kind, deviceOs: result.device_os ?? null }
-  },
+  linkDeviceSend: async a => linked(await linkWithCode(string(a, 'code'))),
   linkHostBegin: () => api.linkHostBegin(),
   linkHostCancel: () => api.linkHostCancel(),
-  linkDeviceJoin: async a => {
-    const result = await api.linkDeviceJoin(string(a, 'code'))
-    await st().reloadFriends()
-    await st().refreshMyDevice()
-    return { endpointId: result.endpoint_id, name: result.name, deviceKind: result.device_kind, deviceOs: result.device_os ?? null }
-  },
+  linkDeviceJoin: async a => linked(await linkWithCode(string(a, 'code'))),
   accountSyncNow: async () => { await api.accountSyncNow(); await st().refreshMyDevice() },
   accountRemoveDevice: async a => { await api.accountRemoveDevice(string(a, 'endpointId')); await st().reloadFriends() },
   accountLeave: async () => { await api.accountLeave(); await st().reloadFriends() },
@@ -265,9 +257,20 @@ let locationRefreshQueued = false
 let resnapshot: ((force?: boolean) => void) | undefined
 let pushLocations: (() => void) | undefined
 const needsName = () => !!st().settings && (!st().settings!.displayName.trim() || !localStorage.getItem('dropbeam.namedSelf'))
+/** A finished link, as Swift shows it (title + detail already worded). */
+const linked = async (r: LinkResult) => {
+  // Linked into an account: the name comes from the account, so the first-run
+  // "What should people call you?" sheet has nothing left to ask.
+  try { localStorage.setItem('dropbeam.namedSelf', '1') } catch { /* private mode */ }
+  await st().reloadFriends()
+  await st().refreshMyDevice()
+  resnapshot?.()
+  return { endpointId: r.endpoint_id, name: r.name, deviceKind: r.device_kind, deviceOs: r.device_os ?? null,
+    friends: r.friends ?? null, messages: r.messages ?? null, title: linkedTitle(r), detail: linkedDetail(r) }
+}
 const deviceSnapshot = () => {
   const d = st().myDevice
-  return d ? { name: d.name, endpointId: d.endpoint_id, deviceKind: d.device_kind, deviceOs: d.device_os ?? null, accountPub: d.account_pub, linkedDevices: d.linked_devices,
+  return d ? { name: d.name, displayName: d.display_name ?? st().settings?.displayName ?? null, endpointId: d.endpoint_id, deviceKind: d.device_kind, deviceOs: d.device_os ?? null, accountPub: d.account_pub, linkedDevices: d.linked_devices,
     devices: (d.devices ?? []).map(x => ({ friendId: x.friend_id, endpointId: x.endpoint_id, name: x.name, deviceKind: x.device_kind, deviceOs: x.device_os, lastSyncMs: x.last_sync_ms, thisDevice: x.this_device })) } : null
 }
 /** Friends as Swift sees them: own devices flagged and labelled "Your Mac" etc. */
@@ -446,7 +449,7 @@ async function start() {
   for (const name of ['friends://changed', 'account://synced', 'link://linked']) {
     try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
   }
-  for (const name of ['link://linked', 'account://left', 'link://failed']) {
+  for (const name of ['link://linked', 'account://left', 'link://failed', 'link://progress']) {
     try { stops.push(await listen(name, ({ payload }) => send('event', { name, payload }))) } catch { /* optional event */ }
   }
 }
