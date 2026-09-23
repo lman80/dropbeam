@@ -2,6 +2,8 @@ import Foundation
 import Combine
 import WebKit
 import Network
+import UIKit
+import UserNotifications
 
 @MainActor
 final class Bridge: ObservableObject {
@@ -17,6 +19,13 @@ final class Bridge: ObservableObject {
             Task { @MainActor in self?.networkAvailable = available }
         }
         networkMonitor.start(queue: DispatchQueue(label: "dropbeam.native.network"))
+        // The notification plugin can zero the icon badge; re-assert ours whenever
+        // the app comes forward or leaves, so the Home Screen count stays right.
+        for name in [UIApplication.didBecomeActiveNotification, UIApplication.willResignActiveNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+                Task { @MainActor in Bridge.shared.updateAppBadge(force: true) }
+            }
+        }
     }
     @Published var history: [HistoryEntry] = []
     @Published var locations: [FriendLocations] = []
@@ -29,7 +38,8 @@ final class Bridge: ObservableObject {
     @Published var transfers: [Transfer] = []
     @Published var settings: Settings?
     @Published var chatOverview: [ChatOverview] = []
-    @Published var chatUnread: [String: Int] = [:]
+    @Published var chatUnread: [String: Int] = [:] { didSet { updateAppBadge() } }
+    @Published var folders: [SharedFolder] = []
     @Published var chatTyping: [String: Bool] = [:]
     @Published var threads: [String: [ChatMessage]] = [:]
     @Published var chatDraftFiles: [String] = []
@@ -48,6 +58,16 @@ final class Bridge: ObservableObject {
     private let decoder = JSONDecoder()
     var unread: Int { chatUnread.values.reduce(0) { min(9999, $0 + min(9999, max(0, $1))) } }
     var sendTransfers: [Transfer] { transfers.filter { $0.chatOnly != true } }
+    private var appliedBadge: Int?
+    /// Unread chats on the app icon. Badge permission is requested together with
+    /// alerts/sounds at first launch (notification plugin: [.badge, .alert, .sound]);
+    /// without it iOS simply ignores the count.
+    func updateAppBadge(force: Bool = false) {
+        let count = unread
+        guard force || count != appliedBadge else { return }
+        appliedBadge = count
+        UNUserNotificationCenter.current().setBadgeCount(count) { _ in }
+    }
 
     func call<T: Decodable>(_ name: String, _ args: [String: Any] = [:]) async throws -> T {
         guard let webview else { throw failure("The app bridge is not ready.") }
@@ -109,6 +129,7 @@ final class Bridge: ObservableObject {
         case "thread":
             if let thread = try decoder.decode(ChatThread?.self, from: data) { threads[thread.friendId] = thread.messages }
         case "presence": presence = try decoder.decode([String: Bool].self, from: data)
+        case "folders": folders = try decoder.decode(LossyArray<SharedFolder>.self, from: data).values
         default: break // Forward-compatible snapshots.
         }
     }
@@ -180,9 +201,11 @@ final class Bridge: ObservableObject {
     func pickFiles(source: String) async throws -> [String] {
         guard mediaTask == nil else { throw failure("A selection is still finishing. Please try again in a moment.") }
         let token = UUID(); mediaToken = token
-        preparingMedia = source == "photos" ? "Preparing photo…" : "Preparing files…"
+        preparingMedia = source == "photos" ? "Preparing photo…" : source == "folder" ? "Preparing folder…" : "Preparing files…"
         let task = Task<[String], Error> {
             try await NativePresentation.waitForPickerDismissal()
+            // A whole folder is picked natively (a temporary copy the engine can read).
+            if source == "folder" { return try await NativeFolderPicker.shared.pickFolderToSend().map { [$0] } ?? [] }
             return try await call("pickFiles", ["source": source])
         }
         mediaTask = task

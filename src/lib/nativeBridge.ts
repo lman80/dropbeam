@@ -1,7 +1,7 @@
 import { loadLocations, nativeLocationRows, type CheckedLoad } from './locationsLoad'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { api, HAS_TAURI, type Settings, type Friend, locationsApi, type SharedLocation, type LocationPage } from './api'
+import { api, HAS_TAURI, type Settings, type Friend, type LinkResult, locationsApi, type SharedLocation, type LocationPage } from './api'
 import { useStore, rememberLocationUpload, type View } from '../store'
 import { MOBILE_UI } from './platform'
 import { friendOnlineState } from './presence'
@@ -15,6 +15,9 @@ import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRi
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
 import { ownDeviceLabels, personGroups } from './deviceIcons'
+import { nativeFolders, folderLinks } from './nativeFolders'
+import { linkedDetail, linkedTitle } from './deviceLink'
+import { linkWithCode } from '../components/LinkDeviceModal'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -152,20 +155,10 @@ const handlers: BridgeHandlers = {
   shareFiles: a => api.shareFiles(paths(a)),
   linkDeviceBegin: () => api.linkDeviceBegin(),
   linkDeviceCancel: () => api.linkDeviceCancel(),
-  linkDeviceSend: async a => {
-    const result = await api.linkDeviceSend(string(a, 'code'))
-    await st().reloadFriends()
-    await st().refreshMyDevice()
-    return { endpointId: result.endpoint_id, name: result.name, deviceKind: result.device_kind, deviceOs: result.device_os ?? null }
-  },
+  linkDeviceSend: async a => linked(await linkWithCode(string(a, 'code'))),
   linkHostBegin: () => api.linkHostBegin(),
   linkHostCancel: () => api.linkHostCancel(),
-  linkDeviceJoin: async a => {
-    const result = await api.linkDeviceJoin(string(a, 'code'))
-    await st().reloadFriends()
-    await st().refreshMyDevice()
-    return { endpointId: result.endpoint_id, name: result.name, deviceKind: result.device_kind, deviceOs: result.device_os ?? null }
-  },
+  linkDeviceJoin: async a => linked(await linkWithCode(string(a, 'code'))),
   accountSyncNow: async () => { await api.accountSyncNow(); await st().refreshMyDevice() },
   accountRemoveDevice: async a => { await api.accountRemoveDevice(string(a, 'endpointId')); await st().reloadFriends() },
   accountLeave: async () => { await api.accountLeave(); await st().reloadFriends() },
@@ -250,6 +243,49 @@ const handlers: BridgeHandlers = {
     return true
   },
   respondToOffer: a => st().respondToOffer(string(a, 'id'), a.accept === true),
+  // Shared Folders (same engine commands/store actions as desktop FoldersView).
+  foldersRefresh: async () => {
+    await st().reloadPairs()
+    if (!st().myEid) { const eid = await api.myEndpointId().catch(() => null); if (eid) useStore.setState({ myEid: eid }) }
+    return folderSnapshot()
+  },
+  folderSetPaused: async a => {
+    if (typeof a.bool !== 'boolean') throw new Error('Invalid pause value')
+    await api.setFolderPaused(folderLinks(st().pairs, string(a, 'folderId'))[0].id, a.bool)
+    await st().reloadPairs()
+  },
+  folderStop: async a => { for (const link of folderLinks(st().pairs, string(a, 'folderId'))) await api.stopFolderTransfer(link.id).catch(() => {}) },
+  folderVerify: a => api.verifyFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id),
+  folderLeave: async a => {
+    for (const link of folderLinks(st().pairs, string(a, 'folderId'))) await storeAction(() => st().removePair(link.id))
+  },
+  folderRemoveMember: a => storeAction(() => st().removePair(folderMember(a).id)),
+  folderSetRole: async a => {
+    if (typeof a.bool !== 'boolean') throw new Error('Invalid role value')
+    const member = folderMember(a)
+    if (!!member.peerIsViewer === a.bool) return
+    await api.setMemberRole(member.id, a.bool)
+    await st().reloadPairs()
+  },
+  /** The code of a pending (not yet accepted) invite link, to show again. */
+  folderShowInvite: a => api.pairInvite(folderMember(a).id),
+  /** A fresh invite code for one more person (desktop "Add person"). */
+  folderAddPerson: async a => {
+    const code = await api.folderAddPerson(folderLinks(st().pairs, string(a, 'folderId'))[0].id)
+    await st().reloadPairs()
+    return code
+  },
+  folderInviteFriend: async a => {
+    await api.inviteFriendToFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id, string(a, 'friendId'))
+    await st().reloadPairs()
+  },
+}
+const folderSnapshot = () => { const s = st(); return nativeFolders(s.pairs, s.folderStatuses, s.folderSummaries, s.folderLastSynced, s.myEid, s.friends) }
+/** A member link, checked to belong to the named folder (never act on a stale id). */
+function folderMember(a: BridgeArgs) {
+  const link = folderLinks(st().pairs, string(a, 'folderId')).find(p => p.id === string(a, 'pairId'))
+  if (!link) throw new Error('That person is no longer in this folder.')
+  return link
 }
 // The web Locations view owns its map locally; native uses the same cache and
 // locationsApi, without mounting a hidden browser or duplicating engine logic.
@@ -265,9 +301,20 @@ let locationRefreshQueued = false
 let resnapshot: ((force?: boolean) => void) | undefined
 let pushLocations: (() => void) | undefined
 const needsName = () => !!st().settings && (!st().settings!.displayName.trim() || !localStorage.getItem('dropbeam.namedSelf'))
+/** A finished link, as Swift shows it (title + detail already worded). */
+const linked = async (r: LinkResult) => {
+  // Linked into an account: the name comes from the account, so the first-run
+  // "What should people call you?" sheet has nothing left to ask.
+  try { localStorage.setItem('dropbeam.namedSelf', '1') } catch { /* private mode */ }
+  await st().reloadFriends()
+  await st().refreshMyDevice()
+  resnapshot?.()
+  return { endpointId: r.endpoint_id, name: r.name, deviceKind: r.device_kind, deviceOs: r.device_os ?? null,
+    friends: r.friends ?? null, messages: r.messages ?? null, title: linkedTitle(r), detail: linkedDetail(r) }
+}
 const deviceSnapshot = () => {
   const d = st().myDevice
-  return d ? { name: d.name, endpointId: d.endpoint_id, deviceKind: d.device_kind, deviceOs: d.device_os ?? null, accountPub: d.account_pub, linkedDevices: d.linked_devices,
+  return d ? { name: d.name, displayName: d.display_name ?? st().settings?.displayName ?? null, endpointId: d.endpoint_id, deviceKind: d.device_kind, deviceOs: d.device_os ?? null, accountPub: d.account_pub, linkedDevices: d.linked_devices,
     devices: (d.devices ?? []).map(x => ({ friendId: x.friend_id, endpointId: x.endpoint_id, name: x.name, deviceKind: x.device_kind, deviceOs: x.device_os, lastSyncMs: x.last_sync_ms, thisDevice: x.this_device })) } : null
 }
 /** Friends as Swift sees them: own devices flagged and labelled "Your Mac" etc. */
@@ -412,6 +459,7 @@ async function start() {
       chatDraftFiles: s.chatDraftFiles,
       presence: presenceSnapshot(s),
       myDevice: deviceSnapshot(),
+      folders: folderSnapshot(),
     }
     for (const change of changedSnapshots(previous, snapshots)) send('state', change)
     if (s.activeChatId !== activeChat) {
@@ -446,7 +494,7 @@ async function start() {
   for (const name of ['friends://changed', 'account://synced', 'link://linked']) {
     try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
   }
-  for (const name of ['link://linked', 'account://left', 'link://failed']) {
+  for (const name of ['link://linked', 'account://left', 'link://failed', 'link://progress']) {
     try { stops.push(await listen(name, ({ payload }) => send('event', { name, payload }))) } catch { /* optional event */ }
   }
 }

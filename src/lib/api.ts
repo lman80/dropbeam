@@ -4,7 +4,7 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { mockApi, mockListen, mockLocationRequest, mockSharedLocations, mockSyncedFolders } from './mock'
+import { mockApi, mockListen, mockLocationRequest, mockSharedLocations, mockSyncedFolders, emit as mockEmit } from './mock'
 import { normalizeSharedLocations } from './normalize'
 import { MOBILE_UI } from './platform'
 import { pickMobileFiles } from '../components/MobileFileSheet'
@@ -239,7 +239,9 @@ export interface HistoryItem {
 }
 
 /** A successfully linked device; command and link wire fields use snake_case. */
-export interface LinkResult { endpoint_id: string; name: string; device_kind: string; device_os?: string }
+export interface LinkResult { endpoint_id: string; name: string; device_kind: string; device_os?: string
+  /** What the link brought over (friends and chat messages), when known. */
+  friends?: number; messages?: number }
 /** One device in this account (this one first). */
 export interface AccountDevice {
   friend_id: string | null
@@ -250,7 +252,9 @@ export interface AccountDevice {
   last_sync_ms: number | null
   this_device: boolean
 }
-export interface MyDeviceInfo extends LinkResult { account_pub: string; linked_devices: number; device_os?: string; devices?: AccountDevice[] }
+export interface MyDeviceInfo extends LinkResult { account_pub: string; linked_devices: number; device_os?: string; devices?: AccountDevice[]
+  /** The person's name — the same on every device in the account. `name` is this device's own name. */
+  display_name?: string }
 
 /** A named peer you can send to directly — no code, no QR. */
 export interface Friend {
@@ -606,22 +610,36 @@ const realApi = {
 }
 
 // Keep browser-only link placeholders in this bridge, within the backend slice.
+// Preview knobs: ?devices=0 shows a device not linked yet; a pasted device code
+// containing "fail" shows the error screen, anything else the progress + success.
+const previewParam = (k: string) => typeof location === 'undefined' ? null : new URLSearchParams(location.search).get(k)
+const previewLink = async (code: string): Promise<LinkResult> => {
+  if (/fail/i.test(code)) { await new Promise(r => setTimeout(r, 900)); throw 'Both devices already belong to different accounts, so they can’t be linked. On the device you want to move, open Settings → Devices → Remove This Device from Account, then try again.' }
+  mockEmit('link://progress', { stage: 'waiting', friends: 0, messages: 0 })
+  await new Promise(r => setTimeout(r, 900))
+  mockEmit('link://progress', { stage: 'importing', friends: 7, messages: 309 })
+  await new Promise(r => setTimeout(r, 1400))
+  return { endpoint_id: 'preview-phone', name: 'iPhone', device_kind: 'phone', device_os: 'ios', friends: 7, messages: 309 }
+}
 const backend: typeof realApi = HAS_TAURI ? realApi : ({
   ...mockApi,
-  linkDeviceBegin: async () => 'dropbeamlink1:preview',
+  linkDeviceBegin: async () => 'dropbeamlink1:eyJ2IjoxLCJlaWQiOiJwcmV2aWV3IiwibmFtZSI6IlByZXZpZXciLCJ0b2tlbiI6IjAwIn0',
   linkDeviceCancel: async () => {},
-  linkDeviceSend: async () => ({ endpoint_id: 'preview', name: 'My phone', device_kind: 'phone' }),
-  linkHostBegin: async () => 'dropbeamjoin1:preview',
+  linkDeviceSend: previewLink,
+  linkHostBegin: async () => 'dropbeamjoin1:eyJ2IjoxLCJlaWQiOiJwcmV2aWV3IiwibmFtZSI6IlByZXZpZXciLCJ0b2tlbiI6IjAwIn0',
   linkHostCancel: async () => {},
-  linkDeviceJoin: async () => ({ endpoint_id: 'preview', name: 'My computer', device_kind: 'laptop', device_os: 'macos' }),
+  linkDeviceJoin: previewLink,
   accountSyncNow: async () => {},
   accountRemoveDevice: async () => {},
   accountLeave: async () => {},
-  myDeviceInfo: async () => ({
-    endpoint_id: 'preview', name: 'My computer', device_kind: 'desktop', account_pub: 'preview-account', linked_devices: 1, device_os: 'macos',
+  myDeviceInfo: async () => previewParam('devices') === '0' ? ({
+    endpoint_id: 'preview', name: "Ashton's MacBook Pro", device_kind: 'laptop', account_pub: '', linked_devices: 0, device_os: 'macos', devices: [], display_name: 'Ashton',
+  }) : ({
+    endpoint_id: 'preview', name: "Ashton's MacBook Pro", device_kind: 'laptop', account_pub: 'preview-account', linked_devices: 2, device_os: 'macos', display_name: 'Ashton',
     devices: [
-      { friend_id: null, endpoint_id: 'preview', name: 'My computer', device_kind: 'laptop', device_os: 'macos', last_sync_ms: null, this_device: true },
-      { friend_id: 'mock-phone', endpoint_id: 'preview-phone', name: "Ashton's iPhone", device_kind: 'phone', device_os: 'ios', last_sync_ms: Date.now() - 60_000, this_device: false },
+      { friend_id: null, endpoint_id: 'preview', name: "Ashton's MacBook Pro", device_kind: 'laptop', device_os: 'macos', last_sync_ms: null, this_device: true },
+      { friend_id: 'mock-phone', endpoint_id: 'preview-phone', name: 'iPhone', device_kind: 'phone', device_os: 'ios', last_sync_ms: Date.now() - 60_000, this_device: false },
+      { friend_id: null, endpoint_id: 'preview-phone-2', name: 'iPhone', device_kind: 'phone', device_os: 'ios', last_sync_ms: null, this_device: false },
     ],
   }),
 } as typeof realApi)

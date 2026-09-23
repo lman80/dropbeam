@@ -1,84 +1,171 @@
-import { Button, Row, Section, Sheet } from '../mobile/kit'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { AlertCircle, CheckCircle2, Copy, Loader2, QrCode, Smartphone } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
-import { QRCodeSVG } from 'qrcode.react'
-import { api, HAS_TAURI, onFriendsChanged } from '../lib/api'
+import { api, HAS_TAURI } from '../lib/api'
+import { mockListen } from '../lib/mock'
 import { MOBILE_UI } from '../lib/platform'
+import { deviceCodeProblem, isDeviceCode, linkedDetail, linkedTitle, linkErrorText, progressText, type LinkedDevice, type LinkProgress } from '../lib/deviceLink'
 import { useStore } from '../store'
+import { QrCodeView } from './CodeQr'
 import { QrScanner } from './QrScanner'
 
-export function LinkNewDeviceModal({ onClose }: { onClose: () => void }) {
-  const [scanning, setScanning] = useState(true)
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
-  const send = async (code: string) => {
-    setScanning(false)
-    if (!/^dropbeamlink1:/i.test(code)) { setError('This is not a device linking code. Open the linking screen on your new device.'); return }
-    setBusy(true)
-    try {
-      const linked = await api.linkDeviceSend(code)
-      useStore.getState().toast('success', `Linked ${linked.name}`)
-      void useStore.getState().reloadFriends().catch(() => {})
-      onClose()
-    } catch (e) { setError(`Could not link the device: ${String(e)}`) }
-    finally { setBusy(false) }
-  }
-  if (scanning) return <QrScanner hint="Scan the code shown on your new device." onResult={code => void send(code)} onClose={onClose} />
-  if (MOBILE_UI) return <Sheet title="Link a New Device" onClose={onClose}><Section footer={<span role={busy ? 'status' : 'alert'}>{busy ? 'Linking device…' : error}</span>}>{!busy && <Row title="Try Again" tint onPress={() => { setError(''); setScanning(true) }} />}</Section></Sheet>
-  return <LinkDialog title="Link a new device"><p role="status">{busy ? 'Linking device…' : error}</p>{!busy && <><button className="btn btn-primary" onClick={() => { setError(''); setScanning(true) }}>Try again</button><button className="btn btn-ghost" onClick={onClose}>Close</button></>}</LinkDialog>
+/** Link with a scanned/pasted device code of either kind. The engine picks the
+ *  direction (the account that already has devices wins) and refuses two
+ *  different accounts, so both commands take any device code. */
+export async function linkWithCode(code: string) {
+  const c = code.trim()
+  const problem = deviceCodeProblem(c)
+  if (problem) throw new Error(problem)
+  return /^dropbeamjoin1:/i.test(c) ? api.linkDeviceJoin(c) : api.linkDeviceSend(c)
+}
+export { isDeviceCode }
+
+function onLinkEvent<T>(name: string, cb: (payload: T) => void): Promise<() => void> {
+  if (!HAS_TAURI) return mockListen(name, p => cb(p as T))
+  return listen<T>(name, e => cb(e.payload))
 }
 
-export function LinkDeviceModal({ onClose }: { onClose: () => void }) {
+type Phase = 'show' | 'scan' | 'working' | 'done' | 'error'
+
+/**
+ * The one linking flow, whichever device it's opened on. This device shows
+ * its code AND can scan the other's — either device scanning the other works,
+ * and the account that already has devices is the one both end up in.
+ * `start`: open on the code ('show') or straight in the camera ('scan').
+ */
+export function LinkFlow({ onClose, start, title }: { onClose: () => void; start: 'show' | 'scan'; title: string }) {
+  const myDevice = useStore(s => s.myDevice)
+  // A device that already shares its account shows a "join me" code (older
+  // builds scanning it then join); a new one shows "link me".
+  const hosting = (myDevice?.devices?.length ?? 0) > 1
+  const [phase, setPhase] = useState<Phase>(start)
+  const [attempt, setAttempt] = useState(0)
   const [code, setCode] = useState('')
+  const [codeError, setCodeError] = useState('')
+  const [progress, setProgress] = useState<LinkProgress | null>(null)
+  const [linked, setLinked] = useState<LinkedDevice | null>(null)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
-  const [canceling, setCanceling] = useState(false)
+  // How the last attempt was made (this device scanning, or showing its code).
+  const [via, setVia] = useState<'show' | 'scan'>(start)
+  const phaseRef = useRef(phase)
+  phaseRef.current = phase
   const closeRef = useRef(onClose)
   useEffect(() => { closeRef.current = onClose }, [onClose])
-  const cancelRef = useRef<() => Promise<void>>(async () => {})
-  useEffect(() => {
-    let alive = true, begun = false, complete = false
-    let unlisten: (() => void) | undefined
-    const changed = () => {
-      if (!alive || !begun || complete) return
-      complete = true
-      useStore.getState().toast('success', 'This device is now linked')
-      void useStore.getState().reloadFriends().catch(() => {})
-      closeRef.current()
-    }
-    // Subscribe to the precise completion event before displaying the code.
-    const start = async () => {
-      unlisten = await (HAS_TAURI ? listen('friends://changed', changed) : onFriendsChanged(changed))
-      if (!alive) { unlisten(); return }
-      const value = await api.linkDeviceBegin()
-      begun = true
-      if (!alive) { await api.linkDeviceCancel(); return }
-      setCode(value)
-    }
-    const pending = start().catch(e => { if (alive) setError(`Could not create a linking code: ${String(e)}`) })
-    cancelRef.current = async () => {
-      setCanceling(true)
-      await pending
-      try { await api.linkDeviceCancel(); complete = true; closeRef.current() }
-      catch (e) { setError(`Could not cancel linking: ${String(e)}`); setCanceling(false) }
-    }
-    return () => { alive = false; unlisten?.(); if (begun && !complete) void api.linkDeviceCancel().catch(() => {}) }
+
+  const finished = useCallback((d: LinkedDevice | null) => {
+    setLinked(d); setPhase('done'); setProgress(null)
+    void useStore.getState().reloadFriends().catch(() => {})
   }, [])
-  if (MOBILE_UI) return <Sheet title="Link This Device" size="large" onClose={() => { if (!canceling) void cancelRef.current() }} primary={<Button disabled={canceling} onClick={() => void cancelRef.current()}>{canceling ? 'Canceling…' : 'Done'}</Button>}>
-    <Section title="Link This Device to Another Account" footer="On a device you already use, open Settings → Profile → Link a New Device and scan this code.">
-      {code ? <><div className="mk-qr"><QRCodeSVG value={code} size={240} level="M" /></div><Row title={copied ? 'Copied' : 'Copy Code'} tint onPress={() => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => setError('Could not copy the code.'))} /></> : <Row title={error ? 'Code unavailable' : 'Creating code…'} />}
-    </Section>
-    {error && <Section footer={<span className="mk-error" role="alert">{error}</span>} />}
-  </Sheet>
-  return <LinkDialog title="Link this device to my account">
-    <p>On the device you already use, open Settings &gt; Devices &gt; Link a new device and scan this code.</p>
-    {code ? <><div className="link-qr"><QRCodeSVG value={code} size={240} level="M" /></div><textarea className="input" aria-label="Device linking code" readOnly value={code} /><button className="btn btn-primary" onClick={() => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => setError('Could not copy the code. Select and copy the text instead.'))}>{copied ? 'Copied' : 'Copy'}</button></> : !error && <p role="status">Creating code…</p>}
-    {error && <p role="alert">{error}</p>}
-    <button className="btn btn-ghost" disabled={canceling} onClick={() => void cancelRef.current()}>{canceling ? 'Canceling…' : 'Cancel'}</button>
+
+  // The other device scanned OUR code: its progress, success and failure arrive as events.
+  useEffect(() => {
+    let alive = true
+    const stops: (() => void)[] = []
+    void (async () => {
+      const add = async (p: Promise<() => void>) => { const stop = await p.catch(() => undefined); if (!stop) return; if (alive) stops.push(stop); else stop() }
+      await add(onLinkEvent<LinkProgress>('link://progress', p => {
+        if (!alive || phaseRef.current === 'done') return
+        setProgress(p)
+        if (phaseRef.current === 'show') { setVia('show'); setPhase('working') }
+      }))
+      await add(onLinkEvent<LinkedDevice>('link://linked', d => { if (alive && phaseRef.current !== 'done') finished(d) }))
+      await add(onLinkEvent<string>('link://failed', e => {
+        if (!alive || phaseRef.current === 'done') return
+        setError(linkErrorText(e)); setPhase('error')
+      }))
+    })()
+    return () => { alive = false; stops.forEach(s => s()) }
+  }, [finished])
+
+  // A fresh one-time code each time the code screen opens (or on Try again).
+  const showing = phase === 'show'
+  useEffect(() => {
+    if (!showing) return
+    let alive = true
+    setCode(''); setCodeError(''); setCopied(false)
+    const begin = hosting ? api.linkHostBegin : api.linkDeviceBegin
+    begin().then(c => { if (alive) setCode(c) }).catch(e => { if (alive) setCodeError(`Couldn’t create a code. ${linkErrorText(e)}`) })
+    return () => { alive = false }
+  }, [showing, attempt, hosting])
+  // Whatever happens, no code stays live after the dialog closes.
+  useEffect(() => () => { void api.linkHostCancel().catch(() => {}); void api.linkDeviceCancel().catch(() => {}) }, [])
+
+  const scanned = async (value: string) => {
+    setPhase('working'); setVia('scan'); setProgress(null); setError('')
+    try { finished(await linkWithCode(value)) }
+    catch (e) { if (phaseRef.current !== 'done') { setError(linkErrorText(e)); setPhase('error') } }
+  }
+  const retry = () => { setError(''); setProgress(null); if (via === 'scan') setPhase('scan'); else { setAttempt(a => a + 1); setPhase('show') } }
+  const copy = () => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => setCodeError('Couldn’t copy the code. Select it and copy it instead.'))
+
+  if (phase === 'scan') return <QrScanner title="Scan your other device" hint="On your other device open Settings → Devices → Link a Device, then scan the code it shows."
+    validate={deviceCodeProblem} onResult={v => void scanned(v)} onClose={() => start === 'scan' ? closeRef.current() : setPhase('show')} />
+
+  return <LinkDialog title={phase === 'done' ? 'Devices linked' : title} onClose={onClose}>
+    {phase === 'show' && <>
+      <ol className="device-link-steps">
+        <li>Open DropBeam on your other device.</li>
+        <li>Go to <strong>Settings → Devices → Link a Device</strong> — on a phone you’re just setting up, tap <strong>Already use DropBeam?</strong></li>
+        <li>Scan this code.</li>
+      </ol>
+      {code ? <QrCodeView value={code} size={220} hint="Scan with DropBeam on your other device" label="QR code to link your other device" />
+        : !codeError && <p className="account-waiting" role="status"><Loader2 size={14} className="spin" /> Creating a code…</p>}
+      {codeError && <p role="alert" className="error-text">{codeError}</p>}
+      {code && <p className="account-waiting" role="status">Waiting for your other device… The code works once, for 10 minutes.</p>}
+      <div className="device-link-actions">
+        <button className="btn btn-ghost" onClick={() => setPhase('scan')}><QrCode size={14} />Scan the other device’s code instead</button>
+        {code && <button className="btn btn-ghost" onClick={copy}><Copy size={14} />{copied ? 'Copied' : 'Copy code'}</button>}
+        {codeError && <button className="btn btn-ghost" onClick={retry}>Try again</button>}
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+      </div>
+      <p className="device-link-note">Either device can scan the other. Your friends and chats come along, and nothing on either device is lost.</p>
+    </>}
+    {phase === 'working' && <div className="device-link-state" role="status" aria-live="polite">
+      <Loader2 size={34} className="spin" />
+      <p><strong>{progressText(progress)}</strong></p>
+      <p className="account-waiting">Keep DropBeam open on both devices.</p>
+      <button className="btn btn-ghost" onClick={onClose}>Hide</button>
+    </div>}
+    {phase === 'done' && <div className="account-linked" role="status">
+      <CheckCircle2 size={40} />
+      <p><strong>{linkedTitle(linked)}</strong></p>
+      <p>{linkedDetail(linked)}</p>
+      <button className="btn btn-primary" onClick={onClose}>Done</button>
+    </div>}
+    {phase === 'error' && <div className="device-link-state device-link-error" role="alert">
+      <AlertCircle size={34} />
+      <p>{error}</p>
+      <div className="device-link-actions">
+        <button className="btn btn-primary" onClick={retry}>Try again</button>
+        {via === 'scan'
+          ? <button className="btn btn-ghost" onClick={() => { setError(''); setPhase('show') }}><Smartphone size={14} />Show this device’s code instead</button>
+          : <button className="btn btn-ghost" onClick={() => { setError(''); setPhase('scan') }}><QrCode size={14} />Scan the other device instead</button>}
+        <button className="btn btn-ghost" onClick={onClose}>Close</button>
+      </div>
+    </div>}
   </LinkDialog>
 }
 
-function LinkDialog({ title, children }: { title: string; children: React.ReactNode }) {
-  return createPortal(<div className="dialog-overlay device-link-overlay"><div className={MOBILE_UI ? 'dialog mobile-sheet device-link-dialog' : 'card dialog device-link-dialog'} role="dialog" aria-modal="true" aria-label={title}><h2>{title}</h2>{children}</div></div>, document.body)
+/** Show this device's code (a new device linking to an account you already use). */
+export function LinkDeviceModal({ onClose }: { onClose: () => void }) {
+  return <LinkFlow start="show" title="Link this device" onClose={onClose} />
+}
+
+/** Scan a new device's code from a device you already use. */
+export function LinkNewDeviceModal({ onClose }: { onClose: () => void }) {
+  return <LinkFlow start="scan" title="Link a new device" onClose={onClose} />
+}
+
+function LinkDialog({ title, onClose, children }: { title: string; onClose?: () => void; children: React.ReactNode }) {
+  useEffect(() => {
+    if (!onClose) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  return createPortal(<div className="dialog-overlay device-link-overlay" onMouseDown={e => { if (onClose && e.target === e.currentTarget) onClose() }}>
+    <div className={MOBILE_UI ? 'dialog mobile-sheet device-link-dialog' : 'card dialog device-link-dialog'} role="dialog" aria-modal="true" aria-label={title}><h2>{title}</h2>{children}</div>
+  </div>, document.body)
 }

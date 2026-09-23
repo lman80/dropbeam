@@ -539,7 +539,8 @@ pub fn outbox(config_dir: &Path) -> Vec<ChatMessage> {
         .values()
         .flatten()
         .filter(|m| {
-            m.from_me && matches!(m.status.as_deref(), Some("sending") | Some("failed"))
+            // A message unsent before it was ever delivered is never delivered.
+            m.from_me && !m.deleted && matches!(m.status.as_deref(), Some("sending") | Some("failed"))
         })
         .cloned()
         .collect();
@@ -673,7 +674,7 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
                 // `seq` is a per-device Lamport clock, so the other device's
                 // numbers mean nothing here: slot the message in by its time,
                 // right after the latest local message that isn't newer.
-                m.seq = thread.iter().filter(|x| x.ts <= m.ts).map(|x| x.seq).max().unwrap_or(0);
+                m.seq = slot_seq(thread, m.ts);
                 thread.push(m);
                 changed += 1;
             }
@@ -918,6 +919,25 @@ mod tests {
     }
 
     #[test]
+    fn folding_a_devices_thread_slots_by_time_and_keeps_our_outbox() {
+        let dir = test_dir("fold");
+        // A year of conversation on the main thread (seq 1..3)…
+        append(&dir, &msg("old1", "owner", 100, 1, false));
+        append(&dir, &msg("old2", "owner", 200, 2, true));
+        append(&dir, &msg("new", "owner", 900, 3, false));
+        // …and a second device's thread with its own clock (seq 1..2).
+        append(&dir, &msg("dev1", "device", 500, 1, false));
+        append(&dir, &msg("dev2", "device", 950, 2, true)); // still "sending"
+        append(&dir, &msg("old1", "device", 100, 1, false)); // the same message twice
+        assert_eq!(fold_thread(&dir, "device", "owner"), 2);
+        let order: Vec<String> = messages(&dir, "owner").into_iter().map(|m| m.id).collect();
+        assert_eq!(order, ["old1", "old2", "dev1", "new", "dev2"]);
+        assert!(messages(&dir, "device").is_empty());
+        assert_eq!(outbox(&dir).len(), 2, "our unsent messages keep retrying (old2 + dev2)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn message_status_gate_distinguishes_ours_from_theirs() {
         let dir = ops_dir("status");
         let _ = std::fs::create_dir_all(&dir);
@@ -932,18 +952,47 @@ mod tests {
     }
 }
 
-/// Merge an authenticated link snapshot using merge_threads' id dedup and cap.
+/// Merge an authenticated link snapshot exactly like an own-device sync: no
+/// duplicates, slotted by time among this device's own messages, and a copy
+/// still "sending" on the other device is not this device's to deliver.
 pub(crate) fn import_link_thread(config_dir: &Path, peer: &str, messages: Vec<ChatMessage>) {
+    merge_synced(config_dir, peer, messages);
+}
+
+/// Where a message with wall-clock `ts` belongs in `thread`: right after the
+/// latest message that isn't newer. `seq` is a per-thread Lamport clock, so a
+/// message from another thread or device can't keep its own number.
+fn slot_seq(thread: &[ChatMessage], ts: u64) -> u64 {
+    thread.iter().filter(|x| x.ts <= ts).map(|x| x.seq).max().unwrap_or(0)
+}
+
+/// Move this device's thread `from` into `into` (both are the same person's
+/// conversation). Unlike `merge_threads` the two threads kept separate seq
+/// clocks, so messages are slotted in by time; statuses and local paths are
+/// kept (these are this device's own copies). Returns how many moved.
+pub(crate) fn fold_thread(config_dir: &Path, from: &str, into: &str) -> usize {
+    if from == into {
+        return 0;
+    }
     let mut cache = CACHE.lock().unwrap();
     let all = store_mut(&mut cache, config_dir);
-    let dest = all.entry(peer.to_owned()).or_default();
-    for mut m in messages {
-        if dest.iter().any(|x| x.id == m.id) { continue; }
-        m.peer_id = peer.to_owned();
-        m.path = None;
+    let Some(moving) = all.remove(from) else { return 0 };
+    let dest = all.entry(into.to_owned()).or_default();
+    let mut moved = 0;
+    for mut m in moving {
+        if dest.iter().any(|x| x.id == m.id && x.from_me == m.from_me) {
+            continue;
+        }
+        m.peer_id = into.to_owned();
+        m.seq = slot_seq(dest, m.ts);
         dest.push(m);
+        moved += 1;
     }
-    dest.sort_by_key(order_key);
-    if dest.len() > MAX_PER_PEER { dest.drain(..dest.len() - MAX_PER_PEER); }
+    dest.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
+    if dest.len() > MAX_PER_PEER {
+        let drop = dest.len() - MAX_PER_PEER;
+        dest.drain(0..drop);
+    }
     save_all(config_dir, all);
+    moved
 }
