@@ -39,6 +39,14 @@ const AVATAR_CAP: usize = 2 << 20;
 /// Re-exchange with a device at least this often even if nothing changed here,
 /// so its changes still arrive if its own nudge to us was lost.
 const REFRESH: Duration = Duration::from_secs(10 * 60);
+/// Clock skew tolerated on timestamps from another device; anything further in
+/// the future is clamped so one bad clock can't pin a tombstone forever.
+const SKEW_MS: u64 = 10 * 60 * 1000;
+const AVATAR_BUDGET: usize = 8 << 20;
+
+fn clamp(t: u64) -> u64 {
+    t.min(chat::now_ms().saturating_add(SKEW_MS))
+}
 
 // ── change notification ─────────────────────────────────────────────────────
 
@@ -127,7 +135,7 @@ pub(crate) fn mark_linked(dir: &Path, eid: &str) {
     let now = chat::now_ms();
     with_book(dir, &account, |b| {
         let at = b.linked.entry(eid.to_owned()).or_default();
-        *at = (*at).max(now).max(b.removed_devices.get(eid).map_or(0, |r| r + 1));
+        *at = (*at).max(now).max(b.removed_devices.get(eid).map_or(0, |r| r.saturating_add(1)));
     });
     note_change();
 }
@@ -151,6 +159,24 @@ pub(crate) fn own_devices(dir: &Path) -> Vec<Friend> {
         .filter(|f| f.account_pub.as_deref() == Some(account.as_str()))
         .filter(|f| f.endpoint_id.as_deref().is_some_and(|e| !book.is_removed(e)))
         .collect()
+}
+
+/// A friend the user removed on one of their devices (don't let a stray hello
+/// quietly re-add them; adding them again on purpose still works).
+pub(crate) fn friend_removed(dir: &Path, eid: &str) -> bool {
+    let Some(account) = my_pub(dir) else { return false };
+    let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    read_book(dir, &account).removed_friends.contains_key(eid)
+}
+
+/// Merge another device's link/removal times into ours (clamped, by max).
+fn merge_roster_times(dir: &Path, account: &str, roster: &Roster, removed_friends: &HashMap<String, u64>) -> Book {
+    with_book(dir, account, |b| {
+        for (e, t) in &roster.linked { let x = b.linked.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
+        for (e, t) in &roster.removed { let x = b.removed_devices.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
+        for (e, t) in removed_friends { let x = b.removed_friends.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
+        b.clone()
+    })
 }
 
 pub(crate) fn is_own_device(dir: &Path, eid: &str) -> bool {
@@ -365,12 +391,7 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
     let account = &local.account;
     let mut out = Applied { new_friends: vec![], want_avatars: vec![], left_account: false, changed: false };
     // 1. Tombstones + link times, merged by max.
-    let book = with_book(dir, account, |b| {
-        for (e, t) in &meta.roster.linked { let x = b.linked.entry(e.clone()).or_default(); *x = (*x).max(*t); }
-        for (e, t) in &meta.roster.removed { let x = b.removed_devices.entry(e.clone()).or_default(); *x = (*x).max(*t); }
-        for (e, t) in &meta.removed_friends { let x = b.removed_friends.entry(e.clone()).or_default(); *x = (*x).max(*t); }
-        b.clone()
-    });
+    let book = merge_roster_times(dir, account, &meta.roster, &meta.removed_friends);
     if book.is_removed(&local.me) {
         leave_account(dir, account);
         out.left_account = true;
@@ -389,7 +410,10 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
         }
         device_ids.insert(d.eid.clone());
         let linked = book.linked.get(&d.eid).copied().unwrap_or(0);
-        out.changed |= friends::upsert_own_device(dir, &d.eid, &d.name, d.kind.as_deref(), d.os.as_deref(), account, linked);
+        // A device's name comes only from the device itself (its own roster
+        // entry); third-hand names would ping-pong between devices forever.
+        let own_entry = d.eid == from;
+        out.changed |= friends::upsert_own_device(dir, &d.eid, &d.name, d.kind.as_deref(), d.os.as_deref(), account, linked, own_entry);
     }
     // Devices removed from the account: forget them here too.
     for f in friends::load(dir) {
@@ -444,9 +468,11 @@ fn leave_account(dir: &Path, account: &str) {
 }
 
 fn avatars_for(local: &Local, wanted: &[String]) -> HashMap<String, Value> {
+    let mut budget = AVATAR_BUDGET;
     wanted.iter().filter_map(|eid| {
         let (mtime, path) = local.avatars.get(eid)?;
-        let bytes = std::fs::read(path).ok().filter(|b| !b.is_empty() && b.len() <= AVATAR_CAP)?;
+        let bytes = std::fs::read(path).ok().filter(|b| !b.is_empty() && b.len() <= AVATAR_CAP && b.len() <= budget)?;
+        budget -= bytes.len(); // the rest go next round
         Some((eid.clone(), json!({"mtime": mtime, "b64": STANDARD.encode(bytes)})))
     }).collect()
 }
@@ -550,8 +576,10 @@ fn apply_messages(dir: &Path, messages: &Value) -> usize {
     let mut changed = 0;
     for (eid, msgs) in messages.as_object().into_iter().flatten() {
         let Some(friend) = friends::load(dir).into_iter().find(|f| f.endpoint_id.as_deref() == Some(eid.as_str())) else { continue };
+        // A friend's extra device talks in the person's thread here too.
+        let owner = friends::thread_owner(dir, &friend.id).map_or(friend.id, |o| o.id);
         let Ok(msgs) = serde_json::from_value::<Vec<chat::ChatMessage>>(msgs.clone()) else { continue };
-        changed += chat::merge_synced(dir, &friend.id, msgs);
+        changed += chat::merge_synced(dir, &owner, msgs);
     }
     changed
 }
@@ -666,14 +694,16 @@ async fn server_exchange(ctx: &Ctx, who: &str, req: &Value, send: &mut iroh::end
         send.finish()?;
         return Ok(None);
     };
-    let removed = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(dir, &account).is_removed(who) };
+    let meta: Meta = serde_json::from_value(req["meta"].clone())?;
+    // Learn the caller's link/removal times FIRST: a device relinked elsewhere
+    // must not be told it's removed by a device that hasn't heard yet.
+    let removed = merge_roster_times(dir, &account, &meta.roster, &meta.removed_friends).is_removed(who);
     if removed {
         iroh_net::write_frame(send, &json!({"kind": "account-sync-removed"})).await?;
         send.finish()?;
         return Ok(None);
     }
     let local = ctx.gather(&account);
-    let meta: Meta = serde_json::from_value(req["meta"].clone())?;
     let applied = apply_meta(dir, &local, who, &meta);
     if applied.left_account {
         iroh_net::write_frame(send, &json!({"kind": "account-sync-denied"})).await?;
@@ -850,7 +880,7 @@ pub fn account_remove_device(app: AppHandle, state: State<'_, Arc<AppState>>, en
     let account = my_pub(dir).ok_or("This device isn't linked to an account.")?;
     with_book(dir, &account, |b| {
         let at = b.removed_devices.entry(endpoint_id.clone()).or_default();
-        *at = (*at).max(chat::now_ms()).max(b.linked.get(&endpoint_id).map_or(0, |l| l + 1));
+        *at = (*at).max(chat::now_ms()).max(b.linked.get(&endpoint_id).map_or(0, |l| l.saturating_add(1)));
     });
     if let Some(f) = friends::load(dir).into_iter().find(|f| f.endpoint_id.as_deref() == Some(endpoint_id.as_str())) {
         friends::remove(dir, &f.id)?;
@@ -867,7 +897,7 @@ pub async fn account_leave(app: AppHandle, state: State<'_, Arc<AppState>>, iroh
     let account = my_pub(&dir).ok_or("This device isn't linked to an account.")?;
     let me = iroh.get().ok_or("Network not ready")?.id().to_string();
     // Tell the other devices first (best effort), then forget the key.
-    with_book(&dir, &account, |b| { b.removed_devices.insert(me.clone(), chat::now_ms().max(b.linked.get(&me).map_or(0, |l| l + 1))); });
+    with_book(&dir, &account, |b| { b.removed_devices.insert(me.clone(), chat::now_ms().max(b.linked.get(&me).map_or(0, |l| l.saturating_add(1)))); });
     let net = iroh.inner().clone();
     let targets: Vec<String> = own_devices(&dir).into_iter().filter_map(|f| f.endpoint_id).collect();
     let handles: Vec<_> = targets.into_iter().map(|eid| {
@@ -986,6 +1016,59 @@ mod tests {
     }
 
     #[test]
+    fn unsend_is_sticky_even_against_a_newer_reaction() {
+        let d = dir();
+        let mut m = text("x", "p", false, 5);
+        m.deleted = true;
+        m.text.clear();
+        m.rev = 10;
+        chat::append(&d, &m);
+        let mut reacted = text("x", "p", false, 5);
+        reacted.rev = 99;
+        reacted.reactions = vec![chat::Reaction { emoji: "❤️".into(), from_me: true }];
+        chat::merge_synced(&d, "p", vec![reacted]);
+        let got = chat::messages(&d, "p").remove(0);
+        assert!(got.deleted && got.text.is_empty(), "a friend's unsend never comes back");
+        // …and the undeleted copy adopts the unsend.
+        let e = dir();
+        chat::append(&e, &text("x", "p", false, 5));
+        chat::merge_synced(&e, "p", vec![m]);
+        assert!(chat::messages(&e, "p")[0].deleted);
+        for d in [d, e] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    fn future_timestamps_are_clamped_and_relinks_are_learned_before_refusing() {
+        let d = dir();
+        let key = iroh::SecretKey::generate();
+        crate::link::adopt_key_for_tests(&d, &key);
+        let account = hex::encode(key.public().as_bytes());
+        with_book(&d, &account, |b| { b.removed_devices.insert("ipad".into(), 1_000); });
+        // A roster from a device that already saw the relink (and one with a wild clock).
+        let roster = Roster { linked: HashMap::from([("ipad".into(), 2_000), ("evil".into(), u64::MAX)]), ..Default::default() };
+        let book = merge_roster_times(&d, &account, &roster, &HashMap::new());
+        assert!(!book.is_removed("ipad"), "relink learned before the removed check");
+        assert!(book.linked["evil"] <= chat::now_ms() + SKEW_MS, "far-future times are clamped");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_removed_friend_is_not_re_added_by_a_stray_hello() {
+        let d = dir();
+        crate::link::adopt_key_for_tests(&d, &iroh::SecretKey::generate());
+        let f1 = eid();
+        let f = friends::upsert_by_endpoint(&d, &f1, "Mong");
+        record_friend_removed(&d, &f);
+        friends::remove(&d, &f.id).unwrap();
+        friends::apply_hello(&d, "", &f1, "Mong");
+        assert!(friends::load(&d).is_empty());
+        // Adding them again on purpose still works.
+        friends::upsert_by_endpoint(&d, &f1, "Mong");
+        assert_eq!(friends::load(&d).len(), 1);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn edits_win_by_rev_and_status_only_moves_forward() {
         let d = dir();
         let mut m = text("x", "p", true, 5);
@@ -1015,8 +1098,8 @@ mod tests {
         let (me_a, me_b, f1, phone) = (eid(), eid(), eid(), eid());
         let fa = friends::upsert_by_endpoint(&a, &f1, "Mong");
         friends::upsert_by_endpoint(&b, &f1, "Mong");
-        friends::upsert_own_device(&a, &phone, "Phone", Some("phone"), Some("ios"), &account, 1);
-        friends::upsert_own_device(&b, &phone, "Phone", Some("phone"), Some("ios"), &account, 1);
+        friends::upsert_own_device(&a, &phone, "Phone", Some("phone"), Some("ios"), &account, 1, true);
+        friends::upsert_own_device(&b, &phone, "Phone", Some("phone"), Some("ios"), &account, 1, true);
         // A removes the friend and the phone.
         std::thread::sleep(Duration::from_millis(5));
         record_friend_removed(&a, &fa);

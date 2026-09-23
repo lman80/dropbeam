@@ -227,7 +227,6 @@ pub async fn link_device_join(app: AppHandle, state: State<'_, Arc<AppState>>, i
     let me = device(&state, &iroh)?;
     if code.eid == me.endpoint_id { return Err("cannot link this device to itself".into()); }
     let token: [u8; 16] = hex::decode(&code.token).ok().and_then(|v| v.try_into().ok()).ok_or("invalid link code")?;
-    *state.pending_link.lock().unwrap() = Some(PendingLink { token, created_at: Instant::now() });
     let ep = iroh.get().ok_or("network not ready")?.clone();
     let host = code.eid.clone();
     let dialed = tokio::time::timeout(Duration::from_secs(60), async {
@@ -239,15 +238,20 @@ pub async fn link_device_join(app: AppHandle, state: State<'_, Arc<AppState>>, i
     }).await;
     let (_conn, mut send, offer) = match dialed {
         Ok(Ok(v)) => v,
-        Ok(Err(_)) => { *state.pending_link.lock().unwrap() = None; return Err("Couldn't reach the other device. Make sure DropBeam is open on it.".into()); }
-        Err(_) => { *state.pending_link.lock().unwrap() = None; return Err("link timed out".into()); }
+        Ok(Err(_)) => return Err("Couldn't reach the other device. Make sure DropBeam is open on it.".into()),
+        Err(_) => return Err("link timed out".into()),
     };
     if offer["kind"] != "link-offer" {
-        *state.pending_link.lock().unwrap() = None;
         return Err(offer["reason"].as_str().unwrap_or("link rejected").to_owned());
     }
+    // The offer must answer THIS dial (same one-time token, from the scanned host);
+    // it's bound to the connection, so no other peer can push an account here.
+    let echoed: Option<[u8; 16]> = offer["token"].as_str().and_then(|t| hex::decode(t).ok()).and_then(|v| v.try_into().ok());
+    #[allow(deprecated)]
+    let same = echoed.is_some_and(|e| ring::constant_time::verify_slices_are_equal(&e, &token).is_ok());
+    if !same { return Err("invalid link offer".into()); }
     let host_info: LinkResult = serde_json::from_value(offer["sender"].clone()).map_err(|_| "invalid link offer")?;
-    let result = receive(&state, me, &host, &offer);
+    let result = adopt_offer(&state, me, &host, &offer);
     let reply = result.as_ref().cloned().unwrap_or_else(|e| json!({"kind":"link-error", "reason":e}));
     let _ = iroh_net::write_frame(&mut send, &reply).await;
     let _ = send.finish();
@@ -303,6 +307,11 @@ pub(crate) async fn serve_join(net: &IrohState, who: &str, req: &Value, send: &m
 
 fn receive(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<Value, String> {
     consume(&mut st.pending_link.lock().unwrap(), req["token"].as_str().unwrap_or(""))?;
+    adopt_offer(st, me, who, req)
+}
+/// Apply an authenticated link offer (the caller has already checked it is the
+/// one this device asked for).
+fn adopt_offer(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<Value, String> {
     if req["v"] != 1 { return Err("unsupported link version".into()); }
     let sender: LinkResult = serde_json::from_value(req["sender"].clone()).map_err(|_| "invalid sender")?;
     if sender.endpoint_id != who || who == me.endpoint_id { return Err("invalid sender identity".into()); }

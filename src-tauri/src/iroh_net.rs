@@ -5124,7 +5124,12 @@ pub async fn send_chat(
 pub async fn send_chat_any(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value) -> Result<serde_json::Value> {
     let mut last = Err(anyhow::anyhow!("no reachable device"));
     for eid in eids {
-        last = send_chat(state, ep, eid, payload.clone()).await;
+        last = match send_chat(state, ep, eid, payload.clone()).await {
+            // A device that doesn't know us yet drops the message but still
+            // acks it — that is not delivery; try the person's next device.
+            Ok(ack) if ack["applied"] == false => Err(anyhow::anyhow!("recipient device doesn't know us yet")),
+            other => other,
+        };
         if last.is_ok() {
             break;
         }

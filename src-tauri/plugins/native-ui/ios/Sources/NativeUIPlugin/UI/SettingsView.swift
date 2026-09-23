@@ -52,7 +52,7 @@ struct SettingsView: View {
                     Text("DropBeam · Direct, end-to-end encrypted transfers").font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
                 }.padding(20)
             }.contentMargins(.bottom, 24, for: .scrollContent).navigationTitle("Settings").navigationBarTitleDisplayMode(.large).beamCanvas()
-                .task { do { version = try await bridge.call("appVersion"); try await bridge.action("myDeviceInfo") } catch { bridge.errorMessage = error.localizedDescription } }
+                .task { version = (try? await bridge.call("appVersion")) ?? ""; try? await bridge.action("myDeviceInfo") }
                 .confirmationDialog("Clear interrupted transfer leftovers?", isPresented: $clearCache, titleVisibility: .visible) { Button("Clear Transfer Cache", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("clearTransferCache"); bridge.showToast(freed > 0 ? "Cleared \(Formatters.bytes(freed))" : "No transfer leftovers to clear") } } }
         }
     }

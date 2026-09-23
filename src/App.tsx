@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useState } from 'react'
+import { JoinAccountModal } from './components/DevicesPanel'
 import { motion } from 'framer-motion'
 import { AlertTriangle, X } from 'lucide-react'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -251,6 +252,7 @@ function NameSetupModal() {
   const save = useStore((s) => s.saveSettings)
   const [show, setShow] = useState(false)
   const [name, setName] = useState('')
+  const [joining, setJoining] = useState(false)
 
   useEffect(() => {
     if (settings && !localStorage.getItem('dropbeam.namedSelf')) {
@@ -342,8 +344,12 @@ function NameSetupModal() {
           >
             Continue
           </button>
+          {!MOBILE_UI && <button className="btn btn-ghost" style={{ width: '100%', justifyContent: 'center', marginTop: 8 }} onClick={() => setJoining(true)}>
+            Already use DropBeam on another device? Link it
+          </button>}
         </div>
       </motion.div>
+      {joining && <JoinAccountModal onClose={() => setJoining(false)} onShowCode={() => setJoining(false)} />}
     </div>
   )
 }

@@ -25,7 +25,7 @@ test('own devices read "Your Mac"/"Your iPhone" and fall back to names when two 
     { a: 'Work Mac', b: 'Home Mac', c: 'Your iPhone' })
 })
 
-test("a friend's extra devices fold under their oldest record; own devices never do", async () => {
+test("a friend's extra devices fold under one deterministic record; own devices never do", async () => {
   const { personGroups } = await import('../src/lib/deviceIcons.ts')
   const f = [
     { id: 'mac', createdAt: 1, accountPub: 'ashton', endpointId: 'e1' },
@@ -36,4 +36,6 @@ test("a friend's extra devices fold under their oldest record; own devices never
   ]
   assert.deepEqual(personGroups(f, 'me'), { phone: 'mac' })
   assert.deepEqual(personGroups(f, null), { phone: 'mac', mine2: 'mine1' })
+  // Owner = smallest endpoint id, whatever the local creation order.
+  assert.deepEqual(personGroups([{ id: 'x', createdAt: 1, accountPub: 'a', endpointId: 'zz' }, { id: 'y', createdAt: 9, accountPub: 'a', endpointId: 'aa' }], null), { x: 'y' })
 })

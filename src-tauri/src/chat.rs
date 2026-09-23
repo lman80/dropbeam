@@ -312,14 +312,17 @@ pub fn apply_reaction(
         .reactions
         .iter()
         .position(|r| r.from_me == from_me && r.emoji == emoji);
-    match (add, existing) {
-        (true, None) => msg.reactions.push(Reaction { emoji: emoji.to_string(), from_me }),
+    let changed = match (add, existing) {
+        (true, None) => { msg.reactions.push(Reaction { emoji: emoji.to_string(), from_me }); true }
         (false, Some(i)) => {
             msg.reactions.remove(i);
+            true
         }
-        _ => {} // already in the desired state — idempotent no-op
+        _ => false, // already in the desired state — idempotent no-op
+    };
+    if changed {
+        msg.rev = bump_rev(msg.rev);
     }
-    msg.rev = bump_rev(msg.rev);
     let out = msg.clone();
     save_all(config_dir, &all);
     Some(out)
@@ -621,12 +624,16 @@ pub(crate) fn sync_hash(m: &ChatMessage) -> String {
     hex::encode(&Sha256::digest(state.as_bytes())[..6])
 }
 
-/// `(sync_key, sync_hash)` for every message in a thread, oldest first.
+/// Own devices keep the newest messages of each thread in step; older history
+/// (which each device may have trimmed differently) is left alone.
+const SYNC_WINDOW: usize = 1000;
+
+/// `(sync_key, sync_hash)` for the newest `SYNC_WINDOW` messages, oldest first.
 pub(crate) fn sync_digest(config_dir: &Path, peer_id: &str) -> Vec<(String, String)> {
     let mut cache = CACHE.lock().unwrap();
     store_mut(&mut cache, config_dir)
         .get(peer_id)
-        .map(|t| t.iter().map(|m| (sync_key(m), sync_hash(m))).collect())
+        .map(|t| t[t.len().saturating_sub(SYNC_WINDOW)..].iter().map(|m| (sync_key(m), sync_hash(m))).collect())
         .unwrap_or_default()
 }
 
@@ -658,6 +665,11 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
         }
         match thread.iter_mut().find(|x| x.id == m.id && x.from_me == m.from_me) {
             None => {
+                // Older than everything a full thread keeps: it would be trimmed
+                // at once — skip it rather than churn (and never converge).
+                if thread.len() >= MAX_PER_PEER && thread.first().is_some_and(|f| m.ts < f.ts) {
+                    continue;
+                }
                 // `seq` is a per-device Lamport clock, so the other device's
                 // numbers mean nothing here: slot the message in by its time,
                 // right after the latest local message that isn't newer.
@@ -667,8 +679,7 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
             }
             Some(x) => {
                 let before = sync_hash(x);
-                let newer = m.rev > x.rev
-                    || (m.rev == x.rev && ((m.deleted && !x.deleted) || (m.edited && !x.edited)));
+                let newer = !x.deleted && (m.deleted || m.rev > x.rev || (m.rev == x.rev && m.edited && !x.edited));
                 if newer {
                     x.text = m.text;
                     x.edited = m.edited;

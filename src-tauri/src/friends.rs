@@ -675,6 +675,12 @@ pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: 
             return;
         }
     }
+    // A friend the user removed (on any of their devices) isn't re-added just
+    // because they said hello; adding them again by code still works.
+    if crate::account::friend_removed(config_dir, endpoint_id)
+        && !read_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        return;
+    }
     let _ = upsert_by_endpoint(config_dir, endpoint_id, name);
 }
 
@@ -757,7 +763,9 @@ fn owner_in(all: &[Friend], f: Friend, mine: Option<&str>) -> Friend {
     let Some(account) = f.account_pub.as_deref().filter(|a| Some(*a) != mine) else { return f };
     all.iter()
         .filter(|o| o.account_pub.as_deref() == Some(account) && o.endpoint_id.is_some())
-        .min_by_key(|o| (o.created_at, o.id.clone()))
+        // Deterministic on every device (NOT created_at, which is per-device), so
+        // all of the user's own devices file this person's thread identically.
+        .min_by_key(|o| o.endpoint_id.clone())
         .cloned()
         .unwrap_or(f)
 }
@@ -780,7 +788,7 @@ pub fn person_endpoints(config_dir: &Path, owner_id: &str) -> Vec<String> {
         let mut others: Vec<&Friend> = all.iter()
             .filter(|o| o.id != owner.id && o.account_pub.as_deref() == Some(account))
             .collect();
-        others.sort_by_key(|o| o.created_at);
+        others.sort_by_key(|o| o.endpoint_id.clone());
         out.extend(others.into_iter().filter_map(|o| o.endpoint_id.clone()));
     }
     out
@@ -1362,6 +1370,12 @@ pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &ser
     // though it still holds the key, until it is linked again.
     let key = key.filter(|k| !crate::account::is_removed_device(config_dir, k, endpoint_id));
     set_device_info(config_dir, endpoint_id, req["device_kind"].as_str(), key);
+    // A device that no longer proves an account (left it, or was removed) stops
+    // counting as part of that person / as one of our devices. Only a hello from
+    // a build that speaks accounts ("device_os" rides with it) is conclusive.
+    if key.is_none() && req.get("device_os").is_some() {
+        clear_account_for_endpoint(config_dir, endpoint_id);
+    }
     // A friend's newly recognized extra device: fold any conversation it already
     // had into the person's main thread so nothing disappears from view.
     if key.is_some() {
@@ -1396,7 +1410,7 @@ pub(crate) fn set_device_os(config_dir: &Path, endpoint_id: &str, os: &str) {
 /// "removed" tombstone compares against when the device was linked, not when
 /// this copy happened to hear about it.
 pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str, kind: Option<&str>,
-    os: Option<&str>, account_pub: &str, created_at: u64) -> bool {
+    os: Option<&str>, account_pub: &str, created_at: u64, authoritative_name: bool) -> bool {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);
     let name = clean_name(name, "My device");
@@ -1405,7 +1419,7 @@ pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str
         if f.account_pub.as_deref() != Some(account_pub) { f.account_pub = Some(account_pub.to_owned()); changed = true; }
         if kind.is_some() && f.device_kind.as_deref() != kind { f.device_kind = kind.map(str::to_owned); changed = true; }
         if os.is_some() && f.device_os.as_deref() != os { f.device_os = os.map(str::to_owned); changed = true; }
-        if !f.name_custom && f.name != name { f.name = name; changed = true; }
+        if authoritative_name && !f.name_custom && f.name != name { f.name = name; changed = true; }
         if changed { let _ = save(config_dir, &friends); }
         return changed;
     }
@@ -1482,6 +1496,17 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
     (friend, true)
+}
+
+pub(crate) fn clear_account_for_endpoint(config_dir: &Path, endpoint_id: &str) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id) && f.account_pub.is_some()) {
+        f.account_pub = None;
+        changed = true;
+    }
+    if changed { let _ = save(config_dir, &friends); }
 }
 
 /// Clear the account claim on every record that carries `account_pub` (this
