@@ -7686,6 +7686,7 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
     let mut buf = vec![0u8; CHUNK];
     for (index, (path, name, size, _)) in items.iter().enumerate() {
         let mut f = open_for_send(path).await?;
+        let opened = f.metadata().await.ok().map(|m| (m.modified().ok(), m.len()));
         // A file swapped for a FOLDER after the manifest was built opens fine on
         // Unix and only fails on read with a bare "Is a directory (os error 21)".
         anyhow::ensure!(f.metadata().await.map(|m| m.is_file()).unwrap_or(true),
@@ -7720,6 +7721,15 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             })
             .await?;
             remaining -= n as u64;
+        }
+        // Written to WHILE we read it (same inode, new mtime or length): what
+        // went out mixes two versions, and would still pass the integrity check
+        // (it hashes what was READ). Fail loudly — the retry re-reads it whole.
+        // An atomic save (new inode) keeps our handle on the old, consistent
+        // version; an edit before we opened it simply sends the newer bytes.
+        if let (Some(before), Ok(after)) = (opened, f.metadata().await) {
+            anyhow::ensure!(before == (after.modified().ok(), after.len()),
+                "\"{name}\" changed while sending — try again");
         }
         if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(path)?; }
         if let Some(hash) = hash {

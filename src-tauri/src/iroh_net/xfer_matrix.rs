@@ -199,8 +199,9 @@ async fn push(paths: &[PathBuf], dest: &Path) -> Result<u64> {
     let got = rx.await?;
     client.close().await;
     server.close().await;
+    let sent = sent?; // the sender's own outcome is what its user sees
     got?;
-    sent
+    Ok(sent)
 }
 
 pub(super) fn chat_link(items: &[SendItem], dirs: &[String], total: u64) -> crate::models::ChatTransferLink {
@@ -1004,6 +1005,51 @@ async fn matrix_source_grows_mid_send_sends_the_advertised_bytes() {
         use std::io::Write;
         std::fs::OpenOptions::new().append(true).open(p).unwrap().write_all(&[7u8; 5000]).unwrap();
     }, true).await;
+}
+
+/// A file written to WHILE its bytes are being read (same inode): the send
+/// must fail rather than deliver a silent mix of two versions, and a retry
+/// then lands the file exactly as it is on disk now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_source_edited_during_read_never_lands_a_mix() {
+    let _gate = PACE_GATE.read().await;
+    for via in [Via::Push, Via::Friend] {
+        let src = scratch("editread");
+        let rx = scratch("editread-rx");
+        let dest = rx.0.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let head = put(&src.0, "a-head.bin", 1 << 20, 1);
+        // Under the parallel threshold and > the small limit: a classic body.
+        let doc = put(&src.0, "b-doc.bin", 12 << 20, 2);
+        let slow = Throttle::new(&dest, Duration::from_millis(2));
+        let edited = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::spawn({ let (dest, doc, edited) = (dest.clone(), doc.clone(), edited.clone()); async move {
+            // Once the doc's bytes are landing, rewrite its tail in place.
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let busy = std::fs::read_dir(&dest).into_iter().flatten().flatten().chain(std::fs::read_dir(dest.join("x")).into_iter().flatten().flatten())
+                    .any(|e| e.file_name().to_string_lossy().starts_with(".dropbeam-recv-") && e.metadata().map(|m| m.len() > 1 << 20).unwrap_or(false));
+                if busy {
+                    use std::io::{Seek, Write};
+                    let mut f = std::fs::OpenOptions::new().write(true).open(&doc).unwrap();
+                    f.seek(std::io::SeekFrom::Start(11 << 20)).unwrap();
+                    f.write_all(&[9u8; 4096]).unwrap();
+                    f.sync_all().unwrap();
+                    edited.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }});
+        let r = transfer(via, &[head.clone(), doc.clone()], &dest, QUICK).await;
+        watcher.abort();
+        drop(slow);
+        assert!(edited.load(Ordering::SeqCst), "{via:?}: the edit never happened mid-read");
+        let err = r.expect_err("a file edited mid-read must not land as a mix");
+        assert!(format!("{err:#}").contains("changed while sending"), "{via:?}: {err:#}");
+        assert!(!dest.join("b-doc.bin").exists(), "{via:?}: a mixed copy landed");
+        transfer(via, &[head.clone(), doc.clone()], &dest, QUICK).await.unwrap_or_else(|e| panic!("{via:?} retry: {e:#}"));
+        assert_eq!(sha(&dest.join("b-doc.bin")), sha(&doc), "{via:?}");
+    }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_source_shrinks_mid_send_fails_cleanly() {
