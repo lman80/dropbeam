@@ -56,11 +56,11 @@ html.mobile .locations-view { max-width: 1100px; margin: 0 auto; padding: 8px 28
 .location-error { color: var(--red, #e47474); padding: 12px 16px; font-size: var(--font-base); overflow-wrap: anywhere; }
 .location-status { color: var(--accent); margin: 5px 16px 12px; font-size: var(--font-sm); }
 .location-modal { position: fixed; inset: 0; z-index: 200; display: grid; place-items: center; background: #0008; padding: 20px; backdrop-filter: blur(4px); }
-.location-modal form { width: 440px; max-width: 100%; max-height: 85vh; overflow: auto; padding: 24px; }
+.location-modal form { width: 440px; max-width: 100%; max-height: 85vh; overflow: auto; padding: 20px 22px 22px; }
 .location-modal p { font-size: var(--font-base); line-height: 1.6; overflow-wrap: anywhere; color: var(--text-muted); }
 .location-modal label, .location-editor > label { display: block; font-size: var(--font-sm); font-weight: 600; margin-bottom: 16px; }
 .location-modal input:not([type=checkbox]), .location-editor > label > input { display: block; width: 100%; margin-top: 7px; }
-.location-modal .dialog-actions { justify-content: flex-end; margin-top: 22px; }
+.location-modal .dialog-actions { justify-content: flex-end; margin-top: 6px; }
 .location-trash-items { max-height: 170px; overflow: auto; font-size: var(--font-base); padding-left: 18px; overflow-wrap: anywhere; }
 .location-settings { margin: 26px 0; }
 .location-host-row { padding: 16px; display: flex; align-items: center; gap: 13px; margin-bottom: 10px; flex-wrap: wrap; }

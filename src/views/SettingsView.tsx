@@ -247,7 +247,7 @@ export function SettingsView() {
 
       <SectionTitle>Profile</SectionTitle>
       <Card>
-        <Row title="Display name" desc={MOBILE_UI ? "The name your friends see." : "What paired devices see you as."}>
+        <Row title="Display name" desc="What friends see. Your name and photo apply to all your devices — they sync across your account.">
           <DisplayNameInput value={settings.displayName} onSave={(displayName) => void save({ displayName })} />
         </Row>
       </Card>

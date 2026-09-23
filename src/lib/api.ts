@@ -4,7 +4,7 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { mockApi, mockListen, mockSharedLocations, mockSyncedFolders } from './mock'
+import { mockApi, mockListen, mockLocationRequest, mockSharedLocations, mockSyncedFolders } from './mock'
 import { normalizeSharedLocations } from './normalize'
 import { MOBILE_UI } from './platform'
 import { pickMobileFiles } from '../components/MobileFileSheet'
@@ -801,7 +801,9 @@ export const locationsApi = {
   hostedStatus: (id: string) => invoke<HostedLocationStatus>('hosted_location_status', { id }),
   save: (location: HostedLocation) => invoke<HostedLocation[]>('save_location', { location, removeId: null }),
   remove: (removeId: string) => invoke<HostedLocation[]>('save_location', { location: null, removeId }),
-  request: <T,>(friendId: string, request: Record<string, unknown>) => invoke<T>('location_request', { friendId, request }),
+  request: <T,>(friendId: string, request: Record<string, unknown>) => HAS_TAURI
+    ? invoke<T>('location_request', { friendId, request })
+    : (mockLocationRequest(request) as Promise<T>),
   list: (friendId: string) => HAS_TAURI
     ? invoke<unknown[]>('location_request', { friendId, request: { kind: 'locations.list' } }).then(normalizeSharedLocations)
     : mockSharedLocations(friendId),

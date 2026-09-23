@@ -16,9 +16,12 @@ export function Toasts() {
         display: 'flex',
         flexDirection: 'column',
         gap: 10,
-        zIndex: 100,
-        maxWidth: 380,
+        zIndex: 300,
+        maxWidth: 'min(380px, calc(100vw - 36px))',
       }}
+      role="region"
+      aria-label="Notifications"
+      aria-live="polite"
     >
       <AnimatePresence>
         {toasts.map((t) => {
@@ -33,18 +36,21 @@ export function Toasts() {
               animate={{ opacity: 1, x: 0, scale: 1 }}
               exit={{ opacity: 0, x: 40, scale: 0.96 }}
               transition={{ type: 'spring', stiffness: 380, damping: 30 }}
-              className="card"
+              className="card toast"
+              role={t.kind === 'error' ? 'alert' : 'status'}
               style={{
                 display: 'flex',
                 alignItems: 'flex-start',
                 gap: 10,
-                padding: '12px 14px',
-                borderRadius: 14,
+                padding: '11px 12px 11px 14px',
+                borderRadius: 'var(--radius-lg)',
+                boxShadow: 'var(--shadow-pop)',
+                borderLeft: `3px solid ${color}`,
               }}
             >
               <Icon size={18} color={color} style={{ flexShrink: 0, marginTop: 1 }} />
-              <div style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', lineHeight: 1.45, flex: 1 }}>{t.message}</div>
-              <button className="icon-btn" style={{ width: 24, height: 24 }} onClick={() => dismiss(t.id)}>
+              <div className="selectable" style={{ fontSize: 'var(--font-base)', lineHeight: 1.45, flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>{t.message}</div>
+              <button className="icon-btn icon-btn-sm" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
                 <X size={14} />
               </button>
             </motion.div>
