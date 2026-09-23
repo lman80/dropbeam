@@ -1,7 +1,7 @@
 import { loadLocations, nativeLocationRows, type CheckedLoad } from './locationsLoad'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { api, HAS_TAURI, type Settings, type Friend, locationsApi, type SharedLocation, type LocationPage } from './api'
+import { api, HAS_TAURI, isActive, type Settings, type Friend, locationsApi, type SharedLocation, type LocationPage } from './api'
 import { useStore, rememberLocationUpload, type View } from '../store'
 import { MOBILE_UI } from './platform'
 import { friendOnlineState } from './presence'
@@ -15,6 +15,7 @@ import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRi
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
 import { ownDeviceLabels, personGroups } from './deviceIcons'
+import { routeCode } from './codes'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -44,6 +45,32 @@ const handlers: BridgeHandlers = {
     if (!await st().receiveCode(string(a, 'code'))) throw new Error(st().toasts.at(-1)?.message || 'Could not receive files')
   },
   cancelTransfer: a => api.cancelTransfer(string(a, 'id')),
+  // Remove a finished card from the Send list (never an in-flight one).
+  dismissTransfer: a => {
+    const t = st().transfers[string(a, 'id')]
+    if (t && !isActive(t.state)) st().removeTransfer(t.id)
+  },
+  pauseTransfer: a => api.pauseTransfer(string(a, 'id')),
+  verifyTransfer: a => api.verifyTransfer(string(a, 'id')),
+  cancelVerify: a => api.cancelVerify(string(a, 'id')),
+  // A parked "wait for a direct link" send: go over the relay now.
+  forceRelay: a => api.forceRelay(string(a, 'id')),
+  // The Send screen's "Have a code?" takes every DropBeam code, like desktop.
+  // Folder invites need the native folder picker, so they're handed back to Swift.
+  openAnyCode: async a => {
+    const route = routeCode(string(a, 'code'))
+    switch (route.action) {
+      case 'receive': await handlers.receiveWithCode({ code: route.code }); return { kind: 'receive' }
+      case 'addFriend': await handlers.addFriendByCode({ code: route.code }); return { kind: 'friend' }
+      case 'acceptFriendInvite': await handlers.acceptFriend({ code: route.code }); return { kind: 'friend' }
+      case 'acceptFolderInvite': return { kind: 'folderInvite', code: route.code }
+      case 'linkDevice': {
+        const r = /^dropbeamjoin1:/i.test(route.code) ? await handlers.linkDeviceJoin({ code: route.code }) : await handlers.linkDeviceSend({ code: route.code })
+        return { kind: 'linked', name: (r as { name?: string } | undefined)?.name ?? null }
+      }
+      case 'invalid': throw new Error(route.message)
+    }
+  },
   retryTransfer: a => {
     const t = st().transfers[string(a, 'id')]
     if (t?.direction === 'receive') {

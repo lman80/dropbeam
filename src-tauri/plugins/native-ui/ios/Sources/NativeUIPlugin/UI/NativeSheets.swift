@@ -8,56 +8,89 @@ struct QRScannerSheet: View {
     let title: String
     /// Connect as soon as a QR code is recognized (no extra Continue tap).
     var autoSubmit = false
+    var hint = "Point the camera at a DropBeam QR code, or paste the code."
     let submit: (String) async throws -> Void
     @State private var paste = false
     @State private var code = ""
     @State private var busy = false
     @State private var error: String?
     @State private var cameraAllowed = false
+    @State private var cameraDenied = false
     @State private var scannerError: String?
+    @FocusState private var fieldFocused: Bool
+    private var scannerReady: Bool { cameraAllowed && DataScannerViewController.isSupported && DataScannerViewController.isAvailable && scannerError == nil }
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 24) {
-                    if cameraAllowed && DataScannerViewController.isSupported && DataScannerViewController.isAvailable && scannerError == nil && !paste {
+                VStack(spacing: 20) {
+                    if scannerReady && !paste {
                         ZStack {
-                            QRScanner { value in if !busy { code = value; paste = true; Haptics.tap(); if autoSubmit { connect() } } } failure: { scannerError = $0; paste = true }
-                            RoundedRectangle(cornerRadius: 24).stroke(.white.opacity(0.85), lineWidth: 2).padding(36).allowsHitTesting(false)
-                            VStack { Spacer(); Text("Place the QR code inside the frame").font(.subheadline).padding(12).background(.ultraThinMaterial, in: Capsule()).padding() }.allowsHitTesting(false)
-                        }.frame(height: 340).clipShape(RoundedRectangle(cornerRadius: 24)).accessibilityLabel("QR code camera")
+                            QRScanner { value in if !busy { code = value; Haptics.success(); if autoSubmit { connect() } else { paste = true } } } failure: { scannerError = $0; paste = true }
+                            RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(.white.opacity(0.9), lineWidth: 3).padding(44).allowsHitTesting(false)
+                            if busy { ProgressView().controlSize(.large).tint(.white).padding(20).background(.ultraThinMaterial, in: Circle()) }
+                        }
+                        .frame(height: 360).clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                        .accessibilityElement().accessibilityLabel("Camera viewfinder. Point it at a DropBeam QR code.")
+                        Text(hint).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     } else if !paste {
-                        BeamEmpty(symbol: "qrcode.viewfinder", title: "A code connects you.", detail: scannerError ?? "Camera scanning is unavailable. Paste a DropBeam code below.")
+                        unavailable
                     }
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: 16) {
-                            Button(paste ? "Scan QR Code" : "Paste code instead") { paste.toggle(); Haptics.tap() }.beamButton()
-                            if paste {
-                                TextField("DropBeam code", text: $code, axis: .vertical).textInputAutocapitalization(.never).autocorrectionDisabled().padding(14).background(.quaternary, in: RoundedRectangle(cornerRadius: 14))
-                                Button(busy ? "Connecting…" : "Continue", action: connect).beamButton(prominent: true).disabled(busy || code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if paste || !scannerReady {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("DropBeam Code").font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
+                            TextField("dropbeam:…", text: $code, axis: .vertical)
+                                .textInputAutocapitalization(.never).autocorrectionDisabled().font(.body.monospaced())
+                                .lineLimit(2...5).focused($fieldFocused).submitLabel(.go)
+                                .padding(14).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            HStack(spacing: 12) {
+                                PasteButton(payloadType: String.self) { strings in
+                                    Task { @MainActor in code = strings.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+                                }.buttonBorderShape(.capsule).tint(.beam).frame(maxWidth: .infinity)
+                                Button(action: connect) { Text(busy ? "Connecting…" : "Continue").frame(maxWidth: .infinity, minHeight: 32) }
+                                    .beamButton(prominent: true).disabled(busy || code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
-                            if let error { Text(error).foregroundStyle(.red).font(.subheadline) }
                         }
                     }
-                }.padding(20)
-            }.navigationTitle(title).navigationBarTitleDisplayMode(.inline).beamCanvas()
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(busy) } }
-                .task {
-                    guard DataScannerViewController.isSupported else { paste = true; return }
-                    switch AVCaptureDevice.authorizationStatus(for: .video) {
-                    case .authorized: cameraAllowed = true
-                    case .notDetermined: cameraAllowed = await AVCaptureDevice.requestAccess(for: .video)
-                    default: cameraAllowed = false
+                    if let error {
+                        Label(error, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading).accessibilityAddTraits(.updatesFrequently)
                     }
-                    if !cameraAllowed { paste = true }
+                    if scannerReady {
+                        Button(paste ? "Scan a QR Code Instead" : "Enter Code Instead") { paste.toggle(); error = nil; Haptics.tap(); if paste { fieldFocused = true } }
+                            .font(.subheadline.weight(.semibold))
+                    }
+                }.padding(20)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle(title).navigationBarTitleDisplayMode(.inline).beamCanvas()
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(busy) } }
+            .task {
+                guard DataScannerViewController.isSupported else { paste = true; return }
+                switch AVCaptureDevice.authorizationStatus(for: .video) {
+                case .authorized: cameraAllowed = true
+                case .notDetermined: cameraAllowed = await AVCaptureDevice.requestAccess(for: .video)
+                default: cameraAllowed = false
                 }
+                cameraDenied = !cameraAllowed
+                if !cameraAllowed { paste = true }
+            }
         }.tint(.beam).interactiveDismissDisabled(busy)
+    }
+    @ViewBuilder private var unavailable: some View {
+        ContentUnavailableView {
+            Label(cameraDenied ? "Camera Access Is Off" : "Scanning Unavailable", systemImage: "qrcode.viewfinder")
+        } description: {
+            Text(scannerError ?? (cameraDenied ? "Allow camera access in Settings to scan codes, or paste the code below." : "Paste a DropBeam code below."))
+        } actions: {
+            if cameraDenied { Button("Open Settings") { if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }.beamButton() }
+        }
     }
     private func connect() {
         guard !busy else { return }; busy = true; error = nil
         Task {
             defer { busy = false }
-            do { try await submit(code.trimmingCharacters(in: .whitespacesAndNewlines)); Haptics.tap(); dismiss() }
-            catch { self.error = error.localizedDescription }
+            do { try await submit(code.trimmingCharacters(in: .whitespacesAndNewlines)); Haptics.success(); dismiss() }
+            catch { self.error = error.localizedDescription; Haptics.warning(); paste = true }
         }
     }
 }
@@ -90,6 +123,7 @@ private struct QRScanner: UIViewControllerRepresentable {
     }
 }
 
+/// "Send to…" chooser after picking files from the Send tab or the share sheet.
 struct SendToSheet: View {
     @EnvironmentObject private var bridge: Bridge
     @Environment(\.dismiss) private var dismiss
@@ -97,29 +131,57 @@ struct SendToSheet: View {
     @State private var busy = false
     @State private var error: String?
     private func mine(_ friend: Friend) -> Bool { if friend.ownDevice { return true }; guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return false }; return friend.accountPub == account }
+    private var people: [Friend] { bridge.friends.filter { $0.groupedUnder == nil } }
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    Text(paths.count == 1 ? (paths[0] as NSString).lastPathComponent : "\(paths.count) files").font(.subheadline).foregroundStyle(.secondary)
-                    group("My Devices", friends: bridge.friends.filter(mine))
-                    group("Friends", friends: bridge.friends.filter { !mine($0) })
-                    Button { send(nil) } label: { GlassCard { HStack { FileGlyph(name: "", symbol: "qrcode"); Text("Quick Send (code)").font(.headline); Spacer(); Image(systemName: "chevron.right") } } }.buttonStyle(.plain)
-                    if let error { Text(error).foregroundStyle(.red) }
-                }.padding(20).disabled(busy)
-            }.navigationTitle("Send to").beamCanvas()
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(busy) } }
-                .task { try? await bridge.action("refreshRecipients") }
+            List {
+                Section {
+                    HStack(spacing: 14) {
+                        if paths.count == 1, let path = paths.first, LocalMedia(path: path) != nil {
+                            MediaThumbnail(path: path, width: 44, height: 44).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        } else { FileGlyph(name: paths.first ?? "", symbol: paths.count > 1 ? "doc.on.doc" : nil) }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(paths.count == 1 ? (paths[0] as NSString).lastPathComponent : "\(paths.count) items").font(.headline).lineLimit(2)
+                            Text(sizeLabel).font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }.accessibilityElement(children: .combine)
+                }
+                if let error { Section { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) } }
+                group("My Devices", friends: people.filter(mine), empty: "Link your other devices in Settings → My Devices.")
+                group("Friends", friends: people.filter { !mine($0) }, empty: "Add a friend to send by name.")
+                Section {
+                    Button { send(nil) } label: {
+                        HStack(spacing: 14) {
+                            RowIcon(symbol: "qrcode", color: .beam)
+                            VStack(alignment: .leading, spacing: 2) { Text("Quick Send with a Code").foregroundStyle(.primary); Text("Anyone with DropBeam can receive").font(.subheadline).foregroundStyle(.secondary) }
+                        }.contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                } footer: { Text("You’ll get a code and QR to share. The files stay on this iPhone until someone receives them.") }
+            }
+            .beamList()
+            .disabled(busy)
+            .overlay { if busy { ProgressView("Sending…").padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20)) } }
+            .navigationTitle("Send To").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(busy) } }
+            .task { try? await bridge.action("refreshRecipients") }
         }.tint(.beam).interactiveDismissDisabled(busy)
     }
-    private func group(_ title: String, friends: [Friend]) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title).font(.title2.weight(.semibold))
-            if friends.isEmpty { GlassCard { Text(title == "My Devices" ? "Your linked devices appear here." : "Add a friend to send by name.").foregroundStyle(.secondary) } }
+    private var sizeLabel: String {
+        let total = paths.reduce(0.0) { sum, path in sum + ((try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.doubleValue ?? 0) }
+        return total > 0 ? Formatters.bytes(total) : "Ready to send"
+    }
+    @ViewBuilder private func group(_ title: String, friends: [Friend], empty: String) -> some View {
+        Section(title) {
+            if friends.isEmpty { Text(empty).foregroundStyle(.secondary) }
             ForEach(friends) { friend in
                 Button { send(friend.id) } label: {
-                    GlassCard { HStack(spacing: 14) { ContactAvatar(friend: friend); VStack(alignment: .leading, spacing: 5) { Text(friend.displayName).font(.headline).foregroundStyle(.primary); PresenceLabel(online: bridge.presence[friend.id] == true) }; Spacer(); Image(systemName: "chevron.right").foregroundStyle(.tertiary) } }
-                }.buttonStyle(.plain)
+                    HStack(spacing: 14) {
+                        ContactAvatar(friend: friend, size: 42)
+                        VStack(alignment: .leading, spacing: 2) { Text(friend.displayName).font(.body.weight(.semibold)).foregroundStyle(.primary).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }; PresenceLabel(online: bridge.presence[friend.id] == true) }
+                        Spacer()
+                        Image(systemName: "paperplane.fill").foregroundStyle(.tint)
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain).accessibilityLabel("Send to \(friend.displayName), \(bridge.presence[friend.id] == true ? "online" : "offline")")
             }
         }
     }
@@ -130,8 +192,8 @@ struct SendToSheet: View {
             do {
                 if let friend { try await bridge.sendToFriend(friendId: friend, paths: paths) }
                 else { try await bridge.action("quickSend", ["paths": paths]) }
-                bridge.pendingSend = []; Haptics.tap(); dismiss()
-            } catch { self.error = error.localizedDescription }
+                bridge.pendingSend = []; Haptics.success(); dismiss()
+            } catch { self.error = error.localizedDescription; Haptics.warning() }
         }
     }
 }
@@ -142,33 +204,46 @@ struct OnboardingSheet: View {
     @State private var busy = false
     @State private var error: String?
     @State private var joining = false
+    @FocusState private var focused: Bool
+    private var valid: Bool { !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     var body: some View {
         ScrollView {
             VStack(spacing: 28) {
-                Image(systemName: "paperplane.fill").font(.system(size: 64, weight: .light)).foregroundStyle(.tint).padding(.top, 40)
-                Text("Welcome to DropBeam").font(.largeTitle.bold()).multilineTextAlignment(.center)
-                GlassCard {
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text("What should people call you?").font(.headline)
-                        TextField("Your name", text: $name).textContentType(.name).textInputAutocapitalization(.words).padding(14).background(.quaternary, in: RoundedRectangle(cornerRadius: 14))
-                        Text("Friends see this name when you send files and chat. You can change it anytime in Settings. You can finish setup without a network connection.").foregroundStyle(.secondary)
-                    }
+                VStack(spacing: 16) {
+                    Image(systemName: "paperplane.fill").font(.system(size: 46, weight: .semibold)).foregroundStyle(.white)
+                        .frame(width: 96, height: 96)
+                        .background(LinearGradient(colors: [.beam, .blue], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                        .shadow(color: .beam.opacity(0.35), radius: 18, y: 8).accessibilityHidden(true)
+                    Text("Welcome to DropBeam").font(.largeTitle.bold()).multilineTextAlignment(.center)
+                    Text("Send photos and files straight to friends and your own devices — fast, private, end-to-end encrypted.")
+                        .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }.padding(.top, 36)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("What should friends call you?").font(.headline)
+                    TextField("Your name", text: $name).textContentType(.name).textInputAutocapitalization(.words)
+                        .submitLabel(.continue).onSubmit(save).focused($focused)
+                        .padding(14).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    Text("Shown when you send files and chat. You can change it anytime in Settings.").font(.footnote).foregroundStyle(.secondary)
                 }
-                if let error { Text(error).foregroundStyle(.red) }
-                Button(busy ? "Saving…" : "Continue") {
-                    busy = true
-                    Task { defer { busy = false }; do { try await bridge.action("setDisplayName", ["name": name]); bridge.needsName = false } catch { self.error = error.localizedDescription } }
-                }.frame(minHeight: 44).beamButton(prominent: true).disabled(busy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                GlassCard {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Label("Already use DropBeam?", systemImage: "laptopcomputer.and.iphone").font(.headline)
-                        Text("Bring your friends and chats over: on your other device open Settings → Devices → Add a Device, then scan its code.").foregroundStyle(.secondary)
-                        Button { joining = true; Haptics.tap() } label: { Label("Scan Code", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
-                    }
-                }
-            }.padding(24)
-        }.beamCanvas().tint(.beam).interactiveDismissDisabled().onAppear { name = bridge.settings?.displayName ?? "" }
+                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.subheadline) }
+                Button(action: save) { Text(busy ? "Saving…" : "Continue").font(.headline).frame(maxWidth: .infinity, minHeight: 36) }
+                    .beamButton(prominent: true).controlSize(.large).disabled(busy || !valid)
+                VStack(spacing: 8) {
+                    Text("Already use DropBeam on another device?").font(.subheadline).foregroundStyle(.secondary)
+                    Button { joining = true; Haptics.tap() } label: { Label("Link to Your Account", systemImage: "qrcode.viewfinder") }
+                        .font(.subheadline.weight(.semibold))
+                }.padding(.top, 4)
+            }.padding(24).frame(maxWidth: 520).frame(maxWidth: .infinity)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .beamCanvas().tint(.beam).interactiveDismissDisabled()
+        .onAppear { name = bridge.settings?.displayName ?? "" }
         .sheet(isPresented: $joining) { JoinAccountSheet() }
+    }
+    private func save() {
+        guard valid, !busy else { return }
+        busy = true; focused = false
+        Task { defer { busy = false }; do { try await bridge.action("setDisplayName", ["name": name]); Haptics.success(); bridge.needsName = false } catch { self.error = error.localizedDescription } }
     }
 }
 
@@ -180,17 +255,23 @@ struct FolderInviteSheet: View {
     @State private var error: String?
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 24) {
-                    BeamEmpty(symbol: "folder.badge.person.crop", title: invite.folderName, detail: "\(invite.fromName) wants to share this folder with you. Import a folder into DropBeam in Files to keep its local copy in sync.")
-                    Button(busy ? "Joining…" : "Accept & Import Folder") {
+            ContentUnavailableView {
+                Label(invite.folderName, systemImage: "folder.fill.badge.person.crop")
+            } description: {
+                Text("\(invite.fromName) wants to share this folder with you. Choose a folder in Files to keep in sync with theirs.")
+            } actions: {
+                VStack(spacing: 12) {
+                    Button {
                         busy = true
-                        Task { defer { busy = false }; do { let accepted: Bool = try await bridge.call("acceptFolderInvite", ["code": invite.code]); if accepted { bridge.showToast("Joined shared folder"); dismiss() } } catch { self.error = error.localizedDescription } }
-                    }.beamButton(prominent: true).disabled(busy)
-                    if let error { Text(error).foregroundStyle(.red) }
-                }.padding(20)
-            }.navigationTitle("Folder Invite").beamCanvas()
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Decline") { dismiss() }.disabled(busy) } }
-        }.interactiveDismissDisabled(busy)
+                        Task { defer { busy = false }; do { let accepted: Bool = try await bridge.call("acceptFolderInvite", ["code": invite.code]); if accepted { Haptics.success(); bridge.showToast("Joined shared folder"); dismiss() } } catch { self.error = error.localizedDescription } }
+                    } label: { Text(busy ? "Joining…" : "Choose Folder & Join").frame(minWidth: 220, minHeight: 32) }
+                        .beamButton(prominent: true).disabled(busy)
+                    if let error { Text(error).font(.subheadline).foregroundStyle(.red) }
+                }
+            }
+            .beamCanvas()
+            .navigationTitle("Shared Folder Invite").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Decline") { dismiss() }.disabled(busy) } }
+        }.tint(.beam).interactiveDismissDisabled(busy).presentationDetents([.medium, .large])
     }
 }

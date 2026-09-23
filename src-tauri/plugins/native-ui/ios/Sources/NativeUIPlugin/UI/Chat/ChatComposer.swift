@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ChatComposer: View {
     @EnvironmentObject private var bridge: Bridge
@@ -41,6 +42,9 @@ struct ChatComposer: View {
                     Menu {
                         Button { pick("photos") } label: { Label("Photos", systemImage: "photo.on.rectangle.angled") }
                         Button { pick("files") } label: { Label("Files", systemImage: "folder") }
+                        if UIPasteboard.general.hasImages {
+                            Button { pasteImage() } label: { Label("Paste Image", systemImage: "doc.on.clipboard") }
+                        }
                         if bridge.settings?.giphyApiKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
                             Button { focused = false; gifPicker = true } label: { Label("GIFs", systemImage: "magnifyingglass") }
                         }
@@ -108,6 +112,17 @@ struct ChatComposer: View {
             catch { picking = false; throw error }
             // Unlock + immediately on the picker reply, before any staging reply.
             picking = false
+            guard !paths.isEmpty, bridge.chatPath.last == friendID else { return }
+            try await bridge.action("stageChatFiles", ["friendId": friendID, "paths": paths])
+        }
+    }
+    /// Stage the clipboard's image(s) like picked photos (screenshots are the #1 paste).
+    private func pasteImage() {
+        focused = false; reply = nil
+        bridge.perform {
+            let images = UIPasteboard.general.images ?? []
+            guard !images.isEmpty else { return }
+            let paths = try await Task.detached(priority: .userInitiated) { try PastedImages.save(images) }.value
             guard !paths.isEmpty, bridge.chatPath.last == friendID else { return }
             try await bridge.action("stageChatFiles", ["friendId": friendID, "paths": paths])
         }
@@ -182,5 +197,25 @@ private struct ChatGifPicker: View {
                     } catch is CancellationError {} catch { if !Task.isCancelled { self.error = error.localizedDescription; loading = false } }
                 }
         }.tint(.beam)
+    }
+}
+
+/// Pasted images are written as files so they ride the normal staged-attachment path.
+enum PastedImages {
+    static func save(_ images: [UIImage]) throws -> [String] {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Pasted", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Keep the folder small: drop pastes older than a day.
+        let old = Date().addingTimeInterval(-86_400)
+        for url in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
+            if let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, date < old { try? FileManager.default.removeItem(at: url) }
+        }
+        let stamp = Date().formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false).timeSeparator(.omitted).dateSeparator(.dash)).replacingOccurrences(of: ":", with: "")
+        return try images.enumerated().compactMap { index, image in
+            guard let data = image.pngData() else { return nil }
+            let url = dir.appendingPathComponent("Pasted \(stamp)\(images.count > 1 ? "-\(index + 1)" : "").png")
+            try data.write(to: url, options: .atomic)
+            return url.path
+        }
     }
 }

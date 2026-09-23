@@ -24,6 +24,11 @@ import Foundation
         let rows = try decode(LossyArray<FriendLocations>.self, #"[{"friendId":"a","friendName":"A","online":true,"locations":[{"id":"n","name":"NAS","rights":{"upload":true},"freeBytes":5e9,"totalBytes":-1}],"status":"offline","checking":true,"checkedAt":1700000000000},{"friendId":"b","error":"x"}]"#).values
         precondition(rows[0].status == "offline" && rows[0].checking && rows[0].checkedAt == 1_700_000_000_000 && rows[0].locations[0].freeBytes == 5e9 && rows[0].locations[0].totalBytes == nil)
         precondition(rows[1].status == "error" && !rows[1].checking && rows[1].checkedAt == nil)
-        print("8 native model regression checks passed")
+        let moving = try decode(LossyArray<Transfer>.self, #"[{"id":"t1","state":"transferring","locality":"internet","connDetail":{"path":"relay","rttMs":42.4,"upgrading":true},"verify":{"state":"done","checked":2,"total":2,"mismatched":[],"missing":["b"]},"integrity":[{"name":"a","verified":true},{"verified":true}]},{"id":"t2","locality":"local","connDetail":"bad","verify":7,"integrity":{}}]"#).values
+        precondition(moving.count == 2 && moving[0].routeLabel == "Relay · going direct · 42 ms" && moving[0].verify?.missing == ["b"] && moving[0].integrity?.count == 1 && moving[0].integrityVerified)
+        precondition(moving[1].routeLabel == "Local" && moving[1].connDetail == nil && moving[1].verify == nil && !moving[1].integrityVerified)
+        let opened = try decode(OpenCodeResult.self, #"{"kind":"folderInvite","code":"dropbeam-folder:x"}"#)
+        precondition(opened.kind == "folderInvite" && opened.code == "dropbeam-folder:x" && opened.name == nil)
+        print("11 native model regression checks passed")
     }
 }
