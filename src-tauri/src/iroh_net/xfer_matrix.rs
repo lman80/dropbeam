@@ -284,8 +284,10 @@ async fn friend(paths: &[PathBuf], dest: &Path) -> Result<u64> {
     let results = rx.await?;
     client.close().await;
     server.close().await;
-    for r in results { r.map_err(|e| anyhow::anyhow!("receiver: {e}"))?; }
-    sent
+    // The SENDER's own outcome is what the user sees; report it first.
+    let sent = sent?;
+    for r in results { r.map_err(|e| anyhow::anyhow!("receiver task: {e}"))?; }
+    Ok(sent)
 }
 
 async fn quick(paths: &[PathBuf], dest: &Path) -> Result<u64> {
@@ -1183,4 +1185,62 @@ async fn matrix_resend_after_collision_does_not_pile_up_copies() {
         assert_eq!(sha(&dest.join("notes (1).txt")), sha(&small));
         assert_eq!(sha(&dest.join("movie (1).mov")), sha(&big));
     }
+}
+
+/// A REAL full disk (a tiny HFS+ image mounted in scratch; macOS only, run
+/// explicitly): a receive that runs out of space fails promptly on both ends
+/// with no visible partial file, keeps nothing half-written under a real name,
+/// and once space is freed a retry lands byte-identical.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "mounts a disk image; run with --ignored"]
+async fn matrix_disk_full_fails_cleanly_then_retry_lands() {
+    let _gate = PACE_GATE.read().await;
+    let base = scratch("diskfull");
+    let image = base.0.join("tiny.dmg");
+    let mount = base.0.join("vol");
+    std::fs::create_dir_all(&mount).unwrap();
+    let ok = |c: &mut std::process::Command| assert!(c.status().unwrap().success(), "{c:?}");
+    ok(std::process::Command::new("hdiutil").args(["create", "-size", "12m", "-fs", "HFS+", "-volname", "dbfull", "-quiet"]).arg(&image));
+    ok(std::process::Command::new("hdiutil").args(["attach", "-nobrowse", "-quiet", "-mountpoint"]).arg(&mount).arg(&image));
+    struct Detach(PathBuf);
+    impl Drop for Detach { fn drop(&mut self) { let _ = std::process::Command::new("hdiutil").args(["detach", "-force", "-quiet"]).arg(&self.0).status(); } }
+    let _detach = Detach(mount.clone());
+    let src = scratch("diskfull-src");
+    // Too big for the ~10 MiB free: classic (under the parallel threshold) and
+    // a small batch whose LAST file overflows.
+    let big = put(&src.0, "too-big.bin", 14 << 20, 1);
+    let batch = vec![put(&src.0, "fits-1.bin", 3 << 20, 2), put(&src.0, "fits-2.bin", 3 << 20, 3), put(&src.0, "overflows.bin", 8 << 20, 4)];
+    for via in [Via::Push, Via::Friend, Via::Quick] {
+        for paths in [vec![big.clone()], batch.clone()] {
+            let dest = mount.join(format!("{via:?}"));
+            std::fs::create_dir_all(&dest).unwrap();
+            let started = Instant::now();
+            let err = transfer(via, &paths, &dest, QUICK).await.expect_err("a full disk must fail the receive");
+            assert!(!format!("{err:#}").contains("HUNG") && started.elapsed() < Duration::from_secs(30), "{via:?}: {err:#} after {:?}", started.elapsed());
+            eprintln!("{via:?} {}: {err:#}", paths.len());
+            if via == Via::Friend { assert!(format!("{err:#}").contains("their disk is full"), "{err:#}"); }
+            for p in tree(&dest) {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                assert!(!name.starts_with(".dropbeam-recv-"), "{via:?}: stage litter {p:?}");
+                if !name.starts_with(".dropbeam-") {
+                    // Anything visible is a COMPLETE file.
+                    let src = paths.iter().find(|s| s.file_name().unwrap().to_string_lossy() == name).unwrap();
+                    assert_eq!(sha(&dest.join(&p)), sha(src), "{via:?}: a truncated {name} is visible");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+    }
+    // Space freed: the same send now lands.
+    let dest = mount.join("after");
+    transfer(Via::Friend, &batch[..2], &dest, QUICK).await.unwrap();
+    assert_landed(Via::Friend, &batch[..2], &dest, &[]);
+}
+
+#[test]
+fn disk_full_is_recognised_through_context() {
+    let raw = anyhow::Error::from(std::io::Error::from_raw_os_error(if cfg!(windows) { 112 } else { 28 })).context("writing stage");
+    assert!(is_disk_full(&raw));
+    assert!(!is_disk_full(&anyhow::anyhow!("permission denied")));
 }

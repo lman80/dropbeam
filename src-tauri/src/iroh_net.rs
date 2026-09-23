@@ -707,7 +707,7 @@ async fn receive_with_landed<T>(
         let result = body.await;
         let terminal = match &result {
             Ok(_) => serde_json::json!({"landed": total, "ok": true}),
-            Err(e) => serde_json::json!({"error": crate::telemetry::redact_paths_only(&format!("{e:#}"))}),
+            Err(e) => serde_json::json!({"error": receiver_error_text(e)}),
         };
         let _ = terminal_tx.send(integrity::terminal(terminal));
         result
@@ -759,8 +759,26 @@ async fn receive_with_landed<T>(
 // Also covers preparation/finalization errors outside the wrapped receive body.
 // If the body already sent a terminal frame, the finished stream rejects this
 // write immediately, so it cannot append a second terminal receipt.
+/// True when the error chain bottoms out in "no space left on the device"
+/// (ENOSPC on macOS/Linux; ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL on Windows).
+fn is_disk_full(error: &anyhow::Error) -> bool {
+    error.chain().filter_map(|e| e.downcast_ref::<std::io::Error>()).any(|e| {
+        e.kind() == std::io::ErrorKind::StorageFull
+            || matches!(e.raw_os_error(), Some(code) if (cfg!(unix) && code == 28) || (cfg!(windows) && (code == 112 || code == 39)))
+    })
+}
+
+/// A receive failure as the SENDER will read it (shown verbatim on their card):
+/// plain words for a full disk, the redacted technical chain otherwise.
+fn receiver_error_text(error: &anyhow::Error) -> String {
+    if is_disk_full(error) {
+        return "their disk is full — once they free up space, retry and it picks up where it stopped".into();
+    }
+    crate::telemetry::redact_paths_only(&format!("{error:#}"))
+}
+
 async fn send_receiver_error(send: &mut SendStream, error: &anyhow::Error) {
-    let frame = integrity::terminal(serde_json::json!({"error": crate::telemetry::redact_paths_only(&format!("{error:#}"))}));
+    let frame = integrity::terminal(serde_json::json!({"error": receiver_error_text(error)}));
     if matches!(
         tokio::time::timeout(Duration::from_secs(5), integrity::write_terminal(send, &frame)).await,
         Ok(Ok(()))
@@ -8502,7 +8520,7 @@ async fn read_pull_files_negotiated_inner<F: Fn(u64, u64)>(
     if integrity::enabled(&header) {
         let frame = match &result {
             Ok(_) => integrity::terminal(serde_json::json!({"ok": true, "landed": header["total"]})),
-            Err(e) => integrity::terminal(serde_json::json!({"error": crate::telemetry::redact_paths_only(&format!("{e:#}"))})),
+            Err(e) => integrity::terminal(serde_json::json!({"error": receiver_error_text(e)})),
         };
         if let Err(e) = integrity::write_terminal(send, &frame).await {
             log::warn!("Quick Send receipt output failed: {e:#}");
@@ -9270,7 +9288,7 @@ async fn receive_location_headless_progress<F: Fn(u64, u64)>(conn: &Connection, 
     if integrity::enabled(header) {
         let frame = match &result {
             Ok(()) => integrity::terminal(serde_json::json!({"ok": true, "landed": header["total"]})),
-            Err(e) => integrity::terminal(serde_json::json!({"error": crate::telemetry::redact_paths_only(&format!("{e:#}"))})),
+            Err(e) => integrity::terminal(serde_json::json!({"error": receiver_error_text(e)})),
         };
         integrity::write_terminal(send, &frame).await?;
     } else if result.is_ok() { send.write_all(b"ok").await?; }
