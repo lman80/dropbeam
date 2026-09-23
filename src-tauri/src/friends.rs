@@ -59,6 +59,7 @@ fn read_raw(config_dir: &Path) -> Vec<Friend> {
 /// contact after update" failure, so we refuse it: if we're about to write `[]`
 /// but the file on disk still holds real records, abort rather than overwrite.
 fn save_inner(config_dir: &Path, friends: &[Friend], allow_empty: bool) -> Result<(), String> {
+    crate::account::note_change();
     let _ = fs::create_dir_all(config_dir);
     let txt = serde_json::to_string_pretty(friends).map_err(|e| e.to_string())?;
     if friends.is_empty() && !allow_empty {
@@ -120,6 +121,7 @@ pub fn create(
         progress_v: None,
         device_kind: None,
         account_pub: None,
+        device_os: None,
     };
     let invite = Invite {
         v: 1,
@@ -165,6 +167,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         progress_v: None,
         device_kind: None,
         account_pub: None,
+        device_os: None,
     };
     let detached = detached_threads(config_dir)?;
     friends.push(friend.clone());
@@ -214,6 +217,7 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         progress_v: None,
         device_kind: None,
         account_pub: None,
+        device_os: None,
     });
     let _ = save(config_dir, &friends);
 }
@@ -487,6 +491,7 @@ pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, o
         progress_v: None,
         device_kind: None,
         account_pub: None,
+        device_os: None,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -625,6 +630,7 @@ pub fn self_heal_chat_sender(
         progress_v: None,
         device_kind: None,
         account_pub: None,
+        device_os: None,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -838,6 +844,7 @@ mod tests {
             progress_v: None,
             device_kind: None,
             account_pub: None,
+            device_os: None,
         }
     }
 
@@ -865,6 +872,7 @@ mod tests {
             progress_v: None,
             device_kind: None,
             account_pub: None,
+            device_os: None,
         }
     }
 
@@ -1095,6 +1103,7 @@ mod tests {
                 edited: false,
                 deleted: false,
                 gif: None,
+                rev: 0,
             },
         );
     }
@@ -1311,7 +1320,134 @@ pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &ser
     let key = req["account_pub"].as_str().filter(|key| {
         crate::link::verify_account(key, req["account_sig"].as_str().unwrap_or(""), endpoint_id)
     });
+    // A device the user removed from their account stays a plain contact even
+    // though it still holds the key, until it is linked again.
+    let key = key.filter(|k| !crate::account::is_removed_device(config_dir, k, endpoint_id));
     set_device_info(config_dir, endpoint_id, req["device_kind"].as_str(), key);
+    if let Some(os) = req["device_os"].as_str().filter(|os| !os.is_empty() && os.len() <= 16) {
+        set_device_os(config_dir, endpoint_id, os);
+    }
+}
+
+pub(crate) fn set_device_os(config_dir: &Path, endpoint_id: &str, os: &str) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        if f.device_os.as_deref() != Some(os) {
+            f.device_os = Some(os.to_owned());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &friends);
+    }
+}
+
+/// Record (or refresh) one of the user's OWN devices, learned from another own
+/// device's roster. Keeps the roster's `created_at` for a new record so a later
+/// "removed" tombstone compares against when the device was linked, not when
+/// this copy happened to hear about it.
+pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str, kind: Option<&str>,
+    os: Option<&str>, account_pub: &str, created_at: u64) -> bool {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    let name = clean_name(name, "My device");
+    if let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        let mut changed = false;
+        if f.account_pub.as_deref() != Some(account_pub) { f.account_pub = Some(account_pub.to_owned()); changed = true; }
+        if kind.is_some() && f.device_kind.as_deref() != kind { f.device_kind = kind.map(str::to_owned); changed = true; }
+        if os.is_some() && f.device_os.as_deref() != os { f.device_os = os.map(str::to_owned); changed = true; }
+        if !f.name_custom && f.name != name { f.name = name; changed = true; }
+        if changed { let _ = save(config_dir, &friends); }
+        return changed;
+    }
+    friends.push(Friend {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: PairRole::B,
+        name,
+        secret: random_secret(),
+        created_at: if created_at > 0 { created_at } else { now_ms() },
+        auto_accept: true,
+        endpoint_id: Some(endpoint_id.to_owned()),
+        avatar: None,
+        name_custom: false,
+        progress_v: None,
+        device_kind: kind.map(str::to_owned),
+        account_pub: Some(account_pub.to_owned()),
+        device_os: os.map(str::to_owned),
+    });
+    let _ = save(config_dir, &friends);
+    true
+}
+
+/// A friend record as one of the user's own devices shares it.
+pub(crate) struct SyncedFriend<'a> {
+    pub endpoint_id: &'a str,
+    pub name: &'a str,
+    pub name_custom: bool,
+    pub created_at: u64,
+    pub auto_accept: bool,
+    pub device_kind: Option<&'a str>,
+    pub device_os: Option<&'a str>,
+    pub account_pub: Option<&'a str>,
+}
+
+/// Adopt a friend another own device knows. Returns (local friend, newly added).
+/// An existing record keeps its local choices, except that a rename the user
+/// made on the other device is adopted when this one was never renamed here.
+pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Friend, bool) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    if let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(r.endpoint_id)) {
+        let mut changed = false;
+        if r.name_custom && !f.name_custom && !r.name.trim().is_empty() {
+            f.name = clean_name(r.name, &f.name.clone());
+            f.name_custom = true;
+            changed = true;
+        }
+        if f.device_kind.is_none() && r.device_kind.is_some() { f.device_kind = r.device_kind.map(str::to_owned); changed = true; }
+        if f.device_os.is_none() && r.device_os.is_some() { f.device_os = r.device_os.map(str::to_owned); changed = true; }
+        if f.account_pub.is_none() && r.account_pub.is_some() { f.account_pub = r.account_pub.map(str::to_owned); changed = true; }
+        let out = f.clone();
+        if changed { let _ = save(config_dir, &friends); }
+        return (out, false);
+    }
+    let id = detached_threads(config_dir).ok()
+        .and_then(|d| d.get(r.endpoint_id).cloned())
+        .filter(|id| !friends.iter().any(|f| &f.id == id))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let friend = Friend {
+        id,
+        role: PairRole::B,
+        name: clean_name(r.name, "Friend"),
+        secret: random_secret(),
+        created_at: if r.created_at > 0 { r.created_at } else { now_ms() },
+        auto_accept: r.auto_accept,
+        endpoint_id: Some(r.endpoint_id.to_owned()),
+        avatar: None,
+        name_custom: r.name_custom,
+        progress_v: None,
+        device_kind: r.device_kind.map(str::to_owned),
+        account_pub: r.account_pub.map(str::to_owned),
+        device_os: r.device_os.map(str::to_owned),
+    };
+    friends.push(friend.clone());
+    let _ = save(config_dir, &friends);
+    (friend, true)
+}
+
+/// Clear the account claim on every record that carries `account_pub` (this
+/// device left that account): they become ordinary contacts again.
+pub(crate) fn clear_account(config_dir: &Path, account_pub: &str) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.account_pub.as_deref() == Some(account_pub)) {
+        f.account_pub = None;
+        changed = true;
+    }
+    if changed { let _ = save(config_dir, &friends); }
 }
 
 #[cfg(test)]

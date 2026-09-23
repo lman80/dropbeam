@@ -1,5 +1,6 @@
 import { deviceKindLabel } from '../lib/deviceIcons'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
+import { DevicesPanel } from '../components/DevicesPanel'
 import { useEffect, useState, type ReactNode } from 'react'
 import { CheckCircle2, Download, FolderOpen, HardDrive, RefreshCw, Trash2 } from 'lucide-react'
 import { api, type Settings } from '../lib/api'
@@ -247,7 +248,7 @@ export function SettingsView() {
         Settings
       </h1>
       {deviceModals}
-      <section className="card" style={{ padding: 18, marginBottom: 16 }}><h2>Devices</h2><Row title={deviceDescription} desc={linkedDescription} /><div className="device-link-actions"><button className="btn btn-ghost" onClick={() => setLinkMode('new')}>Link a new device</button><button className="btn btn-ghost" onClick={() => setLinkMode('this')}>Link this device to my account</button></div></section>
+      <DevicesPanel />
       {!MOBILE_UI && <LocationSettings />}
 
       <SectionTitle>Profile</SectionTitle>

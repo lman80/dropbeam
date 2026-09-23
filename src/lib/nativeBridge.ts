@@ -1,7 +1,7 @@
 import { loadLocations } from './locationsLoad'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { api, HAS_TAURI, type Settings, locationsApi, type SharedLocation, type LocationPage } from './api'
+import { api, HAS_TAURI, type Settings, type Friend, locationsApi, type SharedLocation, type LocationPage } from './api'
 import { useStore, rememberLocationUpload, type View } from '../store'
 import { MOBILE_UI } from './platform'
 import { friendOnlineState } from './presence'
@@ -14,6 +14,7 @@ import { restoredChatTransfer } from './chatTransfer'
 import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRight } from './nativePhase3'
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
+import { ownDeviceLabels } from './deviceIcons'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -155,8 +156,19 @@ const handlers: BridgeHandlers = {
     const result = await api.linkDeviceSend(string(a, 'code'))
     await st().reloadFriends()
     await st().refreshMyDevice()
-    return { endpointId: result.endpoint_id, name: result.name, deviceKind: result.device_kind }
+    return { endpointId: result.endpoint_id, name: result.name, deviceKind: result.device_kind, deviceOs: result.device_os ?? null }
   },
+  linkHostBegin: () => api.linkHostBegin(),
+  linkHostCancel: () => api.linkHostCancel(),
+  linkDeviceJoin: async a => {
+    const result = await api.linkDeviceJoin(string(a, 'code'))
+    await st().reloadFriends()
+    await st().refreshMyDevice()
+    return { endpointId: result.endpoint_id, name: result.name, deviceKind: result.device_kind, deviceOs: result.device_os ?? null }
+  },
+  accountSyncNow: async () => { await api.accountSyncNow(); await st().refreshMyDevice() },
+  accountRemoveDevice: async a => { await api.accountRemoveDevice(string(a, 'endpointId')); await st().reloadFriends() },
+  accountLeave: async () => { await api.accountLeave(); await st().reloadFriends() },
   updateSettings: a => {
     if (!a.patch || typeof a.patch !== 'object' || Array.isArray(a.patch)) throw new Error('Invalid settings patch')
     return storeAction(() => st().saveSettings(a.patch as Partial<Settings>))
@@ -249,7 +261,17 @@ let locationRefreshQueued = false
 let resnapshot: ((force?: boolean) => void) | undefined
 let pushLocations: (() => void) | undefined
 const needsName = () => !!st().settings && (!st().settings!.displayName.trim() || !localStorage.getItem('dropbeam.namedSelf'))
-const deviceSnapshot = () => { const d = st().myDevice; return d ? { name: d.name, endpointId: d.endpoint_id, deviceKind: d.device_kind, accountPub: d.account_pub, linkedDevices: d.linked_devices } : null }
+const deviceSnapshot = () => {
+  const d = st().myDevice
+  return d ? { name: d.name, endpointId: d.endpoint_id, deviceKind: d.device_kind, deviceOs: d.device_os ?? null, accountPub: d.account_pub, linkedDevices: d.linked_devices,
+    devices: (d.devices ?? []).map(x => ({ friendId: x.friend_id, endpointId: x.endpoint_id, name: x.name, deviceKind: x.device_kind, deviceOs: x.device_os, lastSyncMs: x.last_sync_ms, thisDevice: x.this_device })) } : null
+}
+/** Friends as Swift sees them: own devices flagged and labelled "Your Mac" etc. */
+const friendSnapshot = (friends: Friend[], accountPub?: string | null) => {
+  const own = friends.filter(f => accountPub && f.accountPub === accountPub)
+  const labels = ownDeviceLabels(own)
+  return friends.map(({ secret: _secret, ...friend }) => ({ ...friend, ownDevice: friend.id in labels, ownLabel: labels[friend.id] ?? null }))
+}
 const locationSnapshot = () => st().friends.map(f => ({ friendId: f.id, friendName: f.name, online: friendOnlineState(f.name, st().friendSeen, st().folderStatuses) === true, locations: shared[f.id] ?? [], error: locationErrors[f.id] ?? null }))
 function refreshLocations(force = false) {
   if (refreshing) { locationRefreshQueued ||= force; return refreshing }
@@ -350,7 +372,7 @@ async function start() {
       return
     }
     const snapshots = {
-      friends: s.friends.map(({ secret: _secret, ...friend }) => friend),
+      friends: friendSnapshot(s.friends, s.myDevice?.account_pub),
       transfers: nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
         .filter(t => !(t.state === 'canceled' && !t.fileNames.length)),
         Object.assign({}, ...(s.activeChatId ? s.chats[s.activeChatId] ?? [] : []).map(m => {
@@ -400,7 +422,12 @@ async function start() {
       if (name === 'locations://changed') void refreshLocations(true)
     })) } catch { /* optional event */ }
   }
-  try { stops.push(await listen('friends://changed', () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
+  for (const name of ['friends://changed', 'account://synced', 'link://linked']) {
+    try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
+  }
+  for (const name of ['link://linked', 'account://left', 'link://failed']) {
+    try { stops.push(await listen(name, ({ payload }) => send('event', { name, payload }))) } catch { /* optional event */ }
+  }
 }
 if (import.meta.hot) import.meta.hot.dispose(() => {
   cleanup?.()

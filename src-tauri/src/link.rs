@@ -7,6 +7,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::{chat::{self, ChatMessage}, friends, iroh_net::{self, IrohState}, AppState};
 
 const PREFIX: &str = "dropbeamlink1:";
+/// Shown by a device that already has the account: a new device scans it and
+/// asks to join (the reverse of `PREFIX`, where the new device shows the code).
+const JOIN_PREFIX: &str = "dropbeamjoin1:";
 const TTL: Duration = Duration::from_secs(600);
 pub(crate) const MAX_OFFER: usize = 64 << 20;
 const MAX_AVATAR: usize = 2 << 20;
@@ -32,13 +35,32 @@ fn consume(pending: &mut Option<PendingLink>, token: &str) -> Result<(), String>
 #[derive(Serialize, Deserialize)]
 struct LinkCode { v: u8, eid: String, name: String, token: String }
 fn encode(code: &LinkCode) -> String { format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(code).unwrap())) }
-fn parse(code: &str) -> Result<LinkCode, String> {
+fn encode_join(code: &LinkCode) -> String { format!("{JOIN_PREFIX}{}", URL_SAFE_NO_PAD.encode(serde_json::to_vec(code).unwrap())) }
+fn parse(code: &str) -> Result<LinkCode, String> { parse_with(code, PREFIX) }
+fn parse_with(code: &str, prefix: &str) -> Result<LinkCode, String> {
     if code.len() > 8192 { return Err("invalid link code".into()); }
-    let payload = crate::codes::strip_prefix(code, PREFIX).ok_or("invalid link prefix")?;
+    let payload = crate::codes::strip_prefix(code, prefix).ok_or("invalid link prefix")?;
     let c: LinkCode = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).map_err(|_| "invalid link code")?).map_err(|_| "invalid link code")?;
     if c.v != 1 || hex::decode(&c.token).map_or(true, |v| v.len() != 16) || c.eid.parse::<iroh::EndpointId>().is_err() { return Err("invalid link code".into()); }
     Ok(c)
 }
+/// This device's account id (hex public key), if it belongs to an account.
+pub(crate) fn account_pub(dir: &Path) -> Option<String> {
+    let _guard = ACCOUNT_LOCK.lock().unwrap();
+    read_key(dir).ok().flatten().map(|k| hex::encode(k.public().as_bytes()))
+}
+/// The account's signature over `endpoint`, proving this device holds the key.
+pub(crate) fn sign_endpoint(dir: &Path, endpoint: &str) -> Option<String> {
+    let _guard = ACCOUNT_LOCK.lock().unwrap();
+    read_key(dir).ok().flatten().map(|k| hex::encode(k.sign(endpoint.as_bytes()).to_bytes()))
+}
+/// Leave the account: this device forgets the key (it can be linked again).
+pub(crate) fn forget_key(dir: &Path) {
+    let _guard = ACCOUNT_LOCK.lock().unwrap();
+    let _ = std::fs::remove_file(dir.join("account.key"));
+}
+#[cfg(test)]
+pub(crate) fn adopt_key_for_tests(dir: &Path, key: &iroh::SecretKey) { write_key(dir, key).unwrap(); }
 fn read_key(dir: &Path) -> Result<Option<iroh::SecretKey>, String> {
     match std::fs::read(dir.join("account.key")) {
         Ok(bytes) => Ok(Some(iroh::SecretKey::from_bytes(&bytes.try_into().map_err(|_| "invalid account key")?))),
@@ -81,18 +103,20 @@ pub(crate) fn profile(state: &IrohState, endpoint: &str) -> Value {
     let _guard = ACCOUNT_LOCK.lock().unwrap();
     // Ordinary hello does not create an account; only explicit account commands do.
     let key = read_key(&st.config_dir).ok().flatten();
-    json!({"device_kind": st.settings.lock().unwrap().device_kind,
+    json!({"device_kind": st.settings.lock().unwrap().device_kind, "device_os": std::env::consts::OS,
         "account_pub": key.as_ref().map(|k| hex::encode(k.public().as_bytes())),
         "account_sig": key.map(|k| hex::encode(k.sign(endpoint.as_bytes()).to_bytes()))})
 }
 #[derive(Clone, Serialize, Deserialize)]
-pub struct LinkResult { endpoint_id: String, name: String, device_kind: String }
+pub struct LinkResult { endpoint_id: String, name: String, device_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")] device_os: Option<String> }
 #[derive(Serialize)]
-pub struct DeviceInfo { #[serde(flatten)] device: LinkResult, account_pub: String, linked_devices: usize }
+pub struct DeviceInfo { #[serde(flatten)] device: LinkResult, account_pub: String, linked_devices: usize,
+    device_os: &'static str, devices: Vec<crate::account::DeviceView> }
 fn device(st: &AppState, net: &IrohState) -> Result<LinkResult, String> {
     let endpoint_id = net.get().ok_or("network not ready")?.id().to_string();
     let s = st.settings.lock().unwrap();
-    Ok(LinkResult { endpoint_id, name: s.display_name.clone(), device_kind: s.device_kind.clone() })
+    Ok(LinkResult { endpoint_id, name: s.display_name.clone(), device_kind: s.device_kind.clone(), device_os: Some(std::env::consts::OS.into()) })
 }
 #[tauri::command]
 pub fn my_device_info(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>) -> Result<DeviceInfo, String> {
@@ -101,8 +125,9 @@ pub fn my_device_info(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohS
     // until it either links a new device (link_device_send) or receives an offer,
     // otherwise its own throwaway key would block adopting the real account.
     let account_pub = { let _guard = ACCOUNT_LOCK.lock().unwrap(); read_key(&state.config_dir)?.map(|k| hex::encode(k.public().as_bytes())).unwrap_or_default() };
-    let linked_devices = if account_pub.is_empty() { 0 } else { friends::load(&state.config_dir).iter().filter(|f| f.account_pub.as_deref() == Some(&account_pub)).count() };
-    Ok(DeviceInfo { device, account_pub, linked_devices })
+    let devices = if account_pub.is_empty() { vec![] } else { crate::account::device_views(&state, &device.endpoint_id) };
+    let linked_devices = devices.len().saturating_sub(1);
+    Ok(DeviceInfo { device, account_pub, linked_devices, device_os: std::env::consts::OS, devices })
 }
 #[tauri::command]
 pub fn link_device_begin(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>) -> Result<String, String> {
@@ -160,11 +185,120 @@ pub async fn link_device_send(app: AppHandle, state: State<'_, Arc<AppState>>, i
     if reply["kind"] != "link-ok" { return Err(reply["reason"].as_str().unwrap_or("link rejected").to_owned()); }
     let result: LinkResult = serde_json::from_value(reply.clone()).map_err(|_| "invalid link reply")?;
     if result.endpoint_id != code.eid || !verify_account(&hex::encode(key.public().as_bytes()), reply["account_sig"].as_str().unwrap_or(""), &result.endpoint_id) { return Err("invalid link identity".into()); }
-    friends::upsert_by_endpoint(&state.config_dir, &result.endpoint_id, &result.name);
-    friends::set_device_info(&state.config_dir, &result.endpoint_id, Some(&result.device_kind), Some(&hex::encode(key.public().as_bytes())));
-    iroh_net::broadcast_profile(app.clone(), iroh.inner().clone());
-    let _ = app.emit("friends://changed", ());
+    record_new_device(&app, &state, &iroh, &key, &result);
     Ok(result)
+}
+
+/// Both link flows end here on the device that already had the account: the
+/// new device is an own device from now on, and every other own device hears
+/// about it on the next account sync.
+fn record_new_device(app: &AppHandle, st: &AppState, iroh: &Arc<IrohState>, key: &iroh::SecretKey, result: &LinkResult) {
+    friends::upsert_by_endpoint(&st.config_dir, &result.endpoint_id, &result.name);
+    friends::set_device_info(&st.config_dir, &result.endpoint_id, Some(&result.device_kind), Some(&hex::encode(key.public().as_bytes())));
+    if let Some(os) = result.device_os.as_deref() { friends::set_device_os(&st.config_dir, &result.endpoint_id, os); }
+    if let Some(me) = iroh.get().map(|e| e.id().to_string()) { crate::account::mark_linked(&st.config_dir, &me); }
+    crate::account::mark_linked(&st.config_dir, &result.endpoint_id);
+    iroh_net::broadcast_profile(app.clone(), iroh.clone());
+    let _ = app.emit("friends://changed", ());
+    let _ = app.emit("link://linked", result);
+    crate::account::account_sync_now();
+}
+
+// ── Reverse flow: the device that HAS the account shows a code, the new one scans it.
+
+static HOST_PENDING: Mutex<Option<PendingLink>> = Mutex::new(None);
+
+/// Show a code another (new) device can scan to join this device's account.
+#[tauri::command]
+pub fn link_host_begin(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>) -> Result<String, String> {
+    let me = device(&state, &iroh)?;
+    let token: [u8; 16] = rand::random();
+    *HOST_PENDING.lock().unwrap() = Some(PendingLink { token, created_at: Instant::now() });
+    Ok(encode_join(&LinkCode { v: 1, eid: me.endpoint_id, name: me.name, token: hex::encode(token) }))
+}
+#[tauri::command]
+pub fn link_host_cancel() { *HOST_PENDING.lock().unwrap() = None; }
+
+/// This (new) device joins the account of the device whose code was scanned:
+/// it receives the same offer `link_device_send` would push, over one stream.
+#[tauri::command]
+pub async fn link_device_join(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>, code: String) -> Result<LinkResult, String> {
+    let code = parse_with(&code, JOIN_PREFIX)?;
+    let me = device(&state, &iroh)?;
+    if code.eid == me.endpoint_id { return Err("cannot link this device to itself".into()); }
+    let token: [u8; 16] = hex::decode(&code.token).ok().and_then(|v| v.try_into().ok()).ok_or("invalid link code")?;
+    *state.pending_link.lock().unwrap() = Some(PendingLink { token, created_at: Instant::now() });
+    let ep = iroh.get().ok_or("network not ready")?.clone();
+    let host = code.eid.clone();
+    let dialed = tokio::time::timeout(Duration::from_secs(60), async {
+        let conn = ep.connect(iroh_net::dial_addr(host.parse()?), iroh_net::ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        iroh_net::write_frame(&mut send, &json!({"kind":"link-join", "v":1, "token":code.token, "device":me})).await?;
+        let offer = iroh_net::read_frame_cap(&mut recv, MAX_OFFER).await?;
+        anyhow::Ok((conn, send, offer))
+    }).await;
+    let (_conn, mut send, offer) = match dialed {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => { *state.pending_link.lock().unwrap() = None; return Err("Couldn't reach the other device. Make sure DropBeam is open on it.".into()); }
+        Err(_) => { *state.pending_link.lock().unwrap() = None; return Err("link timed out".into()); }
+    };
+    if offer["kind"] != "link-offer" {
+        *state.pending_link.lock().unwrap() = None;
+        return Err(offer["reason"].as_str().unwrap_or("link rejected").to_owned());
+    }
+    let host_info: LinkResult = serde_json::from_value(offer["sender"].clone()).map_err(|_| "invalid link offer")?;
+    let result = receive(&state, me, &host, &offer);
+    let reply = result.as_ref().cloned().unwrap_or_else(|e| json!({"kind":"link-error", "reason":e}));
+    let _ = iroh_net::write_frame(&mut send, &reply).await;
+    let _ = send.finish();
+    let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+    result?;
+    let _ = app.emit("friends://changed", ());
+    let _ = app.emit("chat://changed", ());
+    iroh_net::broadcast_profile(app.clone(), iroh.inner().clone());
+    crate::account::account_sync_now();
+    Ok(host_info)
+}
+
+/// Host side of `link_device_join`: check the one-time code, send the offer,
+/// then record the new device once it proves it adopted the account.
+pub(crate) async fn serve_join(net: &IrohState, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream, recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<()> {
+    let app = net.app.get().ok_or_else(|| anyhow::anyhow!("app unavailable"))?.clone();
+    let st = app.state::<Arc<AppState>>();
+    let iroh = app.state::<Arc<IrohState>>().inner().clone();
+    let token = req["token"].as_str().unwrap_or("").to_owned();
+    let prepared = (|| -> Result<(iroh::SecretKey, Value), String> {
+        consume(&mut HOST_PENDING.lock().unwrap(), &token)?;
+        if req["v"] != 1 { return Err("unsupported link version".into()); }
+        let newcomer: LinkResult = serde_json::from_value(req["device"].clone()).map_err(|_| "invalid device")?;
+        if newcomer.endpoint_id != who { return Err("invalid device identity".into()); }
+        let key = account(&st.config_dir)?;
+        let code = LinkCode { v: 1, eid: who.to_owned(), name: newcomer.name, token: token.clone() };
+        let offer = offer(&st, net, &code, &key)?;
+        if serde_json::to_vec(&offer).map_err(|_| "cannot encode link")?.len() > MAX_OFFER { return Err("link history exceeds 64 MiB".into()); }
+        Ok((key, offer))
+    })();
+    let (key, offer) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            iroh_net::write_frame(send, &json!({"kind":"link-error", "reason":e})).await?;
+            send.finish()?;
+            return Ok(());
+        }
+    };
+    iroh_net::write_frame(send, &offer).await?;
+    send.finish()?;
+    let reply = tokio::time::timeout(Duration::from_secs(60), iroh_net::read_frame(recv)).await??;
+    if reply["kind"] != "link-ok" {
+        let _ = app.emit("link://failed", reply["reason"].as_str().unwrap_or("link rejected"));
+        return Ok(());
+    }
+    let result: LinkResult = serde_json::from_value(reply.clone())?;
+    if result.endpoint_id != who || !verify_account(&hex::encode(key.public().as_bytes()), reply["account_sig"].as_str().unwrap_or(""), who) {
+        anyhow::bail!("invalid link identity");
+    }
+    record_new_device(&app, &st, &iroh, &key, &result);
+    Ok(())
 }
 
 fn receive(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<Value, String> {
@@ -203,6 +337,9 @@ fn receive(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<Valu
         }
     }
     write_key(&st.config_dir, &key)?;
+    drop(_guard);
+    crate::account::mark_linked(&st.config_dir, &me.endpoint_id);
+    crate::account::mark_linked(&st.config_dir, who);
     for (f, avatar) in validated {
         let eid = f.endpoint_id.as_deref();
         if eid.is_some_and(|id| id == me.endpoint_id || id == who) { continue; }
@@ -221,7 +358,8 @@ fn receive(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<Valu
     }
     friends::upsert_by_endpoint(&st.config_dir, who, &sender.name);
     friends::set_device_info(&st.config_dir, who, Some(&sender.device_kind), Some(&public));
-    Ok(json!({"kind":"link-ok", "endpoint_id":me.endpoint_id, "name":me.name, "device_kind":me.device_kind,
+    if let Some(os) = sender.device_os.as_deref() { friends::set_device_os(&st.config_dir, who, os); }
+    Ok(json!({"kind":"link-ok", "endpoint_id":me.endpoint_id, "name":me.name, "device_kind":me.device_kind, "device_os":me.device_os,
         "account_sig":hex::encode(key.sign(me.endpoint_id.as_bytes()).to_bytes())}))
 }
 pub(crate) async fn serve(net: &IrohState, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream) -> anyhow::Result<()> {
@@ -311,7 +449,7 @@ mod receive_tests {
             transfers: Mutex::new(HashMap::new()), offers: Mutex::new(HashMap::new()),
             force_quit: AtomicBool::new(false), main_focused: AtomicBool::new(false), active_chat: Mutex::new(None) }
     }
-    fn me() -> LinkResult { LinkResult { endpoint_id: iroh::SecretKey::generate().public().to_string(), name: "Phone".into(), device_kind: "phone".into() } }
+    fn me() -> LinkResult { LinkResult { endpoint_id: iroh::SecretKey::generate().public().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: Some("ios".into()) } }
     fn offer(key: &iroh::SecretKey, who: &str) -> Value {
         json!({"kind":"link-offer", "v":1, "token":hex::encode([7;16]),
             "account_seed_hex":hex::encode(key.to_bytes()), "account_pub":hex::encode(key.public().as_bytes()),

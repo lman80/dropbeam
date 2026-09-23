@@ -1938,6 +1938,7 @@ fn refresh_presence(conn: &Connection, received: &mut u64, emit: impl FnOnce()) 
 fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
     if let Some(app) = state.app.get() {
         if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+            crate::account::device_seen(&st.config_dir, endpoint_id);
             if let Some(friend) = crate::friends::load(&st.config_dir).into_iter()
                 .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
                 let _ = app.emit("friend://presence", serde_json::json!({ "peerId": friend.id }));
@@ -2821,6 +2822,12 @@ async fn serve_stream_inner(
         Some("link-offer") => {
             crate::link::serve(state, &conn.remote_id().to_string(), &req, send).await?;
         }
+        Some("link-join") => {
+            crate::link::serve_join(state, &conn.remote_id().to_string(), &req, send, recv).await?;
+        }
+        Some("account-sync") => {
+            crate::account::serve(state, &conn.remote_id().to_string(), &req, send, recv).await?;
+        }
         Some("link-ok" | "link-error") => {}
         Some("friend-hello") => {
             // A peer is introducing themselves: learn their stable EndpointId +
@@ -3425,6 +3432,7 @@ async fn serve_stream_inner(
                                 edited: false,
                                 deleted: false,
                                 gif,
+                                rev: 0,
                             };
                             if crate::chat::append(&config_dir, &msg) {
                                 let _ = app.emit("chat://message", &msg);

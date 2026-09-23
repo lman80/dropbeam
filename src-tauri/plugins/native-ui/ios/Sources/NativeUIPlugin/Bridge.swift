@@ -230,6 +230,26 @@ final class Bridge: ObservableObject {
     func linkDeviceBegin() async throws -> String { try await call("linkDeviceBegin") }
     func linkDeviceCancel() async throws { try await action("linkDeviceCancel") }
     func linkDeviceSend(code: String) async throws -> LinkResult { try await call("linkDeviceSend", ["code": code]) }
+    func linkHostBegin() async throws -> String { try await call("linkHostBegin") }
+    func linkHostCancel() async throws { try await action("linkHostCancel") }
+    func linkDeviceJoin(code: String) async throws -> LinkResult { try await call("linkDeviceJoin", ["code": code]) }
+    func accountSyncNow() async throws { try await action("accountSyncNow") }
+    func accountRemoveDevice(endpointId: String) async throws { try await action("accountRemoveDevice", ["endpointId": endpointId]) }
+    func accountLeave() async throws { try await action("accountLeave") }
+    /// True for the two device-link codes (either direction).
+    static func isLinkCode(_ code: String) -> Bool {
+        let c = code.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return c.hasPrefix("dropbeamjoin1:") || c.hasPrefix("dropbeamlink1:")
+    }
+    /// Link with whichever device-link code was scanned: a code shown by a device
+    /// that has the account ("dropbeamjoin1:") makes THIS device join it; a code
+    /// shown by a new device ("dropbeamlink1:") adds that device to this account.
+    func linkWithScannedCode(_ code: String) async throws -> LinkResult {
+        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasPrefix("dropbeamjoin1:") { return try await linkDeviceJoin(code: trimmed) }
+        if trimmed.lowercased().hasPrefix("dropbeamlink1:") { return try await linkDeviceSend(code: trimmed) }
+        throw NSError(domain: "DropBeam", code: 1, userInfo: [NSLocalizedDescriptionKey: "That isn't a DropBeam device code. On your other device open Settings → Devices."])
+    }
     func updateSettings(patch: [String: Any]) async throws { try await action("updateSettings", ["patch": patch]) }
     func respondToOffer(id: String, accept: Bool) async throws { try await action("respondToOffer", ["id": id, "accept": accept]) }
 }

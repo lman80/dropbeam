@@ -1,7 +1,8 @@
 import { groupDevices } from '../lib/deviceIcons'
 import { DeviceBadge } from '../components/DeviceBadge'
 import { QrScanner } from '../components/QrScanner'
-import { LinkNewDeviceModal } from '../components/LinkDeviceModal'
+import { AddDeviceModal } from '../components/DevicesPanel'
+import { useOwnDeviceLabels } from '../lib/ownDevices'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -39,9 +40,9 @@ export function FriendsView() {
   const myDevice = useStore(s => s.myDevice)
   const { myDevices, others } = groupDevices(friends, myDevice?.account_pub)
   useEffect(() => { void useStore.getState().refreshMyDevice().catch(() => {}) }, [])
-  const devices = <section><div className="device-section-heading"><h2 className={MOBILE_UI ? 'ios-section-title' : ''}>My devices</h2><button className={MOBILE_UI ? 'ios-button' : 'btn btn-ghost'} onClick={() => setLinking(true)}>Link a device</button></div>
+  const devices = <section><div className="device-section-heading"><h2 className={MOBILE_UI ? 'ios-section-title' : ''}>My devices</h2><button className={MOBILE_UI ? 'ios-button' : 'btn btn-ghost'} onClick={() => setLinking(true)}>Add a device</button></div>
     {myDevices.length ? <div className={MOBILE_UI ? 'ios-list' : 'device-list'}>{myDevices.map(f => <FriendCard key={f.id} friend={f} />)}</div> : <p className={MOBILE_UI ? 'mobile-inset ios-footnote' : ''}>Link your phone or another computer</p>}
-    {linking && <LinkNewDeviceModal onClose={() => setLinking(false)} />}
+    {linking && <AddDeviceModal onClose={() => setLinking(false)} />}
   </section>
 
   // #34: presence must recover without a restart. Opening Friends actively
@@ -353,6 +354,7 @@ function YouCard() {
 }
 
 function FriendCard({ friend }: { friend: Friend }) {
+  const ownLabel = useOwnDeviceLabels()[friend.id] as string | undefined
   const sendToFriend = useStore((s) => s.sendToFriend)
   const removeFriend = useStore((s) => s.removeFriend)
   const renameFriend = useStore((s) => s.renameFriend)
@@ -537,7 +539,8 @@ function FriendCard({ friend }: { friend: Friend }) {
             />
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ fontWeight: 700, fontSize: 'calc(15px * var(--ui-font-scale, 1))' }}>{friend.name}</span>
+              <span style={{ fontWeight: 700, fontSize: 'calc(15px * var(--ui-font-scale, 1))' }}>{ownLabel ?? friend.name}</span>
+              {ownLabel && <span style={{ color: 'var(--text-faint)', fontSize: 'calc(12px * var(--ui-font-scale, 1))' }}>{friend.name}</span>}
               <button
                 className="icon-btn"
                 title="Rename"

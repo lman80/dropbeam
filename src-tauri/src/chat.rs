@@ -117,6 +117,11 @@ pub struct ChatMessage {
     /// A GIF attachment (Giphy) — when present, the UI renders a GIF bubble.
     #[serde(default)]
     pub gif: Option<GifMeta>,
+    /// Mutation clock (ms) bumped on every local reaction/edit/unsend, so a
+    /// user's own devices can tell which copy of a message is newer when they
+    /// sync (last writer wins). 0 = never changed since it was stored.
+    #[serde(default)]
+    pub rev: u64,
 }
 
 /// Stable causal order: logical seq first, then wall-clock, then id as a final
@@ -151,6 +156,7 @@ fn store_mut<'a>(
 }
 
 fn save_all(config_dir: &Path, all: &HashMap<String, Vec<ChatMessage>>) {
+    crate::account::note_change();
     let _ = fs::create_dir_all(config_dir);
     // Compact JSON, not pretty: chats.json is machine-read only and can reach MBs
     // (2000 msgs/peer); pretty-printing roughly doubles the serialize+write cost on
@@ -311,6 +317,7 @@ pub fn apply_reaction(
         }
         _ => {} // already in the desired state — idempotent no-op
     }
+    msg.rev = bump_rev(msg.rev);
     let out = msg.clone();
     save_all(config_dir, &all);
     Some(out)
@@ -335,6 +342,7 @@ pub fn apply_edit(
         .find(|m| m.id == target_id && !m.deleted && m.from_me == author_is_me)?;
     msg.text = new_text.to_string();
     msg.edited = true;
+    msg.rev = bump_rev(msg.rev);
     let out = msg.clone();
     save_all(config_dir, &all);
     Some(out)
@@ -361,6 +369,7 @@ pub fn apply_delete(
     msg.path = None;
     msg.gif = None;
     msg.reactions.clear();
+    msg.rev = bump_rev(msg.rev);
     let out = msg.clone();
     save_all(config_dir, &all);
     Some(out)
@@ -582,6 +591,110 @@ fn preview(m: &ChatMessage) -> String {
     }
 }
 
+fn bump_rev(rev: u64) -> u64 {
+    now_ms().max(rev + 1)
+}
+
+/// Confirmed delivery progress of a message we sent, ranked so two copies merge
+/// upward. Everything short of "delivered" ranks 0: a copy still "sending" on
+/// the device that owns the outbox must never be overridden to stop retrying.
+fn status_rank(status: Option<&str>) -> u8 {
+    match status {
+        Some("read") => 2,
+        Some("delivered") => 1,
+        _ => 0,
+    }
+}
+
+/// Message identity across devices: direction + id (an incoming id can never
+/// collide with one of ours — the same rule `append` dedups by).
+pub(crate) fn sync_key(m: &ChatMessage) -> String {
+    format!("{}{}", if m.from_me { "o:" } else { "i:" }, m.id)
+}
+
+/// Fingerprint of a message's mutable state, for own-device sync digests.
+pub(crate) fn sync_hash(m: &ChatMessage) -> String {
+    use sha2::{Digest, Sha256};
+    let state = format!("{}|{}|{}|{}", m.rev, status_rank(m.status.as_deref()), m.deleted, m.edited);
+    hex::encode(&Sha256::digest(state.as_bytes())[..6])
+}
+
+/// `(sync_key, sync_hash)` for every message in a thread, oldest first.
+pub(crate) fn sync_digest(config_dir: &Path, peer_id: &str) -> Vec<(String, String)> {
+    let mut cache = CACHE.lock().unwrap();
+    store_mut(&mut cache, config_dir)
+        .get(peer_id)
+        .map(|t| t.iter().map(|m| (sync_key(m), sync_hash(m))).collect())
+        .unwrap_or_default()
+}
+
+/// The messages of a thread whose `sync_key` is in `keys`, device-local paths stripped.
+pub(crate) fn sync_messages(config_dir: &Path, peer_id: &str, keys: &std::collections::HashSet<String>) -> Vec<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    store_mut(&mut cache, config_dir)
+        .get(peer_id)
+        .map(|t| t.iter().filter(|m| keys.contains(&sync_key(m))).cloned().map(|mut m| { m.path = None; m }).collect())
+        .unwrap_or_default()
+}
+
+/// Merge messages from one of the user's OTHER devices into the local thread
+/// `peer_id`. New messages are inserted — a copy still "sending" on the other
+/// device reads "sent" here, so this device's outbox never re-sends it — and a
+/// message both have keeps the newer content (higher `rev`) and the furthest
+/// delivery status. Returns how many messages changed.
+pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatMessage>) -> usize {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let thread = all.entry(peer_id.to_owned()).or_default();
+    let mut changed = 0;
+    for mut m in incoming {
+        m.peer_id = peer_id.to_owned();
+        m.path = None;
+        if m.from_me && status_rank(m.status.as_deref()) == 0 {
+            // Not ours to deliver: the device that sent it owns the retry.
+            m.status = Some("sent".into());
+        }
+        match thread.iter_mut().find(|x| x.id == m.id && x.from_me == m.from_me) {
+            None => {
+                thread.push(m);
+                changed += 1;
+            }
+            Some(x) => {
+                let before = sync_hash(x);
+                let newer = m.rev > x.rev
+                    || (m.rev == x.rev && ((m.deleted && !x.deleted) || (m.edited && !x.edited)));
+                if newer {
+                    x.text = m.text;
+                    x.edited = m.edited;
+                    x.deleted = m.deleted;
+                    x.reactions = m.reactions;
+                    x.rev = m.rev;
+                    if x.deleted {
+                        x.files.clear();
+                        x.gif = None;
+                        x.path = None;
+                    }
+                }
+                if x.from_me && status_rank(m.status.as_deref()) > status_rank(x.status.as_deref()) {
+                    x.status = m.status;
+                }
+                if sync_hash(x) != before {
+                    changed += 1;
+                }
+            }
+        }
+    }
+    if changed > 0 {
+        thread.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
+        if thread.len() > MAX_PER_PEER {
+            let drop = thread.len() - MAX_PER_PEER;
+            thread.drain(0..drop);
+        }
+        save_all(config_dir, all);
+    }
+    changed
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -623,6 +736,7 @@ mod tests {
             edited: false,
             deleted: false,
             gif: None,
+            rev: 0,
         }
     }
 

@@ -6,6 +6,8 @@ import AVFoundation
 struct QRScannerSheet: View {
     @Environment(\.dismiss) private var dismiss
     let title: String
+    /// Connect as soon as a QR code is recognized (no extra Continue tap).
+    var autoSubmit = false
     let submit: (String) async throws -> Void
     @State private var paste = false
     @State private var code = ""
@@ -19,7 +21,7 @@ struct QRScannerSheet: View {
                 VStack(spacing: 24) {
                     if cameraAllowed && DataScannerViewController.isSupported && DataScannerViewController.isAvailable && scannerError == nil && !paste {
                         ZStack {
-                            QRScanner { value in if !busy { code = value; paste = true; Haptics.tap() } } failure: { scannerError = $0; paste = true }
+                            QRScanner { value in if !busy { code = value; paste = true; Haptics.tap(); if autoSubmit { connect() } } } failure: { scannerError = $0; paste = true }
                             RoundedRectangle(cornerRadius: 24).stroke(.white.opacity(0.85), lineWidth: 2).padding(36).allowsHitTesting(false)
                             VStack { Spacer(); Text("Place the QR code inside the frame").font(.subheadline).padding(12).background(.ultraThinMaterial, in: Capsule()).padding() }.allowsHitTesting(false)
                         }.frame(height: 340).clipShape(RoundedRectangle(cornerRadius: 24)).accessibilityLabel("QR code camera")
@@ -139,6 +141,7 @@ struct OnboardingSheet: View {
     @State private var name = ""
     @State private var busy = false
     @State private var error: String?
+    @State private var joining = false
     var body: some View {
         ScrollView {
             VStack(spacing: 28) {
@@ -156,8 +159,16 @@ struct OnboardingSheet: View {
                     busy = true
                     Task { defer { busy = false }; do { try await bridge.action("setDisplayName", ["name": name]); bridge.needsName = false } catch { self.error = error.localizedDescription } }
                 }.frame(minHeight: 44).beamButton(prominent: true).disabled(busy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                GlassCard {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label("Already use DropBeam?", systemImage: "laptopcomputer.and.iphone").font(.headline)
+                        Text("Bring your friends and chats over: on your other device open Settings → Devices → Add a Device, then scan its code.").foregroundStyle(.secondary)
+                        Button { joining = true; Haptics.tap() } label: { Label("Scan Code", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
+                    }
+                }
             }.padding(24)
         }.beamCanvas().tint(.beam).interactiveDismissDisabled().onAppear { name = bridge.settings?.displayName ?? "" }
+        .sheet(isPresented: $joining) { JoinAccountSheet() }
     }
 }
 

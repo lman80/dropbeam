@@ -17,6 +17,10 @@ import Foundation
         let emptyPage = try decode(BrowserPage.self, "{}")
         let rights = try decode(SharedLocation.self, #"{"id":"folder","rights":{"upload":"yes"}}"#).rights
         precondition(emptyPage.entries.isEmpty && !emptyPage.hasMore && !rights.upload && !rights.manage)
-        print("5 native model regression checks passed")
+        let own = try decode(LossyArray<Friend>.self, #"[{"id":"mac","name":"Ashton laptop","ownDevice":true,"ownLabel":"Your Mac","deviceOs":"macos"},{"id":"f","name":"Mong","ownDevice":"bad"}]"#).values
+        precondition(own[0].displayName == "Your Mac" && own[0].ownDevice && own[1].displayName == "Mong" && !own[1].ownDevice)
+        let me = try decode(MyDevice.self, #"{"name":"Phone","accountPub":"abc","devices":[{"endpointId":"e1","name":"Phone","thisDevice":true},{"name":"no id"},{"endpointId":"e2","name":"Mac","deviceOs":"macos","lastSyncMs":1700000000000,"friendId":"mac"}]}"#)
+        precondition(me.inAccount && me.devices.count == 2 && me.devices[0].thisDevice && me.devices[1].lastSyncMs == 1700000000000)
+        print("7 native model regression checks passed")
     }
 }

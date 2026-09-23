@@ -7,11 +7,11 @@ struct FriendsView: View {
     @State private var folderScan = false
     @Namespace private var avatars
     private var filtered: [Friend] {
-        bridge.friends.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }
+        bridge.friends.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.displayName.localizedCaseInsensitiveContains(search) }
     }
     private func isMine(_ friend: Friend) -> Bool {
         guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return false }
-        return friend.accountPub == account
+        return friend.ownDevice || friend.accountPub == account
     }
     var body: some View {
         NavigationStack {
@@ -50,8 +50,12 @@ struct FriendsView: View {
             Text(title).font(.title2.weight(.semibold))
             if friends.isEmpty {
                 GlassCard {
-                    Text(search.isEmpty ? (title == "My Devices" ? "Your linked devices will feel right at home here." : "Good things are better shared. Add your first friend with +.") : "No matches yet.")
-                        .foregroundStyle(.secondary).font(.body)
+                    if title == "My Devices" && search.isEmpty {
+                        NavigationLink { DevicesView() } label: { SettingsLinkLabel(title: "Link Your Other Devices", symbol: "laptopcomputer.and.iphone") }.buttonStyle(.plain)
+                    } else {
+                        Text(search.isEmpty ? "Good things are better shared. Add your first friend with +." : "No matches yet.")
+                            .foregroundStyle(.secondary).font(.body)
+                    }
                 }
             }
             ForEach(friends) { friend in
@@ -61,13 +65,14 @@ struct FriendsView: View {
                 } label: {
                     GlassCard {
                         HStack(spacing: 14) {
-                            FriendAvatar(friend: friend).matchedGeometryEffect(id: friend.id, in: avatars)
+                            ContactAvatar(friend: friend).matchedGeometryEffect(id: friend.id, in: avatars)
                             VStack(alignment: .leading, spacing: 5) {
-                                Text(friend.name).font(.headline).foregroundStyle(.primary)
+                                Text(friend.displayName).font(.headline).foregroundStyle(.primary)
+                                if friend.ownDevice { Text(friend.name).font(.footnote).foregroundStyle(.secondary).lineLimit(1) }
                                 PresenceLabel(online: bridge.presence[friend.id] == true)
                             }
                             Spacer(minLength: 4)
-                            if let glyph = deviceSymbol(friend.deviceKind) { Image(systemName: glyph).foregroundStyle(.secondary) }
+                            if !friend.ownDevice, let glyph = deviceSymbol(friend.deviceKind) { Image(systemName: glyph).foregroundStyle(.secondary) }
                             Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
                         }
                     }
@@ -94,7 +99,8 @@ struct AddFriendSheet: View {
     @EnvironmentObject private var bridge: Bridge
     var body: some View {
         QRScannerSheet(title: "Add Friend") { code in
-            if code.lowercased().hasPrefix("dropbeamf1:") { try await bridge.acceptFriend(code: code) }
+            if Bridge.isLinkCode(code) { let r = try await bridge.linkWithScannedCode(code); bridge.showToast("Linked with \(r.name ?? "your device")") }
+            else if code.lowercased().hasPrefix("dropbeamf1:") { try await bridge.acceptFriend(code: code) }
             else { try await bridge.addFriendByCode(code: code) }
         }
     }

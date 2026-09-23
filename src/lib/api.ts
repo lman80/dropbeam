@@ -239,13 +239,25 @@ export interface HistoryItem {
 }
 
 /** A successfully linked device; command and link wire fields use snake_case. */
-export interface LinkResult { endpoint_id: string; name: string; device_kind: string }
-export interface MyDeviceInfo extends LinkResult { account_pub: string; linked_devices: number }
+export interface LinkResult { endpoint_id: string; name: string; device_kind: string; device_os?: string }
+/** One device in this account (this one first). */
+export interface AccountDevice {
+  friend_id: string | null
+  endpoint_id: string
+  name: string
+  device_kind: string | null
+  device_os: string | null
+  last_sync_ms: number | null
+  this_device: boolean
+}
+export interface MyDeviceInfo extends LinkResult { account_pub: string; linked_devices: number; device_os?: string; devices?: AccountDevice[] }
 
 /** A named peer you can send to directly — no code, no QR. */
 export interface Friend {
   deviceKind?: string | null
   accountPub?: string | null
+  /** "macos" | "ios" | "windows" | "linux" — from the device's hello. */
+  deviceOs?: string | null
   id: string
   role: PairRole
   name: string
@@ -502,6 +514,14 @@ const realApi = {
   linkDeviceBegin: () => invoke<string>('link_device_begin'),
   linkDeviceCancel: () => invoke<void>('link_device_cancel'),
   linkDeviceSend: (code: string) => invoke<LinkResult>('link_device_send', { code }),
+  /** Show a code a NEW device scans to join this device's account. */
+  linkHostBegin: () => invoke<string>('link_host_begin'),
+  linkHostCancel: () => invoke<void>('link_host_cancel'),
+  /** This (new) device joins the account whose `dropbeamjoin1:` code was scanned. */
+  linkDeviceJoin: (code: string) => invoke<LinkResult>('link_device_join', { code }),
+  accountSyncNow: () => invoke<void>('account_sync_now'),
+  accountRemoveDevice: (endpointId: string) => invoke<void>('account_remove_device', { endpointId }),
+  accountLeave: () => invoke<void>('account_leave'),
   myDeviceInfo: () => invoke<MyDeviceInfo>('my_device_info'),
   // Friends — named peers you send to directly.
   createFriend: (friendName: string) =>
@@ -591,8 +611,18 @@ const backend: typeof realApi = HAS_TAURI ? realApi : ({
   linkDeviceBegin: async () => 'dropbeamlink1:preview',
   linkDeviceCancel: async () => {},
   linkDeviceSend: async () => ({ endpoint_id: 'preview', name: 'My phone', device_kind: 'phone' }),
+  linkHostBegin: async () => 'dropbeamjoin1:preview',
+  linkHostCancel: async () => {},
+  linkDeviceJoin: async () => ({ endpoint_id: 'preview', name: 'My computer', device_kind: 'laptop', device_os: 'macos' }),
+  accountSyncNow: async () => {},
+  accountRemoveDevice: async () => {},
+  accountLeave: async () => {},
   myDeviceInfo: async () => ({
-    endpoint_id: 'preview', name: 'My computer', device_kind: 'desktop', account_pub: '', linked_devices: 0,
+    endpoint_id: 'preview', name: 'My computer', device_kind: 'desktop', account_pub: 'preview-account', linked_devices: 1, device_os: 'macos',
+    devices: [
+      { friend_id: null, endpoint_id: 'preview', name: 'My computer', device_kind: 'laptop', device_os: 'macos', last_sync_ms: null, this_device: true },
+      { friend_id: 'mock-phone', endpoint_id: 'preview-phone', name: "Ashton's iPhone", device_kind: 'phone', device_os: 'ios', last_sync_ms: Date.now() - 60_000, this_device: false },
+    ],
   }),
 } as typeof realApi)
 const mobilePick = () => pickMobileFiles({ photos: backend.pickPhotos, files: backend.pickFiles })
@@ -694,7 +724,7 @@ export function onPairsChanged(cb: () => void): Promise<UnlistenFn> {
 export function onFriendsChanged(cb: () => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('friends://changed', () => cb())
   // reloadFriends also reloads the chat overview; history is fetched on openChat.
-  return Promise.all([listen('friends://changed', () => cb()), listen('chat://changed', () => cb())])
+  return Promise.all(['friends://changed', 'chat://changed', 'account://synced', 'account://left', 'link://linked'].map((name) => listen(name, () => cb())))
     .then((stops) => () => stops.forEach((stop) => stop()))
 }
 

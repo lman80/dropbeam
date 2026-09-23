@@ -97,6 +97,48 @@ struct PresenceLabel: View {
         }
     }
 }
+/// SF Symbol for a device, preferring what the OS says it is.
+func deviceSymbol(_ kind: String?, os: String?) -> String {
+    switch (os, kind) {
+    case ("ios", "tablet"): return "ipad"
+    case ("ios", _): return "iphone"
+    case ("macos", "desktop"): return "desktopcomputer"
+    case ("macos", _): return "laptopcomputer"
+    case ("windows", _): return "pc"
+    default: return deviceSymbol(kind) ?? "desktopcomputer"
+    }
+}
+/// "iPhone", "Mac", "PC"… (mirrors deviceNoun in src/lib/deviceIcons.ts).
+func deviceNoun(_ kind: String?, os: String?) -> String {
+    switch os {
+    case "ios": return kind == "tablet" ? "iPad" : "iPhone"
+    case "macos": return "Mac"
+    case "windows": return "PC"
+    case "linux": return "Linux PC"
+    default: return kind == "phone" ? "Phone" : kind == "tablet" ? "Tablet" : "Computer"
+    }
+}
+/// An own device's avatar: its SF Symbol on a soft glass disc, like Blip's "Your devices".
+struct DeviceAvatar: View {
+    let kind: String?
+    let os: String?
+    var size: CGFloat = 52
+    var body: some View {
+        ZStack {
+            Circle().fill(LinearGradient(colors: [Color(uiColor: .systemGray5), Color(uiColor: .systemGray4)], startPoint: .top, endPoint: .bottom))
+            Image(systemName: deviceSymbol(kind, os: os)).font(.system(size: size * 0.42, weight: .regular)).foregroundStyle(.primary.opacity(0.8))
+        }.frame(width: size, height: size).accessibilityHidden(true)
+    }
+}
+/// Avatar for any contact: an own device shows its device glyph instead of a photo.
+struct ContactAvatar: View {
+    let friend: Friend
+    var size: CGFloat = 52
+    var body: some View {
+        if friend.ownDevice { DeviceAvatar(kind: friend.deviceKind, os: friend.deviceOs, size: size) }
+        else { FriendAvatar(friend: friend, size: size) }
+    }
+}
 func deviceSymbol(_ kind: String?) -> String? {
     switch kind {
     case "phone", "iphone": return "iphone"

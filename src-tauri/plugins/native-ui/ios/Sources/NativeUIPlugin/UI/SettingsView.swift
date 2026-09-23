@@ -5,22 +5,26 @@ struct SettingsView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var version = ""
     @State private var clearCache = false
-    @State private var linkNew = false
-    @State private var linkThis = false
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     profile
                     SettingsGroup(title: "Devices") {
-                        HStack(spacing: 14) {
-                            Image(systemName: "iphone").font(.title)
-                            VStack(alignment: .leading, spacing: 5) { Text("This iPhone").font(.headline); Text("\(bridge.myDevice?.linkedDevices ?? 0) linked devices").foregroundStyle(.secondary) }
-                        }.frame(minHeight: 44)
-                        Divider()
-                        settingsButton("Link a New Device", symbol: "qrcode.viewfinder") { linkNew = true }
-                        Divider()
-                        settingsButton("Link This Device", symbol: "link") { linkThis = true }
+                        NavigationLink { DevicesView() } label: {
+                            HStack(spacing: 14) {
+                                HStack(spacing: -10) {
+                                    ForEach(Array((bridge.myDevice?.devices ?? []).prefix(3).enumerated()), id: \.element.id) { _, d in DeviceAvatar(kind: d.deviceKind, os: d.deviceOs, size: 38) }
+                                    if (bridge.myDevice?.devices ?? []).isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 38) }
+                                }
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("My Devices").font(.headline).foregroundStyle(.primary)
+                                    Text(devicesSummary).font(.subheadline).foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 0)
+                                Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.tertiary)
+                            }.frame(minHeight: 52).contentShape(Rectangle())
+                        }.buttonStyle(.plain)
                     }
                     SettingsGroup(title: "General") {
                         HStack { Text("Appearance"); Spacer(); Picker("Appearance", selection: settingString("theme", bridge.settings?.theme ?? "system")) { Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark") }.pickerStyle(.menu).labelsHidden() }.frame(minHeight: 44)
@@ -49,10 +53,13 @@ struct SettingsView: View {
                 }.padding(20)
             }.contentMargins(.bottom, 24, for: .scrollContent).navigationTitle("Settings").navigationBarTitleDisplayMode(.large).beamCanvas()
                 .task { do { version = try await bridge.call("appVersion"); try await bridge.action("myDeviceInfo") } catch { bridge.errorMessage = error.localizedDescription } }
-                .sheet(isPresented: $linkNew) { QRScannerSheet(title: "Link a New Device") { code in _ = try await bridge.linkDeviceSend(code: code); bridge.showToast("Device linked") } }
-                .sheet(isPresented: $linkThis) { LinkThisDeviceSheet() }
                 .confirmationDialog("Clear interrupted transfer leftovers?", isPresented: $clearCache, titleVisibility: .visible) { Button("Clear Transfer Cache", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("clearTransferCache"); bridge.showToast(freed > 0 ? "Cleared \(Formatters.bytes(freed))" : "No transfer leftovers to clear") } } }
         }
+    }
+    private var devicesSummary: String {
+        let others = (bridge.myDevice?.devices ?? []).filter { !$0.thisDevice }
+        if others.isEmpty { return "Link your other devices to share friends and chats" }
+        return "This iPhone and " + ListFormatter.localizedString(byJoining: others.map { "your " + deviceNoun($0.deviceKind, os: $0.deviceOs) })
     }
     private var profile: some View {
         GlassCard {

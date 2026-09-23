@@ -1094,10 +1094,19 @@ pub fn rename_friend(
 
 #[tauri::command]
 pub fn remove_friend(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     sync: State<'_, Arc<SyncManager>>,
     id: String,
 ) -> Result<(), String> {
+    // Removing one of the user's own devices = removing it from the account on
+    // every device; removing a friend = forgetting them on every own device.
+    if let Some(f) = friends::get(&state.config_dir, &id) {
+        if let Some(eid) = f.endpoint_id.as_deref().filter(|e| crate::account::is_own_device(&state.config_dir, e)) {
+            return crate::account::account_remove_device(app, state, eid.to_owned());
+        }
+        crate::account::record_friend_removed(&state.config_dir, &f);
+    }
     friends::remove(&state.config_dir, &id)?;
     // Soft-detach: friends::remove preserves the transcript and endpoint index.
     sync.reconcile_friends();
@@ -1257,6 +1266,7 @@ pub async fn send_chat_message(
         edited: false,
         deleted: false,
         gif: None,
+        rev: 0,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1357,6 +1367,7 @@ pub(crate) fn post_file_note(
         edited: false,
         deleted: false,
         gif: None,
+        rev: 0,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1584,6 +1595,7 @@ pub async fn send_chat_gif(
         edited: false,
         deleted: false,
         gif: Some(gif),
+        rev: 0,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);

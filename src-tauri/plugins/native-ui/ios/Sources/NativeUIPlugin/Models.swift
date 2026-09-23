@@ -8,13 +8,33 @@ struct Friend: Decodable, Identifiable {
     var deviceKind: String?
     var accountPub: String?
     var autoAccept: Bool?
+    var deviceOs: String?
+    /// One of the user's own devices (same account) — shown as "Your Mac" etc.
+    var ownDevice: Bool = false
+    var ownLabel: String?
+    /// The name to show: "Your iPhone" for an own device, else the friend's name.
+    var displayName: String { ownDevice ? (ownLabel ?? name) : name }
 }
 struct MyDevice: Decodable {
     var name: String?
     var endpointId: String?
     var deviceKind: String?
+    var deviceOs: String?
     var accountPub: String?
     var linkedDevices: Int?
+    var devices: [AccountDevice] = []
+    var inAccount: Bool { !(accountPub ?? "").isEmpty }
+}
+/// A device in this account (the first one is this device).
+struct AccountDevice: Decodable, Identifiable {
+    var id: String { endpointId }
+    let endpointId: String
+    var friendId: String?
+    var name: String
+    var deviceKind: String?
+    var deviceOs: String?
+    var lastSyncMs: Double?
+    var thisDevice: Bool
 }
 struct Transfer: Decodable, Identifiable {
     let id: String
@@ -152,6 +172,7 @@ struct LinkResult: Decodable {
     var endpointId: String?
     var name: String?
     var deviceKind: String?
+    var deviceOs: String?
 }
 // Accept any JSON result for actions whose return value the UI doesn't need.
 struct IgnoredResult: Decodable { init(from decoder: Decoder) throws {} }
@@ -258,6 +279,21 @@ extension Friend {
         self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
         self.accountPub = (try? c.decode(String.self, forKey: BridgeKey("accountPub")))
         self.autoAccept = (try? c.decode(Bool.self, forKey: BridgeKey("autoAccept")))
+        self.deviceOs = (try? c.decode(String.self, forKey: BridgeKey("deviceOs")))
+        self.ownDevice = (try? c.decode(Bool.self, forKey: BridgeKey("ownDevice"))) ?? false
+        self.ownLabel = (try? c.decode(String.self, forKey: BridgeKey("ownLabel")))
+    }
+}
+extension AccountDevice {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.endpointId = try c.decode(String.self, forKey: BridgeKey("endpointId"))
+        self.friendId = (try? c.decode(String.self, forKey: BridgeKey("friendId")))
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Device"
+        self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
+        self.deviceOs = (try? c.decode(String.self, forKey: BridgeKey("deviceOs")))
+        self.lastSyncMs = (try? c.decode(Double.self, forKey: BridgeKey("lastSyncMs")))
+        self.thisDevice = (try? c.decode(Bool.self, forKey: BridgeKey("thisDevice"))) ?? false
     }
 }
 
@@ -269,6 +305,8 @@ extension MyDevice {
         self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
         self.accountPub = (try? c.decode(String.self, forKey: BridgeKey("accountPub")))
         self.linkedDevices = (try? c.decode(Int.self, forKey: BridgeKey("linkedDevices")))
+        self.deviceOs = (try? c.decode(String.self, forKey: BridgeKey("deviceOs")))
+        self.devices = (try? c.decode(LossyArray<AccountDevice>.self, forKey: BridgeKey("devices")))?.values ?? []
     }
 }
 

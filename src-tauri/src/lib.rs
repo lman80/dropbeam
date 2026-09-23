@@ -1,3 +1,4 @@
+mod account;
 mod codes;
 mod link;
 mod location_sync;
@@ -219,6 +220,15 @@ pub struct AppState {
     /// this via `set_active_chat`. iMessage rule: don't banner a message for the
     /// chat that's already on screen and focused.
     pub active_chat: Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl AppState {
+    pub(crate) fn for_tests(config_dir: PathBuf) -> Self {
+        AppState { config_dir, settings: Mutex::new(Default::default()), pending_link: Mutex::new(None),
+            transfers: Mutex::new(HashMap::new()), offers: Mutex::new(HashMap::new()),
+            force_quit: AtomicBool::new(false), main_focused: AtomicBool::new(false), active_chat: Mutex::new(None) }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -590,6 +600,8 @@ pub fn run() {
             location_sync::start(app.handle().clone(), config_dir.clone(), iroh_state.clone());
             // Keep retrying undelivered chat messages until they land (reliable chat).
             iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
+            // Keep the user's own devices (same account) in step: friends, chats, devices.
+            account::spawn(app.handle().clone(), iroh_state.clone());
             // Background diagnostics: periodically upload a REDACTED error/perf digest
             // so background problems surface without users reporting them. Uploads ONLY
             // to the operator-configured `settings.diagnostics_url` (empty by default →
@@ -773,6 +785,12 @@ pub fn run() {
             commands::set_member_role,
             commands::my_endpoint_id,
             link::link_device_begin,
+            link::link_host_begin,
+            link::link_host_cancel,
+            link::link_device_join,
+            account::account_sync_now,
+            account::account_remove_device,
+            account::account_leave,
             link::link_device_cancel,
             link::link_device_send,
             link::my_device_info,

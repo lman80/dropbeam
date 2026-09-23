@@ -1255,6 +1255,16 @@ export const useStore = create<AppStore>((set, get) => ({
     void api.setActiveChat(get().activeChatId)
     saveChatUnread(get().chatUnread)
     for (const f of friends) void get().probeFriend(f.id).catch(() => {})
+    // Another of the user's devices may have synced messages into the open thread.
+    const active = get().activeChatId
+    if (active) {
+      const msgs = await api.getChatMessages(active).catch(() => null)
+      if (msgs) set((s) => {
+        const byId = new Map(msgs.map((m) => [m.id, normalizeChatMessage(m)]))
+        for (const m of s.chats[active] ?? []) if (!byId.has(m.id)) byId.set(m.id, m)
+        return { chats: { ...s.chats, [active]: [...byId.values()].sort(byOrder) } }
+      })
+    }
   },
 
   sendToFriend: async (id, paths) => {

@@ -39,6 +39,7 @@ import { ConnInspector } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from '../components/FriendAvatar'
+import { useOwnDeviceLabels } from '../lib/ownDevices'
 import { FileIcon as TypeIcon, fileKind as typeKind } from '../components/FileIcon'
 import { formatBytes } from '../lib/format'
 import { linkify } from '../lib/linkify'
@@ -162,12 +163,13 @@ export function ChatView() {
   }, [activeChatId])
 
   const online = (f: Friend) => friendOnlineState(f.name, friendSeen, folderStatuses) === true
+  const ownLabels = useOwnDeviceLabels()
 
   if (MOBILE_UI) return activeChatId ? <div className="mobile-page mobile-conversation"><Conversation key={activeChatId} friendId={activeChatId} /></div> : <div className="mobile-page mobile-chats"><MobileHeader title="Chats" /><div className="ios-list">{rows.map(({ friend, last }) => {
     const recent = chats[friend.id]?.at(-1)
     const ts = overview.find(o => o.peerId === friend.id)?.lastTs ?? recent?.ts
     const count = unread[friend.id] ?? 0
-    return <button className="ios-row mobile-chat-row" key={friend.id} onClick={() => void openChat(friend.id)}><span className="mobile-chat-avatar"><FriendAvatar friend={friend} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{friend.name}</span><span className="ios-footnote mobile-ellipsis">{last ?? recent?.text ?? 'No messages yet'}</span></span><span className="mobile-chat-trailing"><time className="ios-footnote">{ts ? clock(ts) : ''}</time>{count > 0 && <span className="mobile-unread">{count > 99 ? '99+' : count}</span>}</span></button>
+    return <button className="ios-row mobile-chat-row" key={friend.id} onClick={() => void openChat(friend.id)}><span className="mobile-chat-avatar"><FriendAvatar friend={friend} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{ownLabels[friend.id] ?? friend.name}</span><span className="ios-footnote mobile-ellipsis">{last ?? recent?.text ?? 'No messages yet'}</span></span><span className="mobile-chat-trailing"><time className="ios-footnote">{ts ? clock(ts) : ''}</time>{count > 0 && <span className="mobile-unread">{count > 99 ? '99+' : count}</span>}</span></button>
   })}</div>{!rows.length && <div className="mobile-empty"><MessageCircle /><h2 className="ios-title2">No chats yet</h2><p className="ios-footnote">Add a friend to start a conversation.</p><button className="ios-button ios-primary" onClick={() => setView('friends')}>Add a friend</button></div>}</div>
 
   // Only show the "nobody to chat with" empty state when there are genuinely no
@@ -224,7 +226,7 @@ export function ChatView() {
                   {online(friend) && <span className="chat-dot" />}
                 </span>
                 <span style={{ flex: 1, minWidth: 0 }}>
-                  <span className="chat-row-name">{friend.name}</span>
+                  <span className="chat-row-name">{ownLabels[friend.id] ?? friend.name}</span>
                   <span className="chat-row-last">{last ?? 'No messages yet'}</span>
                 </span>
                 {u > 0 && <span className="chat-unread">{u > 99 ? '99+' : u}</span>}
@@ -276,6 +278,7 @@ function Conversation({ friendId }: { friendId: string }) {
     friend ? presenceLabel(friendPresence(friend.name, s.friendSeen, s.folderStatuses)) : '',
   )
   const typing = useStore((s) => !!s.chatTyping[friendId])
+  const ownLabel = useOwnDeviceLabels()[friendId] as string | undefined
   const giphyKey = useStore((s) => s.settings?.giphyApiKey ?? '')
   const setView = useStore((s) => s.setView)
   const toast = useStore((s) => s.toast)
@@ -651,7 +654,7 @@ function Conversation({ friendId }: { friendId: string }) {
           {online && <span className="chat-dot" />}
         </span>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 700, fontSize: 'calc(14.5px * var(--ui-font-scale, 1))' }}>{friend.name}</div>
+          <div style={{ fontWeight: 700, fontSize: 'calc(14.5px * var(--ui-font-scale, 1))' }}>{ownLabel ?? friend.name}</div>
           <div
             style={{
               display: 'flex',

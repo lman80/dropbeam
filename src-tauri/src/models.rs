@@ -513,6 +513,10 @@ pub struct Friend {
     pub device_kind: Option<String>,
     #[serde(default)]
     pub account_pub: Option<String>,
+    /// The peer's OS ("macos", "ios", "windows", "linux"), from its hello, so
+    /// an own device can read "Your Mac" / "Your iPhone" instead of a raw name.
+    #[serde(default)]
+    pub device_os: Option<String>,
     pub id: String,
     pub role: PairRole,
     pub name: String,

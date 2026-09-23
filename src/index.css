@@ -2285,3 +2285,27 @@ html.mobile button > svg { flex-shrink: 0; }
 .device-link-dialog p { margin: 0; }
 .link-qr { align-self: center; background: white; padding: 16px; border-radius: 12px; }
 .link-qr svg { display: block; max-width: 100%; height: auto; }
+
+/* Settings → Devices (multi-device account) */
+.account-devices-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.account-devices-head h2 { margin: 0 0 4px; }
+.account-devices-sub { margin: 0; color: var(--text-faint); font-size: calc(12.5px * var(--ui-font-scale, 1)); line-height: 1.45; }
+.account-device-list { list-style: none; margin: 0 0 14px; padding: 0; border: 1px solid var(--border); border-radius: 12px; overflow: visible; }
+.account-device { display: flex; align-items: center; gap: 12px; padding: 10px 12px; position: relative; }
+.account-device + .account-device { border-top: 1px solid var(--border); }
+.account-device-glyph { width: 38px; height: 38px; flex: none; border-radius: 50%; display: grid; place-items: center; background: var(--surface-2, rgba(127,127,127,.12)); color: var(--text); }
+.account-device-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.account-device-text strong { font-size: calc(13.5px * var(--ui-font-scale, 1)); font-weight: 650; }
+.account-device-text span { color: var(--text-faint); font-size: calc(12px * var(--ui-font-scale, 1)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-device-menu { position: relative; }
+.account-device-popover { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; min-width: 190px; padding: 4px; border-radius: 10px; background: var(--surface, var(--bg)); border: 1px solid var(--border); box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+.account-device-popover button { width: 100%; text-align: left; padding: 8px 10px; border: 0; border-radius: 7px; background: none; color: inherit; font: inherit; cursor: pointer; }
+.account-device-popover button:hover { background: rgba(127,127,127,.12); }
+.account-device-popover .danger, .danger-text { color: var(--danger, #e5484d); }
+.account-devices-empty p { margin: 0 0 12px; color: var(--text-dim, var(--text)); line-height: 1.5; }
+.account-linked { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; color: var(--success, #30a46c); }
+.account-linked p { color: var(--text); }
+.account-waiting { text-align: center; color: var(--text-faint); font-size: calc(12.5px * var(--ui-font-scale, 1)); }
+.avatar-device { color: white; }
+.spin { animation: account-spin 1s linear infinite; }
+@keyframes account-spin { to { transform: rotate(360deg); } }
