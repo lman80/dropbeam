@@ -5160,7 +5160,14 @@ pub async fn send_chat_any(state: &IrohState, ep: &Endpoint, eids: &[String], pa
         last = match send_chat(state, ep, eid, payload.clone()).await {
             // A device that doesn't know us yet drops the message but still
             // acks it — that is not delivery; try the person's next device.
-            Ok(ack) if ack["applied"] == false => Err(anyhow::anyhow!("recipient device doesn't know us yet")),
+            // (A new message, not an edit/reaction on something it lacks:
+            // then introduce ourselves, so the outbox's next try lands.)
+            Ok(ack) if ack["applied"] == false => {
+                if payload.get("msgKind").and_then(|k| k.as_str()).is_none_or(|k| !matches!(k, "reaction" | "edit" | "delete")) {
+                    introduce_once(state, eid);
+                }
+                Err(anyhow::anyhow!("recipient device doesn't know us yet"))
+            }
             other => other,
         };
         if last.is_ok() {
@@ -5168,6 +5175,24 @@ pub async fn send_chat_any(state: &IrohState, ep: &Endpoint, eids: &[String], pa
         }
     }
     last
+}
+
+/// Say hello to a device that turned our message away as a stranger (e.g. a
+/// friend's new phone we never met, or one whose hello to us got lost), at
+/// most once a minute per device. If its user removed us it stays a stranger.
+fn introduce_once(state: &IrohState, eid: &str) {
+    static LAST: std::sync::OnceLock<Mutex<HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    {
+        let mut last = LAST.get_or_init(Default::default).lock().unwrap();
+        if last.get(eid).is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        last.insert(eid.to_owned(), std::time::Instant::now());
+    }
+    let Some(app) = state.app.get() else { return };
+    let (Some(net), Some(st)) = (app.try_state::<Arc<IrohState>>(), app.try_state::<Arc<crate::AppState>>()) else { return };
+    let name = st.settings.lock().unwrap().display_name.clone();
+    say_hello_to_endpoint(net.inner().clone(), eid.to_owned(), name);
 }
 
 pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) -> serde_json::Value {

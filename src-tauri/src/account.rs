@@ -13,6 +13,19 @@
 //! Chat threads are matched by the friend's endpoint id (friend ids are local).
 //! Merges are last-writer-wins per message (`ChatMessage::rev`) + furthest
 //! delivery status, so repeated exchanges converge and stop.
+//!
+//! Who you are vs. which device: the display name and profile photo belong to
+//! the PERSON — one account-wide profile, last change wins on every own device,
+//! so friends see the same name/photo whichever device they reach. Each device
+//! keeps its own device name ("Ashton's MacBook Pro", "iPhone") for the device
+//! list ("Your Mac"). A name nobody chose (the computer's default) never
+//! spreads; a chosen one replaces it everywhere.
+//!
+//! Ordering is Lamport-style throughout: a relink, re-add, rename, edit or
+//! removal is stamped one past the newest stamp it has seen, so devices whose
+//! clocks disagree still agree on the outcome. Removals are tombstones merged
+//! by max; a device that leaves while the others are offline says so in its
+//! next hello (`left_accounts`), since it can no longer sign for the account.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -431,8 +444,11 @@ pub(crate) fn apply_left_notice(dir: &Path, who: &str, notice: &Value) -> bool {
     let Some(n) = notice.get(&account) else { return false };
     let Some(at) = n["at"].as_u64() else { return false };
     let since = n["since"].as_u64();
+    // Only a device of this account can leave it (anyone else could otherwise
+    // hide themselves from the user's other devices).
+    let own = is_own_device(dir, who);
     let removed = with_book(dir, &account, |b| {
-        let linked = b.linked.get(who).copied().unwrap_or(0);
+        let Some(linked) = b.linked.get(who).copied().or(own.then_some(0)) else { return false };
         // It left the link we know about (the same link time, when it said),
         // not an older one it was since linked again after.
         let current = since.map_or(at > linked, |s| s >= linked);
@@ -2013,6 +2029,12 @@ mod edge_tests {
         // …and the Mac hears it from the iPhone.
         assert!(sync(&b, &a).await.client.is_ok());
         assert_eq!(a.own_device_ids(), [b.eid()]);
+        // Someone who was never one of our devices can't "leave" (and so can't
+        // hide themselves from our other devices).
+        let stranger = eid();
+        friends::upsert_by_endpoint(&a.dir, &stranger, "Stranger");
+        assert!(!apply_left_notice(&a.dir, &stranger, &json!({account.clone(): {"at": chat::now_ms()}})));
+        assert!(!device_was_removed(&a.dir, &stranger));
         // A notice about an older link doesn't undo a newer one.
         mark_linked(&a.dir, &c.eid());
         assert!(!apply_left_notice(&a.dir, &c.eid(), &json!({account.clone(): {"at": 1, "since": 1}})));
