@@ -1,7 +1,7 @@
 import { MOBILE_UI } from '../lib/platform'
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { QRCodeSVG } from 'qrcode.react'
+import { ShareCode } from '../components/CodeQr'
 import {
   AlertCircle,
   ArrowLeftRight,
@@ -9,7 +9,6 @@ import {
   Check,
   CheckCircle2,
   Clock,
-  Copy,
   Eye,
   FolderOpen,
   FolderSync,
@@ -42,6 +41,10 @@ export function FoldersView() {
   const pairs = useStore((s) => s.pairs)
   const statuses = useStore((s) => s.folderStatuses)
   const [modal, setModal] = useState<'create' | 'accept' | null>(null)
+  // A folder invite scanned/pasted somewhere else (Receive box, Add friend, the
+  // menu-bar popover) lands here: Accept invite opens with it prefilled.
+  const pendingInvite = useStore((s) => s.pendingFolderInvite)
+  const setPendingInvite = useStore((s) => s.setPendingFolderInvite)
   const [invite, setInvite] = useState<{ code: string; name: string } | null>(null)
 
   return (
@@ -101,7 +104,14 @@ export function FoldersView() {
         </div>
       )}
 
-      {modal && <PairingModal mode={modal} onClose={() => setModal(null)} />}
+      {(modal || pendingInvite) && (
+        <PairingModal
+          key={pendingInvite ?? modal ?? ''}
+          mode={pendingInvite ? 'accept' : modal!}
+          initialInvite={pendingInvite ?? ''}
+          onClose={() => { setModal(null); setPendingInvite(null) }}
+        />
+      )}
       {invite && <InviteModal code={invite.code} folderName={invite.name} onClose={() => setInvite(null)} />}
     </div>
   )
@@ -1092,17 +1102,6 @@ function InviteModal({
   folderName: string
   onClose: () => void
 }) {
-  const toast = useStore((s) => s.toast)
-  const [copied, setCopied] = useState(false)
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(code)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1600)
-    } catch {
-      toast('error', 'Could not copy')
-    }
-  }
   return (
     <div
       onClick={onClose}
@@ -1133,37 +1132,10 @@ function InviteModal({
         </div>
         <div className="dialog-body">
           <p style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.5 }}>
-            Send this to the other person. They open DropBeam → <b>Accept invite</b>, paste it, and
-            choose a folder.
+            Send this to the other person. They open DropBeam → <b>Accept invite</b>, scan this QR
+            code (or paste the invite), and choose a folder.
           </p>
-          <div style={{ display: 'grid', placeItems: 'center', margin: '6px 0 14px' }}>
-            <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
-              <QRCodeSVG value={code} size={150} level="M" fgColor="#15161d" bgColor="#fff" />
-            </div>
-          </div>
-          <div
-            className="selectable"
-            style={{
-              fontFamily: 'var(--font-mono)',
-              fontSize: 'calc(11px * var(--ui-font-scale, 1))',
-              background: 'var(--surface-2)',
-              border: '1px solid var(--border)',
-              borderRadius: 11,
-              padding: '10px 12px',
-              wordBreak: 'break-all',
-              maxHeight: 80,
-              overflowY: 'auto',
-              color: 'var(--text-muted)',
-            }}
-          >
-            {code}
-          </div>
-        </div>
-        <div className="dialog-actions">
-          <button className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} style={{ width: '100%', marginTop: 12 }} onClick={copy}>
-            {copied ? <Check size={15} /> : <Copy size={15} />}
-            {copied ? 'Copied' : 'Copy invite'}
-          </button>
+          <ShareCode code={code} layout="stack" copyLabel="Copy invite" />
         </div>
       </motion.div>
     </div>

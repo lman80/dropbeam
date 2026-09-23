@@ -1,9 +1,9 @@
-import { QrScanner } from './QrScanner'
+import { ScanCodeButton, ShareCode } from './CodeQr'
+import { parseCode, wrongCodeMessage } from '../lib/codes'
 import { MOBILE_UI } from '../lib/platform'
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { QRCodeSVG } from 'qrcode.react'
-import { ArrowLeftRight, ArrowRight, Check, Copy, FolderOpen, FolderSync, X } from 'lucide-react'
+import { ArrowLeftRight, ArrowRight, Check, FolderOpen, FolderSync, X } from 'lucide-react'
 import { api } from '../lib/api'
 import { useStore } from '../store'
 import { friendOnlineState } from '../lib/presence'
@@ -12,24 +12,25 @@ import { Spinner } from './bits'
 export function PairingModal({
   mode,
   onClose,
+  initialInvite = '',
 }: {
   mode: 'create' | 'accept'
   onClose: () => void
+  /** Accept mode: an invite already scanned/pasted elsewhere (prefilled). */
+  initialInvite?: string
 }) {
   const reloadPairs = useStore((s) => s.reloadPairs)
   const reloadFriends = useStore((s) => s.reloadFriends)
   const toast = useStore((s) => s.toast)
   const friends = useStore((s) => s.friends)
-  const [scanning, setScanning] = useState(false)
   const [folder, setFolder] = useState('')
   const [syncMode, setSyncMode] = useState<'mirror' | 'twoway' | 'oneway'>('twoway')
   const [peerName, setPeerName] = useState('')
   // Existing friends the user picked to invite straight into this folder (no code).
   const [invitees, setInvitees] = useState<string[]>([])
-  const [inviteInput, setInviteInput] = useState('')
+  const [inviteInput, setInviteInput] = useState(initialInvite)
   const [createdInvite, setCreatedInvite] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [copied, setCopied] = useState(false)
 
   const pickFolder = async () => {
     const d = await api.pickDirectory()
@@ -103,14 +104,15 @@ export function PairingModal({
       toast('error', 'Paste the invite code from the other person.')
       return
     }
-    if (!/^dropbeam1:/i.test(inviteInput.trim())) { toast('error', 'This is not a shared folder invite.'); return }
+    const parsed = parseCode(inviteInput)
+    if (parsed?.kind !== 'folderInvite') { toast('error', wrongCodeMessage(['folderInvite'], parsed)); return }
     if (!folder) {
       toast('error', 'Choose a folder for the shared files.')
       return
     }
     setBusy(true)
     try {
-      await api.acceptPair(inviteInput.trim(), folder)
+      await api.acceptPair(parsed.code, folder)
       await reloadPairs()
       toast('success', 'Paired! Files will now sync automatically.')
       onClose()
@@ -121,24 +123,7 @@ export function PairingModal({
     }
   }
 
-  const copyInvite = async () => {
-    if (!createdInvite) return
-    try {
-      await navigator.clipboard.writeText(createdInvite)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1600)
-    } catch {
-      toast('error', 'Could not copy to clipboard')
-    }
-  }
-
   const folderName = folder ? folder.split('/').pop() || folder : ''
-
-  if (scanning) return <QrScanner hint="Scan the shared folder invite." onClose={() => setScanning(false)} onResult={text => {
-    setScanning(false)
-    if (!/^dropbeam1:/i.test(text.trim())) { toast('error', 'This is not a shared folder invite.'); return }
-    setInviteInput(text.trim())
-  }} />
 
   return (
     <AnimatePresence>
@@ -186,50 +171,10 @@ export function PairingModal({
             <div className="dialog-body">
               <p style={{ fontSize: 'calc(13.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 0 }}>
                 Send this invite to the other person. In their DropBeam, they choose{' '}
-                <b>Accept invite</b> and pick a folder. After that, anything dropped in{' '}
+                <b>Accept invite</b>, scan this QR code (or paste the invite) and pick a folder. After that, anything dropped in{' '}
                 <b>{folderName}</b> beams over automatically.
               </p>
-              <div
-                style={{
-                  display: 'flex',
-                  gap: 16,
-                  alignItems: 'center',
-                  marginTop: 8,
-                  flexWrap: 'wrap',
-                }}
-              >
-                <div style={{ background: '#fff', padding: 12, borderRadius: 14, border: '1px solid var(--border)' }}>
-                  <QRCodeSVG value={createdInvite} size={120} level="M" fgColor="#15161d" bgColor="#fff" />
-                </div>
-                <div style={{ flex: 1, minWidth: 200 }}>
-                  <div
-                    className="selectable"
-                    style={{
-                      fontFamily: 'var(--font-mono)',
-                      fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
-                      background: 'var(--surface-2)',
-                      border: '1px solid var(--border)',
-                      borderRadius: 11,
-                      padding: '10px 12px',
-                      wordBreak: 'break-all',
-                      maxHeight: 96,
-                      overflowY: 'auto',
-                      color: 'var(--text-muted)',
-                      lineHeight: 1.5,
-                    }}
-                  >
-                    {createdInvite}
-                  </div>
-                  <button
-                    className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`}
-                    style={{ width: '100%', marginTop: 10 }}
-                    onClick={copyInvite}
-                  >
-                    {copied ? <Check size={15} /> : <Copy size={15} />}
-                    {copied ? 'Copied to clipboard' : 'Copy invite'}
-                  </button>
-                </div>
-              </div>
+              <ShareCode code={createdInvite} layout="stack" copyLabel="Copy invite" />
             </div>
           ) : (
             <div className="dialog-body">
@@ -257,15 +202,23 @@ export function PairingModal({
 
               {mode === 'accept' && (
                 <div style={{ marginTop: 16 }}>
-                  <label style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
-                    Invite code
-                  </label>
-                  <button className="btn btn-ghost" onClick={() => setScanning(true)}>Scan QR code</button>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                    <label htmlFor="folder-invite-code" style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', fontWeight: 600, color: 'var(--text-muted)' }}>
+                      Invite code
+                    </label>
+                    <ScanCodeButton
+                      hint="Hold the folder invite QR code up to your camera."
+                      title="Scan a folder invite"
+                      accept={['folderInvite']}
+                      onCode={(code) => setInviteInput(code)}
+                    />
+                  </div>
                   <textarea
+                    id="folder-invite-code"
                     className="input"
                     style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'calc(12px * var(--ui-font-scale, 1))', resize: 'none' }}
                     autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-                    placeholder="Paste the dropbeam1:… invite here"
+                    placeholder="Paste the dropbeam1:… invite, or scan its QR"
                     value={inviteInput}
                     onChange={(e) => setInviteInput(e.target.value)}
                   />

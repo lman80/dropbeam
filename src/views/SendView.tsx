@@ -1,13 +1,13 @@
 import { useMemo, useState } from 'react'
 import { AnimatePresence } from 'framer-motion'
-import { ArrowDownToLine, Inbox, QrCode } from 'lucide-react'
+import { ArrowDownToLine, Inbox } from 'lucide-react'
 import { api } from '../lib/api'
 import { useStore } from '../store'
 import { MOBILE_UI } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { DropZone } from '../components/DropZone'
 import { TransferCard } from '../components/TransferCard'
-import { QrScanner } from '../components/QrScanner'
+import { ScanCodeButton } from '../components/CodeQr'
 import { EmptyState } from '../components/bits'
 
 export function SendView() {
@@ -16,10 +16,10 @@ export function SendView() {
   const dragHovering = useStore((s) => s.dragHovering)
   const setPendingSend = useStore((s) => s.setPendingSend)
   const receiveCode = useStore((s) => s.receiveCode)
+  const openCode = useStore((s) => s.openCode)
   const [picking, setPicking] = useState(false)
   const [code, setCode] = useState('')
   const [showReceive, setShowReceive] = useState(false)
-  const [scanning, setScanning] = useState(false)
 
   // One unified, newest-first list of everything — sends AND receives. Ghost
   // entries (a discarded marker like a ping) are filtered out.
@@ -56,7 +56,9 @@ export function SendView() {
     if (!code.trim()) return
     // Only clear the field + close the panel if the receive actually started —
     // otherwise the user loses what they typed before they can read the error.
-    const ok = await receiveCode(code)
+    // Desktop: any DropBeam code does its one sensible thing (a friend code adds
+    // the friend, a folder invite opens Accept invite…). Mobile keeps receive-only.
+    const ok = await (MOBILE_UI ? receiveCode(code) : openCode(code))
     if (ok) {
       setCode('')
       setShowReceive(false)
@@ -99,7 +101,6 @@ export function SendView() {
     >
       <DropZone hovering={dragHovering} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} picking={picking} />
 
-      {scanning && <QrScanner hint="Scan the sender’s receive code." onClose={() => setScanning(false)} onResult={value => { setCode(value); setScanning(false) }} />}
       {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
       <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
         {!MOBILE_UI && !/Mac/i.test(navigator.userAgent) && (
@@ -108,25 +109,44 @@ export function SendView() {
           </button>
         )}
         {!showReceive ? (
-          <button
-            className="btn btn-ghost"
-            style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
-            onClick={() => setShowReceive(true)}
-          >
-            <ArrowDownToLine size={14} /> Have a code? Receive files
-          </button>
+          <>
+            <button
+              className="btn btn-ghost"
+              style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
+              onClick={() => setShowReceive(true)}
+            >
+              <ArrowDownToLine size={14} /> Have a code? Receive files
+            </button>
+            <ScanCodeButton
+              label="Scan a QR code"
+              style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))' }}
+              hint="Hold the sender’s QR code up to your camera."
+              title="Scan to receive"
+              accept={['receive']}
+              onCode={(value) => void openCode(value)}
+              onOther={(p) => void openCode(p.code)}
+            />
+          </>
         ) : (
           <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 540, flexWrap: 'wrap' }}>
             <input
               className="input"
               autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-              placeholder="Paste the code the sender shared…"
+              placeholder="Paste the code, or scan the sender’s QR…"
+              aria-label="Receive code"
               value={code}
               autoFocus
               onChange={(e) => setCode(e.target.value)}
               style={{ fontFamily: 'var(--font-mono)', fontSize: 'calc(14px * var(--ui-font-scale, 1))' }}
             />
-            <button className="btn btn-ghost" type="button" onClick={() => setScanning(true)}><QrCode size={15} />Scan QR</button>
+            <ScanCodeButton
+              label="Scan QR code"
+              hint="Hold the sender’s QR code up to your camera."
+              title="Scan to receive"
+              accept={['receive']}
+              onCode={(value) => { setCode(value); void openCode(value).then((ok) => { if (ok) { setCode(''); setShowReceive(false) } }) }}
+              onOther={(p) => void openCode(p.code).then((ok) => { if (ok) { setCode(''); setShowReceive(false) } })}
+            />
             <button className="btn btn-primary" type="submit" disabled={!code.trim()}>
               <ArrowDownToLine size={15} /> Receive
             </button>

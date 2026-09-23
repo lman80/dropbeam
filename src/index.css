@@ -2273,13 +2273,6 @@ html.mobile button > svg { flex-shrink: 0; }
 .device-list { display: flex; flex-direction: column; gap: 10px; }
 .device-link-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .qr-overlay, .device-link-overlay { position: fixed; inset: 0; z-index: 250; display: grid; place-items: center; background: rgb(0 0 0 / 50%); padding: 16px; }
-.qr-scanner { position: relative; width: 420px; height: 520px; max-width: 100%; max-height: 100dvh; overflow: auto; padding: 0; background: #111; color: white; isolation: isolate; }
-.qr-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: -1; }
-.qr-viewfinder { position: absolute; width: 65%; aspect-ratio: 1; top: 38%; left: 50%; transform: translate(-50%, -50%); border: 3px solid white; border-radius: 16px; box-shadow: 0 0 0 999px rgb(0 0 0 / 25%); pointer-events: none; z-index: -1; }
-.qr-controls { position: relative; display: flex; flex-direction: column; gap: 8px; margin-top: 290px; padding: 16px; background: rgb(0 0 0 / 75%); }
-.qr-controls p { margin: 0; }
-.qr-controls .btn { color: white; }
-.qr-controls form { display: flex; flex-direction: column; gap: 8px; }
 .device-link-dialog { width: 440px; max-width: 100%; max-height: 90dvh; overflow: auto; padding: 22px; display: flex; flex-direction: column; gap: 12px; }
 .device-link-dialog h2 { font-size: 18px; margin: 0; }
 .device-link-dialog p { margin: 0; }
@@ -2309,3 +2302,54 @@ html.mobile button > svg { flex-shrink: 0; }
 .avatar-device { color: white; }
 .spin { animation: account-spin 1s linear infinite; }
 @keyframes account-spin { to { transform: rotate(360deg); } }
+/* ---- QR codes: one look for every shown code (QrCodeView / ShareCode) ----
+   The tile is ALWAYS dark-on-white (a phone camera can't read an inverted,
+   dark-mode QR reliably) with its own quiet zone; the card ring keeps it from
+   floating as a white hole in dark mode. */
+.qr-code { margin: 0; max-width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
+.qr-code-tile { position: relative; display: block; max-width: 100%; padding: 8px; border-radius: 16px; background: #fff; border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(20, 22, 40, 0.06), 0 6px 18px rgba(20, 22, 40, 0.08); line-height: 0; cursor: zoom-in; transition: transform 0.14s ease, box-shadow 0.14s ease; }
+.qr-code-tile:hover { transform: translateY(-1px); box-shadow: 0 2px 4px rgba(20, 22, 40, 0.08), 0 10px 24px rgba(20, 22, 40, 0.12); }
+.qr-code-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+div.qr-code-tile { cursor: default; }
+.qr-code-tile svg { display: block; max-width: 100%; height: auto; border-radius: 8px; }
+.qr-code-zoom { position: absolute; right: 6px; bottom: 6px; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 7px; background: rgba(11, 12, 18, 0.72); color: #fff; opacity: 0; transition: opacity 0.14s ease; }
+.qr-code-tile:hover .qr-code-zoom, .qr-code-tile:focus-visible .qr-code-zoom { opacity: 1; }
+.qr-code-hint { display: inline-flex; align-items: center; gap: 5px; font-size: calc(11.5px * var(--ui-font-scale, 1)); color: var(--text-muted); text-align: center; }
+.dark .qr-code-tile { border-color: color-mix(in srgb, #fff 18%, var(--border)); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 10%, transparent), 0 8px 24px rgba(0, 0, 0, 0.4); }
+.qr-enlarged-overlay { background: rgb(6 7 12 / 86%) !important; backdrop-filter: blur(6px); }
+.qr-enlarged { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.qr-enlarged-tile { background: #fff; padding: 14px; border-radius: 22px; box-shadow: var(--shadow-lg); line-height: 0; }
+.qr-enlarged-tile svg { display: block; width: min(480px, 78vw, calc(100dvh - 190px)); height: auto; }
+.qr-enlarged p { margin: 0; color: #fff; font-size: 13px; font-weight: 600; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }
+
+.share-code { display: flex; gap: 18px; align-items: center; }
+.share-code-stack { flex-direction: column; align-items: stretch; gap: 14px; }
+.share-code-stack > .qr-code { align-self: center; }
+.share-code-row { flex-wrap: wrap; }
+.share-code-side { flex: 1; min-width: 210px; display: flex; flex-direction: column; gap: 9px; }
+.share-code-instructions { font-size: calc(12.5px * var(--ui-font-scale, 1)); color: var(--text-muted); line-height: 1.5; }
+.share-code-text { display: block; font-family: var(--font-mono); font-size: calc(11px * var(--ui-font-scale, 1)); line-height: 1.5; color: var(--text-muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: 11px; padding: 9px 11px; word-break: break-all; max-height: 74px; overflow-y: auto; }
+
+/* ---- QR scanner (desktop) ---- */
+.qr-overlay .qrs { width: 440px; max-width: calc(100vw - 32px) !important; padding: 18px 20px 20px; border-radius: 20px; gap: 0; }
+.qrs-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.qrs-title { display: flex; align-items: center; gap: 8px; font-size: calc(16px * var(--ui-font-scale, 1)); font-weight: 750; }
+.qrs-title svg { color: var(--accent); }
+.qrs-body { display: flex; flex-direction: column; gap: 10px; }
+.qrs-stage { position: relative; aspect-ratio: 4 / 3; flex-shrink: 0; border-radius: 16px; overflow: hidden; background: #0b0c12; isolation: isolate; }
+.qrs-stage.dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.qrs-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: opacity 0.2s ease; }
+.qrs-finder { position: absolute; top: 50%; left: 50%; width: 58%; aspect-ratio: 1; transform: translate(-50%, -50%); box-shadow: 0 0 0 999px rgb(0 0 0 / 32%); border-radius: 18px; pointer-events: none; }
+.qrs-finder i { position: absolute; width: 26px; height: 26px; border: 3.5px solid #fff; }
+.qrs-finder i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; border-top-left-radius: 18px; }
+.qrs-finder i:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; border-top-right-radius: 18px; }
+.qrs-finder i:nth-child(3) { bottom: 0; left: 0; border-right: 0; border-top: 0; border-bottom-left-radius: 18px; }
+.qrs-finder i:nth-child(4) { bottom: 0; right: 0; border-left: 0; border-top: 0; border-bottom-right-radius: 18px; }
+.qrs-stage-msg { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 22px; text-align: center; color: rgb(255 255 255 / 82%); font-size: calc(12.5px * var(--ui-font-scale, 1)); line-height: 1.5; }
+.qrs-drop { background: rgb(11 12 18 / 86%); color: #fff; }
+.qrs-hint { margin: 2px 0 0; font-size: calc(13px * var(--ui-font-scale, 1)); color: var(--text); font-weight: 600; text-align: center; }
+.qrs-notice { margin: 0; padding: 8px 11px; border-radius: 11px; background: var(--amber-soft); color: var(--amber); font-size: calc(12.5px * var(--ui-font-scale, 1)); line-height: 1.45; overflow-wrap: anywhere; }
+.qrs-alt { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+.qrs-paste { display: flex; gap: 8px; }
+.qrs-paste .input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: calc(12.5px * var(--ui-font-scale, 1)); }
+.qrs-tip { margin: 0; font-size: calc(11.5px * var(--ui-font-scale, 1)); color: var(--text-faint); text-align: center; line-height: 1.45; }

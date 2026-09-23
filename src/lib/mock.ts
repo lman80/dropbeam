@@ -374,9 +374,11 @@ export const mockApi = {
     const t = base(id, 'send', names)
     setTimeout(() => {
       t.state = 'waitingForPeer'
-      t.code = 'direct1aBcDeFgH2jKlMnPqRsTuVwXyZ3456789aBcDeFgHjKmNpQ'
+      // Realistic length (address JSON, ~390 chars) so previews show a true-density QR.
+      t.code = 'directeyJhZGRyIjp7ImlkIjoiMGYxZTJkM2M0YjVhNjk3ODg3OTZhNWI0YzNkMmUxZjAwZjFlMmQzYzRiNWE2OTc4ODc5NmE1YjRjM2QyZTFmMCIsImFkZHJzIjpbeyJSZWxheSI6Imh0dHBzOi8vdXNlMS0xLnJlbGF5Lm4wLmlyb2gubGluay4vIn0seyJJcCI6IjE5Mi4xNjguMS4yMzo1MjAxMSJ9LHsiSXAiOiIyMDMuMC4xMTMuNDQ6NTIwMTEifSx7IklwIjoiWzIwMDE6ZGI4OjNlNDA6NWMxMDo6MmJdOjUyMDExIn1dfSwidG9rZW4iOiI3ZjNjOWExZS01YjJkLTRjOGYtOWU2MS0wYTRkMmI3YzhlMTMifQ'
       emit('transfer://update', { ...t })
-      setTimeout(() => simulate(t, 540_000_000), 2600)
+      // Preview: ?holdCode=1 keeps the card waiting so the QR can be inspected.
+      if (!new URLSearchParams(location.search).has('holdCode')) setTimeout(() => simulate(t, 540_000_000), 2600)
     }, 250)
     return base(id, 'send', names)
   },

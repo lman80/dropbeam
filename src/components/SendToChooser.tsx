@@ -185,7 +185,7 @@ export function SendToChooser() {
                 <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
                   <div style={{ fontSize: 'calc(14px * var(--ui-font-scale, 1))', fontWeight: 650 }}>Share with a code or QR</div>
                   <div style={{ fontSize: 'calc(11.5px * var(--ui-font-scale, 1))', color: 'var(--text-faint)' }}>
-                    For anyone — they enter the code to receive
+                    For anyone — they scan the QR or paste the code
                   </div>
                 </div>
                 <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
