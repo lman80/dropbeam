@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- macOS-only Info.plist keys (tauri.conf.json → bundle.macOS.infoPlist);
+       merged on top of Info.plist for the desktop bundle only. -->
+
+  <!-- Menu-bar app (like Blip): born with NO Dock icon so a login launch is
+       silent and DropBeam just sits in the menu bar, ready to receive. We flip to
+       a regular app (Dock icon + focus) at runtime ONLY while the main window is
+       open (set_activation_policy in lib.rs). Starting Accessory and only ever
+       going Accessory->Regular at runtime avoids the flaky Regular->Accessory
+       hide transition and the login Dock-icon flash. -->
+  <key>LSUIElement</key>
+  <true/>
+
+  <!-- Why we touch these folders, so the macOS access prompt is correct (a
+       Shared Drop Folder often lives on the Desktop). The repeated-prompt fix is
+       the stable ad-hoc signature + getting the app out of quarantine, not these
+       strings, but they make the prompt proper. -->
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+
+  <!-- (If LAN discovery still fails on macOS: System Settings -> Privacy &
+       Security -> Local Network -> enable DropBeam.) -->
+
+  <!-- Finder right-click → Services → "Share with DropBeam". The app must live
+       in /Applications for macOS (pbs) to index the service. -->
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key>
+      <dict>
+        <key>default</key>
+        <string>Share with DropBeam</string>
+      </dict>
+      <key>NSMessage</key>
+      <string>shareWithDropBeam</string>
+      <key>NSPortName</key>
+      <string>DropBeam</string>
+      <key>NSSendFileTypes</key>
+      <array>
+        <string>public.item</string>
+      </array>
+      <key>NSServiceDescription</key>
+      <string>Send the selected file to a friend with DropBeam.</string>
+      <key>NSTimeout</key>
+      <string>5000</string>
+    </dict>
+  </array>
+</dict>
+</plist>

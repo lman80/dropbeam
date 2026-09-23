@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>DropBeam</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -19,7 +21,7 @@
 	<key>CFBundleVersion</key>
 	<string>0.52.2</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<false/>
+	<true/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
@@ -29,11 +31,11 @@
 		<string>_irohv1._udp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>DropBeam uses the camera to scan friend, device, and shared-folder QR codes.</string>
+	<string>DropBeam uses the camera only to scan QR codes for adding friends, linking your devices and joining shared folders.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>DropBeam finds your friends&apos; devices on the same network so files transfer directly between them at full local speed.</string>
+	<string>DropBeam looks for your devices and friends on this network so files go straight between them at full speed, without the internet.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>DropBeam saves photos you choose to keep from a chat to your library.</string>
+	<string>DropBeam saves photos and videos you choose to keep to your photo library.</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
@@ -48,47 +50,8 @@
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
-	</array>
-	<key>UISupportedInterfaceOrientations~ipad</key>
-	<array>
-		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationPortraitUpsideDown</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
-	<key>LSUIElement</key>
-	<true/>
-	<key>NSDesktopFolderUsageDescription</key>
-	<string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
-	<key>NSDocumentsFolderUsageDescription</key>
-	<string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
-	<key>NSDownloadsFolderUsageDescription</key>
-	<string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
-	<key>NSServices</key>
-	<array>
-		<dict>
-			<key>NSMenuItem</key>
-			<dict>
-				<key>default</key>
-				<string>Share with DropBeam</string>
-			</dict>
-			<key>NSMessage</key>
-			<string>shareWithDropBeam</string>
-			<key>NSPortName</key>
-			<string>DropBeam</string>
-			<key>NSSendFileTypes</key>
-			<array>
-				<string>public.item</string>
-			</array>
-			<key>NSServiceDescription</key>
-			<string>Send the selected file to a friend with DropBeam.</string>
-			<key>NSTimeout</key>
-			<string>5000</string>
-		</dict>
-	</array>
 </dict>
 </plist>

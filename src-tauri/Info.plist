@@ -2,66 +2,32 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- Menu-bar app (like Blip): born with NO Dock icon so a login launch is
-       silent and DropBeam just sits in the menu bar, ready to receive. We flip to
-       a regular app (Dock icon + focus) at runtime ONLY while the main window is
-       open (set_activation_policy in lib.rs). Starting Accessory and only ever
-       going Accessory->Regular at runtime avoids the flaky Regular->Accessory
-       hide transition and the login Dock-icon flash. -->
-  <key>LSUIElement</key>
+  <!-- Keys shared by macOS AND iOS. Tauri merges this file into BOTH the macOS
+       bundle and the iOS app (gen/apple/app_iOS/Info.plist). macOS-only keys
+       (LSUIElement, folder prompts, Services) live in Info.macos.plist
+       (tauri.conf.json → bundle.macOS.infoPlist) so they never ship in the
+       iPhone app. -->
+
+  <!-- DropBeam's own end-to-end encryption (QUIC/TLS + Noise-style keys from
+       iroh/rustls) is standard crypto that is NOT provided by Apple's OS, so it
+       is not the "exempt" kind. App Store Connect then asks the export-compliance
+       questions per build (answer: standard algorithms; see docs/APPSTORE.md). -->
+  <key>ITSAppUsesNonExemptEncryption</key>
   <true/>
 
-  <!-- Why we touch these folders, so the macOS access prompt is correct (a
-       Shared Drop Folder often lives on the Desktop). The repeated-prompt fix is
-       the stable ad-hoc signature + getting the app out of quarantine, not these
-       strings, but they make the prompt proper. -->
-  <key>NSDesktopFolderUsageDescription</key>
-  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
-  <key>NSDocumentsFolderUsageDescription</key>
-  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
-  <key>NSDownloadsFolderUsageDescription</key>
-  <string>DropBeam watches your chosen Shared Drop Folder to auto-send new files to the people you share it with.</string>
+  <!-- Camera: QR scanning for friend, device and shared-folder codes. -->
+  <key>NSCameraUsageDescription</key>
+  <string>DropBeam uses the camera only to scan QR codes for adding friends, linking your devices and joining shared folders.</string>
 
-  <!-- macOS 15+ gates multicast behind the Local Network privilege and DENIES IT
-       SILENTLY without this string — which blocks the mDNS discovery that lets two
-       machines on the same Wi-Fi find each other and transfer at full local speed.
-       (If LAN discovery still fails: System Settings -> Privacy & Security ->
-       Local Network -> enable DropBeam.) -->
-        <key>ITSAppUsesNonExemptEncryption</key>
-    <false/>
-<key>NSCameraUsageDescription</key>
-  <string>DropBeam uses the camera to scan friend, device, and shared-folder QR codes.</string>
-<key>NSPhotoLibraryAddUsageDescription</key>
-  <string>DropBeam saves photos you choose to keep from a chat to your library.</string>
-<key>NSBonjourServices</key>
+  <!-- Saving a received photo/video to the library from the share sheet. -->
+  <key>NSPhotoLibraryAddUsageDescription</key>
+  <string>DropBeam saves photos and videos you choose to keep to your photo library.</string>
+
+  <!-- iroh's mDNS peer discovery (N0_SERVICE_NAME). Without BOTH of these the OS
+       silently drops multicast and LAN peers never appear (macOS 15+ and iOS). -->
+  <key>NSBonjourServices</key>
   <array><string>_irohv1._udp</string></array>
-<key>NSLocalNetworkUsageDescription</key>
-  <string>DropBeam finds your friends' devices on the same network so files transfer directly between them at full local speed.</string>
-
-  <!-- Finder right-click → Services → "Share with DropBeam". Tauri v2 merges
-       this file into the generated Info.plist at bundle time. The app must live
-       in /Applications for macOS (pbs) to index the service. -->
-  <key>NSServices</key>
-  <array>
-    <dict>
-      <key>NSMenuItem</key>
-      <dict>
-        <key>default</key>
-        <string>Share with DropBeam</string>
-      </dict>
-      <key>NSMessage</key>
-      <string>shareWithDropBeam</string>
-      <key>NSPortName</key>
-      <string>DropBeam</string>
-      <key>NSSendFileTypes</key>
-      <array>
-        <string>public.item</string>
-      </array>
-      <key>NSServiceDescription</key>
-      <string>Send the selected file to a friend with DropBeam.</string>
-      <key>NSTimeout</key>
-      <string>5000</string>
-    </dict>
-  </array>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>DropBeam looks for your devices and friends on this network so files go straight between them at full speed, without the internet.</string>
 </dict>
 </plist>
