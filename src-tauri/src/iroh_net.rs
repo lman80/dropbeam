@@ -1740,12 +1740,28 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
 #[derive(Debug)]
 pub(crate) struct DirectPathSelector;
 
-fn path_preference_key(is_relay: bool, is_ipv6: bool, rtt: Duration) -> (bool, i128) {
-    (is_relay, rtt.as_nanos() as i128 - if is_ipv6 { 3_000_000 } else { 0 })
+/// Path ranking: relay last; among direct paths a LOCAL-network one (the peer's
+/// address is on one of our LAN subnets) always beats a public one — even when a
+/// jittery Wi-Fi momentarily measures the public path faster. Field case
+/// (2026-09-25): two Macs on one Wi-Fi flipped onto the router's PUBLIC address
+/// (hairpin NAT through 116.46.x) whenever it sampled a few ms faster; that
+/// router hairpins badly, so real sends timed out ("interrupted before the
+/// recipient confirmed receipt") while the LAN path was right there.
+/// Within a class the lower RTT wins, with a small IPv6 bias.
+fn path_preference_key(is_relay: bool, is_lan: bool, is_ipv6: bool, rtt: Duration) -> (bool, bool, i128) {
+    (is_relay, !is_lan, rtt.as_nanos() as i128 - if is_ipv6 { 3_000_000 } else { 0 })
 }
 
-fn should_switch_path(current: Option<(bool, i128)>, best: (bool, i128)) -> bool {
-    current.is_none_or(|current| current.0 != best.0 || best.1 + 5_000_000 <= current.1)
+fn should_switch_path(current: Option<(bool, bool, i128)>, best: (bool, bool, i128)) -> bool {
+    current.is_none_or(|current| (best.0, best.1) < (current.0, current.1)
+        || ((best.0, best.1) == (current.0, current.1) && best.2 + 5_000_000 <= current.2))
+}
+
+fn remote_is_lan(tuple: &iroh::endpoint::transports::FourTuple) -> bool {
+    match tuple.remote() {
+        iroh::endpoint::transports::Addr::Ip(sa) => on_local_subnet(sa.ip(), &LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner())),
+        _ => false,
+    }
 }
 
 impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
@@ -1757,7 +1773,7 @@ impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
         for path in ctx.paths() {
             let Some(stats) = path.stats() else { continue; };
             let tuple = path.network_path();
-            let key = path_preference_key(tuple.is_relay(), tuple.addr_kind() == AddrKind::IpV6, stats.rtt);
+            let key = path_preference_key(tuple.is_relay(), remote_is_lan(&tuple), tuple.addr_kind() == AddrKind::IpV6, stats.rtt);
             if Some(tuple) == ctx.current() && current_key.is_none_or(|current| key < current) {
                 current_key = Some(key);
             }
@@ -10587,8 +10603,8 @@ mod path_preference_tests {
 
     #[test]
     fn direct_beats_faster_relay_and_relay_recovers_when_direct_disappears() {
-        let direct = path_preference_key(false, false, Duration::from_secs(1));
-        let relay = path_preference_key(true, false, Duration::from_millis(1));
+        let direct = path_preference_key(false, false, false, Duration::from_secs(1));
+        let relay = path_preference_key(true, false, false, Duration::from_millis(1));
         assert!(direct < relay);
         assert!(should_switch_path(Some(relay), direct));
         // When the direct path is abandoned it is absent from ctx.paths(),
@@ -10598,13 +10614,27 @@ mod path_preference_tests {
 
     #[test]
     fn direct_paths_keep_ipv6_bias_and_five_ms_hysteresis() {
-        let v4 = path_preference_key(false, false, Duration::from_millis(20));
-        let v6 = path_preference_key(false, true, Duration::from_millis(22));
+        let v4 = path_preference_key(false, false, false, Duration::from_millis(20));
+        let v6 = path_preference_key(false, false, true, Duration::from_millis(22));
         assert!(v6 < v4);
         assert!(!should_switch_path(Some(v4), v6));
-        assert!(!should_switch_path(Some(v4), path_preference_key(false, false, Duration::from_millis(16))));
-        assert!(should_switch_path(Some(v4), path_preference_key(false, false, Duration::from_millis(15))));
+        assert!(!should_switch_path(Some(v4), path_preference_key(false, false, false, Duration::from_millis(16))));
+        assert!(should_switch_path(Some(v4), path_preference_key(false, false, false, Duration::from_millis(15))));
     }
+    #[test]
+    fn a_lan_path_beats_a_faster_public_path_and_relay_stays_last() {
+        let lan = path_preference_key(false, true, false, Duration::from_millis(60));
+        let public = path_preference_key(false, false, false, Duration::from_millis(15));
+        let relay = path_preference_key(true, true, false, Duration::from_millis(1));
+        assert!(lan < public, "a local-network path wins even when the hairpin samples faster");
+        assert!(public < relay);
+        assert!(should_switch_path(Some(public), lan));
+        assert!(!should_switch_path(Some(lan), public));
+        // Same class: only a clear (>5 ms) RTT gain switches.
+        let lan2 = path_preference_key(false, true, false, Duration::from_millis(57));
+        assert!(!should_switch_path(Some(lan), lan2));
+    }
+
 }
 
 #[cfg(test)]
