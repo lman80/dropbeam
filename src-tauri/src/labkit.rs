@@ -102,7 +102,7 @@ pub async fn lab_endpoint_for(mode: &str) -> Result<Endpoint> {
     crate::iroh_net::watch_local_subnets().await;
     if mode != "relay" { return lab_endpoint(false).await; }
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
-    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(noq_proto::congestion::Bbr3Config::default()));
+    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(crate::iroh_net::bbr_config()));
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
     Endpoint::builder(presets::N0)
@@ -115,7 +115,7 @@ pub async fn lab_endpoint_for(mode: &str) -> Result<Endpoint> {
 async fn lab_endpoint_inner(accept: bool, state_dir: Option<&Path>) -> Result<Endpoint> {
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
-        noq_proto::congestion::Bbr3Config::default(),
+        crate::iroh_net::bbr_config(),
     ));
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);
@@ -191,7 +191,7 @@ pub fn filter_addr(addr: EndpointAddr, mode: &str) -> EndpointAddr {
 pub async fn operator_endpoint(state_dir: &Path) -> Result<Endpoint> {
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
-        noq_proto::congestion::Bbr3Config::default(),
+        crate::iroh_net::bbr_config(),
     ));
     tcfg = tcfg.stream_receive_window((8u32 * 1024 * 1024).into());
     tcfg = tcfg.send_window(8 * 1024 * 1024);

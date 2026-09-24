@@ -1777,6 +1777,18 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
 #[derive(Debug)]
 pub(crate) struct DirectPathSelector;
 
+/// BBRv3 with a larger initial congestion window. The QUIC default (~12 KB,
+/// 10 packets) needs ~9 doublings — ~2 s at a 220 ms intercontinental RTT —
+/// before a 3 MB photo is even in flight. DROPBEAM_INITIAL_WINDOW (bytes)
+/// overrides it for A/B tests.
+pub(crate) fn bbr_config() -> noq_proto::congestion::Bbr3Config {
+    let iw = std::env::var("DROPBEAM_INITIAL_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(INITIAL_WINDOW);
+    let mut c = noq_proto::congestion::Bbr3Config::default();
+    c.initial_window(iw);
+    c
+}
+const INITIAL_WINDOW: u64 = 128 * 1024;
+
 /// Path ranking: relay last; among direct paths a LOCAL-network one (the peer's
 /// address is on one of our LAN subnets) always beats a public one — even when a
 /// jittery Wi-Fi momentarily measures the public path faster. Field case
@@ -1867,9 +1879,7 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // any home uplink), so realistic throughput is unchanged but the link stays
     // usable for everything else during a transfer.
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
-    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(
-        noq_proto::congestion::Bbr3Config::default(),
-    ));
+    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(bbr_config()));
     // Field incident (2026-09-12): 14 advertised IPv4 addresses (11 Docker
     // gateways) plus address churn exhausted the default 13 path ids, producing
     // MaxPathIdReached and permanently relay-only connections. Both peers need
