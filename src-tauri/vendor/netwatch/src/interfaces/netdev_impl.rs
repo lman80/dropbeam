@@ -199,6 +199,13 @@ fn local_addresses(ifaces: &[netdev::Interface]) -> LocalAddresses {
             // Skip down interfaces
             continue;
         }
+        // DropBeam patch: never advertise container/VM bridge addresses
+        // (docker0, br-*, veth*, virbr*, …). A remote peer can't reach them, yet
+        // each one costs a NAT-traversal path probe — a Docker host advertised
+        // 11 of them and burned the connection's path budget.
+        if !super::is_interesting_interface(&iface.name) {
+            continue;
+        }
         let ifc_is_loopback = is_loopback(iface);
         let addrs = iface
             .ipv4

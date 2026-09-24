@@ -1,4 +1,5 @@
 mod account;
+mod automation;
 mod block;
 mod codes;
 mod link;
@@ -457,6 +458,7 @@ pub fn run() {
                 .app_config_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
             let _ = std::fs::create_dir_all(&config_dir);
+            automation::spawn(app.handle().clone(), config_dir.clone());
             spawn_upload_queue_consumer(app.handle().clone(), config_dir.clone());
 
             let default_download = commands::download_directory(app.handle())

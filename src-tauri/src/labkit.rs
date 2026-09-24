@@ -426,6 +426,13 @@ pub fn build_corpus(dir: &Path, suite: &str) -> Result<Vec<LabCase>> {
     if suite == "big" {
         cases.push(case("huge-1gib", vec![file("huge.bin", 1 << 30, 43)?]));
     }
+    if suite == "sized" {
+        // One file of LAB_SIZE_MIB (default 64) — sustained-throughput probe.
+        let mib: u64 = std::env::var("LAB_SIZE_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let p = dir.join(format!("sized-{mib}mib.bin"));
+        write_payload_file(&p, mib << 20, 45)?;
+        cases.push(case("sized", vec![p]));
+    }
     if suite == "huge" {
         let gib: u64 = std::env::var("LAB_HUGE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
         let p = dir.join(format!("huge-{gib}gib.bin"));
@@ -559,7 +566,7 @@ pub fn build_corpus(dir: &Path, suite: &str) -> Result<Vec<LabCase>> {
         for i in 0..50 { paths.push(file(&format!("mixed-small-{i:02}.bin"), 4096 + i * 7, 300 + i as u64)?); }
         cases.push(case("mixed-batch", paths));
     }
-    anyhow::ensure!(!cases.is_empty(), "unknown suite {suite:?} (quick|full|big|huge|edge|many|mixed|torture2)");
+    anyhow::ensure!(!cases.is_empty(), "unknown suite {suite:?} (quick|full|big|huge|sized|edge|many|mixed|torture2)");
     Ok(cases)
 }
 
