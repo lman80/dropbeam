@@ -8214,7 +8214,11 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     // A Location host always answers, but preparing a 400-item batch on a
     // network-mounted NAS can take longer than the six-second legacy fallback,
     // and there is no legacy path for Locations anyway: give it a minute.
-    let ready_patience = Duration::from_secs(if location.is_some() { 60 } else { 6 });
+    // A peer recorded as modern ALWAYS answers; on a lossy path its ready frame
+    // can take a few retransmits. Falling back at 6 s there silently demoted the
+    // peer to legacy for good (no resume, no integrity) — field case 2026-09-25 on
+    // a hairpinned path. Give known-modern peers 20 s; unknown peers keep 6 s.
+    let ready_patience = Duration::from_secs(if location.is_some() { 60 } else if known_capable { 20 } else { 6 });
     let reply = if known_capable || n > 0 || location.is_some() {
         match tokio::time::timeout(ready_patience, &mut pending).await {
             Ok(r) => Some(r?),
@@ -8228,7 +8232,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
             Err(_) => {
                 if known_capable {
                     log::warn!(
-                        "peer {peer_id} was recorded progress-capable but sent no ready frame in 6s — treating it as legacy"
+                        "peer {peer_id} was recorded progress-capable but sent no ready frame in {}s — treating it as legacy", ready_patience.as_secs()
                     );
                     if let Some(state) = friend_state {
                         state.learn_progress(&peer_id, 0);
