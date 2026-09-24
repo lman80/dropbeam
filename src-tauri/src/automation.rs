@@ -6,6 +6,8 @@
 //!   {"op":"send","to":"<friend endpoint id or name>","paths":["/abs/file", …]}
 //!   {"op":"quicksend","paths":[…]}          → the ticket is logged as "code"
 //!   {"op":"receive","code":"direct…"}       → lands in the download folder
+//!   {"op":"chat","to":"<friend>","text":"…"}  → a chat message
+//!   {"op":"addfriend","code":"dropbeam:…"}     → add a friend by their code
 //! Every command and every terminal state of a transfer it started is appended
 //! to `<config>/automation-results.jsonl` (one JSON object per line) so a test
 //! driver on another machine can collect outcomes over ssh.
@@ -62,7 +64,7 @@ pub fn spawn(app: AppHandle, config_dir: PathBuf) {
             };
             for cmd in cmds {
                 let (st, net) = (st.inner().clone(), net.inner().clone());
-                let result = run(&app, &st, &net, &cmd);
+                let result = run(&app, &st, &net, &cmd).await;
                 match result {
                     Ok((op, id, code)) => {
                         started.lock().unwrap().insert(id.clone(), (op.clone(), Instant::now()));
@@ -83,8 +85,24 @@ fn paths_of(cmd: &Value) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
-fn run(app: &AppHandle, st: &Arc<AppState>, net: &Arc<IrohState>, cmd: &Value) -> Result<(String, String, Option<String>), String> {
+async fn run(app: &AppHandle, st: &Arc<AppState>, net: &Arc<IrohState>, cmd: &Value) -> Result<(String, String, Option<String>), String> {
     match cmd["op"].as_str().unwrap_or("") {
+        "chat" => {
+            let to = cmd["to"].as_str().unwrap_or("");
+            let f = friends::load(&st.config_dir).into_iter()
+                .find(|f| f.endpoint_id.as_deref() == Some(to) || f.name == to)
+                .ok_or_else(|| format!("no friend {to:?}"))?;
+            let text = cmd["text"].as_str().unwrap_or("").to_owned();
+            let m = crate::commands::send_chat_message(app.state(), app.state(), app.clone(), f.id, text, None, None).await?;
+            Ok(("chat".into(), m.id, None))
+        }
+        "addfriend" => {
+            let code = cmd["code"].as_str().unwrap_or("");
+            let f = friends::add_by_code(&st.config_dir, code)?;
+            let name = st.settings.lock().unwrap().display_name.clone();
+            if let Some(eid) = f.endpoint_id.clone() { crate::iroh_net::say_hello_to_endpoint(net.clone(), eid, name); }
+            Ok(("addfriend".into(), f.id, None))
+        }
         "send" => {
             let to = cmd["to"].as_str().unwrap_or("");
             let f = friends::load(&st.config_dir).into_iter()
