@@ -83,12 +83,14 @@ pub fn lab_secret(state_dir: &Path) -> iroh::SecretKey {
 /// `accept` registers the app ALPN (plus the lab results channel) so peers can
 /// dial us.
 pub async fn lab_endpoint(accept: bool) -> Result<Endpoint> {
+    crate::iroh_net::watch_local_subnets().await;
     lab_endpoint_inner(accept, None).await
 }
 
 /// Like `lab_endpoint`, but persists identity under `state_dir` so the node id
 /// survives self-update restarts. Used by `serve`.
 pub async fn lab_endpoint_persistent(accept: bool, state_dir: &Path) -> Result<Endpoint> {
+    crate::iroh_net::watch_local_subnets().await;
     lab_endpoint_inner(accept, Some(state_dir)).await
 }
 
@@ -97,6 +99,7 @@ pub async fn lab_endpoint_persistent(accept: bool, state_dir: &Path) -> Result<E
 /// peer's addrs alone still lets iroh upgrade to direct) — every byte provably
 /// rides the public relay, the path a user behind a hostile NAT gets.
 pub async fn lab_endpoint_for(mode: &str) -> Result<Endpoint> {
+    crate::iroh_net::watch_local_subnets().await;
     if mode != "relay" { return lab_endpoint(false).await; }
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
     tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(noq_proto::congestion::Bbr3Config::default()));

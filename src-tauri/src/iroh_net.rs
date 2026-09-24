@@ -1775,14 +1775,22 @@ impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
 
 /// Build and bind the endpoint with our persistent identity. Uses iroh's default
 /// (n0) relays + discovery for now; Phase 5 swaps in self-hosted infrastructure.
-pub async fn start(config_dir: &Path) -> Result<Endpoint> {
+/// Keep LOCAL_SUBNETS (LAN detection for the Local badge + single-stream LAN
+/// sends) current. Idempotent: the app and the lab tool both call it.
+pub async fn watch_local_subnets() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     refresh_local_subnets().await;
+    if STARTED.swap(true, Ordering::SeqCst) { return; }
     tokio::spawn(async {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             refresh_local_subnets().await;
         }
     });
+}
+
+pub async fn start(config_dir: &Path) -> Result<Endpoint> {
+    watch_local_subnets().await;
     let secret = load_or_create_secret(config_dir);
     // Seed the known-address cache so the FIRST dial after a relaunch already
     // carries every peer address that worked before.
@@ -5656,7 +5664,7 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
         // Big single folder files fan across parallel streams exactly like friend
         // sends (same negotiation, same resume). Folder sync was the LAST big-file
         // path still single-stream — which is where iroh's per-stream stalls hurt.
-        let n = parallel_stream_count(items.len(), total);
+        let n = parallel_streams_for(&conn, items.len(), total);
         let header = serde_json::json!({
             "kind": "folder-files",
             "pair_id": pair_id,
@@ -6581,6 +6589,17 @@ pub fn set_parallel_streams(on: bool) {
 /// How many streams to fan a transfer across: only a SINGLE file at least
 /// PARALLEL_MIN big, and never so many that a stream would carry under ~4 MiB.
 /// Returns 0 = "send the classic single-stream way".
+/// Streams for a send on `conn`: parallel only helps over the internet. Measured
+/// 2026-09-25 (256 MiB, 4 alternating pairs each): same-Wi-Fi Mac→Mac single stream
+/// 4.9 MB/s vs 3.3 MB/s parallel; Korea←US internet parallel 7.8 vs 6.6 MB/s. So a
+/// LAN path sends one stream (still resumable), everything else fans out.
+fn parallel_streams_for(conn: &Connection, item_count: usize, total: u64) -> u64 {
+    if matches!(conn_locality(conn), crate::models::Locality::Local) {
+        return 0;
+    }
+    parallel_stream_count(item_count, total)
+}
+
 fn parallel_stream_count(item_count: usize, total: u64) -> u64 {
     // Kill-switch first: off → 0 → every path sends the classic single stream, and
     // the receiver (which only forks parallel on an advertised `parallel > 0`)
@@ -8098,7 +8117,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
         let source = &snapshot.source;
         (source.items.clone(), source.dirs.clone(), source.items.iter().map(|i| i.2).sum())
     } else { gather_items(paths)? };
-    let n = parallel_stream_count(items.len(), total);
+    let n = parallel_streams_for(conn, items.len(), total);
     // Rate-limit only INTERNET sends — a LAN transfer doesn't touch the uplink, so
     // it stays full speed regardless of the cap.
     let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
@@ -8868,7 +8887,7 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
 async fn serve_pull_verified<F: Fn(u64, u64)>(conn: &Connection, send: &mut SendStream,
     recv: &mut RecvStream, paths: &[PathBuf], parallel: bool, cancel: &AtomicBool, progress: F) -> Result<u64> {
     let (items, dirs, total) = gather_items(paths)?;
-    let n = if parallel { parallel_stream_count(items.len(), total) } else { 0 };
+    let n = if parallel { parallel_streams_for(conn, items.len(), total) } else { 0 };
     let mut header = files_header(&items, &dirs, total, n, "", false);
     header["integrity_v"] = serde_json::json!(1);
     write_frame(send, &header).await?;
@@ -8915,7 +8934,7 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
 ) -> Result<u64> {
     let (items, dirs, total) = gather_items(paths)?;
     let n = if allow_parallel {
-        parallel_stream_count(items.len(), total)
+        parallel_streams_for(conn, items.len(), total)
     } else {
         0
     };
