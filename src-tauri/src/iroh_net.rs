@@ -1154,6 +1154,43 @@ fn emit_completed(
     }
 }
 
+/// Prove we can write into `dir` WITHOUT risking an async worker. On macOS a
+/// file open inside a privacy-protected folder (Downloads, Desktop, Documents)
+/// BLOCKS until the user answers the "allow access" prompt. Field case
+/// (2026-09-25, a fresh build on an unattended Mac): every receive attempt parked
+/// another tokio worker in `open()` until all ten were stuck and the whole app
+/// froze — no chat, no presence, no transfers. The probe runs on the blocking
+/// pool with a deadline: a pending prompt fails THIS transfer in plain words and
+/// the app stays alive (the parked probe thread finishes whenever the prompt is
+/// answered). A directory that passed recently isn't probed again.
+pub(crate) async fn ensure_writable(dir: &Path) -> Result<()> {
+    static OK: std::sync::OnceLock<Mutex<HashMap<PathBuf, Instant>>> = std::sync::OnceLock::new();
+    let ok = OK.get_or_init(Default::default);
+    if ok.lock().unwrap().get(dir).is_some_and(|at| at.elapsed() < Duration::from_secs(300)) {
+        return Ok(());
+    }
+    let owned = dir.to_path_buf();
+    let probe = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&owned)?;
+        let p = owned.join(format!(".dropbeam-write-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&p, b"")?;
+        std::fs::remove_file(&p)
+    });
+    match tokio::time::timeout(Duration::from_secs(5), probe).await {
+        Ok(Ok(Ok(()))) => {
+            ok.lock().unwrap().insert(dir.to_path_buf(), Instant::now());
+            Ok(())
+        }
+        Ok(Ok(Err(e))) => anyhow::bail!("can't save into {} on this device: {e}", folder_name(dir)),
+        Ok(Err(e)) => anyhow::bail!("can't check {}: {e}", folder_name(dir)),
+        Err(_) => anyhow::bail!("DropBeam is waiting for permission to save into {} — allow it in the macOS prompt (or System Settings → Privacy & Security → Files and Folders), then retry", folder_name(dir)),
+    }
+}
+
+fn folder_name(dir: &Path) -> String {
+    dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
 /// Plain words for the failures people can act on; everything else verbatim.
 fn friendly_failure(dir: Direction, err: &str) -> String {
     let lower = err.to_ascii_lowercase();
@@ -2422,6 +2459,11 @@ async fn serve_stream_inner(
             } else {
                 PathBuf::from(configured)
             };
+            if let Err(e) = ensure_writable(&dest).await {
+                log::warn!("friend-recv refused: {e:#}");
+                send_receiver_error(send, &e).await;
+                return Err(e);
+            }
             // Identify the sender by matching their endpoint id to a friend.
             let who = conn.remote_id().to_string();
             let friend = crate::friends::load(&config_dir)
@@ -3799,6 +3841,7 @@ pub fn start_receive(
         // Inline the dial+pull so we own the Connection — that lets the progress
         // ticks read the live Direct/Relay path for the badge.
         let outcome: Result<(Vec<PathBuf>, crate::models::Locality)> = async {
+            ensure_writable(&dest).await?;
             let (addr, token) = parse_ticket(&ticket)?;
             // Resume across drops: re-dial + re-pull and pick up from the on-disk
             // partial. The budget is PROGRESS-based, not a fixed count — a huge Quick
