@@ -419,6 +419,8 @@ fn incoming_chat_id(peer: &str, transfer: &str) -> String {
 }
 
 const TRANSFER_STALL: Duration = Duration::from_secs(60);
+/// How long a linked push waits for its chat note before landing as a plain send.
+const CHAT_NOTE_WAIT: Duration = Duration::from_secs(8);
 
 fn incoming_chat_link(req: &serde_json::Value, peer: &str) -> Option<crate::models::ChatTransferLink> {
     let mut link: crate::models::ChatTransferLink = serde_json::from_value(req.get("chatTransfer")?.clone()).ok()?;
@@ -2464,20 +2466,25 @@ async fn serve_stream_inner(
                 let link = incoming_chat_link(&req, &who).ok_or_else(|| anyhow::anyhow!("invalid chat batch manifest"))?;
                 item_offset = link.item_offset;
                 // The file note and push use independent streams. Hold modern linked
-                // pushes while their immutable note is being delivered.
-                let deadline = Instant::now() + TRANSFER_STALL;
-                loop {
-                    let matched = crate::friends::load(&config_dir).iter()
-                        .find(|f| f.endpoint_id.as_deref() == Some(who.as_str()))
-                        .map(|f| crate::chat::messages(&config_dir, &f.id).iter()
-                            .find(|m| m.file_xfer_id.as_deref() == Some(&link.id))
-                            .map(|m| matches_chat_manifest(&link, m)).unwrap_or(false))
-                        .unwrap_or(false);
-                    if matched { break; }
-                    anyhow::ensure!(Instant::now() < deadline, "unmatched chat batch manifest");
+                // pushes briefly while their immutable note is being delivered. The
+                // note lives in the thread chat_sender resolves (a friend's extra
+                // device speaks in the person's thread). If it never shows up, the
+                // FILES still matter more than the chat card: receive them as a
+                // plain send instead of failing the whole transfer.
+                let thread = crate::friends::chat_sender(&config_dir, &who).map(|f| f.id);
+                let deadline = Instant::now() + CHAT_NOTE_WAIT;
+                let matched = loop {
+                    let matched = thread.as_ref().is_some_and(|t| crate::chat::messages(&config_dir, t).iter()
+                        .find(|m| m.file_xfer_id.as_deref() == Some(&link.id))
+                        .is_some_and(|m| matches_chat_manifest(&link, m)));
+                    if matched || Instant::now() >= deadline { break matched; }
                     write_frame(send, &serde_json::json!({"hold": true})).await?;
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                };
+                if !matched {
+                    log::warn!("friend-recv: chat note for {} never matched — receiving as a plain send", &link.id);
                 }
+                if matched {
                 {
                     let mut batches = state.chat_batches.lock().unwrap();
                     if let Some(batch) = batches.get_mut(&link.id) {
@@ -2523,6 +2530,7 @@ async fn serve_stream_inner(
                         break;
                     }
                 });
+            }
             }
             let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
             let cancel = Arc::new(AtomicBool::new(false));
