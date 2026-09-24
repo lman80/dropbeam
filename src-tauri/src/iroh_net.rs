@@ -4217,7 +4217,7 @@ async fn send_friend_batch(conn: &Connection, items: &[SendItem], dirs: &[String
     let mut done: u64 = items.iter().zip(&landed).filter(|(_, landed)| **landed).map(|(i, _)| i.2).sum();
     progress(done, total);
     anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
-    let mut pushes = plan_location_pushes(items, &landed);
+    let mut pushes = plan_pushes(items, &landed, friend_batch_items());
     // Even an all-skipped folder may contain empty directories to recreate.
     if pushes.is_empty() && !dirs.is_empty() { pushes.push(items.len()..items.len()); }
     for (index, r) in pushes.iter().enumerate() {
@@ -4254,6 +4254,20 @@ const BATCH_ITEMS: usize = 400;
 /// is re-sent on the next attempt (at most 32 MiB of rework); large files retain
 /// their existing single-file parallel streams and byte-range resume.
 fn plan_location_pushes(items: &[SendItem], landed: &[bool]) -> Vec<std::ops::Range<usize>> {
+    plan_pushes(items, landed, BATCH_ITEMS)
+}
+
+/// Friend sends batch more small files per push than Location uploads: a friend
+/// lands them locally at once, while a NAS host needed the 400-item cap to answer
+/// in time. Every push costs a few round trips, which dominate a folder of tiny
+/// files over a long link. DROPBEAM_FRIEND_BATCH overrides it for A/B tests.
+fn friend_batch_items() -> usize {
+    std::env::var("DROPBEAM_FRIEND_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(FRIEND_BATCH_ITEMS)
+}
+const FRIEND_BATCH_ITEMS: usize = 2000;
+const BATCH_NAME_BYTES: usize = 256 * 1024;
+
+fn plan_pushes(items: &[SendItem], landed: &[bool], max_items: usize) -> Vec<std::ops::Range<usize>> {
     assert_eq!(items.len(), landed.len());
     let mut pushes = Vec::new();
     let mut i = 0;
@@ -4264,9 +4278,14 @@ fn plan_location_pushes(items: &[SendItem], landed: &[bool]) -> Vec<std::ops::Ra
             i += 1;
         } else {
             let mut bytes = 0;
+            // The push header lists every name and must stay well under the 1 MiB
+            // frame cap, so a batch of very long paths is split early.
+            let mut name_bytes = 0;
             while i < items.len() && !landed[i] && items[i].2 < SMALL_FILE_LIMIT
-                && i - start < BATCH_ITEMS && bytes + items[i].2 <= BATCH_BYTES {
+                && i - start < max_items && bytes + items[i].2 <= BATCH_BYTES
+                && (i == start || name_bytes + items[i].1.len() <= BATCH_NAME_BYTES) {
                 bytes += items[i].2;
+                name_bytes += items[i].1.len();
                 i += 1;
             }
         }
@@ -9685,6 +9704,18 @@ mod tests {
             .map(|(i, &size)| (std::path::PathBuf::new(), i.to_string(), size, 0)).collect();
         super::plan_location_pushes(&items, landed)
     }
+    #[test]
+    fn friend_batches_are_bigger_but_long_names_split_early() {
+        let tiny: Vec<SendItem> = (0..3000).map(|i| (PathBuf::from("x"), format!("f{i}"), 10, 0)).collect();
+        let landed = vec![false; tiny.len()];
+        assert_eq!(super::plan_pushes(&tiny, &landed, 2000).len(), 2);
+        assert_eq!(super::plan_location_pushes(&tiny, &landed).len(), 8);
+        let long: Vec<SendItem> = (0..2000).map(|i| (PathBuf::from("x"), format!("{}{i}", "p/".repeat(500)), 10, 0)).collect();
+        let pushes = super::plan_pushes(&long, &vec![false; long.len()], 2000);
+        assert!(pushes.len() > 2, "~1 KB names split by the header budget");
+        assert!(pushes.iter().all(|r| long[r.clone()].iter().map(|i| i.1.len()).sum::<usize>() <= 256 * 1024));
+    }
+
 
     #[test]
     fn location_push_plan_small() {

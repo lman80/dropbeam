@@ -410,6 +410,11 @@ pub fn run() {
                     .level_for("iroh", iroh_level)
                     .level_for("iroh_relay", iroh_level)
                     .level_for("iroh_net", iroh_level)
+                    // tracing's log bridge emits a content-free "select_path;" /
+                    // "tx;" line for every span entered — thousands a second during
+                    // a transfer in verbose mode, rotating the real evidence away
+                    // within a minute and costing CPU on the send path.
+                    .level_for("tracing", log::LevelFilter::Warn)
                     // The default cap is a tiny 40 KB with discard-on-rotate, which
                     // kept deleting exactly the history we need when diagnosing a
                     // user-reported transfer. Keep rotated files, 2 MB each (4 MB in

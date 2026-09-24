@@ -53,6 +53,8 @@ struct Ownership {
     created: SystemTime,
     transfer_id: String,
 }
+/// Stages at least this big fsync their cleanup record (see `create`).
+const FLUSH_RECORD_MIN: u64 = 8 << 20;
 fn sidecar(path: &Path) -> PathBuf { path.with_extension("owner.json") }
 /// Durable enough for a cleanup record: survives an app crash or kill (the
 /// case recovery exists for). On macOS `sync_all` is F_FULLFSYNC — a full
@@ -96,9 +98,15 @@ impl ReceiveStage {
         let mut registry = OpenOptions::new().read(true).write(true).create_new(true).open(sidecar(&stage.path))?;
         stage.registry = Some((registry.try_clone()?, Identity::of(&registry)?));
         registry.write_all(&serde_json::to_vec(&record)?)?;
-        flush_to_disk(&registry)?;
+        // The record only matters after an OS crash or power cut (an app crash
+        // keeps it in the page cache), and losing it then just leaves one hidden
+        // stage file behind. For a small file that's a few KB — not worth two
+        // fsyncs per file, which on Linux ext4 (~25 ms each) made a 1,500-file
+        // folder take over a minute. Big stages keep the flush.
+        let flush = size >= FLUSH_RECORD_MIN;
+        if flush { flush_to_disk(&registry)?; }
         if let Some(dir) = stage.path.parent() {
-            #[cfg(unix)] flush_to_disk(&File::open(dir)?)?;
+            #[cfg(unix)] if flush { flush_to_disk(&File::open(dir)?)?; }
             note_partial_dir(dir);
         }
         Ok((stage, file))
