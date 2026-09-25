@@ -159,3 +159,7 @@ netwatch = { path = "vendor/netwatch" }
 # Bbr3Config::dropbeam_fixes, see iroh_net.rs bbr_config) and ACK_FREQUENCY parameters handed to
 # every path's controller. Search "DropBeam patch" in vendor/noq-proto/src.
 noq-proto = { path = "vendor/noq-proto" }
+# iroh 1.2.0, vendored: n0-computer/iroh#4509 fix — pending_open_paths deduplicated and bounded
+# (it grew geometrically with several connections to one peer → multi-GB → crash). Search
+# "DropBeam patch" in vendor/iroh/src.
+iroh = { path = "vendor/iroh" }
