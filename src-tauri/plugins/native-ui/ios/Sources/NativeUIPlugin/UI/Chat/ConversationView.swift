@@ -107,18 +107,20 @@ struct ConversationView: View {
         .toolbar(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItem(placement: .principal) { header }
+            // One trailing item, as wide as Back, so the contact header sits dead centre.
             ToolbarItem(placement: .topBarTrailing) {
-                Button { searching.toggle(); if !searching { query = "" }; Haptics.tap() } label: {
-                    Image(systemName: searching ? "xmark" : "magnifyingglass")
-                }.accessibilityLabel(searching ? "Close search" : "Search conversation")
-            }
-            if reportable {
-                ToolbarItem(placement: .topBarTrailing) {
+                if searching {
+                    Button { searching = false; query = ""; Haptics.tap() } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("Close search")
+                } else {
                     Menu {
+                        Button("Search", systemImage: "magnifyingglass") { searching = true }
                         Button("Contact Info", systemImage: "person.crop.circle") { showDetail = true }
-                        Divider()
-                        Button("Report \(friend.displayName)…", systemImage: "exclamationmark.bubble") { reporting = ReportTarget(friend: friend) }
-                        Button("Block \(friend.displayName)…", systemImage: "hand.raised", role: .destructive) { blocking = friend }
+                        if reportable {
+                            Divider()
+                            Button("Report \(friend.displayName)…", systemImage: "exclamationmark.bubble") { reporting = ReportTarget(friend: friend) }
+                            Button("Block \(friend.displayName)…", systemImage: "hand.raised", role: .destructive) { blocking = friend }
+                        }
                     } label: { Image(systemName: "ellipsis") }.accessibilityLabel("More")
                 }
             }
@@ -157,12 +159,18 @@ struct ConversationView: View {
     /// Avatar over the name capsule, centered in the glass navigation bar.
     private var header: some View {
         Button { Haptics.tap(); showDetail = true } label: {
-            VStack(spacing: 3) {
-                ContactAvatar(friend: friend, size: 34)
-                HStack(spacing: 2) {
+            VStack(spacing: -4) {
+                ContactAvatar(friend: friend, size: 36).zIndex(1)
+                // iOS 26 Messages: the name rides a glass capsule so it stays legible
+                // over bubbles scrolling beneath the bar.
+                HStack(spacing: 3) {
                     Text(friend.displayName).font(.caption.weight(.semibold)).lineLimit(1)
                     Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
-                }.foregroundStyle(.primary)
+                }
+                .foregroundStyle(Color.primary)
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .glassSurface(Capsule())
+                .frame(maxWidth: 220)
             }
         }.buttonStyle(.plain)
             .accessibilityElement(children: .ignore)
@@ -244,7 +252,7 @@ struct ConversationView: View {
     }
     private func searchFooter(_ proxy: ScrollViewProxy) -> some View {
         HStack {
-            Text(matches.isEmpty ? "No matches" : "\(matchIndex + 1) of \(matches.count)").font(.footnote).foregroundStyle(.secondary)
+            Text(query.isEmpty ? "" : matches.isEmpty ? "No matches" : "\(matchIndex + 1) of \(matches.count)").font(.footnote).foregroundStyle(.secondary)
             Spacer()
             Button { matchIndex = max(0, matchIndex - 1); scrollToMatch(proxy) } label: { Image(systemName: "chevron.up").frame(width: 44, height: 44) }.accessibilityLabel("Previous search result").disabled(matchIndex == 0 || matches.isEmpty)
             Button { matchIndex = min(matches.count - 1, matchIndex + 1); scrollToMatch(proxy) } label: { Image(systemName: "chevron.down").frame(width: 44, height: 44) }.accessibilityLabel("Next search result").disabled(matches.isEmpty || matchIndex >= matches.count - 1)

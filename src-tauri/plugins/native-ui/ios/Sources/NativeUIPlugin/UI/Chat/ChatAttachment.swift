@@ -5,6 +5,8 @@ struct ChatAttachment: View {
     @EnvironmentObject private var bridge: Bridge
     let message: ChatMessage
     @State private var selected: LocalMedia?
+    /// A lone photo/video keeps its own shape (clamped like Messages) instead of a square crop.
+    @State private var singleAspect: CGFloat?
     private var transfer: Transfer? { bridge.transfers.first { $0.chatOnly == true && $0.id == message.fileXferId } ?? bridge.transfers.first { $0.id == message.fileXferId } }
     private var paths: [String] { Self.availablePaths(message, bridge: bridge) }
     private var failed: Bool { message.fileXferFailed == true || ["failed", "canceled"].contains(transfer?.state ?? "") }
@@ -41,7 +43,8 @@ struct ChatAttachment: View {
                             }
                         }
                         Spacer(minLength: 0)
-                        Image(systemName: item.path == nil ? "clock" : "arrow.down.circle").font(.body).opacity(0.8)
+                        // Only a file that hasn't arrived yet needs a marker.
+                        if item.path == nil { Image(systemName: "clock").font(.body).opacity(0.8).accessibilityLabel("Not yet available") }
                     }
                     .foregroundStyle(message.fromMe ? Color.white : Color.primary)
                     .padding(.horizontal, 12).padding(.vertical, 10)
@@ -80,7 +83,15 @@ struct ChatAttachment: View {
                     HStack(spacing: 2) { tile(media[2]); tile(media[3], extra: media.count - 4) }
                 }
             }
-        }.aspectRatio(media.count == 2 ? 2 : 1, contentMode: .fit)
+        }.aspectRatio(media.count == 2 ? 2 : media.count == 1 ? (singleAspect ?? media.first?.path.flatMap { Self.aspects[$0] } ?? 1) : 1, contentMode: .fit)
+        .task(id: media.count == 1 ? media.first?.path : nil) {
+            guard media.count == 1, let path = media.first?.path else { return }
+            let preview = await ThumbnailProvider.shared.image(path: path, points: 240)
+            guard let size = preview?.image.size, size.width > 0, size.height > 0, !Task.isCancelled else { return }
+            let aspect = min(1.78, max(0.66, size.width / size.height))
+            Self.aspects[path] = aspect
+            if singleAspect != aspect { singleAspect = aspect }
+        }
     }
     private func tile(_ item: Item, extra: Int = 0) -> some View {
         GeometryReader { geo in
@@ -94,6 +105,8 @@ struct ChatAttachment: View {
             }.buttonStyle(.plain).disabled(item.path == nil).accessibilityLabel(item.name)
         }
     }
+    /// Remembered shapes so a bubble re-appearing while scrolling never changes height.
+    @MainActor private static var aspects: [String: CGFloat] = [:]
     nonisolated static func fileURL(_ path: String) -> URL { path.hasPrefix("file://") ? URL(string: path) ?? URL(fileURLWithPath: path) : URL(fileURLWithPath: path) }
     @MainActor static func availablePaths(_ message: ChatMessage, bridge: Bridge) -> [String] {
         let transfer = bridge.transfers.first { $0.chatOnly == true && $0.id == message.fileXferId } ?? bridge.transfers.first { $0.id == message.fileXferId }
@@ -106,7 +119,7 @@ struct ChatAttachment: View {
             paths.insert(path, at: 0)
         }
         var seen = Set<String>()
-        return paths.filter { seen.insert($0).inserted }
+        return paths.map(LocalPaths.resolve).filter { seen.insert($0).inserted }
     }
 }
 

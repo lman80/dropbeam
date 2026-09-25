@@ -72,7 +72,17 @@ struct ChatComposer: View {
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: 8) {
                         ForEach(bridge.chatDraftFiles, id: \.self) { path in
-                            MediaThumbnail(path: path, width: 88, height: 88)
+                            Group {
+                                if LocalMedia(path: path) != nil { MediaThumbnail(path: path, width: 88, height: 88) }
+                                else {
+                                    // Documents: say what it is, not just a generic glyph.
+                                    VStack(spacing: 6) {
+                                        Image(systemName: Formatters.symbol(path)).font(.title2).foregroundStyle(.secondary)
+                                        Text((path as NSString).lastPathComponent).font(.caption2).foregroundStyle(.primary)
+                                            .lineLimit(2).truncationMode(.middle).multilineTextAlignment(.center)
+                                    }.padding(8).frame(width: 88, height: 88).background(Color(uiColor: .secondarySystemFill))
+                                }
+                            }
                                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                                 .overlay(alignment: .topTrailing) {
                                     Button { bridge.perform { try await bridge.removeChatDraftFile(path: path) } } label: {
