@@ -30,3 +30,36 @@ enum Formatters {
         }
     }
 }
+
+/// A peer label fit for people: a name passes through; network addresses
+/// ("192.168.1.40:5", "[fe80::1]:443", "host.local:4000") and raw endpoint ids
+/// are hidden (nil) — never show them in primary UI.
+func humanPeer(_ value: String?) -> String? {
+    guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+    let lower = raw.lowercased()
+    if lower.range(of: #"^\[?[0-9a-f:.]+\]?(:\d+)?$"#, options: .regularExpression) != nil, lower.contains(".") || lower.contains(":") { return nil }
+    if lower.range(of: #"^[0-9a-f]{16,}$"#, options: .regularExpression) != nil { return nil }
+    if lower.range(of: #"^[a-z0-9.-]+\.(local|lan|home)(:\d+)?$"#, options: .regularExpression) != nil { return nil }
+    return raw
+}
+
+/// iOS can move an app's data container when the app is updated or reinstalled, so an
+/// absolute path saved earlier ("…/Data/Application/<old UUID>/Library/…") goes stale and
+/// its photo bubble or history row shows a placeholder. Re-root such a path into the
+/// current container when the old one is gone and the file exists there.
+enum LocalPaths {
+    @MainActor private static var memo: [String: String] = [:]
+    @MainActor static func resolve(_ path: String) -> String {
+        if let known = memo[path] { return known }
+        let isURL = path.hasPrefix("file://")
+        let raw = isURL ? (URL(string: path)?.path ?? path) : path
+        var result = path
+        if !FileManager.default.fileExists(atPath: raw),
+           let range = raw.range(of: #"/Data/Application/[0-9A-Fa-f-]{36}/"#, options: .regularExpression) {
+            let candidate = (NSHomeDirectory() as NSString).appendingPathComponent(String(raw[range.upperBound...]))
+            if FileManager.default.fileExists(atPath: candidate) { result = candidate }
+        }
+        memo[path] = result
+        return result
+    }
+}
