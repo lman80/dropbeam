@@ -1,30 +1,26 @@
 import { FileIcon } from './FileIcon'
 import { integrityLabel } from '../lib/integrity'
-import { ShareFilesButton } from './ShareFilesButton'
 import { MOBILE_UI } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import { ShareCode } from './CodeQr'
 import {
-  AlertCircle,
-  ArrowDownToLine,
   Check,
   CheckCircle2,
   FolderOpen,
-  Loader2,
   Pause,
-  PauseCircle,
   Play,
   RotateCw,
-  Send,
+  ShieldCheck,
   X,
 } from 'lucide-react'
 import { api, isActive, type TransferUpdate } from '../lib/api'
 import { formatBytes, formatBytesLive, formatEta, formatSpeed as formatSpeedValue } from '../lib/format'
-import { LocalityBadge, ProgressBar, Spinner } from './bits'
+import { ProgressBar, Spinner, IconButton, MenuButton } from './ui'
+import { folderLabel } from '../lib/humanize'
 import { IntegrityDetails } from './IntegrityDetails'
-import { ConnInspector } from './ConnInspector'
+import { ConnInfo } from './ConnInspector'
 import { useStore } from '../store'
 
 function title(t: TransferUpdate): string {
@@ -69,11 +65,6 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
       t.state === 'waitingForPeer' ||
       t.state === 'connecting' ||
       t.state === 'transferring')
-  const isFriendPending =
-    t.direction === 'send' &&
-    !!t.friendName &&
-    (t.state === 'starting' || t.state === 'waitingForPeer' || t.state === 'connecting')
-
   const copyCode = async () => {
     if (!t.code) return
     try {
@@ -84,8 +75,6 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
       toast('error', 'Could not copy to clipboard')
     }
   }
-
-  const DirIcon = t.direction === 'send' ? Send : ArrowDownToLine
 
   // By default the SPEED is live (what the link is doing right now) and the TIME
   // LEFT is based on the whole-transfer average (which doesn't swing with every
@@ -146,467 +135,199 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
     </article>
   }
 
+  const failed = t.state === 'failed'
+  const paused = t.state === 'paused'
+  const completed = t.state === 'completed'
+  const canceled = t.state === 'canceled'
+  const transferring = t.state === 'transferring'
+  const connecting = !isOffer && !isSendWaiting && (t.state === 'starting' || t.state === 'waitingForPeer' || t.state === 'connecting')
+  const who = t.friendName
+  const showInFolder = () => {
+    // A single file → reveal it SELECTED in its folder; several → open the folder.
+    // Match the folder's own separator so it works on Windows + macOS. A folder
+    // card carries ONE display name standing for many files (fileCount).
+    const sep = t.outDir!.includes('\\') ? '\\' : '/'
+    if (t.fileCount === 1 && t.fileNames.length === 1) api.revealPath(`${t.outDir}${sep}${t.fileNames[0]}`).catch(() => {})
+    else api.openPath(t.outDir!).catch(() => {})
+  }
+  const verify = t.verify
+  const verifyOk = verify?.state === 'done' && verify.mismatched.length + verify.missing.length === 0
+  const verifyBad = verify?.state === 'done' && !verifyOk
+  const locationNotes = [
+    t.locationSkipped ? `${t.locationSkipped} already there` : '',
+    t.locationConflicts ? `${t.locationConflicts} kept as copies` : '',
+    t.locationReplaced ? `${t.locationReplaced} updated` : '',
+  ].filter(Boolean)
+  const locationTip = [
+    t.locationSkipped ? `${t.locationSkipped} ${t.locationSkipped === 1 ? 'file was' : 'files were'} already there.` : '',
+    t.locationConflicts ? `${t.locationConflicts} ${t.locationConflicts === 1 ? 'file' : 'files'} already existed with different content — saved next to them as “… (2)”.` : '',
+    t.locationReplaced ? `${t.locationReplaced} ${t.locationReplaced === 1 ? 'file was' : 'files were'} updated — the older version is in the folder’s Trash.` : '',
+  ].filter(Boolean).join(' ')
+
+  // ── the one-line status under the title ──────────────────────────────────
+  let meta: React.ReactNode
+  if (isOffer) {
+    meta = <>{who ?? 'Someone'} wants to send you this{t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}</>
+  } else if (isSendWaiting) {
+    meta = 'Waiting for the other device to scan or paste the code'
+  } else if (t.detail && active && !transferring) {
+    meta = t.detail
+  } else if (connecting) {
+    meta = <span className="xfer-connecting"><Spinner size={11} />{statusLabel(t)}</span>
+  } else if (transferring) {
+    meta = (
+      <>
+        {statusLabel(t)}
+        {t.bytesTotal > 0 && <> · <span className="tnum">{formatBytesLive(t.bytesDone)} of {formatBytesLive(t.bytesTotal)}</span></>}
+        {' · '}
+        <button className="xfer-meter" onClick={toggleSpeedMode}
+          title={speedMode === 'live' ? 'Current speed — click for the average' : 'Average speed — click for the current speed'}>
+          {speedText.replace(/ (live|avg)$/, '')}
+        </button>
+        {' · '}
+        <button className="xfer-meter" onClick={toggleEtaMode}
+          title={etaMode === 'avg' ? 'Estimated from the average speed — click to use the current speed' : 'Estimated from the current speed — click to use the average'}>
+          {etaText.replace(/ · (live|avg)$/, '')}
+        </button>
+      </>
+    )
+  } else if (paused) {
+    meta = <>Paused{who ? ` · to ${who}` : ''}{t.bytesTotal > 0 ? <> · <span className="tnum">{formatBytes(t.bytesDone)} of {formatBytes(t.bytesTotal)}</span></> : ''}</>
+  } else if (failed) {
+    meta = <span className="xfer-error" title={t.error ?? undefined}>{t.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}{t.error ? ` — ${t.error}` : ''}</span>
+  } else if (completed) {
+    const saved = t.direction === 'receive' && t.outDir ? `Saved to ${folderLabel(t.outDir)}` : null
+    meta = (
+      <span title={summary ? `Took ${formatEta(summary.durationMs / 1000)} · ${formatSpeed(summary.avgBps)} average` : undefined}>
+        {statusLabel(t)}
+        {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
+        {saved && ` · ${saved}`}
+        {locationNotes.length > 0 && <span title={locationTip}> · {locationNotes.join(' · ')}</span>}
+      </span>
+    )
+  } else if (canceled) {
+    meta = statusLabel(t)
+  } else {
+    meta = statusLabel(t)
+  }
+
   return (
     <motion.div
-      layout
-      initial={{ opacity: 0, y: 12, scale: 0.99 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, scale: 0.97, transition: { duration: 0.15 } }}
-      transition={{ type: 'spring', stiffness: 320, damping: 28 }}
-      className="card xfer-card"
-      style={{ padding: 14, overflow: 'hidden' }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0, transition: { duration: 0.12 } }}
+      transition={{ duration: 0.16 }}
+      className={`xfer-row${canceled ? ' is-muted' : ''}`}
     >
-      {/* header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <div
-          style={{
-            width: 30,
-            height: 30,
-            borderRadius: 'var(--radius-sm)',
-            display: 'grid',
-            placeItems: 'center',
-            flexShrink: 0,
-            color: stateColor(t),
-            background: `color-mix(in srgb, ${stateColor(t)} 14%, transparent)`,
-          }}
-        >
-          {t.state === 'completed' ? (
-            <CheckCircle2 size={17} />
-          ) : t.state === 'failed' ? (
-            <AlertCircle size={17} />
-          ) : t.state === 'paused' ? (
-            <PauseCircle size={17} />
+      <div className="xfer-line">
+        <span className="xfer-icon" aria-hidden>
+          <FileIcon name={t.fileNames.length > 1 || t.fileCount > 1 ? (t.fileNames[0] ?? '') : (t.fileNames[0] ?? '')} size={22} />
+          {(completed || failed) && (
+            <span className={`xfer-badge ${completed ? 'ok' : 'bad'}`}>{completed ? <Check size={9} strokeWidth={3} /> : <X size={9} strokeWidth={3} />}</span>
+          )}
+        </span>
+        <div className="xfer-main">
+          <div className="xfer-title selectable" title={t.fileNames.join('\n') || undefined}>{title(t)}</div>
+          <div className="xfer-meta">{meta}</div>
+        </div>
+        <div className="xfer-trailing">
+          {isOffer ? (
+            <>
+              <button className="btn btn-secondary btn-sm" onClick={() => respondToOffer(t.id, false)}>Decline</button>
+              <button className="btn btn-primary btn-sm" onClick={() => respondToOffer(t.id, true)}>Accept</button>
+            </>
           ) : (
-            <DirIcon size={16} />
+            <>
+              {t.detail && t.state === 'waitingForPeer' && (
+                <button className="btn btn-plain btn-sm" onClick={() => void api.forceRelay(t.id)} title="Send through the relay now instead of waiting for a direct connection">
+                  Send Anyway
+                </button>
+              )}
+              {failed && t.direction === 'send' && (
+                <button className="btn btn-secondary btn-sm" onClick={() => void retryTransfer(t.id)}>
+                  <RotateCw /> Retry
+                </button>
+              )}
+              {paused && t.direction === 'send' && (
+                <button className="btn btn-secondary btn-sm" onClick={() => void retryTransfer(t.id)}>
+                  <Play /> Resume
+                </button>
+              )}
+              {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} />}
+              {completed && t.direction === 'receive' && t.outDir && (
+                <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in Finder' : 'Open Folder'} onClick={showInFolder}>
+                  <FolderOpen />
+                </IconButton>
+              )}
+              {completed && t.direction === 'send' && verify?.state !== 'running' && (
+                <MenuButton
+                  items={[
+                    { label: verify ? 'Verify Again' : 'Verify Copy', icon: <ShieldCheck />, onSelect: () => void api.verifyTransfer(t.id).catch((e) => toast('error', String(e))) },
+                  ]}
+                />
+              )}
+              {canPause && (
+                <IconButton label="Pause" tooltip="Pause — keeps what’s already sent" onClick={() => void api.pauseTransfer(t.id)}>
+                  <Pause fill="currentColor" strokeWidth={0} />
+                </IconButton>
+              )}
+              <IconButton
+                label={active ? 'Cancel' : 'Remove from list'}
+                onClick={() => (active ? api.cancelTransfer(t.id) : removeTransfer(t.id))}
+              >
+                <X />
+              </IconButton>
+            </>
           )}
         </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div
-            className="selectable"
-            style={{
-              fontWeight: 650,
-              fontSize: 'var(--font-base)',
-              whiteSpace: 'nowrap',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-            }}
-            title={t.fileNames.join('\n') || undefined}
-          >
-            {title(t)}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '2px 8px', marginTop: 3, flexWrap: 'wrap', minWidth: 0 }}>
-            <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', minWidth: 0, overflowWrap: 'anywhere' }}>{statusLabel(t)}{t.locationSkipped ? ` · ${t.locationSkipped} ${t.locationSkipped === 1 ? 'file' : 'files'} already there` : ''}{t.locationConflicts ? ` · ${t.locationConflicts} ${t.locationConflicts === 1 ? 'file' : 'files'} already existed with different content — saved next to them as ‘… (2)’` : ''}{t.locationReplaced ? ` · ${t.locationReplaced} ${t.locationReplaced === 1 ? 'file' : 'files'} updated — the older version is in the folder’s Trash` : ''}</span>
-            {t.connDetail ? (
-              <ConnInspector detail={t.connDetail} compact />
-            ) : (
-              <LocalityBadge locality={t.locality} />
-            )}
-          </div>
-        </div>
-        {canPause && (
-          <button
-            className="icon-btn"
-            title="Pause — keeps what's already been sent"
-            aria-label="Pause"
-            onClick={() => void api.pauseTransfer(t.id)}
-          >
-            <Pause size={15} />
-          </button>
-        )}
-        <button
-          className="icon-btn"
-          title={isOffer ? 'Decline' : active ? 'Cancel' : 'Dismiss'}
-          aria-label={isOffer ? 'Decline' : active ? 'Cancel' : 'Dismiss'}
-          onClick={() =>
-            isOffer
-              ? respondToOffer(t.id, false)
-              : active
-                ? api.cancelTransfer(t.id)
-                : removeTransfer(t.id)
-          }
-        >
-          <X size={16} />
-        </button>
       </div>
 
-      {/* Parked: "Wait for a direct connection" is holding this off the relay.
-          The escape-hatch button only makes sense while we're still parked
-          (waitingForPeer); once we've fallen through to the relay it's just an
-          informational line. */}
-      {t.detail && active && (
-        <div className="conn-park">
-          <Loader2 size={14} className="spin" />
-          <span style={{ flex: 1, minWidth: 0 }}>{t.detail}</span>
-          {t.state === 'waitingForPeer' && (
-            <button className="btn btn-ghost btn-sm" onClick={() => void api.forceRelay(t.id)}>
-              Send over relay anyway
-            </button>
-          )}
+      {(transferring || (paused && t.bytesTotal > 0)) && (
+        <div className="xfer-progress">
+          <ProgressBar percent={t.percent} tone={paused ? 'paused' : undefined} label={`${title(t)} progress`} />
         </div>
       )}
 
-      {/* manual-accept offer from a friend */}
-      {isOffer && (
-        <div style={{ marginTop: 10 }}>
-          <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
-            <b style={{ color: 'var(--text)' }}>{t.friendName ?? 'Someone'}</b> wants to send you{' '}
-            <b style={{ color: 'var(--text)' }}>
-              {t.fileNames.length ? t.fileNames[0] : 'files'}
-            </b>
-            {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
-          </div>
-          <div style={{ display: 'flex', gap: 10 }}>
-            <button
-              className="btn btn-primary"
-              style={{ flex: 1 }}
-              onClick={() => respondToOffer(t.id, true)}
-            >
-              <Check size={16} /> Accept
-            </button>
-            <button
-              className="btn btn-ghost"
-              style={{ flex: 1 }}
-              onClick={() => respondToOffer(t.id, false)}
-            >
-              <X size={16} /> Decline
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* send waiting: QR + code (anyone can scan it with DropBeam, or paste it) */}
       {isSendWaiting && (
-        <div style={{ marginTop: 14 }}>
+        <div className="xfer-code">
           <ShareCode
             code={t.code!}
-            size={184}
-            instructions={<>On the other device, open DropBeam → <b>Have a code?</b> and scan this QR code — or paste the code.</>}
-            footer={
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>
-                <Spinner size={14} />
-                Waiting for the other device to connect…
-              </div>
-            }
+            size={148}
+            instructions="On the other device, open DropBeam, choose Receive, and scan this code — or paste it."
+            footer={<span className="xfer-connecting"><Spinner size={11} />Waiting for the other device…</span>}
           />
         </div>
       )}
 
-      {/* transferring: progress */}
-      {t.state === 'transferring' && (
-        <div style={{ marginTop: 10 }}>
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'baseline',
-              marginBottom: 6,
-            }}
-          >
-            <span style={{ fontSize: 'var(--font-lg)', fontWeight: 750 }} className="gradient-text">
-              {Math.round(t.percent)}%
-            </span>
-            <span style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)' }}>
-              {formatBytesLive(t.bytesDone)}
-              {t.bytesTotal > 0 ? ` / ${formatBytesLive(t.bytesTotal)}` : ''}
-            </span>
-          </div>
-          <ProgressBar percent={t.percent} />
-          <div className="xfer-meters">
-            <button
-              className="xfer-meter"
-              onClick={toggleSpeedMode}
-              title={
-                speedMode === 'live'
-                  ? 'Speed over the last few seconds — click for the whole-transfer average'
-                  : 'Average speed for the whole transfer — click for the live rate'
-              }
-            >
-              {speedText}
-            </button>
-            <button
-              className="xfer-meter"
-              onClick={toggleEtaMode}
-              title={
-                etaMode === 'avg'
-                  ? 'Based on the whole-transfer average — click to base it on the live rate'
-                  : 'Based on the live rate — click to base it on the whole-transfer average'
-              }
-            >
-              {etaText}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* friend send: no code, just a calm "beaming to {name}" */}
-      {isFriendPending && (
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 9,
-            marginTop: 10,
-            fontSize: 'var(--font-sm)',
-            color: 'var(--text-muted)',
-          }}
-        >
-          <Spinner size={15} />
-          Connecting to {t.friendName}’s device…
-        </div>
-      )}
-
-      {/* connecting (receive or post-handshake) */}
-      {!isFriendPending &&
-        (t.state === 'connecting' || (t.state === 'starting' && !isSendWaiting)) && (
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 9,
-              marginTop: 10,
-              fontSize: 'var(--font-sm)',
-              color: 'var(--text-muted)',
-            }}
-          >
-            <Spinner size={15} />
-            {t.direction === 'receive' ? 'Connecting to sender…' : 'Connecting…'}
-          </div>
-        )}
-
-      {/* completed */}
-      {t.state === 'completed' && (
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            marginTop: 10,
-            gap: 12,
-          }}
-        >
-          <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>
-            <div>
-              {t.direction === 'receive' ? 'Saved' : 'Delivered'}
-              {t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}
-            </div>
-            {summary && (
-              <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-faint)', marginTop: 2 }}>
-                {formatEta(summary.durationMs / 1000)} · {formatSpeed(summary.avgBps)} avg
-              </div>
-            )}
-          </div>
-          {MOBILE_UI && t.direction === 'receive' && t.outDir && (
-            <ShareFilesButton outDir={t.outDir} fileNames={t.fileNames} />
-          )}
-          {!MOBILE_UI && t.direction === 'receive' && t.outDir && (
-            <button
-              className="btn btn-ghost btn-sm"
-              style={{ flexShrink: 0 }}
-              onClick={() => {
-                // A single file → reveal it SELECTED in its folder ("Show in
-                // folder"); multiple → just open the folder. Match the folder's own
-                // path separator so it works on Windows + macOS.
-                const sep = t.outDir!.includes('\\') ? '\\' : '/'
-                // A folder card carries ONE display name standing for many files
-                // (fileCount), so only a genuinely single-file card reveals a file.
-                if (t.fileCount === 1 && t.fileNames.length === 1) {
-                  api.revealPath(`${t.outDir}${sep}${t.fileNames[0]}`).catch(() => {})
-                } else {
-                  api.openPath(t.outDir!).catch(() => {})
-                }
-              }}
-            >
-              <FolderOpen size={14} />{' '}
-              {t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
-            </button>
-          )}
-        </div>
-      )}
-
-      <IntegrityDetails rows={t.integrity} total={t.bytesTotal} completed={t.state === 'completed'} />
-
-      {/* Verify copy: a full SHA-256 comparison of every file in this send against
-          the copy that actually landed on the peer. Only a finished SEND has both
-          sides to compare, and the peer reads at its own pace (a NAS manages
-          ~10 MB/s), so a big folder shows live progress and can be canceled. */}
-      {t.direction === 'send' && t.state === 'completed' && (
-        <div style={{ marginTop: 10 }}>
-          {t.verify?.state === 'running' ? (
+      {completed && t.direction === 'send' && verify && (
+        <div className="xfer-verify">
+          {verify.state === 'running' ? (
             <>
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'baseline',
-                  justifyContent: 'space-between',
-                  gap: 8,
-                  marginBottom: 6,
-                }}
-              >
-                <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>
-                  Verifying… {t.verify.checked.toLocaleString()} /{' '}
-                  {t.verify.total.toLocaleString()} files
-                  {t.verify.bytesTotal > 0
-                    ? ` · ${formatBytes(t.verify.bytesHashed)} / ${formatBytes(t.verify.bytesTotal)}`
-                    : ''}
-                </span>
-                <button
-                  className="btn btn-ghost btn-sm"
-                  style={{ flexShrink: 0 }}
-                  onClick={() => void api.cancelVerify(t.id)}
-                >
-                  Cancel
-                </button>
+              <div className="xfer-verify-line">
+                <span className="tnum">Verifying… {verify.checked.toLocaleString()} of {verify.total.toLocaleString()} {verify.total === 1 ? 'file' : 'files'}</span>
+                <button className="btn btn-plain btn-sm" onClick={() => void api.cancelVerify(t.id)}>Stop</button>
               </div>
-              <ProgressBar
-                percent={
-                  t.verify.bytesTotal > 0
-                    ? (t.verify.bytesHashed / t.verify.bytesTotal) * 100
-                    : 0
-                }
-              />
+              <ProgressBar percent={verify.bytesTotal > 0 ? (verify.bytesHashed / verify.bytesTotal) * 100 : 0} label="Verification progress" />
             </>
-          ) : t.verify?.state === 'done' &&
-            t.verify.mismatched.length + t.verify.missing.length === 0 ? (
-            <div
-              style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 'var(--font-sm)', color: 'var(--green)' }}
-            >
-              <CheckCircle2 size={15} /> All {t.verify.total.toLocaleString()} files identical
-            </div>
-          ) : t.verify?.state === 'done' ? (
-            <details>
-              <summary style={{ cursor: 'pointer', fontSize: 'var(--font-sm)', color: 'var(--red)' }}>
-                {(t.verify.mismatched.length + t.verify.missing.length).toLocaleString()} of{' '}
-                {t.verify.total.toLocaleString()} files don’t match
-              </summary>
-              <div
-                className="selectable"
-                style={{
-                  marginTop: 6,
-                  maxHeight: 150,
-                  overflowY: 'auto',
-                  fontSize: 'var(--font-xs)',
-                  color: 'var(--text-muted)',
-                  lineHeight: 1.5,
-                }}
-              >
-                {t.verify.mismatched.map((name) => (
-                  <div key={`different:${name}`}>Different: {name}</div>
-                ))}
-                {t.verify.missing.map((name) => (
-                  <div key={`missing:${name}`}>Missing: {name}</div>
-                ))}
+          ) : verifyOk ? (
+            <div className="xfer-verify-line ok"><CheckCircle2 size={13} /> {verify.total === 1 ? 'The copy matches' : `All ${verify.total.toLocaleString()} files match`}</div>
+          ) : verifyBad ? (
+            <details className="xfer-verify-bad">
+              <summary>{(verify.mismatched.length + verify.missing.length).toLocaleString()} of {verify.total.toLocaleString()} files don’t match</summary>
+              <div className="selectable">
+                {verify.mismatched.map((name) => <div key={`different:${name}`}>Different: {name}</div>)}
+                {verify.missing.map((name) => <div key={`missing:${name}`}>Missing: {name}</div>)}
               </div>
             </details>
-          ) : (
-            <>
-              {t.verify?.state === 'failed' && (
-                <div style={{ fontSize: 'var(--font-sm)', color: 'var(--red)', marginBottom: 8, lineHeight: 1.45 }}>
-                  {t.verify.error ?? 'Could not verify the copy.'}
-                </div>
-              )}
-              {t.verify?.state === 'canceled' && (
-                <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', marginBottom: 8 }}>
-                  Verification canceled.
-                </div>
-              )}
-              <div className="xfer-actions" style={{ marginTop: 0 }}>
-                <button
-                  className="btn btn-ghost btn-sm"
-                  title="Re-hash every file on both devices and compare (SHA-256)"
-                  onClick={() => {
-                    void api.verifyTransfer(t.id).catch((e) => toast('error', String(e)))
-                  }}
-                >
-                  <Check size={14} /> Verify copy
-                </button>
-              </div>
-            </>
-          )}
+          ) : verify.state === 'failed' ? (
+            <div className="xfer-verify-line bad">{verify.error ?? 'Couldn’t verify the copy.'}</div>
+          ) : null}
         </div>
       )}
 
-      {/* failed */}
-      {t.state === 'failed' && (
-        <div style={{ marginTop: 12 }}>
-          <div
-            style={{
-              fontSize: 'var(--font-sm)',
-              color: 'var(--red)',
-              background: 'var(--red-soft)',
-              borderRadius: 'var(--radius-md)',
-              padding: '10px 12px',
-              lineHeight: 1.45,
-            }}
-          >
-            {t.error ?? 'The transfer failed.'}
-          </div>
-          {/* One-tap re-send, only on a failed SEND (a failed receive has no original
-              paths/recipient to replay — retryTransfer is a no-op there). */}
-          {t.direction === 'send' && (
-            <div className="xfer-actions">
-              <button className="btn btn-primary btn-sm" onClick={() => void retryTransfer(t.id)}>
-                <RotateCw size={14} /> Retry
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* paused: how far it got + one-tap Resume (replays the same send; everything
-          already delivered is skipped). Cancel/Dismiss stays in the header. */}
-      {t.state === 'paused' && (
-        <div style={{ marginTop: 12 }}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              fontSize: 'var(--font-sm)',
-              color: 'var(--text-muted)',
-              background: 'var(--surface-2)',
-              borderRadius: 'var(--radius-md)',
-              padding: '10px 12px',
-              lineHeight: 1.45,
-            }}
-          >
-            <PauseCircle size={15} style={{ flexShrink: 0 }} />
-            <span>
-              {t.detail ?? 'Paused — resume any time'}
-              {t.bytesTotal > 0
-                ? ` · ${formatBytes(t.bytesDone)} of ${formatBytes(t.bytesTotal)} done`
-                : ''}
-            </span>
-          </div>
-          {t.bytesTotal > 0 && (
-            <div style={{ marginTop: 8 }}>
-              <ProgressBar percent={t.percent} />
-            </div>
-          )}
-          {t.direction === 'send' && (
-            <div className="xfer-actions">
-              <button className="btn btn-primary btn-sm" onClick={() => void retryTransfer(t.id)}>
-                <Play size={14} /> Resume
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-
-      {t.state === 'canceled' && (
-        <div style={{ marginTop: 12, fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>
-          Transfer canceled.
-        </div>
-      )}
+      <IntegrityDetails rows={t.integrity} total={t.bytesTotal} completed={completed} />
     </motion.div>
   )
-}
-
-function stateColor(t: TransferUpdate): string {
-  if (t.state === 'completed') return 'var(--green)'
-  if (t.state === 'failed') return 'var(--red)'
-  if (t.state === 'canceled') return 'var(--text-faint)'
-  if (t.state === 'paused') return 'var(--text-muted)'
-  return 'var(--accent)'
 }
 
 function statusLabel(t: TransferUpdate): string {
@@ -614,11 +335,11 @@ function statusLabel(t: TransferUpdate): string {
   const send = t.direction === 'send'
   switch (t.state) {
     case 'starting':
-      return send && fn ? `Beaming to ${fn}…` : 'Starting…'
+      return send && fn ? `Connecting to ${fn}…` : 'Starting…'
     case 'waitingForPeer':
-      return send && fn ? `Beaming to ${fn}…` : 'Ready to send'
+      return send && fn ? `Waiting for ${fn}…` : 'Ready to send'
     case 'connecting':
-      return fn ? (send ? `Beaming to ${fn}…` : `Receiving from ${fn}…`) : 'Connecting…'
+      return fn ? (send ? `Connecting to ${fn}…` : `Connecting to ${fn}…`) : 'Connecting…'
     case 'waitingForAccept':
       return fn ? `${fn} wants to send files` : 'Incoming files'
     case 'transferring':
@@ -626,10 +347,10 @@ function statusLabel(t: TransferUpdate): string {
     case 'completed':
       return send ? (fn ? `Sent to ${fn}` : 'Sent') : fn ? `Received from ${fn}` : 'Received'
     case 'failed':
-      return 'Failed'
+      return send ? 'Couldn’t send' : 'Couldn’t receive'
     case 'canceled':
       return !send && fn ? 'Declined' : 'Canceled'
     case 'paused':
-      return fn ? `Paused — sending to ${fn}` : 'Paused'
+      return 'Paused'
   }
 }

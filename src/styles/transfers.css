@@ -1,87 +1,118 @@
-/* Transfer rows/cards shared by Send & Receive and Chat: connection detail, parked state, meters, actions. */
-/* ── Connection inspector ────────────────────────────────────────────────── */
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
+/* Transfer rows (Send & Receive list, shared by Chat's phone layout): one line of
+   title + one line of status, a thin progress bar, trailing actions. */
+
+.xfer-list {
+  display: flex;
+  flex-direction: column;
 }
-.spin {
-  animation: spin 0.9s linear infinite;
+.xfer-row {
+  position: relative;
+  padding: 10px 12px;
 }
-.conn-insp {
-  display: inline-flex;
+.xfer-row + .xfer-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 52px;
+  right: 0;
+  height: 1px;
+  background: var(--separator);
+}
+.xfer-row.is-muted .xfer-title,
+.xfer-row.is-muted .xfer-icon { opacity: 0.55; }
+.xfer-line {
+  display: flex;
   align-items: center;
-  gap: 4px;
-  font-size: calc(12px * var(--ui-font-scale, 1));
+  gap: 12px;
+  min-height: 32px;
+}
+.xfer-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 32px;
+  flex-shrink: 0;
+}
+.xfer-badge {
+  position: absolute;
+  right: -3px;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.xfer-badge.ok { background: var(--green-dot); }
+.xfer-badge.bad { background: var(--red); }
+.xfer-main { flex: 1; min-width: 0; }
+.xfer-title {
+  font-size: var(--text-13);
+  font-weight: 500;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.conn-insp-ic {
-  display: inline-flex;
+.xfer-meta {
+  margin-top: 2px;
+  font-size: var(--text-12);
+  line-height: 1.35;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.conn-insp-label {
-  font-weight: 650;
-}
-.conn-insp-rtt {
-  color: var(--text-faint);
-}
-.conn-insp-up {
-  display: inline-flex;
+.xfer-error { color: var(--red); }
+.xfer-connecting { display: inline-flex; align-items: center; gap: 6px; }
+.xfer-trailing {
+  display: flex;
   align-items: center;
-  gap: 3px;
-  color: var(--accent);
-  font-size: calc(11px * var(--ui-font-scale, 1));
+  gap: 4px;
+  flex-shrink: 0;
 }
+.xfer-trailing .btn + .btn { margin-left: 4px; }
+.xfer-trailing .btn + .icon-btn { margin-left: 4px; }
+.xfer-progress { margin: 8px 0 2px 40px; }
+.xfer-code { margin: 12px 0 4px 40px; }
+.xfer-verify { margin: 8px 0 0 40px; font-size: var(--text-12); color: var(--text-muted); }
+.xfer-verify-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.xfer-verify-line.ok { justify-content: flex-start; color: var(--green); gap: 6px; margin: 0; }
+.xfer-verify-line.bad { color: var(--red); margin: 0; }
+.xfer-verify-bad summary { cursor: default; color: var(--red); }
+.xfer-verify-bad > div { margin-top: 6px; max-height: 150px; overflow-y: auto; font-size: var(--text-11); line-height: 1.5; }
+.xfer-row > .integrity-fail { margin-left: 40px; }
+
+/* The speed and the time left are BUTTONS — clicking the speed swaps current ↔
+   average, clicking the time swaps which rate the estimate uses (both choices are
+   global and remembered). They read as plain text until hovered. */
+.xfer-meter {
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  color: inherit;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 0 3px;
+  margin: 0 -3px;
+  cursor: default;
+  white-space: nowrap;
+}
+.xfer-meter:hover { background: var(--surface-hover); color: var(--text); }
+.xfer-meters { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; }
+.xfer-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+/* Legacy: the old parked-state strip (phone layout only). */
 .conn-park {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 12px;
-  padding: 9px 12px;
-  border-radius: 11px;
-  background: var(--amber-soft);
-  color: var(--amber);
-  font-size: calc(12.5px * var(--ui-font-scale, 1));
-}
-.conn-park .btn-ghost {
-  color: var(--amber);
-  border-color: color-mix(in srgb, var(--amber) 35%, transparent);
-  flex-shrink: 0;
-}
-
-/* Transfer card action row: secondary actions sit bottom-right, small. */
-.xfer-actions {
-  display: flex;
-  justify-content: flex-end;
   gap: 8px;
-  flex-wrap: wrap;
   margin-top: 10px;
-}
-/* Transfer card meters: the speed and the time left are BUTTONS — clicking the
-   speed swaps live ↔ average, clicking the time swaps which rate it is based on
-   (both choices are global and remembered). */
-.xfer-meters {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 8px;
-  margin-top: 6px;
-}
-.xfer-meter {
-  font: inherit;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
+  font-size: var(--text-12);
   color: var(--text-muted);
-  background: none;
-  border: none;
-  border-radius: 7px;
-  padding: 2px 5px;
-  margin: -2px -5px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.xfer-meter:hover {
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-  color: var(--text);
 }
 
 /* Integrity: only failures speak up in primary UI. */

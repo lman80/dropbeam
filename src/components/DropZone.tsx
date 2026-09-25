@@ -1,17 +1,20 @@
-import { motion } from 'framer-motion'
-import { FilePlus2, Upload } from 'lucide-react'
-import { IS_MAC, MOBILE_UI } from '../lib/platform'
+import { AnimatePresence, motion } from 'framer-motion'
+import { FilePlus2, FileUp, Upload } from 'lucide-react'
+import { MOBILE_UI } from '../lib/platform'
 
 export function DropZone({
   hovering,
   picking = false,
   onPick,
   onPickPhotos,
+  compact = false,
 }: {
   hovering: boolean
   picking?: boolean
   onPick: () => void
   onPickPhotos?: () => void
+  /** Transfers are listed below: no big target, just the drag overlay. */
+  compact?: boolean
 }) {
   if (MOBILE_UI) return (
     <section className="mobile-send-hero" data-testid="dropzone" aria-busy={picking}>
@@ -24,75 +27,41 @@ export function DropZone({
       </div>
     </section>
   )
-  const Panel = MOBILE_UI ? motion.div : motion.button
   return (
-    <Panel
-      onClick={MOBILE_UI ? undefined : onPick}
-      disabled={MOBILE_UI ? undefined : picking}
-      aria-busy={picking}
-      data-testid="dropzone"
-      className="dropzone"
-      aria-label={MOBILE_UI ? undefined : 'Choose files to send'}
-      animate={{ scale: hovering ? 1.012 : 1 }}
-      transition={{ type: 'spring', stiffness: 400, damping: 25 }}
-      style={{
-        width: '100%',
-        border: `2px dashed ${hovering ? 'var(--accent)' : 'var(--border-strong)'}`,
-        background: hovering
-          ? 'color-mix(in srgb, var(--accent) 8%, var(--surface))'
-          : 'var(--surface)',
-        borderRadius: 'var(--radius-2xl)',
-        // A phone screen is short — a 46px-tall pad pushes the transfer list
-        // below the fold.
-        padding: MOBILE_UI ? '30px 20px' : '46px 24px',
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        gap: 14,
-        cursor: 'default',
-        transition: 'background 0.18s, border-color 0.18s',
-        boxShadow: hovering ? 'var(--shadow-lg)' : 'var(--shadow)',
-      }}
-    >
-      <motion.div
-        animate={hovering ? { y: -4 } : { y: 0 }}
-        transition={{ type: 'spring', stiffness: 300, damping: 18 }}
-        className={hovering ? 'animate-beam' : ''}
-        style={{
-          width: 68,
-          height: 68,
-          borderRadius: 'var(--radius-2xl)',
-          display: 'grid',
-          placeItems: 'center',
-          color: 'white',
-          background: 'linear-gradient(135deg, var(--accent), var(--accent-2))',
-          boxShadow: '0 10px 28px color-mix(in srgb, var(--accent) 40%, transparent)',
-        }}
-      >
-        {hovering && !MOBILE_UI ? <Upload size={30} /> : <FilePlus2 size={28} />}
-      </motion.div>
-      <div style={{ textAlign: 'center' }}>
-        {/* Phone users choose between the photo library and Files. */}
-        <div style={{ fontSize: 'var(--font-xl)', fontWeight: 700, letterSpacing: '-0.01em', color: 'var(--text)' }}>
-          {MOBILE_UI ? 'Choose files to send' : hovering ? 'Drop to send' : 'Drag files here to send'}
-        </div>
-        <div style={{ fontSize: 'var(--font-base)', color: 'var(--text-muted)', marginTop: 4 }}>
-          {MOBILE_UI ? (
-            'Pick photos, videos or documents, then choose who to send them to.'
-          ) : (
-            <>
-              or <span style={{ color: 'var(--accent-text)', fontWeight: 600 }}>click to choose</span>{' '}
-              {IS_MAC ? 'files & folders' : 'files'}
-            </>
-          )}
-        </div>
-      </div>
-      {MOBILE_UI && (
-        <div style={{ display: 'flex', gap: 12 }}>
-          <button className="btn btn-primary" disabled={picking} onClick={onPickPhotos} aria-label="Photos & Videos">Photos</button>
-          <button className="btn btn-ghost" disabled={picking} onClick={onPick}>Files</button>
-        </div>
+    <>
+      {!compact && (
+        <button
+          onClick={onPick}
+          disabled={picking}
+          aria-busy={picking}
+          data-testid="dropzone"
+          className={`dropzone${hovering ? ' hovering' : ''}`}
+          aria-label="Choose files to send"
+        >
+          <FileUp className="dropzone-glyph" strokeWidth={1.5} />
+          <span className="dropzone-title">Drop files here to send</span>
+          <span className="dropzone-hint">
+            Send to a friend by name, or to anyone with a code. Files sent to you appear here.
+          </span>
+        </button>
       )}
-    </Panel>
+      {/* While a drag is over the window: one calm target over the content. */}
+      <AnimatePresence>
+        {hovering && (
+          <motion.div
+            className="drop-overlay"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.12 }}
+            aria-hidden
+          >
+            <div className="drop-overlay-label">
+              <Upload size={18} /> Drop to Send
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </>
   )
 }

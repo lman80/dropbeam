@@ -373,7 +373,7 @@ select option {
   outline: none;
   transition: box-shadow var(--dur-fast);
 }
-.dark .input { background: var(--surface-2); box-shadow: inset 0 0 0 0.5px var(--border); }
+.dark .input { background-color: var(--surface-2); box-shadow: inset 0 0 0 0.5px var(--border); }
 textarea.input { height: auto; padding: 6px 9px; line-height: 1.45; }
 .input:focus { box-shadow: inset 0 0 0 1px var(--accent), var(--focus-ring); }
 .input::placeholder,
@@ -556,7 +556,6 @@ select.input {
 }
 .section-row > .section-title { margin: 0; flex: 1; min-width: 0; }
 .section-row > .btn { margin: 0; }
-.page > .section-title:first-of-type,
 .page-header + .section-title,
 .page-header + .section-row { margin-top: 4px; }
 
@@ -1137,7 +1136,7 @@ html:not(.mobile) .dialog-footer {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  padding-top: 20px;
+  padding-top: 16px;
   background: transparent;
 }
 html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
@@ -1277,6 +1276,9 @@ html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* Room for a group's hairline/focus ring, which the scroll box would clip. */
+  padding: 3px;
+  margin: -3px;
 }
 .dialog-actions {
   position: sticky;
