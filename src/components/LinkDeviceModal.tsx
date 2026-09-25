@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { AlertCircle, CheckCircle2, Copy, Loader2, QrCode, Smartphone } from 'lucide-react'
+import { AlertCircle, CheckCircle2, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
 import { api, HAS_TAURI } from '../lib/api'
 import { mockListen } from '../lib/mock'
@@ -9,6 +9,8 @@ import { deviceCodeProblem, isDeviceCode, linkedDetail, linkedTitle, linkErrorTe
 import { useStore } from '../store'
 import { QrCodeView } from './CodeQr'
 import { QrScanner } from './QrScanner'
+import { useEscape } from './Dialog'
+import { IconButton, Spinner } from './ui'
 
 /** Link with a scanned/pasted device code of either kind. The engine picks the
  *  direction (the account that already has devices wins) and refuses two
@@ -100,50 +102,52 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   const retry = () => { setError(''); setProgress(null); if (via === 'scan') setPhase('scan'); else { setAttempt(a => a + 1); setPhase('show') } }
   const copy = () => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => setCodeError('Couldn’t copy the code. Select it and copy it instead.'))
 
-  if (phase === 'scan') return <QrScanner title="Scan your other device" hint="On your other device open Settings → Devices → Link a Device, then scan the code it shows."
+  if (phase === 'scan') return <QrScanner title="Scan your other device" hint="On your other device, open Settings → Devices → Link a device."
     validate={deviceCodeProblem} onResult={v => void scanned(v)} onClose={() => start === 'scan' ? closeRef.current() : setPhase('show')} />
 
-  return <LinkDialog title={phase === 'done' ? 'Devices linked' : title} onClose={onClose}>
-    {phase === 'show' && <>
-      <ol className="device-link-steps">
-        <li>Open DropBeam on your other device.</li>
-        <li>Go to <strong>Settings → Devices → Link a Device</strong> — on a phone you’re just setting up, tap <strong>Already use DropBeam?</strong></li>
-        <li>Scan this code.</li>
-      </ol>
-      {code ? <QrCodeView value={code} size={220} hint="Scan with DropBeam on your other device" label="QR code to link your other device" />
-        : !codeError && <p className="account-waiting" role="status"><Loader2 size={14} className="spin" /> Creating a code…</p>}
-      {codeError && <p role="alert" className="error-text">{codeError}</p>}
-      {code && <p className="account-waiting" role="status">Waiting for your other device… The code works once, for 10 minutes.</p>}
-      <div className="device-link-actions">
-        <button className="btn btn-ghost" onClick={() => setPhase('scan')}><QrCode size={14} />Scan the other device’s code instead</button>
-        {code && <button className="btn btn-ghost" onClick={copy}><Copy size={14} />{copied ? 'Copied' : 'Copy code'}</button>}
-        {codeError && <button className="btn btn-ghost" onClick={retry}>Try again</button>}
-        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+  const footer = phase === 'show' ? <>
+    <button className="btn btn-plain" onClick={() => setPhase('scan')}>Scan their code instead</button>
+    <span className="spacer" />
+    {codeError
+      ? <button className="btn btn-secondary" onClick={retry}>Try again</button>
+      : <button className="btn btn-secondary" disabled={!code} onClick={copy}>{copied ? 'Copied' : 'Copy code'}</button>}
+    <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+  </> : phase === 'working' ? <button className="btn btn-secondary" onClick={onClose}>Hide</button>
+    : phase === 'done' ? <button className="btn btn-primary" autoFocus onClick={onClose}>Done</button>
+    : <>
+      {via === 'scan'
+        ? <button className="btn btn-plain" onClick={() => { setError(''); setPhase('show') }}>Show this device’s code</button>
+        : <button className="btn btn-plain" onClick={() => { setError(''); setPhase('scan') }}>Scan their code instead</button>}
+      <span className="spacer" />
+      <button className="btn btn-secondary" onClick={onClose}>Close</button>
+      <button className="btn btn-primary" autoFocus onClick={retry}>Try again</button>
+    </>
+
+  return <LinkDialog title={phase === 'done' ? 'Devices linked' : title} onClose={onClose} footer={footer}>
+    {phase === 'show' && <div className="link-show">
+      <p className="link-instruction">On your other device, open <strong>Settings → Devices → Link a device</strong> and scan this code.</p>
+      <div className="link-qr-slot">
+        {code ? <QrCodeView value={code} size={200} hint={null} label="QR code to link your other device" />
+          : !codeError && <Spinner size={18} />}
       </div>
-      <p className="device-link-note">Either device can scan the other. Your friends and chats come along, and nothing on either device is lost.</p>
-    </>}
-    {phase === 'working' && <div className="device-link-state" role="status" aria-live="polite">
-      <Loader2 size={34} className="spin" />
-      <p><strong>{progressText(progress)}</strong></p>
-      <p className="account-waiting">Keep DropBeam open on both devices.</p>
-      <button className="btn btn-ghost" onClick={onClose}>Hide</button>
+      {codeError
+        ? <p role="alert" className="form-error link-status">{codeError}</p>
+        : <p className="link-status" role="status">{code ? 'Waiting for your other device…' : 'Creating a code…'}</p>}
     </div>}
-    {phase === 'done' && <div className="account-linked" role="status">
-      <CheckCircle2 size={40} />
-      <p><strong>{linkedTitle(linked)}</strong></p>
-      <p>{linkedDetail(linked)}</p>
-      <button className="btn btn-primary" onClick={onClose}>Done</button>
+    {phase === 'working' && <div className="link-state" role="status" aria-live="polite">
+      <Spinner size={22} />
+      <p className="link-state-title">{progressText(progress)}</p>
+      <p className="link-state-sub">Keep DropBeam open on both devices.</p>
     </div>}
-    {phase === 'error' && <div className="device-link-state device-link-error" role="alert">
-      <AlertCircle size={34} />
-      <p>{error}</p>
-      <div className="device-link-actions">
-        <button className="btn btn-primary" onClick={retry}>Try again</button>
-        {via === 'scan'
-          ? <button className="btn btn-ghost" onClick={() => { setError(''); setPhase('show') }}><Smartphone size={14} />Show this device’s code instead</button>
-          : <button className="btn btn-ghost" onClick={() => { setError(''); setPhase('scan') }}><QrCode size={14} />Scan the other device instead</button>}
-        <button className="btn btn-ghost" onClick={onClose}>Close</button>
-      </div>
+    {phase === 'done' && <div className="link-state" role="status">
+      <CheckCircle2 className="link-state-ok" size={30} strokeWidth={1.75} />
+      <p className="link-state-title">{linkedTitle(linked)}</p>
+      <p className="link-state-sub">{linkedDetail(linked)}</p>
+    </div>}
+    {phase === 'error' && <div className="link-state" role="alert">
+      <AlertCircle className="link-state-bad" size={30} strokeWidth={1.75} />
+      <p className="link-state-title">Couldn’t link</p>
+      <p className="link-state-sub">{error}</p>
     </div>}
   </LinkDialog>
 }
@@ -158,14 +162,17 @@ export function LinkNewDeviceModal({ onClose }: { onClose: () => void }) {
   return <LinkFlow start="scan" title="Link a new device" onClose={onClose} />
 }
 
-function LinkDialog({ title, onClose, children }: { title: string; onClose?: () => void; children: React.ReactNode }) {
-  useEffect(() => {
-    if (!onClose) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+function LinkDialog({ title, onClose, footer, children }: { title: string; onClose?: () => void; footer?: React.ReactNode; children: React.ReactNode }) {
+  // Stacks with the scanner and any dialog that opened this one: Esc peels the topmost.
+  useEscape(onClose)
   return createPortal(<div className="dialog-overlay device-link-overlay" onMouseDown={e => { if (onClose && e.target === e.currentTarget) onClose() }}>
-    <div className={MOBILE_UI ? 'dialog mobile-sheet device-link-dialog' : 'card dialog device-link-dialog'} role="dialog" aria-modal="true" aria-label={title}><h2>{title}</h2>{children}</div>
+    <div className={MOBILE_UI ? 'dialog mobile-sheet device-link-dialog' : 'dialog dialog-panel device-link-dialog'} role="dialog" aria-modal="true" aria-label={title}>
+      <div className="dialog-head">
+        <h2 className="dialog-title">{title}</h2>
+        {onClose && <IconButton label="Close" tooltip="Close (Esc)" onClick={onClose}><X /></IconButton>}
+      </div>
+      <div className="dialog-body">{children}</div>
+      {footer && <div className="dialog-actions dialog-footer">{footer}</div>}
+    </div>
   </div>, document.body)
 }
