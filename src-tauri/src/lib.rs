@@ -415,6 +415,11 @@ pub fn run() {
                     // a transfer in verbose mode, rotating the real evidence away
                     // within a minute and costing CPU on the send path.
                     .level_for("tracing", log::LevelFilter::Warn)
+                    // iroh opens a "poll_send" span per UDP PACKET: with Detailed
+                    // logging on, a LAN send wrote ~200 KB/s of log (4 MB file every
+                    // ~20 s) and pushed every line into the webview too, costing
+                    // real throughput. Path/hole-punch detail lives elsewhere.
+                    .level_for("iroh::socket::transports", log::LevelFilter::Warn)
                     // The default cap is a tiny 40 KB with discard-on-rotate, which
                     // kept deleting exactly the history we need when diagnosing a
                     // user-reported transfer. Keep rotated files, 2 MB each (4 MB in

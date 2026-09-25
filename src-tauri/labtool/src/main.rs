@@ -411,6 +411,12 @@ async fn send(args: &[String]) -> Result<()> {
             };
             let ms = started.elapsed().as_millis().max(1) as u64;
             let path_end = labkit::conn_detail(&conn);
+            let st = conn.stats();
+            let paths: Vec<serde_json::Value> = conn.paths().iter().map(|p| (p.stats(), p)).map(|(ps, p)| json!({
+                "addr": format!("{:?}", p.remote_addr()), "selected": p.is_selected(), "rttMs": ps.rtt.as_millis() as u64, "cwnd": ps.cwnd, "congestionEvents": ps.congestion_events,
+                "spurious": ps.spurious_congestion_events, "lost": ps.lost_packets, "sent": ps.udp_tx.datagrams, "mtu": ps.current_mtu,
+            })).collect();
+            let stats = json!({"sentPackets": st.udp_tx.datagrams, "lostPackets": st.lost_packets, "paths": paths});
             conn.close(0u32.into(), b"case done");
             Ok(json!({
                 "event": "sent",
@@ -424,6 +430,7 @@ async fn send(args: &[String]) -> Result<()> {
                 "pathStart": path_start,
                 "pathEnd": path_end,
                 "profile": *samples.lock().unwrap(),
+                "stats": stats,
             }))
         }
         .await;
