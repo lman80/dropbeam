@@ -251,283 +251,126 @@ html.overlay-window #root {
 }
 .hud-x { flex-shrink: 0; color: var(--text-faint); }
 
-/* ── Blip-style receive card (the "receive" overlay window) ──────────────── */
-/* The card now fills a NORMAL macOS window (titleBarStyle Overlay): the OS draws
-   the rounded corners, shadow, and red/yellow/green traffic-light buttons, so the
-   content just fills the window edge-to-edge with an opaque surface. */
+/* ---- Floating transfer card (190×184 `receive` window) ----
+   A normal macOS window (titleBarStyle Overlay): the OS draws the corners,
+   shadow and traffic lights, so the card fills it edge to edge. Every state is
+   one fixed stack that fits 184px exactly:
+   28 traffic-light strip · 56 art · 8 · 16 name · 16 from · 12 · 28 slot · 20 */
 .rc-root {
+  position: relative;
   height: 100vh;
-  display: flex;
   background: var(--surface);
   color: var(--text);
-}
-.rc-card {
-  position: relative;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 2px 12px 10px;
-  background: var(--surface);
-  color: var(--text);
-}
-/* Spacer under the native traffic-light buttons (top-left), also a drag strip. */
-.rc-top {
-  height: 24px;
-  flex-shrink: 0;
-  align-self: stretch;
-}
-.rc-close,
-.rc-min {
-  width: 24px;
-  height: 24px;
-  display: grid;
-  place-items: center;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-}
-.rc-close:hover,
-.rc-min:hover {
-  background: color-mix(in srgb, var(--text) 12%, transparent);
-  color: var(--text);
-}
-
-/* Minimized "pill" form — a small horizontal bar showing just the essentials. */
-.rc-mini {
-  position: relative;
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 10px 9px 11px;
-  border-radius: 16px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
-  color: var(--text);
-  cursor: pointer;
-}
-.rc-mini-av {
-  flex-shrink: 0;
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  color: #fff;
-  font-weight: 700;
-  font-size: calc(13px * var(--ui-font-scale, 1));
-  background: #5b616b;
-}
-.rc-mini-av.done {
-  background: var(--green, #2fbf5a);
-}
-.rc-mini-text {
-  flex: 1;
-  min-width: 0;
-}
-.rc-mini-name {
-  font-size: calc(12.5px * var(--ui-font-scale, 1));
-  font-weight: 650;
-  white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
-.rc-mini-sub {
-  font-size: calc(11px * var(--ui-font-scale, 1));
-  color: var(--text-muted);
-  margin-top: 1px;
-}
-/* Bottom-right resize grip. */
-.rc-grip {
-  position: absolute;
-  right: 3px;
-  bottom: 3px;
-  width: 16px;
-  height: 16px;
-  cursor: nwse-resize;
-  color: var(--text-faint);
-  display: grid;
-  place-items: center;
-}
-.rc-art {
-  position: relative;
-  margin-bottom: 8px;
-}
-.rc-page {
-  width: 52px;
-  height: 66px;
-  border-radius: 10px;
-  background: #fff;
-  color: #8a8f98;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16);
-}
-.rc-ext {
-  font-size: calc(10px * var(--ui-font-scale, 1));
-  font-weight: 800;
-  letter-spacing: 0.5px;
-  color: #aeb3bb;
-}
-.rc-avatar-wrap {
-  position: absolute;
-  left: 50%;
-  bottom: -13px;
-  transform: translateX(-50%);
-  width: 52px;
-  height: 52px;
-}
-.rc-ring {
+.dark .rc-root { background: #2c2c2f; }
+/* Absolutely stacked, so a card fading out and the next fading in overlap
+   instead of splitting the window in two. */
+.rc-card {
   position: absolute;
   inset: 0;
-}
-.rc-ring-bg {
-  fill: none;
-  stroke: color-mix(in srgb, var(--text) 12%, transparent);
-  stroke-width: 4;
-}
-.rc-ring-fg {
-  fill: none;
-  stroke: var(--accent);
-  stroke-width: 4;
-  stroke-linecap: round;
-  transition: stroke-dashoffset 0.3s ease;
-}
-.rc-avatar {
-  position: absolute;
-  inset: 8px;
-  border-radius: 50%;
-  background: #5b616b;
-  color: #fff;
-  display: grid;
-  place-items: center;
-  font-size: calc(15px * var(--ui-font-scale, 1));
-  font-weight: 700;
-  border: 2px solid var(--bg-elev);
-}
-.rc-avatar-done {
-  background: var(--green, #2fbf5a);
-  border-color: var(--bg-elev);
-}
-.rc-name {
-  font-size: calc(12.5px * var(--ui-font-scale, 1));
-  font-weight: 650;
-  text-align: center;
-  line-height: 1.3;
-  /* Fixed width + centered: a long name is cut in the middle (in JS, so the
-     extension survives) and can never stretch the card off-centre. */
-  align-self: stretch;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-top: 6px;
-}
-.rc-from {
-  font-size: calc(11px * var(--ui-font-scale, 1));
-  color: var(--text-muted);
-  margin-top: 3px;
-  text-align: center;
-  max-width: 100%;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.rc-actions {
-  position: relative;
-  display: flex;
-  gap: 9px;
-  margin-top: 11px;
-  width: 100%;
-}
-.rc-btn {
-  border: none;
-  border-radius: 10px;
-  font-size: calc(12.5px * var(--ui-font-scale, 1));
-  font-weight: 650;
-  padding: 7px 11px;
-  cursor: pointer;
-  display: grid;
-  place-items: center;
-}
-.rc-decline {
-  flex: 1;
-  background: color-mix(in srgb, var(--text) 10%, transparent);
-  color: var(--text);
-}
-.rc-accept-group {
-  flex: 1;
-  display: flex;
-  gap: 1px;
-}
-.rc-accept {
-  background: var(--accent);
-  color: #fff;
-}
-.rc-accept-group .rc-accept:first-child {
-  flex: 1;
-  border-top-right-radius: 3px;
-  border-bottom-right-radius: 3px;
-}
-.rc-accept-caret {
-  padding: 9px 7px;
-  border-top-left-radius: 3px;
-  border-bottom-left-radius: 3px;
-}
-.rc-status {
-  align-self: stretch;
-  margin-top: 8px;
-  font-size: calc(11.5px * var(--ui-font-scale, 1));
-  font-weight: 600;
-  text-align: center;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  color: var(--text-muted);
-}
-.rc-done {
-  margin-top: 11px;
-  width: 100%;
-  background: color-mix(in srgb, var(--text) 10%, transparent);
-  color: var(--text);
-}
-.rc-menu {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 8px);
-  min-width: 190px;
-  padding: 6px;
-  border-radius: 14px;
-  background: var(--bg-elev);
-  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
   display: flex;
   flex-direction: column;
-  z-index: 5;
+  align-items: center;
+  padding: 0 12px;
 }
-.rc-menu-label {
-  font-size: calc(10.5px * var(--ui-font-scale, 1));
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-faint);
-  padding: 5px 9px 6px;
+.rc-top { height: 28px; flex-shrink: 0; align-self: stretch; }
+
+/* File tile with the sender's avatar tucked into its corner — never over the name. */
+.rc-art {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  flex-shrink: 0;
 }
-.rc-menu-item {
-  border: none;
-  background: transparent;
-  color: var(--text);
-  text-align: left;
-  font-size: calc(13px * var(--ui-font-scale, 1));
-  padding: 8px 9px;
+.rc-file {
+  position: absolute;
+  left: 6px;
+  top: 0;
+  width: 42px;
+  height: 50px;
   border-radius: 8px;
-  cursor: pointer;
+  display: grid;
+  place-items: center;
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 0.5px var(--border);
+  color: var(--text-muted);
 }
-.rc-menu-item:hover {
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
+.dark .rc-file { background: var(--surface-3); }
+.rc-avatar {
+  position: absolute;
+  right: 2px;
+  bottom: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: #8e8e93;
+  color: #fff;
+  font-size: var(--text-11);
+  font-weight: 600;
+  box-shadow: 0 0 0 2px var(--surface);
 }
+.dark .rc-avatar { box-shadow: 0 0 0 2px #2c2c2f; }
+.rc-avatar.done { background: var(--green-dot); }
+
+.rc-name {
+  display: flex;
+  justify-content: center;
+  align-items: baseline;
+  gap: 4px;
+  align-self: stretch;
+  min-width: 0;
+  height: 16px;
+  margin-top: 8px;
+  font-size: var(--text-12);
+  font-weight: 600;
+  line-height: 16px;
+}
+.rc-name-text { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rc-name-more { flex-shrink: 0; font-weight: 400; color: var(--text-muted); }
+.rc-from {
+  align-self: stretch;
+  height: 16px;
+  font-size: var(--text-11);
+  line-height: 16px;
+  color: var(--text-muted);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The bottom slot is the same height in every state: no jump from offer →
+   progress → sent. */
+.rc-slot {
+  align-self: stretch;
+  height: 28px;
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+}
+.rc-actions { display: flex; gap: 8px; width: 100%; }
+.rc-actions > .btn { flex: 1; min-width: 0; }
+.rc-accept { flex: 1; display: flex; min-width: 0; gap: 1px; }
+.rc-accept > .btn:first-child { flex: 1; min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.rc-caret { width: 20px; padding: 0; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+.rc-done { width: 100%; }
+.rc-progress { width: 100%; display: flex; flex-direction: column; gap: 6px; }
+.rc-meter {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--text-11);
+  line-height: 14px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* The "Save to" menu has to fit inside the small window. */
+html.window-receive .menu { min-width: 0; width: 166px; padding: 4px; }
+html.window-receive .menu-item { height: 22px; font-size: var(--text-12); }
+html.window-receive .menu-label { padding: 2px 8px; }
