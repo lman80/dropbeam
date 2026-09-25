@@ -282,10 +282,18 @@ pub async fn verify_received_indexed(recv: &mut RecvStream, hashes: &[FileHash],
     Ok(())
 }
 
-pub async fn send_ack(send: &mut SendStream) -> Result<()> {
-    write_frame(send, &serde_json::json!({"kind": "integrity_ack"})).await?;
-    send.finish()?;
-    Ok(())
+/// Called only after the peer's receipt was validated, so the transfer has
+/// already succeeded: the ack is a courtesy that lets the receiver mark its rows
+/// acknowledged. A receiver with nothing to acknowledge (e.g. the empty terminal
+/// Location push) does not wait for it and may drop its stream first, stopping
+/// ours with code 0 — that must never turn a verified transfer into a failure.
+pub async fn send_ack(send: &mut SendStream) {
+    let sent = async {
+        write_frame(send, &serde_json::json!({"kind": "integrity_ack"})).await?;
+        send.finish()?;
+        anyhow::Ok(())
+    }.await;
+    if let Err(e) = sent { log::debug!("integrity ack not delivered (transfer already verified): {e:#}"); }
 }
 /// Bytes are already saved. Only an application acknowledgement certifies that
 /// the sender validated the receipt. Failure retains a Saved, unverified result.

@@ -8409,7 +8409,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
                 };
                 let sent = write_and_receipt(write,
                     read_landed_progress_with_work(&mut recv, total, progress_base, cancel, &landed, Some(&hashes), Some(verification_activity), Some(activity))).await?;
-                integrity::send_ack(&mut send).await?;
+                integrity::send_ack(&mut send).await;
                 return Ok(sent);
             }
             if n == 0 {
@@ -8580,7 +8580,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
         }
     };
     let sent = write_and_receipt(write, receipt).await?;
-    if decision.load(Ordering::SeqCst) == 1 { integrity::send_ack(&mut send).await?; }
+    if decision.load(Ordering::SeqCst) == 1 { integrity::send_ack(&mut send).await; }
     Ok(sent)
 }
 
@@ -9046,7 +9046,7 @@ async fn serve_pull_verified<F: Fn(u64, u64)>(conn: &Connection, send: &mut Send
         Ok(total)
     };
     let sent = write_and_receipt(write, read_landed_progress_hashed(recv, total, 0, cancel, &|_, _| {}, Some(&hashes), Some(&activity))).await?;
-    integrity::send_ack(send).await?;
+    integrity::send_ack(send).await;
     Ok(sent)
 }
 
@@ -10829,8 +10829,44 @@ mod loopback_tests {
             integrity::send_hashes(&mut send, &hashes).await.unwrap();
             read_landed_progress_hashed(&mut recv, 0, 0, &AtomicBool::new(false), &|_, _| {}, Some(&Mutex::new(hashes)), None).await.unwrap();
             assert_eq!(integrity::reports().len(), 5000);
-            integrity::send_ack(&mut send).await.unwrap();
+            integrity::send_ack(&mut send).await;
             receiver.await.unwrap(); client.close().await; server.close().await;
+        }).await;
+    }
+
+    /// Regression: the empty terminal push of a Location upload has no rows to
+    /// acknowledge, so the host returns without reading the ack and drops its
+    /// stream (STOP_SENDING 0). Under load that stop reached the sender before
+    /// it wrote the ack, failing a fully landed + verified upload with
+    /// "sending stopped by peer: error 0". The ack must be best-effort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn integrity_ack_to_a_stopped_stream_does_not_fail_a_verified_transfer() {
+        integrity::scope(async {
+            let server = loopback_endpoint(true).await; let client = loopback_endpoint(false).await;
+            let srv = server.clone();
+            let receiver = tokio::spawn(integrity::scope(async move {
+                let conn = srv.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                integrity::write_terminal(&mut send, &integrity::terminal(serde_json::json!({"ok": true, "landed": 0}))).await.unwrap();
+                send.finish().unwrap();
+                let _ = send.stopped().await;
+                integrity::receive_ack(&mut recv).await; // nothing to acknowledge: returns at once
+                drop(recv); // STOP_SENDING(0) before the sender's ack
+                conn
+            }));
+            let conn = client.connect(server.addr(), ALPN).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(b"x").await.unwrap(); // open the stream on the wire
+            read_landed_progress_hashed(&mut recv, 0, 0, &AtomicBool::new(false), &|_, _| {}, Some(&Mutex::new(vec![])), None).await.unwrap();
+            // Deterministically lose the race: the peer's stop is already here.
+            assert_eq!(tokio::time::timeout(Duration::from_secs(10), send.stopped()).await.unwrap().unwrap(), Some(0u32.into()));
+            // Any write now fails exactly as the old `send_ack(..).await?` did...
+            let err = write_frame(&mut send, &serde_json::json!({"kind": "probe"})).await.unwrap_err();
+            assert!(format!("{err:#}").contains("stopped by peer"), "{err:#}");
+            // ...but the ack is best-effort, so the verified transfer stands.
+            integrity::send_ack(&mut send).await;
+            let _host = receiver.await.unwrap();
+            client.close().await; server.close().await;
         }).await;
     }
 
