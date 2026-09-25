@@ -1,0 +1,94 @@
+/* Transfer rows/cards shared by Send & Receive and Chat: connection detail, parked state, meters, actions. */
+/* ── Connection inspector ────────────────────────────────────────────────── */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+.conn-insp {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: calc(12px * var(--ui-font-scale, 1));
+  white-space: nowrap;
+}
+.conn-insp-ic {
+  display: inline-flex;
+}
+.conn-insp-label {
+  font-weight: 650;
+}
+.conn-insp-rtt {
+  color: var(--text-faint);
+}
+.conn-insp-up {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--accent);
+  font-size: calc(11px * var(--ui-font-scale, 1));
+}
+.conn-park {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 9px 12px;
+  border-radius: 11px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: calc(12.5px * var(--ui-font-scale, 1));
+}
+.conn-park .btn-ghost {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 35%, transparent);
+  flex-shrink: 0;
+}
+
+/* Transfer card action row: secondary actions sit bottom-right, small. */
+.xfer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+/* Transfer card meters: the speed and the time left are BUTTONS — clicking the
+   speed swaps live ↔ average, clicking the time swaps which rate it is based on
+   (both choices are global and remembered). */
+.xfer-meters {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 6px;
+}
+.xfer-meter {
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-radius: 7px;
+  padding: 2px 5px;
+  margin: -2px -5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.xfer-meter:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+/* Integrity: only failures speak up in primary UI. */
+.integrity-fail { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: var(--text-12); color: var(--red); }
+.integrity-fail .icon-btn { margin: -4px 0; }
+.integrity-row { margin-top: 8px; }
+.integrity-name { font-weight: 500; overflow-wrap: anywhere; }
+.integrity-bad { color: var(--red); font-weight: 400; }
+.integrity-row code { display: block; font-family: var(--font-mono); font-size: var(--text-11); color: var(--text-muted); overflow-wrap: anywhere; }
+.conn-info-btn { color: var(--text-faint); }

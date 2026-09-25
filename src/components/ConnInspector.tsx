@@ -1,47 +1,49 @@
-import { Cloud, Loader2, Wifi, Zap } from 'lucide-react'
-import type { ConnDetail } from '../lib/api'
+import { Cloud, Info, Wifi, Zap } from 'lucide-react'
+import type { ConnDetail, Locality } from '../lib/api'
+import { pathKind, pathLabel, pathSentence, type PathKind } from '../lib/humanize'
+import { InfoButton, Spinner } from './ui'
 
-/** The connection inspector: shows EXACTLY how two computers are connected right
- *  now — the real path (LAN / hole-punched direct / relay), its latency, and a live
- *  "upgrading to direct…" hint while a hole-punch is forming. Used on transfer cards
- *  and next to a friend. Pass `compact` for a tight inline pill. */
-export function ConnInspector({
+const ICONS: Record<PathKind, typeof Wifi | null> = { local: Wifi, direct: Zap, relay: Cloud, connecting: null }
+
+/** The connection details people rarely need: which path, latency, relay region,
+ *  whether it's switching to direct. Shown only on request, behind an ⓘ button,
+ *  never as primary UI text. */
+export function ConnInfo({
   detail,
-  compact = false,
+  locality,
+  label = 'Connection details',
+  align = 'end',
 }: {
   detail?: ConnDetail | null
-  compact?: boolean
+  locality?: Locality | null
+  label?: string
+  align?: 'start' | 'end' | 'center'
 }) {
-  if (!detail) return null
-  const { path, rttMs, upgrading, relay } = detail
-  const meta =
-    path === 'local'
-      ? { icon: <Wifi size={13} />, label: 'Local network', color: 'var(--accent)', hint: 'Same Wi-Fi — fastest' }
-      : path === 'direct'
-        ? { icon: <Zap size={13} />, label: 'Direct', color: 'var(--green)', hint: 'Peer-to-peer, no relay' }
-        : path === 'relay'
-          ? {
-              icon: <Cloud size={13} />,
-              label: relay ? `Relay · ${relay}` : 'Relay',
-              color: 'var(--amber)',
-              hint: 'Via a relay server — slower',
-            }
-          : { icon: <Loader2 size={13} className="spin" />, label: 'Connecting…', color: 'var(--text-faint)', hint: '' }
-
+  const kind = pathKind(detail, locality)
+  if (!kind) return null
+  const Icon = ICONS[kind]
   return (
-    <span className={`conn-insp${compact ? ' compact' : ''}`} title={meta.hint}>
-      <span className="conn-insp-ic" style={{ color: meta.color }}>
-        {meta.icon}
-      </span>
-      <span className="conn-insp-label" style={{ color: meta.color }}>
-        {meta.label}
-      </span>
-      {rttMs != null && <span className="conn-insp-rtt">· {rttMs} ms</span>}
-      {upgrading && (
-        <span className="conn-insp-up">
-          <Loader2 size={11} className="spin" /> upgrading to direct…
-        </span>
+    <InfoButton label={label} icon={<Info />} align={align} width={250} className="conn-info-btn">
+      <h4 style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        {Icon ? <Icon size={14} /> : <Spinner size={12} />}
+        {pathLabel(kind)}
+      </h4>
+      <p>{pathSentence(kind)}</p>
+      {(detail?.rttMs != null || detail?.relay || detail?.upgrading) && (
+        <dl className="kv">
+          {detail?.rttMs != null && (<><dt>Latency</dt><dd>{detail.rttMs} ms</dd></>)}
+          {detail?.relay && (<><dt>Relay</dt><dd>{detail.relay}</dd></>)}
+          {detail?.upgrading && (<><dt>Status</dt><dd>Trying to connect directly…</dd></>)}
+        </dl>
       )}
-    </span>
+    </InfoButton>
   )
+}
+
+/** Back-compat: the old inline inspector pill is now just a quiet human label
+ *  (no latency, no relay code) with the details behind ConnInfo. */
+export function ConnInspector({ detail }: { detail?: ConnDetail | null; compact?: boolean }) {
+  const kind = pathKind(detail)
+  if (!kind || kind === 'connecting') return null
+  return <span className="channel-label">{pathLabel(kind)}</span>
 }

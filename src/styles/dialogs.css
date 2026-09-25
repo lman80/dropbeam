@@ -1,0 +1,247 @@
+/* Shared dialogs: send-to chooser, device linking, QR codes + scanner, block & report. */
+/* Recipient chooser rows (the "send to whom?" sheet) */
+.chooser-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-md);
+  font: inherit;
+  color: var(--text);
+  cursor: default;
+  transition: background var(--dur-fast) ease;
+}
+.chooser-row:hover {
+  background: var(--surface-hover);
+}
+.chooser-row:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.chooser-avatar {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: var(--font-sm);
+  flex-shrink: 0;
+}
+.chooser-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  background: var(--accent-soft);
+  flex-shrink: 0;
+}
+.chooser-name { font-size: var(--font-base); font-weight: 650; }
+.chooser-sub { font-size: var(--font-xs); color: var(--text-faint); }
+/* Presence dot on an avatar (top-right). */
+.presence-dot {
+  position: absolute;
+  right: -1px;
+  top: -1px;
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  background: var(--text-faint);
+  border: 2px solid var(--surface);
+  box-sizing: content-box;
+  width: 9px;
+  height: 9px;
+}
+.presence-dot.online { background: var(--green); }
+
+/* Device identity and camera dialogs. */
+.device-avatar { position: relative; display: inline-flex; flex-shrink: 0; }
+.device-badge { position: absolute; right: -4px; bottom: -4px; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 6px; background: var(--surface); color: var(--text-muted); border: 1px solid var(--border); z-index: 1; }
+.device-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; }
+.device-section-heading h2 { font-size: 14px; }
+.device-list { display: flex; flex-direction: column; gap: 10px; }
+.device-link-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+/* Above the first-run name sheet (z 1000): "Already use DropBeam? Link it" opens these from it. */
+.qr-overlay, .device-link-overlay { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; background: var(--overlay); -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); padding: 16px; }
+.device-link-dialog { width: 440px; max-width: 100%; max-height: 90dvh; overflow: auto; padding: 22px; display: flex; flex-direction: column; gap: 12px; }
+.device-link-dialog h2 { font-size: var(--font-xl); font-weight: 750; letter-spacing: -0.015em; margin: 0; }
+html:not(.mobile) .device-link-dialog { border-radius: var(--radius-2xl); background: var(--bg-elev); box-shadow: var(--shadow-lg); padding: 20px 22px 22px; }
+html:not(.mobile) .device-link-dialog ol { margin: 0; padding-left: 20px; color: var(--text-muted); line-height: 1.55; }
+html:not(.mobile) .device-link-dialog .device-link-actions { justify-content: flex-end; }
+.device-link-dialog p { margin: 0; }
+.link-qr { align-self: center; background: white; padding: 16px; border-radius: 12px; }
+.link-qr svg { display: block; max-width: 100%; height: auto; }
+
+/* Settings → Devices (multi-device account) */
+.account-devices-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.account-devices-head h2 { margin: 0 0 4px; }
+.account-devices-sub { margin: 0; color: var(--text-faint); font-size: calc(12.5px * var(--ui-font-scale, 1)); line-height: 1.45; }
+.account-device-list { list-style: none; margin: 0 0 14px; padding: 0; border: 1px solid var(--border); border-radius: 12px; overflow: visible; }
+.account-device { display: flex; align-items: center; gap: 12px; padding: 10px 12px; position: relative; }
+.account-device + .account-device { border-top: 1px solid var(--border); }
+.account-device-glyph { width: 38px; height: 38px; flex: none; border-radius: 50%; display: grid; place-items: center; background: var(--surface-2, rgba(127,127,127,.12)); color: var(--text); }
+.account-device-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.account-device-text strong { font-size: calc(13.5px * var(--ui-font-scale, 1)); font-weight: 650; }
+.account-device-text span { color: var(--text-faint); font-size: calc(12px * var(--ui-font-scale, 1)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-device-menu { position: relative; }
+.account-device-popover { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; min-width: 190px; padding: 4px; border-radius: 10px; background: var(--surface, var(--bg)); border: 1px solid var(--border); box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+.account-device-popover button { width: 100%; text-align: left; padding: 8px 10px; border: 0; border-radius: 7px; background: none; color: inherit; font: inherit; cursor: pointer; }
+.account-device-popover button:hover { background: rgba(127,127,127,.12); }
+.account-device-popover .danger, .danger-text { color: var(--danger, #e5484d); }
+.account-devices-empty p { margin: 0 0 12px; color: var(--text-dim, var(--text)); line-height: 1.5; }
+.account-linked { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; color: var(--success, #30a46c); }
+.account-linked p { color: var(--text); }
+.account-waiting { text-align: center; color: var(--text-faint); font-size: calc(12.5px * var(--ui-font-scale, 1)); }
+.account-waiting .spin { vertical-align: -2px; }
+.account-devices-profile { margin: 0 0 12px; color: var(--text-faint); font-size: calc(12.5px * var(--ui-font-scale, 1)); line-height: 1.45; }
+.device-link-steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; line-height: 1.45; }
+.device-link-note { color: var(--text-faint); font-size: calc(12px * var(--ui-font-scale, 1)); line-height: 1.45; }
+.device-link-state { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; padding: 8px 0; color: var(--accent, var(--text)); }
+.device-link-state p { color: var(--text); line-height: 1.45; }
+.device-link-error { color: var(--danger, #e5484d); }
+.device-link-error .device-link-actions { justify-content: center; }
+.avatar-device { color: white; }
+.spin { animation: account-spin 1s linear infinite; }
+@keyframes account-spin { to { transform: rotate(360deg); } }
+/* ---- QR codes: one look for every shown code (QrCodeView / ShareCode) ----
+   The tile is ALWAYS dark-on-white (a phone camera can't read an inverted,
+   dark-mode QR reliably) with its own quiet zone; the card ring keeps it from
+   floating as a white hole in dark mode. */
+.qr-code { margin: 0; max-width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
+.qr-code-tile { position: relative; display: block; max-width: 100%; padding: 8px; border-radius: 16px; background: #fff; border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(20, 22, 40, 0.06), 0 6px 18px rgba(20, 22, 40, 0.08); line-height: 0; cursor: zoom-in; transition: transform 0.14s ease, box-shadow 0.14s ease; }
+.qr-code-tile:hover { transform: translateY(-1px); box-shadow: 0 2px 4px rgba(20, 22, 40, 0.08), 0 10px 24px rgba(20, 22, 40, 0.12); }
+.qr-code-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+div.qr-code-tile { cursor: default; }
+.qr-code-tile svg { display: block; max-width: 100%; height: auto; border-radius: 8px; }
+.qr-code-zoom { position: absolute; right: 6px; bottom: 6px; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 7px; background: rgba(11, 12, 18, 0.72); color: #fff; opacity: 0; transition: opacity 0.14s ease; }
+.qr-code-tile:hover .qr-code-zoom, .qr-code-tile:focus-visible .qr-code-zoom { opacity: 1; }
+.qr-code-hint { display: inline-flex; align-items: center; gap: 5px; font-size: calc(11.5px * var(--ui-font-scale, 1)); color: var(--text-muted); text-align: center; }
+.dark .qr-code-tile { border-color: color-mix(in srgb, #fff 18%, var(--border)); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 10%, transparent), 0 8px 24px rgba(0, 0, 0, 0.4); }
+.qr-enlarged-overlay { background: rgb(6 7 12 / 86%) !important; backdrop-filter: blur(6px); }
+.qr-enlarged { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.qr-enlarged-tile { background: #fff; padding: 14px; border-radius: 22px; box-shadow: var(--shadow-lg); line-height: 0; }
+.qr-enlarged-tile svg { display: block; width: min(480px, 78vw, calc(100dvh - 190px)); height: auto; }
+.qr-enlarged p { margin: 0; color: #fff; font-size: 13px; font-weight: 600; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }
+
+.share-code { display: flex; gap: 18px; align-items: center; }
+.share-code-stack { flex-direction: column; align-items: stretch; gap: 14px; }
+.share-code-stack > .qr-code { align-self: center; }
+.share-code-row { flex-wrap: wrap; }
+.share-code-side { flex: 1; min-width: 210px; display: flex; flex-direction: column; gap: 9px; }
+.share-code-instructions { font-size: calc(12.5px * var(--ui-font-scale, 1)); color: var(--text-muted); line-height: 1.5; }
+.share-code-text { display: block; font-family: var(--font-mono); font-size: calc(11px * var(--ui-font-scale, 1)); line-height: 1.5; color: var(--text-muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: 11px; padding: 9px 11px; word-break: break-all; max-height: 74px; overflow-y: auto; }
+
+/* ---- QR scanner (desktop) ---- */
+.qr-overlay .qrs { width: 440px; max-width: calc(100vw - 32px) !important; padding: 18px 20px 20px; border-radius: 20px; gap: 0; }
+.qrs-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.qrs-title { display: flex; align-items: center; gap: 8px; font-size: calc(16px * var(--ui-font-scale, 1)); font-weight: 750; }
+.qrs-title svg { color: var(--accent); }
+.qrs-body { display: flex; flex-direction: column; gap: 10px; }
+.qrs-stage { position: relative; aspect-ratio: 4 / 3; flex-shrink: 0; border-radius: 16px; overflow: hidden; background: #0b0c12; isolation: isolate; }
+.qrs-stage.dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.qrs-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: opacity 0.2s ease; }
+.qrs-finder { position: absolute; top: 50%; left: 50%; width: 58%; aspect-ratio: 1; transform: translate(-50%, -50%); box-shadow: 0 0 0 999px rgb(0 0 0 / 32%); border-radius: 18px; pointer-events: none; }
+.qrs-finder i { position: absolute; width: 26px; height: 26px; border: 3.5px solid #fff; }
+.qrs-finder i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; border-top-left-radius: 18px; }
+.qrs-finder i:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; border-top-right-radius: 18px; }
+.qrs-finder i:nth-child(3) { bottom: 0; left: 0; border-right: 0; border-top: 0; border-bottom-left-radius: 18px; }
+.qrs-finder i:nth-child(4) { bottom: 0; right: 0; border-left: 0; border-top: 0; border-bottom-right-radius: 18px; }
+.qrs-stage-msg { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 22px; text-align: center; color: rgb(255 255 255 / 82%); font-size: calc(12.5px * var(--ui-font-scale, 1)); line-height: 1.5; }
+.qrs-drop { background: rgb(11 12 18 / 86%); color: #fff; }
+.qrs-hint { margin: 2px 0 0; font-size: calc(13px * var(--ui-font-scale, 1)); color: var(--text); font-weight: 600; text-align: center; }
+.qrs-notice { margin: 0; padding: 8px 11px; border-radius: 11px; background: var(--amber-soft); color: var(--amber); font-size: calc(12.5px * var(--ui-font-scale, 1)); line-height: 1.45; overflow-wrap: anywhere; }
+.qrs-alt { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+.qrs-paste { display: flex; gap: 8px; }
+.qrs-paste .input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: calc(12.5px * var(--ui-font-scale, 1)); }
+.qrs-tip { margin: 0; font-size: calc(11.5px * var(--ui-font-scale, 1)); color: var(--text-faint); text-align: center; line-height: 1.45; }
+
+/* ---- Block & Report (App Store 1.2) ---- */
+.safety-points {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: var(--font-base);
+  color: var(--text);
+  line-height: 1.45;
+}
+.safety-note {
+  margin: 12px 0 0;
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+}
+.safety-label {
+  display: block;
+  margin: 14px 0 6px;
+  padding: 0;
+  font-size: var(--font-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.safety-reasons {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.safety-reasons .safety-label { margin-top: 0; }
+.safety-reason {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-md);
+  font-size: var(--font-base);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.safety-reason:hover { background: var(--surface-hover); }
+.safety-reason.on { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+.safety-reason input, .safety-check input { accent-color: var(--accent); margin: 0; flex-shrink: 0; }
+.safety-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  font-size: var(--font-base);
+  cursor: pointer;
+}
+.safety-check input { margin-top: 3px; }
+.safety-check > span { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.safety-quote {
+  display: block;
+  padding: 6px 10px;
+  border-left: 3px solid var(--border-strong);
+  background: var(--bg);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  color: var(--text-muted);
+  font-size: var(--font-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 96px;
+  overflow: auto;
+}
+.safety-hint { font-weight: 400; font-size: var(--font-xs); color: var(--text-faint); }
+.safety-notes { width: 100%; resize: vertical; min-height: 64px; font: inherit; font-size: var(--font-base); box-sizing: border-box; }
+.chat-menu.safety-menu { position: fixed; min-width: 150px; z-index: 1000; }
+.blocked-list { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+.blocked-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg);
+}
+.blocked-row .blocked-name { flex: 1; min-width: 0; font-weight: 600; font-size: var(--font-base); }
+.blocked-row .blocked-when { font-size: var(--font-xs); color: var(--text-faint); white-space: nowrap; }

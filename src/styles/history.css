@@ -1,0 +1,5 @@
+/* History (Recents + Recoverable files). */
+/* History rows: the remove (×) appears on hover/focus so the list stays calm. */
+.history-row-remove { opacity: 0; }
+.row-hover:hover .history-row-remove,
+.history-row-remove:focus-visible { opacity: 1; }

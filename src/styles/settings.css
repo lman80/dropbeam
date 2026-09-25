@@ -1,0 +1,9 @@
+/* Settings. */
+/* Feature panels embedded at the top of Settings (Devices, Locations) share
+   one heading style: a 15px title + muted one-line description. */
+.settings-page .account-devices-head h2,
+.settings-page .location-settings .location-heading h2 {
+  font-size: var(--font-lg);
+  font-weight: 700;
+  margin: 0 0 3px;
+}

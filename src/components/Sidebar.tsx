@@ -13,8 +13,8 @@ import { isActive } from '../lib/api'
 import { useStore, type View } from '../store'
 import { FriendAvatar } from './FriendAvatar'
 import { SuperFeedback } from '../vendor/superfeedback'
-import { IS_MAC } from '../lib/platform'
-import { SidebarBrand } from './TitleBar'
+import { avatarColor } from '../lib/avatar'
+import { IconButton } from './ui'
 
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
@@ -40,11 +40,12 @@ export function Sidebar() {
 
   return (
     <nav className="app-sidebar" aria-label="Main">
-      {!IS_MAC && <SidebarBrand />}
+      {/* macOS: clears the traffic lights and drags the window. */}
+      <div className="sidebar-top titlebar-drag" data-tauri-drag-region />
       {NAV.map((item) => {
         const active = view === item.id
         const Icon = item.icon
-        const badge = item.id === 'send' ? activeCount : item.id === 'chat' ? unreadCount : 0
+        const count = item.id === 'send' ? activeCount : item.id === 'chat' ? unreadCount : 0
         return (
           <button
             key={item.id}
@@ -54,35 +55,48 @@ export function Sidebar() {
             title={item.label}
             onClick={() => setView(item.id)}
           >
-            <Icon size={18} strokeWidth={2} style={{ flexShrink: 0 }} />
+            <Icon strokeWidth={1.75} />
             <span className="nav-label">{item.label}</span>
-            {badge > 0 && (
-              <span className="count-badge" aria-label={item.id === 'send' ? `${badge} active` : `${badge} unread`}>
-                {badge > 99 ? '99+' : badge}
+            {count > 0 && (
+              <span
+                className={`nav-count${item.id === 'chat' ? ' unread' : ' active-dot'}`}
+                aria-label={item.id === 'send' ? `${count} in progress` : `${count} unread`}
+              >
+                {count > 99 ? '99+' : count}
               </span>
             )}
           </button>
         )
       })}
 
-      {/* Opens the SuperFeedback panel (no floating button — it overlapped Send). */}
-      <button className="nav-item sidebar-feedback" title="Send feedback" onClick={() => SuperFeedback.open()}>
-        <MessageSquarePlus size={18} strokeWidth={2} style={{ flexShrink: 0 }} />
-        <span className="nav-label">Feedback</span>
-      </button>
+      <div className="sidebar-spacer" />
 
-      <div style={{ flex: 1 }} />
-
-      <div className="sidebar-me" title={name || 'This device'}>
-        <div className="sidebar-me-avatar">
-          <FriendAvatar friend={{ name, avatar }} />
-        </div>
-        <div className="sidebar-me-text">
-          <div className="truncate-1" style={{ fontSize: 'var(--font-sm)', fontWeight: 650 }}>
-            {name || 'This device'}
-          </div>
-          <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-faint)' }}>This device</div>
-        </div>
+      <div className="sidebar-foot">
+        <button
+          className="sidebar-me"
+          title="Your profile"
+          onClick={() => setView('friends')}
+        >
+          <span className="sidebar-me-avatar" style={{ background: avatarColor(name || 'you') }}>
+            <FriendAvatar friend={{ name: name || 'You', avatar }} />
+          </span>
+          <span className="sidebar-me-text">
+            <span className="sidebar-me-name truncate-1" style={{ display: 'block' }}>{name || 'You'}</span>
+          </span>
+        </button>
+        {/* Opens the SuperFeedback panel. Not a page, so it isn't a nav item; the
+            click blurs it so no focus/selection state lingers after the panel closes. */}
+        <IconButton
+          label="Send feedback"
+          className="sidebar-feedback"
+          side="top"
+          onClick={(e) => {
+            e.currentTarget.blur()
+            SuperFeedback.open()
+          }}
+        >
+          <MessageSquarePlus strokeWidth={1.75} />
+        </IconButton>
       </div>
     </nav>
   )
