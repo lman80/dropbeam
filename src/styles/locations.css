@@ -1,1 +1,285 @@
-/* Locations screen. */
+/* Locations: friends' folders, synced folders, folders this device shares,
+   the file browser, and the Locations section inside Settings. Built on the
+   .group/.row pattern — no tiles, pills or dashed boxes. */
+
+/* ---- Page sections ---- */
+.locations-view > .page-header + .location-section > .section-title { margin-top: 4px; }
+.location-section .section-row > .btn-plain,
+.location-settings .section-row > .btn-plain { margin-right: -8px; }
+.location-row { --row-inset: 44px; }
+.location-row .row-sub { display: block; }
+.location-glyph {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  flex-shrink: 0;
+  align-self: center;
+  color: var(--text-muted);
+}
+.location-glyph > svg { width: 17px; height: 17px; stroke-width: 1.75; }
+.location-chevron { width: 14px; height: 14px; color: var(--text-faint); flex-shrink: 0; }
+button.row.location-row { cursor: default; transition: background var(--dur-fast); }
+
+/* "Alex · Online" with a presence dot. */
+.location-presence { display: flex !important; align-items: center; gap: 6px; }
+.location-presence > .dot, .location-reach > .dot, .location-status > .dot { flex-shrink: 0; }
+
+/* Quiet trailing words: free space, reachability, sync status. */
+.location-reach,
+.location-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 220px;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.location-reach.warn { color: var(--amber); }
+.location-status.tone-bad { color: var(--red); }
+.location-status > .spinner { flex-shrink: 0; }
+.location-row .row-trailing { gap: 4px; min-width: 0; }
+.location-row .row-trailing > .location-status { margin-right: 6px; }
+
+/* Last activity / live upload line under a shared-from-this-device row. */
+.location-activity { display: flex !important; align-items: center; gap: 6px; color: var(--text-faint); }
+.location-activity.live { color: var(--accent-text); }
+
+/* One quiet line for friends whose locations couldn't be loaded. */
+.location-note {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 8px 2px 0;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+  min-width: 0;
+}
+.location-errors { margin: 8px 0 0; }
+.location-errors > div + div { margin-top: 8px; }
+.location-errors dt { font-weight: 500; }
+.location-errors dd { margin: 1px 0 0; color: var(--text-muted); overflow-wrap: anywhere; }
+
+/* Spacer so unchecked menu items line up with a checked one. */
+.location-menu-space { display: inline-block; width: 15px; height: 15px; flex-shrink: 0; }
+
+/* ---- File browser ---- */
+.location-browser-head { margin-bottom: 8px; }
+.location-crumbs { display: flex; align-items: center; gap: 4px; min-width: 0; flex: 1; }
+.location-crumbs > .icon-btn { margin-left: -6px; flex-shrink: 0; }
+.location-breadcrumbs { min-width: 0; flex: 1; }
+.location-crumb-list { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.location-crumb {
+  flex: 0 1 auto;
+  max-width: 180px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font: inherit;
+  color: var(--text-muted);
+  cursor: default;
+  transition: color var(--dur-fast), background var(--dur-fast);
+}
+button.location-crumb:hover { color: var(--text); background: var(--surface-hover); }
+.location-crumb.current { flex: 0 1 auto; max-width: none; color: var(--text); }
+.location-crumb:first-child { margin-left: -4px; }
+.location-crumb-sep { width: 16px; height: 16px; flex-shrink: 0; color: var(--text-faint); }
+
+.location-upload .location-upload-caret { width: 12px; height: 12px; margin: 0 -2px 0 -1px; opacity: 0.85; }
+
+.location-toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  margin-bottom: 12px;
+}
+.location-search { flex: 0 1 220px; min-width: 110px; }
+.location-sort { flex: 0 0 auto; width: 136px; }
+/* `.dark .input` resets the background shorthand, which drops select.input's chevron. */
+.dark select.location-sort {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a8a8f' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+.location-selection {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  font-size: var(--text-12);
+}
+.location-selection > .muted { margin-right: 4px; }
+.location-selection > .btn { margin-right: 2px; }
+
+.location-table-group { transition: box-shadow var(--dur), background var(--dur); }
+.location-table-group.location-drop {
+  box-shadow: 0 0 0 2px var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+.location-table-group.location-loading tbody { opacity: 0.55; transition: opacity var(--dur); }
+.location-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: var(--text-13);
+}
+.location-table th {
+  height: 28px;
+  padding: 0 8px;
+  text-align: left;
+  font-size: var(--text-11);
+  font-weight: 500;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--separator);
+  white-space: nowrap;
+}
+.location-table td {
+  height: 32px;
+  padding: 0 8px;
+  color: var(--text-muted);
+  font-size: var(--text-12);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.location-table tbody tr + tr td { box-shadow: inset 0 1px 0 var(--separator); }
+.location-table tbody tr { transition: background var(--dur-fast); }
+.location-table tbody tr:hover { background: var(--surface-hover); }
+.location-table tbody tr.selected { background: var(--accent-soft); }
+.location-table tbody tr.selected + tr td,
+.location-table tbody tr.selected td { box-shadow: none; }
+.location-col-check { width: 36px; padding: 0 0 0 12px !important; }
+.location-col-check input { display: block; margin: 0; }
+.location-col-size { width: 84px; text-align: right; }
+.location-col-date { width: 168px; }
+th.location-col-size { text-align: right; }
+.location-col-name { color: var(--text) !important; font-size: var(--text-13) !important; }
+.location-filename {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: default;
+}
+.location-filename > svg { width: 16px; height: 16px; flex-shrink: 0; stroke-width: 1.75; }
+.location-icon-folder { color: var(--accent-text); }
+.location-icon-file { color: var(--text-faint); }
+button.location-filename:hover > span { text-decoration: underline; text-decoration-color: var(--text-faint); text-underline-offset: 2px; }
+
+.location-table-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 132px;
+  padding: 0 16px;
+  font-size: var(--text-13);
+  color: var(--text-muted);
+}
+
+.location-browser-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 24px;
+  margin-top: 8px;
+  padding: 0 2px;
+  font-size: var(--text-12);
+}
+.location-browser-foot > span { display: flex; align-items: center; gap: 6px; }
+.location-pager { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.location-pager > span { margin-right: 6px; font-size: var(--text-12); }
+
+/* ---- Dialogs (sync a folder, add/edit a location, file actions) ---- */
+.location-form { display: flex; flex-direction: column; gap: 16px; }
+.location-field { display: flex; flex-direction: column; min-width: 0; }
+.location-field .field-hint { margin-top: 6px; }
+.location-choose {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 36px;
+  padding: 4px 4px 4px 10px;
+  box-sizing: border-box;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.location-choose-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: var(--text-13);
+}
+.location-choose-name > svg { width: 15px; height: 15px; flex-shrink: 0; color: var(--text-muted); }
+.location-pick-group { max-height: 232px; overflow-y: auto; }
+.location-dialog .group { box-shadow: 0 0 0 0.5px var(--border-strong); }
+.location-pick-group .row { --row-inset: 44px; }
+.location-pick { cursor: default; }
+.location-pick .row-title, .location-pick .row-sub { display: block; }
+.location-pick.on { background: var(--accent-soft) !important; }
+.location-pick-check { width: 15px; height: 15px; flex-shrink: 0; color: var(--accent-text); }
+.location-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: var(--text-13);
+  line-height: 1.4;
+  color: var(--text);
+}
+.location-check + .location-check { margin-top: 6px; }
+.location-check input { margin: 2px 0 0; flex-shrink: 0; }
+.location-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.location-chips .pick-chip { max-width: 200px; }
+.location-chips .pick-chip > svg { flex-shrink: 0; }
+.location-options { display: flex; flex-direction: column; gap: 6px; }
+.location-advanced > summary {
+  font-size: var(--text-12);
+  color: var(--text-muted);
+  cursor: default;
+  width: fit-content;
+  border-radius: var(--radius-sm);
+}
+.location-advanced[open] > summary { margin-bottom: 10px; }
+.location-cap-input { display: flex; align-items: center; gap: 8px; }
+.location-cap-input > .input { width: 112px; }
+.location-inline { display: flex; align-items: center; gap: 8px; }
+.location-inline > .input { flex: 1; min-width: 0; }
+.location-inline > .btn { flex-shrink: 0; }
+.location-name-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  font-size: var(--text-12);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.location-name-list > li { display: flex; flex-direction: column; min-width: 0; }
+.location-name-list > li.truncate-1 { display: block; }
+.location-name-list .form-error { margin: 0; }
+.location-dialog form + .location-name-list,
+.location-dialog .dialog-text + .location-name-list { margin-top: 0; }
+
+/* ---- Settings → Locations ---- */
+.location-settings { margin-bottom: 24px; }
+.location-settings-error { margin: 0 0 8px 2px; }
+.location-added { display: flex !important; align-items: center; gap: 4px; color: var(--green); }
+.location-activity-row { min-height: 36px; font-size: var(--text-13); }
+.location-activity-row .row-trailing { font-size: var(--text-12); }
