@@ -271,7 +271,7 @@ export function ChatView() {
             />
           )}
         </div>
-        <div className="scroll-area chat-list" role="list">
+        <div className="scroll-area chat-list">
           {!conversations.length && <div className="chat-list-note">No conversations yet</div>}
           {listRows.map(({ friend, last, ts, conversation }) => {
             const active = friend.id === activeChatId
@@ -280,7 +280,6 @@ export function ChatView() {
             return (
               <button
                 key={friend.id}
-                role="listitem"
                 className={`chat-row${active ? ' active' : ''}${u > 0 ? ' unread' : ''}${conversation ? '' : ' compact'}`}
                 aria-current={active ? 'true' : undefined}
                 onClick={() => void openChat(friend.id)}
@@ -1383,6 +1382,7 @@ const MessageRow = memo(function MessageRow({
   const [tray, setTray] = useState<{ anchor: DOMRect; trigger: HTMLElement | null } | null>(null)
   const [menu, setMenu] = useState<{ anchor: DOMRect; trigger: HTMLElement | null; context: boolean } | null>(null)
   const mainRef = useRef<HTMLDivElement>(null)
+  const hadSelectionRef = useRef(false)
   const closeTray = useCallback(() => setTray(null), [])
   const closeMenu = useCallback(() => setMenu(null), [])
 
@@ -1482,12 +1482,19 @@ const MessageRow = memo(function MessageRow({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: 0.16 }}
+          onMouseDown={(e) => {
+            // A right-click selects the word under it before `contextmenu` fires,
+            // so decide here whether the reader had already selected text.
+            if (e.button !== 2) return
+            const sel = window.getSelection()
+            hadSelectionRef.current = !!sel && !sel.isCollapsed && !!mainRef.current?.contains(sel.anchorNode)
+          }}
           onContextMenu={(e) => {
             if (m.deleted) return
             // Keep the native menu on selected text so Copy/Look Up still work.
-            const sel = window.getSelection()
-            if (sel && !sel.isCollapsed && mainRef.current?.contains(sel.anchorNode)) return
+            if (hadSelectionRef.current) return
             e.preventDefault()
+            window.getSelection()?.removeAllRanges()
             setTray(null)
             setMenu({ anchor: new DOMRect(e.clientX, e.clientY, 0, 0), trigger: null, context: true })
           }}
