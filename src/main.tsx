@@ -9,6 +9,7 @@ import { api, HAS_TAURI } from './lib/api'
 import { DESKTOP_OS, MOBILE_UI } from './lib/platform'
 import { SuperFeedback } from './vendor/superfeedback'
 import { ErrorBoundary } from './components/ErrorBoundary'
+import { useStore } from './store'
 
 // Which window are we? The popover and HUD load the same bundle as the main
 // app and pick their compact UI from the Tauri window label. `?window=` lets us
@@ -49,6 +50,9 @@ if (MOBILE_UI) {
 if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
   document.documentElement.classList.add('dark')
 }
+
+// Browser preview only: expose the store so screenshot scripts can reach every state.
+if (!HAS_TAURI) (window as unknown as { __store?: typeof useStore }).__store = useStore
 
 const Root =
   label === 'popover' ? Popover : label === 'hud' ? Hud : label === 'receive' ? ReceiveCard : App

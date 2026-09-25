@@ -2,11 +2,11 @@ import { groupDevices, personGroups } from '../lib/deviceIcons'
 import { DeviceBadge } from '../components/DeviceBadge'
 import { AddDeviceModal } from '../components/DevicesPanel'
 import { useOwnDeviceLabels } from '../lib/ownDevices'
-import { SafetyMenu } from '../components/SafetyDialogs'
-import { ScanCodeButton, ShareCode } from '../components/CodeQr'
+import { ConfirmDialog, SafetyMenu } from '../components/SafetyDialogs'
+import { QrCodeView, ScanCodeButton, ShareCode } from '../components/CodeQr'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
 import {
   ChevronRight,
@@ -18,7 +18,6 @@ import {
   Pencil,
   QrCode,
   Radar,
-  RefreshCw,
   Send,
   Trash2,
   UserPlus,
@@ -27,12 +26,13 @@ import {
 import { api, fileSrc, HAS_TAURI, type ConnDetail, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { parseCode, wrongCodeMessage } from '../lib/codes'
-import { ChannelBadge, EmptyState, Spinner } from '../components/bits'
 import { MobileHeader } from '../components/MobileHeader'
 import { Dialog } from '../components/Dialog'
 import { createPortal } from 'react-dom'
-import { ConnInspector } from '../components/ConnInspector'
-import { avatarGradient, initials } from '../lib/avatar'
+import { ConnInfo } from '../components/ConnInspector'
+import { FriendAvatar } from '../components/FriendAvatar'
+import { EmptyState, IconButton, MenuButton, SectionHeader, Spinner, type MenuItem } from '../components/ui'
+import { avatarColor, avatarGradient, initials } from '../lib/avatar'
 import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/presence'
 
 export function FriendsView() {
@@ -70,78 +70,508 @@ export function FriendsView() {
     {adding && <AddFriendModal onClose={() => setAdding(false)} />}
   </div>
 
+  return <DesktopFriends />
+}
+
+// ── Desktop Friends page ─────────────────────────────────────────────────────
+// A native list: You (profile + your code), My devices, Friends. Each person is
+// one row — avatar, name, one quiet status line — with Send, Message and a "…"
+// menu for everything else. Dialogs handle rename / invite / remove so rows
+// never change height.
+
+/** Round avatar with at most one overlay: a small green dot when online. */
+function PersonAvatar({ friend, online, device, size = 32 }: {
+  friend: Pick<Friend, 'id' | 'name' | 'avatar'> & Partial<Pick<Friend, 'accountPub' | 'deviceKind' | 'deviceOs'>>
+  online?: boolean
+  device?: boolean
+  size?: number
+}) {
   return (
-    <div className="page">
+    <span
+      className={`fr-avatar${device ? ' is-device' : ''}`}
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.36), background: device ? undefined : avatarColor(friend.id) }}
+      aria-hidden
+    >
+      <FriendAvatar friend={friend} />
+      {online && <span className="fr-presence" />}
+    </span>
+  )
+}
+
+/** "Online", "Last seen 3h ago", "Not seen yet". */
+function statusText(p: ReturnType<typeof friendPresence>) {
+  return p.status === 'online' ? 'Online' : presenceLabel(p)
+}
+
+function DesktopFriends() {
+  const friends = useStore((s) => s.friends)
+  const myDevice = useStore((s) => s.myDevice)
+  const [adding, setAdding] = useState(false)
+  const [linking, setLinking] = useState(false)
+  const grouped = personGroups(friends, myDevice?.account_pub)
+  const { myDevices, others } = groupDevices(friends.filter((f) => !grouped[f.id]), myDevice?.account_pub)
+
+  return (
+    <div className="page friends-page">
       <div className="page-header titlebar-drag">
-        <div>
-          <h1 className="page-title">Friends</h1>
-          <p className="page-subtitle">Send files and chat with people by name.</p>
-        </div>
+        <h1 className="page-title">Friends</h1>
         <div className="page-actions">
           <button className="btn btn-primary" onClick={() => setAdding(true)}>
-            <UserPlus size={15} /> Add friend
+            <UserPlus /> Add friend
           </button>
         </div>
       </div>
 
-      {/* ── You ─────────────────────────────────────────────── */}
-      <SectionLabel first>You</SectionLabel>
-      <YouCard />
+      <SectionHeader>You</SectionHeader>
+      <YouSection />
 
-      {/* ── Your other devices (multi-device account) ───────── */}
-      <div className="section-row">
-        <SectionLabel>{myDevices.length ? `My devices · ${myDevices.length}` : 'My devices'}</SectionLabel>
-        <button className="btn btn-quiet btn-sm" onClick={() => setLinking(true)}>
-          <Plus size={14} /> Link a device
-        </button>
+      <SectionHeader
+        count={myDevices.length}
+        action={myDevices.length ? <button className="btn btn-plain btn-sm" onClick={() => setLinking(true)}>Link a device…</button> : undefined}
+      >
+        My devices
+      </SectionHeader>
+      <div className="group fr-list">
+        {myDevices.map((f) => <FriendRow key={f.id} friend={f} />)}
+        {myDevices.length === 0 && (
+          <button className="row fr-add-row" onClick={() => setLinking(true)}>
+            <span className="fr-avatar is-device" aria-hidden><Plus size={16} /></span>
+            <span className="row-main">
+              <span className="row-title">Link a device…</span>
+              <span className="row-sub">Use DropBeam on your phone or another computer</span>
+            </span>
+          </button>
+        )}
       </div>
-      {myDevices.length ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>{myDevices.map((f) => <FriendCard key={f.id} friend={f} />)}</div>
-      ) : (
-        <button className="card empty-row" onClick={() => setLinking(true)}>
-          <span className="empty-row-icon"><Plus size={16} /></span>
-          <span style={{ flex: 1, minWidth: 0 }}>
-            <span className="empty-row-title">Link your phone or another computer</span>
-            <span className="empty-row-sub">Your friends and chats follow you to every device you link.</span>
-          </span>
-          <ChevronRight size={16} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
-        </button>
-      )}
-      {linking && <AddDeviceModal onClose={() => setLinking(false)} />}
 
-      {/* ── Friends ─────────────────────────────────────────── */}
-      <SectionLabel>{others.length ? `Friends · ${others.length}` : 'Friends'}</SectionLabel>
+      <SectionHeader count={others.length}>Friends</SectionHeader>
       {others.length === 0 ? (
-        <div className="card" style={{ padding: '6px 0 0' }}>
+        <div className="group">
           <EmptyState
-            icon={<Users size={24} />}
+            icon={<Users />}
             title="No friends yet"
-            hint="Share your code with someone (or paste theirs). Add them once and you can beam files and chat by name forever — it survives app updates, so you never re-add anyone."
+            hint="Add a friend with their DropBeam code."
+            action={<button className="btn btn-secondary" onClick={() => setAdding(true)}>Add friend</button>}
+            style={{ padding: '32px 24px' }}
           />
-          <div style={{ display: 'flex', justifyContent: 'center', paddingBottom: 22 }}>
-            <button className="btn btn-primary" onClick={() => setAdding(true)}>
-              <UserPlus size={15} /> Add a friend
-            </button>
-          </div>
         </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          <AnimatePresence initial={false}>
-            {others.map((f) => (
-              <FriendCard key={f.id} friend={f} />
-            ))}
-          </AnimatePresence>
+        <div className="group fr-list">
+          {others.map((f) => <FriendRow key={f.id} friend={f} />)}
         </div>
       )}
 
+      {linking && <AddDeviceModal onClose={() => setLinking(false)} />}
       <AnimatePresence>{adding && <AddFriendModal onClose={() => setAdding(false)} />}</AnimatePresence>
     </div>
   )
 }
 
-function SectionLabel({ children, first }: { children: ReactNode; first?: boolean }) {
-  return <h2 className="section-title" style={{ margin: first ? '0 2px 9px' : '22px 2px 9px' }}>{children}</h2>
+/** Your profile (picture + name) and your permanent DropBeam code. */
+function YouSection() {
+  const settings = useStore((s) => s.settings)
+  const saveSettings = useStore((s) => s.saveSettings)
+  const pickAvatar = useStore((s) => s.pickAvatar)
+  const clearAvatar = useStore((s) => s.clearAvatar)
+  const toast = useStore((s) => s.toast)
+  const displayName = settings?.displayName ?? ''
+  const [code, setCode] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+  const [dialog, setDialog] = useState<null | 'name' | 'qr'>(null)
+
+  useEffect(() => {
+    let alive = true
+    api
+      .myInviteCode()
+      .then((c) => alive && setCode(c))
+      .catch(() => alive && setCode(''))
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const copyCode = async () => {
+    if (!code) return
+    try {
+      await navigator.clipboard.writeText(code)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1600)
+    } catch {
+      toast('error', 'Couldn’t copy the code')
+    }
+  }
+
+  const me = { id: displayName || 'you', name: displayName || 'You', avatar: settings?.avatar ?? null }
+  return (
+    <div className="group fr-list">
+      <div className="row">
+        <button className="fr-you-avatar" onClick={() => void pickAvatar()} aria-label="Change picture" title="Change picture">
+          <PersonAvatar friend={me} />
+          <span className="fr-you-avatar-edit" aria-hidden><Camera size={14} /></span>
+        </button>
+        <div className="row-main">
+          <div className="row-title truncate-1" title={displayName}>{displayName || 'You'}</div>
+          <div className="row-sub">Your name and picture</div>
+        </div>
+        <div className="row-trailing">
+          <MenuButton
+            label="Edit profile"
+            items={[
+              { label: 'Edit name…', onSelect: () => setDialog('name') },
+              { label: 'Change picture…', onSelect: () => void pickAvatar() },
+              { label: 'Remove picture', onSelect: () => void clearAvatar(), hidden: !settings?.avatar },
+            ]}
+          />
+        </div>
+      </div>
+      <div className="row">
+        <span className="fr-avatar is-device" aria-hidden><QrCode size={16} /></span>
+        <div className="row-main">
+          <div className="row-title">Your DropBeam code</div>
+          {code ? (
+            <div className="row-sub fr-code truncate-1 selectable" title={code}>{code}</div>
+          ) : (
+            <div className="row-sub">{code === null ? 'Loading…' : 'Appears once DropBeam has connected'}</div>
+          )}
+        </div>
+        <div className="row-trailing">
+          <button className="btn btn-secondary btn-sm fr-code-btn" disabled={!code} onClick={() => setDialog('qr')}>Show QR</button>
+          <button className="btn btn-secondary btn-sm fr-code-btn" disabled={!code} onClick={() => void copyCode()}>
+            {copied ? <><Check /> Copied</> : 'Copy'}
+          </button>
+        </div>
+      </div>
+
+      <AnimatePresence>
+        {dialog === 'name' && (
+          <NameDialog
+            key="name"
+            title="Your name"
+            label="Name"
+            initial={displayName}
+            onSave={(n) => { if (n !== displayName) void saveSettings({ displayName: n }) }}
+            onClose={() => setDialog(null)}
+          />
+        )}
+        {dialog === 'qr' && code && (
+          <Dialog
+            key="qr"
+            title="Your DropBeam code"
+            width={340}
+            onClose={() => setDialog(null)}
+            footer={
+              <>
+                <button className="btn btn-secondary" onClick={() => void copyCode()}>{copied ? 'Copied' : 'Copy code'}</button>
+                <button className="btn btn-primary" autoFocus onClick={() => setDialog(null)}>Done</button>
+              </>
+            }
+          >
+            <div className="fr-qr">
+              <QrCodeView value={code} size={200} hint={null} label="QR code for your DropBeam code" />
+              <p>Friends scan this in DropBeam → Add friend.</p>
+            </div>
+          </Dialog>
+        )}
+      </AnimatePresence>
+    </div>
+  )
 }
+
+/** One-field rename dialog (friend or your own name). */
+function NameDialog({ title, label, initial, onSave, onClose }: {
+  title: string
+  label: string
+  initial: string
+  onSave: (name: string) => void
+  onClose: () => void
+}) {
+  const [name, setName] = useState(initial)
+  const save = () => {
+    const n = name.trim()
+    if (!n) return
+    onSave(n)
+    onClose()
+  }
+  return (
+    <Dialog
+      title={title}
+      width={360}
+      onClose={onClose}
+      footer={
+        <>
+          <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!name.trim()} onClick={save}>Save</button>
+        </>
+      }
+    >
+      <label className="field-label" htmlFor="fr-name-input">{label}</label>
+      <input
+        id="fr-name-input"
+        className="input"
+        value={name}
+        autoFocus
+        onFocus={(e) => e.currentTarget.select()}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); save() } }}
+      />
+    </Dialog>
+  )
+}
+
+/** A friend (or one of your own devices) as one list row. */
+function FriendRow({ friend }: { friend: Friend }) {
+  const ownLabel = useOwnDeviceLabels()[friend.id] as string | undefined
+  const sendToFriend = useStore((s) => s.sendToFriend)
+  const removeFriend = useStore((s) => s.removeFriend)
+  const renameFriend = useStore((s) => s.renameFriend)
+  const setFriendAutoAccept = useStore((s) => s.setFriendAutoAccept)
+  const pingFriend = useStore((s) => s.pingFriend)
+  const openChat = useStore((s) => s.openChat)
+  const friendSeen = useStore((s) => s.friendSeen)
+  const folderStatuses = useStore((s) => s.folderStatuses)
+  const toast = useStore((s) => s.toast)
+  const [busy, setBusy] = useState(false)
+  const [dialog, setDialog] = useState<null | 'rename' | 'remove' | 'invite'>(null)
+  const [invite, setInvite] = useState<string | null>(null)
+  const [loadingInvite, setLoadingInvite] = useState(false)
+  const [pinging, setPinging] = useState(false)
+  const [pingedOffline, setPingedOffline] = useState(false)
+  const [conn, setConn] = useState<ConnDetail | null>(null)
+
+  const presence = friendPresence(friend.name, friendSeen, folderStatuses)
+  const isOnline = presence.status === 'online'
+  const channel = Object.values(folderStatuses).find(
+    (s) => s.peerName?.trim().toLowerCase() === friend.name.trim().toLowerCase(),
+  )?.locality
+  const label = ownLabel ?? friend.name
+
+  // Check the live path once when a friend comes online (it feeds the
+  // connection-details popover); forget it when they drop. The `alive` guard
+  // stops a late probe from a prior cycle clobbering current state.
+  useEffect(() => {
+    if (!isOnline) return
+    let alive = true
+    useStore
+      .getState()
+      .probeFriend(friend.id)
+      .then((d) => { if (alive) setConn(d) })
+      .catch(() => { if (alive) setConn(null) })
+    return () => {
+      alive = false
+    }
+  }, [isOnline, friend.id])
+
+  const check = async () => {
+    setPinging(true)
+    setPingedOffline(false)
+    try {
+      const ok = await pingFriend(friend.id)
+      if (ok) toast('success', `${label} is online`)
+      else {
+        setPingedOffline(true)
+        toast('info', `${label} didn’t respond — they may be offline`)
+      }
+    } finally {
+      setPinging(false)
+    }
+  }
+
+  const send = async () => {
+    setBusy(true)
+    try {
+      const paths = await api.pickFiles()
+      if (paths.length) {
+        // The store already toasted a failure; only confirm a send that started.
+        if (await sendToFriend(friend.id, paths)) toast('info', `Beaming to ${label}…`)
+      }
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const showInvite = async () => {
+    if (invite) return setDialog('invite')
+    setLoadingInvite(true)
+    try {
+      setInvite(await api.friendInvite(friend.id))
+      setDialog('invite')
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setLoadingInvite(false)
+    }
+  }
+
+  // A live presence recovery clears a stale "No response" from an earlier check.
+  const status = pinging ? 'Checking…' : pingedOffline && !isOnline ? 'No response' : statusText(presence)
+  const check15 = <span className="menu-check" aria-hidden />
+  const items: MenuItem[] = [
+    { label: 'Rename…', icon: check15, onSelect: () => setDialog('rename') },
+    { label: 'Show invite…', icon: check15, onSelect: () => void showInvite(), disabled: loadingInvite },
+    {
+      label: 'Auto-accept files',
+      icon: <span className="menu-check" aria-hidden>{friend.autoAccept && <Check />}</span>,
+      onSelect: () => void setFriendAutoAccept(friend.id, !friend.autoAccept),
+    },
+    { label: 'Check if online', icon: check15, onSelect: () => void check(), disabled: pinging },
+  ]
+  const removeItem: MenuItem[] = [
+    { label: ownLabel ? 'Remove device…' : 'Remove friend…', icon: check15, danger: true, onSelect: () => setDialog('remove') },
+  ]
+
+  return (
+    <div className="row fr-row">
+      <PersonAvatar friend={friend} online={isOnline} device={!!ownLabel} />
+      <div className="row-main">
+        <div className="row-title truncate-1" title={label}>{label}</div>
+        <div className="row-sub truncate-1">{status}</div>
+      </div>
+      <div className="row-trailing">
+        <span className="fr-conn">{isOnline && <ConnInfo detail={conn} locality={channel} label={`Connection to ${label}`} />}</span>
+        <button className="btn btn-secondary btn-sm fr-send" onClick={() => void send()} disabled={busy}>
+          {busy ? <Spinner size={12} /> : <Send />} Send
+        </button>
+        <IconButton label={`Message ${label}`} onClick={() => openChat(friend.id)}>
+          <MessageCircle />
+        </IconButton>
+        {ownLabel ? (
+          <MenuButton label={`More options for ${label}`} items={[...items, { separator: true }, ...removeItem]} />
+        ) : (
+          <SafetyMenu friend={friend} before={items} after={removeItem} blankIcon={check15} />
+        )}
+      </div>
+
+      <AnimatePresence>
+        {dialog === 'rename' && (
+          <NameDialog
+            key="rename"
+            title={`Rename ${friend.name}`}
+            label="Name"
+            initial={friend.name}
+            onSave={(n) => { if (n !== friend.name) void renameFriend(friend.id, n) }}
+            onClose={() => setDialog(null)}
+          />
+        )}
+        {dialog === 'remove' && (
+          <ConfirmDialog
+            key="remove"
+            title={`Remove ${label}?`}
+            confirmLabel="Remove"
+            onConfirm={() => removeFriend(friend.id)}
+            onClose={() => setDialog(null)}
+          >
+            Your chat history stays on this device.
+            {friend.endpointId && ' Add them again any time to pick up where you left off.'}
+          </ConfirmDialog>
+        )}
+        {dialog === 'invite' && invite && (
+          <Dialog
+            key="invite"
+            title={`Invite for ${friend.name}`}
+            width={360}
+            onClose={() => setDialog(null)}
+            footer={<button className="btn btn-primary" autoFocus onClick={() => setDialog(null)}>Done</button>}
+          >
+            <ShareCode
+              code={invite}
+              layout="stack"
+              size={180}
+              hint={null}
+              copyLabel="Copy invite"
+              copyVariant="secondary"
+              instructions={<>{friend.name} can scan this or paste it in Add friend.</>}
+            />
+          </Dialog>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
+function AddFriendModal({ onClose }: { onClose: () => void }) {
+  const acceptFriend = useStore((s) => s.acceptFriend)
+  const addFriendByCode = useStore((s) => s.addFriendByCode)
+  const openCode = useStore((s) => s.openCode)
+  const [error, setError] = useState('')
+  const [codeInput, setCodeInput] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const submit = async (value = codeInput) => {
+    setError('')
+    if (!value.trim()) {
+      setError('Paste your friend’s code, or scan their QR code.')
+      return
+    }
+    const parsed = parseCode(value)
+    if (!parsed) {
+      setError(wrongCodeMessage(['friend'], null))
+      return
+    }
+    setBusy(true)
+    try {
+      if (parsed.kind === 'friendInvite') await acceptFriend(parsed.code) // legacy invite
+      else if (parsed.kind === 'friend') await addFriendByCode(parsed.code)
+      // Some other DropBeam code (a Quick Send, a folder invite…): do what it's for.
+      else if (!(await openCode(parsed.code))) return
+      onClose()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog
+      title="Add a friend"
+      onClose={onClose}
+      busy={busy}
+      width={420}
+      footer={
+        <>
+          <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="btn btn-primary" onClick={() => void submit()} disabled={busy || !codeInput.trim()}>
+            {busy && <Spinner size={13} />} Add
+          </button>
+        </>
+      }
+    >
+      <label htmlFor="add-friend-code" className="field-label">Their DropBeam code</label>
+      <div className="fr-code-field">
+        <input
+          id="add-friend-code"
+          className="input"
+          autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
+          placeholder="dropbeam:…"
+          value={codeInput}
+          autoFocus
+          aria-invalid={!!error}
+          onChange={(e) => { setCodeInput(e.target.value); if (error) setError('') }}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void submit() } }}
+        />
+        <ScanCodeButton
+          className="btn btn-plain"
+          label="Scan QR…"
+          disabled={busy}
+          hint="Hold your friend’s QR code up to the camera."
+          title="Scan a friend’s code"
+          accept={['friend', 'friendInvite']}
+          onCode={(code) => { setCodeInput(code); void submit(code) }}
+          onOther={(p) => { setCodeInput(p.code); void submit(p.code) }}
+        />
+      </div>
+      {error ? (
+        <p role="alert" className="form-error">{error}</p>
+      ) : (
+        <p className="field-hint">It’s on their Friends page, under You.</p>
+      )}
+    </Dialog>
+  )
+}
+
+// ── Phone layout (legacy web phone UI; kept compiling) ─────────────────────
 
 /** Reusable avatar: the user's chosen picture, or an initials monogram. */
 function Avatar({
@@ -188,7 +618,7 @@ function Avatar({
   )
 }
 
-/** Your own profile: picture, editable name, and your permanent code. */
+/** Phone layout: your profile and permanent code. */
 function YouCard() {
   const settings = useStore((s) => s.settings)
   const saveSettings = useStore((s) => s.saveSettings)
@@ -235,7 +665,7 @@ function YouCard() {
     }
   }
 
-  if (MOBILE_UI) return <section className="mobile-you mobile-inset">
+  return <section className="mobile-you mobile-inset">
     <div className="mobile-profile">
       <button className="mobile-avatar-button" aria-label="Change picture" onClick={() => void pickAvatar()}><Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={64} radius={20} /></button>
       <div className="mobile-grow">
@@ -252,95 +682,10 @@ function YouCard() {
     <p className="ios-footnote">Share this code once. Your friends stay connected across updates.</p>
   </section>
 
-  return (
-    <div className="card" style={{ padding: 16 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-        {/* Avatar with a hover "change" affordance */}
-        <button
-          className="you-avatar-btn"
-          title="Change picture"
-          onClick={() => void pickAvatar()}
-          style={{ position: 'relative', flexShrink: 0, padding: 0, border: 'none', background: 'none', cursor: 'pointer' }}
-        >
-          <Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={56} radius={999} />
-          <span className="you-avatar-cam">
-            <Camera size={13} />
-          </span>
-        </button>
-
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {editing ? (
-            <input
-              className="input"
-              value={name}
-              autoFocus
-              onChange={(e) => setName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') saveName()
-                if (e.key === 'Escape') {
-                  setName(displayName)
-                  setEditing(false)
-                }
-              }}
-              onBlur={saveName}
-              style={{ fontSize: 'var(--font-md)', fontWeight: 700, padding: '5px 10px', maxWidth: 280 }}
-            />
-          ) : (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
-              <span className="truncate-1" style={{ fontWeight: 750, fontSize: 'var(--font-lg)' }}>{displayName || 'You'}</span>
-              <button
-                className="icon-btn"
-                title="Edit your name"
-                aria-label="Edit your name"
-                style={{ width: 24, height: 24, borderRadius: 6 }}
-                onClick={() => {
-                  setName(displayName)
-                  setEditing(true)
-                }}
-              >
-                <Pencil size={12.5} />
-              </button>
-            </div>
-          )}
-          <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', marginTop: 3 }}>
-            This is the name and picture your friends see.
-          </div>
-          {settings?.avatar ? (
-            <button
-              onClick={() => void clearAvatar()}
-              style={{ background: 'none', border: 'none', padding: 0, marginTop: 5, cursor: 'pointer', color: 'var(--text-faint)', fontSize: 'calc(11.5px * var(--ui-font-scale, 1))' }}
-            >
-              Remove picture
-            </button>
-          ) : null}
-        </div>
-      </div>
-
-      {/* Your permanent code: QR + text + Copy */}
-      <div
-        style={{
-          marginTop: 14,
-          paddingTop: 14,
-          borderTop: '1px solid var(--border)',
-        }}
-      >
-        <div style={{ fontSize: 'calc(13px * var(--ui-font-scale, 1))', fontWeight: 650, marginBottom: 10 }}>Your DropBeam code</div>
-        {code ? (
-          <ShareCode
-            code={code}
-            size={168}
-            instructions="Friends scan this QR in DropBeam (Friends → Add friend) or paste the code. Share it once — it never changes, so friends who add you stay connected across every update."
-          />
-        ) : (
-          <div style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>Your code appears once DropBeam has connected.</div>
-        )}
-      </div>
-    </div>
-  )
 }
 
+/** Phone layout: a friend row that opens a manage sheet. */
 function FriendCard({ friend }: { friend: Friend }) {
-  const ownLabel = useOwnDeviceLabels()[friend.id] as string | undefined
   const sendToFriend = useStore((s) => s.sendToFriend)
   const removeFriend = useStore((s) => s.removeFriend)
   const renameFriend = useStore((s) => s.renameFriend)
@@ -353,72 +698,19 @@ function FriendCard({ friend }: { friend: Friend }) {
   const [sheetOpen, setSheetOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
-  const [editing, setEditing] = useState(false)
   const [name, setName] = useState(friend.name)
   const [invite, setInvite] = useState<string | null>(null)
   const [loadingInvite, setLoadingInvite] = useState(false)
   const [pinging, setPinging] = useState(false)
-  const [pingedOffline, setPingedOffline] = useState(false)
-  const [conn, setConn] = useState<ConnDetail | null>(null)
-  const [probing, setProbing] = useState(false)
 
   const presence = friendPresence(friend.name, friendSeen, folderStatuses)
   const isOnline = presence.status === 'online'
-  const channel = Object.values(folderStatuses).find(
-    (s) => s.peerName?.trim().toLowerCase() === friend.name.trim().toLowerCase(),
-  )?.locality
-
-  const probe = async () => {
-    setProbing(true)
-    try {
-      setConn(await useStore.getState().probeFriend(friend.id))
-    } catch {
-      setConn(null)
-    } finally {
-      setProbing(false)
-    }
-  }
-
-  // Auto-check the live path once when a friend comes online; clear it when they
-  // drop. The `alive` guard stops a late-resolving probe from a prior cycle (or
-  // after the card unmounts/reorders) from clobbering current state.
-  useEffect(() => {
-    if (!isOnline) {
-      setConn(null)
-      return
-    }
-    let alive = true
-    ;(async () => {
-      setProbing(true)
-      try {
-        const d = await useStore.getState().probeFriend(friend.id)
-        if (alive) setConn(d)
-      } catch {
-        if (alive) setConn(null)
-      } finally {
-        if (alive) setProbing(false)
-      }
-    })()
-    return () => {
-      alive = false
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOnline, friend.id])
-
-  // A live presence recovery clears a stale "No response" from an earlier Check,
-  // so the label, dot, and connection line all agree the friend is back.
-  useEffect(() => {
-    if (isOnline) setPingedOffline(false)
-  }, [isOnline])
-
   const check = async () => {
     setPinging(true)
-    setPingedOffline(false)
     try {
       const ok = await pingFriend(friend.id)
       if (ok) toast('success', `${friend.name} is online`)
       else {
-        setPingedOffline(true)
         toast('info', `${friend.name} didn’t respond — they may be offline`)
       }
     } finally {
@@ -458,10 +750,9 @@ function FriendCard({ friend }: { friend: Friend }) {
 
   const saveName = () => {
     if (name.trim() && name.trim() !== friend.name) renameFriend(friend.id, name.trim())
-    setEditing(false)
   }
 
-  if (MOBILE_UI) return <>
+  return <>
     <div className="ios-row mobile-friend-row">
       <button className="mobile-friend-open" onClick={() => setSheetOpen(true)} aria-label={`Manage ${friend.name}`}>
         <span className="device-avatar"><Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={40} radius={12} /><DeviceBadge kind={friend.deviceKind} /></span>
@@ -480,307 +771,6 @@ function FriendCard({ friend }: { friend: Friend }) {
     </MobileFriendSheet>}
   </>
 
-  return (
-    <motion.div
-      layout
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.97 }}
-      className="card"
-      style={{ padding: 14, overflow: 'hidden' }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <div style={{ position: 'relative', flexShrink: 0 }}>
-          <Avatar name={friend.name} seed={friend.id} picture={friend.avatar} size={44} radius={999} /><DeviceBadge kind={friend.deviceKind} />
-          <span
-            title={presenceLabel(presence)}
-            style={{
-              position: 'absolute',
-              right: -1,
-              top: -1,
-              width: 13,
-              height: 13,
-              borderRadius: 999,
-              background: isOnline ? 'var(--green)' : 'var(--text-faint)',
-              border: '2.5px solid var(--surface)',
-            }}
-          />
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {editing ? (
-            <input
-              className="input"
-              value={name}
-              autoFocus
-              onChange={(e) => setName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') saveName()
-                if (e.key === 'Escape') {
-                  setName(friend.name)
-                  setEditing(false)
-                }
-              }}
-              onBlur={saveName}
-              style={{ fontSize: 'var(--font-md)', fontWeight: 650, padding: '5px 10px', maxWidth: 260 }}
-            />
-          ) : (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span className="truncate-1" style={{ fontWeight: 700, fontSize: 'var(--font-md)' }} title={ownLabel ?? friend.name}>{ownLabel ?? friend.name}</span>
-              {ownLabel && <span className="truncate-1" style={{ color: 'var(--text-faint)', fontSize: 'var(--font-xs)' }}>{friend.name}</span>}
-              <button
-                className="icon-btn"
-                title="Rename"
-                aria-label={`Rename ${friend.name}`}
-                style={{ width: 22, height: 22, borderRadius: 6 }}
-                onClick={() => {
-                  setName(friend.name)
-                  setEditing(true)
-                }}
-              >
-                <Pencil size={12} />
-              </button>
-            </div>
-          )}
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 7,
-              fontSize: 'calc(12px * var(--ui-font-scale, 1))',
-              marginTop: 2,
-              flexWrap: 'wrap',
-              color: isOnline ? 'var(--green)' : 'var(--text-faint)',
-            }}
-          >
-            <span>{pingedOffline ? 'No response' : presenceLabel(presence)}</span>
-            {isOnline && conn ? (
-              <>
-                <span style={{ color: 'var(--border-strong)' }}>·</span>
-                <ConnInspector detail={conn} compact />
-                <button
-                  onClick={probe}
-                  disabled={probing}
-                  title="Re-check how you're connected"
-                  style={{
-                    background: 'none',
-                    border: 'none',
-                    padding: 0,
-                    cursor: 'pointer',
-                    color: 'var(--text-faint)',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                  }}
-                >
-                  <RefreshCw size={11} className={probing ? 'spin' : undefined} />
-                </button>
-              </>
-            ) : isOnline && probing ? (
-              <>
-                <span style={{ color: 'var(--border-strong)' }}>·</span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--text-faint)' }}>
-                  <Spinner size={11} /> checking link…
-                </span>
-              </>
-            ) : (
-              channel && channel !== 'unknown' && <ChannelBadge locality={channel} size={11} />
-            )}
-            <span style={{ color: 'var(--border-strong)' }}>·</span>
-            <button
-              onClick={check}
-              disabled={pinging}
-              style={{
-                background: 'none',
-                border: 'none',
-                padding: 0,
-                cursor: 'pointer',
-                color: 'var(--accent)',
-                fontSize: 'calc(12px * var(--ui-font-scale, 1))',
-                fontWeight: 600,
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-              }}
-            >
-              {pinging ? <Spinner size={11} /> : <Radar size={12} />}
-              {pinging ? 'Checking…' : 'Check'}
-            </button>
-          </div>
-        </div>
-        <button
-          className="icon-btn"
-          title={`Message ${friend.name}`}
-          aria-label={`Message ${friend.name}`}
-          onClick={() => openChat(friend.id)}
-          style={{ width: 36, height: 36 }}
-        >
-          <MessageCircle size={18} />
-        </button>
-        <button className="btn btn-primary" onClick={send} disabled={busy} style={{ flexShrink: 0 }}>
-          {busy ? <Spinner size={14} /> : <Send size={15} />} Send
-        </button>
-      </div>
-
-      {/* One compact management row: auto-accept + invite + remove */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 10,
-          marginTop: 12,
-          paddingTop: 12,
-          borderTop: '1px solid var(--border)',
-        }}
-      >
-        <button
-          className={`toggle${friend.autoAccept ? ' on' : ''}`}
-          role="switch"
-          aria-checked={friend.autoAccept}
-          aria-label={`Auto-accept files from ${friend.name}`}
-          title={friend.autoAccept ? 'Files save automatically' : 'You approve each file'}
-          onClick={() => setFriendAutoAccept(friend.id, !friend.autoAccept)}
-        />
-        <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', flex: 1, minWidth: 0 }}>
-          {friend.autoAccept ? 'Auto-accept files' : 'Approve files first'}
-        </span>
-        <button className="btn btn-ghost btn-sm" onClick={showInvite} disabled={loadingInvite}>
-          {loadingInvite ? <Spinner size={13} /> : <Copy size={13} />} {invite ? 'Hide invite' : 'Invite'}
-        </button>
-        {!ownLabel && !confirmRemove && <SafetyMenu friend={friend} />}
-        {confirmRemove ? (
-          <>
-            <button className="btn btn-ghost btn-sm" onClick={() => setConfirmRemove(false)}>
-              Cancel
-            </button>
-            <button className="btn btn-danger btn-sm" onClick={() => removeFriend(friend.id)}>
-              <Trash2 size={13} /> Remove
-            </button>
-          </>
-        ) : (
-          <button className="icon-btn icon-btn-danger" title="Remove friend" aria-label={`Remove ${friend.name}`} onClick={() => setConfirmRemove(true)}>
-            <Trash2 size={15} />
-          </button>
-        )}
-      </div>
-
-      {confirmRemove && (
-        <p role="status" style={{ fontSize: 'calc(12.5px * var(--ui-font-scale, 1))', color: 'var(--text-muted)', margin: '8px 0 0' }}>
-          Remove {friend.name}? Your chat history will be kept on this device.
-          {friend.endpointId && ' Re-add the same device to restore the conversation.'}
-        </p>
-      )}
-
-      {invite && <InvitePanel invite={invite} friendName={friend.name} onClose={() => setInvite(null)} />}
-    </motion.div>
-  )
-}
-
-/** Inline invite reveal (re-show an existing friend's invite). */
-function InvitePanel({
-  invite,
-  friendName,
-  onClose,
-}: {
-  invite: string
-  friendName: string
-  onClose: () => void
-}) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, height: 0 }}
-      animate={{ opacity: 1, height: 'auto' }}
-      style={{ overflow: 'hidden', marginTop: 12 }}
-    >
-      <div style={{ borderTop: '1px solid var(--border)', paddingTop: 14 }}>
-        <ShareCode
-          code={invite}
-          size={168}
-          copyLabel="Copy invite"
-          instructions={<>Send this to {friendName}. They open DropBeam → Friends → <b>Add friend</b> and scan this QR code or paste the invite.</>}
-          footer={<button className="btn btn-ghost" onClick={onClose}>Hide</button>}
-        />
-      </div>
-    </motion.div>
-  )
-}
-
-function AddFriendModal({ onClose }: { onClose: () => void }) {
-  const acceptFriend = useStore((s) => s.acceptFriend)
-  const addFriendByCode = useStore((s) => s.addFriendByCode)
-  const openCode = useStore((s) => s.openCode)
-  const [error, setError] = useState('')
-  const [codeInput, setCodeInput] = useState('')
-  const [busy, setBusy] = useState(false)
-
-  const submit = async (value = codeInput) => {
-    setError('')
-    if (!value.trim()) {
-      setError("Paste your friend's code, or scan their QR code.")
-      return
-    }
-    const parsed = parseCode(value)
-    if (!parsed) {
-      setError(wrongCodeMessage(['friend'], null))
-      return
-    }
-    setBusy(true)
-    try {
-      if (parsed.kind === 'friendInvite') await acceptFriend(parsed.code) // legacy invite
-      else if (parsed.kind === 'friend') await addFriendByCode(parsed.code)
-      // Some other DropBeam code (a Quick Send, a folder invite…): do what it's for.
-      else if (!(await openCode(parsed.code))) return
-      onClose()
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <Dialog
-      title="Add a friend"
-      subtitle="Scan their QR code or paste their DropBeam code."
-      icon={<UserPlus size={18} />}
-      onClose={onClose}
-      busy={busy}
-      footer={
-        <button className="btn btn-primary btn-block" onClick={() => void submit()} disabled={busy}>
-          {busy ? <Spinner size={15} /> : <UserPlus size={15} />} Add friend
-        </button>
-      }
-    >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 6 }}>
-        <label htmlFor="add-friend-code" className="field-label" style={{ margin: 0 }}>
-          Your friend's code
-        </label>
-        <ScanCodeButton
-          small
-          disabled={busy}
-          hint="Hold your friend’s QR code (Friends → You) up to your camera."
-          title="Scan a friend’s code"
-          accept={['friend', 'friendInvite']}
-          onCode={(code) => { setCodeInput(code); void submit(code) }}
-          onOther={(p) => { setCodeInput(p.code); void submit(p.code) }}
-        />
-      </div>
-      <textarea
-        id="add-friend-code"
-        className="input"
-        style={{ minHeight: 72, fontFamily: 'var(--font-mono)', fontSize: 'var(--font-sm)', resize: 'none', wordBreak: 'break-all' }}
-        autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-        placeholder="Paste their dropbeam:… code, or scan their QR"
-        value={codeInput}
-        autoFocus
-        onChange={(e) => setCodeInput(e.target.value)}
-        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void submit() } }}
-      />
-      {error && <p role="alert" className="form-error">{error}</p>}
-      <p className="dialog-text" style={{ margin: '12px 0 0' }}>
-        Ask your friend for their code (Friends → <b>You</b>) — scan the QR on their screen or paste the code. Their
-        name fills in automatically and you’ll both be connected — no retyping names, no re-adding after updates.
-      </p>
-    </Dialog>
-  )
 }
 
 /** Native modal focus trapping, Escape dismissal and focus restoration. */

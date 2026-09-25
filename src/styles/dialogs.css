@@ -1,0 +1,219 @@
+/* Shared dialogs: send-to chooser, device linking, QR codes + scanner, block & report. */
+/* Recipient chooser rows (Send to…, and Shared Folders' "Add people"). */
+.chooser-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: calc(100% + 16px);
+  min-height: 44px;
+  margin: 0 -8px;
+  padding: 6px 8px;
+  box-sizing: border-box;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-md);
+  font: inherit;
+  text-align: left;
+  color: var(--text);
+  cursor: default;
+  transition: background var(--dur-fast) ease;
+}
+.chooser-row:hover:not(:disabled) { background: var(--surface-hover); }
+.chooser-row:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.chooser-row:disabled { opacity: 0.5; }
+.chooser-row > div, .chooser-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.chooser-avatar {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 600;
+  font-size: var(--text-11);
+  flex-shrink: 0;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.chooser-avatar .avatar-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+.chooser-avatar .device-badge { display: none; } /* one overlay only: presence */
+.chooser-glyph, .chooser-icon { background: var(--surface-2); color: var(--text-muted); }
+.chooser-glyph .avatar-device { color: var(--text-muted); }
+.chooser-icon { width: 32px; height: 32px; border-radius: 999px; display: grid; place-items: center; flex-shrink: 0; }
+.chooser-icon svg { width: 16px; height: 16px; }
+.chooser-name { font-size: var(--text-13); font-weight: 500; line-height: 1.3; }
+.chooser-sub { font-size: var(--text-12); color: var(--text-muted); line-height: 1.35; }
+.chooser-go { flex-shrink: 0; font-size: var(--text-12); font-weight: 500; color: var(--accent-text); opacity: 0; transition: opacity var(--dur-fast); }
+.chooser-row:hover .chooser-go, .chooser-row:focus-visible .chooser-go { opacity: 1; }
+.chooser-section { margin: 12px 0 4px; font-size: var(--text-12); font-weight: 600; color: var(--text-muted); }
+.chooser-section:first-child { margin-top: 0; }
+.chooser-note { margin: 12px 0 0; font-size: var(--text-12); color: var(--text-muted); line-height: 1.4; }
+/* The "Share with a code" row sits in the footer, under a hairline. */
+html:not(.mobile) .chooser-dialog .dialog-footer { display: block; margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--separator); }
+.chooser-dialog .chooser-share .chooser-name { color: var(--text); }
+/* Presence dot on an avatar (bottom-right, one overlay). */
+.presence-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-faint) 60%, transparent);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.presence-dot.online { background: var(--green-dot); }
+.presence-dot:not(.online) { display: none; }
+
+/* Plain buttons at the left of a footer sit optically flush with the text. */
+:is(.device-link-dialog, .qrs, .safety-dialog) .dialog-footer > .btn-plain:first-child { margin-left: -8px; }
+
+/* Device identity (phone layout keeps the overlay badge). */
+.device-avatar { position: relative; display: inline-flex; flex-shrink: 0; }
+.device-badge { position: absolute; right: -4px; bottom: -4px; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 6px; background: var(--surface); color: var(--text-muted); border: 1px solid var(--border); z-index: 1; }
+.device-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; }
+.device-section-heading h2 { font-size: var(--text-13); }
+.device-list { display: flex; flex-direction: column; gap: 8px; }
+.avatar-device { color: white; }
+
+/* Link a device: above the first-run name sheet (z 1000) — "Already use
+   DropBeam? Link it" opens these from it. */
+.qr-overlay, .device-link-overlay { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; background: var(--overlay); padding: 20px; }
+html:not(.mobile) .device-link-dialog { width: 420px; }
+.link-show { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; }
+.link-instruction { margin: 0; font-size: var(--text-13); color: var(--text); line-height: 1.45; max-width: 320px; }
+.link-instruction strong { font-weight: 600; }
+.link-qr-slot { display: grid; place-items: center; min-height: 212px; }
+.link-status { margin: 0; font-size: var(--text-12); color: var(--text-muted); }
+.link-state { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px 8px 4px; text-align: center; }
+.link-state > svg, .link-state > .spinner { margin-bottom: 6px; }
+.link-state-title { margin: 0; font-size: var(--text-13); font-weight: 600; color: var(--text); }
+.link-state-sub { margin: 0; font-size: var(--text-12); color: var(--text-muted); line-height: 1.45; max-width: 320px; overflow-wrap: anywhere; }
+.link-state-ok { color: var(--green); }
+.link-state-bad { color: var(--red); }
+
+/* Settings → Devices: one group of device rows (+ a "Link a device…" row). */
+.page-header + .account-devices > .section-row { margin-top: 4px; }
+.account-device-list { --row-inset: 56px; }
+.account-device-glyph { position: relative; width: 32px; height: 32px; flex: none; border-radius: 999px; display: grid; place-items: center; background: var(--surface-2); color: var(--text-muted); }
+.account-device-dot { position: absolute; right: -1px; bottom: -1px; width: 8px; height: 8px; border-radius: 999px; background: var(--green-dot); box-shadow: 0 0 0 2px var(--surface); }
+.account-device-add .row-title, .account-device-add .row-sub { display: block; }
+.account-device-add .row-title { color: var(--accent-text); }
+.account-device-add .account-device-glyph { color: var(--accent-text); }
+.account-sync { min-width: 72px; }
+
+/* ---- QR codes: one look for every shown code (QrCodeView / ShareCode) ----
+   Always dark-on-white (a phone camera can't reliably read an inverted QR):
+   a plain white rounded square with its own quiet zone — no frame, no shadow.
+   In dark mode a hairline keeps its edge from bleeding into the surface. */
+.qr-code { margin: 0; max-width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
+.qr-code-tile { position: relative; display: block; max-width: 100%; padding: 6px; border: none; border-radius: var(--radius-lg); background: #fff; line-height: 0; cursor: zoom-in; }
+.qr-code-tile:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+div.qr-code-tile { cursor: default; }
+.qr-code-tile svg { display: block; max-width: 100%; height: auto; }
+.qr-code-zoom { position: absolute; right: 6px; bottom: 6px; width: 22px; height: 22px; display: grid; place-items: center; border-radius: var(--radius-sm); background: rgba(0, 0, 0, 0.6); color: #fff; opacity: 0; transition: opacity var(--dur-fast); }
+.qr-code-tile:hover .qr-code-zoom, .qr-code-tile:focus-visible .qr-code-zoom { opacity: 1; }
+.qr-code-hint { font-size: var(--text-12); color: var(--text-muted); text-align: center; }
+.dark .qr-code-tile { box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.12); }
+.dark .qr-code-tile:focus-visible { box-shadow: var(--focus-ring); }
+.qr-enlarged-overlay { background: rgba(0, 0, 0, 0.72) !important; -webkit-backdrop-filter: none; backdrop-filter: none; }
+.qr-enlarged { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.qr-enlarged-tile { background: #fff; padding: 12px; border-radius: 16px; line-height: 0; }
+.qr-enlarged-tile svg { display: block; width: min(440px, 78vw, calc(100dvh - 160px)); height: auto; }
+.qr-enlarged p { margin: 0; color: rgba(255, 255, 255, 0.85); font-size: var(--text-13); }
+
+.share-code { display: flex; gap: 16px; align-items: center; }
+.share-code-stack { flex-direction: column; align-items: stretch; gap: 12px; }
+.share-code-stack > .qr-code { align-self: center; }
+.share-code-row { flex-wrap: wrap; }
+.share-code-side { flex: 1; min-width: 210px; display: flex; flex-direction: column; gap: 8px; }
+.share-code-stack .share-code-side { min-width: 0; }
+.share-code-instructions { font-size: var(--text-12); color: var(--text-muted); line-height: 1.45; }
+.share-code-stack .share-code-instructions { text-align: center; }
+.share-code-text { display: block; font-family: var(--font-mono); font-size: var(--text-11); line-height: 1.5; color: var(--text-muted); background: var(--surface-2); border-radius: var(--radius-md); padding: 0 10px; border-block: 6px solid var(--surface-2); box-sizing: border-box; word-break: break-all; max-height: calc(6em + 12px); overflow-y: auto; }
+
+/* ---- QR scanner (desktop) ---- */
+html:not(.mobile) .qr-overlay .qrs { width: 420px; }
+.qrs-body { display: flex; flex-direction: column; gap: 12px; }
+/* The camera well: a neutral surface until the camera is live, then black. */
+.qrs-stage { position: relative; aspect-ratio: 4 / 3; flex-shrink: 0; border-radius: var(--radius-md); overflow: hidden; background: var(--surface-2); isolation: isolate; transition: background var(--dur); }
+.qrs-stage.live { background: #000; }
+.qrs-stage.dropping { box-shadow: inset 0 0 0 2px var(--accent); background: var(--accent-soft); }
+.qrs-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: opacity var(--dur-slow) ease; }
+.qrs-finder { position: absolute; top: 50%; left: 50%; width: 56%; aspect-ratio: 1; transform: translate(-50%, -50%); box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.3); border-radius: 14px; pointer-events: none; }
+.qrs-finder i { position: absolute; width: 22px; height: 22px; border: 3px solid #fff; }
+.qrs-finder i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; border-top-left-radius: 14px; }
+.qrs-finder i:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; border-top-right-radius: 14px; }
+.qrs-finder i:nth-child(3) { bottom: 0; left: 0; border-right: 0; border-top: 0; border-bottom-left-radius: 14px; }
+.qrs-finder i:nth-child(4) { bottom: 0; right: 0; border-left: 0; border-top: 0; border-bottom-right-radius: 14px; }
+.qrs-stage-msg { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 24px; text-align: center; color: var(--text-muted); font-size: var(--text-12); line-height: 1.45; }
+.qrs-stage-msg svg { color: var(--text-faint); }
+.qrs-stage.dropping .qrs-stage-msg, .qrs-stage.dropping .qrs-stage-msg svg { color: var(--accent-text); }
+.qrs-hint { margin: 0; font-size: var(--text-13); color: var(--text); text-align: center; line-height: 1.4; }
+.qrs-notice { margin: 0; padding: 8px 10px; border-radius: var(--radius-md); background: var(--amber-soft); color: var(--amber); font-size: var(--text-12); line-height: 1.45; overflow-wrap: anywhere; }
+.qrs-paste { display: flex; gap: 8px; }
+.qrs-paste .input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: var(--text-12); }
+html:not(.mobile) .qrs-actions { padding-top: 16px; }
+.qrs-actions .btn-plain:first-child { margin-left: -8px; }
+
+/* ---- Block & Report (App Store 1.2) ---- */
+.safety-text { color: var(--text); margin: 0 0 8px; }
+.safety-note { color: var(--text-muted); margin: 0; }
+.safety-label {
+  display: block;
+  margin: 16px 0 6px;
+  padding: 0;
+  font-size: var(--text-12);
+  font-weight: 500;
+  color: var(--text-muted);
+}
+.safety-reasons { border: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.safety-reasons .safety-label { margin-top: 0; }
+.safety-reason {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  padding: 2px 0;
+  font-size: var(--text-13);
+  cursor: default;
+}
+.safety-reason input, .safety-check input { accent-color: var(--accent); margin: 0; flex-shrink: 0; }
+.safety-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: var(--text-13);
+  cursor: default;
+}
+.safety-check input { margin-top: 2px; }
+.safety-check > span { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.safety-quote {
+  display: block;
+  padding: 6px 10px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--text-12);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 96px;
+  overflow: auto;
+}
+.safety-hint { font-weight: 400; font-size: var(--text-12); color: var(--text-muted); }
+.safety-notes { width: 100%; resize: vertical; min-height: 60px; font: inherit; font-size: var(--text-13); box-sizing: border-box; }
+.safety-foot { margin: 16px 0 0; font-size: var(--text-12); color: var(--text-muted); line-height: 1.4; }
+/* Settings → Privacy & safety → Blocked (list rows). */
+.blocked-list { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+.blocked-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg);
+}
+.blocked-row .blocked-name { flex: 1; min-width: 0; font-weight: 500; font-size: var(--text-13); }
+.blocked-row .blocked-when { font-size: var(--text-11); color: var(--text-faint); white-space: nowrap; }

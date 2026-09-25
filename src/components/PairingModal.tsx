@@ -1,7 +1,7 @@
 import { ScanCodeButton, ShareCode } from './CodeQr'
 import { parseCode, wrongCodeMessage } from '../lib/codes'
 import { useState } from 'react'
-import { ArrowLeftRight, ArrowRight, Check, FolderOpen, FolderSync } from 'lucide-react'
+import { Check, FolderOpen } from 'lucide-react'
 import { Dialog } from './Dialog'
 import { folderName as baseName } from '../lib/syncedFolders'
 import { api } from '../lib/api'
@@ -85,7 +85,7 @@ export function PairingModal({
         if (offline.length) {
           toast(
             'info',
-            `${offline.join(', ')} ${offline.length === 1 ? 'is' : 'are'} offline — if the invite doesn't arrive, share the folder's code from its card.`,
+            `${offline.join(', ')} ${offline.length === 1 ? 'is' : 'are'} offline. If the invite doesn’t arrive, share the folder’s invite code.`,
           )
         }
         onClose()
@@ -114,7 +114,7 @@ export function PairingModal({
     try {
       await api.acceptPair(parsed.code, folder)
       await reloadPairs()
-      toast('success', 'Paired! Files will now sync automatically.')
+      toast('success', 'Joined the folder. Files will sync automatically.')
       onClose()
     } catch (e) {
       toast('error', String(e))
@@ -125,203 +125,171 @@ export function PairingModal({
 
   const folderName = folder ? baseName(folder) || folder : ''
 
+  if (createdInvite) {
+    return (
+      <Dialog
+        title={`Invite to “${folderName}”`}
+        width={420}
+        onClose={onClose}
+        footer={<button className="btn btn-secondary" onClick={onClose}>Done</button>}
+      >
+        <p className="dialog-text">In DropBeam, they choose Accept invite and scan or paste this.</p>
+        <ShareCode code={createdInvite} layout="stack" copyLabel="Copy invite" />
+      </Dialog>
+    )
+  }
+
   return (
     <Dialog
-      title={createdInvite ? 'Share this invite' : mode === 'create' ? 'New shared folder' : 'Accept an invite'}
-      subtitle={createdInvite ? undefined : mode === 'create' ? 'Keep a folder in sync with friends, peer-to-peer.' : 'Join a folder someone shared with you.'}
-      icon={<FolderSync size={18} />}
-      width={470}
+      title={mode === 'create' ? 'New shared folder' : 'Accept a folder invite'}
+      width={460}
+      className="folder-dialog"
       onClose={onClose}
       busy={busy}
       footer={
-            createdInvite ? (
-              <button className="btn btn-ghost btn-block" onClick={onClose}>Done</button>
-            ) : (
-              <button
-                className="btn btn-primary btn-block"
-                onClick={mode === 'create' ? doCreate : doAccept}
-                disabled={busy}
-              >
-                {busy ? <Spinner size={15} /> : null}
-                {mode === 'create'
-                  ? invitees.length > 0
-                    ? `Create & invite ${invitees.length}`
-                    : 'Create & get invite'
-                  : 'Pair folder'}
-              </button>
-            )
+        <>
+          <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
+          <button
+            className="btn btn-primary"
+            onClick={mode === 'create' ? doCreate : doAccept}
+            disabled={busy}
+          >
+            {busy ? <Spinner size={13} /> : null}
+            {mode === 'create'
+              ? invitees.length > 0
+                ? `Create & invite ${invitees.length}`
+                : 'Create'
+              : 'Accept'}
+          </button>
+        </>
       }
     >
-          {/* CREATE — invite reveal */}
-          {createdInvite ? (
-            <div>
-              <p className="dialog-text">
-                Send this invite to the other person. In their DropBeam, they choose{' '}
-                <b>Accept invite</b>, scan this QR code (or paste the invite) and pick a folder. After that, anything dropped in{' '}
-                <b>{folderName}</b> beams over automatically.
-              </p>
-              <ShareCode code={createdInvite} layout="stack" copyLabel="Copy invite" />
-            </div>
-          ) : (
-            <div>
-              {/* folder picker */}
-              <label className="field-label">
-                {mode === 'create' ? 'Folder to share' : 'Folder to receive into'}
-              </label>
-              <button
-                className="btn btn-ghost btn-block"
-                style={{ justifyContent: 'flex-start', padding: '10px 12px' }}
-                onClick={pickFolder}
-                title={folder || undefined}
-              >
-                <FolderOpen size={16} />
-                <span
-                  style={{
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                    color: folder ? 'var(--text)' : 'var(--text-faint)',
-                  }}
+      {mode === 'accept' && (
+        <div className="folder-field">
+          <div className="folder-field-head">
+            <label htmlFor="folder-invite-code" className="field-label">Invite</label>
+            <ScanCodeButton
+              small
+              className="btn btn-plain btn-sm"
+              hint="Hold the folder invite QR code up to your camera."
+              title="Scan a folder invite"
+              accept={['folderInvite']}
+              onCode={(code) => setInviteInput(code)}
+            />
+          </div>
+          <textarea
+            id="folder-invite-code"
+            className="input folder-code-input"
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
+            placeholder="Paste the invite"
+            value={inviteInput}
+            onChange={(e) => setInviteInput(e.target.value)}
+          />
+        </div>
+      )}
+
+      <div className="folder-field">
+        <label className="field-label">{mode === 'create' ? 'Folder to share' : 'Save into'}</label>
+        <button className="btn btn-secondary folder-picker" onClick={pickFolder} title={folder || undefined}>
+          <FolderOpen />
+          <span className={folder ? undefined : 'placeholder'}>{folder ? folderName : 'Choose a folder…'}</span>
+        </button>
+      </div>
+
+      {mode === 'create' && (
+        <div className="folder-field">
+          <label className="field-label" id="folder-mode-label">Access</label>
+          <div className="group folder-mode-group" role="radiogroup" aria-labelledby="folder-mode-label">
+            <ModeOption
+              active={syncMode === 'mirror'}
+              onClick={() => setSyncMode('mirror')}
+              title="Total sync"
+              desc="Everyone adds, edits and deletes. Both folders stay identical."
+            />
+            <ModeOption
+              active={syncMode === 'twoway'}
+              onClick={() => setSyncMode('twoway')}
+              title="Two-way"
+              desc="Everyone adds and edits. Deletes stay on each side."
+            />
+            <ModeOption
+              active={syncMode === 'oneway'}
+              onClick={() => setSyncMode('oneway')}
+              title="View only"
+              desc="Only you make changes. Others get a read-only copy."
+            />
+          </div>
+        </div>
+      )}
+
+      {mode === 'create' && friends.length > 0 && (
+        <div className="folder-field">
+          <label className="field-label">
+            Invite friends <span className="optional">(optional)</span>
+          </label>
+          <div className="folder-chips">
+            {friends.map((f) => {
+              const on = invitees.includes(f.id)
+              return (
+                <button
+                  key={f.id}
+                  type="button"
+                  className={`pick-chip${on ? ' on' : ''}`}
+                  aria-pressed={on}
+                  onClick={() =>
+                    setInvitees((prev) =>
+                      prev.includes(f.id)
+                        ? prev.filter((x) => x !== f.id)
+                        : [...prev, f.id],
+                    )
+                  }
                 >
-                  {folder || 'Choose a folder…'}
-                </span>
-              </button>
+                  {on && <Check size={13} />}
+                  <span className="truncate-1" style={{ maxWidth: 180 }}>{f.name}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
-              {mode === 'accept' && (
-                <div style={{ marginTop: 16 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                    <label htmlFor="folder-invite-code" className="field-label" style={{ margin: 0 }}>
-                      Invite code
-                    </label>
-                    <ScanCodeButton
-                      small
-                      hint="Hold the folder invite QR code up to your camera."
-                      title="Scan a folder invite"
-                      accept={['folderInvite']}
-                      onCode={(code) => setInviteInput(code)}
-                    />
-                  </div>
-                  <textarea
-                    id="folder-invite-code"
-                    className="input"
-                    style={{ marginTop: 6, minHeight: 70, fontFamily: 'var(--font-mono)', fontSize: 'var(--font-sm)', resize: 'none', wordBreak: 'break-all' }}
-                    autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-                    placeholder="Paste the dropbeam1:… invite, or scan its QR"
-                    value={inviteInput}
-                    onChange={(e) => setInviteInput(e.target.value)}
-                  />
-                </div>
-              )}
-
-              {mode === 'create' && (
-                <div style={{ marginTop: 16 }}>
-                  <label className="field-label">
-                    Their name <span className="optional">(optional)</span>
-                  </label>
-                  <input
-                    className="input"
-                    placeholder="e.g. Alex"
-                    value={peerName}
-                    onChange={(e) => setPeerName(e.target.value)}
-                  />
-                  <div className="field-hint">
-                    Add a name and you'll be linked as friends automatically — then you can beam files
-                    to each other without sharing a code again.
-                  </div>
-                </div>
-              )}
-
-              {mode === 'create' && (
-                <div style={{ marginTop: 16 }}>
-                  <label className="field-label">
-                    Who can do what
-                  </label>
-                  <div role="radiogroup" aria-label="Who can do what" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    <DirOption
-                      active={syncMode === 'mirror'}
-                      onClick={() => setSyncMode('mirror')}
-                      icon={<FolderSync size={16} />}
-                      title="Full access · total sync"
-                      desc="Everyone can add, edit, and delete — both folders stay identical (a shared source of truth). Deleted files are kept in history so nothing is lost."
-                    />
-                    <DirOption
-                      active={syncMode === 'twoway'}
-                      onClick={() => setSyncMode('twoway')}
-                      icon={<ArrowLeftRight size={16} />}
-                      title="Full access · no deletes"
-                      desc="Both sides can add and change files and they sync both ways, but deletes stay local (a safer shared drop)."
-                    />
-                    <DirOption
-                      active={syncMode === 'oneway'}
-                      onClick={() => setSyncMode('oneway')}
-                      icon={<ArrowRight size={16} />}
-                      title="View only (read-only for them)"
-                      desc="You’re the owner: your files flow to everyone you invite, but their changes never come back to you. They can view and download — not change your folder."
-                    />
-                  </div>
-                </div>
-              )}
-
-              {mode === 'create' && friends.length > 0 && (
-                <div style={{ marginTop: 16 }}>
-                  <label className="field-label">
-                    Invite friends{' '}
-                    <span className="optional">(optional)</span>
-                  </label>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    {friends.map((f) => {
-                      const on = invitees.includes(f.id)
-                      return (
-                        <button
-                          key={f.id}
-                          type="button"
-                          className={`pick-chip${on ? ' on' : ''}`}
-                          aria-pressed={on}
-                          onClick={() =>
-                            setInvitees((prev) =>
-                              prev.includes(f.id)
-                                ? prev.filter((x) => x !== f.id)
-                                : [...prev, f.id],
-                            )
-                          }
-                        >
-                          {on && <Check size={13} />}
-                          <span className="truncate-1" style={{ maxWidth: 180 }}>{f.name}</span>
-                        </button>
-                      )
-                    })}
-                  </div>
-                  <div className="field-hint">
-                    They’ll get a prompt to accept and choose where to save the folder. Or skip
-                    this and share the invite code with anyone.
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
+      {mode === 'create' && (
+        <div className="folder-field">
+          <label className="field-label" htmlFor="folder-peer-name">
+            {friends.length > 0 ? 'Or someone new' : 'Their name'} <span className="optional">(optional)</span>
+          </label>
+          <input
+            id="folder-peer-name"
+            className="input"
+            placeholder="Name"
+            value={peerName}
+            onChange={(e) => setPeerName(e.target.value)}
+          />
+          <div className="field-hint">They’re added as a friend when they join.</div>
+        </div>
+      )}
     </Dialog>
   )
 }
 
-function DirOption({
+function ModeOption({
   active,
   onClick,
-  icon,
   title,
   desc,
 }: {
   active: boolean
   onClick: () => void
-  icon: React.ReactNode
   title: string
   desc: string
 }) {
   return (
-    <button type="button" role="radio" aria-checked={active} className={`option-card${active ? ' on' : ''}`} onClick={onClick}>
-      <div className="option-card-title">
-        {icon} {title}
-      </div>
-      <div className="option-card-desc">{desc}</div>
+    <button type="button" role="radio" aria-checked={active} className="row" onClick={onClick}>
+      <span className="folder-radio" aria-hidden />
+      <span className="row-main">
+        <span className="row-title" style={{ display: 'block' }}>{title}</span>
+        <span className="row-sub" style={{ display: 'block' }}>{desc}</span>
+      </span>
     </button>
   )
 }

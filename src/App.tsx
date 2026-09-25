@@ -10,7 +10,6 @@ import { parseCode } from './lib/codes'
 import { IS_MAC, MOBILE_UI } from './lib/platform'
 import { startNativeBridge } from './lib/nativeBridge'
 import { nativeShellActive } from './lib/nativeShell'
-import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
 import { MobileTabBar } from './components/MobileTabBar'
 import { Toasts } from './components/Toasts'
@@ -20,6 +19,7 @@ import { SafetyDialogHost } from './components/SafetyDialogs'
 import { QrScanner } from './components/QrScanner'
 import { routeDropToScanner } from './lib/qrImage'
 import { BeamLogo } from './components/bits'
+import { IconButton, Spinner } from './components/ui'
 import { Dialog } from './components/Dialog'
 import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
@@ -151,29 +151,31 @@ export default function App() {
 
   if (!ready) {
     return (
-      <div style={{ height: '100%', display: 'grid', placeItems: 'center' }}>
-        <div className="animate-beam">
-          <BeamLogo size={46} />
-        </div>
+      <div style={{ height: '100%', display: 'grid', placeItems: 'center' }} aria-busy="true" aria-label="Loading DropBeam">
+        <Spinner size={18} style={{ animationDelay: '-0.2s' }} />
       </div>
     )
   }
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-      <ErrorBoundary region="window controls">
-        {!MOBILE_UI && IS_MAC && <TitleBar />}
+      {MOBILE_UI && <ErrorBoundary region="window controls">
         <InstallBanner />
         <LocalNetworkBanner />
-      </ErrorBoundary>
+      </ErrorBoundary>}
       <div className="app-workspace" style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         {!MOBILE_UI && (
           <ErrorBoundary region="sidebar">
             <Sidebar />
           </ErrorBoundary>
         )}
-
-
+        <div className="app-main-col" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+        {/* Notices sit at the top of the content column (the sidebar runs to the
+            top of the window under the macOS traffic lights). */}
+        {!MOBILE_UI && <ErrorBoundary region="window controls">
+          <InstallBanner />
+          <LocalNetworkBanner />
+        </ErrorBoundary>}
         <main
           className={MOBILE_UI ? `scroll-area mobile-main${view === 'chat' ? ' mobile-main-chat' : ''}` : "scroll-area"}
           style={{
@@ -188,9 +190,9 @@ export default function App() {
             {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
                 so it never deadlocks on a view that has its own AnimatePresence. */}
             {MOBILE_UI ? <MobileApp bridgeOnly={nativeShell} /> : <motion.div
-              initial={MOBILE_UI ? false : { opacity: 0, y: 6 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.18 }}
+              initial={MOBILE_UI ? false : { opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.12 }}
               style={{ minHeight: '100%', height: view === 'chat' ? '100%' : undefined }}
             >
               {view === 'send' && <SendView />}
@@ -203,6 +205,7 @@ export default function App() {
             </motion.div>}
           </ErrorBoundary>
         </main>
+        </div>
       </div>
       {MOBILE_UI && !nativeShell && (
         <ErrorBoundary region="mobile navigation">
@@ -261,6 +264,16 @@ function PopoverCodeHandoff() {
   />
 }
 
+/** A device name ("Ashton's MacBook Pro", "DESKTOP-4F2K", "ubuntu") is not what
+ *  people should call you — offer the person's first name when we can find it. */
+function suggestedName(current: string): string {
+  const name = current.trim()
+  const possessive = name.match(/^(.+?)[’']s\s+(mac|macbook|imac|mac mini|mac studio|mac pro|pc|laptop|desktop|computer|iphone|ipad)\b/i)
+  if (possessive) return possessive[1].trim()
+  if (/^(desktop|laptop)-[a-z0-9]+$/i.test(name) || /^(macbook|imac|mac|ubuntu|localhost|pc)( (air|pro))?$/i.test(name)) return ''
+  return name
+}
+
 function NameSetupModal() {
   const settings = useStore((s) => s.settings)
   const save = useStore((s) => s.saveSettings)
@@ -270,7 +283,7 @@ function NameSetupModal() {
 
   useEffect(() => {
     if (settings && !localStorage.getItem('dropbeam.namedSelf')) {
-      setName(settings.displayName || '')
+      setName(suggestedName(settings.displayName || ''))
       setShow(true)
     }
   }, [settings])
@@ -284,37 +297,42 @@ function NameSetupModal() {
   }
   return (
     <>
-      <Dialog width={400} ariaLabel="Choose your name" className="onboard-dialog">
-        <div style={{ display: 'flex', justifyContent: 'center', margin: '6px 0 14px' }}>
+      <Dialog
+        width={380}
+        ariaLabel="Welcome to DropBeam"
+        className="onboard-dialog"
+        footer={
+          <>
+            {!MOBILE_UI && (
+              <button className="btn btn-plain" onClick={() => setJoining(true)} style={{ marginLeft: -8 }}>
+                Link an existing device…
+              </button>
+            )}
+            <span className="spacer" />
+            <button className="btn btn-primary" onClick={finish} disabled={!name.trim()}>
+              Continue
+            </button>
+          </>
+        }
+      >
+        <div className="onboard">
           <BeamLogo size={44} />
-        </div>
-        <h2 className="dialog-title" style={{ textAlign: 'center', marginBottom: 6 }}>
-          What should people call you?
-        </h2>
-        <p className="dialog-text" style={{ textAlign: 'center', marginBottom: 18 }}>
-          {MOBILE_UI
-            ? 'Friends see this name in chats and when you send photos or files. You can change it anytime in Settings.'
-            : 'This is the name friends see when you send files or share a folder. You can change it anytime in Settings.'}
-        </p>
-        {MOBILE_UI && <p style={{ lineHeight: 1.5, color: 'var(--text-muted)' }}>Keep DropBeam open while sending or receiving. Find received files in Files → On My iPhone → DropBeam.</p>}
-        <input
-          autoFocus
-          className="input"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && name.trim() && finish()}
-          placeholder="Your name"
-          aria-label="Your name"
-          maxLength={40}
-          style={{ fontSize: 'var(--font-md)', padding: '10px 13px' }}
-        />
-        <div className="dialog-actions" style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 16 }}>
-          <button className="btn btn-primary btn-lg btn-block" onClick={finish} disabled={!name.trim()}>
-            Continue
-          </button>
-          {!MOBILE_UI && <button className="btn btn-quiet btn-block" onClick={() => setJoining(true)}>
-            Already use DropBeam on another device? Link it
-          </button>}
+          <h2 className="onboard-title">Welcome to DropBeam</h2>
+          <p className="onboard-text">
+            {MOBILE_UI
+              ? 'Choose the name friends see when you send them something.'
+              : 'Choose the name friends see when you send files or share a folder.'}
+          </p>
+          <input
+            autoFocus
+            className="input onboard-input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && name.trim() && finish()}
+            placeholder="Your name"
+            aria-label="Your name"
+            maxLength={40}
+          />
         </div>
       </Dialog>
       {joining && <JoinAccountModal onClose={() => setJoining(false)} onShowCode={() => setJoining(false)} />}
@@ -347,18 +365,18 @@ function LocalNetworkBanner() {
   if (!blocked || dismissed) return null
   return (
     <div className="app-banner warn" role="status">
-      <AlertTriangle size={15} style={{ flexShrink: 0 }} />
-      <span style={{ flex: 1 }}>
-        DropBeam can’t reach a device on your network directly, so transfers are using a slow relay.
-        {IS_MAC ? <> Enable DropBeam under <b>Local Network</b> — and check it on the <b>other</b> device too.</>
-          : <> Check that your firewall allows DropBeam on private networks — on <b>both</b> devices.</>}
+      <AlertTriangle />
+      <span style={{ flex: 1, minWidth: 0 }}>
+        {IS_MAC
+          ? <>Transfers to devices nearby are slow. Allow DropBeam under <b>Local Network</b> on both devices.</>
+          : <>Transfers to devices nearby are slow. Allow DropBeam through the firewall on private networks, on both devices.</>}
       </span>
-      {IS_MAC && <button className="btn btn-ghost btn-sm" style={{ flexShrink: 0 }} onClick={() => api.openLocalNetworkSettings().catch(() => {})}>
+      {IS_MAC && <button className="btn btn-secondary btn-sm" style={{ flexShrink: 0 }} onClick={() => api.openLocalNetworkSettings().catch(() => {})}>
         Open Settings
       </button>}
-      <button className="icon-btn icon-btn-sm" onClick={() => setDismissed(true)} title="Dismiss" aria-label="Dismiss">
-        <X size={15} />
-      </button>
+      <IconButton label="Dismiss" size="sm" onClick={() => setDismissed(true)}>
+        <X />
+      </IconButton>
     </div>
   )
 }
@@ -371,11 +389,11 @@ function InstallBanner() {
   if (!hint || dismissed) return null
   return (
     <div className="app-banner warn" role="status">
-      <AlertTriangle size={15} style={{ flexShrink: 0 }} />
-      <span style={{ flex: 1 }}>{hint}</span>
-      <button className="icon-btn icon-btn-sm" onClick={() => setDismissed(true)} title="Dismiss" aria-label="Dismiss">
-        <X size={15} />
-      </button>
+      <AlertTriangle />
+      <span style={{ flex: 1, minWidth: 0 }}>{hint}</span>
+      <IconButton label="Dismiss" size="sm" onClick={() => setDismissed(true)}>
+        <X />
+      </IconButton>
     </div>
   )
 }

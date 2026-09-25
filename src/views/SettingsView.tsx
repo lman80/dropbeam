@@ -1,77 +1,107 @@
 import { deviceKindLabel } from '../lib/deviceIcons'
-import { folderName } from '../lib/syncedFolders'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { DevicesPanel } from '../components/DevicesPanel'
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
-import { Ban, CheckCircle2, Download, FolderOpen, HardDrive, Mail, QrCode, RefreshCw, Trash2 } from 'lucide-react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { FolderOpen, Info, QrCode, ScanLine } from 'lucide-react'
 import { QrCodeView } from '../components/CodeQr'
 import { QrScanner } from '../components/QrScanner'
 import { api, type Settings } from '../lib/api'
 import { contactMailto, platformLabel } from '../lib/report'
 import { formatBytes } from '../lib/format'
-import { useStore } from '../store'
+import { folderLabel } from '../lib/humanize'
+import { useStore, type View } from '../store'
 import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
-import { ChannelBadge, ProgressBar, SectionTitle, Spinner } from '../components/bits'
+import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spinner, Toggle } from '../components/ui'
 
-/** The enclosing settings row's title — the default accessible name of its switch. */
-const RowTitle = createContext('')
+// ── Tabs ─────────────────────────────────────────────────────────────────────
+// Settings is split into panes (like a Mac preferences window) instead of one
+// long scroll. The pane you land on follows where you came from — "Add a
+// location" on Locations opens the Locations pane, the GIF setup link in Chat
+// opens General, "Settings" under History's recoverable files opens Transfers —
+// otherwise it's the pane you last had open.
+type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'privacy' | 'advanced'
+const TABS: { value: Tab; label: string }[] = [
+  { value: 'general', label: 'General' },
+  { value: 'devices', label: 'Devices' },
+  { value: 'locations', label: 'Locations' },
+  { value: 'transfers', label: 'Transfers' },
+  { value: 'privacy', label: 'Privacy' },
+  { value: 'advanced', label: 'Advanced' },
+]
+let lastTab: Tab = 'general'
+let cameFrom: View | null = null
+useStore.subscribe((s, prev) => {
+  if (s.view === 'settings' && prev.view !== 'settings') cameFrom = prev.view
+})
+function initialTab(): Tab {
+  const from = cameFrom
+  cameFrom = null
+  if (from === 'locations') return 'locations'
+  if (from === 'chat') return 'general'
+  if (from === 'history') return 'transfers'
+  return lastTab
+}
 
-function Toggle({
+// The relay URL and detailed logging only apply on the next launch. Remember
+// what this launch started with, so "Restart" appears only after a real change.
+let bootRelay: string | null = null
+let bootVerbose: boolean | null = null
+const captureBoot = (st: Settings | null | undefined) => {
+  if (!st || bootRelay !== null) return
+  bootRelay = st.customRelay
+  bootVerbose = st.verboseLogging
+}
+captureBoot(useStore.getState().settings)
+useStore.subscribe((s) => captureBoot(s.settings))
+
+const RELAY_GUIDE = 'https://github.com/lman80/dropbeam/blob/main/RELAY-SETUP.md'
+
+// ── Rows ─────────────────────────────────────────────────────────────────────
+function Row({ title, sub, children }: { title: ReactNode; sub?: ReactNode; children?: ReactNode }) {
+  return (
+    <div className="row set-row">
+      <div className="row-main">
+        <div className="row-title">{title}</div>
+        {sub && <div className="row-sub">{sub}</div>}
+      </div>
+      {children && <div className="row-trailing">{children}</div>}
+    </div>
+  )
+}
+
+function ToggleRow({
+  title,
+  sub,
   on,
   onChange,
   disabled,
-  label,
+  extra,
 }: {
+  title: string
+  sub?: ReactNode
   on: boolean
   onChange: (v: boolean) => void
   disabled?: boolean
-  label?: string
-}) {
-  const rowTitle = useContext(RowTitle)
-  return (
-    <button
-      className={`toggle${on ? ' on' : ''}`}
-      role="switch"
-      aria-checked={on}
-      aria-label={label ?? (rowTitle || undefined)}
-      onClick={() => !disabled && onChange(!on)}
-      disabled={disabled}
-    />
-  )
-}
-
-function Row({
-  title,
-  desc,
-  children,
-}: {
-  title: string
-  desc?: string
-  /** Optional: some rows are informational only (no control on the right). */
-  children?: ReactNode
+  /** Shown before the switch (e.g. a Restart button once a change needs one). */
+  extra?: ReactNode
 }) {
   return (
-    <div className="settings-row">
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div className="settings-row-title">{title}</div>
-        {desc && <div className="settings-row-desc">{desc}</div>}
-      </div>
-      {children && <div className="settings-row-control"><RowTitle.Provider value={title}>{children}</RowTitle.Provider></div>}
-    </div>
+    <Row title={title} sub={sub}>
+      {extra}
+      <Toggle on={on} onChange={onChange} label={title} disabled={disabled} />
+    </Row>
   )
 }
 
-function Card({ children }: { children: ReactNode }) {
+function InfoTip({ label, children, width = 280 }: { label: string; children: ReactNode; width?: number }) {
   return (
-    <div className="card settings-card">
-      {children}
-    </div>
+    <InfoButton label={label} icon={<Info />} width={width} align="start" className="set-info-btn">
+      <div className="set-info">{children}</div>
+    </InfoButton>
   )
 }
-
-const SEP = <div className="settings-sep" role="separator" />
 
 export function SettingsView() {
   const settings = useStore((s) => s.settings) as Settings
@@ -80,15 +110,20 @@ export function SettingsView() {
   const [showEidQr, setShowEidQr] = useState(false)
   const [scanOperator, setScanOperator] = useState(false)
   const appVer = useStore((s) => s.appVer)
-  const update = useStore((s) => s.update)
-  const checkingUpdate = useStore((s) => s.checkingUpdate)
-  const updateError = useStore((s) => s.updateError)
-  const checkForUpdates = useStore((s) => s.checkForUpdates)
-  const installUpdate = useStore((s) => s.installUpdate)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
   const [historyUsage, setHistoryUsage] = useState<number | null>(null)
   const [freeingHistory, setFreeingHistory] = useState(false)
+  const [confirmFree, setConfirmFree] = useState(false)
+  const [tab, setTabState] = useState<Tab>(initialTab)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  const setTab = (t: Tab) => {
+    lastTab = t
+    setTabState(t)
+    // Each pane starts at its top.
+    rootRef.current?.closest('.scroll-area')?.scrollTo({ top: 0 })
+  }
 
   // Total disk used by recoverable copies across all shared folders.
   useEffect(() => {
@@ -149,6 +184,7 @@ export function SettingsView() {
       toast('error', String(e))
     } finally {
       setFreeingHistory(false)
+      setConfirmFree(false)
     }
   }
 
@@ -234,125 +270,105 @@ export function SettingsView() {
     </div>
   }
 
-  return (
-    <div className="page settings-page">
-      <div className="page-header titlebar-drag">
-        <div>
-          <h1 className="page-title">Settings</h1>
-          <p className="page-subtitle">Devices, locations, notifications and how transfers connect.</p>
-        </div>
-      </div>
-      {deviceModals}
-      <DevicesPanel />
-      {!MOBILE_UI && <LocationSettings />}
+  const restartButton = (
+    <button className="btn btn-secondary btn-sm" onClick={() => api.restartApp().catch(() => {})}>
+      Restart
+    </button>
+  )
+  const relayChanged = settings.customRelay.trim() !== (bootRelay ?? '').trim()
+  const verboseChanged = bootVerbose !== null && settings.verboseLogging !== bootVerbose
+  const diagUrlInvalid = settings.diagnosticsUrl !== '' && !settings.diagnosticsUrl.startsWith('https://')
 
-      <SectionTitle>Profile</SectionTitle>
-      <Card>
-        <Row title="Display name" desc="What friends see. Your name and photo apply to all your devices — they sync across your account.">
+  // The self-test answers "ok · node ab12…" when the engine is up — say that in words.
+  const testOk = testResult?.startsWith('ok') ?? false
+  const connectionSub = testing ? (
+    'Checking…'
+  ) : testResult ? (
+    testOk ? (
+      <span className="set-status"><Dot tone="ok" /> Ready for direct transfers</span>
+    ) : (
+      <span className="set-status set-status-error">{testResult}</span>
+    )
+  ) : (
+    'Transfers go straight to the other device, end-to-end encrypted.'
+  )
+
+  const general = (
+    <>
+      <SectionHeader>Profile</SectionHeader>
+      <div className="group">
+        <Row title="Name" sub="What friends see, on all your devices.">
           <DisplayNameInput value={settings.displayName} onSave={(displayName) => void save({ displayName })} />
         </Row>
-      </Card>
+      </div>
 
-      <SectionTitle>Downloads</SectionTitle>
-      <Card>
-        {!MOBILE_UI && (
-          <Row title="Save received files to">
-            <button className="btn btn-ghost btn-sm" onClick={changeDir} title={settings.downloadDir}>
-              <FolderOpen size={15} />
-              <span
-                style={{
-                  maxWidth: 200,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {folderName(settings.downloadDir)}
-              </span>
-            </button>
-          </Row>
-        )}
-        {!MOBILE_UI && SEP}
-        <Row
-          title="Clear transfer cache"
-          desc="Interrupted transfers keep their progress on disk so they can resume. Old leftovers are cleaned automatically after a week; this removes them now."
-        >
-          <button className="btn btn-ghost btn-sm" onClick={clearCache} disabled={clearing}>
-            {clearing ? <Spinner size={14} /> : <Trash2 size={15} />}
-            <span>Clear now</span>
-          </button>
-        </Row>
-      </Card>
-
-      <SectionTitle>Appearance</SectionTitle>
-      <Card>
+      <SectionHeader>Appearance</SectionHeader>
+      <div className="group">
         <Row title="Theme">
-          <div className="seg">
-            {(['system', 'light', 'dark'] as const).map((t) => (
-              <button
-                key={t}
-                className={settings.theme === t ? 'active' : ''}
-                onClick={() => save({ theme: t })}
-                style={{ textTransform: 'capitalize', padding: '6px 12px' }}
-              >
-                {t}
-              </button>
-            ))}
-          </div>
+          <Segmented
+            label="Theme"
+            value={settings.theme}
+            onChange={(theme) => save({ theme })}
+            options={[
+              { value: 'system', label: 'System' },
+              { value: 'light', label: 'Light' },
+              { value: 'dark', label: 'Dark' },
+            ]}
+          />
         </Row>
-      </Card>
+      </div>
 
-      <SectionTitle>Behavior</SectionTitle>
-      <Card>
-        {/* Login items and the close-to-menu-bar behaviour don't exist on iOS —
-            the system decides when a backgrounded app keeps running. */}
-        {!MOBILE_UI && (
-          <>
-            <Row
-              title="Stay ready in the background"
-              desc={`Start DropBeam automatically at login and keep it quietly in the ${TRAY_NAME}, so files can arrive even when you haven’t opened it. Turn off and DropBeam only receives while it’s open.`}
-            >
-              <Toggle on={settings.launchAtLogin} onChange={(v) => save({ launchAtLogin: v })} />
-            </Row>
-            {SEP}
-            <Row
-              title="Keep running when you close the window"
-              desc={`Closing the window tucks DropBeam into the ${TRAY_NAME} instead of quitting, so it keeps receiving.`}
-            >
-              <Toggle on={settings.minimizeToTray} onChange={(v) => save({ minimizeToTray: v })} />
-            </Row>
-            {SEP}
-          </>
-        )}
-        <Row
-          title="Notify when a file arrives"
-          desc={MOBILE_UI ? "Show a notification when a file arrives. Keep DropBeam open while transferring files." : "Pop a notification when someone sends you a file, even if DropBeam is in the background."}
-        >
-          <Toggle on={settings.notifyOnComplete} onChange={(v) => save({ notifyOnComplete: v })} />
-        </Row>
-        {SEP}
-        <Row
-          title="Chat message notifications"
-          desc={MOBILE_UI ? "Show a notification for new messages when you’re outside the conversation. Delivery may pause while the app is in the background." : "Pop a notification when a friend messages you and the app isn’t focused."}
-        >
-          <Toggle on={settings.notifyOnMessage} onChange={(v) => save({ notifyOnMessage: v })} />
-        </Row>
-        {SEP}
-        <Row
+      <SectionHeader>App</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="Open at login"
+          sub={`Waits in the ${TRAY_NAME} so files can arrive anytime.`}
+          on={settings.launchAtLogin}
+          onChange={(v) => save({ launchAtLogin: v })}
+        />
+        <ToggleRow
+          title="Keep running when the window is closed"
+          sub={`DropBeam stays in the ${TRAY_NAME} and keeps receiving.`}
+          on={settings.minimizeToTray}
+          onChange={(v) => save({ minimizeToTray: v })}
+        />
+        <ToggleRow
+          title="Show folder sync progress"
+          sub={`A small panel near the ${TRAY_NAME} while a shared folder syncs.`}
+          on={settings.showSyncPopup}
+          onChange={(v) => save({ showSyncPopup: v })}
+        />
+        <ToggleRow title="Play sounds" on={settings.playSounds} onChange={(v) => save({ playSounds: v })} />
+      </div>
+
+      <SectionHeader>Notifications</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="When a file arrives"
+          on={settings.notifyOnComplete}
+          onChange={(v) => save({ notifyOnComplete: v })}
+        />
+        <ToggleRow
+          title="When a message arrives"
+          sub="Only while you’re not looking at DropBeam."
+          on={settings.notifyOnMessage}
+          onChange={(v) => save({ notifyOnMessage: v })}
+        />
+      </div>
+
+      <SectionHeader>Chat</SectionHeader>
+      <div className="group">
+        <ToggleRow
           title="Send read receipts"
-          desc="Let friends see when you’ve read their message. Turning this off stops you sending them."
-        >
-          <Toggle on={settings.sendReadReceipts} onChange={(v) => save({ sendReadReceipts: v })} />
-        </Row>
-        {SEP}
-        <Row
-          title="GIFs (Giphy key)"
-          desc="Paste a free key from developers.giphy.com to enable the GIF picker in chat. Leave blank to hide it."
-        >
+          sub="Friends see when you’ve read their messages."
+          on={settings.sendReadReceipts}
+          onChange={(v) => save({ sendReadReceipts: v })}
+        />
+        <Row title="GIFs" sub="Add a free key from developers.giphy.com to turn on GIFs.">
           <input
-            className="input"
-            style={{ width: 220 }}
+            className="input set-field"
             type="text"
+            aria-label="Giphy API key"
             autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
             placeholder="Giphy API key"
             defaultValue={settings.giphyApiKey}
@@ -360,484 +376,303 @@ export function SettingsView() {
               const v = e.target.value.trim()
               if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
             }}
+            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
           />
         </Row>
-        {SEP}
-        <Row title="Play sounds" desc="Soft cues when you send, receive, or get a file offer.">
-          <Toggle on={settings.playSounds} onChange={(v) => save({ playSounds: v })} />
-        </Row>
-        {!MOBILE_UI && (
-          <>
-            {SEP}
-            <Row
-              title="Show the folder-sync popup"
-              desc="The little floating “syncing folder…” card that appears during a shared-folder transfer. Turn it off if it’s distracting."
-            >
-              <Toggle on={settings.showSyncPopup} onChange={(v) => save({ showSyncPopup: v })} />
-            </Row>
-          </>
-        )}
-      </Card>
+      </div>
 
-      <SectionTitle>Connection</SectionTitle>
-      <Card>
-        <Row
-          title="Direct peer-to-peer"
-          desc={MOBILE_UI ? "Send to other devices with end-to-end encryption. Keep DropBeam open on both devices until the transfer finishes." : "Every transfer — Quick Send, friends, and shared folders — goes straight to the other computer, end-to-end encrypted, as fast as your network allows. Your firewall may ask once to allow DropBeam."}
-        >
-          <span className="chip chip-green">On</span>
-        </Row>
-        {SEP}
-        <Row
-          title="Test direct connection"
-          desc={testResult || (MOBILE_UI ? 'Check the connection on this device.' : 'Confirm the direct engine is running on this computer.')}
-        >
-          <button className="btn btn-ghost btn-sm" onClick={runDirectTest} disabled={testing}>
-            {testing ? <Spinner size={14} /> : <RefreshCw size={15} />} Test
+      <SectionHeader>Updates</SectionHeader>
+      <div className="group">
+        <UpdateRow />
+      </div>
+    </>
+  )
+
+  const transfers = (
+    <>
+      <SectionHeader>Downloads</SectionHeader>
+      <div className="group">
+        <Row title="Save files to">
+          <button className="btn btn-secondary set-dir" onClick={changeDir} title={settings.downloadDir}>
+            <FolderOpen />
+            <span className="truncate-1">{folderLabel(settings.downloadDir)}</span>
           </button>
         </Row>
-        {SEP}
-        {MOBILE_UI ? (
-          <Row
-            title="Local network access"
-            desc="iOS asks once for permission to find devices on your Wi-Fi. If nearby transfers keep falling back to the slow relay, turn DropBeam on under Settings → Privacy & Security → Local Network — and check it on the other device too."
-          />
-        ) : IS_MAC ? (
-          <Row
-            title="Local network access"
-            desc="macOS must allow DropBeam on your Local Network for fast same-Wi-Fi transfers. If transfers to a nearby device keep using the slow relay, enable DropBeam here — and check it on the other device too."
-          >
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => api.openLocalNetworkSettings().catch(() => {})}
-            >
-              Open Settings
+        <Row title="Transfer leftovers" sub="Lets interrupted transfers resume. Cleared after a week.">
+          <button className="btn btn-secondary" onClick={clearCache} disabled={clearing}>
+            {clearing && <Spinner size={12} />}
+            Clear Now
+          </button>
+        </Row>
+      </div>
+
+      <SectionHeader>
+        Connection
+          <InfoTip label="How transfers connect">
+            <p><b>Local network.</b> Same Wi‑Fi or network — the fastest path, and it never leaves your network.</p>
+            <p><b>Direct.</b> Peer to peer across the internet, end-to-end encrypted.</p>
+            <p><b>Relayed.</b> When a direct path isn’t possible, an encrypted relay carries the data. It can’t read your files, but it’s slower.</p>
+          </InfoTip>
+      </SectionHeader>
+      <div className="group">
+        <Row title="Test connection" sub={connectionSub}>
+          <button className="btn btn-secondary" onClick={runDirectTest} disabled={testing}>
+            {testing && <Spinner size={12} />}
+            Test
+          </button>
+        </Row>
+        {IS_MAC ? (
+          <Row title="Local network access" sub="Needed for fast transfers on the same Wi‑Fi. Check both devices.">
+            <button className="btn btn-secondary" onClick={() => api.openLocalNetworkSettings().catch(() => {})}>
+              Open Settings…
             </button>
           </Row>
         ) : (
-          <Row
-            title="Local network access"
-            desc={IS_WINDOWS
-              ? 'For fast same-Wi-Fi transfers, allow DropBeam on Private networks when Windows Firewall asks (or in Windows Security → Firewall & network protection → Allow an app). Check the other device too.'
-              : 'For fast same-Wi-Fi transfers, make sure a firewall (ufw, firewalld…) isn’t blocking DropBeam on your local network. Check the other device too.'}
-          />
+          <Row title="Local network access" sub="Needed for fast transfers on the same Wi‑Fi. Check both devices.">
+            <InfoTip label="How to allow DropBeam on your local network">
+              <p>
+                {IS_WINDOWS
+                  ? 'Allow DropBeam on Private networks when Windows Firewall asks, or in Windows Security → Firewall & network protection → Allow an app.'
+                  : 'Make sure a firewall (ufw, firewalld…) isn’t blocking DropBeam on your local network.'}
+              </p>
+            </InfoTip>
+          </Row>
         )}
-        {SEP}
-        <Row
+        <ToggleRow
           title="Only send over direct connections"
-          desc="Refuse the slow relay: if a direct path (local network or peer-to-peer) can't be made, the send fails instead of crawling through the relay. Applies to Quick Send + friend sends; shared folders always use the best available path."
-        >
-          <Toggle on={settings.requireDirect} onChange={(v) => save({ requireDirect: v })} />
-        </Row>
-        {SEP}
-        <Row
+          sub="If there’s no direct path, the send stops instead of using a relay."
+          on={settings.requireDirect}
+          onChange={(v) => save({ requireDirect: v })}
+        />
+        <ToggleRow
           title="Wait for a direct connection"
-          desc={
+          sub={
             settings.requireDirect
-              ? 'Off because “Only send over direct connections” above already refuses the relay outright — there’s nothing to wait for.'
-              : 'When a send can only reach the relay, DropBeam holds off and keeps trying for a fast direct path instead of crawling through the relay. Your files stay put until a direct link forms — and each transfer card shows a “Send over relay anyway” button if you’d rather not wait.'
+              ? 'Not needed while only direct connections are allowed.'
+              : 'Hold sends until a direct path forms, instead of using a relay.'
           }
-        >
-          <Toggle
-            on={settings.requireDirect ? false : settings.waitForDirect}
-            disabled={settings.requireDirect}
-            onChange={(v) => save({ waitForDirect: v })}
-          />
+          on={settings.requireDirect ? false : settings.waitForDirect}
+          disabled={settings.requireDirect}
+          onChange={(v) => save({ waitForDirect: v })}
+        />
+        <ToggleRow
+          title="Parallel streams"
+          sub="Faster sends for files over 16 MB. Turn off if transfers stall."
+          on={settings.parallelStreams}
+          onChange={(v) => save({ parallelStreams: v })}
+        />
+      </div>
+
+      <SectionHeader>Speed</SectionHeader>
+      <div className="group">
+        <Row title="Upload limit" sub="In Mbps. Local network transfers always run at full speed.">
+          <UploadLimit value={settings.uploadLimitMbps || 0} onChange={(uploadLimitMbps) => save({ uploadLimitMbps })} />
         </Row>
-        {SEP}
-        <Row
-          title="Use parallel streams for big files"
-          desc="Send one large file (16 MB or more) over several connections at once for higher speed — the file is reassembled exactly. On by default. Turn off only if a transfer keeps stalling on a particular network; it'll then send the steady, single-stream way."
-        >
-          <Toggle on={settings.parallelStreams} onChange={(v) => save({ parallelStreams: v })} />
-        </Row>
-        {SEP}
-        <Row
-          title="Limit internet upload speed"
-          desc="Cap how much of your upload a transfer uses, so video calls, streaming, and browsing stay smooth — and so a big transfer doesn't overwhelm an older Wi-Fi router. 0 = unlimited. Local-network transfers always run full speed. There's no safe way to auto-test a router's breaking point, so start at the recommended 100 Mbps and raise it until your Wi-Fi stutters, then back off a little."
-        >
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                max={100000}
-                aria-label="Upload limit in Mbps"
-                value={settings.uploadLimitMbps || 0}
-                onChange={(e) =>
-                  save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })
-                }
-                style={{ width: 84, fontWeight: 600, padding: '6px 9px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}
-              />
-              <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)' }}>Mbps</span>
-            </div>
-            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-              {[
-                { label: '50', v: 50 },
-                { label: '100', v: 100, rec: true },
-                { label: '150', v: 150 },
-                { label: '300', v: 300 },
-                { label: 'Unlimited', v: 0 },
-              ].map((p) => {
-                const on = (settings.uploadLimitMbps || 0) === p.v
-                return (
-                  <button
-                    key={p.v}
-                    className={`pick-chip${on ? ' on' : ''}`}
-                    aria-pressed={on}
-                    onClick={() => save({ uploadLimitMbps: p.v })}
-                    title={p.rec ? 'Recommended starting point for most home routers' : undefined}
-                    style={{ padding: '3px 9px', fontSize: 'var(--font-xs)' }}
-                  >
-                    {p.label}
-                    {p.rec ? ' ★' : ''}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-        </Row>
-        {SEP}
-        <Row
+        <ToggleRow
           title="Show speeds in megabits"
-          desc="Off (default on every device) shows bytes per second (kB/s, MB/s). On shows megabits per second (Mbps), like internet plans. This preference applies to this device."
-        >
-          <Toggle on={settings.showMegabits} onChange={(v) => save({ showMegabits: v })} />
-        </Row>
-      </Card>
+          sub="Mbps instead of MB/s, on this device."
+          on={settings.showMegabits}
+          onChange={(v) => save({ showMegabits: v })}
+        />
+      </div>
 
-      <SectionTitle>How transfers connect</SectionTitle>
-      <Card>
-        <div style={{ padding: '12px 2px', display: 'flex', flexDirection: 'column', gap: 14 }}>
-          {[
-            {
-              loc: 'local' as const,
-              text: "You and the other device are on the same Wi-Fi / network. Files go straight across your local network — the fastest option, and they never touch the internet.",
-            },
-            {
-              loc: 'direct' as const,
-              text: 'A direct peer-to-peer link across the internet (DropBeam "hole-punches" through both routers). Files go straight between the two computers, end-to-end encrypted, no middleman. Fast and private.',
-            },
-            {
-              loc: 'internet' as const,
-              text: "When a direct link can't be made (a strict or locked-down network), files hop through an encrypted relay server. Still private — the relay can't read them — but much slower, since everything routes through a shared middle server.",
-            },
-            {
-              loc: 'unknown' as const,
-              text: "Still working out the best route to the other device — usually a second or two while it tries for a direct path before settling.",
-            },
-          ].map((c) => (
-            <div key={c.loc} style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
-              <div style={{ flexShrink: 0, marginTop: 1 }}>
-                <ChannelBadge locality={c.loc} showConnecting />
-              </div>
-              <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                {c.text}
-              </span>
-            </div>
-          ))}
-          <span style={{ fontSize: 'var(--font-xs)', color: 'var(--text-faint)', lineHeight: 1.5 }}>
-            The badge on each transfer shows which one it's using. Want to avoid the slow relay
-            entirely? Turn on "Only send over direct connections" above.
-          </span>
-        </div>
-      </Card>
-
-      {!MOBILE_UI && (
-        <>
-      <SectionTitle>Recoverable files</SectionTitle>
-      <Card>
-        <div style={{ padding: '12px 2px 4px' }}>
-          <div style={{ fontSize: 'var(--font-base)', fontWeight: 600 }}>Deleted &amp; replaced files in shared folders</div>
-          <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
-            When something is deleted or overwritten in a shared folder, DropBeam keeps a copy so you can
-            get it back. Old copies are cleaned up automatically so they never pile up.{' '}
-            {historyUsage !== null && (
-              <b style={{ color: 'var(--text)' }}>Currently using {formatBytes(historyUsage)}.</b>
-            )}
-          </div>
-        </div>
-
-        <div style={{ padding: '10px 2px' }}>
-          <div style={{ fontSize: 'var(--font-sm)', fontWeight: 600, marginBottom: 8 }}>Keep copies for</div>
-          <div className="seg" style={{ display: 'flex', width: '100%' }}>
-            {(
-              [
-                { label: '7 days', v: 7 },
-                { label: '30 days', v: 30 },
-                { label: '90 days', v: 90 },
-                { label: 'Forever', v: 0 },
-              ] as const
-            ).map((o) => (
-              <button
-                key={o.v}
-                className={settings.folderHistoryKeepDays === o.v ? 'active' : ''}
-                style={{ flex: 1, justifyContent: 'center' }}
-                onClick={() => save({ folderHistoryKeepDays: o.v })}
-              >
-                {o.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div style={{ padding: '10px 2px 14px' }}>
-          <div style={{ fontSize: 'var(--font-sm)', fontWeight: 600, marginBottom: 8 }}>Storage limit per folder</div>
-          <div className="seg" style={{ display: 'flex', width: '100%' }}>
-            {(
-              [
-                { label: '500 MB', v: 500 * 1024 * 1024 },
-                { label: '2 GB', v: 2 * 1024 * 1024 * 1024 },
-                { label: '5 GB', v: 5 * 1024 * 1024 * 1024 },
-                { label: 'No limit', v: 0 },
-              ] as const
-            ).map((o) => (
-              <button
-                key={o.v}
-                className={settings.folderHistoryBudgetBytes === o.v ? 'active' : ''}
-                style={{ flex: 1, justifyContent: 'center' }}
-                onClick={() => save({ folderHistoryBudgetBytes: o.v })}
-              >
-                {o.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {SEP}
-        <Row
-          title="Free up space now"
-          desc="Remove every saved copy across all your shared folders. Your live files aren’t touched."
-        >
-          <button className="btn btn-ghost btn-sm" onClick={freeHistory} disabled={freeingHistory}>
-            {freeingHistory ? <Spinner size={14} /> : <HardDrive size={15} />} Free up
-          </button>
-        </Row>
-      </Card>
-        </>
-      )}
-
-      {!MOBILE_UI && <SafetySection />}
-
-      <SectionTitle>Custom relay (advanced)</SectionTitle>
-      <Card>
-        <Row
-          title="Relay server URL"
-          desc="When two devices can't connect directly, files fall back to a relay. By default that's iroh's shared public relays — fine, but sometimes slow or flaky for far-apart devices. Point BOTH devices at your own free relay for a fast, reliable fallback. Leave blank to use the public relays. Applied on restart. Setup guide (free, ~10 min): github.com/lman80/dropbeam → RELAY-SETUP.md"
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            {MOBILE_UI ? <span style={{ color: 'var(--text-muted)' }}>Close and reopen DropBeam to apply changes.</span> : <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => api.restartApp().catch(() => {})}
-              title="Restart DropBeam so the relay change takes effect"
-            >
-              <RefreshCw size={14} /> Restart
-            </button>}
-            <input
-              className="input"
-              style={{ width: 230 }}
-              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-              placeholder="https://relay.example.com"
-              value={settings.customRelay}
-              onChange={(e) => save({ customRelay: e.target.value })}
-            />
-          </div>
-        </Row>
-      </Card>
-
-      <SectionTitle>{MOBILE_UI ? 'About' : 'Updates'}</SectionTitle>
-      <Card>
-        {MOBILE_UI ? (
-          <Row
-            title="Version"
-            desc={`DropBeam ${appVer || '…'}`}
+      <SectionHeader>
+        Recoverable files
+          <InfoTip label="About recoverable files">
+            <p>When a file in a shared folder is deleted or replaced, DropBeam keeps a copy you can restore from History. Old copies are removed automatically.</p>
+          </InfoTip>
+      </SectionHeader>
+      <div className="group">
+        <Row title="Keep copies for">
+          <Segmented
+            label="Keep copies for"
+            value={String(settings.folderHistoryKeepDays)}
+            onChange={(v) => save({ folderHistoryKeepDays: Number(v) })}
+            options={[
+              { value: '7', label: '7 days' },
+              { value: '30', label: '30 days' },
+              { value: '90', label: '90 days' },
+              { value: '0', label: 'Forever' },
+            ]}
           />
+        </Row>
+        <Row title="Limit per folder">
+          <Segmented
+            label="Storage limit per folder"
+            value={String(settings.folderHistoryBudgetBytes)}
+            onChange={(v) => save({ folderHistoryBudgetBytes: Number(v) })}
+            options={[
+              { value: String(500 * 1024 * 1024), label: '500 MB' },
+              { value: String(2 * 1024 * 1024 * 1024), label: '2 GB' },
+              { value: String(5 * 1024 * 1024 * 1024), label: '5 GB' },
+              { value: '0', label: 'No limit' },
+            ]}
+          />
+        </Row>
+        {confirmFree ? (
+          <Row title="Remove all recoverable copies?" sub="Your live files aren’t touched.">
+            <button className="btn btn-secondary" onClick={() => setConfirmFree(false)} disabled={freeingHistory}>
+              Cancel
+            </button>
+            <button className="btn btn-destructive" onClick={freeHistory} disabled={freeingHistory}>
+              {freeingHistory && <Spinner size={12} />}
+              Remove
+            </button>
+          </Row>
         ) : (
-          <Row title="Version" desc={`DropBeam ${appVer || '…'}`}>
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => checkForUpdates(true)}
-              disabled={checkingUpdate}
-            >
-              {checkingUpdate ? <Spinner size={14} /> : <RefreshCw size={15} />} Check for updates
+          <Row
+            title="Space used"
+            sub={historyUsage === null ? '…' : historyUsage > 0 ? formatBytes(historyUsage) : 'None'}
+          >
+            <button className="btn btn-secondary" onClick={() => setConfirmFree(true)} disabled={historyUsage === 0}>
+              Free Up Space…
             </button>
           </Row>
         )}
-        {!MOBILE_UI && update && (
-          <>
-            {SEP}
-            <div style={{ padding: '13px 4px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <CheckCircle2 size={17} color="var(--green)" />
-                <span style={{ fontWeight: 650, fontSize: 'var(--font-base)' }}>
-                  Version {update.version} is available
-                </span>
-              </div>
-              {update.installing ? (
-                <div style={{ marginTop: 11 }}>
-                  <ProgressBar percent={update.progress} />
-                  <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)', marginTop: 7 }}>
-                    {update.progress < 100
-                      ? `Downloading… ${update.progress}%`
-                      : 'Installing — DropBeam will restart…'}
-                  </div>
-                </div>
-              ) : (
-                <button
-                  className="btn btn-primary"
-                  style={{ marginTop: 11 }}
-                  onClick={() => installUpdate()}
-                >
-                  <Download size={15} /> Install &amp; restart
-                </button>
-              )}
-            </div>
-          </>
-        )}
-        {!MOBILE_UI && updateError && !update && (
-          <>
-            {SEP}
-            <div style={{ padding: '13px 4px' }}>
-              <div style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', marginBottom: 9, lineHeight: 1.5 }}>
-                Couldn't reach the update server. If you're on a network that blocks
-                GitHub, download the latest installer manually:
-              </div>
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={() =>
-                  api.openUrl('https://github.com/lman80/dropbeam/releases/latest').catch(() => {})
-                }
-              >
-                <Download size={15} /> Get the latest from GitHub
-              </button>
-            </div>
-          </>
-        )}
-      </Card>
+      </div>
+    </>
+  )
 
-      <SectionTitle>Diagnostics</SectionTitle>
-      <Card>
-        <Row
-          title="Detailed logging"
-          desc="Add the deepest network-internal logs (iroh connection setup, path selection, hole-punch) on top of the usual diagnostics — turn this on only while reproducing a hard-to-spot connection issue. Sharing diagnostics (below) already keeps DropBeam's own logs detailed; this adds the heavier transport internals. Takes effect after a restart."
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            {MOBILE_UI ? <span style={{ color: 'var(--text-muted)' }}>Close and reopen DropBeam to apply changes.</span> : <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => api.restartApp().catch(() => {})}
-              title="Restart DropBeam so the logging change takes effect"
+  const privacy = (
+    <>
+      <SafetySection />
+
+      <SectionHeader>Diagnostics</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="Share diagnostics"
+          sub="A redacted daily summary of errors. Never file names or contents."
+          on={settings.shareDiagnostics}
+          onChange={(v) => save({ shareDiagnostics: v })}
+        />
+        {settings.shareDiagnostics && (
+          <Row
+            title="Custom collector"
+            sub={diagUrlInvalid ? <span className="set-status-error">Use an https:// address.</span> : 'Leave empty to use the built-in one.'}
+          >
+            <input
+              className="input set-field"
+              aria-label="Diagnostics endpoint"
+              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+              placeholder="https://"
+              value={settings.diagnosticsUrl}
+              onChange={(e) => save({ diagnosticsUrl: e.target.value })}
+            />
+            <button
+              className="btn btn-secondary"
+              disabled={testingDiag || diagUrlInvalid}
+              onClick={async () => {
+                setTestingDiag(true)
+                try {
+                  toast('info', await api.diagnosticsTest())
+                } catch (e) {
+                  toast('error', String(e))
+                } finally {
+                  setTestingDiag(false)
+                }
+              }}
             >
-              <RefreshCw size={14} /> Restart
-            </button>}
-            <Toggle on={settings.verboseLogging} onChange={(v) => save({ verboseLogging: v })} />
-          </div>
-        </Row>
-        {SEP}
-        <Row
-          title="Export logs"
-          desc={MOBILE_UI ? "Save a diagnostics file in DropBeam’s folder in Files. You can share it to help troubleshoot an issue." : "Bundle the logs into one file in your Downloads folder (no passwords or file contents — just diagnostics). Send it over DropBeam (drop it on a friend) or AirDrop to get the issue diagnosed."}
-        >
-          <button className="btn btn-ghost btn-sm" onClick={exportLogs} disabled={exporting}>
-            {exporting ? <Spinner size={14} /> : <Download size={15} />}
-            <span>Export</span>
+              {testingDiag && <Spinner size={12} />}
+              Send Test
+            </button>
+          </Row>
+        )}
+      </div>
+
+      <SectionHeader>
+        Support
+          <InfoTip label="Reporting a person">
+            <p>To report a person or a message, use Report… on their friend card, in their chat, or on the message. We reply within 24 hours.</p>
+          </InfoTip>
+      </SectionHeader>
+      <div className="group">
+        <Row title="Report a problem" sub="Opens an email to the DropBeam team.">
+          <button
+            className="btn btn-secondary"
+            onClick={() =>
+              api
+                .openMailto(contactMailto(appVer || null, platformLabel(navigator.userAgent)))
+                .catch((e) => toast('error', `Couldn’t open your mail app: ${String(e)}`))
+            }
+          >
+            Email Us…
           </button>
         </Row>
-        {SEP}
-        <Row
-          title="Share background diagnostics"
-          desc="Automatically send a small, redacted summary of errors and transfer performance (never file names or contents) so problems can be found and fixed without you reporting them. Keeps DropBeam's own logs detailed so the summary is useful. Uploads about once a day — only to the endpoint set below."
-        >
-          <Toggle on={settings.shareDiagnostics} onChange={(v) => save({ shareDiagnostics: v })} />
-        </Row>
-        {settings.shareDiagnostics && (
-          <>
-            {SEP}
-            <Row
-              title="Diagnostics endpoint"
-              desc="A collector is built in, so this works out of the box. Override it here only if you run your own (advanced)."
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <input
-                  className="input"
-                  style={{ width: 240 }}
-                  autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-                  placeholder="Built-in (leave blank)"
-                  value={settings.diagnosticsUrl}
-                  onChange={(e) => save({ diagnosticsUrl: e.target.value })}
-                />
-                <button
-                  className="btn btn-ghost btn-sm"
-                  disabled={
-                    testingDiag ||
-                    (settings.diagnosticsUrl !== '' && !settings.diagnosticsUrl.startsWith('https://'))
-                  }
-                  onClick={async () => {
-                    setTestingDiag(true)
-                    try {
-                      toast('info', await api.diagnosticsTest())
-                    } catch (e) {
-                      toast('error', String(e))
-                    } finally {
-                      setTestingDiag(false)
-                    }
-                  }}
-                >
-                  {testingDiag ? <Spinner size={14} /> : 'Send test'}
-                </button>
-              </div>
-            </Row>
-          </>
-        )}
-      </Card>
+      </div>
+    </>
+  )
 
-      <SectionTitle>Lab Mode</SectionTitle>
-      <Card>
+  const advanced = (
+    <>
+      <SectionHeader>
+        Relay
+          <InfoTip label="About relays">
+            <p>When two devices can’t connect directly, data goes through a relay. Point both devices at your own relay for a faster, steadier fallback.</p>
+            <button className="btn btn-plain btn-sm set-info-link" onClick={() => api.openUrl(RELAY_GUIDE).catch(() => {})}>
+              Relay setup guide
+            </button>
+          </InfoTip>
+      </SectionHeader>
+      <div className="group">
         <Row
-          title="Enable Lab Mode"
-          desc={MOBILE_UI ? "Allow one trusted developer device to run diagnostics over an encrypted connection. Off by default. Only the operator ID below is accepted. Turn this on only when the developer asks." : "Let ONE trusted device (the developer's) run automated tests against this app and install updates for you, over the same encrypted link your files use. Off by default. Even when on, only the exact operator ID below is ever accepted — no one else can connect. Leave this off unless the developer asks you to turn it on."}
+          title="Custom relay"
+          sub={relayChanged ? 'Restart DropBeam to use this relay.' : 'Use the same relay on both devices. Leave empty for public relays.'}
         >
-          <Toggle
-            on={settings.labModeEnabled}
-            onChange={(v) => save({ labModeEnabled: v })}
+          {relayChanged && restartButton}
+          <input
+            className="input set-field set-field-wide"
+            aria-label="Relay server URL"
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+            placeholder="https://relay.example.com"
+            value={settings.customRelay}
+            onChange={(e) => save({ customRelay: e.target.value })}
           />
         </Row>
+      </div>
+
+      <SectionHeader>Logs</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="Detailed logging"
+          sub={verboseChanged ? 'Restart DropBeam to apply.' : 'Adds network internals while you reproduce a connection problem.'}
+          on={settings.verboseLogging}
+          onChange={(v) => save({ verboseLogging: v })}
+          extra={verboseChanged ? restartButton : undefined}
+        />
+        <Row title="Export logs" sub="Saves a log bundle to Downloads. No passwords or file contents.">
+          <button className="btn btn-secondary" onClick={exportLogs} disabled={exporting}>
+            {exporting && <Spinner size={12} />}
+            Export…
+          </button>
+        </Row>
+      </div>
+
+      <SectionHeader>Lab Mode</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="Allow Lab Mode"
+          sub="Lets one trusted developer device run tests on this app. Turn on only if asked."
+          on={settings.labModeEnabled}
+          onChange={(v) => save({ labModeEnabled: v })}
+        />
         {settings.labModeEnabled && (
           <>
-            {SEP}
-            <Row
-              title="Operator device ID"
-              desc="Paste the ID the developer gives you. Only this device can drive Lab Mode. Blank = nothing is accepted."
-            >
-              <div style={{ display: 'flex', gap: 6 }}>
-                <input
-                  className="input"
-                  style={{ width: 240 }}
-                  autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-                  placeholder="Paste operator ID"
-                  value={settings.labOperatorId}
-                  onChange={(e) => save({ labOperatorId: e.target.value.trim() })}
-                />
-                <button className="icon-btn" aria-label="Scan operator ID QR code" title="Scan QR code" onClick={() => setScanOperator(true)}><QrCode size={16} /></button>
-              </div>
-              {scanOperator && (
-                <QrScanner
-                  title="Scan operator ID"
-                  hint="Scan the operator device ID QR code."
-                  validate={(t) => (/^[0-9a-f]{64}$/i.test(t.trim()) ? null : 'That QR code isn’t a device ID.')}
-                  onClose={() => setScanOperator(false)}
-                  onResult={(t) => { setScanOperator(false); void save({ labOperatorId: t.trim().toLowerCase() }) }}
-                />
-              )}
+            <Row title="Operator ID" sub={settings.labOperatorId ? 'Only this device can connect.' : 'No device can connect until you add one.'}>
+              <input
+                className="input set-field set-field-wide set-mono"
+                aria-label="Operator device ID"
+                autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+                placeholder="Paste operator ID"
+                value={settings.labOperatorId}
+                onChange={(e) => save({ labOperatorId: e.target.value.trim() })}
+              />
+              <IconButton label="Scan operator ID QR code" tooltip="Scan QR code" onClick={() => setScanOperator(true)}>
+                <ScanLine />
+              </IconButton>
             </Row>
-            {SEP}
-            <Row
-              title="This device's ID"
-              desc="Send this to the developer so they can reach this device for testing."
-            >
-              <div style={{ display: 'flex', gap: 6 }}>
+            <Row title="This device’s ID" sub="Share it with the developer for testing.">
               <button
-                className="btn btn-ghost btn-sm"
+                className="btn btn-secondary"
                 disabled={!myEid}
                 onClick={async () => {
                   if (!myEid) return
@@ -851,27 +686,146 @@ export function SettingsView() {
               >
                 {myEid ? 'Copy ID' : 'Starting…'}
               </button>
-              <button className="icon-btn" disabled={!myEid} aria-pressed={showEidQr} aria-label="Show device ID QR code" title="QR code" onClick={() => setShowEidQr((v) => !v)}><QrCode size={16} /></button>
-              </div>
+              <IconButton
+                label={showEidQr ? 'Hide device ID QR code' : 'Show device ID QR code'}
+                tooltip={showEidQr ? 'Hide QR code' : 'Show QR code'}
+                disabled={!myEid}
+                active={showEidQr}
+                aria-pressed={showEidQr}
+                onClick={() => setShowEidQr((v) => !v)}
+              >
+                <QrCode />
+              </IconButton>
             </Row>
-            {showEidQr && myEid && <div style={{ display: 'grid', placeItems: 'center', padding: '4px 0 14px' }}><QrCodeView value={myEid} size={160} hint="Scan to read this device ID" /></div>}
+            {showEidQr && myEid && (
+              <div className="set-qr">
+                <QrCodeView value={myEid} size={148} hint="Scan to read this device ID" />
+              </div>
+            )}
           </>
         )}
-      </Card>
-
-      <div
-        style={{
-          textAlign: 'center',
-          fontSize: 'var(--font-xs)',
-          color: 'var(--text-faint)',
-          marginTop: 18,
-          lineHeight: 1.6,
-        }}
-      >
-        DropBeam · Direct, end-to-end encrypted peer-to-peer transfers
-        <br />
-        No accounts · Your files never touch a server · Diagnostics are opt-out
       </div>
+      {scanOperator && (
+        <QrScanner
+          title="Scan operator ID"
+          hint="Scan the operator device ID QR code."
+          validate={(t) => (/^[0-9a-f]{64}$/i.test(t.trim()) ? null : 'That QR code isn’t a device ID.')}
+          onClose={() => setScanOperator(false)}
+          onResult={(t) => { setScanOperator(false); void save({ labOperatorId: t.trim().toLowerCase() }) }}
+        />
+      )}
+    </>
+  )
+
+  const visibleTabs = TABS.filter((t) => t.value !== 'locations' || !MOBILE_UI)
+
+  return (
+    <div className="page settings-page" ref={rootRef}>
+      <div className="page-header titlebar-drag">
+        <h1 className="page-title">Settings</h1>
+        <div className="page-actions">
+          <Segmented role="tablist" label="Settings sections" value={tab} onChange={setTab} options={visibleTabs} className="settings-tabs" />
+        </div>
+      </div>
+      {deviceModals}
+      <div role="tabpanel" aria-label={TABS.find((t) => t.value === tab)?.label} className={`settings-pane settings-pane-${tab}`}>
+        {tab === 'general' && general}
+        {tab === 'devices' && <DevicesPanel />}
+        {tab === 'locations' && <LocationSettings />}
+        {tab === 'transfers' && transfers}
+        {tab === 'privacy' && privacy}
+        {tab === 'advanced' && advanced}
+      </div>
+    </div>
+  )
+}
+
+/** Version + update check + install progress, as one row. */
+function UpdateRow() {
+  const appVer = useStore((s) => s.appVer)
+  const update = useStore((s) => s.update)
+  const checkingUpdate = useStore((s) => s.checkingUpdate)
+  const updateError = useStore((s) => s.updateError)
+  const checkForUpdates = useStore((s) => s.checkForUpdates)
+  const installUpdate = useStore((s) => s.installUpdate)
+
+  let sub: ReactNode
+  let control: ReactNode
+  if (update?.installing) {
+    sub = update.progress < 100 ? `Downloading version ${update.version}… ${update.progress}%` : 'Installing — DropBeam will restart…'
+    control = <div className="set-update-bar"><ProgressBar percent={update.progress} label="Update download" /></div>
+  } else if (update) {
+    sub = `Version ${update.version} is available.`
+    control = (
+      <button className="btn btn-primary" onClick={() => installUpdate()}>
+        Install and Restart
+      </button>
+    )
+  } else if (updateError) {
+    sub = 'Couldn’t reach the update server.'
+    control = (
+      <>
+        <button className="btn btn-secondary" onClick={() => api.openUrl('https://github.com/lman80/dropbeam/releases/latest').catch(() => {})}>
+          Download…
+        </button>
+        <button className="btn btn-secondary" onClick={() => checkForUpdates(true)} disabled={checkingUpdate}>
+          {checkingUpdate && <Spinner size={12} />}
+          Try Again
+        </button>
+      </>
+    )
+  } else {
+    sub = checkingUpdate ? 'Checking for updates…' : null
+    control = (
+      <button className="btn btn-secondary" onClick={() => checkForUpdates(true)} disabled={checkingUpdate}>
+        {checkingUpdate && <Spinner size={12} />}
+        Check for Updates
+      </button>
+    )
+  }
+  return <Row title={<span className="tnum">DropBeam {appVer || '…'}</span>} sub={sub}>{control}</Row>
+}
+
+/** Upload cap: presets as a segmented control, plus a custom value. 0 = off. */
+const UPLOAD_PRESETS = [0, 50, 100, 150, 300]
+function UploadLimit({ value, onChange }: { value: number; onChange: (mbps: number) => void }) {
+  const [custom, setCustom] = useState(!UPLOAD_PRESETS.includes(value))
+  const seg = custom ? 'custom' : String(value)
+  return (
+    <div className="set-upload">
+      {custom && (
+        <label className="set-upload-custom">
+          <input
+            className="input tnum"
+            type="number"
+            min={0}
+            max={100000}
+            aria-label="Upload limit in Mbps"
+            autoFocus
+            value={value || ''}
+            placeholder="0"
+            onChange={(e) => onChange(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+          />
+          <span className="muted">Mbps</span>
+        </label>
+      )}
+      <Segmented
+        label="Upload limit"
+        value={seg}
+        onChange={(v) => {
+          if (v === 'custom') { setCustom(true); return }
+          setCustom(false)
+          onChange(Number(v))
+        }}
+        options={[
+          { value: '0', label: 'Off' },
+          { value: '50', label: '50' },
+          { value: '100', label: '100', title: 'A good starting point for most home Wi‑Fi' },
+          { value: '150', label: '150' },
+          { value: '300', label: '300' },
+          { value: 'custom', label: 'Custom' },
+        ]}
+      />
     </div>
   )
 }
@@ -900,9 +854,8 @@ function DisplayNameInput({ value, onSave }: { value: string; onSave: (name: str
   }
   return (
     <input
-      className="input"
+      className="input set-field"
       aria-label="Display name"
-      style={{ width: 220 }}
       value={draft ?? value}
       maxLength={64}
       onFocus={() => setDraft(value)}
@@ -913,65 +866,48 @@ function DisplayNameInput({ value, onSave }: { value: string; onSave: (name: str
   )
 }
 
-/** Settings → Privacy & safety: the Blocked list (unblock) + Report a problem / Contact. */
+/** Settings → Privacy: the Blocked list (unblock). */
 function SafetySection() {
   const blocked = useStore((s) => s.blocked)
   const unblock = useStore((s) => s.unblockPerson)
-  const appVer = useStore((s) => s.appVer)
   const toast = useStore((s) => s.toast)
   const [busy, setBusy] = useState<string | null>(null)
   return (
     <>
-      <SectionTitle>Privacy &amp; safety</SectionTitle>
-      <Card>
-        <Row
-          title="Blocked"
-          desc="Blocked people can't message you, send you files, invite you to folders or browse your Locations — and they aren't told. Blocks apply on all your linked devices. Block someone from their friend card or chat (⋯ → Block…)."
-        />
-        <div className="blocked-list" style={{ margin: '0 4px 12px' }}>
-          {blocked.length === 0 ? (
-            <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-faint)', padding: '2px 6px' }}>No one is blocked.</span>
-          ) : (
-            blocked.map((p) => (
-              <div className="blocked-row" key={p.id}>
-                <Ban size={15} color="var(--text-faint)" />
-                <span className="blocked-name truncate-1" title={p.name}>{p.name}</span>
-                <span className="blocked-when">
-                  {p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}blocked {new Date(p.at).toLocaleDateString()}
-                </span>
-                <button
-                  className="btn btn-ghost btn-sm"
-                  disabled={busy === p.id}
-                  onClick={async () => {
-                    setBusy(p.id)
-                    await unblock(p.id)
-                    setBusy(null)
-                    toast('info', `${p.name} is unblocked. Add them again with their code if you want to.`)
-                  }}
-                >
-                  {busy === p.id ? <Spinner size={13} /> : null} Unblock
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-        {SEP}
-        <Row
-          title="Report a problem or contact us"
-          desc="Opens an email to the DropBeam team. To report a person or a message, use Report… on their friend card, in their chat, or on the message. We respond within 24 hours."
-        >
-          <button
-            className="btn btn-ghost btn-sm"
-            onClick={() =>
-              api
-                .openMailto(contactMailto(appVer || null, platformLabel(navigator.userAgent)))
-                .catch((e) => toast('error', `Couldn’t open your mail app: ${String(e)}`))
-            }
-          >
-            <Mail size={15} /> Email us
-          </button>
-        </Row>
-      </Card>
+      <SectionHeader>
+        Blocked
+          <InfoTip label="About blocking">
+            <p>Blocked people can’t message you, send you files, invite you to folders or browse your Locations, and they aren’t told. Blocks apply on all your devices.</p>
+            <p>To block someone, use … → Block on their friend card or in their chat.</p>
+          </InfoTip>
+      </SectionHeader>
+      <div className="group">
+        {blocked.length === 0 ? (
+          <div className="row set-row"><div className="row-main row-sub set-empty">No one is blocked.</div></div>
+        ) : (
+          blocked.map((p) => (
+            <Row
+              key={p.id}
+              title={<span className="truncate-1 set-block-name" title={p.name}>{p.name}</span>}
+              sub={`${p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}Blocked ${new Date(p.at).toLocaleDateString()}`}
+            >
+              <button
+                className="btn btn-secondary"
+                disabled={busy === p.id}
+                onClick={async () => {
+                  setBusy(p.id)
+                  await unblock(p.id)
+                  setBusy(null)
+                  toast('info', `${p.name} is unblocked. Add them again with their code if you want to.`)
+                }}
+              >
+                {busy === p.id && <Spinner size={12} />}
+                Unblock
+              </button>
+            </Row>
+          ))
+        )}
+      </div>
     </>
   )
 }

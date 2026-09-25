@@ -1,0 +1,376 @@
+/* Overlay windows: menu-bar popover, folder-sync HUD, floating receive card. */
+/* ===================================================================== */
+/* Overlay windows: the menu-bar popover and the floating transfer HUD.  */
+/* These windows are transparent, so the body must not paint a backdrop. */
+/* ===================================================================== */
+html.overlay-window,
+html.overlay-window body,
+html.overlay-window #root {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+/* ---- Menu-bar popover (300×390 window) ---- */
+.popover-root {
+  height: 100%;
+  /* Transparent margin so the panel's shadow fades inside the window instead
+     of being clipped square at its edge. */
+  padding: 6px 12px 20px;
+  box-sizing: border-box;
+}
+.popover-panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  /* Opaque (a backdrop-filter flickered on the inactive menu window). */
+  background: var(--surface);
+  border-radius: 12px;
+  box-shadow: 0 0 0 0.5px var(--border-strong), 0 6px 16px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+  transition: box-shadow var(--dur-fast);
+}
+.dark .popover-panel {
+  background: #2c2c2f;
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.14), 0 6px 16px rgba(0, 0, 0, 0.45);
+}
+/* A file dragged over the panel: a solid accent ring, no dashes. */
+.popover-panel.dragging { box-shadow: inset 0 0 0 2px var(--accent), 0 6px 16px rgba(0, 0, 0, 0.18); }
+
+.popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  flex-shrink: 0;
+  padding: 0 6px 0 12px;
+  -webkit-app-region: drag;
+}
+.popover-head .icon-btn { -webkit-app-region: no-drag; }
+.popover-title { font-size: var(--text-13); font-weight: 600; }
+
+.pop-search { margin: 0 10px 6px; flex-shrink: 0; }
+.pop-search > .input { height: 26px; }
+
+.popover-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 6px 8px;
+}
+
+/* Friend rows */
+.pop-contacts { display: flex; flex-direction: column; }
+.pop-contact {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 38px;
+  padding: 4px 6px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: default;
+  transition: background var(--dur-fast);
+}
+.pop-contact:hover:not(:disabled) { background: var(--surface-hover); }
+.pop-contact:focus-visible { outline: none; box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
+.pop-contact.drop { background: var(--accent); color: #fff; }
+.pop-contact.drop .pop-contact-sub { color: rgba(255, 255, 255, 0.85); }
+.pop-contact-av {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 600;
+  font-size: var(--text-11);
+  flex-shrink: 0;
+}
+.pop-contact-av .avatar-device { width: 14px; height: 14px; }
+.pop-online-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--green-dot);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.dark .pop-online-dot { box-shadow: 0 0 0 2px #2c2c2f; }
+.pop-contact-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.pop-contact-name {
+  font-size: var(--text-13);
+  font-weight: 500;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pop-contact-sub { font-size: var(--text-11); color: var(--text-muted); line-height: 1.3; }
+
+.pop-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 24px 12px;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+}
+.pop-loading { display: grid; place-items: center; padding: 16px; }
+
+/* Transfers: compact rows with a thin bar */
+.pop-xfers {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  max-height: 128px;
+  overflow-y: auto;
+  padding: 4px 6px;
+  border-top: 1px solid var(--separator);
+}
+.pop-xfer { padding: 5px 6px; }
+.pop-xfer-line { display: flex; align-items: center; gap: 9px; }
+.pop-xfer-icon {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+}
+.pop-xfer-icon > svg { width: 15px; height: 15px; }
+.pop-xfer-text { flex: 1; min-width: 0; }
+.pop-xfer-name { display: flex; align-items: baseline; gap: 4px; min-width: 0; font-size: var(--text-12); font-weight: 500; line-height: 1.3; }
+.pop-xfer-more { flex-shrink: 0; color: var(--text-muted); font-weight: 400; }
+.pop-xfer-sub { font-size: var(--text-11); color: var(--text-muted); line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pop-xfer-bar { margin: 5px 0 1px 35px; }
+.pop-xfer-code {
+  display: block;
+  margin: 4px 0 0 35px;
+  font-family: var(--font-mono);
+  font-size: var(--text-11);
+  color: var(--text-muted);
+  word-break: break-all;
+  line-height: 1.4;
+}
+.pop-xfer-qr { display: grid; place-items: center; padding: 8px 0 4px; }
+
+/* Receive-with-a-code field, just above the footer */
+.pop-receive {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 10px 0;
+  border-top: 1px solid var(--separator);
+  flex-shrink: 0;
+}
+.pop-receive > .input { flex: 1; min-width: 0; height: 26px; }
+.pop-receive-go:not(:disabled) { color: var(--accent-text); }
+
+.pop-foot {
+  display: flex;
+  gap: 8px;
+  padding: 10px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--separator);
+}
+.pop-receive + .pop-foot { border-top: none; }
+.pop-foot > .btn { flex: 1; min-width: 0; }
+.pop-foot > .btn[aria-expanded='true'] { background: var(--surface-active); }
+
+/* ---- Folder-sync HUD (384×132 window, pill in the top-right) ---- */
+.hud-root {
+  height: 100%;
+  display: grid;
+  place-items: start end;
+  /* Transparent margin so the pill's shadow fades inside the window. */
+  padding: 8px 16px 30px;
+  box-sizing: border-box;
+}
+.hud-pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 300px;
+  box-sizing: border-box;
+  padding: 8px 8px 8px 10px;
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 0 0 0.5px var(--border-strong), 0 6px 18px rgba(0, 0, 0, 0.18);
+  cursor: default;
+  text-align: left;
+}
+.dark .hud-pill {
+  background: #2c2c2f;
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.14), 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+.hud-ring {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  color: var(--accent-text);
+}
+.hud-ring > svg { position: absolute; inset: 0; }
+.hud-ring > svg:last-child { position: static; width: 13px; height: 13px; stroke-width: 2.25; }
+.hud-ring-track { fill: none; stroke: var(--surface-3); stroke-width: 2.5; }
+.hud-ring-fill {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.3s var(--ease-out);
+}
+.hud-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.hud-title,
+.hud-sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hud-title { font-size: var(--text-13); font-weight: 600; line-height: 1.3; }
+.hud-sub { font-size: var(--text-11); color: var(--text-muted); line-height: 1.3; }
+.hud-pct {
+  flex-shrink: 0;
+  min-width: 34px;
+  text-align: right;
+  font-size: var(--text-12);
+  font-weight: 500;
+  color: var(--text-muted);
+}
+.hud-x { flex-shrink: 0; color: var(--text-faint); }
+
+/* ---- Floating transfer card (190×184 `receive` window) ----
+   A normal macOS window (titleBarStyle Overlay): the OS draws the corners,
+   shadow and traffic lights, so the card fills it edge to edge. Every state is
+   one fixed stack that fits 184px exactly:
+   28 traffic-light strip · 56 art · 8 · 16 name · 16 from · 12 · 28 slot · 20 */
+.rc-root {
+  position: relative;
+  height: 100vh;
+  background: var(--surface);
+  color: var(--text);
+  overflow: hidden;
+}
+.dark .rc-root { background: #2c2c2f; }
+/* Absolutely stacked, so a card fading out and the next fading in overlap
+   instead of splitting the window in two. */
+.rc-card {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 12px;
+}
+.rc-top { height: 28px; flex-shrink: 0; align-self: stretch; }
+
+/* File tile with the sender's avatar tucked into its corner — never over the name. */
+.rc-art {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  flex-shrink: 0;
+}
+.rc-file {
+  position: absolute;
+  left: 6px;
+  top: 0;
+  width: 42px;
+  height: 50px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 0.5px var(--border);
+  color: var(--text-muted);
+}
+.dark .rc-file { background: var(--surface-3); }
+.rc-avatar {
+  position: absolute;
+  right: 2px;
+  bottom: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: #8e8e93;
+  color: #fff;
+  font-size: var(--text-11);
+  font-weight: 600;
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.dark .rc-avatar { box-shadow: 0 0 0 2px #2c2c2f; }
+.rc-avatar.done { background: var(--green-dot); }
+
+.rc-name {
+  display: flex;
+  justify-content: center;
+  align-items: baseline;
+  gap: 4px;
+  align-self: stretch;
+  min-width: 0;
+  height: 16px;
+  margin-top: 8px;
+  font-size: var(--text-12);
+  font-weight: 600;
+  line-height: 16px;
+}
+.rc-name-text { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rc-name-more { flex-shrink: 0; font-weight: 400; color: var(--text-muted); }
+.rc-from {
+  align-self: stretch;
+  height: 16px;
+  font-size: var(--text-11);
+  line-height: 16px;
+  color: var(--text-muted);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The bottom slot is the same height in every state: no jump from offer →
+   progress → sent. */
+.rc-slot {
+  align-self: stretch;
+  height: 28px;
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+}
+.rc-actions { display: flex; gap: 8px; width: 100%; }
+.rc-actions > .btn { flex: 1; min-width: 0; }
+.rc-accept { flex: 1; display: flex; min-width: 0; gap: 1px; }
+.rc-accept > .btn:first-child { flex: 1; min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.rc-caret { width: 20px; padding: 0; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+.rc-done { width: 100%; }
+.rc-progress { width: 100%; display: flex; flex-direction: column; gap: 6px; }
+.rc-meter {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--text-11);
+  line-height: 14px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* The "Save to" menu has to fit inside the small window. */
+html.window-receive .menu { min-width: 0; width: 166px; padding: 4px; }
+html.window-receive .menu-item { height: 22px; font-size: var(--text-12); }
+html.window-receive .menu-label { padding: 2px 8px; }

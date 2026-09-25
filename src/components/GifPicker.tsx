@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Search, X } from 'lucide-react'
 import { type GifResult, searchGifs, trendingGifs } from '../lib/gif'
+import { IconButton } from './ui'
 
 /** A composer popover: search box + a grid of trending/searched GIFs. Click one
  *  to send it. Lightweight — debounced search, lazy-loaded animated thumbnails,
@@ -61,7 +62,7 @@ export function GifPicker({
   }, [query, apiKey, hasKey])
 
   return (
-    <div className="gif-picker" onMouseDown={(e) => e.stopPropagation()}>
+    <div className="gif-picker" role="dialog" aria-label="GIFs" onMouseDown={(e) => e.stopPropagation()}>
       <div className="gif-picker-head">
         <Search size={14} className="gif-picker-search-ic" />
         <input
@@ -69,35 +70,33 @@ export function GifPicker({
           className="gif-picker-input"
           value={query}
           placeholder="Search GIFs"
+          aria-label="Search GIFs"
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Escape') onClose()
           }}
         />
-        <button className="gif-picker-close" onClick={onClose} title="Close">
-          <X size={15} />
-        </button>
+        <IconButton size="sm" label="Close" tooltip="Close (Esc)" onClick={onClose}>
+          <X />
+        </IconButton>
       </div>
       <div className="gif-picker-grid">
         {!hasKey && (
           <div className="gif-picker-note">
-            <div style={{ marginBottom: 8 }}>GIFs need a free Giphy key.</div>
-            <button className="btn btn-primary" onClick={onSetup}>
-              Set it up
+            <div>GIFs need a free Giphy key.</div>
+            <button className="btn btn-secondary btn-sm" style={{ marginTop: 8 }} onClick={onSetup}>
+              Open Settings
             </button>
-            <div style={{ marginTop: 8, fontSize: 'calc(11px * var(--ui-font-scale, 1))', opacity: 0.7 }}>
-              Grab one at developers.giphy.com → paste it in Settings.
-            </div>
           </div>
         )}
         {hasKey && loading && <div className="gif-picker-note">Loading…</div>}
         {hasKey && error && (
           <div className="gif-picker-note">
-            Couldn’t load GIFs — check your Giphy key in Settings.
+            Couldn’t load GIFs. Check your Giphy key in Settings.
           </div>
         )}
         {hasKey && !loading && !error && results.length === 0 && (
-          <div className="gif-picker-note">No GIFs found.</div>
+          <div className="gif-picker-note">No results</div>
         )}
         {hasKey &&
           !loading &&

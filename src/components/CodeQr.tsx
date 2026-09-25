@@ -9,7 +9,7 @@
 import { useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { QRCodeSVG } from 'qrcode.react'
-import { Check, Copy, Maximize2, QrCode, Smartphone, X } from 'lucide-react'
+import { Check, Copy, Maximize2, QrCode } from 'lucide-react'
 import { CODE_LABEL, parseCode, qrSpec, wrongCodeMessage, type CodeKind, type ParsedCode } from '../lib/codes'
 import { QrScanner } from './QrScanner'
 import { useEscape } from './Dialog'
@@ -41,7 +41,7 @@ export function QrCodeView({ value, size: base = 200, hint = QR_HINT, label, enl
           <span className="qr-code-zoom" aria-hidden="true"><Maximize2 size={12} /></span>
         </button>
       ) : <div className="qr-code-tile">{svg}</div>}
-      {hint && <figcaption className="qr-code-hint"><Smartphone size={13} />{hint}</figcaption>}
+      {hint && <figcaption className="qr-code-hint">{hint}</figcaption>}
       {big && <QrEnlarged value={value} level={level} name={name} onClose={() => setBig(false)} />}
     </figure>
   )
@@ -54,7 +54,7 @@ function QrEnlarged({ value, level, name, onClose }: { value: string; level: 'L'
       <div className="qr-enlarged" role="dialog" aria-modal="true" aria-label={name} onClick={(e) => e.stopPropagation()}>
         <div className="qr-enlarged-tile"><QRCodeSVG value={value} size={480} level={level} marginSize={3} fgColor={FG} bgColor={BG} title={name} /></div>
         <p>{QR_HINT}</p>
-        <button className="btn btn-ghost" autoFocus onClick={onClose}><X size={15} />Done</button>
+        <button className="btn btn-secondary" autoFocus onClick={onClose}>Done</button>
       </div>
     </div>,
     document.body,
@@ -63,8 +63,10 @@ function QrEnlarged({ value, level, name, onClose }: { value: string; level: 'L'
 
 /** QR + text code + Copy. `layout="row"` puts the QR beside the text (wide
  *  cards); "stack" puts it on top (dialogs, narrow panes). */
-export function ShareCode({ code, instructions, footer, layout = 'row', size = 200, copyLabel = 'Copy code', hint = QR_HINT }: {
+export function ShareCode({ code, instructions, footer, layout = 'row', size = 200, copyLabel = 'Copy code', hint = QR_HINT, copyVariant = 'primary' }: {
   code: string
+  /** 'secondary' when the surrounding dialog already has its own primary button. */
+  copyVariant?: 'primary' | 'secondary'
   instructions?: ReactNode
   footer?: ReactNode
   layout?: 'row' | 'stack'
@@ -80,7 +82,7 @@ export function ShareCode({ code, instructions, footer, layout = 'row', size = 2
       setCopied(true)
       setTimeout(() => setCopied(false), 1600)
     } catch {
-      toast('error', 'Could not copy — select the code and copy it instead.')
+      toast('error', 'Couldn’t copy — select the code and copy it instead.')
     }
   }
   return (
@@ -89,7 +91,7 @@ export function ShareCode({ code, instructions, footer, layout = 'row', size = 2
       <div className="share-code-side">
         {instructions && <div className="share-code-instructions">{instructions}</div>}
         <code className="share-code-text selectable" aria-label="Code">{code}</code>
-        <button type="button" className={`btn ${copied ? 'btn-ghost' : 'btn-primary'}`} onClick={copy}>
+        <button type="button" className={`btn ${copyVariant === 'secondary' ? 'btn-secondary' : 'btn-primary'} share-code-copy`} onClick={copy}>
           {copied ? <Check size={15} /> : <Copy size={15} />}
           {copied ? 'Copied' : copyLabel}
         </button>

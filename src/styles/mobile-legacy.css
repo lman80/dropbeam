@@ -1,0 +1,238 @@
+/* Abandoned web phone UI (html.mobile) — kept verbatim, never shown on desktop. */
+/* ===========================================================================
+   iOS / phone layout
+   ---------------------------------------------------------------------------
+   EVERY rule below is scoped under `html.mobile`, a class set once in main.tsx
+   from lib/platform.ts. Nothing here can affect a desktop window: on desktop
+   the class is never present, so the cascade is byte-identical to before.
+   =========================================================================== */
+
+/* --- Baseline touch behaviour --- */
+html.mobile {
+  background: var(--bg-grad-1);
+  color-scheme: light;
+}
+html.mobile.dark {
+  color-scheme: dark;
+}
+html.mobile body,
+html.mobile #root {
+  background-color: var(--bg-grad-1);
+}
+html.mobile,
+html.mobile body {
+  /* No rubber-banding the whole app; individual scroll areas still bounce. */
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}
+html.mobile * {
+  /* Kill the grey flash on tap and the long-press "copy/share" bubble. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+html.mobile input,
+html.mobile textarea,
+html.mobile .selectable {
+  -webkit-touch-callout: default;
+}
+html.mobile .scroll-area {
+  -webkit-overflow-scrolling: touch;
+  /* An always-visible 9px scrollbar gutter looks broken on a phone. */
+  scrollbar-width: none;
+}
+html.mobile .scroll-area::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+/* Landscape / Dynamic Island: keep content out of the rounded corners. */
+html.mobile .scroll-area {
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+/* --- Touch-sized controls (Apple's 44pt minimum) --- */
+html.mobile .btn {
+  padding: 0.7rem 1.05rem;
+  font-size: 0.9375rem;
+  min-height: 44px;
+  border-radius: 0.85rem;
+}
+html.mobile .btn:active {
+  /* No hover on a touch screen, so the press itself has to read. */
+  filter: brightness(0.94);
+}
+html.mobile .icon-btn {
+  width: 44px;
+  height: 44px;
+}
+html.mobile .input {
+  min-height: 44px;
+}
+/* 16px is the threshold below which iOS auto-zooms the page on focus. */
+html.mobile input,
+html.mobile textarea,
+html.mobile select {
+  font-size: 16px;
+}
+html.mobile .toggle {
+  transform: scale(1.15);
+  transform-origin: right center;
+}
+html.mobile .seg button {
+  min-height: 40px;
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+/* --- Bottom tab bar (replaces the desktop sidebar) --- */
+html.mobile .tabbar {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-around;
+  flex-shrink: 0;
+  gap: 2px;
+  padding: 6px 4px 0;
+  padding-bottom: max(6px, env(safe-area-inset-bottom));
+  padding-left: max(4px, env(safe-area-inset-left));
+  padding-right: max(4px, env(safe-area-inset-right));
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+}
+html.mobile .tabbar-item {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 3px;
+  padding: 5px 2px 7px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: 12px;
+  transition: color 0.14s;
+}
+html.mobile .tabbar-item.active {
+  color: var(--accent);
+}
+html.mobile .tabbar-item:active {
+  background: var(--surface-hover);
+}
+html.mobile .tabbar-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  height: 24px;
+}
+html.mobile .tabbar-label {
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  white-space: nowrap;
+}
+html.mobile .tabbar-badge {
+  position: absolute;
+  top: -5px;
+  left: 11px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+html.mobile .gif-picker {
+  max-width: calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right));
+  max-height: calc(100dvh - 160px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+}
+html.mobile div.sync-file { cursor: default; }
+
+/* Mobile Chat is a stack: activeChatId is also the notification/Friends route. */
+html.mobile .chat-header > div { overflow-wrap: anywhere; }
+html.mobile .chat-header .icon-btn,
+html.mobile .chat-composer .icon-btn { flex-shrink: 0; }
+html.mobile .chat-staged { max-height: 120px; overflow-y: auto; flex-shrink: 0; }
+html.mobile .chat-searchbar { flex-shrink: 0; }
+html.mobile .chat-searchbar input { min-width: 0; }
+html.mobile .emoji-pop { left: 8px; max-width: calc(100% - 16px); max-height: 35dvh; overflow-y: auto; }
+html.mobile .chat-line-body { min-width: 0; }
+html.mobile .chat-fileblock,
+html.mobile .chat-media,
+html.mobile .chat-audio,
+html.mobile .chat-img { max-width: 100%; }
+
+/* Shared narrow-screen sizing: wrap actions and let flex content shrink. */
+html.mobile main .card,
+html.mobile main .card div,
+html.mobile main form { min-width: 0 !important; overflow-wrap: anywhere; }
+html.mobile main :is(.card, form) :is(input, textarea, select) { min-width: 0; max-width: 100%; }
+html.mobile main :is(.card, form) div:has(> .btn),
+html.mobile main .card div:has(> .icon-btn),
+html.mobile main form:has(> .btn) { flex-wrap: wrap; }
+html.mobile main .btn { max-width: 100%; white-space: normal; }
+html.mobile main .icon-btn,
+html.mobile main .toggle { flex-shrink: 0; }
+html.mobile main form > .input { flex: 1 1 100%; }
+html.mobile main .card svg { flex-shrink: 0; }
+html.mobile main .card svg[role="img"] { max-width: 100%; height: auto; }
+
+/* The keyboard changes the visual viewport, not the document's scroll position.
+   The flex shell gives remaining height to the thread and keeps its composer
+   and navigation inside the visible bottom edge. */
+html.mobile,
+html.mobile body { overflow: hidden; }
+html.mobile body { position: fixed; inset: 0; }
+html.mobile #root {
+  position: absolute;
+  top: var(--mobile-viewport-top, 0px);
+  width: 100%;
+  height: var(--mobile-viewport-height, 100%);
+  min-height: 0;
+  overflow: hidden;
+}
+html.mobile .chat-thread { overscroll-behavior: contain; }
+html.mobile .chat-input { font-size: 16px; }
+
+
+/* Legacy mobile controls; Slice A typography lives in mobile.css. */
+html.mobile { font-size: 17px; --ui-font-scale: 1; }
+html.mobile body { font-size: 1rem; }
+html.mobile button { min-width: 44px; min-height: 44px; }
+html.mobile .btn { font-size: 1rem !important; padding: 12px 18px !important; }
+html.mobile .icon-btn { width: 44px !important; height: 44px !important; }
+html.mobile :is(input, textarea, select) { font-size: 17px !important; min-height: 44px; }
+html.mobile .seg button { min-height: 44px; }
+html.mobile .toggle { width: 51px; height: 44px; transform: none; background: transparent; }
+html.mobile .toggle::before { content: ''; position: absolute; inset: 6px 0; border-radius: 99px; background: var(--border-strong); }
+html.mobile .toggle.on::before { background: var(--accent); }
+html.mobile .toggle::after { width: 26px; height: 26px; top: 9px; }
+html.mobile .toggle.on::after { transform: translateX(19px); }
+html.mobile :is(.friend-avatar, .chooser-avatar) { min-width: 48px; width: 48px; height: 48px; }
+html.mobile .chooser-row { padding: 14px 12px; }
+html.mobile .tabbar-label { font-size: 12px; }
+html.mobile .emoji-pop { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+html.mobile .emoji-cell { padding: 5px 0; }
+
+html.mobile button { flex-shrink: 0; }
+/* Transient bottom chrome must not sit between the composer and keyboard. */
+html.mobile.keyboard-visible :is(.app-toasts, [data-mobile-bottom-bar]) { display: none !important; }
+html.mobile .app-toasts { left: 16px; right: 16px !important; bottom: calc(80px + env(safe-area-inset-bottom)) !important; max-width: none !important; }
+html.mobile .dialog-overlay { top: var(--mobile-viewport-top, 0px); height: var(--mobile-viewport-height, 100dvh); }
+
+html.mobile .mobile-file-sheet { position: fixed; inset: auto 0 0; margin: 0; width: 100%; max-width: none; max-height: 90dvh; padding: 0; border: 0; border-radius: 24px 24px 0 0; background: var(--surface); color: var(--text); }
+html.mobile .mobile-file-sheet::backdrop { background: rgb(0 0 0 / 45%); }
+html.mobile .mobile-file-sheet-body { display: flex; flex-direction: column; gap: 12px; padding: 24px 20px max(24px, env(safe-area-inset-bottom)); }
+html.mobile .mobile-file-sheet h2 { font-size: 20px; margin: 0 0 8px; }
+html.mobile .mobile-file-sheet .btn { justify-content: flex-start; flex-wrap: wrap; }
+html.mobile .mobile-file-sheet .btn span { flex-basis: 100%; text-align: left; color: var(--text-muted); font-size: 15px; }
+html.mobile button > svg { flex-shrink: 0; }

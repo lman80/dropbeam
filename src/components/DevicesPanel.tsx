@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useState } from 'react'
-import { MoreHorizontal, Plus, QrCode, RefreshCw } from 'lucide-react'
+import { createElement, useEffect, useMemo, useState } from 'react'
+import { AnimatePresence } from 'framer-motion'
+import { Plus, QrCode } from 'lucide-react'
 import { api, type AccountDevice } from '../lib/api'
 import { deviceIcon, deviceNoun, ownDeviceLabels } from '../lib/deviceIcons'
 import { friendOnlineState } from '../lib/presence'
 import { useStore } from '../store'
 import { LinkFlow } from './LinkDeviceModal'
+import { ConfirmDialog } from './SafetyDialogs'
+import { MenuButton } from './ui'
 
 export { linkWithCode, isDeviceCode } from './LinkDeviceModal'
 
@@ -16,9 +19,16 @@ function ago(ms: number) {
   return new Date(ms).toLocaleDateString()
 }
 
-function DeviceGlyph({ d, size = 20 }: { d: Pick<AccountDevice, 'device_kind' | 'device_os'>; size?: number }) {
-  const Icon = deviceIcon(d.device_os === 'macos' && d.device_kind !== 'desktop' ? 'laptop' : d.device_kind ?? undefined)
-  return <span className="account-device-glyph"><Icon size={size} strokeWidth={1.7} aria-hidden /></span>
+/** Device glyph in a neutral disc (a tiny green dot when that device is online). */
+function DeviceGlyph({ d, online }: { d: Pick<AccountDevice, 'device_kind' | 'device_os'>; online?: boolean }) {
+  const kind = d.device_os === 'macos' && d.device_kind !== 'desktop' ? 'laptop' : d.device_kind ?? undefined
+  return <span className="account-device-glyph" aria-hidden>
+    <DeviceIcon kind={kind} />
+    {online && <span className="account-device-dot" />}
+  </span>
+}
+function DeviceIcon({ kind }: { kind?: string }) {
+  return createElement(deviceIcon(kind), { size: 16, strokeWidth: 1.7 })
 }
 
 /** Settings → Devices on desktop: every device in this account, kept in sync peer to peer. */
@@ -27,9 +37,8 @@ export function DevicesPanel() {
   const friends = useStore(s => s.friends)
   const friendSeen = useStore(s => s.friendSeen)
   const folderStatuses = useStore(s => s.folderStatuses)
-  const displayName = useStore(s => s.settings?.displayName ?? '')
   const [mode, setMode] = useState<null | 'show' | 'scan'>(null)
-  const [menu, setMenu] = useState<string | null>(null)
+  const [confirm, setConfirm] = useState<null | { kind: 'remove'; device: AccountDevice } | { kind: 'leave' }>(null)
   const [syncing, setSyncing] = useState(false)
   const devices = useMemo(() => myDevice?.devices ?? [], [myDevice])
   const inAccount = !!myDevice?.account_pub && devices.length > 1
@@ -39,65 +48,78 @@ export function DevicesPanel() {
   const labels = useMemo(() => ownDeviceLabels(devices.filter(d => !d.this_device)
     .map(d => ({ id: d.endpoint_id, name: d.name, deviceKind: d.device_kind, deviceOs: d.device_os }))), [devices])
   useEffect(() => { void useStore.getState().refreshMyDevice().catch(() => {}) }, [])
-  useEffect(() => {
-    if (!menu) return
-    const close = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenu(null) }
-    window.addEventListener('keydown', close)
-    return () => window.removeEventListener('keydown', close)
-  }, [menu])
   const online = (d: AccountDevice) => { const f = friends.find(x => x.id === d.friend_id); return f ? friendOnlineState(f.name, friendSeen, folderStatuses) === true : false }
   const syncNow = async () => {
     setSyncing(true)
     try { await api.accountSyncNow(); await new Promise(r => setTimeout(r, 2500)); await useStore.getState().refreshMyDevice() } finally { setSyncing(false) }
   }
   const remove = async (d: AccountDevice) => {
-    setMenu(null)
     const label = labels[d.endpoint_id] ?? d.name
-    if (!window.confirm(`Remove ${label} from your account?\n\nIt stops getting your friends and chats, and it’s told the next time it’s online. You can link it again later.`)) return
     try { await api.accountRemoveDevice(d.endpoint_id); useStore.getState().toast('success', `${label} was removed from your account`); await useStore.getState().reloadFriends() }
     catch (e) { useStore.getState().toast('error', String(e)) }
   }
   const leave = async () => {
-    if (!window.confirm(`Remove this ${myNoun} from your account?\n\nYour friends and chats stay on this ${myNoun}, but stop syncing with your other devices. Devices that are offline are told the next time they see this one.`)) return
     try { await api.accountLeave(); useStore.getState().toast('success', `This ${myNoun} left your account`); await useStore.getState().reloadFriends() }
     catch (e) { useStore.getState().toast('error', String(e)) }
   }
-  return <section className="card account-devices" style={{ padding: 18, marginBottom: 16 }}>
-    <div className="account-devices-head">
-      <div>
-        <h2>Devices</h2>
-        <p className="account-devices-sub">Your friends, chats, name and photo sync directly between your devices — end-to-end encrypted, no cloud.</p>
-      </div>
-      {inAccount && <button className="btn btn-ghost" disabled={syncing} onClick={() => void syncNow()}><RefreshCw size={14} className={syncing ? 'spin' : ''} />{syncing ? 'Syncing…' : 'Sync now'}</button>}
+  const thisTitle = `This ${myNoun}`
+  return <section className="account-devices">
+    <div className="section-row">
+      <h2 className="section-title">Devices</h2>
+      {inAccount && <button className="btn btn-plain btn-sm account-sync" disabled={syncing} onClick={() => void syncNow()}>{syncing ? 'Syncing…' : 'Sync now'}</button>}
     </div>
-    {inAccount ? <>
-      <ul className="account-device-list">
-        {devices.map(d => {
-          const title = d.this_device ? `This ${deviceNoun(d.device_kind, d.device_os)}` : labels[d.endpoint_id] ?? `Your ${deviceNoun(d.device_kind, d.device_os)}`
-          const sub = d.this_device ? d.name : [d.name, online(d) ? 'Online' : 'Offline', d.last_sync_ms ? `Synced ${ago(d.last_sync_ms)}` : 'Not synced yet'].filter(Boolean).join(' · ')
-          return <li key={d.endpoint_id} className="account-device">
-            <DeviceGlyph d={d} />
-            <span className="account-device-text"><strong>{title}</strong><span>{sub}</span></span>
-            {!d.this_device && <span className="account-device-menu">
-              <button className="icon-btn" aria-label={`Options for ${title}`} aria-expanded={menu === d.endpoint_id} onClick={() => setMenu(menu === d.endpoint_id ? null : d.endpoint_id)}><MoreHorizontal size={16} /></button>
-              {menu === d.endpoint_id && <div className="account-device-popover" role="menu"><button role="menuitem" className="danger" onClick={() => void remove(d)}>Remove from account</button></div>}
-            </span>}
-          </li>
-        })}
-      </ul>
-      {displayName && <p className="account-devices-profile">Friends see you as <strong>{displayName}</strong> on every device. Change your name or photo on any of them and the others follow.</p>}
-      <div className="device-link-actions">
-        <button className="btn btn-primary" onClick={() => setMode('show')}><Plus size={14} />Link a device</button>
-        <button className="btn btn-ghost danger-text" onClick={() => void leave()}>Remove this {myNoun} from account</button>
-      </div>
-    </> : <div className="account-devices-empty">
-      <p><strong>Use DropBeam on your phone or another computer?</strong> Link them and each one gets your friends and chats right away — then everything stays in sync.</p>
-      <div className="device-link-actions">
-        <button className="btn btn-primary" onClick={() => setMode('show')}><Plus size={14} />Link a device</button>
-        <button className="btn btn-ghost" onClick={() => setMode('scan')}><QrCode size={14} />Scan the other device’s code</button>
-      </div>
-    </div>}
+    <div className="group account-device-list">
+      {inAccount ? devices.map(d => {
+        const title = d.this_device ? thisTitle : labels[d.endpoint_id] ?? `Your ${deviceNoun(d.device_kind, d.device_os)}`
+        const on = !d.this_device && online(d)
+        const sub = d.this_device ? d.name : [on ? 'Online' : 'Offline', d.last_sync_ms ? `Synced ${ago(d.last_sync_ms)}` : 'Not synced yet'].join(' · ')
+        return <div key={d.endpoint_id} className="row">
+          <DeviceGlyph d={d} online={on} />
+          <div className="row-main">
+            <div className="row-title truncate-1" title={d.name}>{title}</div>
+            <div className="row-sub truncate-1">{sub}</div>
+          </div>
+          <div className="row-trailing">
+            <MenuButton
+              label={`Options for ${title}`}
+              items={d.this_device
+                ? [{ label: `Remove this ${myNoun} from account…`, danger: true, onSelect: () => setConfirm({ kind: 'leave' }) }]
+                : [{ label: 'Remove from account…', danger: true, onSelect: () => setConfirm({ kind: 'remove', device: d }) }]}
+            />
+          </div>
+        </div>
+      }) : me && <div className="row">
+        <DeviceGlyph d={me} />
+        <div className="row-main">
+          <div className="row-title">{thisTitle}</div>
+          <div className="row-sub truncate-1">{me.name}</div>
+        </div>
+      </div>}
+      <button className="row account-device-add" onClick={() => setMode('show')}>
+        <span className="account-device-glyph" aria-hidden><Plus size={16} /></span>
+        <span className="row-main">
+          <span className="row-title">Link a device…</span>
+          {!inAccount && <span className="row-sub">Get your friends and chats on your phone or another computer</span>}
+        </span>
+      </button>
+      {!inAccount && <button className="row account-device-add" onClick={() => setMode('scan')}>
+        <span className="account-device-glyph" aria-hidden><QrCode size={16} /></span>
+        <span className="row-main"><span className="row-title">Scan another device’s code…</span></span>
+      </button>}
+    </div>
     {mode && <LinkFlow start={mode} title="Link a device" onClose={() => { setMode(null); void useStore.getState().refreshMyDevice().catch(() => {}) }} />}
+    <AnimatePresence>
+      {confirm?.kind === 'remove' && <ConfirmDialog key="remove"
+        title={`Remove ${labels[confirm.device.endpoint_id] ?? confirm.device.name} from your account?`}
+        confirmLabel="Remove" onConfirm={() => remove(confirm.device)} onClose={() => setConfirm(null)}>
+        It stops getting your friends and chats, and is told the next time it’s online. You can link it again later.
+      </ConfirmDialog>}
+      {confirm?.kind === 'leave' && <ConfirmDialog key="leave"
+        title={`Remove this ${myNoun} from your account?`}
+        confirmLabel="Remove" onConfirm={leave} onClose={() => setConfirm(null)}>
+        Your friends and chats stay on this {myNoun} but stop syncing with your other devices.
+      </ConfirmDialog>}
+    </AnimatePresence>
   </section>
 }
 

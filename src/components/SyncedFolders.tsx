@@ -1,44 +1,41 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Dialog } from './Dialog'
-import {
-  AlertTriangle, ArrowRight, Check, Clock, FolderOpen, FolderSync, HardDrive,
-  Pause, Play, Plus, RefreshCw, Trash2, Upload,
-} from 'lucide-react'
+import { Dot, IconButton, MenuButton, SectionHeader, Spinner, type MenuItem } from './ui'
+import { Check, Folder, FolderOpen, HardDrive, Pause, Play, RefreshCw, Trash2 } from 'lucide-react'
 import {
   api, syncedFoldersApi, onSyncedFolderStatus,
   type SharedLocation, type SyncedFolder, type SyncedFolderStatus,
 } from '../lib/api'
 import { formatRelativeTime } from '../lib/format'
-import { destinationLabel, folderName, statusPill, summarySentence } from '../lib/syncedFolders'
+import { IS_MAC } from '../lib/platform'
+import { destinationLabel, folderName, statusPill, type Pill } from '../lib/syncedFolders'
 import { useStore } from '../store'
-import './locations.css'
 
 /** Friends' locations, as the Locations view already has them loaded. */
 export type SharedByFriend = Record<string, SharedLocation[]>
 
-/** Open the "Sync a folder here" sheet from anywhere on the Locations page. */
+/** Open the "Sync a folder" sheet from anywhere on the Locations page. */
 const OPEN_EVENT = 'dropbeam:sync-folder'
+// eslint-disable-next-line react-refresh/only-export-components -- tiny event helper shared with the page header
 export function openSyncFolderSheet() { window.dispatchEvent(new CustomEvent(OPEN_EVENT)) }
 
-/**
- * The button that starts the whole thing, sitting above the friends' location
- * cards so "I want a folder that just goes to the NAS" is one click from the
- * place those folders live.
- */
-export function SyncFolderToolbar() {
-  return <div className="location-sync-cta">
-    <div><strong>Keep a folder on this device copied to one of these</strong>
-      <p className="location-muted">Drop files into a folder here and they turn up there — no dragging, no thinking about it.</p></div>
-    <button className="btn btn-ghost" onClick={openSyncFolderSheet}><FolderSync size={15} /> Sync a folder here</button>
-  </div>
+const DOT: Record<Pill['tone'], 'ok' | 'off' | 'error' | 'busy'> = { ok: 'ok', busy: 'busy', wait: 'off', off: 'off', bad: 'error' }
+
+/** "Up to date · checked 2m ago", "Paused", "Copying 12 files…" — one line of words. */
+function statusWords(folder: SyncedFolder, status: SyncedFolderStatus | undefined, pill: Pill): string {
+  if (pill.tone === 'off') return 'Paused'
+  if (pill.tone === 'busy') return `${pill.label}…`
+  const checked = status?.lastCheckAt || folder.lastCheckAt
+  if (pill.tone === 'ok' && checked) return `${pill.label} · checked ${formatRelativeTime(checked).replace(/^Just now$/, 'just now')}`
+  return pill.label
 }
 
 // ── The section ──────────────────────────────────────────────────────────────
 
 /**
- * "Synced to a location": the folders on THIS device that keep a friend's
- * location up to date. One way, on purpose — this is "my Mac feeds the NAS",
- * not a two-way mirror.
+ * "Synced folders": the folders on THIS device that keep a friend's location
+ * up to date. One way, on purpose — this is "my Mac feeds the NAS", not a
+ * two-way mirror. One row per folder; everything but pause lives in its menu.
  */
 export function SyncedFolders({ shared }: { shared: SharedByFriend }) {
   const friends = useStore(s => s.friends)
@@ -46,7 +43,7 @@ export function SyncedFolders({ shared }: { shared: SharedByFriend }) {
   const [folders, setFolders] = useState<SyncedFolder[]>([])
   const [statuses, setStatuses] = useState<Record<string, SyncedFolderStatus>>({})
   const [sheet, setSheet] = useState(false)
-  const [confirmRemove, setConfirmRemove] = useState('')
+  const [confirmRemove, setConfirmRemove] = useState<SyncedFolder | null>(null)
   const [busy, setBusy] = useState('')
 
   const reload = useCallback(async () => {
@@ -78,85 +75,87 @@ export function SyncedFolders({ shared }: { shared: SharedByFriend }) {
     const location = shared[folder.friendId]?.find(l => l.id === folder.locationId)
     // The location's own name is only known while its host is reachable; until
     // then say whose folder it is rather than something anonymous.
-    const name = location?.name || (friend ? `${friend.name}’s folder` : 'that folder')
-    return { friend: friend?.name || 'a device you removed', location: name, label: destinationLabel(name, folder.relPath) }
+    const name = location?.name || (friend ? `${friend.name}’s folder` : 'a removed device')
+    return { location: name, label: destinationLabel(name, folder.relPath) }
   }
 
-  if (!folders.length && !sheet) return null
-  return <section className="location-synced" aria-label="Folders synced to a location">
-    <div className="location-heading"><div><h2><FolderSync size={17} /> Synced to a location</h2>
-      <p>Folders on this device that copy themselves to a friend’s folder. Anything you put in one turns up there.</p></div>
-      <button className="btn btn-ghost" onClick={() => setSheet(true)}><Plus size={15} /> Sync a folder</button></div>
-
-    <div className="location-grid">{folders.map(folder => {
-      const status = statuses[folder.id]
-      const pill = statusPill(folder, status)
-      const where = place(folder)
-      const checked = status?.lastCheckAt || folder.lastCheckAt
-      return <div className="card location-tile location-synced-tile" key={folder.id}>
-        <div className="location-tile-top"><span className="location-drive-icon"><FolderSync size={22} /></span>
-          <span className={`location-pill ${pill.tone}`}>
-            {pill.tone === 'ok' && <Check size={11} />}
-            {pill.tone === 'busy' && <Upload size={11} />}
-            {pill.tone === 'wait' && <Clock size={11} />}
-            {pill.tone === 'bad' && <AlertTriangle size={11} />}
-            {pill.tone === 'off' && <Pause size={11} />}
-            {pill.label}</span></div>
-        <h2>{folderName(folder.localPath)}</h2>
-        <div className="location-route"><span title={folder.localPath}>This device</span><ArrowRight size={13} />
-          <span title={where.label}><HardDrive size={12} /> {where.label}</span></div>
-        <p className="location-path" title={folder.localPath}>{folder.localPath}</p>
-        <small className="location-muted location-last">{checked
-          ? <>Last checked {formatRelativeTime(checked)}</>
-          : <>Not checked yet</>}{folder.deleteRemote
-            ? ' · deletes are copied over too'
-            : ` · files you delete here stay on ${where.location}`}</small>
-        <div className="location-tile-actions">
-          <button className="btn btn-ghost" disabled={busy === folder.id || !folder.enabled}
-            onClick={() => void act(folder.id, () => syncedFoldersApi.syncNow(folder.id))}>
-            <RefreshCw size={14} className={status?.state === 'scanning' || status?.state === 'uploading' ? 'location-spin' : ''} /> Sync now</button>
-          <button className="btn btn-ghost" disabled={busy === folder.id}
-            onClick={() => void act(folder.id, () => syncedFoldersApi.update(folder.id, { enabled: !folder.enabled }))}>
-            {folder.enabled ? <><Pause size={14} /> Pause</> : <><Play size={14} /> Resume</>}</button>
-          <button className="btn btn-ghost" onClick={() => { void api.openPath(folder.localPath) }}>
-            <FolderOpen size={14} /> Open folder</button>
-          {confirmRemove === folder.id
-            ? <>
-              <button className="btn btn-danger" disabled={busy === folder.id}
-                onClick={() => { setConfirmRemove(''); void act(folder.id, () => syncedFoldersApi.remove(folder.id)) }}>
-                Stop copying</button>
-              <button className="btn btn-ghost" onClick={() => setConfirmRemove('')}>Keep it</button>
-            </>
-            : <button className="btn btn-ghost" onClick={() => setConfirmRemove(folder.id)}><Trash2 size={14} /> Remove</button>}
+  const removing = confirmRemove ? place(confirmRemove) : null
+  return <>
+    {folders.length > 0 && <section className="location-section" aria-label="Synced folders">
+      <SectionHeader>Synced folders</SectionHeader>
+      <div className="group">{folders.map(folder => {
+        const status = statuses[folder.id]
+        const pill = statusPill(folder, status)
+        const where = place(folder)
+        const words = statusWords(folder, status, pill)
+        const working = busy === folder.id
+        const items: MenuItem[] = [
+          { label: 'Sync now', icon: <RefreshCw />, disabled: working || !folder.enabled, onSelect: () => void act(folder.id, () => syncedFoldersApi.syncNow(folder.id)) },
+          { label: IS_MAC ? 'Open in Finder' : 'Open folder', icon: <FolderOpen />, onSelect: () => { void api.openPath(folder.localPath) } },
+          { separator: true },
+          { heading: 'When you delete a file here' },
+          { label: `Keep the copy on ${where.location}`, icon: folder.deleteRemote ? <span className="location-menu-space" /> : <Check />, disabled: working,
+            onSelect: () => { if (folder.deleteRemote) void act(folder.id, () => syncedFoldersApi.update(folder.id, { deleteRemote: false })) } },
+          { label: 'Move the copy to Trash too', icon: folder.deleteRemote ? <Check /> : <span className="location-menu-space" />, disabled: working,
+            onSelect: () => { if (!folder.deleteRemote) void act(folder.id, () => syncedFoldersApi.update(folder.id, { deleteRemote: true })) } },
+          { separator: true },
+          { label: 'Stop syncing…', icon: <Trash2 />, danger: true, disabled: working, onSelect: () => setConfirmRemove(folder) },
+        ]
+        return <div className="row location-row" key={folder.id}>
+          <span className="location-glyph" aria-hidden><Folder /></span>
+          <div className="row-main">
+            <div className="row-title truncate-1" title={folder.localPath}>{folderName(folder.localPath)}</div>
+            <div className="row-sub truncate-1" title={where.label}>To {where.label}</div>
+          </div>
+          <div className="row-trailing">
+            <span className={`location-status tone-${pill.tone}`} title={words} role="status">
+              {pill.tone === 'busy' ? <Spinner size={10} /> : <Dot tone={DOT[pill.tone]} />}
+              <span className="truncate-1">{words}</span>
+            </span>
+            <IconButton label={folder.enabled ? `Pause ${folderName(folder.localPath)}` : `Resume ${folderName(folder.localPath)}`}
+              tooltip={folder.enabled ? 'Pause' : 'Resume'} disabled={working}
+              onClick={() => void act(folder.id, () => syncedFoldersApi.update(folder.id, { enabled: !folder.enabled }))}>
+              {folder.enabled ? <Pause fill="currentColor" strokeWidth={0} /> : <Play />}
+            </IconButton>
+            <MenuButton label={`More for ${folderName(folder.localPath)}`} items={items} />
+          </div>
         </div>
-        {confirmRemove === folder.id && <p className="location-muted" role="status">
-          Nothing is deleted — the folder stays on this device and the copies stay on {where.location}.</p>}
-      </div>
-    })}</div>
+      })}</div>
+    </section>}
+
+    {confirmRemove && removing && <Dialog title={`Stop syncing “${folderName(confirmRemove.localPath)}”?`} width={380}
+      busy={busy === confirmRemove.id} onClose={() => setConfirmRemove(null)}
+      footer={<>
+        <button className="btn btn-secondary" disabled={busy === confirmRemove.id} onClick={() => setConfirmRemove(null)}>Cancel</button>
+        <button className="btn btn-destructive" disabled={busy === confirmRemove.id}
+          onClick={() => { const f = confirmRemove; void act(f.id, () => syncedFoldersApi.remove(f.id)).then(() => setConfirmRemove(null)) }}>Stop syncing</button>
+      </>}>
+      <p className="dialog-text">Nothing is deleted. The folder stays on this device and the copies stay on {removing.location}.</p>
+    </Dialog>}
 
     {sheet && <SyncSheet shared={shared} onClose={() => setSheet(false)} onDone={() => { setSheet(false); void reload() }} />}
-  </section>
+  </>
 }
 
-// ── The 3-step sheet ─────────────────────────────────────────────────────────
+// ── The sheet ────────────────────────────────────────────────────────────────
 
 type Choice = { friendId: string; locationId: string; name: string }
 
 function SyncSheet({ shared, onClose, onDone }: { shared: SharedByFriend; onClose: () => void; onDone: () => void }) {
   const friends = useStore(s => s.friends)
   const toast = useStore(s => s.toast)
-  const [step, setStep] = useState(1)
   const [localPath, setLocalPath] = useState('')
   const [choice, setChoice] = useState<Choice | null>(null)
   const [relPath, setRelPath] = useState('')
   const [deleteRemote, setDeleteRemote] = useState(false)
-  const [advanced, setAdvanced] = useState(false)
   const [busy, setBusy] = useState(false)
 
   // Only folders a friend actually lets this device add files to.
   const options = useMemo(() => friends.flatMap(f =>
     (shared[f.id] || []).filter(l => l.rights.upload).map(l => ({ friendId: f.id, locationId: l.id, name: l.name, friend: f.name }))
   ), [friends, shared])
+  // One destination? It's the answer — don't make anyone click it.
+  const picked = choice ?? (options.length === 1 ? { friendId: options[0].friendId, locationId: options[0].locationId, name: options[0].name } : null)
 
   const pick = async () => {
     try {
@@ -166,71 +165,61 @@ function SyncSheet({ shared, onClose, onDone }: { shared: SharedByFriend; onClos
       // Default the destination folder to the folder's own name, so the NAS
       // gets "Travel", not a pile of loose files at its top level.
       setRelPath(folderName(dir))
-      setStep(2)
     } catch (e) { toast('error', String(e)) }
   }
 
   const save = async () => {
-    if (!localPath || !choice) return
+    if (!localPath || !picked) return
     setBusy(true)
     try {
-      await syncedFoldersApi.add(choice.friendId, choice.locationId, relPath.trim(), localPath, deleteRemote)
-      toast('success', `“${folderName(localPath)}” will be kept copied to ${choice.name}.`)
+      await syncedFoldersApi.add(picked.friendId, picked.locationId, relPath.trim(), localPath, deleteRemote)
+      toast('success', `“${folderName(localPath)}” will be kept copied to ${picked.name}.`)
       onDone()
     } catch (e) { toast('error', String(e)); setBusy(false) }
   }
 
-  const footer = step === 1
-    ? <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-    : step === 2
-      ? <><button className="btn btn-ghost" onClick={() => setStep(1)}>Back</button>
-        <button className="btn btn-primary" disabled={!choice} onClick={() => setStep(3)}>Next<ArrowRight size={15} /></button></>
-      : <><button className="btn btn-ghost" disabled={busy} onClick={() => setStep(2)}>Back</button>
-        <button className="btn btn-primary" disabled={busy || !choice} onClick={() => void save()}>
-          {busy ? 'Setting it up…' : 'Start syncing'}</button></>
-  return <Dialog title="Sync a folder" subtitle="Keep a folder on this device copied to a friend’s location."
-    icon={<FolderSync size={18} />} width={470} onClose={onClose} busy={busy} className="location-sync-dialog" footer={footer}>
-      <ol className="location-steps">
-        {['Choose the folder', 'Choose where it goes', 'Check it over'].map((label, i) => (
-          <li key={label} className={step === i + 1 ? 'now' : step > i + 1 ? 'done' : ''}>
-            <i>{step > i + 1 ? <Check size={11} /> : i + 1}</i>{label}</li>
-        ))}
-      </ol>
+  const footer = <>
+    <button className="btn btn-secondary" disabled={busy} onClick={onClose}>Cancel</button>
+    <button className="btn btn-primary" disabled={busy || !picked || !localPath} onClick={() => void save()}>
+      {busy ? 'Starting…' : 'Start syncing'}</button>
+  </>
+  return <Dialog title="Sync a folder" width={440} onClose={onClose} busy={busy} className="location-dialog" footer={footer}>
+    <div className="location-form">
+      <div className="location-field">
+        <span className="field-label">Folder on this device</span>
+        <div className="location-choose">
+          {localPath
+            ? <span className="location-choose-name" title={localPath}><Folder /><span className="truncate-1">{folderName(localPath)}</span></span>
+            : <span className="location-choose-name faint">No folder chosen</span>}
+          <button type="button" className="btn btn-secondary" onClick={() => void pick()}>{localPath ? 'Change…' : 'Choose…'}</button>
+        </div>
+      </div>
 
-      {step === 1 && <div className="location-step">
-        <p>Pick a folder on this device. Everything already in it, and everything you add later, gets copied over.</p>
-        <button className="btn btn-primary" onClick={() => void pick()}><FolderOpen size={15} /> Choose a folder…</button>
-        {localPath && <p className="location-path">{localPath}</p>}
-      </div>}
+      <div className="location-field">
+        <span className="field-label" id="sync-dest-label">Copy to</span>
+        {!options.length
+          ? <p className="field-hint">None of your friends’ locations accept files from you yet.</p>
+          : <div className="group location-pick-group" role="radiogroup" aria-labelledby="sync-dest-label">{options.map(o => {
+            const on = picked?.locationId === o.locationId && picked?.friendId === o.friendId
+            return <button key={`${o.friendId}:${o.locationId}`} type="button" role="radio" aria-checked={on}
+              className={`row location-pick${on ? ' on' : ''}`}
+              onClick={() => setChoice({ friendId: o.friendId, locationId: o.locationId, name: o.name })}>
+              <span className="location-glyph" aria-hidden><HardDrive /></span>
+              <span className="row-main"><span className="row-title truncate-1">{o.name}</span><span className="row-sub truncate-1">{o.friend}</span></span>
+              {on && <Check className="location-pick-check" aria-hidden />}
+            </button>
+          })}</div>}
+      </div>
 
-      {step === 2 && <div className="location-step">
-        <p>Where should the copies go?</p>
-        {!options.length && <p className="location-muted">
-          None of your friends’ folders accept files from this device yet. Open one of their locations first, or ask them to allow uploads.</p>}
-        <div className="location-pick-list">{options.map(o => (
-          <button key={`${o.friendId}:${o.locationId}`} type="button"
-            className={`location-pick ${choice?.locationId === o.locationId && choice?.friendId === o.friendId ? 'on' : ''}`}
-            onClick={() => setChoice({ friendId: o.friendId, locationId: o.locationId, name: o.name })}>
-            <HardDrive size={17} /><span><strong>{o.name}</strong><small>{o.friend}</small></span>
-            {choice?.locationId === o.locationId && choice?.friendId === o.friendId && <Check size={15} />}
-          </button>
-        ))}</div>
-        <label className="field-label">Folder to put them in
-          <input className="input" style={{ marginTop: 6 }} value={relPath} onChange={e => setRelPath(e.target.value)} placeholder="Leave empty for the top level" />
-        </label>
-      </div>}
+      <label className="location-field">
+        <span className="field-label">Into folder <span className="optional">(optional)</span></span>
+        <input className="input" value={relPath} onChange={e => setRelPath(e.target.value)} placeholder="Top level" />
+      </label>
 
-      {step === 3 && choice && <div className="location-step">
-        <p className="location-summary">{summarySentence(localPath, choice.name, relPath, deleteRemote)}</p>
-        <p className="location-muted">It checks for new files the moment you add them, and again every half hour just in case.</p>
-        <details open={advanced} onToggle={e => setAdvanced((e.target as HTMLDetailsElement).open)}>
-          <summary>Advanced</summary>
-          <label className="location-check">
-            <input type="checkbox" checked={deleteRemote} onChange={e => setDeleteRemote(e.target.checked)} />
-            <span>Also remove the copy when I delete a file here
-              <small className="location-muted"> — the copy goes to {choice.name}’s trash, where it can still be recovered.</small></span>
-          </label>
-        </details>
-      </div>}
+      <label className="location-check">
+        <input type="checkbox" checked={deleteRemote} onChange={e => setDeleteRemote(e.target.checked)} />
+        <span>When I delete a file here, move its copy to {picked?.name ? `${picked.name}’s` : 'the location’s'} Trash</span>
+      </label>
+    </div>
   </Dialog>
 }

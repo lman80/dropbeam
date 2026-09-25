@@ -9,17 +9,23 @@ export function initials(name: string): string {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
 }
 
-const AVATAR_GRADIENTS = [
-  'linear-gradient(135deg, #6366f1, #a855f7)',
-  'linear-gradient(135deg, #0ea5e9, #22d3ee)',
-  'linear-gradient(135deg, #f97316, #f43f5e)',
-  'linear-gradient(135deg, #10b981, #14b8a6)',
-  'linear-gradient(135deg, #ec4899, #8b5cf6)',
-  'linear-gradient(135deg, #f59e0b, #ef4444)',
+// Flat, slightly muted system tints — one per person, stable across launches.
+const AVATAR_COLORS = [
+  '#6e6ee8', // indigo
+  '#3a9ad9', // blue
+  '#e0764a', // orange
+  '#3aa57a', // green
+  '#c9609a', // pink
+  '#9a6fd6', // purple
+  '#d69a2e', // amber
+  '#5d8a9e', // slate
 ]
 
+/** A stable flat background colour for a person's monogram (name kept for the
+ *  existing call sites — it no longer returns a gradient). */
 export function avatarGradient(id: string): string {
   let h = 0
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0
-  return AVATAR_GRADIENTS[h % AVATAR_GRADIENTS.length]
+  return AVATAR_COLORS[h % AVATAR_COLORS.length]
 }
+export const avatarColor = avatarGradient

@@ -7,6 +7,7 @@ import { useEffect, useId, useRef, type CSSProperties, type ReactNode } from 're
 import { motion } from 'framer-motion'
 import { X } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
+import { IconButton } from './ui'
 
 type Entry = { close: () => void }
 const stack: Entry[] = []
@@ -93,24 +94,24 @@ export function Dialog({
         aria-label={title ? undefined : ariaLabel}
         className={MOBILE_UI ? `dialog mobile-sheet ${className ?? ''}` : `dialog dialog-panel ${className ?? ''}`}
         style={MOBILE_UI ? style : { width, ...style }}
-        initial={MOBILE_UI ? false : { opacity: 0, scale: 0.97, y: 6 }}
-        animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
-        exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.98 }}
-        transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+        initial={MOBILE_UI ? false : { opacity: 0, scale: 0.985 }}
+        animate={MOBILE_UI ? { opacity: 1 } : { opacity: 1, scale: 1 }}
+        exit={MOBILE_UI ? { opacity: 0 } : { opacity: 0, scale: 0.99 }}
+        transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
       >
         {(title || onClose) && (
           <div className="dialog-head">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
-              {icon && <span className="dialog-icon">{icon}</span>}
-              <div style={{ minWidth: 0 }}>
-                {title && <h2 id={titleId} className="dialog-title">{title}</h2>}
-                {subtitle && <p className="dialog-subtitle">{subtitle}</p>}
-              </div>
+            <div style={{ minWidth: 0 }}>
+              {/* Dialogs no longer carry an icon tile; `icon` is accepted for
+                  older call sites and only used on the phone layout. */}
+              {MOBILE_UI && icon && <span className="dialog-icon">{icon}</span>}
+              {title && <h2 id={titleId} className="dialog-title">{title}</h2>}
+              {subtitle && <p className="dialog-subtitle">{subtitle}</p>}
             </div>
             {onClose && (
-              <button type="button" className="icon-btn" aria-label="Close" title="Close (Esc)" disabled={busy} onClick={onClose}>
-                <X size={17} />
-              </button>
+              <IconButton label="Close" tooltip="Close (Esc)" disabled={busy} onClick={onClose}>
+                <X />
+              </IconButton>
             )}
           </div>
         )}

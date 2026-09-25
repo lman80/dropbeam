@@ -1,29 +1,23 @@
 import { MOBILE_UI } from '../lib/platform'
 import { folderName as baseFolderName } from '../lib/syncedFolders'
-import { useState } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
+import { useEffect, useState, type ReactNode } from 'react'
+import { AnimatePresence } from 'framer-motion'
 import { ShareCode } from '../components/CodeQr'
 import {
   AlertCircle,
-  ArrowLeftRight,
-  ArrowRight,
-  Check,
   CheckCircle2,
   Clock,
-  Eye,
+  Folder,
+  FolderCheck,
   FolderOpen,
   FolderSync,
   History,
-  Pause,
-  Pencil,
-  Play,
-  Plus,
   QrCode,
   Settings2,
   Unlink,
+  UserMinus,
   UserPlus,
   WifiOff,
-  X,
 } from 'lucide-react'
 import {
   api,
@@ -33,13 +27,45 @@ import {
   type VerifyResult,
 } from '../lib/api'
 import { useStore } from '../store'
-import { EmptyState, LocalityBadge, ProgressBar, Spinner } from '../components/bits'
 import { formatBytes, formatEta, formatRelativeTime, formatSpeed as formatSpeedValue } from '../lib/format'
+import { baseName } from '../lib/humanize'
 import { PairingModal } from '../components/PairingModal'
 import { Dialog } from '../components/Dialog'
-import { avatarGradient, initials } from '../lib/avatar'
+import { avatarColor, initials } from '../lib/avatar'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { friendOnlineState } from '../lib/presence'
+import { ConnInfo } from '../components/ConnInspector'
+import {
+  Dot,
+  EmptyState,
+  IconButton,
+  MenuButton,
+  ProgressBar,
+  Segmented,
+  SectionHeader,
+  Spinner,
+  Toggle,
+  type MenuItem,
+} from '../components/ui'
+
+// ── Glyphs ────────────────────────────────────────────────────────────────────
+// Filled pause/play (SF "pause.fill"/"play.fill" style): lucide's outlined pause
+// reads as a "columns" icon at 16px.
+function PauseGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden fill="currentColor">
+      <rect x="4" y="3" width="2.75" height="10" rx="0.9" />
+      <rect x="9.25" y="3" width="2.75" height="10" rx="0.9" />
+    </svg>
+  )
+}
+function PlayGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden fill="currentColor">
+      <path d="M5 3.4v9.2c0 .6.66.97 1.17.65l7.2-4.6a.77.77 0 0 0 0-1.3l-7.2-4.6A.77.77 0 0 0 5 3.4Z" />
+    </svg>
+  )
+}
 
 export function FoldersView() {
   const pairs = useStore((s) => s.pairs)
@@ -54,63 +80,50 @@ export function FoldersView() {
   return (
     <div className="page">
       <div className="page-header titlebar-drag">
-        <div>
-          <h1 className="page-title">Shared Folders</h1>
-          <p className="page-subtitle">Folders that stay in sync with friends, automatically.</p>
-        </div>
+        <h1 className="page-title">Shared Folders</h1>
         <div className="page-actions">
-          <button className="btn btn-ghost" onClick={() => setModal('accept')}>
-            <Plus size={15} /> Accept invite
+          <button className="btn btn-secondary" onClick={() => setModal('accept')}>
+            Accept invite…
           </button>
           <button className="btn btn-primary" onClick={() => setModal('create')}>
-            <FolderSync size={15} /> New folder
+            New folder…
           </button>
         </div>
       </div>
 
       {pairs.length === 0 ? (
-        <div className="card">
-          <EmptyState
-            icon={<FolderSync size={24} />}
-            title="No shared folders yet"
-            hint="Pair a folder with a friend so anything you drop in is automatically beamed to them — even across the internet. Optionally, files vanish from your side once delivered."
-          />
-          <div style={{ display: 'flex', gap: 10, justifyContent: 'center', paddingBottom: 24 }}>
-            <button className="btn btn-ghost" onClick={() => setModal('accept')}>
-              Accept an invite
-            </button>
-            <button className="btn btn-primary" onClick={() => setModal('create')}>
-              <FolderSync size={15} /> Create one
-            </button>
-          </div>
-        </div>
+        <EmptyState
+          icon={<FolderSync />}
+          title="No shared folders"
+          hint="Keep a folder in sync with friends."
+        />
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <AnimatePresence initial={false}>
-            {groupFolders(pairs).map((g) => (
-              <FolderCard
-                key={g.key}
-                pair={g.rep}
-                members={g.members}
-                statuses={statuses}
-                onShowInvite={(code) =>
-                  setInvite({ code, name: baseFolderName(g.rep.folder) })
-                }
-              />
-            ))}
-          </AnimatePresence>
+        <div className="group folder-list">
+          {groupFolders(pairs).map((g) => (
+            <FolderRow
+              key={g.key}
+              pair={g.rep}
+              members={g.members}
+              statuses={statuses}
+              onShowInvite={(code) => setInvite({ code, name: baseFolderName(g.rep.folder) })}
+            />
+          ))}
         </div>
       )}
 
-      {(modal || pendingInvite) && (
-        <PairingModal
-          key={pendingInvite ?? modal ?? ''}
-          mode={pendingInvite ? 'accept' : modal!}
-          initialInvite={pendingInvite ?? ''}
-          onClose={() => { setModal(null); setPendingInvite(null) }}
-        />
-      )}
-      {invite && <InviteModal code={invite.code} folderName={invite.name} onClose={() => setInvite(null)} />}
+      <AnimatePresence>
+        {(modal || pendingInvite) && (
+          <PairingModal
+            key={pendingInvite ?? modal ?? ''}
+            mode={pendingInvite ? 'accept' : modal!}
+            initialInvite={pendingInvite ?? ''}
+            onClose={() => { setModal(null); setPendingInvite(null) }}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {invite && <InviteModal code={invite.code} folderName={invite.name} onClose={() => setInvite(null)} />}
+      </AnimatePresence>
     </div>
   )
 }
@@ -128,56 +141,87 @@ function groupFolders(pairs: Pair[]): { key: string; rep: Pair; members: Pair[] 
   return [...byKey.entries()].map(([key, members]) => ({ key, rep: members[0], members }))
 }
 
+/** "Alex" · "Alex, Sam" · "Alex, Sam and 2 others". */
+function joinNames(names: string[]): string {
+  if (names.length <= 2) return names.join(', ')
+  if (names.length === 3) return `${names[0]}, ${names[1]}, ${names[2]}`
+  return `${names[0]}, ${names[1]} and ${names.length - 2} others`
+}
+
+type Tone = 'ok' | 'busy' | 'warn' | 'error' | 'off'
+
+/** One status, in words: "Syncing 8 of 12 · 41 MB/s", "Up to date", "Paused"… */
 function statusInfo(
   pair: Pair,
-  status?: FolderStatus,
-  lastSynced?: number,
-): { color: string; label: string } {
+  status: FolderStatus | undefined,
+  formatSpeed: (bps: number) => string,
+): { tone: Tone; label: string } {
   const peer = pair.peerName || 'your friend'
-  if (status?.paused) {
-    return { color: 'var(--amber)', label: 'Sync paused — Resume to merge changes' }
+  if (status?.peerUnshared) {
+    return { tone: 'error', label: `${pair.peerName || 'They'} stopped sharing this folder` }
   }
+  if (status?.paused) return { tone: 'off', label: 'Paused' }
   // Only truly "waiting" if the creator has never been reached by anyone yet.
   if (pair.role === 'a' && !pair.peerName && !status?.peerOnline) {
-    return { color: 'var(--amber)', label: 'Waiting for someone to accept the invite' }
+    return { tone: 'warn', label: 'Waiting for someone to join' }
   }
   const st = status?.state ?? 'idle'
+  const speed = status && status.speedBps > 0 ? ` · ${formatSpeed(status.speedBps)}` : ''
   switch (st) {
-    case 'sending':
+    case 'sending': {
+      const total = status?.sessionTotalFiles ?? 0
+      const done = status?.sessionDoneFiles ?? 0
       return {
-        color: 'var(--accent)',
-        label: status?.sendingFile ? `Sending ${status.sendingFile}` : 'Sending…',
+        tone: 'busy',
+        label: total > 1 ? `Syncing ${Math.min(done + 1, total)} of ${total}${speed}` : `Sending${speed}`,
       }
+    }
     case 'receiving':
-      return { color: 'var(--accent)', label: 'Receiving…' }
+      return { tone: 'busy', label: `Receiving${speed}` }
     case 'waiting':
+      // The Rust sender fills `detail` with the honest, specific reason: either
+      // "Waiting for <peer> to come online" (peer offline) or "Couldn't reach <peer>
+      // just now — retrying" (reached but the transfer failed/stalled).
       return {
-        color: 'var(--amber)',
-        // The Rust sender fills `detail` with the honest, specific reason: either
-        // "Waiting for <peer> to come online" (peer offline) or "Couldn't reach <peer>
-        // just now — retrying" (reached but the transfer failed/stalled). This fallback
-        // only shows if detail is unexpectedly null.
+        tone: 'warn',
         label:
           (status?.detail ?? `Waiting for ${peer}`) +
           (status && status.queued > 0 ? ` · ${status.queued} queued` : ''),
       }
     case 'error':
-      return { color: 'var(--red)', label: status?.detail ?? 'Something went wrong' }
+      return { tone: 'error', label: status?.detail ?? 'Something went wrong' }
     default:
       if (status && !status.peerOnline && pair.peerName) {
-        return { color: 'var(--text-faint)', label: `${peer} is offline — will sync when they're back` }
+        return { tone: 'off', label: `${peer} is offline` }
       }
-      return {
-        color: 'var(--green)',
-        label: lastSynced ? `Up to date · synced ${midSentence(formatRelativeTime(lastSynced))}` : 'Up to date',
-      }
+      return { tone: 'ok', label: 'Up to date' }
   }
 }
 
 /** "Just now" / "Today 3:42 PM" read as "synced just now" mid-sentence (month names keep their case). */
 const midSentence = (rel: string) => (/^(Just|Today|Yesterday)\b/.test(rel) ? rel[0].toLowerCase() + rel.slice(1) : rel)
 
-function FolderCard({
+function useFolderSound(pairId: string) {
+  const [soundOn, setSoundOn] = useState(() => {
+    try {
+      return localStorage.getItem(`folder-sound-${pairId}`) === 'on'
+    } catch {
+      return false
+    }
+  })
+  const toggle = () => {
+    const next = !soundOn
+    setSoundOn(next)
+    try {
+      localStorage.setItem(`folder-sound-${pairId}`, next ? 'on' : 'off')
+    } catch {
+      /* localStorage unavailable — the toggle just won't persist */
+    }
+  }
+  return [soundOn, toggle] as const
+}
+
+function FolderRow({
   pair,
   members,
   statuses,
@@ -195,7 +239,6 @@ function FolderCard({
   const reloadPairs = useStore((s) => s.reloadPairs)
   const toast = useStore((s) => s.toast)
   const focusFolderHistory = useStore((s) => s.focusFolderHistory)
-  const myName = useStore((s) => s.settings?.displayName || 'You')
   const status = statuses[pair.id]
   const lastSynced = useStore((s) => s.folderLastSynced[pair.id])
   const summary = useStore((s) => s.folderSummaries[pair.id])
@@ -207,8 +250,9 @@ function FolderCard({
   const updateGroup = (patch: Partial<PairUpdate>) =>
     members.forEach((m) => updatePair({ ...patch, id: m.id }))
   const removeGroup = () => members.forEach((m) => removePair(m.id))
+
+  const [dialog, setDialog] = useState<'settings' | 'add' | 'unpair' | null>(null)
   const [addingPerson, setAddingPerson] = useState(false)
-  const [pickingPerson, setPickingPerson] = useState(false)
   // "Share an invite code" path: mint a fresh group invite anyone can use.
   const addPerson = async () => {
     setAddingPerson(true)
@@ -220,21 +264,20 @@ function FolderCard({
       setAddingPerson(false)
     }
   }
-  const [open, setOpen] = useState(false)
-  const [confirmUnpair, setConfirmUnpair] = useState(false)
-  // Per-member removal (incl. clearing a stuck "waiting to join" invite).
-  const [confirmMember, setConfirmMember] = useState<string | null>(null)
-  const memberToRemove = members.find((m) => m.id === confirmMember)
-  const doRemoveMember = async () => {
-    if (!confirmMember) return
+  const [loadingInvite, setLoadingInvite] = useState(false)
+  const showInvite = async () => {
+    setLoadingInvite(true)
     try {
-      await removePair(confirmMember)
+      onShowInvite(await api.pairInvite(pair.id))
+    } catch (e) {
+      toast('error', String(e))
     } finally {
-      setConfirmMember(null)
+      setLoadingInvite(false)
     }
   }
+
   // Owner only: set a member to editor (full) or viewer (read-only). No-op if
-  // they're already that role (so clicking the active segment does nothing).
+  // they're already that role.
   const setRole = async (m: Pair, viewer: boolean) => {
     if (!!m.peerIsViewer === viewer) return
     try {
@@ -244,866 +287,415 @@ function FolderCard({
       toast('error', String(e))
     }
   }
-  const [loadingInvite, setLoadingInvite] = useState(false)
+
   const [verifying, setVerifying] = useState(false)
-  // The last Verify outcome, shown inline as a clear confirmation. null = not run.
+  // The last Verify outcome, shown in the row as a clear confirmation. null = not run.
   const [verifyResult, setVerifyResult] = useState<VerifyResult | null>(null)
   const runVerify = async () => {
     setVerifying(true)
     setVerifyResult(null)
     try {
-      const r = await api.verifyFolder(pair.id)
-      setVerifyResult(r)
+      setVerifyResult(await api.verifyFolder(pair.id))
     } catch (e) {
       toast('error', String(e))
     } finally {
       setVerifying(false)
     }
   }
-  const [soundOn, setSoundOn] = useState(() => {
-    try {
-      return localStorage.getItem(`folder-sound-${pair.id}`) === 'on'
-    } catch {
-      return false
-    }
-  })
-  const toggleSound = () => {
-    const next = !soundOn
-    setSoundOn(next)
-    try {
-      localStorage.setItem(`folder-sound-${pair.id}`, next ? 'on' : 'off')
-    } catch {
-      /* localStorage unavailable — the toggle just won't persist */
-    }
-  }
+  // The confirmation fades after a while; the folder's status line takes over.
+  useEffect(() => {
+    if (!verifyResult) return
+    const t = window.setTimeout(() => setVerifyResult(null), 15_000)
+    return () => window.clearTimeout(t)
+  }, [verifyResult])
 
-  const info = statusInfo(pair, status, lastSynced)
   const folderName = baseFolderName(pair.folder) // Windows paths use backslashes
-  const peer = pair.peerName || 'Pending peer'
+  const names = members.map((m) => m.peerName).filter(Boolean)
+  const pendingCount = members.length - names.length
+  const withLine = names.length
+    ? `with ${joinNames(names)}${pendingCount ? ` · ${pendingCount} invite${pendingCount === 1 ? '' : 's'} pending` : ''}`
+    : 'Just you so far'
+  // This side only receives: a viewer, or the receiving end of a one-way folder.
+  const viewOnly = !!pair.iAmViewer || (!pair.mirror && !pair.twoWay && pair.role === 'b')
 
-  const showInvite = async () => {
-    setLoadingInvite(true)
-    try {
-      const code = await api.pairInvite(pair.id)
-      onShowInvite(code)
-    } catch (e) {
-      toast('error', String(e))
-    } finally {
-      setLoadingInvite(false)
-    }
+  const info = statusInfo(pair, status, formatSpeed)
+  const active = status?.state === 'sending' || status?.state === 'receiving'
+  const pendingInvite = pair.role === 'a' && !pair.peerName
+  let statusExtra = ''
+  if (info.tone === 'ok' && summary && summary.files > 0) {
+    statusExtra = `${summary.direction === 'send' ? 'Sent' : 'Received'} ${summary.files} file${summary.files === 1 ? '' : 's'} · ${formatBytes(summary.bytes)} in ${formatEta(summary.durationMs / 1000)} · ${formatSpeed(summary.avgBps)} avg`
   }
+  const statusTitle = lastSynced ? `Last synced ${midSentence(formatRelativeTime(lastSynced))}` : undefined
+
+  const menu: MenuItem[] = [
+    { label: 'Add person…', icon: <UserPlus />, onSelect: () => setDialog('add'), disabled: addingPerson },
+    { label: 'Show invite…', icon: <QrCode />, onSelect: () => void showInvite(), hidden: pair.role !== 'a', disabled: loadingInvite },
+    { separator: true },
+    { label: 'Folder history', icon: <History />, onSelect: () => focusFolderHistory(pair.id), hidden: !pair.mirror },
+    { label: 'Verify', icon: <FolderCheck />, onSelect: () => void runVerify(), hidden: !pair.mirror, disabled: verifying },
+    { label: 'Settings…', icon: <Settings2 />, onSelect: () => setDialog('settings') },
+    { separator: true },
+    { label: isGroup ? 'Leave folder…' : 'Unpair…', icon: <Unlink />, danger: true, onSelect: () => setDialog('unpair') },
+  ]
 
   return (
-    <motion.div
-      layout
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.97 }}
-      className="card"
-      style={{ padding: 16, overflow: 'hidden' }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <div
-          style={{
-            width: 40,
-            height: 40,
-            borderRadius: 12,
-            display: 'grid',
-            placeItems: 'center',
-            flexShrink: 0,
-            color: 'white',
-            background: 'linear-gradient(135deg, var(--accent), var(--accent-2))',
-          }}
-        >
-          <FolderSync size={19} />
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-            <span className="truncate-1" style={{ fontWeight: 700, fontSize: 'var(--font-md)' }} title={peer}>{peer}</span>
-            {pair.mirror ? (
-              <span className="chip chip-accent">
-                <FolderSync size={11} /> Total sync
-              </span>
-            ) : (
-              <span className="chip chip-neutral">
-                {pair.twoWay ? <ArrowLeftRight size={11} /> : <ArrowRight size={11} />}
-                {pair.twoWay
-                  ? 'Two-way'
-                  : pair.role === 'a'
-                    ? 'View only (they receive)'
-                    : 'View only (you receive)'}
-              </span>
-            )}
-            {pair.autoDelete && (
-              <span className="chip chip-amber">
-                Auto-delete
-              </span>
-            )}
-            {status?.paused && (
-              <span className="chip chip-amber">
-                Paused
-              </span>
-            )}
-          </div>
-          <div
-            style={{
-              fontSize: 'var(--font-xs)',
-              color: 'var(--text-faint)',
-              marginTop: 2,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-            title={pair.folder}
-          >
-            {folderName}
-          </div>
-        </div>
-        {!MOBILE_UI && <button className="icon-btn" title="Open folder" aria-label="Open folder" onClick={() => api.openPath(pair.folder)}>
-          <FolderOpen size={16} />
-        </button>}
-        {pair.mirror && (
-          <button
-            className="icon-btn"
-            title={status?.paused ? 'Resume syncing this folder' : 'Pause syncing this folder'}
-            aria-label={status?.paused ? 'Resume syncing' : 'Pause syncing'}
-            onClick={() => void api.setFolderPaused(pair.id, !status?.paused)}
-            style={{ color: status?.paused ? 'var(--amber)' : undefined }}
-          >
-            {status?.paused ? <Play size={16} /> : <Pause size={16} />}
-          </button>
-        )}
-        <button
-          className="icon-btn"
-          title="Folder settings"
-          aria-label="Folder settings"
-          aria-expanded={open}
-          onClick={() =>
-            setOpen((o) => {
-              // Re-arm the destructive confirms fresh each time the drawer reopens.
-              if (o) {
-                setConfirmUnpair(false)
-                setVerifying(false)
-                setVerifyResult(null)
-              }
-              return !o
-            })
-          }
-          style={{ color: open ? 'var(--accent)' : undefined }}
-        >
-          <Settings2 size={16} />
-        </button>
-      </div>
-
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}>
-        <span
-          style={{
-            width: 8,
-            height: 8,
-            borderRadius: 999,
-            background: info.color,
-            flexShrink: 0,
-            boxShadow: `0 0 0 3px color-mix(in srgb, ${info.color} 22%, transparent)`,
-          }}
-        />
-        <span style={{ fontSize: 'var(--font-sm)', color: 'var(--text-muted)', minWidth: 0, overflowWrap: 'anywhere' }}>{info.label}</span>
-        {pair.role === 'a' && !pair.peerName && (
-          <button
-            className="btn btn-ghost btn-sm"
-            style={{ marginLeft: 'auto', flexShrink: 0 }}
-            onClick={showInvite}
-            disabled={loadingInvite}
-          >
-            {loadingInvite ? <Spinner size={13} /> : <QrCode size={13} />} Show invite
-          </button>
-        )}
-      </div>
-
-      {/* The peer stopped sharing this folder — the link is effectively dead. */}
-      {status?.peerUnshared && (
-        <div
-          style={{
-            marginTop: 11,
-            padding: '10px 12px',
-            borderRadius: 10,
-            background: 'color-mix(in srgb, var(--red) 12%, transparent)',
-            border: '1px solid color-mix(in srgb, var(--red) 35%, transparent)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 9,
-            fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
-          }}
-        >
-          <Unlink size={15} color="var(--red)" style={{ flexShrink: 0 }} />
-          <span style={{ color: 'var(--text-muted)' }}>
-            {(pair.peerName || 'The other person')} no longer shares this folder. Your files are
-            still here — you can remove this now-inactive folder.
+    <div className="row folder-row">
+      <span className="folder-glyph" aria-hidden><Folder /></span>
+      <div className="row-main">
+        <div className="row-title truncate-1" title={pair.folder}>{folderName}</div>
+        <div className="row-sub truncate-1" title={withLine}>{withLine}</div>
+        <div className={`folder-status tone-${info.tone}`} title={statusTitle}>
+          <Dot tone={info.tone} />
+          <span className="truncate-1 tnum">
+            {info.label}
+            {viewOnly && <span className="folder-status-quiet"> · View only</span>}
+            {statusExtra && <span className="folder-status-quiet"> · {statusExtra}</span>}
           </span>
+          {pendingInvite && (
+            <button className="btn btn-plain btn-sm folder-status-action" onClick={showInvite} disabled={loadingInvite}>
+              Show invite…
+            </button>
+          )}
         </div>
-      )}
 
-      {pair.iAmViewer && (
-        <Banner color="var(--amber)" bg="var(--amber-soft)" icon={<Eye size={15} />}>
-          View only: changes you make here are not sent
-        </Banner>
-      )}
+        {(verifying || verifyResult) && <VerifyLine verifying={verifying} result={verifyResult} />}
 
-      {/* Members — everyone in this folder (you + each person you're linked to) */}
-      <div style={{ display: 'flex', gap: 8, marginTop: 11, flexWrap: 'wrap', alignItems: 'center' }}>
-        <Member name={myName} you online viewerSelf={pair.iAmViewer} />
-        {members.map((m) => (
-          <Member
-            key={m.id}
-            name={m.peerName || 'Waiting to join…'}
-            online={statuses[m.id]?.peerOnline ?? false}
-            pending={!m.peerName}
-            isViewer={!!m.peerIsViewer}
-            // Only the folder OWNER may assign roles (enforced in the engine too).
-            // We own it iff the folder's ownerEid matches THIS device's endpoint id.
-            canSetRole={iAmOwner && !!m.peerName}
-            onSetRole={(viewer) => setRole(m, viewer)}
-            onRemove={() => setConfirmMember(m.id)}
-          />
-        ))}
-        <button
-          className="btn btn-ghost btn-sm"
-          onClick={() => setPickingPerson(true)}
-          disabled={addingPerson}
-          title="Invite a friend — or anyone, with a code — to this folder"
-        >
-          {addingPerson ? <Spinner size={13} /> : <UserPlus size={13} />} Add person
-        </button>
-      </div>
-      <AnimatePresence>
-        {pickingPerson && (
-          <AddPersonDialog
-            pair={pair}
-            members={members}
-            folderName={folderName}
-            onClose={() => setPickingPerson(false)}
-            onShareCode={() => { setPickingPerson(false); void addPerson() }}
-          />
-        )}
-      </AnimatePresence>
-
-      {/* Confirm removing one member (or clearing a stuck pending invite). */}
-      {memberToRemove && (
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            marginTop: 9,
-            padding: '9px 12px',
-            background: 'var(--amber-soft)',
-            border: '1px solid var(--border)',
-            borderRadius: 10,
-            fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
-          }}
-        >
-          <span style={{ flex: 1, lineHeight: 1.4 }}>
-            {memberToRemove.peerName
-              ? `Remove ${memberToRemove.peerName} from this folder? They'll stop syncing it with you.`
-              : 'Cancel this pending invite? Anyone you already sent the link to won’t be able to join with it.'}
-          </span>
-          <button className="btn btn-ghost btn-sm" onClick={() => setConfirmMember(null)}>
-            Cancel
-          </button>
-          <button className="btn btn-danger btn-sm" onClick={doRemoveMember}>
-            {memberToRemove.peerName ? 'Remove' : 'Cancel invite'}
-          </button>
-        </div>
-      )}
-
-      {/* Sync state — lets you confirm both folders actually match. */}
-      {pair.mirror && status?.peerOnline && status?.state === 'idle' && (status?.queued ?? 0) === 0 && (
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 7,
-            marginTop: 10,
-            fontSize: 'calc(12.5px * var(--ui-font-scale, 1))',
-            color: 'var(--text-muted)',
-          }}
-        >
-          <Check size={14} color="var(--green)" style={{ flexShrink: 0 }} />
-          <span>
-            In sync
-            {typeof status.peerFiles === 'number' && status.peerFiles > 0
-              ? ` — ${pair.peerName || 'they'} ${pair.peerName ? 'has' : 'have'} ${status.peerFiles} file${status.peerFiles === 1 ? '' : 's'}`
-              : ''}
-          </span>
-        </div>
-      )}
-
-      {/* Live transfer progress while sending or receiving */}
-      {(status?.state === 'sending' || status?.state === 'receiving') && (
-        <motion.div
-          initial={{ opacity: 0, height: 0 }}
-          animate={{ opacity: 1, height: 'auto' }}
-          style={{ marginTop: 12, overflow: 'hidden' }}
-        >
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'baseline',
-              marginBottom: 6,
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 'calc(15px * var(--ui-font-scale, 1))', fontWeight: 750 }} className="gradient-text">
-                {Math.round(status.percent)}%
+        {/* Live transfer: the file, a thin bar, bytes + time left. */}
+        {active && status && (
+          <div className="folder-xfer">
+            <div className="folder-xfer-head">
+              <span className="folder-xfer-name truncate-1" title={status.sendingFile ?? undefined}>
+                {status.sendingFile ? baseName(status.sendingFile) : status.state === 'sending' ? 'Sending…' : 'Receiving…'}
               </span>
-              <LocalityBadge locality={status.locality} />
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ fontSize: 'calc(12px * var(--ui-font-scale, 1))', color: 'var(--text-muted)' }}>
-                {formatBytes(status.bytesDone)}
-                {status.bytesTotal > 0 ? ` / ${formatBytes(status.bytesTotal)}` : ''}
+              <span className="folder-xfer-meta tnum">
+                {status.bytesTotal > 0
+                  ? `${formatBytes(status.bytesDone)} of ${formatBytes(status.bytesTotal)}`
+                  : formatBytes(status.bytesDone)}
+                {status.etaSeconds != null ? ` · ${formatEta(status.etaSeconds)} left` : ''}
               </span>
+              <ConnInfo detail={status.connDetail} locality={status.locality} />
               {status.state === 'sending' && (
                 <button
-                  className="btn btn-ghost btn-sm"
-                  title="Stop this transfer (it won't be lost — it retries)"
+                  className="btn btn-secondary btn-sm"
+                  title="Stop this transfer — it isn’t lost, it tries again later"
                   onClick={() => api.stopFolderTransfer(pair.id)}
                 >
-                  <X size={13} /> Stop
+                  Stop
                 </button>
               )}
             </div>
-          </div>
-          <ProgressBar percent={status.percent} />
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
-              color: 'var(--text-faint)',
-              marginTop: 6,
-              gap: 10,
-            }}
-          >
-            <span
-              style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-            >
-              {status.sendingFile || (status.state === 'sending' ? 'Sending…' : 'Receiving…')}
-            </span>
-            <span style={{ flexShrink: 0 }}>
-              {formatSpeed(status.speedBps)}
-              {status.etaSeconds != null ? ` · ${formatEta(status.etaSeconds)} left` : ''}
-            </span>
-          </div>
-
-          {/* The rest of a dropped batch, listed up front with per-file rows so it
-              reads as "all these files are going through" — not one popup at a time. */}
-          {status.queuedFiles && status.queuedFiles.length > 0 && (
-            <div
-              style={{
-                marginTop: 10,
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 6,
-                maxHeight: 168,
-                overflowY: 'auto',
-              }}
-            >
-              {status.queuedFiles.map((name, i) => (
-                <div key={`${name}-${i}`} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 7,
-                      fontSize: 'calc(12px * var(--ui-font-scale, 1))',
-                      color: 'var(--text-faint)',
-                    }}
-                  >
-                    <Clock size={12} style={{ flexShrink: 0 }} />
-                    <span
-                      style={{
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {name}
-                    </span>
-                    <span style={{ marginLeft: 'auto', flexShrink: 0 }}>Queued</span>
-                  </div>
-                  <ProgressBar percent={0} />
-                </div>
-              ))}
-            </div>
-          )}
-        </motion.div>
-      )}
-
-      {/* Last completed-drop summary — total files, size, time, and average speed,
-          the same recap the Send/Receive tab shows when a transfer finishes. */}
-      {status?.state !== 'sending' && status?.state !== 'receiving' && summary && summary.files > 0 && (
-        <div
-          style={{
-            marginTop: 10,
-            fontSize: 'calc(11.5px * var(--ui-font-scale, 1))',
-            color: 'var(--text-faint)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-          }}
-        >
-          <Check size={12} color="var(--green)" style={{ flexShrink: 0 }} />
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {summary.direction === 'send' ? 'Sent' : 'Received'} {summary.files} file
-            {summary.files === 1 ? '' : 's'} · {formatBytes(summary.bytes)} ·{' '}
-            {formatEta(summary.durationMs / 1000)} · {formatSpeed(summary.avgBps)} avg
-          </span>
-        </div>
-      )}
-
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            style={{ overflow: 'hidden' }}
-          >
-            <div style={{ borderTop: '1px solid var(--border)', marginTop: 14, paddingTop: 6 }}>
-              <SettingRow
-                title="Play sound on sync"
-                desc="Hear a soft cue whenever a file is sent to or received from this folder. Off by default."
-              >
-                <button
-                  role="switch"
-                  aria-checked={soundOn}
-                  aria-label="Play sound on sync"
-                  className={`toggle${soundOn ? ' on' : ''}`}
-                  onClick={toggleSound}
-                />
-              </SettingRow>
-              <SettingRow
-                title="Total sync (source of truth)"
-                desc="Adds, edits, and deletes all sync both ways — like a shared drive. Deleted and replaced files are kept in History so nothing is lost."
-              >
-                <button
-                  role="switch"
-                  aria-checked={pair.mirror}
-                  aria-label="Total sync (source of truth)"
-                  className={`toggle${pair.mirror ? ' on' : ''}`}
-                  onClick={() => updateGroup({ mirror: !pair.mirror })}
-                />
-              </SettingRow>
-              {!pair.mirror && (
-                <SettingRow
-                  title="Two-way sync"
-                  desc="Receive the peer's files too, not just send."
-                >
-                  <button
-                    role="switch"
-                    aria-checked={pair.twoWay}
-                    aria-label="Two-way sync"
-                    className={`toggle${pair.twoWay ? ' on' : ''}`}
-                    onClick={() => updateGroup({ twoWay: !pair.twoWay })}
-                  />
-                </SettingRow>
-              )}
-              {!pair.mirror && (
-                <SettingRow
-                  title="Delete after delivery"
-                  desc="Remove the local copy once the peer confirms receipt — a self-emptying outbox."
-                >
-                  <button
-                    role="switch"
-                    aria-checked={pair.autoDelete}
-                    aria-label="Delete after delivery"
-                    className={`toggle${pair.autoDelete ? ' on' : ''}`}
-                    onClick={() => updateGroup({ autoDelete: !pair.autoDelete })}
-                  />
-                </SettingRow>
-              )}
-              {!pair.mirror && pair.autoDelete && (
-                <SettingRow title="When deleting" desc="Trash is recoverable; permanent is not.">
-                  <div className="seg">
-                    {(['trash', 'permanent'] as const).map((m) => (
-                      <button
-                        key={m}
-                        className={pair.deleteMode === m ? 'active' : ''}
-                        style={{ textTransform: 'capitalize', padding: '5px 12px' }}
-                        onClick={() => updateGroup({ deleteMode: m })}
-                      >
-                        {m === 'trash' ? 'Trash' : 'Permanent'}
-                      </button>
-                    ))}
-                  </div>
-                </SettingRow>
-              )}
-              {pair.mirror && (verifying || verifyResult) && (
-                <VerifyBanner verifying={verifying} result={verifyResult} />
-              )}
-              <div
-                style={{
-                  display: 'flex',
-                  gap: 8,
-                  justifyContent: 'flex-end',
-                  flexWrap: 'wrap',
-                  marginTop: 12,
-                  paddingBottom: 2,
-                }}
-              >
-                {pair.mirror && (
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    style={{ marginRight: 'auto' }}
-                    title="See & restore deleted or replaced files, and manage their storage"
-                    onClick={() => focusFolderHistory(pair.id)}
-                  >
-                    <History size={14} /> History
-                  </button>
-                )}
-                {pair.mirror && (
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    title="Re-check that both folders are identical and fix any difference"
-                    disabled={verifying}
-                    onClick={runVerify}
-                  >
-                    {verifying ? <Spinner size={13} /> : <FolderSync size={14} />}{' '}
-                    {verifying ? 'Checking…' : 'Verify'}
-                  </button>
-                )}
-                {pair.role === 'a' && (
-                  <button className="btn btn-ghost btn-sm" onClick={showInvite} disabled={loadingInvite}>
-                    <QrCode size={14} /> Show invite
-                  </button>
-                )}
-                {confirmUnpair ? (
-                  <>
-                    <button className="btn btn-ghost btn-sm" onClick={() => setConfirmUnpair(false)}>
-                      Cancel
-                    </button>
-                    <button className="btn btn-danger btn-sm" onClick={removeGroup}>
-                      <Unlink size={14} /> Confirm {isGroup ? 'leave' : 'unpair'}
-                    </button>
-                  </>
-                ) : (
-                  <button className="btn btn-danger btn-sm" onClick={() => setConfirmUnpair(true)}>
-                    <Unlink size={14} /> Unpair
-                  </button>
-                )}
+            <ProgressBar percent={status.percent} label={`${folderName} progress`} />
+            {status.queuedFiles && status.queuedFiles.length > 0 && (
+              <div className="folder-queue truncate-1" title={status.queuedFiles.join('\n')}>
+                {status.queuedFiles.length} more queued: {status.queuedFiles.map((n) => baseName(n)).join(', ')}
               </div>
-            </div>
-          </motion.div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="row-trailing folder-actions">
+        {!MOBILE_UI && (
+          <IconButton label="Open folder" tooltip="Show in Finder" onClick={() => api.openPath(pair.folder)}>
+            <FolderOpen />
+          </IconButton>
+        )}
+        {pair.mirror && (
+          <IconButton
+            label={status?.paused ? 'Resume syncing' : 'Pause syncing'}
+            onClick={() => void api.setFolderPaused(pair.id, !status?.paused)}
+          >
+            {status?.paused ? <PlayGlyph /> : <PauseGlyph />}
+          </IconButton>
+        )}
+        <MenuButton label="More" items={menu} />
+      </div>
+
+      <AnimatePresence>
+        {dialog === 'settings' && (
+          <FolderSettingsDialog
+            key="settings"
+            pair={pair}
+            members={members}
+            statuses={statuses}
+            folderName={folderName}
+            iAmOwner={iAmOwner}
+            isGroup={isGroup}
+            viewOnly={viewOnly}
+            onUpdate={updateGroup}
+            onSetRole={setRole}
+            onRemoveMember={(id) => removePair(id)}
+            onAddPerson={() => setDialog('add')}
+            onUnpair={() => setDialog('unpair')}
+            onClose={() => setDialog(null)}
+          />
+        )}
+        {dialog === 'add' && (
+          <AddPersonDialog
+            key="add"
+            pair={pair}
+            members={members}
+            folderName={folderName}
+            onClose={() => setDialog(null)}
+            onShareCode={() => { setDialog(null); void addPerson() }}
+          />
+        )}
+        {dialog === 'unpair' && (
+          <Dialog
+            key="unpair"
+            title={isGroup ? `Leave “${folderName}”?` : `Unpair “${folderName}”?`}
+            width={380}
+            onClose={() => setDialog(null)}
+            footer={
+              <>
+                <button className="btn btn-secondary" onClick={() => setDialog(null)}>Cancel</button>
+                <button className="btn btn-destructive" onClick={() => { setDialog(null); removeGroup() }}>
+                  {isGroup ? 'Leave' : 'Unpair'}
+                </button>
+              </>
+            }
+          >
+            <p className="dialog-text" style={{ margin: 0 }}>
+              {isGroup
+                ? 'You’ll stop syncing this folder with everyone.'
+                : `Syncing with ${pair.peerName || 'the other person'} stops.`}{' '}
+              Files already here stay on this computer.
+            </p>
+          </Dialog>
         )}
       </AnimatePresence>
-    </motion.div>
-  )
-}
-
-function Member({
-  name,
-  online,
-  you,
-  pending,
-  isViewer,
-  viewerSelf,
-  canSetRole,
-  onSetRole,
-  onRemove,
-}: {
-  name: string
-  online: boolean
-  you?: boolean
-  pending?: boolean
-  isViewer?: boolean
-  viewerSelf?: boolean
-  canSetRole?: boolean
-  onSetRole?: (viewer: boolean) => void
-  onRemove?: () => void
-}) {
-  const showViewer = isViewer || viewerSelf
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 7,
-        padding: onRemove && !you ? '4px 6px 4px 5px' : '4px 11px 4px 5px',
-        background: 'var(--surface-2)',
-        borderRadius: 999,
-        border: '1px solid var(--border)',
-      }}
-      title={you ? 'You' : online ? `${name} · online` : `${name} · offline`}
-    >
-      <span
-        style={{
-          position: 'relative',
-          width: 24,
-          height: 24,
-          borderRadius: 999,
-          display: 'grid',
-          placeItems: 'center',
-          color: 'white',
-          fontWeight: 700,
-          fontSize: 'calc(10px * var(--ui-font-scale, 1))',
-          flexShrink: 0,
-          background: you
-            ? 'linear-gradient(135deg, var(--accent), var(--accent-2))'
-            : pending
-              ? 'var(--text-faint)'
-              : avatarGradient(name),
-        }}
-      >
-        {pending ? '?' : initials(name)}
-        {!you && !pending && (
-          <span
-            style={{
-              position: 'absolute',
-              right: -1,
-              bottom: -1,
-              width: 9,
-              height: 9,
-              borderRadius: 999,
-              background: online ? 'var(--green)' : 'var(--text-faint)',
-              border: '2px solid var(--surface)',
-            }}
-          />
-        )}
-      </span>
-      <span className="truncate-1" style={{ maxWidth: 200, fontSize: 'var(--font-sm)', fontWeight: 600, color: pending ? 'var(--text-faint)' : 'var(--text)' }}>
-        {you ? `${name} (you)` : name}
-      </span>
-      {/* Owner control: a clear two-option toggle that always shows BOTH roles with
-          the current one highlighted — so it's obvious what they are AND how to
-          change it (the old single icon showed only the opposite action). */}
-      {canSetRole && !you ? (
-        <div
-          style={{
-            display: 'inline-flex',
-            borderRadius: 999,
-            border: '1px solid var(--border)',
-            background: 'var(--surface)',
-            overflow: 'hidden',
-            flexShrink: 0,
-          }}
-        >
-          <RoleSeg
-            active={!isViewer}
-            icon={<Pencil size={10} />}
-            label="Editor"
-            title="Full access — can add, change, and delete files"
-            onClick={(e) => {
-              e.stopPropagation()
-              onSetRole?.(false)
-            }}
-          />
-          <RoleSeg
-            active={!!isViewer}
-            icon={<Eye size={10} />}
-            label="Viewer"
-            title="Read-only — can view and download, but not change the folder"
-            onClick={(e) => {
-              e.stopPropagation()
-              onSetRole?.(true)
-            }}
-          />
-        </div>
-      ) : (
-        showViewer && (
-          <span
-            title="Read-only — they can view and download, but not change the folder"
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 3,
-              fontSize: 'calc(10.5px * var(--ui-font-scale, 1))',
-              fontWeight: 700,
-              padding: '1px 6px',
-              borderRadius: 999,
-              background: 'var(--surface)',
-              color: 'var(--text-muted)',
-              border: '1px solid var(--border)',
-            }}
-          >
-            <Eye size={10} /> Viewer
-          </span>
-        )
-      )}
-      {onRemove && !you && (
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            onRemove()
-          }}
-          title={pending ? 'Cancel this invite' : `Remove ${name} from this folder`}
-          aria-label={pending ? 'Cancel this invite' : `Remove ${name} from this folder`}
-          style={{
-            display: 'grid',
-            placeItems: 'center',
-            width: 18,
-            height: 18,
-            borderRadius: 999,
-            border: 'none',
-            background: 'transparent',
-            color: 'var(--text-faint)',
-            cursor: 'pointer',
-            padding: 0,
-            flexShrink: 0,
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--red)')}
-          onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-faint)')}
-        >
-          <X size={13} />
-        </button>
-      )}
     </div>
   )
 }
 
-/** One segment of the Editor|Viewer role toggle. Active = filled accent. */
-function RoleSeg({
-  active,
-  icon,
-  label,
-  title,
-  onClick,
-}: {
-  active: boolean
-  icon: React.ReactNode
-  label: string
-  title: string
-  onClick: (e: React.MouseEvent) => void
-}) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 3,
-        padding: '2px 8px',
-        fontSize: 'calc(10.5px * var(--ui-font-scale, 1))',
-        fontWeight: 700,
-        border: 'none',
-        cursor: active ? 'default' : 'pointer',
-        background: active ? 'var(--accent)' : 'transparent',
-        color: active ? '#fff' : 'var(--text-faint)',
-        transition: 'all 0.12s',
-      }}
-      onMouseEnter={(e) => {
-        if (!active) e.currentTarget.style.color = 'var(--text)'
-      }}
-      onMouseLeave={(e) => {
-        if (!active) e.currentTarget.style.color = 'var(--text-faint)'
-      }}
-    >
-      {icon} {label}
-    </button>
-  )
-}
-
-/** The Verify outcome banner: a spinner while the manifest round-trip runs, then a
- *  clear, trustworthy confirmation of whether the two folders are identical. */
-function VerifyBanner({
-  verifying,
-  result,
-}: {
-  verifying: boolean
-  result: VerifyResult | null
-}) {
-  // While checking, OR if a result is mid-render but a new check started.
+/** The Verify outcome: a spinner while the manifest round-trip runs, then a clear
+ *  confirmation of whether the two folders are identical. */
+function VerifyLine({ verifying, result }: { verifying: boolean; result: VerifyResult | null }) {
+  let icon: ReactNode
+  let text: string
+  let tone = ''
   if (verifying || !result) {
-    return (
-      <Banner color="var(--accent)" bg="var(--accent-soft)" icon={<Spinner size={14} />}>
-        Checking both folders match…
-      </Banner>
-    )
+    icon = <Spinner size={12} />
+    text = 'Checking both folders match…'
+  } else if (!result.compared) {
+    icon = <WifiOff />
+    tone = 'warn'
+    text = result.peerOnline
+      ? 'Couldn’t check yet — try Verify again in a moment'
+      : 'Couldn’t check — the other device is offline'
+  } else if (result.identical) {
+    icon = <CheckCircle2 />
+    tone = 'ok'
+    text = `Both folders match · ${result.matched.toLocaleString()} ${result.matched === 1 ? 'file' : 'files'}`
+  } else {
+    const d = result.differences
+    const parts: string[] = []
+    if (result.missingOnPeer) parts.push(`${result.missingOnPeer} to send`)
+    if (result.missingLocally) parts.push(`${result.missingLocally} to receive`)
+    if (result.pendingDeletes) parts.push(`${result.pendingDeletes} to remove`)
+    icon = <AlertCircle />
+    tone = 'warn'
+    text = `Found ${d} ${d === 1 ? 'difference' : 'differences'}${parts.length ? ` (${parts.join(', ')})` : ''} · fixing now`
   }
-  if (!result.compared) {
-    return (
-      <Banner color="var(--amber)" bg="var(--amber-soft)" icon={<WifiOff size={15} />}>
-        {result.peerOnline
-          ? 'The other device is online. Its latest folder snapshot is not available yet — try Verify again shortly.'
-          : 'The other device is offline — try again when they’re online.'}
-      </Banner>
-    )
-  }
-  if (result.identical) {
-    const n = result.matched.toLocaleString()
-    return (
-      <Banner color="var(--green)" bg="var(--green-soft)" icon={<CheckCircle2 size={15} />}>
-        Both folders match — {n} {result.matched === 1 ? 'file' : 'files'}, identical.
-      </Banner>
-    )
-  }
-  const d = result.differences
-  // Spell out the breakdown so the user trusts the number.
-  const parts: string[] = []
-  if (result.missingOnPeer) parts.push(`${result.missingOnPeer} to send`)
-  if (result.missingLocally) parts.push(`${result.missingLocally} to receive`)
-  if (result.pendingDeletes) parts.push(`${result.pendingDeletes} to remove`)
   return (
-    <Banner color="var(--amber)" bg="var(--amber-soft)" icon={<AlertCircle size={15} />}>
-      Found {d} {d === 1 ? 'difference' : 'differences'}
-      {parts.length > 0 ? ` (${parts.join(', ')})` : ''} — syncing them now…
-    </Banner>
-  )
-}
-
-function Banner({
-  color,
-  bg,
-  icon,
-  children,
-}: {
-  color: string
-  bg: string
-  icon: React.ReactNode
-  children: React.ReactNode
-}) {
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 10,
-        marginTop: 12,
-        padding: '10px 12px',
-        borderRadius: 'var(--radius-md)',
-        background: bg,
-        color,
-        fontSize: 'var(--font-sm)',
-        fontWeight: 600,
-        lineHeight: 1.4,
-      }}
-    >
-      <span style={{ flexShrink: 0, display: 'inline-flex' }}>{icon}</span>
-      <span>{children}</span>
+    <div className={`folder-verify ${tone}`} role="status">
+      {icon}
+      <span className="truncate-1">{text}</span>
     </div>
   )
 }
 
-function SettingRow({
-  title,
-  desc,
-  children,
+function FolderSettingsDialog({
+  pair,
+  members,
+  statuses,
+  folderName,
+  iAmOwner,
+  isGroup,
+  viewOnly,
+  onUpdate,
+  onSetRole,
+  onRemoveMember,
+  onAddPerson,
+  onUnpair,
+  onClose,
 }: {
-  title: string
-  desc: string
-  children: React.ReactNode
+  pair: Pair
+  members: Pair[]
+  statuses: Record<string, FolderStatus>
+  folderName: string
+  iAmOwner: boolean
+  isGroup: boolean
+  viewOnly: boolean
+  onUpdate: (patch: Partial<PairUpdate>) => void
+  onSetRole: (m: Pair, viewer: boolean) => void
+  onRemoveMember: (id: string) => Promise<void> | void
+  onAddPerson: () => void
+  onUnpair: () => void
+  onClose: () => void
 }) {
+  const myName = useStore((s) => s.settings?.displayName || 'You')
+  const [soundOn, toggleSound] = useFolderSound(pair.id)
+  // Per-member removal (incl. clearing a stuck "waiting to join" invite).
+  const [confirmMember, setConfirmMember] = useState<string | null>(null)
+  const memberToRemove = members.find((m) => m.id === confirmMember)
+  const doRemoveMember = async () => {
+    if (!confirmMember) return
+    try {
+      await onRemoveMember(confirmMember)
+    } finally {
+      setConfirmMember(null)
+    }
+  }
+  const myRole = iAmOwner ? 'Owner' : viewOnly ? 'Viewer' : 'Editor'
+
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '11px 2px' }}>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 'var(--font-base)', fontWeight: 600 }}>{title}</div>
-        <div style={{ fontSize: 'var(--font-xs)', color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.45 }}>
-          {desc}
+    <Dialog
+      title={folderName}
+      width={460}
+      className="folder-dialog"
+      onClose={onClose}
+      footer={
+        <>
+          <button className="btn btn-danger" onClick={onUnpair}>
+            {isGroup ? 'Leave folder…' : 'Unpair…'}
+          </button>
+          <span className="spacer" />
+          <button className="btn btn-primary" onClick={onClose}>Done</button>
+        </>
+      }
+    >
+      <SectionHeader style={{ marginTop: 0 }}>People</SectionHeader>
+      <div className="group folder-people">
+        <div className="row">
+          <span className="folder-avatar" style={{ background: avatarColor(myName) }}>{initials(myName)}</span>
+          <div className="row-main">
+            <div className="row-title truncate-1">{myName} <span className="faint">(you)</span></div>
+            {viewOnly && <div className="row-sub">Changes you make here aren’t sent</div>}
+          </div>
+          <span className="folder-role">{myRole}</span>
         </div>
+        {members.map((m) => {
+          const pending = !m.peerName
+          const online = statuses[m.id]?.peerOnline ?? false
+          const canSetRole = iAmOwner && !pending
+          return (
+            <div className="row" key={m.id}>
+              <span
+                className={`folder-avatar${pending ? ' pending' : ''}`}
+                style={pending ? undefined : { background: avatarColor(m.peerName) }}
+              >
+                {pending ? <Clock /> : initials(m.peerName)}
+                {!pending && <span className={`folder-avatar-dot${online ? ' online' : ''}`} />}
+              </span>
+              <div className="row-main">
+                <div className="row-title truncate-1" title={m.peerName || undefined}>
+                  {pending ? 'Invite pending' : m.peerName}
+                </div>
+                <div className="row-sub">{pending ? 'Waiting for them to join' : online ? 'Online' : 'Offline'}</div>
+              </div>
+              {/* Only the folder OWNER may assign roles (enforced in the engine too). */}
+              {canSetRole ? (
+                <Segmented
+                  label={`${m.peerName}’s access`}
+                  value={m.peerIsViewer ? 'viewer' : 'editor'}
+                  options={[
+                    { value: 'editor', label: 'Editor', title: 'Can add, change and delete files' },
+                    { value: 'viewer', label: 'Viewer', title: 'Can view and download, but not change the folder' },
+                  ]}
+                  onChange={(v) => onSetRole(m, v === 'viewer')}
+                />
+              ) : (
+                !pending && <span className="folder-role">{m.peerIsViewer ? 'Viewer' : 'Editor'}</span>
+              )}
+              <IconButton
+                size="sm"
+                danger
+                label={pending ? 'Cancel invite' : `Remove ${m.peerName}`}
+                onClick={() => setConfirmMember(m.id)}
+              >
+                <UserMinus />
+              </IconButton>
+            </div>
+          )
+        })}
+        <button type="button" className="row folder-add-row" onClick={onAddPerson}>
+          <span className="folder-avatar add"><UserPlus /></span>
+          <span className="row-main row-title">Add person…</span>
+        </button>
       </div>
-      <div style={{ flexShrink: 0 }}>{children}</div>
+
+      <SectionHeader>Sync</SectionHeader>
+      <div className="group folder-settings">
+        <SettingRow title="Total sync" desc="Adds, edits and deletes sync both ways. Removed files are kept in History.">
+          <Toggle label="Total sync" on={pair.mirror} onChange={() => onUpdate({ mirror: !pair.mirror })} />
+        </SettingRow>
+        {!pair.mirror && (
+          <SettingRow title="Two-way" desc="Receive their files too, not just send.">
+            <Toggle label="Two-way sync" on={pair.twoWay} onChange={() => onUpdate({ twoWay: !pair.twoWay })} />
+          </SettingRow>
+        )}
+        {!pair.mirror && (
+          <SettingRow title="Delete after delivery" desc="Remove your copy once they have it.">
+            <Toggle label="Delete after delivery" on={pair.autoDelete} onChange={() => onUpdate({ autoDelete: !pair.autoDelete })} />
+          </SettingRow>
+        )}
+        {!pair.mirror && pair.autoDelete && (
+          <SettingRow title="When deleting" desc="Trash can be recovered; permanent can’t.">
+            <Segmented
+              label="When deleting"
+              value={pair.deleteMode}
+              options={[
+                { value: 'trash', label: 'Trash' },
+                { value: 'permanent', label: 'Permanent' },
+              ]}
+              onChange={(v) => onUpdate({ deleteMode: v })}
+            />
+          </SettingRow>
+        )}
+        <SettingRow title="Play sound on sync" desc="A soft sound when files send or arrive.">
+          <Toggle label="Play sound on sync" on={soundOn} onChange={toggleSound} />
+        </SettingRow>
+      </div>
+
+      <AnimatePresence>
+        {memberToRemove && (
+          <Dialog
+            key="remove-member"
+            title={memberToRemove.peerName ? `Remove ${memberToRemove.peerName}?` : 'Cancel this invite?'}
+            width={380}
+            onClose={() => setConfirmMember(null)}
+            footer={
+              <>
+                <button className="btn btn-secondary" onClick={() => setConfirmMember(null)}>
+                  {memberToRemove.peerName ? 'Cancel' : 'Keep invite'}
+                </button>
+                <button className="btn btn-destructive" onClick={doRemoveMember}>
+                  {memberToRemove.peerName ? 'Remove' : 'Cancel invite'}
+                </button>
+              </>
+            }
+          >
+            <p className="dialog-text" style={{ margin: 0 }}>
+              {memberToRemove.peerName
+                ? `They’ll stop syncing “${folderName}” with you.`
+                : 'Anyone you sent the invite to won’t be able to join with it.'}
+            </p>
+          </Dialog>
+        )}
+      </AnimatePresence>
+    </Dialog>
+  )
+}
+
+function SettingRow({ title, desc, children }: { title: string; desc: string; children: ReactNode }) {
+  return (
+    <div className="row">
+      <div className="row-main">
+        <div className="row-title">{title}</div>
+        <div className="row-sub">{desc}</div>
+      </div>
+      <div className="row-trailing">{children}</div>
     </div>
   )
 }
@@ -1142,8 +734,8 @@ function AddPersonDialog({
       await reloadPairs()
       const online = friendOnlineState(name, friendSeen, folderStatuses) === true
       toast(online ? 'success' : 'info', online
-        ? `Invited ${name} to “${folderName}”. They’ll pick where to save it.`
-        : `${name} looks offline — if the invite doesn’t reach them in a minute or so, share a code instead.`)
+        ? `Invited ${name} to “${folderName}”`
+        : `${name} is offline. If the invite doesn’t arrive, share a code instead.`)
       onClose()
     } catch (e) {
       toast('error', String(e))
@@ -1153,47 +745,44 @@ function AddPersonDialog({
   }
   return (
     <Dialog
-      title="Add someone"
-      subtitle={<>to “{folderName}”</>}
-      icon={<UserPlus size={18} />}
+      title={`Add someone to “${folderName}”`}
       width={420}
+      className="folder-dialog"
       onClose={onClose}
       busy={!!busy}
-      bodyStyle={{ display: 'flex', flexDirection: 'column', gap: 2, margin: '0 -8px', padding: '0 8px' }}
       footer={
-        <button className="chooser-row" style={{ margin: '0 -8px' }} disabled={!!busy} onClick={onShareCode}>
-          <span className="chooser-icon"><QrCode size={18} /></span>
-          <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-            <div className="chooser-name">Share an invite code</div>
-            <div className="chooser-sub">For anyone — they scan the QR or paste the code</div>
-          </div>
-        </button>
+        <>
+          <button className="btn btn-secondary" disabled={!!busy} onClick={onShareCode}>
+            <QrCode /> Share an invite code…
+          </button>
+          <span className="spacer" />
+          <button className="btn btn-secondary" disabled={!!busy} onClick={onClose}>Cancel</button>
+        </>
       }
     >
       {candidates.length === 0 ? (
-        <p className="dialog-text" style={{ margin: '0 8px' }}>
-          {friends.length ? 'All your friends are already in this folder.' : 'You haven’t added any friends yet.'} Share an invite code instead.
+        <p className="dialog-text" style={{ margin: 0 }}>
+          {friends.length ? 'All your friends are already in this folder.' : 'You haven’t added any friends yet.'}
         </p>
       ) : (
-        <>
-          <h3 className="section-title" style={{ margin: '2px 8px 4px' }}>Friends</h3>
+        <div className="group folder-pick">
           {candidates.map((f) => {
             const online = friendOnlineState(f.name, friendSeen, folderStatuses) === true
             return (
-              <button key={f.id} className="chooser-row" disabled={!!busy} onClick={() => void invite(f.id, f.name)}>
-                <span className="chooser-avatar" style={{ background: avatarGradient(f.id) }}>
+              <button key={f.id} type="button" className="row" disabled={!!busy} onClick={() => void invite(f.id, f.name)}>
+                <span className="folder-avatar" style={{ background: avatarColor(f.id) }}>
                   <FriendAvatar friend={f} />
-                  <span className={`presence-dot${online ? ' online' : ''}`} />
+                  <span className={`folder-avatar-dot${online ? ' online' : ''}`} />
                 </span>
-                <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-                  <div className="chooser-name truncate-1">{f.name}</div>
-                  <div className="chooser-sub" style={{ color: online ? 'var(--green)' : undefined }}>{online ? 'Online now' : 'Offline — the invite may not arrive'}</div>
-                </div>
-                {busy === f.id ? <Spinner size={15} /> : <UserPlus size={16} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />}
+                <span className="row-main">
+                  <span className="row-title truncate-1" style={{ display: 'block' }}>{f.name}</span>
+                  <span className="row-sub" style={{ display: 'block' }}>{online ? 'Online' : 'Offline'}</span>
+                </span>
+                {busy === f.id ? <Spinner size={14} /> : <span className="folder-pick-cta">Invite</span>}
               </button>
             )
           })}
-        </>
+        </div>
       )}
     </Dialog>
   )
@@ -1209,12 +798,13 @@ function InviteModal({
   onClose: () => void
 }) {
   return (
-    <Dialog title={`Invite to “${folderName}”`} icon={<UserPlus size={18} />} width={420} onClose={onClose}
-      footer={<button className="btn btn-ghost btn-block" onClick={onClose}>Done</button>}>
-      <p className="dialog-text">
-        Send this to the other person. They open DropBeam → <b>Accept invite</b>, scan this QR
-        code (or paste the invite), and choose a folder.
-      </p>
+    <Dialog
+      title={`Invite to “${folderName}”`}
+      width={420}
+      onClose={onClose}
+      footer={<button className="btn btn-secondary" onClick={onClose}>Done</button>}
+    >
+      <p className="dialog-text">In DropBeam, they choose Accept invite and scan or paste this.</p>
       <ShareCode code={code} layout="stack" copyLabel="Copy invite" />
     </Dialog>
   )

@@ -1,0 +1,125 @@
+/* Transfer rows (Send & Receive list, shared by Chat's phone layout): one line of
+   title + one line of status, a thin progress bar, trailing actions. */
+
+.xfer-list {
+  display: flex;
+  flex-direction: column;
+}
+.xfer-row {
+  position: relative;
+  padding: 10px 12px;
+}
+.xfer-row + .xfer-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 52px;
+  right: 0;
+  height: 1px;
+  background: var(--separator);
+}
+.xfer-row.is-muted .xfer-title,
+.xfer-row.is-muted .xfer-icon { opacity: 0.55; }
+.xfer-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 32px;
+}
+.xfer-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 32px;
+  flex-shrink: 0;
+}
+.xfer-badge {
+  position: absolute;
+  right: -3px;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.xfer-badge.ok { background: var(--green-dot); }
+.xfer-badge.bad { background: var(--red); }
+.xfer-main { flex: 1; min-width: 0; }
+.xfer-title {
+  font-size: var(--text-13);
+  font-weight: 500;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xfer-meta {
+  margin-top: 2px;
+  font-size: var(--text-12);
+  line-height: 1.35;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xfer-error { color: var(--red); }
+.xfer-connecting { display: inline-flex; align-items: center; gap: 6px; }
+.xfer-trailing {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.xfer-trailing .btn + .btn { margin-left: 4px; }
+.xfer-trailing .btn + .icon-btn { margin-left: 4px; }
+.xfer-progress { margin: 8px 0 2px 40px; }
+.xfer-code { margin: 12px 0 4px 40px; }
+.xfer-verify { margin: 8px 0 0 40px; font-size: var(--text-12); color: var(--text-muted); }
+.xfer-verify-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.xfer-verify-line.ok { justify-content: flex-start; color: var(--green); gap: 6px; margin: 0; }
+.xfer-verify-line.bad { color: var(--red); margin: 0; }
+.xfer-verify-bad summary { cursor: default; color: var(--red); }
+.xfer-verify-bad > div { margin-top: 6px; max-height: 150px; overflow-y: auto; font-size: var(--text-11); line-height: 1.5; }
+.xfer-row > .integrity-fail { margin-left: 40px; }
+
+/* The speed and the time left are BUTTONS — clicking the speed swaps current ↔
+   average, clicking the time swaps which rate the estimate uses (both choices are
+   global and remembered). They read as plain text until hovered. */
+.xfer-meter {
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  color: inherit;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 0 3px;
+  margin: 0 -3px;
+  cursor: default;
+  white-space: nowrap;
+}
+.xfer-meter:hover { background: var(--surface-hover); color: var(--text); }
+.xfer-meters { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; }
+.xfer-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+/* Legacy: the old parked-state strip (phone layout only). */
+.conn-park {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+}
+
+/* Integrity: only failures speak up in primary UI. */
+.integrity-fail { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: var(--text-12); color: var(--red); }
+.integrity-fail .icon-btn { margin: -4px 0; }
+.integrity-row { margin-top: 8px; }
+.integrity-name { font-weight: 500; overflow-wrap: anywhere; }
+.integrity-bad { color: var(--red); font-weight: 400; }
+.integrity-row code { display: block; font-family: var(--font-mono); font-size: var(--text-11); color: var(--text-muted); overflow-wrap: anywhere; }
+.conn-info-btn { color: var(--text-faint); }

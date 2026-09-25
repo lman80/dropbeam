@@ -1,14 +1,15 @@
 import { useMemo, useState } from 'react'
 import { AnimatePresence } from 'framer-motion'
-import { ArrowDownToLine, FolderUp, Inbox } from 'lucide-react'
-import { api } from '../lib/api'
+import { ArrowDownToLine, FolderUp, Inbox, Send as SendIcon } from 'lucide-react'
+import { api, isActive } from '../lib/api'
 import { useStore } from '../store'
 import { IS_MAC, MOBILE_UI } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { DropZone } from '../components/DropZone'
 import { TransferCard } from '../components/TransferCard'
 import { ScanCodeButton } from '../components/CodeQr'
-import { EmptyState } from '../components/bits'
+import { Dialog } from '../components/Dialog'
+import { SectionHeader } from '../components/ui'
 
 export function SendView() {
   const transfers = useStore((s) => s.transfers)
@@ -91,97 +92,85 @@ export function SendView() {
     </div>
   )
 
+  const finished = list.filter((t) => !isActive(t.state) && t.state !== 'paused')
+  const clearFinished = () => finished.forEach((t) => useStore.getState().removeTransfer(t.id))
+
   return (
-    <div className="page" style={MOBILE_UI ? { padding: '4px 16px 24px' } : undefined}>
+    <div className="page send-page">
       <div className="page-header titlebar-drag">
-        <div>
-          <h1 className="page-title">Send &amp; Receive</h1>
-          <p className="page-subtitle">Beam files straight to a friend — or to anyone with a code.</p>
+        <h1 className="page-title">Send &amp; Receive</h1>
+        <div className="page-actions">
+          <button className="btn btn-secondary" onClick={() => setShowReceive(true)}>
+            <ArrowDownToLine /> Receive…
+          </button>
+          {!IS_MAC && (
+            <button className="btn btn-secondary" disabled={picking} onClick={() => void onPick('folder')} title="Send a folder and everything in it">
+              <FolderUp /> Send Folder…
+            </button>
+          )}
+          <button className="btn btn-primary" disabled={picking} onClick={() => void onPick()}>
+            <SendIcon /> Send Files…
+          </button>
         </div>
       </div>
-      <DropZone hovering={dragHovering} onPick={() => void onPick()} onPickPhotos={() => void onPick('photos')} picking={picking} />
 
-      {/* Receiving by code is secondary now — friend transfers arrive on their own. */}
-      <div style={{ marginTop: 12, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        {!MOBILE_UI && !IS_MAC && (
-          <button className="btn btn-ghost btn-sm" disabled={picking} onClick={() => void onPick('folder')} title="Folders use a separate picker here. Sends the folder and everything in it.">
-            <FolderUp size={14} /> Choose a folder
-          </button>
-        )}
-        {!showReceive ? (
-          <>
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => setShowReceive(true)}
-            >
-              <ArrowDownToLine size={14} /> Have a code? Receive files
-            </button>
-            <ScanCodeButton
-              label="Scan a QR code"
-              small
-              hint="Hold the sender’s QR code up to your camera."
-              title="Scan to receive"
-              accept={['receive']}
-              onCode={(value) => void openCode(value)}
-              onOther={(p) => void openCode(p.code)}
-            />
-          </>
-        ) : (
-          <form onSubmit={submitReceive} style={{ display: 'flex', gap: 8, width: '100%', maxWidth: 540, flexWrap: 'wrap', justifyContent: 'center' }}>
-            <input
-              className="input"
-              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-              placeholder="Paste the code, or scan the sender’s QR…"
-              aria-label="Receive code"
-              value={code}
-              autoFocus
-              onChange={(e) => setCode(e.target.value)}
-              style={{ fontFamily: 'var(--font-mono)', fontSize: 'calc(14px * var(--ui-font-scale, 1))' }}
-            />
-            <ScanCodeButton
-              label="Scan QR code"
-              hint="Hold the sender’s QR code up to your camera."
-              title="Scan to receive"
-              accept={['receive']}
-              onCode={(value) => { setCode(value); void openCode(value).then((ok) => { if (ok) { setCode(''); setShowReceive(false) } }) }}
-              onOther={(p) => void openCode(p.code).then((ok) => { if (ok) { setCode(''); setShowReceive(false) } })}
-            />
-            <button className="btn btn-primary" type="submit" disabled={!code.trim()}>
-              <ArrowDownToLine size={15} /> Receive
-            </button>
-            <button
-              className="btn btn-ghost"
-              type="button"
-              onClick={() => {
-                setShowReceive(false)
-                setCode('')
-              }}
-            >
-              Cancel
-            </button>
+      {list.length === 0 ? (
+        <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} />
+      ) : (
+        <>
+          <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} compact />
+          <SectionHeader
+            action={finished.length > 0 ? <button className="btn btn-plain btn-sm" onClick={clearFinished}>Clear Finished</button> : undefined}
+          >
+            Transfers
+          </SectionHeader>
+          <div className="group xfer-list">
+            <AnimatePresence initial={false}>
+              {list.map((t) => (
+                <TransferCard key={t.id} t={t} />
+              ))}
+            </AnimatePresence>
+          </div>
+        </>
+      )}
+
+      {showReceive && (
+        <Dialog
+          title="Receive Files"
+          width={420}
+          onClose={() => { setShowReceive(false); setCode('') }}
+          footer={
+            <>
+              <button className="btn btn-secondary" type="button" onClick={() => { setShowReceive(false); setCode('') }}>Cancel</button>
+              <button className="btn btn-primary" type="submit" form="receive-code-form" disabled={!code.trim()}>Receive</button>
+            </>
+          }
+        >
+          <form id="receive-code-form" onSubmit={submitReceive}>
+            <label className="field-label" htmlFor="receive-code">Paste the code from the sender, or scan their QR code.</label>
+            <div className="receive-code-row">
+              <input
+                id="receive-code"
+                className="input mono"
+                autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
+                placeholder="Code"
+                aria-label="Receive code"
+                value={code}
+                autoFocus
+                onChange={(e) => setCode(e.target.value)}
+              />
+              <ScanCodeButton
+                label="Scan…"
+                hint="Hold the sender’s QR code up to your camera."
+                title="Scan to receive"
+                accept={['receive']}
+                onCode={(value) => { setCode(value); void openCode(value).then((ok) => { if (ok) { setCode(''); setShowReceive(false) } }) }}
+                onOther={(p) => void openCode(p.code).then((ok) => { if (ok) { setCode(''); setShowReceive(false) } })}
+              />
+            </div>
           </form>
-        )}
-      </div>
-
-      <div style={{ marginTop: 22, display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <AnimatePresence initial={false}>
-          {list.map((t) => (
-            <TransferCard key={t.id} t={t} />
-          ))}
-        </AnimatePresence>
-
-        {list.length === 0 && (
-          <EmptyState
-            icon={<Inbox size={24} />}
-            title="Nothing here yet"
-            hint={
-              MOBILE_UI
-                ? 'Tap Photos or Files above, then pick who to send them to — a friend, or anyone with a code. Anything sent to you shows up here automatically.'
-                : `Drag files onto the area above and pick who to send to — a friend, or anyone with a code. Whatever you receive shows up here automatically, too.${IS_MAC ? ' Tip: you can also drop a file straight onto the DropBeam menu-bar icon to send it to a friend.' : ''}`
-            }
-          />
-        )}
-      </div>
+        </Dialog>
+      )}
     </div>
   )
 }

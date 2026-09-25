@@ -5,16 +5,16 @@ import { presenceText } from '../mobile/helpers'
 import { friendPresence } from '../lib/presence'
 import { Fragment } from 'react'
 import { groupDevices } from '../lib/deviceIcons'
-import { DeviceBadge } from './DeviceBadge'
+import { useOwnDeviceLabels } from '../lib/ownDevices'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect } from 'react'
 import { AnimatePresence } from 'framer-motion'
-import { ChevronRight, QrCode, Send, Users } from 'lucide-react'
+import { QrCode, UserPlus } from 'lucide-react'
 import { Dialog } from './Dialog'
 import { useStore } from '../store'
 import { avatarGradient } from '../lib/avatar'
 import { FriendAvatar } from './FriendAvatar'
-import { claimPresenceChecks, friendOnlineState } from '../lib/presence'
+import { claimPresenceChecks, presenceLabel } from '../lib/presence'
 
 function baseName(p: string): string {
   return folderName(p) // splits on / and \ (Windows paths)
@@ -31,6 +31,7 @@ export function SendToChooser() {
   const sendPaths = useStore((s) => s.sendPaths)
   const setPendingSend = useStore((s) => s.setPendingSend)
   const setView = useStore((s) => s.setView)
+  const ownLabels = useOwnDeviceLabels()
 
   const open = !!files && files.length > 0
   const close = () => setPendingSend(null)
@@ -64,62 +65,72 @@ export function SendToChooser() {
     <Section title="Or"><Row icon={<IconSquare><QrCode /></IconSquare>} title="Quick Send (code)" accessory="chevron" onPress={withCode} /></Section>
   </Sheet> : null
 
+  const people = [{ title: 'My devices', items: myDevices }, { title: 'Friends', items: others }].filter((g) => g.items.length)
+  const anyOffline = friends.some((f) => friendPresence(f.name, friendSeen, folderStatuses).status !== 'online')
+
   return (
     <AnimatePresence>
       {open && (
         <Dialog
-          title="Send to…"
+          title="Send to"
           subtitle={<span className="truncate-1" style={{ display: 'block' }} title={files?.join('\n')}>{title}</span>}
-          icon={<Send size={17} />}
           onClose={close}
-          bodyStyle={{ display: 'flex', flexDirection: 'column', gap: 2, margin: '0 -8px', padding: '0 8px' }}
+          width={400}
+          className="chooser-dialog"
           footer={
-            <button className="chooser-row" onClick={withCode} style={{ margin: '0 -8px' }}>
-              <span className="chooser-icon"><QrCode size={18} /></span>
-              <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-                <div className="chooser-name">Share with a code or QR</div>
-                <div className="chooser-sub">For anyone — they scan the QR or paste the code</div>
-              </div>
-              <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
+            <button className="chooser-row chooser-share" onClick={withCode}>
+              <span className="chooser-avatar chooser-glyph" aria-hidden><QrCode size={16} /></span>
+              <span className="chooser-text">
+                <span className="chooser-name">Share with a code or QR code</span>
+                <span className="chooser-sub">For anyone, even without DropBeam friends</span>
+              </span>
             </button>
           }
         >
           {friends.length === 0 ? (
             <button
-              className="card empty-row"
+              className="chooser-row"
               onClick={() => {
                 close()
                 setView('friends')
               }}
             >
-              <span className="empty-row-icon"><Users size={16} /></span>
-              <span style={{ flex: 1, minWidth: 0 }}>
-                <span className="empty-row-title">Add a friend to send by name</span>
-                <span className="empty-row-sub">Friends get files in one click — no codes.</span>
+              <span className="chooser-avatar chooser-glyph" aria-hidden><UserPlus size={16} /></span>
+              <span className="chooser-text">
+                <span className="chooser-name">Add a friend</span>
+                <span className="chooser-sub">Then send to them by name</span>
               </span>
-              <ChevronRight size={16} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
             </button>
           ) : (
-            [ { title: 'My devices', items: myDevices }, { title: 'Friends', items: others } ].filter(group => group.items.length).map((group, gi) => <Fragment key={group.title}><h3 className="section-title" style={{ margin: gi ? '12px 8px 4px' : '2px 8px 4px' }}>{group.title}</h3>{group.items.map((f) => {
-              const online = friendOnlineState(f.name, friendSeen, folderStatuses)
-              return (
-                <button key={f.id} className="chooser-row" onClick={() => toFriend(f.id)}>
-                  <span className="chooser-avatar" style={{ background: avatarGradient(f.id) }}>
-                    <FriendAvatar friend={f} /><DeviceBadge kind={f.deviceKind} />
-                    <span className={`presence-dot${online ? ' online' : ''}`} title={online ? 'Online' : 'Status unknown'} />
-                  </span>
-                  <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
-                    <div className="chooser-name truncate-1">{f.name}</div>
-                    <div className="chooser-sub" style={{ color: online ? 'var(--green)' : undefined }}>
-                      {/* Honest: friend file sends retry ~90s then fail — there is
-                          no store-and-forward for files (chat messages DO queue). */}
-                      {online ? 'Online now' : 'Offline — a send keeps trying for ~2 minutes'}
-                    </div>
-                  </div>
-                  <ChevronRight size={17} style={{ color: 'var(--text-faint)', flexShrink: 0 }} />
-                </button>
-              )
-            })}</Fragment>)
+            <>
+              {people.map((group) => (
+                <Fragment key={group.title}>
+                  <h3 className="chooser-section">{group.title}</h3>
+                  {group.items.map((f) => {
+                    const presence = friendPresence(f.name, friendSeen, folderStatuses)
+                    const online = presence.status === 'online'
+                    const name = ownLabels[f.id] ?? f.name
+                    const own = !!ownLabels[f.id]
+                    return (
+                      <button key={f.id} className="chooser-row" onClick={() => toFriend(f.id)} title={`Send to ${name}`}>
+                        <span className={`chooser-avatar${own ? ' chooser-glyph' : ''}`} style={own ? undefined : { background: avatarGradient(f.id) }} aria-hidden>
+                          <FriendAvatar friend={f} />
+                          {online && <span className="presence-dot online" />}
+                        </span>
+                        <span className="chooser-text">
+                          <span className="chooser-name truncate-1">{name}</span>
+                          <span className="chooser-sub truncate-1">{online ? 'Online' : presenceLabel(presence)}</span>
+                        </span>
+                        <span className="chooser-go" aria-hidden>Send</span>
+                      </button>
+                    )
+                  })}
+                </Fragment>
+              ))}
+              {/* Honest, said once: friend file sends retry ~90s then fail — there is
+                  no store-and-forward for files (chat messages DO queue). */}
+              {anyOffline && <p className="chooser-note">If someone’s offline, DropBeam keeps trying for about 2 minutes.</p>}
+            </>
           )}
         </Dialog>
       )}

@@ -3,9 +3,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import jsQR from 'jsqr'
 import { fileSrc } from '../lib/api'
-import { CameraOff, ClipboardPaste, ImageUp, ScanLine, X } from 'lucide-react'
-import { IS_LINUX, IS_MAC, MOBILE_UI } from '../lib/platform'
+import { CameraOff, ImageUp, X } from 'lucide-react'
+import { IS_MAC, MOBILE_UI } from '../lib/platform'
 import { useEscape } from './Dialog'
+import { IconButton } from './ui'
 import { decodeQrFromImage, imageFromTransfer, setScannerDrop } from '../lib/qrImage'
 
 
@@ -80,12 +81,12 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
       if (!alive) return
       stop()
       const name = e instanceof Error ? e.name : ''
-      const alt = MOBILE_UI ? 'or paste the code.' : 'or scan a screenshot / paste the code below.'
+      const where = IS_MAC ? 'System Settings → Privacy & Security → Camera' : 'your system’s camera privacy settings'
       setError(name === 'NotAllowedError' || name === 'SecurityError'
-        ? `Camera access is off for DropBeam. Turn it on in ${IS_MAC ? 'System Settings → Privacy & Security → Camera' : 'your system’s camera privacy settings'}, ${alt}`
-        : name === 'NotFoundError' || name === 'OverconstrainedError' ? `No camera found — ${alt}`
-        : name === 'NotReadableError' ? `The camera is busy in another app. Close it, ${alt}`
-        : `The camera isn’t available here — ${alt}`)
+        ? `Camera access is off. Turn it on in ${where}.`
+        : name === 'NotFoundError' || name === 'OverconstrainedError' ? 'No camera found.'
+        : name === 'NotReadableError' ? 'The camera is in use by another app.'
+        : 'The camera isn’t available.')
       setPaste(true)
     }
     if (!navigator.mediaDevices?.getUserMedia) fail(new Error('Unavailable'))
@@ -132,7 +133,7 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
     const onDrop = (paths: string[]) => {
       const path = paths.find(p => IMAGE_EXT.test(p))
       if (!path) { setNotice('Drop an image (PNG or JPEG) that shows the QR code.'); return }
-      void fetch(fileSrc(path)).then(r => r.blob()).then(readImage).catch(() => setNotice('That image couldn’t be opened. Try “Scan from image…”.'))
+      void fetch(fileSrc(path)).then(r => r.blob()).then(readImage).catch(() => setNotice('That image couldn’t be opened. Try “Choose image…”.'))
     }
     const release = setScannerDrop(onDrop)
     return () => {
@@ -147,40 +148,40 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
     {(notice || error) && <Section footer={<span className="mk-error" role="alert">{notice || error}</span>} />}
   </Sheet>
 
+  const status = reading ? 'Reading image…' : dropping ? 'Drop the image to scan it' : error || (!live ? 'Starting camera…' : '')
   return createPortal(<ScannerFrame close={close}>
-    <div className="card dialog qrs" role="dialog" aria-modal="true" aria-label={title} onClick={e => e.stopPropagation()}
+    <div className="dialog dialog-panel qrs" role="dialog" aria-modal="true" aria-label={title} onClick={e => e.stopPropagation()}
       onDragOver={e => { if (Array.from(e.dataTransfer.items).some(i => i.kind === 'file')) { e.preventDefault(); setDropping(true) } }}
       onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropping(false) }}
       onDrop={e => { e.preventDefault(); setDropping(false); const img = imageFromTransfer(e.dataTransfer); if (img) void readImage(img); else setNotice('Drop an image (PNG or JPEG) that shows the QR code.') }}>
       <div className="dialog-head">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
-          <span className="dialog-icon"><ScanLine size={18} /></span>
-          <h2 className="dialog-title">{title}</h2>
-        </div>
-        <button className="icon-btn" aria-label="Close" title="Close (Esc)" onClick={close}><X size={17} /></button>
+        <h2 className="dialog-title">{title}</h2>
+        <IconButton label="Close" tooltip="Close (Esc)" onClick={close}><X /></IconButton>
       </div>
       <div className="dialog-body qrs-body">
-        <div className={`qrs-stage${dropping ? ' dropping' : ''}`}>
+        <div className={`qrs-stage${live && !dropping && !reading ? ' live' : ''}${dropping ? ' dropping' : ''}`}>
           <video ref={video} autoPlay muted playsInline className="qrs-video" style={{ transform: mirror ? 'scaleX(-1)' : undefined, opacity: live ? 1 : 0 }} />
           <canvas ref={canvas} hidden />
-          {live && <div className="qrs-finder" aria-hidden="true"><i /><i /><i /><i /></div>}
-          {!live && !error && <div className="qrs-stage-msg">Starting camera…</div>}
-          {error && !dropping && !reading && <div className="qrs-stage-msg"><CameraOff size={26} strokeWidth={1.6} /><span>{error}</span></div>}
-          {dropping && <div className="qrs-stage-msg qrs-drop"><ImageUp size={26} strokeWidth={1.6} /><span>Drop the image to scan it</span></div>}
-          {reading && <div className="qrs-stage-msg qrs-drop"><span>Reading image…</span></div>}
+          {live && !dropping && !reading && <div className="qrs-finder" aria-hidden="true"><i /><i /><i /><i /></div>}
+          {status && <div className="qrs-stage-msg" role={error ? 'alert' : 'status'}>
+            {error && !dropping && !reading && <CameraOff size={22} strokeWidth={1.6} aria-hidden />}
+            {dropping && <ImageUp size={22} strokeWidth={1.6} aria-hidden />}
+            <span>{status}</span>
+          </div>}
         </div>
         <p className="qrs-hint">{hint}</p>
         {notice && <p className="qrs-notice" role="alert">{notice}</p>}
-        <div className="qrs-alt">
-          <button className="btn btn-ghost btn-sm" type="button" disabled={reading} onClick={() => fileInput.current?.click()}><ImageUp size={14} />Scan from image…</button>
-          <button className="btn btn-ghost btn-sm" type="button" onClick={() => setPaste(p => !p)}><ClipboardPaste size={14} />Paste the code</button>
-          <input ref={fileInput} type="file" accept="image/*" hidden onChange={e => { const f = e.target.files?.[0] ?? null; e.target.value = ''; void readImage(f) }} />
-        </div>
-        {paste && <form className="qrs-paste" onSubmit={e => { e.preventDefault(); e.stopPropagation(); rejected.current = ''; finish(code) }}>
-          <input className="input" aria-label="Paste a code" placeholder="Paste the code…" autoFocus autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={code} onChange={e => { setCode(e.target.value); setNotice('') }} />
+        {paste ? <form className="qrs-paste" onSubmit={e => { e.preventDefault(); e.stopPropagation(); rejected.current = ''; finish(code) }}>
+          <input className="input" aria-label="Paste a code" placeholder="Paste the code" autoFocus autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={code} onChange={e => { setCode(e.target.value); setNotice('') }} />
           <button className="btn btn-primary" disabled={!code.trim()}>Use code</button>
-        </form>}
-        <p className="qrs-tip">No camera? Drop a screenshot of the QR here, or copy one ({IS_MAC ? '⇧⌘⌃4' : IS_LINUX ? 'Ctrl+Shift+PrtSc' : 'Win+Shift+S'}) and press {IS_MAC ? '⌘V' : 'Ctrl+V'}.</p>
+        </form> : null}
+      </div>
+      <div className="dialog-actions dialog-footer qrs-actions">
+        <button className="btn btn-plain" type="button" disabled={reading} onClick={() => fileInput.current?.click()}>Choose image…</button>
+        {!paste && <button className="btn btn-plain" type="button" onClick={() => setPaste(true)}>Paste code</button>}
+        <span className="spacer" />
+        <button className="btn btn-secondary" type="button" onClick={close}>Cancel</button>
+        <input ref={fileInput} type="file" accept="image/*" hidden onChange={e => { const f = e.target.files?.[0] ?? null; e.target.value = ''; void readImage(f) }} />
       </div>
     </div>
   </ScannerFrame>, document.body)
