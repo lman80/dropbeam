@@ -199,7 +199,7 @@ fn validate_root(config: &Path, root: &Path) -> Result<()> {
     let mut protected = vec![config.clone(), PathBuf::from("/")];
     if let Some(home) = std::env::var_os("HOME") {
         let home = fs::canonicalize(home)?;
-        #[cfg(target_os = "macos")] {
+        #[cfg(target_vendor = "apple")] {
             let library = canonical_missing(&home.join("Library"))?;
             ensure!(!root.starts_with(&library), LocationError::UnsafeRoot);
             protected.push(library);
@@ -447,11 +447,14 @@ mod unix {
         let old = c(old)?; let new = c(new)?;
         #[cfg(target_os = "linux")]
         let rc = unsafe { libc::syscall(libc::SYS_renameat2, from.as_raw_fd(), old.as_ptr(), to.as_raw_fd(), new.as_ptr(), libc::RENAME_NOREPLACE) as i32 };
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         let rc = unsafe { libc::renameatx_np(from.as_raw_fd(), old.as_ptr(), to.as_raw_fd(), new.as_ptr(), libc::RENAME_EXCL) };
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        { bail!("Atomic no-replace rename is unavailable on this platform"); }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        // Anywhere else: report ENOSYS so callers take the hard-link fallback
+        // (`unsupported`) instead of failing a fully received file. (iOS used to
+        // land here and every Mac→iPhone file failed at 100%.)
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+        { return Err(std::io::Error::from_raw_os_error(libc::ENOSYS)).context("Atomic no-replace rename is unavailable on this platform"); }
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         io(rc).context("Could not move item without replacing data (the filesystem must support atomic no-replace rename)")
     }
     pub(super) fn probe(dir: &fs::File) -> Result<bool> {
@@ -643,13 +646,13 @@ mod unix {
         loop {
             #[cfg(target_os = "linux")]
             let errno = unsafe { libc::__errno_location() };
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             let errno = unsafe { libc::__error() };
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_vendor = "apple"))]
             unsafe { *errno = 0; }
             let ent = unsafe { libc::readdir(d.0) };
             if ent.is_null() {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(target_os = "linux", target_vendor = "apple"))]
                 if unsafe { *errno } != 0 { return Err(std::io::Error::last_os_error().into()); }
                 break;
             }
