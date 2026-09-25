@@ -1,1 +1,111 @@
-/* Friends screen. */
+/* Friends screen: You, My devices and Friends as native lists. */
+
+/* Rows carry a 32px avatar, so separators start under the text. */
+.fr-list { --row-inset: 56px; }
+.fr-list > .row { min-height: 48px; }
+
+/* Round avatar: flat colour + initials (or the picture), one presence dot. */
+.fr-avatar {
+  position: relative;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  color: #fff;
+  font-weight: 600;
+  font-size: var(--text-11);
+  line-height: 1;
+  letter-spacing: 0.01em;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.fr-avatar .avatar-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+/* Your own devices and non-person rows: a neutral glyph disc. */
+.fr-avatar.is-device { background: var(--surface-2); color: var(--text-muted); }
+.fr-avatar.is-device .avatar-device { color: var(--text-muted); }
+.fr-avatar.is-device svg { width: 16px; height: 16px; }
+.fr-presence {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--green-dot);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+/* Your picture: click to change; a quiet camera overlay on hover/focus. */
+.fr-you-avatar {
+  position: relative;
+  flex-shrink: 0;
+  display: grid;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: none;
+  cursor: default;
+}
+.fr-you-avatar-edit {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transition: opacity var(--dur-fast);
+}
+.fr-you-avatar:hover .fr-you-avatar-edit,
+.fr-you-avatar:focus-visible .fr-you-avatar-edit { opacity: 1; }
+.fr-you-avatar:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+.fr-code { font-family: var(--font-mono); font-size: var(--text-11); }
+.fr-code-btn { min-width: 68px; }
+
+/* "Link a device…" row when there are none yet. */
+.fr-add-row .row-title,
+.fr-add-row .row-sub { display: block; }
+.fr-add-row .row-title { color: var(--accent-text); }
+.fr-add-row .fr-avatar { color: var(--accent-text); }
+
+/* Trailing controls: the connection ⓘ keeps its slot (no shift) and shows on
+   hover / keyboard focus only. */
+.fr-conn { display: inline-flex; width: 22px; justify-content: center; }
+.fr-row .fr-conn { opacity: 0; transition: opacity var(--dur-fast); }
+.fr-row:hover .fr-conn,
+.fr-row:focus-within .fr-conn { opacity: 1; }
+.fr-send { min-width: 64px; }
+.fr-send .spinner { margin: 0 1px; }
+
+/* Menu checkmark column (Auto-accept files). */
+.menu-check {
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--text);
+}
+.menu-check svg { width: 13px; height: 13px; stroke-width: 2.4; }
+.menu-item:hover:not(:disabled) .menu-check,
+.menu-item:focus-visible .menu-check { color: #fff; }
+
+/* Your code dialog. */
+.fr-qr { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 4px 0 0; }
+.fr-qr p { margin: 0; font-size: var(--text-12); color: var(--text-muted); text-align: center; }
+
+/* Add friend: code field + Scan QR… */
+.fr-code-field { display: flex; align-items: center; gap: 8px; }
+.fr-code-field .input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: var(--text-12); }
+.fr-code-field .btn { flex-shrink: 0; }
