@@ -1614,29 +1614,69 @@ function ImageAttachment({ src, name, detail, onOpen, onError }: {
   )
 }
 
-/** A video attachment: first frame as the poster with a play glyph; plays inline
- *  on click (native controls appear only then). */
+/** First frames already captured, keyed by media URL, so a re-mounted or
+ *  re-laid-out bubble shows its picture instantly instead of flashing blank. */
+const posterCache = new Map<string, { poster: string; ratio: number }>()
+
+/** A video attachment: first frame as a still with a play glyph; plays inline
+ *  on click (native controls appear only then). WebKit can drop a paused
+ *  <video>'s decoded frame (scrolling, memory pressure, window changes), which
+ *  left a blank grey box — so the first frame is captured once to an image. */
 function VideoAttachment({ src, name, detail, onError }: { src: string; name: string; detail: string; onError: () => void }) {
   const ref = useRef<HTMLVideoElement>(null)
+  const cached = posterCache.get(src)
   const [playing, setPlaying] = useState(false)
-  const [ratio, setRatio] = useState<number | null>(null)
+  const [poster, setPoster] = useState<string | null>(cached?.poster ?? null)
+  const [ratio, setRatio] = useState<number | null>(cached?.ratio ?? null)
   const box = ratio
     ? ratio >= 1 ? { width: 280, height: Math.round(280 / ratio) } : { width: Math.round(280 * ratio), height: 280 }
     : { width: 280, height: 158 }
+  const capture = (v: HTMLVideoElement) => {
+    if (posterCache.has(src) || !v.videoWidth || !v.videoHeight) return
+    try {
+      const scale = Math.min(1, 560 / v.videoWidth)
+      const c = document.createElement('canvas')
+      c.width = Math.round(v.videoWidth * scale)
+      c.height = Math.round(v.videoHeight * scale)
+      const ctx = c.getContext('2d')
+      if (!ctx) return
+      ctx.drawImage(v, 0, 0, c.width, c.height)
+      // A frame grabbed before it's decoded is solid black; never cache that.
+      const px = ctx.getImageData(0, 0, c.width, c.height).data
+      let lum = 0, n = 0
+      for (let i = 0; i < px.length; i += 4 * 97) { lum += px[i] + px[i + 1] + px[i + 2]; n++ }
+      if (n && lum / (3 * n) < 6) return
+      const url = c.toDataURL('image/jpeg', 0.82)
+      const r = v.videoWidth / v.videoHeight
+      posterCache.set(src, { poster: url, ratio: r })
+      setPoster(url)
+    } catch {
+      // Canvas refused (cross-origin) — keep the live first frame instead.
+    }
+  }
   return (
     <div className={`att-video${playing ? ' playing' : ''}`} style={box} title={playing ? undefined : detail}>
+      {poster && !playing && <img className="att-video-poster" src={poster} alt="" draggable={false} />}
       <video
         ref={ref}
         // A media fragment makes the webview paint the first frame instead of a
         // black box before the viewer presses play.
         src={`${src}#t=0.1`}
-        preload="metadata"
+        crossOrigin="anonymous"
+        preload={poster && !playing ? 'none' : 'metadata'}
         playsInline
         controls={playing}
+        style={poster && !playing ? { visibility: 'hidden' } : undefined}
         onLoadedMetadata={(e) => {
           const v = e.currentTarget
           if (v.videoWidth && v.videoHeight) setRatio(v.videoWidth / v.videoHeight)
         }}
+        onLoadedData={(e) => {
+          // Force a real seek to the first frame; capture once it has landed.
+          const v = e.currentTarget
+          if (!posterCache.has(src) && !v.seeking) v.currentTime = Math.min(0.1, (v.duration || 1) / 2)
+        }}
+        onSeeked={(e) => capture(e.currentTarget)}
         onError={onError}
       />
       {!playing && (

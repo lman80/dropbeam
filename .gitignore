@@ -32,3 +32,4 @@ dist-ssr
 
 # Cloudflare deploy config (account + KV ids) — keep out of the public repo
 diagnostics-worker/wrangler.toml
+public/mock-media/
