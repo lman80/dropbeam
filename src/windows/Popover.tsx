@@ -2,22 +2,42 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { AnimatePresence, motion } from 'framer-motion'
-import { ArrowDownToLine, Check, Copy, Power, QrCode, Search, Send, Settings, UserPlus, X } from 'lucide-react'
+import {
+  AppWindow,
+  ArrowDown,
+  ArrowDownToLine,
+  ArrowRight,
+  ArrowUp,
+  Check,
+  Copy,
+  Power,
+  QrCode,
+  ScanLine,
+  Search,
+  Send,
+  Settings,
+} from 'lucide-react'
 import { api, HAS_TAURI, isActive, type TransferUpdate } from '../lib/api'
 import { useStore } from '../store'
-import { Spinner } from '../components/bits'
+import { IconButton, MenuButton, ProgressBar, Spinner } from '../components/ui'
 import { QrScanner } from '../components/QrScanner'
 import { QrCodeView } from '../components/CodeQr'
+import { FriendAvatar } from '../components/FriendAvatar'
 import { parseCode } from '../lib/codes'
 import { Toasts } from '../components/Toasts'
-import { avatarGradient, initials } from '../lib/avatar'
-import { friendOnlineState } from '../lib/presence'
+import { avatarColor } from '../lib/avatar'
+import { friendPresence, presenceLabel } from '../lib/presence'
+import { peerLabel } from '../lib/humanize'
 import { formatSpeed as formatSpeedValue } from '../lib/format'
 
 const openMain = () => invoke('open_main_window').catch(() => {})
 const hideSelf = () => invoke('hide_popover').catch(() => {})
 const quitApp = () => invoke('quit_app').catch(() => {})
+// The main window listens for tray actions (the Linux tray menu uses the same path).
+const openSettings = () => {
+  void emit('dropbeam://tray-action', 'settings').catch(() => {})
+  void openMain()
+}
 
 export function Popover() {
   const init = useStore((s) => s.init)
@@ -45,6 +65,14 @@ export function Popover() {
   useEffect(() => {
     init()
   }, [init])
+
+  // Escape closes the menu-bar panel (menus and the receive field handle theirs first).
+  useEffect(() => {
+    if (!HAS_TAURI) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !e.defaultPrevented) void hideSelf() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -287,29 +315,27 @@ export function Popover() {
     <div className="popover-root">
       <div className={`popover-panel${dragActive ? ' dragging' : ''}`}>
         <header className="popover-head">
-          <button className="icon-btn" title="Open DropBeam" onClick={openMain}>
-            <Settings size={15} />
-          </button>
           <span className="popover-title">DropBeam</span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-            <button
-              className="icon-btn icon-btn-quit"
-              title="Quit DropBeam"
-              onClick={quitApp}
-            >
-              <Power size={15} />
-            </button>
-            <button className="icon-btn" title="Close" onClick={hideSelf}>
-              <X size={15} />
-            </button>
-          </div>
+          <MenuButton
+            size="sm"
+            label="DropBeam menu"
+            items={[
+              { label: 'Open DropBeam', icon: <AppWindow />, onSelect: openMain },
+              { label: 'Settings…', icon: <Settings />, onSelect: openSettings },
+              { separator: true },
+              { label: 'Quit DropBeam', icon: <Power />, onSelect: quitApp },
+            ]}
+          />
         </header>
 
-        <div className="pop-search-wrap">
-          <Search size={15} className="pop-search-icon" />
+        <div className="pop-search search-field">
+          <Search />
           <input
-            className="pop-search"
-              placeholder="Search friends"
+            className="input"
+            type="search"
+            placeholder="Search"
+            aria-label="Search friends"
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -319,7 +345,8 @@ export function Popover() {
           {filtered.length ? (
             <div className="pop-contacts">
               {filtered.map((f) => {
-                const online = friendOnlineState(f.name, friendSeen, folderStatuses) === true
+                const presence = friendPresence(f.name, friendSeen, folderStatuses)
+                const online = presence.status === 'online'
                 const hot = dragHoverId === f.id
                 return (
                   <button
@@ -332,96 +359,81 @@ export function Popover() {
                     disabled={pickingFor !== null}
                     title={`Send files to ${f.name}`}
                   >
-                    <span
-                      className="pop-contact-av"
-                      style={{ background: avatarGradient(f.id) }}
-                    >
-                      {pickingFor === f.id ? <Spinner size={15} /> : initials(f.name)}
+                    <span className="pop-contact-av" style={{ background: avatarColor(f.id) }}>
+                      {pickingFor === f.id ? <Spinner size={12} /> : <FriendAvatar friend={f} />}
                       {online && <span className="pop-online-dot" />}
                     </span>
                     <span className="pop-contact-text">
                       <span className="pop-contact-name">{f.name}</span>
                       <span className="pop-contact-sub">
-                        {hot ? 'Drop to send' : online ? 'Online now' : 'Tap or drop a file'}
+                        {hot ? 'Drop to send' : online ? 'Online' : presenceLabel(presence)}
                       </span>
                     </span>
-                    <Send size={15} className="pop-contact-send" />
                   </button>
                 )
               })}
             </div>
-          ) : (
-            <button
-              className="btn btn-ghost"
-              style={{ width: '100%', fontSize: 12.5 }}
-              onClick={openMain}
-            >
-              <UserPlus size={14} /> {query ? 'No match — add a friend' : 'Add a friend in the app'}
-            </button>
-          )}
-
-          {active.length > 0 && (
-            <>
-              <div className="popover-section-label">Transfers</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                {active.map((t) => (
-                  <PopoverTransfer key={t.id} t={t} />
-                ))}
-              </div>
-            </>
-          )}
+          ) : ready ? (
+            <div className="pop-empty">
+              <span>{query ? 'No friends match.' : 'No friends yet.'}</span>
+              <button className="btn btn-plain btn-sm" onClick={openMain}>
+                Add a Friend…
+              </button>
+            </div>
+          ) : null}
 
           {!ready && (
-            <div style={{ display: 'grid', placeItems: 'center', padding: 16 }}>
-              <Spinner size={18} />
+            <div className="pop-loading">
+              <Spinner size={16} />
             </div>
           )}
         </div>
 
+        {/* Transfers get their own strip under the list, so the friend rows
+            (the drop targets) keep their place while something is sending. */}
+        {active.length > 0 && (
+          <div className="pop-xfers" aria-label="Transfers" role="region">
+            {active.map((t) => (
+              <PopoverTransfer key={t.id} t={t} />
+            ))}
+          </div>
+        )}
+
+        {showReceive && (
+          <form className="pop-receive" onSubmit={submitReceive}>
+            <input
+              className="input set-mono"
+              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
+              placeholder="Paste a code"
+              aria-label="Receive code"
+              value={code}
+              autoFocus
+              onChange={(e) => setCode(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setShowReceive(false) } }}
+            />
+            <IconButton label="Scan a QR code" tooltip="Scan a QR code (opens DropBeam)" side="top" onClick={startScan}>
+              <ScanLine />
+            </IconButton>
+            <IconButton label="Receive" side="top" type="submit" disabled={!code.trim()} className="pop-receive-go">
+              <ArrowRight />
+            </IconButton>
+          </form>
+        )}
+
         <footer className="pop-foot">
           <button
-            className="btn btn-primary"
-            style={{ flex: 1, justifyContent: 'center' }}
-            onClick={pickAndSend}
-            disabled={pickingFor !== null}
-          >
-            {pickingFor === '__quick__' ? <Spinner size={15} /> : <Send size={15} />} Send a file
-          </button>
-          <button
-            className="btn btn-ghost"
-            title="Receive with a code"
+            className={`btn btn-secondary${showReceive ? ' on' : ''}`}
+            aria-expanded={showReceive}
             onClick={() => setShowReceive((v) => !v)}
-            style={{ color: showReceive ? 'var(--accent)' : undefined }}
           >
-            <ArrowDownToLine size={16} />
+            <ArrowDownToLine />
+            Receive…
+          </button>
+          <button className="btn btn-primary" onClick={pickAndSend} disabled={pickingFor !== null}>
+            {pickingFor === '__quick__' ? <Spinner size={12} /> : <Send />}
+            Send File…
           </button>
         </footer>
-        <AnimatePresence initial={false}>
-          {showReceive && (
-            <motion.form
-              onSubmit={submitReceive}
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-              style={{ overflow: 'hidden', display: 'flex', gap: 8, padding: '0 12px 12px' }}
-            >
-              <input
-                className="input"
-                autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-                placeholder="Paste a code to receive"
-                aria-label="Receive code"
-                value={code}
-                autoFocus
-                onChange={(e) => setCode(e.target.value)}
-                style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
-              />
-              <button className="btn btn-ghost" type="button" aria-label="Scan a QR code" title="Scan a QR code (opens DropBeam)" onClick={startScan}><QrCode size={15} /></button>
-              <button className="btn btn-primary" type="submit" disabled={!code.trim()}>
-                <ArrowDownToLine size={15} />
-              </button>
-            </motion.form>
-          )}
-        </AnimatePresence>
       </div>
       {/* The popover runs its own store instance, so errors toasted here (failed
           drag-to-send, bad receive code, engine still starting) rendered NOWHERE
@@ -439,21 +451,25 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
   const [copied, setCopied] = useState(false)
   const [showQr, setShowQr] = useState(false)
   const name = t.fileNames[0] ?? (t.direction === 'receive' ? 'Incoming' : 'Files')
+  const more = t.fileCount > 1 ? ` +${t.fileCount - 1}` : ''
   const isSendWaiting =
     t.direction === 'send' && t.state === 'waitingForPeer' && !!t.code && !t.friendName
+  const who = t.friendName ?? peerLabel(t.peer)
 
   const label =
     t.state === 'completed'
       ? t.direction === 'send'
-        ? 'Sent'
-        : 'Received'
+        ? who ? `Sent to ${who}` : 'Sent'
+        : who ? `Received from ${who}` : 'Received'
       : t.state === 'transferring'
         ? `${Math.round(t.percent)}% · ${formatSpeed(t.speedBps)}`
-        : t.friendName
-          ? `to ${t.friendName}`
-          : t.direction === 'receive'
-            ? 'Receiving…'
-            : 'Waiting…'
+        : isSendWaiting
+          ? 'Waiting — share the code'
+          : who
+            ? t.direction === 'send' ? `Waiting for ${who}` : `Connecting to ${who}…`
+            : t.direction === 'receive'
+              ? 'Receiving…'
+              : 'Waiting…'
 
   const copy = async () => {
     if (!t.code) return
@@ -467,68 +483,41 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
   }
 
   return (
-    <div className="popover-xfer">
-      <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
-        <span
-          style={{
-            width: 7,
-            height: 7,
-            borderRadius: 999,
-            flexShrink: 0,
-            background:
-              t.state === 'completed'
-                ? 'var(--green)'
-                : t.state === 'failed'
-                  ? 'var(--red)'
-                  : 'var(--accent)',
-          }}
-        />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div
-            style={{
-              fontSize: 12.5,
-              fontWeight: 600,
-              whiteSpace: 'nowrap',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-            }}
-          >
-            {name}
+    <div className="pop-xfer">
+      <div className="pop-xfer-line">
+        <span className="pop-xfer-icon" aria-hidden>
+          {t.state === 'completed' ? <Check /> : t.direction === 'send' ? <ArrowUp /> : <ArrowDown />}
+        </span>
+        <div className="pop-xfer-text">
+          <div className="pop-xfer-name" title={t.fileNames.join(', ')}>
+            <span className="truncate-1">{name}</span>
+            {more && <span className="pop-xfer-more tnum">{more}</span>}
           </div>
-          <div style={{ fontSize: 11, color: 'var(--text-faint)' }}>{label}</div>
+          <div className="pop-xfer-sub tnum">{label}</div>
         </div>
         {isSendWaiting && (
-          <button
-            className="icon-btn"
-            style={{ width: 26, height: 26, color: showQr ? 'var(--accent)' : undefined }}
-            onClick={() => setShowQr((v) => !v)}
-            title={showQr ? 'Hide QR code' : 'Show QR code'}
-            aria-label={showQr ? 'Hide QR code' : 'Show QR code'}
+          <IconButton
+            size="sm"
+            label={showQr ? 'Hide QR code' : 'Show QR code'}
+            active={showQr}
             aria-pressed={showQr}
+            side="top"
+            onClick={() => setShowQr((v) => !v)}
           >
-            <QrCode size={13} />
-          </button>
+            <QrCode />
+          </IconButton>
         )}
         {isSendWaiting && (
-          <button
-            className="icon-btn"
-            style={{ width: 26, height: 26 }}
-            onClick={copy}
-            title="Copy code"
-            aria-label="Copy code"
-          >
-            {copied ? <Check size={13} /> : <Copy size={13} />}
-          </button>
+          <IconButton size="sm" label={copied ? 'Copied' : 'Copy code'} side="top" onClick={copy}>
+            {copied ? <Check /> : <Copy />}
+          </IconButton>
         )}
       </div>
-      {isSendWaiting && showQr && <div style={{ display: 'grid', placeItems: 'center', padding: '10px 0 4px' }}><QrCodeView value={t.code!} size={168} hint="Scan with DropBeam" enlarge={false} /></div>}
-      {isSendWaiting && !showQr && <code className="popover-code selectable">{t.code}</code>}
+      {isSendWaiting && showQr && <div className="pop-xfer-qr"><QrCodeView value={t.code!} size={148} hint="Scan with DropBeam" enlarge={false} /></div>}
+      {isSendWaiting && !showQr && <code className="pop-xfer-code selectable">{t.code}</code>}
       {t.state === 'transferring' && (
-        <div className="popover-progress">
-          <div
-            className="popover-progress-fill"
-            style={{ width: `${Math.max(3, t.percent)}%` }}
-          />
+        <div className="pop-xfer-bar">
+          <ProgressBar percent={t.percent} label={`${name} progress`} />
         </div>
       )}
     </div>

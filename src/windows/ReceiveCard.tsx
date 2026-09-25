@@ -13,18 +13,29 @@ import {
   Send as SendIcon,
 } from 'lucide-react'
 import { HAS_TAURI, api, type TransferUpdate } from '../lib/api'
-import { formatEta, formatSpeed } from '../lib/format'
+import { avatarColor } from '../lib/avatar'
+import { peerLabel } from '../lib/humanize'
+import { MenuPopover, ProgressBar, Spinner, type MenuItem } from '../components/ui'
 import { useStore } from '../store'
 
 // Pick a file-type glyph from the extension (audio waveform, image, video…).
-function iconFor(name: string) {
+function glyphFor(name: string) {
   const ext = name.split('.').pop()?.toLowerCase() ?? ''
-  if (['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'aiff'].includes(ext)) return FileAudio
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'tiff', 'bmp', 'svg'].includes(ext))
-    return FileImage
-  if (['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm'].includes(ext)) return FileVideo
-  if (['txt', 'md', 'rtf', 'pdf', 'doc', 'docx', 'pages'].includes(ext)) return FileText
-  return FileIcon
+  const props = { size: 20, strokeWidth: 1.6 }
+  if (['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'aiff'].includes(ext)) return <FileAudio {...props} />
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'tiff', 'bmp', 'svg'].includes(ext)) return <FileImage {...props} />
+  if (['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm'].includes(ext)) return <FileVideo {...props} />
+  if (['txt', 'md', 'rtf', 'pdf', 'doc', 'docx', 'pages'].includes(ext)) return <FileText {...props} />
+  return <FileIcon {...props} />
+}
+
+/** "3 s", "2 min", "1 h 5 min" — or null when there's no useful estimate. */
+function etaText(seconds: number | null | undefined): string | null {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0.5) return null
+  if (seconds < 60) return `${Math.ceil(seconds)} s`
+  const mins = Math.round(seconds / 60)
+  if (mins < 60) return `${mins} min`
+  return `${Math.floor(mins / 60)} h ${mins % 60} min`
 }
 
 function initialOf(name: string | null | undefined): string {
@@ -35,7 +46,7 @@ function initialOf(name: string | null | undefined): string {
 // Truncate a long filename in the MIDDLE so the extension stays visible. The
 // card is fixed-width and centered, so the name is cut to fit rather than being
 // allowed to stretch the layout off-centre (CSS can only ellipsize the end).
-function midTruncate(s: string, max = 26): string {
+function midTruncate(s: string, max = 24): string {
   if (s.length <= max) return s
   const keep = Math.floor((max - 1) / 2)
   return `${s.slice(0, keep)}…${s.slice(s.length - keep)}`
@@ -50,13 +61,10 @@ const SENDING_STATES = ['starting', 'waitingForPeer', 'connecting', 'transferrin
 
 // Card window size (logical px). The window has native macOS traffic-light
 // controls (titleBarStyle Overlay) — yellow minimizes it into the Dock, red
-// dismisses it — so there's no custom minimize/close chrome anymore.
-// As small as the content allows: the progress card carries name, %, speed and
-// time left, and only an offer (Accept / Decline / Save to…) needs the taller
-// frame, so the window is sized per state instead of to the biggest one.
+// dismisses it — so there's no custom minimize/close chrome anymore. Every
+// state (offer, progress, sent) is laid out to fit this one frame exactly.
 const FULL_W = 190
 const FULL_H = 184
-const OFFER_H = 200
 
 /**
  * The floating Blip-style transfer card (bottom-right, near Downloads).
@@ -137,11 +145,11 @@ export function ReceiveCard() {
   // file directly on the main Send page — is handled there, not here.
   const sendCandidate = outgoing ?? justSent
 
-  // An offer needs room for its buttons; everything else is the compact card.
-  useCardFrame(incoming?.state === 'waitingForAccept' ? OFFER_H : FULL_H)
+  useCardFrame(FULL_H)
 
   const [saveDirs, setSaveDirs] = useState<SaveDir[]>([{ label: 'Default folder', path: '' }])
-  const [menuOpen, setMenuOpen] = useState(false)
+  const [menuAnchor, setMenuAnchor] = useState<{ rect: DOMRect; el: HTMLElement } | null>(null)
+  const closeMenu = () => setMenuAnchor(null)
   useEffect(() => {
     if (!HAS_TAURI) return
     void (async () => {
@@ -184,7 +192,7 @@ export function ReceiveCard() {
   const visible = !!active && cardKey !== dismissedKey
 
   const closeCard = () => {
-    setMenuOpen(false)
+    closeMenu()
     if (cardKey) setDismissedKey(cardKey)
     setJustSent(null)
   }
@@ -204,7 +212,7 @@ export function ReceiveCard() {
       void win.show()
       return
     }
-    setMenuOpen(false)
+    closeMenu()
     void win.hide()
     // Debounce dropping the Dock icon: back-to-back transfers shouldn't flap the
     // activation policy off→on→off. Only revert to menu-bar-only after a quiet
@@ -245,12 +253,12 @@ export function ReceiveCard() {
 
   const respond = (accept: boolean, dest?: string) => {
     if (!incoming) return
-    setMenuOpen(false)
+    closeMenu()
     void api.respondToOffer(incoming.id, accept, dest)
   }
 
   const chooseFolder = async () => {
-    setMenuOpen(false)
+    closeMenu()
     try {
       const dir = await api.pickDirectory()
       if (dir && incoming) void api.respondToOffer(incoming.id, true, dir)
@@ -262,51 +270,39 @@ export function ReceiveCard() {
   // ── Render data for whichever card is active ──────────────────────────────
   const t = visible ? active : null
   const rates = useStore((s) => (t ? s.transferRates[t.id] : undefined))
-  const speedMode = useStore((s) => s.speedMode)
   const etaMode = useStore((s) => s.etaMode)
   const sending = !incoming && showSend
   const done = sending && !outgoing && !!justSent // a send that just completed
 
   const name = t?.fileNames[0] ?? (sending ? 'File' : 'Incoming file')
-  const multi = (t?.fileCount ?? 1) > 1
-  const Glyph = iconFor(name)
+  const extra = (t?.fileCount ?? 1) - 1
   const pendingOffer = incoming?.state === 'waitingForAccept'
   const pct = done ? 100 : t?.state === 'transferring' ? t.percent : 0
-  const ringActive = !pendingOffer && !done // show the moving ring while transferring
 
-  // Progress ring geometry around the avatar.
-  const R = 22
-  const C = 2 * Math.PI * R
+  const who = t ? t.friendName ?? peerLabel(t.peer) : null
+  const sub = incoming
+    ? `From ${who || 'someone nearby'}`
+    : done
+      ? who ? `Sent to ${who}` : 'Sent'
+      : who ? `To ${who}` : 'Sending'
+  // One human line under the bar: how far, and how long is left.
+  const eta = t?.state === 'transferring'
+    ? etaText((etaMode === 'avg' ? rates?.avgEta ?? rates?.liveEta : rates?.liveEta ?? rates?.avgEta) ?? t.etaSeconds)
+    : null
+  const meter = t?.state === 'transferring'
+    ? [`${Math.round(pct)}%`, eta && `${eta} left`].filter(Boolean).join(' · ')
+    : t?.state === 'connecting' || t?.state === 'starting'
+      ? 'Connecting…'
+      : t?.state === 'waitingForPeer'
+        ? `Waiting for ${who || 'the other device'}…`
+        : 'Starting…'
 
-  const friendName = t?.friendName ?? null
-  const sub = (() => {
-    if (incoming) {
-      return incoming.state === 'transferring'
-        ? `Receiving… ${Math.round(pct)}%`
-        : 'Connecting…'
-    }
-    // outgoing
-    if (done) return friendName ? `Sent to ${friendName}` : 'Sent'
-    return friendName ? `Sending to ${friendName}…` : 'Sending…'
-  })()
-  // The one live line the compact card has room for: how far, how fast, how long
-  // left — the same live/average bases the in-app card uses.
-  const meter =
-    t?.state === 'transferring'
-      ? [
-          `${Math.round(pct)}%`,
-          formatSpeed(
-            (speedMode === 'live' ? rates?.liveBps ?? rates?.avgBps : rates?.avgBps ?? rates?.liveBps) ??
-              t.speedBps,
-          ),
-          formatEta(
-            (etaMode === 'avg' ? rates?.avgEta ?? rates?.liveEta : rates?.liveEta ?? rates?.avgEta) ??
-              t.etaSeconds,
-          ) + ' left',
-        ]
-          .filter((part) => !part.startsWith('—'))
-          .join(' · ')
-      : null
+  const menuItems: MenuItem[] = [
+    { heading: 'Save to' },
+    ...saveDirs.map((d) => ({ label: d.label, onSelect: () => respond(true, d.path) })),
+    { separator: true },
+    { label: 'Choose Folder…', onSelect: () => void chooseFolder() },
+  ]
 
   return (
     <div className="rc-root">
@@ -315,93 +311,80 @@ export function ReceiveCard() {
           <motion.div
             key={`${t.direction}-${t.id}`}
             className="rc-card"
-            initial={{ opacity: 0, y: 16, scale: 0.94 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 16, scale: 0.94 }}
-            transition={{ type: 'spring', stiffness: 360, damping: 28 }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.16 }}
           >
             {/* Spacer under the native traffic-light buttons (titleBarStyle
                 Overlay puts red/yellow/green here); also a drag handle. */}
             <div className="rc-top" data-tauri-drag-region />
-            <div className="rc-art" data-tauri-drag-region>
-              <div className="rc-page">
-                <Glyph size={30} strokeWidth={1.4} />
-                <span className="rc-ext">{name.split('.').pop()?.slice(0, 4).toUpperCase()}</span>
-              </div>
-              <div className="rc-avatar-wrap">
-                <svg width={52} height={52} viewBox="0 0 52 52" className="rc-ring">
-                  <circle cx={26} cy={26} r={R} className="rc-ring-bg" />
-                  {ringActive && (
-                    <circle
-                      cx={26}
-                      cy={26}
-                      r={R}
-                      className="rc-ring-fg"
-                      strokeDasharray={C}
-                      strokeDashoffset={C * (1 - pct / 100)}
-                      transform="rotate(-90 26 26)"
-                    />
-                  )}
-                </svg>
-                {done ? (
-                  <div className="rc-avatar rc-avatar-done">
-                    <Check size={28} strokeWidth={3} />
-                  </div>
-                ) : (
-                  <div className="rc-avatar">
-                    {sending && !friendName ? <SendIcon size={24} /> : initialOf(friendName)}
-                  </div>
-                )}
+            <div className="rc-art" data-tauri-drag-region aria-hidden>
+              <div className="rc-file">{glyphFor(name)}</div>
+              <div
+                className={`rc-avatar${done ? ' done' : ''}`}
+                style={done ? undefined : { background: who ? avatarColor(who) : undefined }}
+              >
+                {done ? <Check size={13} strokeWidth={3} /> : sending && !who ? <SendIcon size={11} /> : initialOf(who)}
               </div>
             </div>
 
-            <div className="rc-name" title={name}>
-              {midTruncate(name)}
-              {multi ? ` +${(t.fileCount ?? 1) - 1} more` : ''}
+            <div className="rc-name" title={t.fileNames.join(', ') || name}>
+              <span className="rc-name-text">{midTruncate(name, extra > 0 ? 19 : 24)}</span>
+              {extra > 0 && <span className="rc-name-more tnum">+{extra}</span>}
             </div>
-            <div className="rc-from">{incoming ? `From ${friendName || 'someone'}` : sub}</div>
+            <div className="rc-from" title={sub}>{sub}</div>
 
-            {pendingOffer ? (
-              <div className="rc-actions">
-                <button className="rc-btn rc-decline" onClick={() => respond(false)}>
-                  Decline
-                </button>
-                <div className="rc-accept-group">
-                  <button className="rc-btn rc-accept" onClick={() => respond(true)}>
-                    Accept
+            <div className="rc-slot">
+              {pendingOffer ? (
+                <div className="rc-actions">
+                  <button className="btn btn-secondary btn-sm" onClick={() => respond(false)}>
+                    Decline
                   </button>
-                  <button
-                    className="rc-btn rc-accept rc-accept-caret"
-                    onClick={() => setMenuOpen((v) => !v)}
-                    title="Save to…"
-                  >
-                    <ChevronDown size={14} />
-                  </button>
-                </div>
-                {menuOpen && (
-                  <div className="rc-menu">
-                    <div className="rc-menu-label">Save to</div>
-                    {saveDirs.map((d) => (
-                      <button key={d.label} className="rc-menu-item" onClick={() => respond(true, d.path)}>
-                        {d.label}
-                      </button>
-                    ))}
-                    <button className="rc-menu-item" onClick={chooseFolder}>
-                      Choose…
+                  <div className="rc-accept">
+                    <button className="btn btn-primary btn-sm" onClick={() => respond(true)}>
+                      Accept
+                    </button>
+                    <button
+                      className="btn btn-primary btn-sm rc-caret"
+                      aria-label="Save to…"
+                      title="Save to…"
+                      aria-haspopup="menu"
+                      aria-expanded={!!menuAnchor}
+                      onClick={(e) => {
+                        const el = e.currentTarget
+                        setMenuAnchor(menuAnchor ? null : { rect: el.getBoundingClientRect(), el })
+                      }}
+                    >
+                      <ChevronDown />
                     </button>
                   </div>
-                )}
-              </div>
-            ) : done ? (
-              <button className="rc-btn rc-done" onClick={() => setJustSent(null)}>
-                Done
-              </button>
-            ) : (
-              <div className="rc-status">{meter ?? (incoming ? sub : `${Math.round(pct)}%`)}</div>
-            )}
+                </div>
+              ) : done ? (
+                <button className="btn btn-secondary btn-sm rc-done" onClick={() => setJustSent(null)}>
+                  Done
+                </button>
+              ) : (
+                <div className="rc-progress">
+                  <ProgressBar percent={pct} label={`${name} progress`} />
+                  <div className="rc-meter tnum">
+                    {t.state !== 'transferring' && <Spinner size={10} />}
+                    {meter}
+                  </div>
+                </div>
+              )}
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
+      {menuAnchor && pendingOffer && (
+        <MenuPopover
+          anchor={menuAnchor.rect}
+          trigger={menuAnchor.el}
+          items={menuItems}
+          onClose={() => setMenuAnchor(null)}
+        />
+      )}
     </div>
   )
 }
