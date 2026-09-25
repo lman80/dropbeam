@@ -2,10 +2,10 @@ import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { currentMonitor, getCurrentWindow, LogicalPosition } from '@tauri-apps/api/window'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ArrowDownToLine, Send, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, X } from 'lucide-react'
 import { HAS_TAURI } from '../lib/api'
-import type { Locality } from '../lib/api'
-import { ChannelBadge } from '../components/bits'
+import { folderLabel } from '../lib/humanize'
+import { IconButton } from '../components/ui'
 import { useStore } from '../store'
 
 interface Pill {
@@ -14,7 +14,6 @@ interface Pill {
   title: string
   sub: string
   percent: number
-  locality: Locality
 }
 
 export function Hud() {
@@ -45,8 +44,10 @@ export function Hud() {
     )
     if (folder) {
       const pair = pairs.find((p) => p.id === folder.pairId)
-      const who = folder.peerName || pair?.peerName || 'folder'
+      const who = folder.peerName || pair?.peerName || null
       const sending = folder.state === 'sending'
+      const toWho = who ? `${sending ? 'to' : 'from'} ${who}` : sending ? 'Sending' : 'Receiving'
+      const folderTitle = pair?.folder ? folderLabel(pair.folder) : who ? `Folder ${toWho}` : 'Shared folder'
       const total = folder.sessionTotalFiles ?? 0
       if (total > 1) {
         // A whole folder drop = ONE bar. Overall % = files already done plus the
@@ -57,19 +58,17 @@ export function Hud() {
         return {
           key: folder.pairId,
           direction: sending ? 'send' : 'receive',
-          title: sending ? `Syncing to ${who}` : `Syncing from ${who}`,
-          sub: `${Math.min(done + 1, total)} of ${total} files · ${Math.round(overall)}%`,
+          title: folderTitle,
+          sub: `${Math.min(done + 1, total)} of ${total} files ${who ? toWho : ''}`.trim(),
           percent: overall,
-          locality: folder.locality,
         }
       }
       return {
         key: folder.pairId,
         direction: sending ? 'send' : 'receive',
-        title: folder.sendingFile || (sending ? `Syncing to ${who}` : `Syncing from ${who}`),
-        sub: `${Math.round(folder.percent)}% · ${sending ? 'to' : 'from'} ${who}`,
+        title: folder.sendingFile ? folderLabel(folder.sendingFile) : folderTitle,
+        sub: folder.sendingFile ? `${folderTitle} · ${toWho}` : `Syncing ${toWho}`,
         percent: folder.percent,
-        locality: folder.locality,
       }
     }
     return null
@@ -113,6 +112,8 @@ export function Hud() {
     else void win.hide()
   }, [visible])
 
+  const R = 12
+  const C = 2 * Math.PI * R
   return (
     <div className="hud-root">
       <AnimatePresence>
@@ -120,34 +121,45 @@ export function Hud() {
           <motion.div
             key={shown.key}
             className="hud-pill"
-            initial={{ opacity: 0, y: -14, scale: 0.9 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -14, scale: 0.9 }}
-            transition={{ type: 'spring', stiffness: 380, damping: 26 }}
+            role="status"
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
             onClick={() => invoke('open_main_window').catch(() => {})}
           >
-            <span className="hud-icon">
-              {shown.direction === 'send' ? <Send size={15} /> : <ArrowDownToLine size={15} />}
+            <span className="hud-ring" aria-hidden>
+              <svg width={28} height={28} viewBox="0 0 28 28">
+                <circle cx={14} cy={14} r={R} className="hud-ring-track" />
+                <circle
+                  cx={14}
+                  cy={14}
+                  r={R}
+                  className="hud-ring-fill"
+                  strokeDasharray={C}
+                  strokeDashoffset={C * (1 - Math.max(0, Math.min(100, shown.percent)) / 100)}
+                  transform="rotate(-90 14 14)"
+                />
+              </svg>
+              {shown.direction === 'send' ? <ArrowUp /> : <ArrowDown />}
             </span>
-            <span style={{ flex: 1, minWidth: 0 }}>
-              <span className="hud-title">{shown.title}</span>
+            <span className="hud-text">
+              <span className="hud-title" title={shown.title}>{shown.title}</span>
               <span className="hud-sub">{shown.sub}</span>
             </span>
-            {shown.locality !== 'unknown' && <ChannelBadge locality={shown.locality} iconOnly size={11} />}
-            <span className="hud-ring" aria-label={`${Math.round(shown.percent)} percent`}>
-              {Math.round(shown.percent)}<small>%</small>
-            </span>
-            <button
+            <span className="hud-pct tnum">{Math.round(shown.percent)}%</span>
+            <IconButton
+              size="sm"
+              label="Dismiss"
               className="hud-x"
-              title="Dismiss"
-              aria-label="Dismiss"
+              tooltip={null}
               onClick={(e) => {
                 e.stopPropagation()
                 setDismissed(shown.key)
               }}
             >
-              <X size={13} />
-            </button>
+              <X />
+            </IconButton>
           </motion.div>
         )}
       </AnimatePresence>
