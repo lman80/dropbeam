@@ -8,17 +8,16 @@ struct SendView: View {
     @State private var picking = false
     @State private var receiving = false
     @State private var scanning = false
-    @State private var bounce = 0
     @FocusState private var codeFocused: Bool
     private var finished: [Transfer] { bridge.sendTransfers.filter { !$0.active } }
     var body: some View {
         NavigationStack {
             List {
-                Section { hero }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 8, trailing: 20))
+                Section { hero }.clearRow(EdgeInsets(top: 4, leading: 20, bottom: 4, trailing: 20))
                 Section {
                     receiveRow
-                } header: { Text("Have a Code?") } footer: {
-                    Text("Paste or scan any DropBeam code: files someone sent you, a friend’s code, a shared-folder invite or a device link.")
+                } header: { Text("Receive") } footer: {
+                    Text("Paste or scan a code from DropBeam — files, a friend, a shared folder or one of your devices.")
                 }
                 Section {
                     if bridge.sendTransfers.isEmpty { emptyState.clearRow() }
@@ -50,38 +49,18 @@ struct SendView: View {
         }
     }
     private var hero: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Send something good.").font(.title2.weight(.bold))
-                    Text("Straight to their device — across the room or across the world.").font(.subheadline).foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 8)
-                Image(systemName: "paperplane.fill").font(.largeTitle).foregroundStyle(.tint)
-                    .symbolEffect(.bounce, value: bounce).accessibilityHidden(true)
-            }
-            GlassGroup {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 14) { pickButtons }
-                    VStack(spacing: 14) { pickButtons }
-                }
-            }
-        }.padding(.top, 4)
-    }
-    @ViewBuilder private var pickButtons: some View {
-        pickButton("Photos", symbol: "photo.on.rectangle.angled", source: "photos")
-        pickButton("Files", symbol: "doc.fill", source: "files")
-        SendFolderButton()
+        ActionTileRow {
+            pickButton("Photos", symbol: "photo.on.rectangle", source: "photos")
+            pickButton("Files", symbol: "doc", source: "files")
+            SendFolderButton()
+        }
     }
     private func pickButton(_ title: String, symbol: String, source: String) -> some View {
-        Button {
-            picking = true; bounce += 1
+        ActionTile(title: title, symbol: symbol, large: true) {
+            picking = true
             bridge.perform { defer { picking = false }; try await bridge.pickAndSend(source: source) }
-        } label: {
-            VStack(spacing: 10) { Image(systemName: symbol).font(.title); Text(title).font(.headline) }
-                .frame(maxWidth: .infinity, minHeight: 88)
         }
-        .beamButton(prominent: source == "photos").disabled(picking)
+        .disabled(picking)
         .accessibilityLabel("Send \(title)")
     }
     private var trimmed: String { code.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -115,16 +94,9 @@ struct SendView: View {
         Task { for id in ids { try? await bridge.action("dismissTransfer", ["id": id]) } }
     }
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            ZStack {
-                Circle().fill(Color.beam.opacity(0.08)).frame(width: 104, height: 104)
-                Image(systemName: "circle.dotted").font(.system(size: 88, weight: .ultraLight)).foregroundStyle(Color.beam.opacity(0.3))
-                Image(systemName: "paperplane").font(.system(size: 38, weight: .light)).foregroundStyle(.tint).rotationEffect(.degrees(-12))
-                Image(systemName: "sparkle").font(.body).foregroundStyle(.tint).offset(x: 38, y: -30)
-            }.accessibilityHidden(true)
-            Text("Nothing in Flight").font(.headline)
-            Text("Pick a photo or file and make someone’s day.").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-        }.frame(maxWidth: .infinity).padding(.vertical, 12).accessibilityElement(children: .combine)
+        Text("Files you send and receive show up here.")
+            .font(.subheadline).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity).padding(.vertical, 20)
     }
 }
 
@@ -143,24 +115,21 @@ struct TransferRow: View {
     private var canPause: Bool { transfer.direction == "send" && ["starting", "waitingForPeer", "connecting", "transferring"].contains(transfer.state ?? "") }
     private var canVerify: Bool { transfer.direction == "send" && transfer.state == "completed" && transfer.verify?.state != "running" }
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 12) {
                 icon
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(transfer.title).font(.headline).lineLimit(2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(transfer.title).font(.body.weight(.semibold)).lineLimit(2).truncationMode(.middle)
                     Text(subtitle).font(.subheadline).foregroundStyle(failed ? Color.red : .secondary).lineLimit(2)
+                        .accessibilityLabel("\(transfer.status), \(subtitle)")
                 }
                 Spacer(minLength: 4)
                 trailing
             }
             if moving {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 5) {
                     ProgressView(value: min(100, max(0, transfer.percent ?? 0)), total: 100).tint(.beam)
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(progressLine).font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                        Spacer(minLength: 4)
-                        if let route = transfer.routeLabel { RouteBadge(label: route) }
-                    }
+                    Text(progressLine).font(.caption).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
                 }.accessibilityElement(children: .combine)
             }
             if let detail = transfer.detail, !detail.isEmpty, transfer.active {
@@ -168,8 +137,8 @@ struct TransferRow: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) { ProgressView().controlSize(.small); Text(detail).font(.footnote).foregroundStyle(.secondary) }
                     if transfer.state == "waitingForPeer" {
-                        Button { bridge.perform { try await bridge.action("forceRelay", ["id": transfer.id]) } } label: { Label("Send over Relay Now", systemImage: "cloud.fill") }
-                            .beamButton().controlSize(.small)
+                        Button("Send Through a Relay Now") { bridge.perform { try await bridge.action("forceRelay", ["id": transfer.id]) } }
+                            .font(.footnote.weight(.semibold)).buttonStyle(.borderless)
                     }
                 }
             }
@@ -177,14 +146,14 @@ struct TransferRow: View {
             if failed || transfer.state == "paused", let error = transfer.error {
                 Text(error).font(.footnote).foregroundStyle(.secondary)
             }
-            if transfer.state == "completed" && transfer.sharePaths?.isEmpty != false {
-                Text("The files are no longer available to share.").font(.footnote).foregroundStyle(.secondary)
+            if transfer.state == "completed" && transfer.sharePaths?.isEmpty != false && transfer.direction == "receive" {
+                Text("No longer on this iPhone.").font(.footnote).foregroundStyle(.secondary)
             }
             if transfer.state == "waitingForPeer", let code = transfer.code { codeBlock(code) }
             if transfer.state == "waitingForAccept", transfer.direction == "receive" {
                 HStack(spacing: 12) {
-                    Button { respond(true) } label: { Text("Accept").frame(maxWidth: .infinity) }.beamButton(prominent: true)
                     Button(role: .destructive) { respond(false) } label: { Text("Decline").frame(maxWidth: .infinity) }.beamButton()
+                    Button { respond(true) } label: { Text("Accept").frame(maxWidth: .infinity) }.beamButton(prominent: true)
                 }.controlSize(.large)
             }
         }
@@ -212,18 +181,37 @@ struct TransferRow: View {
         }
     }
     private var subtitle: String {
-        let who = transfer.friendName ?? transfer.peer
-        let status = transfer.state == "waitingForPeer" && transfer.direction == "send" ? "Share this code to send" : transfer.status
-        return [who, status].compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: " · ")
+        let name = transfer.friendName.flatMap { $0.isEmpty ? nil : $0 } ?? humanPeer(transfer.peer)
+        let who = name.map { (transfer.direction == "receive" ? "From " : "To ") + $0 }
+        let status: String
+        switch transfer.state {
+        case "waitingForPeer" where transfer.direction == "send" && transfer.code != nil: status = "Waiting for a receiver"
+        case "failed": status = transfer.direction == "send" ? "Couldn’t send" : "Couldn’t receive"
+        default: status = transfer.status
+        }
+        // A finished row's badge already says Sent/Received; the line says who and how much.
+        if transfer.state == "completed" {
+            let size = (transfer.bytesTotal ?? 0) > 0 ? Formatters.bytes(transfer.bytesTotal) : nil
+            return [who ?? status, size].compactMap { $0 }.joined(separator: " · ")
+        }
+        return [who, status].compactMap { $0 }.joined(separator: " · ")
     }
     private var progressLine: String {
         var parts = ["\(Formatters.bytes(transfer.bytesDone)) of \(Formatters.bytes(transfer.bytesTotal))"]
         if (transfer.speedBps ?? 0) > 0 { parts.append(Formatters.speed(transfer.speedBps, megabits: bridge.settings?.showMegabits == true)) }
         if let eta = Formatters.eta(transfer.etaSeconds) { parts.append(eta) }
+        // The route only matters to people when it explains a slow transfer.
+        if transfer.routeLabel?.hasPrefix("Relay") == true { parts.append("via relay") }
         return parts.joined(separator: " · ")
     }
     private var icon: some View {
-        FileGlyph(name: transfer.fileNames?.first ?? "", symbol: (transfer.fileCount ?? 0) > 1 ? "doc.on.doc" : nil)
+        Group {
+            if (transfer.fileCount ?? 1) <= 1, let path = transfer.sharePaths?.first.map(LocalPaths.resolve), LocalMedia(path: path) != nil {
+                MediaThumbnail(path: path, width: 44, height: 44, badges: false).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                FileGlyph(name: transfer.fileNames?.first ?? "", symbol: (transfer.fileCount ?? 0) > 1 ? "doc.on.doc" : nil)
+            }
+        }
             .overlay(alignment: .bottomTrailing) {
                 Image(systemName: badge.0).font(.system(size: 16, weight: .bold)).symbolRenderingMode(.palette)
                     .foregroundStyle(.white, badge.1)
@@ -258,8 +246,8 @@ struct TransferRow: View {
     }
     private func codeBlock(_ code: String) -> some View {
         VStack(spacing: 12) {
-            QRCodeView(code: code)
-            Text(code).font(.callout.monospaced()).textSelection(.enabled).multilineTextAlignment(.center).lineLimit(3)
+            QRCodeView(code: code, side: 168)
+            CodeLine(code: code).padding(.horizontal, 8)
             HStack(spacing: 12) {
                 Button { UIPasteboard.general.string = code; copied = true; Haptics.success() } label: {
                     Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc").frame(maxWidth: .infinity)
@@ -268,33 +256,21 @@ struct TransferRow: View {
             }
         }.frame(maxWidth: .infinity).padding(.top, 4)
     }
-    /// Route, end-to-end integrity and "Verify copy" for a finished transfer.
+    /// A finished transfer stays quiet unless something needs attention: files the
+    /// end-to-end check couldn't confirm, or a "Verify Copy" the user started.
     @ViewBuilder private var completedDetails: some View {
-        let rows = transfer.integrity ?? []
-        if transfer.routeLabel != nil || !rows.isEmpty {
-            HStack(spacing: 8) {
-                if let route = transfer.routeLabel { RouteBadge(label: route) }
-                if transfer.integrityVerified {
-                    Label("Verified end to end", systemImage: "checkmark.seal.fill").font(.caption.weight(.medium)).foregroundStyle(.green)
-                } else if !rows.isEmpty {
-                    Label("\(rows.filter { !$0.verified }.count) unverified", systemImage: "exclamationmark.triangle.fill").font(.caption.weight(.medium)).foregroundStyle(.orange)
+        let unverified = (transfer.integrity ?? []).filter { !$0.verified }
+        if !unverified.isEmpty {
+            DisclosureGroup {
+                ForEach(unverified) { row in
+                    Text(row.name).font(.footnote).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                 }
+            } label: {
+                Label(unverified.count == 1 ? "1 file couldn’t be checked" : "\(unverified.count) files couldn’t be checked", systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote.weight(.medium)).foregroundStyle(.orange)
             }
         }
-        if !rows.isEmpty {
-            DisclosureGroup {
-                ForEach(rows) { row in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Label(row.name, systemImage: row.verified ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                            .font(.footnote).foregroundStyle(row.verified ? Color.primary : Color.orange).lineLimit(1)
-                        if let digest = row.digest, !digest.isEmpty {
-                            Text("\((row.algorithm ?? "sha256").uppercased()) \(digest.prefix(16))…").font(.caption2.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-                        }
-                    }.accessibilityElement(children: .combine)
-                }
-            } label: { Text("Integrity details").font(.footnote.weight(.semibold)) }
-        }
-        if transfer.direction == "send" { verifySection }
+        if transfer.direction == "send", transfer.verify != nil { verifySection }
     }
     @ViewBuilder private var verifySection: some View {
         switch transfer.verify?.state ?? "" {
@@ -316,10 +292,13 @@ struct TransferRow: View {
                 ForEach(report.mismatched, id: \.self) { Text("Different: \($0)").font(.caption) }
                 ForEach(report.missing, id: \.self) { Text("Missing: \($0)").font(.caption) }
             } label: { Label("\(report.mismatched.count + report.missing.count) of \(report.total) files don’t match", systemImage: "xmark.shield.fill").font(.footnote.weight(.semibold)).foregroundStyle(.red) }
-            Button(action: verify) { Label("Verify Again", systemImage: "arrow.clockwise") }.beamButton().controlSize(.small)
+            Button("Verify Again", action: verify).font(.footnote.weight(.semibold)).buttonStyle(.borderless)
         default:
-            if transfer.verify?.state == "failed" { Text(transfer.verify?.error ?? "Couldn’t verify the copy.").font(.footnote).foregroundStyle(.red) }
-            Button(action: verify) { Label("Verify Copy", systemImage: "checkmark.shield") }.beamButton().controlSize(.small)
+            HStack {
+                Text(transfer.verify?.error ?? "Couldn’t verify the copy.").font(.footnote).foregroundStyle(.red)
+                Spacer(minLength: 8)
+                Button("Try Again", action: verify).font(.footnote.weight(.semibold)).buttonStyle(.borderless)
+            }
         }
     }
     private func pause() { bridge.perform { try await bridge.action("pauseTransfer", ["id": transfer.id]) } }

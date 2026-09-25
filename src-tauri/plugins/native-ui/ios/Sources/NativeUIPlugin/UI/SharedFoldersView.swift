@@ -157,19 +157,11 @@ struct SharedFolderDetailView: View {
     }
     private var header: some View {
         VStack(spacing: 12) {
-            Image(systemName: "folder.fill").font(.system(size: 56)).foregroundStyle(.blue).padding(18)
-                .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 26)).accessibilityHidden(true)
-            Text(folder.name).font(.title.bold()).multilineTextAlignment(.center)
-            HStack(spacing: 8) {
-                chip(folder.modeLabel, symbol: folder.mirror ? "arrow.triangle.2.circlepath" : folder.mode == "twoWay" ? "arrow.left.arrow.right" : "arrow.right", tint: .beam)
-                if folder.paused { chip("Paused", symbol: "pause.fill", tint: .orange) }
-                if folder.autoDelete { chip("Auto-delete", symbol: "trash", tint: .orange) }
-            }
-        }.frame(maxWidth: .infinity).padding(.vertical, 8)
-    }
-    private func chip(_ text: String, symbol: String, tint: Color) -> some View {
-        Label(text, systemImage: symbol).font(.caption.weight(.semibold)).foregroundStyle(tint)
-            .padding(.horizontal, 10).padding(.vertical, 5).background(tint.opacity(0.12), in: Capsule())
+            Image(systemName: "folder.fill").font(.system(size: 64)).foregroundStyle(.blue).accessibilityHidden(true)
+            Text(folder.name).font(.title2.bold()).multilineTextAlignment(.center).lineLimit(3)
+            Text(([folder.modeLabel] + (folder.paused ? ["Paused"] : []) + (folder.autoDelete ? ["Removes files after sending"] : [])).joined(separator: " · "))
+                .font(.subheadline).foregroundStyle(folder.paused ? Color.orange : .secondary).multilineTextAlignment(.center)
+        }.frame(maxWidth: .infinity).padding(.vertical, 4)
     }
     private var statusCard: some View {
         Group {
@@ -184,7 +176,7 @@ struct SharedFolderDetailView: View {
                 if folder.busy {
                     HStack(alignment: .firstTextBaseline) {
                         Text("\(Int(folder.percent))%").font(.title3.weight(.bold)).foregroundStyle(.tint)
-                        if let locality = folder.locality, locality != "unknown" { RouteBadge(label: locality == "internet" ? "Relay" : locality.capitalized) }
+                        if folder.locality == "internet" { Text("via relay").font(.footnote).foregroundStyle(.secondary) }
                         Spacer()
                         if folder.state == "sending" {
                             Button { run("stop") { try await bridge.action("folderStop", ["folderId": folderID]) } } label: { Label("Stop", systemImage: "xmark") }.font(.footnote).beamButton().controlSize(.small)
@@ -210,32 +202,20 @@ struct SharedFolderDetailView: View {
         }
     }
     @ViewBuilder private var actions: some View {
-        GlassGroup {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 10) { actionButtons }
-                VStack(spacing: 12) { actionButtons }
+        ActionTileRow {
+            if folder.mirror {
+                ActionTile(title: folder.paused ? "Resume" : "Pause", symbol: folder.paused ? "play" : "pause") {
+                    run("pause") { try await bridge.action("folderSetPaused", ["folderId": folderID, "bool": !folder.paused]) }
+                }.disabled(busy != nil)
+            }
+            ActionTile(title: "Open in Files", symbol: "folder") { openInFiles() }.disabled(busy != nil)
+            if folder.mirror {
+                ActionTile(title: busy == "verify" ? "Checking…" : "Verify", symbol: "checkmark.shield") {
+                    verify = nil
+                    run("verify") { verify = try await bridge.call("folderVerify", ["folderId": folderID]) }
+                }.disabled(busy != nil)
             }
         }
-    }
-    @ViewBuilder private var actionButtons: some View {
-        if folder.mirror {
-            action(folder.paused ? "Resume" : "Pause", symbol: folder.paused ? "play.fill" : "pause.fill") {
-                run("pause") { try await bridge.action("folderSetPaused", ["folderId": folderID, "bool": !folder.paused]) }
-            }
-        }
-        action("Open in Files", symbol: "folder") { openInFiles() }
-        if folder.mirror {
-            action(busy == "verify" ? "Checking…" : "Verify", symbol: "checkmark.shield") {
-                verify = nil
-                run("verify") { verify = try await bridge.call("folderVerify", ["folderId": folderID]) }
-            }
-        }
-    }
-    private func action(_ label: String, symbol: String, tap: @escaping () -> Void) -> some View {
-        Button(action: tap) {
-            VStack(spacing: 6) { Image(systemName: symbol).font(.title3); Text(label).font(.footnote.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8) }
-                .frame(maxWidth: .infinity, minHeight: 54)
-        }.beamButton().disabled(busy != nil)
     }
     private func verifyCard(_ r: FolderVerify) -> some View {
         Group {
@@ -274,13 +254,13 @@ struct SharedFolderDetailView: View {
         }
     }
     @ViewBuilder private var inviteButtons: some View {
-        Button { inviting = true; Haptics.tap() } label: { Label("Invite a Friend", systemImage: "person.badge.plus").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
+        Button { inviting = true; Haptics.tap() } label: { Label("Invite a Friend", systemImage: "person.badge.plus").frame(maxWidth: .infinity) }.beamButton(prominent: true).controlSize(.large)
         Button {
             run("code") {
                 let value: String = try await bridge.call("folderAddPerson", ["folderId": folderID])
                 code = InviteCode(code: value, folderName: folder.name)
             }
-        } label: { Label(busy == "code" ? "Making…" : "Share a Code", systemImage: "qrcode").frame(maxWidth: .infinity, minHeight: 36) }.beamButton().disabled(busy != nil)
+        } label: { Label(busy == "code" ? "Making…" : "Share a Code", systemImage: "qrcode").frame(maxWidth: .infinity) }.beamButton().controlSize(.large).disabled(busy != nil)
     }
     private func memberRow(_ member: FolderMember) -> some View {
         let friend = member.friendId.flatMap { id in bridge.friends.first { $0.id == id } }
@@ -347,11 +327,11 @@ struct InviteCodeSheet: View {
                 Section {
                     VStack(spacing: 16) {
                         QRCodeView(code: invite.code, side: 220)
-                        Text(invite.code).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(4).multilineTextAlignment(.center)
+                        CodeLine(code: invite.code).padding(.horizontal, 12)
                         HStack(spacing: 12) {
-                            Button { UIPasteboard.general.string = invite.code; copied = true; Haptics.success() } label: { Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc").frame(maxWidth: .infinity, minHeight: 32) }.beamButton()
-                            ShareLink(item: invite.code) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity, minHeight: 32) }.beamButton(prominent: true)
-                        }
+                            Button { UIPasteboard.general.string = invite.code; copied = true; Haptics.success() } label: { Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc").frame(maxWidth: .infinity) }.beamButton()
+                            ShareLink(item: invite.code) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity) }.beamButton()
+                        }.controlSize(.large)
                     }.frame(maxWidth: .infinity).padding(.vertical, 12)
                 } footer: { Text("Send this to the person you want to invite. They scan or paste it in DropBeam to join \(invite.folderName).") }
             }.beamList().navigationTitle("Invite to Folder").navigationBarTitleDisplayMode(.inline)

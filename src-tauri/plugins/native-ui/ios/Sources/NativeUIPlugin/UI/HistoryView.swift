@@ -5,6 +5,7 @@ struct HistoryView: View {
     @State private var segment = 0
     @State private var search = ""
     @State private var clearing = false
+    @State private var recoverySettings = false
     @State private var media: LocalMedia?
     private var filtered: [HistoryEntry] {
         bridge.history.filter { search.isEmpty || ($0.fileNames.joined(separator: " ") + " " + ($0.peer ?? "")).localizedCaseInsensitiveContains(search) }
@@ -17,12 +18,15 @@ struct HistoryView: View {
             }
             .navigationTitle("History").navigationBarTitleDisplayMode(.large)
             .searchable(text: $search, prompt: segment == 0 ? "Files or people" : "Saved copies")
+            // Always present (a toolbar item that comes and goes shifts the title bar).
             .toolbar { ToolbarItem(placement: .topBarTrailing) {
-                if segment == 0 {
-                    Menu { Button("Clear History", systemImage: "trash", role: .destructive) { clearing = true } } label: { Image(systemName: "ellipsis") }
-                        .accessibilityLabel("History options").disabled(bridge.history.isEmpty)
-                }
+                Menu {
+                    if segment == 0 { Button("Clear History", systemImage: "trash", role: .destructive) { clearing = true }.disabled(bridge.history.isEmpty) }
+                    else { Button("Recovery Settings", systemImage: "gearshape") { recoverySettings = true } }
+                } label: { Image(systemName: "ellipsis") }
+                    .accessibilityLabel("History options")
             } }
+            .navigationDestination(isPresented: $recoverySettings) { RecoverySettingsView() }
             .confirmationDialog("Clear all transfer history?", isPresented: $clearing, titleVisibility: .visible) {
                 Button("Clear History", role: .destructive) { bridge.perform { try await bridge.action("historyClear") } }
             } message: { Text("Your files stay where they are.") }
@@ -73,7 +77,7 @@ struct HistoryView: View {
     private func historyRow(_ entry: HistoryEntry) -> some View {
         HStack(spacing: 14) {
             Group {
-                if let path = entry.localPaths.first, LocalMedia(path: path) != nil {
+                if let path = entry.localPaths.first.map(LocalPaths.resolve), LocalMedia(path: path) != nil {
                     MediaThumbnail(path: path, width: 44, height: 44).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 } else { FileGlyph(name: entry.fileNames.first ?? "", symbol: entry.fileNames.count > 1 ? "doc.on.doc" : nil) }
             }
@@ -86,20 +90,23 @@ struct HistoryView: View {
             }
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(entry.title).font(.body.weight(.semibold)).lineLimit(1).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
+                    Text(entry.title).font(.body.weight(.semibold)).lineLimit(1).truncationMode(.middle).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
                     Spacer(minLength: 6)
                     Text(entry.date.formatted(date: .omitted, time: .shortened)).font(.subheadline).foregroundStyle(.secondary)
                 }
-                Text("\(entry.direction == "send" ? "To" : "From") \(entry.peer ?? "a device") · \(Formatters.bytes(entry.bytesTotal)) · \(route(entry.locality))")
-                    .font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
-                if entry.state == "failed" { Text(entry.error ?? "Transfer failed").font(.footnote).foregroundStyle(.red).lineLimit(2) }
+                Text(subtitle(entry)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                if entry.state == "failed" {
+                    Text(entry.error.map { "\(entry.direction == "send" ? "Couldn’t send" : "Couldn’t receive") — \($0)" } ?? (entry.direction == "send" ? "Couldn’t send" : "Couldn’t receive"))
+                        .font(.footnote).foregroundStyle(.red).lineLimit(2)
+                }
             }
         }.padding(.vertical, 4).contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityHint(entry.localPaths.isEmpty ? "" : "Opens the file")
     }
-    private func route(_ value: String?) -> String {
-        switch value { case "internet": return "Relay"; case "local": return "Local"; case "direct": return "Direct"; default: return value?.capitalized ?? "Unknown route" }
+    private func subtitle(_ entry: HistoryEntry) -> String {
+        let who = humanPeer(entry.peer).map { (entry.direction == "send" ? "To " : "From ") + $0 } ?? (entry.direction == "send" ? "Sent" : "Received")
+        return entry.bytesTotal > 0 ? "\(who) · \(Formatters.bytes(entry.bytesTotal))" : who
     }
     private func dayLabel(_ day: Date) -> String {
         let calendar = Calendar.current
@@ -112,7 +119,7 @@ struct HistoryView: View {
     private func share(_ entry: HistoryEntry) { bridge.perform { try await bridge.action("historyOpen", ["entryId": entry.id]) } }
     private func open(_ entry: HistoryEntry) {
         Haptics.tap()
-        if entry.localPaths.count == 1, let path = entry.localPaths.first, FileManager.default.fileExists(atPath: path), let item = LocalMedia(path: path) { media = item }
+        if entry.localPaths.count == 1, let path = entry.localPaths.first.map(LocalPaths.resolve), FileManager.default.fileExists(atPath: path), let item = LocalMedia(path: path) { media = item }
         else { share(entry) }
     }
 }

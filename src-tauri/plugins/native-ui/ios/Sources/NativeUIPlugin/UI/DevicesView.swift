@@ -11,46 +11,36 @@ struct DevicesView: View {
     private var inAccount: Bool { bridge.myDevice?.inAccount == true && devices.count > 1 }
     private var myNoun: String { deviceNoun(bridge.myDevice?.deviceKind, os: bridge.myDevice?.deviceOs ?? "ios") }
     var body: some View {
-        ScrollView {
-            GlassGroup {
-                VStack(alignment: .leading, spacing: 24) {
-                    hero
-                    if inAccount {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("My Devices").font(.title2.weight(.semibold))
-                            GlassCard {
-                                VStack(spacing: 0) {
-                                    ForEach(Array(devices.enumerated()), id: \.element.id) { index, device in
-                                        if index > 0 { Divider().padding(.leading, 62) }
-                                        row(device)
-                                    }
-                                }
-                            }
-                            if let name = bridge.settings?.displayName, !name.isEmpty {
-                                Text("Friends see you as **\(name)** on every device. Change your name or photo on any of them and the others follow.")
-                                    .font(.footnote).foregroundStyle(.secondary)
-                            }
-                        }
-                        Button { linking = .show; Haptics.tap() } label: { Label("Link a Device", systemImage: "plus").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
-                        Button { syncNow() } label: { Label(syncing ? "Syncing…" : "Sync Now", systemImage: "arrow.triangle.2.circlepath").frame(maxWidth: .infinity, minHeight: 36) }.beamButton().disabled(syncing)
-                        Button(role: .destructive) { leaving = true } label: { Text("Remove This \(myNoun) from Account").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
-                    } else {
-                        GlassCard {
-                            VStack(alignment: .leading, spacing: 14) {
-                                Label("Use DropBeam on another device?", systemImage: "laptopcomputer.and.iphone").font(.headline)
-                                Text("Link your Mac, PC or another phone and each one gets your friends and chats right away — then everything stays in sync.").foregroundStyle(.secondary)
-                                Button { linking = .show; Haptics.tap() } label: { Label("Link a Device", systemImage: "plus").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
-                                Button { linking = .scan; Haptics.tap() } label: { Label("Scan the Other Device's Code", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
-                            }
-                        }
+        List {
+            Section { hero }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 4, trailing: 20))
+            if inAccount {
+                Section {
+                    ForEach(devices) { device in row(device) }
+                } header: { Text("My Devices") } footer: {
+                    if let name = bridge.settings?.displayName, !name.isEmpty {
+                        Text("Friends see you as \(name) on every device. A new name or photo on one updates the others.")
                     }
-                    Text("Your friends, conversations, name and photo sync directly between your devices — end-to-end encrypted, never stored on a server.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }.padding(20)
+                }
+                Section {
+                    Button { linking = .show; Haptics.tap() } label: { Label("Link a Device", systemImage: "plus.circle") }
+                    Button { syncNow() } label: {
+                        HStack { Label("Sync Now", systemImage: "arrow.triangle.2.circlepath"); Spacer(); if syncing { ProgressView() } }
+                    }.disabled(syncing)
+                }
+                Section {
+                    Button("Remove This \(myNoun) from Account", role: .destructive) { leaving = true }
+                } footer: { Text("Friends, chats, your name and photo sync directly between your devices, end-to-end encrypted.") }
+            } else {
+                Section {
+                    Button { linking = .show; Haptics.tap() } label: { Label("Link a Device", systemImage: "plus.circle") }
+                    Button { linking = .scan; Haptics.tap() } label: { Label("Scan the Other Device’s Code", systemImage: "qrcode.viewfinder") }
+                } header: { Text("Use DropBeam on Another Device") } footer: {
+                    Text("Link your Mac, PC or another phone to share your friends and chats. They stay in sync directly between your devices, end-to-end encrypted.")
+                }
             }
         }
-        .contentMargins(.bottom, 24, for: .scrollContent)
-        .navigationTitle("Devices").navigationBarTitleDisplayMode(.large).beamCanvas()
+        .beamList()
+        .navigationTitle("Devices").navigationBarTitleDisplayMode(.large)
         .refreshable { await refresh(sync: true) }
         .task { await refresh(sync: false) }
         .sheet(item: $linking, onDismiss: { Task { await refresh(sync: false) } }) { start in LinkDeviceSheet(start: start, title: "Link a Device") }
@@ -62,12 +52,13 @@ struct DevicesView: View {
         } message: { Text("Your friends and chats stay on this \(myNoun), but stop syncing with your other devices. Devices that are offline are told the next time they see this one.") }
     }
     private var hero: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: -8) {
             ForEach(Array(devices.prefix(3).enumerated()), id: \.element.id) { _, d in
-                DeviceAvatar(kind: d.deviceKind, os: d.deviceOs, size: 56)
+                DeviceAvatar(kind: d.deviceKind, os: d.deviceOs, size: 64)
+                    .overlay(Circle().stroke(Color(uiColor: .systemGroupedBackground), lineWidth: 3))
             }
-            if devices.isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 56) }
-        }.frame(maxWidth: .infinity).padding(.top, 4)
+            if devices.isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 64) }
+        }.frame(maxWidth: .infinity)
     }
     /// "Your iPhone" — or "Your iPhone 2" when two of your devices would read the
     /// same (mirrors ownDeviceLabels in src/lib/deviceIcons.ts).
@@ -83,20 +74,21 @@ struct DevicesView: View {
     }
     @ViewBuilder private func row(_ device: AccountDevice) -> some View {
         HStack(spacing: 14) {
-            DeviceAvatar(kind: device.deviceKind, os: device.deviceOs, size: 46)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(label(device)).font(.headline)
-                Text(subtitle(device)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+            DeviceAvatar(kind: device.deviceKind, os: device.deviceOs, size: 42)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label(device)).font(.body.weight(.semibold)).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
+                Text(subtitle(device)).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
             }
             Spacer(minLength: 4)
             if !device.thisDevice {
                 Menu {
                     Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device }
-                } label: { Image(systemName: "ellipsis").frame(width: 36, height: 36).contentShape(Rectangle()) }
-                    .accessibilityLabel("Options for \(label(device))")
+                } label: { Image(systemName: "ellipsis.circle").font(.title3).frame(width: 44, height: 44).contentShape(Rectangle()) }
+                    .buttonStyle(.borderless).accessibilityLabel("Options for \(label(device))")
             }
         }
-        .frame(minHeight: 60)
+        .padding(.vertical, 2)
+        .swipeActions { if !device.thisDevice { Button("Remove", role: .destructive) { removing = device } } }
         .contextMenu { if !device.thisDevice { Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device } } }
     }
     private func subtitle(_ device: AccountDevice) -> String {
@@ -260,7 +252,7 @@ struct LinkDeviceSheet: View {
     @ViewBuilder private var showing: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("1. Open DropBeam on your other device.")
-            Text("2. Go to **Settings → Devices → Link a Device** — on a phone you're just setting up, tap **Already use DropBeam?**")
+            Text("2. Go to **Settings → Devices → Link a Device**. On a phone you're just setting up, tap **Link to Your Account**.")
             Text("3. Scan this code.")
         }.frame(maxWidth: .infinity, alignment: .leading).foregroundStyle(.secondary)
         GlassCard {

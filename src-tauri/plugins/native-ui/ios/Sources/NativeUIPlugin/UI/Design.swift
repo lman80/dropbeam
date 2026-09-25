@@ -22,35 +22,17 @@ import UIKit
 extension Color {
     static let beam = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
-            ? UIColor(red: 124/255, green: 124/255, blue: 1, alpha: 1)
+            ? UIColor(red: 108/255, green: 106/255, blue: 250/255, alpha: 1)
             : UIColor(red: 91/255, green: 91/255, blue: 240/255, alpha: 1)
     })
 }
-/// The app's canvas: grouped background + a gentle beam glow drifting at the top.
+/// The app's canvas: the plain system grouped background (like Settings and Files).
 struct BeamBackground: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.colorScheme) private var scheme
-    @State private var drift = false
     var body: some View {
-        ZStack(alignment: .top) {
-            Color(uiColor: .systemGroupedBackground)
-            glow.frame(height: 440)
-                .mask(LinearGradient(colors: [.black, .black.opacity(0.55), .clear], startPoint: .top, endPoint: .bottom))
-                .opacity(scheme == .dark ? 0.24 : 0.17)
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-        .onAppear { if !reduceMotion { withAnimation(.easeInOut(duration: 9).repeatForever(autoreverses: true)) { drift = true } } }
-    }
-    @ViewBuilder private var glow: some View {
-        if #available(iOS 18, *) {
-            MeshGradient(width: 3, height: 3,
-                points: [[0,0], [0.5,0], [1,0], [0,0.5], [drift ? 0.65 : 0.35,0.5], [1,0.5], [0,1], [0.5,1], [1,1]],
-                colors: [.beam, .blue, .beam, .clear, .beam, .blue, .clear, .clear, .clear])
-        } else {
-            LinearGradient(colors: [.beam, .blue.opacity(0.6), .clear], startPoint: .topLeading, endPoint: .bottom)
-        }
+        Color(uiColor: .systemGroupedBackground)
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 /// A floating glass panel for overlays (progress, banners, selection bars) —
@@ -186,27 +168,35 @@ struct IconToggle: View {
                 Text(title).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
             }
         }
+        .tint(.green) // iOS convention: switches are green; the brand tint is for actions.
     }
 }
 struct FriendAvatar: View {
     let friend: Friend
     var size: CGFloat = 52
     @State private var avatar: UIImage?
+    init(friend: Friend, size: CGFloat = 52) {
+        self.friend = friend; self.size = size
+        // A cached photo draws on the first frame — no initials flash on re-layout.
+        _avatar = State(initialValue: friend.avatar.flatMap { ThumbnailProvider.shared.cached(path: $0, points: size)?.image })
+    }
     var body: some View {
         Group {
             if let avatar {
                 Image(uiImage: avatar).resizable().scaledToFill()
             } else {
+                // Contacts/Messages monogram: soft grey gradient, white initials.
                 ZStack {
-                    LinearGradient(colors: [.beam, .blue.opacity(0.8)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                    Text(initials).font(.system(size: size * 0.36, weight: .semibold, design: .rounded)).foregroundStyle(.white)
+                    LinearGradient(colors: [Color(uiColor: .systemGray2), Color(uiColor: .systemGray)], startPoint: .top, endPoint: .bottom)
+                    Text(initials).font(.system(size: size * 0.4, weight: .medium, design: .rounded)).foregroundStyle(.white)
+                        .minimumScaleFactor(0.5).lineLimit(1).padding(.horizontal, size * 0.08)
                 }
             }
         }
         .frame(width: size, height: size).clipShape(Circle()).accessibilityHidden(true)
         .task(id: "\(friend.avatar ?? "")|\(size)") {
-            avatar = nil
-            guard let path = friend.avatar else { return }
+            guard let path = friend.avatar else { avatar = nil; return }
+            if let hit = ThumbnailProvider.shared.cached(path: path, points: size) { avatar = hit.image; return }
             let result = await ThumbnailProvider.shared.image(path: path, points: size)
             if !Task.isCancelled { avatar = result?.image }
         }
@@ -305,5 +295,57 @@ struct BeamError: View {
         } description: { Text(message) } actions: {
             Button("Try Again", action: retry).beamButton()
         }
+    }
+}
+
+/// Contacts-style action tile: a tinted symbol over a short caption on the grouped
+/// cell background. Lay several out in an HStack; they share the width equally.
+struct ActionTile: View {
+    let title: String
+    let symbol: String
+    var large = false
+    var destructive = false
+    let action: () -> Void
+    @ScaledMetric(relativeTo: .body) private var height: CGFloat = 58
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: large ? 7 : 5) {
+                Image(systemName: symbol).font(large ? .title2 : .title3).frame(height: large ? 28 : 22)
+                Text(title).font((large ? Font.subheadline : .caption).weight(.medium)).lineLimit(1).minimumScaleFactor(0.8)
+            }
+            .foregroundStyle(destructive ? AnyShapeStyle(Color.red) : AnyShapeStyle(.tint))
+            .frame(maxWidth: .infinity, minHeight: large ? height + 14 : height)
+            .padding(.horizontal, 4)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+        .buttonStyle(TilePressStyle())
+    }
+}
+private struct TilePressStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(!enabled ? 0.4 : configuration.isPressed ? 0.55 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+/// A row of ActionTiles that stacks vertically at accessibility text sizes.
+struct ActionTileRow<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) { content }
+            VStack(spacing: 10) { content }
+        }
+    }
+}
+/// A one-line, middle-truncated code (codes never wrap or hyphenate).
+struct CodeLine: View {
+    let code: String
+    var body: some View {
+        Text(code).font(.footnote.monospaced()).foregroundStyle(.secondary)
+            .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+            .accessibilityLabel("Code")
     }
 }

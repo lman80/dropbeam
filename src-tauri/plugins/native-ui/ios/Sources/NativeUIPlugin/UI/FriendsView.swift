@@ -26,9 +26,9 @@ struct FriendsView: View {
                     Section {
                         NavigationLink { LocationsView() } label: { RowLabel(title: "Locations", symbol: "externaldrive.fill", color: .teal) }
                         NavigationLink { SharedFoldersView() } label: { RowLabel(title: "Shared Folders", symbol: "folder.fill.badge.person.crop", color: .blue) }
-                        Button { showingCode = true; Haptics.tap() } label: { RowLabel(title: "My DropBeam Code", symbol: "qrcode", color: .beam) }
+                        Button { showingCode = true; Haptics.tap() } label: { RowLabel(title: "My Code", symbol: "qrcode", color: .beam) }
                             .buttonStyle(.plain)
-                    } footer: { Text("Friends add you by scanning your code. Shared Folders stay in sync with friends; Locations are drives they let you browse.") }
+                    }
                 }
                 let mine = filtered.filter(isMine)
                 let others = filtered.filter { !isMine($0) }
@@ -43,13 +43,11 @@ struct FriendsView: View {
                 if !others.isEmpty || search.isEmpty {
                     Section {
                         if others.isEmpty {
-                            VStack(spacing: 12) {
-                                Image(systemName: "person.2.fill").font(.system(size: 36)).foregroundStyle(.tint).accessibilityHidden(true)
-                                Text("Good things are better shared.").font(.headline)
-                                Text("Add a friend by scanning their DropBeam code, or share yours.").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                                Button { adding = true; Haptics.tap() } label: { Label("Add Friend", systemImage: "person.badge.plus").padding(.horizontal, 8) }
-                                    .beamButton(prominent: true).padding(.top, 4)
-                            }.frame(maxWidth: .infinity).padding(.vertical, 16)
+                            VStack(spacing: 6) {
+                                Text("No Friends Yet").font(.headline)
+                                Text("Scan a friend’s DropBeam code, or show them yours.").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                                Button("Add Friend") { adding = true; Haptics.tap() }.font(.body.weight(.semibold)).buttonStyle(.borderless).padding(.top, 6)
+                            }.frame(maxWidth: .infinity).padding(.vertical, 14)
                         }
                         ForEach(others) { friend in row(friend) }
                     } header: { Text("Friends") }.headerProminence(.increased)
@@ -180,6 +178,7 @@ struct FriendDetailView: View {
     @State private var checking = false
     @State private var blocking: Friend?
     @State private var reporting: ReportTarget?
+    @State private var headerHidden = false
     private var friend: Friend { bridge.friends.first { $0.id == friendID } ?? initial }
     private var isMine: Bool {
         if friend.ownDevice { return true }
@@ -189,50 +188,54 @@ struct FriendDetailView: View {
     var body: some View {
         List {
             Section {
-                VStack(spacing: 10) {
-                    ContactAvatar(friend: friend, size: 104).padding(6).background(.ultraThinMaterial, in: Circle())
-                        .overlay(Circle().strokeBorder(.white.opacity(0.35), lineWidth: 1))
-                    Text(friend.displayName).font(.title.bold()).multilineTextAlignment(.center)
+                VStack(spacing: 8) {
+                    ContactAvatar(friend: friend, size: 96)
+                    Text(friend.displayName).font(.title2.bold()).multilineTextAlignment(.center).lineLimit(3)
                     if friend.ownDevice && friend.name != friend.displayName { Text(friend.name).font(.subheadline).foregroundStyle(.secondary) }
                     PresenceLabel(online: bridge.presence[friendID] == true)
-                    if let check { Text(check).font(.footnote).foregroundStyle(.secondary).accessibilityAddTraits(.updatesFrequently) }
                 }.frame(maxWidth: .infinity).accessibilityElement(children: .combine)
-            }.clearRow()
+            }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 4, trailing: 20))
             Section {
-                GlassGroup {
-                    HStack(spacing: 10) {
-                        action("Send", symbol: "paperplane.fill", prominent: true) { sendOptions = true; Haptics.tap() }
-                        action("Message", symbol: "bubble.left.fill") { bridge.perform { try await bridge.openChat(friendId: friendID) } }
-                        action(checking ? "Checking" : "Check", symbol: "wave.3.right") {
-                            checking = true
-                            bridge.perform { defer { checking = false }; check = try await bridge.pingFriend(id: friendID).label }
-                        }.disabled(checking)
-                    }
+                ActionTileRow {
+                    ActionTile(title: "Send", symbol: "paperplane") { sendOptions = true; Haptics.tap() }
+                    ActionTile(title: "Message", symbol: "message") { bridge.perform { try await bridge.openChat(friendId: friendID) } }
+                    ActionTile(title: "Locations", symbol: "externaldrive") { browsing = true; Haptics.tap() }
                 }
             }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 8, trailing: 20))
             Section {
                 IconToggle(title: "Accept Files Automatically", symbol: "tray.and.arrow.down.fill", color: .green, isOn: Binding(get: { friend.autoAccept ?? false }, set: { value in
                     bridge.perform { try await bridge.setAutoAccept(id: friendID, bool: value) }
                 }))
-                ActionRow(title: "Rename", symbol: "pencil", color: .orange) { name = friend.name; renaming = true }
-            } footer: { Text("When on, files from \(friend.displayName) are saved without asking first.") }
+            } footer: { Text("Files from \(friend.displayName) are saved without asking first.") }
             Section {
-                NavigationLink { LocationsView(friendID: friendID) } label: { RowLabel(title: "Browse Locations", symbol: "externaldrive.fill", color: .teal) }
+                Button {
+                    checking = true; check = nil
+                    bridge.perform { defer { checking = false }; check = try await bridge.pingFriend(id: friendID).plainLabel }
+                } label: {
+                    HStack {
+                        Text("Test Connection").foregroundStyle(.tint)
+                        Spacer(minLength: 8)
+                        if checking { ProgressView() }
+                        else if let check { Text(check).foregroundStyle(.secondary).multilineTextAlignment(.trailing) }
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain).disabled(checking)
+                    .accessibilityElement(children: .combine).accessibilityAddTraits(.updatesFrequently)
             }
             Section {
+                if !isMine {
+                    Button("Report \(friend.displayName)…") { reporting = ReportTarget(friend: friend) }
+                    Button("Block \(friend.displayName)", role: .destructive) { blocking = friend; Haptics.warning() }
+                }
                 Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", role: .destructive) { removing = true; Haptics.warning() }
-                    .frame(maxWidth: .infinity)
-            }
-            if !isMine {
-                Section {
-                    Button { reporting = ReportTarget(friend: friend) } label: { Label("Report \(friend.displayName)…", systemImage: "exclamationmark.bubble") }
-                    Button(role: .destructive) { blocking = friend; Haptics.warning() } label: { Label("Block \(friend.displayName)", systemImage: "hand.raised") }
-                } footer: { Text("Blocking stops their messages, files and invites on all your devices. They aren’t told.") }
+            } footer: {
+                if !isMine { Text("Blocking stops their messages, files and invites on all your devices. They aren’t told.") }
             }
         }
         .beamList()
-        .navigationTitle(friend.displayName).navigationBarTitleDisplayMode(.inline)
-        .toolbar { ToolbarItem(placement: .principal) { Text("").accessibilityHidden(true) } } // the header already shows the name
+        .onScrollHeaderHidden($headerHidden, threshold: 150)
+        .navigationTitle(headerHidden ? friend.displayName : "").navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(isPresented: $browsing) { LocationsView(friendID: friendID) }
+        .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Edit") { name = friend.name; renaming = true } } }
         .onChange(of: bridge.friends.map(\.id)) { _, ids in if !ids.contains(friendID) { dismiss() } }
         .safetyPrompts(block: $blocking, report: $reporting)
         .confirmationDialog("Send to \(friend.displayName)", isPresented: $sendOptions, titleVisibility: .visible) {
@@ -250,11 +253,18 @@ struct FriendDetailView: View {
             Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", role: .destructive) { bridge.perform { try await bridge.removeFriend(id: friendID); if !bridge.friends.contains(where: { $0.id == friendID }) { dismiss() } } }
         } message: { Text(friend.ownDevice ? "It stops syncing your friends and chats." : "You can add \(friend.name) again with their code.") }
     }
-    private func action(_ label: String, symbol: String, prominent: Bool = false, tap: @escaping () -> Void) -> some View {
-        Button(action: tap) {
-            VStack(spacing: 6) { Image(systemName: symbol).font(.title3); Text(label).font(.footnote.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8) }
-                .frame(maxWidth: .infinity, minHeight: 54)
-        }.beamButton(prominent: prominent)
-    }
+    @State private var browsing = false
     private func pick(_ source: String) { bridge.perform { try await bridge.pickAndSend(source: source, friendId: friendID) } }
+}
+
+extension View {
+    /// Flips `hidden` once the list scrolls past `threshold` points — used to fade a
+    /// big page header's name into the navigation bar (iOS 18+; earlier keeps the header).
+    @ViewBuilder func onScrollHeaderHidden(_ hidden: Binding<Bool>, threshold: CGFloat) -> some View {
+        if #available(iOS 18, *) {
+            onScrollGeometryChange(for: Bool.self) { geo in geo.contentOffset.y + geo.contentInsets.top > threshold } action: { _, value in
+                withAnimation(.easeOut(duration: 0.15)) { hidden.wrappedValue = value }
+            }
+        } else { self }
+    }
 }

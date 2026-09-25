@@ -11,12 +11,18 @@ actor ThumbnailProvider {
         let duration: Double?
         init(_ image: UIImage, duration: Double? = nil) { self.image = image; self.duration = duration }
     }
-    private let cache = NSCache<NSString, Preview>()
+    // NSCache is thread-safe; `cached` peeks it synchronously so views can draw a
+    // cached image on their very first frame instead of flashing a placeholder.
+    nonisolated(unsafe) private let cache = NSCache<NSString, Preview>()
     init() { cache.totalCostLimit = 48 * 1024 * 1024; cache.countLimit = 160 }
+    private static func key(_ path: String, _ points: CGFloat) -> NSString {
+        "\(path)|\(max(1, Int(ceil(points * 2))))" as NSString
+    }
+    nonisolated func cached(path: String, points: CGFloat) -> Preview? { cache.object(forKey: Self.key(path, points)) }
 
     func image(path: String, points: CGFloat, fullSize: Bool = false) async -> Preview? {
         let pixels = max(1, Int(ceil(points * 2)))
-        let key = "\(path)|\(fullSize ? "full" : String(pixels))" as NSString
+        let key = fullSize ? "\(path)|full" as NSString : Self.key(path, points)
         if let cached = cache.object(forKey: key) { return cached }
         let url = ChatAttachment.fileURL(path)
         let preview: Preview?
@@ -65,6 +71,15 @@ struct MediaThumbnail: View {
     let height: CGFloat
     var badges = true
     @State private var preview: ThumbnailProvider.Preview?
+    /// The path `preview` belongs to: a new size keeps showing the old image until the
+    /// sharper one is ready, so re-layouts never flash the placeholder.
+    @State private var shownPath: String?
+    init(path: String, width: CGFloat, height: CGFloat, badges: Bool = true) {
+        self.path = path; self.width = width; self.height = height; self.badges = badges
+        let hit = ThumbnailProvider.shared.cached(path: path, points: max(width, height))
+        _preview = State(initialValue: hit)
+        _shownPath = State(initialValue: hit == nil ? nil : path)
+    }
     var body: some View {
         ZStack {
             Color(uiColor: .secondarySystemFill)
@@ -73,21 +88,24 @@ struct MediaThumbnail: View {
         }
         .frame(width: width, height: height).clipped()
         .overlay {
-            if badges && LocalMedia(path: path)?.video == true {
-                Image(systemName: "play.fill").foregroundStyle(.white).padding(8).background(.black.opacity(0.35), in: Circle())
+            if badges && preview != nil && LocalMedia(path: path)?.video == true {
+                Image(systemName: "play.fill").font(.system(size: min(22, max(12, min(width, height) * 0.16))))
+                    .foregroundStyle(.white).padding(min(14, max(6, min(width, height) * 0.1)))
+                    .background(.black.opacity(0.35), in: Circle())
             }
         }
         .overlay(alignment: .bottomTrailing) {
-            if badges, let seconds = preview?.duration, seconds.isFinite, seconds >= 0 {
+            if badges, let seconds = preview?.duration, seconds.isFinite, seconds >= 0, min(width, height) >= 60 {
                 Text(String(format: "%d:%02d", Int(seconds) / 60, Int(seconds) % 60))
-                    .font(.caption2.monospacedDigit()).foregroundStyle(.white).padding(4)
-                    .background(.black.opacity(0.65), in: Capsule()).padding(4)
+                    .font(.caption2.monospacedDigit().weight(.medium)).foregroundStyle(.white)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(.black.opacity(0.55), in: Capsule()).padding(6)
             }
         }
-        .task(id: "\(path)|\(width)|\(height)") {
-            preview = nil
+        .task(id: "\(path)|\(Int(width))|\(Int(height))") {
+            if shownPath != path { preview = nil }
             let result = await ThumbnailProvider.shared.image(path: path, points: max(width, height))
-            if !Task.isCancelled { preview = result }
+            if !Task.isCancelled, let result { preview = result; shownPath = path }
         }
     }
 }

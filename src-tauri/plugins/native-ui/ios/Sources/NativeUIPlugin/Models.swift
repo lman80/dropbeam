@@ -173,6 +173,16 @@ struct ConnectionCheck: Decodable {
         let route = path?.capitalized ?? "Online"
         return rttMs.map { "\(route) · \(Int($0)) ms" } ?? route
     }
+    /// The result in plain words (no latency numbers or route jargon).
+    var plainLabel: String {
+        guard online == true else { return "Not reachable" }
+        switch path {
+        case "local": return "Same network"
+        case "direct": return "Direct connection"
+        case "relay", "internet": return "Through a relay"
+        default: return "Connected"
+        }
+    }
 }
 struct LinkResult: Decodable {
     var endpointId: String?

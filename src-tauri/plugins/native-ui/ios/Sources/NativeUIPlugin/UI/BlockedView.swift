@@ -84,7 +84,7 @@ struct ReportSheet: View {
                 } header: { Text("What’s Wrong?") }
                 if let quote {
                     Section {
-                        Toggle(isFile ? "Include File Name" : "Include Message Text", isOn: $includeText)
+                        Toggle(isFile ? "Include File Name" : "Include Message Text", isOn: $includeText).tint(.green)
                         Text(quote).font(.subheadline).foregroundStyle(.secondary).lineLimit(5)
                             .opacity(includeText ? 1 : 0.45)
                     } footer: { Text(isFile ? "Only the name is included — never the file itself." : "Only this message is included, and only if you leave this on.") }
@@ -93,7 +93,7 @@ struct ReportSheet: View {
                     TextField("What happened (optional)", text: $notes, axis: .vertical).lineLimit(3...6)
                 } header: { Text("Details") }
                 Section {
-                    Toggle("Also Block \(target.friend.displayName)", isOn: $alsoBlock)
+                    Toggle("Also Block \(target.friend.displayName)", isOn: $alsoBlock).tint(.green)
                 } footer: {
                     Text("Your report opens as an email to the DropBeam team in your Mail app — you’ll see it before it’s sent. We review reports within 24 hours.")
                 }

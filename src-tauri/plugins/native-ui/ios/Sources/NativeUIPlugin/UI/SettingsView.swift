@@ -21,16 +21,14 @@ struct SettingsView: View {
                             MyAvatar(size: 62)
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(bridge.settings?.displayName ?? "Your Profile").font(.title3.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
+                                    .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
                                 Text("Name, photo & DropBeam code").font(.subheadline).foregroundStyle(.secondary)
                             }
                         }.padding(.vertical, 4)
                     }
                     NavigationLink { DevicesView() } label: {
                         HStack(spacing: 14) {
-                            HStack(spacing: -10) {
-                                ForEach(Array((bridge.myDevice?.devices ?? []).prefix(3).enumerated()), id: \.element.id) { _, d in DeviceAvatar(kind: d.deviceKind, os: d.deviceOs, size: 34) }
-                                if (bridge.myDevice?.devices ?? []).isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 34) }
-                            }
+                            RowIcon(symbol: "laptopcomputer.and.iphone", color: .gray)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("My Devices").foregroundStyle(.primary).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
                                 Text(devicesSummary).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
@@ -47,7 +45,7 @@ struct SettingsView: View {
                 Section {
                     SettingToggle(title: "Files", symbol: "bell.badge.fill", color: .red, key: "notifyOnComplete", value: bridge.settings?.notifyOnComplete)
                     SettingToggle(title: "Messages", symbol: "message.fill", color: .green, key: "notifyOnMessage", value: bridge.settings?.notifyOnMessage)
-                } header: { Text("Notifications") } footer: { Text("Keep DropBeam open while transferring — delivery can pause in the background.") }
+                } header: { Text("Notifications") } footer: { Text("Keep DropBeam open while transferring. iOS can pause transfers in the background.") }
                 Section {
                     SettingToggle(title: "Read Receipts", symbol: "checkmark.message.fill", color: .blue, key: "sendReadReceipts", value: bridge.settings?.sendReadReceipts)
                     NavigationLink { TextSettingView(title: "GIF Search", key: "giphyApiKey", value: bridge.settings?.giphyApiKey ?? "", placeholder: "Giphy API key", footer: "Add a free key from developers.giphy.com to search GIFs in chats. Leave blank to hide the GIF button.") } label: {
@@ -55,20 +53,8 @@ struct SettingsView: View {
                     }
                 } header: { Text("Chat") } footer: { Text("Friends see when you’ve read their messages while Read Receipts is on.") }
                 Section {
-                    SettingToggle(title: "Direct Connections Only", symbol: "lock.shield.fill", color: .teal, key: "requireDirect", value: bridge.settings?.requireDirect)
-                    if bridge.settings?.waitForDirect != nil {
-                        SettingToggle(title: "Wait for a Direct Link", symbol: "hourglass", color: .orange, key: "waitForDirect", value: bridge.settings?.requireDirect == true ? false : bridge.settings?.waitForDirect)
-                            .disabled(bridge.settings?.requireDirect == true)
-                    }
-                    NavigationLink { ConnectionInfoView() } label: { RowLabel(title: "How Transfers Connect", symbol: "antenna.radiowaves.left.and.right", color: .blue) }
-                } header: { Text("Connections") } footer: { Text("Direct Connections Only fails a send when no direct path can be made. Shared folders always use the best available path.") }
-                Section {
-                    SettingToggle(title: "Parallel Streams", symbol: "square.stack.3d.up.fill", color: .indigo, key: "parallelStreams", value: bridge.settings?.parallelStreams)
-                    NavigationLink { UploadLimitView() } label: {
-                        RowLabel(title: "Upload Limit", symbol: "speedometer", color: .orange, value: (bridge.settings?.uploadLimitMbps ?? 0) > 0 ? "\(Int(bridge.settings?.uploadLimitMbps ?? 0)) Mbps" : "None")
-                    }
-                    SettingToggle(title: "Show Speeds in Megabits", symbol: "gauge.with.dots.needle.67percent", color: .gray, key: "showMegabits", value: bridge.settings?.showMegabits)
-                } header: { Text("Speed") } footer: { Text("Parallel streams can speed up files over 16 MB. Turn off if transfers stall.") }
+                    NavigationLink { TransferSettingsView() } label: { RowLabel(title: "Transfers", symbol: "arrow.up.arrow.down", color: .blue) }
+                }
                 Section("Storage") {
                     NavigationLink { RecoverySettingsView() } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }
                     ActionRow(title: "Clear Transfer Cache", symbol: "trash.fill", color: .gray) { clearCache = true }
@@ -81,16 +67,11 @@ struct SettingsView: View {
                     IconToggle(title: "Feedback Button", symbol: "hand.tap.fill", color: .gray, isOn: Binding(get: { feedbackButton }, set: { feedbackButton = $0; SuperFeedback.setEnabled($0) }))
                     LinkRow(title: "Help & Support", symbol: "questionmark.circle.fill", color: .green, url: DropBeamLinks.support)
                     ActionRow(title: "Report a Problem", symbol: "envelope.fill", color: .orange) { contact() }
-                } header: { Text("Privacy & Support") } footer: { Text("The feedback button floats at the screen edge — drag it anywhere, or turn it off and use Send Feedback.") }
-                Section("Advanced") {
-                    NavigationLink { TextSettingView(title: "Custom Relay", key: "customRelay", value: bridge.settings?.customRelay ?? "", placeholder: "https://relay.example.com", footer: "Use the same relay URL on both devices. Leave blank to use the public relays. Close and reopen DropBeam to apply.", link: ("Relay setup guide", DropBeamLinks.relaySetup)) } label: {
-                        RowLabel(title: "Custom Relay", symbol: "server.rack", color: .gray, value: (bridge.settings?.customRelay ?? "").isEmpty ? "Off" : "On")
-                    }
-                }
+                } header: { Text("Privacy & Support") } footer: { Text("The feedback button floats at the edge of the screen. Drag it anywhere.") }
                 Section {
                     LabeledContent("Version", value: version.isEmpty ? "…" : version)
                 } footer: {
-                    Text("DropBeam · Direct, end-to-end encrypted transfers").frame(maxWidth: .infinity).padding(.top, 8)
+                    Text("End-to-end encrypted").frame(maxWidth: .infinity).padding(.top, 8)
                 }
             }
             .beamList()
@@ -129,7 +110,7 @@ struct SettingToggle: View {
     var body: some View {
         let binding = Binding(get: { value ?? false }, set: { next in bridge.perform { try await bridge.updateSettings(patch: [key: next]) } })
         if let symbol { IconToggle(title: title, symbol: symbol, color: color, isOn: binding) }
-        else { Toggle(title, isOn: binding) }
+        else { Toggle(title, isOn: binding).tint(.green) }
     }
 }
 struct MyAvatar: View {
@@ -155,9 +136,7 @@ struct ProfileView: View {
                                 .overlay(Circle().stroke(Color(uiColor: .systemGroupedBackground), lineWidth: 3))
                         }
                     }.accessibilityLabel("Change profile photo")
-                    Button { name = bridge.settings?.displayName ?? ""; editing = true } label: {
-                        HStack(spacing: 6) { Text(bridge.settings?.displayName ?? "Your Name").font(.title.bold()).foregroundStyle(.primary); Image(systemName: "pencil").font(.body).foregroundStyle(.tint) }
-                    }.buttonStyle(.plain).accessibilityLabel("Edit name, \(bridge.settings?.displayName ?? "")")
+                    Text(bridge.settings?.displayName ?? "Your Name").font(.title2.bold()).multilineTextAlignment(.center).lineLimit(3)
                     Text("Friends see this name and photo.").font(.subheadline).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity)
             }.clearRow()
@@ -165,6 +144,7 @@ struct ProfileView: View {
         }
         .beamList()
         .navigationTitle("Profile").navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Edit") { name = bridge.settings?.displayName ?? ""; editing = true }.accessibilityLabel("Edit name") } }
         .alert("Display Name", isPresented: $editing) {
             TextField("Name", text: $name).textContentType(.name)
             Button("Cancel", role: .cancel) {}
@@ -185,17 +165,17 @@ struct MyCodeSection: View {
                 } else if code.isEmpty { ProgressView().frame(height: 240) }
                 else {
                     InviteQRCode(code: code)
-                    Text(code).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(3).multilineTextAlignment(.center)
+                    CodeLine(code: code).padding(.horizontal, 12)
                 }
                 HStack(spacing: 12) {
-                    Button { UIPasteboard.general.string = code; Haptics.success(); bridge.showToast("Code copied") } label: { Label("Copy", systemImage: "doc.on.doc").frame(maxWidth: .infinity, minHeight: 32) }
+                    Button { UIPasteboard.general.string = code; Haptics.success(); bridge.showToast("Code copied") } label: { Label("Copy", systemImage: "doc.on.doc").frame(maxWidth: .infinity) }
                         .beamButton().disabled(code.isEmpty)
-                    ShareLink(item: code, subject: Text("Add me on DropBeam"), message: Text("Add me on DropBeam with this code:")) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity, minHeight: 32) }
-                        .beamButton(prominent: true).disabled(code.isEmpty)
-                }
+                    ShareLink(item: code, subject: Text("Add me on DropBeam"), message: Text("Add me on DropBeam with this code:")) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity) }
+                        .beamButton().disabled(code.isEmpty)
+                }.controlSize(.large)
             }.frame(maxWidth: .infinity).padding(.vertical, 12)
         } header: { Text("Your DropBeam Code") } footer: {
-            Text("A friend scans this in DropBeam (Friends → + → Add Friend) or pastes the code to add you.")
+            Text("Friends scan this code or paste it into DropBeam to add you.")
         }
         .task { load() }
     }
@@ -213,8 +193,7 @@ struct InviteQRCode: View {
     }
     var body: some View {
         Group { if let image { Image(uiImage: image).interpolation(.none).resizable().scaledToFit() } else { Image(systemName: "qrcode").resizable().scaledToFit() } }
-            .padding(16).frame(maxWidth: 240).background(.white, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
+            .padding(14).frame(maxWidth: 220).background(.white, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             .accessibilityLabel("DropBeam QR code")
     }
 }
@@ -241,7 +220,7 @@ struct LinkThisDeviceSheet: View {
                         if code.isEmpty && error == nil { ProgressView().frame(height: 240) }
                         if !code.isEmpty {
                             InviteQRCode(code: code)
-                            Text(code).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(3)
+                            CodeLine(code: code).padding(.horizontal, 12)
                             Button { UIPasteboard.general.string = code; Haptics.success() } label: { Label("Copy Code", systemImage: "doc.on.doc") }.beamButton()
                         }
                         if let error {
@@ -454,5 +433,36 @@ struct PrivacyView: View {
             RowIcon(symbol: symbol, color: color)
             VStack(alignment: .leading, spacing: 3) { Text(title).font(.body.weight(.semibold)).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }; Text(detail).font(.subheadline).foregroundStyle(.secondary) }
         }.padding(.vertical, 2).accessibilityElement(children: .combine)
+    }
+}
+
+/// Settings → Transfers: routing and speed switches most people never touch.
+struct TransferSettingsView: View {
+    @EnvironmentObject private var bridge: Bridge
+    var body: some View {
+        List {
+            Section {
+                SettingToggle(title: "Direct Connections Only", symbol: "lock.shield.fill", color: .teal, key: "requireDirect", value: bridge.settings?.requireDirect)
+                if bridge.settings?.waitForDirect != nil {
+                    SettingToggle(title: "Wait for a Direct Link", symbol: "hourglass", color: .orange, key: "waitForDirect", value: bridge.settings?.requireDirect == true ? false : bridge.settings?.waitForDirect)
+                        .disabled(bridge.settings?.requireDirect == true)
+                }
+                NavigationLink { ConnectionInfoView() } label: { RowLabel(title: "How Transfers Connect", symbol: "antenna.radiowaves.left.and.right", color: .blue) }
+            } header: { Text("Connections") } footer: { Text("Direct Connections Only fails a send when no direct path can be made. Shared folders always use the best available path.") }
+            Section {
+                SettingToggle(title: "Parallel Streams", symbol: "square.stack.3d.up.fill", color: .indigo, key: "parallelStreams", value: bridge.settings?.parallelStreams)
+                NavigationLink { UploadLimitView() } label: {
+                    RowLabel(title: "Upload Limit", symbol: "speedometer", color: .orange, value: (bridge.settings?.uploadLimitMbps ?? 0) > 0 ? "\(Int(bridge.settings?.uploadLimitMbps ?? 0)) Mbps" : "None")
+                }
+                SettingToggle(title: "Show Speeds in Megabits", symbol: "gauge.with.dots.needle.67percent", color: .gray, key: "showMegabits", value: bridge.settings?.showMegabits)
+            } header: { Text("Speed") } footer: { Text("Parallel streams can speed up files over 16 MB. Turn off if transfers stall.") }
+            Section("Relay") {
+                NavigationLink { TextSettingView(title: "Custom Relay", key: "customRelay", value: bridge.settings?.customRelay ?? "", placeholder: "https://relay.example.com", footer: "Use the same relay URL on both devices. Leave blank to use the public relays. Close and reopen DropBeam to apply.", link: ("Relay setup guide", DropBeamLinks.relaySetup)) } label: {
+                    RowLabel(title: "Custom Relay", symbol: "server.rack", color: .gray, value: (bridge.settings?.customRelay ?? "").isEmpty ? "Off" : "On")
+                }
+            }
+        }
+        .beamList()
+        .navigationTitle("Transfers").navigationBarTitleDisplayMode(.inline)
     }
 }

@@ -31,6 +31,12 @@ final class Bridge: ObservableObject {
     @Published var locations: [FriendLocations] = []
     @Published var needsName = false
     @Published var pendingSend: [String] = []
+    /// Paths the user just picked on the Send tab, owned by Swift. The web store's
+    /// `pendingSend` snapshot (re-pushed right after every pick reply) must not be able to
+    /// clear them before the Send To sheet appears — that race left the sheet unshown.
+    @Published var pickedToSend: [String] = []
+    /// What the Send To sheet offers: a fresh pick, else an engine/share-sheet request.
+    var sendQueue: [String] { pickedToSend.isEmpty ? pendingSend : pickedToSend }
     @Published var folderInvites: [FolderInvite] = []
     @Published var toast: String?
     @Published var friends: [Friend] = []
@@ -177,7 +183,7 @@ final class Bridge: ObservableObject {
         guard !paths.isEmpty else { return }
         try await NativePresentation.waitForPickerDismissal()
         if let friendId { try await sendToFriend(friendId: friendId, paths: paths) }
-        else { pendingSend = paths }
+        else { pickedToSend = paths }
     }
     func showToast(_ message: String) {
         toast = message
