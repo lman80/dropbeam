@@ -132,6 +132,17 @@ function seedChats() {
   mockChats.f4 = [msg('f4', 9 * DAY, true, 'Welcome aboard!', { status: 'delivered' })]
 }
 seedChats()
+// Chat preview extras (ui-chat): an emoji-only reply (renders large, no bubble)
+// and a photo with a caption. Fractional seq slots them into Alex's thread
+// without renumbering the seed above.
+if (!EMPTY && mockChats.f1) {
+  const base = { peerId: 'f1', files: [] as string[], bytes: 0, path: null, reactions: [], edited: false, deleted: false, gif: null }
+  mockChats.f1.push(
+    { ...base, id: 'seed-f1-jumbo', fromMe: false, kind: 'text', text: '🙌', status: null, ts: T0 - 3 * HOUR + 30_000, seq: 4.5 },
+    { ...base, id: 'seed-f1-caption', fromMe: true, kind: 'file', text: 'Cover option B — thoughts?', files: ['cover-b.jpg'], bytes: 2_600_000, path: '/mock-media/mountains.jpg', status: 'read', ts: T0 - 45 * MIN, seq: 10.5 },
+  )
+  mockChats.f1.sort((a, b) => a.seq - b.seq)
+}
 // Shared-folder activity woven into Alex's thread (store reads this key at start).
 if (typeof localStorage !== 'undefined' && !EMPTY && !localStorage.getItem('dropbeam-folder-activity-v2')) {
   try {
