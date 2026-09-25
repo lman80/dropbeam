@@ -1789,6 +1789,36 @@ pub(crate) fn bbr_config() -> noq_proto::congestion::Bbr3Config {
 }
 const INITIAL_WINDOW: u64 = 128 * 1024;
 
+/// Ask the peer to ACK every 11th packet (QUIC ack-frequency extension; the
+/// peer's max_ack_delay still bounds the wait, so a slow link keeps ~25 ms ACKs).
+/// On Wi-Fi every ACK competes with the data for airtime: measured 2026-09-25,
+/// Mac→Mac on one Wi-Fi, 200 MB, six paired runs — 7.5 → 10.3 MB/s average,
+/// every run faster; intercontinental (6.7 vs 6.8 MB/s) and 2 MB sends
+/// unchanged. 5, 16 and 32 all did worse than 10. Peers without the extension
+/// ignore it. DROPBEAM_ACK_THRESH=<n>|off overrides for A/B tests.
+pub(crate) fn ack_frequency() -> Option<noq_proto::AckFrequencyConfig> {
+    let n: u32 = match std::env::var("DROPBEAM_ACK_THRESH") {
+        Ok(v) if v == "off" => return None,
+        Ok(v) => v.parse().unwrap_or(ACK_THRESHOLD),
+        Err(_) => ACK_THRESHOLD,
+    };
+    let mut c = noq_proto::AckFrequencyConfig::default();
+    c.ack_eliciting_threshold(n.into());
+    Some(c)
+}
+const ACK_THRESHOLD: u32 = 10;
+
+/// The congestion controller every endpoint uses: BBRv3 unless DROPBEAM_CC
+/// (cubic | newreno) picks another one for an A/B test.
+pub(crate) fn congestion_factory() -> Arc<dyn noq_proto::congestion::ControllerFactory + Send + Sync + 'static> {
+    let iw = std::env::var("DROPBEAM_INITIAL_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(INITIAL_WINDOW);
+    match std::env::var("DROPBEAM_CC").as_deref() {
+        Ok("cubic") => { let mut c = noq_proto::congestion::CubicConfig::default(); c.initial_window(iw); Arc::new(c) }
+        Ok("newreno") => { let mut c = noq_proto::congestion::NewRenoConfig::default(); c.initial_window(iw); Arc::new(c) }
+        _ => Arc::new(bbr_config()),
+    }
+}
+
 /// Path ranking: relay last; among direct paths a LOCAL-network one (the peer's
 /// address is on one of our LAN subnets) always beats a public one — even when a
 /// jittery Wi-Fi momentarily measures the public path faster. Field case
@@ -1879,7 +1909,8 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     // any home uplink), so realistic throughput is unchanged but the link stays
     // usable for everything else during a transfer.
     let mut tcfg = iroh::endpoint::QuicTransportConfig::builder();
-    tcfg = tcfg.congestion_controller_factory(std::sync::Arc::new(bbr_config()));
+    tcfg = tcfg.congestion_controller_factory(congestion_factory());
+    tcfg = tcfg.ack_frequency_config(ack_frequency());
     // Field incident (2026-09-12): 14 advertised IPv4 addresses (11 Docker
     // gateways) plus address churn exhausted the default 13 path ids, producing
     // MaxPathIdReached and permanently relay-only connections. Both peers need
