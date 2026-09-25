@@ -1,15 +1,16 @@
-import { ChevronLeft, Plus } from 'lucide-react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, ChevronLeft, ChevronRight, File, Folder, FolderPlus, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { ArrowDownToLine, ArrowUpFromLine, ChevronRight, File, Folder, FolderPlus, Home, Pencil, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { api, locationsApi, onLocationsChanged, onTransferUpdate, type LocationEntry, type LocationPage, type SharedLocation } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { rememberLocationUpload, useStore } from '../store'
-import './locations.css'
+import { Dialog } from './Dialog'
+import { IconButton, MenuPopover, Spinner } from './ui'
 
 type Action = 'mkdir' | 'rename' | 'trash'
 const join = (parent: string, name: string) => parent ? `${parent}/${name}` : name
-export function FileBrowser({ friendId, location, online, onBack }: { friendId: string; location: SharedLocation; online: string; onBack?: () => void }) {
+/** Browse a friend's Location. `host` is the friend's display name, `online` their presence in words. */
+export function FileBrowser({ friendId, location, online, host, onBack }: { friendId: string; location: SharedLocation; online: string; host?: string; onBack?: () => void }) {
   const toast = useStore(s => s.toast)
   const [selecting, setSelecting] = useState(false)
   const [actionsOpen, setActionsOpen] = useState(false)
@@ -53,14 +54,14 @@ export function FileBrowser({ friendId, location, online, onBack }: { friendId: 
   const navigate = (next: string) => { if (busy) return; cursors.current = [undefined]; setPath(next); setPage(0); setSelected([]); setQuery(''); setData({ entries: [], page: 0, hasMore: false }) }
   const upload = useCallback(async (paths: string[]) => {
     if (!paths.length) return
-    if (!location.rights.upload) { toast('error', 'This location is read-only.'); return }
+    if (!location.rights.upload) { toast('error', 'This location is view only.'); return }
     if (actionBusy.current) return
     actionBusy.current = true; setBusy(true)
     try {
       const u = await locationsApi.upload(friendId, location.id, path, paths)
       rememberLocationUpload(u.id, friendId, location.id, path, paths)
       if (!useStore.getState().transfers[u.id]) useStore.getState().upsertTransfer(u)
-      toast('success', 'Upload started. Follow progress in Send & Receive.')
+      toast('success', 'Uploading · follow it in Send & Receive')
     } catch(e) { toast('error', String(e)) }
     finally { actionBusy.current = false; setBusy(false) }
   }, [friendId, location.id, location.rights.upload, path, toast])
@@ -88,12 +89,16 @@ export function FileBrowser({ friendId, location, online, onBack }: { friendId: 
           setTrashResults([...results])
         }
         const failed = results.filter(r => r.error)
+        const moved = results.length - failed.length
         setSelected(failed.map(r => r.name))
-        toast(failed.length ? 'info' : 'success', `${results.length - failed.length} moved to trash; ${failed.length} failed.`)
-        if (failed.length) setActionError('Some items could not be moved. Review the results below; retry applies only to failed items.')
+        toast(failed.length ? 'info' : 'success', failed.length
+          ? `Moved ${moved} of ${results.length} to Trash · ${failed.length} couldn’t be moved`
+          : `Moved ${moved === 1 ? `“${results[0].name}”` : `${moved} items`} to Trash`)
+        if (failed.length) setActionError(`${failed.length === 1 ? 'This item' : 'These items'} couldn’t be moved. Try again to retry just ${failed.length === 1 ? 'it' : 'them'}.`)
+        else setDialog(null)
         return
       }
-      toast('success', dialog === 'mkdir' ? 'Folder created.' : 'Renamed.')
+      toast('success', dialog === 'mkdir' ? 'Folder created' : 'Renamed')
       setDialog(null); setSelected([])
     } catch(e) { setActionError(String(e)) }
     finally { actionBusy.current = false; setBusy(false); restart() }
@@ -107,32 +112,49 @@ export function FileBrowser({ friendId, location, online, onBack }: { friendId: 
     actionBusy.current = true; setBusy(true)
     try {
       const result = await request<{ transferId: string | null; skipped?: string[] }>('download', { paths: selected.map(n => join(path, n)) })
-      if (result.skipped?.length) { setError(`Skipped ${result.skipped.length} unsupported item(s): ${result.skipped.slice(0, 10).join('; ')}`) }
-      if (result.transferId) toast('success', 'Download started. Follow progress in Send & Receive.')
-      else toast('info', 'No transferable items in the selection.')
+      if (result.skipped?.length) toast('info', `Skipped ${result.skipped.length === 1 ? '1 item' : `${result.skipped.length} items`} that can’t be downloaded: ${result.skipped.slice(0, 3).map(p => p.split('/').pop()).join(', ')}${result.skipped.length > 3 ? '…' : ''}`)
+      if (result.transferId) toast('success', 'Downloading · follow it in Send & Receive')
+      else toast('info', 'Nothing in the selection can be downloaded')
     }
     catch(e) { toast('error', String(e)) }
     finally { actionBusy.current = false; setBusy(false) }
   }
   const openDialog = (action: Action) => { setDialog(action); setName(action === 'rename' ? selected[0] : ''); setActionError(''); setTrashResults([]) }
-  const validName = name.trim() && name.trim() !== '.' && name.trim() !== '..' && !/[\/\0]/.test(name) && !name.toLowerCase().startsWith('.dropbeam-')
+  const validName = name.trim() && name.trim() !== '.' && name.trim() !== '..' && !/[/\0]/.test(name) && !name.toLowerCase().startsWith('.dropbeam-')
   const parts = path.split('/').filter(Boolean)
   const toggle = (item: LocationEntry) => setSelected(s => s.includes(item.name) ? s.filter(n => n !== item.name) : [...s, item.name])
-  const actionSheet = dialog && <div className="location-modal dialog-overlay"><form className={MOBILE_UI ? "dialog mobile-sheet" : "card dialog dialog-panel"} role="dialog" aria-modal="true" aria-labelledby="location-action-title" onSubmit={e => { e.preventDefault(); void run() }} onKeyDown={e => {
-        if (e.key === 'Escape' && !busy) setDialog(null)
-        if (e.key === 'Tab') {
-          const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)'))
-          const first = controls[0], last = controls[controls.length - 1]
-          if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus() }
-          if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus() }
-        }
-      }}>
-      <div className="dialog-head"><h2 className="dialog-title" id="location-action-title">{dialog === 'trash' ? 'Move to trash?' : dialog === 'rename' ? 'Rename item' : 'New folder'}</h2><button type="button" className="icon-btn" aria-label="Close dialog" disabled={busy} onClick={() => setDialog(null)}><X size={17} /></button></div>
-      {dialog === 'trash' ? <><ul className="location-trash-items">{selectedEntries.map(e => <li key={e.name}>{e.name}</li>)}</ul><p>These items will move to <strong>{location.name}/.dropbeam-trash/&lt;timestamp&gt;/</strong>. They are not permanently deleted. The owner can restore them from that folder.</p></> : <label className="field-label">{dialog === 'rename' ? `New name for “${selected[0]}”` : 'Folder name'}<input className="input" style={{ marginTop: 6 }} autoFocus required maxLength={200} value={name} onChange={e => setName(e.target.value)} /></label>}
-      {actionError && <p className="location-error" role="alert">{actionError}</p>}
-      {!!trashResults.length && <ul className="location-trash-items" aria-live="polite">{trashResults.map(r => <li key={r.name}><strong>{r.name}:</strong> {r.error ? `Failed — ${r.error}` : `Moved to ${r.trashPath}`}</li>)}</ul>}
-      <div className="dialog-actions dialog-footer location-toolbar"><button type="button" autoFocus={dialog === 'trash'} className="btn btn-ghost" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className={dialog === 'trash' ? 'btn btn-danger' : 'btn btn-primary'} disabled={busy || (dialog !== 'trash' && !validName) || (dialog === 'trash' && !selectedEntries.length)}>{busy ? 'Working…' : dialog === 'trash' ? 'Move to trash' : dialog === 'mkdir' ? 'Create folder' : 'Rename'}</button></div>
-    </form></div>
+  const trashCount = selectedEntries.length
+  const trashTitle = trashCount === 1 ? `Move “${selectedEntries[0].name}” to Trash?` : `Move ${trashCount} items to Trash?`
+  const failures = trashResults.filter(r => r.error)
+  const actionSheet = dialog && <Dialog width={400} busy={busy} onClose={() => setDialog(null)} className="location-dialog"
+    title={dialog === 'trash' ? (trashCount ? trashTitle : 'Move to Trash') : dialog === 'rename' ? 'Rename' : 'New folder'}
+    footer={<>
+      <button type="button" className="btn btn-secondary" disabled={busy} autoFocus={dialog === 'trash'} onClick={() => setDialog(null)}>{failures.length ? 'Close' : 'Cancel'}</button>
+      <button type="submit" form="location-action-form" className={dialog === 'trash' ? 'btn btn-destructive' : 'btn btn-primary'}
+        disabled={busy || (dialog !== 'trash' && !validName) || (dialog === 'trash' && !trashCount)}>
+        {busy ? 'Working…' : dialog === 'trash' ? (failures.length ? 'Try again' : 'Move to Trash') : dialog === 'mkdir' ? 'Create' : 'Rename'}</button>
+    </>}>
+    <form id="location-action-form" onSubmit={e => { e.preventDefault(); void run() }}>
+      {dialog === 'trash'
+        ? <>
+          <p className="dialog-text">{trashCount === 1 ? 'It moves' : 'They move'} to this location’s Trash folder, where the owner can restore {trashCount === 1 ? 'it' : 'them'}.</p>
+          {trashCount > 1 && <ul className="location-name-list">
+            {selectedEntries.slice(0, 5).map(e => <li key={e.name} className="truncate-1" title={e.name}>{e.name}</li>)}
+            {trashCount > 5 && <li className="faint">and {trashCount - 5} more</li>}
+          </ul>}
+        </>
+        : <label className="location-field">
+          <span className="field-label">{dialog === 'rename' ? 'New name' : 'Name'}</span>
+          <input className="input" autoFocus required maxLength={200} value={name} placeholder={dialog === 'mkdir' ? 'Untitled folder' : undefined}
+            onFocus={e => { if (dialog === 'rename') { const dot = e.target.value.lastIndexOf('.'); e.target.setSelectionRange(0, dot > 0 ? dot : e.target.value.length) } }}
+            onChange={e => setName(e.target.value)} />
+        </label>}
+      {actionError && <p className="form-error" role="alert">{actionError}</p>}
+      {failures.length > 0 && <ul className="location-name-list" aria-live="polite">
+        {failures.map(r => <li key={r.name}><span className="truncate-1" title={r.name}>{r.name}</span><span className="form-error">{r.error}</span></li>)}
+      </ul>}
+    </form>
+  </Dialog>
   if (MOBILE_UI) return <section className="mobile-browser" aria-label={`${location.name} file browser`}>
     <header className="mobile-header-compact visible mobile-browser-header"><button className="ios-button mobile-back" aria-label="Back" disabled={busy} onClick={() => path ? navigate(parts.slice(0, -1).join('/')) : onBack?.()}><ChevronLeft />Back</button><h1 className="ios-headline mobile-grow mobile-ellipsis">{parts.at(-1) ?? location.name}</h1><button className="ios-button" onClick={() => { setSelecting(!selecting); setSelected([]) }}>{selecting ? 'Done' : 'Select'}</button><button className="ios-icon" aria-label="Folder actions" aria-expanded={actionsOpen} onClick={() => setActionsOpen(!actionsOpen)}><Plus /></button></header>
     <div className="mobile-inset"><input className="mobile-search" aria-label="Search folder" placeholder="Search folder" value={query} onChange={e => { cursors.current = [undefined]; setPage(0); setQuery(e.target.value) }} /></div>
@@ -145,29 +167,120 @@ export function FileBrowser({ friendId, location, online, onBack }: { friendId: 
     {(selected.length > 0 || actionsOpen) && <div className="mobile-browser-actions"><button className="ios-button" disabled={!selected.length || busy || loading || !!error} onClick={() => void download()}><ArrowDownToLine size={18} />Download</button>{location.rights.upload && <><button className="ios-button" disabled={busy || loading || !!error} onClick={() => void pick(false)}>Upload files</button><button className="ios-button" disabled={busy || loading || !!error} onClick={() => void pick(true)}>Upload folder</button></>}{location.rights.manage && <><button className="ios-button" disabled={busy || loading || !!error} onClick={() => openDialog('mkdir')}>New folder</button><button className="ios-button" disabled={selected.length !== 1 || busy || loading} onClick={() => openDialog('rename')}>Rename</button><button className="ios-button ios-destructive" disabled={!selected.length || busy || loading} onClick={() => openDialog('trash')}>Trash</button></>}<button className="ios-button" disabled={busy} onClick={() => { setActionsOpen(false); setSelected([]); setSelecting(false) }}>Done</button></div>}
     {actionSheet}
   </section>
-  return <section className={`card file-browser${hover && location.rights.upload ? ' location-drag' : ''}`} aria-label={`${location.name} file browser`}>
-    <nav className="location-breadcrumbs" aria-label="Folder path"><button disabled={busy} onClick={() => navigate('')}><Home size={15} />{location.name}</button>{parts.map((part, i) => <span key={i}><ChevronRight size={14} /><button disabled={busy} onClick={() => navigate(parts.slice(0,i+1).join('/'))}>{part}</button></span>)}</nav>
-    <div className="location-toolbar location-actions">
-      <button className="btn btn-primary" disabled={!selected.length || busy || loading || !!error} onClick={() => { void download() }}><ArrowDownToLine size={15} />Download{selected.length > 0 ? ` (${selected.length})` : ''}</button>
-      {location.rights.upload && <><button className="btn btn-ghost" disabled={busy || loading || !!error} onClick={() => { void pick(false) }}><ArrowUpFromLine size={15} />Upload files</button>{!MOBILE_UI && <button className="btn btn-ghost" disabled={busy || loading || !!error} onClick={() => { void pick(true) }}><Folder size={15} />Upload folder</button>}</>}
-      {location.rights.manage && <><button className="btn btn-ghost" disabled={busy || loading || !!error} onClick={() => openDialog('mkdir')}><FolderPlus size={15} />New folder</button><button className="icon-btn" title="Rename selected item" aria-label="Rename selected item" disabled={selected.length !== 1 || busy || loading} onClick={() => openDialog('rename')}><Pencil size={16} /></button><button className="icon-btn" title="Move selected items to trash" aria-label="Move selected items to trash" disabled={!selected.length || busy || loading} onClick={() => openDialog('trash')}><Trash2 size={16} /></button></>}
-      <button className="icon-btn" title="Refresh folder" aria-label="Refresh folder" disabled={loading || busy} onClick={restart}><RefreshCw size={16} /></button>
+  const canAct = !busy && !loading && !error
+  const pageable = page > 0 || data.hasMore
+  const here = parts.at(-1) ?? location.name
+  return <section className="location-browser" aria-label={`${location.name} file browser`}>
+    <div className="page-header titlebar-drag location-browser-head">
+      <div className="location-crumbs">
+        <IconButton label="All locations" onClick={onBack} disabled={!onBack}><ChevronLeft /></IconButton>
+        <nav aria-label="Folder path" className="location-breadcrumbs">
+          <h1 className="page-title location-crumb-list">
+            {[location.name, ...parts].map((part, i, all) => {
+              const last = i === all.length - 1
+              return <Fragment key={i}>
+                {i > 0 && <ChevronRight className="location-crumb-sep" aria-hidden />}
+                {last
+                  ? <span className="location-crumb current truncate-1" title={part} aria-current="page">{part}</span>
+                  : <button type="button" className="location-crumb truncate-1" title={part} disabled={busy}
+                    onClick={() => navigate(parts.slice(0, i).join('/'))}>{part}</button>}
+              </Fragment>
+            })}
+          </h1>
+        </nav>
+      </div>
+      <div className="page-actions">
+        <IconButton label="Refresh" disabled={loading || busy} onClick={restart}><RefreshCw /></IconButton>
+        {location.rights.manage && <IconButton label="New folder" disabled={!canAct} onClick={() => openDialog('mkdir')}><FolderPlus /></IconButton>}
+        {location.rights.upload && <UploadButton disabled={!canAct} onPick={folder => void pick(folder)} />}
+      </div>
     </div>
-    <div className="location-toolbar location-filter"><label><Search size={16} /><input aria-label="Filter folder" placeholder="Filter folder…" value={query} onChange={e => (() => { cursors.current = [undefined]; setPage(0); setQuery(e.target.value) })()} /></label><select aria-label="Sort files" value={sort} onChange={e => (() => { cursors.current = [undefined]; setPage(0); setSort(e.target.value) })()}><option value="name">Name · A–Z</option><option value="size">Size · Largest first</option><option value="modified">Modified · Newest first</option></select></div>
-    {busy && <p className="location-status" role="status">Preparing… Large downloads are safely staged on the host first.</p>}
-    {error && <div className="location-error" role="alert">{error}<br/><button className="btn btn-ghost" disabled={busy || loading} onClick={restart}>Try again</button></div>}
-    <div className="location-table-wrap" aria-busy={loading}>
-      <table className="location-table"><thead><tr><th><input type="checkbox" aria-label="Select all visible items" disabled={!entries.length || busy || loading} checked={entries.length > 0 && entries.every(e => selected.includes(e.name))} onChange={e => setSelected(e.target.checked ? entries.map(e => e.name) : [])} /></th><th>Name</th><th>Size</th><th>Modified</th></tr></thead><tbody>
-        {entries.map(entry => <tr key={entry.name} className={selected.includes(entry.name) ? 'selected' : ''} onDoubleClick={() => entry.isDir && navigate(join(path, entry.name))}>
-          <td><input type="checkbox" aria-label={`Select ${entry.name}`} disabled={busy || loading} checked={selected.includes(entry.name)} onChange={() => toggle(entry)} /></td>
-          <td><button className="location-filename" disabled={busy || loading} onClick={() => entry.isDir ? navigate(join(path, entry.name)) : toggle(entry)}>{entry.isDir ? <Folder size={20} /> : <File size={19} />}<span>{entry.name}</span>{entry.isDir && <ChevronRight size={14} />}</button></td>
-          <td>{entry.isDir ? '—' : formatBytes(entry.size)}</td><td>{entry.modified ? new Date(entry.modified).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—'}</td></tr>)}
-      </tbody></table>
-      {loading && <p className="location-empty-small" role="status">Loading folder…</p>}
-      {!loading && !error && !entries.length && <div className="location-empty-small"><FolderOpenIllustration /><h3>{query ? 'No matching items' : 'This folder is empty'}</h3><p>{query ? 'Try another name in this folder.' : location.rights.upload ? (MOBILE_UI ? 'Upload photos or files here.' : 'Upload files or drop them here.') : 'Files shared here will appear in this folder.'}</p></div>}
+
+    <div className="location-toolbar-row">
+      <label className="search-field location-search">
+        <Search aria-hidden />
+        <input className="input" type="search" aria-label={`Filter ${here}`} placeholder="Filter" value={query}
+          onChange={e => { cursors.current = [undefined]; setPage(0); setQuery(e.target.value) }} />
+      </label>
+      <select className="input location-sort" aria-label="Sort by" value={sort}
+        onChange={e => { cursors.current = [undefined]; setPage(0); setSort(e.target.value) }}>
+        <option value="name">Name</option><option value="size">Size</option><option value="modified">Date modified</option>
+      </select>
+      <div className="location-selection" aria-live="polite">{selected.length > 0 && <>
+        <span className="muted tnum truncate-1">{selected.length} selected</span>
+        <button type="button" className="btn btn-secondary btn-sm" disabled={!canAct} onClick={() => { void download() }}><ArrowDownToLine />Download</button>
+        {location.rights.manage && <>
+          <IconButton size="sm" label="Rename" disabled={selected.length !== 1 || busy || loading} onClick={() => openDialog('rename')}><Pencil /></IconButton>
+          <IconButton size="sm" label="Move to Trash" danger disabled={busy || loading} onClick={() => openDialog('trash')}><Trash2 /></IconButton>
+        </>}
+        <IconButton size="sm" label="Clear selection" onClick={() => setSelected([])}><X /></IconButton>
+      </>}</div>
     </div>
-    <footer className="location-browser-footer"><span>{online} · {data.total ?? data.entries.length} items · Page {page+1}{location.rights.upload ? (MOBILE_UI ? ' · Upload available' : ' · Drop files here to upload') : ' · Read only'}</span><div className="location-toolbar"><button className="btn btn-ghost" disabled={page === 0 || loading || busy} onClick={() => { setPage(p => p-1); setSelected([]) }}>Previous</button><button className="btn btn-ghost" disabled={!data.hasMore || loading || busy} onClick={() => { setPage(p => p+1); setSelected([]) }}>Next</button></div></footer>
+
+    <div className={`group location-table-group${hover && location.rights.upload ? ' location-drop' : ''}${loading && entries.length ? ' location-loading' : ''}`} aria-busy={loading}>
+      <table className="location-table">
+        <thead><tr>
+          <th className="location-col-check"><input type="checkbox" aria-label="Select all" disabled={!entries.length || busy || loading}
+            checked={entries.length > 0 && entries.every(e => selected.includes(e.name))}
+            onChange={e => setSelected(e.target.checked ? entries.map(e => e.name) : [])} /></th>
+          <th>Name</th><th className="location-col-size">Size</th><th className="location-col-date">Date modified</th>
+        </tr></thead>
+        <tbody>{entries.map(entry => {
+          const on = selected.includes(entry.name)
+          return <tr key={entry.name} className={on ? 'selected' : ''} aria-selected={on}
+            onClick={e => { if ((e.target as HTMLElement).closest('input,button')) return; toggle(entry) }}
+            onDoubleClick={() => entry.isDir && navigate(join(path, entry.name))}>
+            <td className="location-col-check"><input type="checkbox" aria-label={`Select ${entry.name}`} disabled={busy || loading} checked={on} onChange={() => toggle(entry)} /></td>
+            <td className="location-col-name">
+              {entry.isDir
+                ? <button type="button" className="location-filename" disabled={busy || loading} onClick={() => navigate(join(path, entry.name))}>
+                  <Folder className="location-icon-folder" aria-hidden /><span className="truncate-1" title={entry.name}>{entry.name}</span></button>
+                : <span className="location-filename"><File className="location-icon-file" aria-hidden /><span className="truncate-1" title={entry.name}>{entry.name}</span></span>}
+            </td>
+            <td className="location-col-size tnum">{entry.isDir ? '—' : formatBytes(entry.size)}</td>
+            <td className="location-col-date tnum">{entry.modified ? new Date(entry.modified).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—'}</td>
+          </tr>
+        })}</tbody>
+      </table>
+      {error
+        ? <div className="location-table-note" role="alert"><span className="truncate-1" title={error}>Couldn’t open this folder</span>
+          <button type="button" className="btn btn-plain btn-sm" disabled={busy || loading} onClick={restart}>Try again</button></div>
+        : loading && !entries.length
+          ? <div className="location-table-note" role="status"><Spinner /> Loading…</div>
+          : !entries.length && <div className="location-table-note">{query ? 'No matches' : location.rights.upload ? 'Empty folder · drop files here to upload' : 'Empty folder'}</div>}
+    </div>
+
+    <footer className="location-browser-foot">
+      <span className="truncate-1 muted" role="status">
+        {busy
+          ? <><Spinner size={11} /> Preparing…</>
+          : hover && location.rights.upload
+            ? <>Drop to upload to {here}</>
+            : <span className="truncate-1">{host ? `${host} · ` : ''}{online} · <span className="tnum">{data.total ?? entries.length} item{(data.total ?? entries.length) === 1 ? '' : 's'}</span>{location.rights.upload ? '' : ' · View only'}</span>}
+      </span>
+      {pageable && <div className="location-pager">
+        <span className="faint tnum">Page {page + 1}</span>
+        <IconButton size="sm" label="Previous page" disabled={page === 0 || loading || busy} onClick={() => { setPage(p => p - 1); setSelected([]) }}><ChevronLeft /></IconButton>
+        <IconButton size="sm" label="Next page" disabled={!data.hasMore || loading || busy} onClick={() => { setPage(p => p + 1); setSelected([]) }}><ChevronRight /></IconButton>
+      </div>}
+    </footer>
     {actionSheet}
   </section>
 }
-function FolderOpenIllustration() { return <Folder size={38} strokeWidth={1.2} style={{ color: 'var(--accent)', margin: '8px auto' }} /> }
+
+/** "Upload" with a small menu: files, or a whole folder. */
+function UploadButton({ disabled, onPick }: { disabled: boolean; onPick: (folder: boolean) => void }) {
+  const [anchor, setAnchor] = useState<DOMRect | null>(null)
+  const [trigger, setTrigger] = useState<HTMLElement | null>(null)
+  const close = useCallback(() => setAnchor(null), [])
+  return <>
+    <button type="button" className="btn btn-primary location-upload" disabled={disabled} aria-haspopup="menu" aria-expanded={!!anchor}
+      onClick={e => { setTrigger(e.currentTarget); setAnchor(anchor ? null : e.currentTarget.getBoundingClientRect()) }}>
+      <ArrowUpFromLine />Upload<ChevronDown className="location-upload-caret" />
+    </button>
+    {anchor && <MenuPopover anchor={anchor} trigger={trigger} onClose={close} items={[
+      { label: 'Files…', icon: <File />, onSelect: () => onPick(false) },
+      { label: 'Folder…', icon: <Folder />, onSelect: () => onPick(true) },
+    ]} />}
+  </>
+}
