@@ -430,7 +430,7 @@ export const mockSyncedFolders = {
 function mockFolderStatus(p: Pair): FolderStatus {
   const idle: FolderStatus = {
     pairId: p.id, state: 'idle', queued: 0, sendingFile: null, percent: 0, bytesDone: 0, bytesTotal: 0,
-    speedBps: 0, etaSeconds: null, detail: null, peerOnline: !!p.peerName, peerName: p.peerName || null, locality: 'unknown', peerFiles: 1284,
+    speedBps: 0, etaSeconds: null, detail: null, peerOnline: friends.some((f) => f.name === p.peerName && !!ONLINE[f.id]), peerName: p.peerName || null, locality: 'unknown', peerFiles: 1284,
   }
   switch (p.id) {
     case 'p1': return { ...idle, state: 'sending', queued: 3, queuedFiles: ['shoot/IMG_0425.CR2', 'shoot/IMG_0426.CR2', 'shoot/IMG_0427 — alternate angle, slightly out of focus.CR2'], sendingFile: 'beach-sunset.jpg', percent: 62, bytesDone: 77_000_000, bytesTotal: 124_000_000, speedBps: 41_000_000, etaSeconds: 1.1, locality: 'local', sessionTotalFiles: 12, sessionDoneFiles: 8, connDetail: { path: 'local', rttMs: 3, upgrading: false, relay: null } }
