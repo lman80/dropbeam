@@ -115,7 +115,7 @@ export function SyncedFolders({ shared }: { shared: SharedByFriend }) {
             <IconButton label={folder.enabled ? `Pause ${folderName(folder.localPath)}` : `Resume ${folderName(folder.localPath)}`}
               tooltip={folder.enabled ? 'Pause' : 'Resume'} disabled={working}
               onClick={() => void act(folder.id, () => syncedFoldersApi.update(folder.id, { enabled: !folder.enabled }))}>
-              {folder.enabled ? <Pause /> : <Play />}
+              {folder.enabled ? <Pause fill="currentColor" strokeWidth={0} /> : <Play />}
             </IconButton>
             <MenuButton label={`More for ${folderName(folder.localPath)}`} items={items} />
           </div>
