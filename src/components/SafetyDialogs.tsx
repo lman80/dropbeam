@@ -1,12 +1,11 @@
 // Block & Report (App Store guideline 1.2), desktop. One host renders whichever
 // dialog the store's `safety` prompt asks for, so the friend card, the chat
 // header and a message's menu all open the same two dialogs.
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { createPortal } from 'react-dom'
+import { useEffect, useState, type ReactNode } from 'react'
 import { AnimatePresence } from 'framer-motion'
-import { Ban, Flag, MoreHorizontal } from 'lucide-react'
+import { Ban, Flag } from 'lucide-react'
 import { Dialog } from './Dialog'
-import { Spinner } from './bits'
+import { MenuButton, Spinner, type MenuItem } from './ui'
 import { api, type ChatMessage, type Friend } from '../lib/api'
 import { useStore } from '../store'
 import { REPORT_REASONS, platformLabel, reportMailto, type ReportReason } from '../lib/report'
@@ -45,30 +44,30 @@ function BlockDialog({ friend, onClose }: { friend: Friend; onClose: () => void 
   return (
     <Dialog
       title={`Block ${friend.name}?`}
-      icon={<Ban size={19} />}
-      width={440}
+      width={400}
+      className="safety-dialog"
       onClose={onClose}
       busy={busy}
       footer={
         <>
-          <button className="btn btn-ghost" onClick={() => openSafety({ kind: 'report', friendId: friend.id })} disabled={busy}>
-            <Flag size={14} /> Report instead…
+          <button className="btn btn-plain" onClick={() => openSafety({ kind: 'report', friendId: friend.id })} disabled={busy}>
+            Report…
           </button>
-          <span style={{ flex: 1 }} />
-          <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
-          <button className="btn btn-danger" onClick={block} disabled={busy}>
-            {busy ? <Spinner size={14} /> : <Ban size={14} />} Block
+          <span className="spacer" />
+          <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="btn btn-destructive" onClick={block} disabled={busy}>
+            {busy && <Spinner size={13} />} Block
           </button>
         </>
       }
     >
-      <ul className="safety-points">
-        <li>{friend.name} is removed from your friends on all your linked devices.</li>
-        <li>They can’t message you, send you files, invite you to folders or browse your Locations — even if they have your code.</li>
-        <li>They aren’t told. To them it looks like you’re not accepting.</li>
-        <li>Your chat history stays on this device. Unblock any time in Settings → Privacy &amp; safety.</li>
-      </ul>
-      <p className="dialog-text safety-note">Shared folders you’re both in keep syncing until you leave them in Shared Folders.</p>
+      <p className="dialog-text safety-text">
+        {friend.name} is removed from your friends and can’t message you, send you files or invite you to folders.
+        They aren’t told.
+      </p>
+      <p className="dialog-text safety-text safety-note">
+        Your chats stay, and shared folders keep syncing until you leave them. You can unblock in Settings.
+      </p>
     </Dialog>
   )
 }
@@ -117,16 +116,15 @@ function ReportDialog({ friend, message, onClose }: { friend: Friend; message?: 
   return (
     <Dialog
       title={subject === 'person' ? `Report ${friend.name}` : subject === 'file' ? 'Report this file' : 'Report this message'}
-      subtitle="Reports go to the DropBeam team by email. You’ll see the email before it’s sent."
-      icon={<Flag size={19} />}
-      width={480}
+      width={440}
+      className="safety-dialog"
       onClose={onClose}
       busy={busy}
       footer={
         <>
-          <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
           <button className="btn btn-primary" onClick={submit} disabled={busy || !reason}>
-            {busy ? <Spinner size={14} /> : null} Continue to email
+            {busy && <Spinner size={13} />} Continue to email
           </button>
         </>
       }
@@ -150,7 +148,7 @@ function ReportDialog({ friend, message, onClose }: { friend: Friend; message?: 
           </span>
         </label>
       )}
-      <label className="safety-label" htmlFor="report-notes">Anything else? <span className="safety-hint">(optional)</span></label>
+      <label className="safety-label" htmlFor="report-notes">Anything else? <span className="optional">Optional</span></label>
       <textarea
         id="report-notes"
         className="input safety-notes"
@@ -164,70 +162,67 @@ function ReportDialog({ friend, message, onClose }: { friend: Friend; message?: 
         <input type="checkbox" checked={alsoBlock} onChange={(e) => setAlsoBlock(e.target.checked)} />
         <span>Also block {friend.name}</span>
       </label>
+      <p className="safety-foot">Reports go to the DropBeam team by email. You’ll see it before it’s sent.</p>
     </Dialog>
   )
 }
 
-/** "⋯" menu with Report… / Block… for a friend (friend card, chat header).
- *  Rendered in a portal at a fixed position so a card's rounded clipping
- *  (overflow: hidden) can't cut it off; flips above the button near the bottom. */
-export function SafetyMenu({ friend }: { friend: Friend }) {
+/** "…" menu with Report… / Block… for a friend (friend row, chat header).
+ *  `before` / `after` add the caller's own items around the safety actions
+ *  (the Friends list puts Rename, Invite… and Remove in the same menu). */
+export function SafetyMenu({ friend, before = [], after = [], size, blankIcon }: {
+  friend: Friend
+  before?: MenuItem[]
+  after?: MenuItem[]
+  size?: 'sm' | 'md'
+  /** Replace the Report/Block glyphs (e.g. with an empty checkmark column so
+   *  they line up with the caller's items). */
+  blankIcon?: ReactNode
+}) {
   const openSafety = useStore((s) => s.openSafety)
-  const [pos, setPos] = useState<CSSProperties | null>(null)
-  const btn = useRef<HTMLButtonElement>(null)
-  const menu = useRef<HTMLDivElement>(null)
-  const open = pos !== null
-  useEffect(() => {
-    if (!open) return
-    const down = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (!menu.current?.contains(t) && !btn.current?.contains(t)) setPos(null)
-    }
-    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') setPos(null) }
-    const away = () => setPos(null)
-    window.addEventListener('mousedown', down)
-    window.addEventListener('keydown', key)
-    window.addEventListener('resize', away)
-    window.addEventListener('scroll', away, true)
-    return () => {
-      window.removeEventListener('mousedown', down)
-      window.removeEventListener('keydown', key)
-      window.removeEventListener('resize', away)
-      window.removeEventListener('scroll', away, true)
-    }
-  }, [open])
-  const toggle = () => {
-    if (open) return setPos(null)
-    const r = btn.current?.getBoundingClientRect()
-    if (!r) return
-    const right = Math.max(8, window.innerWidth - r.right)
-    setPos(r.bottom + 110 > window.innerHeight ? { right, top: 'auto', bottom: window.innerHeight - r.top + 6 } : { right, top: r.bottom + 6, bottom: 'auto' })
+  const visible = (items: MenuItem[]) => items.some((i) => !i.hidden)
+  const items: MenuItem[] = [
+    ...before,
+    { separator: true, hidden: !visible(before) },
+    { label: 'Report…', icon: blankIcon ?? <Flag />, onSelect: () => openSafety({ kind: 'report', friendId: friend.id }) },
+    { label: 'Block…', icon: blankIcon ?? <Ban />, danger: true, onSelect: () => openSafety({ kind: 'block', friendId: friend.id }) },
+    { separator: true, hidden: !visible(after) },
+    ...after,
+  ]
+  return <MenuButton label={`More options for ${friend.name}`} items={items} size={size} />
+}
+
+/** A small "are you sure?" dialog: one line of consequence, Cancel + the
+ *  destructive action. */
+export function ConfirmDialog({ title, children, confirmLabel, onConfirm, onClose }: {
+  title: string
+  children?: ReactNode
+  confirmLabel: string
+  onConfirm: () => void | Promise<unknown>
+  onClose: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const confirm = async () => {
+    setBusy(true)
+    try { await onConfirm() } finally { setBusy(false) }
+    onClose()
   }
-  const pick = (fn: () => void) => () => { setPos(null); fn() }
   return (
-    <>
-      <button
-        ref={btn}
-        className="icon-btn"
-        aria-label={`More options for ${friend.name}`}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        title="More"
-        onClick={toggle}
-      >
-        <MoreHorizontal size={16} />
-      </button>
-      {pos && createPortal(
-        <div ref={menu} className="chat-menu safety-menu" role="menu" style={pos}>
-          <button role="menuitem" onClick={pick(() => openSafety({ kind: 'report', friendId: friend.id }))}>
-            <Flag size={14} /> Report…
+    <Dialog
+      title={title}
+      width={380}
+      onClose={onClose}
+      busy={busy}
+      footer={
+        <>
+          <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="btn btn-destructive" autoFocus onClick={() => void confirm()} disabled={busy}>
+            {busy && <Spinner size={13} />} {confirmLabel}
           </button>
-          <button role="menuitem" className="danger" onClick={pick(() => openSafety({ kind: 'block', friendId: friend.id }))}>
-            <Ban size={14} /> Block…
-          </button>
-        </div>,
-        document.body,
-      )}
-    </>
+        </>
+      }
+    >
+      {children && <p className="dialog-text" style={{ margin: 0 }}>{children}</p>}
+    </Dialog>
   )
 }
