@@ -24,8 +24,9 @@ struct RootView: View {
         .overlay { MediaPreparationOverlay() }
         .safeAreaInset(edge: .top) {
             if bridge.networkAvailable == false {
-                Label("You’re offline. Connect to Wi-Fi or cellular to reach other devices.", systemImage: "wifi.slash")
-                    .font(.footnote.weight(.medium)).multilineTextAlignment(.leading)
+                Label("You’re Offline", systemImage: "wifi.slash")
+                    .font(.footnote.weight(.semibold))
+                    .accessibilityHint("Connect to Wi-Fi or cellular to reach other devices.")
                     .padding(.horizontal, 16).padding(.vertical, 10).glassCapsule()
                     .padding(.horizontal, 16).padding(.top, 4)
                     .accessibilityAddTraits(.updatesFrequently)

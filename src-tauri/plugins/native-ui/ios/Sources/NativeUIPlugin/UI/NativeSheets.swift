@@ -37,18 +37,27 @@ struct QRScannerSheet: View {
                     }
                     if paste || !scannerReady {
                         VStack(alignment: .leading, spacing: 12) {
-                            Text("DropBeam Code").font(.footnote.weight(.semibold)).foregroundStyle(.secondary).textCase(.uppercase)
-                            TextField("dropbeam:…", text: $code, axis: .vertical)
-                                .textInputAutocapitalization(.never).autocorrectionDisabled().font(.body.monospaced())
-                                .lineLimit(2...5).focused($fieldFocused).submitLabel(.go)
-                                .padding(14).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                            HStack(spacing: 12) {
-                                PasteButton(payloadType: String.self) { strings in
-                                    Task { @MainActor in code = strings.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
-                                }.buttonBorderShape(.capsule).tint(.beam).frame(maxWidth: .infinity)
-                                Button(action: connect) { Text(busy ? "Connecting…" : "Continue").frame(maxWidth: .infinity, minHeight: 32) }
-                                    .beamButton(prominent: true).disabled(busy || code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            // One line: codes must never wrap (wrapping hyphenates them).
+                            HStack(spacing: 8) {
+                                TextField("Paste a DropBeam code", text: $code)
+                                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                                    .font(code.isEmpty ? .body : .body.monospaced())
+                                    .focused($fieldFocused).submitLabel(.go).onSubmit(connect)
+                                if code.isEmpty {
+                                    PasteButton(payloadType: String.self) { strings in
+                                        Task { @MainActor in code = strings.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+                                    }.labelStyle(.iconOnly).buttonBorderShape(.circle).tint(.beam)
+                                } else {
+                                    Button { code = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary) }
+                                        .buttonStyle(.plain).accessibilityLabel("Clear")
+                                }
                             }
+                            .padding(.leading, 14).padding(.trailing, 6).frame(minHeight: 50)
+                            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            if !scannerReady { Text(hint).font(.footnote).foregroundStyle(.secondary) }
+                            Button(action: connect) { Text(busy ? "Connecting…" : "Continue").frame(maxWidth: .infinity) }
+                                .beamButton(prominent: true).controlSize(.large).padding(.top, 4)
+                                .disabled(busy || code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                     }
                     if let error {
@@ -147,16 +156,16 @@ struct SendToSheet: View {
                     }.accessibilityElement(children: .combine)
                 }
                 if let error { Section { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) } }
-                group("My Devices", friends: people.filter(mine), empty: "Link your other devices in Settings → My Devices.")
-                group("Friends", friends: people.filter { !mine($0) }, empty: "Add a friend to send by name.")
+                if people.contains(where: mine) { group("My Devices", friends: people.filter(mine), empty: "") }
+                group("Friends", friends: people.filter { !mine($0) }, empty: "No friends yet — Quick Send works for anyone.")
                 Section {
                     Button { send(nil) } label: {
                         HStack(spacing: 14) {
                             RowIcon(symbol: "qrcode", color: .beam)
-                            VStack(alignment: .leading, spacing: 2) { Text("Quick Send with a Code").foregroundStyle(.primary); Text("Anyone with DropBeam can receive").font(.subheadline).foregroundStyle(.secondary) }
+                            VStack(alignment: .leading, spacing: 2) { Text("Quick Send with a Code").foregroundStyle(.primary).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }; Text("Anyone with DropBeam can receive").font(.subheadline).foregroundStyle(.secondary) }
                         }.contentShape(Rectangle())
                     }.buttonStyle(.plain)
-                } footer: { Text("You’ll get a code and QR to share. The files stay on this iPhone until someone receives them.") }
+                } footer: { Text("You’ll get a code to share. Files stay on this iPhone until someone receives them.") }
             }
             .beamList()
             .disabled(busy)
@@ -177,9 +186,9 @@ struct SendToSheet: View {
                 Button { send(friend.id) } label: {
                     HStack(spacing: 14) {
                         ContactAvatar(friend: friend, size: 42)
-                        VStack(alignment: .leading, spacing: 2) { Text(friend.displayName).font(.body.weight(.semibold)).foregroundStyle(.primary).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }; PresenceLabel(online: bridge.presence[friend.id] == true) }
-                        Spacer()
-                        Image(systemName: "paperplane.fill").foregroundStyle(.tint)
+                        VStack(alignment: .leading, spacing: 2) { Text(friend.displayName).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(2).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }; PresenceLabel(online: bridge.presence[friend.id] == true) }
+                        Spacer(minLength: 8)
+                        Image(systemName: "paperplane").foregroundStyle(.tint)
                     }.contentShape(Rectangle())
                 }.buttonStyle(.plain).accessibilityLabel("Send to \(friend.displayName), \(bridge.presence[friend.id] == true ? "online" : "offline")")
             }
@@ -210,24 +219,22 @@ struct OnboardingSheet: View {
         ScrollView {
             VStack(spacing: 28) {
                 VStack(spacing: 16) {
-                    Image(systemName: "paperplane.fill").font(.system(size: 46, weight: .semibold)).foregroundStyle(.white)
-                        .frame(width: 96, height: 96)
-                        .background(LinearGradient(colors: [.beam, .blue], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-                        .shadow(color: .beam.opacity(0.35), radius: 18, y: 8).accessibilityHidden(true)
+                    AppIconImage(size: 92)
                     Text("Welcome to DropBeam").font(.largeTitle.bold()).multilineTextAlignment(.center)
-                    Text("Send photos and files straight to friends and your own devices — fast, private, end-to-end encrypted.")
+                    Text("Send photos and files straight to friends and your own devices. Private and end-to-end encrypted.")
                         .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                }.padding(.top, 36)
+                }.padding(.top, 40)
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("What should friends call you?").font(.headline)
+                    Text("Your Name").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
                     TextField("Your name", text: $name).textContentType(.name).textInputAutocapitalization(.words)
                         .submitLabel(.continue).onSubmit(save).focused($focused)
-                        .padding(14).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    Text("Shown when you send files and chat. You can change it anytime in Settings.").font(.footnote).foregroundStyle(.secondary)
+                        .padding(.horizontal, 14).frame(minHeight: 50)
+                        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    Text("Friends see this when you send files and chat.").font(.footnote).foregroundStyle(.secondary)
                 }
                 if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.subheadline) }
-                Button(action: save) { Text(busy ? "Saving…" : "Continue").font(.headline).frame(maxWidth: .infinity, minHeight: 36) }
-                    .beamButton(prominent: true).controlSize(.large).disabled(busy || !valid)
+                Button(action: save) { Text(busy ? "Saving…" : "Continue").font(.headline).frame(maxWidth: .infinity) }
+                    .beamButton(prominent: true).controlSize(.extraLarge).disabled(busy || !valid)
                 VStack(spacing: 8) {
                     Text("Already use DropBeam on another device?").font(.subheadline).foregroundStyle(.secondary)
                     Button { joining = true; Haptics.tap() } label: { Label("Link to Your Account", systemImage: "qrcode.viewfinder") }
@@ -273,5 +280,29 @@ struct FolderInviteSheet: View {
             .navigationTitle("Shared Folder Invite").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Decline") { dismiss() }.disabled(busy) } }
         }.tint(.beam).interactiveDismissDisabled(busy).presentationDetents([.medium, .large])
+    }
+}
+
+/// The app's own icon (from the bundle), for onboarding; falls back to a flat tile.
+struct AppIconImage: View {
+    let size: CGFloat
+    private static let icon: UIImage? = {
+        guard let icons = Bundle.main.infoDictionary?["CFBundleIcons"] as? [String: Any],
+              let primary = icons["CFBundlePrimaryIcon"] as? [String: Any],
+              let files = primary["CFBundleIconFiles"] as? [String], let name = files.last else { return nil }
+        return UIImage(named: name)
+    }()
+    var body: some View {
+        Group {
+            if let icon = Self.icon { Image(uiImage: icon).resizable().scaledToFit() }
+            else {
+                Image(systemName: "paperplane.fill").font(.system(size: size * 0.46, weight: .semibold)).foregroundStyle(.white)
+                    .frame(width: size, height: size).background(Color.beam)
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: size * 0.225, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: size * 0.225, style: .continuous).strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+        .accessibilityHidden(true)
     }
 }
