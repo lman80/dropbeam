@@ -41,10 +41,10 @@ struct RootView: View {
             }
         }
         .sheet(isPresented: Binding(get: { bridge.needsName }, set: { _ in })) { OnboardingSheet() }
-        .sheet(isPresented: Binding(get: { !bridge.needsName && !bridge.pendingSend.isEmpty }, set: { if !$0 { bridge.pendingSend = []; bridge.perform { try await bridge.action("dismissSend") } } })) {
-            SendToSheet(paths: bridge.pendingSend)
+        .sheet(isPresented: Binding(get: { !bridge.needsName && !bridge.sendQueue.isEmpty }, set: { if !$0 { bridge.pickedToSend = []; bridge.pendingSend = []; bridge.perform { try await bridge.action("dismissSend") } } })) {
+            SendToSheet(paths: bridge.sendQueue)
         }
-        .sheet(item: Binding(get: { !bridge.needsName && bridge.pendingSend.isEmpty ? bridge.folderInvites.first : nil }, set: { if $0 == nil && !bridge.folderInvites.isEmpty { bridge.folderInvites.removeFirst() } })) { invite in FolderInviteSheet(invite: invite) }
+        .sheet(item: Binding(get: { !bridge.needsName && bridge.sendQueue.isEmpty ? bridge.folderInvites.first : nil }, set: { if $0 == nil && !bridge.folderInvites.isEmpty { bridge.folderInvites.removeFirst() } })) { invite in FolderInviteSheet(invite: invite) }
 
         .animation(.snappy, value: bridge.toast)
         .onChange(of: bridge.toast) { _, toast in if let toast { UIAccessibility.post(notification: .announcement, argument: toast) } }
