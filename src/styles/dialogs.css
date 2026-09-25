@@ -131,7 +131,7 @@ div.qr-code-tile { cursor: default; }
 .share-code-stack .share-code-side { min-width: 0; }
 .share-code-instructions { font-size: var(--text-12); color: var(--text-muted); line-height: 1.45; }
 .share-code-stack .share-code-instructions { text-align: center; }
-.share-code-text { display: block; font-family: var(--font-mono); font-size: var(--text-11); line-height: 1.5; color: var(--text-muted); background: var(--surface-2); border-radius: var(--radius-md); padding: 6px 10px; word-break: break-all; max-height: calc(6em + 12px); overflow-y: auto; }
+.share-code-text { display: block; font-family: var(--font-mono); font-size: var(--text-11); line-height: 1.5; color: var(--text-muted); background: var(--surface-2); border-radius: var(--radius-md); padding: 0 10px; border-block: 6px solid var(--surface-2); box-sizing: border-box; word-break: break-all; max-height: calc(6em + 12px); overflow-y: auto; }
 
 /* ---- QR scanner (desktop) ---- */
 html:not(.mobile) .qr-overlay .qrs { width: 420px; }
