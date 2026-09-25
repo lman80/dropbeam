@@ -157,6 +157,11 @@ let pairs: Pair[] = EMPTY ? [] : [
   { ...pairBase, id: 'p6', role: 'a', peerName: '', folder: '/Users/you/Desktop/Wedding Plans', twoWay: true, mirror: true, createdAt: T0 - 2 * HOUR, ownerEid: 'mock-me' },
 ]
 let pairCounter = 6
+// Folders preview: one multi-person folder (two links sharing a group id).
+if (!EMPTY) pairs.push(
+  { ...pairBase, id: 'pg1', role: 'a', peerName: 'Alex', folder: '/Users/you/Documents/Trip to Japan', twoWay: true, mirror: true, createdAt: T0 - 5 * DAY, ownerEid: 'mock-me', groupId: 'g-trip' },
+  { ...pairBase, id: 'pg2', role: 'a', peerName: 'Priya Raman', folder: '/Users/you/Documents/Trip to Japan', twoWay: true, mirror: true, createdAt: T0 - 5 * DAY, ownerEid: 'mock-me', groupId: 'g-trip', peerIsViewer: true },
+)
 
 const folderHistory: Record<string, HistoryItem[]> = EMPTY ? {} : {
   p1: [
