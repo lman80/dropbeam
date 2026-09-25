@@ -1781,10 +1781,20 @@ pub(crate) struct DirectPathSelector;
 /// 10 packets) needs ~9 doublings — ~2 s at a 220 ms intercontinental RTT —
 /// before a 3 MB photo is even in flight. DROPBEAM_INITIAL_WINDOW (bytes)
 /// overrides it for A/B tests.
-pub(crate) fn bbr_config() -> noq_proto::congestion::Bbr3Config {
+///
+/// `dropbeam_fixes` turns on our patches in the vendored noq-proto
+/// (vendor/noq-proto/src/congestion/bbr3/mod.rs) for the Wi-Fi "cwnd pinned at
+/// 4-5 packets, 0.2 MB/s for minutes" stall: the draft-06 end-of-probe ACKS_INIT
+/// transition (noq advanced the 2-cycle max-bw filter every ROUND, so any fade of
+/// a few RTTs erased the bandwidth model), an ACK-frequency-aware minimum window
+/// (with our ack threshold of 10 a sub-11-packet window gets every ACK held for
+/// max_ack_delay, a trap BBR's model can't climb out of), and a PROBE_UP exit fix.
+/// `stock` = true gives unpatched noq BBRv3 (DROPBEAM_CC=bbr) for A/B.
+pub(crate) fn bbr_config(stock: bool) -> noq_proto::congestion::Bbr3Config {
     let iw = std::env::var("DROPBEAM_INITIAL_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(INITIAL_WINDOW);
     let mut c = noq_proto::congestion::Bbr3Config::default();
     c.initial_window(iw);
+    c.dropbeam_fixes(!stock);
     c
 }
 const INITIAL_WINDOW: u64 = 128 * 1024;
@@ -1808,14 +1818,16 @@ pub(crate) fn ack_frequency() -> Option<noq_proto::AckFrequencyConfig> {
 }
 const ACK_THRESHOLD: u32 = 10;
 
-/// The congestion controller every endpoint uses: BBRv3 unless DROPBEAM_CC
-/// (cubic | newreno) picks another one for an A/B test.
+/// The congestion controller every endpoint uses: patched BBRv3 ("bbrfix", the
+/// default) unless DROPBEAM_CC picks another for an A/B test: bbr (stock noq
+/// BBRv3), cubic or newreno.
 pub(crate) fn congestion_factory() -> Arc<dyn noq_proto::congestion::ControllerFactory + Send + Sync + 'static> {
     let iw = std::env::var("DROPBEAM_INITIAL_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(INITIAL_WINDOW);
     match std::env::var("DROPBEAM_CC").as_deref() {
         Ok("cubic") => { let mut c = noq_proto::congestion::CubicConfig::default(); c.initial_window(iw); Arc::new(c) }
         Ok("newreno") => { let mut c = noq_proto::congestion::NewRenoConfig::default(); c.initial_window(iw); Arc::new(c) }
-        _ => Arc::new(bbr_config()),
+        Ok("bbr") => Arc::new(bbr_config(true)),
+        _ => Arc::new(bbr_config(false)),
     }
 }
 

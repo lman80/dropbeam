@@ -155,3 +155,7 @@ strip = false
 [patch.crates-io]
 tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }
 netwatch = { path = "vendor/netwatch" }
+# noq-proto 1.3.0, vendored: BBRv3 fixes for the Wi-Fi cwnd-pinned-at-the-floor stall (opt-in via
+# Bbr3Config::dropbeam_fixes, see iroh_net.rs bbr_config) and ACK_FREQUENCY parameters handed to
+# every path's controller. Search "DropBeam patch" in vendor/noq-proto/src.
+noq-proto = { path = "vendor/noq-proto" }
