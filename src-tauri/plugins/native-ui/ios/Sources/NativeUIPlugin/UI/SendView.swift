@@ -185,7 +185,7 @@ struct TransferRow: View {
         let who = name.map { (transfer.direction == "receive" ? "From " : "To ") + $0 }
         let status: String
         switch transfer.state {
-        case "waitingForPeer" where transfer.direction == "send" && transfer.code != nil: status = "Waiting for someone to receive"
+        case "waitingForPeer" where transfer.direction == "send" && transfer.code != nil: status = "Waiting for a receiver"
         case "failed": status = transfer.direction == "send" ? "Couldn’t send" : "Couldn’t receive"
         default: status = transfer.status
         }
