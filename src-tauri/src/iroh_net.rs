@@ -2876,7 +2876,7 @@ async fn serve_stream_inner(
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
                     prepare_partial_async(&dest, &fp, total).await
                 } else {
-                    (|| {
+                    blocking_fs(|| {
                         std::fs::create_dir_all(&dest)?;
                         let p = dest.join(format!(
                             ".dropbeam-partial-tmp-{}.part",
@@ -2884,7 +2884,7 @@ async fn serve_stream_inner(
                         ));
                         std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?.set_len(total)?;
                         Ok((p, Coverage::default()))
-                    })()
+                    })
                 };
                 let res = match prep {
                     Ok((part, cov)) => {
@@ -3306,13 +3306,13 @@ async fn serve_stream_inner(
                 let prep: Result<(PathBuf, Coverage)> = if resumable {
                     prepare_partial_async(&partial_dir, &fp, total).await
                 } else {
-                    (|| {
+                    blocking_fs(|| {
                         std::fs::create_dir_all(&partial_dir)?;
                         let p = partial_dir
                             .join(format!(".dropbeam-partial-tmp-{}.part", uuid::Uuid::new_v4()));
                         std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?.set_len(total)?;
                         Ok((p, Coverage::default()))
-                    })()
+                    })
                 };
                 let res = match prep {
                     Ok((part, cov)) => {
@@ -6499,6 +6499,23 @@ fn publish_unique_owned(part: &Path, natural: &Path, limit: usize, identity: Opt
 /// directory) so the bytes still land. Structure is preserved for every file whose
 /// parent we CAN create; only the genuinely-blocked file deviates. Because `rel`
 /// is pre-sanitized to Normal components, the result never escapes `dest_dir`.
+/// Run a filesystem call that may block for a long time — on macOS, `open()` in
+/// a protected folder (Desktop, Downloads, Documents…) parks until the user
+/// answers a privacy prompt — without wedging the async runtime. Field case
+/// (2026-09-25): a receive blocked in `ReceiveStage::create` on a tokio worker
+/// while a Desktop prompt was pending; tasks queued behind it on that worker
+/// (incl. its un-stealable LIFO slot) included the QUIC connection driver, so
+/// the whole connection idled out ("connection lost: timed out") and every
+/// incoming dial failed until the prompt was answered. `block_in_place` hands
+/// this worker's queue to a fresh worker first. Current-thread runtimes (unit
+/// tests) just run it inline.
+fn blocking_fs<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 fn ensure_parent_or_flat(dest_dir: &Path, rel: &Path) -> PathBuf {
     if let Some(parent) = rel.parent() {
         if !parent.as_os_str().is_empty() {
@@ -8055,9 +8072,9 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
         // ancestor is a FILE — ENOTDIR — rather than aborting the whole batch, the
         // real-user folder-receive crash). `natural` is the INTENDED path; it may
         // already exist from a prior send of the same folder.
-        let natural = ensure_parent_or_flat(dest_dir, &rel);
+        let natural = blocking_fs(|| ensure_parent_or_flat(dest_dir, &rel));
         let dest = natural.with_file_name(format!(".dropbeam-recv-{}.part", uuid::Uuid::new_v4()));
-        let (mut stage, file) = ReceiveStage::create(dest.clone(), size, transfer_id)?;
+        let (mut stage, file) = blocking_fs(|| ReceiveStage::create(dest.clone(), size, transfer_id))?;
         let mut f = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::from_std(file));
         let leaves = integrity::Leaves::default();
         let mut hash = integrity::enabled(header).then(|| integrity::Blocks::new(0, leaves.clone()).unwrap());
@@ -8914,12 +8931,12 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
         let prep: Result<(PathBuf, Coverage)> = if owns_partial {
             prepare_partial_async(dest_dir, &fp, total).await
         } else {
-            (|| {
+            blocking_fs(|| {
                 let p = dest_dir
                     .join(format!(".dropbeam-partial-tmp-{}.part", uuid::Uuid::new_v4()));
                 std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?.set_len(total)?;
                 Ok((p, Coverage::default()))
-            })()
+            })
         };
         let res = match prep {
             Ok((part, cov)) => {
