@@ -8,12 +8,9 @@ struct SendFolderButton: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var picking = false
     var body: some View {
-        Button {
+        ActionTile(title: "Folder", symbol: "folder", large: true) {
             picking = true
             bridge.perform { defer { picking = false }; try await bridge.pickAndSend(source: "folder") }
-        } label: {
-            VStack(spacing: 10) { Image(systemName: "folder.fill").font(.title); Text("Folder").font(.headline) }
-                .frame(maxWidth: .infinity, minHeight: 88)
-        }.beamButton().disabled(picking).accessibilityHint("Send a whole folder")
+        }.disabled(picking).accessibilityLabel("Send a Folder")
     }
 }
