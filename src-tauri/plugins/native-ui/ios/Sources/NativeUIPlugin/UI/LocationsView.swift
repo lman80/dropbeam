@@ -35,8 +35,8 @@ struct LocationsView: View {
         }
         .navigationTitle(friendID == nil ? "Locations" : (rows.first?.friendName ?? "Locations")).navigationBarTitleDisplayMode(friendID == nil ? .large : .inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) {
+                // Refreshing is automatic (and pull-to-refresh); just show when it's working.
                 if busy { ProgressView().accessibilityLabel("Checking locations") }
-                else { Button(action: refresh) { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh locations") }
             } }
             .task {
                 onlineBefore = Set(bridge.presence.filter(\.value).map(\.key))
@@ -59,7 +59,7 @@ struct LocationsView: View {
     private func section(_ friend: FriendLocations) -> some View {
         Section {
             if friend.status == "offline" {
-                Label("Offline — showing what it shared last time.", systemImage: "moon.zzz.fill").font(.footnote).foregroundStyle(.secondary)
+                Label("Offline — showing what was shared last time", systemImage: "moon.zzz.fill").font(.footnote).foregroundStyle(.secondary)
             } else if friend.status == "error", let error = friend.error {
                 problem(error)
             }
@@ -204,7 +204,7 @@ struct BrowserView: View {
                 ContentUnavailableView { Label("Couldn’t Open This Folder", systemImage: "exclamationmark.triangle") } description: { Text(error) } actions: { Button("Try Again") { Task { await load() } }.beamButton() }
             } else if loading && page.entries.isEmpty { ProgressView() }
             else if !loading && page.entries.isEmpty {
-                if query.isEmpty { ContentUnavailableView("Empty Folder", systemImage: "folder", description: Text(rights.upload ? "Nothing here yet. Tap ••• to upload photos or files." : "Nothing has been put in this folder yet.")) }
+                if query.isEmpty { ContentUnavailableView("Empty Folder", systemImage: "folder", description: Text(rights.upload ? "Upload photos or files with the ••• menu." : "Nothing here yet.")) }
                 else { ContentUnavailableView.search(text: query) }
             }
         }
@@ -218,15 +218,14 @@ struct BrowserView: View {
             }
             .toolbar { ToolbarItemGroup(placement: .topBarTrailing) {
                 Button(selecting ? "Done" : "Select") { Haptics.tap(); selecting.toggle(); selected.removeAll() }.disabled(busy)
-                Menu {
+                if rights.manage || rights.upload { Menu {
                     if rights.manage { Button("New Folder", systemImage: "folder.badge.plus") { name = ""; editing = "mkdir" } }
                     if rights.upload {
                         Button("Upload Photos", systemImage: "photo") { upload("photos") }
                         Button("Upload Files", systemImage: "doc") { upload("files") }
                         Button("Upload Folder", systemImage: "folder") { upload("folder") }
                     }
-                    Button("Refresh", systemImage: "arrow.clockwise") { Task { await load() } }
-                } label: { Image(systemName: "ellipsis") }.accessibilityLabel("Folder options").disabled(busy || loading)
+                } label: { Image(systemName: "ellipsis") }.accessibilityLabel("Folder options").disabled(busy || loading) }
             } }
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 8) {
