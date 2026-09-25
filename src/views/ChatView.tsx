@@ -1448,7 +1448,7 @@ function FileMessage({
   )?.id)
   useEffect(() => setBroken(false), [path, landedTransfer, transfer?.state])
   const available = mine || !!landedPath || !!m.path && (!transfer || transfer.state === 'completed')
-  const canPreview = !!path && HAS_TAURI && !broken && available
+  const canPreview = !!path && (HAS_TAURI || path.startsWith('/mock-media/')) && !broken && available
   const src = canPreview ? `${fileSrc(path!)}?landed=${landedTransfer ?? 'initial'}` : null
   const open = () => path && api.openPath(path).catch(() => {})
   const resendChatFile = useStore((s) => s.resendChatFile)

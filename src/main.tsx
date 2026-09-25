@@ -50,6 +50,13 @@ if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
   document.documentElement.classList.add('dark')
 }
 
+// Browser preview only: expose the store so screenshot scripts can reach every state.
+if (!HAS_TAURI) {
+  void import('./store').then(({ useStore }) => {
+    ;(window as unknown as { __store?: typeof useStore }).__store = useStore
+  })
+}
+
 const Root =
   label === 'popover' ? Popover : label === 'hud' ? Hud : label === 'receive' ? ReceiveCard : App
 async function renderApp() {

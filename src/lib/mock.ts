@@ -68,46 +68,28 @@ let settings: Settings = {
   folderHistoryBudgetBytes: 2 * 1024 * 1024 * 1024,
 }
 
-const history: HistoryEntry[] = [
-  {
-    id: 'h1',
-    direction: 'receive',
-    fileNames: ['Vacation Photos.zip'],
-    bytesTotal: 248_000_000,
-    peer: '192.168.1.40:5',
-    locality: 'local',
-    code: null,
-    state: 'completed',
-    timestampMs: Date.now() - 42 * 60_000,
-    error: null,
-    outDir: '/Users/you/Downloads',
-  },
-  {
-    id: 'h2',
-    direction: 'send',
-    fileNames: ['budget-2026.xlsx'],
-    bytesTotal: 84_000,
-    peer: '70.2.1.9:5',
-    locality: 'internet',
-    code: null,
-    state: 'completed',
-    timestampMs: Date.now() - 8 * 3600_000,
-    error: null,
-    outDir: null,
-  },
-  {
-    id: 'h3',
-    direction: 'send',
-    fileNames: ['demo-reel.mov', 'notes.txt'],
-    bytesTotal: 1_240_000_000,
-    peer: null,
-    locality: 'unknown',
-    code: null,
-    state: 'failed',
-    timestampMs: Date.now() - 26 * 3600_000,
-    error: 'The other side went offline before the transfer finished.',
-    outDir: null,
-  },
+// Preview knobs (dev only): ?empty=1 renders every list empty so the empty
+// states can be reviewed; otherwise the preview is seeded with a varied, realistic
+// data set (long names, offline friends, relay vs local, failures…).
+const EMPTY = typeof location !== 'undefined' && new URLSearchParams(location.search).has('empty')
+const MIN = 60_000
+const HOUR = 3_600_000
+const DAY = 86_400_000
+const T0 = Date.now()
+const okDigest = 'a3f1c9e2b47d05886e1f2a9c3b4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7'
+
+const history: HistoryEntry[] = EMPTY ? [] : [
+  { id: 'h0', direction: 'receive', fileNames: ['IMG_0421.HEIC', 'IMG_0422.HEIC', 'IMG_0423.HEIC'], bytesTotal: 42_000_000, peer: 'Alex', locality: 'local', code: null, state: 'completed', timestampMs: T0 - 12 * MIN, error: null, outDir: '/Users/you/Downloads',
+    integrity: [{ name: 'IMG_0421.HEIC', size: 14_000_000, algorithm: 'blake3', digest: okDigest, peerDigest: okDigest, verified: true, acknowledged: true }] },
+  { id: 'h1', direction: 'receive', fileNames: ['Vacation Photos.zip'], bytesTotal: 248_000_000, peer: '192.168.1.40:5', locality: 'local', code: null, state: 'completed', timestampMs: T0 - 42 * MIN, error: null, outDir: '/Users/you/Downloads' },
+  { id: 'hx-video', direction: 'send', fileNames: ['Clip.mov'], bytesTotal: 128_400_000, peer: 'Alex', locality: 'local', code: null, state: 'completed', timestampMs: T0 - 50 * MIN, error: null, outDir: null },
+  { id: 'h2', direction: 'send', fileNames: ['budget-2026.xlsx'], bytesTotal: 84_000, peer: '70.2.1.9:5', locality: 'internet', code: null, state: 'completed', timestampMs: T0 - 8 * HOUR, error: null, outDir: null },
+  { id: 'h3', direction: 'send', fileNames: ['demo-reel.mov', 'notes.txt'], bytesTotal: 1_240_000_000, peer: null, locality: 'unknown', code: null, state: 'failed', timestampMs: T0 - 26 * HOUR, error: 'The other side went offline before the transfer finished.', outDir: null },
+  { id: 'h4', direction: 'send', fileNames: ['Family Videos — Summer at the lake house (the long edit, final final v3).mov'], bytesTotal: 14_200_000_000, peer: 'Jordan Kim', locality: 'internet', code: null, state: 'completed', timestampMs: T0 - 30 * HOUR, error: null, outDir: null },
+  { id: 'h5', direction: 'receive', fileNames: ['Rechnungen_Übersicht_März.pdf'], bytesTotal: 842_000, peer: '陈伟', locality: 'direct', code: null, state: 'completed', timestampMs: T0 - 3 * DAY, error: null, outDir: '/Users/you/Downloads' },
+  { id: 'h6', direction: 'receive', fileNames: ['Keynote Deck.key'], bytesTotal: 92_000_000, peer: 'Sam', locality: 'internet', code: null, state: 'canceled', timestampMs: T0 - 4 * DAY, error: null, outDir: null },
+  { id: 'h7', direction: 'send', fileNames: ['Screenshot 2026-09-12 at 10.41.22.png'], bytesTotal: 2_100_000, peer: 'Lab Peer', locality: 'direct', code: null, state: 'failed', timestampMs: T0 - 12 * DAY, error: 'Verification failed — the copy on the other device didn’t match.', outDir: null },
+  { id: 'h8', direction: 'receive', fileNames: ['song.m4a'], bytesTotal: 7_400_000, peer: 'Priya Raman', locality: 'local', code: null, state: 'completed', timestampMs: T0 - 40 * DAY, error: null, outDir: '/Users/you/Downloads' },
 ]
 
 let counter = 0
@@ -115,42 +97,107 @@ let counter = 0
 const pendingOffers: Record<string, TransferUpdate> = {}
 // In-memory chat threads keyed by friend id (mock only).
 const mockChats: Record<string, ChatMessage[]> = {}
+function seedChats() {
+  if (EMPTY) return
+  let seq = 0
+  const msg = (peerId: string, ago: number, fromMe: boolean, text: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({
+    id: `seed-${peerId}-${++seq}`, peerId, fromMe, kind: 'text', text, files: [], bytes: 0, path: null,
+    status: fromMe ? 'read' : null, ts: T0 - ago, seq, reactions: [], edited: false, deleted: false, gif: null, ...extra,
+  })
+  const file = (peerId: string, ago: number, fromMe: boolean, files: string[], bytes: number, path: string | null, extra: Partial<ChatMessage> = {}) =>
+    msg(peerId, ago, fromMe, '', { kind: 'file', files, bytes, path, ...extra })
+  mockChats.f1 = [
+    msg('f1', 2 * DAY, false, 'Hey! Did the footage come through?'),
+    msg('f1', 2 * DAY - MIN, true, 'Half of it — the relay was crawling. Trying again on the same Wi-Fi now'),
+    msg('f1', 3 * HOUR, false, 'Perfect. Here’s the link to the brief: https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', { reactions: [{ emoji: '👍', fromMe: true }] }),
+    msg('f1', 3 * HOUR - MIN, true, 'Got it', { replyTo: 'seed-f1-3', replyPreview: 'Here’s the link to the brief…', edited: true }),
+    file('f1', 2 * HOUR, false, ['Beach.jpg'], 3_400_000, '/mock-media/beach.jpg', { reactions: [{ emoji: '❤️', fromMe: true }, { emoji: '❤️', fromMe: false }] }),
+    file('f1', 2 * HOUR - MIN, false, ['Portrait.jpg'], 2_100_000, '/mock-media/portrait.jpg'),
+    file('f1', 2 * HOUR - 2 * MIN, false, ['Q3 Report.pdf'], 18_400_000, '/Users/you/Downloads/Q3 Report.pdf'),
+    msg('f1', 90 * MIN, true, 'This message was unsent', { deleted: true }),
+    file('f1', 55 * MIN, true, ['Clip.mov'], 128_400_000, '/mock-media/clip.webm', { status: 'delivered', fileXferId: 'hx-video' }),
+    file('f1', 50 * MIN, true, ['design-system.fig', 'tokens.json', 'README.md', 'logo.svg'], 58_000_000, '/Users/you/Desktop/design-system.fig', { status: 'delivered' }),
+    file('f1', 40 * MIN, true, ['Presentation.key'], 312_000_000, '/Users/you/Desktop/Presentation.key', { status: 'delivered', fileXferId: 'cx-failed', fileXferFailed: true }),
+    msg('f1', 30 * MIN, false, 'مرحبا — سلام — こんにちは — Ünïcödé names work too'),
+    file('f1', 6 * MIN, true, ['raw-footage-day2.mov'], 4_800_000_000, '/Users/you/Movies/raw-footage-day2.mov', { status: 'sending', fileXferId: 'cx-live' }),
+    msg('f1', 5 * MIN, true, 'Sending the rest tonight.', { status: 'delivered' }),
+  ]
+  mockChats.f3 = [
+    msg('f3', 26 * HOUR, false, 'Can you drop the brand files in the shared folder?'),
+    msg('f3', 25 * HOUR, true, 'On it'),
+    msg('f3', 20 * MIN, false, 'Thanks!! Also — lunch Thursday?'),
+    msg('f3', 19 * MIN, false, 'I’m buying'),
+  ]
+  mockChats.f6 = [file('f6', 3 * DAY, false, ['Mountains.jpg'], 1_900_000, '/mock-media/mountains.jpg')]
+  mockChats.f4 = [msg('f4', 9 * DAY, true, 'Welcome aboard!', { status: 'delivered' })]
+}
+seedChats()
+// Shared-folder activity woven into Alex's thread (store reads this key at start).
+if (typeof localStorage !== 'undefined' && !EMPTY && !localStorage.getItem('dropbeam-folder-activity-v2')) {
+  try {
+    localStorage.setItem('dropbeam-folder-activity-v2', JSON.stringify({ p1: [
+      { id: 'fa1', ts: T0 - 100 * MIN, direction: 'receive', files: ['Moodboard/ref-01.jpg', 'Moodboard/ref-02.jpg', 'Moodboard/ref-03.jpg'], bytes: 9_400_000, pairId: 'p1', from: 'Alex' },
+      { id: 'fa2', ts: T0 - 35 * MIN, direction: 'send', files: ['cover-photo.png'], bytes: 2_200_000, pairId: 'p1' },
+      { id: 'fa3', ts: T0 - 20 * MIN, direction: 'send', files: [], bytes: 0, pairId: 'p1', action: 'moved', moves: [{ from: 'drafts/brief-v2.pdf', to: 'final/brief-v2.pdf' }] },
+    ] }))
+  } catch { /* preview only */ }
+}
+if (typeof localStorage !== 'undefined' && !EMPTY && !localStorage.getItem('dropbeam-chat-unread')) {
+  try { localStorage.setItem('dropbeam-chat-unread', JSON.stringify({ f3: 2, f6: 14 })) } catch { /* preview only */ }
+}
 
-let pairs: Pair[] = [
-  {
-    id: 'p1',
-    role: 'a',
-    peerName: 'Alex',
-    secret: 'mock',
-    folder: '/Users/you/Desktop/Project (shared with Alex)',
-    twoWay: true,
-    mirror: true,
-    autoDelete: false,
-    deleteMode: 'trash',
-    createdAt: Date.now() - 3 * 86400_000,
-    endpointId: null,
-    groupId: null,
-    // Mock: we own this folder (matches myEndpointId below) so the owner role
-    // controls render in dev/preview.
-    ownerEid: 'mock-me',
-  },
+const pairBase = { secret: 'mock', autoDelete: false, deleteMode: 'trash' as const, endpointId: null, groupId: null }
+let pairs: Pair[] = EMPTY ? [] : [
+  // Mock: we own p1 (matches myEndpointId below) so the owner role controls render.
+  { ...pairBase, id: 'p1', role: 'a', peerName: 'Alex', folder: '/Users/you/Desktop/Project (shared with Alex)', twoWay: true, mirror: true, createdAt: T0 - 3 * DAY, ownerEid: 'mock-me' },
+  { ...pairBase, id: 'p2', role: 'a', peerName: 'Sam', folder: '/Users/you/Pictures/Family Photos', twoWay: true, mirror: true, createdAt: T0 - 20 * DAY, ownerEid: 'mock-me' },
+  { ...pairBase, id: 'p3', role: 'b', peerName: 'Jordan Kim', folder: '/Users/you/Documents/Design Assets — Brand Refresh 2026 (Final Deliverables)', twoWay: false, mirror: false, createdAt: T0 - 9 * DAY, iAmViewer: true, ownerEid: 'mock-jordan' },
+  { ...pairBase, id: 'p4', role: 'a', peerName: 'Priya Raman', folder: '/Users/you/Documents/Tax Documents 2026', twoWay: true, mirror: true, createdAt: T0 - 60 * DAY, ownerEid: 'mock-me' },
+  { ...pairBase, id: 'p5', role: 'b', peerName: 'Chen Wei', folder: '/Users/you/Music/Band Practice', twoWay: true, mirror: false, createdAt: T0 - 90 * DAY, ownerEid: 'mock-chen' },
+  { ...pairBase, id: 'p6', role: 'a', peerName: '', folder: '/Users/you/Desktop/Wedding Plans', twoWay: true, mirror: true, createdAt: T0 - 2 * HOUR, ownerEid: 'mock-me' },
 ]
-let pairCounter = 1
+let pairCounter = 6
 
-const folderHistory: Record<string, HistoryItem[]> = {
+const folderHistory: Record<string, HistoryItem[]> = EMPTY ? {} : {
   p1: [
-    { id: 'fh1', relPath: 'src/old-logo.svg', size: 24_000, reason: 'deleted', timestampMs: Date.now() - 36 * 60_000 },
-    { id: 'fh2', relPath: 'notes.md', size: 4_200, reason: 'replaced', timestampMs: Date.now() - 5 * 3600_000 },
-    { id: 'fh3', relPath: 'drafts/v1.fig', size: 742_000_000, reason: 'deleted', timestampMs: Date.now() - 2 * 86400_000 },
-    { id: 'fh4', relPath: 'shoot/raw/IMG_0421.CR2', size: 38_400_000, reason: 'deleted', timestampMs: Date.now() - 9 * 86400_000 },
+    { id: 'fh1', relPath: 'src/old-logo.svg', size: 24_000, reason: 'deleted', timestampMs: T0 - 36 * MIN },
+    { id: 'fh2', relPath: 'notes.md', size: 4_200, reason: 'replaced', timestampMs: T0 - 5 * HOUR },
+    { id: 'fh3', relPath: 'drafts/v1.fig', size: 742_000_000, reason: 'deleted', timestampMs: T0 - 2 * DAY },
+    { id: 'fh4', relPath: 'shoot/raw/IMG_0421.CR2', size: 38_400_000, reason: 'deleted', timestampMs: T0 - 9 * DAY },
+  ],
+  p2: [
+    { id: 'fh5', relPath: '2025/Christmas/IMG_2231 — the one where everyone is actually looking at the camera.jpg', size: 6_200_000, reason: 'deleted', timestampMs: T0 - 3 * HOUR },
+    { id: 'fh6', relPath: '2025/Christmas/IMG_2232.jpg', size: 5_900_000, reason: 'replaced', timestampMs: T0 - 3 * HOUR },
   ],
 }
 
-let friends: Friend[] = [
-  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: Date.now() - 5 * 86400_000, autoAccept: true, endpointId: 'mock-endpoint-alex', avatar: null },
-  { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: Date.now() - 2 * 86400_000, autoAccept: false, endpointId: null, avatar: null },
+let friends: Friend[] = EMPTY ? [] : [
+  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: T0 - 5 * DAY, autoAccept: true, endpointId: 'mock-endpoint-alex', avatar: null, deviceKind: 'laptop', deviceOs: 'macos' },
+  { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: T0 - 2 * DAY, autoAccept: false, endpointId: null, avatar: null, deviceKind: 'desktop', deviceOs: 'windows' },
+  { id: 'f3', role: 'a', name: 'Jordan Kim', secret: 'mock', createdAt: T0 - 9 * DAY, autoAccept: true, endpointId: 'mock-jordan', avatar: null, deviceKind: 'laptop', deviceOs: 'linux' },
+  { id: 'f4', role: 'b', name: 'Maximilian Alexander von Hohenzollern-Sigmaringen', secret: 'mock', createdAt: T0 - 1 * DAY, autoAccept: true, endpointId: null, avatar: null },
+  { id: 'f5', role: 'a', name: 'Priya Raman', secret: 'mock', createdAt: T0 - 60 * DAY, autoAccept: true, endpointId: 'mock-priya', avatar: null, deviceKind: 'phone', deviceOs: 'ios' },
+  { id: 'f6', role: 'a', name: 'Chen Wei', secret: 'mock', createdAt: T0 - 90 * DAY, autoAccept: true, endpointId: 'mock-chen', avatar: null, deviceKind: 'desktop', deviceOs: 'linux' },
+  { id: 'f7', role: 'a', name: 'Lab Peer', secret: 'mock', createdAt: T0 - 4 * HOUR, autoAccept: true, endpointId: 'mock-lab', avatar: null, deviceKind: 'laptop', deviceOs: 'macos' },
+  { id: 'f8', role: 'b', name: 'Mom', secret: 'mock', createdAt: T0 - 200 * DAY, autoAccept: false, endpointId: 'mock-mom', avatar: null, deviceKind: 'phone', deviceOs: 'ios' },
+  // One of MY devices (same account) — rendered under "My devices", not Friends.
+  { id: 'mock-phone', role: 'a', name: 'iPhone', secret: 'mock', createdAt: T0 - 30 * DAY, autoAccept: true, endpointId: 'preview-phone', avatar: null, deviceKind: 'phone', deviceOs: 'ios', accountPub: 'preview-account' },
 ]
-let friendCounter = 2
+/** Who the preview treats as reachable, and how. Everyone else is offline. */
+const ONLINE: Record<string, { path: string; rttMs: number; upgrading: boolean; relay: string | null }> = {
+  f1: { path: 'local', rttMs: 3, upgrading: false, relay: null },
+  f3: { path: 'relay', rttMs: 88, upgrading: true, relay: 'use1' },
+  f6: { path: 'direct', rttMs: 41, upgrading: false, relay: null },
+  f7: { path: 'direct', rttMs: 14, upgrading: false, relay: null },
+  'mock-phone': { path: 'local', rttMs: 6, upgrading: false, relay: null },
+}
+// Seed "last seen" for a few offline friends so every presence label shows.
+if (typeof localStorage !== 'undefined' && !EMPTY && !localStorage.getItem('dropbeam-friend-seen')) {
+  try {
+    localStorage.setItem('dropbeam-friend-seen', JSON.stringify({ sam: T0 - 3 * HOUR, 'priya raman': T0 - 2 * DAY, mom: T0 - 9 * DAY }))
+  } catch { /* preview only */ }
+}
+let friendCounter = 8
 
 function base(id: string, direction: 'send' | 'receive', names: string[]): TransferUpdate {
   return {
@@ -254,8 +301,8 @@ function mockSend(to = 'Hui') {
   setTimeout(() => simulate(t, 2_400_000), 700)
 }
 // Dev helper for the UI sweep: window.__mockGallery() drops one transfer card in
-// EVERY state (plus long names) and seeds a varied chat thread with Alex, so the
-// whole design language can be reviewed without a second device.
+// EVERY state (plus long names), so the whole design language can be reviewed
+// without a second device. (Chats are seeded at startup — see seedChats.)
 function mockGallery() {
   const mk = (id: string, dir: 'send' | 'receive', names: string[], patch: Partial<TransferUpdate>) => {
     const t = { ...base(id, dir, names), bytesTotal: 248_000_000, peer: '192.168.1.55:51022', ...patch }
@@ -270,35 +317,27 @@ function mockGallery() {
   mk('g7', 'receive', ['IMG_0421.HEIC', 'IMG_0422.HEIC', 'IMG_0423.HEIC', 'IMG_0424.HEIC'], { state: 'completed', percent: 100, bytesDone: 42_000_000, bytesTotal: 42_000_000, fileCount: 4, locality: 'local', friendName: 'Alex', outDir: settings.downloadDir })
   mk('g8', 'send', ['notes.txt'], { state: 'canceled', percent: 12, friendName: 'Sam' })
   mk('g9', 'send', ['Quick send bundle.zip'], { state: 'waitingForPeer', code: 'dropbeam:MOCKquicksendcode0000aaaabbbbccccdddd', percent: 0 })
-  const now = Date.now()
-  const msg = (i: number, fromMe: boolean, text: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({
-    id: `gm${i}`, peerId: 'f1', fromMe, kind: 'text', text, files: [], bytes: 0, path: null,
-    status: fromMe ? 'read' : null, ts: now - (40 - i) * 60_000, seq: i, reactions: [], edited: false, deleted: false, ...extra,
-  })
-  const thread: ChatMessage[] = [
-    msg(1, false, 'Hey! Did the footage come through?'),
-    msg(2, true, 'Half of it — the relay was crawling. Trying again on the same Wi-Fi now 🙌'),
-    msg(3, false, 'Perfect. Here’s the link to the brief: https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', { reactions: [{ emoji: '👍', fromMe: true }] }),
-    msg(4, true, 'Got it', { replyTo: 'gm3', replyPreview: 'Here’s the link to the brief…', edited: true }),
-    msg(5, false, '', { kind: 'file', files: ['Q3 Report.pdf'], bytes: 18_400_000 }),
-    msg(6, true, 'This message was unsent', { deleted: true }),
-    msg(7, false, 'مرحبا — سلام — こんにちは — Ünïcödé names work too'),
-    msg(8, true, 'Sending the rest tonight.', { status: 'delivered' }),
-  ]
-  mockChats.f1 = thread
-  thread.forEach((m) => emit('chat://message', m))
+}
+// Live chat-file transfers for the seeded Alex thread: one mid-flight send and one
+// that failed, so the in-chat progress and Retry states render in the preview.
+if (typeof window !== 'undefined' && !EMPTY) {
+  setTimeout(() => {
+    emit('transfer://update', { ...base('cx-live', 'send', ['raw-footage-day2.mov']), state: 'transferring', friendName: 'Alex', bytesTotal: 4_800_000_000, bytesDone: 1_920_000_000, percent: 40, speedBps: 88_000_000, etaSeconds: 33, locality: 'local', peer: '192.168.1.40:5', connDetail: { path: 'local', rttMs: 3, upgrading: false, relay: null }, chatTransfer: { id: 'cx-live', offset: 0, total: 4_800_000_000, last: true } })
+    emit('transfer://update', { ...base('cx-failed', 'send', ['Presentation.key']), state: 'failed', friendName: 'Alex', bytesTotal: 312_000_000, bytesDone: 71_000_000, percent: 23, error: 'Alex went offline before the file finished.', chatTransfer: { id: 'cx-failed', offset: 0, total: 312_000_000, last: true } })
+  }, 600)
 }
 if (typeof window !== 'undefined') {
   const w = window as unknown as { __mockIncoming?: (m: boolean) => void; __mockSend?: (to?: string) => void }
   w.__mockIncoming = mockIncoming
   w.__mockSend = mockSend
   ;(window as unknown as { __mockGallery?: () => void }).__mockGallery = mockGallery
+  ;(window as unknown as { __mockEmit?: typeof emit }).__mockEmit = emit
 }
 
 // ── Synced folders (dev preview) ─────────────────────────────────────────────
 // Enough behaviour to exercise every card state: a healthy folder, one whose
 // host is asleep, and whatever the preview adds.
-let mockFolders: MockSyncedFolder[] = [
+let mockFolders: MockSyncedFolder[] = EMPTY ? [] : [
   {
     id: 'sf1', friendId: 'f1', locationId: 'loc1', relPath: 'Travel',
     localPath: '/Users/you/Pictures/Travel', enabled: true, deleteRemote: false,
@@ -321,14 +360,39 @@ function pushStatus(id: string, patch: Partial<MockSyncedFolderStatus>) {
   mockStatuses = { ...mockStatuses, [id]: next }
   emit('location-sync://status', next)
 }
-/** Folders "Alex" shares with this device, so the preview can exercise the picker. */
+/** Folders friends share with this device, so the preview can exercise the picker. */
 export const mockSharedLocations = async (friendId: string) =>
-  friendId === 'f1'
+  EMPTY ? [] : friendId === 'f1'
     ? [
-        { id: 'loc1', name: 'Buddy NAS', rights: { upload: true, manage: true } },
-        { id: 'loc2', name: 'Alex Photo Archive', rights: { upload: false, manage: false } },
+        { id: 'loc1', name: 'Buddy NAS', rights: { upload: true, manage: true }, reachable: true, freeBytes: 1_320_000_000_000, totalBytes: 4_000_000_000_000 },
+        { id: 'loc2', name: 'Alex Photo Archive', rights: { upload: false, manage: false }, reachable: true, freeBytes: null, totalBytes: null },
       ]
-    : []
+    : friendId === 'f6'
+      ? [{ id: 'loc3', name: 'Studio Scratch Disk — Projects 2024–2026', rights: { upload: true, manage: false }, reachable: false }]
+      : friendId === 'f3' ? Promise.reject(new Error('Jordan’s DropBeam is too old to share Locations.')) : []
+
+/** Folders THIS device hosts (Settings → Locations, and the gateway cards). */
+let mockHosted = EMPTY ? [] : [
+  { id: 'h-nas', name: 'Buddy NAS', path: '/Volumes/buddy/Shared', friendIds: ['f1', 'f6', 'f3'], rights: { upload: true, manage: false } },
+  { id: 'h-ext', name: 'Photo Backup', path: '/Volumes/T7 Shield/Photo Backup', friendIds: [], rights: { upload: false, manage: false } },
+]
+export const mockLocations = {
+  listHosted: async () => mockHosted,
+  hostedStatus: async (id: string) => id === 'h-nas'
+    ? { id, reachable: true, freeBytes: 1_320_000_000_000, markerOk: true, error: null, lastActivity: { at: T0 - 25 * MIN, friendId: 'f1', direction: 'upload', bytes: 412_000_000 } }
+    : { id, reachable: false, freeBytes: 0, markerOk: false, error: 'The disk isn’t connected.', lastActivity: null },
+  save: async (loc: { id: string }) => { mockHosted = [...mockHosted.filter((l) => l.id !== loc.id), loc as typeof mockHosted[number]]; return mockHosted },
+  remove: async (id: string) => { mockHosted = mockHosted.filter((l) => l.id !== id); return mockHosted },
+  activity: async () => EMPTY ? [] : [
+    { friendId: 'f1', locationId: 'h-nas', operation: 'upload', item: 'Taxes/2026/W-2.pdf', at: T0 - 25 * MIN },
+    { friendId: 'f6', locationId: 'h-nas', operation: 'download', item: 'Mixes/Final Master v12.wav', at: T0 - 3 * HOUR },
+    { friendId: 'f1', locationId: 'h-nas', operation: 'rename', item: 'Old name.txt', to: 'New name.txt', at: T0 - 2 * DAY },
+  ],
+  mountCandidates: async () => [
+    { label: 'buddy', path: '/Volumes/buddy', fstype: 'smbfs', kind: 'network', freeBytes: 1_320_000_000_000, totalBytes: 4_000_000_000_000 },
+    { label: 'T7 Shield', path: '/Volumes/T7 Shield', fstype: 'apfs', kind: 'removable', freeBytes: 210_000_000_000, totalBytes: 1_000_000_000_000 },
+  ],
+}
 
 export const mockSyncedFolders = {
   list: async (): Promise<MockSyncedFolder[]> => mockFolders,
@@ -356,6 +420,22 @@ export const mockSyncedFolders = {
     setTimeout(() => pushStatus(id, { state: 'waiting', message: 'Waiting for Linux Box' }), 1200)
     setTimeout(() => pushStatus(id, { state: 'idle', lastCheckAt: Date.now(), message: 'Up to date' }), 3600)
   },
+}
+
+function mockFolderStatus(p: Pair): FolderStatus {
+  const idle: FolderStatus = {
+    pairId: p.id, state: 'idle', queued: 0, sendingFile: null, percent: 0, bytesDone: 0, bytesTotal: 0,
+    speedBps: 0, etaSeconds: null, detail: null, peerOnline: !!p.peerName, peerName: p.peerName || null, locality: 'unknown', peerFiles: 1284,
+  }
+  switch (p.id) {
+    case 'p1': return { ...idle, state: 'sending', queued: 3, queuedFiles: ['shoot/IMG_0425.CR2', 'shoot/IMG_0426.CR2', 'shoot/IMG_0427 — alternate angle, slightly out of focus.CR2'], sendingFile: 'beach-sunset.jpg', percent: 62, bytesDone: 77_000_000, bytesTotal: 124_000_000, speedBps: 41_000_000, etaSeconds: 1.1, locality: 'local', sessionTotalFiles: 12, sessionDoneFiles: 8, connDetail: { path: 'local', rttMs: 3, upgrading: false, relay: null } }
+    case 'p2': return { ...idle, state: 'waiting', queued: 14, peerOnline: false, detail: 'Waiting for Sam' }
+    case 'p3': return { ...idle, state: 'receiving', sendingFile: 'Logo — primary lockup (dark).svg', percent: 18, bytesDone: 18_000_000, bytesTotal: 98_000_000, speedBps: 2_100_000, etaSeconds: 38, locality: 'internet', connDetail: { path: 'relay', rttMs: 88, upgrading: true, relay: 'use1' } }
+    case 'p4': return { ...idle, paused: true, peerOnline: false }
+    case 'p5': return { ...idle, peerUnshared: true, peerOnline: true, locality: 'direct' }
+    case 'p6': return { ...idle, peerOnline: false }
+    default: return idle
+  }
 }
 
 export const mockApi = {
@@ -518,7 +598,7 @@ export const mockApi = {
   exportDiagnostics: async (): Promise<string> => '/Users/you/Downloads/DropBeam-diagnostics-0.txt',
   diagnosticsTest: async (): Promise<string> => 'Sent a test digest (3 distinct issues) to your endpoint.',
   restartApp: async (): Promise<void> => {},
-  lanNetworkBlocked: async (): Promise<boolean> => false,
+  lanNetworkBlocked: async (): Promise<boolean> => typeof location !== 'undefined' && new URLSearchParams(location.search).has('lan'),
   openLocalNetworkSettings: async (): Promise<void> => {},
   openUrl: async (_url: string): Promise<void> => {},
   getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
@@ -644,40 +724,7 @@ export const mockApi = {
     }
     return freed
   },
-  getFolderStatuses: async (): Promise<FolderStatus[]> =>
-    pairs.map((p) =>
-      p.id === 'p1'
-        ? {
-            pairId: p.id,
-            state: 'sending' as const,
-            queued: 1,
-            sendingFile: 'beach-sunset.jpg',
-            percent: 62,
-            bytesDone: 77_000_000,
-            bytesTotal: 124_000_000,
-            speedBps: 41_000_000,
-            etaSeconds: 1.1,
-            detail: null,
-            peerOnline: true,
-            peerName: p.peerName || null,
-            locality: 'local' as const,
-          }
-        : {
-            pairId: p.id,
-            state: 'idle' as const,
-            queued: 0,
-            sendingFile: null,
-            percent: 0,
-            bytesDone: 0,
-            bytesTotal: 0,
-            speedBps: 0,
-            etaSeconds: null,
-            detail: null,
-            peerOnline: !!p.peerName,
-            peerName: p.peerName || null,
-            locality: 'unknown' as const,
-          },
-    ),
+  getFolderStatuses: async (): Promise<FolderStatus[]> => pairs.map((p) => mockFolderStatus(p)),
 
   createFriend: async (friendName: string): Promise<{ friend: Friend; invite: string }> => {
     const id = `f${++friendCounter}`
@@ -741,15 +788,11 @@ export const mockApi = {
   },
   pingFriend: async (id: string): Promise<boolean> => {
     await new Promise((r) => setTimeout(r, 1200))
-    // Alex is "online" in the mock; others aren't.
-    const f = friends.find((x) => x.id === id)
-    return f?.name === 'Alex'
+    return !!ONLINE[id]
   },
   probeConnection: async (friendId: string) => {
     await new Promise((r) => setTimeout(r, 600))
-    const f = friends.find((x) => x.id === friendId)
-    if (f?.name === 'Alex') return { path: 'direct', rttMs: 14, upgrading: false, relay: null }
-    return { path: 'relay', rttMs: 48, upgrading: true, relay: 'use1' }
+    return ONLINE[friendId] ?? null
   },
   forceRelay: async (): Promise<void> => {},
   respondToOffer: async (id: string, accept: boolean): Promise<void> => {
@@ -808,7 +851,7 @@ export const mockApi = {
         const last = msgs[msgs.length - 1]
         return {
           peerId,
-          lastText: last ? (last.kind === 'file' ? '📎 File' : last.text) : '',
+          lastText: !last ? '' : last.deleted ? 'Message deleted' : last.gif ? '🎞️ GIF' : last.kind === 'file' ? (last.files.length === 1 ? `📎 ${last.files[0]}` : `📎 ${last.files.length} files`) : last.text,
           lastTs: last?.ts ?? 0,
           lastFromMe: last?.fromMe ?? false,
           count: msgs.length,

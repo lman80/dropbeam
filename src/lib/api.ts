@@ -4,7 +4,7 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { mockApi, mockListen, mockLocationRequest, mockSharedLocations, mockSyncedFolders, emit as mockEmit } from './mock'
+import { mockApi, mockListen, mockLocationRequest, mockSharedLocations, mockSyncedFolders, mockLocations, emit as mockEmit } from './mock'
 import { normalizeSharedLocations } from './normalize'
 import { MOBILE_UI } from './platform'
 import { pickMobileFiles } from '../components/MobileFileSheet'
@@ -828,11 +828,11 @@ export interface MountCandidate { label: string; path: string; fstype: string; k
 export interface LocationEntry { name: string; isDir: boolean; size: number; modified: number }
 export interface LocationPage { entries: LocationEntry[]; page?: number; hasMore: boolean; cursor?: string; nextCursor?: string; total?: number }
 export const locationsApi = {
-  activity: () => HAS_TAURI ? invoke<LocationActivity[]>('location_activity') : Promise.resolve([]),
-  listHosted: () => HAS_TAURI ? invoke<HostedLocation[]>('list_locations') : Promise.resolve([]),
-  hostedStatus: (id: string) => invoke<HostedLocationStatus>('hosted_location_status', { id }),
-  save: (location: HostedLocation) => invoke<HostedLocation[]>('save_location', { location, removeId: null }),
-  remove: (removeId: string) => invoke<HostedLocation[]>('save_location', { location: null, removeId }),
+  activity: () => HAS_TAURI ? invoke<LocationActivity[]>('location_activity') : mockLocations.activity() as Promise<LocationActivity[]>,
+  listHosted: () => HAS_TAURI ? invoke<HostedLocation[]>('list_locations') : mockLocations.listHosted() as Promise<HostedLocation[]>,
+  hostedStatus: (id: string) => HAS_TAURI ? invoke<HostedLocationStatus>('hosted_location_status', { id }) : mockLocations.hostedStatus(id) as Promise<HostedLocationStatus>,
+  save: (location: HostedLocation) => HAS_TAURI ? invoke<HostedLocation[]>('save_location', { location, removeId: null }) : mockLocations.save(location) as Promise<HostedLocation[]>,
+  remove: (removeId: string) => HAS_TAURI ? invoke<HostedLocation[]>('save_location', { location: null, removeId }) : mockLocations.remove(removeId) as Promise<HostedLocation[]>,
   request: <T,>(friendId: string, request: Record<string, unknown>) => HAS_TAURI
     ? invoke<T>('location_request', { friendId, request })
     : (mockLocationRequest(request) as Promise<T>),
@@ -840,7 +840,7 @@ export const locationsApi = {
     ? invoke<unknown[]>('location_request', { friendId, request: { kind: 'locations.list' } }).then(normalizeSharedLocations)
     : mockSharedLocations(friendId),
   /** The wizard's first step: NAS shares and external disks this device can see. */
-  mountCandidates: () => HAS_TAURI ? invoke<MountCandidate[]>('list_mount_candidates') : Promise.resolve([]),
+  mountCandidates: () => HAS_TAURI ? invoke<MountCandidate[]>('list_mount_candidates') : mockLocations.mountCandidates() as Promise<MountCandidate[]>,
   upload: (friendId: string, locationId: string, relPath: string, paths: string[], replaceExisting = false) =>
     invoke<TransferUpdate>('upload_to_location', { friendId, target: { location_id: locationId, rel_path: relPath }, paths, replaceExisting }),
 }
