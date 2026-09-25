@@ -30,13 +30,14 @@ export class ErrorBoundary extends Component<Props, { failed: boolean }> {
     if (!this.state.failed) return this.props.children
     return (
       <div role="alert" aria-label={`${this.props.region} error`} style={{
-        margin: 12, padding: 16, borderRadius: 10,
-        background: 'var(--bg-elev, #fff)', color: 'var(--text, #222)',
-        border: '1px solid var(--border, #ccc)', alignSelf: 'flex-start',
+        margin: 12, padding: 16, borderRadius: 12,
+        background: 'var(--surface, #fff)', color: 'var(--text, #222)',
+        boxShadow: '0 0 0 0.5px var(--border, #ccc)', alignSelf: 'flex-start',
+        fontSize: 13,
         ...this.props.fallbackStyle,
       }}>
-        <p style={{ margin: '0 0 10px' }}>Something went wrong — reload</p>
-        <button type="button" className="btn btn-ghost" onClick={() => window.location.reload()}>
+        <p style={{ margin: '0 0 12px' }}>This part of DropBeam couldn’t load.</p>
+        <button type="button" className="btn btn-secondary" onClick={() => window.location.reload()}>
           Reload
         </button>
       </div>
