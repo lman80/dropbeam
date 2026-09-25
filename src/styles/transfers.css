@@ -20,7 +20,7 @@
 }
 .xfer-row.is-muted .xfer-title,
 .xfer-row.is-muted .xfer-icon { opacity: 0.55; }
-.xfer-line {
+.xfer-head {
   display: flex;
   align-items: center;
   gap: 12px;

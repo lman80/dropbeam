@@ -219,7 +219,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
       transition={{ duration: 0.16 }}
       className={`xfer-row${canceled ? ' is-muted' : ''}`}
     >
-      <div className="xfer-line">
+      <div className="xfer-head">
         <span className="xfer-icon" aria-hidden>
           <FileIcon name={t.fileNames.length > 1 || t.fileCount > 1 ? (t.fileNames[0] ?? '') : (t.fileNames[0] ?? '')} size={22} />
           {(completed || failed) && (
@@ -292,7 +292,9 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
         <div className="xfer-code">
           <ShareCode
             code={t.code!}
-            size={148}
+            size={132}
+            hint={null}
+            copyVariant="secondary"
             instructions="On the other device, open DropBeam, choose Receive, and scan this code — or paste it."
             footer={<span className="xfer-connecting"><Spinner size={11} />Waiting for the other device…</span>}
           />
