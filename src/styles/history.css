@@ -1,5 +1,44 @@
 /* History (Recents + Recoverable files). */
-/* History rows: the remove (×) appears on hover/focus so the list stays calm. */
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
+  margin-bottom: 4px;
+}
+.history-search { width: 200px; flex-shrink: 1; min-width: 120px; }
+.history-toolbar + section > .section-title,
+.history-toolbar + .rf > .section-title:first-child { margin-top: 16px; }
+.rf .section-title { min-width: 0; }
+.rf .section-row > .icon-btn { margin-right: 8px; }
+
+.history-group { --row-inset: 44px; }
+.history-row { padding: 8px 8px 8px 12px; }
+.history-icon { display: grid; place-items: center; width: 20px; flex-shrink: 0; }
+.history-trailing { gap: 2px; }
+.history-state {
+  font-size: var(--text-12);
+  color: var(--text-faint);
+  white-space: nowrap;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+.history-state.failed { color: var(--red); cursor: default; }
+.history-row .integrity-fail { margin-top: 2px; }
+
+/* The remove (×) appears on hover/focus so the list stays calm. */
 .history-row-remove { opacity: 0; }
-.row-hover:hover .history-row-remove,
+.history-row:hover .history-row-remove,
 .history-row-remove:focus-visible { opacity: 1; }
+
+/* Recoverable files */
+.rf-storage { --row-inset: 44px; }
+.rf-storage .row { padding: 10px 8px 10px 12px; }
+.rf-storage .progress { margin-top: 8px; max-width: 360px; }
+.rf-glyph { display: grid; place-items: center; width: 20px; flex-shrink: 0; color: var(--text-muted); align-self: flex-start; margin-top: 1px; }
+.rf-glyph svg { width: 18px; height: 18px; }
+.rf-section-meta { font-weight: 400; color: var(--text-faint); white-space: nowrap; }
+.rf-items { --row-inset: 44px; }
+.rf-items .row { padding: 8px 8px 8px 12px; }
+.rf-more { color: var(--accent-text); font-size: var(--text-12); justify-content: center; min-height: 36px !important; }

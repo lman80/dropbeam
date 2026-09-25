@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { AnimatePresence } from 'framer-motion'
-import { FolderSync } from 'lucide-react'
 import { Dialog } from './Dialog'
 import { api, onFolderInvite, type FolderInvite } from '../lib/api'
 import { useStore } from '../store'
@@ -40,7 +39,7 @@ export function FolderInviteModal() {
     try {
       await api.acceptPair(current.code, folder)
       await reloadPairs()
-      toast('success', `Joined “${current.folderName || 'shared folder'}”. Files will sync here.`)
+      toast('success', `Joined “${current.folderName || 'shared folder'}”`)
       drop(current.code)
     } catch (e) {
       toast('error', String(e))
@@ -53,27 +52,24 @@ export function FolderInviteModal() {
     <AnimatePresence>
       {invite && (
         <Dialog
-          title="Shared folder invite"
-          subtitle={<><b>{invite.fromName || 'A friend'}</b> wants to share <b>“{invite.folderName || 'a folder'}”</b> with you.</>}
-          icon={<FolderSync size={19} />}
-          width={420}
+          title={`Join “${invite.folderName || 'a shared folder'}”?`}
+          width={400}
           onClose={dismiss}
           busy={busy}
           footer={
             <>
-              <button className="btn btn-ghost" onClick={dismiss} disabled={busy}>
+              <button className="btn btn-secondary" onClick={dismiss} disabled={busy}>
                 Decline
               </button>
               <button className="btn btn-primary" onClick={accept} disabled={busy}>
-                {busy ? <Spinner size={15} /> : null}
-                Accept &amp; choose folder
+                {busy ? <Spinner size={13} /> : null}
+                Accept…
               </button>
             </>
           }
         >
           <p className="dialog-text" style={{ margin: 0 }}>
-            Accept and choose a folder on this computer to keep in sync. Anything either of you
-            drops in will appear for both.
+            {invite.fromName || 'A friend'} wants to share this folder with you. Choose where to keep it.
           </p>
         </Dialog>
       )}

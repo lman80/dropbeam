@@ -1,24 +1,15 @@
 import { MobileHeader } from '../components/MobileHeader'
 import { integrityLabel } from '../lib/integrity'
 import { ChevronRight } from 'lucide-react'
-import { ShareFilesButton } from '../components/ShareFilesButton'
 import { MOBILE_UI } from '../lib/platform'
 import { useMemo, useState } from 'react'
-import { AnimatePresence, motion } from 'framer-motion'
-import {
-  ArrowDownToLine,
-  CheckCircle2,
-  FolderOpen,
-  History as HistoryIcon,
-  Search,
-  Send,
-  Trash2,
-  XCircle,
-  X,
-} from 'lucide-react'
+import { AnimatePresence } from 'framer-motion'
+import { FolderOpen, History as HistoryIcon, Search, Trash2, X } from 'lucide-react'
 import { api, type HistoryEntry } from '../lib/api'
 import { useStore } from '../store'
-import { EmptyState, LocalityBadge } from '../components/bits'
+import { EmptyState, IconButton, MenuButton, SectionHeader, Segmented, Tooltip } from '../components/ui'
+import { Dialog } from '../components/Dialog'
+import { peerLabel } from '../lib/humanize'
 import { IntegrityDetails } from '../components/IntegrityDetails'
 import { FileIcon } from '../components/FileIcon'
 import { RecoverableFilesView } from './RecoverableFilesView'
@@ -34,6 +25,18 @@ function entryTitle(e: HistoryEntry): string {
 
 function timeOfDay(ms: number): string {
   return new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+}
+
+/** Time for today/yesterday (the section says which day), a short date before that. */
+function whenLabel(ms: number): string {
+  const group = dayGroup(ms)
+  if (group === 'Today' || group === 'Yesterday') return timeOfDay(ms)
+  const d = new Date(ms)
+  return d.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+  })
 }
 
 /** Files-app style date buckets: Today / Yesterday / Last 7 days / month. */
@@ -58,6 +61,7 @@ export function HistoryView() {
   // A deep-link from a folder lands on the Recoverable tab.
   const [tab, setTab] = useState<Tab>(focusPair ? 'recoverable' : 'recents')
   const [query, setQuery] = useState('')
+  const [confirmClear, setConfirmClear] = useState(false)
 
   const clearAll = async () => {
     await api.clearHistory()
@@ -72,39 +76,42 @@ export function HistoryView() {
   return (
     <div className="page">
       <div className="page-header titlebar-drag">
-        <div>
-          <h1 className="page-title">History</h1>
-          <p className="page-subtitle">Everything you’ve sent and received, plus files you can bring back.</p>
-        </div>
+        <h1 className="page-title">History</h1>
         {tab === 'recents' && history.length > 0 && (
           <div className="page-actions">
-            <button className="btn btn-ghost" onClick={clearAll} title="Clears this list — your files aren't touched">
-              <Trash2 size={15} /> Clear list
-            </button>
+            <MenuButton
+              label="More"
+              items={[{ label: 'Clear list…', icon: <Trash2 />, onSelect: () => setConfirmClear(true) }]}
+            />
           </div>
         )}
       </div>
 
-      {/* segmented tabs */}
-      <div className="seg" role="tablist" aria-label="History" style={{ display: 'flex', width: '100%', marginBottom: 16, boxSizing: 'border-box' }}>
-        <button
-          role="tab"
-          aria-selected={tab === 'recents'}
-          className={tab === 'recents' ? 'active' : ''}
-          style={{ flex: 1, justifyContent: 'center' }}
-          onClick={() => setTab('recents')}
-        >
-          Recents
-        </button>
-        <button
-          role="tab"
-          aria-selected={tab === 'recoverable'}
-          className={tab === 'recoverable' ? 'active' : ''}
-          style={{ flex: 1, justifyContent: 'center' }}
-          onClick={() => setTab('recoverable')}
-        >
-          Recoverable files
-        </button>
+      <div className="history-toolbar">
+        <Segmented
+          role="tablist"
+          label="History"
+          value={tab}
+          onChange={setTab}
+          options={[
+            { value: 'recents', label: 'Recents' },
+            { value: 'recoverable', label: 'Recoverable files' },
+          ]}
+        />
+        {tab === 'recents' && history.length > 0 && (
+          <label className="search-field history-search">
+            <Search />
+            <input
+              className="input"
+              type="search"
+              aria-label="Search history"
+              placeholder="Search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape' && query) { e.preventDefault(); setQuery('') } }}
+            />
+          </label>
+        )}
       </div>
 
       {tab === 'recents' ? (
@@ -112,6 +119,24 @@ export function HistoryView() {
       ) : (
         <RecoverableFilesView />
       )}
+
+      <AnimatePresence>
+        {confirmClear && (
+          <Dialog
+            title="Clear the history list?"
+            width={380}
+            onClose={() => setConfirmClear(false)}
+            footer={
+              <>
+                <button className="btn btn-secondary" onClick={() => setConfirmClear(false)}>Cancel</button>
+                <button className="btn btn-destructive" onClick={() => { setConfirmClear(false); void clearAll() }}>Clear list</button>
+              </>
+            }
+          >
+            <p className="dialog-text" style={{ margin: 0 }}>The files themselves aren’t touched.</p>
+          </Dialog>
+        )}
+      </AnimatePresence>
     </div>
   )
 }
@@ -152,160 +177,109 @@ function Recents({
   </>
 
   if (history.length === 0) {
-    return (
-      <div className="card">
-        <EmptyState
-          icon={<HistoryIcon size={24} />}
-          title="No transfers yet"
-          hint="Files you send and receive will show up here."
-        />
-      </div>
-    )
+    return <EmptyState icon={<HistoryIcon />} title="No transfers yet" hint="Files you send and receive show up here." />
+  }
+
+  if (groups.length === 0) {
+    return <EmptyState icon={<Search />} title="No matches" hint="Try another file name or person." />
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-      <label className="search-field">
-        <Search size={15} />
-        <input
-          className="input"
-          type="search"
-          aria-label="Search history"
-          placeholder="Search files & people"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Escape' && query) { e.preventDefault(); setQuery('') } }}
-        />
-      </label>
-
-      {groups.length === 0 ? (
-        <div className="card">
-          <EmptyState icon={<Search size={22} />} title="No matches" hint="Try a different file name or person." />
-        </div>
-      ) : (
-        groups.map((g) => (
-          <div key={g.label}>
-            <h2 className="section-title" style={{ margin: '2px 4px 7px' }}>{g.label}</h2>
-            <div className="card" style={{ padding: 6 }}>
-              <AnimatePresence initial={false}>
-                {g.entries.map((e) => (
-                  <RecentRow key={e.id} e={e} />
-                ))}
-              </AnimatePresence>
-            </div>
+    <>
+      {groups.map((g) => (
+        <section key={g.label}>
+          <SectionHeader>{g.label}</SectionHeader>
+          <div className="group history-group">
+            {g.entries.map((e) => (
+              <RecentRow key={e.id} e={e} />
+            ))}
           </div>
-        ))
-      )}
-    </div>
+        </section>
+      ))}
+    </>
   )
 }
 
 function RecentRow({ e }: { e: HistoryEntry }) {
   const ok = e.state === 'completed'
   const failed = e.state === 'failed'
-  const DirIcon = e.direction === 'send' ? Send : ArrowDownToLine
 
   if (MOBILE_UI) return <div className="ios-row"><span className="mobile-tinted-icon"><FileIcon name={e.fileNames[0] ?? ''} size={22} /></span><div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{entryTitle(e)}</h3><p className="ios-footnote">{e.peer ?? 'Peer'} · {formatBytes(e.bytesTotal)}{e.locality !== 'unknown' && ` · ${e.locality === 'internet' ? 'Relay' : 'Direct'}`} · {ok ? integrityLabel(e.integrity ?? [], e.bytesTotal, true) : e.state}</p></div>{ok && e.outDir && <button className="ios-button" aria-label={`Show ${entryTitle(e)}`} onClick={() => void api.shareFiles(e.fileNames.map(n => `${e.outDir}/${n}`)).catch(error => useStore.getState().toast('error', String(error)))}>Show<ChevronRight size={16} /></button>}</div>
 
-  return (
-    <motion.div
-      layout
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="row-hover"
-      style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px' }}
-    >
-      <div style={{ position: 'relative', flexShrink: 0, width: 34, height: 34 }}>
-        <div
-          style={{
-            width: 34,
-            height: 34,
-            borderRadius: 9,
-            display: 'grid',
-            placeItems: 'center',
-            background: 'var(--surface-2)',
-          }}
-        >
-          <FileIcon name={e.fileNames[0] ?? ''} size={18} />
-        </div>
-        {/* tiny direction chip */}
-        <div
-          style={{
-            position: 'absolute',
-            right: -4,
-            bottom: -4,
-            width: 16,
-            height: 16,
-            borderRadius: 999,
-            display: 'grid',
-            placeItems: 'center',
-            background: 'var(--surface)',
-            border: '1.5px solid var(--surface)',
-            color: e.direction === 'send' ? 'var(--accent)' : 'var(--green)',
-          }}
-        >
-          <DirIcon size={10} />
-        </div>
-      </div>
+  const who = peerLabel(e.peer)
+  const verb = e.direction === 'send' ? 'Sent' : 'Received'
+  const meta = [
+    who ? `${verb} ${e.direction === 'send' ? 'to' : 'from'} ${who}` : verb,
+    e.bytesTotal > 0 ? formatBytes(e.bytesTotal) : null,
+    whenLabel(e.timestampMs),
+  ].filter(Boolean).join(' · ')
+  const canReveal = e.direction === 'receive' && !!e.outDir && ok
+  const canRetry = failed && e.direction === 'send' && hasRetryPayload(e.id)
+  const remove = () => {
+    void api.removeHistoryEntry(e.id)
+      .then(() => useStore.getState().reloadHistory())
+      .catch((err) => useStore.getState().toast('error', String(err)))
+  }
 
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontWeight: 600, fontSize: 'var(--font-base)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={e.fileNames.join('\n')}>
-          {entryTitle(e)}
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '2px 7px', marginTop: 2, fontSize: 'var(--font-xs)', color: 'var(--text-muted)', flexWrap: 'wrap', minWidth: 0 }}>
-          <span className="truncate-1" style={{ maxWidth: '100%' }}>
-            {e.direction === 'send' ? 'Sent' : 'Received'}
-            {e.peer ? ` ${e.direction === 'send' ? 'to' : 'from'} ${e.peer}` : ''}
-          </span>
-          {e.bytesTotal > 0 && <span>· {formatBytes(e.bytesTotal)}</span>}
-          <span>· {timeOfDay(e.timestampMs)}</span>
-          <LocalityBadge locality={e.locality} />
-        </div>
+  return (
+    <div className="row history-row">
+      <span className="history-icon" aria-hidden><FileIcon name={e.fileNames[0] ?? ''} size={20} /></span>
+      <div className="row-main">
+        <div className="row-title truncate-1" title={e.fileNames.join('\n')}>{entryTitle(e)}</div>
+        <div className="row-sub truncate-1 tnum" title={meta}>{meta}</div>
         <IntegrityDetails rows={e.integrity} total={e.bytesTotal} completed={ok} />
       </div>
-
-      {ok ? (
-        <CheckCircle2 size={16} color="var(--green)" style={{ flexShrink: 0 }} />
-      ) : failed ? (
-        <XCircle size={16} color="var(--red)" style={{ flexShrink: 0 }} />
-      ) : null}
-      {MOBILE_UI && e.direction === 'receive' && e.outDir && ok && (
-            <ShareFilesButton outDir={e.outDir} fileNames={e.fileNames} />
-          )}
-          {!MOBILE_UI && e.direction === 'receive' && e.outDir && ok && (
-        <button
-          className="icon-btn"
-          title={e.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
-          aria-label={e.fileNames.length === 1 ? 'Show in folder' : 'Open folder'}
-          onClick={() => {
-            const sep = e.outDir!.includes('\\') ? '\\' : '/'
-            if (e.fileNames.length === 1) {
-              api.revealPath(`${e.outDir}${sep}${e.fileNames[0]}`).catch(() => {})
-            } else {
-              api.openPath(e.outDir!).catch(() => {})
-            }
-          }}
+      <div className="row-trailing history-trailing">
+        {failed && (
+          <>
+            <Tooltip label={e.error || undefined}>
+              <span className="history-state failed" tabIndex={e.error ? 0 : undefined}>
+                {e.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}
+              </span>
+            </Tooltip>
+            {canRetry && (
+              <button className="btn btn-plain btn-sm" onClick={() => void useStore.getState().retryTransfer(e.id)}>
+                Retry
+              </button>
+            )}
+          </>
+        )}
+        {e.state === 'canceled' && <span className="history-state">Canceled</span>}
+        {canReveal && (
+          <IconButton
+            label={e.fileNames.length === 1 ? 'Show in Finder' : 'Open folder'}
+            onClick={() => {
+              const sep = e.outDir!.includes('\\') ? '\\' : '/'
+              if (e.fileNames.length === 1) {
+                api.revealPath(`${e.outDir}${sep}${e.fileNames[0]}`).catch(() => {})
+              } else {
+                api.openPath(e.outDir!).catch(() => {})
+              }
+            }}
+          >
+            <FolderOpen />
+          </IconButton>
+        )}
+        <IconButton
+          className="history-row-remove"
+          label="Remove from list"
+          tooltip="Remove from list — the files stay put"
+          onClick={remove}
         >
-          <FolderOpen size={15} />
-        </button>
-      )}
-      {/* keep the status icons in one column whether or not a row has a folder button */}
-      {!MOBILE_UI && !(e.direction === 'receive' && e.outDir && ok) && <span aria-hidden style={{ width: 32, flexShrink: 0 }} />}
-      {!MOBILE_UI && (
-        <button
-          className="icon-btn icon-btn-danger history-row-remove"
-          title="Remove from this list — the files stay where they are"
-          aria-label={`Remove ${entryTitle(e)} from history`}
-          onClick={() => {
-            void api.removeHistoryEntry(e.id)
-              .then(() => useStore.getState().reloadHistory())
-              .catch((err) => useStore.getState().toast('error', String(err)))
-          }}
-        >
-          <X size={15} />
-        </button>
-      )}
-    </motion.div>
+          <X />
+        </IconButton>
+      </div>
+    </div>
   )
+}
+
+/** A failed send can be replayed only while the store still remembers its files
+ *  (the same cache store.retryTransfer reads); otherwise there is nothing to retry. */
+function hasRetryPayload(id: string): boolean {
+  try {
+    const all = JSON.parse(localStorage.getItem('dropbeam-retry-payloads') || '{}') as Record<string, unknown>
+    return !!all[id]
+  } catch {
+    return false
+  }
 }

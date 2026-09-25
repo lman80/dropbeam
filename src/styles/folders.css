@@ -1,1 +1,153 @@
-/* Folders screen. */
+/* Shared Folders screen: one group, one row per folder. */
+.folder-list { --row-inset: 48px; }
+.folder-row {
+  align-items: flex-start;
+  padding: 12px 12px 12px 16px;
+  gap: 12px;
+}
+.folder-glyph {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  color: var(--accent-text);
+  flex-shrink: 0;
+}
+.folder-glyph svg { width: 20px; height: 20px; stroke-width: 1.75; }
+.folder-row .row-title { font-weight: 600; }
+.folder-actions { margin: -3px -4px 0 0; gap: 2px; }
+
+/* The one status line: a dot + words. Text stays quiet; colour only for real trouble. */
+.folder-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 20px;
+  margin-top: 3px;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+}
+.folder-status > .dot { width: 7px; height: 7px; }
+.folder-status.tone-error { color: var(--red); }
+.folder-status-quiet { color: var(--text-faint); }
+.folder-status-action { margin-left: 2px; height: 20px; padding: 0 6px; flex-shrink: 0; }
+
+/* Verify outcome (temporary line under the status). */
+.folder-verify {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+  min-width: 0;
+}
+.folder-verify > svg { width: 13px; height: 13px; flex-shrink: 0; }
+.folder-verify.ok > svg { color: var(--green); }
+.folder-verify.warn > svg { color: var(--amber-dot); }
+
+/* Live transfer inside the row. */
+.folder-xfer { margin-top: 10px; }
+.folder-xfer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 24px;
+  margin-bottom: 6px;
+  font-size: var(--text-12);
+}
+.folder-xfer-name { flex: 1; color: var(--text); }
+.folder-xfer-meta { color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+.folder-xfer-head .conn-info-btn { margin: 0 -4px; }
+.folder-queue {
+  margin-top: 6px;
+  font-size: var(--text-12);
+  color: var(--text-faint);
+}
+
+/* Settings dialog: people + sync options. */
+.folder-people .row,
+.folder-settings .row,
+.folder-pick .row { min-height: 44px; }
+.folder-people { --row-inset: 48px; }
+.folder-pick { --row-inset: 52px; }
+.folder-avatar {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  color: #fff;
+  font-size: var(--text-11);
+  font-weight: 600;
+}
+.folder-pick .folder-avatar { width: 30px; height: 30px; }
+.folder-avatar > svg { width: 14px; height: 14px; }
+.folder-avatar .avatar-img { border-radius: 50%; }
+.folder-avatar.pending,
+.folder-avatar.add {
+  color: var(--text-muted);
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 0.5px var(--border);
+}
+.folder-avatar.add { color: var(--accent-text); }
+.folder-avatar-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.folder-avatar-dot.online { background: var(--green-dot); }
+.folder-role { font-size: var(--text-12); color: var(--text-muted); white-space: nowrap; }
+.folder-add-row { color: var(--accent-text) !important; }
+.folder-add-row .row-title { color: var(--accent-text); font-weight: 400; }
+.folder-pick-cta { font-size: var(--text-12); color: var(--accent-text); opacity: 0; transition: opacity var(--dur-fast); }
+.folder-pick .row:hover .folder-pick-cta,
+.folder-pick .row:focus-visible .folder-pick-cta { opacity: 1; }
+
+/* New folder / accept dialogs. */
+.folder-field + .folder-field { margin-top: 16px; }
+.folder-picker {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 8px;
+}
+.folder-picker > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-picker .placeholder { color: var(--text-faint); }
+.folder-picker > svg { color: var(--accent-text); }
+.folder-mode-group { --row-inset: 40px; }
+.folder-mode-group .row { min-height: 0; padding: 8px 12px; gap: 10px; align-items: flex-start; }
+.folder-radio {
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  flex-shrink: 0;
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  transition: background var(--dur-fast), box-shadow var(--dur-fast);
+}
+.dark .folder-radio { background: var(--surface-3); }
+.folder-mode-group .row[aria-checked='true'] .folder-radio { background: #fff; box-shadow: inset 0 0 0 5px var(--accent); }
+.folder-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.folder-code-input {
+  min-height: 64px;
+  font-family: var(--font-mono);
+  font-size: var(--text-12);
+  resize: none;
+  word-break: break-all;
+}
+.folder-field-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.folder-field-head .field-label { margin: 0; }
+/* Keep the groups' hairline rings from being clipped by the scrolling body. */
+.folder-dialog .dialog-body { padding: 1px; margin: -1px; }
