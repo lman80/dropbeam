@@ -211,6 +211,7 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
     let mut all = read_peers(config);
     let entry = all.entry(eid.to_owned()).or_default();
     let before = (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone());
+    let push_text_before = entry.push_text;
     if let Some(k) = verified {
         let k = seal::b64(&k);
         if !entry.key.is_empty() && entry.key != k {
@@ -226,7 +227,8 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
     if let Some(t) = m["push_text"].as_bool() {
         entry.push_text = t;
     }
-    let changed = before != (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone());
+    let changed = before != (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone())
+        || push_text_before != entry.push_text;
     let now = crate::chat::now_ms();
     // Hellos repeat often; only touch the disk when something changed (or daily,
     // to keep the "last heard" stamp roughly current).
@@ -237,12 +239,20 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
     changed
 }
 
-/// Recipient keys for the given endpoints (those we hold a verified key for).
+/// A key we haven't heard confirmed for this long may have been rotated away.
+const STALE_KEY_MS: u64 = 60 * 24 * 3600 * 1000;
+
+/// Recipient keys for the given endpoints (those we hold a verified, recent key for).
 pub fn recipients(config: &Path, eids: &[String]) -> Vec<seal::Recipient> {
     let all = peers(config);
+    let now = crate::chat::now_ms();
     eids.iter()
         .filter_map(|e| {
-            let k = seal::key32(&all.get(e)?.key).ok()?;
+            let p = all.get(e)?;
+            if now.saturating_sub(p.updated_ms) > STALE_KEY_MS {
+                return None;
+            }
+            let k = seal::key32(&p.key).ok()?;
             Some(seal::Recipient { eid: e.clone(), key: k })
         })
         .collect()

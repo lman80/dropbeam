@@ -148,7 +148,9 @@ final class Bridge: ObservableObject {
             // which then stays up (name saved or not) until the user finishes it.
             if needsName && !onboarding { onboarding = true }
         case "pendingSend": pendingSend = try decoder.decode(LossyArray<String>.self, from: data).values
-        case "friends": friends = try decoder.decode(LossyArray<Friend>.self, from: data).values
+        case "friends":
+            friends = try decoder.decode(LossyArray<Friend>.self, from: data).values
+            PushRegistration.saveNames(friends.compactMap { f in f.endpointId.map { ($0, f.name) } })
         case "myDevice": myDevice = try decoder.decode(MyDevice?.self, from: data)
         case "transfers": transfers = try decoder.decode(LossyArray<Transfer>.self, from: data).values
         case "settings":

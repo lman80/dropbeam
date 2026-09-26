@@ -10,7 +10,7 @@ import UserNotifications
 /// Layout (Rust `mailbox::seal::seal_small`): eph_pub(32) ‖ nonce(12) ‖ ct ‖ tag,
 /// key = HKDF-SHA256(X25519(push_key, eph_pub), salt: eph_pub ‖ my_pub,
 /// info: "dropbeam-push-v1"), ChaCha20-Poly1305. Plaintext {"t","b","th"}.
-/// Anything unexpected leaves the generic banner as it is.
+/// Plaintext {"t","b","f"}. Anything unexpected leaves the generic banner.
 final class NotificationService: UNNotificationServiceExtension {
     private var handler: ((UNNotificationContent) -> Void)?
     private var content: UNMutableNotificationContent?
@@ -22,16 +22,36 @@ final class NotificationService: UNNotificationServiceExtension {
             return
         }
         content = best
-        if let sealed = request.content.userInfo["e"] as? String, !sealed.isEmpty,
-           let preview = Self.open(sealed) {
-            if let t = preview["t"] as? String, !t.isEmpty { best.title = t }
-            if let b = preview["b"] as? String, !b.isEmpty { best.body = b }
+        // "e" = {"f": sender (checked by the server against the item's signature),
+        //        "e": preview sealed by that sender to this phone}.
+        if let outer = request.content.userInfo["e"] as? String,
+           let wrap = try? JSONSerialization.jsonObject(with: Data(outer.utf8)) as? [String: Any],
+           let from = wrap["f"] as? String, let sealed = wrap["e"] as? String,
+           let name = Self.names()[from] {
+            // The title is always YOUR name for them; the text only if the sealed
+            // preview really is from that sender.
+            best.title = name
+            if let preview = Self.open(sealed), preview["f"] as? String == from,
+               let b = preview["b"] as? String, !b.isEmpty {
+                best.body = b
+            }
         }
         contentHandler(best)
     }
 
     override func serviceExtensionTimeWillExpire() {
         if let handler, let content { handler(content) }
+    }
+
+    static var group: URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.ashtonmiller.dropbeam")
+    }
+
+    static func names() -> [String: String] {
+        guard let url = group?.appendingPathComponent("push-names.json"),
+              let data = try? Data(contentsOf: url),
+              let map = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return [:] }
+        return map
     }
 
     static func open(_ sealed: String) -> [String: Any]? {

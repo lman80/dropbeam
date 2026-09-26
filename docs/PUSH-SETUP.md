@@ -37,7 +37,7 @@ cd ~/DropBeam-ios && scripts/enable-push.sh
 ```
 
 Then build/upload to TestFlight as usual (bump `bundle.iOS.bundleVersion`).
-TestFlight/App Store builds use APNs production; `--debug` builds use sandbox.
+The entitlement says `development`; Xcode switches it to production when it exports for TestFlight/App Store, so TestFlight phones use APNs production and `--debug` builds use sandbox automatically.
 
 That's it. Phones register with the Transfer Servers they use; when a server holds
 something for a phone that isn't connected it asks the Worker to send

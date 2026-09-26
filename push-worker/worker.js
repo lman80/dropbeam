@@ -20,7 +20,7 @@
  * Logs nothing but counters. See docs/PUSH-SETUP.md.
  */
 
-const PER_TOKEN_HOUR = 30
+const PER_TOKEN_HOUR = 60 // per server + phone (servers also coalesce to one per 30s)
 const PER_SERVER_HOUR = 500
 const MAX_BODY = 8 * 1024
 const enc = new TextEncoder()
@@ -80,7 +80,7 @@ async function push(request, env) {
   if (typeof tok.exp !== 'number' || tok.exp < Date.now()) return json({ ok: false, gone: true, reason: 'expired' }, 410)
   if (!/^[0-9a-f]{64,200}$/i.test(tok.token || '')) return json({ ok: false, reason: 'token' }, 400)
   // 3) Rate limits (per phone token, per server).
-  if (!(await allow(env, `t:${tok.token.slice(0, 32)}`, PER_TOKEN_HOUR)) || !(await allow(env, `s:${b.server}`, PER_SERVER_HOUR))) {
+  if (!(await allow(env, `t:${b.server.slice(0, 16)}:${tok.token.slice(0, 32)}`, PER_TOKEN_HOUR)) || !(await allow(env, `s:${b.server}`, PER_SERVER_HOUR))) {
     return json({ ok: false, reason: 'rate' }, 429)
   }
   // 4) APNs.
@@ -97,7 +97,6 @@ async function push(request, env) {
       'apns-topic': env.APNS_TOPIC || tok.bundle || 'com.ashtonmiller.dropbeam',
       'apns-push-type': 'alert',
       'apns-priority': '10',
-      ...(b.collapse ? { 'apns-collapse-id': String(b.collapse).slice(0, 64) } : {}),
     },
     body: JSON.stringify(body),
   })

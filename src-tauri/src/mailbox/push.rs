@@ -204,11 +204,12 @@ fn my_name(config: &Path) -> String {
 fn seal_for(config: &Path, to: &[seal::Recipient], body: impl Fn(bool) -> String) -> Value {
     let peers = super::keys::peers(config);
     let title = my_name(config);
+    let me = identity(config).map(|k| k.public().to_string()).unwrap_or_default();
     let mut out = serde_json::Map::new();
     for r in to {
         let Some(p) = peers.get(&r.eid) else { continue };
         let Some(pk) = p.push_key.as_deref().and_then(|k| seal::key32(k).ok()) else { continue };
-        let pt = json!({"t": title, "b": body(p.push_text), "th": ""}).to_string();
+        let pt = json!({"t": title, "b": body(p.push_text), "f": me}).to_string();
         if let Ok(s) = seal::seal_small(&pk, pt.as_bytes()) {
             out.insert(r.eid.clone(), json!(s));
         }
@@ -300,6 +301,19 @@ pub fn signed_request(signer: &iroh::SecretKey, sealed_token: &str, collapse: &s
         "sig": seal::b64(&sig.to_bytes())})
 }
 
+/// At most one wake-up per phone per 30s: a burst of messages is one banner,
+/// and the relay's hourly budget lasts through a real conversation.
+fn coalesce_ok(to: &str) -> bool {
+    static LAST: Mutex<Option<HashMap<String, std::time::Instant>>> = Mutex::new(None);
+    let mut g = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.get(to).is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+        return false;
+    }
+    m.insert(to.to_owned(), std::time::Instant::now());
+    true
+}
+
 /// Something new is held: wake each addressed phone that registered here and
 /// isn't connected right now.
 pub fn on_stored(config: &Path, item: &Item) {
@@ -314,16 +328,21 @@ pub fn on_stored(config: &Path, item: &Item) {
     let collapse = {
         use sha2::{Digest, Sha256};
         hex::encode(&Sha256::digest(item.from.as_bytes())[..8])
-    };
+    }; // becomes the notification thread id (groups one sender's banners)
     for to in &item.to {
-        if super::server::recently_seen_device(to) {
+        if super::server::recently_seen_device(to) || !coalesce_ok(to) {
             continue;
         }
         let path = reg_dir(&root).join(format!("{to}.json"));
         let Some(token) = std::fs::read(&path).ok()
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .and_then(|v| v["sealed_token"].as_str().map(String::from)) else { continue };
-        let payload = item.push.get(to).cloned().unwrap_or_default();
+        // The sender id is the one the server verified on the item; the phone
+        // names the banner from its own contacts and checks the preview matches.
+        let payload = match item.push.get(to) {
+            Some(sealed) => json!({"f": item.from, "e": sealed}).to_string(),
+            None => json!({"f": item.from}).to_string(),
+        };
         let body = signed_request(&signer, &token, &collapse, &payload);
         let url = url.clone();
         tauri::async_runtime::spawn(async move {

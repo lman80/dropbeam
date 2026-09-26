@@ -1342,6 +1342,9 @@ pub(crate) fn receive_dir(state: &IrohState, config_dir: &Path) -> PathBuf {
     }
     match state.app.get() {
         Some(app) => crate::commands::download_directory(app).unwrap_or_else(|_| std::env::temp_dir()),
+        // The background server lands things where the app would: ~/Downloads.
+        None if crate::mailbox::is_headless() => std::env::var_os("HOME").map(PathBuf::from)
+            .map(|h| h.join("Downloads")).unwrap_or_else(|| config_dir.join("Downloads")),
         None => config_dir.join("Downloads"),
     }
 }
@@ -2854,6 +2857,12 @@ async fn serve_stream_inner(
                     "error": crate::telemetry::redact_paths_only(&format!("{e:#}"))})).await;
                 let _ = send.finish();
             }
+        }
+        // `DropBeam --server` has no one to show files to: say so before a byte
+        // moves (the sender shows a clear error instead of re-uploading forever).
+        Some("files" | "files.stat" | "files.verify") if crate::mailbox::is_headless() => {
+            send_receiver_error(send, &anyhow::anyhow!("This computer is running in the background without the DropBeam app open. Try again when it's open.")).await;
+            let _ = send.finish();
         }
         Some("files") => {
             // A friend pushed files straight to us. Receive into the download

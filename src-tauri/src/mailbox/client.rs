@@ -1168,6 +1168,12 @@ pub async fn fetch_from(net: &IrohState, config: &Path, server: &str) -> Result<
             anyhow::ensure!(list["ok"].as_bool() == Some(true), "server refused the fetch");
             let server_name = list["name"].as_str().unwrap_or("Transfer Server").chars().take(64).collect::<String>();
             let items = list["items"].as_array().cloned().unwrap_or_default();
+            if list["more"].as_bool() != Some(true) {
+                // Held-for-approval entries this server no longer has (expired,
+                // canceled, delivered elsewhere) stop asking.
+                let listed: HashSet<&str> = items.iter().filter_map(|i| i["item_id"].as_str()).collect();
+                prune_pending(config, server, &listed);
+            }
             if items.is_empty() {
                 break;
             }
@@ -1552,6 +1558,16 @@ fn note_pending(config: &Path, p: PendingFile) -> bool {
         write_store(&pending_path(config), &map);
     }
     fresh
+}
+
+fn prune_pending(config: &Path, server: &str, listed: &HashSet<&str>) {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map: BTreeMap<String, PendingFile> = read_store(&pending_path(config));
+    let before = map.len();
+    map.retain(|_, p| p.server != server || listed.contains(p.item_id.as_str()));
+    if map.len() != before {
+        write_store(&pending_path(config), &map);
+    }
 }
 
 fn forget_pending(config: &Path, link_id: &str) {

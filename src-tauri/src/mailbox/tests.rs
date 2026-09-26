@@ -570,3 +570,115 @@ async fn items_sealed_to_a_rotated_key_still_open() {
     let b_thread = crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap().id;
     assert_eq!(crate::chat::messages(&w.b.config, &b_thread)[0].text, "before rotation");
 }
+
+/// LIVE end-to-end against a real Transfer Server (the owner's Linux box), over
+/// the real network (n0 discovery/relays). Two phases so the box can be told
+/// about the test identities in between:
+///   LIVE_DIR=/tmp/dbl cargo test --lib live_setup -- --ignored --nocapture
+///   (add the printed endpoints as friends on the server)
+///   LIVE_DIR=/tmp/dbl LIVE_SERVER=<eid> cargo test --lib live_run -- --ignored --nocapture
+mod live {
+    use super::*;
+
+    fn dirs() -> (PathBuf, PathBuf) {
+        let base = PathBuf::from(std::env::var("LIVE_DIR").unwrap_or_else(|_| "/tmp/dbl".into()));
+        (base.join("a"), base.join("b"))
+    }
+
+    fn identity(dir: &Path) -> iroh::SecretKey {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("iroh-identity.key");
+        if !p.exists() {
+            let seed: [u8; 32] = rand::random();
+            std::fs::write(&p, seed).unwrap();
+        }
+        iroh::SecretKey::from_bytes(&std::fs::read(&p).unwrap().try_into().unwrap())
+    }
+
+    #[test]
+    #[ignore]
+    fn live_setup() {
+        let (a, b) = dirs();
+        println!("LIVE_A {}", identity(&a).public());
+        println!("LIVE_B {}", identity(&b).public());
+    }
+
+    async fn up(dir: &Path) -> (Arc<IrohState>, iroh::Endpoint, tokio::task::JoinHandle<()>) {
+        let ep = iroh_net::start(dir).await.unwrap();
+        let state = Arc::new(IrohState::default());
+        let _ = state.location_config.set(dir.to_path_buf());
+        let _ = state.endpoint.set(ep.clone());
+        let l = tokio::spawn(iroh_net::accept_loop(ep.clone(), state.clone()));
+        (state, ep, l)
+    }
+
+    /// A friend-hello with our mailbox fields; the reply's fields are applied.
+    async fn hello(state: &IrohState, ep: &iroh::Endpoint, dir: &Path, to: &str) {
+        let conn = tokio::time::timeout(Duration::from_secs(30), ep.connect(iroh_net::dial_addr(to.parse().unwrap()), iroh_net::ALPN)).await.unwrap().unwrap();
+        let req = json!({"kind": "friend-hello", "friend_id": "", "endpoint_id": ep.id().to_string(), "name": "Transfer test",
+            "mailbox": super::super::hello_fields(dir, ep.secret_key(), to)});
+        let reply = rpc(&conn, req).await;
+        super::super::on_hello(state, dir, to, &reply);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn live_run() {
+        let server = std::env::var("LIVE_SERVER").expect("LIVE_SERVER=<endpoint id>");
+        let (a_dir, b_dir) = dirs();
+        let (a_eid, b_eid) = (identity(&a_dir).public().to_string(), identity(&b_dir).public().to_string());
+        let t0 = std::time::Instant::now();
+        let b_for_a = crate::friends::upsert_by_endpoint(&a_dir, &b_eid, "Test B").id;
+        crate::friends::upsert_by_endpoint(&a_dir, &server, "Linux Box");
+        crate::friends::upsert_by_endpoint(&b_dir, &a_eid, "Test A");
+        crate::friends::upsert_by_endpoint(&b_dir, &server, "Linux Box");
+        // B comes online once, long enough to introduce itself, then goes away.
+        {
+            let (bs, bep, bl) = up(&b_dir).await;
+            hello(&bs, &bep, &b_dir, &server).await;
+            let (as_, aep, al) = up(&a_dir).await;
+            hello(&as_, &aep, &a_dir, &b_eid).await; // A learns B's key (B's reply)
+            bl.abort(); bep.close().await; al.abort(); aep.close().await;
+        }
+        println!("[{:>5.1}s] B introduced itself and went offline", t0.elapsed().as_secs_f64());
+        let (as_, aep, _al) = up(&a_dir).await;
+        hello(&as_, &aep, &a_dir, &server).await;
+        let srv = client::servers(&a_dir).into_iter().find(|s| s.eid == server).expect("the box granted access in its hello");
+        println!("[{:>5.1}s] A sees server {:?} member={} through={}", t0.elapsed().as_secs_f64(), srv.name, srv.member, srv.through);
+        client::set_prefs(&a_dir, &server, Some(true), None, Some("seen")).unwrap();
+        // Chat + a 24 MB file, while B is offline.
+        let msg = uuid::Uuid::new_v4().to_string();
+        let held = client::deposit_chat(&as_, &a_dir, &b_for_a, "chat", &chat_frame(&msg, "live: held on the Linux box"), Some(&msg)).await.unwrap();
+        println!("[{:>5.1}s] chat held on {:?}", t0.elapsed().as_secs_f64(), held.name);
+        let src = a_dir.join("live-24MB.bin");
+        let data: Vec<u8> = (0..24 * 1024 * 1024).map(|_| rand::random::<u8>()).collect();
+        std::fs::write(&src, &data).unwrap();
+        let want = { use sha2::Digest; hex::encode(sha2::Sha256::digest(&data)) };
+        let xfer = uuid::Uuid::new_v4().to_string();
+        let up_t = std::time::Instant::now();
+        let held = client::deposit_files(&as_, &a_dir, &b_for_a, &xfer, &xfer, &deposit_files_of(&[(src.clone(), "live-24MB.bin")]), &[], &["live-24MB.bin".into()],
+            &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+        println!("[{:>5.1}s] file held on {:?} (upload {:.1}s)", t0.elapsed().as_secs_f64(), held.name, up_t.elapsed().as_secs_f64());
+        aep.close().await; // A goes offline too: delivery doesn't need the sender.
+        // B comes back and pulls.
+        let (bs, bep, _bl) = up(&b_dir).await;
+        let n = client::fetch_from(&bs, &b_dir, &server).await.unwrap();
+        println!("[{:>5.1}s] B received {n} item(s)", t0.elapsed().as_secs_f64());
+        assert_eq!(n, 2);
+        let got = std::fs::read(b_dir.join("Downloads/live-24MB.bin")).unwrap();
+        let have = { use sha2::Digest; hex::encode(sha2::Sha256::digest(&got)) };
+        assert_eq!(have, want);
+        println!("sha256 match: {have}");
+        let thread = crate::friends::chat_sender(&b_dir, &a_eid).unwrap().id;
+        let texts: Vec<String> = crate::chat::messages(&b_dir, &thread).into_iter().map(|m| m.text).collect();
+        assert_eq!(texts.iter().filter(|t| t.as_str() == "live: held on the Linux box").count(), 1);
+        assert_eq!(client::fetch_from(&bs, &b_dir, &server).await.unwrap(), 0, "nothing twice");
+        bep.close().await;
+        let (as_, aep, _al) = up(&a_dir).await;
+        let r = client::refresh_status(&as_, &a_dir).await;
+        println!("receipts: {:?}", r.iter().map(|r| (r.sent.kind.clone(), r.state.clone())).collect::<Vec<_>>());
+        assert!(r.len() == 2 && r.iter().all(|r| r.state == "delivered"));
+        aep.close().await;
+        println!("LIVE OK in {:.1}s", t0.elapsed().as_secs_f64());
+    }
+}

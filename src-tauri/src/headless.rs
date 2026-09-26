@@ -80,21 +80,28 @@ pub fn lock_for_app(config: &Path) -> Option<EngineLock> {
     if let Some(l) = try_lock(config, "app") {
         return Some(l);
     }
-    #[cfg(unix)]
-    if let Some((pid, mode)) = holder(config) {
-        if mode == "server" && pid > 1 {
-            log::info!("engine: the background Transfer Server is running; taking over for the app");
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Never run the same identity twice: keep asking the background service to
+    // stop until it has (it always does; systemd's restart then waits on us).
+    let mut tries = 0u32;
+    loop {
+        #[cfg(unix)]
+        if tries % 20 == 0 {
+            if let Some((pid, mode)) = holder(config) {
+                if mode == "server" && pid > 1 {
+                    log::info!("engine: the background Transfer Server is running; taking over for the app");
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                }
+            }
         }
-    }
-    for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(250));
         if let Some(l) = try_lock(config, "app") {
             return Some(l);
         }
+        tries += 1;
+        if tries == 240 {
+            log::warn!("engine: still waiting for the background Transfer Server to stop");
+        }
     }
-    log::warn!("engine: couldn't get the engine lock; starting anyway");
-    None
 }
 
 struct StderrLog;
@@ -127,6 +134,7 @@ pub fn run(args: &[String]) {
         std::thread::sleep(Duration::from_secs(5));
     };
     log::info!("DropBeam --server: running the Transfer Server in the background");
+    crate::mailbox::set_headless();
     tauri::async_runtime::block_on(async move {
         let state = Arc::new(crate::iroh_net::IrohState::default());
         let _ = state.location_config.set(config.clone());

@@ -78,7 +78,7 @@ targets:
         com.apple.security.application-groups: [group.com.ashtonmiller.dropbeam]
         # Transfer Server push — off until the App ID has Push Notifications
         # enabled (docs/PUSH-SETUP.md; scripts/enable-push.sh flips this line).
-        # aps-environment: production
+        # aps-environment: development
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full

@@ -278,8 +278,20 @@ export function usePendingFile(linkId: string | null | undefined): PendingFile |
   const snap = useSyncExternalStore(subscribePending, () => pendingCache)
   return linkId ? snap[linkId] : undefined
 }
+const DECLINED_KEY = 'dropbeam-declined-held-files'
+/** Held sends you declined (so their card says so instead of "on its way"). */
+export function isDeclined(linkId: string | null | undefined): boolean {
+  if (!linkId) return false
+  try { return (JSON.parse(localStorage.getItem(DECLINED_KEY) ?? '[]') as string[]).includes(linkId) } catch { return false }
+}
 export async function decideFile(linkId: string, accept: boolean): Promise<void> {
   if (HAS_TAURI) await invoke<void>('mailbox_decide_file', { linkId, accept })
+  if (!accept) {
+    try {
+      const list = JSON.parse(localStorage.getItem(DECLINED_KEY) ?? '[]') as string[]
+      localStorage.setItem(DECLINED_KEY, JSON.stringify([...list.filter((x) => x !== linkId), linkId].slice(-200)))
+    } catch { /* storage unavailable */ }
+  }
   const { [linkId]: _, ...rest } = pendingCache
   void _
   pendingCache = rest

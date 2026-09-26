@@ -41,7 +41,7 @@ import { formatBytes } from '../lib/format'
 import { linkify } from '../lib/linkify'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 import { EmptyState, IconButton, MenuButton, MenuPopover, type MenuItem } from '../components/ui'
-import { decideFile, onServersChanged, serverApi, serverNoteText, usePendingFile } from '../lib/transferServer'
+import { decideFile, isDeclined, onServersChanged, serverApi, serverNoteText, usePendingFile } from '../lib/transferServer'
 import { ServerOfferCard, useUsableServers } from '../components/TransferServerSettings'
 
 /** Stable empty array so the messages selector doesn't return a fresh ref each render. */
@@ -1901,7 +1901,7 @@ function FileMessage({
           <button type="button" className="btn btn-secondary btn-sm" disabled={deciding} onClick={() => { setDeciding(true); void decideFile(pending.linkId, true) }}>Download</button>
         </div>
       ) : !mine && m.via && !m.path ? (
-        <div className="xfer-line">{deciding ? 'Downloading…' : `On its way from ${m.via}…`}</div>
+        <div className="xfer-line">{isDeclined(m.fileXferId) ? 'Declined' : deciding ? 'Downloading…' : `On its way from ${m.via}…`}</div>
       ) : m.fileXferId ? (
         <div className="xfer-line">Waiting…</div>
       ) : null}

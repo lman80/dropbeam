@@ -32,6 +32,15 @@ use crate::iroh_net::IrohState;
 
 pub const VERSION: u64 = 1;
 
+static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Running as `DropBeam --server` (no app window, no one to accept files).
+pub fn is_headless() -> bool {
+    HEADLESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_headless() {
+    HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Route one `mailbox.*` stream. Server-side kinds go to `server`; the
 /// server→recipient poke goes to `client`.
 pub async fn serve(state: &IrohState, conn: &Connection, send: &mut SendStream, recv: &mut RecvStream, kind: &str, req: &Value) -> Result<()> {
@@ -98,7 +107,9 @@ pub fn hello_fields(config: &Path, signer: &iroh::SecretKey, who: &str) -> Value
         v["key"] = json!(seal::b64(&pk));
         v["sig"] = json!(seal::sign_mailbox_key(signer, &pk));
     }
-    if let Some((pk, sig)) = push::push_key_advert(config, signer) {
+    // Only people we know get our push key (it's what makes a banner speak).
+    let trusted = crate::account::is_own_device(config, who) || crate::friends::chat_sender(config, who).is_some();
+    if let Some((pk, sig)) = push::push_key_advert(config, signer).filter(|_| trusted) {
         v["push_key"] = json!(pk);
         v["push_sig"] = json!(sig);
         v["push_text"] = json!(push::previews_allowed(config));

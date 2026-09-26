@@ -65,6 +65,16 @@ enum PushRegistration {
         return key
     }
 
+    /// endpoint id → friend name, for the extension: a banner's title always
+    /// comes from YOUR contacts, never from what a sender claims.
+    static func saveNames(_ pairs: [(String, String)]) {
+        guard let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) else { return }
+        var map: [String: String] = [:]
+        for (eid, name) in pairs { map[eid] = name }
+        guard let data = try? JSONSerialization.data(withJSONObject: map) else { return }
+        try? data.write(to: dir.appendingPathComponent("push-names.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
     // ── token → engine ──────────────────────────────────────────────────────
 
     /// The engine's config folder (tauri app_config_dir on iOS).
@@ -111,5 +121,10 @@ enum PushRegistration {
         if !class_respondsToSelector(cls, didFail) {
             class_addMethod(cls, didFail, imp_implementationWithBlock(fail), "v@:@@")
         }
+        // UIKit caches which optional delegate methods exist when the delegate is
+        // set; re-assign it so the new ones are seen.
+        let app = UIApplication.shared
+        app.delegate = nil
+        app.delegate = delegate
     }
 }
