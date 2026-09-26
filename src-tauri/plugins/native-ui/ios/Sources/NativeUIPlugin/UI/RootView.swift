@@ -116,6 +116,8 @@ private struct RootPresentations: ViewModifier {
             .sheet(item: folderInvite) { invite in FolderInviteSheet(invite: invite) }
             // An invite link / Camera-scanned friend QR opened the app: add them.
             .sheet(item: link) { link in AddFriendSheet(initialCode: link.value).environmentObject(bridge) }
+            // The floating feedback button would sit over the setup copy.
+            .onChange(of: settingUp, initial: true) { _, now in SuperFeedback.setSuppressed(now) }
             .task(id: settingUp) {
                 // Existing installs that never answered the notification prompt get it
                 // once here (new ones are asked inside setup, at the moment it's explained).
