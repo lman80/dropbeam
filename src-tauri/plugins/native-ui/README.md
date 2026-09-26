@@ -1,3 +1,17 @@
+Share extension (2026-09-26): "DropBeam" in the system share sheet. Target `DropBeamShare`
+(`gen/apple/DropBeamShare`, bundle `com.ashtonmiller.dropbeam.share`, App Group
+`group.com.ashtonmiller.dropbeam` on both targets). The extension copies shared items
+into `ShareJobs/.incoming-<id>/files` as soon as it opens, lists recipients from
+`share-recipients.json` (+ `share-avatars/`, written by `ShareInbox.swift` whenever
+friends/presence change), and on a tap writes `job.json`, renames the folder to
+`ShareJobs/<id>` and opens `dropbeam://share?job=<id>` via the responder chain (iOS may
+ask "Open in DropBeam?" once). `ShareInbox.ingestSoon()` runs on activate, every
+foreground and that URL: it moves the job into `dropbeam-picked/share-<id>` and sends to
+the friend (links/text as chat messages), starts a Quick Send, or shows Send To. If the
+send fails it explains why, then offers Send To with the same files. If iOS refuses to
+open the app, the extension says "Saved" and posts a tap-to-finish notification.
+XCUITest: `tests/ios-uitests/UITests/ShareExtensionTests.swift`.
+
 Owner-feedback fixes and current verification: [OWNER-REVIEW.md](OWNER-REVIEW.md). Photos/Files bridge calls now time out after 90 seconds; local UI media is downsampled asynchronously through ThumbnailProvider. SuperFeedback is draggable and only its panel/trigger owns touches.
 
 Beta review preparation (2026-09-21) is documented in [BETA-REVIEW.md](BETA-REVIEW.md), including validation, privacy audit, changed files and remaining device checks.

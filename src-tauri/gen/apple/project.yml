@@ -97,6 +97,8 @@ targets:
     dependencies:
       # Opens sealed Transfer Server notification previews (DropBeamNotify below).
       - target: DropBeamNotify
+      # Share → DropBeam from any app (DropBeamShare target below).
+      - target: DropBeamShare
       - framework: libapp.a
         embed: false
       - sdk: CoreGraphics.framework
@@ -152,6 +154,57 @@ targets:
         SKIP_INSTALL: YES
     postBuildScripts:
       # Extension versions must match the app's (tauri rewrites the app plist each build).
+      - name: Match App Version
+        basedOnDependencyAnalysis: false
+        script: |
+          APP_PLIST="${SRCROOT}/app_iOS/Info.plist"
+          OUT="${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
+          for KEY in CFBundleShortVersionString CFBundleVersion; do
+            VALUE=$(/usr/libexec/PlistBuddy -c "Print :$KEY" "$APP_PLIST")
+            /usr/libexec/PlistBuddy -c "Set :$KEY $VALUE" "$OUT"
+          done
+  # Share extension: "DropBeam" in the system share sheet. It copies the shared items
+  # into the App Group and opens the app, which sends them (native-ui ShareInbox.swift).
+  DropBeamShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: DropBeamShare
+    info:
+      path: DropBeamShare/Info.plist
+      properties:
+        CFBundleDisplayName: DropBeam
+        # Replaced with the app's own version at build time (see postBuildScripts).
+        CFBundleShortVersionString: "0.0.0"
+        CFBundleVersion: "0"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 100
+              NSExtensionActivationSupportsMovieWithMaxCount: 100
+              NSExtensionActivationSupportsFileWithMaxCount: 100
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
+    entitlements:
+      path: DropBeamShare/DropBeamShare.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.ashtonmiller.dropbeam]
+    settings:
+      base:
+        PRODUCT_NAME: DropBeamShare
+        PRODUCT_BUNDLE_IDENTIFIER: com.ashtonmiller.dropbeam.share
+        DEVELOPMENT_TEAM: R2RDA8476R
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        ARCHS: [arm64]
+        EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    postBuildScripts:
+      # App Store validation requires the extension's versions to match the app's, and
+      # tauri rewrites the app's Info.plist on every build — copy them over (before signing).
       - name: Match App Version
         basedOnDependencyAnalysis: false
         script: |
