@@ -548,6 +548,20 @@ pub fn outbox(config_dir: &Path) -> Vec<ChatMessage> {
     out
 }
 
+/// Whether any of OUR undelivered messages is queued for one of these threads —
+/// the cheap gate for waking the outbox when a friend is seen online.
+pub fn has_outbox_for(config_dir: &Path, peer_ids: &[&str]) -> bool {
+    let mut cache = CACHE.lock().unwrap();
+    let store = store_mut(&mut cache, config_dir);
+    peer_ids.iter().any(|peer| {
+        store.get(*peer).is_some_and(|thread| {
+            thread.iter().any(|m| {
+                m.from_me && !m.deleted && matches!(m.status.as_deref(), Some("sending") | Some("failed"))
+            })
+        })
+    })
+}
+
 /// A short preview of each conversation, for the chat list.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -948,6 +962,26 @@ mod tests {
         assert_eq!(message_status(&dir, "p", "mm").as_deref(), Some("delivered"));
         assert_eq!(message_status(&dir, "p", "theirs"), None); // not from_me → None
         assert_eq!(message_status(&dir, "p", "nope"), None); // unknown
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbox_gate_is_per_thread_and_ignores_delivered_and_unsent() {
+        let dir = test_dir("outbox-for");
+        let mut done = msg("d", "alex", 1, 1, true);
+        done.status = Some("delivered".into());
+        append(&dir, &done);
+        append(&dir, &msg("theirs", "alex", 2, 2, false));
+        assert!(!has_outbox_for(&dir, &["alex"]), "nothing of ours is waiting");
+        let mut gone = msg("u", "alex", 3, 3, true);
+        gone.deleted = true;
+        append(&dir, &gone);
+        assert!(!has_outbox_for(&dir, &["alex"]), "an unsent message is never delivered");
+        let mut queued = msg("q", "alex", 4, 4, true);
+        queued.status = Some("failed".into());
+        append(&dir, &queued);
+        assert!(has_outbox_for(&dir, &["other", "alex"]));
+        assert!(!has_outbox_for(&dir, &["sam"]), "another friend's thread is not woken");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

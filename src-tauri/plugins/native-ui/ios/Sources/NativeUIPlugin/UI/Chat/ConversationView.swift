@@ -23,6 +23,18 @@ struct ConversationView: View {
     @State private var pendingReport: ReportTarget?
     /// Points the composer covers from the screen bottom (feedback button keeps clear).
     @State private var composerHeight: CGFloat = 0
+    /// An active check of the friend is in flight (header reads "Connecting…").
+    @State private var probing = true
+    /// The latest active check got no answer, overriding a still-fresh presence stamp.
+    @State private var probedOffline = false
+    @State private var lastProbe = Date.distantPast
+    /// Bumped to restart the check loop (thread opened again / app foregrounded).
+    @State private var probeRun = 0
+    /// Reachable right now, as far as the latest evidence says.
+    private var online: Bool { bridge.presence[friendID] == true && !probedOffline }
+    /// Offline, and the check that says so has finished.
+    private var knownOffline: Bool { !online && !probing }
+    private var hasQueued: Bool { messages.contains { $0.fromMe && $0.deleted != true && ["sending", "failed"].contains($0.status ?? "") } }
     /// A friend (not one of the user's own devices): Report / Block are offered.
     private var reportable: Bool {
         guard let f = bridge.friends.first(where: { $0.id == friendID }), !f.ownDevice else { return false }
@@ -80,10 +92,12 @@ struct ConversationView: View {
             .modifier(ComposerBar {
                 VStack(spacing: 0) {
                     if searching { searchFooter(proxy) }
+                    if knownOffline && !searching { offlineNote.transition(.opacity) }
                     ChatComposer(friendID: friendID, reply: $reply, editing: $editing, text: $draft) { scrollDown(proxy) }
                 }
                 // The feedback button stays available here, parked above the composer
                 // (it grows with replies, drafts and attachments) — never over Send.
+                .animation(.easeInOut(duration: 0.2), value: knownOffline)
                 .background { GeometryReader { geo in
                     Color.clear.preference(key: ComposerTopKey.self, value: geo.frame(in: .global).minY)
                 } }
@@ -113,6 +127,24 @@ struct ConversationView: View {
                     loaded = true
                 } catch is CancellationError {} catch { bridge.errorMessage = error.localizedDescription }
             }
+        }
+        // Presence: check the friend the moment the thread opens (and again on
+        // return to the foreground) instead of waiting on the background beacon.
+        .task(id: probeRun) { await presenceLoop() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active, Date().timeIntervalSince(lastProbe) > 5 { probeRun += 1 }
+        }
+        .onChange(of: bridge.presence[friendID] == true) { _, isOnline in
+            guard isOnline else { return }
+            probedOffline = false; probing = false
+            // Seen through another channel (a folder beacon, an incoming connection):
+            // one quick check makes the engine flush what was waiting for them.
+            if hasQueued { Task { _ = try? await bridge.checkPresence(id: friendID) } }
+        }
+        .onChange(of: bridge.chatTyping[friendID] == true) { _, typing in if typing { probedOffline = false; probing = false } }
+        .onChange(of: messages.last?.id) { _, _ in
+            // Their new message is proof they're reachable right now.
+            if let last = messages.last, !last.fromMe, Date().timeIntervalSince(last.date) < 60 { probedOffline = false; probing = false }
         }
         .background(ChatPalette.background.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
@@ -176,18 +208,79 @@ struct ConversationView: View {
                 ContactAvatar(friend: friend, size: 36).zIndex(1)
                 // iOS 26 Messages: the name rides a glass capsule so it stays legible
                 // over bubbles scrolling beneath the bar.
-                HStack(spacing: 3) {
-                    Text(friend.displayName).font(.caption.weight(.semibold)).lineLimit(1)
-                    Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
+                VStack(spacing: 0) {
+                    HStack(spacing: 3) {
+                        Text(friend.displayName).font(.caption.weight(.semibold)).lineLimit(1)
+                        Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
+                    }
+                    .foregroundStyle(Color.primary)
+                    TimelineView(.periodic(from: .now, by: 60)) { _ in
+                        Text(presenceText).font(.caption2).foregroundStyle(online ? Color.green : Color.secondary)
+                            .lineLimit(1).contentTransition(.opacity)
+                    }
                 }
-                .foregroundStyle(Color.primary)
-                .padding(.horizontal, 10).padding(.vertical, 4)
+                .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+                .padding(.horizontal, 12).padding(.vertical, 4)
                 .glassSurface(Capsule())
                 .frame(maxWidth: 220)
+                .animation(.easeInOut(duration: 0.2), value: presenceText)
             }
         }.buttonStyle(.plain)
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(friend.displayName).accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
+            .accessibilityLabel("\(friend.displayName), \(presenceText)").accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
+    }
+
+    /// "Online", "Connecting…", "Last seen 5 min ago" or "Offline" under the name.
+    private var presenceText: String {
+        if online { return "Online" }
+        if probing { return "Connecting…" }
+        guard let seen = bridge.presenceSeen[friendID] else { return "Offline" }
+        return Self.lastSeen(Date(timeIntervalSince1970: seen / 1000))
+    }
+    static func lastSeen(_ date: Date, now: Date = Date()) -> String {
+        let minutes = Int(now.timeIntervalSince(date) / 60)
+        if minutes < 1 { return "Last seen just now" }
+        if minutes < 60 { return "Last seen \(minutes) min ago" }
+        if minutes < 24 * 60 { return "Last seen \(minutes / 60) hr ago" }
+        if Calendar.current.isDateInYesterday(date) { return "Last seen yesterday" }
+        return "Last seen \(date.formatted(.dateTime.month(.abbreviated).day()))"
+    }
+
+    /// Calm inline note over the composer while the friend can't be reached.
+    private var offlineNote: some View {
+        Text("\(friend.displayName) is offline. Messages will send when you’re both online with DropBeam open.")
+            .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity).padding(.horizontal, 28).padding(.top, 6).padding(.bottom, 8)
+            .accessibilityIdentifier("chat.offlineNote")
+    }
+
+    /// Check now; while they stay offline, check again every 30 s (never faster).
+    private func presenceLoop() async {
+        var first = true
+        while !Task.isCancelled {
+            // Always on open (a fresh-looking stamp may be stale); after that only
+            // while they read as offline — online friends are refreshed by the engine.
+            if first || !online { await probe() }
+            first = false
+            try? await Task.sleep(for: .seconds(30))
+        }
+    }
+    /// One active check. The header gives up waiting after 8 s (Offline) while the
+    /// dial itself may still land and flip it to Online.
+    private func probe() async {
+        lastProbe = Date()
+        if bridge.presence[friendID] != true { probing = true }
+        let check = Task { @MainActor in (try? await bridge.checkPresence(id: friendID)) ?? false }
+        let deadline = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled, probing else { return }
+            probing = false; probedOffline = true
+        }
+        let reached = await check.value
+        deadline.cancel()
+        probedOffline = !reached
+        probing = false
     }
 
     @ViewBuilder private func messageRow(_ message: ChatMessage, index: Int) -> some View {
@@ -229,7 +322,7 @@ struct ConversationView: View {
                             Text("Edited").font(.caption2.weight(.medium)).foregroundStyle(message.fromMe ? ChatPalette.sent : Color.secondary)
                         }
                         if lastMine, let status = delivery(message) {
-                            Text(status).font(.caption2.weight(.medium)).foregroundStyle(status == "Not Delivered" ? Color.red : Color.secondary)
+                            Text(status).font(.caption2.weight(.medium)).foregroundStyle(.secondary)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: message.fromMe ? .trailing : .leading)
@@ -245,8 +338,9 @@ struct ConversationView: View {
         switch message.status {
         case "read": return "Read"
         case "delivered", "sent": return "Delivered"
-        case "sending": return "Sending…"
-        case "failed": return "Not Delivered"
+        // The engine keeps every undelivered message queued and retries it until it
+        // lands, so neither state is a failure; offline it is simply waiting.
+        case "sending", "failed": return knownOffline ? "Waiting to send" : "Sending…"
         default: return nil
         }
     }

@@ -1224,7 +1224,13 @@ pub async fn ping_friend(
     let Some(ep) = iroh.get().cloned() else {
         return Ok(false);
     };
-    Ok(crate::iroh_net::ping_endpoint(&ep, &eid).await)
+    let online = crate::iroh_net::ping_endpoint(&ep, &eid).await;
+    // A friend who answers is online NOW: flush anything queued for them at once
+    // (chat opens probe right away, so queued messages go out within seconds).
+    if online {
+        crate::iroh_net::wake_chat_outbox_for(&state.config_dir, &id);
+    }
+    Ok(online)
 }
 
 /// Probe how we're connected to a friend right now (connection inspector). Returns
@@ -1239,7 +1245,11 @@ pub async fn probe_connection(
     let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id) else {
         return Ok(None);
     };
-    Ok(crate::iroh_net::probe_conn(&ep, &eid).await)
+    let detail = crate::iroh_net::probe_conn(&ep, &eid).await;
+    if detail.is_some() {
+        crate::iroh_net::wake_chat_outbox_for(&state.config_dir, &friend_id);
+    }
+    Ok(detail)
 }
 
 /// "Send over relay anyway": break the wait-for-direct park for one transfer (by

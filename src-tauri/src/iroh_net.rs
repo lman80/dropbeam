@@ -5551,6 +5551,19 @@ pub fn wake_chat_outbox() {
     chat_outbox_wake_cell().notify_one();
 }
 
+/// A friend just answered a ping/probe: if messages to that person are still
+/// queued, flush them now rather than waiting out the per-peer backoff (up to
+/// 300s). Only wakes when something is actually queued for them, so the periodic
+/// presence probes of online friends never churn the outbox loop.
+pub fn wake_chat_outbox_for(config_dir: &std::path::Path, friend_id: &str) -> bool {
+    let owner = crate::friends::thread_owner(config_dir, friend_id).map_or_else(|| friend_id.to_string(), |o| o.id);
+    let queued = crate::chat::has_outbox_for(config_dir, &[friend_id, owner.as_str()]);
+    if queued {
+        wake_chat_outbox();
+    }
+    queued
+}
+
 pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
     tauri::async_runtime::spawn(async move {
         // Per-peer failure backoff so ONE offline friend (the daily reality for a peer

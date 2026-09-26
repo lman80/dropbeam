@@ -353,11 +353,38 @@ function Conversation({ friendId }: { friendId: string }) {
   const onlineNow = useStore((s) =>
     friend ? friendOnlineState(friend.name, s.friendSeen, s.folderStatuses) === true : false,
   )
+  // An active check of this friend is in flight (thread just opened / refocused).
+  const [checking, setChecking] = useState(() => !onlineNow)
   const presenceText = useStore((s) => {
     if (!friend) return ''
     const p = friendPresence(friend.name, s.friendSeen, s.folderStatuses)
-    return p.status === 'online' ? 'Online' : presenceLabel(p)
+    return p.status === 'online' ? 'Online' : checking ? 'Connecting…' : presenceLabel(p)
   })
+  const windowFocused = useStore((s) => s.windowFocused)
+  const lastCheckRef = useRef({ id: '', at: 0 })
+  // Fast presence (#44): dial the friend the moment the thread opens or the window
+  // regains focus, instead of waiting on the background beacon's backoff; while
+  // they stay offline, re-check every 30 s. "Connecting…" is bounded at 8 s.
+  // A successful ping also makes the engine flush messages queued for them.
+  useEffect(() => {
+    if (!windowFocused) {
+      setChecking(false)
+      return
+    }
+    let cancelled = false
+    const check = (showConnecting: boolean) => {
+      lastCheckRef.current = { id: friendId, at: Date.now() }
+      if (showConnecting) setChecking(true)
+      const bound = window.setTimeout(() => { if (!cancelled) setChecking(false) }, 8000)
+      void useStore.getState().pingFriend(friendId).finally(() => {
+        window.clearTimeout(bound)
+        if (!cancelled) setChecking(false)
+      })
+    }
+    if (lastCheckRef.current.id !== friendId || Date.now() - lastCheckRef.current.at > 5000) check(!onlineNow)
+    const timer = window.setInterval(() => { if (!onlineNow) check(false) }, 30_000)
+    return () => { cancelled = true; window.clearInterval(timer); setChecking(false) }
+  }, [friendId, windowFocused, onlineNow])
   const typing = useStore((s) => !!s.chatTyping[friendId])
   const ownLabel = useOwnDeviceLabels()[friendId] as string | undefined
   const giphyKey = useStore((s) => s.settings?.giphyApiKey ?? '')
@@ -875,6 +902,7 @@ function Conversation({ friendId }: { friendId: string }) {
                         firstOfRun={row.firstOfRun}
                         lastOfRun={row.lastOfRun}
                         meta={row.meta}
+                        waiting={!onlineNow && !checking}
                         allById={messages}
                         onReply={beginReply}
                         onEdit={beginEdit}
@@ -915,6 +943,11 @@ function Conversation({ friendId }: { friendId: string }) {
       </div>
 
       <div className={MOBILE_UI ? 'chat-composer mobile-composer' : 'chat-composer'}>
+        {!onlineNow && !checking && (
+          <p className="chat-offline-note" role="status">
+            {displayName} is offline. Messages will send when you’re both online with DropBeam open.
+          </p>
+        )}
         {reply && !editing && (
           <div className="composer-context">
             <CornerUpLeft size={14} aria-hidden />
@@ -1353,6 +1386,7 @@ const MessageRow = memo(function MessageRow({
   firstOfRun,
   lastOfRun,
   meta,
+  waiting,
   allById,
   onReply,
   onEdit,
@@ -1364,6 +1398,8 @@ const MessageRow = memo(function MessageRow({
   firstOfRun: boolean
   lastOfRun: boolean
   meta: MetaKind
+  /** The friend is offline: an undelivered message is queued, not failing. */
+  waiting: boolean
   allById: ChatMessage[]
   onReply: (m: ChatMessage) => void
   onEdit: (m: ChatMessage) => void
@@ -1461,7 +1497,7 @@ const MessageRow = memo(function MessageRow({
     if (m.edited && !m.deleted) parts.push('Edited')
     if (meta && !(m.kind === 'file' && (inFlight || m.fileXferFailed))) {
       const s = m.status
-      if (meta === 'pending' || s === 'sending' || s === 'failed' || s == null) parts.push('Sending…')
+      if (meta === 'pending' || s === 'sending' || s === 'failed' || s == null) parts.push(waiting ? 'Waiting to send' : 'Sending…')
       else parts.push(s === 'read' ? 'Read' : 'Delivered')
     }
     return parts.join(' · ')

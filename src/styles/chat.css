@@ -864,6 +864,14 @@ html:not(.mobile) .chat-list-pane {
   gap: 6px;
   padding: 8px 16px 14px;
 }
+.chat-offline-note {
+  margin: 0 0 2px;
+  padding: 0 12px;
+  text-align: center;
+  font-size: var(--text-12);
+  line-height: 1.4;
+  color: var(--text-muted);
+}
 .composer-context {
   display: flex;
   align-items: center;

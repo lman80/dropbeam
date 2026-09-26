@@ -52,6 +52,8 @@ final class Bridge: ObservableObject {
     @Published var chatDraftFiles: [String] = []
     @Published var chatPath: [String] = []
     @Published var presence: [String: Bool] = [:]
+    /// Last contact (ms since 1970) for people who are not online right now.
+    @Published var presenceSeen: [String: Double] = [:]
     @Published var selectedTab = "send"
     @Published var errorMessage: String?
     /// A `dropbeam:` link the app was opened with (invite link, Camera-scanned QR).
@@ -152,6 +154,7 @@ final class Bridge: ObservableObject {
         case "thread":
             if let thread = try decoder.decode(ChatThread?.self, from: data) { threads[thread.friendId] = thread.messages }
         case "presence": presence = try decoder.decode([String: Bool].self, from: data)
+        case "presenceSeen": presenceSeen = try decoder.decode([String: Double].self, from: data)
         case "folders": folders = try decoder.decode(LossyArray<SharedFolder>.self, from: data).values
         case "blocked": blocked = try decoder.decode(LossyArray<BlockedPerson>.self, from: data).values
         default: break // Forward-compatible snapshots.
@@ -284,6 +287,11 @@ final class Bridge: ObservableObject {
     func sendChatGif(friendId: String, id: String) async throws { try await action("sendChatGif", ["friendId": friendId, "id": id]) }
     func setView(name: String) async throws { try await action("setView", ["name": name]) }
     func pingFriend(id: String) async throws -> ConnectionCheck { try await call("pingFriend", ["id": id]) }
+    /// Dial every device of this person now; true as soon as any answers.
+    func checkPresence(id: String) async throws -> Bool {
+        let check: ConnectionCheck = try await call("checkPresence", ["id": id])
+        return check.online == true
+    }
     func removeFriend(id: String) async throws { try await action("removeFriend", ["id": id]) }
     /// Block the person behind friend `id` (all their devices, on all your devices).
     func blockFriend(id: String) async throws { try await action("blockFriend", ["id": id]) }

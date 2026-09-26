@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { api, HAS_TAURI, isActive, type Settings, type Friend, type LinkResult, locationsApi, type SharedLocation, type LocationPage } from './api'
 import { useStore, rememberLocationUpload, type View } from '../store'
 import { MOBILE_UI } from './platform'
-import { friendOnlineState } from './presence'
+import { friendOnlineState, friendPresence } from './presence'
 import { transferSharePaths } from './mobilePick'
 import { setNativeShellActive } from './nativeShell'
 import { changedSnapshots, dispatchNativeCall, deliverNativeReply, pickNativeMedia, nativeAvatarPath, type BridgeArgs, type BridgeHandlers } from './nativeBridgeProtocol'
@@ -177,6 +177,18 @@ const handlers: BridgeHandlers = {
     const online = await st().pingFriend(id)
     const detail = online ? await st().probeFriend(id).catch(() => null) : null
     return { online, path: detail?.path ?? null, rttMs: detail?.rttMs ?? null }
+  },
+  // Chat threads ask as they open / return to the foreground: dial every device of
+  // the person at once and answer as soon as ANY of them does. A success feeds the
+  // presence snapshot and (engine side) flushes messages queued for them.
+  checkPresence: async a => {
+    const ids = personDevices(string(a, 'id'))
+    if (!ids.length) return { online: false }
+    const online = await new Promise<boolean>(resolve => {
+      let left = ids.length
+      for (const id of ids) void st().pingFriend(id).then(ok => { if (ok) resolve(true); else if (--left === 0) resolve(false) })
+    })
+    return { online }
   },
   removeFriend: a => st().removeFriend(string(a, 'id')),
   blockFriend: async a => { if (!await st().blockFriend(string(a, 'id'))) throw new Error(st().toasts.at(-1)?.message || 'Could not block') },
@@ -383,6 +395,26 @@ const presenceSnapshot = (s: ReturnType<typeof st>) => {
   for (const [member, owner] of Object.entries(personGroups(s.friends, s.myDevice?.account_pub))) if (out[member]) out[owner] = true
   return out
 }
+/** Last contact (ms) for people NOT online right now, so a thread can say
+ * "Last seen 5 min ago". Online people are left out on purpose: their stamp moves
+ * on every probe, and re-pushing it every 30 s would be pure churn. */
+const presenceSeenSnapshot = (s: ReturnType<typeof st>, online: Record<string, boolean>) => {
+  const out: Record<string, number> = {}
+  const groups = personGroups(s.friends, s.myDevice?.account_pub)
+  for (const f of s.friends) {
+    const owner = groups[f.id] ?? f.id
+    if (online[owner]) continue
+    const seen = friendPresence(f.name, s.friendSeen, s.folderStatuses).lastSeen
+    if (seen != null && seen > (out[owner] ?? 0)) out[owner] = seen
+  }
+  return out
+}
+/** Every friend record that speaks for this person: the thread owner + their grouped devices. */
+const personDevices = (id: string) => {
+  const s = st()
+  const groups = personGroups(s.friends, s.myDevice?.account_pub)
+  return s.friends.filter(f => f.id === id || groups[f.id] === id).map(f => f.id)
+}
 const presenceOf = (name: string) => friendOnlineState(name, st().friendSeen, st().folderStatuses) === true
 const locationSnapshot = () => nativeLocationRows(st().friends, { presence: f => presenceOf(f.name), results: locationResults, shared, checking: locationChecking, now: Date.now() })
 // Tauri command errors arrive as plain strings; the engine already words them
@@ -492,6 +524,7 @@ async function start() {
       useStore.setState({ windowFocused: nativeFocused })
       return
     }
+    const presence = presenceSnapshot(s)
     const snapshots = {
       friends: friendSnapshot(s.friends, s.myDevice?.account_pub),
       transfers: nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
@@ -510,7 +543,8 @@ async function start() {
       chatTyping: s.chatTyping,
       thread: nativeThread(s.activeChatId, s.chats),
       chatDraftFiles: s.chatDraftFiles,
-      presence: presenceSnapshot(s),
+      presence,
+      presenceSeen: presenceSeenSnapshot(s, presence),
       myDevice: deviceSnapshot(),
       folders: folderSnapshot(),
       blocked: s.blocked,
