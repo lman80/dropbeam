@@ -121,10 +121,9 @@ enum PushRegistration {
         if !class_respondsToSelector(cls, didFail) {
             class_addMethod(cls, didFail, imp_implementationWithBlock(fail), "v@:@@")
         }
-        // UIKit caches which optional delegate methods exist when the delegate is
-        // set; re-assign it so the new ones are seen.
-        let app = UIApplication.shared
-        app.delegate = nil
-        app.delegate = delegate
+        // Do NOT re-assign UIApplication.delegate here: UIKit checks
+        // respondsToSelector when it delivers the token, and nil-then-reassign
+        // released the launch delegate → dangling pointer → crashes in UIKit
+        // (objc_retain / respondsToSelector on a freed delegate) seconds later.
     }
 }
