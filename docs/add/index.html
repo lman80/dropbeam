@@ -1,0 +1,54 @@
+<!doctype html>
+<!--
+  DropBeam invite link page — NOT LIVE YET.
+  To publish: GitHub → lman80/dropbeam → Settings → Pages → Deploy from branch `main`, folder `/docs`.
+  It is then https://lman80.github.io/dropbeam/add/#dropbeam:… and the iOS app can include it in
+  shared invites (set InviteText.webPage in UI/Invite.swift).
+  Privacy: the code rides in the #fragment, which browsers never send to the server. No scripts
+  load from anywhere else; nothing is logged or stored.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Add me on DropBeam</title>
+<style>
+  :root { font-family: -apple-system, system-ui, sans-serif; color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: Canvas; color: CanvasText; }
+  main { max-width: 420px; padding: 32px 24px; text-align: center; }
+  h1 { font-size: 28px; margin: 0 0 8px; }
+  p { color: GrayText; line-height: 1.45; margin: 0 0 18px; }
+  a.button, button { display: block; width: 100%; box-sizing: border-box; padding: 15px; border-radius: 14px; border: 0;
+    font: 600 17px -apple-system, system-ui, sans-serif; text-decoration: none; margin: 10px 0; cursor: pointer; }
+  a.button { background: #5b5bf0; color: #fff; }
+  button { background: rgba(127,127,127,.16); color: inherit; }
+  code { display: block; word-break: break-all; font-size: 12px; color: GrayText; margin-top: 18px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Add me on DropBeam</h1>
+  <p>DropBeam sends photos and files straight between devices — no server in between. Open the invite in the app to add your friend.</p>
+  <a class="button" id="open" href="#">Open in DropBeam</a>
+  <button id="copy" type="button">Copy Invite</button>
+  <p id="hint">No DropBeam yet? Install it, then come back and tap Open — or copy the invite and paste it under Add Friend.</p>
+  <code id="code"></code>
+</main>
+<script>
+  // The code is everything after '#': "dropbeam:<payload>" (a bare payload also works).
+  const raw = decodeURIComponent(location.hash.slice(1)).trim()
+  const code = /^dropbeam:/i.test(raw) ? raw : raw ? 'dropbeam:' + raw : ''
+  const valid = /^dropbeam:[A-Za-z0-9_-]{8,}$/i.test(code)
+  let name = ''
+  try { const bin = atob(code.slice(9).replace(/-/g, '+').replace(/_/g, '/')); name = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)))).name || '' } catch {}
+  if (name) document.getElementById('title').textContent = 'Add ' + name + ' on DropBeam'
+  document.getElementById('code').textContent = valid ? code : 'This invite link is incomplete. Ask for a new one.'
+  const open = document.getElementById('open')
+  if (valid) { open.href = code; setTimeout(() => { location.href = code }, 300) } else open.style.display = 'none'
+  document.getElementById('copy').onclick = async () => {
+    try { await navigator.clipboard.writeText(code); document.getElementById('copy').textContent = 'Copied' } catch {}
+  }
+</script>
+</body>
+</html>

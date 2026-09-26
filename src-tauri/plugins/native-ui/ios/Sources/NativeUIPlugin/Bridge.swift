@@ -54,6 +54,12 @@ final class Bridge: ObservableObject {
     @Published var presence: [String: Bool] = [:]
     @Published var selectedTab = "send"
     @Published var errorMessage: String?
+    /// A `dropbeam:` link the app was opened with (invite link, Camera-scanned QR).
+    @Published var incomingLink: IncomingLink?
+    /// First-run setup is showing (persisted, so a relaunch mid-setup resumes it).
+    @Published var onboarding = UserDefaults.standard.bool(forKey: "dropbeam.onboarding.pending") {
+        didSet { UserDefaults.standard.set(onboarding, forKey: "dropbeam.onboarding.pending") }
+    }
     weak var webview: WKWebView?
     private var nextID = 0
     private struct Pending {
@@ -123,7 +129,11 @@ final class Bridge: ObservableObject {
         switch key {
         case "history": history = try decoder.decode(LossyArray<HistoryEntry>.self, from: data).values
         case "locations": locations = try decoder.decode(LossyArray<FriendLocations>.self, from: data).values
-        case "needsName": needsName = try decoder.decode(Bool.self, from: data)
+        case "needsName":
+            needsName = try decoder.decode(Bool.self, from: data)
+            // Only a brand-new install is asked its name: that starts first-run setup,
+            // which then stays up (name saved or not) until the user finishes it.
+            if needsName && !onboarding { onboarding = true }
         case "pendingSend": pendingSend = try decoder.decode(LossyArray<String>.self, from: data).values
         case "friends": friends = try decoder.decode(LossyArray<Friend>.self, from: data).values
         case "myDevice": myDevice = try decoder.decode(MyDevice?.self, from: data)
@@ -152,6 +162,7 @@ final class Bridge: ObservableObject {
         if name == "view", let tab = object["name"] as? String,
            ["send", "friends", "chat", "history", "settings"].contains(tab) { selectedTab = tab }
         if name == "error" { errorMessage = object["message"] as? String }
+        if name == "openURL", let url = object["url"] as? String { incomingLink = IncomingLink(value: url) }
         if name == "received://files", let paths = object["paths"] as? [String] {
             ReceivedMediaSaver.shared.received(paths: paths, chat: object["chat"] as? Bool ?? false)
         }
@@ -311,4 +322,9 @@ final class Bridge: ObservableObject {
     }
     func updateSettings(patch: [String: Any]) async throws { try await action("updateSettings", ["patch": patch]) }
     func respondToOffer(id: String, accept: Bool) async throws { try await action("respondToOffer", ["id": id, "accept": accept]) }
+}
+
+struct IncomingLink: Identifiable, Equatable {
+    let id = UUID()
+    let value: String
 }

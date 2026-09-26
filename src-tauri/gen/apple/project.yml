@@ -60,6 +60,11 @@ targets:
         NSLocalNetworkUsageDescription: DropBeam looks for your devices and friends on this network so files go straight between them at full speed, without the internet.
         NSBonjourServices:
           - _irohv1._udp
+        # Friend codes are `dropbeam:<payload>` — registering the scheme makes an
+        # invite link or a friend's QR scanned with the Camera app open DropBeam.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.ashtonmiller.dropbeam.invite
+            CFBundleURLSchemes: [dropbeam]
         NSCameraUsageDescription: DropBeam uses the camera only to scan QR codes for adding friends, linking your devices and joining shared folders.
         NSPhotoLibraryAddUsageDescription: DropBeam saves photos and videos you choose to keep to your photo library.
         # Received files land in the app's Documents dir; these two make that

@@ -152,6 +152,17 @@ fn file_from_args(argv: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// `dropbeam:` links the app was opened with (iOS: tapping an invite link or
+/// scanning a friend's QR with the Camera app). Kept until the UI takes them, so
+/// a cold launch — before the web view listens — loses nothing.
+static OPEN_URLS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Returns (and clears) the links the app was opened with.
+#[tauri::command]
+fn take_open_urls() -> Vec<String> {
+    std::mem::take(&mut *OPEN_URLS.lock().unwrap())
+}
+
 /// The UI calls this on launch to pick up a file the app was opened to send
 /// (cold start via the Windows right-click menu). Returns it and clears it.
 #[tauri::command]
@@ -588,7 +599,9 @@ pub fn run() {
                 // `application:didFinishLaunching:`, so the run loop isn't pumping
                 // yet: calling them here deadlocks the app forever (webview never
                 // paints — a black screen). Do it off-thread once the loop is up.
-                #[cfg(mobile)]
+                // (iOS asks from the native onboarding instead — at the moment
+                // it's explained, never stacked on the Local Network prompt.)
+                #[cfg(all(mobile, not(target_os = "ios")))]
                 {
                     let h = app.handle().clone();
                     std::thread::spawn(move || {
@@ -891,11 +904,23 @@ pub fn run() {
             traydrag_debug,
             frontend_log,
             take_launch_file,
+            take_open_urls,
             set_popover_rows,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DropBeam")
         .run(|_app, _event| {
+            // A `dropbeam:` link (invite link, Camera-scanned friend QR): queue it
+            // for the UI and tell a running one right away.
+            #[cfg(target_os = "ios")]
+            if let tauri::RunEvent::Opened { urls } = &_event {
+                let links: Vec<String> = urls.iter().map(|u| u.to_string())
+                    .filter(|u| u.to_ascii_lowercase().starts_with("dropbeam")).collect();
+                if !links.is_empty() {
+                    OPEN_URLS.lock().unwrap().extend(links);
+                    let _ = tauri::Emitter::emit(_app, "open-url://incoming", ());
+                }
+            }
             // macOS: clicking the Dock icon (or otherwise re-opening the app) when
             // the main window is hidden/minimized should bring it back. Without
             // this the window "disappears" after it's been hidden to the tray.

@@ -26,7 +26,7 @@ struct FriendsView: View {
                     Section {
                         NavigationLink { LocationsView() } label: { RowLabel(title: "Locations", symbol: "externaldrive.fill", color: .teal) }
                         NavigationLink { SharedFoldersView() } label: { RowLabel(title: "Shared Folders", symbol: "folder.fill.badge.person.crop", color: .blue) }
-                        Button { showingCode = true; Haptics.tap() } label: { RowLabel(title: "My Code", symbol: "qrcode", color: .beam) }
+                        Button { showingCode = true; Haptics.tap() } label: { RowLabel(title: "Invite Friends", symbol: "qrcode", color: .beam) }
                             .buttonStyle(.plain)
                     }
                 }
@@ -62,7 +62,7 @@ struct FriendsView: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button("Add Friend", systemImage: "person.badge.plus") { adding = true }
-                    Button("Show My Code", systemImage: "qrcode") { showingCode = true }
+                    Button("Share My Invite", systemImage: "qrcode") { showingCode = true }
                     Button("Join Shared Folder", systemImage: "folder.badge.plus") { folderScan = true }
                 } label: { Image(systemName: "plus") }.accessibilityLabel("Add friend or folder")
             } }
@@ -74,6 +74,13 @@ struct FriendsView: View {
                 }
             }
             .sheet(isPresented: $adding) { AddFriendSheet().environmentObject(bridge) }
+            #if targetEnvironment(simulator)
+            // QA: `-openAddFriend` / `-openInvite` (with `-openTab friends`).
+            .onAppear {
+                if CommandLine.arguments.contains("-openAddFriend") { adding = true }
+                if CommandLine.arguments.contains("-openInvite") { showingCode = true }
+            }
+            #endif
             .sheet(isPresented: $showingCode) { MyCodeSheet().environmentObject(bridge) }
             .confirmationDialog(removing.map { "Remove \($0.displayName)?" } ?? "", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { friend in
                 Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", role: .destructive) {
@@ -140,17 +147,6 @@ private extension View {
     }
 }
 
-struct AddFriendSheet: View {
-    @EnvironmentObject private var bridge: Bridge
-    var body: some View {
-        QRScannerSheet(title: "Add Friend", hint: "Scan the QR code on your friend’s Profile, or paste the code they sent you.") { code in
-            if Bridge.isLinkCode(code) { let r = try await bridge.linkWithScannedCode(code); bridge.showToast("Linked with \(r.name ?? "your device")") }
-            else if code.lowercased().hasPrefix("dropbeamf1:") { try await bridge.acceptFriend(code: code) }
-            else { try await bridge.addFriendByCode(code: code) }
-        }
-    }
-}
-
 /// Your own code as a sheet (from Friends → +), so a friend can scan it right away.
 struct MyCodeSheet: View {
     @EnvironmentObject private var bridge: Bridge
@@ -159,7 +155,7 @@ struct MyCodeSheet: View {
         NavigationStack {
             List { MyCodeSection() }
                 .beamList()
-                .navigationTitle("My Code").navigationBarTitleDisplayMode(.inline)
+                .navigationTitle("Invite Friends").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }.presentationDetents([.large]).tint(.beam)
     }

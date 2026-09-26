@@ -2,6 +2,7 @@ import SwiftUI
 import VisionKit
 import Vision
 import AVFoundation
+import PhotosUI
 
 struct QRScannerSheet: View {
     @Environment(\.dismiss) private var dismiss
@@ -17,6 +18,7 @@ struct QRScannerSheet: View {
     @State private var cameraAllowed = false
     @State private var cameraDenied = false
     @State private var scannerError: String?
+    @State private var photo: PhotosPickerItem?
     @FocusState private var fieldFocused: Bool
     private var scannerReady: Bool { cameraAllowed && DataScannerViewController.isSupported && DataScannerViewController.isAvailable && scannerError == nil }
     var body: some View {
@@ -64,6 +66,10 @@ struct QRScannerSheet: View {
                         Label(error, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(.red)
                             .frame(maxWidth: .infinity, alignment: .leading).accessibilityAddTraits(.updatesFrequently)
                     }
+                    // A QR saved as a screenshot or sent as a picture (invite cards).
+                    PhotosPicker(selection: $photo, matching: .images, photoLibrary: .shared()) {
+                        Label("Scan from Photo", systemImage: "photo.on.rectangle").frame(maxWidth: .infinity, minHeight: 32)
+                    }.beamButton().disabled(busy)
                     if scannerReady {
                         Button(paste ? "Scan a QR Code Instead" : "Enter Code Instead") { paste.toggle(); error = nil; Haptics.tap(); if paste { fieldFocused = true } }
                             .font(.subheadline.weight(.semibold))
@@ -71,6 +77,17 @@ struct QRScannerSheet: View {
                 }.padding(20)
             }
             .scrollDismissesKeyboard(.interactively)
+            .onChange(of: photo) { _, item in
+                guard let item else { return }
+                Task {
+                    defer { photo = nil }
+                    do {
+                        guard let data = try await item.loadTransferable(type: Data.self) else { throw QRPhotoReader.Failure.unreadable }
+                        code = try await QRPhotoReader.codes(in: data)[0]; error = nil; Haptics.success()
+                        if autoSubmit { connect() } else { paste = true }
+                    } catch { self.error = error.localizedDescription; Haptics.warning() }
+                }
+            }
             .navigationTitle(title).navigationBarTitleDisplayMode(.inline).beamCanvas()
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(busy) } }
             .task {
@@ -103,7 +120,7 @@ struct QRScannerSheet: View {
         }
     }
 }
-private struct QRScanner: UIViewControllerRepresentable {
+struct QRScanner: UIViewControllerRepresentable {
     let recognized: (String) -> Void
     let failure: (String) -> Void
     func makeCoordinator() -> Coordinator { Coordinator(recognized, failure) }
@@ -204,53 +221,6 @@ struct SendToSheet: View {
                 bridge.pickedToSend = []; bridge.pendingSend = []; Haptics.success(); dismiss()
             } catch { self.error = error.localizedDescription; Haptics.warning() }
         }
-    }
-}
-
-struct OnboardingSheet: View {
-    @EnvironmentObject private var bridge: Bridge
-    @State private var name = ""
-    @State private var busy = false
-    @State private var error: String?
-    @State private var joining = false
-    @FocusState private var focused: Bool
-    private var valid: Bool { !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    var body: some View {
-        ScrollView {
-            VStack(spacing: 28) {
-                VStack(spacing: 16) {
-                    AppIconImage(size: 92)
-                    Text("Welcome to DropBeam").font(.largeTitle.bold()).multilineTextAlignment(.center)
-                    Text("Send photos and files straight to friends and your own devices. Private and end-to-end encrypted.")
-                        .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                }.padding(.top, 40)
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Your Name").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
-                    TextField("Your name", text: $name).textContentType(.name).textInputAutocapitalization(.words)
-                        .submitLabel(.continue).onSubmit(save).focused($focused)
-                        .padding(.horizontal, 14).frame(minHeight: 50)
-                        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    Text("Friends see this when you send files and chat.").font(.footnote).foregroundStyle(.secondary)
-                }
-                if let error { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.subheadline) }
-                Button(action: save) { Text(busy ? "Saving…" : "Continue").font(.headline).frame(maxWidth: .infinity) }
-                    .beamButton(prominent: true).controlSize(.extraLarge).disabled(busy || !valid)
-                VStack(spacing: 8) {
-                    Text("Already use DropBeam on another device?").font(.subheadline).foregroundStyle(.secondary)
-                    Button { joining = true; Haptics.tap() } label: { Label("Link to Your Account", systemImage: "qrcode.viewfinder") }
-                        .font(.subheadline.weight(.semibold))
-                }.padding(.top, 4)
-            }.padding(24).frame(maxWidth: 520).frame(maxWidth: .infinity)
-        }
-        .scrollDismissesKeyboard(.interactively)
-        .beamCanvas().tint(.beam).interactiveDismissDisabled()
-        .onAppear { name = bridge.settings?.displayName ?? "" }
-        .sheet(isPresented: $joining) { JoinAccountSheet() }
-    }
-    private func save() {
-        guard valid, !busy else { return }
-        busy = true; focused = false
-        Task { defer { busy = false }; do { try await bridge.action("setDisplayName", ["name": name]); Haptics.success(); bridge.needsName = false } catch { self.error = error.localizedDescription } }
     }
 }
 

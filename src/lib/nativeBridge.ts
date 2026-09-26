@@ -15,7 +15,7 @@ import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRi
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
 import { ownDeviceLabels, personGroups } from './deviceIcons'
-import { routeCode } from './codes'
+import { routeCode, parseCode, friendCodeName } from './codes'
 import { nativeFolders, folderLinks } from './nativeFolders'
 import { linkedDetail, linkedTitle } from './deviceLink'
 import { linkWithCode } from '../components/LinkDeviceModal'
@@ -65,8 +65,9 @@ const handlers: BridgeHandlers = {
     const route = routeCode(string(a, 'code'))
     switch (route.action) {
       case 'receive': await handlers.receiveWithCode({ code: route.code }); return { kind: 'receive' }
-      case 'addFriend': await handlers.addFriendByCode({ code: route.code }); return { kind: 'friend' }
-      case 'acceptFriendInvite': await handlers.acceptFriend({ code: route.code }); return { kind: 'friend' }
+      // The new friend's id rides back so Swift can show "Waiting for Alex…" → "Connected".
+      case 'addFriend': { const f = await api.addFriendByCode(route.code); await st().reloadFriends(); return { kind: 'friend', friendId: f.id, name: f.name, code: route.code } }
+      case 'acceptFriendInvite': { const f = await api.acceptFriend(route.code); await st().reloadFriends(); return { kind: 'friend', friendId: f.id, name: f.name } }
       case 'acceptFolderInvite': return { kind: 'folderInvite', code: route.code }
       case 'linkDevice': {
         const r = /^dropbeamjoin1:/i.test(route.code) ? await handlers.linkDeviceJoin({ code: route.code }) : await handlers.linkDeviceSend({ code: route.code })
@@ -74,6 +75,12 @@ const handlers: BridgeHandlers = {
       }
       case 'invalid': throw new Error(route.message)
     }
+  },
+  /** What a pasted/scanned/linked text holds, without acting on it: the canonical
+   *  code, its kind and (for a friend code) the name inside — for "Add Alex?". */
+  describeCode: a => {
+    const parsed = parseCode(string(a, 'code'))
+    return parsed ? { kind: parsed.kind, code: parsed.code, name: friendCodeName(parsed.code) } : null
   },
   retryTransfer: a => {
     const t = st().transfers[string(a, 'id')]
@@ -538,6 +545,14 @@ async function start() {
       if (name === 'locations://changed') void refreshLocations(true)
     })) } catch { /* optional event */ }
   }
+  // `dropbeam:` links the app was opened with (invite links, Camera-scanned QRs):
+  // queued by the engine until taken, so a cold launch loses none.
+  const takeOpenUrls = async () => {
+    const urls = await invoke<string[]>('take_open_urls').catch(() => [] as string[])
+    for (const url of urls) send('event', { name: 'openURL', payload: { url } })
+  }
+  try { stops.push(await listen('open-url://incoming', () => { void takeOpenUrls() })) } catch { /* optional event */ }
+  void takeOpenUrls()
   for (const name of ['friends://changed', 'account://synced', 'link://linked']) {
     try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
   }
