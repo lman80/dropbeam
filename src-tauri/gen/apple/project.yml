@@ -73,6 +73,12 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
     entitlements:
       path: app_iOS/app_iOS.entitlements
+      properties:
+        # Shared with the share extension (ShareJobs/, share-recipients.json).
+        com.apple.security.application-groups: [group.com.ashtonmiller.dropbeam]
+        # Transfer Server push — off until the App ID has Push Notifications
+        # enabled (docs/PUSH-SETUP.md; scripts/enable-push.sh flips this line).
+        # aps-environment: production
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full
@@ -89,6 +95,8 @@ targets:
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
       groups: [app]
     dependencies:
+      # Opens sealed Transfer Server notification previews (DropBeamNotify below).
+      - target: DropBeamNotify
       - framework: libapp.a
         embed: false
       - sdk: CoreGraphics.framework
@@ -111,3 +119,45 @@ targets:
         outputFiles:
           - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
+  # Notification Service Extension: turns a Transfer Server push ("New message")
+  # into "Ashton — running late" by opening the sealed preview on the phone.
+  DropBeamNotify:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: DropBeamNotify
+    info:
+      path: DropBeamNotify/Info.plist
+      properties:
+        CFBundleDisplayName: DropBeam
+        CFBundleShortVersionString: "0.0.0"
+        CFBundleVersion: "0"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    entitlements:
+      path: DropBeamNotify/DropBeamNotify.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.ashtonmiller.dropbeam]
+    settings:
+      base:
+        PRODUCT_NAME: DropBeamNotify
+        PRODUCT_BUNDLE_IDENTIFIER: com.ashtonmiller.dropbeam.notify
+        DEVELOPMENT_TEAM: R2RDA8476R
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        ARCHS: [arm64]
+        EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    postBuildScripts:
+      # Extension versions must match the app's (tauri rewrites the app plist each build).
+      - name: Match App Version
+        basedOnDependencyAnalysis: false
+        script: |
+          APP_PLIST="${SRCROOT}/app_iOS/Info.plist"
+          OUT="${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
+          for KEY in CFBundleShortVersionString CFBundleVersion; do
+            VALUE=$(/usr/libexec/PlistBuddy -c "Print :$KEY" "$APP_PLIST")
+            /usr/libexec/PlistBuddy -c "Set :$KEY $VALUE" "$OUT"
+          done

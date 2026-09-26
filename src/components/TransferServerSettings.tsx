@@ -7,7 +7,7 @@ import { Check, FolderOpen, HardDrive, Monitor, Server } from 'lucide-react'
 import { api, locationsApi, type MountCandidate } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { folderLabel } from '../lib/humanize'
-import { IS_MAC, IS_WINDOWS } from '../lib/platform'
+import { IS_LINUX, IS_MAC, IS_WINDOWS } from '../lib/platform'
 import {
   ACCESS_LABEL, expiresIn, heldFor, onServerChanged, onServersChanged, serverApi,
   type DeviceCheck, type ServerAccess, type ServerConfig, type ServerStatus, type UsableServer,
@@ -294,6 +294,8 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
   const [edit, setEdit] = useState<'storage' | 'people' | null>(null)
   const [confirm, setConfirm] = useState<'wipe' | 'off' | { remove: string; name: string } | null>(null)
   const [alsoDelete, setAlsoDelete] = useState(false)
+  const [port, setPort] = useState(c.udpPort ? String(c.udpPort) : '')
+  const [portChanged, setPortChanged] = useState(false)
   const [name, setName] = useState(c.name)
   const [shownName, setShownName] = useState(c.name)
   if (shownName !== c.name) { setShownName(c.name); setName(c.name) }
@@ -341,6 +343,31 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
         <Row title="Accept new things" sub={c.paused ? 'Paused — what’s already here still gets delivered.' : undefined}>
           <Toggle label="Accept new things" on={!c.paused} onChange={(v) => void patch({ paused: !v })} />
         </Row>
+      </div>
+
+      <SectionHeader>Advanced</SectionHeader>
+      <div className="group">
+        <Row title="Network port"
+          sub={portChanged ? 'Restart DropBeam to use it.' : 'Optional. Forward this UDP port on your router so friends connect straight to this computer.'}>
+          <input className="input set-field" style={{ width: 110 }} aria-label="UDP port" inputMode="numeric" placeholder="Automatic"
+            value={port} onChange={(e) => setPort(e.target.value.replace(/\D/g, '').slice(0, 5))}
+            onBlur={() => {
+              const n = port ? Number(port) : 0
+              if (n === (c.udpPort || 0)) return
+              if (n !== 0 && (n < 1024 || n > 65535)) { toast('error', 'Pick a port from 1024 to 65535.'); setPort(c.udpPort ? String(c.udpPort) : ''); return }
+              void patch({ udpPort: n }).then(() => setPortChanged(true))
+            }}
+            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }} />
+        </Row>
+        {IS_LINUX && (
+          <Row title="Keep running when no one is logged in" sub="Runs the server in the background after a restart. The app takes over whenever it’s open.">
+            <button className="btn btn-secondary btn-sm" onClick={() => {
+              void navigator.clipboard.writeText('sudo systemctl enable --now dropbeam-server@$USER')
+                .then(() => toast('success', 'Copied — paste it into Terminal'))
+                .catch(() => toast('error', 'Couldn’t copy'))
+            }}>Copy Command</button>
+          </Row>
+        )}
       </div>
 
       <SectionHeader count={members.length + 1}>People</SectionHeader>

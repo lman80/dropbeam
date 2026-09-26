@@ -81,7 +81,12 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["**", "/**", "$HOME/**", "$APPCONFIG/**"]
+        "scope": [
+          "**",
+          "/**",
+          "$HOME/**",
+          "$APPCONFIG/**"
+        ]
       }
     }
   },
@@ -114,6 +119,13 @@
     "windows": {
       "nsis": {
         "installerHooks": "windows/hooks.nsh"
+      }
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/lib/systemd/system/dropbeam-server@.service": "linux/dropbeam-server@.service"
+        }
       }
     }
   },

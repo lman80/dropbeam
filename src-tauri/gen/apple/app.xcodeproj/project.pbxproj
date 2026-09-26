@@ -16,25 +16,59 @@
 		53CDD0ACFBE8BDF1550B2E53 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 682535EEFE1DA20BE07B123C /* main.mm */; };
 		5C516481BCA83A182C2BCC94 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 3842AE2A64FB9933D0400EA4 /* assets */; };
 		618672DC8A5E0605441C9935 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0E2B15F176E4B041AE33EEEA /* UIKit.framework */; };
+		7F587B89720397AD2197FB48 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FAB36C1E3E83FA445B8336C /* NotificationService.swift */; };
 		836D84C5F07860664DAF79C8 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D8F57162F5CC7AEDD55F173D /* WebKit.framework */; };
+		99F476D6F7428591BC5A4C3B /* DropBeamNotify.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 8E21FB3B303456C0B991C640 /* DropBeamNotify.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		9D59FB167BB4E699DA17D1E9 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 04B56F58E2E44DDE1D67E7B7 /* MetalKit.framework */; };
 		C6BD59C055C986EA4A77FDA2 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AF1DE57E7D9CF13BB2E0E038 /* Assets.xcassets */; };
 		C869023DDFE275D42F3FBF29 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 39EEC6A55698228E08917A52 /* libapp.a */; };
 		E68F6CFDAED6503ABB4044A5 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CE1209BFDECB28E00189B168 /* Metal.framework */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		35E1D11BABAC5756B8D98C47 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A9B1B09F1872768368ACECE2 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 50E9B1AD44C6962B74F80E6B;
+			remoteInfo = DropBeamNotify;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		84895F3D2512B6F87AA9E1B3 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				99F476D6F7428591BC5A4C3B /* DropBeamNotify.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		007E478DB8BC37A788C4730F /* app_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = app_iOS.entitlements; sourceTree = "<group>"; };
+		01DDCEBA87FB2BDBA083B448 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		02B7F8347F94B067E6B27396 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		0330CABA9D6841D3D754058E /* models.rs */ = {isa = PBXFileReference; path = models.rs; sourceTree = "<group>"; };
 		04B56F58E2E44DDE1D67E7B7 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		04EA5A634F74FF864343F3DE /* client.rs */ = {isa = PBXFileReference; path = client.rs; sourceTree = "<group>"; };
 		09EA68E21FDCEDB93DEE503F /* commands.rs */ = {isa = PBXFileReference; path = commands.rs; sourceTree = "<group>"; };
+		0B80636D5952878DDA9F59D7 /* cmds.rs */ = {isa = PBXFileReference; path = cmds.rs; sourceTree = "<group>"; };
+		0C77CE95A74F4D5E856E33A8 /* tests.rs */ = {isa = PBXFileReference; path = tests.rs; sourceTree = "<group>"; };
 		0E2B15F176E4B041AE33EEEA /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		0F1ABED75399A7A71943E70F /* block.rs */ = {isa = PBXFileReference; path = block.rs; sourceTree = "<group>"; };
 		107FF36667095FB22C84919B /* settings.rs */ = {isa = PBXFileReference; path = settings.rs; sourceTree = "<group>"; };
+		108E4CE92E55D87F9FBA235A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		10F698534D65B4A05EE9BFFE /* server.rs */ = {isa = PBXFileReference; path = server.rs; sourceTree = "<group>"; };
 		1631E4CFBB715FFDBF919C8C /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
 		17B52554D60D361AFE791C3E /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
 		184AB4C19C7460DAD0FC0813 /* pairing.rs */ = {isa = PBXFileReference; path = pairing.rs; sourceTree = "<group>"; };
 		18E427AA93C101F0F7758606 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		19E87E5E8C84139A619353FD /* account.rs */ = {isa = PBXFileReference; path = account.rs; sourceTree = "<group>"; };
 		1E81BD6B453D87B7F7B1597B /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		20476284DA7E942073FD3F1F /* friends.rs */ = {isa = PBXFileReference; path = friends.rs; sourceTree = "<group>"; };
 		252D255E1AC93C05FC5F377B /* ios_media.rs */ = {isa = PBXFileReference; path = ios_media.rs; sourceTree = "<group>"; };
@@ -43,10 +77,12 @@
 		2C5E95A83E7CC0EC8C2DE28F /* folder_history.rs */ = {isa = PBXFileReference; path = folder_history.rs; sourceTree = "<group>"; };
 		2F2F58DB8D18AE5642AF94D1 /* location_sync.rs */ = {isa = PBXFileReference; path = location_sync.rs; sourceTree = "<group>"; };
 		306B9C1792E7B1C53FA262A6 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		31B6C4016A618427BAD16CCA /* keys.rs */ = {isa = PBXFileReference; path = keys.rs; sourceTree = "<group>"; };
 		3842AE2A64FB9933D0400EA4 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
 		39EEC6A55698228E08917A52 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		39F196D577817579BAFA9AB5 /* labkit.rs */ = {isa = PBXFileReference; path = labkit.rs; sourceTree = "<group>"; };
 		3BE9337AAC6F7B4835C5A46D /* link.rs */ = {isa = PBXFileReference; path = link.rs; sourceTree = "<group>"; };
+		3FAB36C1E3E83FA445B8336C /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		4DDC17AC7FD6E2D6EAF940E6 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
 		4ED84DFEA2768BB78E03A21F /* lab.rs */ = {isa = PBXFileReference; path = lab.rs; sourceTree = "<group>"; };
 		5050E57A3F0E6DBA22C77BF1 /* tray_drag.rs */ = {isa = PBXFileReference; path = tray_drag.rs; sourceTree = "<group>"; };
@@ -57,17 +93,25 @@
 		5743D244DBAE0672D3FD61AA /* telemetry.rs */ = {isa = PBXFileReference; path = telemetry.rs; sourceTree = "<group>"; };
 		5ED0858E7B0B72533F19F5D4 /* chat.rs */ = {isa = PBXFileReference; path = chat.rs; sourceTree = "<group>"; };
 		682535EEFE1DA20BE07B123C /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		724908FF34F1FB6C7AF3B448 /* ios_log_policy.rs */ = {isa = PBXFileReference; path = ios_log_policy.rs; sourceTree = "<group>"; };
 		7BAFC636FC98BC527E8F5EA3 /* iroh_net.rs */ = {isa = PBXFileReference; path = iroh_net.rs; sourceTree = "<group>"; };
+		7C7B85EAC182832757119BCF /* automation.rs */ = {isa = PBXFileReference; path = automation.rs; sourceTree = "<group>"; };
 		7C8EE44E6025F78B4DFE3F20 /* mac_service.rs */ = {isa = PBXFileReference; path = mac_service.rs; sourceTree = "<group>"; };
 		81E326B61ED92E1D1EECF952 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		8E21FB3B303456C0B991C640 /* DropBeamNotify.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = DropBeamNotify.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		9F1A1F3A757B8E63FA1AC808 /* locations.rs */ = {isa = PBXFileReference; path = locations.rs; sourceTree = "<group>"; };
 		9FACFFCB6E3743955F72464C /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		ADA9EA23DD2A5F3A86EA7E32 /* seal.rs */ = {isa = PBXFileReference; path = seal.rs; sourceTree = "<group>"; };
+		AE75ADFDB545D045E7AB4F9A /* push.rs */ = {isa = PBXFileReference; path = push.rs; sourceTree = "<group>"; };
 		AF1DE57E7D9CF13BB2E0E038 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B59A2B453573A903AF6AD513 /* DropBeamNotify.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = DropBeamNotify.entitlements; sourceTree = "<group>"; };
+		C1811E76DF08C46F869A0DDA /* headless.rs */ = {isa = PBXFileReference; path = headless.rs; sourceTree = "<group>"; };
 		C1E10C9C8643C83CCED7DECB /* provenance.rs */ = {isa = PBXFileReference; path = provenance.rs; sourceTree = "<group>"; };
 		CE1209BFDECB28E00189B168 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		CF674524E34966183631754E /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		D047DEEBAEDBFEFD1943D4CF /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		D2348891FAF8D197F581661E /* panic_log.rs */ = {isa = PBXFileReference; path = panic_log.rs; sourceTree = "<group>"; };
+		D65DF30A6DBF332F047DC5A1 /* xfer_matrix.rs */ = {isa = PBXFileReference; path = xfer_matrix.rs; sourceTree = "<group>"; };
 		D8F57162F5CC7AEDD55F173D /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		DBED1943226884A3717085D4 /* file_protocol.rs */ = {isa = PBXFileReference; path = file_protocol.rs; sourceTree = "<group>"; };
 		E6F6E50253F0B02FF2409477 /* receive_stage.rs */ = {isa = PBXFileReference; path = receive_stage.rs; sourceTree = "<group>"; };
@@ -148,6 +192,31 @@
 			path = debug;
 			sourceTree = "<group>";
 		};
+		677CF3BBAF7E5CB3D61E5320 /* mailbox */ = {
+			isa = PBXGroup;
+			children = (
+				04EA5A634F74FF864343F3DE /* client.rs */,
+				0B80636D5952878DDA9F59D7 /* cmds.rs */,
+				31B6C4016A618427BAD16CCA /* keys.rs */,
+				01DDCEBA87FB2BDBA083B448 /* mod.rs */,
+				AE75ADFDB545D045E7AB4F9A /* push.rs */,
+				ADA9EA23DD2A5F3A86EA7E32 /* seal.rs */,
+				10F698534D65B4A05EE9BFFE /* server.rs */,
+				0C77CE95A74F4D5E856E33A8 /* tests.rs */,
+			);
+			path = mailbox;
+			sourceTree = "<group>";
+		};
+		6EADE64F4F7943EA5CB20742 /* DropBeamNotify */ = {
+			isa = PBXGroup;
+			children = (
+				B59A2B453573A903AF6AD513 /* DropBeamNotify.entitlements */,
+				108E4CE92E55D87F9FBA235A /* Info.plist */,
+				3FAB36C1E3E83FA445B8336C /* NotificationService.swift */,
+			);
+			path = DropBeamNotify;
+			sourceTree = "<group>";
+		};
 		70DD658F1D4B0FED51A79854 /* arm64 */ = {
 			isa = PBXGroup;
 			children = (
@@ -168,6 +237,9 @@
 		855775165ACE55D883F89EB3 /* src */ = {
 			isa = PBXGroup;
 			children = (
+				19E87E5E8C84139A619353FD /* account.rs */,
+				7C7B85EAC182832757119BCF /* automation.rs */,
+				0F1ABED75399A7A71943E70F /* block.rs */,
 				5ED0858E7B0B72533F19F5D4 /* chat.rs */,
 				FBAA48B3DA509BAF6CC39B2B /* codes.rs */,
 				09EA68E21FDCEDB93DEE503F /* commands.rs */,
@@ -176,7 +248,9 @@
 				2C5E95A83E7CC0EC8C2DE28F /* folder_history.rs */,
 				20476284DA7E942073FD3F1F /* friends.rs */,
 				5550EA038F005A9D2E4D6DE8 /* fs_walk.rs */,
+				C1811E76DF08C46F869A0DDA /* headless.rs */,
 				509B84E4384D38209EBF4ABE /* history.rs */,
+				724908FF34F1FB6C7AF3B448 /* ios_log_policy.rs */,
 				2B90FAC625603C0CF676EC62 /* ios_media_format.rs */,
 				252D255E1AC93C05FC5F377B /* ios_media.rs */,
 				7BAFC636FC98BC527E8F5EA3 /* iroh_net.rs */,
@@ -199,6 +273,7 @@
 				5050E57A3F0E6DBA22C77BF1 /* tray_drag.rs */,
 				E9415AC38490CB2A78AC1FE9 /* verify.rs */,
 				DDF0273868336544ABC7B808 /* iroh_net */,
+				677CF3BBAF7E5CB3D61E5320 /* mailbox */,
 			);
 			name = src;
 			path = ../../src;
@@ -211,6 +286,7 @@
 				AF1DE57E7D9CF13BB2E0E038 /* Assets.xcassets */,
 				02B7F8347F94B067E6B27396 /* LaunchScreen.storyboard */,
 				2867E55E70187711EE923EBD /* app_iOS */,
+				6EADE64F4F7943EA5CB20742 /* DropBeamNotify */,
 				BAFB695BB8415511FEC74542 /* Externals */,
 				78CBE3E5873199C0066F12DF /* Sources */,
 				855775165ACE55D883F89EB3 /* src */,
@@ -232,6 +308,7 @@
 			children = (
 				EB2B775C52293A9CDCF80009 /* integrity.rs */,
 				E6F6E50253F0B02FF2409477 /* receive_stage.rs */,
+				D65DF30A6DBF332F047DC5A1 /* xfer_matrix.rs */,
 			);
 			path = iroh_net;
 			sourceTree = "<group>";
@@ -240,6 +317,7 @@
 			isa = PBXGroup;
 			children = (
 				FBC720DFA1D01F55B0A32344 /* app_iOS.app */,
+				8E21FB3B303456C0B991C640 /* DropBeamNotify.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -253,7 +331,7 @@
 			path = app;
 			sourceTree = "<group>";
 		};
-		"TEMP_FCA3943B-35E0-4EF4-8861-EE144A84E9A3" /* x86_64 */ = {
+		"TEMP_683952F8-00D4-4687-AB7B-34CAAC72000C" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -263,6 +341,24 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		50E9B1AD44C6962B74F80E6B /* DropBeamNotify */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D3CE612E8ADD296D517BF818 /* Build configuration list for PBXNativeTarget "DropBeamNotify" */;
+			buildPhases = (
+				B1D4F4D9CE8D89E975C41303 /* Sources */,
+				C5BFE895D244F74311B47744 /* Match App Version */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DropBeamNotify;
+			packageProductDependencies = (
+			);
+			productName = DropBeamNotify;
+			productReference = 8E21FB3B303456C0B991C640 /* DropBeamNotify.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		E86255CB8A1836C0BF0C0E14 /* app_iOS */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = CDCB6DFA1AEBFEE3F608BA27 /* Build configuration list for PBXNativeTarget "app_iOS" */;
@@ -271,10 +367,12 @@
 				81BE6BC5B603407AF570E994 /* Sources */,
 				2FBCB8C3ED193E9C4A9FDB59 /* Resources */,
 				4825CF6C55516D374210C8E1 /* Frameworks */,
+				84895F3D2512B6F87AA9E1B3 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				C0DF0BCA9E6FFF796FD3FCA1 /* PBXTargetDependency */,
 			);
 			name = app_iOS;
 			packageProductDependencies = (
@@ -292,6 +390,9 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
+					50E9B1AD44C6962B74F80E6B = {
+						DevelopmentTeam = R2RDA8476R;
+					};
 					E86255CB8A1836C0BF0C0E14 = {
 						DevelopmentTeam = R2RDA8476R;
 					};
@@ -311,6 +412,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
+				50E9B1AD44C6962B74F80E6B /* DropBeamNotify */,
 				E86255CB8A1836C0BF0C0E14 /* app_iOS */,
 			);
 		};
@@ -331,6 +433,25 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
+		C5BFE895D244F74311B47744 /* Match App Version */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Match App Version";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "APP_PLIST=\"${SRCROOT}/app_iOS/Info.plist\"\nOUT=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nfor KEY in CFBundleShortVersionString CFBundleVersion; do\n  VALUE=$(/usr/libexec/PlistBuddy -c \"Print :$KEY\" \"$APP_PLIST\")\n  /usr/libexec/PlistBuddy -c \"Set :$KEY $VALUE\" \"$OUT\"\ndone\n";
+		};
 		E028F843270D8815FCE2B491 /* Build Rust Code */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
@@ -363,7 +484,23 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B1D4F4D9CE8D89E975C41303 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7F587B89720397AD2197FB48 /* NotificationService.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		C0DF0BCA9E6FFF796FD3FCA1 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 50E9B1AD44C6962B74F80E6B /* DropBeamNotify */;
+			targetProxy = 35E1D11BABAC5756B8D98C47 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		1B9D5B8D34E6E0C88D0207F2 /* release */ = {
@@ -486,6 +623,56 @@
 			};
 			name = debug;
 		};
+		699CBB0E8D9E41FEEBC30BFB /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				ARCHS = (
+					arm64,
+				);
+				CODE_SIGN_ENTITLEMENTS = DropBeamNotify/DropBeamNotify.entitlements;
+				DEVELOPMENT_TEAM = R2RDA8476R;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				INFOPLIST_FILE = DropBeamNotify/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ashtonmiller.dropbeam.notify;
+				PRODUCT_NAME = DropBeamNotify;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = release;
+		};
+		A2E010F29306C0F878940590 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				ARCHS = (
+					arm64,
+				);
+				CODE_SIGN_ENTITLEMENTS = DropBeamNotify/DropBeamNotify.entitlements;
+				DEVELOPMENT_TEAM = R2RDA8476R;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				INFOPLIST_FILE = DropBeamNotify/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ashtonmiller.dropbeam.notify;
+				PRODUCT_NAME = DropBeamNotify;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = debug;
+		};
 		CAA806262C53A2E15E5DB0CA /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -566,6 +753,15 @@
 			buildConfigurations = (
 				4AC19FD47C6011940ACEB467 /* debug */,
 				1B9D5B8D34E6E0C88D0207F2 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		D3CE612E8ADD296D517BF818 /* Build configuration list for PBXNativeTarget "DropBeamNotify" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A2E010F29306C0F878940590 /* debug */,
+				699CBB0E8D9E41FEEBC30BFB /* release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = debug;

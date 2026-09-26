@@ -6,6 +6,8 @@ mod link;
 mod location_sync;
 mod locations;
 mod mailbox;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+mod headless;
 mod chat;
 mod commands;
 #[cfg(target_os = "ios")]
@@ -246,6 +248,12 @@ impl AppState {
             transfers: Mutex::new(HashMap::new()), offers: Mutex::new(HashMap::new()),
             force_quit: AtomicBool::new(false), main_focused: AtomicBool::new(false), active_chat: Mutex::new(None) }
     }
+}
+
+/// `DropBeam --server`: the Transfer Server without a window (see headless.rs).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn run_headless(args: &[String]) {
+    headless::run(args)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -634,6 +642,18 @@ pub fn run() {
             // toggled the old "Direct mode" off must still get a working app.
             let iroh_state = Arc::new(iroh_net::IrohState::default());
             locations::spawn_gc(config_dir.clone());
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            {
+                // One engine per identity: take it over from a background
+                // `DropBeam --server` service if one is running (headless.rs).
+                let (dir, st, handle) = (config_dir.clone(), iroh_state.clone(), app.handle().clone());
+                std::thread::spawn(move || {
+                    let lock = headless::lock_for_app(&dir);
+                    std::mem::forget(lock);
+                    iroh_net::spawn(dir, st, handle);
+                });
+            }
+            #[cfg(any(target_os = "ios", target_os = "android"))]
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
             // Synced folders: a local folder this device keeps copied into a
             // friend's Location. Starts its own reconcile a few seconds in, once

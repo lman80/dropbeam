@@ -626,7 +626,7 @@ pub async fn deposit_chat_on(net: &IrohState, config: &Path, peer_id: &str, kind
     if routes.is_empty() {
         return Err(DepositError::NoRoute);
     }
-    let meta = serde_json::to_vec(frame).map_err(|e| DepositError::Failed(e.to_string()))?;
+    let meta = padded(frame).map_err(|e| DepositError::Failed(e.to_string()))?;
     let mut last = DepositError::Unreachable;
     for route in routes {
         let mut to = std::mem::take(&mut recips);
@@ -669,6 +669,18 @@ pub async fn deposit_chat_on(net: &IrohState, config: &Path, peer_id: &str, kind
         recips = keys::recipients(config, &eids);
     }
     Err(last)
+}
+
+/// A chat frame's bytes, padded to a 512-byte bucket so a server can't tell a
+/// "k" from a paragraph by size. Receivers ignore the `_pad` field.
+fn padded(frame: &Value) -> Result<Vec<u8>> {
+    let mut v = frame.clone();
+    let base = serde_json::to_vec(&v)?.len();
+    let target = (base + 12).div_ceil(512) * 512;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("_pad".into(), json!("x".repeat(target.saturating_sub(base + 10))));
+    }
+    Ok(serde_json::to_vec(&v)?)
 }
 
 /// One file of a file deposit: source path, the name the recipient lands it
@@ -1224,10 +1236,11 @@ async fn receive_one(net: &IrohState, config: &Path, ep: &iroh::Endpoint, conn: 
     if env.item_id != id || !env.stanzas.iter().any(|s| s.eid == me) {
         return Ok(Some((false, "malformed".into())));
     }
-    let Some(my_key) = keys::secret(config) else {
-        anyhow::bail!("mailbox key unavailable right now");
-    };
-    let (fk, meta) = match seal::open(&env, &me, &my_key) {
+    let secrets = keys::all_secrets(config);
+    anyhow::ensure!(!secrets.is_empty(), "mailbox key unavailable right now");
+    let opened = secrets.iter().map(|k| seal::open(&env, &me, k)).find(|r| r.is_ok())
+        .unwrap_or_else(|| seal::open(&env, &me, &secrets[0]));
+    let (fk, meta) = match opened {
         Ok(v) => v,
         Err(e) => {
             log::warn!("mailbox: refused an item that failed verification: {e:#}");
@@ -1634,7 +1647,8 @@ pub fn spawn(net: Arc<IrohState>) {
             }
             let receipts = refresh_status(&net, &config).await;
             crate::iroh_net::apply_receipts(&net, &config, &receipts);
-            if super::push::import_token_file(&config) {
+            let rotated = super::keys::maybe_rotate(&config);
+            if super::push::import_token_file(&config) || rotated {
                 // Friends need our push key to seal previews for us.
                 if let Some(app) = net.app.get() {
                     if let Some(n) = tauri::Manager::try_state::<Arc<IrohState>>(app) {

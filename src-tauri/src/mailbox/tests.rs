@@ -542,3 +542,31 @@ async fn unsending_a_held_message_takes_it_back() {
     assert_eq!(fetch(&w).await, 1);
     assert_eq!(client::unsend_held(&w.a.state, &w.a.config, &m2).await, client::Unsend::Delivered);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_udp_port_is_used() {
+    let port = { let s = std::net::UdpSocket::bind("0.0.0.0:0").unwrap(); s.local_addr().unwrap().port() };
+    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port))).unwrap()
+        .bind().await.unwrap();
+    let bound: Vec<u16> = ep.bound_sockets().iter().map(|a| a.port()).collect();
+    assert!(bound.contains(&port), "{bound:?} should include {port}");
+    ep.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn items_sealed_to_a_rotated_key_still_open() {
+    let w = world("rotate").await;
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "before rotation"), Some(&m)).await.unwrap();
+    // B rotates (key file aged past a month) before fetching.
+    let key = w.b.config.join("mailbox-key.key");
+    let old = std::time::SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
+    std::fs::File::options().write(true).open(&key).unwrap().set_modified(old).unwrap();
+    assert!(keys::maybe_rotate(&w.b.config));
+    assert_eq!(keys::all_secrets(&w.b.config).len(), 2);
+    assert_eq!(fetch(&w).await, 1);
+    let b_thread = crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap().id;
+    assert_eq!(crate::chat::messages(&w.b.config, &b_thread)[0].text, "before rotation");
+}

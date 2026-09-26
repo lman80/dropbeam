@@ -21,6 +21,7 @@ export interface ServerConfig {
   allowed: string[]
   through: string[]
   denied: string[]
+  udpPort: number
 }
 
 export interface PersonUsage { id: string; name: string; own: boolean; items: number; bytes: number; through: boolean }
@@ -87,6 +88,7 @@ let mockCfg: ServerConfig = {
   allowed: [],
   through: ['f6'],
   denied: [],
+  udpPort: 0,
 }
 const mockPeople = (): PersonUsage[] => q.get('server') === 'empty' ? [] : [
   { id: 'own', name: 'You', own: true, items: 3, bytes: 1_200_000_000, through: false },

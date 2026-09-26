@@ -88,6 +88,9 @@ pub struct ServerConfig {
     /// Push relay URL override (empty = the DropBeam relay).
     #[serde(default)]
     pub push_url: String,
+    /// Fixed UDP port for direct connections (0 = automatic). Applies at start.
+    #[serde(default)]
+    pub udp_port: u16,
     #[serde(default)]
     pub created_ms: u64,
 }

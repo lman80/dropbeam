@@ -121,6 +121,7 @@ pub struct ServerPatch {
     pub through: Option<Vec<String>>,
     pub paused: Option<bool>,
     pub enabled: Option<bool>,
+    pub udp_port: Option<u16>,
 }
 
 fn apply_patch(config: &Path, c: &mut server::ServerConfig, p: ServerPatch) -> Result<(), String> {
@@ -167,6 +168,12 @@ fn apply_patch(config: &Path, c: &mut server::ServerConfig, p: ServerPatch) -> R
             c.marker = String::new();
             server::unload(config);
         }
+    }
+    if let Some(port) = p.udp_port {
+        if port != 0 && port < 1024 {
+            return Err("Pick a port from 1024 to 65535.".into());
+        }
+        c.udp_port = port;
     }
     if let Some(e) = p.enabled {
         c.enabled = e;

@@ -26,6 +26,7 @@ class NativeUIPlugin: Plugin {
                 return
             }
             Bridge.shared.webview = webview
+            PushRegistration.start()
             if self.host == nil {
                 let host = UIHostingController(rootView: AnyView(RootView().environmentObject(Bridge.shared)))
                 host.view.backgroundColor = .clear

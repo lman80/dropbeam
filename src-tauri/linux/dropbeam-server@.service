@@ -1,0 +1,19 @@
+# DropBeam Transfer Server, running without a window (for an always-on box that
+# may sit at the login screen). Off until you turn it on:
+#   sudo systemctl enable --now dropbeam-server@$USER
+# The desktop app takes over while it's open and hands back when it quits.
+[Unit]
+Description=DropBeam Transfer Server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/bin/DropBeam --server
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

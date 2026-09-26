@@ -64,6 +64,62 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Monthly rotation: a fresh key limits what a stolen key could open. Old keys
+/// stay (as `mailbox-key.<ms>.old`) for 90 days so items already sealed to them
+/// still open.
+const ROTATE_MS: u64 = 30 * 24 * 3600 * 1000;
+const KEEP_OLD_MS: u64 = 90 * 24 * 3600 * 1000;
+
+fn file_age_ms(path: &Path) -> Option<u64> {
+    let m = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(std::time::SystemTime::now().duration_since(m).ok()?.as_millis() as u64)
+}
+
+/// Rotate the key when it's a month old. True when it rotated (tell friends).
+pub fn maybe_rotate(config: &Path) -> bool {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = key_path(config);
+    let Some(age) = file_age_ms(&path) else { return false };
+    // Drop retired keys past their keep window.
+    for e in std::fs::read_dir(config).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("mailbox-key.") && name.ends_with(".old") && file_age_ms(&e.path()).is_some_and(|a| a > KEEP_OLD_MS) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    if age < ROTATE_MS {
+        return false;
+    }
+    let Ok(old) = std::fs::read(&path) else { return false };
+    let retired = config.join(format!("mailbox-key.{}.old", crate::chat::now_ms()));
+    if write_private_atomic(&retired, &old).is_err() {
+        return false;
+    }
+    let k: [u8; 32] = rand::random();
+    if let Err(e) = write_private_atomic(&path, &k) {
+        log::warn!("mailbox: key rotation failed: {e}");
+        return false;
+    }
+    log::info!("mailbox: rotated the mailbox key");
+    true
+}
+
+/// Every key that may open an item addressed to us: current first.
+pub fn all_secrets(config: &Path) -> Vec<[u8; 32]> {
+    let mut out: Vec<[u8; 32]> = secret(config).into_iter().collect();
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut old: Vec<(std::time::SystemTime, [u8; 32])> = std::fs::read_dir(config).into_iter().flatten().flatten()
+        .filter(|e| { let n = e.file_name().to_string_lossy().into_owned(); n.starts_with("mailbox-key.") && n.ends_with(".old") })
+        .filter_map(|e| {
+            let k = <[u8; 32]>::try_from(std::fs::read(e.path()).ok()?.as_slice()).ok()?;
+            Some((e.metadata().ok()?.modified().ok()?, k))
+        })
+        .collect();
+    old.sort_by(|a, b| b.0.cmp(&a.0));
+    out.extend(old.into_iter().map(|(_, k)| k));
+    out
+}
+
 pub fn public(config: &Path) -> Option<[u8; 32]> {
     secret(config).map(|k| seal::x25519_public(&k))
 }

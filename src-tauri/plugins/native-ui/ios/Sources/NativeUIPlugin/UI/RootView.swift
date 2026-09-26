@@ -128,6 +128,7 @@ private struct RootPresentations: ViewModifier {
                 let center = UNUserNotificationCenter.current()
                 if !settingUp, await center.notificationSettings().authorizationStatus == .notDetermined {
                     _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+                    PushRegistration.permissionGranted()
                 }
             }
     }

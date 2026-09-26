@@ -450,6 +450,7 @@ private struct NotificationsStep: View {
                 busy = true
                 Task {
                     _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
+                    PushRegistration.permissionGranted()
                     busy = false; next()
                 }
             }

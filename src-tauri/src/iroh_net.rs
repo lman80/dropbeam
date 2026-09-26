@@ -2238,6 +2238,17 @@ pub async fn watch_local_subnets() {
 }
 
 pub async fn start(config_dir: &Path) -> Result<Endpoint> {
+    match start_with(config_dir, true).await {
+        Ok(ep) => Ok(ep),
+        // A fixed port that can't be used must never keep DropBeam offline.
+        Err(e) if format!("{e:#}").contains(FIXED_PORT_ERR) => start_with(config_dir, false).await,
+        Err(e) => Err(e),
+    }
+}
+
+const FIXED_PORT_ERR: &str = "fixed UDP port unusable";
+
+async fn start_with(config_dir: &Path, allow_fixed_port: bool) -> Result<Endpoint> {
     watch_local_subnets().await;
     let secret = load_or_create_secret(config_dir);
     // Seed the known-address cache so the FIRST dial after a relaunch already
@@ -2300,10 +2311,25 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
         }
     }
 
-    let ep = builder
-        .bind()
-        .await
-        .context("bind iroh endpoint")?;
+    // Transfer Server option: a FIXED UDP port the owner can forward on their
+    // router, so friends reach this box directly instead of via a relay. Probed
+    // first; anything off falls back to the automatic port.
+    let port = if allow_fixed_port { crate::mailbox::server::load_config(config_dir).udp_port } else { 0 };
+    if port > 0 {
+        anyhow::ensure!(std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(), "{FIXED_PORT_ERR}: busy");
+        builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+            .map_err(|e| anyhow::anyhow!("{FIXED_PORT_ERR}: {e}"))?;
+        if std::net::UdpSocket::bind(("::", port)).is_ok() {
+            builder = builder.bind_addr(std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)))
+                .map_err(|e| anyhow::anyhow!("{FIXED_PORT_ERR}: {e}"))?;
+        }
+        log::info!("iroh: using the fixed UDP port set for the Transfer Server");
+    }
+    let ep = match builder.bind().await {
+        Ok(ep) => ep,
+        Err(e) if port > 0 => anyhow::bail!("{FIXED_PORT_ERR}: {e}"),
+        Err(e) => return Err(anyhow::Error::from(e).context("bind iroh endpoint")),
+    };
 
     // Local-network (mDNS) discovery: lets two machines on the same Wi-Fi/LAN
     // find each other's local addresses and connect DIRECTLY, instead of bouncing
