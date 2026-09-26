@@ -63,6 +63,15 @@ struct ChatAttachment: View {
                 Text("Waiting for files…").font(.caption).foregroundStyle(.secondary)
             }
         }.frame(maxWidth: 240, alignment: .leading)
+        #if targetEnvironment(simulator)
+        // QA: `-openViewer` opens the first multi-photo message on its SECOND photo.
+        .task {
+            guard CommandLine.arguments.contains("-openViewer"), !Self.qaViewerOpened, availableMedia.count > 1 else { return }
+            Self.qaViewerOpened = true
+            try? await Task.sleep(for: .seconds(1.5))
+            selected = availableMedia[1]
+        }
+        #endif
         .fullScreenCover(item: $selected) { item in
             PagedMediaViewer(items: availableMedia, initialPath: item.path).environmentObject(bridge)
         }
@@ -105,6 +114,7 @@ struct ChatAttachment: View {
             }.buttonStyle(.plain).disabled(item.path == nil).accessibilityLabel(item.name)
         }
     }
+    @MainActor private static var qaViewerOpened = false
     /// Remembered shapes so a bubble re-appearing while scrolling never changes height.
     @MainActor private static var aspects: [String: CGFloat] = [:]
     nonisolated static func fileURL(_ path: String) -> URL { path.hasPrefix("file://") ? URL(string: path) ?? URL(fileURLWithPath: path) : URL(fileURLWithPath: path) }
@@ -123,31 +133,57 @@ struct ChatAttachment: View {
     }
 }
 
+/// Photos-style viewer for a message's media: opens on the tapped item, swipes
+/// between the others, pinch/double-tap to zoom (a zoomed photo pans instead of
+/// paging until it's back at 1x), tap to hide the bars.
 struct PagedMediaViewer: View {
     @EnvironmentObject private var bridge: Bridge
     @Environment(\.dismiss) private var dismiss
     let items: [LocalMedia]
-    let initialPath: String
-    @State private var selection = ""
+    @State private var selection: String
+    @State private var chromeHidden = false
+    init(items: [LocalMedia], initialPath: String) {
+        self.items = items
+        // Start ON the tapped page: setting it after appearing made the pager
+        // jump from the first photo (or not move at all).
+        _selection = State(initialValue: items.contains { $0.path == initialPath } ? initialPath : items.first?.path ?? initialPath)
+    }
+    private var index: Int? { items.firstIndex { $0.path == selection } }
     var body: some View {
         NavigationStack {
             TabView(selection: $selection) {
                 ForEach(items) { item in
-                    MediaPage(item: item, active: selection == item.path).tag(item.path)
+                    MediaPage(item: item, active: selection == item.path, toggleChrome: { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } })
+                        .tag(item.path)
                 }
-            }.tabViewStyle(.page(indexDisplayMode: items.count > 1 ? .always : .never))
-                .background(.black).navigationTitle(items.first { $0.path == selection }?.name ?? "Media")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { bridge.perform { try await bridge.shareFiles(paths: [selection]) } } label: {
-                            Image(systemName: "square.and.arrow.up").frame(width: 44, height: 44)
-                        }.accessibilityLabel("Share").disabled(selection.isEmpty)
-                    }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .background(Color.black.ignoresSafeArea())
+            .ignoresSafeArea()
+            .navigationTitle(items.count > 1 ? "\((index ?? 0) + 1) of \(items.count)" : (items.first?.name ?? "Photo"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.hidden, for: .navigationBar)
+            .toolbar(chromeHidden ? .hidden : .visible, for: .navigationBar)
+            .statusBarHidden(chromeHidden)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { bridge.perform { try await bridge.shareFiles(paths: [selection]) } } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }.accessibilityLabel("Share").disabled(selection.isEmpty)
                 }
-                .onAppear { selection = initialPath }
-        }.tint(.beam).preferredColorScheme(.dark)
+            }
+            .accessibilityAction(named: "Next") { step(1) }
+            .accessibilityAction(named: "Previous") { step(-1) }
+            #if targetEnvironment(simulator)
+            // QA: `-viewerStep` pages forward after appearing (no touch input in CI).
+            .task { if CommandLine.arguments.contains("-viewerStep") { try? await Task.sleep(for: .seconds(2)); withAnimation { step(1) } } }
+            #endif
+        }.tint(.white).preferredColorScheme(.dark)
+    }
+    private func step(_ delta: Int) {
+        guard let index, items.indices.contains(index + delta) else { return }
+        selection = items[index + delta].path
     }
 }
 
@@ -162,59 +198,115 @@ struct MediaViewer: View {
 private struct MediaPage: View {
     let item: LocalMedia
     let active: Bool
+    let toggleChrome: () -> Void
     @State private var player: AVPlayer?
     @State private var image: UIImage?
     @State private var unavailable = false
     var body: some View {
-        Group {
-            if item.video { NativeVideoPlayer(player: player) }
-            else if let image { ImageViewer(image: image) }
-            else if unavailable { Text("This image is no longer available.").foregroundStyle(.white) }
-            else { ProgressView().tint(.white) }
-        }
-        .task(id: active) {
-            player?.pause(); player = nil; image = nil; unavailable = false
-            guard active else { return }
-            if item.video { player = AVPlayer(url: ChatAttachment.fileURL(item.path)); player?.play() }
-            else {
-                let preview = await ThumbnailProvider.shared.image(path: item.path, points: 400, fullSize: true)
-                if !Task.isCancelled { image = preview?.image; unavailable = preview == nil }
+        ZStack {
+            Color.black
+            if item.video {
+                NativeVideoPlayer(player: player)
+            } else if let image {
+                ImageViewer(image: image, onTap: toggleChrome)
+            } else if unavailable {
+                Text("This image is no longer available.").foregroundStyle(.white.opacity(0.8))
+            } else {
+                // The cached thumbnail keeps a page from flashing a spinner mid-swipe.
+                if let thumb = ThumbnailProvider.shared.cached(path: item.path, points: 240)?.image {
+                    Image(uiImage: thumb).resizable().scaledToFit()
+                }
+                ProgressView().tint(.white)
             }
         }
-        .onDisappear { player?.pause(); player = nil; image = nil }
+        // Neighbours load too (the pager builds them just before they slide in), and a
+        // page keeps its photo when it scrolls away — no reset, no reload on return.
+        .task(id: item.path) {
+            guard !item.video, image == nil else { return }
+            let preview = await ThumbnailProvider.shared.image(path: item.path, points: 400, fullSize: true)
+            if !Task.isCancelled { image = preview?.image; unavailable = preview == nil }
+        }
+        .task(id: active) {
+            guard item.video else { return }
+            if active {
+                if player == nil { player = AVPlayer(url: ChatAttachment.fileURL(item.path)) }
+                player?.play()
+            } else { player?.pause() }
+        }
+        .onDisappear { player?.pause() }
     }
 }
 
 struct ImageViewer: UIViewRepresentable {
     let image: UIImage
+    var onTap: (() -> Void)? = nil
     func makeCoordinator() -> Coordinator { Coordinator() }
-    func makeUIView(context: Context) -> UIScrollView {
+    func makeUIView(context: Context) -> ImageScrollView {
         let scroll = ImageScrollView()
         scroll.delegate = context.coordinator
-        scroll.minimumZoomScale = 1; scroll.maximumZoomScale = 5
+        scroll.minimumZoomScale = 1; scroll.maximumZoomScale = 4
         scroll.showsVerticalScrollIndicator = false; scroll.showsHorizontalScrollIndicator = false
+        scroll.contentInsetAdjustmentBehavior = .never
+        scroll.decelerationRate = .fast
         scroll.imageView.image = image
         scroll.imageView.contentMode = .scaleAspectFit
         scroll.addSubview(scroll.imageView)
-        context.coordinator.image = scroll.imageView
+        let double = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTap(_:)))
+        double.numberOfTapsRequired = 2
+        scroll.addGestureRecognizer(double)
+        let single = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.singleTap(_:)))
+        single.require(toFail: double)
+        scroll.addGestureRecognizer(single)
+        context.coordinator.scroll = scroll
         return scroll
     }
-    func updateUIView(_ scroll: UIScrollView, context: Context) { context.coordinator.image?.image = image }
-    final class Coordinator: NSObject, UIScrollViewDelegate {
-        weak var image: UIImageView?
-        func viewForZooming(in scrollView: UIScrollView) -> UIView? { image }
+    func updateUIView(_ scroll: ImageScrollView, context: Context) {
+        context.coordinator.onTap = onTap
+        if scroll.imageView.image !== image { scroll.imageView.image = image; scroll.setNeedsLayout() }
     }
+    final class Coordinator: NSObject, UIScrollViewDelegate {
+        weak var scroll: ImageScrollView?
+        var onTap: (() -> Void)?
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? { (scrollView as? ImageScrollView)?.imageView }
+        func scrollViewDidZoom(_ scrollView: UIScrollView) { (scrollView as? ImageScrollView)?.centerImage() }
+        @objc func singleTap(_ gesture: UITapGestureRecognizer) { onTap?() }
+        /// Photos: double-tap zooms in on that spot, or back out.
+        @objc func doubleTap(_ gesture: UITapGestureRecognizer) {
+            guard let scroll else { return }
+            if scroll.zoomScale > scroll.minimumZoomScale + 0.01 {
+                scroll.setZoomScale(scroll.minimumZoomScale, animated: true)
+            } else {
+                let point = gesture.location(in: scroll.imageView)
+                let scale: CGFloat = 2.5
+                let size = CGSize(width: scroll.bounds.width / scale, height: scroll.bounds.height / scale)
+                scroll.zoom(to: CGRect(x: point.x - size.width / 2, y: point.y - size.height / 2, width: size.width, height: size.height), animated: true)
+            }
+        }
+    }
+    /// The image view is sized to the photo's fitted rect (not the whole page), so
+    /// at 1x there is nothing to scroll and every horizontal swipe goes to the pager.
     final class ImageScrollView: UIScrollView {
         let imageView = UIImageView()
-        private var previousSize = CGSize.zero
+        private var laidOut = CGSize.zero
+        private var imageSize = CGSize.zero
         override func layoutSubviews() {
             super.layoutSubviews()
-            if bounds.size != previousSize {
-                previousSize = bounds.size
-                setZoomScale(1, animated: false)
-                imageView.frame = CGRect(origin: .zero, size: bounds.size)
-                contentSize = bounds.size
+            let size = imageView.image?.size ?? .zero
+            guard bounds.width > 0, bounds.height > 0 else { return }
+            if bounds.size != laidOut || size != imageSize {
+                laidOut = bounds.size; imageSize = size
+                zoomScale = 1
+                let fit = size.width > 0 && size.height > 0 ? min(bounds.width / size.width, bounds.height / size.height) : 1
+                imageView.frame = CGRect(origin: .zero, size: CGSize(width: size.width * fit, height: size.height * fit))
+                contentSize = imageView.frame.size
+                centerImage()
+                contentOffset = CGPoint(x: -contentInset.left, y: -contentInset.top)
             }
+        }
+        func centerImage() {
+            let x = max(0, (bounds.width - contentSize.width) / 2)
+            let y = max(0, (bounds.height - contentSize.height) / 2)
+            contentInset = UIEdgeInsets(top: y, left: x, bottom: y, right: x)
         }
     }
 }
