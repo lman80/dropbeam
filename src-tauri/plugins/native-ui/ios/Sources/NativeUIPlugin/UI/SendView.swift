@@ -2,71 +2,88 @@ import SwiftUI
 import CoreImage.CIFilterBuiltins
 import UIKit
 
+/// Home: what to send (one strong tile + two smaller ones), who to send it to
+/// (friends and your devices, online first), a code/QR to receive, then the
+/// transfers — moving ones first, finished ones under Recent.
 struct SendView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var code = ""
     @State private var picking = false
     @State private var receiving = false
     @State private var scanning = false
+    @State private var adding = false
+    @State private var sendingTo: Friend?
     @FocusState private var codeFocused: Bool
+    private var active: [Transfer] { bridge.sendTransfers.filter(\.active) }
     private var finished: [Transfer] { bridge.sendTransfers.filter { !$0.active } }
     var body: some View {
         NavigationStack {
             List {
-                Section { hero }.clearRow(EdgeInsets(top: 4, leading: 20, bottom: 4, trailing: 20))
+                Section { SendSourceGrid(picking: $picking, pick: pick) }
+                    .clearRow(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 Section {
-                    receiveRow
-                } header: { Text("Receive") } footer: {
-                    Text("Paste or scan a code from DropBeam — files, a friend, a shared folder or one of your devices.")
-                }
-                Section {
-                    if bridge.sendTransfers.isEmpty { emptyState.clearRow() }
-                    ForEach(bridge.sendTransfers) { transfer in TransferRow(transfer: transfer) }
+                    RecipientStrip(sendingTo: $sendingTo, adding: $adding)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Color.clear)
                 } header: {
                     HStack {
-                        Text("Transfers")
+                        Text("Send To")
                         Spacer()
-                        if !finished.isEmpty {
-                            Button("Clear") { clearFinished() }.font(.body).textCase(nil).accessibilityLabel("Clear finished transfers")
+                        if !bridge.friends.isEmpty {
+                            Button("See All") { bridge.selectedTab = "friends"; Haptics.tap() }
+                                .font(.body).textCase(nil)
+                        }
+                    }
+                }.headerProminence(.increased)
+                if !active.isEmpty {
+                    Section {
+                        ForEach(active) { transfer in TransferRow(transfer: transfer) }
+                    } header: { Text("In Progress") }.headerProminence(.increased)
+                }
+                Section {
+                    receiveRow
+                    Button { scanning = true; Haptics.tap() } label: {
+                        Label("Scan a QR Code", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity, minHeight: 32, alignment: .leading).contentShape(Rectangle())
+                    }
+                } header: { Text("Receive") }.headerProminence(.increased)
+                Section {
+                    if bridge.sendTransfers.isEmpty { emptyState }
+                    ForEach(finished) { transfer in TransferRow(transfer: transfer) }
+                } header: {
+                    if !finished.isEmpty || bridge.sendTransfers.isEmpty {
+                        HStack {
+                            Text("Recent")
+                            Spacer()
+                            if !finished.isEmpty {
+                                Button("Clear") { clearFinished() }.font(.body).textCase(nil).accessibilityLabel("Clear finished transfers")
+                            }
                         }
                     }
                 }.headerProminence(.increased)
             }
             .beamList()
             .navigationTitle("Send")
-            .animation(.smooth, value: bridge.sendTransfers.map(\.id))
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { scanning = true; Haptics.tap() } label: { Image(systemName: "qrcode.viewfinder") }
-                        .accessibilityLabel("Scan a code")
-                }
-            }
+            .animation(.smooth, value: bridge.sendTransfers.map { "\($0.id)|\($0.active)" })
         }
         .sheet(isPresented: $scanning) {
             QRScannerSheet(title: "Scan a Code", autoSubmit: true, hint: "Scan any DropBeam QR code — files to receive, a friend, a shared folder or one of your devices.") { value in
                 try await bridge.openAnyCode(value.trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
-    }
-    private var hero: some View {
-        ActionTileRow {
-            pickButton("Photos", symbol: "photo.on.rectangle", source: "photos")
-            pickButton("Files", symbol: "doc", source: "files")
-            SendFolderButton()
+        .sheet(isPresented: $adding) { AddFriendSheet().environmentObject(bridge) }
+        .confirmationDialog(sendingTo.map { "Send to \($0.displayName)" } ?? "", isPresented: Binding(get: { sendingTo != nil }, set: { if !$0 { sendingTo = nil } }), titleVisibility: .visible, presenting: sendingTo) { friend in
+            Button("Photos & Videos") { pick("photos", friend.id) }
+            Button("Files") { pick("files", friend.id) }
+            Button("Folder") { pick("folder", friend.id) }
         }
     }
-    private func pickButton(_ title: String, symbol: String, source: String) -> some View {
-        ActionTile(title: title, symbol: symbol, large: true) {
-            picking = true
-            bridge.perform { defer { picking = false }; try await bridge.pickAndSend(source: source) }
-        }
-        .disabled(picking)
-        .accessibilityLabel("Send \(title)")
+    private func pick(_ source: String, _ friendId: String? = nil) {
+        picking = true
+        bridge.perform { defer { picking = false }; try await bridge.pickAndSend(source: source, friendId: friendId) }
     }
     private var trimmed: String { code.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var receiveRow: some View {
         HStack(spacing: 12) {
-            Image(systemName: "arrow.down.circle.fill").font(.title2).foregroundStyle(.tint).accessibilityHidden(true)
             TextField("Paste a code", text: $code)
                 .font(code.isEmpty ? .body : .body.monospaced()).textInputAutocapitalization(.never)
                 .autocorrectionDisabled().submitLabel(.go).onSubmit(receive).focused($codeFocused)
@@ -77,8 +94,8 @@ struct SendView: View {
                     Task { @MainActor in code = strings.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
                 }.labelStyle(.iconOnly).buttonBorderShape(.circle).tint(.beam)
             } else {
-                Button(receiving ? "Opening…" : "Go", action: receive)
-                    .beamButton().controlSize(.small).disabled(receiving)
+                Button(receiving ? "Opening…" : "Receive", action: receive)
+                    .beamButton(prominent: true).controlSize(.small).disabled(receiving)
             }
         }.frame(minHeight: 44)
     }
@@ -94,9 +111,141 @@ struct SendView: View {
         Task { for id in ids { try? await bridge.action("dismissTransfer", ["id": id]) } }
     }
     private var emptyState: some View {
-        Text("Files you send and receive show up here.")
-            .font(.subheadline).foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity).padding(.vertical, 20)
+        HStack(spacing: 14) {
+            Image(systemName: "arrow.up.arrow.down").font(.title3.weight(.medium)).foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("No Transfers Yet").font(.body.weight(.semibold))
+                Text("Sent and received files appear here.").font(.subheadline).foregroundStyle(.secondary)
+            }
+        }.padding(.vertical, 4).accessibilityElement(children: .combine)
+    }
+}
+
+/// The three send sources. Photos leads as one tall filled tile; Files and Folder
+/// stack beside it. At accessibility text sizes the three stack full-width.
+private struct SendSourceGrid: View {
+    @Binding var picking: Bool
+    let pick: (String, String?) -> Void
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @ScaledMetric(relativeTo: .body) private var rowHeight: CGFloat = 62
+    var body: some View {
+        Group {
+            if typeSize.isAccessibilitySize {
+                VStack(spacing: 10) { photos(height: rowHeight); files; folder }
+            } else {
+                HStack(spacing: 10) {
+                    photos(height: rowHeight * 2 + 10)
+                    VStack(spacing: 10) { files; folder }
+                }
+            }
+        }
+        .disabled(picking)
+    }
+    private func photos(height: CGFloat) -> some View {
+        Button { pick("photos", nil) } label: {
+            VStack(alignment: .leading, spacing: 0) {
+                Image(systemName: "photo.on.rectangle.angled").font(.title.weight(.medium))
+                Spacer(minLength: 8)
+                Text("Photos & Videos").font(.headline).multilineTextAlignment(.leading).fixedSize(horizontal: false, vertical: true)
+            }
+            .foregroundStyle(.white)
+            .padding(16)
+            .frame(maxWidth: .infinity, minHeight: height, alignment: .leading)
+            .background(Color.beam, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        }
+        .buttonStyle(SourcePressStyle())
+        .accessibilityLabel("Send Photos and Videos")
+    }
+    private var files: some View { small("Files", symbol: "doc.fill", source: "files", label: "Send Files") }
+    private var folder: some View { small("Folder", symbol: "folder.fill", source: "folder", label: "Send a Folder") }
+    private func small(_ title: String, symbol: String, source: String, label: String) -> some View {
+        Button { pick(source, nil) } label: {
+            HStack(spacing: 12) {
+                Image(systemName: symbol).font(.title3).foregroundStyle(.tint).frame(width: 26)
+                Text(title).font(.body.weight(.semibold)).foregroundStyle(.primary)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, minHeight: rowHeight, alignment: .leading)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        }
+        .buttonStyle(SourcePressStyle())
+        .accessibilityLabel(label)
+    }
+}
+private struct SourcePressStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .opacity(!enabled ? 0.45 : configuration.isPressed ? 0.85 : 1)
+            .animation(.snappy(duration: 0.18), value: configuration.isPressed)
+    }
+}
+
+/// Friends and your own devices as a row of avatars (online first), plus Add.
+/// Tapping one picks what to send straight to them.
+private struct RecipientStrip: View {
+    @EnvironmentObject private var bridge: Bridge
+    @Binding var sendingTo: Friend?
+    @Binding var adding: Bool
+    @ScaledMetric(relativeTo: .caption) private var avatar: CGFloat = 58
+    private var people: [Friend] {
+        let all = bridge.friends.filter { $0.groupedUnder == nil }
+        let online = all.filter { bridge.presence[$0.id] == true }
+        return online + all.filter { bridge.presence[$0.id] != true }
+    }
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 14) {
+                ForEach(people) { friend in person(friend) }
+                addButton
+            }
+            .padding(.horizontal, 16).padding(.vertical, 6)
+        }
+        .scrollClipDisabled()
+    }
+    private func person(_ friend: Friend) -> some View {
+        let online = bridge.presence[friend.id] == true
+        return Button { sendingTo = friend; Haptics.tap() } label: {
+            VStack(spacing: 6) {
+                ContactAvatar(friend: friend, size: avatar)
+                    .overlay(alignment: .bottomTrailing) {
+                        if online {
+                            Circle().fill(Color.green).frame(width: avatar * 0.24, height: avatar * 0.24)
+                                .overlay(Circle().stroke(Color(uiColor: .systemGroupedBackground), lineWidth: 3))
+                                .offset(x: -1, y: -1)
+                        }
+                    }
+                Text(friend.displayName).font(.caption.weight(.medium)).foregroundStyle(.primary)
+                    .multilineTextAlignment(.center).lineLimit(2).frame(width: avatar + 16)
+            }
+        }
+        .buttonStyle(SourcePressStyle())
+        .accessibilityLabel("Send to \(friend.displayName), \(online ? "online" : "offline")")
+        .contextMenu {
+            Button("Send Photos & Videos", systemImage: "photo.on.rectangle") { bridge.perform { try await bridge.pickAndSend(source: "photos", friendId: friend.id) } }
+            Button("Send Files", systemImage: "doc") { bridge.perform { try await bridge.pickAndSend(source: "files", friendId: friend.id) } }
+            Button("Send a Folder", systemImage: "folder") { bridge.perform { try await bridge.pickAndSend(source: "folder", friendId: friend.id) } }
+            if !friend.ownDevice { Button("Message", systemImage: "bubble.left") { bridge.perform { try await bridge.openChat(friendId: friend.id) } } }
+        }
+    }
+    private var addButton: some View {
+        Button { adding = true; Haptics.tap() } label: {
+            VStack(spacing: 6) {
+                Image(systemName: "plus").font(.system(size: avatar * 0.36, weight: .medium)).foregroundStyle(.tint)
+                    .frame(width: avatar, height: avatar)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: Circle())
+                Text("Add").font(.caption.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .buttonStyle(SourcePressStyle())
+        .accessibilityLabel("Add a friend")
     }
 }
 
