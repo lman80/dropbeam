@@ -157,6 +157,8 @@ public enum SuperFeedback {
 
     public static func setContext(_ values: [String: String]) {
         context.merge(values) { _, new in new }
+        // A screen change can show/hide the host app's tab bar: re-measure it.
+        DispatchQueue.main.async { for state in scenes.values { state.refreshObstructions() } }
     }
 
     public static var isEnabled: Bool {
@@ -422,6 +424,10 @@ fileprivate final class SFSceneState: ObservableObject {
     @Published var attachScreenshot = true
     @Published var attachments: [SFAttachment] = []
     @Published var safeAreaInsets: UIEdgeInsets = .zero
+    /// Height from the bottom of the screen that the host app's visible tab bar
+    /// covers (0 when there is none), measured from its real UITabBar so the
+    /// trigger never rests over it — floating iOS 26 bars included.
+    @Published var tabBarInset: CGFloat = 0
     /// Markup shapes in normalised image coordinates; the base image is never rasterised.
     @Published var markupShapes: [SFShape] = []
     /// Non-nil once shapes have been composited; drives the thumbnail and the annotated status.
@@ -535,6 +541,28 @@ fileprivate final class SFSceneState: ObservableObject {
         }
     }
 
+    /// Measure the host app's tab bar (in another window) in overlay coordinates.
+    func refreshObstructions() {
+        guard let scene, let overlay = window else { return }
+        var inset: CGFloat = 0
+        for host in scene.windows where !(host is SFOverlayWindow) && !host.isHidden {
+            guard let bar = Self.tabBar(in: host), !bar.isHidden, bar.alpha > 0.01, bar.window === host else { continue }
+            let frame = overlay.convert(bar.convert(bar.bounds, to: host), from: host)
+            guard frame.height > 0, frame.maxY >= overlay.bounds.maxY - 60 else { continue } // bottom bars only
+            inset = max(inset, overlay.bounds.maxY - frame.minY)
+        }
+        if abs(tabBarInset - inset) > 0.5 { tabBarInset = inset }
+    }
+    private static func tabBar(in root: UIView) -> UITabBar? {
+        var queue: [UIView] = [root]
+        while !queue.isEmpty {
+            let view = queue.removeFirst()
+            if let bar = view as? UITabBar { return bar }
+            queue.append(contentsOf: view.subviews)
+        }
+        return nil
+    }
+
     func tearDown() {
         toastTask?.cancel()
         keyboardObservers.forEach(NotificationCenter.default.removeObserver)
@@ -553,8 +581,9 @@ fileprivate final class SFOverlayWindow: UIWindow {
         let insets = safeAreaInsets
         // Publishing from inside UIKit's layout pass can invalidate SwiftUI mid-update.
         DispatchQueue.main.async { [weak self] in
-            guard let state = self?.state, state.safeAreaInsets != insets else { return }
-            state.safeAreaInsets = insets
+            guard let state = self?.state else { return }
+            if state.safeAreaInsets != insets { state.safeAreaInsets = insets }
+            state.refreshObstructions()
         }
     }
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
@@ -633,8 +662,9 @@ private struct SFOverlayView: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .coordinateSpace(name: space)
-            .onAppear { resting = SFButtonPosition.restore() }
-            .sfOnChange(of: geometry.size) { _ in resetDrag() }
+            .onAppear { resting = SFButtonPosition.restore(); state.refreshObstructions() }
+            .sfOnChange(of: geometry.size) { _ in resetDrag(); state.refreshObstructions() }
+            .sfOnChange(of: state.showsButton) { shown in if shown { state.refreshObstructions() } }
         }
         .ignoresSafeArea(.container)
         .tint(state.accent)
@@ -717,15 +747,20 @@ private struct SFOverlayView: View {
     }
 
     private func resetDrag() { dragOrigin = nil; draggedCenter = nil; dragging = false }
+    /// Where the trigger's CENTRE may go: inside the safe area (notch/Dynamic Island,
+    /// home indicator, landscape sensor housing), clear of the app's bars, with a
+    /// 12pt gap between the 40pt button and any edge.
     private func movementBounds(_ geometry: GeometryProxy) -> CGRect {
         let safe = state.safeAreaInsets, extra = state.config.reservedInsets
-        let insets = UIEdgeInsets(top: safe.top + extra.top, left: safe.left + extra.left, bottom: safe.bottom + extra.bottom, right: safe.right + extra.right)
-        // 20pt radius plus the existing 12pt edge gap.
-        let left = min(geometry.size.width / 2, insets.left + 32)
-        let top = min(geometry.size.height / 2, insets.top + 32)
+        // A measured tab bar beats the configured guess (it may float, grow or be hidden).
+        let bottom = state.tabBarInset > 0 ? max(safe.bottom, state.tabBarInset) : safe.bottom + extra.bottom
+        let insets = UIEdgeInsets(top: safe.top + extra.top, left: safe.left + extra.left, bottom: bottom, right: safe.right + extra.right)
+        let reach: CGFloat = 20 + 12 // radius + edge gap
+        let left = min(geometry.size.width / 2, insets.left + reach)
+        let top = min(geometry.size.height / 2, insets.top + reach)
         return CGRect(x: left, y: top,
-                      width: max(0, geometry.size.width - insets.right - 32 - left),
-                      height: max(0, geometry.size.height - insets.bottom - 32 - top))
+                      width: max(0, geometry.size.width - insets.right - reach - left),
+                      height: max(0, geometry.size.height - insets.bottom - reach - top))
     }
     private func clamp(_ point: CGPoint, to rect: CGRect) -> CGPoint {
         CGPoint(x: min(max(point.x, rect.minX), rect.maxX), y: min(max(point.y, rect.minY), rect.maxY))
