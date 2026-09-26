@@ -21,9 +21,9 @@ import CoreImage.CIFilterBuiltins
 //   the Camera app (or a tapped link) opens DropBeam straight into Add Friend.
 
 enum InviteText {
-    /// A web page that turns `…/add/#<code>` into a `dropbeam:` link (docs/add/index.html).
-    /// Off until that page is published on GitHub Pages — see the file's header.
-    static let webPage: URL? = nil
+    /// A web page that turns `…/add/#<code>` into a `dropbeam:` link. Published from the
+    /// separate public repo lman80/dropbeam-invite (GitHub Pages); source mirrored in docs/add/.
+    static let webPage: URL? = URL(string: "https://lman80.github.io/dropbeam-invite/add/")
     static func message(name: String, code: String) -> String {
         var lines = ["Add me on DropBeam\(name.isEmpty ? "" : " — I’m \(name)")."]
         if let page = webPage { lines.append("Tap to add me: \(page.absoluteString)#\(code)") }

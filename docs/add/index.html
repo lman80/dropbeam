@@ -1,12 +1,5 @@
 <!doctype html>
-<!--
-  DropBeam invite link page — NOT LIVE YET.
-  To publish: GitHub → lman80/dropbeam → Settings → Pages → Deploy from branch `main`, folder `/docs`.
-  It is then https://lman80.github.io/dropbeam/add/#dropbeam:… and the iOS app can include it in
-  shared invites (set InviteText.webPage in UI/Invite.swift).
-  Privacy: the code rides in the #fragment, which browsers never send to the server. No scripts
-  load from anywhere else; nothing is logged or stored.
--->
+<!-- DropBeam invite link page. The code rides in the #fragment, which browsers never send to the server. No external scripts; nothing is logged or stored. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -32,7 +25,7 @@
   <p>DropBeam sends photos and files straight between devices — no server in between. Open the invite in the app to add your friend.</p>
   <a class="button" id="open" href="#">Open in DropBeam</a>
   <button id="copy" type="button">Copy Invite</button>
-  <p id="hint">No DropBeam yet? Install it, then come back and tap Open — or copy the invite and paste it under Add Friend.</p>
+  <p id="hint">No DropBeam yet? <a href="https://testflight.apple.com/join/2CMXFhRt">Get it for iPhone</a>, then come back and tap Open — or copy the invite and paste it under Add Friend.</p>
   <code id="code"></code>
 </main>
 <script>
