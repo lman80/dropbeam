@@ -3097,19 +3097,7 @@ async fn serve_stream_inner(
                     // Cache their profile picture (if they sent one) and point the
                     // friend record at it.
                     if let Some(b64) = avatar_b64 {
-                        use base64::Engine;
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                            if !bytes.is_empty() && bytes.len() <= 2_000_000 {
-                                let path = st.config_dir.join(format!("friend-avatar-{who}.jpg"));
-                                if std::fs::write(&path, &bytes).is_ok() {
-                                    crate::friends::set_avatar_by_endpoint(
-                                        &st.config_dir,
-                                        &who,
-                                        path.to_string_lossy().to_string(),
-                                    );
-                                }
-                            }
-                        }
+                        store_friend_avatar(&st.config_dir, &who, b64);
                     }
                     let _ = app.emit("pairs://changed", ());
                     let _ = app.emit("friends://changed", ());
@@ -3119,7 +3107,13 @@ async fn serve_stream_inner(
             if req["locations_v"].as_u64() == Some(crate::locations::VERSION) {
                 if let Some(app) = state.app.get() { let _ = app.emit("locations://changed", &who); }
             }
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION })).await?;
+            // Answer with OUR picture too, so one hello exchanges both: a friend
+            // whose device was offline when we last broadcast still gets it the
+            // next time they say hello (older peers ignore the extra field).
+            let blocked = state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>())
+                .is_some_and(|st| crate::block::is_blocked(&st.config_dir, &who));
+            let my_avatar = if blocked { None } else { state.app.get().and_then(my_avatar_thumb_b64) };
+            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar })).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -4993,6 +4987,35 @@ fn send_friend_inner(
 /// After accepting a friend invite, dial the inviter (whose EndpointId is in the
 /// invite) and tell them our id for the shared friend record — so the reverse
 /// direction (them → us) also works. Best-effort, fire-and-forget.
+/// Save a friend's profile picture (base64 JPEG from a hello or its reply) and
+/// point every record for that device at it. Only updates existing friends.
+fn store_friend_avatar(config_dir: &std::path::Path, who: &str, b64: &str) {
+    use base64::Engine;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else { return };
+    if bytes.is_empty() || bytes.len() > 2_000_000 || !crate::friends::load_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(who)) {
+        return;
+    }
+    let path = config_dir.join(format!("friend-avatar-{who}.jpg"));
+    // Unchanged picture: skip the write (keeps its mtime, so no UI reload).
+    if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+        crate::friends::set_avatar_by_endpoint(config_dir, who, path.to_string_lossy().to_string());
+        return;
+    }
+    if std::fs::write(&path, &bytes).is_ok() {
+        crate::friends::set_avatar_by_endpoint(config_dir, who, path.to_string_lossy().to_string());
+    }
+}
+
+/// A newer peer answers our hello with its own picture: store it.
+fn apply_hello_reply_avatar(state: &Arc<IrohState>, who: &str, reply: &serde_json::Value) {
+    let Some(b64) = reply.get("avatar").and_then(|v| v.as_str()) else { return };
+    let Some(app) = state.app.get() else { return };
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else { return };
+    if crate::block::is_blocked(&st.config_dir, who) { return; }
+    store_friend_avatar(&st.config_dir, who, b64);
+    let _ = app.emit("friends://changed", ());
+}
+
 /// Cache the encoded avatar thumbnail by (path, mtime) so a profile broadcast to
 /// N friends decodes the image at most once.
 static AVATAR_THUMB_CACHE: std::sync::Mutex<Option<(String, u64, Option<String>)>> =
@@ -5091,6 +5114,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                 let _ = send.finish();
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
+                    apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
                 }
             }
         }
@@ -5125,6 +5149,7 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
                 let _ = send.finish();
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
+                    apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
                 }
             }
         }

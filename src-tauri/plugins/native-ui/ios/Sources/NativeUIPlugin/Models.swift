@@ -320,7 +320,7 @@ extension Friend {
         self.id = try c.decode(String.self, forKey: BridgeKey("id"))
         self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Unknown"
         self.endpointId = (try? c.decode(String.self, forKey: BridgeKey("endpointId")))
-        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar")))
+        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar"))).flatMap { $0.isEmpty ? nil : $0 }
         self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
         self.accountPub = (try? c.decode(String.self, forKey: BridgeKey("accountPub")))
         self.autoAccept = (try? c.decode(Bool.self, forKey: BridgeKey("autoAccept")))
@@ -467,7 +467,7 @@ extension Settings {
         self.downloadDir = (try? c.decode(String.self, forKey: BridgeKey("downloadDir")))
         self.displayName = (try? c.decode(String.self, forKey: BridgeKey("displayName")))
         self.theme = (try? c.decode(String.self, forKey: BridgeKey("theme")))
-        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar")))
+        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar"))).flatMap { $0.isEmpty ? nil : $0 }
         self.showMegabits = (try? c.decode(Bool.self, forKey: BridgeKey("showMegabits")))
         self.playSounds = (try? c.decode(Bool.self, forKey: BridgeKey("playSounds")))
         self.notifyOnComplete = (try? c.decode(Bool.self, forKey: BridgeKey("notifyOnComplete")))
@@ -672,6 +672,14 @@ struct FileIntegrity: Decodable, Identifiable, Equatable {
 struct OpenCodeResult: Decodable {
     var kind: String
     var code: String?
+    var name: String?
+    /// Set when a friend was added: drives "Waiting for Alex…" → "Connected".
+    var friendId: String?
+}
+/// `describeCode`: what a pasted/scanned/linked text holds (nothing is done yet).
+struct CodeDescription: Decodable {
+    var kind: String
+    var code: String
     var name: String?
 }
 extension ConnDetail {

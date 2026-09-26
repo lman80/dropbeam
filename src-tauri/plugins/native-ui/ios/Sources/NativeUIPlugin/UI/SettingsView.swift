@@ -130,7 +130,11 @@ struct SettingToggle: View {
 struct MyAvatar: View {
     @EnvironmentObject private var bridge: Bridge
     let size: CGFloat
-    var body: some View { FriendAvatar(friend: Friend(id: "self", name: bridge.settings?.displayName ?? "Me", avatar: bridge.settings?.avatar), size: size) }
+    // Desktop colours your own monogram by your name (avatarColor(name || 'you')).
+    var body: some View {
+        let name = bridge.settings?.displayName ?? ""
+        FriendAvatar(friend: Friend(id: "self", name: name.isEmpty ? "Me" : name, avatar: bridge.settings?.avatar), size: size, colorSeed: name.isEmpty ? "you" : name)
+    }
 }
 struct ProfileView: View {
     @EnvironmentObject private var bridge: Bridge
@@ -164,38 +168,6 @@ struct ProfileView: View {
             Button("Cancel", role: .cancel) {}
             Button("Save") { bridge.perform { try await bridge.action("setDisplayName", ["name": name]) } }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: { Text("Friends see this name when you send files and chat.") }
-    }
-}
-/// "Your DropBeam code": QR + code + Share/Copy. Shared by Profile and Friends → My Code.
-struct MyCodeSection: View {
-    @EnvironmentObject private var bridge: Bridge
-    @State private var code = ""
-    @State private var codeError: String?
-    var body: some View {
-        Section {
-            VStack(spacing: 16) {
-                if let codeError {
-                    ContentUnavailableView { Label("Couldn’t Load Your Code", systemImage: "qrcode") } description: { Text(codeError) } actions: { Button("Try Again", action: load).beamButton() }
-                } else if code.isEmpty { ProgressView().frame(height: 240) }
-                else {
-                    InviteQRCode(code: code)
-                    CodeLine(code: code).padding(.horizontal, 12)
-                }
-                HStack(spacing: 12) {
-                    Button { UIPasteboard.general.string = code; Haptics.success(); bridge.showToast("Code copied") } label: { Label("Copy", systemImage: "doc.on.doc").frame(maxWidth: .infinity) }
-                        .beamButton().disabled(code.isEmpty)
-                    ShareLink(item: code, subject: Text("Add me on DropBeam"), message: Text("Add me on DropBeam with this code:")) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity) }
-                        .beamButton().disabled(code.isEmpty)
-                }.controlSize(.large)
-            }.frame(maxWidth: .infinity).padding(.vertical, 12)
-        } header: { Text("Your DropBeam Code") } footer: {
-            Text("Friends scan this code or paste it into DropBeam to add you.")
-        }
-        .task { load() }
-    }
-    private func load() {
-        codeError = nil
-        Task { do { code = try await bridge.myInviteCode() } catch { codeError = error.localizedDescription } }
     }
 }
 struct InviteQRCode: View {

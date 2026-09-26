@@ -171,39 +171,76 @@ struct IconToggle: View {
         .tint(.green) // iOS convention: switches are green; the brand tint is for actions.
     }
 }
+/// Per-person avatar colours — the SAME palette and hash as desktop
+/// (src/lib/avatar.ts `avatarColor`), so a friend has one colour everywhere.
+enum AvatarPalette {
+    private static let hex: [UInt32] = [0x6e6ee8, 0x3a9ad9, 0xe0764a, 0x3aa57a, 0xc9609a, 0x9a6fd6, 0xd69a2e, 0x5d8a9e]
+    private static func rgb(_ value: UInt32) -> Color {
+        let r = Double((value >> 16) & 0xff) / 255
+        let g = Double((value >> 8) & 0xff) / 255
+        let b = Double(value & 0xff) / 255
+        return Color(red: r, green: g, blue: b)
+    }
+    static let colors: [Color] = hex.map(rgb)
+    /// JS: `h = (h * 31 + id.charCodeAt(i)) >>> 0` over UTF-16 code units.
+    static func color(for seed: String) -> Color {
+        var h: UInt32 = 0
+        for unit in seed.utf16 { h = h &* 31 &+ UInt32(unit) }
+        return colors[Int(h % UInt32(colors.count))]
+    }
+    /// Desktop's `initials()`: one word → its first two letters, else first + last initial.
+    static func initials(_ name: String) -> String {
+        let parts = name.split(whereSeparator: \.isWhitespace)
+        guard let first = parts.first else { return "?" }
+        if parts.count == 1 { return String(first.prefix(2)).uppercased() }
+        return (String(first.prefix(1)) + String(parts[parts.count - 1].prefix(1))).uppercased()
+    }
+}
 struct FriendAvatar: View {
     let friend: Friend
     var size: CGFloat = 52
+    /// What picks the colour: the friend id (desktop's choice); your own avatar uses your name.
+    var colorSeed: String?
     @State private var avatar: UIImage?
-    init(friend: Friend, size: CGFloat = 52) {
-        self.friend = friend; self.size = size
+    init(friend: Friend, size: CGFloat = 52, colorSeed: String? = nil) {
+        self.friend = friend; self.size = size; self.colorSeed = colorSeed
         // A cached photo draws on the first frame — no initials flash on re-layout.
-        _avatar = State(initialValue: friend.avatar.flatMap { ThumbnailProvider.shared.cached(path: $0, points: size)?.image })
+        _avatar = State(initialValue: friend.avatar.flatMap { Self.cachedPhoto($0, size: size) })
     }
     var body: some View {
         Group {
             if let avatar {
                 Image(uiImage: avatar).resizable().scaledToFill()
             } else {
-                // Contacts/Messages monogram: soft grey gradient, white initials.
+                // Desktop's monogram: the person's flat colour, white initials.
                 ZStack {
-                    LinearGradient(colors: [Color(uiColor: .systemGray2), Color(uiColor: .systemGray)], startPoint: .top, endPoint: .bottom)
-                    Text(initials).font(.system(size: size * 0.4, weight: .medium, design: .rounded)).foregroundStyle(.white)
+                    AvatarPalette.color(for: colorSeed ?? friend.id)
+                    Text(AvatarPalette.initials(friend.name)).font(.system(size: size * 0.38, weight: .semibold, design: .rounded)).foregroundStyle(.white)
                         .minimumScaleFactor(0.5).lineLimit(1).padding(.horizontal, size * 0.08)
                 }
             }
         }
         .frame(width: size, height: size).clipShape(Circle()).accessibilityHidden(true)
         .task(id: "\(friend.avatar ?? "")|\(size)") {
-            guard let path = friend.avatar else { avatar = nil; return }
-            if let hit = ThumbnailProvider.shared.cached(path: path, points: size) { avatar = hit.image; return }
-            let result = await ThumbnailProvider.shared.image(path: path, points: size)
+            guard let raw = friend.avatar, !raw.isEmpty else { avatar = nil; return }
+            // Stored paths name the app container at the time they were saved; iOS
+            // moves the container on updates, so resolve into the current one.
+            let path = LocalPaths.resolve(raw)
+            let tag = Self.version(path)
+            if let hit = ThumbnailProvider.shared.cached(path: path, points: size, tag: tag) { avatar = hit.image; return }
+            let result = await ThumbnailProvider.shared.image(path: path, points: size, tag: tag)
             if !Task.isCancelled { avatar = result?.image }
         }
     }
-    private var initials: String {
-        let value = friend.name.split(separator: " ").prefix(2).compactMap(\.first).map(String.init).joined().uppercased()
-        return value.isEmpty ? "?" : value
+    /// A friend's picture is rewritten in place when they change it: version by mtime.
+    nonisolated static func version(_ path: String) -> String? {
+        ((try? FileManager.default.attributesOfItem(atPath: ChatAttachment.fileURL(path).path))?[.modificationDate] as? Date)
+            .map { String(Int($0.timeIntervalSince1970)) }
+    }
+    @MainActor private static func cachedPhoto(_ raw: String, size: CGFloat) -> UIImage? {
+        guard !raw.isEmpty else { return nil }
+        let path = LocalPaths.resolve(raw)
+        return ThumbnailProvider.shared.cached(path: path, points: size, tag: version(path))?.image
     }
 }
 struct PresenceLabel: View {
