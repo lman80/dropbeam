@@ -74,7 +74,7 @@ struct ChatAttachment: View {
                     Button("Decline") { decide(pending, false) }.beamButton()
                     Button("Download") { decide(pending, true) }.beamButton(prominent: true)
                 }
-                .controlSize(.small).disabled(deciding)
+                .controlSize(.small).disabled(deciding).padding(.bottom, 6)
             } else if !message.fromMe, let via = message.via, items.contains(where: { $0.path == nil }) {
                 Text(accepted == false ? "Declined" : accepted == true ? "Downloading…" : "On its way from \(via)…").font(.caption).foregroundStyle(.secondary)
             } else if items.contains(where: { $0.path == nil }) {

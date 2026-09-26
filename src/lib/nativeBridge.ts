@@ -21,7 +21,7 @@ import { linkedDetail, linkedTitle } from './deviceLink'
 import { linkWithCode } from '../components/LinkDeviceModal'
 import { nativeReportMail, REPORT_REASONS, contactMailto, REPORT_EMAIL } from './report'
 import { serverApi, decideFile, type UsableServer, type PendingFile } from './transferServer'
-import { nativeServerList, nativePendingFiles, serverPrefsArgs } from './nativeServers'
+import { nativeServerList, nativePendingFiles, nativePushStatus, serverPrefsArgs } from './nativeServers'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -365,6 +365,13 @@ const handlers: BridgeHandlers = {
     await decideFile(linkId, a.accept)
     pendingFiles = pendingFiles.filter(p => p.linkId !== linkId)
     resnapshot?.()
+  },
+  /** Can servers wake this iPhone (APNs token registered), and do pushes show text? */
+  pushStatus: async () => nativePushStatus(await invoke<unknown>('push_status').catch(() => null)),
+  pushSetPreviews: async a => {
+    if (typeof a.on !== 'boolean') throw new Error('Invalid on value')
+    await invoke('push_set_previews', { on: a.on })
+    return nativePushStatus(await invoke<unknown>('push_status').catch(() => null))
   },
   folderInviteFriend: async a => {
     await api.inviteFriendToFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id, string(a, 'friendId'))

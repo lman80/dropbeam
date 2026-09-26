@@ -963,3 +963,17 @@ enum ServerCopy {
     }
     static func firstName(_ name: String) -> String { name.split(separator: " ").first.map(String.init) ?? name }
 }
+/// Whether Transfer Servers can wake this iPhone (push_status).
+struct PushStatus: Decodable, Equatable {
+    var enabled = false
+    var previews = true
+    var servers = 0
+}
+extension PushStatus {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.enabled = (try? c.decode(Bool.self, forKey: BridgeKey("enabled"))) ?? false
+        self.previews = (try? c.decode(Bool.self, forKey: BridgeKey("previews"))) ?? true
+        self.servers = (try? c.decode(Int.self, forKey: BridgeKey("servers"))) ?? 0
+    }
+}

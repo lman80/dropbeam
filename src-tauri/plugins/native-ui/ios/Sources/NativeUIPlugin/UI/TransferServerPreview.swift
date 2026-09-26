@@ -10,7 +10,7 @@ import Foundation
         let args = ProcessInfo.processInfo.arguments
         guard args.contains("-previewTransferServer") else { return }
         let b = Bridge.shared
-        b.previewKeys = ["friends", "thread", "transferServers", "pendingFiles", "holdRoutes", "presence", "presenceSeen", "transfers", "chatOverview"]
+        b.previewKeys = ["friends", "thread", "transferServers", "pendingFiles", "holdRoutes", "presence", "presenceSeen", "transfers", "chatOverview", "pushStatus"]
         let now = Date().timeIntervalSince1970 * 1000
         let min = 60_000.0, hour = 3_600_000.0
         b.friends = [
@@ -26,6 +26,8 @@ import Foundation
             UsableServer(eid: "qa-office", name: "Office PC", own: false, member: false, through: false, useIt: false, holdForMe: false, offer: "seen", revoked: true, paused: false, learnedMs: now - 400 * hour),
         ]
         b.holdRoutes = ["qa-alex": "Linux Box"]
+        // `-previewPushOn` shows the registered state; default is the pre-APNs-key state.
+        b.pushStatus = PushStatus(enabled: args.contains("-previewPushOn"), previews: true, servers: args.contains("-previewPushOn") ? 1 : 0)
         b.pendingFiles = [PendingFile(linkId: "qa-pending", peerId: "qa-alex", serverName: "Linux Box", bytes: 48_200_000, names: ["Site photos.zip"])]
         b.transfers = [Transfer(id: "qa-held-file", direction: "send", state: "held", fileNames: ["Floor plan.pdf"], fileCount: 1, bytesTotal: 2_400_000, bytesDone: 2_400_000, percent: 100, friendName: "Alex Rivera", chatOnly: true, heldOn: "Linux Box")]
         b.threads["qa-alex"] = [

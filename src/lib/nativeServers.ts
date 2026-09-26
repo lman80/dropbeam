@@ -75,3 +75,15 @@ export function serverPrefsArgs(a: BridgeArgs): { eid: string; prefs: ServerPref
   if (!Object.keys(prefs).length) throw new Error('Nothing to change')
   return { eid, prefs }
 }
+
+/** Server push state for this iPhone (push_status). Anything odd reads as "not set up yet". */
+export interface NativePushStatus { enabled: boolean; previews: boolean; servers: number }
+export function nativePushStatus(raw: unknown): NativePushStatus {
+  const p = obj(raw)
+  return {
+    enabled: p?.enabled === true,
+    // The engine defaults previews on; only an explicit false turns them off.
+    previews: p?.previews !== false,
+    servers: Math.max(0, Math.floor(num(p?.servers))),
+  }
+}

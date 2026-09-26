@@ -92,7 +92,7 @@ struct SettingsView: View {
             #if targetEnvironment(simulator)
             .onAppear { if CommandLine.arguments.contains("-openSaveFolder") { qaSaveFolder = true } }
             // QA: `-scrollToServers` brings the Transfer Servers section into view.
-            .task { if CommandLine.arguments.contains("-scrollToServers") { try? await Task.sleep(for: .seconds(1)); proxy.scrollTo("transferServersEnd", anchor: .bottom) } }
+            .task { if CommandLine.arguments.contains("-scrollToServers") { try? await Task.sleep(for: .seconds(1)); if CommandLine.arguments.contains("-scrollToServerPush") { proxy.scrollTo("serverNotifications", anchor: .center) } else { proxy.scrollTo("transferServersEnd", anchor: .bottom) } } }
             #endif
             .task { version = (try? await bridge.call("appVersion")) ?? ""; try? await bridge.action("myDeviceInfo") }
             .onAppear { feedbackButton = SuperFeedback.isEnabled }

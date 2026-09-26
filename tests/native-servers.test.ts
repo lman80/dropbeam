@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { nativePendingFiles, nativeServerList, serverPrefsArgs } from '../src/lib/nativeServers.ts'
+import { nativePendingFiles, nativePushStatus, nativeServerList, serverPrefsArgs } from '../src/lib/nativeServers.ts'
 
 test('server list drops malformed/duplicate rows and never holds on an unused server', () => {
   const list = nativeServerList([
@@ -29,4 +29,10 @@ test('server prefs validate types, mark the offer seen, and switch holding off w
   assert.throws(() => serverPrefsArgs({ eid: 'a', useIt: 'yes' }))
   assert.throws(() => serverPrefsArgs({ eid: 'a', offer: 'new' }))
   assert.throws(() => serverPrefsArgs({ eid: 'a' }))
+})
+
+test('push status coerces to calm defaults', () => {
+  assert.deepEqual(nativePushStatus({ enabled: true, previews: false, servers: 2 }), { enabled: true, previews: false, servers: 2 })
+  assert.deepEqual(nativePushStatus(null), { enabled: false, previews: true, servers: 0 })
+  assert.deepEqual(nativePushStatus({ enabled: 'yes', previews: 0, servers: -3.5 }), { enabled: false, previews: true, servers: 0 })
 })

@@ -54,6 +54,8 @@ final class Bridge: ObservableObject {
     @Published var pendingFiles: [PendingFile] = []
     /// Per thread: the server a message would wait on while the friend is offline.
     @Published var holdRoutes: [String: String] = [:]
+    /// Can servers wake this iPhone, and do those notifications show message text?
+    @Published var pushStatus = PushStatus()
     /// Simulator-only QA data is showing; engine snapshots for these keys are ignored.
     var previewKeys: Set<String> = []
     @Published var threads: [String: [ChatMessage]] = [:]
@@ -365,6 +367,16 @@ final class Bridge: ObservableObject {
     func decidePendingFile(linkId: String, accept: Bool) async throws {
         if !previewKeys.contains("pendingFiles") { try await action("decidePendingFile", ["linkId": linkId, "accept": accept]) }
         pendingFiles.removeAll { $0.linkId == linkId }
+    }
+    func refreshPushStatus() async {
+        if previewKeys.contains("pushStatus") { return }
+        if let status: PushStatus = try? await call("pushStatus") { pushStatus = status }
+    }
+    func setPushPreviews(_ on: Bool) async throws {
+        pushStatus.previews = on
+        if previewKeys.contains("pushStatus") { return }
+        do { pushStatus = try await call("pushSetPreviews", ["on": on]) }
+        catch { pushStatus.previews = !on; throw error }
     }
     private func previewServerPrefs(_ args: [String: Any]) {
         guard let i = servers.firstIndex(where: { $0.eid == args["eid"] as? String }) else { return }

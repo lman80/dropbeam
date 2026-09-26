@@ -72,8 +72,8 @@ struct ServerExplainer: View {
                 badge("lock.fill", fill: .primary, glyph: Color(uiColor: .systemBackground)).opacity(f.lock).scaleEffect(0.6 + 0.4 * f.lockScale)
             }
             station("laptopcomputer", friendName ?? "Friend", opacity: f.them) {
-                Text("z").font(.system(size: 13, weight: .semibold, design: .rounded)).italic().foregroundStyle(.secondary)
-                    .offset(x: 2, y: -2 - 4 * f.zzzRise).opacity(f.zzz)
+                Image(systemName: "zzz").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                    .offset(x: 0, y: 2 - 4 * f.zzzRise).opacity(f.zzz)
             }
         }
         .background(alignment: .topLeading) {
@@ -117,7 +117,8 @@ struct ServerExplainer: View {
 
     /// Every animated value at time t ∈ [0, 1) of the loop (same beats as desktop CSS).
     struct Frame {
-        var planeX = 0.5, planeY = 0.0, plane = 1.0, planeBack = false
+        // The still frame: on its way from you to the server, which already holds it locked.
+        var planeX = 0.335, planeY = 0.0, plane = 1.0, planeBack = false
         var you = 1.0, them = 0.45, zzz = 1.0, zzzRise = 0.0
         var lock = 1.0, lockScale = 1.0, check = 0.0, checkScale = 0.0
         var t = 0.4
@@ -128,7 +129,7 @@ struct ServerExplainer: View {
             planeX = Self.track(t, [(0, 0.1667), (0.04, 0.1667), (0.18, 0.72), (0.24, 0.62), (0.33, 0.62), (0.42, 0.5), (0.71, 0.5), (0.82, 0.8333), (1, 0.8333)])
             planeY = Self.arc(t, 0.04, 0.18, -12) + Self.arc(t, 0.33, 0.42, -6) + Self.arc(t, 0.71, 0.82, -12)
             planeBack = t > 0.18 && t < 0.42
-            plane = Self.track(t, [(0, 0), (0.04, 1), (0.43, 1), (0.47, 0.3), (0.68, 0.3), (0.71, 1), (0.82, 1), (0.86, 0), (1, 0)])
+            plane = Self.track(t, [(0, 0), (0.04, 1), (0.40, 1), (0.44, 0), (0.69, 0), (0.75, 1), (0.82, 1), (0.86, 0), (1, 0)])
             them = Self.track(t, [(0, 0.45), (0.66, 0.45), (0.70, 1), (0.97, 1), (1, 0.45)])
             you = Self.track(t, [(0, 1), (0.48, 1), (0.54, 0.45), (0.80, 0.45), (0.84, 1), (1, 1)])
             zzz = Self.track(t, [(0, 0), (0.06, 1), (0.60, 1), (0.66, 0), (1, 0)])
@@ -259,7 +260,7 @@ struct TransferServersSection: View {
             }
             ActionRow(title: "How It Works", symbol: "questionmark", color: .gray) { explaining = true }
                 .id("transferServersEnd")
-                .sheet(isPresented: $explaining) { ServerExplainerSheet().presentationDetents([.medium, .large]) }
+                .sheet(isPresented: $explaining) { ServerExplainerSheet().presentationDetents([.large]) }
                 #if targetEnvironment(simulator)
                 // QA: `-openServerExplainer` shows "How It Works".
                 .task { if CommandLine.arguments.contains("-openServerExplainer") { try? await Task.sleep(for: .seconds(1.5)); explaining = true } }
@@ -267,12 +268,38 @@ struct TransferServersSection: View {
                 .confirmationDialog(removing.map { "Remove \($0.name)?" } ?? "", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { server in
                     Button("Remove", role: .destructive) { bridge.perform { try await bridge.forgetServer(eid: server.eid) } }
                 } message: { _ in Text("It’s no longer shared with you. It comes back if it’s shared again.") }
-            // TODO(phase 2, push): "Notifications from Servers" row goes here —
-            // registers this iPhone for pushes from servers holding messages for you
-            // (lead wires APNs via the push worker). Intentionally not shown yet.
         } header: { Text("Transfer Servers") } footer: {
             Text("Friends’ always-on computers that hold what you send until people are back online.")
         }
+        if !bridge.servers.isEmpty { notifications }
+    }
+    /// Pushes from servers holding messages for you (APNs is wired by the engine;
+    /// until this iPhone has a token the section just says so, calmly).
+    private var notifications: some View {
+        Section {
+            Toggle(isOn: Binding(get: { bridge.pushStatus.previews }, set: { on in
+                bridge.perform { try await bridge.setPushPreviews(on) }
+            })) {
+                RowLabel(title: "Show Message Text", symbol: "text.bubble.fill", color: .blue)
+            }
+            .tint(.green)
+            .id("serverNotifications")
+        } header: { Text("Notifications from Servers") } footer: {
+            Text(pushFooter)
+        }
+        .task { await bridge.refreshPushStatus() }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("DropBeam.mailbox://servers"))) { _ in
+            Task { await bridge.refreshPushStatus() }
+        }
+    }
+    private var pushFooter: String {
+        let status = bridge.pushStatus
+        if !status.enabled {
+            return "Notifications turn on once DropBeam can reach Apple’s push service. Until then, held messages arrive when you open the app."
+        }
+        let text = status.previews ? "Notifications show who it’s from and what they said." : "Notifications only say who it’s from."
+        return status.servers > 0 ? "A server holding your messages can let you know when one arrives. \(text)"
+            : "Turn on Hold My Messages Here for a server so it can let you know when something arrives."
     }
     private func row(_ server: UsableServer) -> some View {
         HStack(spacing: 14) {
