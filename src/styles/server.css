@@ -25,7 +25,7 @@
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  width: 92px;
+  width: 120px;
 }
 .sx-you { left: 15%; }
 .sx-box { left: 50%; }
@@ -187,9 +187,10 @@
 @keyframes sx-in {
   0% { left: 15%; opacity: 0; }
   5% { left: 15%; opacity: 1; }
-  22% { left: 50%; opacity: 1; }
-  26%, 100% { left: 50%; opacity: 0; }
+  20% { left: 40%; opacity: 1; }
+  24%, 100% { left: 44%; opacity: 0; }
 }
+.sx .sx-share .sx-lock { animation: none; opacity: 1; transform: none; }
 @keyframes sx-gauge {
   0%, 12% { width: 18%; }
   34%, 90% { width: 58%; }
@@ -241,6 +242,7 @@
 .srv-steps > span { height: 3px; flex: 1; border-radius: 2px; background: var(--surface-3); }
 .srv-steps > span.on { background: var(--accent); }
 .srv-field { display: grid; gap: 6px; }
+.srv-field > .seg { justify-self: start; }
 .srv-field > label, .srv-field-title { font-weight: 600; font-size: var(--text-13); }
 .srv-hint { font-size: var(--text-12); color: var(--text-muted); margin: 0; text-wrap: pretty; }
 .srv-slider { display: grid; gap: 4px; }
@@ -283,7 +285,7 @@
   max-width: 440px;
   margin: 8px auto;
 }
-.srv-offer h4 { font-size: var(--text-13); font-weight: 600; margin: 0; }
+.srv-offer h4 { font-size: var(--text-13); font-weight: 600; margin: 0 0 4px; }
 .srv-offer p { margin: 0; font-size: var(--text-12); color: var(--text-muted); text-wrap: pretty; }
 .srv-offer-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; }
 .srv-offer-actions label { margin-right: auto; display: inline-flex; gap: 6px; align-items: center; font-size: var(--text-12); color: var(--text-muted); }
@@ -295,3 +297,8 @@
 .chat-meta-link:hover { text-decoration: underline; }
 .srv-pop { display: grid; gap: 10px; }
 .srv-pop p { margin: 0; font-size: var(--text-12); color: var(--text-muted); }
+.srv-ask { display: flex; align-items: center; gap: 6px; }
+.srv-ask > span { flex: 1; min-width: 0; }
+.xfer-line.srv-held { display: flex; align-items: flex-start; gap: 4px; white-space: normal; text-align: inherit; }
+.xfer-line.srv-held .srv-glyph { flex: none; margin: 2px 0 0; }
+.att.mine .xfer-line.srv-held { justify-content: flex-end; text-align: right; }

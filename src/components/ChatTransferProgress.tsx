@@ -40,8 +40,9 @@ export function ChatTransferProgress({ t, onRetry }: { t: TransferUpdate; onRetr
   if (t.state === 'canceled') return <div className="xfer-line">Canceled</div>
   if (t.state === 'held') {
     return (
-      <div className="xfer-line" title={t.detail ?? undefined}>
-        <span className="truncate-1"><Server className="srv-glyph" aria-hidden />Delivered to {t.heldOn ?? 'your Transfer Server'} — reaches {t.friendName ?? 'them'} when they’re online</span>
+      <div className="xfer-line srv-held" title={t.detail ?? undefined}>
+        <Server className="srv-glyph" aria-hidden />
+        <span>Delivered to {t.heldOn ?? 'your Transfer Server'} — reaches {t.friendName?.split(' ')[0] ?? 'them'} when they’re online</span>
       </div>
     )
   }

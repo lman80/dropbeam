@@ -201,7 +201,7 @@ export function SetupWizard({ check, current, startAt = 'storage', onClose, onSa
   onClose: () => void
   onSaved: (s: ServerStatus) => void
 }) {
-  const displayName = useStore((s) => s.settings?.displayName ?? '')
+  const deviceName = useStore((s) => s.myDevice?.name ?? '')
   const editing = !!current?.enabled
   const [step, setStep] = useState<'storage' | 'people' | 'done'>(startAt)
   const [busy, setBusy] = useState(false)
@@ -210,7 +210,7 @@ export function SetupWizard({ check, current, startAt = 'storage', onClose, onSa
     name: current.name, root: current.root, capBytes: current.capBytes, fileDays: current.fileDays,
     access: current.access, allowed: current.allowed, through: current.through,
   } : {
-    name: displayName && !/iphone|ipad/i.test(displayName) ? displayName : 'Transfer Server',
+    name: deviceName && !/iphone|ipad/i.test(deviceName) ? deviceName : 'Transfer Server',
     root: '', capBytes: check?.suggestedCap ?? 100 * GB, fileDays: 14, access: 'all', allowed: [], through: [],
   })
   const save = async () => {
@@ -295,7 +295,8 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
   const [confirm, setConfirm] = useState<'wipe' | 'off' | { remove: string; name: string } | null>(null)
   const [alsoDelete, setAlsoDelete] = useState(false)
   const [name, setName] = useState(c.name)
-  useEffect(() => setName(c.name), [c.name])
+  const [shownName, setShownName] = useState(c.name)
+  if (shownName !== c.name) { setShownName(c.name); setName(c.name) }
   const patch = async (p: Parameters<typeof serverApi.configure>[0]) => {
     try { setStatus(await serverApi.configure(p)) } catch (e) { toast('error', String(e)) }
   }
@@ -351,7 +352,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
           return (
             <Row key={p.id} className="srv-person"
               title={<>{p.name}{through && <span className="srv-tag">Can send to anyone</span>}</>}
-              sub={u ? `${u.items} waiting · ${formatBytes(u.bytes)}` : 'Nothing waiting'}>
+              sub={u && u.items > 0 ? `${u.items} waiting · ${formatBytes(u.bytes)}` : 'Nothing waiting'}>
               <MenuButton label={`Options for ${p.name}`} size="sm" items={[
                 through
                   ? { label: 'Only send to people who use this server', onSelect: () => void patch({ through: c.through.filter((id) => id !== p.id) }) }
@@ -374,7 +375,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
           <SectionHeader>Waiting for delivery</SectionHeader>
           <div className="group">
             {status.waiting.map((w) => (
-              <Row key={w.label} title={`For ${w.label}`}
+              <Row key={w.label} title={w.label === 'Your devices' ? 'For your devices' : w.label.startsWith('Someone') ? 'For someone a friend knows' : `For ${w.label}`}
                 sub={`${w.items} ${w.items === 1 ? 'item' : 'items'} · ${formatBytes(w.bytes)} · waiting ${heldFor(w.oldestMs)} · removed ${expiresIn(w.expiresMs)} if not delivered`} />
             ))}
           </div>
@@ -519,7 +520,7 @@ export function TransferServerPane() {
       {status.supported && !status.config.enabled && (
         <>
           <SectionHeader>Transfer Server</SectionHeader>
-          <div className="group srv-intro">
+          <div className="card srv-intro">
             <ServerExplainer kind="offline" />
             <div className="srv-intro-copy">
               <h3>Hold messages and files for friends who are offline</h3>

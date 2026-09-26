@@ -130,6 +130,23 @@ function seedChats() {
   ]
   mockChats.f6 = [file('f6', 3 * DAY, false, ['Mountains.jpg'], 1_900_000, '/mock-media/mountains.jpg')]
   mockChats.f4 = [msg('f4', 9 * DAY, true, 'Welcome aboard!', { status: 'delivered' })]
+  // Transfer Server states: Priya's iPhone is offline, so things wait on the box.
+  mockChats.f5 = [
+    msg('f5', 26 * HOUR, false, 'Landing at 9 tomorrow'),
+    msg('f5', 25 * HOUR, true, 'I’ll grab you from arrivals', { status: 'read' }),
+    msg('f5', 40 * MIN, true, 'Running 10 min late — the car’s in the short-term lot', { status: 'held', heldOn: 'Linux Box' }),
+    file('f5', 38 * MIN, true, ['Parking map.pdf'], 2_400_000, '/Users/you/Desktop/Parking map.pdf', { status: 'held', heldOn: 'Linux Box', fileXferId: 'cx-held' }),
+  ]
+  // Things that came in through the server, and one waiting for your OK.
+  mockChats.f6 = [
+    file('f6', 3 * DAY, false, ['Mountains.jpg'], 1_900_000, '/mock-media/mountains.jpg'),
+    msg('f6', 9 * HOUR, false, 'Sent the site photos while you were out', { via: 'Linux Box' }),
+    file('f6', 9 * HOUR - MIN, false, ['Site photos.zip'], 48_200_000, null, { via: 'Linux Box', fileXferId: 'receive:mock-chen:held-1' }),
+  ]
+  mockChats.f8 = [
+    msg('f8', 2 * DAY, false, 'Call me when you land'),
+    msg('f8', 20 * MIN, true, 'Landed safe', { status: 'failed', serverNote: 'full', heldOn: 'Linux Box' }),
+  ]
 }
 seedChats()
 // Chat preview extras (ui-chat): an emoji-only reply (renders large, no bubble)
@@ -340,6 +357,7 @@ if (typeof window !== 'undefined' && !EMPTY) {
   setTimeout(() => {
     emit('transfer://update', { ...base('cx-live', 'send', ['raw-footage-day2.mov']), state: 'transferring', friendName: 'Alex', bytesTotal: 4_800_000_000, bytesDone: 1_920_000_000, percent: 40, speedBps: 88_000_000, etaSeconds: 33, locality: 'local', peer: '192.168.1.40:5', connDetail: { path: 'local', rttMs: 3, upgrading: false, relay: null }, chatTransfer: { id: 'cx-live', offset: 0, total: 4_800_000_000, last: true } })
     emit('transfer://update', { ...base('cx-failed', 'send', ['Presentation.key']), state: 'failed', friendName: 'Alex', bytesTotal: 312_000_000, bytesDone: 71_000_000, percent: 23, error: 'Alex went offline before the file finished.', chatTransfer: { id: 'cx-failed', offset: 0, total: 312_000_000, last: true } })
+    emit('transfer://update', { ...base('cx-held', 'send', ['Parking map.pdf']), state: 'held', friendName: 'Priya Raman', heldOn: 'Linux Box', bytesTotal: 2_400_000, bytesDone: 2_400_000, percent: 100, detail: 'Delivered to Linux Box — reaches Priya Raman when they’re online', chatTransfer: { id: 'cx-held', attempt: 1, offset: 0, total: 2_400_000, last: true } })
   }, 600)
 }
 if (typeof window !== 'undefined') {

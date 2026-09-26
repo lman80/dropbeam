@@ -1,6 +1,7 @@
 // Transfer Server: typed bridge + the browser-preview mock.
 // Types mirror src-tauri/src/mailbox/{server,client,cmds}.rs (camelCase).
 
+import { useSyncExternalStore } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { HAS_TAURI } from './api'
@@ -235,4 +236,50 @@ export const ACCESS_LABEL: Record<ServerAccess, string> = {
   me: 'Only your devices',
   chosen: 'Friends you choose',
   all: 'All your friends',
+}
+
+// ── held files from "ask before accepting" friends ────────────────────────────
+export interface PendingFile {
+  linkId: string
+  peerId: string
+  server: string
+  serverName: string
+  itemId: string
+  bytes: number
+  names: string[]
+  at: number
+}
+
+let pendingCache: Record<string, PendingFile> = {}
+const pendingSubs = new Set<() => void>()
+let pendingStarted = false
+function refreshPending() {
+  const load: Promise<PendingFile[]> = HAS_TAURI
+    ? invoke<PendingFile[]>('mailbox_pending_files')
+    : Promise.resolve(q.get('pending') === '1' ? [{ linkId: 'receive:mock-chen:held-1', peerId: 'f6', server: 'mock-linux', serverName: 'Linux Box', itemId: 'x', bytes: 48_200_000, names: ['Site photos.zip'], at: T0 - HOUR }] : [])
+  load.then((list) => {
+    pendingCache = Object.fromEntries(list.map((p) => [p.linkId, p]))
+    pendingSubs.forEach((cb) => cb())
+  }).catch(() => {})
+}
+function subscribePending(cb: () => void) {
+  pendingSubs.add(cb)
+  if (!pendingStarted) {
+    pendingStarted = true
+    refreshPending()
+    if (HAS_TAURI) void listen('mailbox://pending', refreshPending)
+  }
+  return () => { pendingSubs.delete(cb) }
+}
+/** The held send behind a received file card that's waiting for your OK. */
+export function usePendingFile(linkId: string | null | undefined): PendingFile | undefined {
+  const snap = useSyncExternalStore(subscribePending, () => pendingCache)
+  return linkId ? snap[linkId] : undefined
+}
+export async function decideFile(linkId: string, accept: boolean): Promise<void> {
+  if (HAS_TAURI) await invoke<void>('mailbox_decide_file', { linkId, accept })
+  const { [linkId]: _, ...rest } = pendingCache
+  void _
+  pendingCache = rest
+  pendingSubs.forEach((cb) => cb())
 }

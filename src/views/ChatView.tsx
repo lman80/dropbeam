@@ -41,7 +41,7 @@ import { formatBytes } from '../lib/format'
 import { linkify } from '../lib/linkify'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 import { EmptyState, IconButton, MenuButton, MenuPopover, type MenuItem } from '../components/ui'
-import { onServersChanged, serverApi, serverNoteText } from '../lib/transferServer'
+import { decideFile, onServersChanged, serverApi, serverNoteText, usePendingFile } from '../lib/transferServer'
 import { ServerOfferCard, useUsableServers } from '../components/TransferServerSettings'
 
 /** Stable empty array so the messages selector doesn't return a fresh ref each render. */
@@ -1514,8 +1514,8 @@ const MessageRow = memo(function MessageRow({
     if (m.edited && !m.deleted) parts.push('Edited')
     if (meta && !(m.kind === 'file' && (inFlight || m.fileXferFailed))) {
       const s = m.status
-      const note = s === 'failed' ? serverNoteText(m.serverNote, friend.name, m.heldOn) : null
-      if (s === 'held') parts.push(`Delivered to ${m.heldOn ?? 'your Transfer Server'} — reaches ${friend.name} when they’re online`)
+      const note = s === 'failed' ? serverNoteText(m.serverNote, friend.name.split(' ')[0], m.heldOn) : null
+      if (s === 'held') parts.push(`Delivered to ${m.heldOn ?? 'your Transfer Server'} — reaches ${friend.name.split(' ')[0]} when they’re online`)
       else if (note) parts.push(note)
       else if (meta === 'pending' || s === 'sending' || s === 'failed' || s == null) parts.push(waiting ? 'Waiting to send' : 'Sending…')
       else parts.push(s === 'read' ? 'Read' : 'Delivered')
@@ -1614,7 +1614,7 @@ const MessageRow = memo(function MessageRow({
         </motion.div>
 
         {metaText && <div className="chat-meta">{metaText}</div>}
-        {!mine && m.via && lastOfRun && <div className="chat-via">via {m.via}</div>}
+        {!mine && m.via && lastOfRun && !(m.kind === 'file' && !m.path) && <div className="chat-via">via {m.via}</div>}
       </div>
       {tray && <ReactionTray anchor={tray.anchor} trigger={tray.trigger} mine={mine} onPick={doReact} onClose={closeTray} />}
       {menu && (
@@ -1791,6 +1791,9 @@ function FileMessage({
   const openable = !!path && available
 
   const multi = m.files.length > 1
+  // A held send from a friend you asked to confirm first: Download / Decline.
+  const pending = usePendingFile(!mine && !transfer ? m.fileXferId : undefined)
+  const [deciding, setDeciding] = useState(false)
 
   if (MOBILE_UI) {
     const mobileTransfer = transfer ?? {
@@ -1891,6 +1894,14 @@ function FileMessage({
       {body}
       {shownTransfer ? (
         <ChatTransferProgress t={shownTransfer} onRetry={retry} />
+      ) : pending ? (
+        <div className="xfer-line srv-ask">
+          <span className="truncate-1">Waiting on {pending.serverName}</span>
+          <button type="button" className="btn btn-plain btn-sm" disabled={deciding} onClick={() => { setDeciding(true); void decideFile(pending.linkId, false) }}>Decline</button>
+          <button type="button" className="btn btn-secondary btn-sm" disabled={deciding} onClick={() => { setDeciding(true); void decideFile(pending.linkId, true) }}>Download</button>
+        </div>
+      ) : !mine && m.via && !m.path ? (
+        <div className="xfer-line">{deciding ? 'Downloading…' : `On its way from ${m.via}…`}</div>
       ) : m.fileXferId ? (
         <div className="xfer-line">Waiting…</div>
       ) : null}
