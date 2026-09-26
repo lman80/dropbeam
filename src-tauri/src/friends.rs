@@ -448,12 +448,46 @@ pub fn my_code(my_name: &str, my_endpoint_id: &str) -> String {
     format!("{USER_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
 }
 
+/// The base64url body of a personal code, however it was pasted: the canonical
+/// `dropbeam:…`, the code wrapped across lines by a chat app, a whole invite
+/// message ("Add me on DropBeam … dropbeam:eyJ…"), a `dropbeam://add?code=…`
+/// link, or the bare payload when someone deleted the "dropbeam:" part
+/// (people often do — they assume it's a label). The payload itself is never
+/// altered; only surrounding text/whitespace is dropped.
+fn user_code_body(code: &str) -> Option<String> {
+    if let Some(body) = crate::codes::strip_prefix(code, USER_PREFIX) {
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        if !compact.is_empty() && compact.bytes().all(is_b64url) {
+            return Some(compact);
+        }
+    }
+    let lower = code.to_ascii_lowercase();
+    // Embedded in text or a link (percent-encoded ':' included).
+    for needle in [USER_PREFIX, "dropbeam%3a"] {
+        let mut from = 0;
+        while let Some(at) = lower[from..].find(needle) {
+            let start = from + at + needle.len();
+            let body: String = code[start..].bytes().take_while(|b| is_b64url(*b)).map(char::from).collect();
+            if body.len() >= 8 && body.starts_with("eyJ") {
+                return Some(body);
+            }
+            from = start;
+        }
+    }
+    // The bare payload (prefix deleted): base64url JSON always starts "eyJ".
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    (compact.starts_with("eyJ") && compact.bytes().all(is_b64url)).then_some(compact)
+}
+
+fn is_b64url(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
 fn decode_user_code(code: &str) -> Result<UserCode, String> {
     if crate::link::is_device_code(code) {
         return Err(crate::link::DEVICE_CODE_AS_FRIEND.into());
     }
-    let body = crate::codes::strip_prefix(code, USER_PREFIX)
-        .ok_or("That doesn't look like a DropBeam code.")?;
+    let body = user_code_body(code).ok_or("That doesn't look like a DropBeam code.")?;
     let bytes = URL_SAFE_NO_PAD
         .decode(body.trim())
         .map_err(|_| "That DropBeam code is malformed.".to_string())?;
@@ -1412,6 +1446,27 @@ mod code_tests {
         }
         assert!(decode_user_code("other:invalid").is_err());
         assert!(decode_user_code("Dropbeam:invalid").is_err());
+    }
+
+    #[test]
+    fn personal_code_found_in_messages_links_and_without_prefix() {
+        let original = my_code("Alex", "e1d2c3b4a5");
+        let payload = original.strip_prefix("dropbeam:").unwrap();
+        let (a, b) = payload.split_at(20);
+        let pasted = [
+            payload.to_string(),                                     // "dropbeam:" deleted
+            format!("  {payload}\n"),
+            format!("dropbeam:{a}\n{b}"),                            // wrapped by a chat app
+            format!("Add me on DropBeam!\nOpen DropBeam → Add Friend.\n\n{original}\n"),
+            format!("dropbeam://add?code=dropbeam%3A{payload}"),
+            format!("https://example.invalid/add#{original}"),
+        ];
+        for code in pasted {
+            let decoded = decode_user_code(&code).unwrap_or_else(|e| panic!("{code:?}: {e}"));
+            assert_eq!((decoded.name.as_str(), decoded.eid.as_str()), ("Alex", "e1d2c3b4a5"));
+        }
+        assert!(decode_user_code("Add me on DropBeam").is_err());
+        assert!(decode_user_code("eyJub3QiOiJhIGZyaWVuZCJ9").is_err(), "JSON without an eid is not a friend code");
     }
 }
 
