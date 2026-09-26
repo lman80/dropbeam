@@ -1,6 +1,6 @@
 # Transfer Server — design plan (GitHub #45)
 
-Status: design only, nothing implemented. Baseline: branch `ios` @ `a618186` (v0.52.x, iroh 1.2 vendored).
+Status: IMPLEMENTED on `ios` (phases 1–3; push needs the owner's APNs key — docs/PUSH-SETUP.md). Deviations: per-item `item.json` instead of one index.json; receipts in an append-only `receipts.jsonl`; access = members (own devices + all/chosen friends) may leave things for other members, "send through" per friend for anyone else; the iroh-relay sidecar was not built (fixed UDP port instead). Baseline: branch `ios` @ `a618186` (v0.52.x, iroh 1.2 vendored).
 Scope: store-and-forward of **chat + friend file sends** through a DropBeam device the user chooses, plus iOS push. Folder sync, Locations and Quick Send are out of scope for v1.
 
 ---
