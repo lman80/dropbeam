@@ -363,7 +363,7 @@
 			path = app;
 			sourceTree = "<group>";
 		};
-		"TEMP_E8E5B3D7-F8D3-4F91-87D6-AD3E31DB57F9" /* x86_64 */ = {
+		"TEMP_DFC3641B-AC04-4EC2-BCBD-8EF4E0712AA2" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
