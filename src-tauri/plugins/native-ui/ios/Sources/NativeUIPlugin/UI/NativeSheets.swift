@@ -208,15 +208,26 @@ struct SendToSheet: View {
                         Image(systemName: "paperplane").foregroundStyle(.tint)
                     }.contentShape(Rectangle())
                 }.buttonStyle(.plain).accessibilityLabel("Send to \(friend.displayName), \(bridge.presence[friend.id] == true ? "online" : "offline")")
+                .contextMenu {
+                    // Everything goes to all of their devices; this is the exception.
+                    let devices = friend.ownDevice ? [] : personDevices(friend, in: bridge.friends)
+                    if devices.count > 1 {
+                        Section("Send to one device") {
+                            ForEach(devices, id: \.eid) { d in
+                                Button { send(friend.id, device: d.eid) } label: { Label("\(friend.name.split(separator: " ").first.map(String.init) ?? friend.name)’s \(d.label)", systemImage: d.symbol) }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    private func send(_ friend: String?) {
+    private func send(_ friend: String?, device: String? = nil) {
         busy = true; error = nil
         Task {
             defer { busy = false }
             do {
-                if let friend { try await bridge.sendToFriend(friendId: friend, paths: paths) }
+                if let friend { try await bridge.sendToFriend(friendId: friend, paths: paths, device: device) }
                 else { try await bridge.action("quickSend", ["paths": paths]) }
                 bridge.pickedToSend = []; bridge.pendingSend = []; Haptics.success(); dismiss()
             } catch { self.error = error.localizedDescription; Haptics.warning() }

@@ -197,6 +197,11 @@ fn set_device(config: &Path, id: &str, eid: &str, f: impl FnOnce(&mut Delivery))
     })
 }
 
+/// The person's current thread id (the owner record can change as devices join).
+fn thread_of(config: &Path, peer_id: &str) -> String {
+    crate::friends::thread_owner(config, peer_id).map_or_else(|| peer_id.to_owned(), |o| o.id)
+}
+
 /// Where the send with chat link `chat_id` is on each device (for its chat card).
 pub fn deliveries_for(config: &Path, chat_id: &str) -> Vec<Delivery> {
     records(config).into_iter().filter(|r| r.chat_id == chat_id)
@@ -522,12 +527,21 @@ impl Engine {
             set_device(&self.config, &id, &eid, |d| d.state = stop.into());
             return None;
         }
+        // Only a device that is still owed it: never resurrect one the user
+        // canceled (or one that got it) in a race with a queued retry.
+        let mut owed = false;
         let rec = set_device(&self.config, &id, &eid, |d| {
-            d.state = SENDING.into();
-            d.last_try_ms = now();
-            d.via = None;
-            d.item_id = None;
+            if matches!(d.state.as_str(), WAITING | SENDING | OFFLINE) {
+                owed = true;
+                d.state = SENDING.into();
+                d.last_try_ms = now();
+                d.via = None;
+                d.item_id = None;
+            }
         })?;
+        if !owed {
+            return None;
+        }
         self.emit(&id, true);
         let progress: Progress = {
             let me = self.clone();
@@ -633,10 +647,31 @@ impl Engine {
                 });
             }
         };
-        let result = crate::mailbox::client::deposit_files(&self.net, &config, &rec.peer_id, &rec.chat_id, &rec.id,
+        // One sealed copy for all of them only where the server keeps it until
+        // EACH has it; an older server hands a file to whichever device comes
+        // first, so there each device gets its own copy.
+        if holdable.len() > 1 && !crate::mailbox::client::route_keeps_per_device(&self.net, &config, &self.me(), &holdable).await {
+            for eid in &holdable {
+                Box::pin(self.clone().hold_or_queue(id.clone(), vec![eid.clone()], cancel.clone())).await;
+            }
+            return;
+        }
+        let result = crate::mailbox::client::deposit_files(&self.net, &config, &thread_of(&config, &rec.peer_id), &rec.chat_id, &rec.id,
             &files, &dirs, &top, &progress, &on_start, &cancel, Some(&holdable)).await;
         use crate::mailbox::client::DepositError;
         match result {
+            Ok(_) if cancel.load(Ordering::SeqCst) => {
+                // Canceled just as the upload finished: take it back off the server.
+                let stop = Self::stop_state(&id);
+                if stop == CANCELED {
+                    crate::mailbox::client::abandon(&self.net, &config, &rec.chat_id);
+                }
+                update(&config, &id, |r| {
+                    for d in r.devices.iter_mut().filter(|d| holdable.contains(&d.eid)) {
+                        d.state = stop.into();
+                    }
+                });
+            }
             Ok(held) => {
                 log::info!("fanout: held on a Transfer Server for {} offline device(s)", holdable.len());
                 update(&config, &id, |r| {
@@ -662,7 +697,8 @@ impl Engine {
                     }
                 }
                 if !still.is_empty() {
-                    wait(&still, None);
+                    // Still away: back to the server for them.
+                    Box::pin(self.clone().hold_or_queue(id.clone(), still, cancel.clone())).await;
                 }
             }
             Err(DepositError::Canceled) => {
@@ -720,7 +756,7 @@ impl Engine {
             })
         }).unwrap_or_default();
         let stop = if reason == CancelReason::Pause { PAUSED } else { CANCELED };
-        let had_held = rec.devices.iter().any(|d| d.state == HELD);
+        let had_held = rec.devices.iter().any(|d| d.state == HELD || d.state == UPLOADING);
         update(&self.config, id, |r| {
             for d in r.devices.iter_mut().filter(|d| !running.contains(&d.eid)) {
                 if d.state == WAITING || d.state == OFFLINE || (d.state == HELD && reason == CancelReason::Cancel) {
@@ -740,13 +776,19 @@ impl Engine {
     /// A Transfer Server receipt for one of our sends. True = it was ours.
     pub(crate) fn receipt(&self, r: &crate::mailbox::client::Receipt) -> bool {
         let item = r.sent.item_id.as_str();
-        let owner = records(&self.config).into_iter()
-            .find(|rec| rec.devices.iter().any(|d| d.item_id.as_deref() == Some(item)));
-        let Some(rec) = owner else { return false };
+        let all = records(&self.config);
+        let owner = all.iter()
+            .find(|rec| rec.devices.iter().any(|d| d.item_id.as_deref() == Some(item))).cloned();
+        let Some(rec) = owner else {
+            // A replaced copy of one of our sends: it's ours, and it changes nothing.
+            return all.iter().any(|rec| r.sent.transfer_id.as_deref() == Some(rec.id.as_str()));
+        };
+        let sharing = rec.devices.iter().filter(|d| d.item_id.as_deref() == Some(item)).count();
         let mut retry = false;
         update(&self.config, &rec.id, |rec| {
             for d in rec.devices.iter_mut().filter(|d| d.item_id.as_deref() == Some(item) && d.state == HELD) {
-                if r.delivered_to.contains(&d.eid) || (r.state == "delivered" && r.delivered_to.is_empty()) {
+                // An empty list only proves delivery when the copy was for one device.
+                if r.delivered_to.contains(&d.eid) || (r.state == "delivered" && r.delivered_to.is_empty() && sharing == 1) {
                     d.state = DELIVERED.into();
                     d.note = None;
                 } else {
@@ -757,9 +799,15 @@ impl Engine {
                             d.note = Some("refused".into());
                         }
                         "canceled" => d.state = CANCELED.into(),
+                        // The device turned it down (removed/blocked us, couldn't
+                        // verify it): never push it at them directly instead.
+                        "rejected" => {
+                            d.state = FAILED.into();
+                            d.note = Some("refused".into());
+                        }
                         // Never reached it through the server: we still have the
                         // files, so send them directly when the device is back.
-                        "expired" | "lost" | "rejected" => {
+                        "expired" | "lost" => {
                             d.attempts += 1;
                             d.state = if d.attempts >= MAX_ATTEMPTS { FAILED } else { WAITING }.into();
                             d.item_id = None;
@@ -860,6 +908,35 @@ fn with_legs<T>(f: impl FnOnce(&mut HashMap<String, Leg>) -> T) -> T {
     f(g.get_or_insert_with(HashMap::new))
 }
 
+/// Held by a leg's send task: if that task ever ends without reporting (a
+/// panic), its send hears "failed" instead of waiting forever.
+pub(crate) struct LegGuard(pub String);
+impl Drop for LegGuard {
+    fn drop(&mut self) {
+        let tx = with_legs(|l| l.get_mut(&self.0).and_then(|leg| leg.tx.take()));
+        if let Some(tx) = tx {
+            let _ = tx.send(Outcome::Failed("the send stopped unexpectedly".into()));
+        }
+    }
+}
+
+/// Which devices a file card (chat link id) should reach: the devices its
+/// files go to. Unknown = every device of the person.
+static NOTE_TARGETS: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+
+fn note_targets_set(chat_id: &str, eids: Vec<String>) {
+    let mut g = NOTE_TARGETS.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() > 500 {
+        m.clear();
+    }
+    m.insert(chat_id.to_owned(), eids);
+}
+
+pub(crate) fn note_targets(chat_id: &str) -> Option<Vec<String>> {
+    NOTE_TARGETS.lock().unwrap_or_else(|p| p.into_inner()).as_ref().and_then(|m| m.get(chat_id).cloned())
+}
+
 /// Is `id` one device's leg of a fan-out send (so it gets no card of its own)?
 pub(crate) fn is_leg(id: &str) -> bool {
     with_legs(|l| l.contains_key(id))
@@ -920,10 +997,11 @@ impl AppEnv {
 async fn resend_note(app: &tauri::AppHandle, net: &IrohState, rec: &Record, eid: &str) {
     use tauri::Manager;
     let (Some(ep), Some(st)) = (net.get().cloned(), app.try_state::<Arc<crate::AppState>>()) else { return };
-    let Some(m) = crate::chat::messages(&st.config_dir, &rec.peer_id).into_iter()
+    let thread = thread_of(&st.config_dir, &rec.peer_id);
+    let Some(m) = crate::chat::messages(&st.config_dir, &thread).into_iter()
         .find(|m| m.from_me && m.file_xfer_id.as_deref() == Some(rec.chat_id.as_str())) else { return };
     let my_name = st.settings.lock().unwrap().display_name.clone();
-    let payload = crate::iroh_net::chat_payload(&m, &rec.peer_id, &my_name);
+    let payload = crate::iroh_net::chat_payload(&m, &thread, &my_name);
     let _ = crate::iroh_net::send_chat_any(net, &ep, &[eid.to_owned()], payload).await;
 }
 
@@ -936,6 +1014,9 @@ impl Env for AppEnv {
             if job.retry {
                 resend_note(&app, &net, &job.record, &job.eid).await;
             }
+            if job.cancel.load(Ordering::SeqCst) {
+                return Outcome::Canceled;
+            }
             let child = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = tokio::sync::oneshot::channel();
             with_legs(|l| {
@@ -943,12 +1024,17 @@ impl Env for AppEnv {
                 l.insert(child.clone(), Leg { parent: job.record.id.clone(), tx: Some(tx), progress, done_at: None });
             });
             let rec = job.record;
-            let started = crate::iroh_net::send_to_friend_opts(app, net, rec.friend_name.clone(), job.eid.clone(), rec.paths.clone(),
+            let started = crate::iroh_net::send_to_friend_opts(app, net.clone(), rec.friend_name.clone(), job.eid.clone(), rec.paths.clone(),
                 Some(rec.chat_id.clone()), Some(rec.attempt), Some(ChildCtx { id: child.clone(), first_dial: job.first_dial }),
                 Some(vec![job.eid.clone()]));
             if let Err(e) = started {
                 with_legs(|l| l.remove(&child));
                 return Outcome::Failed(e);
+            }
+            // A stop that landed while this leg was starting didn't reach it yet.
+            if job.cancel.load(Ordering::SeqCst) {
+                let reason = with_live(|l| l.get(&rec.id).and_then(|x| x.reason)).unwrap_or(CancelReason::Cancel);
+                net.cancel_with(&child, reason);
             }
             rx.await.unwrap_or(Outcome::Failed("stopped".into()))
         })
@@ -961,7 +1047,7 @@ impl Env for AppEnv {
         if !significant {
             return;
         }
-        if let Some(m) = crate::chat::set_deliveries(config, &rec.peer_id, &rec.chat_id, &rec.devices) {
+        if let Some(m) = crate::chat::set_deliveries(config, &thread_of(config, &rec.peer_id), &rec.chat_id, &rec.devices) {
             let _ = self.app.emit("chat://message", &m);
         }
         // One History row for the whole send, once it reached (or is safely on
@@ -1028,9 +1114,35 @@ pub fn send(app: tauri::AppHandle, net: Arc<IrohState>, config: &Path, friend_id
             "This friend was added on an old version — re-add them to send directly.",
         )?;
         let hold = only.map(|o| vec![o]);
-        return crate::iroh_net::send_to_friend_opts(app, net, friend.name, eid, paths, chat_transfer_id, chat_attempt, None, hold);
+        let u = crate::iroh_net::send_to_friend_opts(app, net, friend.name, eid.clone(), paths, chat_transfer_id.clone(), chat_attempt, None, hold)?;
+        note_targets_set(chat_transfer_id.as_deref().unwrap_or(&u.id), vec![eid]);
+        return Ok(u);
     }
     let engine = ENGINE.get().cloned().ok_or("DropBeam is still connecting — try again in a moment.")?;
+    // Resume/Retry of a recent send to them: only the devices still owed it
+    // (a paused or failed device), never the ones that already have it.
+    let t = now();
+    let resumable = records(config).into_iter().filter(|r| {
+        (chat_transfer_id.as_deref() == Some(r.chat_id.as_str()) || (r.paths == paths && t.saturating_sub(r.created_ms) < 24 * 3600 * 1000))
+            && thread_of(config, &r.peer_id) == owner.id
+            && !r.devices.iter().any(Delivery::busy)
+            && r.devices.iter().any(|d| d.state == PAUSED || d.state == FAILED)
+            && r.devices.iter().all(|d| devices.iter().any(|x| x.eid == d.eid))
+    }).max_by_key(|r| r.created_ms);
+    if let Some(rec) = resumable {
+        let owed: Vec<String> = rec.devices.iter().filter(|d| matches!(d.state.as_str(), PAUSED | FAILED | WAITING)).map(|d| d.eid.clone()).collect();
+        let rec = update(config, &rec.id, |r| {
+            for d in r.devices.iter_mut().filter(|d| owed.contains(&d.eid)) {
+                d.state = WAITING.into();
+                d.attempts = 0;
+                d.note = None;
+            }
+        }).unwrap_or(rec);
+        log::info!("fanout: resuming a send for {} of the person's devices", owed.len());
+        note_targets_set(&rec.chat_id, owed.clone());
+        engine.start(rec.id.clone(), owed, true);
+        return Ok(card(&rec, &HashMap::new()));
+    }
     let (names, total) = crate::iroh_net::card_summary(&paths)?;
     let id = uuid::Uuid::new_v4().to_string();
     let rec = Record {
@@ -1039,6 +1151,7 @@ pub fn send(app: tauri::AppHandle, net: Arc<IrohState>, config: &Path, friend_id
         attempt: chat_attempt.unwrap_or(1).max(now()), devices, ..Default::default()
     };
     log::info!("fanout: sending to {} devices of one friend", rec.devices.len());
+    note_targets_set(&rec.chat_id, rec.devices.iter().map(|d| d.eid.clone()).collect());
     let snapshot = card(&rec, &HashMap::new());
     engine.begin(rec);
     Ok(snapshot)

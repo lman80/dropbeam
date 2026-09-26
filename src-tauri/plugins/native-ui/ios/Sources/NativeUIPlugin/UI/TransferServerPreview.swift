@@ -41,6 +41,33 @@ import Foundation
             ChatMessage(id: "j2", peerId: "qa-jordan", fromMe: true, ts: now - 25 * hour, kind: "text", text: "Nice, that’ll help", status: "read"),
             ChatMessage(id: "j3", peerId: "qa-jordan", fromMe: true, ts: now - 20 * min, kind: "text", text: "Sending the cut tonight", status: "failed", heldOn: "Linux Box", serverNote: "full"),
         ]
+        // `-previewMultiDevice`: Alex has a Mac AND an iPhone; sends go to both.
+        if args.contains("-previewMultiDevice") {
+            b.friends = [
+                Friend(id: "qa-alex", name: "Alex Rivera", endpointId: "qa-alex-eid", deviceKind: "laptop", deviceOs: "macos"),
+                Friend(id: "qa-alex-phone", name: "Alex Rivera", endpointId: "qa-alex-phone-eid", deviceKind: "phone", deviceOs: "ios", groupedUnder: "qa-alex"),
+                Friend(id: "qa-jordan", name: "Jordan Lee", endpointId: "qa-jordan-eid"),
+            ]
+            b.presence = ["qa-alex": true, "qa-jordan": false]
+            let mac = Delivery(eid: "qa-alex-eid", label: "Mac", kind: "laptop", os: "macos", state: "delivered")
+            let phoneHeld = Delivery(eid: "qa-alex-phone-eid", label: "iPhone", kind: "phone", os: "ios", state: "held", via: "Linux Box")
+            let phoneDone = Delivery(eid: "qa-alex-phone-eid", label: "iPhone", kind: "phone", os: "ios", state: "delivered")
+            b.transfers = [
+                Transfer(id: "qa-fan-live", direction: "send", state: "transferring", fileNames: ["Drone footage.mov"], fileCount: 1, bytesTotal: 1_400_000_000, bytesDone: 530_000_000, percent: 38, speedBps: 61_000_000, etaSeconds: 14, friendName: "Alex Rivera", chatOnly: false,
+                         deliveries: [Delivery(eid: "qa-alex-eid", label: "Mac", kind: "laptop", os: "macos", state: "sending"), Delivery(eid: "qa-alex-phone-eid", label: "iPhone", kind: "phone", os: "ios", state: "uploading", via: "Linux Box")]),
+                Transfer(id: "qa-fan-held", direction: "send", state: "completed", fileNames: ["Beach trip.zip"], fileCount: 1, bytesTotal: 212_000_000, bytesDone: 212_000_000, percent: 100, friendName: "Alex Rivera", chatOnly: false, heldOn: "Linux Box", deliveries: [mac, phoneHeld]),
+                Transfer(id: "qa-fan-both", direction: "send", state: "completed", fileNames: ["Itinerary.pdf"], fileCount: 1, bytesTotal: 640_000, bytesDone: 640_000, percent: 100, friendName: "Alex Rivera", chatOnly: false, deliveries: [mac, phoneDone]),
+            ]
+            b.threads["qa-alex"] = [
+                ChatMessage(id: "m1", peerId: "qa-alex", fromMe: false, ts: now - 40 * min, kind: "text", text: "Can you send the trip stuff? I’m on my phone", status: "delivered"),
+                ChatMessage(id: "m2", peerId: "qa-alex", fromMe: true, ts: now - 12 * min, kind: "file", files: ["Beach trip.zip"], bytes: 212_000_000, path: "/tmp/Beach trip.zip", status: "delivered", fileXferId: "qa-fan-held", deliveries: [mac, phoneHeld]),
+                ChatMessage(id: "m3", peerId: "qa-alex", fromMe: true, ts: now - 11 * min, kind: "file", files: ["Itinerary.pdf"], bytes: 640_000, path: "/tmp/Itinerary.pdf", status: "read", fileXferId: "qa-fan-both", deliveries: [mac, phoneDone]),
+            ]
+        }
+        if let i = args.firstIndex(of: "-previewTab"), i + 1 < args.count {
+            let tab = args[i + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { b.selectedTab = tab }
+        }
         if let i = args.firstIndex(of: "-previewChat"), i + 1 < args.count {
             let id = "qa-" + args[i + 1]
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { b.selectedTab = "chat"; b.chatPath = [id] }

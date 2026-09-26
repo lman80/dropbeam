@@ -11,6 +11,7 @@ struct ChatAttachment: View {
     private var paths: [String] { Self.availablePaths(message, bridge: bridge) }
     private var failed: Bool { message.fileXferFailed == true || ["failed", "canceled"].contains(transfer?.state ?? "") }
     private var active: Bool { transfer?.active == true }
+    private var friendName: String { bridge.friends.first { $0.id == message.peerId }?.name ?? "them" }
     /// A held send from a friend who needs your OK first (Download / Decline).
     private var pending: PendingFile? { message.fromMe || transfer != nil ? nil : bridge.pendingFiles.first { $0.linkId == message.fileXferId } }
     @State private var deciding = false
@@ -56,7 +57,12 @@ struct ChatAttachment: View {
                     .background(ChatPalette.fill(message.fromMe), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 }.buttonStyle(.plain).disabled(item.path == nil)
             }
-            if failed {
+            if message.fromMe, !active, !failed, let devices = DeliveryCopy.multi(transfer?.deliveries ?? message.deliveries) {
+                // Sent to their Mac AND iPhone: where it is on each, in one line.
+                Text(DeliveryCopy.summary(friend: friendName, devices))
+                    .font(.caption).foregroundStyle(DeliveryCopy.problem(devices) ? Color.red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if failed {
                 Button(message.fromMe ? "Not Delivered · Retry" : "Not Delivered · Ask sender to retry") {
                     if message.fromMe { bridge.perform { try await bridge.retryChatFile(friendId: message.peerId, messageId: message.id) } }
                 }.font(.caption).foregroundStyle(.secondary).disabled(!message.fromMe)

@@ -40,7 +40,8 @@ const handlers: BridgeHandlers = {
     const source = nativeChatSource(a)
     return pickNativeMedia(source, invoke)
   },
-  sendToFriend: async a => { await storeAction(() => st().sendToFriend(string(a, 'friendId'), paths(a))); st().setPendingSend(null) },
+  // `device` (an endpoint id) = "Send to one device"; without it every device gets it.
+  sendToFriend: async a => { await storeAction(() => st().sendToFriend(string(a, 'friendId'), paths(a), typeof a.device === 'string' && a.device ? a.device : undefined)); st().setPendingSend(null) },
   quickSend: async a => { await storeAction(() => st().sendPaths(paths(a))); st().setPendingSend(null) },
   dismissSend: () => st().setPendingSend(null),
   refreshRecipients: async () => {

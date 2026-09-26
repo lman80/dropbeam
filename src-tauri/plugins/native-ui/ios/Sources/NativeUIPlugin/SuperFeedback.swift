@@ -425,6 +425,10 @@ fileprivate final class SFSceneState: ObservableObject {
     @Published var enabled = SuperFeedback.isEnabled
     @Published var suppressed = false
     @Published var keyboardVisible = false
+    /// The host app is showing a sheet / full-screen cover / alert: the trigger
+    /// would float over it (it lives in a window above the app's), so it steps aside.
+    @Published var hostPresenting = false
+    private var presentationTimer: Timer?
     private var keyboardObservers: [NSObjectProtocol] = []
     @Published var isPresented = false
     @Published var toast: String?
@@ -457,6 +461,11 @@ fileprivate final class SFSceneState: ObservableObject {
 
     init(scene: UIWindowScene, config: SuperFeedback.Config) {
         self.scene = scene; self.config = config
+        let timer = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshHostPresentation() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        presentationTimer = timer
         // The keyboard usually brings a text field + send button to the screen edge.
         for (name, visible) in [(UIResponder.keyboardWillShowNotification, true), (UIResponder.keyboardWillHideNotification, false)] {
             keyboardObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -470,7 +479,20 @@ fileprivate final class SFSceneState: ObservableObject {
     }
 
     var accent: Color { config.accent ?? Color(red: 109 / 255, green: 94 / 255, blue: 252 / 255) }
-    var showsButton: Bool { enabled && !suppressed && !keyboardVisible && config.trigger != .none && !isPresented && !sheetClosing }
+    var showsButton: Bool { enabled && !suppressed && !keyboardVisible && !hostPresenting && config.trigger != .none && !isPresented && !sheetClosing }
+
+    /// Presentations don't announce themselves app-wide, so look (cheaply, a few
+    /// times a second) for anything presented over one of the host's windows.
+    func refreshHostPresentation() {
+        guard let scene else { return }
+        let presenting = scene.windows.contains { host in
+            !(host is SFOverlayWindow) && !host.isHidden && host.rootViewController?.presentedViewController != nil
+        }
+        if presenting != hostPresenting {
+            hostPresenting = presenting
+            if presenting { buttonFrame = .zero }
+        }
+    }
 
     func present() {
         guard !isPresented, !sheetClosing, let scene else { return }
@@ -582,6 +604,8 @@ fileprivate final class SFSceneState: ObservableObject {
     }
 
     func tearDown() {
+        presentationTimer?.invalidate()
+        presentationTimer = nil
         toastTask?.cancel()
         keyboardObservers.forEach(NotificationCenter.default.removeObserver)
         keyboardObservers = []

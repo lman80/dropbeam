@@ -291,6 +291,9 @@ struct TransferRow: View {
                     }
                 }
             }
+            if let devices = DeliveryCopy.multi(transfer.deliveries), transfer.direction == "send", transfer.state != "canceled" {
+                DeliveryRows(deliveries: devices)
+            }
             if transfer.state == "completed" { completedDetails }
             if failed || transfer.state == "paused", let error = transfer.error {
                 Text(error).font(.footnote).foregroundStyle(.secondary)
@@ -337,6 +340,10 @@ struct TransferRow: View {
         case "waitingForPeer" where transfer.direction == "send" && transfer.code != nil: status = "Waiting for a receiver"
         case "failed": status = transfer.direction == "send" ? "Couldn’t send" : "Couldn’t receive"
         default: status = transfer.status
+        }
+        // Sent to a friend's several devices: one line says where it is on each.
+        if let devices = DeliveryCopy.multi(transfer.deliveries), transfer.direction == "send", ["completed", "held"].contains(transfer.state ?? "") {
+            return DeliveryCopy.summary(friend: name ?? "them", devices)
         }
         // A finished row's badge already says Sent/Received; the line says who and how much.
         if transfer.state == "completed" {

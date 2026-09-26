@@ -4840,6 +4840,7 @@ fn send_friend_inner(
         .collect();
     tauri::async_runtime::spawn(integrity::scope(async move {
         let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
+        let _leg_guard = first_dial.map(|_| crate::fanout::LegGuard(id.clone()));
         // Only the FIRST reach-out may divert to the server: once any connection
         // formed, a later drop resumes the direct send (never restarts it on the
         // server from byte zero).

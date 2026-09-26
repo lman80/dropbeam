@@ -234,7 +234,11 @@ final class Bridge: ObservableObject {
         toast = message
         Task { try? await Task.sleep(for: .seconds(5)); if toast == message { toast = nil } }
     }
-    func sendToFriend(friendId: String, paths: [String]) async throws { try await action("sendToFriend", ["friendId": friendId, "paths": paths]) }
+    func sendToFriend(friendId: String, paths: [String], device: String? = nil) async throws {
+        var args: [String: Any] = ["friendId": friendId, "paths": paths]
+        if let device { args["device"] = device }
+        try await action("sendToFriend", args)
+    }
     func receiveWithCode(code: String) async throws { try await action("receiveWithCode", ["code": code]) }
     /// Any DropBeam code (Quick Send, friend, friend invite, folder invite, device link),
     /// routed like desktop's "Have a code?". Folder invites open the folder picker here.

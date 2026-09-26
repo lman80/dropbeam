@@ -65,6 +65,8 @@ struct Transfer: Decodable, Identifiable {
     var integrity: [FileIntegrity]?
     /// Transfer Server name: uploading to it ("transferring") or held there ("held").
     var heldOn: String?
+    /// A send to a friend with several devices: where it is on each one.
+    var deliveries: [Delivery]?
     var active: Bool { ["starting", "waitingForPeer", "connecting", "waitingForAccept", "transferring"].contains(state ?? "") }
     var title: String { (fileCount ?? 0) > 1 ? "\(fileCount ?? 0) files" : fileNames?.first ?? "Files" }
     var status: String {
@@ -114,6 +116,8 @@ struct ChatMessage: Decodable, Identifiable, Equatable {
     var serverNote: String?
     /// Receiver side: arrived through this Transfer Server.
     var via: String?
+    /// Sender side: a file sent to a friend's several devices — where it is on each.
+    var deliveries: [Delivery]?
     var date: Date { Date(timeIntervalSince1970: ts / 1000) }
     var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? (text ?? "") : files?.joined(separator: ", ") ?? "Attachment" }
 }
@@ -401,6 +405,7 @@ extension Transfer {
         self.verify = (try? c.decode(VerifyReport.self, forKey: BridgeKey("verify")))
         self.integrity = (try? c.decode(LossyArray<FileIntegrity>.self, forKey: BridgeKey("integrity")))?.values
         self.heldOn = (try? c.decode(String.self, forKey: BridgeKey("heldOn"))).flatMap { $0.isEmpty ? nil : $0 }
+        self.deliveries = (try? c.decode(LossyArray<Delivery>.self, forKey: BridgeKey("deliveries")))?.values
     }
 }
 
@@ -437,6 +442,7 @@ extension ChatMessage {
         self.heldOn = (try? c.decode(String.self, forKey: BridgeKey("heldOn"))).flatMap { $0.isEmpty ? nil : $0 }
         self.serverNote = (try? c.decode(String.self, forKey: BridgeKey("serverNote"))).flatMap { $0.isEmpty ? nil : $0 }
         self.via = (try? c.decode(String.self, forKey: BridgeKey("via"))).flatMap { $0.isEmpty ? nil : $0 }
+        self.deliveries = (try? c.decode(LossyArray<Delivery>.self, forKey: BridgeKey("deliveries")))?.values
     }
 }
 

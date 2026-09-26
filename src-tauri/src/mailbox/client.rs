@@ -265,6 +265,14 @@ pub fn can_hold(config: &Path, me: &str, peer_id: &str) -> bool {
     !eids.is_empty() && !keys::recipients(config, &eids).is_empty() && !routes(config, me, &eids).is_empty()
 }
 
+/// Whether the first server we'd use keeps a file until EVERY device it was
+/// sealed for has it (older servers hand it to whichever device fetches first).
+pub async fn route_keeps_per_device(net: &IrohState, config: &Path, me: &str, eids: &[String]) -> bool {
+    let Some(ep) = net.get().cloned() else { return false };
+    let Some(route) = routes(config, me, eids).into_iter().next() else { return false };
+    server_hello(&ep, &route.server).await.is_some_and(|h| h["per_device"].as_bool() == Some(true))
+}
+
 /// Which of these devices a server could hold something for right now (we have
 /// their mailbox key and a route that takes them). Empty = none.
 pub fn holdable_devices(config: &Path, me: &str, eids: &[String]) -> Vec<String> {
@@ -526,7 +534,9 @@ async fn deposit_on(ep: &iroh::Endpoint, server: &str, env: &seal::Envelope, pus
     let result = async {
         let (mut send, mut recv) = conn.open_bi().await.map_err(|_| RpcError::Unreachable)?;
         let header = serde_json::to_value(env).map_err(|e| RpcError::Failed(e.to_string()))?;
-        write_frame(&mut send, &json!({"kind": "mailbox.deposit", "v": super::VERSION, "header": header, "push": push}))
+        write_frame(&mut send, &json!({"kind": "mailbox.deposit", "v": super::VERSION, "header": header, "push": push,
+            // A file goes to EVERY device it's sealed for (server keeps it until each has it).
+            "all_devices": upload.is_some()}))
             .await.map_err(|_| RpcError::Unreachable)?;
         let reply = tokio::time::timeout(Duration::from_secs(30), read_frame_cap(&mut recv, 64 * 1024)).await
             .map_err(|_| RpcError::Unreachable)?.map_err(|_| RpcError::Unreachable)?;
@@ -784,7 +794,7 @@ pub async fn deposit_files(
         to.sort_unstable();
         s.state == "uploading" && s.xfer_id.as_deref() == Some(xfer_id) && s.files_sig.as_deref() == Some(&sig) && s.header.is_some() && s.file_key.is_some()
             // Only a partial sealed for the SAME devices may be resumed.
-            && (to.is_empty() || to == sealed_for)
+            && to == sealed_for
     });
     let mut prepared: Option<(seal::Envelope, [u8; 32], String)> = resumable.as_ref().and_then(|s| {
         let env: seal::Envelope = serde_json::from_value(s.header.clone()?).ok()?;

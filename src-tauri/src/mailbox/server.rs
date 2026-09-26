@@ -190,6 +190,11 @@ pub struct Item {
     /// person's devices sync their conversation among themselves.
     #[serde(default)]
     pub delivered: Vec<String>,
+    /// The sender asked for every sealed-for device to get it. Items from older
+    /// senders (sealed for a whole person, "whoever fetches first") finish on
+    /// the first ack as they always did.
+    #[serde(default)]
+    pub all_devices: bool,
 }
 
 impl Item {
@@ -483,7 +488,9 @@ fn hello_reply(config: &Path, c: &ServerConfig, who: &str) -> Value {
     let quota = with_store(config, |s| quota_numbers(config, c, s, &person, r.own)).unwrap_or(json!(null));
     json!({"ok": true, "v": super::VERSION, "name": server_name(c), "paused": c.paused,
         "rights": r, "quota": quota, "expiry": {"file_days": c.file_days, "chat_days": c.chat_days},
-        "push": super::push::configured()})
+        "push": super::push::configured(),
+        // Files wait for every device they were sealed for (see Item::delivered).
+        "per_device": true})
 }
 
 fn header_sha(header: &Value) -> String {
@@ -595,6 +602,7 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
             kind: env.kind.clone(), ct_size, header_sha: sha.clone(), created_ms: created,
             expires_ms: created + days * DAY_MS, state: "uploading".into(), push: push.clone(),
             hbytes, refused: vec![], delivered: vec![],
+            all_devices: req["all_devices"].as_bool().unwrap_or(false),
         };
         let dir = item_dir(&s.root, &item.id);
         let write = (|| -> Result<()> {
@@ -795,7 +803,7 @@ fn ack(config: &Path, who: &str, req: &Value) -> Value {
             }
             // A file reaches EVERY device it was sealed for; chat/ops sync
             // between a person's devices, so the first one is enough.
-            let done = it.kind != "file" || it.to.iter().all(|t| it.delivered.contains(t) || it.refused.contains(t));
+            let done = it.kind != "file" || !it.all_devices || it.to.iter().all(|t| it.delivered.contains(t) || it.refused.contains(t));
             if done {
                 s.items.insert(id.clone(), it);
                 finish_item(s, &id, "delivered");

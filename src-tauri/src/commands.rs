@@ -1373,7 +1373,13 @@ fn deliver_chat(
         let my_name = state.settings.lock().unwrap().display_name.clone();
         let payload = crate::iroh_net::chat_payload(msg, &friend.id, &my_name);
         let config_dir = state.config_dir.clone();
-        let eids = friends::person_endpoints(&config_dir, &friend.id);
+        let mut eids = friends::person_endpoints(&config_dir, &friend.id);
+        // A file card reaches the devices its files go to ("Send to one device"
+        // must not leave a card for files that never come on the others).
+        let targets = msg.file_xfer_id.as_deref().and_then(crate::fanout::note_targets);
+        if let Some(t) = targets.filter(|t| !t.is_empty()) {
+            eids = t;
+        }
         let (pid, mid) = (friend.id.clone(), msg.id.clone());
         let app = app.clone();
         let iroh = iroh.clone();
