@@ -1,0 +1,10 @@
+name = "dropbeam-push"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+APNS_TOPIC = "com.ashtonmiller.dropbeam"
+
+[[kv_namespaces]]
+binding = "PUSH_RL"
+id = "01482baf090e4b7c994c4010d5e251b7"

@@ -45,13 +45,15 @@ struct RootView: View {
         .animation(.snappy, value: bridge.toast)
         .onChange(of: bridge.toast) { _, toast in if let toast { UIAccessibility.post(notification: .announcement, argument: toast) } }
         .preferredColorScheme(bridge.settings?.theme == "dark" ? .dark : bridge.settings?.theme == "light" ? .light : nil)
-        .task { try? await bridge.nativeChatFocus(scenePhase == .active) }
+        .task { try? await bridge.nativeChatFocus(scenePhase == .active); await bridge.mailboxFetchNow() }
         .onChange(of: bridge.selectedTab) { _, tab in
             SuperFeedback.setContext(["screen": tab])
             bridge.perform { try await bridge.setView(name: tab) }
         }
         .onChange(of: scenePhase) { _, phase in
             Task { try? await bridge.nativeChatFocus(phase == .active) }
+            // Anything a Transfer Server held for us while we were away.
+            if phase == .active { Task { await bridge.mailboxFetchNow() } }
         }
         .alert("Couldn’t complete that", isPresented: showsError) {
             Button("OK", role: .cancel) { bridge.errorMessage = nil }

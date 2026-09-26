@@ -17,6 +17,7 @@ struct SettingsView: View {
     @State private var qaSaveFolder = false
     var body: some View {
         NavigationStack {
+          ScrollViewReader { proxy in
             List {
                 Section {
                     NavigationLink { ProfileView() } label: {
@@ -65,6 +66,7 @@ struct SettingsView: View {
                         RowLabel(title: "GIF Search", symbol: "sparkles.rectangle.stack.fill", color: .purple, value: (bridge.settings?.giphyApiKey ?? "").isEmpty ? "Off" : "On")
                     }
                 } header: { Text("Chat") } footer: { Text("Friends see when you’ve read their messages while Read Receipts is on.") }
+                TransferServersSection()
                 Section("Storage") {
                     NavigationLink { RecoverySettingsView() } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }
                     ActionRow(title: "Clear Transfer Cache", symbol: "trash.fill", color: .gray) { clearCache = true }
@@ -89,12 +91,15 @@ struct SettingsView: View {
             .navigationDestination(isPresented: $qaSaveFolder) { SaveFolderView() }
             #if targetEnvironment(simulator)
             .onAppear { if CommandLine.arguments.contains("-openSaveFolder") { qaSaveFolder = true } }
+            // QA: `-scrollToServers` brings the Transfer Servers section into view.
+            .task { if CommandLine.arguments.contains("-scrollToServers") { try? await Task.sleep(for: .seconds(1)); proxy.scrollTo("transferServersEnd", anchor: .bottom) } }
             #endif
             .task { version = (try? await bridge.call("appVersion")) ?? ""; try? await bridge.action("myDeviceInfo") }
             .onAppear { feedbackButton = SuperFeedback.isEnabled }
             .confirmationDialog("Clear interrupted transfer leftovers?", isPresented: $clearCache, titleVisibility: .visible) {
                 Button("Clear Transfer Cache", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("clearTransferCache"); bridge.showToast(freed > 0 ? "Cleared \(Formatters.bytes(freed))" : "No transfer leftovers to clear") } }
             } message: { Text("Partly received files are removed. Finished files aren’t affected.") }
+          }
         }
     }
     /// Email the DropBeam team (the address lives in src/lib/report.ts).

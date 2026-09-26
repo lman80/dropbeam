@@ -85,6 +85,9 @@ pub struct ServerConfig {
     /// Refuse new items when the disk has less than this free (0 = 5 GB / 5%).
     #[serde(default)]
     pub min_free: u64,
+    /// Push relay URL override (empty = the DropBeam relay).
+    #[serde(default)]
+    pub push_url: String,
     #[serde(default)]
     pub created_ms: u64,
 }
@@ -1009,6 +1012,12 @@ pub fn device_seen(eid: &str) {
     if fresh {
         wake_delivery();
     }
+}
+
+/// Connected (or heard from) in the last minute — no need to wake its phone.
+pub fn recently_seen_device(eid: &str) -> bool {
+    SEEN.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+        .and_then(|m| m.get(eid)).is_some_and(|t| t.elapsed() < Duration::from_secs(60))
 }
 
 fn recently_seen(eid: &str) -> bool {

@@ -42,6 +42,14 @@ struct ConversationView: View {
         return f.accountPub != account
     }
     private var messages: [ChatMessage] { bridge.threads[friendID] ?? [] }
+    /// Where a message to them would wait while they're offline (a Transfer Server's name).
+    private var holdOn: String? { bridge.holdRoutes[friendID] }
+    private var firstName: String { ServerCopy.firstName(friend.displayName) }
+    /// A Transfer Server this person shared that hasn't been answered yet.
+    private var offer: UsableServer? {
+        let endpoints = Set(bridge.friends.filter { $0.id == friendID || $0.groupedUnder == friendID }.compactMap(\.endpointId))
+        return bridge.servers.first { endpoints.contains($0.eid) && $0.offer == "new" && !$0.revoked && !$0.own }
+    }
     private var friend: Friend { bridge.friends.first { $0.id == friendID } ?? Friend(id: friendID, name: "Friend") }
     private var matches: [String] {
         guard !query.isEmpty else { return [] }
@@ -59,6 +67,11 @@ struct ConversationView: View {
                     ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
                         messageRow(message, index: index)
                             .id(message.id)
+                    }
+                    if let offer {
+                        ServerOfferCard(server: offer, friendName: ServerCopy.firstName(friend.displayName))
+                            .padding(.top, 16).padding(.horizontal, 4)
+                            .transition(.opacity)
                     }
                     if bridge.chatTyping[friendID] == true {
                         HStack(alignment: .bottom, spacing: 6) { ContactAvatar(friend: friend, size: 28); TypingBubble(); Spacer() }
@@ -131,6 +144,11 @@ struct ConversationView: View {
         // Presence: check the friend the moment the thread opens (and again on
         // return to the foreground) instead of waiting on the background beacon.
         .task(id: probeRun) { await presenceLoop() }
+        .task(id: probeRun) { await bridge.refreshHoldRoute(friendId: friendID) }
+        .onChange(of: bridge.servers) { _, _ in Task { await bridge.refreshHoldRoute(friendId: friendID) } }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("DropBeam.mailbox://servers"))) { _ in
+            Task { await bridge.refreshHoldRoute(friendId: friendID) }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active, Date().timeIntervalSince(lastProbe) > 5 { probeRun += 1 }
         }
@@ -248,7 +266,8 @@ struct ConversationView: View {
 
     /// Calm inline note over the composer while the friend can't be reached.
     private var offlineNote: some View {
-        Text("\(friend.displayName) is offline. Messages will send when you’re both online with DropBeam open.")
+        Text(holdOn.map { "\(friend.displayName) is offline. Messages wait on \($0) and arrive when they’re back." }
+             ?? "\(friend.displayName) is offline. Messages will send when you’re both online with DropBeam open.")
             .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity).padding(.horizontal, 28).padding(.top, 6).padding(.bottom, 8)
@@ -316,13 +335,22 @@ struct ConversationView: View {
                 }
                 .padding(.top, newRun && !newCluster ? 10 : newCluster ? 0 : 2)
                 .padding(.top, message.reactions?.isEmpty == false ? 24 : 0)
-                if message.edited == true || (lastMine && delivery(message) != nil) {
+                let via = !message.fromMe && lastInRun && !(message.kind == "file" && message.path == nil) ? message.via : nil
+                if message.edited == true || via != nil || (lastMine && delivery(message) != nil) {
                     VStack(alignment: message.fromMe ? .trailing : .leading, spacing: 1) {
                         if message.edited == true {
                             Text("Edited").font(.caption2.weight(.medium)).foregroundStyle(message.fromMe ? ChatPalette.sent : Color.secondary)
                         }
+                        if let via {
+                            Text("via \(via)").font(.caption2).foregroundStyle(.secondary)
+                        }
                         if lastMine, let status = delivery(message) {
-                            Text(status).font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                            Group {
+                                if message.status == "held" { Text("\(Image(systemName: "server.rack")) \(status)") } else { Text(status) }
+                            }
+                            .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing).fixedSize(horizontal: false, vertical: true)
+                            .padding(.leading, 40)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: message.fromMe ? .trailing : .leading)
@@ -338,6 +366,9 @@ struct ConversationView: View {
         switch message.status {
         case "read": return "Read"
         case "delivered", "sent": return "Delivered"
+        case "held": return ServerCopy.held(server: message.heldOn, friend: firstName)
+        case "failed" where ServerCopy.note(message.serverNote, friend: firstName, server: message.heldOn) != nil:
+            return ServerCopy.note(message.serverNote, friend: firstName, server: message.heldOn)
         // The engine keeps every undelivered message queued and retries it until it
         // lands, so neither state is a failure; offline it is simply waiting.
         case "sending", "failed": return knownOffline ? "Waiting to send" : "Sending…"

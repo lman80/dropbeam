@@ -77,6 +77,10 @@ fn hkdf32(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
     out
 }
 
+pub fn hkdf32_pub(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
+    hkdf32(ikm, salt, info)
+}
+
 fn aead_key(k: &[u8; 32]) -> LessSafeKey {
     LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, k).expect("32-byte ChaCha20 key"))
 }

@@ -482,6 +482,14 @@ async fn rpc(conn: &iroh::endpoint::Connection, req: &Value) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(20), read_frame_cap(&mut recv, 4 << 20)).await.context("server didn't answer")?
 }
 
+/// Hand our sealed push token to a server (it can only use it via the relay).
+pub async fn push_register(ep: &iroh::Endpoint, server: &str, sealed_token: &str) -> bool {
+    let Some(conn) = connect(ep, server, Duration::from_secs(8)).await else { return false };
+    let reply = rpc(&conn, &json!({"kind": "mailbox.push-register", "v": super::VERSION, "sealed_token": sealed_token})).await;
+    conn.close(0u32.into(), b"done");
+    reply.is_ok_and(|r| r["ok"].as_bool() == Some(true))
+}
+
 /// Ask `server` what we may do there (None = unreachable / not a server).
 pub async fn server_hello(ep: &iroh::Endpoint, server: &str) -> Option<Value> {
     let conn = connect(ep, server, Duration::from_secs(6)).await?;
@@ -1626,6 +1634,7 @@ pub fn spawn(net: Arc<IrohState>) {
             }
             let receipts = refresh_status(&net, &config).await;
             crate::iroh_net::apply_receipts(&net, &config, &receipts);
+            super::push::register_everywhere(&net, &config).await;
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {},
                 _ = wake_cell().notified() => {},

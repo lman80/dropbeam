@@ -11,6 +11,11 @@ struct ChatAttachment: View {
     private var paths: [String] { Self.availablePaths(message, bridge: bridge) }
     private var failed: Bool { message.fileXferFailed == true || ["failed", "canceled"].contains(transfer?.state ?? "") }
     private var active: Bool { transfer?.active == true }
+    /// A held send from a friend who needs your OK first (Download / Decline).
+    private var pending: PendingFile? { message.fromMe || transfer != nil ? nil : bridge.pendingFiles.first { $0.linkId == message.fileXferId } }
+    @State private var deciding = false
+    /// This session's answer to a pending file (the engine then updates the message).
+    @State private var accepted: Bool?
     private struct Item: Identifiable {
         let id: Int
         let name: String
@@ -55,10 +60,23 @@ struct ChatAttachment: View {
                 Button(message.fromMe ? "Not Delivered · Retry" : "Not Delivered · Ask sender to retry") {
                     if message.fromMe { bridge.perform { try await bridge.retryChatFile(friendId: message.peerId, messageId: message.id) } }
                 }.font(.caption).foregroundStyle(.secondary).disabled(!message.fromMe)
+            } else if transfer?.state == "held" {
+                // Short: the thread's status line under the latest message says the rest.
+                Label { Text("Held on \(transfer?.heldOn ?? "your Transfer Server")") } icon: { Image(systemName: "server.rack") }
+                    .labelStyle(ServerLineStyle())
             } else if active {
                 ProgressView(value: min(1, max(0, (transfer?.percent ?? 0) / 100))).tint(ChatPalette.sent)
-                Text("\(message.fromMe ? "Sending" : "Receiving") \(Int(transfer?.percent ?? 0))%")
+                Text(transfer?.heldOn.map { "Sending to \($0) · \(Int(transfer?.percent ?? 0))%" } ?? "\(message.fromMe ? "Sending" : "Receiving") \(Int(transfer?.percent ?? 0))%")
                     .font(.caption).foregroundStyle(.secondary)
+            } else if let pending {
+                Text("Waiting on \(pending.serverName)").font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button("Decline") { decide(pending, false) }.beamButton()
+                    Button("Download") { decide(pending, true) }.beamButton(prominent: true)
+                }
+                .controlSize(.small).disabled(deciding)
+            } else if !message.fromMe, let via = message.via, items.contains(where: { $0.path == nil }) {
+                Text(accepted == false ? "Declined" : accepted == true ? "Downloading…" : "On its way from \(via)…").font(.caption).foregroundStyle(.secondary)
             } else if items.contains(where: { $0.path == nil }) {
                 Text("Waiting for files…").font(.caption).foregroundStyle(.secondary)
             }
@@ -74,6 +92,13 @@ struct ChatAttachment: View {
         #endif
         .fullScreenCover(item: $selected) { item in
             PagedMediaViewer(items: availableMedia, initialPath: item.path).environmentObject(bridge)
+        }
+    }
+    private func decide(_ file: PendingFile, _ accept: Bool) {
+        deciding = true
+        bridge.perform {
+            do { try await bridge.decidePendingFile(linkId: file.linkId, accept: accept); accepted = accept }
+            catch { deciding = false; throw error }
         }
     }
     private var grid: some View {
@@ -327,5 +352,16 @@ struct LocalMedia: Identifiable {
         let video = ["mp4", "mov", "m4v"].contains(ext)
         guard video || ["jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "tiff", "tif", "bmp", "avif"].contains(ext) else { return nil }
         self.path = path; self.name = (path as NSString).lastPathComponent; self.video = video
+    }
+}
+
+/// A small caption line with a leading glyph (Transfer Server status under a file).
+struct ServerLineStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            configuration.icon.font(.caption2)
+            configuration.title.fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.caption).foregroundStyle(.secondary)
     }
 }

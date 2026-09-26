@@ -48,6 +48,14 @@ final class Bridge: ObservableObject {
     @Published var folders: [SharedFolder] = []
     @Published var blocked: [BlockedPerson] = []
     @Published var chatTyping: [String: Bool] = [:]
+    /// Transfer Servers this device may use (iOS only uses them, never hosts).
+    @Published var servers: [UsableServer] = []
+    /// Files friends sent through a server that wait for this user's OK.
+    @Published var pendingFiles: [PendingFile] = []
+    /// Per thread: the server a message would wait on while the friend is offline.
+    @Published var holdRoutes: [String: String] = [:]
+    /// Simulator-only QA data is showing; engine snapshots for these keys are ignored.
+    var previewKeys: Set<String> = []
     @Published var threads: [String: [ChatMessage]] = [:]
     @Published var chatDraftFiles: [String] = []
     @Published var chatPath: [String] = []
@@ -127,6 +135,7 @@ final class Bridge: ObservableObject {
         } catch { finish(id, .failure(error)) }
     }
     func update(key: String, value: Any) throws {
+        if previewKeys.contains(key) { return }
         let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
         switch key {
         case "history": history = try decoder.decode(LossyArray<HistoryEntry>.self, from: data).values
@@ -157,11 +166,15 @@ final class Bridge: ObservableObject {
         case "presenceSeen": presenceSeen = try decoder.decode([String: Double].self, from: data)
         case "folders": folders = try decoder.decode(LossyArray<SharedFolder>.self, from: data).values
         case "blocked": blocked = try decoder.decode(LossyArray<BlockedPerson>.self, from: data).values
+        case "transferServers": servers = try decoder.decode(LossyArray<UsableServer>.self, from: data).values
+        case "pendingFiles": pendingFiles = try decoder.decode(LossyArray<PendingFile>.self, from: data).values
         default: break // Forward-compatible snapshots.
         }
     }
     func event(name: String, payload: Any) {
         let object = payload as? [String: Any] ?? [:]
+        // Simulator QA data owns navigation (the engine doesn't know the seeded friends).
+        if previewKeys.contains("thread") && ["chatOpen", "view"].contains(name) { return }
         if name == "view", let tab = object["name"] as? String,
            ["send", "friends", "chat", "history", "settings"].contains(tab) { selectedTab = tab }
         if name == "error" { errorMessage = object["message"] as? String }
@@ -329,6 +342,36 @@ final class Bridge: ObservableObject {
         throw NSError(domain: "DropBeam", code: 1, userInfo: [NSLocalizedDescriptionKey: "That isn't a DropBeam device code. On your other device open Settings → Devices."])
     }
     func updateSettings(patch: [String: Any]) async throws { try await action("updateSettings", ["patch": patch]) }
+    // MARK: Transfer Servers
+    func setServerPrefs(eid: String, useIt: Bool? = nil, holdForMe: Bool? = nil, offer: String? = nil) async throws {
+        var args: [String: Any] = ["eid": eid]
+        if let useIt { args["useIt"] = useIt }
+        if let holdForMe { args["holdForMe"] = holdForMe }
+        if let offer { args["offer"] = offer }
+        if previewKeys.contains("transferServers") { previewServerPrefs(args); return }
+        servers = try await call("serverPrefs", args)
+    }
+    func forgetServer(eid: String) async throws {
+        if previewKeys.contains("transferServers") { servers.removeAll { $0.eid == eid }; return }
+        servers = try await call("serverForget", ["eid": eid])
+    }
+    /// Pull anything a Transfer Server holds for us (every return to the foreground).
+    func mailboxFetchNow() async { try? await action("mailboxFetchNow") }
+    func refreshHoldRoute(friendId: String) async {
+        if previewKeys.contains("holdRoutes") { return }
+        let route: String? = try? await call("serverHoldRoute", ["friendId": friendId])
+        holdRoutes[friendId] = route.flatMap { $0.isEmpty ? nil : $0 }
+    }
+    func decidePendingFile(linkId: String, accept: Bool) async throws {
+        if !previewKeys.contains("pendingFiles") { try await action("decidePendingFile", ["linkId": linkId, "accept": accept]) }
+        pendingFiles.removeAll { $0.linkId == linkId }
+    }
+    private func previewServerPrefs(_ args: [String: Any]) {
+        guard let i = servers.firstIndex(where: { $0.eid == args["eid"] as? String }) else { return }
+        if let v = args["useIt"] as? Bool { servers[i].useIt = v; if !v { servers[i].holdForMe = false } }
+        if let v = args["holdForMe"] as? Bool { servers[i].holdForMe = v }
+        servers[i].offer = args["offer"] as? String ?? "seen"
+    }
     func respondToOffer(id: String, accept: Bool) async throws { try await action("respondToOffer", ["id": id, "accept": accept]) }
 }
 

@@ -20,6 +20,8 @@ import { nativeFolders, folderLinks } from './nativeFolders'
 import { linkedDetail, linkedTitle } from './deviceLink'
 import { linkWithCode } from '../components/LinkDeviceModal'
 import { nativeReportMail, REPORT_REASONS, contactMailto, REPORT_EMAIL } from './report'
+import { serverApi, decideFile, type UsableServer, type PendingFile } from './transferServer'
+import { nativeServerList, nativePendingFiles, serverPrefsArgs } from './nativeServers'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -340,10 +342,44 @@ const handlers: BridgeHandlers = {
     await st().reloadPairs()
     return code
   },
+  // Transfer Servers (servers this device may use; iOS never hosts one).
+  serversList: async () => { await refreshServers(); return usableServers },
+  serverPrefs: async a => {
+    const { eid, prefs } = serverPrefsArgs(a)
+    usableServers = nativeServerList(await serverApi.serverPrefs(eid, prefs))
+    resnapshot?.()
+    return usableServers
+  },
+  serverForget: async a => {
+    usableServers = nativeServerList(await serverApi.forgetServer(string(a, 'eid')))
+    resnapshot?.()
+    return usableServers
+  },
+  /** Pull anything a server holds for us (Swift calls this on every foreground). */
+  mailboxFetchNow: async () => { await serverApi.fetchNow(); void refreshPending() },
+  /** The server a message to this friend would wait on while they're offline. */
+  serverHoldRoute: a => serverApi.holdRoute(string(a, 'friendId')),
+  decidePendingFile: async a => {
+    if (typeof a.accept !== 'boolean') throw new Error('Invalid accept value')
+    const linkId = string(a, 'linkId')
+    await decideFile(linkId, a.accept)
+    pendingFiles = pendingFiles.filter(p => p.linkId !== linkId)
+    resnapshot?.()
+  },
   folderInviteFriend: async a => {
     await api.inviteFriendToFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id, string(a, 'friendId'))
     await st().reloadPairs()
   },
+}
+let usableServers: UsableServer[] = []
+let pendingFiles: PendingFile[] = []
+async function refreshServers() {
+  usableServers = nativeServerList(await serverApi.servers().catch(() => usableServers))
+  resnapshot?.()
+}
+async function refreshPending() {
+  pendingFiles = nativePendingFiles(await invoke<unknown>('mailbox_pending_files').catch(() => pendingFiles))
+  resnapshot?.()
 }
 const folderSnapshot = () => { const s = st(); return nativeFolders(s.pairs, s.folderStatuses, s.folderSummaries, s.folderLastSynced, s.myEid, s.friends) }
 /** A member link, checked to belong to the named folder (never act on a stale id). */
@@ -548,6 +584,8 @@ async function start() {
       myDevice: deviceSnapshot(),
       folders: folderSnapshot(),
       blocked: s.blocked,
+      transferServers: usableServers,
+      pendingFiles,
     }
     for (const change of changedSnapshots(previous, snapshots)) send('state', change)
     if (s.activeChatId !== activeChat) {
@@ -587,6 +625,11 @@ async function start() {
   }
   try { stops.push(await listen('open-url://incoming', () => { void takeOpenUrls() })) } catch { /* optional event */ }
   void takeOpenUrls()
+  // Transfer Servers: the list and held files re-push on their events; Swift also
+  // hears mailbox://servers to re-ask a thread's hold route.
+  void refreshServers(); void refreshPending()
+  try { stops.push(await listen('mailbox://servers', ({ payload }) => { void refreshServers(); send('event', { name: 'mailbox://servers', payload: payload ?? null }) })) } catch { /* optional event */ }
+  try { stops.push(await listen('mailbox://pending', () => { void refreshPending() })) } catch { /* optional event */ }
   for (const name of ['friends://changed', 'account://synced', 'link://linked']) {
     try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
   }

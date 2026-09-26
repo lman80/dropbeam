@@ -101,6 +101,7 @@ pub fn hello_fields(config: &Path, signer: &iroh::SecretKey, who: &str) -> Value
     if let Some((pk, sig)) = push::push_key_advert(config, signer) {
         v["push_key"] = json!(pk);
         v["push_sig"] = json!(sig);
+        v["push_text"] = json!(push::previews_allowed(config));
     }
     v
 }

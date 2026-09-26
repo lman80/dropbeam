@@ -351,3 +351,42 @@ pub fn mailbox_decide_file(app: AppHandle, state: State<'_, Arc<AppState>>, link
     client::decide_file(&state.config_dir, &link_id, accept);
     let _ = app.emit("mailbox://pending", ());
 }
+
+/// iOS: the app got its APNs token + notification-extension key.
+#[tauri::command]
+pub fn push_set_device(app: AppHandle, state: State<'_, Arc<AppState>>, net: State<'_, Arc<IrohState>>, token: String, env: String, push_key: String) -> Result<(), String> {
+    let changed = super::push::set_device(&state.config_dir, &token, &env, &push_key).map_err(|e| e.to_string())?;
+    if changed {
+        // Friends need our push key; servers need the new token.
+        crate::iroh_net::broadcast_profile(app, net.inner().clone());
+        client::wake();
+    }
+    Ok(())
+}
+
+/// "Show message text in notifications".
+#[tauri::command]
+pub fn push_set_previews(app: AppHandle, state: State<'_, Arc<AppState>>, net: State<'_, Arc<IrohState>>, on: bool) {
+    super::push::set_previews(&state.config_dir, on);
+    crate::iroh_net::broadcast_profile(app, net.inner().clone());
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushStatus {
+    /// This device has an APNs token (push works on this build).
+    pub enabled: bool,
+    pub previews: bool,
+    /// Servers holding our messages that can wake this phone.
+    pub servers: usize,
+}
+
+#[tauri::command]
+pub fn push_status(state: State<'_, Arc<AppState>>) -> PushStatus {
+    let d = super::push::device(&state.config_dir);
+    PushStatus {
+        enabled: d.as_ref().is_some_and(|d| !d.token.is_empty()),
+        previews: d.as_ref().is_none_or(|d| d.previews),
+        servers: d.map_or(0, |d| d.registered.len()),
+    }
+}

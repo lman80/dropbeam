@@ -85,6 +85,9 @@ pub struct PeerInfo {
     /// Their notification preview key (iOS; base64), same signature rule.
     #[serde(default)]
     pub push_key: Option<String>,
+    /// They're fine with message text in their notifications.
+    #[serde(default = "yes")]
+    pub push_text: bool,
     #[serde(default)]
     pub inbox: Vec<ServerRef>,
     /// Servers this peer sends through (so their items may reach us from there).
@@ -92,6 +95,10 @@ pub struct PeerInfo {
     pub sends: Vec<ServerRef>,
     #[serde(default)]
     pub updated_ms: u64,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn peers_path(config: &Path) -> PathBuf {
@@ -160,6 +167,9 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
     }
     entry.inbox = inbox;
     entry.sends = sends;
+    if let Some(t) = m["push_text"].as_bool() {
+        entry.push_text = t;
+    }
     let changed = before != (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone());
     let now = crate::chat::now_ms();
     // Hellos repeat often; only touch the disk when something changed (or daily,

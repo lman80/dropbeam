@@ -63,6 +63,8 @@ struct Transfer: Decodable, Identifiable {
     var connDetail: ConnDetail?
     var verify: VerifyReport?
     var integrity: [FileIntegrity]?
+    /// Transfer Server name: uploading to it ("transferring") or held there ("held").
+    var heldOn: String?
     var active: Bool { ["starting", "waitingForPeer", "connecting", "waitingForAccept", "transferring"].contains(state ?? "") }
     var title: String { (fileCount ?? 0) > 1 ? "\(fileCount ?? 0) files" : fileNames?.first ?? "Files" }
     var status: String {
@@ -76,6 +78,7 @@ struct Transfer: Decodable, Identifiable {
         case "failed": return "Transfer failed"
         case "paused": return "Paused"
         case "canceled": return "Canceled"
+        case "held": return "Waiting on \(heldOn ?? "a Transfer Server")"
         default: return "Preparing"
         }
     }
@@ -105,6 +108,12 @@ struct ChatMessage: Decodable, Identifiable, Equatable {
     var gif: ChatGif?
     var fileXferId: String?
     var fileXferFailed: Bool?
+    /// Sender side: the Transfer Server holding this message (status "held").
+    var heldOn: String?
+    /// Why a server couldn't deliver: expired | lost | refused | full | paused | unreachable | needs_update.
+    var serverNote: String?
+    /// Receiver side: arrived through this Transfer Server.
+    var via: String?
     var date: Date { Date(timeIntervalSince1970: ts / 1000) }
     var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? (text ?? "") : files?.joined(separator: ", ") ?? "Attachment" }
 }
@@ -391,6 +400,7 @@ extension Transfer {
         self.connDetail = (try? c.decode(ConnDetail.self, forKey: BridgeKey("connDetail")))
         self.verify = (try? c.decode(VerifyReport.self, forKey: BridgeKey("verify")))
         self.integrity = (try? c.decode(LossyArray<FileIntegrity>.self, forKey: BridgeKey("integrity")))?.values
+        self.heldOn = (try? c.decode(String.self, forKey: BridgeKey("heldOn"))).flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 
@@ -424,6 +434,9 @@ extension ChatMessage {
         self.gif = (try? c.decode(ChatGif.self, forKey: BridgeKey("gif")))
         self.fileXferId = (try? c.decode(String.self, forKey: BridgeKey("fileXferId")))
         self.fileXferFailed = (try? c.decode(Bool.self, forKey: BridgeKey("fileXferFailed")))
+        self.heldOn = (try? c.decode(String.self, forKey: BridgeKey("heldOn"))).flatMap { $0.isEmpty ? nil : $0 }
+        self.serverNote = (try? c.decode(String.self, forKey: BridgeKey("serverNote"))).flatMap { $0.isEmpty ? nil : $0 }
+        self.via = (try? c.decode(String.self, forKey: BridgeKey("via"))).flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 
@@ -867,4 +880,86 @@ extension FolderVerify {
         self.peerOnline = bool("peerOnline"); self.compared = bool("compared"); self.identical = bool("identical")
         self.matched = int("matched"); self.differences = int("differences"); self.localFiles = int("localFiles"); self.peerFiles = int("peerFiles")
     }
+}
+
+/// A Transfer Server this device may use (a friend's always-on computer, or the user's own).
+struct UsableServer: Decodable, Identifiable, Equatable {
+    var id: String { eid }
+    let eid: String
+    var name: String
+    var own: Bool
+    var member: Bool
+    var through: Bool
+    var useIt: Bool
+    var holdForMe: Bool
+    /// "new" → show the one-time offer card; "seen" | "dismissed" | "".
+    var offer: String
+    var revoked: Bool
+    var paused: Bool
+    var learnedMs: Double
+    /// The short line under the server's name (same wording as desktop).
+    var status: String {
+        if revoked { return "No longer available" }
+        if paused { return "Paused by its owner" }
+        if own { return "Yours · holds your messages and sends for you" }
+        if useIt && holdForMe { return "Holds your messages and sends for you" }
+        if useIt { return "Sends for you when friends are offline" }
+        return "Not in use"
+    }
+}
+extension UsableServer {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.eid = try c.decode(String.self, forKey: BridgeKey("eid"))
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))).flatMap { $0.isEmpty ? nil : $0 } ?? "Transfer Server"
+        self.own = (try? c.decode(Bool.self, forKey: BridgeKey("own"))) ?? false
+        self.member = (try? c.decode(Bool.self, forKey: BridgeKey("member"))) ?? false
+        self.through = (try? c.decode(Bool.self, forKey: BridgeKey("through"))) ?? false
+        self.useIt = (try? c.decode(Bool.self, forKey: BridgeKey("useIt"))) ?? false
+        self.holdForMe = (try? c.decode(Bool.self, forKey: BridgeKey("holdForMe"))) ?? false
+        self.offer = (try? c.decode(String.self, forKey: BridgeKey("offer"))) ?? ""
+        self.revoked = (try? c.decode(Bool.self, forKey: BridgeKey("revoked"))) ?? false
+        self.paused = (try? c.decode(Bool.self, forKey: BridgeKey("paused"))) ?? false
+        self.learnedMs = (try? c.decode(Double.self, forKey: BridgeKey("learnedMs"))) ?? 0
+    }
+}
+/// A file a friend sent through a Transfer Server that waits for your OK.
+struct PendingFile: Decodable, Identifiable, Equatable {
+    var id: String { linkId }
+    let linkId: String
+    var peerId: String
+    var serverName: String
+    var bytes: Double
+    var names: [String]
+}
+extension PendingFile {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.linkId = try c.decode(String.self, forKey: BridgeKey("linkId"))
+        self.peerId = (try? c.decode(String.self, forKey: BridgeKey("peerId"))) ?? ""
+        self.serverName = (try? c.decode(String.self, forKey: BridgeKey("serverName"))).flatMap { $0.isEmpty ? nil : $0 } ?? "the Transfer Server"
+        self.bytes = (try? c.decode(Double.self, forKey: BridgeKey("bytes"))).flatMap { $0.isFinite ? $0 : nil } ?? 0
+        self.names = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("names")))?.values ?? []
+    }
+}
+/// Transfer Server copy shared by chat and settings (mirrors src/lib/transferServer.ts).
+enum ServerCopy {
+    /// The short line under an undelivered message for a server note.
+    static func note(_ note: String?, friend: String, server: String?) -> String? {
+        let box = server?.isEmpty == false ? server! : "the Transfer Server"
+        let cap = box.prefix(1).uppercased() + box.dropFirst()
+        switch note {
+        case "expired": return "\(cap) couldn’t deliver it in time · will send when \(friend) is online"
+        case "lost", "refused": return "\(cap) couldn’t deliver it · will send when \(friend) is online"
+        case "full": return "\(cap) is full · will send when \(friend) is online"
+        case "paused": return "\(cap) is paused · will send when \(friend) is online"
+        case "unreachable": return "Couldn’t reach \(box) · will keep trying"
+        case "needs_update": return "\(friend) needs to update DropBeam to get messages while offline"
+        default: return nil
+        }
+    }
+    static func held(server: String?, friend: String) -> String {
+        "Delivered to \(server ?? "your Transfer Server") — reaches \(friend) when they’re online"
+    }
+    static func firstName(_ name: String) -> String { name.split(separator: " ").first.map(String.init) ?? name }
 }
