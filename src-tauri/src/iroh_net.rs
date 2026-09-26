@@ -1053,6 +1053,16 @@ fn progress_cb(
     }
 }
 
+/// The exact files a receive just landed (after collision renames), so the iOS
+/// shell can offer to save photos/videos to the Photos library. Emitted once per
+/// landed batch — a folder that arrives as many pushes emits many small batches.
+fn emit_received_files(app: &AppHandle, id: &str, paths: &[PathBuf], chat: bool) {
+    let files: Vec<String> = paths.iter().filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned()).collect();
+    if files.is_empty() { return; }
+    let _ = app.emit("received://files", serde_json::json!({ "id": id, "paths": files, "chat": chat }));
+}
+
 fn completed_update(id: &str, dir: Direction, names: Vec<String>, total: u64) -> TransferUpdate {
     let mut u = TransferUpdate::new(id.to_string(), dir, names);
     u.state = TransferState::Completed;
@@ -2994,6 +3004,10 @@ async fn serve_stream_inner(
                     for (index, (name, path)) in names.iter().zip(&paths).enumerate() {
                         chat_file_landed(state, &id, Some(received_item_index(item_offset, index)), name, path);
                     }
+                    // Location uploads are hosted payloads, not "files sent to me".
+                    if location_upload.is_none() {
+                        emit_received_files(&app, &id, &paths, req.get("chatTransfer").is_some());
+                    }
                     let landed_in = location_upload.as_ref().map(|u| &u.destination).unwrap_or(&dest)
                         .to_string_lossy().to_string();
                     if card.as_ref().is_some_and(|c| !c.last) {
@@ -4039,6 +4053,7 @@ pub fn start_receive(
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
                     .sum();
+                emit_received_files(&app, &id, &paths, false);
                 emit_completed(&app, &id, Direction::Receive, names, total, loc, None, Some(out_dir), 0);
             }
             Err(e) if e.to_string().contains("canceled") => {

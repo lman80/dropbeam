@@ -12,6 +12,9 @@ struct SettingsView: View {
     @State private var version = ""
     @State private var clearCache = false
     @State private var feedbackButton = SuperFeedback.isEnabled
+    @ObservedObject private var saveFolder = SaveFolder.shared
+    @ObservedObject private var mediaSaver = ReceivedMediaSaver.shared
+    @State private var qaSaveFolder = false
     var body: some View {
         NavigationStack {
             List {
@@ -36,6 +39,16 @@ struct SettingsView: View {
                         }
                     }
                 }
+                Section {
+                    NavigationLink { SaveFolderView() } label: {
+                        RowLabel(title: "Save Files To", symbol: "folder.fill", color: .blue, value: saveFolder.displayName)
+                    }
+                    IconToggle(title: "Save Photos & Videos", symbol: "photo.fill.on.rectangle.fill", color: .orange,
+                               isOn: Binding(get: { mediaSaver.choice == .on }, set: { on in Task { await mediaSaver.setEnabled(on) } }))
+                    NavigationLink { TransferSettingsView() } label: { RowLabel(title: "Connection & Speed", symbol: "arrow.up.arrow.down", color: .teal) }
+                } header: { Text("Transfers") } footer: {
+                    Text("Received photos and videos are also added to your photo library. The originals stay in your save folder.")
+                }
                 Section("General") {
                     Picker(selection: settingString("theme", bridge.settings?.theme ?? "system")) {
                         Text("System").tag("system"); Text("Light").tag("light"); Text("Dark").tag("dark")
@@ -52,9 +65,6 @@ struct SettingsView: View {
                         RowLabel(title: "GIF Search", symbol: "sparkles.rectangle.stack.fill", color: .purple, value: (bridge.settings?.giphyApiKey ?? "").isEmpty ? "Off" : "On")
                     }
                 } header: { Text("Chat") } footer: { Text("Friends see when you’ve read their messages while Read Receipts is on.") }
-                Section {
-                    NavigationLink { TransferSettingsView() } label: { RowLabel(title: "Transfers", symbol: "arrow.up.arrow.down", color: .blue) }
-                }
                 Section("Storage") {
                     NavigationLink { RecoverySettingsView() } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }
                     ActionRow(title: "Clear Transfer Cache", symbol: "trash.fill", color: .gray) { clearCache = true }
@@ -76,6 +86,10 @@ struct SettingsView: View {
             }
             .beamList()
             .navigationTitle("Settings")
+            .navigationDestination(isPresented: $qaSaveFolder) { SaveFolderView() }
+            #if targetEnvironment(simulator)
+            .onAppear { if CommandLine.arguments.contains("-openSaveFolder") { qaSaveFolder = true } }
+            #endif
             .task { version = (try? await bridge.call("appVersion")) ?? ""; try? await bridge.action("myDeviceInfo") }
             .onAppear { feedbackButton = SuperFeedback.isEnabled }
             .confirmationDialog("Clear interrupted transfer leftovers?", isPresented: $clearCache, titleVisibility: .visible) {
@@ -464,5 +478,37 @@ struct TransferSettingsView: View {
         }
         .beamList()
         .navigationTitle("Transfers").navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// Settings → Save Files To: the current folder, Choose Folder…, Reset.
+struct SaveFolderView: View {
+    @ObservedObject private var folder = SaveFolder.shared
+    var body: some View {
+        List {
+            Section {
+                HStack(spacing: 14) {
+                    Image(systemName: "folder.fill").font(.system(size: 30)).foregroundStyle(.blue)
+                        .frame(width: 44, height: 44).accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(folder.displayName).font(.body.weight(.semibold)).lineLimit(2)
+                        Text(folder.place).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                }
+                .padding(.vertical, 4).accessibilityElement(children: .combine)
+                .accessibilityLabel("Current folder: \(folder.displayName), \(folder.place)")
+                Button("Show in Files", systemImage: "arrow.up.forward.app") { folder.showInFiles() }
+            } header: { Text("Current Folder") }
+            Section {
+                Button("Choose Folder…", systemImage: "folder.badge.gearshape") { Task { await folder.choose() } }
+                if folder.custom != nil {
+                    Button("Reset to DropBeam Folder", systemImage: "arrow.uturn.backward") { Haptics.tap(); folder.reset() }
+                }
+            } footer: {
+                Text("Files you receive are saved here. Pick any folder in Files, including iCloud Drive. Files you already received stay where they are.")
+            }
+        }
+        .beamList()
+        .navigationTitle("Save Files To").navigationBarTitleDisplayMode(.inline)
     }
 }

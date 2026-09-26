@@ -532,7 +532,7 @@ async function start() {
   void st().refreshMyDevice().catch(() => {})
   const timer = window.setInterval(sync, 15_000) // Presence must expire without a store mutation.
   cleanup = () => { resnapshot = undefined; pushLocations = undefined; running = false; stops.forEach(stop => stop()); clearInterval(timer); clearTimeout(syncTimer) }
-  for (const name of ['chat://message', 'friend://presence', 'folder-history://changed', 'folder-invite://incoming', 'locations://changed']) {
+  for (const name of ['chat://message', 'friend://presence', 'folder-history://changed', 'folder-invite://incoming', 'locations://changed', 'received://files']) {
     try { stops.push(await listen(name, ({ payload }) => {
       send('event', { name, payload })
       if (name === 'locations://changed') void refreshLocations(true)

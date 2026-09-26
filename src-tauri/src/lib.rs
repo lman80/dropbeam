@@ -484,7 +484,12 @@ pub fn run() {
                     log::error!("could not persist device kind at startup: {e}");
                 }
             }
-            // Sandbox container paths can change across iOS installs.
+            // Sandbox container paths can change across iOS installs, and a folder
+            // the user chose (Settings → Save Files To, iCloud Drive etc.) is only
+            // reachable through a security-scoped bookmark that the native shell
+            // resolves and starts accessing at launch. So the engine always boots
+            // on the app's Documents folder ("On My iPhone → DropBeam" in Files)
+            // and the shell re-applies the chosen folder once its scope is active.
             #[cfg(target_os = "ios")]
             if loaded.download_dir != default_download {
                 loaded.download_dir = default_download.clone();

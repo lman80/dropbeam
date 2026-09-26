@@ -48,6 +48,16 @@ class NativeUIPlugin: Plugin {
             webview.alpha = 0
             webview.isUserInteractionEnabled = false
             webview.accessibilityElementsHidden = true
+            #if targetEnvironment(simulator)
+            // QA hook: `-feedbackPosition left,1` places the feedback button (no touch input in CI).
+            let qaArgs = ProcessInfo.processInfo.arguments
+            if let i = qaArgs.firstIndex(of: "-feedbackPosition"), i + 1 < qaArgs.count {
+                let parts = qaArgs[i + 1].split(separator: ",")
+                if parts.count == 2, let y = Double(parts[1]) {
+                    UserDefaults.standard.set(["side": String(parts[0]), "y": y], forKey: "superfeedback.buttonPosition")
+                }
+            }
+            #endif
             if !Self.feedbackStarted {
                 Self.feedbackStarted = true
                 var feedback = SuperFeedback.Config(
@@ -62,12 +72,32 @@ class NativeUIPlugin: Plugin {
                 // The floating button is a tester tool: on by default in TestFlight/dev
                 // builds, off for App Store users (Settings → Send Feedback always works).
                 feedback.defaultEnabled = Self.isTestBuild
-                feedback.dockedToEdge = true
+                // Rest fully on screen (a half-tucked button read as "off the frame").
+                feedback.dockedToEdge = false
                 feedback.reservedInsets = UIEdgeInsets(top: 44, left: 0, bottom: 64, right: 0) // nav bar + tab bar
                 SuperFeedback.configure(feedback)
                 SuperFeedback.setContext(["screen": Bridge.shared.selectedTab])
                 SuperFeedback.start()
             }
+            #if targetEnvironment(simulator)
+            // QA hook: `simctl launch <udid> <bundle> -simulateReceive name.jpg,…` replays a
+            // "received://files" event for files already in Documents (Photos save flow).
+            let args = ProcessInfo.processInfo.arguments
+            if let i = args.firstIndex(of: "-simulateReceive"), i + 1 < args.count {
+                let docs = SaveFolder.defaultFolder
+                let paths = args[i + 1].split(separator: ",").map { docs.appendingPathComponent(String($0)).path }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    Bridge.shared.event(name: "received://files", payload: ["id": "qa", "paths": paths, "chat": false])
+                }
+            }
+            // QA hook: `-forceDark` renders in dark mode regardless of the simulator setting.
+            if args.contains("-forceDark") { root.view.window?.overrideUserInterfaceStyle = .dark }
+            // QA hook: `-openTab settings` starts on a tab (screenshots without touch input).
+            if let i = args.firstIndex(of: "-openTab"), i + 1 < args.count {
+                let tab = args[i + 1]
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Bridge.shared.selectedTab = tab }
+            }
+            #endif
             invoke.resolve()
         }
     }

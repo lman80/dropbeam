@@ -134,6 +134,7 @@ final class Bridge: ObservableObject {
                 UserDefaults.standard.set(share, forKey: NativeUIPlugin.diagnosticsKey)
                 SuperFeedback.setCrashReportingEnabled(share)
             }
+            SaveFolder.shared.sync(engineDir: settings?.downloadDir)
         case "chatOverview": chatOverview = try decoder.decode(LossyArray<ChatOverview>.self, from: data).values
         case "chatUnread": chatUnread = try decoder.decode([String: Int].self, from: data)
         case "chatTyping": chatTyping = try decoder.decode([String: Bool].self, from: data)
@@ -151,6 +152,9 @@ final class Bridge: ObservableObject {
         if name == "view", let tab = object["name"] as? String,
            ["send", "friends", "chat", "history", "settings"].contains(tab) { selectedTab = tab }
         if name == "error" { errorMessage = object["message"] as? String }
+        if name == "received://files", let paths = object["paths"] as? [String] {
+            ReceivedMediaSaver.shared.received(paths: paths, chat: object["chat"] as? Bool ?? false)
+        }
         if name == "chatOpen" {
             if let id = object["friendId"] as? String { chatPath = [id]; selectedTab = "chat" }
             else { chatPath = [] }
