@@ -41,6 +41,8 @@ import { formatBytes } from '../lib/format'
 import { linkify } from '../lib/linkify'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 import { EmptyState, IconButton, MenuButton, MenuPopover, type MenuItem } from '../components/ui'
+import { onServersChanged, serverApi, serverNoteText } from '../lib/transferServer'
+import { ServerOfferCard, useUsableServers } from '../components/TransferServerSettings'
 
 /** Stable empty array so the messages selector doesn't return a fresh ref each render. */
 const EMPTY_MSGS: ChatMessage[] = []
@@ -391,6 +393,18 @@ function Conversation({ friendId }: { friendId: string }) {
   const setView = useStore((s) => s.setView)
   const toast = useStore((s) => s.toast)
   const displayName = ownLabel ?? friend.name
+  // Where a message would wait if they're offline (a Transfer Server's name).
+  const [holdOn, setHoldOn] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    const load = () => { serverApi.holdRoute(friendId).then((r) => { if (alive) setHoldOn(r) }).catch(() => {}) }
+    load()
+    const un = onServersChanged(load)
+    return () => { alive = false; void un.then((f) => f()) }
+  }, [friendId])
+  // A Transfer Server this friend shared with us that we haven't answered yet.
+  const { servers } = useUsableServers()
+  const offer = servers?.find((sv) => sv.eid === friend.endpointId && sv.offer === 'new' && !sv.revoked)
 
   const [picking, setPicking] = useState(false)
   const [text, setText] = useState('')
@@ -571,7 +585,7 @@ function Conversation({ friendId }: { friendId: string }) {
       const nm = next && next.kind === 'msg' ? next.m : undefined
       const firstOfRun = !pm || pm.fromMe !== row.m.fromMe || !!sep
       const lastOfRun = !nm || nm.fromMe !== row.m.fromMe || !!seps[i + 1]
-      const pendingStatus = row.m.status === 'sending' || row.m.status === 'failed' || row.m.status == null
+      const pendingStatus = row.m.status === 'sending' || row.m.status === 'failed' || row.m.status === 'held' || row.m.status == null
       const meta: MetaKind =
         !row.m.fromMe || row.m.deleted ? null
           : i === lastMine ? 'status'
@@ -869,7 +883,7 @@ function Conversation({ friendId }: { friendId: string }) {
               </span>
               <div className="chat-thread-empty-name truncate-1">{displayName}</div>
               <div className="chat-thread-empty-hint">
-                {online ? 'No messages yet' : `Messages deliver when ${friend.name} is back online.`}
+                {online ? 'No messages yet' : holdOn ? `${friend.name} is offline — messages wait on ${holdOn}.` : `Messages deliver when ${friend.name} is back online.`}
               </div>
             </div>
           )) : (
@@ -913,6 +927,7 @@ function Conversation({ friendId }: { friendId: string }) {
                   </div>
                 )
               })}
+              {offer && <ServerOfferCard server={offer} friendName={displayName} />}
               {typing && !MOBILE_UI && (
                 <div className="chat-line run-start run-end">
                   <div className="chat-line-body">
@@ -945,7 +960,9 @@ function Conversation({ friendId }: { friendId: string }) {
       <div className={MOBILE_UI ? 'chat-composer mobile-composer' : 'chat-composer'}>
         {!onlineNow && !checking && (
           <p className="chat-offline-note" role="status">
-            {displayName} is offline. Messages will send when you’re both online with DropBeam open.
+            {holdOn
+              ? `${displayName} is offline. Messages wait on ${holdOn} and arrive when they’re back.`
+              : `${displayName} is offline. Messages will send when you’re both online with DropBeam open.`}
           </p>
         )}
         {reply && !editing && (
@@ -1497,7 +1514,10 @@ const MessageRow = memo(function MessageRow({
     if (m.edited && !m.deleted) parts.push('Edited')
     if (meta && !(m.kind === 'file' && (inFlight || m.fileXferFailed))) {
       const s = m.status
-      if (meta === 'pending' || s === 'sending' || s === 'failed' || s == null) parts.push(waiting ? 'Waiting to send' : 'Sending…')
+      const note = s === 'failed' ? serverNoteText(m.serverNote, friend.name, m.heldOn) : null
+      if (s === 'held') parts.push(`Delivered to ${m.heldOn ?? 'your Transfer Server'} — reaches ${friend.name} when they’re online`)
+      else if (note) parts.push(note)
+      else if (meta === 'pending' || s === 'sending' || s === 'failed' || s == null) parts.push(waiting ? 'Waiting to send' : 'Sending…')
       else parts.push(s === 'read' ? 'Read' : 'Delivered')
     }
     return parts.join(' · ')
@@ -1594,6 +1614,7 @@ const MessageRow = memo(function MessageRow({
         </motion.div>
 
         {metaText && <div className="chat-meta">{metaText}</div>}
+        {!mine && m.via && lastOfRun && <div className="chat-via">via {m.via}</div>}
       </div>
       {tray && <ReactionTray anchor={tray.anchor} trigger={tray.trigger} mine={mine} onPick={doReact} onClose={closeTray} />}
       {menu && (

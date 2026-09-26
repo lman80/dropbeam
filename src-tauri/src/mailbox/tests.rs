@@ -86,8 +86,10 @@ async fn world(tag: &str) -> World {
     // A learns what S grants it (from S's hello) and opts in.
     let grant = server::grant_for(&s.config, &a.eid());
     assert!(grant.is_some(), "a friend of an all-friends server is a member");
-    client::learn_grant(&a.config, &s.eid(), grant.as_ref());
+    client::learn_grant(&a.config, &s.eid(), grant.as_ref(), false);
     client::set_prefs(&a.config, &s.eid(), Some(true), None, Some("seen")).unwrap();
+    // B hears about S from S's hello too (a member; it hasn't opted in to anything).
+    client::learn_grant(&b.config, &s.eid(), server::grant_for(&s.config, &b.eid()).as_ref(), false);
     World { base, a, s, b, b_for_a }
 }
 
@@ -311,7 +313,7 @@ async fn access_control_and_forgery_are_refused() {
     let a_person = crate::friends::chat_sender(&w.s.config, &w.a.eid()).unwrap().id;
     c.through.push(a_person.clone());
     server::save_config(&w.s.config, &c).unwrap();
-    client::learn_grant(&w.a.config, &w.s.eid(), server::grant_for(&w.s.config, &w.a.eid()).as_ref());
+    client::learn_grant(&w.a.config, &w.s.eid(), server::grant_for(&w.s.config, &w.a.eid()).as_ref(), false);
     client::deposit_chat(&w.a.state, &w.a.config, &o_thread, "chat", &chat_frame(&m, "hi"), Some(&m)).await.unwrap();
 
     // Held for B: nobody else can list, download, ack or cancel it.
@@ -340,7 +342,7 @@ async fn access_control_and_forgery_are_refused() {
     server::save_config(&w.s.config, &c).unwrap();
     assert_eq!(server_items(&w), 0);
     assert!(server::grant_for(&w.s.config, &w.a.eid()).is_none(), "hello stops advertising access");
-    let change = client::learn_grant(&w.a.config, &w.s.eid(), None);
+    let change = client::learn_grant(&w.a.config, &w.s.eid(), None, false);
     assert!(change.revoked);
     let e = client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m2, "again"), Some(&m2)).await.unwrap_err();
     assert_eq!(e, DepositError::NoRoute, "a revoked server is no longer a route");
@@ -424,6 +426,11 @@ async fn delivery_poke_reaches_the_recipient() {
     assert_eq!(pending, vec![(w.b.eid(), 1)]);
     let conn = w.s.ep.connect(iroh_net::dial_addr(w.b.ep.id()), iroh_net::ALPN).await.unwrap();
     assert_eq!(rpc(&conn, json!({"kind": "mailbox.notify", "v": 1, "count": 1})).await["ok"], true);
+    // A stranger can't make B dial out and pull.
+    let x = node(&w.base, "x").await;
+    let xconn = x.ep.connect(iroh_net::dial_addr(w.b.ep.id()), iroh_net::ALPN).await.unwrap();
+    assert_eq!(rpc(&xconn, json!({"kind": "mailbox.notify", "v": 1, "count": 1})).await["ok"], false);
+    x.listener.abort();
 }
 
 async fn rpc(conn: &iroh::endpoint::Connection, req: Value) -> Value {
@@ -431,4 +438,107 @@ async fn rpc(conn: &iroh::endpoint::Connection, req: Value) -> Value {
     iroh_net::write_frame(&mut send, &req).await.unwrap();
     send.finish().unwrap();
     tokio::time::timeout(Duration::from_secs(10), iroh_net::read_frame_cap(&mut recv, 1 << 20)).await.unwrap().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_first_friends_files_wait_for_a_yes() {
+    let w = world("ask").await;
+    let a_on_b = crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap();
+    crate::friends::set_auto_accept(&w.b.config, &a_on_b.id, false).unwrap();
+    let src = w.base.join("src/pic.jpg");
+    let data = write(&src, 5000, 4);
+    let xfer = uuid::Uuid::new_v4().to_string();
+    client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &deposit_files_of(&[(src, "pic.jpg")]), &[], &["pic.jpg".into()],
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+    assert_eq!(fetch(&w).await, 0, "nothing lands without a yes");
+    let pending = client::pending_files(&w.b.config);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(server_items(&w), 1, "it keeps waiting on the server");
+    assert!(!w.b.config.join("Downloads/pic.jpg").exists());
+    client::decide_file(&w.b.config, &pending[0].link_id, true);
+    assert_eq!(fetch(&w).await, 1);
+    assert_eq!(std::fs::read(w.b.config.join("Downloads/pic.jpg")).unwrap(), data);
+    assert!(client::pending_files(&w.b.config).is_empty());
+    // A decline refuses it on the server (the sender sees "not delivered").
+    let src = w.base.join("src/no.jpg");
+    write(&src, 10, 1);
+    let x2 = uuid::Uuid::new_v4().to_string();
+    client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x2, &x2, &deposit_files_of(&[(src, "no.jpg")]), &[], &["no.jpg".into()],
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+    assert_eq!(fetch(&w).await, 0);
+    let link = client::pending_files(&w.b.config)[0].link_id.clone();
+    client::decide_file(&w.b.config, &link, false);
+    assert_eq!(fetch(&w).await, 0);
+    assert_eq!(server_items(&w), 0);
+    assert!(!w.b.config.join("Downloads/no.jpg").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_past_empty_files_and_one_device_refusal_keeps_it_for_the_other() {
+    let w = world("resume-empty").await;
+    let src = w.base.join("src");
+    let a = write(&src.join("a.bin"), (seal::SEG / 2) as usize, 1);
+    write(&src.join("e.bin"), 0, 0);
+    let b = write(&src.join("b.bin"), (seal::SEG / 3) as usize, 2);
+    let c = write(&src.join("c.bin"), (seal::SEG * 2) as usize, 3);
+    let files = deposit_files_of(&[(src.join("a.bin"), "a.bin"), (src.join("e.bin"), "e.bin"), (src.join("b.bin"), "b.bin"), (src.join("c.bin"), "c.bin")]);
+    let xfer = uuid::Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    let progress = move |d: u64, _t: u64| { if d >= seal::SEG { c2.store(true, Ordering::SeqCst); } };
+    assert_eq!(client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["a.bin".into()],
+        &progress, &|_| {}, &cancel).await.unwrap_err(), DepositError::Canceled);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["a.bin".into()],
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+    assert_eq!(fetch(&w).await, 1);
+    let dl = w.b.config.join("Downloads");
+    assert_eq!(std::fs::read(dl.join("a.bin")).unwrap(), a);
+    assert_eq!(std::fs::read(dl.join("b.bin")).unwrap(), b);
+    assert_eq!(std::fs::read(dl.join("c.bin")).unwrap(), c);
+    assert!(dl.join("e.bin").exists());
+
+    // B has a second device; one device turning an item down leaves it for the other.
+    let b2 = node(&w.base, "b2").await;
+    introduce(&b2, &w.a);
+    let person = crate::friends::upsert_by_endpoint(&w.a.config, &b2.eid(), "Bea phone");
+    let _ = person;
+    // Seal to both devices by hand and deposit.
+    let m = uuid::Uuid::new_v4().to_string();
+    let recips = keys::recipients(&w.a.config, &[w.b.eid(), b2.eid()]);
+    assert_eq!(recips.len(), 2);
+    crate::friends::upsert_by_endpoint(&w.s.config, &b2.eid(), "Bea phone");
+    let (env, _) = seal::seal(w.a.ep.secret_key(), &uuid::Uuid::new_v4().to_string(), "chat", 1, &recips,
+        &serde_json::to_vec(&chat_frame(&m, "for both")).unwrap(), 0).unwrap();
+    let conn = w.a.ep.connect(iroh_net::dial_addr(w.s.ep.id()), iroh_net::ALPN).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    iroh_net::write_frame(&mut send, &json!({"kind": "mailbox.deposit", "header": env})).await.unwrap();
+    assert_eq!(iroh_net::read_frame_cap(&mut recv, 4096).await.unwrap()["ok"], true);
+    send.finish().unwrap();
+    assert_eq!(iroh_net::read_frame_cap(&mut recv, 4096).await.unwrap()["state"], "held");
+    // B (desktop) doesn't know A any more → refuses; the phone still gets it.
+    crate::friends::remove(&w.b.config, &crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap().id).unwrap();
+    assert_eq!(fetch(&w).await, 0);
+    assert_eq!(server_items(&w), 1, "one device's refusal doesn't delete it for the other");
+    crate::friends::upsert_by_endpoint(&b2.config, &w.a.eid(), "Ash");
+    let n = client::fetch_from(&b2.state, &b2.config, &w.s.eid()).await.unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(server_items(&w), 0);
+    b2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsending_a_held_message_takes_it_back() {
+    let w = world("unsend").await;
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "oops"), Some(&m)).await.unwrap();
+    assert_eq!(client::held_server_of(&w.a.config, &m), Some(w.s.eid()));
+    assert_eq!(client::unsend_held(&w.a.state, &w.a.config, &m).await, client::Unsend::Removed);
+    assert_eq!(server_items(&w), 0);
+    assert_eq!(fetch(&w).await, 0, "the friend never sees an unsent held message");
+    // Once delivered, the server says so (the unsend then travels as an op).
+    let m2 = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m2, "hi"), Some(&m2)).await.unwrap();
+    assert_eq!(fetch(&w).await, 1);
+    assert_eq!(client::unsend_held(&w.a.state, &w.a.config, &m2).await, client::Unsend::Delivered);
 }

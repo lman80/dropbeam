@@ -13,6 +13,7 @@ import { useStore, type View } from '../store'
 import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
+import { TransferServerPane } from '../components/TransferServerSettings'
 import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spinner, Toggle } from '../components/ui'
 
 // ── Tabs ─────────────────────────────────────────────────────────────────────
@@ -21,12 +22,13 @@ import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spi
 // location" on Locations opens the Locations pane, the GIF setup link in Chat
 // opens General, "Settings" under History's recoverable files opens Transfers —
 // otherwise it's the pane you last had open.
-type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'privacy' | 'advanced'
+type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'advanced'
 const TABS: { value: Tab; label: string }[] = [
   { value: 'general', label: 'General' },
   { value: 'devices', label: 'Devices' },
   { value: 'locations', label: 'Locations' },
   { value: 'transfers', label: 'Transfers' },
+  { value: 'server', label: 'Server' },
   { value: 'privacy', label: 'Privacy' },
   { value: 'advanced', label: 'Advanced' },
 ]
@@ -717,7 +719,7 @@ export function SettingsView() {
     </>
   )
 
-  const visibleTabs = TABS.filter((t) => t.value !== 'locations' || !MOBILE_UI)
+  const visibleTabs = TABS.filter((t) => (t.value !== 'locations' && t.value !== 'server') || !MOBILE_UI)
 
   return (
     <div className="page settings-page" ref={rootRef}>
@@ -733,6 +735,7 @@ export function SettingsView() {
         {tab === 'devices' && <DevicesPanel />}
         {tab === 'locations' && <LocationSettings />}
         {tab === 'transfers' && transfers}
+        {tab === 'server' && <TransferServerPane />}
         {tab === 'privacy' && privacy}
         {tab === 'advanced' && advanced}
       </div>

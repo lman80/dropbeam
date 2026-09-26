@@ -30,6 +30,8 @@ export type TransferState =
   | 'canceled'
   /** Stopped by the user, everything already transferred kept — Resume replays it. */
   | 'paused'
+  /** The friend was offline: the (sealed) files wait on a Transfer Server. */
+  | 'held'
 export type Locality = 'unknown' | 'local' | 'direct' | 'internet'
 
 /** Live detail of how two peers are connected — the connection inspector data. */
@@ -115,6 +117,8 @@ export interface TransferUpdate {
   connDetail?: ConnDetail | null
   /** A short reason for a PARKED/waiting state (e.g. "Waiting for a direct connection"). */
   detail?: string | null
+  /** The Transfer Server this send is uploading to / waiting on. */
+  heldOn?: string | null
 }
 
 export interface HistoryEntry {
@@ -309,7 +313,13 @@ export interface ChatMessage {
    * sender's source or receiver's saved copy. Enables preview + open. */
   path: string | null
   /** Delivery state for messages WE sent. 'sent' is tolerated from older builds. */
-  status: 'sending' | 'delivered' | 'read' | 'failed' | 'sent' | null
+  status: 'sending' | 'delivered' | 'read' | 'failed' | 'sent' | 'held' | null
+  /** Sender: the Transfer Server holding it while the friend is offline. */
+  heldOn?: string | null
+  /** Sender: why a server couldn't take/deliver it ("expired", "full", "unreachable", "needs_update", "lost", "refused"). */
+  serverNote?: string | null
+  /** Receiver: the Transfer Server it arrived through. */
+  via?: string | null
   ts: number
   /** Logical ordering clock — sort by this (then ts, then id), not wall-clock. */
   seq: number

@@ -394,6 +394,19 @@ pub fn set_received_path(config_dir: &Path, peer_id: &str, file_xfer_id: &str, p
     Some(out)
 }
 
+/// A linked file send finished landing: give its received card (if it has no
+/// path yet — e.g. its note came through a Transfer Server) the landed path.
+pub fn set_path_by_link(config_dir: &Path, file_xfer_id: &str, path: &str) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let msg = all.values_mut().flatten()
+        .find(|m| !m.from_me && m.path.is_none() && m.file_xfer_id.as_deref() == Some(file_xfer_id))?;
+    msg.path = Some(path.to_owned());
+    let out = msg.clone();
+    save_all(config_dir, all);
+    Some(out)
+}
+
 /// A received file card for this transfer link, if we have one.
 pub fn received_file(config_dir: &Path, peer_id: &str, file_xfer_id: &str) -> Option<ChatMessage> {
     let mut cache = CACHE.lock().unwrap();

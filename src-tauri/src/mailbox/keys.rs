@@ -18,19 +18,28 @@ fn key_path(config: &Path) -> PathBuf {
 
 /// This device's mailbox secret, created on first use (0600, written atomically
 /// so a crash can never leave a torn key that would strand undelivered items).
-pub fn secret(config: &Path) -> [u8; 32] {
+/// None when the key exists but can't be read right now (e.g. a locked
+/// device): never replace a key on a transient error — every item sealed to
+/// the old one would become unopenable.
+pub fn secret(config: &Path) -> Option<[u8; 32]> {
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    if let Ok(bytes) = std::fs::read(key_path(config)) {
-        if let Ok(k) = <[u8; 32]>::try_from(bytes.as_slice()) {
-            return k;
+    match std::fs::read(key_path(config)) {
+        Ok(bytes) => match <[u8; 32]>::try_from(bytes.as_slice()) {
+            Ok(k) => return Some(k),
+            Err(_) => log::warn!("mailbox: key file is malformed; creating a new mailbox key"),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            log::warn!("mailbox: can't read the mailbox key right now: {e}");
+            return None;
         }
-        log::warn!("mailbox: key file is malformed; creating a new mailbox key");
     }
     let k: [u8; 32] = rand::random();
     if let Err(e) = write_private_atomic(&key_path(config), &k) {
         log::warn!("mailbox: cannot persist the mailbox key: {e}");
+        return None;
     }
-    k
+    Some(k)
 }
 
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -55,8 +64,8 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
-pub fn public(config: &Path) -> [u8; 32] {
-    seal::x25519_public(&secret(config))
+pub fn public(config: &Path) -> Option<[u8; 32]> {
+    secret(config).map(|k| seal::x25519_public(&k))
 }
 
 /// A server a peer told us holds its messages ("deposit for me here").
@@ -78,6 +87,9 @@ pub struct PeerInfo {
     pub push_key: Option<String>,
     #[serde(default)]
     pub inbox: Vec<ServerRef>,
+    /// Servers this peer sends through (so their items may reach us from there).
+    #[serde(default)]
+    pub sends: Vec<ServerRef>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -116,7 +128,7 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
         let k = seal::key32(pk).ok()?;
         seal::verify_mailbox_key(eid, &k, m["push_sig"].as_str()?).then(|| pk.to_owned())
     });
-    let inbox: Vec<ServerRef> = m["inbox"]
+    let refs = |v: &serde_json::Value| -> Vec<ServerRef> { v
         .as_array()
         .map(|a| {
             a.iter()
@@ -129,11 +141,13 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
                 .take(8)
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default() };
+    let inbox = refs(&m["inbox"]);
+    let sends = refs(&m["sends"]);
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut all = read_peers(config);
     let entry = all.entry(eid.to_owned()).or_default();
-    let before = (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone());
+    let before = (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone());
     if let Some(k) = verified {
         let k = seal::b64(&k);
         if !entry.key.is_empty() && entry.key != k {
@@ -145,7 +159,8 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
         entry.push_key = push;
     }
     entry.inbox = inbox;
-    let changed = before != (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone());
+    entry.sends = sends;
+    let changed = before != (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone());
     let now = crate::chat::now_ms();
     // Hellos repeat often; only touch the disk when something changed (or daily,
     // to keep the "last heard" stamp roughly current).

@@ -331,9 +331,23 @@ pub fn mailbox_fetch_now() {
     client::fetch_soon();
 }
 
-/// Can a message to this friend be held on a server if they're offline?
+/// Where a message to this friend would be held if they're offline (the
+/// server's name), or None when no Transfer Server can take it.
 #[tauri::command]
-pub fn mailbox_can_hold(state: State<'_, Arc<AppState>>, net: State<'_, Arc<IrohState>>, friend_id: String) -> bool {
-    let Some(ep) = net.get() else { return false };
-    client::can_hold(&state.config_dir, &ep.id().to_string(), &friend_id)
+pub fn mailbox_hold_route(state: State<'_, Arc<AppState>>, net: State<'_, Arc<IrohState>>, friend_id: String) -> Option<String> {
+    let ep = net.get()?;
+    client::hold_route(&state.config_dir, &ep.id().to_string(), &friend_id)
+}
+
+/// Held file sends from "ask before accepting" friends, waiting for a yes/no.
+#[tauri::command]
+pub fn mailbox_pending_files(state: State<'_, Arc<AppState>>) -> Vec<client::PendingFile> {
+    client::pending_files(&state.config_dir)
+}
+
+/// Accept (download) or decline a held file send.
+#[tauri::command]
+pub fn mailbox_decide_file(app: AppHandle, state: State<'_, Arc<AppState>>, link_id: String, accept: bool) {
+    client::decide_file(&state.config_dir, &link_id, accept);
+    let _ = app.emit("mailbox://pending", ());
 }

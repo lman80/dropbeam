@@ -131,6 +131,10 @@ pub struct TransferUpdate {
     /// connection". Drives the "wait for direct" parked card + "Send over relay anyway".
     #[serde(default)]
     pub detail: Option<String>,
+    /// The Transfer Server this send is uploading to / waiting on (its name),
+    /// when the friend was offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_on: Option<String>,
 }
 
 /// Chat-only batch coordinates; the transfer list keeps its per-push updates.
@@ -189,6 +193,7 @@ impl TransferUpdate {
             friend_name: None,
             conn_detail: None,
             detail: None,
+            held_on: None,
         }
     }
 }

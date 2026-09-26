@@ -675,10 +675,15 @@ fn emit(app: &AppHandle, u: &TransferUpdate) {
                         batch.landed.remove(&chat_item_key(row.index, &row.name));
                     }
                     u.chat_transfer = batch.observe(&link, &u);
-                    if u.chat_transfer.as_ref().and_then(|l| l.batch_state) == Some(TransferState::Completed) {
+                    if let Some(done) = u.chat_transfer.as_ref().filter(|l| l.batch_state == Some(TransferState::Completed)) {
                         // A Transfer Server copy of this send must not land twice.
                         if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
                             crate::mailbox::client::note_direct_landed(&st.config_dir, &link.id);
+                            if let Some(first) = done.completed_paths.values().next() {
+                                if let Some(m) = crate::chat::set_path_by_link(&st.config_dir, &link.id, first) {
+                                    let _ = app.emit("chat://message", &m);
+                                }
+                            }
                         }
                     }
                 }
@@ -1457,6 +1462,7 @@ pub(crate) fn apply_receipts(state: &IrohState, config: &Path, receipts: &[crate
                 let mut u = TransferUpdate::new(card_id.clone(), Direction::Send, s.names.clone());
                 u.bytes_total = s.bytes;
                 u.friend_name = friend.clone();
+                u.held_on = Some(s.server_name.clone());
                 let delivered = r.state == "delivered";
                 if delivered {
                     u.state = TransferState::Completed;
@@ -4722,10 +4728,13 @@ fn send_friend_inner(
         .collect();
     tauri::async_runtime::spawn(integrity::scope(async move {
         let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
-        let mut use_server = match (&hold_peer, &hold_config) {
+        // Only the FIRST reach-out may divert to the server: once any connection
+        // formed, a later drop resumes the direct send (never restarts it on the
+        // server from byte zero).
+        let use_server = AtomicBool::new(match (&hold_peer, &hold_config) {
             (Some(peer), Some(config)) => crate::mailbox::client::can_hold(config, &ep.id().to_string(), peer),
             _ => false,
-        };
+        });
         let mut server_note: Option<String> = None;
         // High-water mark of confirmed bytes across ALL attempts. Declared out here
         // (the retry loop below borrows it) so a PAUSE can report how far the send
@@ -4799,12 +4808,13 @@ fn send_friend_inner(
                             anyhow::bail!("canceled");
                         }
                         match tokio::time::timeout(
-                            Duration::from_secs(if use_server { 6 } else { 20 }),
+                            Duration::from_secs(if use_server.load(Ordering::SeqCst) { 6 } else { 20 }),
                             ep.connect(dial_addr(parsed), ALPN),
                         )
                         .await
                         {
                             Ok(Ok(c)) => {
+                                use_server.store(false, Ordering::SeqCst);
                                 let known_direct = peer_addrs().lock().ok()
                                     .and_then(|a| a.get(&parsed.to_string()).map(|a| a.iter().any(|x| x.observed_working)))
                                     .unwrap_or(false);
@@ -4822,7 +4832,7 @@ fn send_friend_inner(
                                 break c;
                             }
                             _ => {
-                                if use_server {
+                                if use_server.load(Ordering::SeqCst) {
                                     anyhow::bail!(GO_SERVER);
                                 }
                                 if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
@@ -5170,7 +5180,7 @@ fn send_friend_inner(
         match direct {
             Err(e) if e.to_string() == GO_SERVER => {
                 let (Some(peer), Some(config)) = (hold_peer.as_ref(), hold_config.as_ref()) else {
-                    use_server = false;
+                    use_server.store(false, Ordering::SeqCst);
                     continue;
                 };
                 let files: Vec<crate::mailbox::client::DepositFile> = upload_items.iter()
@@ -5195,7 +5205,9 @@ fn send_friend_inner(
                     let secs = upload_started.elapsed().as_secs_f64();
                     u.speed_bps = if secs > 0.5 { done as f64 / secs } else { 0.0 };
                     u.eta_seconds = (u.speed_bps > 0.0).then(|| (all.saturating_sub(done)) as f64 / u.speed_bps);
-                    u.detail = Some(format!("Uploading to {} — locked so only {} can open it", label2.lock().unwrap(), fname2));
+                    let server = label2.lock().unwrap().clone();
+                    u.detail = Some(format!("Uploading to {server} — locked so only {fname2} can open it"));
+                    u.held_on = Some(server);
                     emit(&app2, &u);
                 };
                 let (app3, id3, names3, fname3) = (app.clone(), id.clone(), names.clone(), friend_name.clone());
@@ -5206,13 +5218,26 @@ fn send_friend_inner(
                     u.friend_name = Some(fname3.clone());
                     u.bytes_total = total;
                     u.detail = Some(format!("{fname3} is offline — sending to {server}"));
+                    u.held_on = Some(server.to_owned());
                     emit(&app3, &u);
                 };
-                match crate::mailbox::client::deposit_files(&state, config, peer, &chat_id, &id, &files, &upload_dirs, &top_names, &progress, &on_start, &cancel).await {
+                // A server that's briefly unreachable/busy gets two more tries
+                // (the upload resumes where it stopped) before going direct.
+                let mut tries = 0u64;
+                let deposited = loop {
+                    let r = crate::mailbox::client::deposit_files(&state, config, peer, &chat_id, &id, &files, &upload_dirs, &top_names, &progress, &on_start, &cancel).await;
+                    if matches!(r, Err(crate::mailbox::client::DepositError::Unreachable)) && tries < 2 && !cancel.load(Ordering::SeqCst) {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_secs(5 * tries)).await;
+                        continue;
+                    }
+                    break r;
+                };
+                match deposited {
                     Ok(held) => break Ok(SendEnd::Held(held)),
                     Err(crate::mailbox::client::DepositError::GoDirect) => {
                         log::info!("friend-send: the friend came online mid-upload — sending directly instead");
-                        use_server = false;
+                        use_server.store(false, Ordering::SeqCst);
                         let mut u = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
                         u.state = TransferState::Connecting;
                         u.friend_name = Some(friend_name.clone());
@@ -5227,7 +5252,7 @@ fn send_friend_inner(
                         if !matches!(e, crate::mailbox::client::DepositError::NoRoute) {
                             server_note = Some(e.to_string());
                         }
-                        use_server = false;
+                        use_server.store(false, Ordering::SeqCst);
                         continue;
                     }
                 }
@@ -5244,7 +5269,8 @@ fn send_friend_inner(
                 u.bytes_total = total;
                 u.bytes_done = total;
                 u.percent = 100.0;
-                u.detail = Some(format!("Held on {} — reaches {} when they're online", held.name, friend_name));
+                u.detail = Some(format!("Delivered to {} — reaches {} when they're online", held.name, friend_name));
+                u.held_on = Some(held.name.clone());
                 emit(&app, &u);
                 crate::mailbox::client::wake();
             }
@@ -6163,7 +6189,25 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 // send_chat_any moves on to the person's next device when one
                 // answers applied:false, so Ok here means some device applied it.
                 if target_held {
-                    if crate::mailbox::client::deposit_chat(&state, &config_dir, &thread, "op", &payload, None).await.is_ok() {
+                    // Unsending a message the server still holds: just take it back.
+                    if op.kind == "delete" {
+                        match crate::mailbox::client::unsend_held(&state, &config_dir, &op.target_id).await {
+                            crate::mailbox::client::Unsend::Removed => {
+                                crate::chat::ack_op(&config_dir, &op.id);
+                                continue;
+                            }
+                            crate::mailbox::client::Unsend::Delivered => {
+                                // It reached them already; the unsend travels next round.
+                                if let Some(u) = crate::chat::set_status(&config_dir, &thread, &op.target_id, "delivered") {
+                                    let _ = app.emit("chat://message", &u);
+                                }
+                                continue;
+                            }
+                            crate::mailbox::client::Unsend::Unknown => {}
+                        }
+                    }
+                    let Some(server) = crate::mailbox::client::held_server_of(&config_dir, &op.target_id) else { continue };
+                    if crate::mailbox::client::deposit_chat_on(&state, &config_dir, &thread, "op", &payload, None, Some(&server)).await.is_ok() {
                         crate::chat::ack_op(&config_dir, &op.id);
                     }
                     continue;

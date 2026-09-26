@@ -1173,6 +1173,8 @@ export const useStore = create<AppStore>((set, get) => ({
       } else if (u.state === 'failed' || u.state === 'canceled') {
         // A transfer errored out or was canceled — a soft descending "uh-oh".
         playError()
+      } else if (u.state === 'held' && u.direction === 'send') {
+        playSent()
       } else if (u.state === 'waitingForAccept') {
         playOffer()
       } else if (u.direction === 'receive' && !prev) {

@@ -88,14 +88,16 @@ pub fn seen_within(eid: &str, window: Duration) -> bool {
 /// mailbox key, the servers that hold messages for us, and — when this device
 /// is a Transfer Server — what `who` may do with it.
 pub fn hello_fields(config: &Path, signer: &iroh::SecretKey, who: &str) -> Value {
-    let pk = keys::public(config);
     let mut v = json!({
         "v": VERSION,
-        "key": seal::b64(&pk),
-        "sig": seal::sign_mailbox_key(signer, &pk),
         "inbox": client::my_inbox(config),
+        "sends": client::my_sends(config),
         "grant": server::grant_for(config, who),
     });
+    if let Some(pk) = keys::public(config) {
+        v["key"] = json!(seal::b64(&pk));
+        v["sig"] = json!(seal::sign_mailbox_key(signer, &pk));
+    }
     if let Some((pk, sig)) = push::push_key_advert(config, signer) {
         v["push_key"] = json!(pk);
         v["push_sig"] = json!(sig);
@@ -107,8 +109,14 @@ pub fn hello_fields(config: &Path, signer: &iroh::SecretKey, who: &str) -> Value
 /// `who`. Old peers send nothing, which changes nothing.
 pub fn on_hello(state: &IrohState, config: &Path, who: &str, hello: &Value) {
     let Some(m) = hello.get("mailbox").filter(|m| m.is_object()) else { return };
+    // Only people we already trust may tell us about keys and servers: a
+    // stranger's hello must never become a route for our messages.
+    let own = crate::account::is_own_device(config, who);
+    if !own && crate::friends::chat_sender(config, who).is_none() {
+        return;
+    }
     keys::learn(config, who, m);
-    let change = client::learn_grant(config, who, m.get("grant"));
+    let change = client::learn_grant(config, who, m.get("grant"), own);
     if let Some(app) = state.app.get() {
         use tauri::Emitter;
         if change.any() {

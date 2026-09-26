@@ -4,6 +4,7 @@ import { useStore } from '../store'
 import { IntegrityDetails } from './IntegrityDetails'
 import { ConnInfo } from './ConnInspector'
 import { ProgressBar } from './ui'
+import { Server } from 'lucide-react'
 
 const UNITS = ['B', 'kB', 'MB', 'GB', 'TB']
 /** "1.9 of 4.8 GB" — both figures in the total's unit, so the line doesn't jump. */
@@ -37,11 +38,18 @@ export function ChatTransferProgress({ t, onRetry }: { t: TransferUpdate; onRetr
     )
   }
   if (t.state === 'canceled') return <div className="xfer-line">Canceled</div>
+  if (t.state === 'held') {
+    return (
+      <div className="xfer-line" title={t.detail ?? undefined}>
+        <span className="truncate-1"><Server className="srv-glyph" aria-hidden />Delivered to {t.heldOn ?? 'your Transfer Server'} — reaches {t.friendName ?? 'them'} when they’re online</span>
+      </div>
+    )
+  }
 
   const moving = t.state === 'transferring'
   const paused = t.state === 'paused'
   const label = moving
-    ? `${ofBytes(t.bytesDone, t.bytesTotal)}${t.etaSeconds != null && t.etaSeconds > 0 ? ` · ${formatEta(t.etaSeconds)} left` : ''}`
+    ? `${t.heldOn ? `To ${t.heldOn} · ` : ''}${ofBytes(t.bytesDone, t.bytesTotal)}${t.etaSeconds != null && t.etaSeconds > 0 ? ` · ${formatEta(t.etaSeconds)} left` : ''}`
     : paused ? `Paused · ${ofBytes(t.bytesDone, t.bytesTotal)}`
       : t.state === 'waitingForAccept' ? (send ? `Waiting for ${t.friendName ?? 'them'} to accept` : 'Waiting to accept')
         : t.state === 'connecting' ? 'Connecting…'

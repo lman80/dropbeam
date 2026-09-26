@@ -13,6 +13,7 @@ import {
   Play,
   RotateCw,
   ShieldCheck,
+  Server,
   X,
 } from 'lucide-react'
 import { api, isActive, type TransferUpdate } from '../lib/api'
@@ -139,6 +140,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   const paused = t.state === 'paused'
   const completed = t.state === 'completed'
   const canceled = t.state === 'canceled'
+  const held = t.state === 'held'
   const transferring = t.state === 'transferring'
   const connecting = !isOffer && !isSendWaiting && (t.state === 'starting' || t.state === 'waitingForPeer' || t.state === 'connecting')
   const who = t.friendName
@@ -205,6 +207,8 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
         {locationNotes.length > 0 && <span title={locationTip}> · {locationNotes.join(' · ')}</span>}
       </span>
     )
+  } else if (held) {
+    meta = <span><Server className="srv-glyph" aria-hidden />{statusLabel(t)}{t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}</span>
   } else if (canceled) {
     meta = statusLabel(t)
   } else {
@@ -354,5 +358,7 @@ function statusLabel(t: TransferUpdate): string {
       return !send && fn ? 'Declined' : 'Canceled'
     case 'paused':
       return 'Paused'
+    case 'held':
+      return `Delivered to ${t.heldOn ?? 'your Transfer Server'} — reaches ${fn ?? 'them'} when they’re online`
   }
 }

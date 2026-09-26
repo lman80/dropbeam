@@ -4,7 +4,7 @@
 //! Storage (under the chosen root, default `<config>/transfer-server/`):
 //! ```text
 //! .dropbeam-server-marker            mount identity; missing/wrong = fail closed
-//! receipts.json                      item id → final state (30-day ledger, ids only)
+//! receipts.jsonl                     item id → final state (append-only, 30 days, compacted hourly)
 //! items/<id[..2]>/<id>/header.json   the sealed envelope, exactly as received
 //! items/<id[..2]>/<id>/item.json     the server's record (who, to whom, size, expiry)
 //! items/<id[..2]>/<id>/payload.part  ciphertext while uploading (resumable)
@@ -172,6 +172,12 @@ pub struct Item {
     /// Sealed notification previews per recipient device (phase 2).
     #[serde(default)]
     pub push: HashMap<String, String>,
+    /// Header bytes (counted against quotas along with the payload).
+    #[serde(default)]
+    pub hbytes: u64,
+    /// Recipient devices that turned this item down (it stays for the others).
+    #[serde(default)]
+    pub refused: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -186,6 +192,8 @@ struct Store {
     items: HashMap<String, Item>,
     receipts: HashMap<String, Receipt>,
     uploading: HashSet<String>,
+    /// Depositor asked to cancel while its upload was still streaming.
+    cancel_requested: HashSet<String>,
 }
 
 static STORES: Mutex<Option<HashMap<PathBuf, Store>>> = Mutex::new(None);
@@ -198,7 +206,22 @@ fn now() -> u64 {
     crate::chat::now_ms()
 }
 
+fn read_receipts(root: &Path) -> HashMap<String, Receipt> {
+    let mut out = HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(root.join("receipts.jsonl")) {
+        for line in text.lines() {
+            #[derive(Deserialize)]
+            struct Line { id: String, state: String, at: u64, from: String }
+            if let Ok(l) = serde_json::from_str::<Line>(line) {
+                out.insert(l.id, Receipt { state: l.state, at: l.at, from: l.from });
+            }
+        }
+    }
+    out
+}
+
 fn load_store(root: &Path) -> Store {
+    let receipts = read_receipts(root);
     let mut items = HashMap::new();
     let base = root.join("items");
     for shard in std::fs::read_dir(&base).into_iter().flatten().flatten() {
@@ -213,7 +236,8 @@ fn load_store(root: &Path) -> Store {
                     "uploading" => true,
                     _ => false,
                 };
-                name_ok && bytes_ok && path.join("header.json").is_file()
+                // Already finished (a delete that failed before a restart): gone.
+                name_ok && bytes_ok && path.join("header.json").is_file() && !receipts.contains_key(&it.id)
             });
             match keep {
                 Some(it) => {
@@ -226,11 +250,7 @@ fn load_store(root: &Path) -> Store {
             }
         }
     }
-    let receipts = match crate::settings::read_json_store(&root.join("receipts.json")) {
-        crate::settings::StoreRead::Loaded(r) => r,
-        _ => HashMap::new(),
-    };
-    Store { root: root.to_path_buf(), items, receipts, uploading: HashSet::new() }
+    Store { root: root.to_path_buf(), items, receipts, uploading: HashSet::new(), cancel_requested: HashSet::new() }
 }
 
 /// Run `f` against this config's store (loading/reloading it as needed).
@@ -253,19 +273,43 @@ fn save_item(root: &Path, it: &Item) -> Result<()> {
     Ok(())
 }
 
-fn save_receipts(s: &Store) {
-    if let Ok(bytes) = serde_json::to_vec(&s.receipts) {
-        if let Err(e) = crate::settings::write_atomic_with_backup(&s.root.join("receipts.json"), &bytes, false) {
-            log::warn!("transfer-server: cannot save receipts: {e}");
+/// Rewrite the receipts ledger compactly (hourly, from `gc`).
+fn compact_receipts(s: &Store) {
+    let mut text = String::new();
+    for (id, r) in &s.receipts {
+        if let Ok(line) = serde_json::to_string(&json!({"id": id, "state": r.state, "at": r.at, "from": r.from})) {
+            text.push_str(&line);
+            text.push('\n');
         }
+    }
+    if let Err(e) = crate::settings::write_atomic(&s.root.join("receipts.jsonl"), text.as_bytes()) {
+        log::warn!("transfer-server: cannot save receipts: {e}");
+    }
+}
+
+/// Append one final state (cheap, durable) — the sender's proof of what happened.
+fn append_receipt(root: &Path, id: &str, r: &Receipt) {
+    use std::io::Write;
+    let line = json!({"id": id, "state": r.state, "at": r.at, "from": r.from}).to_string();
+    let result = std::fs::OpenOptions::new().create(true).append(true).open(root.join("receipts.jsonl"))
+        .and_then(|mut f| { f.write_all(format!("{line}\n").as_bytes())?; f.sync_data() });
+    if let Err(e) = result {
+        log::warn!("transfer-server: cannot record a receipt: {e}");
     }
 }
 
 /// Remove an item's bytes + record and remember how it ended.
 fn finish_item(s: &mut Store, id: &str, state: &str) {
     if let Some(it) = s.items.remove(id) {
-        let _ = std::fs::remove_dir_all(item_dir(&s.root, id));
-        s.receipts.insert(id.to_owned(), Receipt { state: state.into(), at: now(), from: it.from });
+        // Receipt first: if the delete below fails (file busy, NAS hiccup), the
+        // next load sees the receipt and finishes the job instead of re-serving it.
+        let r = Receipt { state: state.into(), at: now(), from: it.from };
+        append_receipt(&s.root, id, &r);
+        s.receipts.insert(id.to_owned(), r);
+        if let Err(e) = std::fs::remove_dir_all(item_dir(&s.root, id)) {
+            log::warn!("transfer-server: couldn't delete a finished item yet: {e}");
+        }
+        s.cancel_requested.remove(id);
         if s.receipts.len() > RECEIPT_MAX {
             let mut by_age: Vec<_> = s.receipts.iter().map(|(k, r)| (r.at, k.clone())).collect();
             by_age.sort();
@@ -273,12 +317,11 @@ fn finish_item(s: &mut Store, id: &str, state: &str) {
                 s.receipts.remove(&k);
             }
         }
-        save_receipts(s);
     }
 }
 
 fn used_bytes(s: &Store) -> u64 {
-    s.items.values().map(|i| i.ct_size).sum()
+    s.items.values().map(|i| i.ct_size + i.hbytes).sum()
 }
 
 // ── access control ──────────────────────────────────────────────────────────
@@ -403,7 +446,7 @@ pub async fn serve(config: &Path, me: Option<&str>, conn: &Connection, send: &mu
 
 fn quota_numbers(config: &Path, c: &ServerConfig, s: &Store, person: &str, own: bool) -> Value {
     let used = used_bytes(s);
-    let mine: u64 = s.items.values().filter(|i| i.person == person).map(|i| i.ct_size).sum();
+    let mine: u64 = s.items.values().filter(|i| i.person == person).map(|i| i.ct_size + i.hbytes).sum();
     let per_user = if own { c.cap_bytes } else { c.cap_bytes / 4 };
     let _ = config;
     json!({"used": used, "cap": c.cap_bytes, "user_used": mine, "user_cap": per_user, "item_max": c.item_max})
@@ -411,6 +454,9 @@ fn quota_numbers(config: &Path, c: &ServerConfig, s: &Store, person: &str, own: 
 
 fn hello_reply(config: &Path, c: &ServerConfig, who: &str) -> Value {
     let r = rights_for(config, c, who);
+    if !r.any() {
+        return refuse("denied");
+    }
     let person = if r.own { "own".to_owned() } else { person_of(config, who).unwrap_or_default() };
     let quota = with_store(config, |s| quota_numbers(config, c, s, &person, r.own)).unwrap_or(json!(null));
     json!({"ok": true, "v": super::VERSION, "name": server_name(c), "paused": c.paused,
@@ -486,17 +532,24 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
             s.uploading.insert(env.item_id.clone());
             return Ok((existing, have, s.root.clone()));
         }
-        if s.receipts.contains_key(&env.item_id) {
-            // Already delivered/expired/cancelled once: never resurrect it.
-            return Err(refuse("conflict"));
+        if let Some(r) = s.receipts.get(&env.item_id) {
+            // Already finished once: never resurrect it. For its own sender this
+            // is a lost "held" reply — say so, and the receipt poll does the rest.
+            return Err(if r.from == who {
+                json!({"ok": true, "state": "held", "held_until": 0, "finished": r.state})
+            } else {
+                refuse("conflict")
+            });
         }
         // Quotas: total, per person, free-space floor, per recipient, concurrency.
+        let hbytes = serde_json::to_vec(&header).map(|b| b.len() as u64).unwrap_or(0);
+        let need = ct_size + hbytes;
         let used = used_bytes(s);
-        if c.cap_bytes == 0 || used.saturating_add(ct_size) > c.cap_bytes {
+        if c.cap_bytes == 0 || used.saturating_add(need) > c.cap_bytes {
             return Err(refuse("full"));
         }
-        let mine: u64 = s.items.values().filter(|i| i.person == person).map(|i| i.ct_size).sum();
-        if !rights.own && mine.saturating_add(ct_size) > c.cap_bytes / 4 {
+        let mine: u64 = s.items.values().filter(|i| i.person == person).map(|i| i.ct_size + i.hbytes).sum();
+        if !rights.own && mine.saturating_add(need) > c.cap_bytes / 4 {
             return Err(refuse("user_quota"));
         }
         let pending_writes: u64 = s.items.values().filter(|i| i.state == "uploading").map(|i| i.ct_size).sum();
@@ -519,6 +572,7 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
             id: env.item_id.clone(), from: who.to_owned(), person: person.clone(), to: to.clone(),
             kind: env.kind.clone(), ct_size, header_sha: sha.clone(), created_ms: created,
             expires_ms: created + days * DAY_MS, state: "uploading".into(), push: push.clone(),
+            hbytes, refused: vec![],
         };
         let dir = item_dir(&s.root, &item.id);
         let write = (|| -> Result<()> {
@@ -590,6 +644,10 @@ async fn serve_deposit(config: &Path, c: &ServerConfig, who: &str, me: Option<&s
         return Ok(());
     }
     let held = with_store(config, |s| {
+        if s.cancel_requested.remove(&item.id) {
+            finish_item(s, &item.id, "canceled");
+            return None;
+        }
         let Some(it) = s.items.get_mut(&item.id) else { return None };
         it.state = "held".into();
         let copy = it.clone();
@@ -612,13 +670,16 @@ fn cancel(config: &Path, who: &str, req: &Value) -> Value {
         match s.items.get(&id) {
             Some(it) if it.from == who => {
                 if s.uploading.contains(&id) {
-                    return refuse("busy");
+                    // Still streaming: finish the job when the upload stops.
+                    s.cancel_requested.insert(id.clone());
+                    return json!({"ok": true, "canceled": true});
                 }
                 finish_item(s, &id, "canceled");
-                json!({"ok": true})
+                json!({"ok": true, "canceled": true})
             }
             Some(_) => refuse("denied"),
-            None => json!({"ok": true, "state": s.receipts.get(&id).map(|r| r.state.clone())}),
+            None => json!({"ok": true, "canceled": false,
+                "state": s.receipts.get(&id).filter(|r| r.from == who).map(|r| r.state.clone())}),
         }
     })
     .unwrap_or_else(|_| refuse("storage"))
@@ -645,7 +706,9 @@ fn status_reply(config: &Path, who: &str, req: &Value) -> Value {
 /// sealed header inline so the recipient needs no second round trip.
 fn fetch_reply(config: &Path, who: &str) -> Value {
     with_store(config, |s| {
-        let mut mine: Vec<&Item> = s.items.values().filter(|i| i.state == "held" && i.to.iter().any(|t| t == who)).collect();
+        let mut mine: Vec<&Item> = s.items.values()
+            .filter(|i| i.state == "held" && i.to.iter().any(|t| t == who) && !i.refused.iter().any(|r| r == who))
+            .collect();
         mine.sort_by(|a, b| (a.created_ms, &a.id).cmp(&(b.created_ms, &b.id)));
         let mut inline_budget: i64 = 600 * 1024;
         let items: Vec<Value> = mine.iter().take(500).map(|it| {
@@ -669,7 +732,8 @@ async fn serve_get(config: &Path, who: &str, send: &mut SendStream, req: &Value)
     let id = req["item_id"].as_str().unwrap_or("").to_owned();
     let have = req["have"].as_u64().unwrap_or(0);
     let found = with_store(config, |s| {
-        s.items.get(&id).filter(|it| it.state == "held" && it.to.iter().any(|t| t == who)).map(|it| (it.clone(), item_dir(&s.root, &id)))
+        s.items.get(&id).filter(|it| it.state == "held" && it.to.iter().any(|t| t == who) && !it.refused.iter().any(|r| r == who))
+            .map(|it| (it.clone(), item_dir(&s.root, &id)))
     })
     .ok()
     .flatten();
@@ -702,11 +766,24 @@ fn ack(config: &Path, who: &str, req: &Value) -> Value {
         if !it.to.iter().any(|t| t == who) {
             return refuse("denied");
         }
-        let state = if ok { "delivered" } else { "rejected" };
-        if !ok {
-            log::info!("transfer-server: a recipient refused an item ({})", req["reason"].as_str().unwrap_or("no reason").chars().take(40).collect::<String>());
+        if ok {
+            finish_item(s, &id, "delivered");
+            return json!({"ok": true});
         }
-        finish_item(s, &id, state);
+        let reason: String = req["reason"].as_str().unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == ' ').take(24).collect();
+        log::info!("transfer-server: a recipient device turned an item down ({reason})");
+        // One device can't open it; another of theirs may. Only when every
+        // addressed device has refused is it gone for good.
+        let mut it = it.clone();
+        if !it.refused.iter().any(|r| r == who) {
+            it.refused.push(who.to_owned());
+        }
+        if it.to.iter().all(|t| it.refused.contains(t)) {
+            finish_item(s, &id, "rejected");
+        } else {
+            let _ = save_item(&s.root, &it);
+            s.items.insert(id.clone(), it);
+        }
         json!({"ok": true})
     })
     .unwrap_or_else(|_| refuse("storage"))
@@ -731,10 +808,16 @@ pub fn gc(config: &Path) -> usize {
         for id in &expired {
             finish_item(s, id, "expired");
         }
-        let before = s.receipts.len();
         s.receipts.retain(|_, r| r.at + RECEIPT_MS > t);
-        if s.receipts.len() != before {
-            save_receipts(s);
+        compact_receipts(s);
+        // Retry deletes that failed earlier (the receipt already says "done").
+        for id in s.receipts.keys() {
+            if id.len() >= 2 {
+                let dir = item_dir(&s.root, id);
+                if dir.exists() && !s.items.contains_key(id) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
         }
         expired.len()
     })
@@ -750,7 +833,7 @@ pub fn pending_recipients(config: &Path) -> Vec<(String, usize)> {
     with_store(config, |s| {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for it in s.items.values().filter(|i| i.state == "held") {
-            for t in &it.to {
+            for t in it.to.iter().filter(|t| !it.refused.contains(t)) {
                 *counts.entry(t.clone()).or_default() += 1;
             }
         }
@@ -938,6 +1021,7 @@ fn recently_seen(eid: &str) -> bool {
 pub fn spawn_delivery(config: PathBuf, net: Arc<crate::iroh_net::IrohState>) {
     tauri::async_runtime::spawn(async move {
         let mut backoff: HashMap<String, (u32, Instant)> = HashMap::new();
+        let mut last_count: HashMap<String, usize> = HashMap::new();
         let mut last_gc = Instant::now() - Duration::from_secs(3600);
         loop {
             tokio::select! {
@@ -956,25 +1040,43 @@ pub fn spawn_delivery(config: PathBuf, net: Arc<crate::iroh_net::IrohState>) {
             let cfg = config.clone();
             let pending = tokio::task::spawn_blocking(move || pending_recipients(&cfg)).await.unwrap_or_default();
             backoff.retain(|eid, _| pending.iter().any(|(e, _)| e == eid));
+            last_count.retain(|eid, _| pending.iter().any(|(e, _)| e == eid));
             let now = Instant::now();
             let due: Vec<(String, usize)> = pending.into_iter()
-                .filter(|(eid, _)| recently_seen(eid) || backoff.get(eid).is_none_or(|(_, until)| now >= *until))
+                // A sighting skips the wait only when the last poke failed (they
+                // were away); a device that answered is already pulling.
+                .filter(|(eid, count)| (recently_seen(eid) && !last_count.contains_key(eid))
+                    // Something new arrived for a device that's been answering.
+                    || last_count.get(eid).is_some_and(|c| c != count)
+                    || backoff.get(eid).is_none_or(|(_, until)| now >= *until))
                 .collect();
             let mut tasks = tokio::task::JoinSet::new();
             for (eid, count) in due.into_iter().take(32) {
                 let ep = ep.clone();
                 tasks.spawn(async move {
                     let ok = notify(&ep, &eid, count).await;
-                    (eid, ok)
+                    (eid, count, ok)
                 });
             }
-            while let Some(Ok((eid, ok))) = tasks.join_next().await {
-                let fails = if ok { 0 } else { backoff.get(&eid).map(|b| b.0).unwrap_or(0) + 1 };
-                let wait = match fails {
-                    0 => Duration::from_secs(60), // they're pulling; don't nag
-                    1 => Duration::from_secs(15),
-                    2 => Duration::from_secs(60),
-                    3 => Duration::from_secs(300),
+            while let Some(Ok((eid, count, ok))) = tasks.join_next().await {
+                // Reachable but nothing got taken since the last poke (an item
+                // waiting on its owner's OK, an edit waiting for its message):
+                // poke less and less often instead of every minute.
+                let stuck = ok && last_count.get(&eid) == Some(&count);
+                if ok {
+                    last_count.insert(eid.clone(), count);
+                } else {
+                    last_count.remove(&eid);
+                }
+                let prev = backoff.get(&eid).map(|b| b.0).unwrap_or(0);
+                let fails = if ok && !stuck { 0 } else { prev + 1 };
+                let wait = match (ok, fails) {
+                    (true, 0) => Duration::from_secs(60), // they're pulling; don't nag
+                    (true, 1) => Duration::from_secs(300),
+                    (true, _) => Duration::from_secs(1800),
+                    (false, 1) => Duration::from_secs(15),
+                    (false, 2) => Duration::from_secs(60),
+                    (false, 3) => Duration::from_secs(300),
                     _ => Duration::from_secs(900),
                 };
                 backoff.insert(eid.clone(), (fails, Instant::now() + wait));

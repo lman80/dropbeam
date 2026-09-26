@@ -115,6 +115,14 @@ pub fn my_inbox(config: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// Servers we send through (friends may receive our items from these).
+pub fn my_sends(config: &Path) -> Vec<Value> {
+    servers(config).into_iter()
+        .filter(|s| s.sends_here())
+        .map(|s| json!({"eid": s.eid, "name": s.name}))
+        .collect()
+}
+
 #[derive(Default, Debug)]
 pub struct GrantChange {
     pub new_offer: bool,
@@ -130,12 +138,14 @@ impl GrantChange {
 
 /// Apply what server `who` says we may do (from its hello). `None`/null from a
 /// peer that previously granted access = access removed.
-pub fn learn_grant(config: &Path, who: &str, grant: Option<&Value>) -> GrantChange {
+pub fn learn_grant(config: &Path, who: &str, grant: Option<&Value>, verified_own: bool) -> GrantChange {
     let mut change = GrantChange::default();
     with_servers(config, |map| {
         match grant.filter(|g| g.is_object()) {
             Some(g) => {
-                let own = g["own"].as_bool().unwrap_or(false);
+                // "It's one of your own devices" is OUR call (account roster),
+                // never the peer's claim.
+                let own = verified_own && g["own"].as_bool().unwrap_or(false);
                 let member = g["member"].as_bool().unwrap_or(false) || own;
                 let entry = map.entry(who.to_owned()).or_insert_with(|| {
                     change.new_offer = !own;
@@ -253,6 +263,15 @@ fn person_devices(config: &Path, peer_id: &str, me: &str) -> Vec<String> {
 pub fn can_hold(config: &Path, me: &str, peer_id: &str) -> bool {
     let eids = person_devices(config, peer_id, me);
     !eids.is_empty() && !keys::recipients(config, &eids).is_empty() && !routes(config, me, &eids).is_empty()
+}
+
+/// The server a message to `peer_id` would be held on (its name), if any.
+pub fn hold_route(config: &Path, me: &str, peer_id: &str) -> Option<String> {
+    let eids = person_devices(config, peer_id, me);
+    if eids.is_empty() || keys::recipients(config, &eids).is_empty() {
+        return None;
+    }
+    routes(config, me, &eids).into_iter().next().map(|r| r.name)
 }
 
 /// Any of these devices showed life very recently (so a direct try is worth it).
@@ -373,7 +392,10 @@ impl DepositError {
         match self {
             Self::NoRoute => "no-route",
             Self::NoKeys => "no-keys",
-            Self::Refused { reason, .. } => reason.as_str(),
+            Self::Refused { reason, .. } => match reason.as_str() {
+                r @ ("full" | "user_quota" | "recipient_full" | "paused" | "too_big" | "denied" | "recipient" | "off" | "conflict" | "invalid") => r,
+                _ => "refused",
+            },
             Self::Unreachable => "unreachable",
             Self::GoDirect => "go-direct",
             Self::Canceled => "canceled",
@@ -517,14 +539,11 @@ async fn stream_payload(send: &mut iroh::endpoint::SendStream, env: &seal::Envel
     let io = |e: std::io::Error| RpcError::Failed(e.to_string());
     let first = have / seal::CT_SEG;
     let mut pos = first * seal::SEG; // plaintext offset
+    // Find the file holding plaintext offset `pos` (empty files hold nothing).
     let mut file_idx = 0usize;
     let mut file_off = pos;
-    while file_idx < up.files.len() && file_off >= up.files[file_idx].1 && up.files[file_idx].1 > 0 {
+    while file_idx < up.files.len() && (up.files[file_idx].1 == 0 || file_off >= up.files[file_idx].1) {
         file_off -= up.files[file_idx].1;
-        file_idx += 1;
-    }
-    // Skip zero-length files at the cursor (they contribute no bytes).
-    while file_idx < up.files.len() && up.files[file_idx].1 == 0 {
         file_idx += 1;
     }
     let mut cur: Option<tokio::fs::File> = None;
@@ -579,6 +598,12 @@ async fn stream_payload(send: &mut iroh::endpoint::SendStream, env: &seal::Envel
 /// Leave a chat message (or edit/unsend/reaction op) for person `peer_id`.
 /// `frame` is the exact `{kind:"chat", …}` frame a direct send would carry.
 pub async fn deposit_chat(net: &IrohState, config: &Path, peer_id: &str, kind: &str, frame: &Value, msg_id: Option<&str>) -> Result<Held, DepositError> {
+    deposit_chat_on(net, config, peer_id, kind, frame, msg_id, None).await
+}
+
+/// `deposit_chat`, optionally pinned to one server (an edit/reaction follows
+/// its held message to the same server, which hands items over in order).
+pub async fn deposit_chat_on(net: &IrohState, config: &Path, peer_id: &str, kind: &str, frame: &Value, msg_id: Option<&str>, only_server: Option<&str>) -> Result<Held, DepositError> {
     let ep = net.get().cloned().ok_or(DepositError::Unreachable)?;
     let me = ep.id().to_string();
     let eids = person_devices(config, peer_id, &me);
@@ -586,7 +611,10 @@ pub async fn deposit_chat(net: &IrohState, config: &Path, peer_id: &str, kind: &
     if recips.is_empty() {
         return Err(DepositError::NoKeys);
     }
-    let routes = routes(config, &me, &eids);
+    let mut routes = routes(config, &me, &eids);
+    if let Some(only) = only_server {
+        routes.retain(|r| r.server == only);
+    }
     if routes.is_empty() {
         return Err(DepositError::NoRoute);
     }
@@ -822,6 +850,11 @@ pub async fn deposit_files(
                 finish("rejected", 0);
                 last = DepositError::Refused { reason: "recipient".into(), server: route.name.clone() };
             }
+            Err(RpcError::Refused(reason)) if matches!(reason.as_str(), "busy" | "interrupted" | "storage") => {
+                // Transient: keep the partial so the next try resumes it.
+                last = DepositError::Unreachable;
+                prepared = None;
+            }
             Err(RpcError::Refused(reason)) => {
                 finish("rejected", 0);
                 last = DepositError::Refused { reason, server: route.name.clone() };
@@ -880,6 +913,52 @@ fn file_note(config: &Path, peer_id: &str, xfer_id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// The server holding our message `msg_id`, if one is.
+pub fn held_server_of(config: &Path, msg_id: &str) -> Option<String> {
+    sent_all(config).into_values().find(|s| s.msg_id.as_deref() == Some(msg_id) && s.state == "held").map(|s| s.server)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unsend {
+    /// The server still had it: it's gone, the friend never saw it.
+    Removed,
+    /// It already reached them (the unsend must travel as an op).
+    Delivered,
+    /// Couldn't tell (server unreachable) — try again later.
+    Unknown,
+}
+
+/// Unsend a message a server is holding: delete the server copy.
+pub async fn unsend_held(net: &IrohState, config: &Path, msg_id: &str) -> Unsend {
+    let Some(ep) = net.get().cloned() else { return Unsend::Unknown };
+    let Some(s) = sent_all(config).into_values().find(|s| s.msg_id.as_deref() == Some(msg_id) && s.state == "held") else {
+        return Unsend::Unknown;
+    };
+    let Some(conn) = connect(&ep, &s.server, Duration::from_secs(6)).await else { return Unsend::Unknown };
+    let reply = rpc(&conn, &json!({"kind": "mailbox.cancel", "item_id": s.item_id})).await;
+    conn.close(0u32.into(), b"done");
+    let Ok(reply) = reply else { return Unsend::Unknown };
+    let outcome = if reply["canceled"].as_bool() == Some(true) {
+        Unsend::Removed
+    } else if reply["state"].as_str() == Some("delivered") {
+        Unsend::Delivered
+    } else if reply["ok"].as_bool() == Some(true) {
+        // Gone some other way (expired/refused): nothing reached them.
+        Unsend::Removed
+    } else {
+        Unsend::Unknown
+    };
+    if outcome != Unsend::Unknown {
+        with_sent(config, |m| {
+            if let Some(e) = m.get_mut(&s.item_id) {
+                e.state = if outcome == Unsend::Delivered { "delivered".into() } else { "canceled".into() };
+                e.updated_ms = now();
+            }
+        });
+    }
+    outcome
+}
+
 /// A held chat message reached them directly after all: remove the server copy.
 pub fn delivered_directly(net: &IrohState, config: &Path, msg_id: &str) {
     let items: Vec<Sent> = sent_all(config).into_values()
@@ -924,7 +1003,15 @@ pub async fn refresh_status(net: &IrohState, config: &Path) -> Vec<Receipt> {
     }
     let mut out = Vec::new();
     for (server, items) in by_server {
-        let Some(conn) = connect(&ep, &server, Duration::from_secs(6)).await else { continue };
+        let Some(conn) = connect(&ep, &server, Duration::from_secs(6)).await else {
+            // The server's been gone past these items' expiry: they can't
+            // arrive through it any more, so let the sender take over again.
+            let t = now();
+            for s in items.into_iter().filter(|s| s.held_until > 0 && t > s.held_until + 6 * 3600 * 1000) {
+                out.push(Receipt { sent: s, state: "lost".into() });
+            }
+            continue;
+        };
         let ids: Vec<&str> = items.iter().map(|s| s.item_id.as_str()).collect();
         let reply = rpc(&conn, &json!({"kind": "mailbox.status", "item_ids": ids})).await;
         conn.close(0u32.into(), b"done");
@@ -974,7 +1061,9 @@ impl Drop for FetchGuard {
 
 /// A server says it holds something for us: pull it (rate-limited per server).
 pub fn on_notify(net: &IrohState, config: &Path, from: &str) -> bool {
-    if crate::block::is_blocked(config, from) {
+    // Only servers we use or our friends use may make us pull.
+    let me = net.get().map(|e| e.id().to_string()).unwrap_or_default();
+    if crate::block::is_blocked(config, from) || !fetch_candidates(config, &me).iter().any(|c| c == from) {
         return false;
     }
     {
@@ -1008,15 +1097,19 @@ pub fn on_notify(net: &IrohState, config: &Path, from: &str) -> bool {
 /// us holds their messages (they may deposit replies there for us).
 pub fn fetch_candidates(config: &Path, me: &str) -> Vec<String> {
     let mut out: Vec<String> = servers(config).into_iter().filter(|s| !s.revoked).map(|s| s.eid).collect();
-    for p in keys::peers(config).values() {
-        for s in &p.inbox {
+    for (peer, p) in keys::peers(config) {
+        // Only what current friends (or our own devices) told us counts.
+        if crate::friends::chat_sender(config, &peer).is_none() && !crate::account::is_own_device(config, &peer) {
+            continue;
+        }
+        for s in p.inbox.iter().chain(p.sends.iter()) {
             if !out.contains(&s.eid) {
                 out.push(s.eid.clone());
             }
         }
     }
     out.retain(|e| e != me && !crate::block::is_blocked(config, e));
-    out.truncate(8);
+    out.truncate(12);
     out
 }
 
@@ -1123,7 +1216,10 @@ async fn receive_one(net: &IrohState, config: &Path, ep: &iroh::Endpoint, conn: 
     if env.item_id != id || !env.stanzas.iter().any(|s| s.eid == me) {
         return Ok(Some((false, "malformed".into())));
     }
-    let (fk, meta) = match seal::open(&env, &me, &keys::secret(config)) {
+    let Some(my_key) = keys::secret(config) else {
+        anyhow::bail!("mailbox key unavailable right now");
+    };
+    let (fk, meta) = match seal::open(&env, &me, &my_key) {
         Ok(v) => v,
         Err(e) => {
             log::warn!("mailbox: refused an item that failed verification: {e:#}");
@@ -1144,14 +1240,24 @@ async fn receive_one(net: &IrohState, config: &Path, ep: &iroh::Endpoint, conn: 
                 return Ok(Some((false, "malformed".into())));
             }
             let applied = crate::iroh_net::apply_incoming_chat(net, config, &env.from, &meta, Some(server_name), Some(env.created_ms));
-            if !applied && env.kind == "op" {
-                log::info!("mailbox: a held edit/reaction had no message to apply to");
+            if !applied && env.kind == "op" && now().saturating_sub(env.created_ms) < 3 * super::server::DAY_MS {
+                // Its message hasn't reached this device yet (another server, or
+                // still on its way): leave the edit/reaction there and try later.
+                log::info!("mailbox: a held edit/reaction is waiting for its message");
+                return Ok(None);
             }
             Ok(Some((true, String::new())))
         }
         "file" => receive_file(net, config, conn, server_name, &env, &fk, &meta).await,
         _ => Ok(Some((false, "malformed".into()))),
     }
+}
+
+/// True the first time an item fails integrity (worth one fresh download).
+fn integrity_retry(item_id: &str) -> bool {
+    static TRIED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut g = TRIED.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(HashSet::new).insert(item_id.to_owned())
 }
 
 fn inbox_dir(config: &Path) -> PathBuf {
@@ -1181,9 +1287,36 @@ async fn receive_file(net: &IrohState, config: &Path, conn: &iroh::endpoint::Con
     if files.len() != listed || sum != Some(env.size) || (files.is_empty() && dirs.is_empty()) || files.len() > 100_000 {
         return Ok(Some((false, "malformed".into())));
     }
+    let link_id = crate::iroh_net::incoming_chat_id(&env.from, xfer);
     // Already here (a direct copy won the race)? Then the server copy is redundant.
-    if direct_landed(config, &crate::iroh_net::incoming_chat_id(&env.from, xfer)) {
+    if direct_landed(config, &link_id) {
         return Ok(Some((true, "duplicate".into())));
+    }
+    // "Ask before accepting" friends: a held send waits on the server until the
+    // user says yes, exactly like a direct offer would.
+    let friend = crate::friends::chat_sender(config, &env.from).context("unknown sender")?;
+    match decision(config, &link_id) {
+        Some(false) => {
+            forget_pending(config, &link_id);
+            return Ok(Some((false, "declined".into())));
+        }
+        Some(true) => {}
+        None if !friend.auto_accept => {
+            let names: Vec<String> = meta["names"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            let fresh = note_pending(config, PendingFile {
+                link_id: link_id.clone(), peer_id: friend.id.clone(), server: conn.remote_id().to_string(),
+                server_name: server_name.to_owned(), item_id: env.item_id.clone(), bytes: env.size,
+                names: if names.is_empty() { files.iter().map(|f| f.name.clone()).collect() } else { names }, at: now(),
+            });
+            if fresh {
+                if let Some(app) = net.app.get() {
+                    use tauri::Emitter;
+                    let _ = app.emit("mailbox://pending", ());
+                }
+            }
+            return Ok(None);
+        }
+        None => {}
     }
     let dest = crate::iroh_net::receive_dir(net, config);
     crate::iroh_net::ensure_writable(&dest).await.context("Downloads isn't writable yet")?;
@@ -1235,13 +1368,20 @@ async fn receive_file(net: &IrohState, config: &Path, conn: &iroh::endpoint::Con
             let corrupt = format!("{e:#}").contains("authentication") || format!("{e:#}").contains("integrity");
             if corrupt {
                 let _ = std::fs::remove_file(&ct_path);
-                log::warn!("mailbox: a held file failed its integrity check; refusing it");
+                // Our own partial may be what's damaged (a crash mid-write):
+                // download it once more from scratch before turning it down.
+                if integrity_retry(&env.item_id) {
+                    log::warn!("mailbox: a held file failed its integrity check; downloading it again");
+                    return Err(e);
+                }
+                log::warn!("mailbox: a held file failed its integrity check twice; refusing it");
                 return Ok(Some((false, "integrity".into())));
             }
             return Err(e);
         }
     };
     let _ = std::fs::remove_file(&ct_path);
+    forget_pending(config, &link_id);
     let names: Vec<String> = meta["names"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     crate::iroh_net::land_server_files(net, config, &env.from, xfer, &meta["note"], &names, &files.iter().map(|f| (f.name.clone(), f.size)).collect::<Vec<_>>(), &dirs, &landed, &dest, server_name, env.created_ms);
     Ok(Some((true, String::new())))
@@ -1350,6 +1490,78 @@ fn land_all(ct_path: &Path, item_id: &str, fk: &[u8; 32], size: u64, segs: u64, 
     }
     anyhow::ensure!(idx == files.len() && out.is_none(), "integrity: payload ended early");
     Ok(())
+}
+
+// ── held files waiting for the user's OK ("Ask before accepting") ──────────
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFile {
+    /// The chat card's transfer link ("receive:<peer>:<xfer>").
+    pub link_id: String,
+    pub peer_id: String,
+    pub server: String,
+    pub server_name: String,
+    pub item_id: String,
+    pub bytes: u64,
+    pub names: Vec<String>,
+    pub at: u64,
+}
+
+fn pending_path(config: &Path) -> PathBuf {
+    config.join("mailbox-pending.json")
+}
+fn decisions_path(config: &Path) -> PathBuf {
+    config.join("mailbox-decisions.json")
+}
+
+pub fn pending_files(config: &Path) -> Vec<PendingFile> {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let map: BTreeMap<String, PendingFile> = read_store(&pending_path(config));
+    map.into_values().collect()
+}
+
+/// Returns true when this is news (first time we see it waiting).
+fn note_pending(config: &Path, p: PendingFile) -> bool {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map: BTreeMap<String, PendingFile> = read_store(&pending_path(config));
+    let fresh = !map.contains_key(&p.link_id);
+    if fresh {
+        map.insert(p.link_id.clone(), p);
+        write_store(&pending_path(config), &map);
+    }
+    fresh
+}
+
+fn forget_pending(config: &Path, link_id: &str) {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map: BTreeMap<String, PendingFile> = read_store(&pending_path(config));
+    if map.remove(link_id).is_some() {
+        write_store(&pending_path(config), &map);
+    }
+    let mut d: HashMap<String, (bool, u64)> = read_store(&decisions_path(config));
+    if d.remove(link_id).is_some() {
+        write_store(&decisions_path(config), &d);
+    }
+}
+
+fn decision(config: &Path, link_id: &str) -> Option<bool> {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let d: HashMap<String, (bool, u64)> = read_store(&decisions_path(config));
+    d.get(link_id).map(|(ok, _)| *ok)
+}
+
+/// The user accepted or declined a held file send; pull it (or refuse it) now.
+pub fn decide_file(config: &Path, link_id: &str, accept: bool) {
+    {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut d: HashMap<String, (bool, u64)> = read_store(&decisions_path(config));
+        let t = now();
+        d.insert(link_id.to_owned(), (accept, t));
+        d.retain(|_, (_, at)| *at + SEEN_MS > t);
+        write_store(&decisions_path(config), &d);
+    }
+    fetch_soon();
 }
 
 // ── direct-landed ledger ────────────────────────────────────────────────────
