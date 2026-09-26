@@ -480,3 +480,22 @@ mod tests {
         assert!(open_small(&rand::random(), &sealed).is_err());
     }
 }
+
+#[cfg(test)]
+mod vectors {
+    use super::*;
+    /// Writes docs/mailbox-vectors.json (checked by tests/push-vector.swift with
+    /// CryptoKit, i.e. what the Notification Service Extension runs).
+    #[test]
+    fn push_preview_vector() {
+        let sk = [7u8; 32];
+        let pt = br#"{"t":"Ashton","b":"running 10 min late","th":""}"#;
+        let sealed = seal_small(&x25519_public(&sk), pt).unwrap();
+        assert_eq!(open_small(&sk, &sealed).unwrap(), pt);
+        let v = serde_json::json!({"push_preview": {"secret": b64(&sk), "sealed": sealed, "plaintext": String::from_utf8_lossy(pt)}});
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/mailbox-vectors.json");
+        if !path.exists() {
+            std::fs::write(path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        }
+    }
+}

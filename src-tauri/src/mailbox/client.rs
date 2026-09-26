@@ -1634,6 +1634,14 @@ pub fn spawn(net: Arc<IrohState>) {
             }
             let receipts = refresh_status(&net, &config).await;
             crate::iroh_net::apply_receipts(&net, &config, &receipts);
+            if super::push::import_token_file(&config) {
+                // Friends need our push key to seal previews for us.
+                if let Some(app) = net.app.get() {
+                    if let Some(n) = tauri::Manager::try_state::<Arc<IrohState>>(app) {
+                        crate::iroh_net::broadcast_profile(app.clone(), n.inner().clone());
+                    }
+                }
+            }
             super::push::register_everywhere(&net, &config).await;
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {},

@@ -155,6 +155,22 @@ pub fn seal_token(d: &Device, me: &str, server: &str, worker_pub: &str) -> Resul
     Ok(seal::b64(&out))
 }
 
+/// The iOS shell drops the APNs token + push key in `push-token.json`
+/// (PushRegistration.swift). Adopt it; true when it changed.
+pub fn import_token_file(config: &Path) -> bool {
+    let path = config.join("push-token.json");
+    let Ok(bytes) = std::fs::read(&path) else { return false };
+    let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { return false };
+    let (Some(token), Some(env), Some(key)) = (v["token"].as_str(), v["env"].as_str(), v["pushKey"].as_str()) else { return false };
+    match set_device(config, token, env, key) {
+        Ok(changed) => changed,
+        Err(e) => {
+            log::warn!("push: ignoring a malformed device registration: {e}");
+            false
+        }
+    }
+}
+
 /// Register (or refresh) this phone at every server that holds our messages.
 pub async fn register_everywhere(net: &crate::iroh_net::IrohState, config: &Path) {
     let Some(d) = device(config) else { return };
