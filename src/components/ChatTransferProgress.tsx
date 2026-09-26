@@ -5,6 +5,9 @@ import { IntegrityDetails } from './IntegrityDetails'
 import { ConnInfo } from './ConnInspector'
 import { ProgressBar } from './ui'
 import { Server } from 'lucide-react'
+import type { Delivery } from '../lib/api'
+import { multiDevice } from '../lib/deliveries'
+import { DeliveryLine } from './Deliveries'
 
 const UNITS = ['B', 'kB', 'MB', 'GB', 'TB']
 /** "1.9 of 4.8 GB" — both figures in the total's unit, so the line doesn't jump. */
@@ -18,9 +21,20 @@ function ofBytes(done: number, total: number): string {
  *  it moves, "Couldn't send · Retry" when it fails, and nothing once it's done
  *  (a checksum mismatch is the only thing that speaks up after completion).
  *  Connection details sit behind the ⓘ, never inline. */
-export function ChatTransferProgress({ t, onRetry }: { t: TransferUpdate; onRetry?: () => void }) {
+export function ChatTransferProgress({ t, onRetry, deliveries, friendName }: { t: TransferUpdate; onRetry?: () => void; deliveries?: Delivery[] | null; friendName?: string }) {
   const megabits = useStore((s) => s.settings?.showMegabits ?? false)
   const send = t.direction === 'send'
+  // Sent to a friend's several devices: once nothing is moving, one line says
+  // where it is on each ("Delivered to Alex’s Mac · iPhone: waiting …").
+  const devices = send ? (multiDevice(t.deliveries) ? t.deliveries : multiDevice(deliveries) ? deliveries : null) : null
+  if (devices && ['completed', 'held'].includes(t.state)) {
+    return (
+      <>
+        <DeliveryLine friend={friendName ?? t.friendName ?? 'them'} deliveries={devices} />
+        {t.state === 'completed' && <IntegrityDetails rows={t.integrity} total={t.bytesTotal} completed />}
+      </>
+    )
+  }
 
   if (t.state === 'completed') {
     return <IntegrityDetails rows={t.integrity} total={t.bytesTotal} completed />

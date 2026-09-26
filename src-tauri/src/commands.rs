@@ -1346,6 +1346,7 @@ pub async fn send_chat_message(
         held_on: None,
         server_note: None,
         via: None,
+        deliveries: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1376,8 +1377,15 @@ fn deliver_chat(
         let (pid, mid) = (friend.id.clone(), msg.id.clone());
         let app = app.clone();
         let iroh = iroh.clone();
+        // A file card goes to each of the person's devices (their files do too).
+        let to_all = msg.kind == "file";
         tauri::async_runtime::spawn(async move {
-            let status = match crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await {
+            let sent = if to_all {
+                crate::iroh_net::send_chat_all(&iroh, &ep, &eids, payload).await
+            } else {
+                crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await
+            };
+            let status = match sent {
                 Ok(_) => {
                     // If a Transfer Server was holding it meanwhile, drop that copy.
                     crate::mailbox::client::delivered_directly(&iroh, &config_dir, &mid);
@@ -1431,6 +1439,9 @@ pub(crate) fn post_file_note(
     file_xfer_id: Option<String>,
 ) -> Option<ChatMessage> {
     let friend = friends::get(&state.config_dir, friend_id)?;
+    // A send to several devices may already know where it got to.
+    let file_xfer_id_deliveries = file_xfer_id.as_deref()
+        .map(|x| crate::fanout::deliveries_for(&state.config_dir, x)).unwrap_or_default();
     let msg = ChatMessage {
         file_xfer_id,
         id: uuid::Uuid::new_v4().to_string(),
@@ -1455,6 +1466,7 @@ pub(crate) fn post_file_note(
         held_on: None,
         server_note: None,
         via: None,
+        deliveries: file_xfer_id_deliveries,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1691,6 +1703,7 @@ pub async fn send_chat_gif(
         held_on: None,
         server_note: None,
         via: None,
+        deliveries: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1930,6 +1943,7 @@ pub fn send_to_friend(
     paths: Vec<String>,
     chat_transfer_id: Option<String>,
     chat_attempt: Option<u64>,
+    device: Option<String>,
 ) -> Result<TransferUpdate, String> {
     let paths: Vec<String> = paths.into_iter().filter(|p| !p.trim().is_empty()).collect();
     if paths.is_empty() {
@@ -1940,17 +1954,13 @@ pub fn send_to_friend(
             return Err(format!("File not found: {p}"));
         }
     }
-    let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
-    // iroh-only: dial the friend's endpoint directly (discovery resolves their
-    // address). A friend added before Direct mode has no endpoint id and needs a
-    // quick re-pair to be reachable.
-    let eid = friend.endpoint_id.clone().ok_or(
-        "This friend was added on an old version — re-add them to send directly.",
-    )?;
     if iroh.get().is_none() {
         return Err("DropBeam is still connecting — try again in a moment.".into());
     }
-    crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths, chat_transfer_id, chat_attempt)
+    // iroh-only: dial the friend's devices directly (discovery resolves their
+    // addresses). Every one of the person's devices gets the files, unless the
+    // user picked one (`device` = its endpoint id).
+    crate::fanout::send(app, iroh.inner().clone(), &state.config_dir, &id, paths, chat_transfer_id, chat_attempt, device)
 }
 
 // ── iroh transport (Phase 1: foundation / diagnostics) ───────────────────────

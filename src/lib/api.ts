@@ -72,6 +72,19 @@ export interface VerifyReport {
   error: string | null
 }
 
+/** Where a send to a friend is on ONE of their devices (their Mac, their iPhone…). */
+export interface Delivery {
+  eid: string
+  /** What the device is: "Mac", "iPhone", "Mac 2". */
+  label: string
+  kind?: string | null
+  os?: string | null
+  state: 'sending' | 'uploading' | 'offline' | 'delivered' | 'held' | 'waiting' | 'failed' | 'declined' | 'canceled' | 'paused'
+  /** The Transfer Server holding it for this device. */
+  via?: string | null
+  note?: string | null
+}
+
 export interface TransferUpdate {
   locationSkipped?: number | null
   locationConflicts?: number | null
@@ -119,6 +132,8 @@ export interface TransferUpdate {
   detail?: string | null
   /** The Transfer Server this send is uploading to / waiting on. */
   heldOn?: string | null
+  /** A send to a friend with several devices: where it is on each device. */
+  deliveries?: Delivery[] | null
 }
 
 export interface HistoryEntry {
@@ -320,6 +335,8 @@ export interface ChatMessage {
   serverNote?: string | null
   /** Receiver: the Transfer Server it arrived through. */
   via?: string | null
+  /** Sender side: a file sent to a friend with several devices — where it is on each. */
+  deliveries?: Delivery[] | null
   ts: number
   /** Logical ordering clock — sort by this (then ts, then id), not wall-clock. */
   seq: number
@@ -562,8 +579,9 @@ const realApi = {
   respondToOffer: (id: string, accept: boolean, dest?: string) =>
     invoke<void>('respond_to_offer', { id, accept, dest: dest ?? null }),
   friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
-  sendToFriend: (id: string, paths: string[], chatTransferId?: string, chatAttempt?: number) =>
-    invoke<TransferUpdate>('send_to_friend', { id, paths, chatTransferId, chatAttempt }),
+  /** Files to a friend — to every one of their devices, or just `device` (an endpoint id). */
+  sendToFriend: (id: string, paths: string[], chatTransferId?: string, chatAttempt?: number, device?: string) =>
+    invoke<TransferUpdate>('send_to_friend', { id, paths, chatTransferId, chatAttempt, device: device ?? null }),
   /** Your permanent, reusable DropBeam code (stable device key + name). */
   myInviteCode: () => invoke<string>('my_invite_code'),
   /** Add a friend from their permanent code; auto-fills their name, two-way. */

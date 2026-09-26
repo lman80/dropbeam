@@ -23,6 +23,8 @@ import { folderLabel } from '../lib/humanize'
 import { IntegrityDetails } from './IntegrityDetails'
 import { ConnInfo } from './ConnInspector'
 import { useStore } from '../store'
+import { deliverySummary, multiDevice } from '../lib/deliveries'
+import { DeliveryRows } from './Deliveries'
 
 function title(t: TransferUpdate): string {
   if (t.fileNames.length === 1) return t.fileNames[0]
@@ -49,6 +51,9 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   const toggleSpeedMode = useStore((s) => s.toggleSpeedMode)
   const toggleEtaMode = useStore((s) => s.toggleEtaMode)
   const [copied, setCopied] = useState(false)
+  // Sent to a friend with several devices: say where it is on each one.
+  const devices = t.direction === 'send' && multiDevice(t.deliveries) ? t.deliveries : null
+  const reach = devices ? deliverySummary(t.friendName ?? 'them', devices) : null
 
   const active = isActive(t.state)
   const isOffer = t.state === 'waitingForAccept'
@@ -124,7 +129,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           else removeTransfer(t.id)
         }}>{show ? <FolderOpen size={21} /> : retry ? <RotateCw size={21} /> : <X size={21} />}</button>}
       </div>
-      {t.state === 'completed' ? <p className="ios-footnote">{t.direction === 'send' ? 'Delivered' : 'Saved'}{route && ` · ${route}`} · {verified}</p> : <>
+      {reach && !active ? <p className="ios-footnote">{reach.text}</p> : t.state === 'completed' ? <p className="ios-footnote">{t.direction === 'send' ? 'Delivered' : 'Saved'}{route && ` · ${route}`} · {verified}</p> : <>
         <div className="mobile-progress" role="progressbar" aria-label="Transfer progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(t.percent)}><span style={{ width: `${Math.max(0, Math.min(100, t.percent))}%` }} /></div>
         <div className="mobile-transfer-stats ios-footnote"><button className="xfer-meter" onClick={toggleSpeedMode}>{formatBytesLive(t.bytesDone)} of {formatBytesLive(t.bytesTotal)} · {speedText}</button><button className="xfer-meter" onClick={toggleEtaMode}>{etaText}</button></div>
         <div className="mobile-transfer-badges">{route && <span className="ios-caption">{route}</span>}{verified === 'Verified' && <span className="ios-caption">Verified</span>}</div>
@@ -197,6 +202,9 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
     meta = <>Paused{who ? ` · to ${who}` : ''}{t.bytesTotal > 0 ? <> · <span className="tnum">{formatBytes(t.bytesDone)} of {formatBytes(t.bytesTotal)}</span></> : ''}</>
   } else if (failed) {
     meta = <span className="xfer-error" title={t.error ?? undefined}>{t.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}{t.error ? ` — ${t.error}` : ''}</span>
+  } else if (reach && (completed || held)) {
+    // "Delivered to Alex’s Mac · iPhone: waiting (Linux Box is holding it)"
+    meta = <span title={reach.text}>{reach.text}{t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}</span>
   } else if (completed) {
     const saved = t.direction === 'receive' && t.outDir ? `Saved to ${folderLabel(t.outDir)}` : null
     meta = (
@@ -291,6 +299,8 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           <ProgressBar percent={t.percent} tone={paused ? 'paused' : undefined} label={`${title(t)} progress`} />
         </div>
       )}
+
+      {devices && !canceled && <DeliveryRows deliveries={devices} />}
 
       {isSendWaiting && (
         <div className="xfer-code">

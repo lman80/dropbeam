@@ -184,6 +184,19 @@ pub struct Item {
     /// Recipient devices that turned this item down (it stays for the others).
     #[serde(default)]
     pub refused: Vec<String>,
+    /// Recipient devices that already took a FILE item. A file goes to every
+    /// device it was sealed for, so it stays until each one has it (or turned
+    /// it down, or it expires); chat/op items finish on the first ack because a
+    /// person's devices sync their conversation among themselves.
+    #[serde(default)]
+    pub delivered: Vec<String>,
+}
+
+impl Item {
+    /// Devices that still have to take this item.
+    fn waiting_for(&self, eid: &str) -> bool {
+        self.to.iter().any(|t| t == eid) && !self.refused.iter().any(|r| r == eid) && !self.delivered.iter().any(|d| d == eid)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -191,6 +204,9 @@ struct Receipt {
     state: String,
     at: u64,
     from: String,
+    /// Which recipient devices took it (a file goes to each of them).
+    #[serde(default)]
+    delivered_to: Vec<String>,
 }
 
 struct Store {
@@ -217,9 +233,9 @@ fn read_receipts(root: &Path) -> HashMap<String, Receipt> {
     if let Ok(text) = std::fs::read_to_string(root.join("receipts.jsonl")) {
         for line in text.lines() {
             #[derive(Deserialize)]
-            struct Line { id: String, state: String, at: u64, from: String }
+            struct Line { id: String, state: String, at: u64, from: String, #[serde(default)] delivered_to: Vec<String> }
             if let Ok(l) = serde_json::from_str::<Line>(line) {
-                out.insert(l.id, Receipt { state: l.state, at: l.at, from: l.from });
+                out.insert(l.id, Receipt { state: l.state, at: l.at, from: l.from, delivered_to: l.delivered_to });
             }
         }
     }
@@ -283,7 +299,7 @@ fn save_item(root: &Path, it: &Item) -> Result<()> {
 fn compact_receipts(s: &Store) {
     let mut text = String::new();
     for (id, r) in &s.receipts {
-        if let Ok(line) = serde_json::to_string(&json!({"id": id, "state": r.state, "at": r.at, "from": r.from})) {
+        if let Ok(line) = serde_json::to_string(&json!({"id": id, "state": r.state, "at": r.at, "from": r.from, "delivered_to": r.delivered_to})) {
             text.push_str(&line);
             text.push('\n');
         }
@@ -296,7 +312,7 @@ fn compact_receipts(s: &Store) {
 /// Append one final state (cheap, durable) — the sender's proof of what happened.
 fn append_receipt(root: &Path, id: &str, r: &Receipt) {
     use std::io::Write;
-    let line = json!({"id": id, "state": r.state, "at": r.at, "from": r.from}).to_string();
+    let line = json!({"id": id, "state": r.state, "at": r.at, "from": r.from, "delivered_to": r.delivered_to}).to_string();
     let result = std::fs::OpenOptions::new().create(true).append(true).open(root.join("receipts.jsonl"))
         .and_then(|mut f| { f.write_all(format!("{line}\n").as_bytes())?; f.sync_data() });
     if let Err(e) = result {
@@ -309,7 +325,7 @@ fn finish_item(s: &mut Store, id: &str, state: &str) {
     if let Some(it) = s.items.remove(id) {
         // Receipt first: if the delete below fails (file busy, NAS hiccup), the
         // next load sees the receipt and finishes the job instead of re-serving it.
-        let r = Receipt { state: state.into(), at: now(), from: it.from };
+        let r = Receipt { state: state.into(), at: now(), from: it.from, delivered_to: it.delivered };
         append_receipt(&s.root, id, &r);
         s.receipts.insert(id.to_owned(), r);
         if let Err(e) = std::fs::remove_dir_all(item_dir(&s.root, id)) {
@@ -578,7 +594,7 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
             id: env.item_id.clone(), from: who.to_owned(), person: person.clone(), to: to.clone(),
             kind: env.kind.clone(), ct_size, header_sha: sha.clone(), created_ms: created,
             expires_ms: created + days * DAY_MS, state: "uploading".into(), push: push.clone(),
-            hbytes, refused: vec![],
+            hbytes, refused: vec![], delivered: vec![],
         };
         let dir = item_dir(&s.root, &item.id);
         let write = (|| -> Result<()> {
@@ -696,9 +712,9 @@ fn status_reply(config: &Path, who: &str, req: &Value) -> Value {
     with_store(config, |s| {
         let items: Vec<Value> = ids.iter().map(|id| {
             if let Some(it) = s.items.get(id).filter(|it| it.from == who) {
-                json!({"id": id, "state": it.state, "at": it.created_ms, "expires": it.expires_ms})
+                json!({"id": id, "state": it.state, "at": it.created_ms, "expires": it.expires_ms, "delivered_to": it.delivered})
             } else if let Some(r) = s.receipts.get(id).filter(|r| r.from == who) {
-                json!({"id": id, "state": r.state, "at": r.at})
+                json!({"id": id, "state": r.state, "at": r.at, "delivered_to": r.delivered_to})
             } else {
                 json!({"id": id, "state": "unknown"})
             }
@@ -713,7 +729,7 @@ fn status_reply(config: &Path, who: &str, req: &Value) -> Value {
 fn fetch_reply(config: &Path, who: &str) -> Value {
     with_store(config, |s| {
         let mut mine: Vec<&Item> = s.items.values()
-            .filter(|i| i.state == "held" && i.to.iter().any(|t| t == who) && !i.refused.iter().any(|r| r == who))
+            .filter(|i| i.state == "held" && i.waiting_for(who))
             .collect();
         mine.sort_by(|a, b| (a.created_ms, &a.id).cmp(&(b.created_ms, &b.id)));
         let mut inline_budget: i64 = 600 * 1024;
@@ -738,7 +754,7 @@ async fn serve_get(config: &Path, who: &str, send: &mut SendStream, req: &Value)
     let id = req["item_id"].as_str().unwrap_or("").to_owned();
     let have = req["have"].as_u64().unwrap_or(0);
     let found = with_store(config, |s| {
-        s.items.get(&id).filter(|it| it.state == "held" && it.to.iter().any(|t| t == who) && !it.refused.iter().any(|r| r == who))
+        s.items.get(&id).filter(|it| it.state == "held" && it.waiting_for(who))
             .map(|it| (it.clone(), item_dir(&s.root, &id)))
     })
     .ok()
@@ -773,7 +789,21 @@ fn ack(config: &Path, who: &str, req: &Value) -> Value {
             return refuse("denied");
         }
         if ok {
-            finish_item(s, &id, "delivered");
+            let mut it = it.clone();
+            if !it.delivered.iter().any(|d| d == who) {
+                it.delivered.push(who.to_owned());
+            }
+            // A file reaches EVERY device it was sealed for; chat/ops sync
+            // between a person's devices, so the first one is enough.
+            let done = it.kind != "file" || it.to.iter().all(|t| it.delivered.contains(t) || it.refused.contains(t));
+            if done {
+                s.items.insert(id.clone(), it);
+                finish_item(s, &id, "delivered");
+            } else {
+                log::info!("transfer-server: one of the recipient's devices took an item; holding it for the others");
+                let _ = save_item(&s.root, &it);
+                s.items.insert(id.clone(), it);
+            }
             return json!({"ok": true});
         }
         let reason: String = req["reason"].as_str().unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == ' ').take(24).collect();
@@ -784,8 +814,10 @@ fn ack(config: &Path, who: &str, req: &Value) -> Value {
         if !it.refused.iter().any(|r| r == who) {
             it.refused.push(who.to_owned());
         }
-        if it.to.iter().all(|t| it.refused.contains(t)) {
-            finish_item(s, &id, "rejected");
+        if it.to.iter().all(|t| it.refused.contains(t) || it.delivered.contains(t)) {
+            let state = if it.delivered.is_empty() { "rejected" } else { "delivered" };
+            s.items.insert(id.clone(), it);
+            finish_item(s, &id, state);
         } else {
             let _ = save_item(&s.root, &it);
             s.items.insert(id.clone(), it);
@@ -839,7 +871,7 @@ pub fn pending_recipients(config: &Path) -> Vec<(String, usize)> {
     with_store(config, |s| {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for it in s.items.values().filter(|i| i.state == "held") {
-            for t in it.to.iter().filter(|t| !it.refused.contains(t)) {
+            for t in it.to.iter().filter(|t| it.waiting_for(t)) {
                 *counts.entry(t.clone()).or_default() += 1;
             }
         }

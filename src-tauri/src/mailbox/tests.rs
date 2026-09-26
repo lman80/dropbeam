@@ -175,7 +175,7 @@ async fn files_roundtrip_multi_segment_with_empty_file_and_folder() {
     let s2 = seen.clone();
     let progress = move |d: u64, _t: u64| { s2.fetch_max(d, Ordering::SeqCst); };
     let held = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &["Trip/Sub".into()], &["Trip".into()],
-        &progress, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+        &progress, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
     assert_eq!(held.name, "Linux Box");
     assert_eq!(seen.load(Ordering::SeqCst), big.len() as u64 + 11);
     assert_eq!(fetch(&w).await, 1);
@@ -209,7 +209,7 @@ async fn interrupted_upload_resumes_and_restart_keeps_items() {
     let stop_at = seal::SEG * 2;
     let progress = move |d: u64, _t: u64| { if d >= stop_at { c2.store(true, Ordering::SeqCst); } };
     let r = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["big.bin".into()],
-        &progress, &|_| {}, &cancel).await;
+        &progress, &|_| {}, &cancel, None).await;
     assert_eq!(r.unwrap_err(), DepositError::Canceled);
     // Server restarts (cache dropped): the partial upload is still there.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -220,7 +220,7 @@ async fn interrupted_upload_resumes_and_restart_keeps_items() {
     let f2 = first.clone();
     let progress = move |d: u64, _t: u64| { let _ = f2.compare_exchange(u64::MAX, d, Ordering::SeqCst, Ordering::SeqCst); };
     client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["big.bin".into()],
-        &progress, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+        &progress, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
     assert!(first.load(Ordering::SeqCst) > seal::SEG, "resumed instead of starting over (first progress {})", first.load(Ordering::SeqCst));
     // Restart again before delivery: held items survive.
     server::unload(&w.s.config);
@@ -248,20 +248,20 @@ async fn quotas_pause_and_limits_refuse_cleanly() {
     write(&src, 100_000, 1);
     let files = deposit_files_of(&[(src.clone(), "f.bin")]);
     let x = msg();
-    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap_err();
+    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap_err();
     assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "full"), "{e:?}");
     // Per-person share: a non-owner may use at most a quarter of the space.
     c.cap_bytes = 300_000;
     server::save_config(&w.s.config, &c).unwrap();
     let x = msg();
-    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap_err();
+    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap_err();
     assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "user_quota"), "{e:?}");
     // Item size limit.
     c.cap_bytes = 1 << 30;
     c.item_max = 50_000;
     server::save_config(&w.s.config, &c).unwrap();
     let x = msg();
-    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap_err();
+    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap_err();
     assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "too_big"), "{e:?}");
     assert_eq!(server_items(&w), 0, "refused deposits leave nothing behind");
     // Free-space floor: pretend the disk must keep more free than it has.
@@ -449,7 +449,7 @@ async fn ask_first_friends_files_wait_for_a_yes() {
     let data = write(&src, 5000, 4);
     let xfer = uuid::Uuid::new_v4().to_string();
     client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &deposit_files_of(&[(src, "pic.jpg")]), &[], &["pic.jpg".into()],
-        &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
     assert_eq!(fetch(&w).await, 0, "nothing lands without a yes");
     let pending = client::pending_files(&w.b.config);
     assert_eq!(pending.len(), 1);
@@ -464,7 +464,7 @@ async fn ask_first_friends_files_wait_for_a_yes() {
     write(&src, 10, 1);
     let x2 = uuid::Uuid::new_v4().to_string();
     client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x2, &x2, &deposit_files_of(&[(src, "no.jpg")]), &[], &["no.jpg".into()],
-        &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
     assert_eq!(fetch(&w).await, 0);
     let link = client::pending_files(&w.b.config)[0].link_id.clone();
     client::decide_file(&w.b.config, &link, false);
@@ -487,10 +487,10 @@ async fn resume_past_empty_files_and_one_device_refusal_keeps_it_for_the_other()
     let c2 = cancel.clone();
     let progress = move |d: u64, _t: u64| { if d >= seal::SEG { c2.store(true, Ordering::SeqCst); } };
     assert_eq!(client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["a.bin".into()],
-        &progress, &|_| {}, &cancel).await.unwrap_err(), DepositError::Canceled);
+        &progress, &|_| {}, &cancel, None).await.unwrap_err(), DepositError::Canceled);
     tokio::time::sleep(Duration::from_millis(300)).await;
     client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["a.bin".into()],
-        &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
     assert_eq!(fetch(&w).await, 1);
     let dl = w.b.config.join("Downloads");
     assert_eq!(std::fs::read(dl.join("a.bin")).unwrap(), a);
@@ -657,7 +657,7 @@ mod live {
         let xfer = uuid::Uuid::new_v4().to_string();
         let up_t = std::time::Instant::now();
         let held = client::deposit_files(&as_, &a_dir, &b_for_a, &xfer, &xfer, &deposit_files_of(&[(src.clone(), "live-24MB.bin")]), &[], &["live-24MB.bin".into()],
-            &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+            &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
         println!("[{:>5.1}s] file held on {:?} (upload {:.1}s)", t0.elapsed().as_secs_f64(), held.name, up_t.elapsed().as_secs_f64());
         aep.close().await; // A goes offline too: delivery doesn't need the sender.
         // B comes back and pulls.
@@ -681,4 +681,231 @@ mod live {
         aep.close().await;
         println!("LIVE OK in {:.1}s", t0.elapsed().as_secs_f64());
     }
+}
+
+// ── sending to EVERY device of a friend (fanout) ────────────────────────────
+
+use crate::fanout::{self, Delivery, Outcome, Record};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+/// A second device of B's (same account): an "iPhone" next to B's "Mac".
+async fn second_device(w: &World, name: &str) -> Node {
+    let n = node(&w.base, name).await;
+    let account = "bea-account";
+    crate::friends::upsert_by_endpoint(&w.a.config, &n.eid(), "Bea");
+    crate::friends::set_device_info(&w.a.config, &w.b.eid(), Some("laptop"), Some(account));
+    crate::friends::set_device_os(&w.a.config, &w.b.eid(), "macos");
+    crate::friends::set_device_info(&w.a.config, &n.eid(), Some("phone"), Some(account));
+    crate::friends::set_device_os(&w.a.config, &n.eid(), "ios");
+    crate::friends::upsert_by_endpoint(&n.config, &w.a.eid(), "Ash");
+    crate::friends::upsert_by_endpoint(&n.config, &w.s.eid(), "Box");
+    crate::friends::upsert_by_endpoint(&w.s.config, &n.eid(), "Bea");
+    introduce(&n, &w.a);
+    client::learn_grant(&n.config, &w.s.eid(), server::grant_for(&w.s.config, &n.eid()).as_ref(), false);
+    n
+}
+
+fn inbox(n: &Node) -> PathBuf {
+    let dir = n.config.join("Downloads");
+    std::fs::create_dir_all(&dir).unwrap();
+    let _ = n.state.test_inbox.set(dir.clone());
+    dir
+}
+
+/// Real direct transfers from A's endpoint; "offline" = the dial fails.
+struct TestEnv {
+    ep: iroh::Endpoint,
+    reachable: Mutex<HashSet<String>>,
+}
+
+impl fanout::Env for TestEnv {
+    fn direct(&self, job: fanout::Job, progress: fanout::Progress) -> fanout::BoxFut<Outcome> {
+        let ep = self.ep.clone();
+        let up = self.reachable.lock().unwrap().contains(&job.eid);
+        Box::pin(async move {
+            if !up {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Outcome::Offline;
+            }
+            let id: iroh::EndpointId = job.eid.parse().unwrap();
+            let Ok(Ok(conn)) = tokio::time::timeout(job.first_dial, ep.connect(iroh_net::dial_addr(id), iroh_net::ALPN)).await else {
+                return Outcome::Offline;
+            };
+            let paths: Vec<PathBuf> = job.record.paths.iter().map(PathBuf::from).collect();
+            let r = iroh_net::send_files(&conn, &paths, &job.cancel, |d, _| progress(d, 0.0), "Ash", &AtomicBool::new(false)).await;
+            conn.close(0u32.into(), b"done");
+            match r {
+                Ok(_) => Outcome::Delivered,
+                Err(e) => Outcome::Failed(e.to_string()),
+            }
+        })
+    }
+    fn changed(&self, _config: &Path, _rec: &Record, _live: &HashMap<String, (u64, f64)>, _significant: bool) {}
+    fn stop_legs(&self, _id: &str, _reason: iroh_net::CancelReason) {}
+}
+
+fn test_engine(w: &World, reachable: &[&Node]) -> Arc<fanout::Engine> {
+    let env = TestEnv { ep: w.a.ep.clone(), reachable: Mutex::new(reachable.iter().map(|n| n.eid()).collect()) };
+    fanout::engine_for_tests(Arc::new(env), w.a.state.clone(), w.a.config.clone())
+}
+
+fn sha(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(std::fs::read(path).unwrap()))
+}
+
+/// Start a send of `src` to every one of B's devices; returns its id.
+fn send_to_bea(w: &World, engine: &Arc<fanout::Engine>, src: &Path) -> String {
+    let (owner, devices) = fanout::targets(&w.a.config, &w.b_for_a, &w.a.eid(), None).unwrap();
+    assert_eq!(devices.len(), 2, "both of Bea's devices are targets");
+    let mut labels: Vec<&str> = devices.iter().map(|d| d.label.as_str()).collect();
+    labels.sort_unstable();
+    assert_eq!(labels, ["Mac", "iPhone"]);
+    let (names, total) = iroh_net::card_summary(&[src.to_string_lossy().into_owned()]).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    engine.begin(Record {
+        id: id.clone(), chat_id: id.clone(), peer_id: owner.id, friend_name: owner.name,
+        paths: vec![src.to_string_lossy().into_owned()], names, total, attempt: 1, devices, ..Default::default()
+    });
+    id
+}
+
+async fn until_states(w: &World, id: &str, want: &[(&str, &str)]) -> Vec<Delivery> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let devices = fanout::get(&w.a.config, id).unwrap().devices;
+        if want.iter().all(|(eid, st)| devices.iter().any(|d| d.eid == *eid && d.state == *st)) {
+            return devices;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {want:?}; have {devices:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_two_online_devices_both_get_the_files() {
+    let w = world("fan-online").await;
+    let b2 = second_device(&w, "b2").await;
+    let (in1, in2) = (inbox(&w.b), inbox(&b2));
+    let src = w.base.join("src/holiday.mov");
+    write(&src, 5 * 1024 * 1024 + 77, 3);
+    let engine = test_engine(&w, &[&w.b, &b2]);
+    let id = send_to_bea(&w, &engine, &src);
+    until_states(&w, &id, &[(&w.b.eid(), fanout::DELIVERED), (&b2.eid(), fanout::DELIVERED)]).await;
+    assert_eq!(sha(&in1.join("holiday.mov")), sha(&src));
+    assert_eq!(sha(&in2.join("holiday.mov")), sha(&src));
+    assert_eq!(server_items(&w), 0, "nothing went through the server");
+    let card = fanout::card(&fanout::get(&w.a.config, &id).unwrap(), &HashMap::new());
+    assert_eq!(card.state, crate::models::TransferState::Completed);
+    b2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_offline_devices_share_one_server_copy_until_each_has_it() {
+    let w = world("fan-held").await;
+    let b2 = second_device(&w, "b2").await;
+    let src = w.base.join("src/report.pdf");
+    write(&src, 1_300_000, 9);
+    let engine = test_engine(&w, &[]);
+    let id = send_to_bea(&w, &engine, &src);
+    let devices = until_states(&w, &id, &[(&w.b.eid(), fanout::HELD), (&b2.eid(), fanout::HELD)]).await;
+    assert_eq!(devices[0].item_id, devices[1].item_id, "ONE sealed copy for both devices");
+    assert_eq!(devices[0].via.as_deref(), Some("Linux Box"));
+    assert_eq!(server_items(&w), 1, "stored (and counted against the quota) once");
+    // The Mac takes it first: the server keeps it for the iPhone.
+    assert_eq!(fetch(&w).await, 1);
+    assert_eq!(server_items(&w), 1, "still held for the other device");
+    assert_eq!(server::pending_recipients(&w.s.config), vec![(b2.eid(), 1)]);
+    for r in client::refresh_status(&w.a.state, &w.a.config).await {
+        assert!(engine.receipt(&r));
+    }
+    until_states(&w, &id, &[(&w.b.eid(), fanout::DELIVERED), (&b2.eid(), fanout::HELD)]).await;
+    // A second fetch by the Mac finds nothing new.
+    assert_eq!(fetch(&w).await, 0);
+    // The iPhone takes it: now it's gone from the server.
+    let got = tokio::time::timeout(Duration::from_secs(30), client::fetch_from(&b2.state, &b2.config, &w.s.eid())).await.unwrap().unwrap();
+    assert_eq!(got, 1);
+    assert_eq!(server_items(&w), 0, "deleted once every device has it");
+    for r in client::refresh_status(&w.a.state, &w.a.config).await {
+        assert!(engine.receipt(&r));
+    }
+    until_states(&w, &id, &[(&w.b.eid(), fanout::DELIVERED), (&b2.eid(), fanout::DELIVERED)]).await;
+    assert_eq!(sha(&w.b.config.join("Downloads/report.pdf")), sha(&src));
+    assert_eq!(sha(&b2.config.join("Downloads/report.pdf")), sha(&src));
+    b2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_online_device_direct_offline_device_held_alone() {
+    let w = world("fan-mixed").await;
+    let b2 = second_device(&w, "b2").await;
+    let in1 = inbox(&w.b);
+    let src = w.base.join("src/song.m4a");
+    write(&src, 800_000, 4);
+    let engine = test_engine(&w, &[&w.b]);
+    let id = send_to_bea(&w, &engine, &src);
+    until_states(&w, &id, &[(&w.b.eid(), fanout::DELIVERED), (&b2.eid(), fanout::HELD)]).await;
+    assert_eq!(sha(&in1.join("song.m4a")), sha(&src));
+    // Sealed for the offline iPhone only (the Mac already has it).
+    assert_eq!(server::pending_recipients(&w.s.config), vec![(b2.eid(), 1)]);
+    let got = tokio::time::timeout(Duration::from_secs(30), client::fetch_from(&b2.state, &b2.config, &w.s.eid())).await.unwrap().unwrap();
+    assert_eq!(got, 1);
+    assert_eq!(server_items(&w), 0);
+    assert_eq!(sha(&b2.config.join("Downloads/song.m4a")), sha(&src));
+    let card = fanout::card(&fanout::get(&w.a.config, &id).unwrap(), &HashMap::new());
+    assert_eq!(card.state, crate::models::TransferState::Completed, "reached the person");
+    b2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_without_a_server_waits_and_survives_a_restart() {
+    let w = world("fan-queue").await;
+    client::forget(&w.a.config, &w.s.eid());
+    let b2 = second_device(&w, "b2").await;
+    let (in1, in2) = (inbox(&w.b), inbox(&b2));
+    let src = w.base.join("src/notes.txt");
+    write(&src, 70_000, 1);
+    let engine = test_engine(&w, &[&w.b]);
+    let id = send_to_bea(&w, &engine, &src);
+    until_states(&w, &id, &[(&w.b.eid(), fanout::DELIVERED), (&b2.eid(), fanout::WAITING)]).await;
+    assert_eq!(sha(&in1.join("notes.txt")), sha(&src));
+    assert!(!in2.join("notes.txt").exists());
+    // It's on disk, not just in memory.
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(w.a.config.join("fanout.json")).unwrap()).unwrap();
+    assert_eq!(saved[&id]["devices"].as_array().unwrap().iter().filter(|d| d["state"] == "waiting").count(), 1);
+    let card = fanout::card(&fanout::get(&w.a.config, &id).unwrap(), &HashMap::new());
+    assert_eq!(card.state, crate::models::TransferState::Completed);
+    drop(engine);
+    // "Restart": a fresh engine, and the iPhone is back.
+    let engine = test_engine(&w, &[&w.b, &b2]);
+    engine.recover();
+    engine.retry_due();
+    until_states(&w, &id, &[(&w.b.eid(), fanout::DELIVERED), (&b2.eid(), fanout::DELIVERED)]).await;
+    assert_eq!(sha(&in2.join("notes.txt")), sha(&src));
+    // The Mac got it exactly once.
+    assert_eq!(std::fs::read_dir(&in1).unwrap().count(), 1);
+    b2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_copy_of_a_file_that_already_landed_is_not_duplicated() {
+    let w = world("fan-dedupe").await;
+    let src = w.base.join("src/pic.jpg");
+    let data = write(&src, 400_000, 8);
+    // The same file already reached B (a direct copy of this send landed first).
+    let dl = w.b.config.join("Downloads");
+    std::fs::create_dir_all(&dl).unwrap();
+    std::fs::write(dl.join("pic.jpg"), &data).unwrap();
+    let xfer = uuid::Uuid::new_v4().to_string();
+    client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &deposit_files_of(&[(src.clone(), "pic.jpg")]), &[], &["pic.jpg".into()],
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
+    assert_eq!(fetch(&w).await, 1);
+    let names: Vec<String> = std::fs::read_dir(&dl).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, ["pic.jpg"], "no \"pic (2).jpg\" copy");
+    assert_eq!(std::fs::read(dl.join("pic.jpg")).unwrap(), data);
+    assert_eq!(server_items(&w), 0);
+    // Delivered twice (a replay): still one file.
+    assert_eq!(fetch(&w).await, 0);
+    assert_eq!(std::fs::read_dir(&dl).unwrap().count(), 1);
 }

@@ -30,6 +30,7 @@ import { api, fileSrc, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend
 import { useStore, byOrder, type FolderActivityEvent } from '../store'
 import { completedChatItems, restoredChatTransfer } from '../lib/chatTransfer'
 import { ChatTransferProgress } from '../components/ChatTransferProgress'
+import { DeliveryLine } from '../components/Deliveries'
 import { ConnInfo } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
@@ -1766,6 +1767,7 @@ function FileMessage({
   onLightbox: (src: string) => void
 }) {
   const liveTransfer = useStore((s) => m.fileXferId ? s.chatTransfers[m.fileXferId] : undefined)
+  const friendName = useStore((s) => s.friends.find((f) => f.id === m.peerId)?.name ?? 'them')
   const history = useStore((s) => s.history)
   const transfer = liveTransfer ?? restoredChatTransfer(m, history)
   const name = m.files[0]
@@ -1893,7 +1895,9 @@ function FileMessage({
     <div className={`att${mine ? ' mine' : ''}`}>
       {body}
       {shownTransfer ? (
-        <ChatTransferProgress t={shownTransfer} onRetry={retry} />
+        <ChatTransferProgress t={shownTransfer} onRetry={retry} deliveries={mine ? m.deliveries : null} friendName={friendName} />
+      ) : mine && m.deliveries && m.deliveries.length > 1 ? (
+        <DeliveryLine friend={friendName} deliveries={m.deliveries} />
       ) : pending ? (
         <div className="xfer-line srv-ask">
           <span className="truncate-1">Waiting on {pending.serverName}</span>

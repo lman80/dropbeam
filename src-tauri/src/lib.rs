@@ -13,6 +13,7 @@ mod commands;
 #[cfg(target_os = "ios")]
 mod ios_media;
 mod download_progress;
+mod fanout;
 mod file_protocol;
 mod folder_history;
 mod friends;

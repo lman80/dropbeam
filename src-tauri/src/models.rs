@@ -135,6 +135,9 @@ pub struct TransferUpdate {
     /// when the friend was offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_on: Option<String>,
+    /// A send to a friend with several devices: where it is on each device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliveries: Option<Vec<crate::fanout::Delivery>>,
 }
 
 /// Chat-only batch coordinates; the transfer list keeps its per-push updates.
@@ -194,6 +197,7 @@ impl TransferUpdate {
             conn_detail: None,
             detail: None,
             held_on: None,
+            deliveries: None,
         }
     }
 }

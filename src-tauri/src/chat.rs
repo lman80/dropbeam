@@ -134,6 +134,10 @@ pub struct ChatMessage {
     /// Receiver side: the Transfer Server it arrived through ("via Linux Box").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// Sender side, files sent to a friend with several devices: how far they
+    /// got on each device ("Delivered to Alex's Mac · iPhone: waiting").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliveries: Vec<crate::fanout::Delivery>,
 }
 
 /// Stable causal order: logical seq first, then wall-clock, then id as a final
@@ -402,6 +406,23 @@ pub fn set_path_by_link(config_dir: &Path, file_xfer_id: &str, path: &str) -> Op
     let msg = all.values_mut().flatten()
         .find(|m| !m.from_me && m.path.is_none() && m.file_xfer_id.as_deref() == Some(file_xfer_id))?;
     msg.path = Some(path.to_owned());
+    let out = msg.clone();
+    save_all(config_dir, all);
+    Some(out)
+}
+
+/// Record where a multi-device file send got to on each device, on OUR card
+/// for it (`file_xfer_id` = the send's chat link id). None when unchanged or
+/// the card isn't there (yet).
+pub fn set_deliveries(config_dir: &Path, peer_id: &str, file_xfer_id: &str, deliveries: &[crate::fanout::Delivery]) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let msg = all.get_mut(peer_id)?.iter_mut()
+        .find(|m| m.from_me && m.file_xfer_id.as_deref() == Some(file_xfer_id))?;
+    if msg.deliveries == deliveries {
+        return None;
+    }
+    msg.deliveries = deliveries.to_vec();
     let out = msg.clone();
     save_all(config_dir, all);
     Some(out)
@@ -906,6 +927,7 @@ mod tests {
             held_on: None,
             server_note: None,
             via: None,
+            deliveries: vec![],
         }
     }
 

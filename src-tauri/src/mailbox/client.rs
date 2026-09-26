@@ -265,6 +265,15 @@ pub fn can_hold(config: &Path, me: &str, peer_id: &str) -> bool {
     !eids.is_empty() && !keys::recipients(config, &eids).is_empty() && !routes(config, me, &eids).is_empty()
 }
 
+/// Which of these devices a server could hold something for right now (we have
+/// their mailbox key and a route that takes them). Empty = none.
+pub fn holdable_devices(config: &Path, me: &str, eids: &[String]) -> Vec<String> {
+    if eids.is_empty() || routes(config, me, eids).is_empty() {
+        return vec![];
+    }
+    keys::recipients(config, eids).into_iter().map(|r| r.eid).collect()
+}
+
 /// The server a message to `peer_id` would be held on (its name), if any.
 pub fn hold_route(config: &Path, me: &str, peer_id: &str) -> Option<String> {
     let eids = person_devices(config, peer_id, me);
@@ -317,6 +326,13 @@ pub struct Sent {
     /// The transfer card this file send showed on (sender side).
     #[serde(default)]
     pub transfer_id: Option<String>,
+    /// Recipient devices the server says already took it (a file item stays
+    /// until every device it was sealed for has it).
+    #[serde(default)]
+    pub delivered_to: Vec<String>,
+    /// The devices it was sealed for.
+    #[serde(default)]
+    pub to: Vec<String>,
 }
 
 fn sent_path(config: &Path) -> PathBuf {
@@ -738,10 +754,15 @@ pub async fn deposit_files(
     progress: &(dyn Fn(u64, u64) + Send + Sync),
     on_upload_start: &(dyn Fn(&str) + Send + Sync),
     cancel: &AtomicBool,
+    only: Option<&[String]>,
 ) -> Result<Held, DepositError> {
     let ep = net.get().cloned().ok_or(DepositError::Unreachable)?;
     let me = ep.id().to_string();
-    let eids = person_devices(config, peer_id, &me);
+    let mut eids = person_devices(config, peer_id, &me);
+    // Sealed for just these devices (the others got it directly, or will).
+    if let Some(only) = only {
+        eids.retain(|e| only.contains(e));
+    }
     let recips = keys::recipients(config, &eids);
     if recips.is_empty() {
         return Err(DepositError::NoKeys);
@@ -756,8 +777,14 @@ pub async fn deposit_files(
     let go_direct = |done: u64, total: u64| any_live(&eids) && done.saturating_mul(2) < total;
 
     // An interrupted earlier deposit of these same files resumes where it stopped.
+    let mut sealed_for: Vec<&str> = recips.iter().map(|r| r.eid.as_str()).collect();
+    sealed_for.sort_unstable();
     let resumable = sent_all(config).into_values().find(|s| {
+        let mut to: Vec<&str> = s.to.iter().map(String::as_str).collect();
+        to.sort_unstable();
         s.state == "uploading" && s.xfer_id.as_deref() == Some(xfer_id) && s.files_sig.as_deref() == Some(&sig) && s.header.is_some() && s.file_key.is_some()
+            // Only a partial sealed for the SAME devices may be resumed.
+            && (to.is_empty() || to == sealed_for)
     });
     let mut prepared: Option<(seal::Envelope, [u8; 32], String)> = resumable.as_ref().and_then(|s| {
         let env: seal::Envelope = serde_json::from_value(s.header.clone()?).ok()?;
@@ -826,6 +853,7 @@ pub async fn deposit_files(
                 state: "uploading".into(), updated_ms: now(), held_until: 0,
                 header: serde_json::to_value(&env).ok(), file_key: Some(seal::b64(&fk)), files_sig: Some(sig.clone()),
                 bytes: size, names: top_names.to_vec(), transfer_id: Some(transfer_id.to_owned()),
+                delivered_to: vec![], to: env.stanzas.iter().map(|st| st.eid.clone()).collect(),
             });
         });
         on_upload_start(&route.name);
@@ -1010,7 +1038,10 @@ pub fn delivered_directly(net: &IrohState, config: &Path, msg_id: &str) {
 #[derive(Debug, Clone)]
 pub struct Receipt {
     pub sent: Sent,
+    /// A final state, or "held" when only `delivered_to` changed.
     pub state: String,
+    /// Recipient devices that have it so far.
+    pub delivered_to: Vec<String>,
 }
 
 /// Ask each server about our held items. Returns final-state transitions.
@@ -1028,7 +1059,7 @@ pub async fn refresh_status(net: &IrohState, config: &Path) -> Vec<Receipt> {
             // arrive through it any more, so let the sender take over again.
             let t = now();
             for s in items.into_iter().filter(|s| s.held_until > 0 && t > s.held_until + 6 * 3600 * 1000) {
-                out.push(Receipt { sent: s, state: "lost".into() });
+                out.push(Receipt { sent: s, state: "lost".into(), delivered_to: vec![] });
             }
             continue;
         };
@@ -1039,17 +1070,20 @@ pub async fn refresh_status(net: &IrohState, config: &Path) -> Vec<Receipt> {
         if reply["ok"].as_bool() != Some(true) {
             continue;
         }
-        let states: HashMap<String, String> = reply["items"].as_array().map(|a| a.iter().filter_map(|v| {
-            Some((v["id"].as_str()?.to_owned(), v["state"].as_str()?.to_owned()))
+        let states: HashMap<String, (String, Vec<String>)> = reply["items"].as_array().map(|a| a.iter().filter_map(|v| {
+            let to: Vec<String> = v["delivered_to"].as_array().map(|d| d.iter().filter_map(|e| e.as_str().map(String::from)).collect()).unwrap_or_default();
+            Some((v["id"].as_str()?.to_owned(), (v["state"].as_str()?.to_owned(), to)))
         }).collect()).unwrap_or_default();
         for s in items {
-            let Some(state) = states.get(&s.item_id) else { continue };
+            let Some((state, delivered_to)) = states.get(&s.item_id) else { continue };
             let final_state = match state.as_str() {
                 "delivered" | "expired" | "rejected" | "canceled" => state.clone(),
                 "unknown" => "lost".into(),
+                // Still held — but maybe some of the recipient's devices have it now.
+                _ if delivered_to.iter().any(|d| !s.delivered_to.contains(d)) => "held".into(),
                 _ => continue,
             };
-            out.push(Receipt { sent: s, state: final_state });
+            out.push(Receipt { sent: s, state: final_state, delivered_to: delivered_to.clone() });
         }
     }
     if !out.is_empty() {
@@ -1058,6 +1092,11 @@ pub async fn refresh_status(net: &IrohState, config: &Path) -> Vec<Receipt> {
                 if let Some(e) = m.get_mut(&r.sent.item_id) {
                     e.state = r.state.clone();
                     e.updated_ms = now();
+                    for d in &r.delivered_to {
+                        if !e.delivered_to.contains(d) {
+                            e.delivered_to.push(d.clone());
+                        }
+                    }
                 }
             }
         });
@@ -1418,6 +1457,7 @@ async fn receive_file(net: &IrohState, config: &Path, conn: &iroh::endpoint::Con
 /// landed items: (manifest key "file:i:name" / "dir:name", path).
 #[allow(clippy::too_many_arguments)]
 fn decrypt_and_land(ct_path: &Path, item_id: &str, fk: &[u8; 32], size: u64, segs: u64, files: &[ManifestFile], dirs: &[String], dest: &Path) -> Result<Vec<(String, PathBuf)>> {
+    REUSED.with(|r| r.borrow_mut().clear());
     let mut landed: Vec<(String, PathBuf)> = Vec::new();
     let mut staged: Vec<PathBuf> = Vec::new();
     let result = land_all(ct_path, item_id, fk, size, segs, files, dirs, dest, &mut landed, &mut staged);
@@ -1425,15 +1465,27 @@ fn decrypt_and_land(ct_path: &Path, item_id: &str, fk: &[u8; 32], size: u64, seg
         let _ = std::fs::remove_file(p);
     }
     if let Err(e) = result {
-        // Never leave half a delivery: remove what this pass published.
+        // Never leave half a delivery: remove what this pass published (never a
+        // byte-identical copy that was already there and got reused).
         for (key, path) in &landed {
-            if key.starts_with("file:") {
+            if key.starts_with("file:") && !staged_reused(path) {
                 let _ = std::fs::remove_file(path);
             }
         }
         return Err(e);
     }
     Ok(landed)
+}
+
+thread_local! {
+    /// Files a landing pass reused rather than wrote (never rolled back).
+    static REUSED: std::cell::RefCell<HashSet<PathBuf>> = std::cell::RefCell::new(HashSet::new());
+}
+fn note_reused(p: &Path) {
+    REUSED.with(|r| r.borrow_mut().insert(p.to_path_buf()));
+}
+fn staged_reused(p: &Path) -> bool {
+    REUSED.with(|r| r.borrow().contains(p))
 }
 
 struct OpenOut {
@@ -1460,7 +1512,16 @@ fn close_out(files: &[ManifestFile], i: usize, o: OpenOut, dest: &Path, landed: 
     anyhow::ensure!(hex::encode(o.hash.finalize()) == files[i].sha256.to_lowercase(), "integrity: sha256 mismatch");
     let rel = crate::iroh_net::receive_rel(&files[i].name);
     let natural = crate::iroh_net::ensure_parent_or_flat(dest, &rel);
-    let path = crate::iroh_net::publish_unique(&o.part, &natural)?;
+    // The same file already landed here (a direct copy of this send, or the
+    // user's own identical file): keep that one instead of adding "name (2)".
+    let path = match crate::iroh_net::identical_landed(&o.part, &natural) {
+        Some(existing) => {
+            let _ = std::fs::remove_file(&o.part);
+            note_reused(&existing);
+            existing
+        }
+        None => crate::iroh_net::publish_unique(&o.part, &natural)?,
+    };
     staged.retain(|p| p != &o.part);
     landed.push((format!("file:{i}:{}", files[i].name), path));
     Ok(())

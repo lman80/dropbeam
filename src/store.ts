@@ -285,7 +285,8 @@ interface AppStore {
   reloadFriends: () => Promise<void>
   /** Resolves true once a transfer actually started (false: nothing to send, a
    *  de-duped double-fire, or an error already toasted). */
-  sendToFriend: (id: string, paths: string[]) => Promise<boolean>
+  /** Files to a friend: every one of their devices, or just `device` (endpoint id). */
+  sendToFriend: (id: string, paths: string[], device?: string) => Promise<boolean>
   createFriend: (name: string) => Promise<string>
   acceptFriend: (invite: string) => Promise<void>
   addFriendByCode: (code: string) => Promise<void>
@@ -418,7 +419,7 @@ let lastFriendAt = 0
 // (NOT a per-webview Map) because a send can START in the menu-bar popover while its
 // failed card — and the Retry button — renders in the MAIN window; both windows must
 // read the same payload. Bounded so it can't grow unbounded across a session.
-type RetryPayload = { kind: 'friend'; id: string; paths: string[] } | { kind: 'quick'; paths: string[] } | { kind: 'location'; id: string; locationId: string; relPath: string; paths: string[] }
+type RetryPayload = { kind: 'friend'; id: string; paths: string[]; device?: string } | { kind: 'quick'; paths: string[] } | { kind: 'location'; id: string; locationId: string; relPath: string; paths: string[] }
 const RETRY_KEY = 'dropbeam-retry-payloads'
 function loadRetryPayloads(): Record<string, RetryPayload> {
   try {
@@ -1270,7 +1271,7 @@ export const useStore = create<AppStore>((set, get) => ({
     // Drop the failed card first so the retry starts a fresh transfer instead of
     // leaving a zombie alongside it (this also frees the old payload).
     get().removeTransfer(id)
-    if (payload.kind === 'friend') await get().sendToFriend(payload.id, payload.paths)
+    if (payload.kind === 'friend') await get().sendToFriend(payload.id, payload.paths, payload.device)
     else await get().sendPaths(payload.paths)
   },
 
@@ -1285,7 +1286,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const linkId = card?.fileXferId ?? xferId
       const current = get().chatTransfers[linkId]
       if (current && current.state !== 'failed') return
-      const t = await api.sendToFriend(payload.id, payload.paths, linkId, (current?.chatTransfer?.attempt ?? 0) + 1)
+      const t = await api.sendToFriend(payload.id, payload.paths, linkId, (current?.chatTransfer?.attempt ?? 0) + 1, payload.device)
       setRetryPayload(t.id, payload)
       setChatFileXfer(t.id, { peerId, msgId })
       // Keep the shared chat ID on retries so the receiver follows the same card.
@@ -1355,22 +1356,22 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  sendToFriend: async (id, paths) => {
+  sendToFriend: async (id, paths, device) => {
     paths = paths.filter(Boolean)
     if (!paths.length) return false
     // De-dupe a double-fired send of the same files to the same friend within
     // ~1.5s (a doubled OS drop event would otherwise transfer everything twice).
-    const sig = `${id}|${paths.join('|')}`
+    const sig = `${id}|${device ?? ''}|${paths.join('|')}`
     const now = Date.now()
     if (sig === lastFriendSig && now - lastFriendAt < 1500) return false
     lastFriendSig = sig
     lastFriendAt = now
     set({ view: 'send' })
     try {
-      const u = await api.sendToFriend(id, paths)
+      const u = await api.sendToFriend(id, paths, undefined, undefined, device)
       // Remember the recipient + paths so a failed send can offer one-tap Retry
       // (the TransferUpdate only keeps the friend's display name, not their id).
-      setRetryPayload(u.id, { kind: 'friend', id, paths })
+      setRetryPayload(u.id, { kind: 'friend', id, paths, device })
       if (!get().transfers[u.id]) get().upsertTransfer(u)
       // A direct send to a friend also lands in that friend's chat timeline, on
       // BOTH sides — so every interaction shows up in the conversation (GitHub

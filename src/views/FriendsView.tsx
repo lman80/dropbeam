@@ -1,4 +1,7 @@
-import { groupDevices, personGroups } from '../lib/deviceIcons'
+import { deviceIcon, groupDevices, personGroups } from '../lib/deviceIcons'
+import { deliveryIconKind, personDevices } from '../lib/deliveries'
+
+const firstName = (name: string) => name.trim().split(/\s+/)[0] || name
 import { DeviceBadge } from '../components/DeviceBadge'
 import { AddDeviceModal } from '../components/DevicesPanel'
 import { useOwnDeviceLabels } from '../lib/ownDevices'
@@ -322,6 +325,11 @@ function NameDialog({ title, label, initial, onSave, onClose }: {
 function FriendRow({ friend }: { friend: Friend }) {
   const ownLabel = useOwnDeviceLabels()[friend.id] as string | undefined
   const sendToFriend = useStore((s) => s.sendToFriend)
+  const allFriends = useStore((s) => s.friends)
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
+  // A friend with several devices gets everything on all of them; the menu
+  // offers the exception ("Send to iPhone only…").
+  const theirDevices = ownLabel ? [] : personDevices(allFriends, friend.id, myAccount)
   const removeFriend = useStore((s) => s.removeFriend)
   const renameFriend = useStore((s) => s.renameFriend)
   const setFriendAutoAccept = useStore((s) => s.setFriendAutoAccept)
@@ -376,13 +384,13 @@ function FriendRow({ friend }: { friend: Friend }) {
     }
   }
 
-  const send = async () => {
+  const send = async (device?: { eid: string; label: string }) => {
     setBusy(true)
     try {
       const paths = await api.pickFiles()
       if (paths.length) {
         // The store already toasted a failure; only confirm a send that started.
-        if (await sendToFriend(friend.id, paths)) toast('info', `Beaming to ${label}…`)
+        if (await sendToFriend(friend.id, paths, device?.eid)) toast('info', `Beaming to ${device ? `${firstName(label)}’s ${device.label}` : label}…`)
       }
     } catch (e) {
       toast('error', String(e))
@@ -416,6 +424,14 @@ function FriendRow({ friend }: { friend: Friend }) {
       onSelect: () => void setFriendAutoAccept(friend.id, !friend.autoAccept),
     },
     { label: 'Check if online', icon: check15, onSelect: () => void check(), disabled: pinging },
+    ...(theirDevices.length > 1 ? [
+      { separator: true } as MenuItem,
+      { heading: 'Send to one device' } as MenuItem,
+      ...theirDevices.map((d): MenuItem => {
+        const Icon = deviceIcon(deliveryIconKind(d) ?? undefined)
+        return { label: `${firstName(label)}’s ${d.label}…`, icon: <Icon className="menu-device-icon" aria-hidden />, onSelect: () => void send(d), disabled: busy }
+      }),
+    ] : []),
   ]
   const removeItem: MenuItem[] = [
     { label: ownLabel ? 'Remove device…' : 'Remove friend…', icon: check15, danger: true, onSelect: () => setDialog('remove') },
@@ -430,7 +446,8 @@ function FriendRow({ friend }: { friend: Friend }) {
       </div>
       <div className="row-trailing">
         <span className="fr-conn">{isOnline && <ConnInfo detail={conn} locality={channel} label={`Connection to ${label}`} />}</span>
-        <button className="btn btn-secondary btn-sm fr-send" onClick={() => void send()} disabled={busy}>
+        <button className="btn btn-secondary btn-sm fr-send" onClick={() => void send()} disabled={busy}
+          title={theirDevices.length > 1 ? `Sends to all of ${firstName(label)}’s devices` : undefined}>
           {busy ? <Spinner size={12} /> : <Send />} Send
         </button>
         <IconButton label={`Message ${label}`} onClick={() => openChat(friend.id)}>

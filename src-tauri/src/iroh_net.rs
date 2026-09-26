@@ -81,6 +81,9 @@ struct PendingSend {
 #[derive(Default)]
 pub struct IrohState {
     pub location_config: OnceCell<PathBuf>,
+    /// Tests: a windowless node lands pushed files here (like the app would).
+    #[cfg(test)]
+    pub test_inbox: OnceCell<PathBuf>,
     chat_batches: Mutex<HashMap<String, ChatBatch>>,
     chat_links: Mutex<HashMap<String, crate::models::ChatTransferLink>>,
     pub endpoint: OnceCell<Endpoint>,
@@ -290,6 +293,10 @@ impl IrohState {
     /// the id so the unwinding send loop reports Paused, leaving the card's retry
     /// record intact for a one-tap Resume.
     pub fn cancel_with(&self, id: &str, reason: CancelReason) -> CancelKind {
+        // A send to all of a person's devices: stop every device's leg.
+        if crate::fanout::stop(self, id, reason) {
+            return CancelKind::Active;
+        }
         // Mark BEFORE anything flips the flag, or a fast loop could unwind and
         // read the reason before it was recorded.
         match reason {
@@ -663,6 +670,10 @@ impl Drop for ChatLinkGuard<'_> {
 }
 
 fn emit(app: &AppHandle, u: &TransferUpdate) {
+    // One device's leg of a multi-device send: its card is the send's card.
+    if crate::fanout::route(u) {
+        return;
+    }
     let mut u = u.clone();
     u.integrity = integrity::reports();
     if let Some(state) = app.try_state::<Arc<IrohState>>() {
@@ -1117,7 +1128,7 @@ fn emit_completed(
 /// The notification + History half of a completed transfer (shared with the
 /// Transfer Server paths, which emit their own chat-linked card).
 #[allow(clippy::too_many_arguments)]
-fn completed_side_effects(
+pub(crate) fn completed_side_effects(
     app: &AppHandle,
     id: &str,
     dir: Direction,
@@ -1127,6 +1138,10 @@ fn completed_side_effects(
     friend: Option<String>,
     out_dir: Option<String>,
 ) {
+    // A multi-device send writes ONE History row, for the whole send.
+    if crate::fanout::is_leg(id) {
+        return;
+    }
 
     // Pop a native OS notification for an INCOMING file — this is what makes
     // DropBeam feel "always ready in the background": the app runs in the menu
@@ -1317,6 +1332,7 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     held_on: None,
                     server_note: None,
                     via: via.map(String::from),
+                    deliveries: vec![],
                 };
                 if crate::chat::append(config_dir, &msg) {
                     if let Some(app) = &app {
@@ -1402,6 +1418,7 @@ pub(crate) fn land_server_files(
             held_on: None,
             server_note: None,
             via: Some(server_name.to_owned()),
+            deliveries: vec![],
         };
         if crate::chat::append(config, &msg) {
             changed = Some(msg);
@@ -1459,6 +1476,13 @@ pub(crate) fn apply_receipts(state: &IrohState, config: &Path, receipts: &[crate
                 }
             }
             "file" => {
+                // A send to several of a person's devices tracks each device.
+                if crate::fanout::on_receipt(state, config, r) {
+                    continue;
+                }
+                if r.state == "held" {
+                    continue;
+                }
                 let (Some(app), Some(xfer)) = (app, &s.xfer_id) else { continue };
                 let card_id = s.transfer_id.clone().unwrap_or_else(|| xfer.clone());
                 let friend = crate::friends::get(config, &s.peer_id).map(|f| f.name);
@@ -1466,7 +1490,8 @@ pub(crate) fn apply_receipts(state: &IrohState, config: &Path, receipts: &[crate
                 u.bytes_total = s.bytes;
                 u.friend_name = friend.clone();
                 u.held_on = Some(s.server_name.clone());
-                let delivered = r.state == "delivered";
+                // Expired after reaching at least one of their devices = delivered.
+                let delivered = r.state == "delivered" || (r.state != "canceled" && !r.delivered_to.is_empty());
                 if delivered {
                     u.state = TransferState::Completed;
                     u.bytes_done = s.bytes;
@@ -2880,6 +2905,11 @@ async fn serve_stream_inner(
                 return Ok(());
             }
             let Some(app) = state.app.get().cloned() else {
+                #[cfg(test)]
+                if let Some(dir) = state.test_inbox.get() {
+                    read_files_negotiated(conn, send, recv, &req, dir, &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}).await?;
+                    return Ok(());
+                }
                 let never = AtomicBool::new(false);
                 let _ = read_body(recv, &req, &std::env::temp_dir(), &never, |_, _| {}).await;
                 return Ok(());
@@ -4079,6 +4109,10 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
                 // user-side fetch/receipt loop.
                 crate::mailbox::server::spawn_delivery(config_dir.clone(), state.clone());
                 crate::mailbox::client::spawn(state.clone());
+                // Sends to all of a friend's devices: finish what's still owed.
+                if let Some(app) = state.app.get() {
+                    crate::fanout::init(app.clone(), state.clone(), config_dir.clone());
+                }
                 accept_loop(ep, state).await;
             }
             Err(e) => log::warn!("iroh endpoint failed to start: {e:#}"),
@@ -4332,7 +4366,44 @@ pub fn send_to_friend(
     chat_transfer_id: Option<String>,
     chat_attempt: Option<u64>,
 ) -> Result<TransferUpdate, String> {
-    send_friend_inner(app, state, friend_name, endpoint_id, paths, chat_transfer_id, chat_attempt, None)
+    send_friend_inner(app, state, friend_name, endpoint_id, paths, chat_transfer_id, chat_attempt, None, None, None)
+}
+
+/// `send_to_friend` with the multi-device options: `child` makes this one
+/// device's leg of a send to all of a person's devices (see `fanout`), and
+/// `hold_devices` limits a Transfer Server copy to just these devices.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_to_friend_opts(
+    app: AppHandle,
+    state: Arc<IrohState>,
+    friend_name: String,
+    endpoint_id: String,
+    paths: Vec<String>,
+    chat_transfer_id: Option<String>,
+    chat_attempt: Option<u64>,
+    child: Option<crate::fanout::ChildCtx>,
+    hold_devices: Option<Vec<String>>,
+) -> Result<TransferUpdate, String> {
+    send_friend_inner(app, state, friend_name, endpoint_id, paths, chat_transfer_id, chat_attempt, None, child, hold_devices)
+}
+
+/// What a send card shows before any bytes move: its names and total size.
+pub(crate) fn card_summary(paths: &[String]) -> Result<(Vec<String>, u64), String> {
+    let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let (items, directories, total) = gather_items_with(&pathbufs, false).map_err(|e| e.to_string())?;
+    let names = if items.is_empty() { directories } else { items.into_iter().map(|i| i.1).collect() };
+    Ok((names, total))
+}
+
+/// The files (and empty folders) a Transfer Server copy of a send carries.
+pub(crate) fn deposit_inputs(paths: &[String]) -> Result<(Vec<crate::mailbox::client::DepositFile>, Vec<String>, Vec<String>), String> {
+    let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let (items, directories, _) = gather_items_with(&pathbufs, false).map_err(|e| e.to_string())?;
+    let files = items.into_iter()
+        .map(|(path, name, size, mtime)| crate::mailbox::client::DepositFile { path, name, size, mtime })
+        .collect();
+    let top = pathbufs.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+    Ok((files, directories, top))
 }
 
 type SendItem = (PathBuf, String, u64, u64);
@@ -4394,7 +4465,7 @@ fn occupied_siblings(natural: &Path) -> impl Iterator<Item = (PathBuf, std::fs::
 /// An already-landed regular file byte-identical to `part` at `natural` or one
 /// of its occupied siblings: a re-send reuses it instead of minting another
 /// "name (n)" copy. Bytes are compared only on an exact size match.
-fn identical_landed(part: &Path, natural: &Path) -> Option<PathBuf> {
+pub(crate) fn identical_landed(part: &Path, natural: &Path) -> Option<PathBuf> {
     let len = std::fs::metadata(part).ok()?.len();
     occupied_siblings(natural)
         .find(|(c, m)| m.is_file() && m.len() == len && files_identical(part, c).unwrap_or(false))
@@ -4674,13 +4745,14 @@ pub struct LocationSend {
 }
 pub fn send_location_to_friend(app: AppHandle, state: Arc<IrohState>, friend_name: String,
     endpoint_id: String, paths: Vec<String>, location: LocationSend) -> Result<TransferUpdate, String> {
-    send_friend_inner(app, state, friend_name, endpoint_id, paths, None, None, Some(location))
+    send_friend_inner(app, state, friend_name, endpoint_id, paths, None, None, Some(location), None, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_friend_inner(
     app: AppHandle, state: Arc<IrohState>, friend_name: String, endpoint_id: String,
     paths: Vec<String>, chat_transfer_id: Option<String>, chat_attempt: Option<u64>,
-    location: Option<LocationSend>,
+    location: Option<LocationSend>, child: Option<crate::fanout::ChildCtx>, hold_devices: Option<Vec<String>>,
 ) -> Result<TransferUpdate, String> {
     let ep = state
         .get()
@@ -4694,7 +4766,10 @@ fn send_friend_inner(
         (snapshot.source.items.clone(), snapshot.source.dirs.clone(), snapshot.source.items.iter().map(|i| i.2).sum())
     } else { gather_items_with(&pathbufs, location.as_ref().is_some_and(|l| l.target.is_some())).map_err(|e| e.to_string())? };
     let names = if items.is_empty() { directories.clone() } else { items.iter().map(|i| i.1.clone()).collect() };
-    let id = uuid::Uuid::new_v4().to_string();
+    // One device's leg of a send to all of a person's devices reports to that
+    // send's card (fanout), under the id it was given.
+    let id = child.as_ref().map_or_else(|| uuid::Uuid::new_v4().to_string(), |c| c.id.clone());
+    let first_dial = child.as_ref().map(|c| c.first_dial);
     if let Some(target) = location.as_ref().and_then(|l| l.target.as_ref()) {
         let mut sorted = paths.clone(); sorted.sort();
         let key = format!("{endpoint_id}|{}|{}|{}", target.location_id, target.rel_path, sorted.join("\n"));
@@ -4754,8 +4829,10 @@ fn send_friend_inner(
     // files for them, a short direct attempt is followed by a sealed upload to
     // the server instead of 90s of re-dialing and a failure.
     let hold_config = app.try_state::<Arc<crate::AppState>>().map(|st| st.config_dir.clone());
+    // A fan-out leg never deposits on its own: the fanout decides what goes
+    // to a server (once, sealed for every offline device together).
     let hold_peer: Option<String> = match (&location, &hold_config) {
-        (None, Some(config)) => crate::friends::chat_sender(config, &endpoint_id).map(|f| f.id),
+        (None, Some(config)) if first_dial.is_none() => crate::friends::chat_sender(config, &endpoint_id).map(|f| f.id),
         _ => None,
     };
     let top_names: Vec<String> = pathbufs.iter()
@@ -4766,7 +4843,7 @@ fn send_friend_inner(
         // Only the FIRST reach-out may divert to the server: once any connection
         // formed, a later drop resumes the direct send (never restarts it on the
         // server from byte zero).
-        let use_server = AtomicBool::new(match (&hold_peer, &hold_config) {
+        let use_server = AtomicBool::new(first_dial.is_some() || match (&hold_peer, &hold_config) {
             (Some(peer), Some(config)) => crate::mailbox::client::can_hold(config, &ep.id().to_string(), peer),
             _ => false,
         });
@@ -4843,7 +4920,7 @@ fn send_friend_inner(
                             anyhow::bail!("canceled");
                         }
                         match tokio::time::timeout(
-                            Duration::from_secs(if use_server.load(Ordering::SeqCst) { 6 } else { 20 }),
+                            if use_server.load(Ordering::SeqCst) { first_dial.unwrap_or(Duration::from_secs(6)) } else { Duration::from_secs(20) },
                             ep.connect(dial_addr(parsed), ALPN),
                         )
                         .await
@@ -5214,6 +5291,10 @@ fn send_friend_inner(
         .await;
         match direct {
             Err(e) if e.to_string() == GO_SERVER => {
+                if first_dial.is_some() {
+                    // Offline right now: the fanout holds or queues it for this device.
+                    break Err(anyhow::anyhow!(crate::fanout::DEVICE_OFFLINE));
+                }
                 let (Some(peer), Some(config)) = (hold_peer.as_ref(), hold_config.as_ref()) else {
                     use_server.store(false, Ordering::SeqCst);
                     continue;
@@ -5260,7 +5341,7 @@ fn send_friend_inner(
                 // (the upload resumes where it stopped) before going direct.
                 let mut tries = 0u64;
                 let deposited = loop {
-                    let r = crate::mailbox::client::deposit_files(&state, config, peer, &chat_id, &id, &files, &upload_dirs, &top_names, &progress, &on_start, &cancel).await;
+                    let r = crate::mailbox::client::deposit_files(&state, config, peer, &chat_id, &id, &files, &upload_dirs, &top_names, &progress, &on_start, &cancel, hold_devices.as_deref()).await;
                     if matches!(r, Err(crate::mailbox::client::DepositError::Unreachable)) && tries < 2 && !cancel.load(Ordering::SeqCst) {
                         tries += 1;
                         tokio::time::sleep(Duration::from_secs(5 * tries)).await;
@@ -5337,7 +5418,7 @@ fn send_friend_inner(
             // so a paused send resumes from where it stopped.
             Err(e) if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") => {
                 let reason = cleanup.take_reason(&id);
-                if matches!(reason, CancelReason::Cancel) {
+                if matches!(reason, CancelReason::Cancel) && first_dial.is_none() {
                     if let Some(config) = &hold_config {
                         crate::mailbox::client::abandon(&cleanup, config, &chat_id);
                     }
@@ -5350,6 +5431,13 @@ fn send_friend_inner(
                     progress_high.load(Ordering::SeqCst),
                     total,
                 )
+            }
+            Err(e) if e.to_string() == crate::fanout::DEVICE_OFFLINE => {
+                // Not a failure: this device just isn't reachable yet.
+                let mut u = TransferUpdate::new(id.clone(), Direction::Send, vec![]);
+                u.state = TransferState::Failed;
+                u.error = Some(crate::fanout::DEVICE_OFFLINE.into());
+                emit(&app, &u);
             }
             Err(e) => {
                 let text = match &server_note {
@@ -5881,6 +5969,25 @@ pub async fn send_chat_within(
 /// Deliver to the first of a person's devices that accepts (they sync the rest).
 pub async fn send_chat_any(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value) -> Result<serde_json::Value> {
     send_chat_any_within(state, ep, eids, payload, None).await
+}
+
+/// Deliver to EVERY one of a person's devices that answers (concurrently): a
+/// file note must reach each device its files are going to, so the linked
+/// transfer finds its card there. Ok if at least one device took it.
+pub async fn send_chat_all(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value) -> Result<serde_json::Value> {
+    if eids.len() <= 1 {
+        return send_chat_any(state, ep, eids, payload).await;
+    }
+    let tries = eids.iter().map(|eid| send_chat_any(state, ep, std::slice::from_ref(eid), payload.clone()));
+    let results = n0_future::join_all(tries).await;
+    let mut last = Err(anyhow::anyhow!("no reachable device"));
+    for r in results {
+        if r.is_ok() {
+            return r;
+        }
+        last = r;
+    }
+    last
 }
 
 /// `send_chat_any` with a quick "is anyone there?" budget per device: used when

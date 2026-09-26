@@ -1251,6 +1251,7 @@ mod tests {
                 held_on: None,
                 server_note: None,
                 via: None,
+                deliveries: vec![],
             },
         );
     }

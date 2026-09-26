@@ -109,3 +109,6 @@
 .fr-code-field { display: flex; align-items: center; gap: 8px; }
 .fr-code-field .input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: var(--text-12); }
 .fr-code-field .btn { flex-shrink: 0; }
+/* "Send to one device" items: the device's own glyph in the icon column. */
+.menu-device-icon { width: 14px; height: 14px; flex: none; color: var(--text-muted); stroke-width: 1.8; }
+.menu-item:hover:not(:disabled) .menu-device-icon, .menu-item:focus-visible .menu-device-icon { color: #fff; }

@@ -85,6 +85,7 @@ pub fn note_seen(eid: &str) {
         m.retain(|_, t| t.elapsed() < Duration::from_secs(3600));
     }
     server::device_seen(eid);
+    crate::fanout::device_seen(eid);
 }
 
 /// Seen within `window`.

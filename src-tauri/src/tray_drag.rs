@@ -247,15 +247,8 @@ fn send_drop_to_friend(app: &AppHandle, friend_id: &str, paths: Vec<String>) {
                         .unwrap_or_else(|| p.clone())
                 })
                 .collect();
-            if let Ok(t) = crate::iroh_net::send_to_friend(
-                app.clone(),
-                iroh.inner().clone(),
-                friend.name,
-                eid,
-                paths.clone(),
-                None,
-                None,
-            ) {
+            let _ = eid;
+            if let Ok(t) = crate::fanout::send(app.clone(), iroh.inner().clone(), &state.config_dir, friend_id, paths.clone(), None, None, None) {
                 crate::commands::post_file_note(&state, &iroh, app, friend_id, names, t.bytes_total, paths, None, Some(t.id));
             }
         }
