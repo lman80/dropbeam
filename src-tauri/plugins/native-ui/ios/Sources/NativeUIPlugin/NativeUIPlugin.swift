@@ -90,6 +90,18 @@ class NativeUIPlugin: Plugin {
                     Bridge.shared.event(name: "received://files", payload: ["id": "qa", "paths": paths, "chat": false])
                 }
             }
+            // QA hook: `-resetOnboarding` shows first-run setup again (`-onboardingStep N` jumps).
+            if args.contains("-resetOnboarding") { Bridge.shared.onboarding = true }
+            // QA hook: `-openChat <friendId>` opens a conversation.
+            if let i = args.firstIndex(of: "-openChat"), i + 1 < args.count {
+                let id = args[i + 1]
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { Task { try? await Bridge.shared.openChat(friendId: id) } }
+            }
+            // QA hook: `-feedbackCapture <seconds>` opens the feedback panel (its screenshot
+            // is also written to Documents/qa-feedback.png for inspection).
+            if let i = args.firstIndex(of: "-feedbackCapture"), i + 1 < args.count, let delay = Double(args[i + 1]) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { SuperFeedback.present() }
+            }
             // QA hook: `-forceDark` renders in dark mode regardless of the simulator setting.
             if args.contains("-forceDark") { root.view.window?.overrideUserInterfaceStyle = .dark }
             // QA hook: `-openTab settings` starts on a tab (screenshots without touch input).

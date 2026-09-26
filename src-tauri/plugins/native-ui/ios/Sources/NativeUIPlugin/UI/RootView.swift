@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UserNotifications
 
 struct RootView: View {
     @EnvironmentObject private var bridge: Bridge
@@ -40,16 +41,9 @@ struct RootView: View {
                     .accessibilityAddTraits(.updatesFrequently).allowsHitTesting(false)
             }
         }
-        .sheet(isPresented: Binding(get: { bridge.needsName }, set: { _ in })) { OnboardingSheet() }
-        .sheet(isPresented: Binding(get: { !bridge.needsName && !bridge.sendQueue.isEmpty }, set: { if !$0 { bridge.pickedToSend = []; bridge.pendingSend = []; bridge.perform { try await bridge.action("dismissSend") } } })) {
-            SendToSheet(paths: bridge.sendQueue)
-        }
-        .sheet(item: Binding(get: { !bridge.needsName && bridge.sendQueue.isEmpty ? bridge.folderInvites.first : nil }, set: { if $0 == nil && !bridge.folderInvites.isEmpty { bridge.folderInvites.removeFirst() } })) { invite in FolderInviteSheet(invite: invite) }
-
+        .modifier(RootPresentations())
         .animation(.snappy, value: bridge.toast)
         .onChange(of: bridge.toast) { _, toast in if let toast { UIAccessibility.post(notification: .announcement, argument: toast) } }
-        // The conversation's composer and bubbles own the screen edges.
-        .onChange(of: bridge.selectedTab == "chat" && !bridge.chatPath.isEmpty) { _, inThread in SuperFeedback.setSuppressed(inThread) }
         .preferredColorScheme(bridge.settings?.theme == "dark" ? .dark : bridge.settings?.theme == "light" ? .light : nil)
         .task { try? await bridge.nativeChatFocus(scenePhase == .active) }
         .onChange(of: bridge.selectedTab) { _, tab in
@@ -91,5 +85,46 @@ private struct PanelGlass: ViewModifier {
     @ViewBuilder func body(content: Content) -> some View {
         if #available(iOS 26, *) { content.glassEffect(.regular, in: .rect(cornerRadius: 28)) }
         else { content.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous)) }
+    }
+}
+
+/// Everything the root presents over the tabs: first-run setup, Send To, folder
+/// invites, invite links — one at a time, setup first.
+private struct RootPresentations: ViewModifier {
+    @EnvironmentObject private var bridge: Bridge
+    private var settingUp: Bool { bridge.onboarding || bridge.needsName }
+    private var setup: Binding<Bool> { Binding(get: { settingUp }, set: { _ in }) }
+    private var sending: Binding<Bool> {
+        Binding(get: { !settingUp && !bridge.sendQueue.isEmpty }, set: { presented in
+            guard !presented else { return }
+            bridge.pickedToSend = []; bridge.pendingSend = []
+            bridge.perform { try await bridge.action("dismissSend") }
+        })
+    }
+    private var folderInvite: Binding<FolderInvite?> {
+        Binding(get: { !settingUp && bridge.sendQueue.isEmpty ? bridge.folderInvites.first : nil },
+                set: { if $0 == nil && !bridge.folderInvites.isEmpty { bridge.folderInvites.removeFirst() } })
+    }
+    private var link: Binding<IncomingLink?> {
+        Binding(get: { !settingUp && bridge.sendQueue.isEmpty && bridge.folderInvites.isEmpty ? bridge.incomingLink : nil },
+                set: { if $0 == nil { bridge.incomingLink = nil } })
+    }
+    func body(content: Content) -> some View {
+        content
+            .fullScreenCover(isPresented: setup) { OnboardingFlow().environmentObject(bridge) }
+            .sheet(isPresented: sending) { SendToSheet(paths: bridge.sendQueue) }
+            .sheet(item: folderInvite) { invite in FolderInviteSheet(invite: invite) }
+            // An invite link / Camera-scanned friend QR opened the app: add them.
+            .sheet(item: link) { link in AddFriendSheet(initialCode: link.value).environmentObject(bridge) }
+            .task(id: settingUp) {
+                // Existing installs that never answered the notification prompt get it
+                // once here (new ones are asked inside setup, at the moment it's explained).
+                guard !settingUp else { return }
+                try? await Task.sleep(for: .seconds(2))
+                let center = UNUserNotificationCenter.current()
+                if !settingUp, await center.notificationSettings().authorizationStatus == .notDetermined {
+                    _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+                }
+            }
     }
 }

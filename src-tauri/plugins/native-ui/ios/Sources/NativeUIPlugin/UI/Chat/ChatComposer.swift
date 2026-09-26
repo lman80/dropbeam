@@ -62,6 +62,15 @@ struct ChatComposer: View {
             .sheet(isPresented: $gifPicker) { ChatGifPicker(friendID: friendID).environmentObject(bridge) }
             .onChange(of: editing?.id) { _, _ in if let editing { text = editing.text ?? ""; focused = true } }
             .onChange(of: reply?.id) { _, _ in if reply != nil { focused = true } }
+            #if targetEnvironment(simulator)
+            // QA: `-focusComposer` shows then hides the keyboard (reproduces the state
+            // that made feedback screenshots black).
+            .task {
+                guard CommandLine.arguments.contains("-focusComposer") else { return }
+                try? await Task.sleep(for: .seconds(1.5)); focused = true
+                try? await Task.sleep(for: .seconds(2.5)); focused = false
+            }
+            #endif
             .onChange(of: scenePhase) { _, phase in if phase != .active { stopTyping() } }
             .onDisappear { stopTyping() }
     }

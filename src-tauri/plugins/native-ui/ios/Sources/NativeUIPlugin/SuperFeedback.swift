@@ -165,6 +165,14 @@ public enum SuperFeedback {
         UserDefaults.standard.object(forKey: "superfeedback.enabled") as? Bool ?? (config?.defaultEnabled ?? true)
     }
 
+    /// Keep the trigger clear of bottom-edge controls the host draws itself (a chat
+    /// composer), measured in points from the bottom of the screen; 0 clears it.
+    public static func setBottomObstruction(_ height: CGFloat) {
+        bottomObstruction = height
+        for state in scenes.values where abs(state.bottomObstruction - height) > 0.5 { state.bottomObstruction = height }
+    }
+    private static var bottomObstruction: CGFloat = 0
+
     /// Temporarily hide the trigger (e.g. on a screen whose edge holds fixed controls).
     public static func setSuppressed(_ suppressed: Bool) {
         for state in scenes.values where state.suppressed != suppressed {
@@ -196,6 +204,7 @@ public enum SuperFeedback {
         guard scenes[id] == nil, let config else { return }
         let state = SFSceneState(scene: scene, config: config)
         state.suppressed = suppressedByApp
+        state.bottomObstruction = bottomObstruction
         scenes[id] = state
         let window = SFOverlayWindow(windowScene: scene)
         window.state = state
@@ -428,6 +437,8 @@ fileprivate final class SFSceneState: ObservableObject {
     /// covers (0 when there is none), measured from its real UITabBar so the
     /// trigger never rests over it — floating iOS 26 bars included.
     @Published var tabBarInset: CGFloat = 0
+    /// Host-reported bottom controls (see SuperFeedback.setBottomObstruction).
+    @Published var bottomObstruction: CGFloat = 0
     /// Markup shapes in normalised image coordinates; the base image is never rasterised.
     @Published var markupShapes: [SFShape] = []
     /// Non-nil once shapes have been composited; drives the thumbnail and the annotated status.
@@ -468,6 +479,13 @@ fileprivate final class SFSceneState: ObservableObject {
         case .success(let capture):
             screenshot = capture.image
             screenshotURL = capture.url; screenshotCleanURL = capture.url
+            #if targetEnvironment(simulator)
+            if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                try? capture.image.pngData()?.write(to: docs.appendingPathComponent("qa-feedback.png"))
+                let windows = scene.windows.map { "\(NSStringFromClass(Swift.type(of: $0))) level=\($0.windowLevel.rawValue) hidden=\($0.isHidden)" }
+                try? windows.joined(separator: "\n").write(to: docs.appendingPathComponent("qa-windows.txt"), atomically: true, encoding: String.Encoding.utf8)
+            }
+            #endif
         case .failure(let failure): screenshotFailure = failure.rawValue
         }
         attachScreenshot = config.attachScreenshot
@@ -753,7 +771,8 @@ private struct SFOverlayView: View {
     private func movementBounds(_ geometry: GeometryProxy) -> CGRect {
         let safe = state.safeAreaInsets, extra = state.config.reservedInsets
         // A measured tab bar beats the configured guess (it may float, grow or be hidden).
-        let bottom = state.tabBarInset > 0 ? max(safe.bottom, state.tabBarInset) : safe.bottom + extra.bottom
+        let bottom = max(state.tabBarInset > 0 ? max(safe.bottom, state.tabBarInset) : safe.bottom + extra.bottom,
+                         state.bottomObstruction + 8)
         let insets = UIEdgeInsets(top: safe.top + extra.top, left: safe.left + extra.left, bottom: bottom, right: safe.right + extra.right)
         let reach: CGFloat = 20 + 12 // radius + edge gap
         let left = min(geometry.size.width / 2, insets.left + reach)
@@ -932,8 +951,15 @@ private enum SFImages {
         case tooLarge = "PNG exceeds 2 MB after downscaling"
     }
     static func capture(scene: UIWindowScene) -> Result<(image: UIImage, url: String), CaptureFailure> {
-        let windows = scene.windows.filter { !($0 is SFOverlayWindow) && !$0.isHidden && $0.alpha > 0 }
-            .sorted { $0.windowLevel.rawValue < $1.windowLevel.rawValue }
+        // Only the app's own content windows. Once the keyboard has been shown, UIKit
+        // keeps system windows around (UIRemoteKeyboardWindow, UITextEffectsWindow) at
+        // very high levels; their content lives in another process, so drawHierarchy
+        // paints them as opaque BLACK over everything — the "black screenshot" bug.
+        // Sheets, alerts and menus of the app render inside its normal-level window.
+        let windows = scene.windows.filter { window in
+            !(window is SFOverlayWindow) && !window.isHidden && window.alpha > 0
+                && window.windowLevel <= .normal && !isSystemWindow(window)
+        }.sorted { $0.windowLevel.rawValue < $1.windowLevel.rawValue }
         let bounds = scene.coordinateSpace.bounds
         guard !windows.isEmpty else { return .failure(.noWindows) }
         guard bounds.width > 0, bounds.height > 0 else { return .failure(.invalidBounds) }
@@ -954,6 +980,11 @@ private enum SFImages {
             }
         }
         return encodePNG(image)
+    }
+
+    private static func isSystemWindow(_ window: UIWindow) -> Bool {
+        let name = NSStringFromClass(type(of: window))
+        return name.contains("Keyboard") || name.contains("TextEffects") || name.hasPrefix("_UI")
     }
 
     /// Initial encode plus at most five 0.75 downscales. Never emit an oversized PNG.

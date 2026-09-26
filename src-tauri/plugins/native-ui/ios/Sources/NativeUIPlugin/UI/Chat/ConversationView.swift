@@ -21,6 +21,8 @@ struct ConversationView: View {
     @State private var reporting: ReportTarget?
     /// Report chosen in the Tapback menu: shown once the cover has closed.
     @State private var pendingReport: ReportTarget?
+    /// Points the composer covers from the screen bottom (feedback button keeps clear).
+    @State private var composerHeight: CGFloat = 0
     /// A friend (not one of the user's own devices): Report / Block are offered.
     private var reportable: Bool {
         guard let f = bridge.friends.first(where: { $0.id == friendID }), !f.ownDevice else { return false }
@@ -80,7 +82,17 @@ struct ConversationView: View {
                     if searching { searchFooter(proxy) }
                     ChatComposer(friendID: friendID, reply: $reply, editing: $editing, text: $draft) { scrollDown(proxy) }
                 }
+                // The feedback button stays available here, parked above the composer
+                // (it grows with replies, drafts and attachments) — never over Send.
+                .background { GeometryReader { geo in
+                    Color.clear.preference(key: ComposerTopKey.self, value: geo.frame(in: .global).minY)
+                } }
             })
+            .onPreferenceChange(ComposerTopKey.self) { top in
+                let screen = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds.height ?? 0
+                if top.isFinite, screen > 0 { composerHeight = max(0, screen - top); SuperFeedback.setBottomObstruction(composerHeight) }
+            }
+            .onAppear { if composerHeight > 0 { SuperFeedback.setBottomObstruction(composerHeight) } }
             .onChange(of: messages.map(\.id)) { old, new in
                 if !loaded || old.isEmpty || nearBottom || messages.last?.fromMe == true {
                     scrollDown(proxy, animated: loaded); loaded = !new.isEmpty
@@ -149,6 +161,7 @@ struct ConversationView: View {
             }.environmentObject(bridge).tint(.beam)
         }
         .onDisappear {
+            SuperFeedback.setBottomObstruction(0)
             // Sheets retain this destination; only a pop/switch closes the store.
             if !bridge.chatPath.contains(friendID) || bridge.selectedTab != "chat" {
                 Task { try? await bridge.setTyping(friendId: friendID, on: false); try? await bridge.closeChat(friendId: friendID) }
@@ -270,6 +283,10 @@ private struct ComposerBar<Bar: View>: ViewModifier {
     }
 }
 
+private struct ComposerTopKey: PreferenceKey {
+    static let defaultValue: CGFloat = .infinity
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = min(value, nextValue()) }
+}
 private struct ChatBottomKey: PreferenceKey {
     static let defaultValue: CGFloat = .greatestFiniteMagnitude
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
