@@ -19,9 +19,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.52.2</string>
 	<key>CFBundleVersion</key>
-	<string>0.52.2</string>
-	<key>ITSAppUsesNonExemptEncryption</key>
-	<true/>
+	<string>0.52.3</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

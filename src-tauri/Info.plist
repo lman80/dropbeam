@@ -12,8 +12,6 @@
        iroh/rustls) is standard crypto that is NOT provided by Apple's OS, so it
        is not the "exempt" kind. App Store Connect then asks the export-compliance
        questions per build (answer: standard algorithms; see docs/APPSTORE.md). -->
-  <key>ITSAppUsesNonExemptEncryption</key>
-  <true/>
 
   <!-- Camera: QR scanning for friend, device and shared-folder codes. -->
   <key>NSCameraUsageDescription</key>

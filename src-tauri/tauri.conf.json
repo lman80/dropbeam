@@ -99,6 +99,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "iOS": {
+      "bundleVersion": "0.52.3"
+    },
     "macOS": {
       "minimumSystemVersion": "10.15",
       "infoPlist": "Info.macos.plist",

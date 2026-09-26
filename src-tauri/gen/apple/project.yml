@@ -66,9 +66,6 @@ targets:
         # directory visible in the Files app (On My iPhone -> DropBeam).
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        # DropBeam's own E2E crypto (iroh/rustls) isn't Apple-OS crypto → not exempt.
-        # See docs/APPSTORE.md → Export compliance.
-        ITSAppUsesNonExemptEncryption: true
     entitlements:
       path: app_iOS/app_iOS.entitlements
     scheme:
