@@ -201,7 +201,7 @@ fn my_name(config: &Path) -> String {
     if n.trim().is_empty() { "A friend".into() } else { n.trim().chars().take(60).collect() }
 }
 
-fn seal_for(config: &Path, to: &[seal::Recipient], body: impl Fn(bool) -> String) -> Value {
+fn seal_for(config: &Path, to: &[seal::Recipient], msg_id: Option<&str>, body: impl Fn(bool) -> String) -> Value {
     let peers = super::keys::peers(config);
     let title = my_name(config);
     let me = identity(config).map(|k| k.public().to_string()).unwrap_or_default();
@@ -209,7 +209,12 @@ fn seal_for(config: &Path, to: &[seal::Recipient], body: impl Fn(bool) -> String
     for r in to {
         let Some(p) = peers.get(&r.eid) else { continue };
         let Some(pk) = p.push_key.as_deref().and_then(|k| seal::key32(k).ok()) else { continue };
-        let pt = json!({"t": title, "b": body(p.push_text), "f": me}).to_string();
+        let mut pt = json!({"t": title, "b": body(p.push_text), "f": me});
+        // The message id lets the phone keep one banner per message.
+        if let Some(id) = msg_id {
+            pt["i"] = json!(id);
+        }
+        let pt = pt.to_string();
         if let Ok(s) = seal::seal_small(&pk, pt.as_bytes()) {
             out.insert(r.eid.clone(), json!(s));
         }
@@ -225,7 +230,8 @@ pub fn previews(config: &Path, to: &[seal::Recipient], frame: &Value) -> Value {
     }
     let text: String = frame["text"].as_str().unwrap_or("").chars().take(180).collect();
     let files = frame["files"].as_array().map(|a| a.len()).unwrap_or(0);
-    seal_for(config, to, |show_text| match kind {
+    let id = frame["id"].as_str().filter(|i| i.len() <= 64);
+    seal_for(config, to, id, |show_text| match kind {
         "gif" => "Sent a GIF".into(),
         "file" if files > 1 => format!("Sent you {files} files"),
         "file" => "Sent you a file".into(),
@@ -241,7 +247,7 @@ pub fn file_previews(config: &Path, to: &[seal::Recipient], names: &[String]) ->
         n => format!("Sent you {n} files"),
     };
     let first = names.first().cloned().unwrap_or_default();
-    seal_for(config, to, |show| if show && names.len() == 1 && !first.is_empty() { format!("Sent you {first}") } else { body.clone() })
+    seal_for(config, to, None, |show| if show && names.len() == 1 && !first.is_empty() { format!("Sent you {first}") } else { body.clone() })
 }
 
 // ── server side ─────────────────────────────────────────────────────────────
@@ -314,53 +320,195 @@ fn coalesce_ok(to: &str) -> bool {
     true
 }
 
-/// Something new is held: wake each addressed phone that registered here and
-/// isn't connected right now.
-pub fn on_stored(config: &Path, item: &Item) {
-    if item.kind == "op" {
-        return;
+/// (item id, device) pairs a wake-up already covered — so a device that was
+/// online at deposit time (no push then) gets exactly one later, when it stops
+/// answering, and never a second for the same item.
+static PUSHED: Mutex<Option<std::collections::HashSet<(String, String)>>> = Mutex::new(None);
+
+fn mark_pushed(item: &str, to: &str) -> bool {
+    let mut g = PUSHED.lock().unwrap_or_else(|p| p.into_inner());
+    let set = g.get_or_insert_with(Default::default);
+    if set.len() > 20_000 {
+        set.clear();
     }
-    let Some(root) = root_of(config) else { return };
-    let Some(signer) = identity(config) else { return };
-    let c = super::server::load_config(config);
-    let url = if c.push_url.trim().is_empty() { DEFAULT_URL.to_owned() } else { c.push_url.trim().to_owned() };
+    set.insert((item.to_owned(), to.to_owned()))
+}
+
+fn was_pushed(item: &str, to: &str) -> bool {
+    PUSHED.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+        .is_some_and(|s| s.contains(&(item.to_owned(), to.to_owned())))
+}
+
+/// A short, non-identifying tag for logs.
+fn short(eid: &str) -> String {
+    eid.chars().take(6).collect()
+}
+
+/// The sealed APNs registration a device left here, if any.
+fn registration(config: &Path, to: &str) -> Option<(PathBuf, String)> {
+    let path = reg_dir(&root_of(config)?).join(format!("{to}.json"));
+    let token = std::fs::read(&path).ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["sealed_token"].as_str().map(String::from))?;
+    Some((path, token))
+}
+
+/// The signed relay request that wakes `to` about `item` (None = not a phone
+/// that registered here, or no server identity).
+pub(crate) fn wake_request(config: &Path, item: &Item, to: &str) -> Option<(PathBuf, Value)> {
+    let (path, token) = registration(config, to)?;
+    let signer = identity(config)?;
     // Same sender → one notification thread on the phone.
     let collapse = {
         use sha2::{Digest, Sha256};
         hex::encode(&Sha256::digest(item.from.as_bytes())[..8])
-    }; // becomes the notification thread id (groups one sender's banners)
-    for to in &item.to {
-        if super::server::recently_seen_device(to) || !coalesce_ok(to) {
-            continue;
-        }
-        let path = reg_dir(&root).join(format!("{to}.json"));
-        let Some(token) = std::fs::read(&path).ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| v["sealed_token"].as_str().map(String::from)) else { continue };
-        // The sender id is the one the server verified on the item; the phone
-        // names the banner from its own contacts and checks the preview matches.
-        let payload = match item.push.get(to) {
-            Some(sealed) => json!({"f": item.from, "e": sealed}).to_string(),
-            None => json!({"f": item.from}).to_string(),
-        };
-        let body = signed_request(&signer, &token, &collapse, &payload);
-        let url = url.clone();
+    };
+    // The sender id is the one the server verified on the item; the phone
+    // names the banner from its own contacts and checks the preview matches.
+    let payload = match item.push.get(to) {
+        Some(sealed) => json!({"f": item.from, "e": sealed}).to_string(),
+        None => json!({"f": item.from}).to_string(),
+    };
+    Some((path, signed_request(&signer, &token, &collapse, &payload)))
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn relay_url(config: &Path) -> String {
+    let c = super::server::load_config(config);
+    if c.push_url.trim().is_empty() { DEFAULT_URL.to_owned() } else { c.push_url.trim().to_owned() }
+}
+
+/// Test hook: requests that would have gone to the relay.
+#[cfg(test)]
+pub(crate) static SENT_FOR_TESTS: Mutex<Vec<(String, Value)>> = Mutex::new(Vec::new());
+
+fn send_wake(config: &Path, item: &Item, to: &str, why: &'static str) {
+    let Some((path, body)) = wake_request(config, item, to) else { return };
+    if !coalesce_ok(to) {
+        log::info!("push: skipped waking {} ({why}): one went out in the last 30s", short(to));
+        return;
+    }
+    #[cfg(test)]
+    {
+        SENT_FOR_TESTS.lock().unwrap().push((to.to_owned(), body));
+        let _ = path;
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let url = relay_url(config);
+        let tag = short(to);
         tauri::async_runtime::spawn(async move {
             let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build();
             let Ok(client) = client else { return };
             match client.post(&url).json(&body).send().await {
                 Ok(res) => {
+                    let http = res.status().as_u16();
                     let v: Value = res.json().await.unwrap_or(Value::Null);
+                    let reason: String = v["reason"].as_str().unwrap_or("?").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(24).collect();
                     if v["gone"].as_bool() == Some(true) {
                         let _ = std::fs::remove_file(&path);
-                        log::info!("push: a phone's registration expired; removed it");
-                    } else if v["ok"].as_bool() != Some(true) {
-                        log::info!("push: relay didn't send ({})", v["reason"].as_str().unwrap_or("?").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(24).collect::<String>());
+                        log::info!("push: {tag}'s registration expired; removed it");
+                    } else if v["ok"].as_bool() == Some(true) {
+                        log::info!("push: woke {tag} ({why}) — relay {http}, APNs {}", v["status"].as_u64().unwrap_or(0));
+                    } else {
+                        log::info!("push: relay didn't wake {tag} ({why}): {http} {reason}");
                     }
                 }
-                Err(e) => log::info!("push: relay unreachable: {}", e.without_url()),
+                Err(e) => log::info!("push: relay unreachable waking {tag}: {}", e.without_url()),
             }
         });
+    }
+}
+
+/// Something new is held: wake each addressed phone that registered here and
+/// isn't connected right now. A phone that was online a moment ago is poked
+/// instead (it pulls at once); if that poke fails, `on_unreachable` wakes it.
+pub fn on_stored(config: &Path, item: &Item) {
+    if item.kind == "op" {
+        return;
+    }
+    for to in &item.to {
+        if registration(config, to).is_none() {
+            continue;
+        }
+        if super::server::recently_seen_device(to) {
+            log::info!("push: {} was online moments ago; poking it first", short(to));
+            continue;
+        }
+        mark_pushed(&item.id, to);
+        send_wake(config, item, to, "new item");
+    }
+}
+
+/// A poke to `eid` just failed: wake it (once) for recent items the deposit
+/// didn't push because it looked online then.
+pub fn on_unreachable(config: &Path, eid: &str) {
+    if registration(config, eid).is_none() {
+        return;
+    }
+    let t = now();
+    let mut due: Vec<Item> = super::server::waiting_items(config, eid).into_iter()
+        .filter(|i| i.kind != "op" && t.saturating_sub(i.created_ms) < 15 * 60 * 1000 && !was_pushed(&i.id, eid))
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+    due.sort_by_key(|i| i.created_ms);
+    for i in &due {
+        mark_pushed(&i.id, eid);
+    }
+    send_wake(config, due.last().unwrap(), eid, "didn't answer");
+}
+
+// ── notification de-duplication on the phone ────────────────────────────────
+//
+// The Notification Service Extension shows a banner for a push; the app may
+// later get the same message (from the server, or synced from the Mac). Both
+// share the App Group container (its path is left in `app-group-path` by the
+// iOS shell): the extension lists the message ids it announced in
+// `nse-notified.json`, the app lists the ids it already has in
+// `app-have.json`, and each checks the other's before notifying.
+
+fn group_dir(config: &Path) -> Option<PathBuf> {
+    let p = std::fs::read_to_string(config.join("app-group-path")).ok()?;
+    let p = PathBuf::from(p.trim());
+    p.is_dir().then_some(p)
+}
+
+fn read_ids(path: &Path) -> HashMap<String, u64> {
+    let map: HashMap<String, Value> = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    map.into_iter().map(|(k, v)| (k, v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)).unwrap_or(0))).collect()
+}
+
+/// The extension already announced this message.
+pub fn already_announced(config: &Path, msg_id: &str) -> bool {
+    group_dir(config).is_some_and(|d| read_ids(&d.join("nse-notified.json")).contains_key(msg_id))
+}
+
+/// The app has these messages (so a later push for them stays quiet).
+pub fn note_have(config: &Path, ids: &[&str]) {
+    let Some(dir) = group_dir(config) else { return };
+    if ids.is_empty() {
+        return;
+    }
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = dir.join("app-have.json");
+    let mut map = read_ids(&path);
+    let t = now();
+    for id in ids {
+        map.insert((*id).to_owned(), t);
+    }
+    map.retain(|_, at| t.saturating_sub(*at) < 7 * 24 * 3600 * 1000);
+    if map.len() > 3000 {
+        let mut v: Vec<(u64, String)> = map.iter().map(|(k, a)| (*a, k.clone())).collect();
+        v.sort();
+        for (_, k) in v.into_iter().take(map.len() - 3000) {
+            map.remove(&k);
+        }
+    }
+    if let Ok(bytes) = serde_json::to_vec(&map) {
+        let _ = crate::settings::write_atomic(&path, &bytes);
     }
 }
 
@@ -387,6 +535,44 @@ mod tests {
         let v: Value = serde_json::from_slice(pt).unwrap();
         assert_eq!(v["allowed_server"], "server-eid");
         assert_eq!(v["token"], "ab".repeat(32));
+    }
+
+    #[test]
+    fn phone_announces_each_message_once() {
+        let base = std::env::temp_dir().join(format!("dropbeam-nse-{}", uuid::Uuid::new_v4()));
+        let (config, group) = (base.join("config"), base.join("group"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&group).unwrap();
+        // No shared container (desktop): nothing is ever suppressed.
+        assert!(!already_announced(&config, "m1"));
+        note_have(&config, &["m1"]);
+        assert!(!group.join("app-have.json").exists());
+        std::fs::write(config.join("app-group-path"), group.to_string_lossy().as_bytes()).unwrap();
+        // The extension wrote (as Swift does) an integer-ms map.
+        std::fs::write(group.join("nse-notified.json"), br#"{"m1": 1790000000000}"#).unwrap();
+        assert!(already_announced(&config, "m1"));
+        assert!(!already_announced(&config, "m2"));
+        note_have(&config, &["m2"]);
+        let have: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(group.join("app-have.json")).unwrap()).unwrap();
+        assert!(have.contains_key("m2"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn previews_carry_the_message_id() {
+        let base = std::env::temp_dir().join(format!("dropbeam-prev-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let phone_sk: [u8; 32] = rand::random();
+        let eid = iroh::SecretKey::generate().public().to_string();
+        let pk = seal::x25519_public(&phone_sk);
+        let info: super::super::keys::PeerInfo = serde_json::from_value(json!({"push_key": seal::b64(&pk), "push_text": true})).unwrap();
+        super::super::keys::set_peer_for_tests(&base, &eid, info);
+        let to = vec![seal::Recipient { eid: eid.clone(), key: pk }];
+        let v = previews(&base, &to, &json!({"msgKind": "text", "text": "hi", "id": "msg-1"}));
+        let sealed = v[&eid].as_str().expect("a preview for the phone");
+        let plain: Value = serde_json::from_slice(&seal::open_small(&phone_sk, sealed).unwrap()).unwrap();
+        assert_eq!((plain["i"].as_str(), plain["b"].as_str()), (Some("msg-1"), Some("hi")));
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

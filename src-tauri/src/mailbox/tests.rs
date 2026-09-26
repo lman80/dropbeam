@@ -909,3 +909,166 @@ async fn held_copy_of_a_file_that_already_landed_is_not_duplicated() {
     assert_eq!(fetch(&w).await, 0);
     assert_eq!(std::fs::read_dir(&dl).unwrap().count(), 1);
 }
+
+// ── chat to every device (iMessage-style) ───────────────────────────────────
+
+fn b_thread_on(n: &Node, a: &Node) -> String {
+    crate::friends::chat_sender(&n.config, &a.eid()).unwrap().id
+}
+
+/// S can sign relay requests (its identity key file, as the app keeps it) and
+/// `phone` registered for push there.
+fn register_phone(w: &World, phone: &Node) {
+    std::fs::write(w.s.config.join("iroh-identity.key"), w.s.ep.secret_key().to_bytes()).unwrap();
+    let c = server::load_config(&w.s.config);
+    let r = super::push::register(&w.s.config, &c, &phone.eid(), &json!({"sealed_token": seal::b64(b"sealed-apns-token")}));
+    assert_eq!(r["ok"], true);
+}
+
+fn wakes_for(eid: &str) -> Vec<Value> {
+    super::push::SENT_FOR_TESTS.lock().unwrap().iter().filter(|(to, _)| to == eid).map(|(_, b)| b.clone()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_reaches_online_device_directly_and_offline_phone_through_its_own_copy() {
+    let w = world("chat-each").await;
+    let b2 = second_device(&w, "b2").await; // Bea's iPhone, asleep (unseen → not dialed)
+    register_phone(&w, &b2);
+    let eids = crate::friends::person_endpoints(&w.a.config, &w.b_for_a);
+    assert_eq!(eids.len(), 2);
+    let m = uuid::Uuid::new_v4().to_string();
+    let frame = chat_frame(&m, "on my way");
+    let mut skip = HashSet::new();
+    let out = iroh_net::deliver_chat_message(&w.a.state, &w.a.ep, &w.a.config, &w.b_for_a, &eids, &frame, &m, true, &mut skip).await;
+    let iroh_net::ChatOutcome::Delivered { reach, copies } = out else { panic!("expected delivered, got {out:?}") };
+    assert_eq!(reach.delivered, vec![w.b.eid()], "the Mac got it directly");
+    assert_eq!(copies, vec![b2.eid()], "the sleeping iPhone gets its own server copy");
+    assert!(skip.contains(&b2.eid()), "the rest of this round skips the phone");
+    // Only the phone has something waiting; the server woke it.
+    assert_eq!(server::pending_recipients(&w.s.config), vec![(b2.eid(), 1)]);
+    let wakes = wakes_for(&b2.eid());
+    assert_eq!(wakes.len(), 1, "one push for the phone");
+    assert_eq!(wakes[0]["server"], w.s.eid());
+    let sig = seal::unb64(wakes[0]["sig"].as_str().unwrap()).unwrap();
+    let msg = super::push::request_message(&w.s.eid(), wakes[0]["sealed_token"].as_str().unwrap(), wakes[0]["collapse"].as_str().unwrap(),
+        wakes[0]["payload"].as_str().unwrap(), wakes[0]["ts"].as_u64().unwrap());
+    assert!(w.s.ep.secret_key().public().verify(&msg, &iroh::Signature::from_bytes(&sig.try_into().unwrap())).is_ok(), "the relay can verify it");
+    // The sender's ledger marks it as a copy (its receipts never touch the bubble).
+    let sent: Vec<client::Sent> = client::sent_all(&w.a.config).into_values().collect();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].copy && sent[0].to == vec![b2.eid()]);
+    // The Mac has it once; nothing on the server for it.
+    assert_eq!(crate::chat::messages(&w.b.config, &b_thread_on(&w.b, &w.a)).len(), 1);
+    assert_eq!(fetch(&w).await, 0);
+    // The phone fetches its copy: exactly one message, even if it also arrives
+    // directly / synced from the Mac later.
+    let got = tokio::time::timeout(Duration::from_secs(30), client::fetch_from(&b2.state, &b2.config, &w.s.eid())).await.unwrap().unwrap();
+    assert_eq!(got, 1);
+    let t2 = b_thread_on(&b2, &w.a);
+    assert_eq!(crate::chat::messages(&b2.config, &t2)[0].text, "on my way");
+    iroh_net::apply_incoming_chat(&b2.state, &b2.config, &w.a.eid(), &frame, None, None);
+    assert_eq!(crate::chat::messages(&b2.config, &t2).len(), 1, "no duplicate");
+    assert_eq!(server_items(&w), 0);
+    b2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn edits_follow_a_phone_copy_and_unsend_takes_it_back() {
+    let w = world("chat-each-ops").await;
+    let b2 = second_device(&w, "b2").await;
+    let eids = crate::friends::person_endpoints(&w.a.config, &w.b_for_a);
+    // Message 1 → Mac direct + phone copy; then an edit follows the copy.
+    let m = uuid::Uuid::new_v4().to_string();
+    let mut skip = HashSet::new();
+    let out = iroh_net::deliver_chat_message(&w.a.state, &w.a.ep, &w.a.config, &w.b_for_a, &eids, &chat_frame(&m, "helo"), &m, true, &mut skip).await;
+    assert!(matches!(out, iroh_net::ChatOutcome::Delivered { .. }));
+    let edit = json!({"kind": "chat", "v": 2, "msgKind": "edit", "friendId": "x", "fromName": "Ash", "targetId": m, "text": "hello"});
+    iroh_net::op_follows_copies(&w.a.state, &w.a.config, &w.b_for_a, "edit", &m, &edit).await;
+    // Message 2 → unsent before the phone fetched: its copy is simply taken back.
+    let m2 = uuid::Uuid::new_v4().to_string();
+    let out = iroh_net::deliver_chat_message(&w.a.state, &w.a.ep, &w.a.config, &w.b_for_a, &eids, &chat_frame(&m2, "oops"), &m2, true, &mut skip).await;
+    assert!(matches!(out, iroh_net::ChatOutcome::Delivered { ref copies, .. } if copies == &vec![b2.eid()]));
+    let del = json!({"kind": "chat", "v": 2, "msgKind": "delete", "friendId": "x", "fromName": "Ash", "targetId": m2});
+    iroh_net::op_follows_copies(&w.a.state, &w.a.config, &w.b_for_a, "delete", &m2, &del).await;
+    assert_eq!(server::pending_recipients(&w.s.config), vec![(b2.eid(), 2)], "message 1 + its edit; message 2 is gone");
+    let got = tokio::time::timeout(Duration::from_secs(30), client::fetch_from(&b2.state, &b2.config, &w.s.eid())).await.unwrap().unwrap();
+    assert_eq!(got, 2);
+    let msgs = crate::chat::messages(&b2.config, &b_thread_on(&b2, &w.a));
+    assert_eq!(msgs.len(), 1, "the unsent message never reached the phone");
+    assert_eq!((msgs[0].text.as_str(), msgs[0].edited), ("hello", true));
+    b2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_for_all_devices_stays_for_the_phone_after_the_mac_got_it() {
+    let w = world("chat-all-held").await;
+    let b2 = second_device(&w, "b2").await;
+    // Both offline at send time: one item sealed for both, kept per device.
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "hey"), Some(&m)).await.unwrap();
+    let mut pending = server::pending_recipients(&w.s.config);
+    pending.sort();
+    let mut want = vec![(w.b.eid(), 1), (b2.eid(), 1)];
+    want.sort();
+    assert_eq!(pending, want);
+    // The Mac showed up and got it directly: the server copy stays for the phone.
+    client::delivered_directly(&w.a.state, &w.a.config, &m, &[w.b.eid()]);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(server_items(&w), 1, "not canceled while the phone still needs it");
+    // The Mac fetching it too is harmless (dedupe); the phone gets its copy.
+    assert_eq!(fetch(&w).await, 1);
+    assert_eq!(server_items(&w), 1, "still waiting for the phone");
+    let r = client::refresh_status(&w.a.state, &w.a.config).await;
+    assert_eq!((r[0].state.as_str(), r[0].delivered_to.clone()), ("held", vec![w.b.eid()]), "reached one device → the bubble says Delivered");
+    let got = tokio::time::timeout(Duration::from_secs(30), client::fetch_from(&b2.state, &b2.config, &w.s.eid())).await.unwrap().unwrap();
+    assert_eq!(got, 1);
+    assert_eq!(server_items(&w), 0);
+    // Everyone else's copies were all taken: now it cancels normally.
+    let m2 = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m2, "x"), Some(&m2)).await.unwrap();
+    client::delivered_directly(&w.a.state, &w.a.config, &m2, &[w.b.eid(), b2.eid()]);
+    for _ in 0..50 {
+        if server_items(&w) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(server_items(&w), 0);
+    b2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_server_holds_its_own_messages_for_a_sleeping_phone() {
+    let w = world("chat-self").await;
+    // The server's own app (the Linux box) chats with Bea, whose phone is asleep.
+    introduce(&w.b, &w.s);
+    let b_for_s = crate::friends::chat_sender(&w.s.config, &w.b.eid()).unwrap().id;
+    let me = w.s.eid();
+    assert!(client::can_hold_chat(&w.s.config, &me, &b_for_s), "it can hold chat on itself");
+    assert!(!client::can_hold(&w.s.config, &me, &b_for_s), "files still need another device");
+    register_phone(&w, &w.b);
+    let m = uuid::Uuid::new_v4().to_string();
+    let held = client::deposit_chat(&w.s.state, &w.s.config, &b_for_s, "chat", &chat_frame(&m, "box says hi"), Some(&m)).await.unwrap();
+    assert_eq!((held.server.as_str(), held.name.as_str()), (client::SELF, "Linux Box"));
+    assert_eq!(server::pending_recipients(&w.s.config), vec![(w.b.eid(), 1)]);
+    assert_eq!(wakes_for(&w.b.eid()).len(), 1, "the phone was woken");
+    assert_eq!(fetch(&w).await, 1);
+    let got = crate::chat::messages(&w.b.config, &b_thread_on(&w.b, &w.s));
+    assert_eq!(got[0].text, "box says hi");
+    let r = client::refresh_status(&w.s.state, &w.s.config).await;
+    assert_eq!(r[0].state, "delivered", "receipts work against itself too");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phone_online_at_deposit_is_woken_once_when_it_stops_answering() {
+    let w = world("chat-late-push").await;
+    register_phone(&w, &w.b);
+    super::note_seen(&w.b.eid()); // just connected → the deposit pokes instead
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "you there?"), Some(&m)).await.unwrap();
+    assert!(wakes_for(&w.b.eid()).is_empty(), "no push while it looked online");
+    super::push::on_unreachable(&w.s.config, &w.b.eid());
+    assert_eq!(wakes_for(&w.b.eid()).len(), 1, "the failed poke wakes it");
+    super::push::on_unreachable(&w.s.config, &w.b.eid());
+    assert_eq!(wakes_for(&w.b.eid()).len(), 1, "only once per item");
+}

@@ -1335,9 +1335,16 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     deliveries: vec![],
                 };
                 if crate::chat::append(config_dir, &msg) {
+                    // iPhone: the push banner may already have announced it.
+                    let announced = crate::mailbox::push::already_announced(config_dir, &msg.id);
+                    crate::mailbox::push::note_have(config_dir, &[msg.id.as_str()]);
                     if let Some(app) = &app {
                         let _ = app.emit("chat://message", &msg);
-                        maybe_notify_chat(app, &friend.name, &msg);
+                        if announced {
+                            log::info!("chat notification skipped: the push already showed it");
+                        } else {
+                            maybe_notify_chat(app, &friend.name, &msg);
+                        }
                     }
                 }
             }
@@ -1465,7 +1472,15 @@ pub(crate) fn apply_receipts(state: &IrohState, config: &Path, receipts: &[crate
         match s.kind.as_str() {
             "chat" => {
                 let Some(msg) = &s.msg_id else { continue };
+                // A per-device copy of a message that already reached them:
+                // whatever happens to it, the bubble stays "Delivered".
+                if s.copy {
+                    continue;
+                }
+                // Reached at least one of their devices (others may still fetch).
+                let reached = !r.delivered_to.is_empty() && matches!(r.state.as_str(), "held" | "expired");
                 let updated = match r.state.as_str() {
+                    _ if reached => crate::chat::set_status(config, &s.peer_id, msg, "delivered"),
                     "delivered" => crate::chat::set_status(config, &s.peer_id, msg, "delivered"),
                     "expired" => crate::chat::set_server_failed(config, &s.peer_id, msg, "expired"),
                     "rejected" | "lost" => crate::chat::set_server_failed(config, &s.peer_id, msg, "lost"),
@@ -6028,6 +6043,138 @@ pub async fn send_chat_any_within(state: &IrohState, ep: &Endpoint, eids: &[Stri
     last
 }
 
+/// Where one chat frame got to across a person's devices.
+#[derive(Debug, Default, Clone)]
+pub struct ChatReach {
+    /// Devices that took it (and stored/applied it).
+    pub delivered: Vec<String>,
+    /// Devices that didn't answer (or didn't know us yet).
+    pub missed: Vec<String>,
+}
+
+/// Deliver `payload` to EACH of a person's devices at once — like iMessage,
+/// every device gets the message, not just the first that answers. Used when a
+/// Transfer Server can hold it for the devices that don't answer: a device not
+/// seen in the last 20 s gets a quick 4 s dial, and an iPhone unseen for 2 min
+/// is skipped outright (iOS suspends apps in the background; the dial can't
+/// land). Devices in `skip` (didn't answer earlier this round) count as missed.
+pub async fn send_chat_each(state: &IrohState, ep: &Endpoint, eids: &[String], payload: &serde_json::Value, skip: &HashSet<String>) -> ChatReach {
+    let ios: HashSet<String> = match location_config(state) {
+        Ok(config) => crate::friends::load(&config).into_iter()
+            .filter(|f| f.device_os.as_deref() == Some("ios"))
+            .filter_map(|f| f.endpoint_id).collect(),
+        _ => HashSet::new(),
+    };
+    let new_message = payload.get("msgKind").and_then(|k| k.as_str()).is_none_or(|k| !matches!(k, "reaction" | "edit" | "delete"));
+    let tries = eids.iter().map(|eid| {
+        let skipped = skip.contains(eid) || (ios.contains(eid) && !crate::mailbox::seen_within(eid, Duration::from_secs(120)));
+        let budget = if crate::mailbox::seen_within(eid, Duration::from_secs(20)) { Duration::from_secs(12) } else { Duration::from_secs(4) };
+        async move {
+            if skipped {
+                return (eid.clone(), false);
+            }
+            let ok = match send_chat_within(state, ep, eid, payload.clone(), budget).await {
+                Ok(ack) if ack["applied"] == false => {
+                    if new_message {
+                        introduce_once(state, eid);
+                    }
+                    false
+                }
+                Ok(_) => true,
+                Err(_) => false,
+            };
+            (eid.clone(), ok)
+        }
+    });
+    let mut out = ChatReach::default();
+    for (eid, ok) in n0_future::join_all(tries).await {
+        if ok { out.delivered.push(eid) } else { out.missed.push(eid) }
+    }
+    out
+}
+
+static CHAT_INFLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// While held, no one else delivers this message (the send command and the
+/// outbox loop can both pick up a fresh message).
+pub struct ChatClaim(String);
+impl Drop for ChatClaim {
+    fn drop(&mut self) {
+        if let Some(s) = CHAT_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            s.remove(&self.0);
+        }
+    }
+}
+
+pub fn claim_chat(msg_id: &str) -> Option<ChatClaim> {
+    let mut g = CHAT_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(HashSet::new).insert(msg_id.to_owned()).then(|| ChatClaim(msg_id.to_owned()))
+}
+
+/// How one queued message fared (`deliver_chat_message`).
+#[derive(Debug)]
+pub enum ChatOutcome {
+    /// At least one device has it; `copies` = devices it waits for on a server.
+    Delivered { reach: ChatReach, copies: Vec<String> },
+    /// No device answered; a Transfer Server holds it for them.
+    Held(crate::mailbox::client::Held),
+    /// Nowhere yet (the outbox retries); the server's refusal, if any.
+    Failed(Option<crate::mailbox::client::DepositError>),
+}
+
+/// Deliver one of our messages to a person who has a Transfer Server route:
+/// directly to every device that answers, and a per-device server copy for
+/// each one that doesn't — so an iPhone asleep in a pocket still gets it (and
+/// a notification) even though the Mac already did. `skip` carries the
+/// devices that didn't answer earlier this round (and gains this round's).
+pub async fn deliver_chat_message(state: &IrohState, ep: &Endpoint, config: &Path, peer_id: &str, eids: &[String],
+    payload: &serde_json::Value, msg_id: &str, use_server: bool, skip: &mut HashSet<String>) -> ChatOutcome {
+    let reach = send_chat_each(state, ep, eids, payload, skip).await;
+    skip.extend(reach.missed.iter().cloned());
+    let me = ep.id().to_string();
+    if !reach.delivered.is_empty() {
+        let mut copies = crate::mailbox::client::chat_holdable_devices(config, &me, &reach.missed);
+        if !copies.is_empty() && use_server {
+            match crate::mailbox::client::deposit_chat_for(state, config, peer_id, "chat", payload, Some(msg_id), None, Some(&copies), true).await {
+                Ok(_) => crate::mailbox::client::wake(),
+                Err(e) => {
+                    log::info!("chat: couldn't leave a copy for their other device(s): {}", e.code());
+                    copies.clear();
+                }
+            }
+        } else {
+            copies.clear();
+        }
+        return ChatOutcome::Delivered { reach, copies };
+    }
+    if !use_server {
+        return ChatOutcome::Failed(None);
+    }
+    match crate::mailbox::client::deposit_chat(state, config, peer_id, "chat", payload, Some(msg_id)).await {
+        Ok(h) => {
+            crate::mailbox::client::wake();
+            ChatOutcome::Held(h)
+        }
+        Err(e) => ChatOutcome::Failed(Some(e)),
+    }
+}
+
+/// An edit/unsend/reaction reached them directly: it also follows every
+/// server copy of its message that some device hasn't fetched or got through
+/// a server (sealed for those devices, on the same server, which hands items
+/// over in order). An unsend first just takes back a copy nobody fetched yet.
+pub async fn op_follows_copies(state: &IrohState, config: &Path, thread: &str, op_kind: &str, target_id: &str, payload: &serde_json::Value) {
+    for c in crate::mailbox::client::chat_copies(config, target_id) {
+        if op_kind == "delete" && c.state == "held" && c.delivered_to.is_empty()
+            && crate::mailbox::client::cancel_copy(state, config, &c).await == crate::mailbox::client::Unsend::Removed {
+            continue;
+        }
+        if let Err(e) = crate::mailbox::client::deposit_chat_for(state, config, thread, "op", payload, None, Some(&c.server), Some(&c.to), true).await {
+            log::info!("chat: an edit/reaction couldn't follow its message's server copy: {}", e.code());
+        }
+    }
+}
+
 /// Say hello to a device that turned our message away as a stranger (e.g. a
 /// friend's new phone we never met, or one whose hello to us got lost), at
 /// most once a minute per device. If its user removed us it stays a stranger.
@@ -6186,18 +6333,61 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                     // A Transfer Server can hold messages for this person: then an
                     // offline friend costs a quick ~4s probe, not a long dial, and
                     // the message is sealed + left on the server instead of waiting.
-                    let holdable = crate::mailbox::client::can_hold(&config_dir, &me, &peer_id);
-                    let quick = (holdable && !crate::mailbox::client::any_live(&eids)).then_some(Duration::from_secs(4));
-                    let mut offline = false;
+                    let holdable = crate::mailbox::client::can_hold_chat(&config_dir, &me, &peer_id);
+                    if holdable {
+                        // Every device gets it: direct where they answer, a
+                        // server copy for the rest (see deliver_chat_message).
+                        let mut skip: HashSet<String> = HashSet::new();
+                        for m in msgs {
+                            // Being sent right now by the send command: stop here (order).
+                            let Some(_claim) = claim_chat(&m.id) else { break };
+                            let payload = chat_payload(&m, &peer_id, &my_name);
+                            // Don't re-deposit what a server already gave up on.
+                            let retry_server = !matches!(m.server_note.as_deref(), Some("expired" | "lost"));
+                            match deliver_chat_message(&state, &ep, &config_dir, &peer_id, &eids, &payload, &m.id, retry_server, &mut skip).await {
+                                ChatOutcome::Delivered { reach, copies } => {
+                                    backoff.remove(&peer_id);
+                                    just_delivered.insert(m.id.clone());
+                                    log::info!("chat: delivered to {} of {} device(s){}", reach.delivered.len(), eids.len(),
+                                        if copies.is_empty() { String::new() } else { format!(", {} waiting on a Transfer Server", copies.len()) });
+                                    if let Some(u) = crate::chat::set_status(&config_dir, &peer_id, &m.id, "delivered") {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                }
+                                ChatOutcome::Held(h) => {
+                                    if let Some(u) = crate::chat::set_held(&config_dir, &peer_id, &m.id, &h.name) {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                }
+                                ChatOutcome::Failed(e) => {
+                                    if let Some(e) = &e {
+                                        log::info!("chat: couldn't hold a message on a Transfer Server: {}", e.code());
+                                        if let Some(u) = crate::chat::set_server_note(&config_dir, &peer_id, &m.id, crate::mailbox::client::note_for(e).as_deref()) {
+                                            let _ = app.emit("chat://message", &u);
+                                        }
+                                    }
+                                    if let Some(u) = crate::chat::set_status(&config_dir, &peer_id, &m.id, "failed") {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                    let fails = backoff.get(&peer_id).map(|(f, _)| *f).unwrap_or(0) + 1;
+                                    let delay = match fails {
+                                        1 => Duration::from_secs(12),
+                                        2 => Duration::from_secs(60),
+                                        _ => Duration::from_secs(300),
+                                    };
+                                    backoff.insert(peer_id.clone(), (fails, now + delay));
+                                    break; // preserve order — stop this peer until next round
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     for m in msgs {
+                        let Some(_claim) = claim_chat(&m.id) else { break };
                         let payload = chat_payload(&m, &peer_id, &my_name);
-                        // Once a device didn't answer this round, the rest of this
-                        // person's queue goes straight to the server (same order).
-                        let direct = if offline {
-                            Err(anyhow::anyhow!("offline"))
-                        } else {
-                            send_chat_any_within(&state, &ep, &eids, payload.clone(), quick).await
-                        };
+                        // No Transfer Server for this person: the first device
+                        // that answers gets it (their devices sync the rest).
+                        let direct = send_chat_any_within(&state, &ep, &eids, payload.clone(), None).await;
                         match direct {
                             Ok(_) => {
                                 backoff.remove(&peer_id);
@@ -6212,26 +6402,6 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                                 }
                             }
                             Err(_) => {
-                                offline = true;
-                                // Don't re-deposit what a server already gave up on.
-                                let retry_server = !matches!(m.server_note.as_deref(), Some("expired" | "lost"));
-                                if holdable && retry_server {
-                                    match crate::mailbox::client::deposit_chat(&state, &config_dir, &peer_id, "chat", &payload, Some(&m.id)).await {
-                                        Ok(h) => {
-                                            if let Some(u) = crate::chat::set_held(&config_dir, &peer_id, &m.id, &h.name) {
-                                                let _ = app.emit("chat://message", &u);
-                                            }
-                                            crate::mailbox::client::wake();
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            log::info!("chat: couldn't hold a message on a Transfer Server: {}", e.code());
-                                            if let Some(u) = crate::chat::set_server_note(&config_dir, &peer_id, &m.id, crate::mailbox::client::note_for(&e).as_deref()) {
-                                                let _ = app.emit("chat://message", &u);
-                                            }
-                                        }
-                                    }
-                                }
                                 if let Some(u) = crate::chat::set_status(
                                     &config_dir,
                                     &peer_id,
@@ -6264,12 +6434,15 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                     continue;
                 }
                 let payload = chat_payload(&m, &m.peer_id, &my_name);
-                if send_chat_any(&state, &ep, &eids, payload).await.is_ok() {
+                // Only the devices showing life; the rest keep their server copy.
+                let live: Vec<String> = eids.iter().filter(|e| crate::mailbox::client::any_live(std::slice::from_ref(*e))).cloned().collect();
+                let reach = send_chat_each(&state, &ep, &live, &payload, &HashSet::new()).await;
+                if !reach.delivered.is_empty() {
                     just_delivered.insert(m.id.clone());
                     if let Some(u) = crate::chat::set_status(&config_dir, &m.peer_id, &m.id, "delivered") {
                         let _ = app.emit("chat://message", &u);
                     }
-                    crate::mailbox::client::delivered_directly(&state, &config_dir, &m.id);
+                    crate::mailbox::client::delivered_directly(&state, &config_dir, &m.id, &reach.delivered);
                 }
             }
 
@@ -6355,7 +6528,8 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                     }
                     continue;
                 }
-                if send_chat_any(&state, &ep, &eids, payload).await.is_ok() {
+                if send_chat_any(&state, &ep, &eids, payload.clone()).await.is_ok() {
+                    op_follows_copies(&state, &config_dir, &thread, &op.kind, &op.target_id, &payload).await;
                     crate::chat::ack_op(&config_dir, &op.id);
                 }
             }

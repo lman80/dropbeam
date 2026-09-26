@@ -252,6 +252,41 @@ pub fn routes(config: &Path, me: &str, recipients: &[String]) -> Vec<Route> {
     out
 }
 
+/// This device's own Transfer Server, when it is one: a message it sends can
+/// wait right here (no network hop) for a friend's sleeping device.
+fn self_route(config: &Path) -> Option<Route> {
+    if !super::server::hosting_supported() {
+        return None;
+    }
+    let c = super::server::load_config(config);
+    (c.enabled && !c.paused).then(|| Route { server: SELF.into(), name: super::server::server_name(&c) })
+}
+
+/// The route id standing for "this device's own server".
+pub const SELF: &str = "self";
+
+/// `routes`, for chat: our own Transfer Server comes first when we are one
+/// (chat items are small; files still go through another device).
+pub fn chat_routes(config: &Path, me: &str, recipients: &[String]) -> Vec<Route> {
+    let mut out: Vec<Route> = self_route(config).into_iter().collect();
+    out.extend(routes(config, me, recipients));
+    out
+}
+
+/// Whether a chat message to `peer_id` could be held right now.
+pub fn can_hold_chat(config: &Path, me: &str, peer_id: &str) -> bool {
+    let eids = person_devices(config, peer_id, me);
+    !eids.is_empty() && !keys::recipients(config, &eids).is_empty() && !chat_routes(config, me, &eids).is_empty()
+}
+
+/// Which of these devices a chat item could be held for right now.
+pub fn chat_holdable_devices(config: &Path, me: &str, eids: &[String]) -> Vec<String> {
+    if eids.is_empty() || chat_routes(config, me, eids).is_empty() {
+        return vec![];
+    }
+    keys::recipients(config, eids).into_iter().map(|r| r.eid).collect()
+}
+
 /// The devices of the person owning thread `peer_id`, excluding us.
 fn person_devices(config: &Path, peer_id: &str, me: &str) -> Vec<String> {
     let owner = crate::friends::thread_owner(config, peer_id).map_or_else(|| peer_id.to_owned(), |o| o.id);
@@ -288,7 +323,7 @@ pub fn hold_route(config: &Path, me: &str, peer_id: &str) -> Option<String> {
     if eids.is_empty() || keys::recipients(config, &eids).is_empty() {
         return None;
     }
-    routes(config, me, &eids).into_iter().next().map(|r| r.name)
+    chat_routes(config, me, &eids).into_iter().next().map(|r| r.name)
 }
 
 /// Any of these devices showed life very recently (so a direct try is worth it).
@@ -341,6 +376,10 @@ pub struct Sent {
     /// The devices it was sealed for.
     #[serde(default)]
     pub to: Vec<String>,
+    /// An extra per-device copy of a message another of their devices already
+    /// got directly: its receipts never change the message's status.
+    #[serde(default)]
+    pub copy: bool,
 }
 
 fn sent_path(config: &Path) -> PathBuf {
@@ -506,6 +545,40 @@ async fn rpc(conn: &iroh::endpoint::Connection, req: &Value) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(20), read_frame_cap(&mut recv, 4 << 20)).await.context("server didn't answer")?
 }
 
+/// Leave a small (chat/op) sealed item on `server`, or on this device's own
+/// server for `SELF`.
+async fn deposit_small(ep: &iroh::Endpoint, config: &Path, server: &str, env: &seal::Envelope, push: &Value) -> Result<u64, RpcError> {
+    if server != SELF {
+        return deposit_on(ep, server, env, push, None, true).await;
+    }
+    let header = serde_json::to_value(env).map_err(|e| RpcError::Failed(e.to_string()))?;
+    let req = json!({"kind": "mailbox.deposit", "v": super::VERSION, "header": header, "push": push, "all_devices": true});
+    let me = ep.id().to_string();
+    let config = config.to_path_buf();
+    let r = tokio::task::spawn_blocking(move || super::server::deposit_local(&config, &me, &req)).await
+        .map_err(|e| RpcError::Failed(e.to_string()))?;
+    r.map_err(|reply| {
+        let reason = reply["reason"].as_str().unwrap_or("refused").to_owned();
+        if reason == "recipient" {
+            let outside = reply["not_members"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            RpcError::Recipient(outside)
+        } else {
+            RpcError::Refused(reason)
+        }
+    })
+}
+
+/// One request/reply with `server` (or this device's own server for `SELF`).
+async fn server_rpc(ep: &iroh::Endpoint, config: &Path, server: &str, req: &Value) -> Option<Value> {
+    if server == SELF {
+        return Some(super::server::local_rpc(config, &ep.id().to_string(), req));
+    }
+    let conn = connect(ep, server, Duration::from_secs(6)).await?;
+    let reply = rpc(&conn, req).await;
+    conn.close(0u32.into(), b"done");
+    reply.ok()
+}
+
 /// Hand our sealed push token to a server (it can only use it via the relay).
 pub async fn push_register(ep: &iroh::Endpoint, server: &str, sealed_token: &str) -> bool {
     let Some(conn) = connect(ep, server, Duration::from_secs(8)).await else { return false };
@@ -529,14 +602,14 @@ fn is_file_changed(files: &[(PathBuf, u64, u64)]) -> bool {
 }
 
 /// One deposit attempt of an already-sealed envelope on one server.
-async fn deposit_on(ep: &iroh::Endpoint, server: &str, env: &seal::Envelope, push: &Value, upload: Option<&Upload<'_>>) -> Result<u64, RpcError> {
+async fn deposit_on(ep: &iroh::Endpoint, server: &str, env: &seal::Envelope, push: &Value, upload: Option<&Upload<'_>>, all_devices: bool) -> Result<u64, RpcError> {
     let conn = connect(ep, server, Duration::from_secs(8)).await.ok_or(RpcError::Unreachable)?;
     let result = async {
         let (mut send, mut recv) = conn.open_bi().await.map_err(|_| RpcError::Unreachable)?;
         let header = serde_json::to_value(env).map_err(|e| RpcError::Failed(e.to_string()))?;
         write_frame(&mut send, &json!({"kind": "mailbox.deposit", "v": super::VERSION, "header": header, "push": push,
-            // A file goes to EVERY device it's sealed for (server keeps it until each has it).
-            "all_devices": upload.is_some()}))
+            // It goes to EVERY device it's sealed for (the server keeps it until each has it).
+            "all_devices": all_devices}))
             .await.map_err(|_| RpcError::Unreachable)?;
         let reply = tokio::time::timeout(Duration::from_secs(30), read_frame_cap(&mut recv, 64 * 1024)).await
             .map_err(|_| RpcError::Unreachable)?.map_err(|_| RpcError::Unreachable)?;
@@ -638,14 +711,26 @@ pub async fn deposit_chat(net: &IrohState, config: &Path, peer_id: &str, kind: &
 /// `deposit_chat`, optionally pinned to one server (an edit/reaction follows
 /// its held message to the same server, which hands items over in order).
 pub async fn deposit_chat_on(net: &IrohState, config: &Path, peer_id: &str, kind: &str, frame: &Value, msg_id: Option<&str>, only_server: Option<&str>) -> Result<Held, DepositError> {
+    deposit_chat_for(net, config, peer_id, kind, frame, msg_id, only_server, None, false).await
+}
+
+/// `deposit_chat_on`, sealed only for `devices` (some of the person's devices)
+/// when given. `copy` = another device already got it directly; this is the
+/// per-device copy for the ones that didn't answer (iMessage-style).
+#[allow(clippy::too_many_arguments)]
+pub async fn deposit_chat_for(net: &IrohState, config: &Path, peer_id: &str, kind: &str, frame: &Value, msg_id: Option<&str>,
+    only_server: Option<&str>, devices: Option<&[String]>, copy: bool) -> Result<Held, DepositError> {
     let ep = net.get().cloned().ok_or(DepositError::Unreachable)?;
     let me = ep.id().to_string();
-    let eids = person_devices(config, peer_id, &me);
+    let mut eids = person_devices(config, peer_id, &me);
+    if let Some(only) = devices {
+        eids.retain(|e| only.contains(e));
+    }
     let mut recips = keys::recipients(config, &eids);
     if recips.is_empty() {
         return Err(DepositError::NoKeys);
     }
-    let mut routes = routes(config, &me, &eids);
+    let mut routes = chat_routes(config, &me, &eids);
     if let Some(only) = only_server {
         routes.retain(|r| r.server == only);
     }
@@ -662,16 +747,19 @@ pub async fn deposit_chat_on(net: &IrohState, config: &Path, peer_id: &str, kind
             let item_id = uuid::Uuid::new_v4().to_string();
             let (env, _) = seal::seal(ep.secret_key(), &item_id, kind, now(), &to, &meta, 0).map_err(|e| DepositError::Failed(e.to_string()))?;
             let push = super::push::previews(config, &to, frame);
-            match deposit_on(&ep, &route.server, &env, &push, None).await {
+            match deposit_small(&ep, config, &route.server, &env, &push).await {
                 Ok(until) => {
+                    let sealed_for: Vec<String> = to.iter().map(|r| r.eid.clone()).collect();
+                    let n = sealed_for.len();
                     with_sent(config, |m| {
                         m.insert(item_id.clone(), Sent {
                             item_id: item_id.clone(), server: route.server.clone(), server_name: route.name.clone(),
                             kind: kind.to_owned(), peer_id: peer_id.to_owned(), msg_id: msg_id.map(String::from), xfer_id: None,
-                            created_ms: env.created_ms, state: "held".into(), updated_ms: now(), held_until: until, ..Default::default()
+                            created_ms: env.created_ms, state: "held".into(), updated_ms: now(), held_until: until,
+                            to: sealed_for, copy, ..Default::default()
                         });
                     });
-                    log::info!("mailbox: {kind} held on a Transfer Server for an offline friend");
+                    log::info!("mailbox: {kind} held on a Transfer Server for {n} offline device(s){}", if copy { " (another device already has it)" } else { "" });
                     return Ok(Held { server: route.server.clone(), name: route.name.clone(), item_id, until });
                 }
                 Err(RpcError::Recipient(outside)) => {
@@ -863,13 +951,13 @@ pub async fn deposit_files(
                 state: "uploading".into(), updated_ms: now(), held_until: 0,
                 header: serde_json::to_value(&env).ok(), file_key: Some(seal::b64(&fk)), files_sig: Some(sig.clone()),
                 bytes: size, names: top_names.to_vec(), transfer_id: Some(transfer_id.to_owned()),
-                delivered_to: vec![], to: env.stanzas.iter().map(|st| st.eid.clone()).collect(),
+                delivered_to: vec![], to: env.stanzas.iter().map(|st| st.eid.clone()).collect(), copy: false,
             });
         });
         on_upload_start(&route.name);
         let up = Upload { files: &raw, key: seal::payload_key(&fk, &env.item_id), progress, cancel, go_direct: &go_direct };
         let push = super::push::file_previews(config, &recips, top_names);
-        let outcome = deposit_on(&ep, &route.server, &env, &push, Some(&up)).await;
+        let outcome = deposit_on(&ep, &route.server, &env, &push, Some(&up), true).await;
         let finish = |state: &str, until: u64| {
             with_sent(config, |m| {
                 if let Some(s) = m.get_mut(&env.item_id) {
@@ -891,7 +979,7 @@ pub async fn deposit_files(
             }
             Err(RpcError::GoDirect) => {
                 finish("canceled", 0);
-                cancel_on(&ep, &route.server, &env.item_id).await;
+                cancel_on(&ep, config, &route.server, &env.item_id).await;
                 return Err(DepositError::GoDirect);
             }
             Err(RpcError::Canceled) => {
@@ -919,7 +1007,7 @@ pub async fn deposit_files(
             }
             Err(RpcError::Failed(e)) => {
                 finish("rejected", 0);
-                cancel_on(&ep, &route.server, &env.item_id).await;
+                cancel_on(&ep, config, &route.server, &env.item_id).await;
                 return Err(DepositError::Failed(e));
             }
         }
@@ -946,19 +1034,17 @@ pub fn abandon(net: &IrohState, config: &Path, xfer_id: &str) {
         }
     });
     if let Some(ep) = net.get().cloned() {
+        let config = config.to_path_buf();
         tauri::async_runtime::spawn(async move {
             for s in items {
-                cancel_on(&ep, &s.server, &s.item_id).await;
+                cancel_on(&ep, &config, &s.server, &s.item_id).await;
             }
         });
     }
 }
 
-async fn cancel_on(ep: &iroh::Endpoint, server: &str, item_id: &str) {
-    if let Some(conn) = connect(ep, server, Duration::from_secs(6)).await {
-        let _ = rpc(&conn, &json!({"kind": "mailbox.cancel", "item_id": item_id})).await;
-        conn.close(0u32.into(), b"done");
-    }
+async fn cancel_on(ep: &iroh::Endpoint, config: &Path, server: &str, item_id: &str) {
+    let _ = server_rpc(ep, config, server, &json!({"kind": "mailbox.cancel", "item_id": item_id})).await;
 }
 
 /// The chat card we posted for this file send (so the recipient's copy keeps
@@ -992,10 +1078,7 @@ pub async fn unsend_held(net: &IrohState, config: &Path, msg_id: &str) -> Unsend
     let Some(s) = sent_all(config).into_values().find(|s| s.msg_id.as_deref() == Some(msg_id) && s.state == "held") else {
         return Unsend::Unknown;
     };
-    let Some(conn) = connect(&ep, &s.server, Duration::from_secs(6)).await else { return Unsend::Unknown };
-    let reply = rpc(&conn, &json!({"kind": "mailbox.cancel", "item_id": s.item_id})).await;
-    conn.close(0u32.into(), b"done");
-    let Ok(reply) = reply else { return Unsend::Unknown };
+    let Some(reply) = server_rpc(&ep, config, &s.server, &json!({"kind": "mailbox.cancel", "item_id": s.item_id})).await else { return Unsend::Unknown };
     let outcome = if reply["canceled"].as_bool() == Some(true) {
         Unsend::Removed
     } else if reply["state"].as_str() == Some("delivered") {
@@ -1017,10 +1100,14 @@ pub async fn unsend_held(net: &IrohState, config: &Path, msg_id: &str) -> Unsend
     outcome
 }
 
-/// A held chat message reached them directly after all: remove the server copy.
-pub fn delivered_directly(net: &IrohState, config: &Path, msg_id: &str) {
+/// A held chat message reached some of their devices directly after all
+/// (`got`). A server copy sealed only for devices that now have it is removed;
+/// one still waiting for another device (an iPhone asleep in a pocket) stays,
+/// so that device still gets it — the devices that have it just dedupe.
+pub fn delivered_directly(net: &IrohState, config: &Path, msg_id: &str, got: &[String]) {
     let items: Vec<Sent> = sent_all(config).into_values()
         .filter(|s| s.msg_id.as_deref() == Some(msg_id) && s.state == "held")
+        .filter(|s| s.to.is_empty() || s.to.iter().all(|t| got.contains(t) || s.delivered_to.contains(t)))
         .collect();
     if items.is_empty() {
         return;
@@ -1034,12 +1121,46 @@ pub fn delivered_directly(net: &IrohState, config: &Path, msg_id: &str) {
         }
     });
     if let Some(ep) = net.get().cloned() {
+        let config = config.to_path_buf();
         tauri::async_runtime::spawn(async move {
             for s in items {
-                cancel_on(&ep, &s.server, &s.item_id).await;
+                cancel_on(&ep, &config, &s.server, &s.item_id).await;
             }
         });
     }
+}
+
+/// Server copies of our message `msg_id` still waiting for (some of) the
+/// person's devices, or delivered through a server — an edit/unsend/reaction
+/// has to follow the message there.
+pub fn chat_copies(config: &Path, msg_id: &str) -> Vec<Sent> {
+    sent_all(config).into_values()
+        .filter(|s| s.kind == "chat" && s.msg_id.as_deref() == Some(msg_id) && matches!(s.state.as_str(), "held" | "delivered") && !s.to.is_empty())
+        .collect()
+}
+
+/// Take back one held copy (an unsend before that device fetched it).
+pub async fn cancel_copy(net: &IrohState, config: &Path, s: &Sent) -> Unsend {
+    let Some(ep) = net.get().cloned() else { return Unsend::Unknown };
+    let Some(reply) = server_rpc(&ep, config, &s.server, &json!({"kind": "mailbox.cancel", "item_id": s.item_id})).await else { return Unsend::Unknown };
+    let outcome = if reply["canceled"].as_bool() == Some(true) {
+        Unsend::Removed
+    } else if reply["state"].as_str() == Some("delivered") {
+        Unsend::Delivered
+    } else if reply["ok"].as_bool() == Some(true) {
+        Unsend::Removed
+    } else {
+        Unsend::Unknown
+    };
+    if outcome != Unsend::Unknown {
+        with_sent(config, |m| {
+            if let Some(e) = m.get_mut(&s.item_id) {
+                e.state = if outcome == Unsend::Delivered { "delivered".into() } else { "canceled".into() };
+                e.updated_ms = now();
+            }
+        });
+    }
+    outcome
 }
 
 // ── receipts ────────────────────────────────────────────────────────────────
@@ -1064,7 +1185,8 @@ pub async fn refresh_status(net: &IrohState, config: &Path) -> Vec<Receipt> {
     }
     let mut out = Vec::new();
     for (server, items) in by_server {
-        let Some(conn) = connect(&ep, &server, Duration::from_secs(6)).await else {
+        let ids: Vec<&str> = items.iter().map(|s| s.item_id.as_str()).collect();
+        let Some(reply) = server_rpc(&ep, config, &server, &json!({"kind": "mailbox.status", "item_ids": ids})).await else {
             // The server's been gone past these items' expiry: they can't
             // arrive through it any more, so let the sender take over again.
             let t = now();
@@ -1073,10 +1195,6 @@ pub async fn refresh_status(net: &IrohState, config: &Path) -> Vec<Receipt> {
             }
             continue;
         };
-        let ids: Vec<&str> = items.iter().map(|s| s.item_id.as_str()).collect();
-        let reply = rpc(&conn, &json!({"kind": "mailbox.status", "item_ids": ids})).await;
-        conn.close(0u32.into(), b"done");
-        let Ok(reply) = reply else { continue };
         if reply["ok"].as_bool() != Some(true) {
             continue;
         }

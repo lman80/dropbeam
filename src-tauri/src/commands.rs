@@ -1386,6 +1386,38 @@ fn deliver_chat(
         // A file card goes to each of the person's devices (their files do too).
         let to_all = msg.kind == "file";
         tauri::async_runtime::spawn(async move {
+            // The outbox loop (woken above) may be looking at the same message.
+            let Some(_claim) = crate::iroh_net::claim_chat(&mid) else { return };
+            // A Transfer Server can hold it: every device gets it (direct where
+            // they answer, a server copy — and a phone notification — for the
+            // rest), iMessage-style. File cards keep their own path (their files
+            // fan out to every device through the file send itself).
+            let me = ep.id().to_string();
+            if !to_all && crate::mailbox::client::can_hold_chat(&config_dir, &me, &pid) {
+                let mut skip = std::collections::HashSet::new();
+                let outcome = crate::iroh_net::deliver_chat_message(&iroh, &ep, &config_dir, &pid, &eids, &payload, &mid, true, &mut skip).await;
+                let updated = match outcome {
+                    crate::iroh_net::ChatOutcome::Delivered { reach, copies } => {
+                        log::info!("chat: delivered to {} of {} device(s){}", reach.delivered.len(), eids.len(),
+                            if copies.is_empty() { String::new() } else { format!(", {} waiting on a Transfer Server", copies.len()) });
+                        chat::set_status(&config_dir, &pid, &mid, "delivered")
+                    }
+                    crate::iroh_net::ChatOutcome::Held(h) => chat::set_held(&config_dir, &pid, &mid, &h.name),
+                    crate::iroh_net::ChatOutcome::Failed(e) => {
+                        if let Some(e) = &e {
+                            log::info!("chat: couldn't hold a message on a Transfer Server: {}", e.code());
+                            if let Some(u) = chat::set_server_note(&config_dir, &pid, &mid, crate::mailbox::client::note_for(e).as_deref()) {
+                                let _ = app.emit("chat://message", &u);
+                            }
+                        }
+                        chat::set_status(&config_dir, &pid, &mid, "failed")
+                    }
+                };
+                if let Some(u) = updated {
+                    let _ = app.emit("chat://message", &u);
+                }
+                return;
+            }
             let sent = if to_all {
                 crate::iroh_net::send_chat_all(&iroh, &ep, &eids, payload).await
             } else {
@@ -1394,7 +1426,7 @@ fn deliver_chat(
             let status = match sent {
                 Ok(_) => {
                     // If a Transfer Server was holding it meanwhile, drop that copy.
-                    crate::mailbox::client::delivered_directly(&iroh, &config_dir, &mid);
+                    crate::mailbox::client::delivered_directly(&iroh, &config_dir, &mid, &[]);
                     "delivered"
                 }
                 Err(e) => {

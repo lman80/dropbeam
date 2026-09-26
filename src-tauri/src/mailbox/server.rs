@@ -507,7 +507,9 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
     if c.paused {
         return Err(refuse("paused"));
     }
-    let rights = rights_for(config, c, who);
+    // The server's own app leaving something here (it sends a chat while it
+    // is the Transfer Server itself): it owns the place.
+    let rights = if Some(who) == me { Rights { own: true, member: true, through: true } } else { rights_for(config, c, who) };
     if !rights.any() {
         return Err(refuse("denied"));
     }
@@ -694,6 +696,60 @@ async fn serve_deposit(config: &Path, c: &ServerConfig, who: &str, me: Option<&s
     Ok(())
 }
 
+/// This device's own app leaves a chat/op item on its own Transfer Server (no
+/// network hop: an endpoint can't dial itself). Same checks and bookkeeping
+/// as a `mailbox.deposit` from a member. Returns when it's held until.
+pub fn deposit_local(config: &Path, me: &str, req: &Value) -> std::result::Result<u64, Value> {
+    let c = load_config(config);
+    if !hosting_supported() || !c.enabled {
+        return Err(refuse("off"));
+    }
+    let (item, _, root) = match admit(config, &c, me, Some(me), req) {
+        Ok(v) => v,
+        // Already held (a retry of the same item).
+        Err(r) if r["ok"].as_bool() == Some(true) => return Ok(r["held_until"].as_u64().unwrap_or(0)),
+        Err(r) => return Err(r),
+    };
+    let _guard = UploadGuard { config, id: item.id.clone() };
+    if item.ct_size != 0 {
+        let _ = with_store(config, |s| finish_item(s, &item.id, "rejected"));
+        return Err(refuse("invalid"));
+    }
+    let dir = item_dir(&root, &item.id);
+    if std::fs::write(dir.join("payload"), b"").is_err() {
+        let _ = with_store(config, |s| finish_item(s, &item.id, "rejected"));
+        return Err(refuse("storage"));
+    }
+    let held = with_store(config, |s| {
+        let it = s.items.get_mut(&item.id)?;
+        it.state = "held".into();
+        let copy = it.clone();
+        save_item(&s.root, &copy).ok().map(|_| copy)
+    })
+    .ok()
+    .flatten()
+    .ok_or_else(|| refuse("storage"))?;
+    log::info!("transfer-server: holding a {} item (from this device) for {} device(s)", held.kind, held.to.len());
+    super::push::on_stored(config, &held);
+    wake_delivery();
+    Ok(held.expires_ms)
+}
+
+/// `mailbox.status` / `mailbox.cancel` for this device's own items (local).
+pub fn local_rpc(config: &Path, me: &str, req: &Value) -> Value {
+    match req["kind"].as_str() {
+        Some("mailbox.status") => status_reply(config, me, req),
+        Some("mailbox.cancel") => cancel(config, me, req),
+        _ => refuse("unknown"),
+    }
+}
+
+/// Held chat/file items still waiting for `eid` (for a late wake-up push).
+pub fn waiting_items(config: &Path, eid: &str) -> Vec<Item> {
+    with_store(config, |s| s.items.values().filter(|i| i.state == "held" && i.waiting_for(eid)).cloned().collect())
+        .unwrap_or_default()
+}
+
 fn cancel(config: &Path, who: &str, req: &Value) -> Value {
     let id = req["item_id"].as_str().unwrap_or("").to_owned();
     with_store(config, |s| {
@@ -801,9 +857,11 @@ fn ack(config: &Path, who: &str, req: &Value) -> Value {
             if !it.delivered.iter().any(|d| d == who) {
                 it.delivered.push(who.to_owned());
             }
-            // A file reaches EVERY device it was sealed for; chat/ops sync
-            // between a person's devices, so the first one is enough.
-            let done = it.kind != "file" || !it.all_devices || it.to.iter().all(|t| it.delivered.contains(t) || it.refused.contains(t));
+            // Sent "to every device" (files; chat from senders that fan out
+            // per device, like iMessage): it stays until each one has it.
+            // Otherwise (older senders) the first device is enough — a person's
+            // devices sync their conversation among themselves.
+            let done = !it.all_devices || it.to.iter().all(|t| it.delivered.contains(t) || it.refused.contains(t));
             if done {
                 s.items.insert(id.clone(), it);
                 finish_item(s, &id, "delivered");
@@ -1132,6 +1190,11 @@ pub fn spawn_delivery(config: PathBuf, net: Arc<crate::iroh_net::IrohState>) {
                     _ => Duration::from_secs(900),
                 };
                 backoff.insert(eid.clone(), (fails, Instant::now() + wait));
+                if !ok {
+                    // Didn't answer: if it's a phone that was online a moment
+                    // ago (so the deposit skipped its push), wake it now.
+                    super::push::on_unreachable(&config, &eid);
+                }
                 if let Some(m) = SEEN.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
                     // A sighting only buys ONE immediate attempt.
                     m.remove(&eid);

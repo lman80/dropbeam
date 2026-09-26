@@ -17,7 +17,7 @@
  * Vars:    APNS_TOPIC (default com.ashtonmiller.dropbeam).
  * KV:      PUSH_RL (rate limits; optional — without it limits are per-isolate).
  *
- * Logs nothing but counters. See docs/PUSH-SETUP.md.
+ * Logs only APNs status codes (for `wrangler tail`). See docs/PUSH-SETUP.md.
  */
 
 const PER_TOKEN_HOUR = 60 // per server + phone (servers also coalesce to one per 30s)
@@ -100,8 +100,11 @@ async function push(request, env) {
     },
     body: JSON.stringify(body),
   })
+  // Status only (no token, no payload) so `wrangler tail` can confirm delivery.
+  console.log(`apns ${res.status} ${tok.env === 'sandbox' ? 'sandbox' : 'prod'}`)
   if (res.status === 410 || res.status === 400) {
     const r = await res.json().catch(() => ({}))
+    console.log(`apns reason ${String(r.reason || '').slice(0, 40)}`)
     if (res.status === 410 || r.reason === 'BadDeviceToken' || r.reason === 'Unregistered') return json({ ok: false, gone: true })
     return json({ ok: false, reason: r.reason || 'apns' }, 502)
   }

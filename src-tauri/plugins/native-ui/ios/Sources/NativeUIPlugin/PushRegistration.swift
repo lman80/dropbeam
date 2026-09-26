@@ -25,6 +25,7 @@ enum PushRegistration {
     static func start() {
         guard !started else { return }
         started = true
+        shareGroupPath()
         guard pushKey() != nil else { return }
         installDelegateHooks()
         Task { @MainActor in
@@ -73,6 +74,19 @@ enum PushRegistration {
         for (eid, name) in pairs { map[eid] = name }
         guard let data = try? JSONSerialization.data(withJSONObject: map) else { return }
         try? data.write(to: dir.appendingPathComponent("push-names.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
+    /// Tell the engine where the App Group container is, so it and the
+    /// notification extension can share which messages were already
+    /// announced (one banner per message, never two).
+    static func shareGroupPath() {
+        guard let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup),
+              let dir = engineDir else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("app-group-path")
+        if (try? String(contentsOf: file, encoding: .utf8)) != group.path {
+            try? group.path.write(to: file, atomically: true, encoding: .utf8)
+        }
     }
 
     // ── token → engine ──────────────────────────────────────────────────────

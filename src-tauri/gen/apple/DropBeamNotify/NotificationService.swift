@@ -10,7 +10,8 @@ import UserNotifications
 /// Layout (Rust `mailbox::seal::seal_small`): eph_pub(32) ‖ nonce(12) ‖ ct ‖ tag,
 /// key = HKDF-SHA256(X25519(push_key, eph_pub), salt: eph_pub ‖ my_pub,
 /// info: "dropbeam-push-v1"), ChaCha20-Poly1305. Plaintext {"t","b","th"}.
-/// Plaintext {"t","b","f"}. Anything unexpected leaves the generic banner.
+/// Plaintext {"t","b","f","i"} ("i" = message id, newer senders). Anything
+/// unexpected leaves the generic banner.
 final class NotificationService: UNNotificationServiceExtension {
     private var handler: ((UNNotificationContent) -> Void)?
     private var content: UNMutableNotificationContent?
@@ -31,12 +32,48 @@ final class NotificationService: UNNotificationServiceExtension {
             // The title is always YOUR name for them; the text only if the sealed
             // preview really is from that sender.
             best.title = name
-            if let preview = Self.open(sealed), preview["f"] as? String == from,
-               let b = preview["b"] as? String, !b.isEmpty {
-                best.body = b
+            if let preview = Self.open(sealed), preview["f"] as? String == from {
+                if let b = preview["b"] as? String, !b.isEmpty {
+                    best.body = b
+                }
+                // One banner per message: the app (or an earlier push) already
+                // has this one → deliver it silently, without alerting again.
+                if let id = preview["i"] as? String, !id.isEmpty {
+                    if Self.ids("app-have.json")[id] != nil || Self.ids("nse-notified.json")[id] != nil {
+                        best.sound = nil
+                        if #available(iOS 15.0, *) { best.interruptionLevel = .passive }
+                    } else {
+                        Self.remember(id)
+                    }
+                }
             }
         }
         contentHandler(best)
+    }
+
+    /// {message id: ms} lists shared with the app through the App Group.
+    static func ids(_ name: String) -> [String: Any] {
+        guard let url = group?.appendingPathComponent(name),
+              let data = try? Data(contentsOf: url),
+              let map = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        return map
+    }
+
+    /// Note that this message was announced, so the app doesn't ring again
+    /// when it later fetches or syncs the same message.
+    static func remember(_ id: String) {
+        guard let url = group?.appendingPathComponent("nse-notified.json") else { return }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        func at(_ v: Any) -> Int64 { (v as? NSNumber)?.int64Value ?? 0 }
+        var map = ids("nse-notified.json").filter { now - at($0.value) < 7 * 86_400_000 }
+        map[id] = NSNumber(value: now)
+        if map.count > 2000 {
+            let keep = map.sorted { at($0.value) > at($1.value) }.prefix(2000)
+            map = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: map) {
+            try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        }
     }
 
     override func serviceExtensionTimeWillExpire() {

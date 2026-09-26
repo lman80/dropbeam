@@ -943,6 +943,9 @@ fn apply_messages(dir: &Path, messages: &Value) -> usize {
         // A friend's extra device talks in the person's thread here too.
         let owner = friends::thread_owner(dir, &friend.id).map_or(friend.id, |o| o.id);
         let Ok(msgs) = serde_json::from_value::<Vec<chat::ChatMessage>>(msgs.clone()) else { continue };
+        // iPhone: a push for one of these later must not ring again.
+        let ids: Vec<&str> = msgs.iter().filter(|m| !m.from_me).map(|m| m.id.as_str()).collect();
+        crate::mailbox::push::note_have(dir, &ids);
         changed += chat::merge_synced(dir, &owner, msgs);
     }
     changed
