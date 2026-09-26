@@ -16,25 +16,56 @@
 		53CDD0ACFBE8BDF1550B2E53 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 682535EEFE1DA20BE07B123C /* main.mm */; };
 		5C516481BCA83A182C2BCC94 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 3842AE2A64FB9933D0400EA4 /* assets */; };
 		618672DC8A5E0605441C9935 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0E2B15F176E4B041AE33EEEA /* UIKit.framework */; };
+		6B96CD5A9015534D2BC45958 /* ShareModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 598A37285EC23A07C6021F30 /* ShareModel.swift */; };
 		836D84C5F07860664DAF79C8 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D8F57162F5CC7AEDD55F173D /* WebKit.framework */; };
+		9572A76A6ED999ED7242CB4E /* ShareView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06BD8A4A24EF28F2AF2F6645 /* ShareView.swift */; };
+		998BF12A1927A3ABCD754D61 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F187C4DA4D3BC74A5AD0E6A /* ShareViewController.swift */; };
 		9D59FB167BB4E699DA17D1E9 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 04B56F58E2E44DDE1D67E7B7 /* MetalKit.framework */; };
 		C6BD59C055C986EA4A77FDA2 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AF1DE57E7D9CF13BB2E0E038 /* Assets.xcassets */; };
 		C869023DDFE275D42F3FBF29 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 39EEC6A55698228E08917A52 /* libapp.a */; };
+		DC7F73CF490D2CF395B22FDF /* DropBeamShare.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = EF36321DA5D91135AFBA4A71 /* DropBeamShare.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		E68F6CFDAED6503ABB4044A5 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CE1209BFDECB28E00189B168 /* Metal.framework */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A08E27795E515EB1BF50B802 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A9B1B09F1872768368ACECE2 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B5BADCE8551BB08A36467943;
+			remoteInfo = DropBeamShare;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		84895F3D2512B6F87AA9E1B3 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				DC7F73CF490D2CF395B22FDF /* DropBeamShare.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		007E478DB8BC37A788C4730F /* app_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = app_iOS.entitlements; sourceTree = "<group>"; };
 		02B7F8347F94B067E6B27396 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		0330CABA9D6841D3D754058E /* models.rs */ = {isa = PBXFileReference; path = models.rs; sourceTree = "<group>"; };
 		04B56F58E2E44DDE1D67E7B7 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		06BD8A4A24EF28F2AF2F6645 /* ShareView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareView.swift; sourceTree = "<group>"; };
 		09EA68E21FDCEDB93DEE503F /* commands.rs */ = {isa = PBXFileReference; path = commands.rs; sourceTree = "<group>"; };
 		0E2B15F176E4B041AE33EEEA /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		0F1ABED75399A7A71943E70F /* block.rs */ = {isa = PBXFileReference; path = block.rs; sourceTree = "<group>"; };
 		107FF36667095FB22C84919B /* settings.rs */ = {isa = PBXFileReference; path = settings.rs; sourceTree = "<group>"; };
 		1631E4CFBB715FFDBF919C8C /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
 		17B52554D60D361AFE791C3E /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
 		184AB4C19C7460DAD0FC0813 /* pairing.rs */ = {isa = PBXFileReference; path = pairing.rs; sourceTree = "<group>"; };
 		18E427AA93C101F0F7758606 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		19E87E5E8C84139A619353FD /* account.rs */ = {isa = PBXFileReference; path = account.rs; sourceTree = "<group>"; };
 		1E81BD6B453D87B7F7B1597B /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		20476284DA7E942073FD3F1F /* friends.rs */ = {isa = PBXFileReference; path = friends.rs; sourceTree = "<group>"; };
 		252D255E1AC93C05FC5F377B /* ios_media.rs */ = {isa = PBXFileReference; path = ios_media.rs; sourceTree = "<group>"; };
@@ -55,24 +86,30 @@
 		521590675694E1395FAE49D4 /* download_progress.rs */ = {isa = PBXFileReference; path = download_progress.rs; sourceTree = "<group>"; };
 		5550EA038F005A9D2E4D6DE8 /* fs_walk.rs */ = {isa = PBXFileReference; path = fs_walk.rs; sourceTree = "<group>"; };
 		5743D244DBAE0672D3FD61AA /* telemetry.rs */ = {isa = PBXFileReference; path = telemetry.rs; sourceTree = "<group>"; };
+		598A37285EC23A07C6021F30 /* ShareModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareModel.swift; sourceTree = "<group>"; };
 		5ED0858E7B0B72533F19F5D4 /* chat.rs */ = {isa = PBXFileReference; path = chat.rs; sourceTree = "<group>"; };
 		682535EEFE1DA20BE07B123C /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		724908FF34F1FB6C7AF3B448 /* ios_log_policy.rs */ = {isa = PBXFileReference; path = ios_log_policy.rs; sourceTree = "<group>"; };
 		7BAFC636FC98BC527E8F5EA3 /* iroh_net.rs */ = {isa = PBXFileReference; path = iroh_net.rs; sourceTree = "<group>"; };
+		7C7B85EAC182832757119BCF /* automation.rs */ = {isa = PBXFileReference; path = automation.rs; sourceTree = "<group>"; };
 		7C8EE44E6025F78B4DFE3F20 /* mac_service.rs */ = {isa = PBXFileReference; path = mac_service.rs; sourceTree = "<group>"; };
 		81E326B61ED92E1D1EECF952 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		9F187C4DA4D3BC74A5AD0E6A /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		9F1A1F3A757B8E63FA1AC808 /* locations.rs */ = {isa = PBXFileReference; path = locations.rs; sourceTree = "<group>"; };
 		9FACFFCB6E3743955F72464C /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		AD6A82936A81C88BFD68A81B /* DropBeamShare.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = DropBeamShare.entitlements; sourceTree = "<group>"; };
 		AF1DE57E7D9CF13BB2E0E038 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C1E10C9C8643C83CCED7DECB /* provenance.rs */ = {isa = PBXFileReference; path = provenance.rs; sourceTree = "<group>"; };
+		C8EB59D9FCDB819976CDB945 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		CE1209BFDECB28E00189B168 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
-		CF674524E34966183631754E /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
-		D047DEEBAEDBFEFD1943D4CF /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		D2348891FAF8D197F581661E /* panic_log.rs */ = {isa = PBXFileReference; path = panic_log.rs; sourceTree = "<group>"; };
+		D65DF30A6DBF332F047DC5A1 /* xfer_matrix.rs */ = {isa = PBXFileReference; path = xfer_matrix.rs; sourceTree = "<group>"; };
 		D8F57162F5CC7AEDD55F173D /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		DBED1943226884A3717085D4 /* file_protocol.rs */ = {isa = PBXFileReference; path = file_protocol.rs; sourceTree = "<group>"; };
 		E6F6E50253F0B02FF2409477 /* receive_stage.rs */ = {isa = PBXFileReference; path = receive_stage.rs; sourceTree = "<group>"; };
 		E9415AC38490CB2A78AC1FE9 /* verify.rs */ = {isa = PBXFileReference; path = verify.rs; sourceTree = "<group>"; };
 		EB2B775C52293A9CDCF80009 /* integrity.rs */ = {isa = PBXFileReference; path = integrity.rs; sourceTree = "<group>"; };
+		EF36321DA5D91135AFBA4A71 /* DropBeamShare.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = DropBeamShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F3673D372C5ABDD1AD6E7067 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		FBAA48B3DA509BAF6CC39B2B /* codes.rs */ = {isa = PBXFileReference; path = codes.rs; sourceTree = "<group>"; };
 		FBC720DFA1D01F55B0A32344 /* app_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = app_iOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -98,14 +135,6 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		0C32539E578BFA0B4E3C6CD1 /* release */ = {
-			isa = PBXGroup;
-			children = (
-				D047DEEBAEDBFEFD1943D4CF /* libapp.a */,
-			);
-			path = release;
-			sourceTree = "<group>";
-		};
 		1BBF8C620E54F8C028CA130C /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
@@ -140,23 +169,6 @@
 			path = bindings;
 			sourceTree = "<group>";
 		};
-		5F72359403FB561BE1489F63 /* debug */ = {
-			isa = PBXGroup;
-			children = (
-				CF674524E34966183631754E /* libapp.a */,
-			);
-			path = debug;
-			sourceTree = "<group>";
-		};
-		70DD658F1D4B0FED51A79854 /* arm64 */ = {
-			isa = PBXGroup;
-			children = (
-				5F72359403FB561BE1489F63 /* debug */,
-				0C32539E578BFA0B4E3C6CD1 /* release */,
-			);
-			path = arm64;
-			sourceTree = "<group>";
-		};
 		78CBE3E5873199C0066F12DF /* Sources */ = {
 			isa = PBXGroup;
 			children = (
@@ -168,6 +180,9 @@
 		855775165ACE55D883F89EB3 /* src */ = {
 			isa = PBXGroup;
 			children = (
+				19E87E5E8C84139A619353FD /* account.rs */,
+				7C7B85EAC182832757119BCF /* automation.rs */,
+				0F1ABED75399A7A71943E70F /* block.rs */,
 				5ED0858E7B0B72533F19F5D4 /* chat.rs */,
 				FBAA48B3DA509BAF6CC39B2B /* codes.rs */,
 				09EA68E21FDCEDB93DEE503F /* commands.rs */,
@@ -177,6 +192,7 @@
 				20476284DA7E942073FD3F1F /* friends.rs */,
 				5550EA038F005A9D2E4D6DE8 /* fs_walk.rs */,
 				509B84E4384D38209EBF4ABE /* history.rs */,
+				724908FF34F1FB6C7AF3B448 /* ios_log_policy.rs */,
 				2B90FAC625603C0CF676EC62 /* ios_media_format.rs */,
 				252D255E1AC93C05FC5F377B /* ios_media.rs */,
 				7BAFC636FC98BC527E8F5EA3 /* iroh_net.rs */,
@@ -211,6 +227,7 @@
 				AF1DE57E7D9CF13BB2E0E038 /* Assets.xcassets */,
 				02B7F8347F94B067E6B27396 /* LaunchScreen.storyboard */,
 				2867E55E70187711EE923EBD /* app_iOS */,
+				97F4534C93C950134669F21D /* DropBeamShare */,
 				BAFB695BB8415511FEC74542 /* Externals */,
 				78CBE3E5873199C0066F12DF /* Sources */,
 				855775165ACE55D883F89EB3 /* src */,
@@ -219,10 +236,21 @@
 			);
 			sourceTree = "<group>";
 		};
+		97F4534C93C950134669F21D /* DropBeamShare */ = {
+			isa = PBXGroup;
+			children = (
+				AD6A82936A81C88BFD68A81B /* DropBeamShare.entitlements */,
+				C8EB59D9FCDB819976CDB945 /* Info.plist */,
+				598A37285EC23A07C6021F30 /* ShareModel.swift */,
+				06BD8A4A24EF28F2AF2F6645 /* ShareView.swift */,
+				9F187C4DA4D3BC74A5AD0E6A /* ShareViewController.swift */,
+			);
+			path = DropBeamShare;
+			sourceTree = "<group>";
+		};
 		BAFB695BB8415511FEC74542 /* Externals */ = {
 			isa = PBXGroup;
 			children = (
-				70DD658F1D4B0FED51A79854 /* arm64 */,
 			);
 			path = Externals;
 			sourceTree = "<group>";
@@ -232,6 +260,7 @@
 			children = (
 				EB2B775C52293A9CDCF80009 /* integrity.rs */,
 				E6F6E50253F0B02FF2409477 /* receive_stage.rs */,
+				D65DF30A6DBF332F047DC5A1 /* xfer_matrix.rs */,
 			);
 			path = iroh_net;
 			sourceTree = "<group>";
@@ -240,6 +269,7 @@
 			isa = PBXGroup;
 			children = (
 				FBC720DFA1D01F55B0A32344 /* app_iOS.app */,
+				EF36321DA5D91135AFBA4A71 /* DropBeamShare.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -253,16 +283,27 @@
 			path = app;
 			sourceTree = "<group>";
 		};
-		"TEMP_FCA3943B-35E0-4EF4-8861-EE144A84E9A3" /* x86_64 */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = x86_64;
-			sourceTree = "<group>";
-		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		B5BADCE8551BB08A36467943 /* DropBeamShare */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8FB378B9B4EB3532C36C7B0E /* Build configuration list for PBXNativeTarget "DropBeamShare" */;
+			buildPhases = (
+				857A0E98F806A7EB88F22EE9 /* Sources */,
+				A7A2E8A6D137E086F85FEA80 /* Match App Version */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DropBeamShare;
+			packageProductDependencies = (
+			);
+			productName = DropBeamShare;
+			productReference = EF36321DA5D91135AFBA4A71 /* DropBeamShare.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		E86255CB8A1836C0BF0C0E14 /* app_iOS */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = CDCB6DFA1AEBFEE3F608BA27 /* Build configuration list for PBXNativeTarget "app_iOS" */;
@@ -271,10 +312,12 @@
 				81BE6BC5B603407AF570E994 /* Sources */,
 				2FBCB8C3ED193E9C4A9FDB59 /* Resources */,
 				4825CF6C55516D374210C8E1 /* Frameworks */,
+				84895F3D2512B6F87AA9E1B3 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				1199E845C1F2996C01F55DEE /* PBXTargetDependency */,
 			);
 			name = app_iOS;
 			packageProductDependencies = (
@@ -292,6 +335,9 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
+					B5BADCE8551BB08A36467943 = {
+						DevelopmentTeam = R2RDA8476R;
+					};
 					E86255CB8A1836C0BF0C0E14 = {
 						DevelopmentTeam = R2RDA8476R;
 					};
@@ -311,6 +357,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
+				B5BADCE8551BB08A36467943 /* DropBeamShare */,
 				E86255CB8A1836C0BF0C0E14 /* app_iOS */,
 			);
 		};
@@ -331,6 +378,25 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
+		A7A2E8A6D137E086F85FEA80 /* Match App Version */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Match App Version";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "APP_PLIST=\"${SRCROOT}/app_iOS/Info.plist\"\nOUT=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\nfor KEY in CFBundleShortVersionString CFBundleVersion; do\n  VALUE=$(/usr/libexec/PlistBuddy -c \"Print :$KEY\" \"$APP_PLIST\")\n  /usr/libexec/PlistBuddy -c \"Set :$KEY $VALUE\" \"$OUT\"\ndone\n";
+		};
 		E028F843270D8815FCE2B491 /* Build Rust Code */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
@@ -363,7 +429,25 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		857A0E98F806A7EB88F22EE9 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6B96CD5A9015534D2BC45958 /* ShareModel.swift in Sources */,
+				9572A76A6ED999ED7242CB4E /* ShareView.swift in Sources */,
+				998BF12A1927A3ABCD754D61 /* ShareViewController.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		1199E845C1F2996C01F55DEE /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B5BADCE8551BB08A36467943 /* DropBeamShare */;
+			targetProxy = A08E27795E515EB1BF50B802 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		1B9D5B8D34E6E0C88D0207F2 /* release */ = {
@@ -397,6 +481,31 @@
 				VALID_ARCHS = arm64;
 			};
 			name = release;
+		};
+		1D0EC9E36AE6BBD420E59239 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				ARCHS = (
+					arm64,
+				);
+				CODE_SIGN_ENTITLEMENTS = DropBeamShare/DropBeamShare.entitlements;
+				DEVELOPMENT_TEAM = R2RDA8476R;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				INFOPLIST_FILE = DropBeamShare/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ashtonmiller.dropbeam.share;
+				PRODUCT_NAME = DropBeamShare;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = debug;
 		};
 		3C6497CF9EADFA373F12EF5C /* release */ = {
 			isa = XCBuildConfiguration;
@@ -451,6 +560,31 @@
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+		4867F90418579684FE487B10 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				ARCHS = (
+					arm64,
+				);
+				CODE_SIGN_ENTITLEMENTS = DropBeamShare/DropBeamShare.entitlements;
+				DEVELOPMENT_TEAM = R2RDA8476R;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				INFOPLIST_FILE = DropBeamShare/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ashtonmiller.dropbeam.share;
+				PRODUCT_NAME = DropBeamShare;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = release;
 		};
@@ -552,6 +686,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		8FB378B9B4EB3532C36C7B0E /* Build configuration list for PBXNativeTarget "DropBeamShare" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1D0EC9E36AE6BBD420E59239 /* debug */,
+				4867F90418579684FE487B10 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
 		B302E784349268C93E6F0A36 /* Build configuration list for PBXProject "app" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

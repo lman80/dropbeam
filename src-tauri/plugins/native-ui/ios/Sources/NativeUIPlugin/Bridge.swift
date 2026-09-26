@@ -26,6 +26,11 @@ final class Bridge: ObservableObject {
                 Task { @MainActor in Bridge.shared.updateAppBadge(force: true) }
             }
         }
+        // Items shared to DropBeam from another app wait in the App Group until we
+        // come forward (the share extension also opens us with dropbeam://share).
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor in ShareInbox.shared.ingestSoon() }
+        }
     }
     @Published var history: [HistoryEntry] = []
     @Published var locations: [FriendLocations] = []
@@ -159,13 +164,18 @@ final class Bridge: ObservableObject {
         case "blocked": blocked = try decoder.decode(LossyArray<BlockedPerson>.self, from: data).values
         default: break // Forward-compatible snapshots.
         }
+        // The share extension lists friends from a snapshot in the App Group.
+        if ["friends", "presence", "myDevice"].contains(key) { ShareInbox.shared.recipientsChanged() }
     }
     func event(name: String, payload: Any) {
         let object = payload as? [String: Any] ?? [:]
         if name == "view", let tab = object["name"] as? String,
            ["send", "friends", "chat", "history", "settings"].contains(tab) { selectedTab = tab }
         if name == "error" { errorMessage = object["message"] as? String }
-        if name == "openURL", let url = object["url"] as? String { incomingLink = IncomingLink(value: url) }
+        if name == "openURL", let url = object["url"] as? String {
+            if ShareInbox.isShareURL(url) { ShareInbox.shared.ingestSoon() }
+            else { incomingLink = IncomingLink(value: url) }
+        }
         if name == "received://files", let paths = object["paths"] as? [String] {
             ReceivedMediaSaver.shared.received(paths: paths, chat: object["chat"] as? Bool ?? false)
         }

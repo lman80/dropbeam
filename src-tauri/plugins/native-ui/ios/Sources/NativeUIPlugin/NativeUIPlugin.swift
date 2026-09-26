@@ -42,6 +42,8 @@ class NativeUIPlugin: Plugin {
                 self.host = host
             }
             if let host = self.host { root.view.bringSubviewToFront(host.view) }
+            // Anything shared to DropBeam while it wasn't running.
+            ShareInbox.shared.ingestSoon()
             webview.resignFirstResponder()
             webview.scrollView.isScrollEnabled = false
             webview.isHidden = true // JS bridge remains attached; no invisible touch surface.
