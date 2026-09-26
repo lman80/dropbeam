@@ -56,6 +56,9 @@ sha2 = "0.10"
 # Already locked via TLS; hardware SHA-256 on Apple Silicon without a new
 # download (sha2's optional ARM assembly dependency is not in the offline cache).
 ring = "0.17"
+# Transfer Server envelopes: X25519 with a STATIC recipient key (ring's agreement
+# API is ephemeral-only). Already in the tree via iroh-base at this exact version.
+curve25519-dalek = "5.0.0"
 unicode-normalization = "0.1"
 hex = "0.4"
 whoami = "1"

@@ -5,6 +5,7 @@ mod codes;
 mod link;
 mod location_sync;
 mod locations;
+mod mailbox;
 mod chat;
 mod commands;
 #[cfg(target_os = "ios")]
@@ -873,6 +874,19 @@ pub fn run() {
             commands::location_request,
             commands::upload_to_location,
             mounts::list_mount_candidates,
+            mailbox::cmds::server_check_device,
+            mailbox::cmds::server_folder_space,
+            mailbox::cmds::server_status,
+            mailbox::cmds::server_configure,
+            mailbox::cmds::server_remove_person,
+            mailbox::cmds::server_restore_person,
+            mailbox::cmds::server_wipe,
+            mailbox::cmds::server_disable,
+            mailbox::cmds::mailbox_servers,
+            mailbox::cmds::mailbox_server_prefs,
+            mailbox::cmds::mailbox_forget_server,
+            mailbox::cmds::mailbox_fetch_now,
+            mailbox::cmds::mailbox_can_hold,
             location_sync::list_synced_folders,
             location_sync::synced_folder_statuses,
             location_sync::add_synced_folder,

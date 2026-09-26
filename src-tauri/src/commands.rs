@@ -1343,6 +1343,9 @@ pub async fn send_chat_message(
         deleted: false,
         gif: None,
         rev: 0,
+        held_on: None,
+        server_note: None,
+        via: None,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1375,7 +1378,11 @@ fn deliver_chat(
         let iroh = iroh.clone();
         tauri::async_runtime::spawn(async move {
             let status = match crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await {
-                Ok(_) => "delivered",
+                Ok(_) => {
+                    // If a Transfer Server was holding it meanwhile, drop that copy.
+                    crate::mailbox::client::delivered_directly(&iroh, &config_dir, &mid);
+                    "delivered"
+                }
                 Err(e) => {
                     log::debug!("chat send failed: {e:#}");
                     "failed"
@@ -1445,6 +1452,9 @@ pub(crate) fn post_file_note(
         deleted: false,
         gif: None,
         rev: 0,
+        held_on: None,
+        server_note: None,
+        via: None,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1678,6 +1688,9 @@ pub async fn send_chat_gif(
         deleted: false,
         gif: Some(gif),
         rev: 0,
+        held_on: None,
+        server_note: None,
+        via: None,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);

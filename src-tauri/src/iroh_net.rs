@@ -52,6 +52,14 @@ pub const ALPN: &[u8] = b"dropbeam/1";
 /// before giving up — lets a friend who's just opening their app still receive,
 /// mirroring croc's old parked-send window (without the hours-long hang).
 const FRIEND_SEND_RETRY_SECS: u64 = 90;
+/// Internal signal: the friend didn't answer and a Transfer Server can hold it.
+const GO_SERVER: &str = "dropbeam:go-server";
+
+/// How a friend send ended well: delivered directly, or held on a server.
+enum SendEnd {
+    Direct(crate::models::Locality),
+    Held(crate::mailbox::client::Held),
+}
 
 /// A Quick Send staged on this node, waiting for a receiver to pull it.
 #[derive(Clone)]
@@ -414,7 +422,7 @@ fn speaks_progress_v1(frame: &serde_json::Value) -> bool {
 
 // Optional JSON metadata only: old peers ignore it, and absent metadata keeps
 // legacy cards static. Linked pushes reuse the existing hold/ready negotiation.
-fn incoming_chat_id(peer: &str, transfer: &str) -> String {
+pub(crate) fn incoming_chat_id(peer: &str, transfer: &str) -> String {
     format!("receive:{peer}:{transfer}")
 }
 
@@ -667,6 +675,12 @@ fn emit(app: &AppHandle, u: &TransferUpdate) {
                         batch.landed.remove(&chat_item_key(row.index, &row.name));
                     }
                     u.chat_transfer = batch.observe(&link, &u);
+                    if u.chat_transfer.as_ref().and_then(|l| l.batch_state) == Some(TransferState::Completed) {
+                        // A Transfer Server copy of this send must not land twice.
+                        if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+                            crate::mailbox::client::note_direct_landed(&st.config_dir, &link.id);
+                        }
+                    }
                 }
                 if matches!(u.chat_transfer.as_ref().and_then(|l| l.batch_state), Some(TransferState::Completed | TransferState::Failed | TransferState::Canceled)) {
                     prune_chat_batches(&mut batches);
@@ -1092,6 +1106,22 @@ fn emit_completed(
     u.friend_name = friend.clone();
     u.out_dir = out_dir.clone();
     emit(app, &u);
+    completed_side_effects(app, id, dir, names, total, locality, friend, out_dir);
+}
+
+/// The notification + History half of a completed transfer (shared with the
+/// Transfer Server paths, which emit their own chat-linked card).
+#[allow(clippy::too_many_arguments)]
+fn completed_side_effects(
+    app: &AppHandle,
+    id: &str,
+    dir: Direction,
+    names: Vec<String>,
+    total: u64,
+    locality: crate::models::Locality,
+    friend: Option<String>,
+    out_dir: Option<String>,
+) {
 
     // Pop a native OS notification for an INCOMING file — this is what makes
     // DropBeam feel "always ready in the background": the app runs in the menu
@@ -1161,6 +1191,299 @@ fn emit_completed(
             },
         );
         let _ = app.emit("history://changed", ());
+    }
+}
+
+/// Apply an incoming chat frame from friend endpoint `who` — a new message or an
+/// edit/unsend/reaction — whether it arrived directly or through a Transfer
+/// Server (`via` = that server's name). Returns whether it applied (false for a
+/// stranger, or an op whose target we don't have). Emits to the UI when running.
+pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &str, req: &serde_json::Value, via: Option<&str>, _sent_ms: Option<u64>) -> bool {
+    let app = state.app.get().cloned();
+    let mut applied = true;
+    let msg_kind = req.get("msgKind").and_then(|k| k.as_str()).unwrap_or("text");
+    // Unsolicited frames cannot recreate a removed/unknown contact.
+    let friend = crate::friends::chat_sender(config_dir, &who);
+    if friend.is_none() {
+        applied = false;
+    }
+    if let Some(friend) = friend {
+        let peer_id = friend.id.clone();
+        match msg_kind {
+            "reaction" => {
+                if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                    let emoji = req.get("emoji").and_then(|e| e.as_str()).unwrap_or("");
+                    let add = req.get("add").and_then(|a| a.as_bool()).unwrap_or(true);
+                    // None = we don't have the target message yet → tell the
+                    // sender (applied=false) so it KEEPS the op queued to
+                    // retry, rather than dropping it (apply_* is idempotent).
+                    match crate::chat::apply_reaction(
+                        config_dir, &peer_id, target, emoji, false, add,
+                    ) {
+                        Some(u) => {
+                            if let Some(app) = &app { let _ = app.emit("chat://message", &u); }
+                        }
+                        None => applied = false,
+                    }
+                }
+            }
+            "edit" => {
+                if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                    let new_text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    // author_is_me=false: a remote edit may only touch
+                    // the PEER's own message, never one we authored.
+                    match crate::chat::apply_edit(config_dir, &peer_id, target, new_text, false)
+                    {
+                        Some(u) => {
+                            if let Some(app) = &app { let _ = app.emit("chat://message", &u); }
+                        }
+                        None => applied = false,
+                    }
+                }
+            }
+            "delete" => {
+                if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                    match crate::chat::apply_delete(config_dir, &peer_id, target, false) {
+                        Some(u) => {
+                            if let Some(app) = &app { let _ = app.emit("chat://message", &u); }
+                        }
+                        None => applied = false,
+                    }
+                }
+            }
+            _ => {
+                // A new text / file / gif message.
+                let text =
+                    req.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let files: Vec<String> = req
+                    .get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let bytes = req.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
+                let id = req
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let ts = req.get("ts").and_then(|t| t.as_u64()).unwrap_or_else(crate::chat::now_ms);
+                // Lamport merge: order this incoming message after
+                // everything we already have if its seq is stale/absent.
+                let recv_seq = req.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+                let seq = recv_seq.max(crate::chat::next_seq(config_dir, &peer_id));
+                let reply_to = req.get("replyTo").and_then(|r| r.as_str()).map(String::from);
+                let reply_preview =
+                    req.get("replyPreview").and_then(|r| r.as_str()).map(String::from);
+                let gif: Option<crate::chat::GifMeta> =
+                    req.get("gif").and_then(|g| serde_json::from_value(g.clone()).ok());
+                let is_file = msg_kind == "file" || msg_kind == "gif";
+                // Through a server the note can arrive before its bytes: the path
+                // is set when the file itself lands (land_server_files).
+                let path = if is_file && via.is_none() {
+                    // The receive-safe landing name: a peer-supplied
+                    // absolute/"../" name must never point this card
+                    // (which the UI previews + opens) outside Downloads.
+                    files.first().map(|name| receive_dir(state, config_dir).join(receive_rel(name)).to_string_lossy().to_string())
+                } else {
+                    None
+                };
+                let msg = crate::chat::ChatMessage {
+                    file_xfer_id: req.get("fileXferId").and_then(|v| v.as_str())
+                        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                        .map(|id| incoming_chat_id(&who, id)),
+                    id,
+                    peer_id: peer_id.clone(),
+                    from_me: false,
+                    kind: if is_file { "file".into() } else { "text".into() },
+                    text,
+                    files,
+                    bytes,
+                    path,
+                    status: None,
+                    ts,
+                    seq,
+                    reply_to,
+                    reply_preview,
+                    reactions: vec![],
+                    edited: false,
+                    deleted: false,
+                    gif,
+                    rev: 0,
+                    held_on: None,
+                    server_note: None,
+                    via: via.map(String::from),
+                };
+                if crate::chat::append(config_dir, &msg) {
+                    if let Some(app) = &app {
+                        let _ = app.emit("chat://message", &msg);
+                        maybe_notify_chat(app, &friend.name, &msg);
+                    }
+                }
+            }
+        }
+    }
+    applied
+}
+
+/// Where received files land: the configured download folder, else the OS
+/// Downloads (Documents on iOS), else (headless tests) `<config>/Downloads`.
+pub(crate) fn receive_dir(state: &IrohState, config_dir: &Path) -> PathBuf {
+    let configured = match state.app.get().and_then(|a| a.try_state::<Arc<crate::AppState>>()) {
+        Some(st) => st.settings.lock().unwrap().download_dir.clone(),
+        None => crate::settings::load(config_dir, "", "").download_dir,
+    };
+    if !configured.trim().is_empty() {
+        return PathBuf::from(configured);
+    }
+    match state.app.get() {
+        Some(app) => crate::commands::download_directory(app).unwrap_or_else(|_| std::env::temp_dir()),
+        None => config_dir.join("Downloads"),
+    }
+}
+
+/// A friend's file send arrived through a Transfer Server and is now in
+/// `dest`: attach it to (or create) its chat card and surface a completed,
+/// chat-linked receive exactly like a direct one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn land_server_files(
+    state: &IrohState,
+    config: &Path,
+    from: &str,
+    xfer: &str,
+    note: &serde_json::Value,
+    top_names: &[String],
+    manifest: &[(String, u64)],
+    dirs: &[String],
+    landed: &[(String, PathBuf)],
+    dest: &Path,
+    server_name: &str,
+    created_ms: u64,
+) {
+    let Some(friend) = crate::friends::chat_sender(config, from) else { return };
+    let link_id = incoming_chat_id(from, xfer);
+    let total: u64 = manifest.iter().map(|(_, s)| *s).sum();
+    let first = landed.iter().find(|(k, _)| k.starts_with("file:")).or(landed.first())
+        .map(|(_, p)| p.to_string_lossy().into_owned());
+    let names: Vec<String> = if top_names.is_empty() { manifest.iter().map(|(n, _)| n.clone()).collect() } else { top_names.to_vec() };
+    let mut changed = first.as_deref().and_then(|p| crate::chat::set_received_path(config, &friend.id, &link_id, p, Some(server_name)));
+    if changed.is_none() && crate::chat::received_file(config, &friend.id, &link_id).is_none() {
+        let id = note["id"].as_str().filter(|i| uuid::Uuid::parse_str(i).is_ok()).map(String::from)
+            .unwrap_or_else(|| format!("mbx-{xfer}"));
+        let ts = note["ts"].as_u64().unwrap_or(created_ms);
+        let seq = note["seq"].as_u64().unwrap_or(0).max(crate::chat::next_seq(config, &friend.id));
+        let msg = crate::chat::ChatMessage {
+            file_xfer_id: Some(link_id.clone()),
+            id,
+            peer_id: friend.id.clone(),
+            from_me: false,
+            kind: "file".into(),
+            text: note["text"].as_str().unwrap_or("").chars().take(4000).collect(),
+            files: names.clone(),
+            bytes: total,
+            path: first.clone(),
+            status: None,
+            ts,
+            seq,
+            reply_to: None,
+            reply_preview: None,
+            reactions: vec![],
+            edited: false,
+            deleted: false,
+            gif: None,
+            rev: 0,
+            held_on: None,
+            server_note: None,
+            via: Some(server_name.to_owned()),
+        };
+        if crate::chat::append(config, &msg) {
+            changed = Some(msg);
+        }
+    }
+    let Some(app) = state.app.get() else { return };
+    if let Some(m) = &changed {
+        let _ = app.emit("chat://message", m);
+    }
+    let mut completed_paths = std::collections::BTreeMap::new();
+    for (k, p) in landed {
+        completed_paths.insert(k.clone(), p.to_string_lossy().into_owned());
+    }
+    let link = crate::models::ChatTransferLink {
+        id: link_id.clone(),
+        attempt: crate::chat::now_ms(),
+        manifest: manifest.iter().map(|(name, size)| crate::models::ChatFile { name: name.clone(), size: *size }).collect(),
+        directories: dirs.to_vec(),
+        batch_state: Some(TransferState::Completed),
+        bytes_done: total,
+        completed_files: completed_paths.keys().cloned().collect(),
+        completed_paths,
+        item_offset: 0,
+        offset: 0,
+        total,
+        last: true,
+    };
+    let card_id = format!("server-{xfer}");
+    let mut u = completed_update(&card_id, Direction::Receive, names.clone(), total);
+    u.friend_name = Some(friend.name.clone());
+    u.out_dir = Some(dest.to_string_lossy().into_owned());
+    u.detail = Some(format!("via {server_name}"));
+    u.chat_transfer = Some(link);
+    let _ = app.emit("transfer://update", &u);
+    completed_side_effects(app, &card_id, Direction::Receive, names, total, crate::models::Locality::Unknown,
+        Some(friend.name), Some(dest.to_string_lossy().into_owned()));
+}
+
+/// Final states of things we left on Transfer Servers → chat bubbles + cards.
+pub(crate) fn apply_receipts(state: &IrohState, config: &Path, receipts: &[crate::mailbox::client::Receipt]) {
+    let app = state.app.get();
+    for r in receipts {
+        let s = &r.sent;
+        match s.kind.as_str() {
+            "chat" => {
+                let Some(msg) = &s.msg_id else { continue };
+                let updated = match r.state.as_str() {
+                    "delivered" => crate::chat::set_status(config, &s.peer_id, msg, "delivered"),
+                    "expired" => crate::chat::set_server_failed(config, &s.peer_id, msg, "expired"),
+                    "rejected" | "lost" => crate::chat::set_server_failed(config, &s.peer_id, msg, "lost"),
+                    _ => None,
+                };
+                if let (Some(app), Some(u)) = (app, updated) {
+                    let _ = app.emit("chat://message", &u);
+                }
+            }
+            "file" => {
+                let (Some(app), Some(xfer)) = (app, &s.xfer_id) else { continue };
+                let card_id = s.transfer_id.clone().unwrap_or_else(|| xfer.clone());
+                let friend = crate::friends::get(config, &s.peer_id).map(|f| f.name);
+                let mut u = TransferUpdate::new(card_id.clone(), Direction::Send, s.names.clone());
+                u.bytes_total = s.bytes;
+                u.friend_name = friend.clone();
+                let delivered = r.state == "delivered";
+                if delivered {
+                    u.state = TransferState::Completed;
+                    u.bytes_done = s.bytes;
+                    u.percent = 100.0;
+                } else if r.state == "canceled" {
+                    continue;
+                } else {
+                    u.state = TransferState::Failed;
+                    u.error = Some(if r.state == "expired" {
+                        format!("Expired on {} before it could be delivered", s.server_name)
+                    } else {
+                        format!("{} couldn't deliver it", s.server_name)
+                    });
+                }
+                u.chat_transfer = Some(crate::models::ChatTransferLink {
+                    id: xfer.clone(), attempt: crate::chat::now_ms(), manifest: vec![], directories: vec![],
+                    batch_state: Some(u.state), bytes_done: u.bytes_done, completed_files: vec![], completed_paths: Default::default(),
+                    item_offset: 0, offset: 0, total: s.bytes, last: true,
+                });
+                let _ = app.emit("transfer://update", &u);
+                if delivered {
+                    completed_side_effects(app, &card_id, Direction::Send, s.names.clone(), s.bytes, crate::models::Locality::Unknown, friend, None);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2118,12 +2441,17 @@ fn refresh_presence(conn: &Connection, received: &mut u64, emit: impl FnOnce()) 
 
 /// Map only the authenticated endpoint to a local friend; never trust a wire name.
 fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
+    crate::mailbox::note_seen(endpoint_id);
     if let Some(app) = state.app.get() {
         if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
             crate::account::device_seen(&st.config_dir, endpoint_id);
             if let Some(friend) = crate::friends::load(&st.config_dir).into_iter()
                 .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
                 let _ = app.emit("friend://presence", serde_json::json!({ "peerId": friend.id }));
+                // Messages a Transfer Server holds for them can go direct now.
+                if let Some(owner) = crate::friends::thread_owner(&st.config_dir, &friend.id) {
+                    wake_chat_outbox_for(&st.config_dir, &owner.id);
+                }
             }
         }
     }
@@ -2136,6 +2464,7 @@ fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
 fn is_blockable_kind(kind: &str) -> bool {
     matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite")
         || kind.starts_with("locations.")
+        || kind.starts_with("mailbox.")
 }
 
 /// Answer a blocked peer exactly as a stranger is answered, so nothing tells
@@ -2198,6 +2527,10 @@ async fn serve_stream_inner(
         Some("ping") => {
             write_frame(send, &serde_json::json!({ "kind": "pong", "locations_v": crate::locations::VERSION })).await?;
             send.finish()?;
+        }
+        // Transfer Server (store-and-forward): hosting + the server's delivery poke.
+        Some(kind) if kind.starts_with("mailbox.") => {
+            crate::mailbox::serve(state, conn, send, recv, kind, &req).await?;
         }
         Some(kind) if kind.starts_with("locations.") => {
             let who = conn.remote_id().to_string();
@@ -3104,6 +3437,9 @@ async fn serve_stream_inner(
                 }
             }
             state.learn_progress(&who, u64::from(speaks_progress_v1(&req)));
+            if let Ok(config) = location_config(state) {
+                crate::mailbox::on_hello(state, &config, &who, &req);
+            }
             if req["locations_v"].as_u64() == Some(crate::locations::VERSION) {
                 if let Some(app) = state.app.get() { let _ = app.emit("locations://changed", &who); }
             }
@@ -3113,7 +3449,11 @@ async fn serve_stream_inner(
             let blocked = state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>())
                 .is_some_and(|st| crate::block::is_blocked(&st.config_dir, &who));
             let my_avatar = if blocked { None } else { state.app.get().and_then(my_avatar_thumb_b64) };
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar })).await?;
+            let mailbox = match (location_config(state), state.get()) {
+                (Ok(config), Some(ep)) if !blocked => Some(crate::mailbox::hello_fields(&config, ep.secret_key(), &who)),
+                _ => None,
+            };
+            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox })).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -3563,143 +3903,14 @@ async fn serve_stream_inner(
         }
         Some("chat") => {
             // A friend sent us a chat message OR an update to one (reaction, edit,
-            // delete). Identify them by endpoint id, apply it, surface it live.
-            // `applied` rides the ack so the sender's durable op-outbox knows whether
-            // an edit/unsend/reaction actually landed (its target was stored) — only
-            // then does it drop the op. Stays true for plain messages.
-            let mut applied = true;
-            if let Some(app) = state.app.get().cloned() {
-                let config_dir = app
-                    .try_state::<Arc<crate::AppState>>()
-                    .map(|st| st.config_dir.clone())
-                    .unwrap_or_else(std::env::temp_dir);
-                let who = conn.remote_id().to_string();
-                let msg_kind = req.get("msgKind").and_then(|k| k.as_str()).unwrap_or("text");
-                // Unsolicited frames cannot recreate a removed/unknown contact.
-                let friend = crate::friends::chat_sender(&config_dir, &who);
-                if friend.is_none() {
-                    applied = false;
-                }
-                if let Some(friend) = friend {
-                    let peer_id = friend.id.clone();
-                    match msg_kind {
-                        "reaction" => {
-                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
-                                let emoji = req.get("emoji").and_then(|e| e.as_str()).unwrap_or("");
-                                let add = req.get("add").and_then(|a| a.as_bool()).unwrap_or(true);
-                                // None = we don't have the target message yet → tell the
-                                // sender (applied=false) so it KEEPS the op queued to
-                                // retry, rather than dropping it (apply_* is idempotent).
-                                match crate::chat::apply_reaction(
-                                    &config_dir, &peer_id, target, emoji, false, add,
-                                ) {
-                                    Some(u) => {
-                                        let _ = app.emit("chat://message", &u);
-                                    }
-                                    None => applied = false,
-                                }
-                            }
-                        }
-                        "edit" => {
-                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
-                                let new_text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                                // author_is_me=false: a remote edit may only touch
-                                // the PEER's own message, never one we authored.
-                                match crate::chat::apply_edit(&config_dir, &peer_id, target, new_text, false)
-                                {
-                                    Some(u) => {
-                                        let _ = app.emit("chat://message", &u);
-                                    }
-                                    None => applied = false,
-                                }
-                            }
-                        }
-                        "delete" => {
-                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
-                                match crate::chat::apply_delete(&config_dir, &peer_id, target, false) {
-                                    Some(u) => {
-                                        let _ = app.emit("chat://message", &u);
-                                    }
-                                    None => applied = false,
-                                }
-                            }
-                        }
-                        _ => {
-                            // A new text / file / gif message.
-                            let text =
-                                req.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                            let files: Vec<String> = req
-                                .get("files")
-                                .and_then(|f| f.as_array())
-                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                                .unwrap_or_default();
-                            let bytes = req.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
-                            let id = req
-                                .get("id")
-                                .and_then(|i| i.as_str())
-                                .map(String::from)
-                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                            let ts = req.get("ts").and_then(|t| t.as_u64()).unwrap_or_else(crate::chat::now_ms);
-                            // Lamport merge: order this incoming message after
-                            // everything we already have if its seq is stale/absent.
-                            let recv_seq = req.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
-                            let seq = recv_seq.max(crate::chat::next_seq(&config_dir, &peer_id));
-                            let reply_to = req.get("replyTo").and_then(|r| r.as_str()).map(String::from);
-                            let reply_preview =
-                                req.get("replyPreview").and_then(|r| r.as_str()).map(String::from);
-                            let gif: Option<crate::chat::GifMeta> =
-                                req.get("gif").and_then(|g| serde_json::from_value(g.clone()).ok());
-                            let is_file = msg_kind == "file" || msg_kind == "gif";
-                            let path = if is_file {
-                                files.first().map(|name| {
-                                    let configured = app
-                                        .try_state::<Arc<crate::AppState>>()
-                                        .map(|st| st.settings.lock().unwrap().download_dir.clone())
-                                        .unwrap_or_default();
-                                    let dir = if configured.trim().is_empty() {
-                                        crate::commands::download_directory(&app).unwrap_or_else(|_| std::env::temp_dir())
-                                    } else {
-                                        PathBuf::from(configured)
-                                    };
-                                    // The receive-safe landing name: a peer-supplied
-                                    // absolute/"../" name must never point this card
-                                    // (which the UI previews + opens) outside Downloads.
-                                    dir.join(receive_rel(name)).to_string_lossy().to_string()
-                                })
-                            } else {
-                                None
-                            };
-                            let msg = crate::chat::ChatMessage {
-                                file_xfer_id: req.get("fileXferId").and_then(|v| v.as_str())
-                                    .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-                                    .map(|id| incoming_chat_id(&who, id)),
-                                id,
-                                peer_id: peer_id.clone(),
-                                from_me: false,
-                                kind: if is_file { "file".into() } else { "text".into() },
-                                text,
-                                files,
-                                bytes,
-                                path,
-                                status: None,
-                                ts,
-                                seq,
-                                reply_to,
-                                reply_preview,
-                                reactions: vec![],
-                                edited: false,
-                                deleted: false,
-                                gif,
-                                rev: 0,
-                            };
-                            if crate::chat::append(&config_dir, &msg) {
-                                let _ = app.emit("chat://message", &msg);
-                                maybe_notify_chat(&app, &friend.name, &msg);
-                            }
-                        }
-                    }
-                }
-            }
+            // delete). `applied` rides the ack so the sender's durable op-outbox knows
+            // whether an edit/unsend/reaction actually landed (its target was stored)
+            // — only then does it drop the op. Stays true for plain messages.
+            let who = conn.remote_id().to_string();
+            let applied = match location_config(state) {
+                Ok(config_dir) => apply_incoming_chat(state, &config_dir, &who, &req, None, None),
+                Err(_) => true,
+            };
             // Any inbound chat frame is proof the sender is ONLINE — kick the outbox
             // so messages queued while they slept flush NOW instead of waiting out the
             // per-peer backoff (up to 300s) mid-conversation. Mirrors the folder-side
@@ -3823,6 +4034,10 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
                 // Clean up any duplicate folder-member links from the pre-fix
                 // hello/beacon race (a person added twice to a shared folder).
                 crate::pairing::dedup_group_links(&config_dir);
+                // Transfer Server: host-side delivery pokes + expiry, and the
+                // user-side fetch/receipt loop.
+                crate::mailbox::server::spawn_delivery(config_dir.clone(), state.clone());
+                crate::mailbox::client::spawn(state.clone());
                 accept_loop(ep, state).await;
             }
             Err(e) => log::warn!("iroh endpoint failed to start: {e:#}"),
@@ -4494,13 +4709,30 @@ fn send_friend_inner(
         .try_state::<Arc<crate::AppState>>()
         .map(|st| st.settings.lock().unwrap().display_name.clone())
         .unwrap_or_default();
+    // Transfer Server: when this friend is offline and a server can hold the
+    // files for them, a short direct attempt is followed by a sealed upload to
+    // the server instead of 90s of re-dialing and a failure.
+    let hold_config = app.try_state::<Arc<crate::AppState>>().map(|st| st.config_dir.clone());
+    let hold_peer: Option<String> = match (&location, &hold_config) {
+        (None, Some(config)) => crate::friends::chat_sender(config, &endpoint_id).map(|f| f.id),
+        _ => None,
+    };
+    let top_names: Vec<String> = pathbufs.iter()
+        .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        .collect();
     tauri::async_runtime::spawn(integrity::scope(async move {
         let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
+        let mut use_server = match (&hold_peer, &hold_config) {
+            (Some(peer), Some(config)) => crate::mailbox::client::can_hold(config, &ep.id().to_string(), peer),
+            _ => false,
+        };
+        let mut server_note: Option<String> = None;
         // High-water mark of confirmed bytes across ALL attempts. Declared out here
         // (the retry loop below borrows it) so a PAUSE can report how far the send
         // actually got.
         let progress_high = std::sync::Arc::new(AtomicU64::new(0));
-        let outcome: Result<crate::models::Locality> = async {
+        let outcome: Result<SendEnd> = loop {
+        let direct: Result<crate::models::Locality> = async {
             // A parallel transfer that was UNDERWAY and died is almost always a
             // network blip / sleep — so we auto-reconnect up to 2 extra times, and
             // the resume handshake picks up from the receiver's partial instead of
@@ -4531,7 +4763,7 @@ fn send_friend_inner(
             // index of the first file NOT yet confirmed delivered. Survives across
             // retry attempts so a reconnect never re-sends finished files.
             let mut next_file: usize = 0;
-            let mut upload_batch = LocationBatch { items: upload_items, dirs: upload_dirs, next_file: 0, dirs_pending: true };
+            let mut upload_batch = LocationBatch { items: upload_items.clone(), dirs: upload_dirs.clone(), next_file: 0, dirs_pending: true };
             let linked = location.is_none() && friend_split(&upload_batch.items);
             let split = location.is_some() && location.as_ref().is_none_or(|l| l.snapshot.is_none()) && pathbufs.len() > 1
                 && pathbufs.iter().any(|p| {
@@ -4567,7 +4799,7 @@ fn send_friend_inner(
                             anyhow::bail!("canceled");
                         }
                         match tokio::time::timeout(
-                            Duration::from_secs(20),
+                            Duration::from_secs(if use_server { 6 } else { 20 }),
                             ep.connect(dial_addr(parsed), ALPN),
                         )
                         .await
@@ -4590,6 +4822,9 @@ fn send_friend_inner(
                                 break c;
                             }
                             _ => {
+                                if use_server {
+                                    anyhow::bail!(GO_SERVER);
+                                }
                                 if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
                                     anyhow::bail!("Couldn't reach this friend — make sure their DropBeam is running and online.");
                                 }
@@ -4932,8 +5167,88 @@ fn send_friend_inner(
             }
         }
         .await;
+        match direct {
+            Err(e) if e.to_string() == GO_SERVER => {
+                let (Some(peer), Some(config)) = (hold_peer.as_ref(), hold_config.as_ref()) else {
+                    use_server = false;
+                    continue;
+                };
+                let files: Vec<crate::mailbox::client::DepositFile> = upload_items.iter()
+                    .map(|(path, name, size, mtime)| crate::mailbox::client::DepositFile { path: path.clone(), name: name.clone(), size: *size, mtime: *mtime })
+                    .collect();
+                let label = Arc::new(Mutex::new(String::new()));
+                let last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
+                let upload_started = Instant::now();
+                let (app2, id2, names2, fname2, label2) = (app.clone(), id.clone(), names.clone(), friend_name.clone(), label.clone());
+                let progress = move |done: u64, all: u64| {
+                    let mut last = last_emit.lock().unwrap();
+                    if done < all && last.elapsed() < Duration::from_millis(250) {
+                        return;
+                    }
+                    *last = Instant::now();
+                    let mut u = TransferUpdate::new(id2.clone(), Direction::Send, names2.clone());
+                    u.state = TransferState::Transferring;
+                    u.friend_name = Some(fname2.clone());
+                    u.bytes_total = all;
+                    u.bytes_done = done;
+                    u.percent = if all > 0 { done as f64 * 100.0 / all as f64 } else { 100.0 };
+                    let secs = upload_started.elapsed().as_secs_f64();
+                    u.speed_bps = if secs > 0.5 { done as f64 / secs } else { 0.0 };
+                    u.eta_seconds = (u.speed_bps > 0.0).then(|| (all.saturating_sub(done)) as f64 / u.speed_bps);
+                    u.detail = Some(format!("Uploading to {} — locked so only {} can open it", label2.lock().unwrap(), fname2));
+                    emit(&app2, &u);
+                };
+                let (app3, id3, names3, fname3) = (app.clone(), id.clone(), names.clone(), friend_name.clone());
+                let on_start = move |server: &str| {
+                    *label.lock().unwrap() = server.to_owned();
+                    let mut u = TransferUpdate::new(id3.clone(), Direction::Send, names3.clone());
+                    u.state = TransferState::Connecting;
+                    u.friend_name = Some(fname3.clone());
+                    u.bytes_total = total;
+                    u.detail = Some(format!("{fname3} is offline — sending to {server}"));
+                    emit(&app3, &u);
+                };
+                match crate::mailbox::client::deposit_files(&state, config, peer, &chat_id, &id, &files, &upload_dirs, &top_names, &progress, &on_start, &cancel).await {
+                    Ok(held) => break Ok(SendEnd::Held(held)),
+                    Err(crate::mailbox::client::DepositError::GoDirect) => {
+                        log::info!("friend-send: the friend came online mid-upload — sending directly instead");
+                        use_server = false;
+                        let mut u = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                        u.state = TransferState::Connecting;
+                        u.friend_name = Some(friend_name.clone());
+                        u.bytes_total = total;
+                        u.detail = Some(format!("{friend_name} came online — sending directly"));
+                        emit(&app, &u);
+                        continue;
+                    }
+                    Err(crate::mailbox::client::DepositError::Canceled) => break Err(anyhow::anyhow!("canceled")),
+                    Err(e) => {
+                        log::info!("friend-send: Transfer Server couldn't take it ({}) — retrying directly", e.code());
+                        if !matches!(e, crate::mailbox::client::DepositError::NoRoute) {
+                            server_note = Some(e.to_string());
+                        }
+                        use_server = false;
+                        continue;
+                    }
+                }
+            }
+            other => break other.map(SendEnd::Direct),
+        }
+        };
         match outcome {
-            Ok(loc) => {
+            Ok(SendEnd::Held(held)) => {
+                log::info!("friend-send: held on a Transfer Server until the friend is online");
+                let mut u = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                u.state = TransferState::Held;
+                u.friend_name = Some(friend_name.clone());
+                u.bytes_total = total;
+                u.bytes_done = total;
+                u.percent = 100.0;
+                u.detail = Some(format!("Held on {} — reaches {} when they're online", held.name, friend_name));
+                emit(&app, &u);
+                crate::mailbox::client::wake();
+            }
+            Ok(SendEnd::Direct(loc)) => {
                 // Snapshot the finished card so a later "Verify copy" report is
                 // emitted on THIS card — locality badge, integrity rows and all
                 // (the verify task runs outside the integrity scope).
@@ -4960,16 +5275,28 @@ fn send_friend_inner(
             // whatever the command recorded; either way the partials stay on disk,
             // so a paused send resumes from where it stopped.
             Err(e) if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") => {
+                let reason = cleanup.take_reason(&id);
+                if matches!(reason, CancelReason::Cancel) {
+                    if let Some(config) = &hold_config {
+                        crate::mailbox::client::abandon(&cleanup, config, &chat_id);
+                    }
+                }
                 emit_stopped(
                     &app,
                     &id,
                     Direction::Send,
-                    cleanup.take_reason(&id),
+                    reason,
                     progress_high.load(Ordering::SeqCst),
                     total,
                 )
             }
-            Err(e) => emit_failed(&app, &id, Direction::Send, &e.to_string()),
+            Err(e) => {
+                let text = match &server_note {
+                    Some(note) => format!("{e} ({note})"),
+                    None => e.to_string(),
+                };
+                emit_failed(&app, &id, Direction::Send, &text)
+            }
         }
         // A finished transfer can't be paused any more (a pause raced in after the
         // send ended would otherwise linger and mislabel a later stop).
@@ -5098,6 +5425,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
         return;
     };
     let my_id = ep.id().to_string();
+    let peer_eid = inviter_endpoint_id.clone();
     let addr = dial_addr(parsed);
     let avatar = state.app.get().and_then(my_avatar_thumb_b64);
     tauri::async_runtime::spawn(async move {
@@ -5106,6 +5434,10 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
             "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_changed": true,
         });
         hello.as_object_mut().unwrap().extend(crate::link::profile(&state, &my_id).as_object().unwrap().clone());
+        let config = location_config(&state).ok();
+        if let Some(config) = &config {
+            hello["mailbox"] = crate::mailbox::hello_fields(config, ep.secret_key(), &peer_eid);
+        }
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
         {
@@ -5115,6 +5447,9 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    if let Some(config) = &config {
+                        crate::mailbox::on_hello(&state, config, &conn.remote_id().to_string(), &reply);
+                    }
                 }
             }
         }
@@ -5133,6 +5468,7 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
         return;
     };
     let my_id = ep.id().to_string();
+    let peer_eid = endpoint_id.clone();
     let addr = dial_addr(parsed);
     let avatar = state.app.get().and_then(my_avatar_thumb_b64);
     tauri::async_runtime::spawn(async move {
@@ -5141,6 +5477,10 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
             "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_changed": true,
         });
         hello.as_object_mut().unwrap().extend(crate::link::profile(&state, &my_id).as_object().unwrap().clone());
+        let config = location_config(&state).ok();
+        if let Some(config) = &config {
+            hello["mailbox"] = crate::mailbox::hello_fields(config, ep.secret_key(), &peer_eid);
+        }
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
         {
@@ -5150,6 +5490,9 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    if let Some(config) = &config {
+                        crate::mailbox::on_hello(&state, config, &conn.remote_id().to_string(), &reply);
+                    }
                 }
             }
         }
@@ -5406,6 +5749,18 @@ pub async fn send_chat(
     endpoint_id: &str,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value> {
+    send_chat_within(state, ep, endpoint_id, payload, Duration::from_secs(12)).await
+}
+
+/// `send_chat` with a caller-chosen dial budget (a short one when a Transfer
+/// Server can hold the message instead of us waiting out a sleeping peer).
+pub async fn send_chat_within(
+    state: &IrohState,
+    ep: &Endpoint,
+    endpoint_id: &str,
+    payload: serde_json::Value,
+    dial_budget: Duration,
+) -> Result<serde_json::Value> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
     let addr = dial_addr(parsed);
     // Only reuse outgoing connections: older peers may not accept streams on
@@ -5414,7 +5769,7 @@ pub async fn send_chat(
     let conn = if let Some(conn) = cached {
         conn
     } else {
-        let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
+        let conn = tokio::time::timeout(dial_budget, ep.connect(addr, ALPN))
             .await.map_err(|_| anyhow::anyhow!("chat dial timed out"))?
             .context("dial friend for chat")?;
         if let Some(st) = state.app.get().and_then(|app| app.try_state::<Arc<IrohState>>()) {
@@ -5441,7 +5796,10 @@ pub async fn send_chat(
     // Fail instead so the outbox retries (the receiver dedups by id), and forget
     // that connection so the retry dials fresh.
     match tokio::time::timeout(Duration::from_secs(10), read_frame_cap(&mut recv, 4096)).await {
-        Ok(Ok(ack)) => Ok(ack),
+        Ok(Ok(ack)) => {
+            crate::mailbox::note_seen(endpoint_id);
+            Ok(ack)
+        }
         outcome => {
             if let Ok(mut conns) = state.friend_conns.lock() {
                 if conns.get(endpoint_id).is_some_and(|c| c.conn.stable_id() == conn.stable_id()) {
@@ -5461,9 +5819,27 @@ pub async fn send_chat(
 /// protocol (seq for ordering; optional reply/gif metadata old peers ignore).
 /// Deliver to the first of a person's devices that accepts (they sync the rest).
 pub async fn send_chat_any(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value) -> Result<serde_json::Value> {
+    send_chat_any_within(state, ep, eids, payload, None).await
+}
+
+/// `send_chat_any` with a quick "is anyone there?" budget per device: used when
+/// a Transfer Server can hold the message, so an offline friend costs ~4s, not
+/// 12s per device. In that mode an iPhone unseen for 2 minutes is skipped
+/// outright (iOS suspends apps in the background; the dial can't succeed).
+pub async fn send_chat_any_within(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value, quick: Option<Duration>) -> Result<serde_json::Value> {
     let mut last = Err(anyhow::anyhow!("no reachable device"));
+    let ios: HashSet<String> = match (quick, location_config(state)) {
+        (Some(_), Ok(config)) => crate::friends::load(&config).into_iter()
+            .filter(|f| f.device_os.as_deref() == Some("ios"))
+            .filter_map(|f| f.endpoint_id).collect(),
+        _ => HashSet::new(),
+    };
     for eid in eids {
-        last = match send_chat(state, ep, eid, payload.clone()).await {
+        if quick.is_some() && ios.contains(eid) && !crate::mailbox::seen_within(eid, Duration::from_secs(120)) {
+            continue;
+        }
+        let budget = quick.unwrap_or(Duration::from_secs(12));
+        last = match send_chat_within(state, ep, eid, payload.clone(), budget).await {
             // A device that doesn't know us yet drops the message but still
             // acks it — that is not delivery; try the person's next device.
             // (A new message, not an edit/reaction on something it lacks:
@@ -5607,7 +5983,8 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
             }
             let pending = crate::chat::outbox(&config_dir);
             let ops = crate::chat::pending_ops(&config_dir);
-            if pending.is_empty() && ops.is_empty() {
+            let held = crate::chat::held(&config_dir);
+            if pending.is_empty() && ops.is_empty() && held.is_empty() {
                 idle_since = Some(mtimes);
                 continue;
             }
@@ -5617,6 +5994,7 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 backoff.get(peer).is_some_and(|(_, until)| now < *until)
             };
             let friends = crate::friends::load(&config_dir);
+            let me = ep.id().to_string();
 
             // --- Messages first, so an original lands before any op that targets it.
             // Track which of OUR messages we delivered THIS round.
@@ -5636,9 +6014,22 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                         continue;
                     }
                     let eids = crate::friends::person_endpoints(&config_dir, &peer_id);
+                    // A Transfer Server can hold messages for this person: then an
+                    // offline friend costs a quick ~4s probe, not a long dial, and
+                    // the message is sealed + left on the server instead of waiting.
+                    let holdable = crate::mailbox::client::can_hold(&config_dir, &me, &peer_id);
+                    let quick = (holdable && !crate::mailbox::client::any_live(&eids)).then_some(Duration::from_secs(4));
+                    let mut offline = false;
                     for m in msgs {
                         let payload = chat_payload(&m, &peer_id, &my_name);
-                        match send_chat_any(&state, &ep, &eids, payload).await {
+                        // Once a device didn't answer this round, the rest of this
+                        // person's queue goes straight to the server (same order).
+                        let direct = if offline {
+                            Err(anyhow::anyhow!("offline"))
+                        } else {
+                            send_chat_any_within(&state, &ep, &eids, payload.clone(), quick).await
+                        };
+                        match direct {
                             Ok(_) => {
                                 backoff.remove(&peer_id);
                                 just_delivered.insert(m.id.clone());
@@ -5652,6 +6043,26 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                                 }
                             }
                             Err(_) => {
+                                offline = true;
+                                // Don't re-deposit what a server already gave up on.
+                                let retry_server = !matches!(m.server_note.as_deref(), Some("expired" | "lost"));
+                                if holdable && retry_server {
+                                    match crate::mailbox::client::deposit_chat(&state, &config_dir, &peer_id, "chat", &payload, Some(&m.id)).await {
+                                        Ok(h) => {
+                                            if let Some(u) = crate::chat::set_held(&config_dir, &peer_id, &m.id, &h.name) {
+                                                let _ = app.emit("chat://message", &u);
+                                            }
+                                            crate::mailbox::client::wake();
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            log::info!("chat: couldn't hold a message on a Transfer Server: {}", e.code());
+                                            if let Some(u) = crate::chat::set_server_note(&config_dir, &peer_id, &m.id, crate::mailbox::client::note_for(&e).as_deref()) {
+                                                let _ = app.emit("chat://message", &u);
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(u) = crate::chat::set_status(
                                     &config_dir,
                                     &peer_id,
@@ -5672,6 +6083,24 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                             }
                         }
                     }
+                }
+            }
+
+            // --- Held messages: a Transfer Server has them, but if the friend shows
+            // up here first, hand them over directly (they dedupe by id) and remove
+            // the server copy. Only when they're visibly online — never a blind dial.
+            for m in held {
+                let eids = crate::friends::person_endpoints(&config_dir, &m.peer_id);
+                if !crate::mailbox::client::any_live(&eids) || deferred(&m.peer_id, &backoff) {
+                    continue;
+                }
+                let payload = chat_payload(&m, &m.peer_id, &my_name);
+                if send_chat_any(&state, &ep, &eids, payload).await.is_ok() {
+                    just_delivered.insert(m.id.clone());
+                    if let Some(u) = crate::chat::set_status(&config_dir, &m.peer_id, &m.id, "delivered") {
+                        let _ = app.emit("chat://message", &u);
+                    }
+                    crate::mailbox::client::delivered_directly(&state, &config_dir, &m.id);
                 }
             }
 
@@ -5696,14 +6125,18 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 if just_delivered.contains(&op.target_id) {
                     continue;
                 }
-                let target_ready =
-                    match crate::chat::message_status(&config_dir, &thread, &op.target_id) {
-                        Some(s) => matches!(s.as_str(), "delivered" | "read"),
-                        // None = the target is the PEER's own message (they authored it,
-                        // so they have it) or it aged out of our store — send anyway.
-                        None => true,
-                    };
-                if !target_ready {
+                let target_status = crate::chat::message_status(&config_dir, &thread, &op.target_id);
+                let target_ready = match target_status.as_deref() {
+                    Some(s) => matches!(s, "delivered" | "read"),
+                    // None = the target is the PEER's own message (they authored it,
+                    // so they have it) or it aged out of our store — send anyway.
+                    None => true,
+                };
+                // The target is waiting on a Transfer Server: the op follows it
+                // there (servers hand items over in order), unless the friend is
+                // online right now — then the held message goes direct first.
+                let target_held = target_status.as_deref() == Some("held") && !crate::mailbox::client::any_live(&eids);
+                if !target_ready && !target_held {
                     continue;
                 }
                 let payload = match op.kind.as_str() {
@@ -5729,6 +6162,12 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 // receiver's apply_* are idempotent, so at-least-once is safe.
                 // send_chat_any moves on to the person's next device when one
                 // answers applied:false, so Ok here means some device applied it.
+                if target_held {
+                    if crate::mailbox::client::deposit_chat(&state, &config_dir, &thread, "op", &payload, None).await.is_ok() {
+                        crate::chat::ack_op(&config_dir, &op.id);
+                    }
+                    continue;
+                }
                 if send_chat_any(&state, &ep, &eids, payload).await.is_ok() {
                     crate::chat::ack_op(&config_dir, &op.id);
                 }
@@ -5965,7 +6404,7 @@ fn parse_resume_reply(
 /// sends each file's path RELATIVE to the folder root (so `sub/a.txt` lands in
 /// `sub/a.txt`, not the folder root).
 /// A file's modified-time as whole seconds since the epoch (0 if unavailable).
-fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -6516,7 +6955,7 @@ fn unique_path(dir: &Path, name: &str) -> Result<PathBuf> {
     }
     anyhow::bail!("receive destination name space exhausted ({RECEIVE_NAME_LIMIT} candidates)")
 }
-fn publish_unique(part: &Path, natural: &Path) -> Result<PathBuf> {
+pub(crate) fn publish_unique(part: &Path, natural: &Path) -> Result<PathBuf> {
     publish_unique_limit(part, natural, RECEIVE_NAME_LIMIT)
 }
 fn publish_unique_limit(part: &Path, natural: &Path, limit: usize) -> Result<PathBuf> {
@@ -6569,7 +7008,7 @@ fn blocking_fs<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-fn ensure_parent_or_flat(dest_dir: &Path, rel: &Path) -> PathBuf {
+pub(crate) fn ensure_parent_or_flat(dest_dir: &Path, rel: &Path) -> PathBuf {
     if let Some(parent) = rel.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(dest_dir.join(parent)) {
@@ -9189,7 +9628,7 @@ pub async fn serve_pull<F: Fn(u64, u64)>(
     Ok(sent)
 }
 
-fn location_config(state: &IrohState) -> Result<PathBuf> {
+pub(crate) fn location_config(state: &IrohState) -> Result<PathBuf> {
     state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>())
         .map(|st| st.config_dir.clone()).or_else(|| state.location_config.get().cloned())
         .context("Locations are not ready")

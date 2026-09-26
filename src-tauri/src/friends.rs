@@ -1248,6 +1248,9 @@ mod tests {
                 deleted: false,
                 gif: None,
                 rev: 0,
+                held_on: None,
+                server_note: None,
+                via: None,
             },
         );
     }

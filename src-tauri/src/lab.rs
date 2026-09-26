@@ -199,6 +199,9 @@ async fn dispatch(
                 deleted: false,
                 gif: None,
                 rev: 0,
+                held_on: None,
+                server_note: None,
+                via: None,
             };
             crate::chat::append(&cfg, &msg);
             let ep = state.get().cloned().ok_or_else(|| anyhow::anyhow!("iroh not ready"))?;

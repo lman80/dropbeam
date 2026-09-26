@@ -4,8 +4,9 @@
 //! frames (dial-by-EndpointId, exactly like the folder control beacon). Each
 //! conversation is persisted per friend in `chats.json` so it survives restarts.
 //!
-//! Delivery is online-only for now: a message to an offline friend is stored
-//! locally and shown in your own thread, but there's no store-and-forward yet.
+//! A message to an offline friend is stored locally and retried by the outbox;
+//! when a Transfer Server is available it is sealed and held there instead
+//! (status "held", see `mailbox`) and delivered when the friend comes back.
 
 use std::collections::HashMap;
 use std::fs;
@@ -122,6 +123,17 @@ pub struct ChatMessage {
     /// sync (last writer wins). 0 = never changed since it was stored.
     #[serde(default)]
     pub rev: u64,
+    /// Sender side: the Transfer Server now holding this message for an offline
+    /// friend (its display name), while status is "held". Device-local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_on: Option<String>,
+    /// Sender side: why a server couldn't hold/deliver it ("expired", "full",
+    /// "unreachable", "needs_update", …) — drives the bubble's short note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_note: Option<String>,
+    /// Receiver side: the Transfer Server it arrived through ("via Linux Box").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// Stable causal order: logical seq first, then wall-clock, then id as a final
@@ -274,10 +286,119 @@ pub fn set_status(config_dir: &Path, peer_id: &str, msg_id: &str, status: &str) 
     if msg.status.as_deref() == Some(status) {
         return None;
     }
+    // Never move backwards: a late "failed" from a racing direct attempt must not
+    // undo "delivered"/"read", and must not un-hold a message a Transfer Server
+    // already has (it's no longer ours to retry).
+    let allowed = match msg.status.as_deref() {
+        Some("read") => false,
+        Some("delivered") => status == "read",
+        Some("held") => matches!(status, "delivered" | "read"),
+        _ => true,
+    };
+    if !allowed {
+        return None;
+    }
+    if matches!(status, "delivered" | "read") {
+        msg.server_note = None;
+    }
     msg.status = Some(status.to_string());
     let out = msg.clone();
     save_all(config_dir, &all);
     Some(out)
+}
+
+/// A Transfer Server now holds this undelivered message: "held" (only from
+/// sending/failed — never over a real delivery).
+pub fn set_held(config_dir: &Path, peer_id: &str, msg_id: &str, server_name: &str) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let msg = all.get_mut(peer_id)?.iter_mut().find(|m| m.id == msg_id && m.from_me)?;
+    if !matches!(msg.status.as_deref(), Some("sending") | Some("failed")) {
+        return None;
+    }
+    msg.status = Some("held".into());
+    msg.held_on = Some(server_name.to_owned());
+    msg.server_note = None;
+    let out = msg.clone();
+    save_all(config_dir, all);
+    Some(out)
+}
+
+/// A held message didn't make it through its server (expired / refused /
+/// lost): back to "failed" with a short reason, so the bubble can say so and
+/// the outbox keeps trying directly.
+pub fn set_server_failed(config_dir: &Path, peer_id: &str, msg_id: &str, note: &str) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let msg = all.get_mut(peer_id)?.iter_mut().find(|m| m.id == msg_id && m.from_me)?;
+    if !matches!(msg.status.as_deref(), Some("held") | Some("sending") | Some("failed")) {
+        return None;
+    }
+    if msg.status.as_deref() == Some("failed") && msg.server_note.as_deref() == Some(note) {
+        return None;
+    }
+    msg.status = Some("failed".into());
+    msg.server_note = Some(note.to_owned());
+    let out = msg.clone();
+    save_all(config_dir, all);
+    Some(out)
+}
+
+/// Record why a server couldn't take a still-undelivered message (no status change).
+pub fn set_server_note(config_dir: &Path, peer_id: &str, msg_id: &str, note: Option<&str>) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let msg = all.get_mut(peer_id)?.iter_mut().find(|m| m.id == msg_id && m.from_me)?;
+    if msg.server_note.as_deref() == note || matches!(msg.status.as_deref(), Some("delivered") | Some("read")) {
+        return None;
+    }
+    msg.server_note = note.map(String::from);
+    let out = msg.clone();
+    save_all(config_dir, all);
+    Some(out)
+}
+
+/// Our messages a Transfer Server is holding (candidates for a cheap direct
+/// resend when the friend shows up first), oldest first.
+pub fn held(config_dir: &Path) -> Vec<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    let mut out: Vec<ChatMessage> = store_mut(&mut cache, config_dir)
+        .values()
+        .flatten()
+        .filter(|m| m.from_me && !m.deleted && m.status.as_deref() == Some("held"))
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
+    out
+}
+
+/// Set the landed path of a received file card (server delivery), if unset.
+pub fn set_received_path(config_dir: &Path, peer_id: &str, file_xfer_id: &str, path: &str, via: Option<&str>) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let msg = all.get_mut(peer_id)?.iter_mut().find(|m| !m.from_me && m.file_xfer_id.as_deref() == Some(file_xfer_id))?;
+    let mut changed = false;
+    if msg.path.is_none() {
+        msg.path = Some(path.to_owned());
+        changed = true;
+    }
+    if msg.via.is_none() && via.is_some() {
+        msg.via = via.map(String::from);
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    let out = msg.clone();
+    save_all(config_dir, all);
+    Some(out)
+}
+
+/// A received file card for this transfer link, if we have one.
+pub fn received_file(config_dir: &Path, peer_id: &str, file_xfer_id: &str) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    store_mut(&mut cache, config_dir).get(peer_id)?
+        .iter().find(|m| !m.from_me && m.file_xfer_id.as_deref() == Some(file_xfer_id)).cloned()
 }
 
 /// The next logical sequence number for a conversation: one past the highest
@@ -556,7 +677,7 @@ pub fn has_outbox_for(config_dir: &Path, peer_ids: &[&str]) -> bool {
     peer_ids.iter().any(|peer| {
         store.get(*peer).is_some_and(|thread| {
             thread.iter().any(|m| {
-                m.from_me && !m.deleted && matches!(m.status.as_deref(), Some("sending") | Some("failed"))
+                m.from_me && !m.deleted && matches!(m.status.as_deref(), Some("sending") | Some("failed") | Some("held"))
             })
         })
     })
@@ -769,6 +890,9 @@ mod tests {
             deleted: false,
             gif: None,
             rev: 0,
+            held_on: None,
+            server_note: None,
+            via: None,
         }
     }
 

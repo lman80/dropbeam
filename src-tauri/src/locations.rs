@@ -192,7 +192,7 @@ fn canonical_missing(path: &Path) -> Result<PathBuf> {
     let name = path.file_name().context("Cannot resolve paired mirror folder")?;
     Ok(canonical_missing(parent)?.join(name))
 }
-fn validate_root(config: &Path, root: &Path) -> Result<()> {
+pub(crate) fn validate_root(config: &Path, root: &Path) -> Result<()> {
     let canonical_root = fs::canonicalize(root)?;
     let root = canonical_root.as_path();
     let config = fs::canonicalize(config)?;

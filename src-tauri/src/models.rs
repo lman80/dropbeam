@@ -35,6 +35,9 @@ pub enum TransferState {
     /// receiver, landed files on a Location), so resuming replays the same send
     /// and skips what already arrived.
     Paused,
+    /// The friend was offline, so the (end-to-end sealed) files are waiting on a
+    /// Transfer Server; a later update turns this into Completed ("Delivered").
+    Held,
 }
 
 /// Which channel the active connection is using — so the UI can tell the user

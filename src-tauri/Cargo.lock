@@ -139,6 +139,7 @@ dependencies = [
  "base64 0.22.1",
  "block2",
  "chrono",
+ "curve25519-dalek",
  "hex",
  "http-range",
  "image",

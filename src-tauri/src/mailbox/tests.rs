@@ -1,0 +1,434 @@
+//! In-process LOOPBACK tests for the Transfer Server: three real iroh
+//! endpoints (sender A, server S, recipient B) on 127.0.0.1 with relay and
+//! discovery disabled, each with its own config dir and the REAL accept loop,
+//! so every `mailbox.*` stream goes through `serve_stream` exactly as in the app.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use super::client::{self, DepositError, DepositFile, UsableServer};
+use super::{keys, seal, server};
+use crate::iroh_net::{self, IrohState};
+
+struct Node {
+    ep: iroh::Endpoint,
+    state: Arc<IrohState>,
+    config: PathBuf,
+    listener: tokio::task::JoinHandle<()>,
+}
+
+impl Node {
+    fn eid(&self) -> String {
+        self.ep.id().to_string()
+    }
+}
+
+struct World {
+    base: PathBuf,
+    a: Node,
+    s: Node,
+    b: Node,
+    /// A's thread id for B.
+    b_for_a: String,
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        for n in [&self.a, &self.s, &self.b] {
+            n.listener.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+async fn node(base: &Path, name: &str) -> Node {
+    let config = base.join(name);
+    std::fs::create_dir_all(&config).unwrap();
+    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(iroh::SecretKey::generate())
+        .alpns(vec![iroh_net::ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind_addr("127.0.0.1:0").unwrap()
+        .bind().await.unwrap();
+    iroh_net::remember_addrs_for_tests(&ep.addr());
+    let state = Arc::new(IrohState::default());
+    state.location_config.set(config.clone()).unwrap();
+    let _ = state.endpoint.set(ep.clone());
+    let listener = tokio::spawn(iroh_net::accept_loop(ep.clone(), state.clone()));
+    Node { ep, state, config, listener }
+}
+
+fn introduce(from: &Node, to: &Node) {
+    // `to` learns `from`'s signed mailbox key + advertised servers, as a hello would.
+    let fields = super::hello_fields(&from.config, from.ep.secret_key(), &to.eid());
+    keys::learn(&to.config, &from.eid(), &fields);
+}
+
+/// A, S and B are mutual friends; S is a Transfer Server open to all friends;
+/// A uses S ("Use it") and knows B's mailbox key.
+async fn world(tag: &str) -> World {
+    let base = std::env::temp_dir().join(format!("dropbeam-mbx-{tag}-{}", uuid::Uuid::new_v4()));
+    let (a, s, b) = (node(&base, "a").await, node(&base, "s").await, node(&base, "b").await);
+    let b_for_a = crate::friends::upsert_by_endpoint(&a.config, &b.eid(), "Bea").id;
+    crate::friends::upsert_by_endpoint(&b.config, &a.eid(), "Ash");
+    crate::friends::upsert_by_endpoint(&s.config, &a.eid(), "Ash");
+    crate::friends::upsert_by_endpoint(&s.config, &b.eid(), "Bea");
+    crate::friends::upsert_by_endpoint(&a.config, &s.eid(), "Box");
+    crate::friends::upsert_by_endpoint(&b.config, &s.eid(), "Box");
+    let mut c = server::ServerConfig { enabled: true, name: "Linux Box".into(), cap_bytes: 1 << 30, min_free: 1, ..Default::default() };
+    server::init_root(&s.config, &mut c).unwrap();
+    server::save_config(&s.config, &c).unwrap();
+    introduce(&b, &a);
+    // A learns what S grants it (from S's hello) and opts in.
+    let grant = server::grant_for(&s.config, &a.eid());
+    assert!(grant.is_some(), "a friend of an all-friends server is a member");
+    client::learn_grant(&a.config, &s.eid(), grant.as_ref());
+    client::set_prefs(&a.config, &s.eid(), Some(true), None, Some("seen")).unwrap();
+    World { base, a, s, b, b_for_a }
+}
+
+fn chat_frame(id: &str, text: &str) -> Value {
+    json!({"kind": "chat", "v": 2, "friendId": "x", "fromName": "Ash", "id": id, "ts": 1_700_000_000_000u64, "seq": 1, "msgKind": "text", "text": text})
+}
+
+fn server_items(w: &World) -> usize {
+    server::status(&w.s.config).items
+}
+
+async fn fetch(w: &World) -> usize {
+    tokio::time::timeout(Duration::from_secs(30), client::fetch_from(&w.b.state, &w.b.config, &w.s.eid())).await.unwrap().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_is_held_then_delivered_once_with_receipt() {
+    let w = world("chat").await;
+    let msg = uuid::Uuid::new_v4().to_string();
+    let held = client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&msg, "running 10 min late"), Some(&msg)).await.unwrap();
+    assert_eq!(held.name, "Linux Box");
+    assert_eq!(server_items(&w), 1);
+    // The server's copy is ciphertext: the text never appears on its disk.
+    let root = server::root(&w.s.config, &server::load_config(&w.s.config)).unwrap();
+    let mut on_disk = Vec::new();
+    for e in walk(&root) {
+        on_disk.extend(std::fs::read(e).unwrap_or_default());
+    }
+    assert!(!String::from_utf8_lossy(&on_disk).contains("running 10 min late"));
+
+    assert_eq!(fetch(&w).await, 1);
+    let b_thread = crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap().id;
+    let got = crate::chat::messages(&w.b.config, &b_thread);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].text, "running 10 min late");
+    assert_eq!(got[0].id, msg);
+    assert_eq!(got[0].via.as_deref(), Some("Linux Box"));
+    assert_eq!(server_items(&w), 0, "delivered items are deleted from the server");
+    // A fetch again finds nothing; the same message arriving directly dedupes.
+    assert_eq!(fetch(&w).await, 0);
+    iroh_net::apply_incoming_chat(&w.b.state, &w.b.config, &w.a.eid(), &chat_frame(&msg, "running 10 min late"), None, None);
+    assert_eq!(crate::chat::messages(&w.b.config, &b_thread).len(), 1, "direct + server copies never duplicate");
+    // A learns it was delivered.
+    let receipts = client::refresh_status(&w.a.state, &w.a.config).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].state, "delivered");
+    assert_eq!(receipts[0].sent.msg_id.as_deref(), Some(msg.as_str()));
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() { out.extend(walk(&p)); } else { out.push(p); }
+    }
+    out
+}
+
+fn write(path: &Path, len: usize, seed: u8) -> Vec<u8> {
+    let data: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, &data).unwrap();
+    data
+}
+
+fn deposit_files_of(paths: &[(PathBuf, &str)]) -> Vec<DepositFile> {
+    paths.iter().map(|(p, name)| {
+        let m = std::fs::metadata(p).unwrap();
+        DepositFile { path: p.clone(), name: (*name).into(), size: m.len(), mtime: iroh_net::mtime_secs(&m) }
+    }).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_roundtrip_multi_segment_with_empty_file_and_folder() {
+    let w = world("files").await;
+    let src = w.base.join("src");
+    let big = write(&src.join("Trip/clip.mov"), (seal::SEG as usize) * 2 + 12345, 7);
+    let small = write(&src.join("Trip/note.txt"), 11, 9);
+    write(&src.join("Trip/empty.bin"), 0, 0);
+    let files = deposit_files_of(&[(src.join("Trip/clip.mov"), "Trip/clip.mov"), (src.join("Trip/empty.bin"), "Trip/empty.bin"), (src.join("Trip/note.txt"), "Trip/note.txt")]);
+    let xfer = uuid::Uuid::new_v4().to_string();
+    let seen = Arc::new(AtomicU64::new(0));
+    let s2 = seen.clone();
+    let progress = move |d: u64, _t: u64| { s2.fetch_max(d, Ordering::SeqCst); };
+    let held = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &["Trip/Sub".into()], &["Trip".into()],
+        &progress, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+    assert_eq!(held.name, "Linux Box");
+    assert_eq!(seen.load(Ordering::SeqCst), big.len() as u64 + 11);
+    assert_eq!(fetch(&w).await, 1);
+    let dl = w.b.config.join("Downloads");
+    assert_eq!(std::fs::read(dl.join("Trip/clip.mov")).unwrap(), big);
+    assert_eq!(std::fs::read(dl.join("Trip/note.txt")).unwrap(), small);
+    assert_eq!(std::fs::metadata(dl.join("Trip/empty.bin")).unwrap().len(), 0);
+    assert!(dl.join("Trip/Sub").is_dir());
+    assert!(!walk(&dl).iter().any(|p| p.to_string_lossy().contains(".dropbeam-mbx-")), "no staging leftovers");
+    // A chat card exists on B's side, linked to the transfer.
+    let b_thread = crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap().id;
+    let card = crate::chat::received_file(&w.b.config, &b_thread, &iroh_net::incoming_chat_id(&w.a.eid(), &xfer)).unwrap();
+    assert_eq!(card.files, vec!["Trip".to_string()]);
+    assert!(card.path.is_some());
+    assert_eq!(server_items(&w), 0);
+    assert!(std::fs::read_dir(w.b.config.join("mailbox-in")).unwrap().next().is_none(), "ciphertext partial removed");
+    let r = client::refresh_status(&w.a.state, &w.a.config).await;
+    assert_eq!((r.len(), r[0].state.as_str(), r[0].sent.kind.as_str()), (1, "delivered", "file"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupted_upload_resumes_and_restart_keeps_items() {
+    let w = world("resume").await;
+    let src = w.base.join("src/big.bin");
+    let data = write(&src, (seal::SEG as usize) * 5 + 99, 3);
+    let files = deposit_files_of(&[(src.clone(), "big.bin")]);
+    let xfer = uuid::Uuid::new_v4().to_string();
+    // Cancel partway through (a pause): the deposit stops, the partial stays.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    let stop_at = seal::SEG * 2;
+    let progress = move |d: u64, _t: u64| { if d >= stop_at { c2.store(true, Ordering::SeqCst); } };
+    let r = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["big.bin".into()],
+        &progress, &|_| {}, &cancel).await;
+    assert_eq!(r.unwrap_err(), DepositError::Canceled);
+    // Server restarts (cache dropped): the partial upload is still there.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    server::unload(&w.s.config);
+    assert_eq!(server_items(&w), 1);
+    // Resume: the second run starts past what the server already has.
+    let first = Arc::new(AtomicU64::new(u64::MAX));
+    let f2 = first.clone();
+    let progress = move |d: u64, _t: u64| { let _ = f2.compare_exchange(u64::MAX, d, Ordering::SeqCst, Ordering::SeqCst); };
+    client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["big.bin".into()],
+        &progress, &|_| {}, &AtomicBool::new(false)).await.unwrap();
+    assert!(first.load(Ordering::SeqCst) > seal::SEG, "resumed instead of starting over (first progress {})", first.load(Ordering::SeqCst));
+    // Restart again before delivery: held items survive.
+    server::unload(&w.s.config);
+    assert_eq!(server_items(&w), 1);
+    assert_eq!(fetch(&w).await, 1);
+    assert_eq!(std::fs::read(w.b.config.join("Downloads/big.bin")).unwrap(), data);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quotas_pause_and_limits_refuse_cleanly() {
+    let w = world("quota").await;
+    let msg = || uuid::Uuid::new_v4().to_string();
+    // Paused.
+    let mut c = server::load_config(&w.s.config);
+    c.paused = true;
+    server::save_config(&w.s.config, &c).unwrap();
+    let m = msg();
+    let e = client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "hi"), Some(&m)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "paused"), "{e:?}");
+    // Full: a cap smaller than the file.
+    c.paused = false;
+    c.cap_bytes = 4096;
+    server::save_config(&w.s.config, &c).unwrap();
+    let src = w.base.join("src/f.bin");
+    write(&src, 100_000, 1);
+    let files = deposit_files_of(&[(src.clone(), "f.bin")]);
+    let x = msg();
+    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "full"), "{e:?}");
+    // Per-person share: a non-owner may use at most a quarter of the space.
+    c.cap_bytes = 300_000;
+    server::save_config(&w.s.config, &c).unwrap();
+    let x = msg();
+    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "user_quota"), "{e:?}");
+    // Item size limit.
+    c.cap_bytes = 1 << 30;
+    c.item_max = 50_000;
+    server::save_config(&w.s.config, &c).unwrap();
+    let x = msg();
+    let e = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &x, &x, &files, &[], &["f.bin".into()], &|_, _| {}, &|_| {}, &AtomicBool::new(false)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "too_big"), "{e:?}");
+    assert_eq!(server_items(&w), 0, "refused deposits leave nothing behind");
+    // Free-space floor: pretend the disk must keep more free than it has.
+    c.item_max = 1 << 30;
+    c.min_free = u64::MAX / 4;
+    server::save_config(&w.s.config, &c).unwrap();
+    let m = msg();
+    let e = client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "hi"), Some(&m)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "full"), "{e:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expiry_reports_back_to_the_sender() {
+    let w = world("expiry").await;
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "old news"), Some(&m)).await.unwrap();
+    // Nothing is overdue yet.
+    assert_eq!(server::gc(&w.s.config), 0);
+    server::age_all_for_tests(&w.s.config, 31 * server::DAY_MS);
+    assert_eq!(server::gc(&w.s.config), 1);
+    assert_eq!(server_items(&w), 0);
+    assert_eq!(fetch(&w).await, 0, "expired items are never delivered");
+    let r = client::refresh_status(&w.a.state, &w.a.config).await;
+    assert_eq!((r.len(), r[0].state.as_str()), (1, "expired"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn access_control_and_forgery_are_refused() {
+    let w = world("auth").await;
+    // A stranger (not S's friend) can't deposit, and gets nothing from a fetch.
+    let stranger = node(&w.base, "x").await;
+    introduce(&w.b, &stranger);
+    crate::friends::upsert_by_endpoint(&stranger.config, &w.b.eid(), "Bea");
+    client::set_server_for_tests(&stranger.config, UsableServer { eid: w.s.eid(), name: "Linux Box".into(), member: true, use_it: true, ..Default::default() });
+    let b_for_x = crate::friends::upsert_by_endpoint(&stranger.config, &w.b.eid(), "Bea").id;
+    let m = uuid::Uuid::new_v4().to_string();
+    let e = client::deposit_chat(&stranger.state, &stranger.config, &b_for_x, "chat", &chat_frame(&m, "spam"), Some(&m)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "denied"), "{e:?}");
+
+    // A member may only leave things for other members unless "send through".
+    let outsider = iroh::SecretKey::generate();
+    let outsider_x: [u8; 32] = rand::random();
+    let o_eid = outsider.public().to_string();
+    let o_thread = crate::friends::upsert_by_endpoint(&w.a.config, &o_eid, "Olly").id;
+    keys::learn(&w.a.config, &o_eid, &json!({"key": seal::b64(&seal::x25519_public(&outsider_x)), "sig": seal::sign_mailbox_key(&outsider, &seal::x25519_public(&outsider_x))}));
+    let e = client::deposit_chat(&w.a.state, &w.a.config, &o_thread, "chat", &chat_frame(&m, "hi"), Some(&m)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "recipient"), "{e:?}");
+    let mut c = server::load_config(&w.s.config);
+    let a_person = crate::friends::chat_sender(&w.s.config, &w.a.eid()).unwrap().id;
+    c.through.push(a_person.clone());
+    server::save_config(&w.s.config, &c).unwrap();
+    client::learn_grant(&w.a.config, &w.s.eid(), server::grant_for(&w.s.config, &w.a.eid()).as_ref());
+    client::deposit_chat(&w.a.state, &w.a.config, &o_thread, "chat", &chat_frame(&m, "hi"), Some(&m)).await.unwrap();
+
+    // Held for B: nobody else can list, download, ack or cancel it.
+    let m2 = uuid::Uuid::new_v4().to_string();
+    let held = client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m2, "for B only"), Some(&m2)).await.unwrap();
+    let conn = w.a.ep.connect(iroh_net::dial_addr(w.s.ep.id()), iroh_net::ALPN).await.unwrap();
+    let listed = rpc(&conn, json!({"kind": "mailbox.fetch"})).await;
+    assert!(listed["items"].as_array().unwrap().iter().all(|i| i["item_id"] != held.item_id.as_str()));
+    assert_eq!(rpc(&conn, json!({"kind": "mailbox.get", "item_id": held.item_id, "have": 0})).await["reason"], "gone");
+    let _ = rpc(&conn, json!({"kind": "mailbox.ack", "item_id": held.item_id, "ok": true})).await;
+    let xconn = stranger.ep.connect(iroh_net::dial_addr(w.s.ep.id()), iroh_net::ALPN).await.unwrap();
+    assert_eq!(rpc(&xconn, json!({"kind": "mailbox.cancel", "item_id": held.item_id})).await["ok"], false);
+    assert_eq!(server_items(&w), 2, "the through item and B's item are both still held");
+
+    // A header "from" someone other than the depositor is refused outright.
+    let forged_by = iroh::SecretKey::generate();
+    let (env, _) = seal::seal(&forged_by, &uuid::Uuid::new_v4().to_string(), "chat", 1,
+        &keys::recipients(&w.a.config, &[w.b.eid()]), b"{}", 0).unwrap();
+    let reply = rpc(&conn, json!({"kind": "mailbox.deposit", "header": env})).await;
+    assert_eq!(reply["reason"], "invalid");
+
+    // Removing A from the server deletes what A left for others.
+    server::remove_person(&w.s.config, &a_person);
+    let mut c = server::load_config(&w.s.config);
+    c.denied.push(a_person);
+    server::save_config(&w.s.config, &c).unwrap();
+    assert_eq!(server_items(&w), 0);
+    assert!(server::grant_for(&w.s.config, &w.a.eid()).is_none(), "hello stops advertising access");
+    let change = client::learn_grant(&w.a.config, &w.s.eid(), None);
+    assert!(change.revoked);
+    let e = client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m2, "again"), Some(&m2)).await.unwrap_err();
+    assert_eq!(e, DepositError::NoRoute, "a revoked server is no longer a route");
+    stranger.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tampered_or_unknown_sender_items_are_refused_by_the_recipient() {
+    let w = world("tamper").await;
+    // B doesn't know this sender: the item is refused (and deleted), never shown.
+    crate::friends::remove(&w.b.config, &crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap().id).unwrap();
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "who dis"), Some(&m)).await.unwrap();
+    assert_eq!(fetch(&w).await, 0);
+    assert_eq!(server_items(&w), 0, "refused items are removed");
+    let r = client::refresh_status(&w.a.state, &w.a.config).await;
+    assert_eq!(r[0].state, "rejected");
+    // A header whose ciphertext was altered on the server fails verification.
+    crate::friends::upsert_by_endpoint(&w.b.config, &w.a.eid(), "Ash");
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "original"), Some(&m)).await.unwrap();
+    let root = server::root(&w.s.config, &server::load_config(&w.s.config)).unwrap();
+    let header_path = walk(&root).into_iter().find(|p| p.ends_with("header.json")).unwrap();
+    let mut h: Value = serde_json::from_slice(&std::fs::read(&header_path).unwrap()).unwrap();
+    h["created_ms"] = json!(h["created_ms"].as_u64().unwrap() + 1);
+    std::fs::write(&header_path, serde_json::to_vec(&h).unwrap()).unwrap();
+    assert_eq!(fetch(&w).await, 0);
+    let b_thread = crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap().id;
+    assert!(crate::chat::messages(&w.b.config, &b_thread).iter().all(|m| m.text != "original"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_items_are_dropped_on_restart() {
+    let w = world("corrupt").await;
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "x"), Some(&m)).await.unwrap();
+    let root = server::root(&w.s.config, &server::load_config(&w.s.config)).unwrap();
+    let item = walk(&root).into_iter().find(|p| p.ends_with("item.json")).unwrap();
+    std::fs::write(&item, b"{torn").unwrap();
+    server::unload(&w.s.config);
+    assert_eq!(server_items(&w), 0);
+    assert!(!item.parent().unwrap().exists(), "unreadable items are removed, not left to rot");
+    // An unmounted/replaced storage folder fails closed.
+    std::fs::remove_file(root.join(".dropbeam-server-marker")).unwrap();
+    server::unload(&w.s.config);
+    let m = uuid::Uuid::new_v4().to_string();
+    let e = client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "x"), Some(&m)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "storage"), "{e:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recipient_inbox_server_is_preferred_and_ops_follow_messages() {
+    let w = world("route").await;
+    // B says "hold my messages on S" — A routes there first, even with its own
+    // (hypothetical) second server listed.
+    let mut b_srv = UsableServer { eid: w.s.eid(), name: "Linux Box".into(), member: true, hold_for_me: true, ..Default::default() };
+    b_srv.offer = "seen".into();
+    client::set_server_for_tests(&w.b.config, b_srv);
+    introduce(&w.b, &w.a);
+    let other = iroh::SecretKey::generate().public().to_string();
+    client::set_server_for_tests(&w.a.config, UsableServer { eid: other.clone(), name: "Other".into(), own: true, member: true, use_it: true, learned_ms: 0, ..Default::default() });
+    let routes = client::routes(&w.a.config, &w.a.eid(), &[w.b.eid()]);
+    assert_eq!(routes[0].server, w.s.eid(), "the recipient's inbox server comes first");
+    // A message, then an edit to it, both held: delivered in order, the edit applies.
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "helo"), Some(&m)).await.unwrap();
+    let edit = json!({"kind": "chat", "v": 2, "msgKind": "edit", "friendId": "x", "fromName": "Ash", "targetId": m, "text": "hello"});
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "op", &edit, None).await.unwrap();
+    assert_eq!(fetch(&w).await, 2);
+    let b_thread = crate::friends::chat_sender(&w.b.config, &w.a.eid()).unwrap().id;
+    let got = crate::chat::messages(&w.b.config, &b_thread);
+    assert_eq!((got.len(), got[0].text.as_str(), got[0].edited), (1, "hello", true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_poke_reaches_the_recipient() {
+    let w = world("notify").await;
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "poke"), Some(&m)).await.unwrap();
+    let pending = server::pending_recipients(&w.s.config);
+    assert_eq!(pending, vec![(w.b.eid(), 1)]);
+    let conn = w.s.ep.connect(iroh_net::dial_addr(w.b.ep.id()), iroh_net::ALPN).await.unwrap();
+    assert_eq!(rpc(&conn, json!({"kind": "mailbox.notify", "v": 1, "count": 1})).await["ok"], true);
+}
+
+async fn rpc(conn: &iroh::endpoint::Connection, req: Value) -> Value {
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    iroh_net::write_frame(&mut send, &req).await.unwrap();
+    send.finish().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), iroh_net::read_frame_cap(&mut recv, 1 << 20)).await.unwrap().unwrap()
+}
