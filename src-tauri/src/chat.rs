@@ -138,6 +138,11 @@ pub struct ChatMessage {
     /// got on each device ("Delivered to Alex's Mac · iPhone: waiting").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliveries: Vec<crate::fanout::Delivery>,
+    /// A link preview (#47) the SENDER's device fetched: title, description,
+    /// site and a small thumbnail travel with the message, so the receiver never
+    /// contacts the site. Older builds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_preview: Option<crate::link_preview::LinkPreview>,
 }
 
 /// Stable causal order: logical seq first, then wall-clock, then id as a final
@@ -348,6 +353,25 @@ pub fn set_server_failed(config_dir: &Path, peer_id: &str, msg_id: &str, note: &
     Some(out)
 }
 
+/// Attach the link preview our device fetched to a message we sent (#47).
+pub fn set_link_preview(config_dir: &Path, peer_id: &str, msg_id: &str, preview: crate::link_preview::LinkPreview) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    let all = store_mut(&mut cache, config_dir);
+    let msg = all.get_mut(peer_id)?.iter_mut().find(|m| m.id == msg_id && m.from_me && !m.deleted)?;
+    msg.link_preview = Some(preview);
+    // Own devices merge by rev: make the copy WITH the preview the newer one.
+    msg.rev = bump_rev(msg.rev);
+    let out = msg.clone();
+    save_all(config_dir, all);
+    Some(out)
+}
+
+/// One stored message, by id.
+pub fn message(config_dir: &Path, peer_id: &str, msg_id: &str) -> Option<ChatMessage> {
+    let mut cache = CACHE.lock().unwrap();
+    store_mut(&mut cache, config_dir).get(peer_id)?.iter().find(|m| m.id == msg_id).cloned()
+}
+
 /// Record why a server couldn't take a still-undelivered message (no status change).
 pub fn set_server_note(config_dir: &Path, peer_id: &str, msg_id: &str, note: Option<&str>) -> Option<ChatMessage> {
     let mut cache = CACHE.lock().unwrap();
@@ -501,6 +525,10 @@ pub fn apply_edit(
         .iter_mut()
         .find(|m| m.id == target_id && !m.deleted && m.from_me == author_is_me)?;
     msg.text = new_text.to_string();
+    // An edit that removes the link drops the preview of it.
+    if msg.link_preview.is_some() && crate::link_preview::first_url(&msg.text).is_none() {
+        msg.link_preview = None;
+    }
     msg.edited = true;
     msg.rev = bump_rev(msg.rev);
     let out = msg.clone();
@@ -525,6 +553,7 @@ pub fn apply_delete(
         .find(|m| m.id == target_id && m.from_me == author_is_me)?;
     msg.deleted = true;
     msg.text = String::new();
+    msg.link_preview = None;
     msg.files.clear();
     msg.path = None;
     msg.gif = None;
@@ -928,6 +957,7 @@ mod tests {
             server_note: None,
             via: None,
             deliveries: vec![],
+            link_preview: None,
         }
     }
 

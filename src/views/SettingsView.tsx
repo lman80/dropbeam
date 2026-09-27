@@ -367,6 +367,12 @@ export function SettingsView() {
           on={settings.sendReadReceipts}
           onChange={(v) => save({ sendReadReceipts: v })}
         />
+        <ToggleRow
+          title="Link previews"
+          sub="When you send a link, this device fetches a small preview and sends it along. Friends never contact the site."
+          on={settings.linkPreviews}
+          onChange={(v) => save({ linkPreviews: v })}
+        />
         <Row title="GIFs" sub="Add a free key from developers.giphy.com to turn on GIFs.">
           <input
             className="input set-field"

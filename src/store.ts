@@ -104,6 +104,7 @@ const DEFAULT_SETTINGS: Settings = {
   avatar: '',
   notifyOnMessage: true,
   sendReadReceipts: true,
+  linkPreviews: true,
   giphyApiKey: '',
   verboseLogging: false,
   showSyncPopup: true,

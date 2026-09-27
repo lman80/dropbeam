@@ -157,9 +157,21 @@ struct MessageBody: View {
                     .padding(mine ? .trailing : .leading, MessageBubbleShape.tail)
                     .accessibilityLabel("In reply to: \(quote)")
                 }
-                textBubble(message.text ?? "", tailed: lastInRun)
+                if let preview = message.linkPreview, message.replyPreview?.isEmpty != false, Self.isOnlyLink(message.text) {
+                    LinkPreviewCard(preview: preview).padding(mine ? .trailing : .leading, MessageBubbleShape.tail)
+                } else {
+                    textBubble(message.text ?? "", tailed: lastInRun)
+                    if let preview = message.linkPreview {
+                        LinkPreviewCard(preview: preview).padding(mine ? .trailing : .leading, MessageBubbleShape.tail)
+                    }
+                }
             }
         }
+    }
+    /// The message is nothing but one link: show just the card, like Messages.
+    static func isOnlyLink(_ text: String?) -> Bool {
+        let t = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !t.contains(where: \.isWhitespace) && (t.hasPrefix("https://") || t.hasPrefix("http://"))
     }
     private func textBubble(_ text: String, tailed: Bool) -> some View {
         Text(Self.attributed(text, query: query))
@@ -247,3 +259,47 @@ struct ChatBubble: View {
 }
 
 final class FrameBox { var rect: CGRect = .zero }
+
+/// #47: the preview card for a link — image, title, site. Everything in it came
+/// with the message; tapping opens the link.
+struct LinkPreviewCard: View {
+    let preview: ChatLinkPreview
+    @Environment(\.openURL) private var openURL
+    private static let cache = NSCache<NSString, UIImage>()
+    private var image: UIImage? {
+        guard let data = preview.image, data.hasPrefix("data:image/"), let comma = data.firstIndex(of: ",") else { return nil }
+        let key = NSString(string: "\(preview.url)#\(data.count)")
+        if let hit = Self.cache.object(forKey: key) { return hit }
+        guard let bytes = Data(base64Encoded: String(data[data.index(after: comma)...])), let img = UIImage(data: bytes) else { return nil }
+        Self.cache.setObject(img, forKey: key)
+        return img
+    }
+    private var host: String? {
+        if let s = preview.siteName, !s.isEmpty { return s }
+        return URL(string: preview.url)?.host()?.replacingOccurrences(of: "www.", with: "")
+    }
+    var body: some View {
+        Button { if let url = URL(string: preview.url) { openURL(url) } } label: {
+            VStack(alignment: .leading, spacing: 0) {
+                if let image {
+                    let ratio = max(1.2, (preview.imageW ?? 1.91) / max(1, preview.imageH ?? 1))
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+                        .frame(width: 260, height: min(200, 260 / ratio)).clipped()
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(preview.title ?? host ?? preview.url).font(.subheadline.weight(.semibold)).lineLimit(2)
+                        .multilineTextAlignment(.leading).foregroundStyle(Color.primary)
+                    if let host { Text(host).font(.footnote).foregroundStyle(.secondary).lineLimit(1) }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12).padding(.vertical, 9)
+            }
+            .frame(width: 260)
+            .background(ChatPalette.received)
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Link: \(preview.title ?? host ?? preview.url)")
+        .accessibilityHint("Opens the link")
+    }
+}

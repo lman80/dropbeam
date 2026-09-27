@@ -4,6 +4,7 @@ mod automation;
 mod block;
 mod codes;
 mod link;
+mod link_preview;
 mod location_sync;
 mod locations;
 mod mailbox;

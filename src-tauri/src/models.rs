@@ -294,6 +294,11 @@ pub struct Settings {
     /// iMessage/WhatsApp). On by default; turning it off stops you sending them.
     #[serde(default = "default_true")]
     pub send_read_receipts: bool,
+    /// Link previews in chat (#47): when you send a link, THIS device fetches a
+    /// small preview (title, image) and sends it with the message. Friends never
+    /// contact the site. On by default.
+    #[serde(default = "default_true")]
+    pub link_previews: bool,
     /// A free Giphy API key (developers.giphy.com) that powers GIF search in chat.
     /// Empty by default → the GIF picker shows a one-line setup prompt instead.
     /// Giphy sanctions client-side keys, so this rides in the client safely.
@@ -371,6 +376,7 @@ impl Default for Settings {
             avatar: String::new(),
             notify_on_message: true,
             send_read_receipts: true,
+            link_previews: true,
             giphy_api_key: String::new(),
             verbose_logging: false,
             show_sync_popup: true,

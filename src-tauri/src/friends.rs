@@ -1253,6 +1253,7 @@ mod tests {
                 server_note: None,
                 via: None,
                 deliveries: vec![],
+                link_preview: None,
             },
         );
     }

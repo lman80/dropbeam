@@ -58,6 +58,7 @@ let settings: Settings = {
   avatar: '',
   notifyOnMessage: true,
   sendReadReceipts: true,
+  linkPreviews: true,
   giphyApiKey: '',
   verboseLogging: false,
   showSyncPopup: true,
@@ -110,7 +111,12 @@ function seedChats() {
   mockChats.f1 = [
     msg('f1', 2 * DAY, false, 'Hey! Did the footage come through?'),
     msg('f1', 2 * DAY - MIN, true, 'Half of it — the relay was crawling. Trying again on the same Wi-Fi now'),
-    msg('f1', 3 * HOUR, false, 'Perfect. Here’s the link to the brief: https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', { reactions: [{ emoji: '👍', fromMe: true }] }),
+    msg('f1', 3 * HOUR, false, 'Perfect. Here’s the link to the brief: https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', { reactions: [{ emoji: '👍', fromMe: true }], linkPreview: {
+      url: 'https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', title: 'Spring campaign brief — goals, audience and the three hero shots', siteName: 'example.com',
+      description: 'Everything the shoot needs in one page.', imageW: 480, imageH: 252,
+      image: 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="480" height="252"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c6cf0"/><stop offset="1" stop-color="#e59ab8"/></linearGradient></defs><rect width="480" height="252" fill="url(#g)"/></svg>'),
+    } }),
+    msg('f1', 3 * HOUR - 1, true, 'https://github.com/lman80/dropbeam', { linkPreview: { url: 'https://github.com/lman80/dropbeam', title: 'lman80/dropbeam: Send files to friends, direct and private', siteName: 'GitHub' } }),
     msg('f1', 3 * HOUR - MIN, true, 'Got it', { replyTo: 'seed-f1-3', replyPreview: 'Here’s the link to the brief…', edited: true }),
     file('f1', 2 * HOUR, false, ['Beach.jpg'], 3_400_000, '/mock-media/beach.jpg', { reactions: [{ emoji: '❤️', fromMe: true }, { emoji: '❤️', fromMe: false }] }),
     file('f1', 2 * HOUR - MIN, false, ['Portrait.jpg'], 2_100_000, '/mock-media/portrait.jpg'),

@@ -1356,9 +1356,41 @@ pub async fn send_chat_message(
         server_note: None,
         via: None,
         deliveries: vec![],
+        link_preview: None,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
+    // #47: a message with a link waits (≤ 8 s) for THIS device to fetch its
+    // preview, then goes out with it. The claim keeps the outbox from sending
+    // it bare meanwhile; the bubble shows at once, the card fills in after.
+    let wants_preview = state.settings.lock().unwrap().link_previews;
+    if let Some(url) = wants_preview.then(|| crate::link_preview::first_url(&msg.text)).flatten() {
+        if let Some(claim) = crate::iroh_net::claim_chat(&msg.id) {
+            let (state, iroh, app) = (state.inner().clone(), iroh.inner().clone(), app.clone());
+            let (friend, sent) = (friend.clone(), msg.clone());
+            tauri::async_runtime::spawn(async move {
+                let preview = tokio::time::timeout(crate::link_preview::BUDGET, crate::link_preview::fetch(&url))
+                    .await
+                    .ok()
+                    .flatten();
+                let dir = state.config_dir.clone();
+                if let Some(p) = preview {
+                    if let Some(u) = chat::set_link_preview(&dir, &sent.peer_id, &sent.id, p) {
+                        let _ = app.emit("chat://message", &u);
+                    }
+                } else {
+                    log::info!("chat: no link preview for a sent link");
+                }
+                drop(claim);
+                // Deliver what's stored now (it may have been edited meanwhile).
+                let current = chat::message(&dir, &sent.peer_id, &sent.id).unwrap_or(sent);
+                if current.status.as_deref() == Some("sending") {
+                    deliver_chat(&state, &iroh, &app, &friend, &current);
+                }
+            });
+            return Ok(msg);
+        }
+    }
     deliver_chat(&state, &iroh, &app, &friend, &msg);
     // No endpoint yet → leave it "sending"; the outbox retry flushes it once the
     // friend is reachable (self-healing learns their key on first contact).
@@ -1514,6 +1546,7 @@ pub(crate) fn post_file_note(
         server_note: None,
         via: None,
         deliveries: file_xfer_id_deliveries,
+        link_preview: None,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1751,6 +1784,7 @@ pub async fn send_chat_gif(
         server_note: None,
         via: None,
         deliveries: vec![],
+        link_preview: None,
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);

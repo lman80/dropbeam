@@ -26,7 +26,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { api, fileSrc, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend, type TransferUpdate } from '../lib/api'
+import { api, fileSrc, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend, type LinkPreview, type TransferUpdate } from '../lib/api'
 import { useStore, byOrder, type FolderActivityEvent } from '../store'
 import { completedChatItems, restoredChatTransfer } from '../lib/chatTransfer'
 import { ChatTransferProgress } from '../components/ChatTransferProgress'
@@ -1311,6 +1311,33 @@ const FolderSyncRow = memo(function FolderSyncRow({
  *  message can't inject markup. The anchor NEVER navigates this webview: we
  *  preventDefault and hand the URL to the OS browser (window.open is the
  *  `vite dev` fallback, where there is no Tauri to invoke). */
+/** The preview card under a message with a link (#47). Everything in it came
+ *  with the message — nothing is fetched here. */
+function LinkCard({ p }: { p: LinkPreview }) {
+  let host = p.siteName || ''
+  if (!host) try { host = new URL(p.url).hostname.replace(/^www\./, '') } catch { /* keep blank */ }
+  const ratio = p.imageW && p.imageH ? Math.max(p.imageW / p.imageH, 1.2) : 1.91
+  return (
+    <a
+      href={p.url}
+      className="chat-linkcard"
+      rel="noopener noreferrer"
+      title={p.url}
+      onClick={(e) => {
+        e.preventDefault()
+        if (HAS_TAURI) api.openUrl(p.url).catch(() => {})
+        else window.open(p.url, '_blank', 'noopener,noreferrer')
+      }}
+    >
+      {p.image && <img className="chat-linkcard-img" src={p.image} alt="" draggable={false} style={{ aspectRatio: String(ratio) }} />}
+      <span className="chat-linkcard-text">
+        <span className="chat-linkcard-title">{p.title || host}</span>
+        {host && <span className="chat-linkcard-site truncate-1">{host}</span>}
+      </span>
+    </a>
+  )
+}
+
 function Linkified({ text }: { text: string }) {
   const parts = useMemo(() => linkify(text), [text])
   return (
@@ -1542,15 +1569,23 @@ const MessageRow = memo(function MessageRow({
   } else if (jumbo) {
     content = <div className="chat-jumbo" title={fullTime(m.ts)}>{m.text.trim()}</div>
   } else {
+    const lp = m.linkPreview
+    // A message that is ONLY the link shows just the card, like Messages.
+    const onlyLink = !!lp && !quote && /^https?:\/\/\S+$/i.test(m.text.trim())
     content = (
-      <div className={`chat-bubble${mine ? ' mine' : ''}`} title={fullTime(m.ts)}>
-        {quote && (
-          <div className="chat-quote">
-            <span className="chat-quote-text">{quote}</span>
+      <>
+        {!onlyLink && (
+          <div className={`chat-bubble${mine ? ' mine' : ''}`} title={fullTime(m.ts)}>
+            {quote && (
+              <div className="chat-quote">
+                <span className="chat-quote-text">{quote}</span>
+              </div>
+            )}
+            <span className="chat-text"><Linkified text={m.text} /></span>
           </div>
         )}
-        <span className="chat-text"><Linkified text={m.text} /></span>
-      </div>
+        {lp && <LinkCard p={lp} />}
+      </>
     )
   }
 

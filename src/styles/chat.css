@@ -474,6 +474,43 @@ html:not(.mobile) .chat-list-pane {
   box-shadow: 0 0 0 2px var(--accent);
 }
 
+/* ── Link preview card (#47) — arrives with the message, never fetched here ── */
+.chat-linkcard {
+  display: flex;
+  flex-direction: column;
+  width: 280px;
+  max-width: 100%;
+  margin-top: 2px;
+  border-radius: var(--bubble-radius);
+  overflow: hidden;
+  background: var(--bubble-in);
+  color: var(--text);
+  text-decoration: none;
+  box-shadow: inset 0 0 0 0.5px var(--border);
+  transition: filter var(--dur-fast) ease;
+}
+.chat-linkcard:hover { filter: brightness(0.97); }
+.dark .chat-linkcard:hover { filter: brightness(1.08); }
+.chat-linkcard-img {
+  display: block;
+  width: 100%;
+  max-height: 200px;
+  object-fit: cover;
+  background: var(--surface-3);
+}
+.chat-linkcard-text { display: flex; flex-direction: column; gap: 1px; padding: 7px 11px 8px; min-width: 0; }
+.chat-linkcard-title {
+  font-size: var(--text-13);
+  font-weight: 600;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.chat-linkcard-site { font-size: var(--text-11); color: var(--text-muted); }
+
 /* ── Hover actions, reactions ────────────────────────────────────────────── */
 .chat-actions {
   position: absolute;

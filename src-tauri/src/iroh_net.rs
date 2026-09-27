@@ -1297,6 +1297,12 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                 let gif: Option<crate::chat::GifMeta> =
                     req.get("gif").and_then(|g| serde_json::from_value(g.clone()).ok());
                 let is_file = msg_kind == "file" || msg_kind == "gif";
+                // #47: a preview the sender fetched — re-checked, never re-fetched.
+                let link_preview = if is_file { None } else {
+                    req.get("linkPreview")
+                        .and_then(|v| serde_json::from_value::<crate::link_preview::LinkPreview>(v.clone()).ok())
+                        .and_then(crate::link_preview::sanitize)
+                };
                 // Through a server the note can arrive before its bytes: the path
                 // is set when the file itself lands (land_server_files).
                 let path = if is_file && via.is_none() {
@@ -1333,6 +1339,7 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     server_note: None,
                     via: via.map(String::from),
                     deliveries: vec![],
+                    link_preview,
                 };
                 if crate::chat::append(config_dir, &msg) {
                     // iPhone: the push banner may already have announced it.
@@ -1426,6 +1433,7 @@ pub(crate) fn land_server_files(
             server_note: None,
             via: Some(server_name.to_owned()),
             deliveries: vec![],
+            link_preview: None,
         };
         if crate::chat::append(config, &msg) {
             changed = Some(msg);
@@ -6241,6 +6249,10 @@ pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) 
     } else {
         o.insert("msgKind".into(), serde_json::json!("text"));
         o.insert("text".into(), serde_json::json!(m.text));
+        // #47: an extra key older builds simply never read.
+        if let Some(lp) = m.link_preview.as_ref().and_then(|p| serde_json::to_value(p).ok()) {
+            o.insert("linkPreview".into(), lp);
+        }
     }
     if let Some(rt) = &m.reply_to {
         o.insert("replyTo".into(), serde_json::json!(rt));

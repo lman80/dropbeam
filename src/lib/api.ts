@@ -183,6 +183,8 @@ export interface Settings {
   notifyOnMessage: boolean
   /** Send read receipts so friends see when you've read their message. */
   sendReadReceipts: boolean
+  /** Fetch + send a preview when you send a link (#47). */
+  linkPreviews: boolean
   /** Free Giphy API key (developers.giphy.com) powering GIF search. '' = off. */
   giphyApiKey: string
   /** Detailed diagnostics logging (app + iroh internals). Applied on restart. */
@@ -295,6 +297,18 @@ export interface Friend {
   nameCustom?: boolean
 }
 
+/** A link preview the SENDER's device fetched (#47) — it travels with the
+ *  message, so the receiver never contacts the site. `image` is a data: URL. */
+export interface LinkPreview {
+  url: string
+  title?: string | null
+  description?: string | null
+  siteName?: string | null
+  image?: string | null
+  imageW?: number
+  imageH?: number
+}
+
 /** A GIF attachment on a chat message (Giphy). */
 export interface GifMeta {
   provider: string
@@ -351,6 +365,8 @@ export interface ChatMessage {
   deleted: boolean
   /** A GIF attachment — render a GIF bubble when present. */
   gif?: GifMeta | null
+  /** A link preview (#47); older builds never send one. */
+  linkPreview?: LinkPreview | null
   /** UI-only (never persisted, never on the wire): set on the SENDER's file card when
    *  the byte transfer it describes ultimately failed, so the card can offer "tap to
    *  resend" instead of implying the file arrived. Carries the failed transfer id so

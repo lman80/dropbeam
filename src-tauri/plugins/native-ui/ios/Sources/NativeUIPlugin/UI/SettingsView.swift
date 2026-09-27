@@ -62,10 +62,11 @@ struct SettingsView: View {
                 } header: { Text("Notifications") } footer: { Text("Keep DropBeam open while transferring. iOS can pause transfers in the background.") }
                 Section {
                     SettingToggle(title: "Read Receipts", symbol: "checkmark.message.fill", color: .blue, key: "sendReadReceipts", value: bridge.settings?.sendReadReceipts)
+                    SettingToggle(title: "Link Previews", symbol: "link", color: .teal, key: "linkPreviews", value: bridge.settings?.linkPreviews ?? true)
                     NavigationLink { TextSettingView(title: "GIF Search", key: "giphyApiKey", value: bridge.settings?.giphyApiKey ?? "", placeholder: "Giphy API key", footer: "Add a free key from developers.giphy.com to search GIFs in chats. Leave blank to hide the GIF button.") } label: {
                         RowLabel(title: "GIF Search", symbol: "sparkles.rectangle.stack.fill", color: .purple, value: (bridge.settings?.giphyApiKey ?? "").isEmpty ? "Off" : "On")
                     }
-                } header: { Text("Chat") } footer: { Text("Friends see when you’ve read their messages while Read Receipts is on.") }
+                } header: { Text("Chat") } footer: { Text("Friends see when you’ve read their messages while Read Receipts is on. With Link Previews, this iPhone fetches a small preview of a link you send; friends never contact the site.") }
                 TransferServersSection()
                 Section("Storage") {
                     NavigationLink { RecoverySettingsView() } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }

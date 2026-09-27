@@ -120,12 +120,24 @@ struct ChatMessage: Decodable, Identifiable, Equatable {
     var via: String?
     /// Sender side: a file sent to a friend's several devices — where it is on each.
     var deliveries: [Delivery]?
+    /// A link preview the sender's device fetched (#47); nothing is fetched here.
+    var linkPreview: ChatLinkPreview?
     var date: Date { Date(timeIntervalSince1970: ts / 1000) }
     var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? (text ?? "") : files?.joined(separator: ", ") ?? "Attachment" }
 }
 struct ChatReaction: Decodable, Equatable {
     var emoji: String?
     var fromMe: Bool?
+}
+/// #47: title / site / a small JPEG (data: URL) that came with the message.
+struct ChatLinkPreview: Decodable, Equatable {
+    var url: String
+    var title: String?
+    var description: String?
+    var siteName: String?
+    var image: String?
+    var imageW: Double?
+    var imageH: Double?
 }
 struct ChatGif: Decodable, Equatable {
     var url: String?
@@ -151,6 +163,7 @@ struct Settings: Decodable {
     var notifyOnComplete: Bool?
     var notifyOnMessage: Bool?
     var sendReadReceipts: Bool?
+    var linkPreviews: Bool?
     var directMode: Bool?
     var preferDirectP2p: Bool?
     var requireDirect: Bool?
@@ -446,6 +459,7 @@ extension ChatMessage {
         self.serverNote = (try? c.decode(String.self, forKey: BridgeKey("serverNote"))).flatMap { $0.isEmpty ? nil : $0 }
         self.via = (try? c.decode(String.self, forKey: BridgeKey("via"))).flatMap { $0.isEmpty ? nil : $0 }
         self.deliveries = (try? c.decode(LossyArray<Delivery>.self, forKey: BridgeKey("deliveries")))?.values
+        self.linkPreview = (try? c.decode(ChatLinkPreview.self, forKey: BridgeKey("linkPreview")))
     }
 }
 
@@ -495,6 +509,7 @@ extension Settings {
         self.notifyOnComplete = (try? c.decode(Bool.self, forKey: BridgeKey("notifyOnComplete")))
         self.notifyOnMessage = (try? c.decode(Bool.self, forKey: BridgeKey("notifyOnMessage")))
         self.sendReadReceipts = (try? c.decode(Bool.self, forKey: BridgeKey("sendReadReceipts")))
+        self.linkPreviews = (try? c.decode(Bool.self, forKey: BridgeKey("linkPreviews")))
         self.directMode = (try? c.decode(Bool.self, forKey: BridgeKey("directMode")))
         self.preferDirectP2p = (try? c.decode(Bool.self, forKey: BridgeKey("preferDirectP2p")))
         self.requireDirect = (try? c.decode(Bool.self, forKey: BridgeKey("requireDirect")))
