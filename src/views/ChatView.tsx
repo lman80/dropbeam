@@ -1481,14 +1481,15 @@ const MessageRow = memo(function MessageRow({
   const menuItems = (context: boolean): MenuItem[] => {
     const top: MenuItem[] = []
     if (context) top.push({ label: 'Reply', icon: <CornerUpLeft />, onSelect: () => onReply(m) })
-    if (copyable) top.push({ label: 'Copy', icon: <Copy />, onSelect: doCopy })
+    // Copy is one click on the hover bar (#68); the right-click menu keeps it too.
+    if (copyable && context) top.push({ label: 'Copy', icon: <Copy />, onSelect: doCopy })
     if (mine && m.kind === 'text' && !m.gif) top.push({ label: 'Edit', icon: <Pencil />, onSelect: () => onEdit(m) })
     const bottom: MenuItem[] = []
     if (mine) bottom.push({ label: 'Unsend', icon: <Trash2 />, danger: true, onSelect: () => void del(friend.id, m.id) })
     if (canReport) bottom.push({ label: 'Report…', icon: <Flag />, danger: true, onSelect: () => openSafety({ kind: 'report', friendId: friend.id, messageId: m.id }) })
     return [...top, ...(top.length && bottom.length ? [{ separator: true } as const] : []), ...bottom]
   }
-  const hasMenu = mine || copyable || canReport
+  const hasMenu = mine || canReport
 
   let content: ReactNode
   const jumbo = !m.deleted && !m.gif && m.kind === 'text' && !quote && isJumboEmoji(m.text)
@@ -1598,6 +1599,11 @@ const MessageRow = memo(function MessageRow({
               <IconButton size="sm" label="Reply" onClick={() => onReply(m)}>
                 <CornerUpLeft />
               </IconButton>
+              {copyable && (
+                <IconButton size="sm" label="Copy" onClick={doCopy}>
+                  <Copy />
+                </IconButton>
+              )}
               {hasMenu && (
                 <IconButton
                   size="sm"
