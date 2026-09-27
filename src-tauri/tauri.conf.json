@@ -106,7 +106,7 @@
       "icons/icon.ico"
     ],
     "iOS": {
-      "bundleVersion": "0.52.11"
+      "bundleVersion": "0.52.12"
     },
     "macOS": {
       "minimumSystemVersion": "10.15",
