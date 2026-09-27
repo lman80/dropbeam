@@ -133,7 +133,20 @@ struct ConversationView: View {
                     scrollDown(proxy, animated: loaded); loaded = !new.isEmpty
                 } else if new.count > old.count { withAnimation { unseen = true } }
             }
-            .onChange(of: bridge.chatTyping[friendID]) { _, _ in if nearBottom { scrollDown(proxy) } }
+            // The typing bubble follows like a new message (#36): scroll once it has
+            // been laid out (the change fires in the insert's own transaction, so an
+            // immediate scrollTo lands short) and again as the spring settles; the
+            // same when it goes away. `nearBottom` is read NOW — the insert itself
+            // pushes the bottom marker out of view and would flip it.
+            .onChange(of: bridge.chatTyping[friendID] == true) { _, _ in
+                guard nearBottom else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    scrollDown(proxy)
+                    try? await Task.sleep(for: .milliseconds(360))
+                    scrollDown(proxy)
+                }
+            }
             .onChange(of: viewport.height) { _, _ in if nearBottom { scrollDown(proxy, animated: false) } }
             .onChange(of: matches) { _, _ in matchIndex = 0; scrollToMatch(proxy) }
             .task {
@@ -153,6 +166,12 @@ struct ConversationView: View {
         // return to the foreground) instead of waiting on the background beacon.
         .task(id: probeRun) { await presenceLoop() }
         .task(id: probeRun) { await bridge.refreshHoldRoute(friendId: friendID) }
+        // QA (-qaTyping): the friend starts typing after 3 s and stops 4 s later.
+        .task {
+            guard CommandLine.arguments.contains("-qaTyping") else { return }
+            try? await Task.sleep(for: .seconds(3)); bridge.chatTyping[friendID] = true
+            try? await Task.sleep(for: .seconds(4)); bridge.chatTyping[friendID] = false
+        }
         .onChange(of: bridge.servers) { _, _ in Task { await bridge.refreshHoldRoute(friendId: friendID) } }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("DropBeam.mailbox://servers"))) { _ in
             Task { await bridge.refreshHoldRoute(friendId: friendID) }
