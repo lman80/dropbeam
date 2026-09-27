@@ -5906,6 +5906,13 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
             t.to_string()
         }
     };
+    // Desktop: a banner whose click opens this conversation (#67). Falls back to
+    // the plugin's plain banner where that isn't available (e.g. `tauri dev`).
+    #[cfg(desktop)]
+    if crate::chat_notify::show(app, who, &body, &msg.peer_id) {
+        log::info!("chat notification queued for {} (clickable)", msg.peer_id);
+        return;
+    }
     use tauri_plugin_notification::NotificationExt;
     // Keep the same content on every platform. Linux uses the desktop sound
     // theme's message event; "default" is the macOS notification sound name.

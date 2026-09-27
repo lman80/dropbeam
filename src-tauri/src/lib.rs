@@ -10,6 +10,8 @@ mod mailbox;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
 mod chat;
+#[cfg(desktop)]
+mod chat_notify;
 mod clipboard_files;
 mod commands;
 #[cfg(target_os = "ios")]

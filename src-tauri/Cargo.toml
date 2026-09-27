@@ -112,11 +112,17 @@ windows-core = "0.62"
 # to the installer's Start-menu AppUserModelID so chat toast notifications show).
 # `Win32_System_DataExchange`: reading copied Explorer files (CF_HDROP) for paste (#37).
 windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_DataExchange"] }
+# Clickable chat notifications (#67): a WinRT toast with an Activated handler —
+# the same crate notify-rust uses under the plugin.
+tauri-winrt-notification = "0.7"
 
 # Linux only: GTK's clipboard for copied files (text/uri-list) on paste (#37) —
 # the same gtk 0.18 Tauri/tao already link, so nothing new is built.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+# Clickable chat notifications (#67): wait for the "default" action. Same
+# notify-rust the notification plugin already builds.
+notify-rust = "4.17"
 
 [target.'cfg(unix)'.dependencies]
 # Ignore SIGPIPE at startup so closed launcher pipes return an I/O error.
@@ -138,6 +144,8 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
 block2 = "0.6"
+# Clickable chat notifications (#67): UNUserNotificationCenter + our delegate.
+objc2-user-notifications = { version = "0.3", features = ["block2", "bitflags"] }
 # Converts the popover window into a non-activating NSPanel so it can appear OVER
 # full-screen apps (a plain NSWindow can't, since Big Sur) without stealing focus
 # or hiding the Dock icon. Pinned to a v2.1 commit (objc2-based, matches our stack).
