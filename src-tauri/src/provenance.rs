@@ -4,7 +4,7 @@
 //! (and it already shows up to anything that reads xattrs). Best-effort and
 //! no-op off macOS — a failure here never affects the transfer.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn set_sender(path: &std::path::Path, sender: &str) {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_void};
@@ -44,7 +44,7 @@ pub fn set_sender(path: &std::path::Path, sender: &str) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[allow(dead_code)]
 pub fn get_sender(path: &std::path::Path) -> Option<String> {
     use std::ffi::CString;
@@ -80,10 +80,10 @@ pub fn get_sender(path: &std::path::Path) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub fn set_sender(_path: &std::path::Path, _sender: &str) {}
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
 mod tests {
     use super::*;
 

@@ -94,7 +94,14 @@ struct HistoryView: View {
                     Spacer(minLength: 6)
                     Text(entry.date.formatted(date: .omitted, time: .shortened)).font(.subheadline).foregroundStyle(.secondary)
                 }
-                Text(subtitle(entry)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                if entry.direction != "send", let from = humanPeer(entry.peer) {
+                    HStack(spacing: 6) {
+                        FromChip(name: from).layoutPriority(1)
+                        if entry.bytesTotal > 0 { Text(Formatters.bytes(entry.bytesTotal)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1) }
+                    }
+                } else {
+                    Text(subtitle(entry)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                }
                 if entry.state == "failed" {
                     Text(entry.error.map { "\(entry.direction == "send" ? "Couldn’t send" : "Couldn’t receive") — \($0)" } ?? (entry.direction == "send" ? "Couldn’t send" : "Couldn’t receive"))
                         .font(.footnote).foregroundStyle(.red).lineLimit(2)

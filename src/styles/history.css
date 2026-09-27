@@ -42,3 +42,36 @@
 .rf-items { --row-inset: 44px; }
 .rf-items .row { padding: 8px 8px 8px 12px; }
 .rf-more { color: var(--accent-text); font-size: var(--text-12); justify-content: center; min-height: 36px !important; }
+
+/* "from Alex" — who a received item came from (provenance, GitHub #12). */
+.history-sub { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.history-sub > .truncate-1 { min-width: 0; }
+.from-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 45%;
+  flex-shrink: 0;
+  padding: 1px 7px 1px 2px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: var(--text-12);
+  line-height: 16px;
+}
+.from-chip-avatar {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  overflow: hidden;
+  color: #fff;
+  font-size: 7.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.from-chip-avatar.is-device { background: transparent; color: var(--text-muted); }
+.from-chip-avatar .avatar-device { width: 12px; height: 12px; color: var(--text-muted); }

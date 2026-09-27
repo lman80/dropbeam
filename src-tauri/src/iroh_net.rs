@@ -3426,6 +3426,11 @@ async fn serve_stream_inner(
                     // Location uploads are hosted payloads, not "files sent to me".
                     if location_upload.is_none() {
                         emit_received_files(&app, &id, &paths, req.get("chatTransfer").is_some());
+                        // Provenance travels with the file (GitHub #12): stamp who
+                        // sent it, as shared-folder receives already do.
+                        if let Some(from) = sender.as_deref() {
+                            for p in &paths { crate::provenance::set_sender(p, from); }
+                        }
                     }
                     let landed_in = location_upload.as_ref().map(|u| &u.destination).unwrap_or(&dest)
                         .to_string_lossy().to_string();

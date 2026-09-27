@@ -12,6 +12,7 @@ import { Dialog } from '../components/Dialog'
 import { peerLabel } from '../lib/humanize'
 import { IntegrityDetails } from '../components/IntegrityDetails'
 import { FileIcon } from '../components/FileIcon'
+import { FromChip } from '../components/FromChip'
 import { RecoverableFilesView } from './RecoverableFilesView'
 import { formatBytes } from '../lib/format'
 
@@ -204,12 +205,15 @@ function RecentRow({ e }: { e: HistoryEntry }) {
   const ok = e.state === 'completed'
   const failed = e.state === 'failed'
 
-  if (MOBILE_UI) return <div className="ios-row"><span className="mobile-tinted-icon"><FileIcon name={e.fileNames[0] ?? ''} size={22} /></span><div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{entryTitle(e)}</h3><p className="ios-footnote">{e.peer ?? 'Peer'} · {formatBytes(e.bytesTotal)}{e.locality !== 'unknown' && ` · ${e.locality === 'internet' ? 'Relay' : 'Direct'}`} · {ok ? integrityLabel(e.integrity ?? [], e.bytesTotal, true) : e.state}</p></div>{ok && e.outDir && <button className="ios-button" aria-label={`Show ${entryTitle(e)}`} onClick={() => void api.shareFiles(e.fileNames.map(n => `${e.outDir}/${n}`)).catch(error => useStore.getState().toast('error', String(error)))}>Show<ChevronRight size={16} /></button>}</div>
+  if (MOBILE_UI) return <div className="ios-row"><span className="mobile-tinted-icon"><FileIcon name={e.fileNames[0] ?? ''} size={22} /></span><div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{entryTitle(e)}</h3><p className="ios-footnote">{e.direction === 'receive' && peerLabel(e.peer) ? <FromChip name={peerLabel(e.peer)!} /> : (peerLabel(e.peer) ?? 'Peer')} · {formatBytes(e.bytesTotal)}{e.locality !== 'unknown' && ` · ${e.locality === 'internet' ? 'Relay' : 'Direct'}`} · {ok ? integrityLabel(e.integrity ?? [], e.bytesTotal, true) : e.state}</p></div>{ok && e.outDir && <button className="ios-button" aria-label={`Show ${entryTitle(e)}`} onClick={() => void api.shareFiles(e.fileNames.map(n => `${e.outDir}/${n}`)).catch(error => useStore.getState().toast('error', String(error)))}>Show<ChevronRight size={16} /></button>}</div>
 
   const who = peerLabel(e.peer)
   const verb = e.direction === 'send' ? 'Sent' : 'Received'
+  // A received item leads with a "from Alex" chip (its provenance); the text
+  // then only needs the size and time.
+  const from = e.direction === 'receive' && who ? who : null
   const meta = [
-    who ? `${verb} ${e.direction === 'send' ? 'to' : 'from'} ${who}` : verb,
+    from ? null : who ? `${verb} to ${who}` : verb,
     e.bytesTotal > 0 ? formatBytes(e.bytesTotal) : null,
     whenLabel(e.timestampMs),
   ].filter(Boolean).join(' · ')
@@ -226,7 +230,10 @@ function RecentRow({ e }: { e: HistoryEntry }) {
       <span className="history-icon" aria-hidden><FileIcon name={e.fileNames[0] ?? ''} size={20} /></span>
       <div className="row-main">
         <div className="row-title truncate-1" title={e.fileNames.join('\n')}>{entryTitle(e)}</div>
-        <div className="row-sub truncate-1 tnum" title={meta}>{meta}</div>
+        <div className="row-sub history-sub tnum" title={from ? `Received from ${from} · ${meta}` : meta}>
+          {from && <FromChip name={from} />}
+          <span className="truncate-1">{meta}</span>
+        </div>
         <IntegrityDetails rows={e.integrity} total={e.bytesTotal} completed={ok} />
       </div>
       <div className="row-trailing history-trailing">
