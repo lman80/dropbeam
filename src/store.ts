@@ -39,6 +39,7 @@ import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
 import { parseCode, routeCode, wrongCodeMessage } from './lib/codes'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 import { MOBILE_UI } from './lib/platform'
+import { feedbackMoment } from './lib/feedback'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
 // Wire the periodic/online update re-check listeners exactly once.
@@ -510,6 +511,9 @@ const typingTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 // the MAIN window via broadcast, and that window's upsertTransfer hook must read the
 // same link to flip the card. Bounded; cleared when the transfer succeeds.
 const CHATXFER_KEY = 'dropbeam-chat-file-xfer'
+/** Friend ids from the last load; null until the first (so launch isn't "added"). */
+let knownFriendIds: Set<string> | null = null
+
 function loadChatFileXfer(): Record<string, { peerId: string; msgId: string }> {
   try {
     return JSON.parse(localStorage.getItem(CHATXFER_KEY) || '{}') as Record<
@@ -1184,6 +1188,12 @@ export const useStore = create<AppStore>((set, get) => ({
         playIncoming()
       }
     }
+    // SuperFeedback moment of value: a transfer finished while we watched it.
+    if (u.state === 'completed' && prev && prev.state !== 'completed') {
+      const chat = !!u.chatTransfer || !!loadChatFileXfer()[u.id]
+      if (chat) { if (u.direction === 'send') feedbackMoment('chat-file-delivered') }
+      else feedbackMoment(u.direction === 'send' ? 'files-sent' : 'files-received')
+    }
     // Time the transfer so we can show a final summary (duration + avg speed).
     if (u.state === 'transferring' && (!prev || prev.state !== 'transferring')) {
       transferStart.set(u.id, Date.now()) // bytes just started moving
@@ -1334,6 +1344,9 @@ export const useStore = create<AppStore>((set, get) => ({
     await get().refreshMyDevice().catch(() => {})
     const friends = await api.listFriends()
     const ids = new Set(friends.map((f) => f.id))
+    // SuperFeedback moment of value: someone new (not the first load).
+    if (knownFriendIds && friends.some((f) => !knownFriendIds!.has(f.id))) feedbackMoment('friend-added')
+    knownFriendIds = ids
     const chatOverview = (await api.listChats()).filter((o) => ids.has(o.peerId))
     set((s) => ({
       friends, chatOverview,

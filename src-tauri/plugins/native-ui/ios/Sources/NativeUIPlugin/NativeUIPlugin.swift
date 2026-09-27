@@ -66,20 +66,28 @@ class NativeUIPlugin: Plugin {
                 var feedback = SuperFeedback.Config(
                     backendURL: URL(string: "https://superfeedback.ashton-mcp-worker.workers.dev")!,
                     repo: "lman80/dropbeam", app: "DropBeam", trigger: .draggable,
-                    position: .rightCenter, accent: .beam, captureLogs: false,
+                    position: .rightCenter, accent: .beam,
+                    // No app/system log lines: DropBeam's logs carry file and friend names.
+                    captureLogs: false,
                     // Crash reports follow Settings → Diagnostics → Share Diagnostics (opt-out).
                     captureCrashes: UserDefaults.standard.object(forKey: Self.diagnosticsKey) as? Bool ?? true,
                     meta: ["version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
-                           "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""]
+                           "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""],
+                    // Ideas & roadmap tab (votes on public ideas).
+                    community: true,
+                    // TestFlight → App Store build with no In-App Purchase products: never show
+                    // the backend's Stripe link here (App Store guideline 3.1.1).
+                    support: .off,
+                    // One anonymous voter ID across the owner's apps (Keychain Sharing entitlement).
+                    keychainGroup: "superfeedback.shared"
                 )
                 // The floating button is a tester tool: on by default in TestFlight/dev
                 // builds, off for App Store users (Settings → Send Feedback always works).
                 feedback.defaultEnabled = Self.isTestBuild
-                // Rest fully on screen (a half-tucked button read as "off the frame").
-                feedback.dockedToEdge = false
-                feedback.reservedInsets = UIEdgeInsets(top: 44, left: 0, bottom: 64, right: 0) // nav bar + tab bar
+                // Fallback room for the nav bar; the tab bar is measured live by the widget.
+                feedback.reservedInsets = UIEdgeInsets(top: 44, left: 0, bottom: 64, right: 0)
                 SuperFeedback.configure(feedback)
-                SuperFeedback.setContext(["screen": Bridge.shared.selectedTab])
+                SuperFeedback.setContext(["route": Bridge.shared.selectedTab])
                 SuperFeedback.start()
             }
             #if targetEnvironment(simulator)
@@ -101,9 +109,11 @@ class NativeUIPlugin: Plugin {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { Task { try? await Bridge.shared.openChat(friendId: id) } }
             }
             // QA hook: `-feedbackCapture <seconds>` opens the feedback panel (its screenshot
-            // is also written to Documents/qa-feedback.png for inspection).
+            // is also written to Documents/qa-feedback.png for inspection); `-feedbackIdeas`
+            // opens it on the Ideas tab.
             if let i = args.firstIndex(of: "-feedbackCapture"), i + 1 < args.count, let delay = Double(args[i + 1]) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { SuperFeedback.present() }
+                let tab: SuperFeedback.Tab = args.contains("-feedbackIdeas") ? .ideas : .feedback
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { SuperFeedback.present(tab: tab) }
             }
             // QA hook: `-forceDark` renders in dark mode regardless of the simulator setting.
             if args.contains("-forceDark") { root.view.window?.overrideUserInterfaceStyle = .dark }

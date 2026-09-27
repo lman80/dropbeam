@@ -75,11 +75,20 @@ struct SettingsView: View {
                     NavigationLink { PrivacyView() } label: { RowLabel(title: "Privacy & Your Data", symbol: "hand.raised.fill", color: .blue) }
                     NavigationLink { BlockedView() } label: { RowLabel(title: "Blocked", symbol: "nosign", color: .gray, value: bridge.blocked.isEmpty ? nil : "\(bridge.blocked.count)") }
                     NavigationLink { DiagnosticsView() } label: { RowLabel(title: "Diagnostics", symbol: "waveform.path.ecg", color: .red) }
-                    ActionRow(title: "Send Feedback", symbol: "bubble.left.and.bubble.right.fill", color: .beam) { SuperFeedback.present() }
-                    IconToggle(title: "Feedback Button", symbol: "hand.tap.fill", color: .gray, isOn: Binding(get: { feedbackButton }, set: { feedbackButton = $0; SuperFeedback.setEnabled($0) }))
                     LinkRow(title: "Help & Support", symbol: "questionmark.circle.fill", color: .green, url: DropBeamLinks.support)
                     ActionRow(title: "Report a Problem", symbol: "envelope.fill", color: .orange) { contact() }
-                } header: { Text("Privacy & Support") } footer: { Text("The feedback button floats at the edge of the screen. Drag it anywhere.") }
+                } header: { Text("Privacy & Support") }
+                Section {
+                    IconToggle(title: "Show Feedback Button", symbol: "hand.tap.fill", color: .gray, isOn: Binding(get: { feedbackButton }, set: { feedbackButton = $0; SuperFeedback.setEnabled($0) }))
+                        .id("feedbackSection")
+                    ActionRow(title: "Send Feedback", symbol: "bubble.left.and.bubble.right.fill", color: .beam) { SuperFeedback.present() }
+                    ActionRow(title: "Ideas & Roadmap", symbol: "lightbulb.fill", color: .yellow) { SuperFeedback.present(tab: .ideas) }
+                    // Hidden until DropBeam has a way to take support here (none on iOS yet).
+                    SuperFeedbackSupportRow { RowLabel(title: "Support Development", symbol: "heart.fill", color: .pink).contentShape(Rectangle()) }
+                        .buttonStyle(.plain)
+                } header: { Text("Feedback") } footer: {
+                    Text("Feedback goes straight to the developer, and you can vote on what gets built next in Ideas & Roadmap. DropBeam is built with AI, so a good suggestion can ship in an update within days.")
+                }
                 Section {
                     LabeledContent("Version", value: version.isEmpty ? "…" : version)
                 } footer: {
@@ -92,6 +101,8 @@ struct SettingsView: View {
             #if targetEnvironment(simulator)
             .onAppear { if CommandLine.arguments.contains("-openSaveFolder") { qaSaveFolder = true } }
             // QA: `-scrollToServers` brings the Transfer Servers section into view.
+            // QA: `-scrollToFeedback` brings the Feedback section into view.
+            .task { if CommandLine.arguments.contains("-scrollToFeedback") { try? await Task.sleep(for: .seconds(1)); proxy.scrollTo("feedbackSection", anchor: .top) } }
             .task { if CommandLine.arguments.contains("-scrollToServers") { try? await Task.sleep(for: .seconds(1)); if CommandLine.arguments.contains("-scrollToServerPush") { proxy.scrollTo("serverNotifications", anchor: .center) } else { proxy.scrollTo("transferServersEnd", anchor: .bottom) } } }
             #endif
             .task { version = (try? await bridge.call("appVersion")) ?? ""; try? await bridge.action("myDeviceInfo") }

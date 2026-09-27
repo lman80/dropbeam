@@ -8,5 +8,10 @@
 	<array>
 		<string>group.com.ashtonmiller.dropbeam</string>
 	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.ashtonmiller.dropbeam</string>
+		<string>$(AppIdentifierPrefix)superfeedback.shared</string>
+	</array>
 </dict>
 </plist>

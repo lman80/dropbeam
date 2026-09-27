@@ -12,7 +12,7 @@ import type { LucideIcon } from 'lucide-react'
 import { isActive } from '../lib/api'
 import { useStore, type View } from '../store'
 import { FriendAvatar } from './FriendAvatar'
-import { SuperFeedback } from '../vendor/superfeedback'
+import { openFeedback, useFeedbackButton } from '../lib/feedback'
 import { avatarColor } from '../lib/avatar'
 import { IconButton } from './ui'
 
@@ -31,6 +31,7 @@ export function Sidebar() {
   const setView = useStore((s) => s.setView)
   const avatar = useStore((s) => s.settings?.avatar ?? null)
   const name = useStore((s) => s.settings?.displayName ?? '')
+  const [showFeedback] = useFeedbackButton()
   const activeCount = useStore(
     (s) => Object.values(s.transfers).filter((t) => isActive(t.state)).length,
   )
@@ -85,18 +86,21 @@ export function Sidebar() {
           </span>
         </button>
         {/* Opens the SuperFeedback panel. Not a page, so it isn't a nav item; the
-            click blurs it so no focus/selection state lingers after the panel closes. */}
-        <IconButton
-          label="Send feedback"
-          className="sidebar-feedback"
-          side="top"
-          onClick={(e) => {
-            e.currentTarget.blur()
-            SuperFeedback.open()
-          }}
-        >
-          <MessageSquarePlus strokeWidth={1.75} />
-        </IconButton>
+            click blurs it so no focus/selection state lingers after the panel closes.
+            Settings → Privacy → "Show feedback button" hides it (Send Feedback there still works). */}
+        {showFeedback && (
+          <IconButton
+            label="Send feedback"
+            className="sidebar-feedback"
+            side="top"
+            onClick={(e) => {
+              e.currentTarget.blur()
+              openFeedback()
+            }}
+          >
+            <MessageSquarePlus strokeWidth={1.75} />
+          </IconButton>
+        )}
       </div>
     </nav>
   )

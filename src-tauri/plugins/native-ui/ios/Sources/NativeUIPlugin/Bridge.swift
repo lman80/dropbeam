@@ -157,9 +157,14 @@ final class Bridge: ObservableObject {
         case "pendingSend": pendingSend = try decoder.decode(LossyArray<String>.self, from: data).values
         case "friends":
             friends = try decoder.decode(LossyArray<Friend>.self, from: data).values
+            // SuperFeedback moment of value: a new friend (not the launch snapshot).
+            if let known = knownFriends, !launching, friends.contains(where: { !known.contains($0.id) }) { SuperFeedback.moment("friend-added") }
+            knownFriends = Set(friends.map(\.id))
             PushRegistration.saveNames(friends.compactMap { f in f.endpointId.map { ($0, f.name) } })
         case "myDevice": myDevice = try decoder.decode(MyDevice?.self, from: data)
-        case "transfers": transfers = try decoder.decode(LossyArray<Transfer>.self, from: data).values
+        case "transfers":
+            transfers = try decoder.decode(LossyArray<Transfer>.self, from: data).values
+            reportTransferMoments()
         case "settings":
             settings = try decoder.decode(Settings?.self, from: data)
             if let share = settings?.shareDiagnostics {
@@ -232,6 +237,23 @@ final class Bridge: ObservableObject {
         try await NativePresentation.waitForPickerDismissal()
         if let friendId { try await sendToFriend(friendId: friendId, paths: paths) }
         else { pickedToSend = paths }
+    }
+    private var knownFriends: Set<String>?
+    /// The first seconds after launch replay stored state (friends, finished transfers) in
+    /// several snapshots: none of that is a new moment of value.
+    private let launchedAt = Date()
+    private var launching: Bool { Date().timeIntervalSince(launchedAt) < 15 }
+    /// Transfers already counted as finished; nil until the first snapshot (history, not news).
+    private var finishedTransfers: Set<String>?
+    /// SuperFeedback moments of value: files sent / received, a file delivered in a chat.
+    private func reportTransferMoments() {
+        let done = transfers.filter { $0.state == "completed" }
+        defer { finishedTransfers = (finishedTransfers ?? []).union(done.map(\.id)) }
+        guard let seen = finishedTransfers, !launching else { return }
+        for transfer in done where !seen.contains(transfer.id) {
+            if transfer.chatOnly == true { if transfer.direction == "send" { SuperFeedback.moment("chat-file-delivered") } }
+            else { SuperFeedback.moment(transfer.direction == "send" ? "files-sent" : "files-received") }
+        }
     }
     func showToast(_ message: String) {
         toast = message

@@ -12,7 +12,6 @@ struct SendView: View {
     @State private var receiving = false
     @State private var scanning = false
     @State private var adding = false
-    @State private var sendingTo: Friend?
     @FocusState private var codeFocused: Bool
     private var active: [Transfer] { bridge.sendTransfers.filter(\.active) }
     private var finished: [Transfer] { bridge.sendTransfers.filter { !$0.active } }
@@ -22,7 +21,7 @@ struct SendView: View {
                 Section { SendSourceGrid(picking: $picking, pick: pick) }
                     .clearRow(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 Section {
-                    RecipientStrip(sendingTo: $sendingTo, adding: $adding)
+                    RecipientStrip(adding: $adding, pick: pick)
                         .listRowInsets(EdgeInsets())
                         .listRowBackground(Color.clear)
                 } header: {
@@ -72,11 +71,6 @@ struct SendView: View {
             }
         }
         .sheet(isPresented: $adding) { AddFriendSheet().environmentObject(bridge) }
-        .confirmationDialog(sendingTo.map { "Send to \($0.displayName)" } ?? "", isPresented: Binding(get: { sendingTo != nil }, set: { if !$0 { sendingTo = nil } }), titleVisibility: .visible, presenting: sendingTo) { friend in
-            Button("Photos & Videos") { pick("photos", friend.id) }
-            Button("Files") { pick("files", friend.id) }
-            Button("Folder") { pick("folder", friend.id) }
-        }
     }
     private func pick(_ source: String, _ friendId: String? = nil) {
         picking = true
@@ -193,8 +187,8 @@ private struct SourcePressStyle: ButtonStyle {
 /// Tapping one picks what to send straight to them.
 private struct RecipientStrip: View {
     @EnvironmentObject private var bridge: Bridge
-    @Binding var sendingTo: Friend?
     @Binding var adding: Bool
+    let pick: (String, String?) -> Void
     @ScaledMetric(relativeTo: .caption) private var avatar: CGFloat = 58
     private var people: [Friend] {
         let all = bridge.friends.filter { $0.groupedUnder == nil }
@@ -213,7 +207,15 @@ private struct RecipientStrip: View {
     }
     private func person(_ friend: Friend) -> some View {
         let online = bridge.presence[friend.id] == true
-        return Button { sendingTo = friend; Haptics.tap() } label: {
+        // A tap opens the send menu anchored to this person (not a screen-wide dialog).
+        return Menu {
+            Section("Send to \(friend.displayName)") {
+                Button("Photos & Videos", systemImage: "photo.on.rectangle") { pick("photos", friend.id) }
+                Button("Files", systemImage: "doc") { pick("files", friend.id) }
+                Button("Folder", systemImage: "folder") { pick("folder", friend.id) }
+            }
+            if !friend.ownDevice { Button("Message", systemImage: "bubble.left") { bridge.perform { try await bridge.openChat(friendId: friend.id) } } }
+        } label: {
             VStack(spacing: 6) {
                 ContactAvatar(friend: friend, size: avatar)
                     .overlay(alignment: .bottomTrailing) {
@@ -227,14 +229,9 @@ private struct RecipientStrip: View {
                     .multilineTextAlignment(.center).lineLimit(2).frame(width: avatar + 16)
             }
         }
+        .menuStyle(.button)
         .buttonStyle(SourcePressStyle())
         .accessibilityLabel("Send to \(friend.displayName), \(online ? "online" : "offline")")
-        .contextMenu {
-            Button("Send Photos & Videos", systemImage: "photo.on.rectangle") { bridge.perform { try await bridge.pickAndSend(source: "photos", friendId: friend.id) } }
-            Button("Send Files", systemImage: "doc") { bridge.perform { try await bridge.pickAndSend(source: "files", friendId: friend.id) } }
-            Button("Send a Folder", systemImage: "folder") { bridge.perform { try await bridge.pickAndSend(source: "folder", friendId: friend.id) } }
-            if !friend.ownDevice { Button("Message", systemImage: "bubble.left") { bridge.perform { try await bridge.openChat(friendId: friend.id) } } }
-        }
     }
     private var addButton: some View {
         Button { adding = true; Haptics.tap() } label: {

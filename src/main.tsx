@@ -6,8 +6,8 @@ import { Popover } from './windows/Popover'
 import { Hud } from './windows/Hud'
 import { ReceiveCard } from './windows/ReceiveCard'
 import { api, HAS_TAURI } from './lib/api'
-import { DESKTOP_OS, MOBILE_UI } from './lib/platform'
-import { SuperFeedback } from './vendor/superfeedback'
+import { DESKTOP_OS, IS_IOS, MOBILE_UI } from './lib/platform'
+import { setFeedbackCrashReports, startFeedback } from './lib/feedback'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { useStore } from './store'
 
@@ -64,33 +64,27 @@ async function renderApp() {
 }
 void renderApp()
 
-// SuperFeedback — a floating "Send feedback" button (main window only, not the
-// popover/HUD). It screenshots the app, takes a message, and opens a GitHub
-// Issue in DropBeam's OWN repo via the user's backend Worker. Dynamically
-// imported so it never loads in the overlay windows.
-if (label === 'main') {
+// SuperFeedback (src/lib/feedback.ts): screenshots the app, takes a message, and
+// opens a GitHub Issue in DropBeam's OWN repo via the backend Worker. Main window
+// only (not the popover/HUD), and never on iOS, which runs the native widget.
+if (label === 'main' && !IS_IOS) {
   void (async () => {
     let appVersion: string | undefined
+    let shareDiagnostics = true
     if (HAS_TAURI) {
       try {
         appVersion = await (await import('@tauri-apps/api/app')).getVersion()
       } catch {
         /* version is best-effort */
       }
+      try {
+        shareDiagnostics = (await api.getSettings()).shareDiagnostics !== false
+      } catch {
+        /* default on, like the setting */
+      }
     }
-    SuperFeedback.init({
-      backendUrl: 'https://superfeedback.ashton-mcp-worker.workers.dev',
-      repo: 'lman80/dropbeam',
-      app: 'DropBeam',
-      // No floating button (it overlapped the Send control). We open the
-      // centered panel from a "Feedback" item in the left sidebar instead.
-      trigger: 'none',
-      appVersion,
-      // v1.2.0 redesign follows the system theme — match DropBeam's light/dark.
-      theme: 'auto',
-      // Default DOM-snapshot capture (no native plugin) — avoids a macOS
-      // Screen-Recording permission prompt; the webview IS the app UI.
-    })
+    startFeedback(appVersion, shareDiagnostics)
+    useStore.subscribe((s) => { if (s.settings) setFeedbackCrashReports(s.settings.shareDiagnostics !== false) })
   })()
 }
 

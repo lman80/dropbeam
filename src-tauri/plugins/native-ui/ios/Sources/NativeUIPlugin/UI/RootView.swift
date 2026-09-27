@@ -47,7 +47,7 @@ struct RootView: View {
         .preferredColorScheme(bridge.settings?.theme == "dark" ? .dark : bridge.settings?.theme == "light" ? .light : nil)
         .task { try? await bridge.nativeChatFocus(scenePhase == .active); await bridge.mailboxFetchNow() }
         .onChange(of: bridge.selectedTab) { _, tab in
-            SuperFeedback.setContext(["screen": tab])
+            SuperFeedback.setContext(["route": tab]) // sent as the report's url
             bridge.perform { try await bridge.setView(name: tab) }
         }
         .onChange(of: scenePhase) { _, phase in

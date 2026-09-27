@@ -15,6 +15,7 @@ import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
 import { TransferServerPane } from '../components/TransferServerSettings'
 import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spinner, Toggle } from '../components/ui'
+import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbackButton } from '../lib/feedback'
 
 // ── Tabs ─────────────────────────────────────────────────────────────────────
 // Settings is split into panes (like a Mac preferences window) instead of one
@@ -581,6 +582,8 @@ export function SettingsView() {
         )}
       </div>
 
+      <FeedbackSection />
+
       <SectionHeader>
         Support
           <InfoTip label="Reporting a person">
@@ -740,6 +743,45 @@ export function SettingsView() {
         {tab === 'advanced' && advanced}
       </div>
     </div>
+  )
+}
+
+/** SuperFeedback: the sidebar button toggle, Send / Ideas, and Support once the
+ *  backend has a support link (re-checked each time Settings opens). */
+function FeedbackSection() {
+  const [showButton, setShowButton] = useFeedbackButton()
+  const [supportAvailable, setSupportAvailable] = useState(false)
+  useEffect(() => {
+    let live = true
+    void fetchSupportAvailable().then((v) => { if (live && v !== null) setSupportAvailable(v) })
+    return () => { live = false }
+  }, [])
+  return (
+    <>
+      <SectionHeader>Feedback</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="Show feedback button"
+          sub="The Feedback button at the bottom of the sidebar."
+          on={showButton}
+          onChange={setShowButton}
+        />
+        <Row
+          title="Send feedback"
+          sub="Goes straight to the developer. DropBeam is built with AI, so a good suggestion can ship in an update within days."
+        >
+          <button className="btn btn-secondary" onClick={openFeedback}>Send Feedback…</button>
+        </Row>
+        <Row title="Ideas & roadmap" sub="Vote on what gets built next.">
+          <button className="btn btn-secondary" onClick={openIdeas}>Open…</button>
+        </Row>
+        {supportAvailable && (
+          <Row title="Support development" sub="Optional. Supporting unlocks nothing.">
+            <button className="btn btn-secondary" onClick={openSupport}>Support…</button>
+          </Row>
+        )}
+      </div>
+    </>
   )
 }
 

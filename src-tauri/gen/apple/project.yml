@@ -76,6 +76,10 @@ targets:
       properties:
         # Shared with the share extension (ShareJobs/, share-recipients.json).
         com.apple.security.application-groups: [group.com.ashtonmiller.dropbeam]
+        # SuperFeedback: one anonymous voter ID across the owner's apps (Keychain Sharing).
+        # The app's own group stays FIRST so it remains the default for any keychain item
+        # DropBeam writes without an explicit group (the first entry is the default).
+        keychain-access-groups: [$(AppIdentifierPrefix)com.ashtonmiller.dropbeam, $(AppIdentifierPrefix)superfeedback.shared]
         # Transfer Server push — off until the App ID has Push Notifications
         # enabled (docs/PUSH-SETUP.md; scripts/enable-push.sh flips this line).
         aps-environment: development
