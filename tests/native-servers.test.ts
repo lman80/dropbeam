@@ -36,3 +36,16 @@ test('push status coerces to calm defaults', () => {
   assert.deepEqual(nativePushStatus(null), { enabled: false, previews: true, servers: 0 })
   assert.deepEqual(nativePushStatus({ enabled: 'yes', previews: 0, servers: -3.5 }), { enabled: false, previews: true, servers: 0 })
 })
+
+test('servers shared by a friend (their own server) and the owner’s share question', () => {
+  const list = nativeServerList([
+    { eid: 'box', name: 'Linux Box', member: true, offer: 'new', via: ['ash-mac', 7], viaPeer: 'f1', viaName: ' Ashton ' },
+    { eid: 'mine', name: 'Linux Box', owner: true, shareFriends: true, offer: 'share', access: 'all' },
+    { eid: 'fake', shareFriends: true },
+  ])
+  assert.deepEqual([list[0].via, list[0].viaPeer, list[0].viaName, list[0].owner], [['ash-mac'], 'f1', 'Ashton', false])
+  assert.deepEqual([list[1].owner, list[1].shareFriends, list[1].offer, list[1].access], [true, true, 'share', 'all'])
+  assert.equal(list[2].shareFriends, false, 'only an owned server can be shared')
+  assert.deepEqual(serverPrefsArgs({ eid: 'mine', shareFriends: true }).prefs, { shareFriends: true, offer: 'seen' })
+  assert.throws(() => serverPrefsArgs({ eid: 'mine', offer: 'share' }))
+})

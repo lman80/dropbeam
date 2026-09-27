@@ -22,6 +22,7 @@ import { linkWithCode } from '../components/LinkDeviceModal'
 import { nativeReportMail, REPORT_REASONS, contactMailto, REPORT_EMAIL } from './report'
 import { serverApi, decideFile, type UsableServer, type PendingFile } from './transferServer'
 import { nativeServerList, nativePendingFiles, nativePushStatus, serverPrefsArgs } from './nativeServers'
+import { lookAlikeGroups, lookAlikesOf, refreshLookAlikes } from './lookAlike'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
@@ -431,7 +432,10 @@ const friendSnapshot = (friends: Friend[], accountPub?: string | null) => {
   const own = friends.filter(f => accountPub && f.accountPub === accountPub)
   const labels = ownDeviceLabels(own)
   const groups = personGroups(friends, accountPub)
-  return friends.map(({ secret: _secret, ...friend }) => ({ ...friend, ownDevice: friend.id in labels, ownLabel: labels[friend.id] ?? null, groupedUnder: groups[friend.id] ?? null }))
+  const alike = lookAlikeGroups()
+  return friends.map(({ secret: _secret, ...friend }) => ({ ...friend, ownDevice: friend.id in labels, ownLabel: labels[friend.id] ?? null, groupedUnder: groups[friend.id] ?? null,
+    // Other contacts this one might be (same name/photo, not linked): a hint only.
+    lookAlikeWith: lookAlikesOf(alike, friend.id).map(x => x.name) }))
 }
 /** Presence per friend; a person reads online when ANY of their devices is. */
 const presenceSnapshot = (s: ReturnType<typeof st>) => {
@@ -639,8 +643,9 @@ async function start() {
   try { stops.push(await listen('mailbox://servers', ({ payload }) => { void refreshServers(); send('event', { name: 'mailbox://servers', payload: payload ?? null }) })) } catch { /* optional event */ }
   try { stops.push(await listen('mailbox://pending', () => { void refreshPending() })) } catch { /* optional event */ }
   for (const name of ['friends://changed', 'account://synced', 'link://linked']) {
-    try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
+    try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}); void refreshLookAlikes().then(() => resnapshot?.()) })) } catch { /* store also refreshes */ }
   }
+  void refreshLookAlikes().then(() => resnapshot?.())
   for (const name of ['link://linked', 'account://left', 'link://failed', 'link://progress']) {
     try { stops.push(await listen(name, ({ payload }) => send('event', { name, payload }))) } catch { /* optional event */ }
   }

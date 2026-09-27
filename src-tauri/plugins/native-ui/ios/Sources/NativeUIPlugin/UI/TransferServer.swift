@@ -194,6 +194,97 @@ struct ServerExplainerSheet: View {
 
 /// The one-time card in a friend's thread when they share their Transfer Server.
 struct ServerOfferCard: View {
+    let server: UsableServer
+    let friendName: String
+    var body: some View {
+        if server.offer == "share" {
+            ShareOwnServerCard(server: server)
+        } else if !server.via.isEmpty {
+            OwnersServerCard(server: server, ownerName: server.viaName.map(ServerCopy.firstName) ?? friendName)
+        } else {
+            FriendServerCard(server: server, friendName: friendName)
+        }
+    }
+}
+
+/// A calm card: a title, one line, two buttons.
+private struct PlainOfferCard: View {
+    let title: String
+    let detail: String
+    let action: String
+    let busy: Bool
+    let answer: (Bool) -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "server.rack").font(.title3).foregroundStyle(.secondary)
+                    .frame(width: 28).accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.headline).fixedSize(horizontal: false, vertical: true)
+                    Text(detail).font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 10) {
+                Button { answer(false) } label: { Text("Not Now").frame(maxWidth: .infinity) }.beamButton()
+                Button { answer(true) } label: { Text(action).frame(maxWidth: .infinity) }.beamButton(prominent: true)
+            }
+            .controlSize(.large).disabled(busy)
+        }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("chat.serverOffer")
+    }
+}
+
+/// A friend's own server: it can hold this user's messages while they're offline.
+private struct OwnersServerCard: View {
+    @EnvironmentObject private var bridge: Bridge
+    let server: UsableServer
+    let ownerName: String
+    @State private var busy = false
+    var body: some View {
+        PlainOfferCard(title: "\(ownerName)’s \(server.name) can hold your messages when you’re offline",
+                       detail: "They wait there, locked, until you’re back.", action: "Turn On", busy: busy) { on in
+            busy = true
+            bridge.perform {
+                defer { busy = false }
+                if on {
+                    try await bridge.setServerPrefs(eid: server.eid, useIt: true, holdForMe: true, offer: "seen")
+                    Haptics.success(); bridge.showToast("\(server.name) will hold your messages")
+                } else {
+                    try await bridge.setServerPrefs(eid: server.eid, offer: "dismissed")
+                }
+            }
+        }
+    }
+}
+
+/// The owner's own device: may their friends use it? (Asked once.)
+private struct ShareOwnServerCard: View {
+    @EnvironmentObject private var bridge: Bridge
+    let server: UsableServer
+    @State private var busy = false
+    var body: some View {
+        PlainOfferCard(title: "\(server.name) is set up as your Transfer Server",
+                       detail: "Share it with your friends? They can leave messages for you there when you’re offline, and it holds theirs until they’re back. It can’t read any of it.",
+                       action: "Share", busy: busy) { share in
+            busy = true
+            bridge.perform {
+                defer { busy = false }
+                if share {
+                    try await bridge.setServerPrefs(eid: server.eid, offer: "seen", shareFriends: true)
+                    Haptics.success(); bridge.showToast("Your friends can use \(server.name)")
+                } else {
+                    try await bridge.setServerPrefs(eid: server.eid, offer: "dismissed")
+                }
+            }
+        }
+    }
+}
+
+/// A friend's server that already lets us in (we're its friend).
+private struct FriendServerCard: View {
     @EnvironmentObject private var bridge: Bridge
     let server: UsableServer
     let friendName: String
@@ -247,6 +338,16 @@ struct TransferServersSection: View {
             }
             ForEach(bridge.servers) { server in
                 row(server)
+                if server.owner && !server.own && !server.revoked && server.access != "me" {
+                    Toggle(isOn: Binding(get: { server.shareFriends }, set: { on in
+                        bridge.perform { try await bridge.setServerPrefs(eid: server.eid, shareFriends: on) }
+                    })) {
+                        Text("Let My Friends Use It").padding(.leading, 44)
+                            .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] + 44 }
+                    }
+                    .tint(.green)
+                    .accessibilityLabel("Let my friends use \(server.name)")
+                }
                 if !server.own && !server.revoked && server.useIt {
                     Toggle(isOn: Binding(get: { server.holdForMe }, set: { on in
                         bridge.perform { try await bridge.setServerPrefs(eid: server.eid, holdForMe: on) }

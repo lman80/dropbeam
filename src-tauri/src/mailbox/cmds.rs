@@ -235,6 +235,14 @@ pub async fn server_remove_person(app: AppHandle, state: State<'_, Arc<AppState>
         if !c.denied.contains(&person_id) {
             c.denied.push(person_id.clone());
         }
+        if person_id.starts_with("v:") {
+            for e in super::members::devices_of(&config, &c, &person_id) {
+                let d = format!("e:{e}");
+                if !c.denied.contains(&d) {
+                    c.denied.push(d);
+                }
+            }
+        }
         c.allowed.retain(|p| p != &person_id);
         c.through.retain(|p| p != &person_id);
         server::save_config(&config, &c).map_err(|e| e.to_string())?;
@@ -254,6 +262,10 @@ pub async fn server_restore_person(app: AppHandle, state: State<'_, Arc<AppState
     let status = tokio::task::spawn_blocking(move || -> Result<server::ServerStatus, String> {
         let mut c = server::load_config(&config);
         c.denied.retain(|p| p != &person_id);
+        if person_id.starts_with("v:") {
+            let devices: Vec<String> = super::members::devices_of(&config, &c, &person_id).into_iter().map(|e| format!("e:{e}")).collect();
+            c.denied.retain(|p| !devices.contains(p));
+        }
         if c.access == "chosen" && !c.allowed.contains(&person_id) {
             c.allowed.push(person_id);
         }
@@ -304,23 +316,25 @@ pub async fn server_disable(app: AppHandle, state: State<'_, Arc<AppState>>, net
 /// Servers this device may use (own + shared by friends).
 #[tauri::command]
 pub fn mailbox_servers(state: State<'_, Arc<AppState>>) -> Vec<client::UsableServer> {
-    client::servers(&state.config_dir)
+    client::servers_view(&state.config_dir)
 }
 
 /// The user's choice about a server: use it for sending, hold my messages
 /// there, or dismiss the offer.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn mailbox_server_prefs(app: AppHandle, state: State<'_, Arc<AppState>>, net: State<'_, Arc<IrohState>>,
-    eid: String, use_it: Option<bool>, hold_for_me: Option<bool>, offer: Option<String>) -> Result<Vec<client::UsableServer>, String> {
-    let before = client::my_inbox(&state.config_dir);
-    client::set_prefs(&state.config_dir, &eid, use_it, hold_for_me, offer.as_deref())?;
+    eid: String, use_it: Option<bool>, hold_for_me: Option<bool>, offer: Option<String>, share_friends: Option<bool>) -> Result<Vec<client::UsableServer>, String> {
+    let before = (client::my_inbox(&state.config_dir), client::my_shared(&state.config_dir));
+    client::set_prefs_full(&state.config_dir, &eid, use_it, hold_for_me, offer.as_deref(), share_friends)?;
     let _ = app.emit("mailbox://servers", ());
-    if client::my_inbox(&state.config_dir) != before {
-        // Friends learn where to leave things for us.
+    if (client::my_inbox(&state.config_dir), client::my_shared(&state.config_dir)) != before {
+        // Friends learn where to leave things for us (and which of our servers
+        // they may use).
         crate::iroh_net::broadcast_profile(app.clone(), net.inner().clone());
     }
     client::wake();
-    Ok(client::servers(&state.config_dir))
+    Ok(client::servers_view(&state.config_dir))
 }
 
 /// Stop using a server we were offered.
@@ -329,7 +343,36 @@ pub fn mailbox_forget_server(app: AppHandle, state: State<'_, Arc<AppState>>, ne
     client::forget(&state.config_dir, &eid);
     let _ = app.emit("mailbox://servers", ());
     crate::iroh_net::broadcast_profile(app.clone(), net.inner().clone());
-    client::servers(&state.config_dir)
+    client::servers_view(&state.config_dir)
+}
+
+/// Who owns this server (a server that isn't linked to an account): one of the
+/// accounts its friends proved, or "" for nobody. The owner's devices manage it
+/// and may share it with the owner's friends.
+#[tauri::command]
+pub async fn server_set_owner(app: AppHandle, state: State<'_, Arc<AppState>>, net: State<'_, Arc<IrohState>>, account: String) -> Result<server::ServerStatus, String> {
+    let config = state.config_dir.clone();
+    let status = tokio::task::spawn_blocking(move || -> Result<server::ServerStatus, String> {
+        if crate::account::my_pub(&config).is_some() {
+            return Err("This computer belongs to your account, so it's already yours.".into());
+        }
+        let account = account.trim().to_owned();
+        if !account.is_empty() && !server::owner_choices(&config).iter().any(|o| o.account == account) {
+            return Err("That person isn't one of this computer's friends any more.".into());
+        }
+        let mut c = server::load_config(&config);
+        if c.owner_account != account {
+            c.owner_account = account;
+            server::save_config(&config, &c).map_err(|e| e.to_string())?;
+            // A different owner: what the previous one vouched for no longer counts.
+            super::members::clear(&config);
+        }
+        Ok(server::status(&config))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    changed(&app, net.inner());
+    Ok(status)
 }
 
 /// Pull anything held for us right now (app foregrounded / pulled to refresh).

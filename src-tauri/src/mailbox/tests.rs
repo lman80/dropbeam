@@ -1072,3 +1072,271 @@ async fn a_phone_online_at_deposit_is_woken_once_when_it_stops_answering() {
     super::push::on_unreachable(&w.s.config, &w.b.eid());
     assert_eq!(wakes_for(&w.b.eid()).len(), 1, "only once per item");
 }
+
+// ── the owner's friends may use the owner's server ──────────────────────────
+
+/// O = the owner's phone (in an account), S = the owner's Transfer Server (NOT
+/// linked; owned by O's account, friends only with O), F = a friend of O who
+/// has never met S.
+struct OwnerWorld {
+    base: PathBuf,
+    o: Node,
+    s: Node,
+    f: Node,
+    account_key: iroh::SecretKey,
+    /// F's thread for O / O's thread for F.
+    o_on_f: String,
+    f_on_o: String,
+}
+
+impl Drop for OwnerWorld {
+    fn drop(&mut self) {
+        for n in [&self.o, &self.s, &self.f] {
+            n.listener.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+/// `who` proves `key`'s account to `to` (the signed hello field).
+fn prove_account(to: &Node, who: &str, key: &iroh::SecretKey) {
+    crate::friends::apply_device_hello(&to.config, who, &json!({"device_kind": "phone", "device_os": "ios",
+        "account_pub": hex::encode(key.public().as_bytes()),
+        "account_sig": hex::encode(key.sign(who.as_bytes()).to_bytes())}));
+}
+
+async fn owner_world(tag: &str) -> OwnerWorld {
+    let base = std::env::temp_dir().join(format!("dropbeam-mbx-own-{tag}-{}", uuid::Uuid::new_v4()));
+    let (o, s, f) = (node(&base, "o").await, node(&base, "s").await, node(&base, "f").await);
+    let account_key = iroh::SecretKey::generate();
+    crate::link::adopt_key_for_tests(&o.config, &account_key);
+    let account = crate::link::account_pub(&o.config).unwrap();
+    // S knows only O (and O proved its account); O and F are friends.
+    crate::friends::upsert_by_endpoint(&s.config, &o.eid(), "Ashton");
+    prove_account(&s, &o.eid(), &account_key);
+    crate::friends::upsert_by_endpoint(&o.config, &s.eid(), "Linux Box");
+    let f_on_o = crate::friends::upsert_by_endpoint(&o.config, &f.eid(), "Fay").id;
+    let o_on_f = crate::friends::upsert_by_endpoint(&f.config, &o.eid(), "Ashton").id;
+    let mut c = server::ServerConfig { enabled: true, name: "Linux Box".into(), cap_bytes: 1 << 30, min_free: 1,
+        owner_account: account, ..Default::default() };
+    server::init_root(&s.config, &mut c).unwrap();
+    server::save_config(&s.config, &c).unwrap();
+    OwnerWorld { base, o, s, f, account_key, o_on_f, f_on_o }
+}
+
+fn server_of<'a>(list: &'a [UsableServer], eid: &str) -> Option<&'a UsableServer> {
+    list.iter().find(|s| s.eid == eid)
+}
+
+/// O learns S is its own server and says yes to sharing it; F hears about it
+/// from O's hello.
+async fn owner_shares(w: &OwnerWorld) {
+    let grant = server::grant_for(&w.s.config, &w.o.eid()).expect("the owner's device is told");
+    assert_eq!(grant["owner"], true);
+    client::learn_grant(&w.o.config, &w.s.eid(), Some(&grant), false);
+    let mine = client::servers(&w.o.config);
+    let entry = server_of(&mine, &w.s.eid()).unwrap();
+    assert!(entry.owner && !entry.use_it && !entry.hold_for_me, "a server's 'you own me' changes nothing by itself: {entry:?}");
+    assert_eq!(entry.offer, "share", "the owner is asked once whether friends may use it");
+    // Nothing is told to friends (or used as our inbox) before the owner says yes.
+    let fields = super::hello_fields(&w.o.config, w.o.ep.secret_key(), &w.f.eid());
+    assert!(fields.get("shared").is_none());
+    assert_eq!(fields["inbox"], json!([]));
+    client::set_prefs_full(&w.o.config, &w.s.eid(), None, None, Some("seen"), Some(true)).unwrap();
+    let entry = client::servers(&w.o.config).into_iter().find(|s| s.eid == w.s.eid()).unwrap();
+    assert!(entry.use_it && entry.hold_for_me && entry.share_friends, "yes = it's ours: {entry:?}");
+    // F and O swap hellos (keys, inbox servers, and now "shared").
+    introduce(&w.o, &w.f);
+    introduce(&w.f, &w.o);
+    assert_eq!(keys::peers(&w.f.config)[&w.o.eid()].shared.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_friend_of_the_owner_gets_the_offer_can_deposit_and_register_push() {
+    let w = owner_world("offer").await;
+    owner_shares(&w).await;
+    // Before O told S who its friends are, S turns F down and F shows nothing.
+    assert!(!client::check_introduced(&w.f.state, &w.f.config).await);
+    assert!(client::servers(&w.f.config).is_empty(), "no offer until the server agrees");
+    // O's device vouches for its friends.
+    assert!(client::push_members(&w.o.state, &w.o.config).await);
+    let c = server::load_config(&w.s.config);
+    assert!(server::rights_for(&w.s.config, &c, &w.f.eid()).member);
+    assert!(!client::push_members(&w.o.state, &w.o.config).await, "nothing new → nothing sent");
+    // F asks S and gets a one-time offer, labeled with who shared it.
+    client::recheck_introduced(&w.s.eid());
+    assert!(client::check_introduced(&w.f.state, &w.f.config).await);
+    let view = client::servers_view(&w.f.config);
+    let entry = server_of(&view, &w.s.eid()).unwrap();
+    assert!(entry.member && !entry.owner && !entry.through && !entry.revoked, "{entry:?}");
+    assert_eq!(entry.offer, "new");
+    assert_eq!(entry.via, vec![w.o.eid()]);
+    assert_eq!(entry.via_peer.as_deref(), Some(w.o_on_f.as_str()));
+    assert_eq!(entry.via_name.as_deref(), Some("Ashton"));
+    // The owner's page lists F (vouched), even with nothing held yet.
+    let st = server::status(&w.s.config);
+    assert!(st.people.iter().any(|p| p.name == "Fay" && p.via_owner), "{:?}", st.people);
+    assert_eq!(st.owner.as_ref().map(|o| o.sharing), Some(1));
+
+    // "Turn On": hold my messages there too → registers push.
+    client::set_prefs(&w.f.config, &w.s.eid(), Some(true), Some(true), Some("seen")).unwrap();
+    assert!(client::push_register(&w.f.ep, &w.s.eid(), &seal::b64(b"sealed-apns-token")).await, "a vouched friend may register for push");
+
+    // F → O while O is offline: held on O's own server, O picks it up.
+    introduce(&w.o, &w.f);
+    let m = uuid::Uuid::new_v4().to_string();
+    let held = client::deposit_chat(&w.f.state, &w.f.config, &w.o_on_f, "chat", &chat_frame(&m, "see you at 8"), Some(&m)).await.unwrap();
+    assert_eq!(held.server, w.s.eid());
+    let got = tokio::time::timeout(Duration::from_secs(30), client::fetch_from(&w.o.state, &w.o.config, &w.s.eid())).await.unwrap().unwrap();
+    assert_eq!(got, 1);
+    assert_eq!(crate::chat::messages(&w.o.config, &w.f_on_o)[0].text, "see you at 8");
+
+    // O → F while F is offline: held on the same server (F's inbox now).
+    introduce(&w.f, &w.o);
+    let m2 = uuid::Uuid::new_v4().to_string();
+    let held = client::deposit_chat(&w.o.state, &w.o.config, &w.f_on_o, "chat", &chat_frame(&m2, "ok!"), Some(&m2)).await.unwrap();
+    assert_eq!(held.server, w.s.eid());
+    let got = tokio::time::timeout(Duration::from_secs(30), client::fetch_from(&w.f.state, &w.f.config, &w.s.eid())).await.unwrap().unwrap();
+    assert_eq!(got, 1);
+    assert_eq!(crate::chat::messages(&w.f.config, &w.o_on_f).iter().filter(|m| m.text == "ok!").count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strangers_and_friends_cannot_vouch_or_use_the_owners_server() {
+    let w = owner_world("stranger").await;
+    owner_shares(&w).await;
+    assert!(client::push_members(&w.o.state, &w.o.config).await);
+    // A stranger: no deposit, no hello, no push registration.
+    let x = node(&w.base, "x").await;
+    crate::friends::upsert_by_endpoint(&x.config, &w.o.eid(), "Ashton");
+    introduce(&w.o, &x);
+    client::set_server_for_tests(&x.config, UsableServer { eid: w.s.eid(), name: "Linux Box".into(), member: true, use_it: true, ..Default::default() });
+    let o_on_x = crate::friends::chat_sender(&x.config, &w.o.eid()).unwrap().id;
+    let m = uuid::Uuid::new_v4().to_string();
+    let e = client::deposit_chat(&x.state, &x.config, &o_on_x, "chat", &chat_frame(&m, "spam"), Some(&m)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "denied"), "{e:?}");
+    assert!(matches!(client::server_hello_reply(&x.ep, &w.s.eid()).await, client::HelloReply::Refused));
+    assert!(!client::push_register(&x.ep, &w.s.eid(), &seal::b64(b"t")).await);
+    // Nobody but the owner's devices may say who the owner's friends are: not a
+    // stranger, not a vouched friend, not someone who merely CLAIMS the account.
+    let forged = json!({"kind": "mailbox.members", "people": [{"key": x.eid(), "name": "X", "devices": [{"eid": x.eid(), "since": 1}]}],
+        "account_pub": crate::link::account_pub(&w.o.config).unwrap()});
+    for n in [&x, &w.f] {
+        let conn = n.ep.connect(iroh_net::dial_addr(w.s.ep.id()), iroh_net::ALPN).await.unwrap();
+        assert_eq!(rpc(&conn, forged.clone()).await["reason"], "denied");
+    }
+    let c = server::load_config(&w.s.config);
+    assert!(!server::rights_for(&w.s.config, &c, &x.eid()).any());
+    // The account isn't proven by a claim: a hello with a bad signature changes nothing.
+    crate::friends::upsert_by_endpoint(&w.s.config, &x.eid(), "Mallory");
+    crate::friends::apply_device_hello(&w.s.config, &x.eid(), &json!({"device_os": "ios",
+        "account_pub": crate::link::account_pub(&w.o.config).unwrap(), "account_sig": hex::encode([0u8; 64])}));
+    assert!(!server::rights_for(&w.s.config, &c, &x.eid()).owner);
+    x.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_blocked_and_denied_friends_of_the_owner_lose_access() {
+    let w = owner_world("revoke").await;
+    owner_shares(&w).await;
+    // A second friend G, and a second owner device O2 later removed from the account.
+    let g = iroh::SecretKey::generate().public().to_string();
+    crate::friends::upsert_by_endpoint(&w.o.config, &g, "Gil");
+    assert!(client::push_members(&w.o.state, &w.o.config).await);
+    let c = server::load_config(&w.s.config);
+    assert!(server::rights_for(&w.s.config, &c, &w.f.eid()).member);
+    assert!(server::rights_for(&w.s.config, &c, &g).member);
+    client::recheck_introduced(&w.s.eid());
+    client::check_introduced(&w.f.state, &w.f.config).await;
+    assert!(server_of(&client::servers(&w.f.config), &w.s.eid()).is_some_and(|s| s.usable()));
+
+    // O blocks G: G is out on the server at the next list.
+    let g_id = crate::friends::chat_sender(&w.o.config, &g).unwrap().id;
+    crate::block::block_friend(&w.o.config, &g_id).unwrap();
+    assert!(client::push_members(&w.o.state, &w.o.config).await);
+    assert!(!server::rights_for(&w.s.config, &c, &g).any(), "blocked by the owner = no access");
+
+    // O removes F: F can't deposit any more, and its app shows the server as gone.
+    let f_rec = crate::friends::get(&w.o.config, &w.f_on_o).unwrap();
+    crate::account::record_friend_removed(&w.o.config, &f_rec);
+    crate::friends::remove(&w.o.config, &w.f_on_o).unwrap();
+    assert!(client::push_members(&w.o.state, &w.o.config).await);
+    assert!(!server::rights_for(&w.s.config, &c, &w.f.eid()).any());
+    let m = uuid::Uuid::new_v4().to_string();
+    let e = client::deposit_chat(&w.f.state, &w.f.config, &w.o_on_f, "chat", &chat_frame(&m, "hello?"), Some(&m)).await.unwrap_err();
+    assert!(matches!(&e, DepositError::Refused { reason, .. } if reason == "denied" || reason == "recipient"), "{e:?}");
+    client::recheck_introduced(&w.s.eid());
+    client::check_introduced(&w.f.state, &w.f.config).await;
+    assert!(server_of(&client::servers(&w.f.config), &w.s.eid()).is_some_and(|s| s.revoked), "shows as no longer available");
+
+    // An older list from another owner device that still lists F doesn't bring
+    // F back: the removal is newer than the friendship.
+    let o2 = node(&w.base, "o2").await;
+    crate::link::adopt_key_for_tests(&o2.config, &w.account_key);
+    crate::friends::upsert_by_endpoint(&w.s.config, &o2.eid(), "Ashton");
+    prove_account(&w.s, &o2.eid(), &w.account_key);
+    crate::friends::upsert_by_endpoint(&o2.config, &w.f.eid(), "Fay");
+    let mut stale = super::members::build(&o2.config);
+    for p in stale["people"].as_array_mut().unwrap() {
+        for d in p["devices"].as_array_mut().unwrap() {
+            d["since"] = json!(1); // befriended long before O removed them
+        }
+    }
+    let conn = o2.ep.connect(iroh_net::dial_addr(w.s.ep.id()), iroh_net::ALPN).await.unwrap();
+    assert_eq!(rpc(&conn, stale).await["ok"], true, "another owner device may share its list");
+    assert!(!server::rights_for(&w.s.config, &c, &w.f.eid()).any(), "a removal on one owner device wins over a stale list");
+
+    // O removes O2 from the account: O2 no longer counts as the owner there.
+    crate::account::mark_linked(&w.o.config, &o2.eid());
+    assert!(server::rights_for(&w.s.config, &c, &o2.eid()).owner);
+    std::thread::sleep(Duration::from_millis(5));
+    {
+        let path = w.o.config.join("account-state.json");
+        let mut book: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        book["removed_devices"][o2.eid()] = json!(crate::chat::now_ms() + 1000);
+        std::fs::write(&path, serde_json::to_vec(&book).unwrap()).unwrap();
+    }
+    assert!(client::push_members(&w.o.state, &w.o.config).await);
+    assert!(!server::rights_for(&w.s.config, &c, &o2.eid()).owner, "a device removed from the owner's account isn't the owner");
+    // The removed device can't lock the real owner device out by reporting it
+    // "removed" (even far in the future): O keeps managing the server.
+    let conn = o2.ep.connect(iroh_net::dial_addr(w.s.ep.id()), iroh_net::ALPN).await.unwrap();
+    let lie = json!({"kind": "mailbox.members", "people": [], "unlinked": {w.o.eid(): u64::MAX}});
+    assert_eq!(rpc(&conn, lie).await["ok"], true);
+    assert!(server::rights_for(&w.s.config, &c, &w.o.eid()).owner, "a disputed report never locks a device out");
+    let lists = super::members::lists_for_tests(&w.s.config);
+    assert!(lists[&o2.eid()].unlinked[&w.o.eid()] <= crate::chat::now_ms() + super::server::DAY_MS, "times are clamped");
+
+    // The server's own "Remove" (person id "v:…") beats the owner's list.
+    std::thread::sleep(Duration::from_millis(20));
+    crate::friends::upsert_by_endpoint(&w.o.config, &w.f.eid(), "Fay again");
+    assert!(client::push_members(&w.o.state, &w.o.config).await);
+    let person = super::members::vouched(&w.s.config, &c, &w.f.eid()).expect("re-added").person;
+    let mut c2 = server::load_config(&w.s.config);
+    c2.denied.push(person);
+    server::save_config(&w.s.config, &c2).unwrap();
+    assert!(!server::rights_for(&w.s.config, &c2, &w.f.eid()).any());
+    o2.listener.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_heard_about_from_a_friend_is_never_treated_as_ours() {
+    let w = owner_world("claim").await;
+    owner_shares(&w).await;
+    assert!(client::push_members(&w.o.state, &w.o.config).await);
+    client::recheck_introduced(&w.s.eid());
+    client::check_introduced(&w.f.state, &w.f.config).await;
+    // Even if the server claimed F owns it, F's app would not believe it.
+    let fake = client::HelloReply::Ok(json!({"ok": true, "name": "Your Box", "rights": {"own": true, "owner": true, "member": true, "through": true}}));
+    client::learn_intro(&w.f.config, &w.s.eid(), &fake, &[w.o.eid()]);
+    let e = client::servers(&w.f.config).into_iter().find(|s| s.eid == w.s.eid()).unwrap();
+    assert!(!e.owner && !e.own && e.offer != "share", "{e:?}");
+    assert!(client::set_prefs_full(&w.f.config, &w.s.eid(), None, None, None, Some(true)).is_err(), "only an owner can share");
+    assert!(client::my_shared(&w.f.config).is_empty());
+    // When O stops sharing it, F's app shows it as gone.
+    client::set_prefs_full(&w.o.config, &w.s.eid(), None, None, None, Some(false)).unwrap();
+    introduce(&w.o, &w.f);
+    client::check_introduced(&w.f.state, &w.f.config).await;
+    let e = client::servers(&w.f.config).into_iter().find(|s| s.eid == w.s.eid()).unwrap();
+    assert!(e.revoked && e.via.is_empty(), "{e:?}");
+}

@@ -3,7 +3,7 @@
 import type { PendingFile, UsableServer } from './transferServer'
 import type { BridgeArgs } from './nativeBridgeProtocol'
 
-const OFFERS = new Set(['new', 'seen', 'dismissed', ''])
+const OFFERS = new Set(['new', 'share', 'seen', 'dismissed', ''])
 const obj = (v: unknown): Record<string, unknown> | null => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null
 const str = (v: unknown, fallback = '') => typeof v === 'string' ? v : fallback
 const num = (v: unknown) => typeof v === 'number' && Number.isFinite(v) ? v : 0
@@ -30,6 +30,12 @@ export function nativeServerList(list: unknown): UsableServer[] {
       revoked: s.revoked === true,
       paused: s.paused === true,
       learnedMs: num(s.learnedMs),
+      owner: s.owner === true,
+      shareFriends: s.owner === true && s.shareFriends === true,
+      access: str(s.access),
+      via: Array.isArray(s.via) ? s.via.filter((v): v is string => typeof v === 'string').slice(0, 8) : [],
+      ...(str(s.viaPeer) ? { viaPeer: str(s.viaPeer) } : {}),
+      ...(str(s.viaName).trim() ? { viaName: str(s.viaName).trim().slice(0, 64) } : {}),
     }]
   })
 }
@@ -54,24 +60,24 @@ export function nativePendingFiles(list: unknown): PendingFile[] {
   })
 }
 
-export interface ServerPrefs { useIt?: boolean; holdForMe?: boolean; offer?: string }
+export interface ServerPrefs { useIt?: boolean; holdForMe?: boolean; offer?: string; shareFriends?: boolean }
 
 /** Validate a native `serverPrefs` call. Turning a server off also stops holding. */
 export function serverPrefsArgs(a: BridgeArgs): { eid: string; prefs: ServerPrefs } {
   const eid = typeof a.eid === 'string' ? a.eid.trim() : ''
   if (!eid) throw new Error('Missing eid')
   const prefs: ServerPrefs = {}
-  for (const key of ['useIt', 'holdForMe'] as const) {
+  for (const key of ['useIt', 'holdForMe', 'shareFriends'] as const) {
     if (a[key] == null) continue
     if (typeof a[key] !== 'boolean') throw new Error(`Invalid ${key}`)
     prefs[key] = a[key] as boolean
   }
   if (a.offer != null) {
-    if (typeof a.offer !== 'string' || !OFFERS.has(a.offer) || a.offer === 'new') throw new Error('Invalid offer')
+    if (typeof a.offer !== 'string' || !OFFERS.has(a.offer) || a.offer === 'new' || a.offer === 'share') throw new Error('Invalid offer')
     prefs.offer = a.offer
   }
   if (prefs.useIt === false) prefs.holdForMe = false
-  if (prefs.offer == null && (prefs.useIt != null || prefs.holdForMe != null)) prefs.offer = 'seen'
+  if (prefs.offer == null && (prefs.useIt != null || prefs.holdForMe != null || prefs.shareFriends != null)) prefs.offer = 'seen'
   if (!Object.keys(prefs).length) throw new Error('Nothing to change')
   return { eid, prefs }
 }

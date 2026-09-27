@@ -287,6 +287,30 @@ function Confirm({ title, body, action, danger, extra, onConfirm, onClose }: {
   )
 }
 
+/** Whose server this is (a computer not linked to an account): their friends can use it too. */
+function OwnerRow({ status, setStatus }: { status: ServerStatus; setStatus: (s: ServerStatus) => void }) {
+  const toast = useStore((s) => s.toast)
+  const choices = status.ownerChoices ?? []
+  const owner = status.owner
+  const sub = !owner
+    ? 'Choose whose server this is. Their friends can then use it too.'
+    : owner.sharing > 0
+      ? `Shared with ${owner.name}’s friends`
+      : `To share it with ${owner.name}’s friends, tap Share on ${owner.name}’s phone or Mac`
+  if (!owner && choices.length === 0) return null
+  return (
+    <Row title="Owner" sub={sub}>
+      <select className="input set-field" aria-label="Owner" value={owner?.account ?? ''}
+        onChange={async (e) => {
+          try { setStatus(await serverApi.setOwner(e.target.value)) } catch (err) { toast('error', String(err)) }
+        }}>
+        <option value="">Nobody</option>
+        {choices.map((o) => <option key={o.account} value={o.account}>{o.name}</option>)}
+      </select>
+    </Row>
+  )
+}
+
 function ServerManager({ status, check, setStatus }: { status: ServerStatus; check: DeviceCheck | null; setStatus: (s: ServerStatus) => void }) {
   const toast = useStore((s) => s.toast)
   const people = usePeople()
@@ -306,7 +330,13 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
   const members = c.access === 'all' ? people : c.access === 'chosen' ? people.filter((p) => c.allowed.includes(p.id)) : []
   const usage = new Map(status.people.map((p) => [p.id, p]))
   const own = usage.get('own')
-  const denied = people.filter((p) => c.denied.includes(p.id))
+  const denied = [
+    ...people.filter((p) => c.denied.includes(p.id)),
+    ...status.people.filter((p) => p.viaOwner && p.removed),
+  ]
+  // Friends of the owner (vouched by the owner's devices) who aren't this computer's friends.
+  const theirs = status.people.filter((p) => p.viaOwner && !p.removed && !members.some((m) => m.id === p.id))
+  const ownerName = status.owner?.name
   const storageLabel = c.root ? folderLabel(c.root) : `This ${COMPUTER}`
   return (
     <>
@@ -340,6 +370,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
         <Row title="Who can use it" sub={ACCESS_LABEL[c.access]}>
           <button className="btn btn-secondary btn-sm" onClick={() => setEdit('people')}>Change</button>
         </Row>
+        {!status.linked && <OwnerRow status={status} setStatus={setStatus} />}
         <Row title="Accept new things" sub={c.paused ? 'Paused — what’s already here still gets delivered.' : undefined}>
           <Toggle label="Accept new things" on={!c.paused} onChange={(v) => void patch({ paused: !v })} />
         </Row>
@@ -370,7 +401,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
         )}
       </div>
 
-      <SectionHeader count={members.length + 1}>People</SectionHeader>
+      <SectionHeader count={members.length + theirs.length + 1}>People</SectionHeader>
       <div className="group">
         <Row className="srv-person" title="You" sub={own ? `${own.items} waiting · ${formatBytes(own.bytes)}` : 'Your devices'} />
         {members.map((p) => {
@@ -390,6 +421,14 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
             </Row>
           )
         })}
+        {theirs.map((p) => (
+          <Row key={p.id} className="srv-person" title={p.name}
+            sub={`${ownerName ? `${ownerName}’s friend` : 'Owner’s friend'} · ${p.items > 0 ? `${p.items} waiting · ${formatBytes(p.bytes)}` : 'Nothing waiting'}`}>
+            <MenuButton label={`Options for ${p.name}`} size="sm" items={[
+              { label: 'Remove', danger: true, onSelect: () => setConfirm({ remove: p.id, name: p.name }) },
+            ]} />
+          </Row>
+        ))}
         {denied.map((p) => (
           <Row key={p.id} className="srv-person" title={p.name} sub="Removed">
             <button className="btn btn-plain btn-sm" onClick={async () => { try { setStatus(await serverApi.restorePerson(p.id)) } catch (e) { toast('error', String(e)) } }}>Allow Again</button>
@@ -452,6 +491,9 @@ function describe(s: UsableServer): string {
   if (s.revoked) return 'No longer available'
   if (s.paused) return 'Paused by its owner'
   if (s.own) return 'Yours · holds your messages and sends for you'
+  if (s.owner && s.shareFriends) return 'Yours · shared with your friends'
+  if (s.owner && !s.useIt) return 'Set up as yours · not in use yet'
+  if (s.viaName && !s.useIt && !s.holdForMe) return `${s.viaName}’s · not in use`
   if (s.useIt && s.holdForMe) return 'Holds your messages and sends for you'
   if (s.useIt) return 'Sends for you when friends are offline'
   return 'Not in use'
@@ -461,7 +503,7 @@ export function ServersYouCanUse({ hosting }: { hosting: boolean }) {
   const { servers, setServers } = useUsableServers()
   const toast = useStore((s) => s.toast)
   if (servers === null) return null
-  const set = async (eid: string, prefs: { useIt?: boolean; holdForMe?: boolean; offer?: string }) => {
+  const set = async (eid: string, prefs: { useIt?: boolean; holdForMe?: boolean; offer?: string; shareFriends?: boolean }) => {
     try { setServers(await serverApi.serverPrefs(eid, { ...prefs, offer: prefs.offer ?? 'seen' })) } catch (e) { toast('error', String(e)) }
   }
   return (
@@ -473,13 +515,18 @@ export function ServersYouCanUse({ hosting }: { hosting: boolean }) {
         )}
         {servers.map((s) => (
           <div key={s.eid}>
-            <Row title={<>{s.name}{s.offer === 'new' && <span className="srv-tag">New</span>}</>} sub={describe(s)}>
+            <Row title={<>{s.name}{(s.offer === 'new' || s.offer === 'share') && <span className="srv-tag">New</span>}</>} sub={describe(s)}>
               {s.revoked ? (
                 <button className="btn btn-plain btn-sm" onClick={async () => setServers(await serverApi.forgetServer(s.eid))}>Remove</button>
               ) : !s.own && (
                 <Toggle label={`Use ${s.name}`} on={s.useIt} disabled={s.paused} onChange={(v) => void set(s.eid, { useIt: v, holdForMe: v ? undefined : false })} />
               )}
             </Row>
+            {s.owner && !s.own && !s.revoked && s.access !== 'me' && (
+              <Row title="Let my friends use it" sub="They can leave messages for you here, and it holds theirs while they’re offline.">
+                <Toggle label="Let my friends use it" on={!!s.shareFriends} onChange={(v) => void set(s.eid, { shareFriends: v })} />
+              </Row>
+            )}
             {!s.own && !s.revoked && s.useIt && (
               <Row title="Hold my messages here" sub="Friends leave things for you here while you’re offline.">
                 <Toggle label="Hold my messages here" on={s.holdForMe} onChange={(v) => void set(s.eid, { holdForMe: v })} />
@@ -494,6 +541,70 @@ export function ServersYouCanUse({ hosting }: { hosting: boolean }) {
 
 /** The one-time card a friend's shared server shows in their chat. */
 export function ServerOfferCard({ server, friendName }: { server: UsableServer; friendName: string }) {
+  if (server.offer === 'share') return <ShareOwnServerCard server={server} />
+  if (server.via?.length) return <OwnersServerCard server={server} ownerName={server.viaName ?? friendName} />
+  return <FriendServerCard server={server} friendName={friendName} />
+}
+
+/** The owner's own device: "may your friends use it?" (asked once). */
+function ShareOwnServerCard({ server }: { server: UsableServer }) {
+  const [busy, setBusy] = useState(false)
+  const toast = useStore((s) => s.toast)
+  const answer = async (share: boolean) => {
+    setBusy(true)
+    try {
+      await serverApi.serverPrefs(server.eid, share ? { shareFriends: true, offer: 'seen' } : { offer: 'dismissed' })
+      if (share) toast('success', `Your friends can use ${server.name}`)
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="srv-offer" role="group" aria-label={`Share ${server.name} with your friends`}>
+      <div>
+        <h4>{server.name} is set up as your Transfer Server</h4>
+        <p>Share it with your friends? They can leave messages for you there when you’re offline, and it holds theirs until they’re back. It can’t read any of it.</p>
+      </div>
+      <div className="srv-offer-actions">
+        <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => void answer(false)}>Not Now</button>
+        <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => void answer(true)}>Share</button>
+      </div>
+    </div>
+  )
+}
+
+/** A friend's device: their own server can hold your messages too. */
+function OwnersServerCard({ server, ownerName }: { server: UsableServer; ownerName: string }) {
+  const [busy, setBusy] = useState(false)
+  const toast = useStore((s) => s.toast)
+  const answer = async (on: boolean) => {
+    setBusy(true)
+    try {
+      await serverApi.serverPrefs(server.eid, on ? { useIt: true, holdForMe: true, offer: 'seen' } : { offer: 'dismissed' })
+      if (on) toast('success', `${server.name} will hold your messages`)
+    } catch (e) {
+      toast('error', String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="srv-offer" role="group" aria-label={`${ownerName}’s ${server.name}`}>
+      <div>
+        <h4>{ownerName}’s {server.name} can hold your messages when you’re offline</h4>
+        <p>They wait there, locked, until you’re back.</p>
+      </div>
+      <div className="srv-offer-actions">
+        <button className="btn btn-secondary btn-sm" disabled={busy} onClick={() => void answer(false)}>Not Now</button>
+        <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => void answer(true)}>Turn On</button>
+      </div>
+    </div>
+  )
+}
+
+function FriendServerCard({ server, friendName }: { server: UsableServer; friendName: string }) {
   const [hold, setHold] = useState(true)
   const [busy, setBusy] = useState(false)
   const toast = useStore((s) => s.toast)

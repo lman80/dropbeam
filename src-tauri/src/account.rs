@@ -343,6 +343,16 @@ fn adopt_profile_avatar(st: &AppState, account: &str, v: &Value) -> bool {
     })
 }
 
+/// This account's roster and friend removals: (device link times, device
+/// removal times, friend removal times), all ms by endpoint id. Empty maps when
+/// this device has no account.
+pub(crate) fn roster_times(dir: &Path) -> (HashMap<String, u64>, HashMap<String, u64>, HashMap<String, u64>) {
+    let Some(account) = my_pub(dir) else { return Default::default() };
+    let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let b = read_book(dir, &account);
+    (b.linked, b.removed_devices, b.removed_friends)
+}
+
 /// True when `account_pub` is this device's account and `eid` was removed from it.
 pub(crate) fn is_removed_device(dir: &Path, account_pub: &str, eid: &str) -> bool {
     if my_pub(dir).as_deref() != Some(account_pub) {

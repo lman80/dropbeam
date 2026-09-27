@@ -361,8 +361,9 @@ final class Bridge: ObservableObject {
     }
     func updateSettings(patch: [String: Any]) async throws { try await action("updateSettings", ["patch": patch]) }
     // MARK: Transfer Servers
-    func setServerPrefs(eid: String, useIt: Bool? = nil, holdForMe: Bool? = nil, offer: String? = nil) async throws {
+    func setServerPrefs(eid: String, useIt: Bool? = nil, holdForMe: Bool? = nil, offer: String? = nil, shareFriends: Bool? = nil) async throws {
         var args: [String: Any] = ["eid": eid]
+        if let shareFriends { args["shareFriends"] = shareFriends }
         if let useIt { args["useIt"] = useIt }
         if let holdForMe { args["holdForMe"] = holdForMe }
         if let offer { args["offer"] = offer }
@@ -398,6 +399,7 @@ final class Bridge: ObservableObject {
         guard let i = servers.firstIndex(where: { $0.eid == args["eid"] as? String }) else { return }
         if let v = args["useIt"] as? Bool { servers[i].useIt = v; if !v { servers[i].holdForMe = false } }
         if let v = args["holdForMe"] as? Bool { servers[i].holdForMe = v }
+        if let v = args["shareFriends"] as? Bool { servers[i].shareFriends = v }
         servers[i].offer = args["offer"] as? String ?? "seen"
     }
     func respondToOffer(id: String, accept: Bool) async throws { try await action("respondToOffer", ["id": id, "accept": accept]) }

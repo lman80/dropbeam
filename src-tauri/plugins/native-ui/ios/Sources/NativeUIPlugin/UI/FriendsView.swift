@@ -14,6 +14,13 @@ struct FriendsView: View {
     private var filtered: [Friend] {
         bridge.friends.filter { $0.groupedUnder == nil }.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.displayName.localizedCaseInsensitiveContains(search) }
     }
+    /// "Mong and Mong might be the same person…" (first such group only; quiet).
+    private func lookAlikeHint(_ people: [Friend]) -> String? {
+        guard let f = people.first(where: { !$0.lookAlikeWith.isEmpty }) else { return nil }
+        let names = [f.displayName] + f.lookAlikeWith
+        let joined = names.count == 2 ? "\(names[0]) and \(names[1])" : names.dropLast().joined(separator: ", ") + " and " + (names.last ?? "")
+        return "\(joined) might be the same person on two devices — ask them to link their devices (Settings → Devices)."
+    }
     private func isMine(_ friend: Friend) -> Bool {
         if friend.ownDevice { return true }
         guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return false }
@@ -50,7 +57,9 @@ struct FriendsView: View {
                             }.frame(maxWidth: .infinity).padding(.vertical, 14)
                         }
                         ForEach(others) { friend in row(friend) }
-                    } header: { Text("Friends") }.headerProminence(.increased)
+                    } header: { Text("Friends") } footer: {
+                        if let hint = lookAlikeHint(others) { Text(hint) }
+                    }.headerProminence(.increased)
                 }
             }
             .beamList()
@@ -203,6 +212,11 @@ struct FriendDetailView: View {
                     bridge.perform { try await bridge.setAutoAccept(id: friendID, bool: value) }
                 }))
             } footer: { Text("Files from \(friend.displayName) are saved without asking first.") }
+            if !isMine, let other = friend.lookAlikeWith.first {
+                Section {} footer: {
+                    Text("This might be the same person as your contact “\(other)” on another device. Ask them to link their devices (Settings → Devices).")
+                }
+            }
             Section {
                 Button {
                     checking = true; check = nil

@@ -22,9 +22,20 @@ export interface ServerConfig {
   through: string[]
   denied: string[]
   udpPort: number
+  /** The account that owns this server when it isn't linked to one ('' = nobody picked). */
+  ownerAccount?: string
 }
 
-export interface PersonUsage { id: string; name: string; own: boolean; items: number; bytes: number; through: boolean }
+export interface PersonUsage {
+  id: string; name: string; own: boolean; items: number; bytes: number; through: boolean
+  /** A friend of the owner that the owner's device vouched for (not this computer's friend). */
+  viaOwner?: boolean
+  /** Removed on this server (can be allowed again). */
+  removed?: boolean
+}
+
+/** An account that owns (or could own) this server. */
+export interface OwnerView { account: string; name: string; devices: number; sharing: number }
 export interface Waiting { label: string; items: number; bytes: number; oldestMs: number; expiresMs: number }
 
 export interface ServerStatus {
@@ -38,6 +49,10 @@ export interface ServerStatus {
   people: PersonUsage[]
   waiting: Waiting[]
   defaultRoot: string
+  owner?: OwnerView | null
+  /** This computer is linked to an account, so it's the owner's already. */
+  linked?: boolean
+  ownerChoices?: OwnerView[]
 }
 
 export interface DeviceCheck {
@@ -51,7 +66,7 @@ export interface DeviceCheck {
   suggestedCap: number
 }
 
-export type ServerPatch = Partial<Omit<ServerConfig, 'denied'>>
+export type ServerPatch = Partial<Omit<ServerConfig, 'denied' | 'ownerAccount'>>
 
 /** A Transfer Server this device may use. */
 export interface UsableServer {
@@ -67,7 +82,19 @@ export interface UsableServer {
   revoked: boolean
   paused: boolean
   learnedMs: number
+  /** The server says it's ours (we're one of its owner's devices). */
+  owner?: boolean
+  /** We let our friends use it. */
+  shareFriends?: boolean
+  access?: string
+  /** Friends' devices that told us about it (their own server). */
+  via?: string[]
+  /** The thread of the person who shared it, and their name. */
+  viaPeer?: string
+  viaName?: string
 }
+
+export type ServerPrefs = { useIt?: boolean; holdForMe?: boolean; offer?: string; shareFriends?: boolean }
 
 // ── browser-preview mock ──────────────────────────────────────────────────────
 const q = typeof location !== 'undefined' ? new URLSearchParams(location.search) : new URLSearchParams()
@@ -94,6 +121,7 @@ const mockPeople = (): PersonUsage[] => q.get('server') === 'empty' ? [] : [
   { id: 'own', name: 'You', own: true, items: 3, bytes: 1_200_000_000, through: false },
   { id: 'f1', name: 'Alex', own: false, items: 0, bytes: 0, through: false },
   { id: 'f6', name: 'Chen Wei', own: false, items: 9, bytes: 36_800_000_000, through: true },
+  { id: 'v:mock-mong', name: 'Mong', own: false, items: 0, bytes: 0, through: false, viaOwner: true },
 ]
 const mockWaiting = (): Waiting[] => q.get('server') === 'empty' ? [] : [
   { label: 'Alex', items: 2, bytes: 1_100_000_000, oldestMs: T0 - 3 * HOUR, expiresMs: T0 + 13 * DAY },
@@ -113,10 +141,15 @@ function mockStatus(): ServerStatus {
     people,
     waiting: mockCfg.enabled ? mockWaiting() : [],
     defaultRoot: '/Users/you/Library/Application Support/com.dropbeam.app/transfer-server',
+    linked: q.get('linked') === '1',
+    ownerChoices: [{ account: 'acct-ashton', name: 'Ashton', devices: 2, sharing: 0 }],
+    owner: mockCfg.ownerAccount ? { account: mockCfg.ownerAccount, name: 'Ashton', devices: 2, sharing: q.get('sharing') === '0' ? 0 : 1 } : null,
   }
 }
 let mockServers: UsableServer[] = q.get('servers') === 'none' ? [] : [
   { eid: 'mock-jordan', name: 'Jordan’s Mac mini', own: false, member: true, through: false, useIt: q.get('offer') !== '1', holdForMe: false, offer: q.get('offer') === '1' ? 'new' : 'seen', revoked: false, paused: false, learnedMs: T0 - 5 * DAY },
+  ...(q.get('offer') === 'via' ? [{ eid: 'mock-ashbox', name: 'Linux Box', own: false, member: true, through: false, useIt: false, holdForMe: false, offer: 'new', revoked: false, paused: false, learnedMs: T0 - HOUR, via: ['mock-ash'], viaPeer: 'f1', viaName: 'Alex' }] : []),
+  ...(q.get('offer') === 'share' ? [{ eid: 'mock-mybox', name: 'Linux Box', own: false, owner: true, member: true, through: true, useIt: true, holdForMe: true, offer: 'share', access: 'all', revoked: false, paused: false, learnedMs: T0 - HOUR }] : []),
   ...(q.get('servers') === 'own' ? [{ eid: 'mock-linux', name: 'Linux Box', own: true, member: true, through: true, useIt: true, holdForMe: true, offer: 'seen', revoked: false, paused: false, learnedMs: T0 - 9 * DAY }] : []),
 ]
 const mockBus = new Set<() => void>()
@@ -145,12 +178,16 @@ const mock = {
     return mockStatus()
   },
   wipe: async (): Promise<ServerStatus> => mockStatus(),
+  setOwner: async (account: string): Promise<ServerStatus> => {
+    mockCfg = { ...mockCfg, ownerAccount: account }
+    return mockStatus()
+  },
   disable: async (): Promise<ServerStatus> => {
     mockCfg = { ...mockCfg, enabled: false }
     return mockStatus()
   },
   servers: async (): Promise<UsableServer[]> => mockServers,
-  serverPrefs: async (eid: string, prefs: { useIt?: boolean; holdForMe?: boolean; offer?: string }): Promise<UsableServer[]> => {
+  serverPrefs: async (eid: string, prefs: ServerPrefs): Promise<UsableServer[]> => {
     mockServers = mockServers.map((s) => s.eid === eid ? { ...s, ...prefs } : s)
     ping()
     return mockServers
@@ -174,8 +211,9 @@ export const serverApi = HAS_TAURI ? {
   wipe: () => invoke<ServerStatus>('server_wipe'),
   disable: (deleteItems: boolean) => invoke<ServerStatus>('server_disable', { deleteItems }),
   servers: () => invoke<UsableServer[]>('mailbox_servers'),
-  serverPrefs: (eid: string, prefs: { useIt?: boolean; holdForMe?: boolean; offer?: string }) =>
-    invoke<UsableServer[]>('mailbox_server_prefs', { eid, useIt: prefs.useIt ?? null, holdForMe: prefs.holdForMe ?? null, offer: prefs.offer ?? null }),
+  serverPrefs: (eid: string, prefs: ServerPrefs) =>
+    invoke<UsableServer[]>('mailbox_server_prefs', { eid, useIt: prefs.useIt ?? null, holdForMe: prefs.holdForMe ?? null, offer: prefs.offer ?? null, shareFriends: prefs.shareFriends ?? null }),
+  setOwner: (account: string) => invoke<ServerStatus>('server_set_owner', { account }),
   forgetServer: (eid: string) => invoke<UsableServer[]>('mailbox_forget_server', { eid }),
   fetchNow: () => invoke<void>('mailbox_fetch_now'),
   holdRoute: (friendId: string) => invoke<string | null>('mailbox_hold_route', { friendId }),

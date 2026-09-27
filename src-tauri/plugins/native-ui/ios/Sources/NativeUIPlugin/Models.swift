@@ -15,6 +15,8 @@ struct Friend: Decodable, Identifiable {
     /// Set on a friend's extra device (same account as an older record): it is
     /// shown and chatted with as part of that person, never as its own row.
     var groupedUnder: String?
+    /// Other contacts this one might be (same name or photo, not linked): a hint only.
+    var lookAlikeWith: [String] = []
     /// The name to show: "Your iPhone" for an own device, else the friend's name.
     var displayName: String { ownDevice ? (ownLabel ?? name) : name }
 }
@@ -341,6 +343,7 @@ extension Friend {
         self.ownDevice = (try? c.decode(Bool.self, forKey: BridgeKey("ownDevice"))) ?? false
         self.ownLabel = (try? c.decode(String.self, forKey: BridgeKey("ownLabel")))
         self.groupedUnder = (try? c.decode(String.self, forKey: BridgeKey("groupedUnder")))
+        self.lookAlikeWith = (try? c.decode([String].self, forKey: BridgeKey("lookAlikeWith"))) ?? []
     }
 }
 extension BlockedPerson {
@@ -903,11 +906,23 @@ struct UsableServer: Decodable, Identifiable, Equatable {
     var revoked: Bool
     var paused: Bool
     var learnedMs: Double
+    /// The server says it's ours (this device is one of its owner's devices).
+    var owner: Bool = false
+    /// We let our friends use it.
+    var shareFriends: Bool = false
+    var access: String = ""
+    /// Friends' devices that told us about it (it's their own server).
+    var via: [String] = []
+    var viaPeer: String?
+    var viaName: String?
     /// The short line under the server's name (same wording as desktop).
     var status: String {
         if revoked { return "No longer available" }
         if paused { return "Paused by its owner" }
         if own { return "Yours · holds your messages and sends for you" }
+        if owner && shareFriends { return "Yours · shared with your friends" }
+        if owner && !useIt { return "Set up as yours · not in use yet" }
+        if let viaName, !useIt, !holdForMe { return "\(viaName)’s · not in use" }
         if useIt && holdForMe { return "Holds your messages and sends for you" }
         if useIt { return "Sends for you when friends are offline" }
         return "Not in use"
@@ -927,6 +942,12 @@ extension UsableServer {
         self.revoked = (try? c.decode(Bool.self, forKey: BridgeKey("revoked"))) ?? false
         self.paused = (try? c.decode(Bool.self, forKey: BridgeKey("paused"))) ?? false
         self.learnedMs = (try? c.decode(Double.self, forKey: BridgeKey("learnedMs"))) ?? 0
+        self.owner = (try? c.decode(Bool.self, forKey: BridgeKey("owner"))) ?? false
+        self.shareFriends = (try? c.decode(Bool.self, forKey: BridgeKey("shareFriends"))) ?? false
+        self.access = (try? c.decode(String.self, forKey: BridgeKey("access"))) ?? ""
+        self.via = (try? c.decode([String].self, forKey: BridgeKey("via"))) ?? []
+        self.viaPeer = try? c.decode(String.self, forKey: BridgeKey("viaPeer"))
+        self.viaName = (try? c.decode(String.self, forKey: BridgeKey("viaName"))).flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 /// A file a friend sent through a Transfer Server that waits for your OK.

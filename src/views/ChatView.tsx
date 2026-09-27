@@ -405,7 +405,11 @@ function Conversation({ friendId }: { friendId: string }) {
   }, [friendId])
   // A Transfer Server this friend shared with us that we haven't answered yet.
   const { servers } = useUsableServers()
-  const offer = servers?.find((sv) => sv.eid === friend.endpointId && sv.offer === 'new' && !sv.revoked)
+  // Also: a server this person owns and shares with their friends, or (on the
+  // owner's own device) the chat with their own server asking to share it.
+  const offer = servers?.find((sv) => !sv.revoked && !sv.own && (
+    (sv.offer === 'new' && (sv.eid === friend.endpointId || (!!sv.viaPeer && sv.viaPeer === friend.id)))
+    || (sv.offer === 'share' && sv.eid === friend.endpointId)))
 
   const [picking, setPicking] = useState(false)
   const [text, setText] = useState('')

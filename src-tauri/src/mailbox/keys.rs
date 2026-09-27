@@ -149,6 +149,9 @@ pub struct PeerInfo {
     /// Servers this peer sends through (so their items may reach us from there).
     #[serde(default)]
     pub sends: Vec<ServerRef>,
+    /// Servers this peer owns and shares with its friends (we may ask to use them).
+    #[serde(default)]
+    pub shared: Vec<ServerRef>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -207,10 +210,11 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
         .unwrap_or_default() };
     let inbox = refs(&m["inbox"]);
     let sends = refs(&m["sends"]);
+    let shared = refs(&m["shared"]);
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut all = read_peers(config);
     let entry = all.entry(eid.to_owned()).or_default();
-    let before = (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone());
+    let before = (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone(), entry.shared.clone());
     let push_text_before = entry.push_text;
     if let Some(k) = verified {
         let k = seal::b64(&k);
@@ -224,10 +228,11 @@ pub fn learn(config: &Path, eid: &str, m: &serde_json::Value) -> bool {
     }
     entry.inbox = inbox;
     entry.sends = sends;
+    entry.shared = shared;
     if let Some(t) = m["push_text"].as_bool() {
         entry.push_text = t;
     }
-    let changed = before != (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone())
+    let changed = before != (entry.key.clone(), entry.push_key.clone(), entry.inbox.clone(), entry.sends.clone(), entry.shared.clone())
         || push_text_before != entry.push_text;
     let now = crate::chat::now_ms();
     // Hellos repeat often; only touch the disk when something changed (or daily,

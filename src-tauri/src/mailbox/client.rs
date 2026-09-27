@@ -74,11 +74,36 @@ pub struct UsableServer {
     pub paused: bool,
     #[serde(default)]
     pub learned_ms: u64,
+    /// The server says it is ours (we're one of its owner's devices): it holds
+    /// our messages and sends for us without asking.
+    #[serde(default)]
+    pub owner: bool,
+    /// We (the owner) agreed to let our friends use it: we tell them about it
+    /// and keep it up to date on who our friends are.
+    #[serde(default)]
+    pub share_friends: bool,
+    /// Who the server lets use it: "me" | "chosen" | "all" ("" = unknown).
+    #[serde(default)]
+    pub access: String,
+    /// Friends' devices that told us about it (it's their owner's server). Empty
+    /// when the server itself told us (we're its friend).
+    #[serde(default)]
+    pub via: Vec<String>,
+    /// For the UI (filled by `servers_view`, never stored): the thread of the
+    /// person who shared it, and their name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_peer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_name: Option<String>,
 }
 
 impl UsableServer {
     pub fn usable(&self) -> bool {
         !self.revoked && !self.paused && (self.own || self.member)
+    }
+    /// We own it and agreed to share it with our friends.
+    pub fn shared_by_me(&self) -> bool {
+        self.owner && self.share_friends && !self.revoked && self.access != "me"
     }
     /// We may deposit here for anyone who uses it (not just the owner's people).
     fn sends_here(&self) -> bool {
@@ -105,6 +130,26 @@ fn with_servers<T>(config: &Path, f: impl FnOnce(&mut BTreeMap<String, UsableSer
         write_store(&servers_path(config), &map);
     }
     out
+}
+
+/// `servers`, with who shared each one (for the offer card and Settings).
+pub fn servers_view(config: &Path) -> Vec<UsableServer> {
+    servers(config).into_iter().map(|mut s| {
+        if let Some(f) = s.via.iter().find_map(|e| crate::friends::chat_sender(config, e)) {
+            s.via_peer = Some(f.id);
+            s.via_name = Some(f.name);
+        }
+        s
+    }).collect()
+}
+
+/// Our own servers we share with our friends (told to friends in hellos, so
+/// their devices can ask the server to let them in).
+pub fn my_shared(config: &Path) -> Vec<Value> {
+    servers(config).into_iter()
+        .filter(|s| s.shared_by_me() && !s.paused)
+        .map(|s| json!({"eid": s.eid, "name": s.name}))
+        .collect()
 }
 
 /// Servers that hold messages for us, as advertised to friends.
@@ -146,7 +191,12 @@ pub fn learn_grant(config: &Path, who: &str, grant: Option<&Value>, verified_own
                 // "It's one of your own devices" is OUR call (account roster),
                 // never the peer's claim.
                 let own = verified_own && g["own"].as_bool().unwrap_or(false);
+                // "You own me" is only the server's claim: it changes nothing by
+                // itself. The user's yes ("share") is what makes it hold our
+                // messages and go to our friends.
+                let owner = own || g["owner"].as_bool().unwrap_or(false);
                 let member = g["member"].as_bool().unwrap_or(false) || own;
+                let access: String = g["access"].as_str().unwrap_or("").chars().take(8).collect();
                 let entry = map.entry(who.to_owned()).or_insert_with(|| {
                     change.new_offer = !own;
                     change.new_own = own;
@@ -158,6 +208,16 @@ pub fn learn_grant(config: &Path, who: &str, grant: Option<&Value>, verified_own
                 }
                 entry.name = g["name"].as_str().unwrap_or("Transfer Server").chars().take(64).collect();
                 entry.own = own;
+                if owner && !entry.owner && !own {
+                    // Newly ours: ask once whether our friends may use it.
+                    entry.offer = if access == "me" || entry.share_friends { "seen".into() } else { "share".into() };
+                    change.new_offer = entry.offer == "share";
+                }
+                if !owner && entry.owner && entry.offer == "share" {
+                    entry.offer = "seen".into();
+                }
+                entry.owner = owner;
+                entry.access = access;
                 entry.member = member;
                 entry.through = g["through"].as_bool().unwrap_or(false) || own;
                 entry.paused = g["paused"].as_bool().unwrap_or(false);
@@ -165,9 +225,12 @@ pub fn learn_grant(config: &Path, who: &str, grant: Option<&Value>, verified_own
                     entry.use_it = true;
                     entry.hold_for_me = true;
                 }
+                if !owner {
+                    entry.share_friends = false;
+                }
                 if entry.revoked {
                     entry.revoked = false;
-                    if !own && entry.offer != "dismissed" {
+                    if !own && !owner && entry.offer != "dismissed" {
                         entry.offer = "new".into();
                         change.new_offer = true;
                     }
@@ -190,8 +253,24 @@ pub fn learn_grant(config: &Path, who: &str, grant: Option<&Value>, verified_own
 
 /// The user's choices about a server offered to them.
 pub fn set_prefs(config: &Path, eid: &str, use_it: Option<bool>, hold_for_me: Option<bool>, offer: Option<&str>) -> Result<(), String> {
+    set_prefs_full(config, eid, use_it, hold_for_me, offer, None)
+}
+
+/// `set_prefs`, plus (for a server we own) whether our friends may use it.
+pub fn set_prefs_full(config: &Path, eid: &str, use_it: Option<bool>, hold_for_me: Option<bool>, offer: Option<&str>, share_friends: Option<bool>) -> Result<(), String> {
     with_servers(config, |map| {
         let s = map.get_mut(eid).ok_or("That Transfer Server isn't available any more.")?;
+        if let Some(v) = share_friends {
+            if v && !s.owner {
+                return Err("Only the owner of this Transfer Server can share it.".to_owned());
+            }
+            s.share_friends = v;
+            if v {
+                // Saying yes = "it's mine": it holds our messages and sends for us.
+                s.use_it = true;
+                s.hold_for_me = true;
+            }
+        }
         if let Some(v) = use_it {
             s.use_it = v || s.own;
         }
@@ -203,6 +282,218 @@ pub fn set_prefs(config: &Path, eid: &str, use_it: Option<bool>, hold_for_me: Op
         }
         Ok(())
     })
+}
+
+// ── servers our friends share (their owner's server) ───────────────────────
+
+/// Servers our friends' (or own) devices told us they share, and who told us.
+pub fn introduced(config: &Path, me: &str) -> Vec<(String, String, Vec<String>)> {
+    let mut out: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut peers: Vec<(String, keys::PeerInfo)> = keys::peers(config).into_iter().collect();
+    peers.sort_by(|a, b| a.0.cmp(&b.0));
+    for (peer, p) in peers {
+        if p.shared.is_empty() || crate::block::is_blocked(config, &peer) {
+            continue;
+        }
+        if crate::friends::chat_sender(config, &peer).is_none() && !crate::account::is_own_device(config, &peer) {
+            continue;
+        }
+        for sref in &p.shared {
+            if sref.eid == me || crate::block::is_blocked(config, &sref.eid) {
+                continue;
+            }
+            match out.iter_mut().find(|(e, _, _)| *e == sref.eid) {
+                Some((_, _, via)) => {
+                    if !via.contains(&peer) {
+                        via.push(peer.clone());
+                    }
+                }
+                None => out.push((sref.eid.clone(), sref.name.clone(), vec![peer.clone()])),
+            }
+        }
+    }
+    out.truncate(8);
+    out
+}
+
+/// What a server's `mailbox.hello` answered.
+pub enum HelloReply {
+    Ok(Value),
+    /// It turned us down ("denied", or it's no longer a Transfer Server).
+    Refused,
+    Unreachable,
+}
+
+pub async fn server_hello_reply(ep: &iroh::Endpoint, server: &str) -> HelloReply {
+    let Some(conn) = connect(ep, server, Duration::from_secs(6)).await else { return HelloReply::Unreachable };
+    let reply = rpc(&conn, &json!({"kind": "mailbox.hello", "v": super::VERSION})).await;
+    conn.close(0u32.into(), b"done");
+    match reply {
+        Ok(r) if r["ok"].as_bool() == Some(true) => HelloReply::Ok(r),
+        Ok(r) if matches!(r["reason"].as_str(), Some("denied" | "off")) => HelloReply::Refused,
+        _ => HelloReply::Unreachable,
+    }
+}
+
+/// Apply a server's `mailbox.hello` answer for a server friends told us about.
+pub fn learn_intro(config: &Path, server: &str, reply: &HelloReply, via: &[String]) -> GrantChange {
+    match reply {
+        HelloReply::Ok(r) => {
+            let rights = &r["rights"];
+            // A server we heard about from a friend is never ours, whatever it says.
+            let g = json!({"name": r["name"], "own": rights["own"], "member": rights["member"], "through": rights["through"],
+                "owner": false, "paused": r["paused"], "access": r["access"]});
+            let own = crate::account::is_own_device(config, server);
+            let mut change = learn_grant(config, server, Some(&g), own);
+            with_servers(config, |map| {
+                if let Some(e) = map.get_mut(server) {
+                    for v in via {
+                        if !e.via.contains(v) && e.via.len() < 8 {
+                            e.via.push(v.clone());
+                            change.changed = true;
+                        }
+                    }
+                }
+            });
+            change
+        }
+        HelloReply::Refused => {
+            if servers(config).iter().any(|s| s.eid == server) {
+                learn_grant(config, server, None, false)
+            } else {
+                GrantChange::default()
+            }
+        }
+        HelloReply::Unreachable => GrantChange::default(),
+    }
+}
+
+static INTRO_CHECKED: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+/// Servers we already gave one quick second look.
+static INTRO_QUICK: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Ask each server our friends share whether we may use it (new ones soon and
+/// often; known ones a few times a day, so a removal shows up).
+pub async fn check_introduced(net: &IrohState, config: &Path) -> bool {
+    let Some(ep) = net.get().cloned() else { return false };
+    let me = ep.id().to_string();
+    let known = servers(config);
+    let mut any = false;
+    for (server, _name, via) in introduced(config, &me) {
+        let entry = known.iter().find(|s| s.eid == server);
+        let every = match entry {
+            None => Duration::from_secs(150),
+            Some(e) if e.revoked => Duration::from_secs(1800),
+            Some(e) if e.via.is_empty() => continue, // the server tells us itself (we're its friend)
+            Some(_) => Duration::from_secs(6 * 3600),
+        };
+        {
+            let mut g = INTRO_CHECKED.lock().unwrap_or_else(|p| p.into_inner());
+            let m = g.get_or_insert_with(HashMap::new);
+            if m.get(&server).is_some_and(|t| t.elapsed() < every) {
+                continue;
+            }
+            m.insert(server.clone(), Instant::now());
+        }
+        let reply = server_hello_reply(&ep, &server).await;
+        if entry.is_none() && !matches!(reply, HelloReply::Ok(_)) {
+            // The owner's device may be telling the server about us right now:
+            // look again shortly (once), then at the normal pace.
+            let mut g = INTRO_CHECKED.lock().unwrap_or_else(|p| p.into_inner());
+            let m = g.get_or_insert_with(HashMap::new);
+            let quick = !INTRO_QUICK.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(HashSet::new).insert(server.clone());
+            if !quick {
+                if let Some(t) = Instant::now().checked_sub(Duration::from_secs(150 - 30)) {
+                    m.insert(server.clone(), t);
+                }
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(32)).await;
+                    wake();
+                });
+            }
+        }
+        let change = learn_intro(config, &server, &reply, &via);
+        any |= change.any();
+    }
+    any | prune_introduced(config, &me)
+}
+
+/// Servers only friends told us about, that no current friend tells us about
+/// any more (they stopped sharing, or aren't our friend now): drop those
+/// friends, and show the server as gone once nobody vouches for it.
+fn prune_introduced(config: &Path, me: &str) -> bool {
+    let current = introduced(config, me);
+    let direct = |eid: &str| crate::friends::chat_sender(config, eid).is_some() || crate::account::is_own_device(config, eid);
+    with_servers(config, |map| {
+        let mut changed = false;
+        for (eid, e) in map.iter_mut().filter(|(_, e)| !e.via.is_empty()) {
+            let now_via: Vec<String> = current.iter().find(|(s, _, _)| s == eid).map(|(_, _, v)| v.clone()).unwrap_or_default();
+            let keep: Vec<String> = e.via.iter().filter(|v| now_via.contains(v)).cloned().collect();
+            if keep != e.via {
+                e.via = keep;
+                changed = true;
+            }
+            if e.via.is_empty() && !e.revoked && !direct(eid) {
+                e.revoked = true;
+                changed = true;
+            }
+        }
+        changed
+    })
+}
+
+/// A friend just told us about a server they share: look at it on the next pass.
+pub fn recheck_introduced(server: &str) {
+    if let Some(m) = INTRO_CHECKED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        m.remove(server);
+    }
+    if let Some(q) = INTRO_QUICK.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        q.remove(server);
+    }
+}
+
+// ── owner side: keeping our shared servers up to date on our friends ────────
+
+static MEMBERS_SENT: Mutex<Option<HashMap<String, (String, Instant, HashSet<String>)>>> = Mutex::new(None);
+
+/// Send our friends list to each server we own and share (when it changed, or
+/// every few hours). True when anything was sent.
+pub async fn push_members(net: &IrohState, config: &Path) -> bool {
+    let Some(ep) = net.get().cloned() else { return false };
+    let mut sent = false;
+    for s in servers(config).into_iter().filter(|s| s.shared_by_me()) {
+        let body = super::members::build(config);
+        let hash = hex::encode(Sha256::digest(serde_json::to_vec(&body).unwrap_or_default()));
+        let fresh = MEMBERS_SENT.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+            .and_then(|m| m.get(&s.eid))
+            .is_some_and(|(h, at, _)| *h == hash && at.elapsed() < Duration::from_secs(6 * 3600));
+        if fresh {
+            continue;
+        }
+        let Some(reply) = server_rpc(&ep, config, &s.eid, &body).await else { continue };
+        if reply["ok"].as_bool() == Some(true) {
+            let eids: HashSet<String> = body["people"].as_array().into_iter().flatten()
+                .flat_map(|p| p["devices"].as_array().cloned().unwrap_or_default())
+                .filter_map(|d| d["eid"].as_str().map(String::from)).collect();
+            MEMBERS_SENT.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(HashMap::new)
+                .insert(s.eid.clone(), (hash, Instant::now(), eids));
+            log::info!("mailbox: told our Transfer Server who our friends are ({} people)", reply["people"].as_u64().unwrap_or(0));
+            sent = true;
+        } else {
+            log::info!("mailbox: our Transfer Server didn't take the friends list ({})", reply["reason"].as_str().unwrap_or("?"));
+        }
+    }
+    sent
+}
+
+/// A friend we haven't told our shared servers about yet said hello.
+pub fn members_behind(config: &Path, friend_eid: &str) -> bool {
+    let shared: Vec<String> = servers(config).into_iter().filter(|s| s.shared_by_me()).map(|s| s.eid).collect();
+    if shared.is_empty() {
+        return false;
+    }
+    let g = MEMBERS_SENT.lock().unwrap_or_else(|p| p.into_inner());
+    shared.iter().any(|srv| !g.as_ref().and_then(|m| m.get(srv)).is_some_and(|(_, _, eids)| eids.contains(friend_eid)))
 }
 
 /// Stop using a server entirely (it may be offered again by a later hello).
@@ -1861,6 +2152,16 @@ pub fn spawn(net: Arc<IrohState>) {
                     }
                 }
             }
+            if check_introduced(&net, &config).await {
+                if let Some(app) = net.app.get() {
+                    use tauri::Emitter;
+                    let _ = app.emit("mailbox://servers", ());
+                    if let Some(n) = tauri::Manager::try_state::<Arc<IrohState>>(app) {
+                        crate::iroh_net::broadcast_profile(app.clone(), n.inner().clone());
+                    }
+                }
+            }
+            push_members(&net, &config).await;
             super::push::register_everywhere(&net, &config).await;
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {},

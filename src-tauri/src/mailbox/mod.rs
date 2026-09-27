@@ -13,6 +13,7 @@
 pub mod client;
 pub mod cmds;
 pub mod keys;
+pub mod members;
 pub mod push;
 pub mod seal;
 pub mod server;
@@ -104,6 +105,17 @@ pub fn hello_fields(config: &Path, signer: &iroh::SecretKey, who: &str) -> Value
         "sends": client::my_sends(config),
         "grant": server::grant_for(config, who),
     });
+    // Our own Transfer Servers that our friends may use: only people we know
+    // hear about them (their device then asks the server itself).
+    let known = crate::account::is_own_device(config, who) || crate::friends::chat_sender(config, who).is_some();
+    let shared = client::my_shared(config);
+    if known && !shared.is_empty() {
+        v["shared"] = json!(shared);
+        if !crate::account::is_own_device(config, who) && client::members_behind(config, who) {
+            // A friend the server hasn't heard about yet: tell it now.
+            client::wake();
+        }
+    }
     if let Some(pk) = keys::public(config) {
         v["key"] = json!(seal::b64(&pk));
         v["sig"] = json!(seal::sign_mailbox_key(signer, &pk));
@@ -128,7 +140,13 @@ pub fn on_hello(state: &IrohState, config: &Path, who: &str, hello: &Value) {
     if !own && crate::friends::chat_sender(config, who).is_none() {
         return;
     }
-    keys::learn(config, who, m);
+    let before: Vec<String> = keys::peers(config).get(who).map(|p| p.shared.iter().map(|s| s.eid.clone()).collect()).unwrap_or_default();
+    let learned = keys::learn(config, who, m);
+    let now_shared: Vec<String> = keys::peers(config).get(who).map(|p| p.shared.iter().map(|s| s.eid.clone()).collect()).unwrap_or_default();
+    let new_shares: Vec<&String> = now_shared.iter().filter(|e| !before.contains(e)).collect();
+    for s in &new_shares {
+        client::recheck_introduced(s);
+    }
     let change = client::learn_grant(config, who, m.get("grant"), own);
     if let Some(app) = state.app.get() {
         use tauri::Emitter;
@@ -142,7 +160,7 @@ pub fn on_hello(state: &IrohState, config: &Path, who: &str, hello: &Value) {
             }
         }
     }
-    if change.any() {
+    if change.any() || !new_shares.is_empty() || (learned && !now_shared.is_empty()) {
         client::wake();
     }
 }

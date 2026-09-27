@@ -6,6 +6,7 @@
 //! both sides end up with a name without any extra handshake.
 
 use std::fs;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1791,4 +1792,111 @@ pub(crate) fn set_link_avatar(config_dir: &Path, id: &str, path: String) {
     let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) { f.avatar = Some(path); }
     let _ = save(config_dir, &friends);
+}
+
+/// One contact in a "these might be the same person" group.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct LookAlike {
+    /// The contact's thread (person) id.
+    pub id: String,
+    pub name: String,
+}
+
+/// Names nobody chose (a device's default) say nothing about who someone is.
+fn telling_name(name: &str) -> Option<String> {
+    let n: String = name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    const GENERIC: &[&str] = &["", "friend", "a friend", "unknown", "dropbeam user", "my device", "iphone", "ipad", "mac", "pc",
+        "macbook", "macbook pro", "macbook air", "imac", "mac mini", "linux", "windows", "android", "phone", "computer"];
+    (!GENERIC.contains(&n.as_str()) && n.chars().count() >= 2).then_some(n)
+}
+
+/// Contacts that look like the same person on two devices that aren't linked
+/// (same name, or the same profile photo) but are different identities. Only a
+/// hint for the user — nothing is merged. Each group lists 2+ people.
+pub fn look_alike(config_dir: &Path) -> Vec<Vec<LookAlike>> {
+    let all = read_raw(config_dir);
+    let mine = crate::account::my_pub(config_dir);
+    // Person (thread owner) → name, and the photos of any of their devices.
+    let mut people: Vec<(LookAlike, Option<String>, Vec<String>)> = Vec::new();
+    for f in &all {
+        if f.endpoint_id.is_none() || (f.account_pub.is_some() && f.account_pub == mine) {
+            continue;
+        }
+        if f.endpoint_id.as_deref().is_some_and(|e| crate::block::is_blocked(config_dir, e)) {
+            continue;
+        }
+        let owner = owner_in(&all, f.clone(), mine.as_deref());
+        let photo = f.avatar.as_deref().and_then(|p| std::fs::read(p).ok()).filter(|b| b.len() > 64)
+            .map(|b| hex::encode(Sha256::digest(&b)));
+        match people.iter_mut().find(|(p, _, _)| p.id == owner.id) {
+            Some((_, _, photos)) => photos.extend(photo),
+            None => people.push((LookAlike { id: owner.id.clone(), name: owner.name.clone() }, telling_name(&owner.name), photo.into_iter().collect())),
+        }
+    }
+    // Union people who share a telling name or a photo.
+    let n = people.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(p: &mut [usize], i: usize) -> usize {
+        let mut i = i;
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            let same_name = people[i].1.is_some() && people[i].1 == people[j].1;
+            let same_photo = people[i].2.iter().any(|h| people[j].2.contains(h));
+            if same_name || same_photo {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+    }
+    let mut groups: HashMap<usize, Vec<LookAlike>> = HashMap::new();
+    for i in 0..n {
+        let r = root(&mut parent, i);
+        groups.entry(r).or_default().push(people[i].0.clone());
+    }
+    let mut out: Vec<Vec<LookAlike>> = groups.into_values().filter(|g| g.len() > 1).collect();
+    for g in &mut out {
+        g.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    out.sort_by(|a, b| a[0].id.cmp(&b[0].id));
+    out
+}
+
+#[cfg(test)]
+mod look_alike_tests {
+    use super::*;
+
+    #[test]
+    fn same_name_or_photo_different_people_are_flagged_but_linked_devices_are_not() {
+        let dir = std::env::temp_dir().join(format!("db-lookalike-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let eid = || iroh::SecretKey::generate().public().to_string();
+        let (m1, m2, a, b, c1, c2) = (eid(), eid(), eid(), eid(), eid(), eid());
+        upsert_by_endpoint(&dir, &m1, "Mong");
+        upsert_by_endpoint(&dir, &m2, " mong ");
+        upsert_by_endpoint(&dir, &a, "iPhone");
+        upsert_by_endpoint(&dir, &b, "iPhone");
+        // Same photo, different names.
+        let photo = dir.join("p.jpg");
+        std::fs::write(&photo, [7u8; 500]).unwrap();
+        upsert_by_endpoint(&dir, &c1, "Chen");
+        upsert_by_endpoint(&dir, &c2, "Wei");
+        set_avatar_by_endpoint(&dir, &c1, photo.to_string_lossy().to_string());
+        set_avatar_by_endpoint(&dir, &c2, photo.to_string_lossy().to_string());
+        let groups = look_alike(&dir);
+        let names: Vec<Vec<String>> = groups.iter().map(|g| { let mut n: Vec<String> = g.iter().map(|x| x.name.trim().to_lowercase()).collect(); n.sort(); n }).collect();
+        assert_eq!(groups.len(), 2, "{names:?}");
+        assert!(names.contains(&vec!["mong".to_string(), "mong".to_string()]));
+        assert!(names.contains(&vec!["chen".to_string(), "wei".to_string()]));
+        // Two devices of ONE person (same verified account) are one person, not a look-alike.
+        set_device_info(&dir, &m1, Some("laptop"), Some("acct-mong"));
+        set_device_info(&dir, &m2, Some("phone"), Some("acct-mong"));
+        assert_eq!(look_alike(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

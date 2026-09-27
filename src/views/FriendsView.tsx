@@ -37,6 +37,7 @@ import { FriendAvatar } from '../components/FriendAvatar'
 import { EmptyState, IconButton, MenuButton, SectionHeader, Spinner, type MenuItem } from '../components/ui'
 import { avatarColor, avatarGradient, initials } from '../lib/avatar'
 import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/presence'
+import { LOOK_ALIKE_HINT, joinNames, useLookAlikes } from '../lib/lookAlike'
 
 export function FriendsView() {
   const friends = useStore((s) => s.friends)
@@ -111,6 +112,7 @@ function DesktopFriends() {
   const myDevice = useStore((s) => s.myDevice)
   const [adding, setAdding] = useState(false)
   const [linking, setLinking] = useState(false)
+  const lookAlikes = useLookAlikes()
   const grouped = personGroups(friends, myDevice?.account_pub)
   const { myDevices, others } = groupDevices(friends.filter((f) => !grouped[f.id]), myDevice?.account_pub)
 
@@ -163,6 +165,11 @@ function DesktopFriends() {
           {others.map((f) => <FriendRow key={f.id} friend={f} />)}
         </div>
       )}
+      {lookAlikes.filter((g) => g.every((x) => others.some((f) => f.id === x.id))).map((g) => (
+        <p key={g.map((x) => x.id).join()} className="fr-lookalike">
+          {joinNames(g.map((x) => x.name))} {LOOK_ALIKE_HINT}.
+        </p>
+      ))}
 
       {linking && <AddDeviceModal onClose={() => setLinking(false)} />}
       <AnimatePresence>{adding && <AddFriendModal onClose={() => setAdding(false)} />}</AnimatePresence>

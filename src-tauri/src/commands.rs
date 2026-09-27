@@ -1145,6 +1145,8 @@ pub fn remove_friend(
     friends::remove(&state.config_dir, &id)?;
     // Soft-detach: friends::remove preserves the transcript and endpoint index.
     sync.reconcile_friends();
+    // A Transfer Server we share with our friends hears about it right away.
+    crate::mailbox::client::wake();
     Ok(())
 }
 
@@ -1160,6 +1162,7 @@ pub fn block_friend(
 ) -> Result<Vec<String>, String> {
     let blocked = crate::block::block_friend(&state.config_dir, &id)?;
     sync.reconcile_friends();
+    crate::mailbox::client::wake();
     let _ = app.emit("friends://changed", ());
     let _ = app.emit("blocked://changed", ());
     Ok(blocked)
@@ -1172,6 +1175,12 @@ pub fn unblock_person(app: AppHandle, state: State<'_, Arc<AppState>>, id: Strin
     crate::block::unblock(&state.config_dir, &id)?;
     let _ = app.emit("blocked://changed", ());
     Ok(())
+}
+
+/// Contacts that might be the same person on two unlinked devices (a hint only).
+#[tauri::command]
+pub fn friends_look_alike(state: State<'_, Arc<AppState>>) -> Vec<Vec<crate::friends::LookAlike>> {
+    friends::look_alike(&state.config_dir)
 }
 
 #[tauri::command]

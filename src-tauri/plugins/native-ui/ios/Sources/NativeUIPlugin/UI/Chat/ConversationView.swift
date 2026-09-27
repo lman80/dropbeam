@@ -45,10 +45,18 @@ struct ConversationView: View {
     /// Where a message to them would wait while they're offline (a Transfer Server's name).
     private var holdOn: String? { bridge.holdRoutes[friendID] }
     private var firstName: String { ServerCopy.firstName(friend.displayName) }
-    /// A Transfer Server this person shared that hasn't been answered yet.
+    /// A Transfer Server this person shared that hasn't been answered yet: their
+    /// server shares with us (it's their friend), a server of theirs they share
+    /// with their friends, or — in the chat with our own server — whether to
+    /// share it with ours.
     private var offer: UsableServer? {
         let endpoints = Set(bridge.friends.filter { $0.id == friendID || $0.groupedUnder == friendID }.compactMap(\.endpointId))
-        return bridge.servers.first { endpoints.contains($0.eid) && $0.offer == "new" && !$0.revoked && !$0.own }
+        return bridge.servers.first { s in
+            guard !s.revoked, !s.own else { return false }
+            if s.offer == "share" { return endpoints.contains(s.eid) }
+            guard s.offer == "new" else { return false }
+            return endpoints.contains(s.eid) || s.viaPeer == friendID || !endpoints.isDisjoint(with: s.via)
+        }
     }
     private var friend: Friend { bridge.friends.first { $0.id == friendID } ?? Friend(id: friendID, name: "Friend") }
     private var matches: [String] {

@@ -36,6 +36,8 @@ const RECEIPT_MAX: usize = 50_000;
 /// An upload nobody resumed for this long is abandoned.
 const STALE_UPLOAD_MS: u64 = 7 * DAY_MS;
 const MAX_ITEMS_PER_RECIPIENT: usize = 2000;
+/// Items one (non-owner) person may leave waiting for one device.
+const MAX_ITEMS_PER_PAIR: usize = 500;
 const MAX_UPLOADS_PER_PERSON: usize = 2;
 const HEADER_MAX: usize = 256 * 1024;
 
@@ -82,6 +84,11 @@ pub struct ServerConfig {
     /// Friend (person) ids the owner removed.
     #[serde(default)]
     pub denied: Vec<String>,
+    /// The account that owns this server when this device isn't linked to one
+    /// (picked on this device). Its devices manage the server and vouch for
+    /// the owner's friends (see `members`).
+    #[serde(default)]
+    pub owner_account: String,
     /// Refuse new items when the disk has less than this free (0 = 5 GB / 5%).
     #[serde(default)]
     pub min_free: u64,
@@ -361,6 +368,9 @@ pub struct Rights {
     pub member: bool,
     /// May also leave items for anyone at all.
     pub through: bool,
+    /// One of the owner's devices (it may share this server with its friends).
+    #[serde(default)]
+    pub owner: bool,
 }
 
 impl Rights {
@@ -369,17 +379,21 @@ impl Rights {
     }
 }
 
-/// The person id a friend endpoint belongs to (None = not a friend).
-fn person_of(config: &Path, eid: &str) -> Option<String> {
+/// The person id an endpoint uses this server as: a friend of this device, or
+/// a friend of the owner that an owner device vouched for ("v:…"). None = neither.
+fn person_of(config: &Path, c: &ServerConfig, eid: &str) -> Option<String> {
     crate::friends::chat_sender(config, eid).map(|f| f.id)
+        .or_else(|| super::members::vouched(config, c, eid).map(|v| v.person))
 }
 
 pub fn rights_for(config: &Path, c: &ServerConfig, eid: &str) -> Rights {
-    if crate::account::is_own_device(config, eid) {
-        return Rights { own: true, member: true, through: true };
+    if super::members::is_owner_device(config, c, eid) {
+        return Rights { own: true, member: true, through: true, owner: true };
     }
-    let Some(person) = person_of(config, eid) else { return Rights::default() };
-    if c.denied.contains(&person) {
+    let Some(person) = person_of(config, c, eid) else { return Rights::default() };
+    // "e:<device>" = a removed friend-of-the-owner's device (their person id
+    // may differ between the owner's devices, their devices can't).
+    if c.denied.contains(&person) || c.denied.iter().any(|d| d.strip_prefix("e:") == Some(eid)) {
         return Rights::default();
     }
     let member = match c.access.as_str() {
@@ -387,7 +401,7 @@ pub fn rights_for(config: &Path, c: &ServerConfig, eid: &str) -> Rights {
         "chosen" => c.allowed.contains(&person),
         _ => false,
     };
-    Rights { own: false, member, through: member && c.through.contains(&person) }
+    Rights { own: false, member, through: member && c.through.contains(&person), owner: false }
 }
 
 /// Whether items may be left for this device without "send through".
@@ -408,7 +422,8 @@ pub fn grant_for(config: &Path, eid: &str) -> Option<Value> {
     if !r.any() {
         return None;
     }
-    Some(json!({"name": server_name(&c), "own": r.own, "member": r.member, "through": r.through, "paused": c.paused}))
+    Some(json!({"name": server_name(&c), "own": r.own, "member": r.member, "through": r.through, "paused": c.paused,
+        "owner": r.owner, "access": c.access}))
 }
 
 pub fn server_name(c: &ServerConfig) -> String {
@@ -462,6 +477,7 @@ pub async fn serve(config: &Path, me: Option<&str>, conn: &Connection, send: &mu
                 "mailbox.fetch" => fetch_reply(config, &who),
                 "mailbox.ack" => ack(config, &who, req),
                 "mailbox.push-register" => super::push::register(config, &c, &who, req),
+                "mailbox.members" => super::members::receive(config, &c, me, &who, req),
                 _ => refuse("unknown"),
             };
             write_frame(send, &reply).await?;
@@ -484,9 +500,9 @@ fn hello_reply(config: &Path, c: &ServerConfig, who: &str) -> Value {
     if !r.any() {
         return refuse("denied");
     }
-    let person = if r.own { "own".to_owned() } else { person_of(config, who).unwrap_or_default() };
+    let person = if r.own { "own".to_owned() } else { person_of(config, c, who).unwrap_or_default() };
     let quota = with_store(config, |s| quota_numbers(config, c, s, &person, r.own)).unwrap_or(json!(null));
-    json!({"ok": true, "v": super::VERSION, "name": server_name(c), "paused": c.paused,
+    json!({"ok": true, "v": super::VERSION, "name": server_name(c), "paused": c.paused, "access": c.access,
         "rights": r, "quota": quota, "expiry": {"file_days": c.file_days, "chat_days": c.chat_days},
         "push": super::push::configured(),
         // Files wait for every device they were sealed for (see Item::delivered).
@@ -509,7 +525,7 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
     }
     // The server's own app leaving something here (it sends a chat while it
     // is the Transfer Server itself): it owns the place.
-    let rights = if Some(who) == me { Rights { own: true, member: true, through: true } } else { rights_for(config, c, who) };
+    let rights = if Some(who) == me { Rights { own: true, member: true, through: true, owner: true } } else { rights_for(config, c, who) };
     if !rights.any() {
         return Err(refuse("denied"));
     }
@@ -538,7 +554,7 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
     if env.size > c.item_max {
         return Err(refuse("too_big"));
     }
-    let person = if rights.own { "own".to_owned() } else { person_of(config, who).unwrap_or_else(|| who.to_owned()) };
+    let person = if rights.own { "own".to_owned() } else { person_of(config, c, who).unwrap_or_else(|| who.to_owned()) };
     let sha = header_sha(&header);
     let days = if env.kind == "file" { c.file_days } else { c.chat_days }.clamp(1, 90) as u64;
     let push: HashMap<String, String> = req["push"].as_object().map(|o| {
@@ -591,6 +607,10 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
         }
         for t in &to {
             if s.items.values().filter(|i| i.to.contains(t)).count() >= MAX_ITEMS_PER_RECIPIENT {
+                return Err(refuse("recipient_full"));
+            }
+            // One depositor can't fill someone's whole allowance by itself.
+            if !rights.own && s.items.values().filter(|i| i.person == person && i.to.contains(t)).count() >= MAX_ITEMS_PER_PAIR {
                 return Err(refuse("recipient_full"));
             }
         }
@@ -949,10 +969,10 @@ pub fn pending_recipients(config: &Path) -> Vec<(String, usize)> {
 /// Drop items for/from a removed person. Items they left FOR this account's own
 /// devices still deliver (decision 14); everything else they deposited goes.
 pub fn remove_person(config: &Path, person: &str) -> usize {
-    let own: HashSet<String> = crate::account::own_devices(config).into_iter().filter_map(|f| f.endpoint_id).collect();
+    let c = load_config(config);
     with_store(config, |s| {
         let doomed: Vec<String> = s.items.values()
-            .filter(|i| i.person == person && !i.to.iter().all(|t| own.contains(t)))
+            .filter(|i| i.person == person && !i.to.iter().all(|t| super::members::is_owner_device(config, &c, t)))
             .map(|i| i.id.clone())
             .collect();
         for id in &doomed {
@@ -1006,6 +1026,12 @@ pub struct PersonUsage {
     pub items: usize,
     pub bytes: u64,
     pub through: bool,
+    /// A friend of the owner (not of this device) that an owner device vouched for.
+    #[serde(default)]
+    pub via_owner: bool,
+    /// Removed on this server (listed so it can be allowed again).
+    #[serde(default)]
+    pub removed: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1031,22 +1057,73 @@ pub struct ServerStatus {
     pub people: Vec<PersonUsage>,
     pub waiting: Vec<Waiting>,
     pub default_root: String,
+    /// Who owns this server (None = not set; this device isn't linked either).
+    pub owner: Option<OwnerView>,
+    /// This device is linked to an account (it owns itself; nothing to pick).
+    pub linked: bool,
+    /// Accounts this device knows (its friends' verified accounts) that could own it.
+    pub owner_choices: Vec<OwnerView>,
+}
+
+/// An account as the owner picker shows it.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerView {
+    pub account: String,
+    pub name: String,
+    /// How many of that account's devices this device knows.
+    pub devices: usize,
+    /// Owner devices currently sharing the server with their friends.
+    pub sharing: usize,
+}
+
+/// The accounts this device's friends proved, as the owner picker lists them.
+pub fn owner_choices(config: &Path) -> Vec<OwnerView> {
+    let mine = crate::account::my_pub(config);
+    let friends = crate::friends::load(config);
+    let mut by: HashMap<String, OwnerView> = HashMap::new();
+    for f in &friends {
+        let (Some(acct), Some(eid)) = (f.account_pub.as_deref(), f.endpoint_id.as_deref()) else { continue };
+        if Some(acct) == mine.as_deref() || crate::block::is_blocked(config, eid) {
+            continue;
+        }
+        let name = crate::friends::thread_owner(config, &f.id).map(|o| o.name).unwrap_or_else(|| f.name.clone());
+        let v = by.entry(acct.to_owned()).or_insert_with(|| OwnerView { account: acct.to_owned(), name, devices: 0, sharing: 0 });
+        v.devices += 1;
+    }
+    let mut out: Vec<OwnerView> = by.into_values().collect();
+    out.sort_by(|a, b| b.devices.cmp(&a.devices).then(a.name.cmp(&b.name)));
+    out
 }
 
 pub fn status(config: &Path) -> ServerStatus {
     let c = load_config(config);
     let friends = crate::friends::load(config);
-    let name_of = |person: &str| friends.iter().find(|f| f.id == person).map(|f| f.name.clone());
+    let vouched = super::members::everyone(config, &c);
+    let name_of = |person: &str| friends.iter().find(|f| f.id == person).map(|f| f.name.clone())
+        .or_else(|| vouched.iter().find(|(id, _, _)| id == person).map(|(_, n, _)| n.clone()))
+        .or_else(|| super::members::name_of(config, &c, person));
     let label_for = |eid: &str| -> String {
-        if crate::account::is_own_device(config, eid) {
+        if super::members::is_owner_device(config, &c, eid) {
             return "Your devices".into();
         }
-        crate::friends::chat_sender(config, eid).map(|f| f.name).unwrap_or_else(|| "Someone a friend knows".into())
+        crate::friends::chat_sender(config, eid).map(|f| f.name)
+            .or_else(|| super::members::vouched(config, &c, eid).map(|v| v.name))
+            .unwrap_or_else(|| "Someone a friend knows".into())
     };
+    let linked = crate::account::my_pub(config).is_some();
+    let choices = if linked { vec![] } else { owner_choices(config) };
+    let owner = super::members::owner_account(config, &c).map(|account| {
+        let sharing = super::members::sharing_devices(config, &c);
+        choices.iter().find(|o| o.account == account).cloned()
+            .map(|o| OwnerView { sharing, ..o })
+            .unwrap_or(OwnerView { account, name: if linked { "You".into() } else { "Owner".into() }, devices: 0, sharing })
+    });
     let mut st = ServerStatus {
         supported: hosting_supported(), config: c.clone(), storage_ok: false, storage_error: None,
         used: 0, free: None, items: 0, people: vec![], waiting: vec![],
         default_root: default_root(config).to_string_lossy().into_owned(),
+        owner, linked, owner_choices: choices,
     };
     if !c.enabled {
         return st;
@@ -1059,6 +1136,7 @@ pub fn status(config: &Path) -> ServerStatus {
                 id: it.person.clone(),
                 name: if it.person == "own" { "You".into() } else { name_of(&it.person).unwrap_or_else(|| "A friend".into()) },
                 own: it.person == "own", items: 0, bytes: 0, through: c.through.contains(&it.person),
+                via_owner: it.person.starts_with("v:"), removed: c.denied.contains(&it.person),
             });
             p.items += 1;
             p.bytes += it.ct_size;
@@ -1075,7 +1153,18 @@ pub fn status(config: &Path) -> ServerStatus {
             crate::locations::volume_bytes(&s.root).map(|(f, _)| f))
     }) {
         Ok((used, items, mut people, mut waiting, free)) => {
-            people.sort_by(|a, b| b.own.cmp(&a.own).then(b.bytes.cmp(&a.bytes)));
+            // Everyone who may use it, even with nothing here right now.
+            if c.access != "me" {
+                for (id, name, _) in &vouched {
+                    let removed = c.denied.contains(id) || super::members::devices_of(config, &c, id).iter()
+                        .any(|e| c.denied.iter().any(|d| d.strip_prefix("e:") == Some(e.as_str())));
+                    if !people.iter().any(|p| &p.id == id) && (removed || c.access == "all" || c.allowed.contains(id)) {
+                        people.push(PersonUsage { id: id.clone(), name: name.clone(), own: false, items: 0, bytes: 0,
+                            through: c.through.contains(id), via_owner: true, removed });
+                    }
+                }
+            }
+            people.sort_by(|a, b| b.own.cmp(&a.own).then(b.bytes.cmp(&a.bytes)).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
             waiting.sort_by_key(|w| w.oldest_ms);
             st.storage_ok = true;
             st.used = used;
