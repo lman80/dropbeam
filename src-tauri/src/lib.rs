@@ -9,6 +9,7 @@ mod mailbox;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
 mod chat;
+mod clipboard_files;
 mod commands;
 #[cfg(target_os = "ios")]
 mod ios_media;
@@ -828,6 +829,7 @@ pub fn run() {
             commands::reveal_path,
             commands::save_pasted_image,
             commands::paste_clipboard_image,
+            clipboard_files::clipboard_file_paths,
             commands::open_path,
             commands::export_diagnostics,
             commands::diagnostics_test,

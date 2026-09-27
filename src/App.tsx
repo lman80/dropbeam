@@ -118,23 +118,35 @@ export default function App() {
   useEffect(() => {
     let un: UnlistenFn | undefined
     let active = true
+    // Files arriving from outside — dropped on the window, or pasted (#37).
+    const route = (paths: string[]) => {
+      // An open QR scanner takes the drop (a screenshot of a QR to decode).
+      if (routeDropToScanner(paths)) return
+      // On the Chat page with a conversation open, a dropped file/folder is
+      // STAGED in the composer (iMessage-style, GitHub #23) — it waits as a chip
+      // so you can add a message and send them together — instead of firing off
+      // immediately or routing to the global send chooser.
+      const st = useStore.getState()
+      if (st.view === 'locations') {
+        window.dispatchEvent(new CustomEvent('dropbeam:location-drop', { detail: paths }))
+      } else if (st.view === 'chat' && st.activeChatId) {
+        st.stageChatFiles(paths)
+      } else {
+        setPendingSend(paths)
+      }
+    }
+    // ⌘V / Ctrl+V outside a text field with files copied in Finder/Explorer (#37)
+    // works like dropping them. Text fields handle their own paste (the chat
+    // composer stages files itself); plain text on the clipboard is left alone.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== 'v' || !(IS_MAC ? e.metaKey : e.ctrlKey) || e.shiftKey || e.altKey) return
+      const t = e.target as HTMLElement | null
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+      void api.clipboardFilePaths().then((paths) => { if (active && paths.length) route(paths) }, () => {})
+    }
+    if (HAS_TAURI && !MOBILE_UI) window.addEventListener('keydown', onKey)
     onFileDrop(
-      (paths) => {
-        // An open QR scanner takes the drop (a screenshot of a QR to decode).
-        if (routeDropToScanner(paths)) return
-        // On the Chat page with a conversation open, a dropped file/folder is
-        // STAGED in the composer (iMessage-style, GitHub #23) — it waits as a chip
-        // so you can add a message and send them together — instead of firing off
-        // immediately or routing to the global send chooser.
-        const st = useStore.getState()
-        if (st.view === 'locations') {
-          window.dispatchEvent(new CustomEvent('dropbeam:location-drop', { detail: paths }))
-        } else if (st.view === 'chat' && st.activeChatId) {
-          st.stageChatFiles(paths)
-        } else {
-          setPendingSend(paths)
-        }
-      },
+      route,
       (h) => {
         setDragHovering(h)
         if (useStore.getState().view === 'locations') window.dispatchEvent(new CustomEvent('dropbeam:location-hover', { detail: h }))
@@ -145,6 +157,7 @@ export default function App() {
     })
     return () => {
       active = false
+      window.removeEventListener('keydown', onKey)
       un?.()
     }
   }, [setPendingSend, setDragHovering])

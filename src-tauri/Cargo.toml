@@ -110,7 +110,13 @@ trash = "5"
 windows-core = "0.62"
 # `Win32_UI_Shell` gates SetCurrentProcessExplicitAppUserModelID (ties the process
 # to the installer's Start-menu AppUserModelID so chat toast notifications show).
-windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+# `Win32_System_DataExchange`: reading copied Explorer files (CF_HDROP) for paste (#37).
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_DataExchange"] }
+
+# Linux only: GTK's clipboard for copied files (text/uri-list) on paste (#37) —
+# the same gtk 0.18 Tauri/tao already link, so nothing new is built.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 [target.'cfg(unix)'.dependencies]
 # Ignore SIGPIPE at startup so closed launcher pipes return an I/O error.

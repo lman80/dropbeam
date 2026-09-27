@@ -140,6 +140,7 @@ dependencies = [
  "block2",
  "chrono",
  "curve25519-dalek",
+ "gtk",
  "hex",
  "http-range",
  "image",

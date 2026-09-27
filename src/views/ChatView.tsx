@@ -731,26 +731,8 @@ function Conversation({ friendId }: { friendId: string }) {
 
   // Cmd/Ctrl-V a screenshot straight into the chat: save the clipboard image to an
   // app-managed folder and stage it as a chip — the same proven flow a dropped file
-  // uses. Text pastes are untouched (we only intercept when an image is present).
-  const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = Array.from(e.clipboardData?.items ?? [])
-    const img = items.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
-    const blob = img?.getAsFile() ?? Array.from(e.clipboardData.files).find((f) => f.type.startsWith('image/'))
-    if (!blob) {
-      // Let normal text/file pastes proceed. WebKitGTK can expose an image-only
-      // clipboard as an entirely empty DataTransfer: ask the native clipboard.
-      if (items.some((i) => i.kind === 'file') || e.clipboardData.files.length ||
-          e.clipboardData.getData('text/plain') || e.clipboardData.getData('text/html')) return
-      e.preventDefault()
-      try {
-        if (!HAS_TAURI) throw new Error('No usable image is on the clipboard.')
-        stageChatFiles([await api.pasteClipboardImage()])
-      } catch (err) {
-        toast('error', String(err))
-      }
-      return
-    }
-    e.preventDefault()
+  // uses. Files copied in Finder/Explorer (#37) are staged the same way.
+  const pasteImage = async (blob: Blob) => {
     // Reject oversized pastes BEFORE any encoding work — otherwise a 40 MB clipboard
     // image would freeze the UI for seconds only to be refused on the Rust side.
     if (blob.size > 25 * 1024 * 1024) {
@@ -772,6 +754,64 @@ function Conversation({ friendId }: { friendId: string }) {
     } catch (err) {
       toast('error', String(err))
     }
+  }
+  const pasteNativeImage = async () => {
+    try {
+      if (!HAS_TAURI) throw new Error('No usable image is on the clipboard.')
+      stageChatFiles([await api.pasteClipboardImage()])
+    } catch (err) {
+      toast('error', String(err))
+    }
+  }
+  /** Type `value` at the caret as if it had been pasted (keeps native undo). */
+  const insertAtCaret = (value: string) => {
+    const ta = taRef.current
+    if (!ta) return
+    ta.focus({ preventScroll: true })
+    if (document.execCommand('insertText', false, value)) return
+    const { selectionStart: a, selectionEnd: b } = ta
+    const next = ta.value.slice(0, a) + value + ta.value.slice(b)
+    setText(next)
+    requestAnimationFrame(() => ta.setSelectionRange(a + value.length, a + value.length))
+  }
+  const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items ?? [])
+    const img = items.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
+    const blob = img?.getAsFile() ?? Array.from(e.clipboardData.files).find((f) => f.type.startsWith('image/'))
+    const plain = e.clipboardData.getData('text/plain')
+    const html = e.clipboardData.getData('text/html')
+    const hasFileItem = items.some((i) => i.kind === 'file') || e.clipboardData.files.length > 0
+    if (HAS_TAURI && !MOBILE_UI) {
+      // A file copied in Finder/Explorer reaches the webview only as its ICON (an
+      // image) and its NAME (text), so ask the OS clipboard for real file
+      // references first. That answer is async, so take the paste over now and
+      // replay it ourselves when there are no files.
+      e.preventDefault()
+      const paths = await api.clipboardFilePaths().catch(() => [] as string[])
+      if (paths.length) {
+        stageChatFiles(paths)
+        return
+      }
+      if (blob) return void pasteImage(blob)
+      if (plain) return insertAtCaret(plain)
+      if (html) {
+        const txt = new DOMParser().parseFromString(html, 'text/html').body.textContent ?? ''
+        if (txt) return insertAtCaret(txt)
+      }
+      // WebKitGTK can expose an image-only clipboard as an empty DataTransfer.
+      if (!hasFileItem) void pasteNativeImage()
+      return
+    }
+    if (!blob) {
+      // Let normal text/file pastes proceed. WebKitGTK can expose an image-only
+      // clipboard as an entirely empty DataTransfer: ask the native clipboard.
+      if (hasFileItem || plain || html) return
+      e.preventDefault()
+      void pasteNativeImage()
+      return
+    }
+    e.preventDefault()
+    void pasteImage(blob)
   }
 
   const pickGif = (g: { id: string; sendUrl: string; pageUrl: string; w: number; h: number }) => {

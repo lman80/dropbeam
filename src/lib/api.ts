@@ -613,6 +613,9 @@ const realApi = {
   savePastedImage: (b64: string, ext: string) =>
     invoke<string>('save_pasted_image', { b64, ext }),
   pasteClipboardImage: () => invoke<string>('paste_clipboard_image'),
+  /** Files/folders copied in Finder / Explorer / a Linux file manager (#37), as
+   *  absolute paths — empty when the clipboard holds none. */
+  clipboardFilePaths: () => invoke<string[]>('clipboard_file_paths'),
   /** Add/remove an emoji reaction on a message (ours or theirs). */
   reactToMessage: (friendId: string, messageId: string, emoji: string, add: boolean) =>
     invoke<void>('react_to_message', { friendId, messageId, emoji, add }),
