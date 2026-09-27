@@ -110,3 +110,16 @@ fn read() -> Vec<String> {
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    /// Manual: copy a file in Finder (or `osascript -e 'set the clipboard to
+    /// (POSIX file "/tmp/x")'`), then `cargo test --lib clipboard_files -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn reads_copied_files_from_the_pasteboard() {
+        let paths = super::clipboard_file_paths();
+        println!("clipboard files: {paths:?}");
+        assert!(!paths.is_empty());
+    }
+}
