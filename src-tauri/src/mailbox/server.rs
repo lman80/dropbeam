@@ -1075,6 +1075,9 @@ pub struct OwnerView {
     pub devices: usize,
     /// Owner devices currently sharing the server with their friends.
     pub sharing: usize,
+    /// Owner devices that report each other removed from the account.
+    #[serde(default)]
+    pub disputed: usize,
 }
 
 /// The accounts this device's friends proved, as the owner picker lists them.
@@ -1088,7 +1091,7 @@ pub fn owner_choices(config: &Path) -> Vec<OwnerView> {
             continue;
         }
         let name = crate::friends::thread_owner(config, &f.id).map(|o| o.name).unwrap_or_else(|| f.name.clone());
-        let v = by.entry(acct.to_owned()).or_insert_with(|| OwnerView { account: acct.to_owned(), name, devices: 0, sharing: 0 });
+        let v = by.entry(acct.to_owned()).or_insert_with(|| OwnerView { account: acct.to_owned(), name, devices: 0, sharing: 0, disputed: 0 });
         v.devices += 1;
     }
     let mut out: Vec<OwnerView> = by.into_values().collect();
@@ -1115,9 +1118,10 @@ pub fn status(config: &Path) -> ServerStatus {
     let choices = if linked { vec![] } else { owner_choices(config) };
     let owner = super::members::owner_account(config, &c).map(|account| {
         let sharing = super::members::sharing_devices(config, &c);
+        let disputed = super::members::disputed_devices(config, &c);
         choices.iter().find(|o| o.account == account).cloned()
-            .map(|o| OwnerView { sharing, ..o })
-            .unwrap_or(OwnerView { account, name: if linked { "You".into() } else { "Owner".into() }, devices: 0, sharing })
+            .map(|o| OwnerView { sharing, disputed, ..o })
+            .unwrap_or(OwnerView { account, name: if linked { "You".into() } else { "Owner".into() }, devices: 0, sharing, disputed })
     });
     let mut st = ServerStatus {
         supported: hosting_supported(), config: c.clone(), storage_ok: false, storage_error: None,

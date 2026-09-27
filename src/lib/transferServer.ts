@@ -35,7 +35,7 @@ export interface PersonUsage {
 }
 
 /** An account that owns (or could own) this server. */
-export interface OwnerView { account: string; name: string; devices: number; sharing: number }
+export interface OwnerView { account: string; name: string; devices: number; sharing: number; disputed?: number }
 export interface Waiting { label: string; items: number; bytes: number; oldestMs: number; expiresMs: number }
 
 export interface ServerStatus {

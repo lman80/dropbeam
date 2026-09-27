@@ -340,9 +340,11 @@ pub fn learn_intro(config: &Path, server: &str, reply: &HelloReply, via: &[Strin
     match reply {
         HelloReply::Ok(r) => {
             let rights = &r["rights"];
-            // A server we heard about from a friend is never ours, whatever it says.
+            // A server we heard about from a friend is never ours, whatever it
+            // says (it stays ours only if it already told us so itself).
+            let was_owner = servers(config).iter().any(|s| s.eid == server && s.owner);
             let g = json!({"name": r["name"], "own": rights["own"], "member": rights["member"], "through": rights["through"],
-                "owner": false, "paused": r["paused"], "access": r["access"]});
+                "owner": was_owner, "paused": r["paused"], "access": r["access"]});
             let own = crate::account::is_own_device(config, server);
             let mut change = learn_grant(config, server, Some(&g), own);
             with_servers(config, |map| {

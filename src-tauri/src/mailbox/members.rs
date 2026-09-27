@@ -153,6 +153,9 @@ struct View {
     index: HashMap<String, Vouched>,
     /// Lists that count (from owner devices, not stale).
     live: usize,
+    /// Owner devices that another owner device reported removed from the
+    /// account and that reported it back (the server can't tell who's right).
+    disputed: usize,
 }
 
 static VIEWS: Mutex<Option<HashMap<PathBuf, Arc<View>>>> = Mutex::new(None);
@@ -177,13 +180,14 @@ fn view(config: &Path, c: &ServerConfig) -> Arc<View> {
 }
 
 fn compute(config: &Path, account: Option<String>) -> View {
-    let empty = |account| View { made: Instant::now(), account, owners: HashSet::new(), index: HashMap::new(), live: 0 };
+    let empty = |account| View { made: Instant::now(), account, owners: HashSet::new(), index: HashMap::new(), live: 0, disputed: 0 };
     let Some(acct) = account.clone() else { return empty(account) };
     let linked_here = crate::account::my_pub(config).is_some();
     let now = crate::chat::now_ms();
     let lists: Vec<(String, OwnerList)> = load(config).into_iter()
         .filter(|(_, l)| now.saturating_sub(l.at) < LIST_TTL_MS)
         .collect();
+    let mut disputed = 0;
     let owners: HashSet<String> = if linked_here {
         crate::account::own_devices(config).into_iter().filter_map(|f| f.endpoint_id).collect()
     } else {
@@ -194,7 +198,9 @@ fn compute(config: &Path, account: Option<String>) -> View {
         // which one is lying), and nobody can lock the real devices out.
         let prove = proving(config, &acct);
         let fresh: Vec<&(String, OwnerList)> = lists.iter().filter(|(from, _)| prove.contains(from)).collect();
-        let linked_at = |d: &str| fresh.iter().filter_map(|(_, l)| l.linked.get(d).copied()).max().unwrap_or(0);
+        // When `d` joined the account, as OTHER devices know it: a device never
+        // vouches for its own link time (a removed one would just claim a new one).
+        let linked_at = |d: &str| fresh.iter().filter(|(from, _)| from != d).filter_map(|(_, l)| l.linked.get(d).copied()).max().unwrap_or(0);
         let reporters = |d: &str| -> Vec<&str> {
             let at = linked_at(d);
             fresh.iter()
@@ -202,13 +208,18 @@ fn compute(config: &Path, account: Option<String>) -> View {
                 .map(|(from, _)| from.as_str())
                 .collect()
         };
-        prove.iter()
+        let owners: HashSet<String> = prove.iter()
             .filter(|d| !reporters(d).iter().any(|r| reporters(r).is_empty()))
             .cloned()
-            .collect()
+            .collect();
+        disputed = owners.iter().filter(|d| !reporters(d).is_empty()).count();
+        if disputed > 0 {
+            log::warn!("transfer-server: {disputed} of the owner's devices report each other removed; both still count");
+        }
+        owners
     };
     let live: Vec<(String, OwnerList)> = lists.into_iter().filter(|(from, _)| owners.contains(from)).collect();
-    View { made: Instant::now(), account, index: index(&live), live: live.len(), owners }
+    View { made: Instant::now(), account, index: index(&live), live: live.len(), owners, disputed }
 }
 
 /// One of the owner's devices: this device's own account devices (a linked
@@ -286,6 +297,11 @@ pub fn sharing_devices(config: &Path, c: &ServerConfig) -> usize {
         return 0;
     }
     view(config, c).live
+}
+
+/// Owner devices that dispute each other's removal (shown on the server page).
+pub fn disputed_devices(config: &Path, c: &ServerConfig) -> usize {
+    view(config, c).disputed
 }
 
 /// The name of vouched person `person` ("v:…"), if listed.

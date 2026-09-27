@@ -1304,6 +1304,12 @@ async fn removed_blocked_and_denied_friends_of_the_owner_lose_access() {
     let lie = json!({"kind": "mailbox.members", "people": [], "unlinked": {w.o.eid(): u64::MAX}});
     assert_eq!(rpc(&conn, lie).await["ok"], true);
     assert!(server::rights_for(&w.s.config, &c, &w.o.eid()).owner, "a disputed report never locks a device out");
+    // …nor can it re-link itself: its own "I joined just now" doesn't count.
+    let conn = o2.ep.connect(iroh_net::dial_addr(w.s.ep.id()), iroh_net::ALPN).await.unwrap();
+    let relink = json!({"kind": "mailbox.members", "people": [], "linked": {o2.eid(): u64::MAX}, "unlinked": {w.o.eid(): u64::MAX}});
+    assert_eq!(rpc(&conn, relink).await["ok"], true);
+    assert!(server::rights_for(&w.s.config, &c, &w.o.eid()).owner, "a removed device can't lock the owner out by re-linking itself");
+    assert_eq!(super::members::disputed_devices(&w.s.config, &c), 2, "the server page shows the dispute");
     let lists = super::members::lists_for_tests(&w.s.config);
     assert!(lists[&o2.eid()].unlinked[&w.o.eid()] <= crate::chat::now_ms() + super::server::DAY_MS, "times are clamped");
 

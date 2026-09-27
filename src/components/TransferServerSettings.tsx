@@ -294,7 +294,9 @@ function OwnerRow({ status, setStatus }: { status: ServerStatus; setStatus: (s: 
   const owner = status.owner
   const sub = !owner
     ? 'Choose whose server this is. Their friends can then use it too.'
-    : owner.sharing > 0
+    : owner.disputed
+      ? `Two of ${owner.name}’s devices each say the other was removed from their account. Block the one that isn’t theirs any more in Friends.`
+      : owner.sharing > 0
       ? `Shared with ${owner.name}’s friends`
       : `To share it with ${owner.name}’s friends, tap Share on ${owner.name}’s phone or Mac`
   if (!owner && choices.length === 0) return null
