@@ -61,6 +61,7 @@
       },
       {
         "label": "receive",
+        "title": "DropBeam",
         "url": "index.html",
         "width": 190,
         "height": 184,

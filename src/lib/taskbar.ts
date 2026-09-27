@@ -1,10 +1,11 @@
 // Taskbar / Dock transfer progress.
 //  • Windows + Linux: the taskbar/launcher button fills as the transfer runs.
 //  • macOS: the Downloads stack already shows a ring while the app is on screen,
-//    so the DOCK ICON's bar is reserved for the case you can't see the app —
-//    the window minimized into the Dock (GitHub #33/#24/#29). It clears the
-//    moment the transfer finishes or the window comes back up.
-import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window'
+//    so the DOCK ICON's bar is reserved for the case you can't see any progress
+//    on screen — the main window minimized/hidden AND the transfer card
+//    minimized into the Dock or not up (GitHub #33/#24/#29). It clears the
+//    moment the transfer finishes or a window comes back up.
+import { getCurrentWindow, ProgressBarStatus, Window } from '@tauri-apps/api/window'
 import { HAS_TAURI } from './api'
 
 const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent)
@@ -25,14 +26,22 @@ function apply(v: number) {
   }
 }
 
-/** Poll whether we're minimized, at most once a second — there is no minimize
- *  event to listen for, and this only runs while a transfer is live. */
+/** True when `win` is up on screen (visible and not minimized into the Dock). */
+async function onScreen(win: Window | null): Promise<boolean> {
+  if (!win) return false
+  const [visible, min] = await Promise.all([win.isVisible(), win.isMinimized()])
+  return visible && !min
+}
+
+/** Poll whether any progress is on screen, at most once a second — there is no
+ *  minimize event to listen for, and this only runs while a transfer is live.
+ *  (`minimized` = "nothing showing progress is on screen".) */
 function refreshMinimized() {
   const now = Date.now()
   if (now - checkedAt < 1000) return
   checkedAt = now
-  getCurrentWindow()
-    .isMinimized()
+  Promise.all([onScreen(getCurrentWindow()), Window.getByLabel('receive').then(onScreen, () => false)])
+    .then(([main, card]) => !main && !card)
     .then((value) => {
       if (value === minimized) return
       minimized = value
