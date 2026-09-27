@@ -1,4 +1,4 @@
-<!-- superfeedback:handling v1 -->
+<!-- superfeedback:handling v2 -->
 ## User feedback (SuperFeedback) — keep the Issues up to date
 
 Users send bugs and ideas from inside the app. Each one becomes a GitHub Issue in
@@ -22,7 +22,22 @@ keep them accurate as you work:
 5. **Won't fix, can't reproduce, or duplicate:**
    `gh issue close N -R lman80/dropbeam --reason "not planned" --comment "<why, or Duplicate of #M>"`
    Ask the owner before declining a feature request — don't decide product direction yourself.
-6. **Before you finish:** every Issue you fixed this session is closed with a comment, and every
+6. **Problems in SuperFeedback itself go upstream.** If the problem is in the feedback button, the
+   feedback panel, screenshots, sending, or the vendored SuperFeedback file (`SuperFeedback.swift`,
+   `superfeedback.js`), it's a SuperFeedback bug, not this app's. Report it where it gets fixed for
+   every app:
+   - First check whether a newer SuperFeedback already fixes it (CHANGELOG.md in
+     github.com/lman80/SuperFeedback). If so, update the widget per its UPDATING.md instead.
+   - Otherwise search `gh issue list -R lman80/SuperFeedback --state all --search "<keywords>"`; if
+     it's already there, comment with this app's details. If not:
+     `gh issue create -R lman80/SuperFeedback --label feedback --label bug --title "[<App>] <problem>" --body "<what happens, steps, platform/OS, widget version (superfeedback.config.json), link to this repo's Issue>"`
+   - On this repo's Issue: `gh label create superfeedback -R lman80/dropbeam --color 6d5efc --force`,
+     `gh issue edit N -R lman80/dropbeam --add-label superfeedback`, and comment
+     "Reported upstream: lman80/SuperFeedback#M". Leave it open until this app's widget is updated
+     to a version with the fix, then close it as completed.
+   - Don't quietly patch the vendored widget: widget updates overwrite local edits. If you must patch
+     it to unblock the app, still report it upstream and include the diff.
+7. **Before you finish:** every Issue you fixed this session is closed with a comment, and every
    one you started but didn't finish still has `building` and a comment saying where it stands.
 
 Never close an Issue without a comment, never delete Issues, and don't edit the report body
