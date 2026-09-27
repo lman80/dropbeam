@@ -225,7 +225,7 @@ export function LocationsView() {
                 const total = up.reduce((n, t) => n + (t.bytesTotal || 0), 0)
                 const paused = up.every(t => t.state === 'paused')
                 return <span className="row-sub location-activity live truncate-1" role="status">
-                  {paused ? null : <Spinner size={10} />} {paused ? 'Upload paused' : 'Uploading'}{total > 0 ? ` · ${Math.floor((done / total) * 100)}% of ${formatBytes(total)}` : '…'}
+                  {paused ? null : <Spinner size={10} />} {f.name} · {paused ? 'Upload paused' : 'Uploading'}{total > 0 ? ` · ${Math.floor((done / total) * 100)}% of ${formatBytes(total)}` : '…'}
                 </span>
               })()}
             </span>
