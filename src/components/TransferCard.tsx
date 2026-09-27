@@ -265,7 +265,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                   <Play /> Resume
                 </button>
               )}
-              {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} />}
+              {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} moving={transferring} />}
               {completed && t.direction === 'receive' && t.outDir && (
                 <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in Finder' : 'Open Folder'} onClick={showInFolder}>
                   <FolderOpen />

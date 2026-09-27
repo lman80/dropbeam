@@ -1933,7 +1933,16 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
 pub fn conn_detail(conn: &Connection) -> crate::models::ConnDetail {
     use crate::models::ConnDetail;
     let paths = conn.paths();
-    let selected = paths.iter().find(|p| p.is_selected() && conn.close_reason().is_none());
+    let open = conn.close_reason().is_none();
+    // Iroh can briefly report NO selected path on a live connection (mid path
+    // switch / after a re-holepunch) and sometimes stays that way while bytes
+    // keep flowing. Don't call that "connecting" (GitHub #30): fall back the same
+    // way `conn_locality` does — an established IP path first, then the relay.
+    let selected = paths
+        .iter()
+        .find(|p| p.is_selected() && open)
+        .or_else(|| paths.iter().find(|p| open && path_is_validated_direct(p)))
+        .or_else(|| paths.iter().find(|p| open && p.is_relay()));
     // A direct upgrade is ready when an established IP path is present but
     // the relay is still selected. Probing paths are not exposed in iroh 1.2.
     let upgrading = selected.as_ref().map(|p| p.is_relay()).unwrap_or(false)

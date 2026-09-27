@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, ChevronLeft, ChevronRight, File, Folder, FolderPlus, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
 import { api, locationsApi, onLocationsChanged, onTransferUpdate, type LocationEntry, type LocationPage, type SharedLocation } from '../lib/api'
@@ -6,6 +6,8 @@ import { formatBytes } from '../lib/format'
 import { rememberLocationUpload, useStore } from '../store'
 import { Dialog } from './Dialog'
 import { IconButton, MenuPopover, Spinner } from './ui'
+import { TransferCard } from './TransferCard'
+import { outgoingForLocation, trackOutgoingLocationUpload } from '../lib/locationUploads'
 
 type Action = 'mkdir' | 'rename' | 'trash'
 const join = (parent: string, name: string) => parent ? `${parent}/${name}` : name
@@ -60,8 +62,9 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     try {
       const u = await locationsApi.upload(friendId, location.id, path, paths)
       rememberLocationUpload(u.id, friendId, location.id, path, paths)
+      trackOutgoingLocationUpload(u.id, { friendId, locationId: location.id, relPath: path })
       if (!useStore.getState().transfers[u.id]) useStore.getState().upsertTransfer(u)
-      toast('success', 'Uploading · follow it in Send & Receive')
+      if (MOBILE_UI) toast('success', 'Uploading · follow it in Send & Receive')
     } catch(e) { toast('error', String(e)) }
     finally { actionBusy.current = false; setBusy(false) }
   }, [friendId, location.id, location.rights.upload, path, toast])
@@ -217,6 +220,8 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       </>}</div>
     </div>
 
+    <LocationUploads friendId={friendId} location={location} />
+
     <div className={`group location-table-group${hover && location.rights.upload ? ' location-drop' : ''}${loading && entries.length ? ' location-loading' : ''}`} aria-busy={loading}>
       <table className="location-table">
         <thead><tr>
@@ -266,6 +271,18 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     </footer>
     {actionSheet}
   </section>
+}
+
+/** Uploads from this device into this Location, in place (GitHub #30) — the same
+ *  card as Send & Receive, so pause/cancel/retry work here too. Its own component
+ *  so progress ticks don't re-render the file table. */
+function LocationUploads({ friendId, location }: { friendId: string; location: SharedLocation }) {
+  const transfers = useStore(s => s.transfers)
+  const uploads = useMemo(() => outgoingForLocation(transfers, friendId, location.id), [transfers, friendId, location.id])
+  if (!uploads.length) return null
+  return <div className="location-uploads" aria-label={`Uploading to ${location.name}`}>
+    {uploads.map(t => <TransferCard key={t.id} t={t} />)}
+  </div>
 }
 
 /** "Upload" with a small menu: files, or a whole folder. */

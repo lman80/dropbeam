@@ -29,3 +29,12 @@ test('speeds stay at one decimal in both units', () => {
   assert.equal(formatSpeed(0, false), '—')
   assert.equal(formatSpeed(12.5e6, true), '100 Mbps')
 })
+
+test('pathKind: a stale "connecting" snapshot is ignored while bytes are moving (#30)', async () => {
+  const { pathKind } = await import('../src/lib/humanize.ts')
+  const connecting = { path: 'connecting', rttMs: null, upgrading: false, relay: null } as never
+  assert.equal(pathKind(connecting, null), 'connecting')
+  assert.equal(pathKind(connecting, 'local', true), 'local')
+  assert.equal(pathKind(connecting, 'internet', true), 'relay')
+  assert.equal(pathKind(connecting, null, true), null)
+})

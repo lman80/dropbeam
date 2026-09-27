@@ -6,6 +6,7 @@ import { ChevronLeft, ChevronRight, HardDrive, Info, RefreshCw } from 'lucide-re
 import { locationsApi, onLocationsChanged, type HostedLocation, type HostedLocationStatus, type SharedLocation } from '../lib/api'
 import { formatBytes, formatRelativeTime } from '../lib/format'
 import { incomingByLocation, trackLocationTransfers } from '../lib/hostedLocations'
+import { outgoingForLocation, pruneOutgoingLocationUploads } from '../lib/locationUploads'
 import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/presence'
 import { useStore } from '../store'
 import { FileBrowser } from '../components/FileBrowser'
@@ -110,6 +111,8 @@ export function LocationsView() {
   const seen = useStore(s => s.friendSeen)
   const statuses = useStore(s => s.folderStatuses)
   const setView = useStore(s => s.setView)
+  const transfers = useStore(s => s.transfers)
+  useEffect(() => pruneOutgoingLocationUploads(useStore.getState().transfers), [])
   const [shared, setShared] = useState<SharedByFriend>(cached)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
@@ -214,7 +217,17 @@ export function LocationsView() {
             <span className="location-glyph" aria-hidden><HardDrive /></span>
             <span className="row-main">
               <span className="row-title truncate-1" title={l.name}>{l.name}</span>
-              <span className="row-sub location-presence truncate-1"><Dot tone={p.online ? 'online' : 'off'} />{f.name} · {p.words}</span>
+              {(() => {
+                // This device's uploads into it (#30): say so right on the tile.
+                const up = outgoingForLocation(transfers, f.id, l.id)
+                if (!up.length) return <span className="row-sub location-presence truncate-1"><Dot tone={p.online ? 'online' : 'off'} />{f.name} · {p.words}</span>
+                const done = up.reduce((n, t) => n + (t.bytesDone || 0), 0)
+                const total = up.reduce((n, t) => n + (t.bytesTotal || 0), 0)
+                const paused = up.every(t => t.state === 'paused')
+                return <span className="row-sub location-activity live truncate-1" role="status">
+                  {paused ? null : <Spinner size={10} />} {paused ? 'Upload paused' : 'Uploading'}{total > 0 ? ` · ${Math.floor((done / total) * 100)}% of ${formatBytes(total)}` : '…'}
+                </span>
+              })()}
             </span>
             <span className="row-trailing">{room}<ChevronRight className="location-chevron" aria-hidden /></span>
           </button>

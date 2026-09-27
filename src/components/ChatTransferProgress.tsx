@@ -78,7 +78,7 @@ export function ChatTransferProgress({ t, onRetry, deliveries, friendName }: { t
       )}
       <div className="xfer-line">
         <span className="tnum truncate-1" title={speed}>{label}</span>
-        <ConnInfo detail={t.connDetail} locality={t.locality} align="end" />
+        <ConnInfo detail={t.connDetail} locality={t.locality} align="end" moving={moving} />
       </div>
     </div>
   )

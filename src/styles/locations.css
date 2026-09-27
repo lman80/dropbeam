@@ -116,6 +116,9 @@ button.location-crumb:hover { color: var(--text); background: var(--surface-hove
 .location-selection > .muted { margin-right: 4px; }
 .location-selection > .btn { margin-right: 2px; }
 
+/* This device's uploads into the open Location (#30), above the file list. */
+.location-uploads { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+
 .location-table-group { transition: box-shadow var(--dur), background var(--dur); }
 .location-table-group.location-drop {
   box-shadow: 0 0 0 2px var(--accent);

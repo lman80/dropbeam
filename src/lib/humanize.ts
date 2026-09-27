@@ -19,10 +19,12 @@ export function peerLabel(peer: string | null | undefined): string | null {
 export type PathKind = 'local' | 'direct' | 'relay' | 'connecting'
 
 /** Which way the bytes flow, from the live detail if we have it, else the locality. */
-export function pathKind(detail?: ConnDetail | null, locality?: Locality | null): PathKind | null {
+export function pathKind(detail?: ConnDetail | null, locality?: Locality | null, moving = false): PathKind | null {
   const p = detail?.path
   if (p === 'local' || p === 'direct' || p === 'relay') return p
-  if (p === 'connecting') return 'connecting'
+  // Bytes are flowing, so it IS connected — a "connecting" snapshot is stale
+  // (GitHub #30). Use the locality badge, or say nothing rather than mislead.
+  if (p === 'connecting' && !moving) return 'connecting'
   if (locality === 'local') return 'local'
   if (locality === 'direct') return 'direct'
   if (locality === 'internet') return 'relay'
