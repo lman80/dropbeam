@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from '@tauri-apps/api/window'
 import { desktopDir, documentDir, downloadDir, homeDir } from '@tauri-apps/api/path'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -15,7 +15,8 @@ import {
 import { HAS_TAURI, api, type TransferUpdate } from '../lib/api'
 import { avatarColor } from '../lib/avatar'
 import { peerLabel } from '../lib/humanize'
-import { MenuPopover, ProgressBar, Spinner, type MenuItem } from '../components/ui'
+import { MenuPopover, Spinner, type MenuItem } from '../components/ui'
+import { IS_MAC, IS_WINDOWS } from '../lib/platform'
 import { useStore } from '../store'
 
 // Pick a file-type glyph from the extension (audio waveform, image, video…).
@@ -304,8 +305,14 @@ export function ReceiveCard() {
     { label: 'Choose Folder…', onSelect: () => void chooseFolder() },
   ]
 
+  // The whole card border is the progress bar (#35, Blip-style): it fills
+  // clockwise from the top while bytes move and closes into a full ring when a
+  // send lands. No ring on an offer — nothing is moving yet.
+  const ringPct = !t || pendingOffer ? null : pct
+
   return (
     <div className="rc-root">
+      <BorderRing pct={ringPct} />
       <AnimatePresence>
         {t && (
           <motion.div
@@ -365,8 +372,8 @@ export function ReceiveCard() {
                   Done
                 </button>
               ) : (
-                <div className="rc-progress">
-                  <ProgressBar percent={pct} label={`${name} progress`} />
+                <div className="rc-progress" role="progressbar" aria-label={`${name} progress`}
+                  aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct)}>
                   <div className="rc-meter tnum">
                     {t.state !== 'transferring' && <Spinner size={10} />}
                     {meter}
@@ -386,6 +393,43 @@ export function ReceiveCard() {
         />
       )}
     </div>
+  )
+}
+
+/** Corner radius of the card WINDOW, which the OS draws: the ring has to follow
+ *  it. macOS titled windows ≈12 pt, Windows 11 8 px, Linux (WebKitGTK, square
+ *  client area) 0. */
+const WINDOW_RADIUS = IS_MAC ? 12 : IS_WINDOWS ? 8 : 0
+const RING_W = 4
+
+/** A progress stroke that runs around the inside of the card's border,
+ *  starting top-centre and going clockwise. `pct` null = hidden. */
+function BorderRing({ pct }: { pct: number | null }) {
+  const ref = useRef<SVGSVGElement>(null)
+  const [size, setSize] = useState({ w: FULL_W, h: FULL_H })
+  useLayoutEffect(() => {
+    const host = ref.current?.parentElement
+    if (!host) return
+    const measure = () => setSize({ w: host.clientWidth, h: host.clientHeight })
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(host)
+    return () => ro.disconnect()
+  }, [])
+  const { w, h } = size
+  const i = RING_W / 2 + 0.5 // stroke centre, half a px in from the edge
+  const r = Math.max(0, WINDOW_RADIUS - i)
+  const d = `M ${w / 2} ${i} H ${w - i - r} A ${r} ${r} 0 0 1 ${w - i} ${i + r} V ${h - i - r} `
+    + `A ${r} ${r} 0 0 1 ${w - i - r} ${h - i} H ${i + r} A ${r} ${r} 0 0 1 ${i} ${h - i - r} `
+    + `V ${i + r} A ${r} ${r} 0 0 1 ${i + r} ${i} Z`
+  const shown = pct != null
+  const p = Math.max(0, Math.min(100, pct ?? 0))
+  return (
+    <svg ref={ref} className={`rc-ring${shown ? ' on' : ''}`} width={w} height={h} aria-hidden>
+      <path d={d} pathLength={100} className="rc-ring-track" />
+      <path d={d} pathLength={100} className="rc-ring-fill"
+        style={{ strokeDashoffset: 100 - p, opacity: p > 0.4 ? 1 : 0 }} />
+    </svg>
   )
 }
 

@@ -357,13 +357,34 @@ html.overlay-window #root {
 .rc-accept > .btn:first-child { flex: 1; min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .rc-caret { width: 20px; padding: 0; border-top-left-radius: 0; border-bottom-left-radius: 0; }
 .rc-done { width: 100%; }
-.rc-progress { width: 100%; display: flex; flex-direction: column; gap: 6px; }
+.rc-progress { width: 100%; display: flex; flex-direction: column; justify-content: center; }
+
+/* The card border is the progress bar (#35): a track around the inside edge,
+   filled clockwise from the top. Sits under the content; fades in/out. */
+.rc-ring {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--dur, 0.2s) ease;
+}
+.rc-ring.on { opacity: 1; }
+.rc-ring path { fill: none; stroke-width: 4; }
+.rc-ring-track { stroke: color-mix(in srgb, var(--text) 9%, transparent); }
+.rc-ring-fill {
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-dasharray: 100 100;
+  transition: stroke-dashoffset 0.6s cubic-bezier(0.25, 0.8, 0.25, 1), opacity 0.2s ease;
+}
+@media (prefers-reduced-motion: reduce) { .rc-ring-fill { transition: none; } }
 .rc-meter {
   display: flex;
   justify-content: center;
   align-items: center;
   gap: 5px;
-  font-size: var(--text-11);
+  font-size: var(--text-12);
+  font-weight: 500;
   line-height: 14px;
   color: var(--text-muted);
   white-space: nowrap;
