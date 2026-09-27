@@ -7,6 +7,8 @@ import { IS_MAC, MOBILE_UI } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { DropZone } from '../components/DropZone'
 import { TransferCard } from '../components/TransferCard'
+import { OtherDevices } from '../components/OtherDevices'
+import { useOtherDevices } from '../lib/otherDevices'
 import { ScanCodeButton } from '../components/CodeQr'
 import { Dialog } from '../components/Dialog'
 import { SectionHeader } from '../components/ui'
@@ -19,6 +21,7 @@ export function SendView() {
   const receiveCode = useStore((s) => s.receiveCode)
   const openCode = useStore((s) => s.openCode)
   const [picking, setPicking] = useState(false)
+  const othersBusy = useOtherDevices((s) => s.devices.length > 0)
   const [code, setCode] = useState('')
   const [showReceive, setShowReceive] = useState(false)
 
@@ -115,7 +118,11 @@ export function SendView() {
       </div>
 
       {list.length === 0 ? (
-        <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} />
+        <>
+          {/* Compact while another device's transfer is showing, so it's in view. */}
+          <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} compact={othersBusy} />
+          <OtherDevices />
+        </>
       ) : (
         <>
           <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} compact />
@@ -131,6 +138,7 @@ export function SendView() {
               ))}
             </AnimatePresence>
           </div>
+          <OtherDevices />
         </>
       )}
 

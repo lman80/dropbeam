@@ -1082,3 +1082,37 @@ export function mockLocationRequest(request: Record<string, unknown>): Promise<u
   if (q) entries = entries.filter((e) => e.name.toLowerCase().includes(q))
   return new Promise((r) => setTimeout(() => r({ entries, page: 0, hasMore: false, total: entries.length }), 250))
 }
+
+// ── "On your other devices" (#31) ───────────────────────────────────────────
+// ?others=0 hides it (nothing happening elsewhere). Otherwise the iPhone is
+// sending a video to Alex (ticking, then "Sent" and gone) and the Mac mini is
+// receiving from Jordan. ?others=still freezes the progress for screenshots.
+export function mockOtherDevices(): import('./otherDevices').DeviceActivity[] {
+  const q = typeof location === 'undefined' ? new URLSearchParams() : new URLSearchParams(location.search)
+  if (q.get('others') === '0') return []
+  const now = Date.now()
+  const phone: import('./otherDevices').DeviceActivity = {
+    endpointId: 'preview-phone', name: 'iPhone', kind: 'phone', os: 'ios', updatedMs: now,
+    items: [{ id: 'od1', direction: 'send', state: 'transferring', names: ['IMG_2041.MOV', 'IMG_2042.HEIC', 'IMG_2043.HEIC'], fileCount: 3,
+      bytesDone: 412_000_000, bytesTotal: 980_000_000, percent: 42, speedBps: 38_000_000, peer: 'Alex' }],
+  }
+  const mini: import('./otherDevices').DeviceActivity = {
+    endpointId: 'preview-mini', name: 'Mac mini', kind: 'desktop', os: 'macos', updatedMs: now,
+    items: [{ id: 'od2', direction: 'receive', state: 'transferring', names: ['Wedding edit v3.mov'], fileCount: 1,
+      bytesDone: 1_900_000_000, bytesTotal: 6_200_000_000, percent: 30.6, speedBps: 94_000_000, peer: 'Jordan Kim' }],
+  }
+  const devices = [phone, mini]
+  if (q.get('others') !== 'still') {
+    const timer = setInterval(() => {
+      const it = phone.items[0]
+      if (it.state === 'completed') { clearInterval(timer); setTimeout(() => emit('account://activity', [mini]), 8000); return }
+      it.bytesDone = Math.min(it.bytesTotal, it.bytesDone + it.speedBps)
+      it.percent = (it.bytesDone / it.bytesTotal) * 100
+      if (it.bytesDone >= it.bytesTotal) { it.state = 'completed'; it.speedBps = 0 }
+      const m = mini.items[0]
+      m.bytesDone = Math.min(m.bytesTotal, m.bytesDone + m.speedBps); m.percent = (m.bytesDone / m.bytesTotal) * 100
+      emit('account://activity', devices.map(d => ({ ...d, items: d.items.map(i => ({ ...i })) })))
+    }, 1000)
+  }
+  return devices
+}

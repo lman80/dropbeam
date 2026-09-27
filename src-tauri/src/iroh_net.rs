@@ -3507,6 +3507,9 @@ async fn serve_stream_inner(
         Some("account-sync") => {
             crate::account::serve(state, &conn.remote_id().to_string(), &req, send, recv).await?;
         }
+        Some("account-activity") => {
+            crate::device_activity::serve(state, &conn.remote_id().to_string(), &req, send).await?;
+        }
         Some("link-ok" | "link-error") => {}
         Some("friend-hello") => {
             // A peer is introducing themselves: learn their stable EndpointId +

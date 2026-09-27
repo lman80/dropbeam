@@ -40,6 +40,7 @@ struct SendView: View {
                         ForEach(active) { transfer in TransferRow(transfer: transfer) }
                     } header: { Text("In Progress") }.headerProminence(.increased)
                 }
+                OtherDevicesSection()
                 Section {
                     receiveRow
                     Button { scanning = true; Haptics.tap() } label: {

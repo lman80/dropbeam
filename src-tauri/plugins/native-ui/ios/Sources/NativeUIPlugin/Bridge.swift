@@ -47,6 +47,8 @@ final class Bridge: ObservableObject {
     @Published var friends: [Friend] = []
     @Published var myDevice: MyDevice?
     @Published var transfers: [Transfer] = []
+    /// Live transfers on the user's other linked devices (read-only, #31).
+    @Published var otherDevices: [DeviceActivity] = []
     @Published var settings: Settings?
     @Published var chatOverview: [ChatOverview] = []
     @Published var chatUnread: [String: Int] = [:] { didSet { updateAppBadge() } }
@@ -177,6 +179,7 @@ final class Bridge: ObservableObject {
         case "blocked": blocked = try decoder.decode(LossyArray<BlockedPerson>.self, from: data).values
         case "transferServers": servers = try decoder.decode(LossyArray<UsableServer>.self, from: data).values
         case "pendingFiles": pendingFiles = try decoder.decode(LossyArray<PendingFile>.self, from: data).values
+        case "otherDevices": otherDevices = try decoder.decode(LossyArray<DeviceActivity>.self, from: data).values.filter { !$0.items.isEmpty }
         default: break // Forward-compatible snapshots.
         }
         // The share extension lists friends from a snapshot in the App Group.

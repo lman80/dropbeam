@@ -8,9 +8,10 @@ import Foundation
 @MainActor enum TransferServerPreview {
     static func seedIfRequested() {
         let args = ProcessInfo.processInfo.arguments
+        seedOtherDevicesAndHistory(args)
         guard args.contains("-previewTransferServer") else { return }
         let b = Bridge.shared
-        b.previewKeys = ["friends", "thread", "transferServers", "pendingFiles", "holdRoutes", "presence", "presenceSeen", "transfers", "chatOverview", "pushStatus"]
+        b.previewKeys.formUnion(["friends", "thread", "transferServers", "pendingFiles", "holdRoutes", "presence", "presenceSeen", "transfers", "chatOverview", "pushStatus"])
         let now = Date().timeIntervalSince1970 * 1000
         let min = 60_000.0, hour = 3_600_000.0
         b.friends = [
@@ -64,14 +65,48 @@ import Foundation
                 ChatMessage(id: "m3", peerId: "qa-alex", fromMe: true, ts: now - 11 * min, kind: "file", files: ["Itinerary.pdf"], bytes: 640_000, path: "/tmp/Itinerary.pdf", status: "read", fileXferId: "qa-fan-both", deliveries: [mac, phoneDone]),
             ]
         }
-        if let i = args.firstIndex(of: "-previewTab"), i + 1 < args.count {
-            let tab = args[i + 1]
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { b.selectedTab = tab }
-        }
+        selectPreviewTab(args)
         if let i = args.firstIndex(of: "-previewChat"), i + 1 < args.count {
             let id = "qa-" + args[i + 1]
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { b.selectedTab = "chat"; b.chatPath = [id] }
         }
+    }
+    static func selectPreviewTab(_ args: [String]) {
+        if let i = args.firstIndex(of: "-previewTab"), i + 1 < args.count {
+            let tab = args[i + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { Bridge.shared.selectedTab = tab }
+        }
+    }
+    /// `-previewOtherDevices`: the iPhone's Mac is sending, the Mac mini receiving (#31).
+    /// `-previewHistory`: received items with "from" chips (#12). Combine with `-previewTab`.
+    static func seedOtherDevicesAndHistory(_ args: [String]) {
+        let b = Bridge.shared
+        let now = Date().timeIntervalSince1970 * 1000
+        if args.contains("-previewOtherDevices") {
+            b.previewKeys.insert("otherDevices")
+            b.otherDevices = [
+                DeviceActivity(endpointId: "qa-mac", name: "Ashton’s MacBook Pro", kind: "laptop", os: "macos", items: [
+                    DeviceTransfer(id: "od1", direction: "send", state: "transferring", names: ["Drone footage.mov", "B-roll 02.mov"], fileCount: 2, bytesDone: 612_000_000, bytesTotal: 1_450_000_000, percent: 42.2, speedBps: 61_000_000, peer: "Alex Rivera"),
+                ]),
+                DeviceActivity(endpointId: "qa-mini", name: "Mac mini", kind: "desktop", os: "macos", items: [
+                    DeviceTransfer(id: "od2", direction: "receive", state: "completed", names: ["Invoice March.pdf"], fileCount: 1, bytesDone: 842_000, bytesTotal: 842_000, percent: 100, speedBps: 0, peer: "Jordan Lee"),
+                ]),
+            ]
+        }
+        if args.contains("-previewHistory") {
+            b.previewKeys.insert("history")
+            if !args.contains("-previewTransferServer") {
+                b.previewKeys.insert("friends")
+                b.friends = [Friend(id: "qa-alex", name: "Alex Rivera", endpointId: "qa-alex-eid"), Friend(id: "qa-jordan", name: "Jordan Lee", endpointId: "qa-jordan-eid")]
+            }
+            b.history = [
+                HistoryEntry(id: "h1", direction: "receive", fileNames: ["Site photos.zip"], bytesTotal: 48_200_000, timestampMs: now - 20 * 60_000, peer: "Alex Rivera", locality: "direct", state: "completed"),
+                HistoryEntry(id: "h2", direction: "send", fileNames: ["Floor plan.pdf"], bytesTotal: 2_400_000, timestampMs: now - 50 * 60_000, peer: "Alex Rivera", locality: "direct", state: "completed"),
+                HistoryEntry(id: "h3", direction: "receive", fileNames: ["Invoice March.pdf", "Receipt.pdf"], bytesTotal: 1_300_000, timestampMs: now - 3 * 3_600_000, peer: "Jordan Lee", locality: "local", state: "completed"),
+                HistoryEntry(id: "h4", direction: "receive", fileNames: ["Keynote.key"], bytesTotal: 92_000_000, timestampMs: now - 27 * 3_600_000, peer: "Sam Ortiz", locality: "internet", state: "completed"),
+            ]
+        }
+        if !args.contains("-previewTransferServer") { selectPreviewTab(args) }
     }
 }
 #endif

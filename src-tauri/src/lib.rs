@@ -1,4 +1,5 @@
 mod account;
+mod device_activity;
 mod automation;
 mod block;
 mod codes;
@@ -665,6 +666,8 @@ pub fn run() {
             iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
             // Keep the user's own devices (same account) in step: friends, chats, devices.
             account::spawn(app.handle().clone(), iroh_state.clone());
+            // Tell the user's other devices what this one is sending/receiving (#31).
+            device_activity::spawn(app.handle().clone(), iroh_state.clone());
             // Background diagnostics: periodically upload a REDACTED error/perf digest
             // so background problems surface without users reporting them. Uploads ONLY
             // to the operator-configured `settings.diagnostics_url` (empty by default →
@@ -853,6 +856,7 @@ pub fn run() {
             link::link_host_cancel,
             link::link_device_join,
             account::account_sync_now,
+            device_activity::other_device_activity,
             account::account_remove_device,
             account::account_leave,
             link::link_device_cancel,

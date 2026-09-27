@@ -18,6 +18,7 @@ import { ownDeviceLabels, personGroups } from './deviceIcons'
 import { routeCode, parseCode, friendCodeName } from './codes'
 import { nativeFolders, folderLinks } from './nativeFolders'
 import { linkedDetail, linkedTitle } from './deviceLink'
+import { startOtherDevices, useOtherDevices } from './otherDevices'
 import { linkWithCode } from '../components/LinkDeviceModal'
 import { nativeReportMail, REPORT_REASONS, contactMailto, REPORT_EMAIL } from './report'
 import { serverApi, decideFile, type UsableServer, type PendingFile } from './transferServer'
@@ -598,6 +599,7 @@ async function start() {
       blocked: s.blocked,
       transferServers: usableServers,
       pendingFiles,
+      otherDevices: useOtherDevices.getState().devices,
     }
     for (const change of changedSnapshots(previous, snapshots)) send('state', change)
     if (s.activeChatId !== activeChat) {
@@ -617,6 +619,11 @@ async function start() {
   // the next turn so serialization cannot hold the picker/staging reply hostage.
   let syncTimer: ReturnType<typeof setTimeout> | undefined
   stops.push(useStore.subscribe(() => {
+    syncTimer ??= setTimeout(() => { syncTimer = undefined; if (running) sync() }, 0)
+  }))
+  // "On your other devices" (#31) lives in its own small store.
+  startOtherDevices()
+  stops.push(useOtherDevices.subscribe(() => {
     syncTimer ??= setTimeout(() => { syncTimer = undefined; if (running) sync() }, 0)
   }))
   sync() // Full initial snapshot, even when init is still in progress.
