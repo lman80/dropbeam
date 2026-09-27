@@ -110,6 +110,7 @@ struct ConversationView: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
+            .modifier(HeaderBar { if !searching { nameCapsule } })
             .modifier(ComposerBar {
                 VStack(spacing: 0) {
                     if searching { searchFooter(proxy) }
@@ -246,33 +247,42 @@ struct ConversationView: View {
         }
     }
 
-    /// Avatar over the name capsule, centered in the glass navigation bar.
+    /// Messages-style header (#46): a big avatar centred in the navigation bar,
+    /// with the name + presence capsule just under the bar (see `nameCapsule`).
+    /// Split in two because the bar's principal slot is only bar-high — a stacked
+    /// avatar + name overflowed upward into the Dynamic Island and forced both small.
     private var header: some View {
         Button { Haptics.tap(); showDetail = true } label: {
-            VStack(spacing: -4) {
-                ContactAvatar(friend: friend, size: 36).zIndex(1)
-                // iOS 26 Messages: the name rides a glass capsule so it stays legible
-                // over bubbles scrolling beneath the bar.
-                VStack(spacing: 0) {
-                    HStack(spacing: 3) {
-                        Text(friend.displayName).font(.caption.weight(.semibold)).lineLimit(1)
-                        Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
-                    }
-                    .foregroundStyle(Color.primary)
-                    TimelineView(.periodic(from: .now, by: 60)) { _ in
-                        Text(presenceText).font(.caption2).foregroundStyle(online ? Color.green : Color.secondary)
-                            .lineLimit(1).contentTransition(.opacity)
-                    }
-                }
-                .dynamicTypeSize(...DynamicTypeSize.xxLarge)
-                .padding(.horizontal, 12).padding(.vertical, 4)
-                .glassSurface(Capsule())
-                .frame(maxWidth: 220)
-                .animation(.easeInOut(duration: 0.2), value: presenceText)
-            }
+            ContactAvatar(friend: friend, size: 50)
         }.buttonStyle(.plain)
+            .accessibilityLabel("\(friend.displayName), \(presenceText)").accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
+    }
+
+    /// Name (with the "more info" chevron) over Online / Last seen, on a glass
+    /// capsule so it stays legible over bubbles scrolling beneath it.
+    private var nameCapsule: some View {
+        Button { Haptics.tap(); showDetail = true } label: {
+            VStack(spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(friend.displayName).font(.subheadline.weight(.semibold)).lineLimit(1)
+                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
+                }
+                .foregroundStyle(Color.primary)
+                TimelineView(.periodic(from: .now, by: 60)) { _ in
+                    Text(presenceText).font(.caption).foregroundStyle(online ? Color.green : Color.secondary)
+                        .lineLimit(1).contentTransition(.opacity)
+                }
+            }
+            .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+            .padding(.horizontal, 16).padding(.vertical, 6)
+            .glassSurface(Capsule(), interactive: true)
+            .frame(maxWidth: 260)
+            .animation(.easeInOut(duration: 0.2), value: presenceText)
+        }.buttonStyle(.plain)
+            .padding(.top, 4).padding(.bottom, 6)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("\(friend.displayName), \(presenceText)").accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
+            .accessibilityIdentifier("chat.header")
     }
 
     /// "Online", "Connecting…", "Last seen 5 min ago" or "Offline" under the name.
@@ -432,6 +442,16 @@ private struct ComposerBar<Bar: View>: ViewModifier {
     func body(content: Content) -> some View {
         if #available(iOS 26, *) { content.safeAreaBar(edge: .bottom, spacing: 0) { bar } }
         else { content.safeAreaInset(edge: .bottom, spacing: 0) { bar.background(.bar) } }
+    }
+}
+
+/// The name capsule under the navigation bar: floats in a scroll-edge bar on
+/// iOS 26 (the thread blurs beneath it, like Messages), a plain inset before.
+private struct HeaderBar<Bar: View>: ViewModifier {
+    @ViewBuilder var bar: Bar
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) { content.safeAreaBar(edge: .top, spacing: 0) { bar.frame(maxWidth: .infinity) } }
+        else { content.safeAreaInset(edge: .top, spacing: 0) { bar.frame(maxWidth: .infinity) } }
     }
 }
 
