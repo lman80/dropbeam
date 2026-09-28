@@ -1666,6 +1666,8 @@ impl Connection {
                         &mut builder,
                         &mut self.path_stats.get_mut(path_id).frame_tx,
                         self.crypto_state.has_keys(space_id.encryption_level()),
+                        // DropBeam patch: keep room for the CONNECTION_CLOSE frame below.
+                        frame::ConnectionClose::SIZE_BOUND + 1,
                     );
                 }
 
@@ -6145,6 +6147,7 @@ impl Connection {
                     builder,
                     stats,
                     space_has_keys,
+                    0,
                 );
             }
         }
@@ -6152,6 +6155,8 @@ impl Connection {
         // ACK_FREQUENCY
         if !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
+            // DropBeam patch: this frame was written unchecked right after the unbounded ACKs.
+            && builder.frame_space_remaining() >= frame::AckFrequency::SIZE_BOUND
             && mem::replace(&mut space.pending.ack_frequency, false)
         {
             let sequence_number = self.ack_frequency.next_sequence_number();
@@ -6599,6 +6604,7 @@ impl Connection {
         builder: &mut PacketBuilder<'a, 'b>,
         stats: &mut FrameStats,
         space_has_keys: bool,
+        reserve: usize,
     ) {
         // 0-RTT packets must never carry acks (which would have to be of handshake packets)
         debug_assert!(space_has_keys, "tried to send ACK in 0-RTT");
@@ -6628,7 +6634,33 @@ impl Connection {
         let ack_delay_exp = TransportParameters::default().ack_delay_exponent;
         let delay = delay_micros >> ack_delay_exp.into_inner();
 
-        if is_multipath_negotiated && space_id == SpaceId::Data {
+        // DropBeam patch (n0-computer/noq#367): the (PATH_)ACKs of every path go into this one
+        // packet and nothing bounded them, so several paths with fragmented ranges overflowed
+        // the frame space and `bytes` panicked while noq held the connection mutex (poison ->
+        // abort). Only write the highest ranges that fit, leaving `reserve` bytes free (for a
+        // CONNECTION_CLOSE); if not even one range fits, the ACK stays pending for the next
+        // packet.
+        let frame_path_id = (is_multipath_negotiated && space_id == SpaceId::Data).then_some(path_id);
+        let limit = builder.frame_space_remaining().saturating_sub(reserve);
+        let Some((fit, _)) = frame::ack_ranges_that_fit(frame_path_id, delay, ranges, ecn, limit)
+        else {
+            trace!(%path_id, limit, "no space for ACK frame in this packet");
+            return;
+        };
+        let truncated;
+        let ranges = if fit < ranges.range_count() {
+            let mut r = ranges.clone();
+            while r.range_count() > fit {
+                r.pop_min();
+            }
+            trace!(%path_id, fit, total = ranges.range_count(), "truncated ACK ranges to fit packet");
+            truncated = r;
+            &truncated
+        } else {
+            ranges
+        };
+
+        if let Some(path_id) = frame_path_id {
             if !ranges.is_empty() {
                 let frame = frame::PathAck::encoder(path_id, delay, ranges, ecn);
                 builder.write_frame(frame, stats);
@@ -6807,6 +6839,23 @@ impl Connection {
         self.spaces[SpaceId::Data]
             .for_path(path_id)
             .pending_immediate_ack = true;
+    }
+
+    /// DropBeam patch (test helper): record `pns` as received-but-unacknowledged on `path_id`
+    /// in the Data space and require an immediate ACK, so tests can build ACK frames of a
+    /// chosen size (e.g. heavily fragmented ranges on several paths).
+    #[cfg(test)]
+    pub(crate) fn inject_pending_acks(
+        &mut self,
+        path_id: PathId,
+        pns: impl IntoIterator<Item = u64>,
+        now: Instant,
+    ) {
+        let acks = &mut self.spaces[SpaceId::Data].for_path(path_id).pending_acks;
+        for pn in pns {
+            acks.insert_one(pn, now);
+        }
+        acks.set_immediate_ack_required();
     }
 
     /// Decodes a packet, returning its decrypted payload, so it can be inspected in tests

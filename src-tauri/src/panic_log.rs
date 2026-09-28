@@ -3,6 +3,10 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::mem::ManuallyDrop;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set until the first panic of the process has written its backtrace.
+static FIRST_PANIC: AtomicBool = AtomicBool::new(true);
 
 struct Line {
     bytes: [u8; 4096],
@@ -70,6 +74,28 @@ pub(crate) fn install(log_dir: Option<&Path>) {
             if let Some(file) = &log {
                 let _ = (&*file).write(bytes);
             }
+            // The FIRST panic is the one that matters: later ones are usually the
+            // cascade it caused (poisoned mutexes, panics in destructors, then an
+            // abort). Capture its backtrace once, like the default hook with
+            // RUST_BACKTRACE=1. This allocates and symbolizes (std's own backtrace
+            // lock only); it never touches the logger or application mutexes.
+            if FIRST_PANIC.swap(false, Ordering::SeqCst) {
+                let when = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let thread = std::thread::current();
+                let text = format!(
+                    "[ERROR][app_lib] first panic: unix_time={when} thread={} version={}\nbacktrace:\n{}\n",
+                    thread.name().unwrap_or("<unnamed>"),
+                    env!("CARGO_PKG_VERSION"),
+                    std::backtrace::Backtrace::force_capture(),
+                );
+                let _ = (&*stderr).write_all(text.as_bytes());
+                if let Some(file) = &log {
+                    let _ = (&*file).write_all(text.as_bytes());
+                }
+            }
         }));
         // catch_unwind is only a last guard: Rust may abort on a nested panic
         // inside a hook before unwinding. The body itself must remain non-panicking.
@@ -120,6 +146,11 @@ mod tests {
         assert!(text.contains("original worker panic"));
         assert!(text.contains("PoisonError"));
         assert!(text.contains("non-string panic payload"));
+        // Exactly one backtrace, attached to the first (root-cause) panic.
+        assert_eq!(text.matches("backtrace:").count(), 1, "{text}");
+        let first_bt = text.find("backtrace:").unwrap();
+        assert!(first_bt > text.find("original worker panic").unwrap());
+        assert!(first_bt < text.find("PoisonError").unwrap());
         assert!(disk.ends_with(b"\n"));
         std::fs::remove_dir_all(dir).unwrap();
     }

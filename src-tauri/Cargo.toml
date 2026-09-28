@@ -176,6 +176,12 @@ netwatch = { path = "vendor/netwatch" }
 # Bbr3Config::dropbeam_fixes, see iroh_net.rs bbr_config) and ACK_FREQUENCY parameters handed to
 # every path's controller. Search "DropBeam patch" in vendor/noq-proto/src.
 noq-proto = { path = "vendor/noq-proto" }
+# noq-proto also carries the (PATH_)ACK packet-overflow fix (n0-computer/noq#367: the ACKs of all
+# multipath paths overflowed one packet -> `bytes` panic under the connection lock -> poisoned
+# mutex -> abort; the Linux Transfer Server crash). noq 1.3.0, vendored: its connection mutex
+# tolerates poison so one panicking connection can't abort the process. See DROPBEAM-PATCH.md in
+# both directories.
+noq = { path = "vendor/noq" }
 # iroh 1.2.0, vendored: n0-computer/iroh#4509 fix — pending_open_paths deduplicated and bounded
 # (it grew geometrically with several connections to one peer → multi-GB → crash). Search
 # "DropBeam patch" in vendor/iroh/src.
