@@ -49,7 +49,7 @@ impl Throttle {
         Throttle(dest.to_path_buf())
     }
 }
-impl Drop for Throttle { fn drop(&mut self) { THROTTLED.lock().unwrap().remove(&self.0); } }
+impl Drop for Throttle { fn drop(&mut self) { THROTTLED.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0); } }
 
 pub(super) struct Scratch(pub PathBuf);
 impl Drop for Scratch {

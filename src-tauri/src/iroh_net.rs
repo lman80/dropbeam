@@ -665,7 +665,8 @@ struct ChatLinkGuard<'a> {
 }
 impl Drop for ChatLinkGuard<'_> {
     fn drop(&mut self) {
-        self.state.chat_links.lock().unwrap().remove(&self.id);
+        // Poison-tolerant: a Drop that panics while unwinding aborts the whole app.
+        self.state.chat_links.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
     }
 }
 
