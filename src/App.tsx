@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useState } from 'react'
-import { isEnterKey } from './lib/keys'
+import { isEnterKey, isPrimaryMod } from './lib/keys'
+import { NAV_ORDER } from './components/Sidebar'
 import { JoinAccountModal } from './components/DevicesPanel'
 import { motion } from 'framer-motion'
 import { AlertTriangle, X } from 'lucide-react'
@@ -91,6 +92,36 @@ export default function App() {
   useEffect(() => {
     init()
   }, [init])
+
+  // Keyboard shortcuts (main window, desktop): ⌘/Ctrl+, Settings · ⌘1–7 pages ·
+  // ⌘F find in Chat/History · ⌘N new message · ⌘O send files.
+  useEffect(() => {
+    if (MOBILE_UI) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.repeat || !isPrimaryMod(e) || e.shiftKey) return
+      // A modal owns the keyboard while it's open.
+      if (document.querySelector('[aria-modal="true"]')) return
+      const st = useStore.getState()
+      const key = e.key.toLowerCase()
+      const n = Number(e.key)
+      if (key === ',') {
+        e.preventDefault(); st.setView('settings')
+      } else if (Number.isInteger(n) && n >= 1 && n <= NAV_ORDER.length) {
+        e.preventDefault(); st.setView(NAV_ORDER[n - 1])
+      } else if (key === 'f' && (st.view === 'chat' || st.view === 'history')) {
+        e.preventDefault(); window.dispatchEvent(new CustomEvent('dropbeam:find'))
+      } else if (key === 'n') {
+        e.preventDefault()
+        if (st.view !== 'chat') st.setView('chat')
+        window.setTimeout(() => window.dispatchEvent(new CustomEvent('dropbeam:new-message')), 0)
+      } else if (key === 'o') {
+        e.preventDefault()
+        void api.pickFiles().then((paths) => { if (paths.length) st.setPendingSend(paths) }, (err) => st.toast('error', err))
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   // Drive the Windows/Linux taskbar progress from the most relevant active
   // transfer (macOS shows this on the Downloads stack instead — no-op there).

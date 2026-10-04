@@ -1,8 +1,9 @@
 import { MobileHeader } from '../components/MobileHeader'
+import { shortcutLabel } from '../lib/keys'
 import { integrityLabel } from '../lib/integrity'
 import { ChevronRight } from 'lucide-react'
 import { MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { AnimatePresence } from 'framer-motion'
 import { FolderOpen, History as HistoryIcon, Search, Trash2, X } from 'lucide-react'
 import { api, type HistoryEntry } from '../lib/api'
@@ -56,6 +57,12 @@ function dayGroup(ms: number): string {
 }
 
 export function HistoryView() {
+  // ⌘F focuses the search field.
+  useEffect(() => {
+    const find = () => document.querySelector<HTMLInputElement>('.history-search input')?.select()
+    window.addEventListener('dropbeam:find', find)
+    return () => window.removeEventListener('dropbeam:find', find)
+  }, [])
   const history = useStore((s) => s.history)
   const reload = useStore((s) => s.reloadHistory)
   const focusPair = useStore((s) => s.historyFocusPair)
@@ -100,7 +107,7 @@ export function HistoryView() {
           ]}
         />
         {tab === 'recents' && history.length > 0 && (
-          <label className="search-field history-search">
+          <label className="search-field history-search" title={`Search  ${shortcutLabel('f')}`}>
             <Search />
             <input
               className="input"

@@ -1,5 +1,5 @@
 import { MobileHeader } from '../components/MobileHeader'
-import { isEnterKey } from '../lib/keys'
+import { isEnterKey, shortcutLabel } from '../lib/keys'
 import { TransferCard } from '../components/TransferCard'
 import { ChevronLeft } from 'lucide-react'
 import { MOBILE_UI, REVEAL_LABEL } from '../lib/platform'
@@ -216,6 +216,13 @@ export function ChatView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // ⌘N: open the "New message to…" menu.
+  useEffect(() => {
+    const open = () => document.querySelector<HTMLButtonElement>('.chat-list-head [aria-label="New message"]')?.click()
+    window.addEventListener('dropbeam:new-message', open)
+    return () => window.removeEventListener('dropbeam:new-message', open)
+  }, [])
+
   // A remembered selection is only being viewed while Chat is mounted.
   useEffect(() => {
     void api.setActiveChat(activeChatId)
@@ -426,6 +433,15 @@ function Conversation({ friendId }: { friendId: string }) {
   // client-side; ↑/↓ jump between matches, Esc closes. Reaches the same ~2000-message
   // window the thread itself keeps — no backend.
   const [searchOpen, setSearchOpen] = useState(false)
+  // ⌘F: open (or re-focus) this conversation's search.
+  useEffect(() => {
+    const find = () => {
+      setSearchOpen(true)
+      window.setTimeout(() => document.querySelector<HTMLInputElement>('.chat-search-field input')?.select(), 0)
+    }
+    window.addEventListener('dropbeam:find', find)
+    return () => window.removeEventListener('dropbeam:find', find)
+  }, [])
   const [searchQ, setSearchQ] = useState('')
   const [searchIdx, setSearchIdx] = useState(0)
 
@@ -851,7 +867,7 @@ function Conversation({ friendId }: { friendId: string }) {
             {online && conn && <ConnInfo detail={conn} align="end" />}
             <IconButton
               label="Search this conversation"
-              tooltip="Search"
+              tooltip={`Search  ${shortcutLabel('f')}`}
               active={searchOpen}
               onClick={() => (searchOpen ? closeSearch() : setSearchOpen(true))}
             >

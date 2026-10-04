@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { shortcutLabel } from '../lib/keys'
 import { AnimatePresence } from 'framer-motion'
 import { ArrowDownToLine, FolderUp, Inbox, Send as SendIcon } from 'lucide-react'
 import { api, isActive } from '../lib/api'
@@ -111,7 +112,7 @@ export function SendView() {
               <FolderUp /> Send Folder…
             </button>
           )}
-          <button className="btn btn-primary" disabled={picking} onClick={() => void onPick()}>
+          <button className="btn btn-primary" disabled={picking} onClick={() => void onPick()} title={`Send files  ${shortcutLabel('o')}`}>
             <SendIcon /> Send Files…
           </button>
         </div>
