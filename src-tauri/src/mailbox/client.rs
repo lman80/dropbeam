@@ -673,6 +673,10 @@ pub struct Sent {
     /// got directly: its receipts never change the message's status.
     #[serde(default)]
     pub copy: bool,
+    /// We asked the server to drop it but couldn't reach it yet: keep asking
+    /// (a canceled upload must not sit on someone's quota for days).
+    #[serde(default)]
+    pub cancel_pending: bool,
 }
 
 fn sent_path(config: &Path) -> PathBuf {
@@ -1133,7 +1137,60 @@ async fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String> {
 
 /// Leave a friend file send (`xfer_id` = the chat transfer id) on a server.
 #[allow(clippy::too_many_arguments)]
+/// Seal and upload files for `peer_id` (see `deposit_files_once`). A file the
+/// user is still editing changes mid-upload: that used to be a permanent
+/// "refused". Now the deposit starts over with the file as it is now (twice at
+/// most), the way a direct send would simply send the current bytes.
+#[allow(clippy::too_many_arguments)]
 pub async fn deposit_files(
+    net: &IrohState,
+    config: &Path,
+    peer_id: &str,
+    xfer_id: &str,
+    transfer_id: &str,
+    files: &[DepositFile],
+    dirs: &[String],
+    top_names: &[String],
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+    on_upload_start: &(dyn Fn(&str) + Send + Sync),
+    cancel: &AtomicBool,
+    only: Option<&[String]>,
+) -> Result<Held, DepositError> {
+    let mut current: Vec<DepositFile> = files.to_vec();
+    let mut tries = 0;
+    loop {
+        let r = deposit_files_once(net, config, peer_id, xfer_id, transfer_id, &current, dirs, top_names, progress, on_upload_start, cancel, only).await;
+        match r {
+            Err(DepositError::Failed(ref msg)) if tries < 2 && !cancel.load(Ordering::SeqCst) && file_changed_error(msg) => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                match restat(&current) {
+                    Some(fresh) => {
+                        log::info!("mailbox: a file changed while uploading; starting over with its current version");
+                        current = fresh;
+                    }
+                    None => return r,
+                }
+            }
+            _ => return r,
+        }
+    }
+}
+
+fn file_changed_error(msg: &str) -> bool {
+    msg.contains("changed") || msg.contains("got shorter")
+}
+
+/// The same files with their current sizes and modified times (None: one is gone).
+fn restat(files: &[DepositFile]) -> Option<Vec<DepositFile>> {
+    files.iter().map(|f| {
+        let m = std::fs::metadata(&f.path).ok().filter(|m| m.is_file())?;
+        Some(DepositFile { path: f.path.clone(), name: f.name.clone(), size: m.len(), mtime: crate::iroh_net::mtime_secs(&m) })
+    }).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deposit_files_once(
     net: &IrohState,
     config: &Path,
     peer_id: &str,
@@ -1244,7 +1301,7 @@ pub async fn deposit_files(
                 state: "uploading".into(), updated_ms: now(), held_until: 0,
                 header: serde_json::to_value(&env).ok(), file_key: Some(seal::b64(&fk)), files_sig: Some(sig.clone()),
                 bytes: size, names: top_names.to_vec(), transfer_id: Some(transfer_id.to_owned()),
-                delivered_to: vec![], to: env.stanzas.iter().map(|st| st.eid.clone()).collect(), copy: false,
+                delivered_to: vec![], to: env.stanzas.iter().map(|st| st.eid.clone()).collect(), copy: false, cancel_pending: false,
             });
         });
         on_upload_start(&route.name);
@@ -1337,7 +1394,23 @@ pub fn abandon(net: &IrohState, config: &Path, xfer_id: &str) {
 }
 
 async fn cancel_on(ep: &iroh::Endpoint, config: &Path, server: &str, item_id: &str) {
-    let _ = server_rpc(ep, config, server, &json!({"kind": "mailbox.cancel", "item_id": item_id})).await;
+    let reached = server_rpc(ep, config, server, &json!({"kind": "mailbox.cancel", "item_id": item_id})).await.is_some();
+    // Unreachable right now: remember, and the background loop retries.
+    with_sent(config, |m| {
+        if let Some(e) = m.get_mut(item_id) {
+            e.cancel_pending = !reached;
+            if !reached { e.updated_ms = now(); }
+        }
+    });
+}
+
+/// Retry cancels that didn't reach their server (background loop).
+async fn retry_cancels(net: &IrohState, config: &Path) {
+    let Some(ep) = net.get().cloned() else { return };
+    let pending: Vec<Sent> = sent_all(config).into_values().filter(|s| s.cancel_pending).collect();
+    for s in pending {
+        cancel_on(&ep, config, &s.server, &s.item_id).await;
+    }
 }
 
 /// The chat card we posted for this file send (so the recipient's copy keeps
@@ -1365,6 +1438,11 @@ pub enum Unsend {
     Unknown,
 }
 
+/// A cancel reply naming devices that already took the item.
+fn taken_by_some(reply: &Value) -> bool {
+    reply["delivered_to"].as_array().is_some_and(|a| !a.is_empty())
+}
+
 /// Unsend a message a server is holding: delete the server copy.
 pub async fn unsend_held(net: &IrohState, config: &Path, msg_id: &str) -> Unsend {
     let Some(ep) = net.get().cloned() else { return Unsend::Unknown };
@@ -1372,7 +1450,11 @@ pub async fn unsend_held(net: &IrohState, config: &Path, msg_id: &str) -> Unsend
         return Unsend::Unknown;
     };
     let Some(reply) = server_rpc(&ep, config, &s.server, &json!({"kind": "mailbox.cancel", "item_id": s.item_id})).await else { return Unsend::Unknown };
-    let outcome = if reply["canceled"].as_bool() == Some(true) {
+    let outcome = if reply["canceled"].as_bool() == Some(true) && taken_by_some(&reply) {
+        // Gone from the server, but some of their devices already took it: the
+        // unsend still has to travel to those as an op.
+        Unsend::Delivered
+    } else if reply["canceled"].as_bool() == Some(true) {
         Unsend::Removed
     } else if reply["state"].as_str() == Some("delivered") {
         Unsend::Delivered
@@ -1436,7 +1518,11 @@ pub fn chat_copies(config: &Path, msg_id: &str) -> Vec<Sent> {
 pub async fn cancel_copy(net: &IrohState, config: &Path, s: &Sent) -> Unsend {
     let Some(ep) = net.get().cloned() else { return Unsend::Unknown };
     let Some(reply) = server_rpc(&ep, config, &s.server, &json!({"kind": "mailbox.cancel", "item_id": s.item_id})).await else { return Unsend::Unknown };
-    let outcome = if reply["canceled"].as_bool() == Some(true) {
+    let outcome = if reply["canceled"].as_bool() == Some(true) && taken_by_some(&reply) {
+        // Gone from the server, but some of their devices already took it: the
+        // unsend still has to travel to those as an op.
+        Unsend::Delivered
+    } else if reply["canceled"].as_bool() == Some(true) {
         Unsend::Removed
     } else if reply["state"].as_str() == Some("delivered") {
         Unsend::Delivered
@@ -1649,6 +1735,9 @@ pub async fn fetch_from(net: &IrohState, config: &Path, server: &str) -> Result<
                     match receive_one(net, config, &ep, &conn, &server_name, item).await {
                         Ok(d) => d,
                         Err(e) => {
+                            if format!("{e:#}").contains("item is gone") {
+                                let _ = std::fs::remove_file(inbox_dir(config).join(format!("{id}.ct")));
+                            }
                             log::info!("mailbox: couldn't take an item yet: {e:#}");
                             None
                         }
@@ -1659,6 +1748,8 @@ pub async fn fetch_from(net: &IrohState, config: &Path, server: &str) -> Result<
                         mark_seen(config, &id);
                         landed += 1;
                     }
+                    // Settled either way: no partial ciphertext stays behind.
+                    let _ = std::fs::remove_file(inbox_dir(config).join(format!("{id}.ct")));
                     let _ = rpc(&conn, &json!({"kind": "mailbox.ack", "item_id": id, "ok": ok, "reason": reason})).await;
                     progressed = true;
                 }
@@ -1756,6 +1847,8 @@ struct ManifestFile {
     name: String,
     size: u64,
     sha256: String,
+    /// The sender's modified time (0 = unknown, left as landed).
+    mtime: u64,
 }
 
 async fn receive_file(net: &IrohState, config: &Path, conn: &iroh::endpoint::Connection, server_name: &str, env: &seal::Envelope, fk: &[u8; 32], meta: &Value) -> Result<Option<(bool, String)>> {
@@ -1767,6 +1860,7 @@ async fn receive_file(net: &IrohState, config: &Path, conn: &iroh::endpoint::Con
         name: f["name"].as_str()?.to_owned(),
         size: f["size"].as_u64()?,
         sha256: f["sha256"].as_str()?.to_owned(),
+        mtime: f["mtime"].as_u64().unwrap_or(0),
     })).collect()).unwrap_or_default();
     let dirs: Vec<String> = meta["dirs"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     let listed = meta["files"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -1869,6 +1963,9 @@ async fn receive_file(net: &IrohState, config: &Path, conn: &iroh::endpoint::Con
     };
     let _ = std::fs::remove_file(&ct_path);
     forget_pending(config, &link_id);
+    // Landed: another copy of this send (a second server, a late direct push
+    // retry) is a duplicate, not a second "completed" card.
+    note_direct_landed(config, &link_id);
     let names: Vec<String> = meta["names"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     crate::iroh_net::land_server_files(net, config, &env.from, xfer, &meta["note"], &names, &files.iter().map(|f| (f.name.clone(), f.size)).collect::<Vec<_>>(), &dirs, &landed, &dest, server_name, env.created_ms);
     Ok(Some((true, String::new())))
@@ -1941,7 +2038,11 @@ fn close_out(files: &[ManifestFile], i: usize, o: OpenOut, dest: &Path, landed: 
             note_reused(&existing);
             existing
         }
-        None => crate::iroh_net::publish_unique(&o.part, &natural)?,
+        None => {
+            // Keep the sender's modified time, like a direct receive does.
+            if files[i].mtime > 0 { crate::iroh_net::set_mtime_secs(&o.part, files[i].mtime); }
+            crate::iroh_net::publish_unique(&o.part, &natural)?
+        }
     };
     staged.retain(|p| p != &o.part);
     landed.push((format!("file:{i}:{}", files[i].name), path));
@@ -2125,6 +2226,35 @@ pub fn fetch_soon() {
     wake_cell().notify_one();
 }
 
+/// Startup sweep of what an interrupted server download can leave behind:
+/// partial ciphertext in `mailbox-in/` that nothing resumed for a week, and
+/// `.dropbeam-mbx-*.part` landing stages (a crash mid-publish) in the receive
+/// folder. Never touches anything else.
+pub(crate) fn sweep_leftovers(config: &Path, receive_dir: &Path) {
+    let age = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+    for e in std::fs::read_dir(inbox_dir(config)).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "ct") && age(&p).is_some_and(|a| a > Duration::from_secs(7 * 24 * 3600)) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    fn walk(dir: &Path, depth: u32, age: &dyn Fn(&Path) -> Option<Duration>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_file() && name.starts_with(".dropbeam-mbx-") && name.ends_with(".part")
+                && age(&e.path()).is_some_and(|a| a > Duration::from_secs(24 * 3600)) {
+                let _ = std::fs::remove_file(e.path());
+            } else if t.is_dir() && depth > 0 && !name.starts_with('.') {
+                walk(&e.path(), depth - 1, age);
+            }
+        }
+    }
+    // Stages sit beside their file: the folder itself and a few levels down.
+    walk(receive_dir, 3, &age);
+}
+
 /// Startup fetch, then receipts every 5 minutes while anything is held, and a
 /// fetch sweep every 30 minutes (servers also poke us when we come online).
 pub fn spawn(net: Arc<IrohState>) {
@@ -2136,6 +2266,10 @@ pub fn spawn(net: Arc<IrohState>) {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         tokio::time::sleep(Duration::from_secs(4)).await;
+        if let Ok(config) = crate::iroh_net::location_config(&net) {
+            let dl = crate::iroh_net::receive_dir(&net, &config);
+            let _ = tokio::task::spawn_blocking(move || sweep_leftovers(&config, &dl)).await;
+        }
         let mut last_fetch = Instant::now() - Duration::from_secs(3600);
         loop {
             let Ok(config) = crate::iroh_net::location_config(&net) else { break };
@@ -2143,6 +2277,7 @@ pub fn spawn(net: Arc<IrohState>) {
                 last_fetch = Instant::now();
                 fetch_all(&net, &config).await;
             }
+            retry_cancels(&net, &config).await;
             let receipts = refresh_status(&net, &config).await;
             crate::iroh_net::apply_receipts(&net, &config, &receipts);
             let rotated = super::keys::maybe_rotate(&config);

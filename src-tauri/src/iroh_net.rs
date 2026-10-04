@@ -3027,7 +3027,9 @@ async fn serve_stream_inner(
         // A Location upload is the one push a headless host DOES serve: it lands in
         // the hosted folder, not in front of a user. It must reach the "files" arm
         // below (receive_location_headless) — this refusal used to shadow it.
-        Some("files" | "files.stat" | "files.verify") if headless_refuses(&req) => {
+        // (files.stat / files.verify are answered above: with no app they reply
+        // "Application is not ready".)
+        Some("files") if headless_refuses(&req) => {
             send_receiver_error(send, &anyhow::anyhow!("This computer is running in the background without the DropBeam app open. Try again when it's open.")).await;
             let _ = send.finish();
         }
