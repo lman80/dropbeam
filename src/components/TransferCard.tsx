@@ -265,10 +265,12 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                 </button>
               )}
               {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} moving={transferring} />}
+              {/* "Where did it go?" is the first question after a file arrives —
+                  a labelled button, not an icon to discover. */}
               {completed && t.direction === 'receive' && t.outDir && (
-                <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL} onClick={showInFolder}>
-                  <FolderOpen />
-                </IconButton>
+                <button className="btn btn-secondary btn-sm" onClick={showInFolder}>
+                  <FolderOpen /> {t.fileCount === 1 && t.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL}
+                </button>
               )}
               {completed && t.direction === 'send' && verify?.state !== 'running' && (
                 <MenuButton

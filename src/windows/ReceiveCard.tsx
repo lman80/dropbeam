@@ -21,7 +21,7 @@ import { FriendAvatar } from '../components/FriendAvatar'
 import { personKey } from '../lib/deviceIcons'
 import { useTransferMeter } from '../lib/useTransferMeter'
 import { formatEta } from '../lib/format'
-import { IS_MAC, IS_WINDOWS } from '../lib/platform'
+import { IS_MAC, IS_WINDOWS, OPEN_FOLDER_LABEL, REVEAL_LABEL } from '../lib/platform'
 import { hasRetryPayload, retryFriendId, useStore } from '../store'
 
 // Pick a file-type glyph from the extension (audio waveform, image, video…).
@@ -131,6 +131,27 @@ export function ReceiveCard() {
     return () => clearTimeout(h)
   }, [justSent])
 
+  // Same for a RECEIVE: when it lands, keep the card up with "Saved in
+  // Downloads" and a button to show it — "where did it go?" is the first
+  // question once a file arrives. It stays until dismissed or a while passes.
+  const [trackedInId, setTrackedInId] = useState<string | null>(null)
+  const [justReceived, setJustReceived] = useState<TransferUpdate | null>(null)
+  if (incoming && incoming.id !== trackedInId) {
+    setTrackedInId(incoming.id)
+    if (justReceived) setJustReceived(null)
+  } else if (!incoming && trackedInId) {
+    const t = transfers[trackedInId]
+    if (!t || (t.state !== 'waitingForAccept' && t.state !== 'transferring' && t.state !== 'connecting')) {
+      setTrackedInId(null)
+      if (t && t.state === 'completed' && t.outDir) setJustReceived(t)
+    }
+  }
+  useEffect(() => {
+    if (!justReceived) return
+    const h = setTimeout(() => setJustReceived(null), 20_000)
+    return () => clearTimeout(h)
+  }, [justReceived])
+
   // The card pops for every send and receive (the user wants it every time, even
   // with the main window open). The one place it would be redundant — dropping a
   // file directly on the main Send page — is handled there, not here.
@@ -174,8 +195,9 @@ export function ReceiveCard() {
   }, [])
 
   // Decide which card (if any) to show. Incoming wins; otherwise the send card.
-  const showSend = !incoming && !!sendCandidate
-  const active = incoming ?? (showSend ? sendCandidate : null)
+  const received = !incoming ? justReceived : null
+  const showSend = !incoming && !received && !!sendCandidate
+  const active = incoming ?? received ?? (showSend ? sendCandidate : null)
   const cardKey = active ? `${active.direction}-${active.id}` : null
   // The close (✕) button dismisses the current item; a different transfer later
   // shows the card again.
@@ -186,6 +208,7 @@ export function ReceiveCard() {
     closeMenu()
     if (cardKey) setDismissedKey(cardKey)
     setJustSent(null)
+    setJustReceived(null)
   }
   // The native-close listener registers ONCE (below), so it must reach the
   // latest closeCard — not the one captured at mount (when cardKey was null).
@@ -264,7 +287,7 @@ export function ReceiveCard() {
   const friends = useStore((s) => s.friends)
   const myAccount = useStore((s) => s.myDevice?.account_pub)
   const retryTransfer = useStore((s) => s.retryTransfer)
-  const sending = !incoming && showSend
+  const sending = !incoming && !received && showSend
   const ended = sending && !outgoing && !!justSent
   const failed = ended && justSent?.state === 'failed'
   const done = ended && !failed // a send that just landed (or reached the Transfer Server)
@@ -277,10 +300,22 @@ export function ReceiveCard() {
   const name = t?.fileNames[0] ?? (sending ? 'File' : 'Incoming file')
   const extra = (t?.fileCount ?? 1) - 1
   const pendingOffer = incoming?.state === 'waitingForAccept'
-  const pct = done ? 100 : t?.state === 'transferring' ? t.percent : 0
+  const pct = done || received ? 100 : t?.state === 'transferring' ? t.percent : 0
+  const single = !!received && received.fileCount <= 1 && received.fileNames.length === 1
+  const showReceived = () => {
+    if (!received?.outDir) return
+    const dir = received.outDir
+    const sep = dir.includes('\\') ? '\\' : '/'
+    const p = single ? api.revealPath(`${dir}${sep}${received.fileNames[0]}`) : api.openPath(dir)
+    p.catch(() => {})
+    setJustReceived(null)
+  }
 
   const who = t ? t.friendName ?? peerLabel(t.peer) : null
-  const sub = incoming
+  const savedIn = received?.outDir ? received.outDir.split(/[/\\]/).filter(Boolean).pop() ?? null : null
+  const sub = received
+    ? savedIn ? `Saved in ${savedIn}` : 'Saved'
+    : incoming
     ? `From ${who || 'someone nearby'}`
     : failed
       ? who ? `Couldn’t send to ${who}` : 'Couldn’t send'
@@ -331,10 +366,10 @@ export function ReceiveCard() {
             <div className="rc-art" data-tauri-drag-region aria-hidden>
               <div className="rc-file">{glyphFor(name)}</div>
               <div
-                className={`rc-avatar${done ? ' done' : failed ? ' failed' : ''}`}
-                style={done || failed ? undefined : { background: friend ? avatarColor(personKey(friends, friend.id, myAccount)) : undefined }}
+                className={`rc-avatar${done || received ? ' done' : failed ? ' failed' : ''}`}
+                style={done || received || failed ? undefined : { background: friend ? avatarColor(personKey(friends, friend.id, myAccount)) : undefined }}
               >
-                {done ? <Check size={13} strokeWidth={3} />
+                {done || received ? <Check size={13} strokeWidth={3} />
                   : failed ? <X size={13} strokeWidth={3} />
                     : friend ? <FriendAvatar friend={friend} />
                       : sending ? <SendIcon size={11} /> : '?'}
@@ -348,7 +383,13 @@ export function ReceiveCard() {
             <div className="rc-from" title={sub}>{sub}</div>
 
             <div className="rc-slot">
-              {pendingOffer ? (
+              {received ? (
+                <div className="rc-actions">
+                  <button className="btn btn-primary btn-sm" onClick={showReceived}>
+                    {single ? REVEAL_LABEL : OPEN_FOLDER_LABEL}
+                  </button>
+                </div>
+              ) : pendingOffer ? (
                 <div className="rc-actions">
                   <button className="btn btn-secondary btn-sm" onClick={() => respond(false)}>
                     Decline

@@ -11,6 +11,7 @@ import {
   ArrowUp,
   Check,
   Copy,
+  FolderOpen,
   Pause,
   Play,
   Power,
@@ -38,6 +39,7 @@ import { sendTargets } from '../lib/deviceIcons'
 import { useOwnDeviceLabels } from '../lib/ownDevices'
 import { useTransferMeter } from '../lib/useTransferMeter'
 import { hasRetryPayload } from '../store'
+import { OPEN_FOLDER_LABEL, REVEAL_LABEL } from '../lib/platform'
 
 const openMain = () => invoke('open_main_window').catch(() => {})
 const hideSelf = () => invoke('hide_popover').catch(() => {})
@@ -512,6 +514,21 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
         {(t.state === 'failed' || t.state === 'paused') && hasRetryPayload(t.id) && (
           <IconButton size="sm" label={t.state === 'paused' ? 'Resume' : 'Retry'} side="top" onClick={() => void retryTransfer(t.id)}>
             {t.state === 'paused' ? <Play /> : <RotateCw />}
+          </IconButton>
+        )}
+        {t.state === 'completed' && t.direction === 'receive' && t.outDir && (
+          <IconButton
+            size="sm"
+            label={t.fileCount <= 1 && t.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL}
+            side="top"
+            onClick={() => {
+              const dir = t.outDir!
+              const sep = dir.includes('\\') ? '\\' : '/'
+              const p = t.fileCount <= 1 && t.fileNames.length === 1 ? api.revealPath(`${dir}${sep}${t.fileNames[0]}`) : api.openPath(dir)
+              p.catch(() => {})
+            }}
+          >
+            <FolderOpen />
           </IconButton>
         )}
         {t.state === 'failed' && (
