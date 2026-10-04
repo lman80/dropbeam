@@ -902,6 +902,9 @@ fn remote_error_is_independent(remote: &anyhow::Error) -> bool {
         "connection lost",
         "unexpected end of stream",
         "aborted",
+        // A range stream that our side abandoned mid-segment (an aborted sibling
+        // of the failed one) reads as a short segment on the receiver.
+        "ended early",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -916,7 +919,20 @@ async fn write_and_receipt<T>(
     tokio::pin!(write, receipt);
     tokio::select! {
         biased;
-        r = &mut receipt => { r?; write.await }
+        r = &mut receipt => match r {
+            Ok(()) => write.await,
+            // The receiver saw our stream die before our writer surfaced WHY
+            // (a range task's error reaches us via the worker drain). Prefer
+            // our own diagnosis — "changed while sending", "canceled" — when
+            // the remote error is only that echo.
+            Err(remote) if !remote_error_is_independent(&remote) => {
+                match tokio::time::timeout(Duration::from_secs(5), &mut write).await {
+                    Ok(Err(local)) => Err(local),
+                    _ => Err(remote),
+                }
+            }
+            Err(remote) => Err(remote),
+        },
         w = &mut write => {
             match w {
                 Ok(value) => { receipt.await?; Ok(value) }
@@ -8964,10 +8980,21 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
     leaves: Option<integrity::Leaves>,
 ) -> Result<()> {
     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(base));
+    // The receiver finalizes the moment every byte is covered, so a file written
+    // to mid-send (same inode) must be caught BEFORE the last byte of any range
+    // leaves — else a mix of two versions lands (and passes integrity, which
+    // hashes what was read). One stamp for the whole plan; each range holds back
+    // its final chunk until its own handle still matches it.
+    let stamp = if plan.iter().any(|&(_, len)| len > 0) {
+        let m = open_for_send(path).await?.metadata().await?;
+        Some((m.modified().ok(), m.len()))
+    } else { None };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
     for &(start, len) in plan {
         let conn = conn.clone();
         let path = path.to_path_buf();
+        let name = name.clone();
         let progress = progress.clone();
         let leaves = leaves.clone();
         let source = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten();
@@ -8975,34 +9002,49 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
             let mut hash = leaves.map(|l| integrity::Blocks::new(start, l)).transpose()?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut uni = conn.open_uni().await?;
-            // The explicit length lets the receiver write EXACTLY its region and
-            // reject an over- or under-sending peer, instead of trusting EOF.
-            uni.write_all(&start.to_be_bytes()).await?;
-            uni.write_all(&len.to_be_bytes()).await?;
-            if len > 0 {
-                let mut f = open_for_send(&path).await?;
-                f.seek(std::io::SeekFrom::Start(start)).await?;
-                let mut remaining = len;
-                let mut buf = vec![0u8; CHUNK];
-                while remaining > 0 {
-                    let want = remaining.min(CHUNK as u64) as usize;
-                    let k = f.read(&mut buf[..want]).await?;
-                    if k == 0 {
-                        anyhow::bail!("file ended early while sending segment");
+            let body: Result<()> = async {
+                // The explicit length lets the receiver write EXACTLY its region and
+                // reject an over- or under-sending peer, instead of trusting EOF.
+                uni.write_all(&start.to_be_bytes()).await?;
+                uni.write_all(&len.to_be_bytes()).await?;
+                if len > 0 {
+                    let mut f = open_for_send(&path).await?;
+                    f.seek(std::io::SeekFrom::Start(start)).await?;
+                    let mut remaining = len;
+                    let mut buf = vec![0u8; CHUNK];
+                    while remaining > 0 {
+                        let want = remaining.min(CHUNK as u64) as usize;
+                        let k = f.read(&mut buf[..want]).await?;
+                        if k == 0 {
+                            anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
+                        }
+                        if k as u64 == remaining {
+                            let now = f.metadata().await?;
+                            anyhow::ensure!(stamp == Some((now.modified().ok(), now.len())),
+                                "\"{name}\" changed while sending — try again");
+                        }
+                        if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
+                        if pace {
+                            pace_bytes(k as u64).await;
+                        }
+                        write_payload(&mut uni, &buf[..k], |n| {
+                            progress.fetch_add(n, Ordering::Relaxed);
+                        })
+                        .await?;
+                        remaining -= k as u64;
                     }
-                    if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
-                    if pace {
-                        pace_bytes(k as u64).await;
-                    }
-                    write_payload(&mut uni, &buf[..k], |n| {
-                        progress.fetch_add(n, Ordering::Relaxed);
-                    })
-                    .await?;
-                    remaining -= k as u64;
                 }
+                if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(&path)?; }
+                if let Some(hash) = hash { hash.finish(); }
+                Ok(())
+            }.await;
+            if body.is_err() {
+                // Dropping an unfinished stream FINISHES it gracefully: the
+                // receiver would read a short segment ("ended early") instead
+                // of the reset that marks it as our own failure's echo.
+                let _ = uni.reset(1u32.into());
             }
-            if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(&path)?; }
-            if let Some(hash) = hash { hash.finish(); }
+            body?;
             uni.finish()?;
             // Keep the stream alive until the peer has acked the segment, so the
             // last bytes aren't dropped by an early reset when the task ends.
@@ -9075,7 +9117,7 @@ fn spawn_range_reader(
             match uni.read(&mut buf[..want]).await? {
                 Some(k) if k > 0 => {
                     #[cfg(test)]
-                    xfer_matrix::throttle(&part).await;
+                    xfer_matrix::throttle(&part, k).await;
                     f.write_all(&buf[..k]).await?;
                     if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
                     done += k as u64;
@@ -9639,6 +9681,22 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             if n == 0 {
                 anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
             }
+            // Written to WHILE we read it (same inode, new mtime or length): what
+            // we read mixes two versions, and would still pass the integrity check
+            // (it hashes what was READ). The receiver publishes an item the moment
+            // its LAST advertised byte arrives, so the check must happen BEFORE
+            // that byte leaves: hold the final chunk back until the source is
+            // proven unchanged since we opened it, else fail (the reset below
+            // makes the receiver drop its stage — nothing mixed ever lands; the
+            // retry re-reads it whole). An atomic save (new inode) keeps our
+            // handle on the old, consistent version; an edit before we opened it
+            // simply sends the newer bytes.
+            if n as u64 == remaining {
+                if let (Some(before), Ok(after)) = (opened, f.metadata().await) {
+                    anyhow::ensure!(before == (after.modified().ok(), after.len()),
+                        "\"{name}\" changed while sending — try again");
+                }
+            }
             if let Some(hash) = &mut hash { hash.update(&buf[..n]); }
             if let Some(plain) = &mut plain { plain.update(&buf[..n]); }
             if pace {
@@ -9650,15 +9708,6 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             })
             .await?;
             remaining -= n as u64;
-        }
-        // Written to WHILE we read it (same inode, new mtime or length): what
-        // went out mixes two versions, and would still pass the integrity check
-        // (it hashes what was READ). Fail loudly — the retry re-reads it whole.
-        // An atomic save (new inode) keeps our handle on the old, consistent
-        // version; an edit before we opened it simply sends the newer bytes.
-        if let (Some(before), Ok(after)) = (opened, f.metadata().await) {
-            anyhow::ensure!(before == (after.modified().ok(), after.len()),
-                "\"{name}\" changed while sending — try again");
         }
         if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(path)?; }
         if let Some(hash) = hash {
@@ -9772,7 +9821,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             match read {
                 Ok(Some(n)) if n > 0 => {
                     #[cfg(test)]
-                    xfer_matrix::throttle(&dest).await;
+                    xfer_matrix::throttle(&dest, n).await;
                     if let Err(e) = f.write_all(&buf[..n]).await {
                         failed = Some(e.into());
                         break;
