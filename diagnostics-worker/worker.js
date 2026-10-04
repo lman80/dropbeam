@@ -12,10 +12,25 @@
  *
  * Setup: see DIAGNOSTICS-SETUP.md. Needs one KV namespace bound as `DIAG` and a
  * secret `DASH_KEY` (the dashboard password).
+ *
+ * Abuse limits (the ingest URL ships inside a public app, so treat it as public):
+ *  - body capped at 64 KB counted on the actual streamed bytes (chunked uploads
+ *    and lying Content-Length headers can't get past it);
+ *  - per-IP limit (optional `RL_IP` rate-limit binding, else per-isolate memory);
+ *  - KV writes are bounded no matter what callers send: a device record is
+ *    rewritten at most once per DEVICE_MIN_INTERVAL_MIN (default 120), and at
+ *    most MAX_DEVICES (default 60) device ids are ever accepted (one small
+ *    `index` key lists them; new ids past the cap are refused). Worst case
+ *    ≈ MAX_DEVICES × 24h/interval + MAX_DEVICES writes a day (≈780 by default),
+ *    under the free tier's 1,000. The dashboard reads the index instead of
+ *    `list()` (list calls share that 1,000/day quota).
  */
 
 const MAX_ISSUES = 250; // cap stored distinct issues per device
 const TTL_SECONDS = 45 * 24 * 3600; // forget a silent device after 45 days
+const MAX_BODY = 65536;
+const INDEX_KEY = 'index';
+const IP_PER_MINUTE = 10; // in-memory fallback when RL_IP isn't bound
 
 export default {
   async fetch(request, env) {
@@ -41,13 +56,15 @@ async function ingest(request, env, url) {
   if (env.INGEST_TOKEN && url.searchParams.get('t') !== env.INGEST_TOKEN) {
     return json({ ok: false, error: 'unauthorized' }, 401);
   }
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  if (!(await allowIp(env, ip))) return json({ ok: false, error: 'rate' }, 429);
   // Body-size cap (digests are tiny) so a hostile client can't inflate storage.
-  const len = Number(request.headers.get('content-length') || 0);
-  if (len > 65536) return json({ ok: false, error: 'too large' }, 413);
+  const raw = await readCapped(request, MAX_BODY);
+  if (raw === null) return json({ ok: false, error: 'too large' }, 413);
 
   let digest;
   try {
-    digest = await request.json();
+    digest = JSON.parse(raw);
   } catch {
     return json({ ok: false, error: 'bad json' }, 400);
   }
@@ -56,7 +73,17 @@ async function ingest(request, env, url) {
   if (!deviceId) return json({ ok: false, error: 'no deviceId' }, 400);
 
   const key = `dev:${deviceId}`;
+  const index = await readIndex(env);
+  if (!index.includes(key)) {
+    if (index.length >= maxDevices(env)) return json({ ok: false, error: 'device limit' }, 429);
+    index.push(key);
+    await env.DIAG.put(INDEX_KEY, JSON.stringify(index));
+  }
   const prev = (await env.DIAG.get(key, 'json')) || { issues: {} };
+  // One write per device per interval, whatever the caller sends.
+  if (prev.lastSeen && Date.now() - prev.lastSeen < minIntervalMs(env)) {
+    return json({ ok: false, error: 'too soon' }, 429);
+  }
 
   // Latest device metadata wins.
   prev.name = h.name || prev.name || '';
@@ -91,10 +118,9 @@ async function dashboard(url, env) {
   if (url.searchParams.get('key') !== env.DASH_KEY) {
     return new Response('Forbidden — append ?key=YOUR_DASH_KEY', { status: 403 });
   }
-  const list = await env.DIAG.list({ prefix: 'dev:' });
   const devices = [];
-  for (const k of list.keys) {
-    const d = await env.DIAG.get(k.name, 'json');
+  for (const name of await readIndex(env)) {
+    const d = await env.DIAG.get(name, 'json');
     if (d) devices.push(d);
   }
   devices.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
@@ -165,6 +191,64 @@ async function dashboard(url, env) {
   <div class="wrap">${cards || '<div class="empty">No diagnostics received yet.</div>'}</div>
   </body></html>`;
   return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+
+/** The body as text, or null past `max` bytes — counted while streaming. */
+async function readCapped(request, max) {
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (declared > max) return null;
+  if (!request.body) return '';
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      try { await reader.cancel(); } catch {}
+      return null;
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) { all.set(c, at); at += c.byteLength; }
+  return new TextDecoder().decode(all);
+}
+
+/** Known device keys. A pre-index deployment is migrated once from `list()`. */
+async function readIndex(env) {
+  const v = await env.DIAG.get(INDEX_KEY, 'json');
+  if (Array.isArray(v)) return v.filter((k) => typeof k === 'string' && k.startsWith('dev:'));
+  const list = await env.DIAG.list({ prefix: 'dev:' });
+  const keys = list.keys.map((k) => k.name).slice(0, maxDevices(env));
+  await env.DIAG.put(INDEX_KEY, JSON.stringify(keys));
+  return keys;
+}
+
+function maxDevices(env) {
+  return Math.max(1, Number(env.MAX_DEVICES) || 60);
+}
+
+function minIntervalMs(env) {
+  const m = Number(env.DEVICE_MIN_INTERVAL_MIN);
+  return (Number.isFinite(m) && m >= 0 ? m : 120) * 60 * 1000;
+}
+
+const ipCounts = new Map();
+async function allowIp(env, ip) {
+  if (env.RL_IP && typeof env.RL_IP.limit === 'function') {
+    try {
+      return (await env.RL_IP.limit({ key: `ip:${ip}` })).success;
+    } catch {}
+  }
+  if (ipCounts.size > 50000) ipCounts.clear();
+  const bucket = `${ip}:${Math.floor(Date.now() / 60000)}`;
+  const n = ipCounts.get(bucket) || 0;
+  if (n >= IP_PER_MINUTE) return false;
+  ipCounts.set(bucket, n + 1);
+  return true;
 }
 
 function json(obj, status = 200) {

@@ -15,14 +15,23 @@
  * Secrets: APNS_KEY_P8 (the .p8 contents), APNS_KEY_ID, APNS_TEAM_ID,
  *          WORKER_SEAL_PRIV (X25519 private JWK from genkey.js).
  * Vars:    APNS_TOPIC (default com.ashtonmiller.dropbeam).
- * KV:      PUSH_RL (rate limits; optional — without it limits are per-isolate).
+ * Rate limits (wrangler.toml `[[ratelimits]]`, no KV — KV's daily write quota
+ * was a kill switch anyone could trip): RL_IP (per CF-Connecting-IP, checked
+ * before any crypto), RL_GLOBAL (whole relay), RL_SERVER (per verified server
+ * key), RL_TOKEN (per SHA-256 of the decrypted APNs token = per phone). Every
+ * key is derived by the Worker, never chosen by the caller. Each binding is
+ * optional; a missing one falls back to a per-isolate in-memory counter, and an
+ * hourly per-isolate budget per phone/server backs the per-minute bindings.
  *
  * Logs only APNs status codes (for `wrangler tail`). See docs/PUSH-SETUP.md.
  */
 
-const PER_TOKEN_HOUR = 60 // per server + phone (servers also coalesce to one per 30s)
+const PER_TOKEN_HOUR = 60 // per phone (servers also coalesce to one per 30s)
 const PER_SERVER_HOUR = 500
+// In-memory fallbacks for the per-minute bindings (same numbers as wrangler.toml).
+const FALLBACK_MINUTE = { RL_IP: 30, RL_GLOBAL: 600, RL_SERVER: 60, RL_TOKEN: 10 }
 const MAX_BODY = 8 * 1024
+const MAX_PAYLOAD = 3000
 const enc = new TextEncoder()
 
 export default {
@@ -33,6 +42,11 @@ export default {
     }
     if (request.method === 'POST' && url.pathname === '/push') {
       try {
+        // Cheap gates first: per-IP and global, before reading or verifying anything.
+        const ip = request.headers.get('cf-connecting-ip') || 'unknown'
+        if (!(await allowMinute(env, 'RL_IP', `ip:${ip}`)) || !(await allowMinute(env, 'RL_GLOBAL', 'all'))) {
+          return json({ ok: false, reason: 'rate' }, 429)
+        }
         return await push(request, env)
       } catch (e) {
         return json({ ok: false, reason: 'error' }, 500)
@@ -54,9 +68,34 @@ const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0))
 const hexBytes = (h) => /^[0-9a-f]{64}$/i.test(h) ? Uint8Array.from(h.match(/../g), (x) => parseInt(x, 16)) : null
 const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 
+/** The body as text, or null past `max` bytes — counted as they stream in, so a
+ * chunked upload or a lying Content-Length can't get past the cap. */
+async function readCapped(request, max) {
+  const declared = Number(request.headers.get('content-length') || 0)
+  if (declared > max) return null
+  if (!request.body) return ''
+  const reader = request.body.getReader()
+  const chunks = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > max) {
+      try { await reader.cancel() } catch {}
+      return null
+    }
+    chunks.push(value)
+  }
+  const all = new Uint8Array(total)
+  let at = 0
+  for (const c of chunks) { all.set(c, at); at += c.byteLength }
+  return new TextDecoder().decode(all)
+}
+
 async function push(request, env) {
-  const raw = await request.text()
-  if (raw.length > MAX_BODY) return json({ ok: false, reason: 'too_big' }, 413)
+  const raw = await readCapped(request, MAX_BODY)
+  if (raw === null) return json({ ok: false, reason: 'too_big' }, 413)
   let b
   try { b = JSON.parse(raw) } catch { return json({ ok: false, reason: 'invalid' }, 400) }
   const fields = [b.v, b.server, b.sealed_token, b.collapse ?? '', b.payload ?? '', b.ts]
@@ -79,12 +118,15 @@ async function push(request, env) {
   if (tok.allowed_server !== b.server) return json({ ok: false, reason: 'token' }, 403)
   if (typeof tok.exp !== 'number' || tok.exp < Date.now()) return json({ ok: false, gone: true, reason: 'expired' }, 410)
   if (!/^[0-9a-f]{64,200}$/i.test(tok.token || '')) return json({ ok: false, reason: 'token' }, 400)
-  // 3) Rate limits (per phone token, per server).
-  if (!(await allow(env, `t:${b.server.slice(0, 16)}:${tok.token.slice(0, 32)}`, PER_TOKEN_HOUR)) || !(await allow(env, `s:${b.server}`, PER_SERVER_HOUR))) {
+  // 3) Rate limits, keyed on what the Worker verified: the signing server's key
+  //    and the phone's real APNs token (hashed), never on caller-chosen strings.
+  const phone = await sha256hex(tok.token.toLowerCase())
+  if (!(await allowMinute(env, 'RL_SERVER', `s:${b.server}`)) || !(await allowMinute(env, 'RL_TOKEN', `t:${phone}`))
+    || !allowHour(`s:${b.server}`, PER_SERVER_HOUR) || !allowHour(`t:${phone}`, PER_TOKEN_HOUR)) {
     return json({ ok: false, reason: 'rate' }, 429)
   }
   // 4) APNs.
-  const payload = typeof b.payload === 'string' && b.payload.length <= 3000 ? b.payload : ''
+  const payload = typeof b.payload === 'string' && b.payload.length <= MAX_PAYLOAD ? b.payload : ''
   const body = {
     aps: { alert: { title: 'DropBeam', body: 'New message' }, 'mutable-content': 1, sound: 'default', 'thread-id': String(b.collapse || '').slice(0, 64) },
     e: payload,
@@ -140,17 +182,37 @@ async function jwt(env) {
   return cachedJwt.token
 }
 
+async function sha256hex(s) {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(s)))
+  return Array.from(d, (x) => x.toString(16).padStart(2, '0')).join('')
+}
+
+// Per-isolate counters (fallback + hourly budgets). Bounded so a flood of
+// distinct keys can't grow memory without limit.
 const memoryCounts = new Map()
-async function allow(env, key, perHour) {
-  const bucket = `${key}:${Math.floor(Date.now() / 3_600_000)}`
-  if (env.PUSH_RL) {
-    const n = parseInt((await env.PUSH_RL.get(bucket)) || '0', 10)
-    if (n >= perHour) return false
-    await env.PUSH_RL.put(bucket, String(n + 1), { expirationTtl: 7200 })
-    return true
-  }
+function bump(bucket, max) {
+  if (memoryCounts.size > 50_000) memoryCounts.clear()
   const n = memoryCounts.get(bucket) || 0
-  if (n >= perHour) return false
+  if (n >= max) return false
   memoryCounts.set(bucket, n + 1)
   return true
+}
+
+function allowHour(key, perHour) {
+  return bump(`h:${key}:${Math.floor(Date.now() / 3_600_000)}`, perHour)
+}
+
+/** Per-minute limit through the `name` rate-limit binding (per Cloudflare
+ * location), or an in-memory counter when the binding isn't configured. */
+async function allowMinute(env, name, key) {
+  const rl = env && env[name]
+  if (rl && typeof rl.limit === 'function') {
+    try {
+      const { success } = await rl.limit({ key })
+      return success
+    } catch {
+      // Binding hiccup: fall through to the local counter rather than fail open/closed.
+    }
+  }
+  return bump(`m:${name}:${key}:${Math.floor(Date.now() / 60_000)}`, FALLBACK_MINUTE[name] || 60)
 }
