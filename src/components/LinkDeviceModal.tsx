@@ -9,7 +9,7 @@ import { deviceCodeProblem, isDeviceCode, linkedDetail, linkedTitle, linkErrorTe
 import { useStore } from '../store'
 import { QrCodeView } from './CodeQr'
 import { QrScanner } from './QrScanner'
-import { useEscape } from './Dialog'
+import { useEscape, useModalFocus } from './Dialog'
 import { IconButton, Spinner } from './ui'
 
 /** Link with a scanned/pasted device code of either kind. The engine picks the
@@ -115,7 +115,7 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
       ? <button className="btn btn-secondary" onClick={retry}>Try again</button>
       : <button className="btn btn-secondary" disabled={!code} onClick={copy}>{copied ? 'Copied' : 'Copy code'}</button>}
     <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
-  </> : phase === 'working' ? <button className="btn btn-secondary" onClick={onClose}>Hide</button>
+  </> : phase === 'working' ? <button className="btn btn-secondary" onClick={onClose}>Cancel Linking</button>
     : phase === 'done' ? <button className="btn btn-primary" autoFocus onClick={onClose}>Done</button>
     : <>
       {via === 'scan'
@@ -168,7 +168,9 @@ export function LinkNewDeviceModal({ onClose }: { onClose: () => void }) {
 function LinkDialog({ title, onClose, footer, children }: { title: string; onClose?: () => void; footer?: React.ReactNode; children: React.ReactNode }) {
   // Stacks with the scanner and any dialog that opened this one: Esc peels the topmost.
   useEscape(onClose)
-  return createPortal(<div className="dialog-overlay device-link-overlay" onMouseDown={e => { if (onClose && e.target === e.currentTarget) onClose() }}>
+  const ref = useRef<HTMLDivElement>(null)
+  useModalFocus(ref)
+  return createPortal(<div ref={ref} className="dialog-overlay device-link-overlay" onMouseDown={e => { if (onClose && e.target === e.currentTarget) onClose() }}>
     <div className={MOBILE_UI ? 'dialog mobile-sheet device-link-dialog' : 'dialog dialog-panel device-link-dialog'} role="dialog" aria-modal="true" aria-label={title}>
       <div className="dialog-head">
         <h2 className="dialog-title">{title}</h2>

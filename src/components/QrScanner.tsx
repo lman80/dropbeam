@@ -5,7 +5,7 @@ import jsQR from 'jsqr'
 import { fileSrc } from '../lib/api'
 import { CameraOff, ImageUp, X } from 'lucide-react'
 import { IS_MAC, MOBILE_UI } from '../lib/platform'
-import { useEscape } from './Dialog'
+import { useEscape, useModalFocus } from './Dialog'
 import { IconButton } from './ui'
 import { decodeQrFromImage, imageFromTransfer, setScannerDrop } from '../lib/qrImage'
 
@@ -191,5 +191,7 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
  *  above any dialog that opened it, so Esc only closes the scanner). */
 function ScannerFrame({ close, children }: { close: () => void; children: React.ReactNode }) {
   useEscape(close)
-  return <div className="dialog-overlay qr-overlay" onMouseDown={e => { if (e.target === e.currentTarget) close() }}>{children}</div>
+  const ref = useRef<HTMLDivElement>(null)
+  useModalFocus(ref)
+  return <div ref={ref} className="dialog-overlay qr-overlay" onMouseDown={e => { if (e.target === e.currentTarget) close() }}>{children}</div>
 }

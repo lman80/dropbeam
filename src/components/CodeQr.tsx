@@ -6,13 +6,13 @@
 //   <ScanCodeButton onCode=… />— opens the camera scanner (with screenshot / paste
 //                              fallbacks) for every ENTERED code; values are
 //                              normalized exactly like pasted ones (lib/codes).
-import { useState, type ReactNode } from 'react'
+import { useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { QRCodeSVG } from 'qrcode.react'
 import { Check, Copy, Maximize2, QrCode } from 'lucide-react'
 import { CODE_LABEL, parseCode, qrSpec, wrongCodeMessage, type CodeKind, type ParsedCode } from '../lib/codes'
 import { QrScanner } from './QrScanner'
-import { useEscape } from './Dialog'
+import { useEscape, useModalFocus } from './Dialog'
 import { useStore } from '../store'
 
 const FG = '#0b0c12'
@@ -49,8 +49,10 @@ export function QrCodeView({ value, size: base = 200, hint = QR_HINT, label, enl
 
 function QrEnlarged({ value, level, name, onClose }: { value: string; level: 'L' | 'M'; name: string; onClose: () => void }) {
   useEscape(onClose)
+  const ref = useRef<HTMLDivElement>(null)
+  useModalFocus(ref)
   return createPortal(
-    <div className="dialog-overlay qr-overlay qr-enlarged-overlay" onClick={onClose}>
+    <div ref={ref} className="dialog-overlay qr-overlay qr-enlarged-overlay" onClick={onClose}>
       <div className="qr-enlarged" role="dialog" aria-modal="true" aria-label={name} onClick={(e) => e.stopPropagation()}>
         <div className="qr-enlarged-tile"><QRCodeSVG value={value} size={480} level={level} marginSize={3} fgColor={FG} bgColor={BG} title={name} /></div>
         <p>{QR_HINT}</p>

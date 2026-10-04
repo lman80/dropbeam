@@ -1083,6 +1083,10 @@ html:not(.mobile) .dialog-overlay {
   padding: 20px;
   background: var(--overlay);
 }
+/* A dialog closed without an exit animation leaves this snapshot to fade out. */
+.dialog-ghost { pointer-events: none; transition: opacity 0.16s ease; }
+.dialog-ghost.leaving { opacity: 0; }
+.dialog-ghost.leaving > .dialog-panel { transform: scale(0.99); transition: transform 0.16s ease; }
 html:not(.mobile) .dialog-panel {
   width: 440px;
   padding: 20px;

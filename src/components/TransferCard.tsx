@@ -26,6 +26,7 @@ import { useStore } from '../store'
 import { deliverySummary, multiDevice } from '../lib/deliveries'
 import { DeliveryRows } from './Deliveries'
 import { useTransferMeter } from '../lib/useTransferMeter'
+import { errorText } from '../lib/errors'
 
 function title(t: TransferUpdate): string {
   if (t.fileNames.length === 1) return t.fileNames[0]
@@ -198,7 +199,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   } else if (paused) {
     meta = <>Paused{who ? ` · to ${who}` : ''}{t.bytesTotal > 0 ? <> · <span className="tnum">{formatBytes(t.bytesDone)} of {formatBytes(t.bytesTotal)}</span></> : ''}</>
   } else if (failed) {
-    meta = <span className="xfer-error" title={t.error ?? undefined}>{t.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}{t.error ? ` — ${t.error}` : ''}</span>
+    meta = <span className="xfer-error" title={t.error ?? undefined}>{t.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}{t.error ? ` — ${errorText(t.error, 'Something went wrong.')}` : ''}</span>
   } else if (reach && (completed || held)) {
     // "Delivered to Alex’s Mac · iPhone: waiting (Linux Box is holding it)"
     meta = <span title={reach.text}>{reach.text}{t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}</span>
