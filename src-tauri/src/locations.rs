@@ -700,13 +700,15 @@ mod unix {
         /// A 17,000-file upload used to stat every path from the root, six
         /// network round trips each on a mounted NAS, and outran the sender's
         /// patience. A missing or unreadable parent means every leaf is absent.
-        pub fn stat_many(&self, raw_parent: &str, leaves: &[String]) -> Result<Vec<Option<(bool, u64)>>> {
+        /// (is_dir, size, mtime secs) per leaf. The mtime lets a continuously
+        /// synced folder tell a same-size EDIT from an unchanged file (D9).
+        pub fn stat_many(&self, raw_parent: &str, leaves: &[String]) -> Result<Vec<Option<(bool, u64, u64)>>> {
             let rel = relative(raw_parent)?;
             let Ok(dir) = self.open_rel(&rel, true) else { return Ok(vec![None; leaves.len()]); };
             Ok(leaves.iter().map(|leaf| {
                 let file = child(&dir, std::ffi::OsStr::new(leaf), false).ok()?;
                 let meta = file.metadata().ok()?;
-                Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 }))
+                Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 }, crate::iroh_net::mtime_secs(&meta)))
             }).collect())
         }
         /// SHA-256 of one entry, opened descriptor-relative with O_NOFOLLOW at
@@ -1054,7 +1056,7 @@ mod unix {
 #[cfg(not(unix))]
 impl Root {
     pub fn stat_entry(&self, _: &str) -> Result<Option<(bool, u64)>> { bail!("Hosting unavailable") }
-    pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64)>>> { bail!("Hosting unavailable") }
+    pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64, u64)>>> { bail!("Hosting unavailable") }
     pub fn hash_entry(&self, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64)) -> Result<Option<String>> { bail!("Hosting unavailable") }
     pub fn listing(&self, _: &str) -> Result<Vec<Entry>> { bail!("Hosting unavailable") }
     pub fn new_folder(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
@@ -1144,8 +1146,8 @@ fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> 
             for (parent, items) in &groups {
                 let leaves: Vec<String> = items.iter().map(|(_, leaf)| leaf.clone()).collect();
                 for ((rel, _), found) in items.iter().zip(root.stat_many(parent, &leaves)?) {
-                    if let Some((is_dir, size)) = found {
-                        entries.push(json!({"rel_path":rel,"size":size,"is_dir":is_dir}));
+                    if let Some((is_dir, size, mtime)) = found {
+                        entries.push(json!({"rel_path":rel,"size":size,"is_dir":is_dir,"mtime":mtime}));
                     }
                 }
             }

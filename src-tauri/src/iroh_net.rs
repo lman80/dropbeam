@@ -4465,7 +4465,7 @@ struct LocationPush {
 tokio::task_local! { static LOCATION_PUSH: LocationPush; }
 
 async fn location_stat(conn: &Connection, target: &crate::locations::Target, paths: &[String])
-    -> Result<std::collections::HashMap<String, (bool, u64)>> {
+    -> Result<std::collections::HashMap<String, (bool, u64, Option<u64>)>> {
     let mut entries = std::collections::HashMap::new();
     for (i, paths) in paths.chunks(1000).enumerate() {
         if i > 0 { tokio::time::sleep(Duration::from_millis(120)).await; }
@@ -4480,7 +4480,8 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
         anyhow::ensure!(reply["ok"] == true, "{}", reply["error"].as_str().unwrap_or("Location stat failed"));
         for entry in reply["data"]["entries"].as_array().context("Invalid stat response")? {
             entries.insert(entry["rel_path"].as_str().context("Invalid stat path")?.to_string(),
-                (entry["is_dir"].as_bool().context("Invalid stat type")?, entry["size"].as_u64().context("Invalid stat size")?));
+                (entry["is_dir"].as_bool().context("Invalid stat type")?, entry["size"].as_u64().context("Invalid stat size")?,
+                 entry["mtime"].as_u64()));
         }
     }
     Ok(entries)
@@ -4722,7 +4723,9 @@ impl LocationBatch {
         require_locations(conn).await?;
         let stat_paths: Vec<_> = self.items.iter().map(|i| i.1.clone()).chain(self.dirs.iter().cloned()).collect();
         let existing = location_stat(conn, location.target.as_ref().context("Missing upload target")?, &stat_paths).await?;
-        let landed: Vec<_> = self.items.iter().map(|item| existing.get(&item.1) == Some(&(false, item.2))).collect();
+        let landed: Vec<_> = self.items.iter()
+            .map(|item| location_item_current(existing.get(&item.1).copied(), item.2, item.3, location.replace_existing))
+            .collect();
         skipped(landed.iter().filter(|&&v| v).count());
         let total: u64 = self.items.iter().map(|i| i.2).sum();
         let folder = folder_label(self.items.iter().map(|i| i.1.as_str())).unwrap_or_default();
@@ -4771,6 +4774,38 @@ impl LocationBatch {
         if swapped > 0 { replaced(swapped); }
         progress(total, total);
         Ok(total)
+    }
+}
+
+/// Whether an upload item already has a current copy on the host (skip it).
+/// An ordinary upload keeps the original rule: same size = already landed (its
+/// resume semantics). A continuously SYNCED folder (`newest_wins`) compares the
+/// modified time too (D9): a same-size EDIT must upload, and a host copy that is
+/// NEWER than ours must never be overwritten by our older one. Mtimes within 2 s
+/// count as equal (FAT/exFAT store 2-second steps). An older host that doesn't
+/// report mtime falls back to the size rule.
+pub(crate) fn location_item_current(remote: Option<(bool, u64, Option<u64>)>, size: u64, mtime: u64, newest_wins: bool) -> bool {
+    let Some((is_dir, rsize, rmtime)) = remote else { return false };
+    if is_dir {
+        return false;
+    }
+    if !newest_wins {
+        return rsize == size;
+    }
+    match rmtime {
+        None => rsize == size,
+        Some(rm) => {
+            let same_time = rm.abs_diff(mtime) <= 2;
+            if same_time {
+                if rsize != size {
+                    log::warn!("synced folder: host copy differs but has the same modified time — keeping the host's copy");
+                }
+                true
+            } else {
+                // Host newer → keep it (skip). Ours newer → upload (replace).
+                rm > mtime
+            }
+        }
     }
 }
 

@@ -44,6 +44,10 @@ const TRANSFER_SILENCE: Duration = Duration::from_secs(900);
 const MAX_FOLDERS: usize = 50;
 
 fn yes() -> bool { true }
+/// "Mac" / "PC" / "computer" for user-facing copy.
+fn this_device() -> &'static str {
+    if cfg!(target_os = "macos") { "Mac" } else if cfg!(target_os = "ios") { "iPhone" } else if cfg!(windows) { "PC" } else { "computer" }
+}
 fn now_ms() -> u64 { crate::chat::now_ms() }
 
 // ── Model ────────────────────────────────────────────────────────────────────
@@ -189,6 +193,7 @@ pub fn plan_upload_paths(root: &Path, changed: &[PathBuf]) -> Vec<PathBuf> {
     for path in changed {
         let Ok(rel) = path.strip_prefix(root) else { continue };
         let Some(first) = rel.components().next() else { continue };
+        if skip_top_level(&first.as_os_str().to_string_lossy()) { continue; }
         let child = root.join(first.as_os_str());
         if !out.contains(&child) { out.push(child); }
     }
@@ -432,6 +437,10 @@ impl Engine {
             if due_full { pending.lock().unwrap().full = false; last_full = now; }
 
             let Some(folder) = load(&self.config_dir).into_iter().find(|f| f.id == id) else { break };
+            // Kept so a failed pass can put its deletes back (D9): they used to be
+            // dropped whenever the host was away, so the NAS kept files the user
+            // had removed.
+            let deletes_taken = deletes.clone();
             let outcome = self.run_once(&folder, &status, due_full, ready, deletes).await;
             match &outcome {
                 Ok(message) => {
@@ -454,8 +463,10 @@ impl Engine {
                         f.last_check_at = now_ms();
                         f.last_result = Some(LastResult { ok: false, message: problem.message.clone() });
                     });
-                    // A failed pass is owed a full re-check, not just its changes.
+                    // A failed pass is owed a full re-check, not just its changes —
+                    // and its deletes are retried (a host that's away comes back).
                     pending.lock().unwrap().full = true;
+                    requeue(&pending, Vec::new(), deletes_taken);
                 }
             }
             let again = { let mut p = pending.lock().unwrap(); let (next, again) = p.run.finished(); p.run = next; again };
@@ -479,7 +490,7 @@ impl Engine {
             .ok_or_else(|| Problem::error("That device is no longer one of your friends"))?;
         let who = friend.name.clone();
         if !root.is_dir() {
-            return Err(Problem::error(&format!("Can't find the folder “{}” on this Mac", folder.name())));
+            return Err(Problem::error(&format!("Can't find the folder “{}” on this {}", folder.name(), this_device())));
         }
         self.set_status(status, "scanning", &format!("Checking what's new in “{}”", folder.name()), 0, None);
         let endpoint = friend.endpoint_id.clone()
@@ -618,11 +629,28 @@ fn classify(error: &str, who: &str) -> Problem {
     }
 }
 
-/// Immediate children of a folder — hidden files included, nothing skipped.
+/// Top-level names a synced folder never uploads (D10): DropBeam's own
+/// bookkeeping (`.dropbeam-history` when the folder is also a Shared Drop
+/// Folder, staging, placeholders) and OS litter (`.DS_Store`, `Thumbs.db`…).
+/// The upload walker already skips these INSIDE subfolders; at the top level they
+/// were handed over as roots and failed the whole pass, every pass. Ordinary
+/// hidden files still go.
+pub fn skip_top_level(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with(".dropbeam")
+        || lower == "dropbeam-history"
+        || lower.ends_with(".dropbeam-incoming")
+        || crate::iroh_net::os_junk_name(name)
+}
+
+/// Immediate children of a folder — hidden files included; only DropBeam's own
+/// files and OS litter are skipped.
 fn children(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(root)? {
-        out.push(entry?.path());
+        let entry = entry?;
+        if skip_top_level(&entry.file_name().to_string_lossy()) { continue; }
+        out.push(entry.path());
     }
     out.sort();
     Ok(out)
@@ -894,5 +922,40 @@ mod tests {
         assert!(classify("This upload is already running — let it finish", "Linux Box").waiting);
         assert!(!classify("This location is not shared with upload permission", "Linux Box").waiting);
         assert_eq!(classify("Friend not found", "Linux Box").message, "Friend not found");
+    }
+
+    /// D10: DropBeam's own files and OS litter at the TOP of a synced folder are
+    /// never upload roots (they failed every pass); ordinary hidden files still go.
+    #[test]
+    fn top_level_bookkeeping_and_litter_are_skipped() {
+        for n in [".dropbeam-history", ".dropbeam-staging", "dropbeam-history", ".DS_Store", "Thumbs.db", "desktop.ini", "a.mov.dropbeam-incoming"] {
+            assert!(skip_top_level(n), "{n}");
+        }
+        for n in [".env", ".git", "photo.jpg", "Dropbeam notes.txt"] {
+            assert!(!skip_top_level(n), "{n}");
+        }
+        let root = std::env::temp_dir().join(format!("dropbeam-d10-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".dropbeam-history/data")).unwrap();
+        std::fs::write(root.join(".DS_Store"), b"x").unwrap();
+        std::fs::write(root.join(".env"), b"x").unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let names: Vec<String> = children(&root).unwrap().iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![".env".to_string(), "a.txt".to_string()]);
+        let planned = plan_upload_paths(&root, &[root.join(".dropbeam-history/index.json"), root.join("a.txt")]);
+        assert_eq!(planned, vec![root.join("a.txt")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// D9: a failed pass keeps its deletes (they used to be dropped whenever the
+    /// host was away).
+    #[test]
+    fn requeued_deletes_survive_a_failed_pass() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let gone = PathBuf::from("/nonexistent/synced/removed.txt");
+        requeue(&pending, Vec::new(), vec![gone.clone()]);
+        let root = PathBuf::from("/nonexistent/synced");
+        let ready = take_ready_deletes(&pending, &root, now_ms());
+        assert_eq!(ready, vec![gone]);
     }
 }
