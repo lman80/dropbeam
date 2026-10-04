@@ -29,6 +29,8 @@ struct MyDevice: Decodable {
     var linkedDevices: Int?
     var devices: [AccountDevice] = []
     var inAccount: Bool { !(accountPub ?? "").isEmpty }
+    /// The account's devices minus any still waiting for approval.
+    var linked: [AccountDevice] { devices.filter { !$0.needsApproval } }
 }
 /// A device in this account (the first one is this device).
 struct AccountDevice: Decodable, Identifiable {
@@ -40,6 +42,9 @@ struct AccountDevice: Decodable, Identifiable {
     var deviceOs: String?
     var lastSyncMs: Double?
     var thisDevice: Bool
+    /// Proves the account key but no remaining device vouched for it (linked by an
+    /// older build, or by a device since removed): the user must approve it (S4).
+    var needsApproval: Bool = false
 }
 struct Transfer: Decodable, Identifiable {
     let id: String
@@ -412,6 +417,8 @@ extension AccountDevice {
         self.deviceOs = (try? c.decode(String.self, forKey: BridgeKey("deviceOs")))
         self.lastSyncMs = (try? c.decode(Double.self, forKey: BridgeKey("lastSyncMs")))
         self.thisDevice = (try? c.decode(Bool.self, forKey: BridgeKey("thisDevice"))) ?? false
+        self.needsApproval = (try? c.decode(Bool.self, forKey: BridgeKey("needsApproval")))
+            ?? (try? c.decode(Bool.self, forKey: BridgeKey("needs_approval"))) ?? false
     }
 }
 

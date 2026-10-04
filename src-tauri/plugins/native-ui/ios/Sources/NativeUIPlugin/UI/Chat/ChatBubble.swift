@@ -274,9 +274,17 @@ struct LinkPreviewCard: View {
         Self.cache.setObject(img, forKey: key)
         return img
     }
+    /// Always the link's real host — never the page's own `siteName`, which the
+    /// page chooses and could use to pose as another site.
     private var host: String? {
-        if let s = preview.siteName, !s.isEmpty { return s }
-        return URL(string: preview.url)?.host()?.replacingOccurrences(of: "www.", with: "")
+        guard let h = URL(string: preview.url)?.host()?.lowercased(), !h.isEmpty else { return nil }
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
+    /// The page's title; its siteName only stands in when there's no title.
+    private var title: String? {
+        if let t = preview.title?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty { return t }
+        if let s = preview.siteName?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { return s }
+        return nil
     }
     var body: some View {
         Button { if let url = URL(string: preview.url) { openURL(url) } } label: {
@@ -287,7 +295,7 @@ struct LinkPreviewCard: View {
                         .frame(width: 260, height: min(200, 260 / ratio)).clipped()
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(preview.title ?? host ?? preview.url).font(.subheadline.weight(.semibold)).lineLimit(2)
+                    Text(title ?? host ?? preview.url).font(.subheadline.weight(.semibold)).lineLimit(2)
                         .multilineTextAlignment(.leading).foregroundStyle(Color.primary)
                     if let host { Text(host).font(.footnote).foregroundStyle(.secondary).lineLimit(1) }
                 }
@@ -299,7 +307,7 @@ struct LinkPreviewCard: View {
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Link: \(preview.title ?? host ?? preview.url)")
+        .accessibilityLabel("Link: \(title ?? host ?? preview.url)")
         .accessibilityHint("Opens the link")
     }
 }

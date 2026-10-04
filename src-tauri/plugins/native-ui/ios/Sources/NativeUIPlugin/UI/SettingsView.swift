@@ -135,7 +135,7 @@ struct SettingsView: View {
         }
     }
     private var devicesSummary: String {
-        let others = (bridge.myDevice?.devices ?? []).filter { !$0.thisDevice }
+        let others = (bridge.myDevice?.linked ?? []).filter { !$0.thisDevice }
         if others.isEmpty { return "Link your other devices to share friends and chats" }
         return "This iPhone and " + ListFormatter.localizedString(byJoining: others.map { "your " + deviceNoun($0.deviceKind, os: $0.deviceOs) })
     }

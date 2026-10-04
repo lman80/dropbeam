@@ -461,6 +461,8 @@ final class Bridge: ObservableObject {
     func linkHostCancel() async throws { try await action("linkHostCancel") }
     func accountSyncNow() async throws { try await action("accountSyncNow") }
     func accountRemoveDevice(endpointId: String) async throws { try await action("accountRemoveDevice", ["endpointId": endpointId]) }
+    /// S4: vouch for a device that proves the account key but wasn't approved by a linked device.
+    func accountApproveDevice(endpointId: String) async throws { try await action("accountApproveDevice", ["endpointId": endpointId]) }
     func accountLeave() async throws { try await action("accountLeave") }
     /// True for the two device-link codes (either direction).
     static func isLinkCode(_ code: String) -> Bool {

@@ -8,6 +8,8 @@ struct DevicesView: View {
     @State private var leaving = false
     @State private var syncing = false
     private var devices: [AccountDevice] { bridge.myDevice?.devices ?? [] }
+    /// Devices actually in the account (not ones still waiting for approval).
+    private var linkedDevices: [AccountDevice] { bridge.myDevice?.linked ?? [] }
     private var inAccount: Bool { bridge.myDevice?.inAccount == true && devices.count > 1 }
     private var myNoun: String { deviceNoun(bridge.myDevice?.deviceKind, os: bridge.myDevice?.deviceOs ?? "ios") }
     var body: some View {
@@ -15,7 +17,8 @@ struct DevicesView: View {
             Section { hero }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 4, trailing: 20))
             if inAccount {
                 Section {
-                    ForEach(devices) { device in row(device) }
+                    ForEach(linkedDevices) { device in row(device) }
+                    ForEach(devices.filter(\.needsApproval)) { device in pendingRow(device) }
                 } header: { Text("My Devices") } footer: {
                     if let name = bridge.settings?.displayName, !name.isEmpty {
                         Text("Friends see you as \(name) on every device. A new name or photo on one updates the others.")
@@ -53,11 +56,11 @@ struct DevicesView: View {
     }
     private var hero: some View {
         HStack(spacing: -8) {
-            ForEach(Array(devices.prefix(3).enumerated()), id: \.element.id) { _, d in
+            ForEach(Array(linkedDevices.prefix(3).enumerated()), id: \.element.id) { _, d in
                 DeviceAvatar(kind: d.deviceKind, os: d.deviceOs, size: 64)
                     .overlay(Circle().stroke(Color(uiColor: .systemGroupedBackground), lineWidth: 3))
             }
-            if devices.isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 64) }
+            if linkedDevices.isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 64) }
         }.frame(maxWidth: .infinity)
     }
     /// "Your iPhone" — or "Your iPhone 2" when two of your devices would read the
@@ -65,7 +68,8 @@ struct DevicesView: View {
     private func label(_ device: AccountDevice) -> String {
         let noun = deviceNoun(device.deviceKind, os: device.deviceOs)
         if device.thisDevice { return "This \(noun)" }
-        let same = devices.filter { !$0.thisDevice && deviceNoun($0.deviceKind, os: $0.deviceOs) == noun }
+        if device.needsApproval { return device.name }
+        let same = linkedDevices.filter { !$0.thisDevice && deviceNoun($0.deviceKind, os: $0.deviceOs) == noun }
         guard same.count > 1 else { return "Your \(noun)" }
         let names = same.map { $0.name.trimmingCharacters(in: .whitespaces) }
         if Set(names).count == names.count, !names.contains(noun), !names.contains("") { return device.name }
@@ -90,6 +94,39 @@ struct DevicesView: View {
         .padding(.vertical, 2)
         .swipeActions { if !device.thisDevice { Button("Remove", role: .destructive) { removing = device } } }
         .contextMenu { if !device.thisDevice { Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device } } }
+    }
+    /// S4: a device that proves the account key but no linked device vouched for
+    /// (linked by an older build, or by a device since removed). Approve or remove.
+    @ViewBuilder private func pendingRow(_ device: AccountDevice) -> some View {
+        HStack(spacing: 14) {
+            DeviceAvatar(kind: device.deviceKind, os: device.deviceOs, size: 42).opacity(0.6)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(device.name) · Needs approval").font(.body.weight(.semibold)).lineLimit(2)
+                    .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
+                Text("Only approve it if it’s your own device.").font(.subheadline).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Button("Approve") { approve(device) }.buttonStyle(.borderedProminent).controlSize(.small)
+            Menu {
+                Button("Approve", systemImage: "checkmark.circle") { approve(device) }
+                Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device }
+            } label: { Image(systemName: "ellipsis.circle").font(.title3).frame(width: 44, height: 44).contentShape(Rectangle()) }
+                .buttonStyle(.borderless).accessibilityLabel("Options for \(device.name)")
+        }
+        .padding(.vertical, 2)
+        .swipeActions { Button("Remove", role: .destructive) { removing = device } }
+        .contextMenu {
+            Button("Approve", systemImage: "checkmark.circle") { approve(device) }
+            Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device }
+        }
+    }
+    private func approve(_ device: AccountDevice) {
+        Haptics.tap()
+        bridge.perform {
+            try await bridge.accountApproveDevice(endpointId: device.endpointId)
+            try? await bridge.action("myDeviceInfo")
+            bridge.showToast("\(device.name) was approved")
+        }
     }
     private func subtitle(_ device: AccountDevice) -> String {
         if device.thisDevice { return device.name }
@@ -178,7 +215,7 @@ struct LinkDeviceSheet: View {
     @State private var closed = false
     @State private var attempt = 0
     /// A device that already shares its account shows a "join me" code.
-    private var hosting: Bool { (bridge.myDevice?.devices.count ?? 0) > 1 }
+    private var hosting: Bool { (bridge.myDevice?.linked.count ?? 0) > 1 }
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -378,7 +415,7 @@ struct LinkSafetyCheck: View {
     let confirm: () -> Void
     let cancel: () -> Void
     private var warning: String {
-        safety.joining ? "This device will join \(safety.name)’s account and share its friends and chats."
+        safety.joining ? "This device will join \(safety.name)’s account: this device’s friends and chats will be shared into that account, and it gets that account’s friends and chats."
             : "\(safety.name) will get full access to your account: your friends, chats and devices."
     }
     var body: some View {

@@ -29,7 +29,7 @@ struct OnboardingFlow: View {
         .tint(.beam)
         .sheet(isPresented: $joining, onDismiss: {
             // Linked into an account: name and photo came with it.
-            if !bridge.needsName, (bridge.myDevice?.devices.count ?? 0) > 1 { go(.friend) }
+            if !bridge.needsName, (bridge.myDevice?.linked.count ?? 0) > 1 { go(.friend) }
         }) { JoinAccountSheet().environmentObject(bridge) }
         .task {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
@@ -368,7 +368,7 @@ private struct DevicesStep: View {
     @EnvironmentObject private var bridge: Bridge
     let next: () -> Void
     @State private var linking = false
-    private var linked: Bool { (bridge.myDevice?.devices.count ?? 0) > 1 }
+    private var linked: Bool { (bridge.myDevice?.linked.count ?? 0) > 1 }
     var body: some View {
         OnboardingPage {
             HStack(spacing: 18) {
