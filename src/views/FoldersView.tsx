@@ -157,6 +157,10 @@ function statusInfo(
   formatSpeed: (bps: number) => string,
 ): { tone: Tone; label: string } {
   const peer = pair.peerName || 'your friend'
+  // The folder itself is gone (unplugged drive, moved/renamed): outranks everything.
+  if (status?.folderMissing) {
+    return { tone: 'error', label: status.detail ?? 'Folder not found — reconnect the drive' }
+  }
   if (status?.peerUnshared) {
     return { tone: 'error', label: `${pair.peerName || 'They'} stopped sharing this folder` }
   }
@@ -357,6 +361,13 @@ function FolderRow({
             </button>
           )}
         </div>
+
+        {status?.warning && !status.folderMissing && (
+          <div className="folder-status tone-warn" title={status.warning}>
+            <Dot tone="warn" />
+            <span className="truncate-1">{status.warning}</span>
+          </div>
+        )}
 
         {(verifying || verifyResult) && <VerifyLine verifying={verifying} result={verifyResult} />}
 
@@ -627,7 +638,7 @@ function FolderSettingsDialog({
 
       <SectionHeader>Sync</SectionHeader>
       <div className="group folder-settings">
-        <SettingRow title="Total sync" desc="Adds, edits and deletes sync both ways. Removed files are kept in History.">
+        <SettingRow title="Total sync" desc="Adds, edits and deletes sync both ways. Removed or replaced files are saved in Recoverable files.">
           <Toggle label="Total sync" on={pair.mirror} onChange={() => onUpdate({ mirror: !pair.mirror })} />
         </SettingRow>
         {!pair.mirror && (

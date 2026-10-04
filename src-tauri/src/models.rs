@@ -637,6 +637,13 @@ pub struct FolderStatus {
     /// Live connection detail for the active folder transfer (inspector data).
     #[serde(default)]
     pub conn_detail: Option<ConnDetail>,
+    /// The folder isn't on disk (unplugged drive, moved/renamed). Nothing syncs.
+    #[serde(default)]
+    pub folder_missing: bool,
+    /// Something worth telling the user that isn't an error — e.g. files the peer
+    /// can't hold under their names (Windows-illegal characters).
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// The honest answer to "are these two folders identical?", returned by the

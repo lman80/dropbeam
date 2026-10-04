@@ -52,9 +52,14 @@ struct PairHandle {
     stopped: Arc<AtomicBool>,
     stop_notify: Arc<Notify>,
     wake: Arc<Notify>,
-    queue: Arc<Mutex<VecDeque<String>>>,
+    queue: Arc<Mutex<SendQueue>>,
     inbound: Arc<Mutex<HashSet<String>>>,
     status: Arc<Mutex<StatusSnapshot>>,
+    /// Signatures the peer answered "kept" for (see `load_skipped`).
+    skipped: Arc<Mutex<HashMap<String, String>>>,
+    /// Files received but not yet announced (History row + notification) — one
+    /// announcement per receive BURST instead of one per 32-file batch.
+    recv_burst: Arc<Mutex<(Vec<String>, u64)>>,
     /// Loop-guard for files we just wrote/removed ourselves (shared with the
     /// listener + collector so an iroh receive lands without echoing back).
     self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
@@ -121,6 +126,9 @@ struct StatusSnapshot {
     /// progress bar ("12 of 50 files") instead of a card flashing once per file.
     session_total_files: u32,
     session_done_files: u32,
+    /// Something the user should know that isn't an error (e.g. files the peer
+    /// can't hold under their names).
+    warning: Option<String>,
 }
 
 impl Default for StatusSnapshot {
@@ -142,6 +150,7 @@ impl Default for StatusSnapshot {
             peer_files: 0,
             session_total_files: 0,
             session_done_files: 0,
+            warning: None,
         }
     }
 }
@@ -151,6 +160,8 @@ impl Default for StatusSnapshot {
 struct DeleteEvent {
     rel: String,
     ts: u64,
+    /// The version (size, mtime) we last had — the peer deletes only THAT version.
+    known: Option<(u64, u64)>,
 }
 
 /// A peer's full folder snapshot, carried on the control beacon for the periodic
@@ -199,12 +210,20 @@ impl SyncManager {
 
         for pair in desired {
             let sig = structural_sig(&pair);
-            let existing_sig = self
+            let (existing_sig, was_viewer) = self
                 .handles
                 .lock()
                 .unwrap()
                 .get(&pair.id)
-                .map(|h| h.sig.clone());
+                .map(|h| (Some(h.sig.clone()), h.config.lock().unwrap().i_am_viewer))
+                .unwrap_or((None, false));
+            // Promoted from viewer to editor: whatever this device changed WHILE it
+            // was read-only must not be pushed to everyone just because the role
+            // flipped. Baseline the current files as already-known; only edits made
+            // from now on (a deliberate act) sync out.
+            if was_viewer && !pair.i_am_viewer && pair.mirror {
+                baseline_on_promotion(&self.config_dir, &pair);
+            }
             match existing_sig {
                 Some(s) if s == sig => {
                     // Only non-structural fields changed — update in place.
@@ -490,8 +509,11 @@ impl SyncManager {
                     session_done_files: s.session_done_files,
                     paused: h.paused.load(Ordering::Relaxed),
                     conn_detail: None,
+                    folder_missing: s.folder_missing,
+                    warning: s.warning.clone(),
                 }
             })
+            .map(apply_missing_folder)
             .collect()
     }
 
@@ -520,28 +542,22 @@ impl SyncManager {
         // stale ones go (>10 min): a live receive may legitimately own a fresh
         // placeholder right now.
         {
-            let now = std::time::SystemTime::now();
             for f in list_files_rec(Path::new(&pair.folder)) {
-                if !f.to_string_lossy().ends_with(".dropbeam-incoming") {
-                    continue;
-                }
-                let stale = std::fs::metadata(&f)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| now.duration_since(t).ok())
-                    .map(|d| d.as_secs() > 600)
-                    .unwrap_or(true);
-                if stale {
-                    let _ = std::fs::remove_file(&f);
+                if f.to_string_lossy().ends_with(".dropbeam-incoming") {
+                    sweep_stale_placeholder(&f);
                 }
             }
         }
         let stopped = Arc::new(AtomicBool::new(false));
         let stop_notify = Arc::new(Notify::new());
         let wake = Arc::new(Notify::new());
-        let queue = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let queue = Arc::new(Mutex::new(SendQueue::default()));
         let inbound = Arc::new(Mutex::new(load_manifest(&self.config_dir, &pair.id)));
+        let skipped = Arc::new(Mutex::new(load_skipped(&self.config_dir, &pair.id)));
         let status = Arc::new(Mutex::new(StatusSnapshot::default()));
+        if let Ok(mut s) = status.lock() {
+            s.warning = skipped_warning(&skipped.lock().unwrap(), &peer_label(&pair));
+        }
         let config = Arc::new(Mutex::new(pair.clone()));
         let sig = structural_sig(&pair);
 
@@ -583,15 +599,26 @@ impl SyncManager {
             let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
             let folder = pair.folder.clone();
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
-                    use notify::EventKind;
-                    if matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                    ) {
-                        for path in event.paths {
-                            let _ = evt_tx.send(path);
+                match res {
+                    Ok(event) => {
+                        use notify::EventKind;
+                        // The OS dropped events (FSEvents MustScanSubDirs / inotify
+                        // queue overflow): individual deletes may be lost. An EMPTY
+                        // path tells the collector to re-diff the folder (D5).
+                        if event.need_rescan() {
+                            let _ = evt_tx.send(PathBuf::new());
                         }
+                        if matches!(
+                            event.kind,
+                            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                        ) {
+                            for path in event.paths {
+                                let _ = evt_tx.send(path);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let _ = evt_tx.send(PathBuf::new());
                     }
                 }
             }) {
@@ -653,10 +680,15 @@ impl SyncManager {
                     status.clone(),
                     skip_current.clone(),
                     paused.clone(),
+                    skipped.clone(),
                 );
 
-                // Seed the queue with any files already sitting in the folder.
-                seed_existing(&pair.folder, &inbound, &queue, &wake);
+                // Seed the queue with any files already sitting in the folder — off
+                // this thread: the scan includes a write-completion check (D2).
+                let (f, i, q, w) = (pair.folder.clone(), inbound.clone(), queue.clone(), wake.clone());
+                tauri::async_runtime::spawn_blocking(move || {
+                    seed_existing(&f, &i, &q, &w);
+                });
             }
         }
 
@@ -680,6 +712,10 @@ impl SyncManager {
             moves.clone(),
             ino_index.clone(),
             paused.clone(),
+            inbound.clone(),
+            queue.clone(),
+            skipped.clone(),
+            self_deleted.clone(),
         );
         // iroh-only: the peer's control payload (presence + name + mirror deletes)
         // arrives via the iroh accept loop's "folder-ctrl" handler.
@@ -693,6 +729,8 @@ impl SyncManager {
             queue,
             inbound,
             status,
+            skipped,
+            recv_burst: Arc::new(Mutex::new((Vec::new(), 0))),
             self_deleted,
             pending_deletes,
             control_wake,
@@ -726,13 +764,14 @@ impl SyncManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_collector(
         self: Arc<Self>,
         mut evt_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
         config: Arc<Mutex<Pair>>,
         stopped: Arc<AtomicBool>,
         wake: Arc<Notify>,
-        queue: Arc<Mutex<VecDeque<String>>>,
+        queue: Arc<Mutex<SendQueue>>,
         inbound: Arc<Mutex<HashSet<String>>>,
         pending_deletes: Arc<Mutex<Vec<DeleteEvent>>>,
         self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
@@ -745,6 +784,8 @@ impl SyncManager {
         let config_dir = self.config_dir.clone();
         let pair_id_c = config.lock().unwrap().id.clone();
         let debounce: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        // At most one overflow re-diff in flight per folder.
+        let rescan_running = Arc::new(AtomicBool::new(false));
         tauri::async_runtime::spawn(async move {
             while let Some(path) = evt_rx.recv().await {
                 if stopped.load(Ordering::SeqCst) {
@@ -754,6 +795,19 @@ impl SyncManager {
                     let c = config.lock().unwrap();
                     (c.folder.clone(), c.mirror, c.i_am_viewer)
                 };
+                // Watcher overflow: deletes may have been dropped — re-diff the
+                // folder against what we know (D5). Mirror editors only.
+                if path.as_os_str().is_empty() {
+                    if mirror && !viewer && !rescan_running.swap(true, Ordering::SeqCst) {
+                        let (m, pid, flag, st) =
+                            (manager.clone(), pair_id_c.clone(), rescan_running.clone(), stopped.clone());
+                        tauri::async_runtime::spawn(async move {
+                            m.propagate_missed_deletes(&pid, now_ms(), &st).await;
+                            flag.store(false, Ordering::SeqCst);
+                        });
+                    }
+                    continue;
+                }
                 let p = path.to_string_lossy().to_string();
                 // One generation counter per path collapses bursts (and lets a
                 // newer event supersede an in-flight handler for the same path).
@@ -779,6 +833,7 @@ impl SyncManager {
                 let ino2 = ino_index.clone();
                 let manager2 = manager.clone();
                 tauri::async_runtime::spawn(async move {
+                    let body = async {
                     // Classify by EXISTENCE, not by the OS event kind. A file that
                     // is present is an add/change; one that's gone is a delete —
                     // works no matter how macOS labels a trash/move/rename.
@@ -786,6 +841,11 @@ impl SyncManager {
                         // ── ADD / CHANGE ──────────────────────────────────────
                         if !is_sendable_candidate(&p, &folder2, &inbound2) {
                             return;
+                        }
+                        // Note first sight (platforms without ctime, see D15) BEFORE
+                        // the settle wait, so a moved-in old file reads as new.
+                        if let Ok(m) = std::fs::metadata(&p) {
+                            let _ = path_version_ms(Path::new(&p), &m);
                         }
                         // Wait for quiet + confirm write-completion via size stability.
                         if !wait_until_stable(&p, &debounce2, gen, &stopped2).await {
@@ -815,12 +875,7 @@ impl SyncManager {
                         {
                             return; // recorded as a move — don't enqueue a byte send
                         }
-                        {
-                            let mut q = queue2.lock().unwrap();
-                            if !q.iter().any(|x| x == &p) {
-                                q.push_back(p.clone());
-                            }
-                        }
+                        queue2.lock().unwrap().push_back(p.clone());
                         wake2.notify_one();
                     } else if Path::new(&p).is_dir() {
                         // ── DIRECTORY appeared / changed ──────────────────────
@@ -836,8 +891,8 @@ impl SyncManager {
                         //
                         // Let an in-progress copy settle before scanning, so a folder
                         // dragged in mid-copy doesn't enqueue a half-written file. The
-                        // reconcile re-sends on any later size/mtime change, so this
-                        // just shrinks the partial-file window.
+                        // sender re-checks each file's size+mtime around the send (D2),
+                        // so a file still growing is re-sent, never marked done.
                         tokio::time::sleep(Duration::from_millis(800)).await;
                         if stopped2.load(Ordering::SeqCst) {
                             return;
@@ -852,17 +907,25 @@ impl SyncManager {
                             return;
                         }
                         let had_files = !files.is_empty();
+                        // Candidate checks stat every file — do them before taking
+                        // the queue lock, then one O(1)-per-item push.
+                        let cands: Vec<String> = files
+                            .iter()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .filter(|fp| is_sendable_candidate(fp, &folder2, &inbound2))
+                            .collect();
+                        if !cfg!(unix) {
+                            for c in &cands {
+                                if let Ok(m) = std::fs::metadata(c) {
+                                    let _ = path_version_ms(Path::new(c), &m);
+                                }
+                            }
+                        }
                         let mut any = false;
                         {
                             let mut q = queue2.lock().unwrap();
-                            for f in files {
-                                let fp = f.to_string_lossy().to_string();
-                                if is_sendable_candidate(&fp, &folder2, &inbound2)
-                                    && !q.iter().any(|x| x == &fp)
-                                {
-                                    q.push_back(fp);
-                                    any = true;
-                                }
+                            for fp in cands {
+                                any |= q.push_back(fp);
                             }
                         }
                         if any {
@@ -935,20 +998,42 @@ impl SyncManager {
                             manager2.warn_viewer_change(&folder2);
                             return;
                         }
+                        // ROOT GUARD (D5/D6): an unplugged drive / unmounted share
+                        // makes EVERY file "disappear". That is never a delete — with
+                        // the folder itself gone, propagate nothing.
+                        if !Path::new(&folder2).is_dir() {
+                            log::warn!("folder {folder2} is not available — not treating {rel:?} as deleted");
+                            return;
+                        }
                         // Expand a DIRECTORY deletion into its children. macOS fires
                         // one Remove event for the folder, not one per file inside —
                         // so propagating only the folder rel left every file behind
                         // on the peer. We recover the children from the manifest
                         // (the files we know lived under `rel/`), tombstone + queue a
                         // delete for each, AND for the folder rel itself (a real file
-                        // delete has no children, so it just tombstones itself).
-                        let mut targets: Vec<String> = {
+                        // delete has no children, so it just tombstones itself). Each
+                        // carries the exact version we had, so the peer deletes only
+                        // that version — never a newer edit, never a file we never saw.
+                        let (mut targets, known_sigs): (Vec<(String, Option<(u64, u64)>)>, Vec<String>) = {
                             let inb = inbound2.lock().unwrap();
                             let prefix = format!("{rel}/");
-                            inb.iter()
-                                .filter_map(|sig| sig_rel(sig))
-                                .filter(|r| r == &rel || r.starts_with(&prefix))
-                                .collect()
+                            let mut latest: HashMap<String, (u64, u64)> = HashMap::new();
+                            let mut sigs = Vec::new();
+                            for sig in inb.iter() {
+                                let Some(r) = sig_rel(sig) else { continue };
+                                if r != rel && !r.starts_with(&prefix) {
+                                    continue;
+                                }
+                                sigs.push(sig.clone());
+                                let mut it = sig.rsplitn(3, '|');
+                                let mt = it.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+                                let sz = it.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0);
+                                let e = latest.entry(r).or_insert((sz, mt));
+                                if mt >= e.1 {
+                                    *e = (sz, mt);
+                                }
+                            }
+                            (latest.into_iter().map(|(r, v)| (r, Some(v))).collect(), sigs)
                         };
                         // DATA-LOSS GUARD: a directory delete that would wipe MANY
                         // files is the dangerous case. A folder REPLACE (drop a new
@@ -965,7 +1050,7 @@ impl SyncManager {
                                     return;
                                 }
                                 let reappeared = Path::new(&p).exists()
-                                    || targets.iter().any(|t| {
+                                    || targets.iter().any(|(t, _)| {
                                         (t == &rel || t.starts_with(&prefix))
                                             && Path::new(&folder2).join(t).exists()
                                     });
@@ -978,18 +1063,30 @@ impl SyncManager {
                                     return;
                                 }
                             }
+                            if !Path::new(&folder2).is_dir() {
+                                return; // the whole folder went away meanwhile
+                            }
                         }
-                        if !targets.iter().any(|r| r == &rel) {
-                            targets.push(rel.clone());
+                        // Children first, the directory rel LAST: the peer applies them
+                        // in order and only removes the directory once it's empty. A
+                        // name we never had a synced version of travels WITHOUT one,
+                        // which (new peers) can only ever remove an EMPTY directory —
+                        // never a file of theirs we never saw.
+                        targets.sort_by(|a, b| a.0.cmp(&b.0));
+                        if !targets.iter().any(|(r, _)| r == &rel) {
+                            targets.push((rel.clone(), None));
+                        } else if let Some(pos) = targets.iter().position(|(r, _)| r == &rel) {
+                            let own = targets.remove(pos);
+                            targets.push(own);
                         }
                         let ts = now_ms();
                         {
                             let mut tomb_changed = false;
                             let mut pend = pd.lock().unwrap();
-                            for t in &targets {
+                            for (t, known) in &targets {
                                 tomb_changed |= note_tombstone(&tomb2, t, ts);
                                 if !pend.iter().any(|d| &d.rel == t) {
-                                    pend.push(DeleteEvent { rel: t.clone(), ts });
+                                    pend.push(DeleteEvent { rel: t.clone(), ts, known: *known });
                                 }
                             }
                             drop(pend);
@@ -999,6 +1096,7 @@ impl SyncManager {
                                 persist_tombstones(&cfgdir2, &pidc2, &tomb2);
                             }
                         }
+                        record_deleted_versions(&cfgdir2, &folder2, &known_sigs, ts);
                         // Forget the deleted files in the loop-guard manifest so a
                         // later same-name file is treated as new.
                         {
@@ -1008,6 +1106,14 @@ impl SyncManager {
                             });
                         }
                         cw.notify_one();
+                    }
+                    };
+                    body.await;
+                    // Debounce-map cleanup: drop this path's entry unless a newer
+                    // event for it is in flight (the map used to grow forever).
+                    let mut d = debounce2.lock().unwrap();
+                    if d.get(&p).copied() == Some(gen) {
+                        d.remove(&p);
                     }
                 });
             }
@@ -1021,11 +1127,12 @@ impl SyncManager {
         stopped: Arc<AtomicBool>,
         stop_notify: Arc<Notify>,
         wake: Arc<Notify>,
-        queue: Arc<Mutex<VecDeque<String>>>,
+        queue: Arc<Mutex<SendQueue>>,
         inbound: Arc<Mutex<HashSet<String>>>,
         status: Arc<Mutex<StatusSnapshot>>,
         skip_current: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
+        skipped: Arc<Mutex<HashMap<String, String>>>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
@@ -1056,6 +1163,22 @@ impl SyncManager {
                         _ = wake.notified() => {}
                         _ = stop_notify.notified() => break,
                         _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
+                    continue;
+                }
+                // MISSING-FOLDER GATE (D6): the drive is unplugged / the folder was
+                // moved. Nothing can be read or sent; don't churn the queue (every
+                // queued file would read as "deleted" and be dropped).
+                let folder_now = config.lock().unwrap().folder.clone();
+                if !Path::new(&folder_now).is_dir() {
+                    if let Ok(mut s) = status.lock() {
+                        s.folder_missing = true;
+                    }
+                    manager.emit_status(&pair_id);
+                    tokio::select! {
+                        _ = wake.notified() => {}
+                        _ = stop_notify.notified() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {}
                     }
                     continue;
                 }
@@ -1105,7 +1228,7 @@ impl SyncManager {
                 // A file removed from disk (e.g. user deleted it) is the ONLY reason
                 // we ever drop a queued item without delivering.
                 if !Path::new(&file).exists() {
-                    queue.lock().unwrap().pop_front();
+                    queue.lock().unwrap().remove(&file);
                     continue;
                 }
                 // Real work in the queue → snap the idle rescan back to 45s.
@@ -1207,24 +1330,25 @@ impl SyncManager {
                         return true;
                     }
                     log::warn!("folder send: dropping un-rootable queued path {f}");
-                    let mut q = queue.lock().unwrap();
-                    if let Some(pos) = q.iter().position(|x| x == f) {
-                        q.remove(pos);
-                    }
+                    queue.lock().unwrap().remove(f);
                     false
                 });
                 if batch.is_empty() {
                     continue;
                 }
                 let file = batch[0].clone();
+                // D2: the exact version (size, mtime) of each file as we START the
+                // send. If a file is still being written and changes under us, the
+                // version that arrived isn't the one on disk: it must not be recorded
+                // as delivered, and must NEVER trip auto-delete.
+                let pre: HashMap<String, (u64, u64)> = batch
+                    .iter()
+                    .filter_map(|f| std::fs::metadata(f).ok().map(|m| (f.clone(), (m.len(), meta_mtime(&m)))))
+                    .collect();
                 // Size of this batch (for the burst's running byte total) + start the
                 // burst clock on the first file so the end-of-drop summary can report
                 // total bytes, elapsed time, and average speed.
-                let batch_bytes: u64 = batch
-                    .iter()
-                    .filter_map(|f| std::fs::metadata(f).ok())
-                    .map(|m| m.len())
-                    .sum();
+                let batch_bytes: u64 = pre.values().map(|(sz, _)| *sz).sum();
                 if session_start.is_none() {
                     session_start = Some(Instant::now());
                 }
@@ -1247,12 +1371,11 @@ impl SyncManager {
                 manager.emit_status(&pair_id);
 
                 // Always ATTEMPT the direct push (try_iroh_folder_send has its own
-                // 12s dial timeout and returns None cheaply if the peer is
-                // unreachable or we don't know their key yet). Driving the result
-                // off the actual dial — not the cached presence flag — means a
-                // queued file lands the instant the peer is reachable, instead of
-                // waiting up to the 300s beacon cadence to flip peer_online.
-                let iroh_loc = manager
+                // 12s dial timeout and returns cheaply if the peer is unreachable or
+                // we don't know their key yet). Driving the result off the actual
+                // dial — not the cached presence flag — means a queued file lands
+                // the instant the peer is reachable.
+                let outcome = manager
                     .try_iroh_folder_send(&pair, &settings, &batch, &status, &stopped, &skip_current)
                     .await;
 
@@ -1262,11 +1385,7 @@ impl SyncManager {
                 if skip_current.swap(false, Ordering::SeqCst) {
                     let mut q = queue.lock().unwrap();
                     for f in &batch {
-                        if let Some(pos) = q.iter().position(|x| x == f) {
-                            if let Some(item) = q.remove(pos) {
-                                q.push_back(item);
-                            }
-                        }
+                        q.rotate_to_back(f);
                     }
                     drop(q);
                     current = String::new();
@@ -1276,116 +1395,39 @@ impl SyncManager {
                     continue;
                 }
 
-                // iroh-only: deliver over iroh, else keep the file queued and back
-                // off (the peer is offline / not yet reachable). The file is only
-                // ever popped from the queue on confirmed delivery.
-                let result = if iroh_loc.is_some() {
-                    set_peer_online(&status, true);
-                    SendOutcome::Delivered
-                } else {
-                    SendOutcome::Offline
-                };
-
-                match result {
-                    SendOutcome::Delivered => {
-                        {
-                            let mut q = queue.lock().unwrap();
-                            for f in &batch {
-                                if q.front() == Some(f) {
-                                    q.pop_front();
-                                } else if let Some(pos) = q.iter().position(|x| x == f) {
-                                    q.remove(pos);
-                                }
-                            }
-                        }
-                        offline_attempts = 0;
-                        // Remember them so a restart won't re-send.
-                        {
-                            let mut inb = inbound.lock().unwrap();
-                            for f in &batch {
-                                if let Some(sig) = file_sig(f, &pair.folder) {
-                                    inb.insert(sig);
-                                }
-                            }
-                            let snapshot = inb.clone();
-                            drop(inb);
-                            manager.persist_manifest(&pair_id, &snapshot);
-                        }
-                        // Auto-delete only AFTER confirmed delivery.
-                        if pair.auto_delete {
-                            for f in &batch {
-                                delete_local(f, pair.delete_mode);
-                            }
-                        }
-                        session_done += batch.len() as u32;
-                        let remaining = queue.lock().unwrap().len();
-                        set_status(&status, FolderState::Idle, None, 0.0, None);
-                        // Hold the burst counters across the gap before the next file
-                        // (set_status leaves these new fields alone) so the bar shows
-                        // a steady "N of M", not a reset between files.
-                        if let Ok(mut s) = status.lock() {
-                            s.session_done_files = session_done;
-                            s.session_total_files = session_done + remaining as u32;
-                        }
+                let report = match outcome {
+                    FolderSendOutcome::Report(r) => r,
+                    FolderSendOutcome::Refused(reason) => {
+                        // The peer turned the push away before reading it. Nothing was
+                        // delivered; keep everything queued and wait — honestly.
+                        offline_attempts = offline_attempts.saturating_add(1);
+                        let peer = peer_label(&pair);
+                        let detail = match reason.as_str() {
+                            "paused" => format!("{peer} has paused this folder"),
+                            "folder-missing" => format!("{peer}'s copy of this folder isn't available (drive disconnected?)"),
+                            "viewer" => format!("{peer} has this folder as view-only for you"),
+                            "unknown-pair" | "not-member" => format!("{peer} isn't sharing this folder with you right now"),
+                            _ => format!("Couldn't reach {peer} just now — retrying"),
+                        };
+                        set_status(&status, FolderState::Waiting, Some(name.clone()), 0.0, Some(detail));
                         manager.emit_status(&pair_id);
-                        session_bytes += batch_bytes;
-                        // Cue the UI to optionally play a sound + flash the HUD.
-                        // `remaining` lets the UI ding ONCE when the whole drop is
-                        // done, not once per file.
-                        // Relative names of the files this batch moved, for the
-                        // chat timeline (GitHub #23). Additive — older UIs ignore it.
-                        let synced_names: Vec<String> = batch
-                            .iter()
-                            .filter_map(|f| {
-                                crate::iroh_net::folder_rel(Path::new(f), &pair.folder)
-                            })
-                            .collect();
-                        let _ = manager.app.emit(
-                            "folder-synced",
-                            serde_json::json!({ "pairId": pair_id, "direction": "send", "remaining": remaining, "files": synced_names, "bytes": batch_bytes }),
-                        );
-                        // Whole drop finished → emit a completion summary (files, total
-                        // bytes, elapsed, average speed) so the folder card can show it
-                        // like the Send/Receive tab does, then re-check convergence.
-                        if remaining == 0 {
-                            let elapsed_ms = session_start
-                                .map(|t| t.elapsed().as_millis() as u64)
-                                .unwrap_or(0);
-                            let avg_bps = if elapsed_ms > 0 {
-                                (session_bytes as f64) / (elapsed_ms as f64 / 1000.0)
-                            } else {
-                                0.0
-                            };
-                            let _ = manager.app.emit(
-                                "folder-complete",
-                                serde_json::json!({
-                                    "pairId": pair_id,
-                                    "direction": "send",
-                                    "files": session_done,
-                                    "bytes": session_bytes,
-                                    "durationMs": elapsed_ms,
-                                    "avgBps": avg_bps,
-                                }),
-                            );
-                            manager.nudge_reconcile(&pair_id);
-                            // Start the next drop's summary fresh — don't let a second
-                            // drop landing back-to-back inflate the next recap.
-                            session_done = 0;
-                            session_bytes = 0;
-                            session_start = None;
+                        // Long, steady back-off: these states change on a human
+                        // timescale; the peer's beacon wakes us sooner when it does.
+                        tokio::select! {
+                            _ = wake.notified() => {}
+                            _ = stop_notify.notified() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
                         }
+                        continue;
                     }
-                    SendOutcome::Offline => {
+                    FolderSendOutcome::Failed => {
                         offline_attempts = offline_attempts.saturating_add(1);
                         // We reached this arm by PASSING the presence gate (peer_online
-                        // was true), then the actual push returned None — the dial timed
-                        // out, the stall watchdog abandoned a frozen stream, or the
-                        // handshake raced. That is NOT the same as "peer is off": the
-                        // presence gate above (`!peer_online`) owns the truly-offline
-                        // case with its own "come online" copy. Surface an HONEST, distinct
-                        // detail here so the user can tell "my friend is offline" from "we
-                        // connected but the transfer didn't go through". Display-only — the
-                        // queueing + backoff below are unchanged.
+                        // was true), then the actual push failed — the dial timed out,
+                        // the stall watchdog abandoned a frozen stream, the handshake
+                        // raced, or the receiver never confirmed what it kept. That is
+                        // NOT the same as "peer is off": surface an honest, distinct
+                        // detail so the user can tell the two apart.
                         set_status(
                             &status,
                             FolderState::Waiting,
@@ -1394,20 +1436,14 @@ impl SyncManager {
                             Some(format!("Couldn't reach {} just now — retrying", peer_label(&pair))),
                         );
                         manager.emit_status(&pair_id);
-                        // Don't let ONE file that keeps failing (e.g. a stalled send
-                        // to a peer whose path just died) block every other file
+                        // Don't let ONE file that keeps failing block every other file
                         // forever: after a few tries, rotate it to the BACK so the
-                        // rest of the queue gets a turn. The file is never dropped —
-                        // it comes back around and keeps retrying with backoff.
+                        // rest of the queue gets a turn. Never dropped.
                         if offline_attempts >= 3 {
                             let mut q = queue.lock().unwrap();
                             if q.len() > batch.len() {
                                 for f in &batch {
-                                    if let Some(pos) = q.iter().position(|x| x == f) {
-                                        if let Some(item) = q.remove(pos) {
-                                            q.push_back(item);
-                                        }
-                                    }
+                                    q.rotate_to_back(f);
                                 }
                                 drop(q);
                                 current = String::new();
@@ -1415,19 +1451,147 @@ impl SyncManager {
                                 continue;
                             }
                         }
-                        // Keep the file queued; just back off until the peer returns.
+                        if wait_backoff(&stop_notify, &stopped, offline_attempts).await {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                set_peer_online(&status, true);
+
+                // Per-item outcomes (D1). Only `Landed` items whose bytes on disk are
+                // still the version we sent (D2) count as delivered.
+                let settled = settle_batch(&batch, &pre, &report);
+                let delivered = settled.delivered.clone();
+                let retry = settled.retry.clone();
+                let kept_any = !settled.kept.is_empty();
+                {
+                    let mut q = queue.lock().unwrap();
+                    let mut inb = inbound.lock().unwrap();
+                    let mut sk = skipped.lock().unwrap();
+                    for f in &settled.delivered {
+                        q.remove(f);
+                        if let Some(sig) = file_sig(f, &pair.folder) {
+                            inb.insert(sig.clone());
+                            sk.remove(&sig);
+                        }
+                    }
+                    for (f, why) in &settled.kept {
+                        // Deliberately not landed (peer keeps a newer copy, the name
+                        // can't exist on their disk, …): don't resend THIS version
+                        // and NEVER auto-delete it.
+                        q.remove(f);
+                        if let Some(sig) = file_sig(f, &pair.folder) {
+                            inb.insert(sig.clone());
+                            sk.insert(sig, why.clone());
+                        }
+                        log::info!("folder send: peer kept its own copy of {} ({why})", file_name_of(f));
+                    }
+                    for f in &settled.gone {
+                        q.remove(f);
+                    }
+                    for f in &settled.retry {
+                        q.rotate_to_back(f);
+                    }
+                }
+                {
+                    let snapshot = inbound.lock().unwrap().clone();
+                    manager.persist_manifest(&pair_id, &snapshot);
+                }
+                if kept_any || !delivered.is_empty() {
+                    let snap = skipped.lock().unwrap().clone();
+                    save_skipped(&manager.config_dir, &pair_id, &snap);
+                    if let Ok(mut s) = status.lock() {
+                        s.warning = skipped_warning(&snap, &peer_label(&pair));
+                    }
+                }
+                if delivered.is_empty() {
+                    if !retry.is_empty() {
+                        offline_attempts = offline_attempts.saturating_add(1);
+                        set_status(
+                            &status,
+                            FolderState::Waiting,
+                            Some(name.clone()),
+                            0.0,
+                            Some(format!("{} couldn't save some files yet — retrying", peer_label(&pair))),
+                        );
+                        manager.emit_status(&pair_id);
                         if wait_backoff(&stop_notify, &stopped, offline_attempts).await {
                             break;
                         }
                     }
-                    SendOutcome::Failed(_msg) => {
-                        // Peer is reachable but the rendezvous handshake raced —
-                        // retry quickly. Never drop the file.
-                        if wait_fixed(&stop_notify, &stopped, 1500).await {
-                            break;
-                        }
-                    }
-                    SendOutcome::Stopped => break,
+                    continue;
+                }
+                offline_attempts = 0;
+                // Auto-delete ONLY files the peer confirmed landed, whose bytes didn't
+                // change mid-send, and only with a receiver that reports per item (a
+                // legacy bare "ok" can't vouch for each file).
+                if pair.auto_delete && report.legacy {
+                    log::warn!(
+                        "folder send: peer is an older DropBeam (no per-file receipt) — \
+                         keeping {} local file(s) instead of deleting after delivery",
+                        delivered.len()
+                    );
+                }
+                for f in auto_delete_targets(&settled, report.legacy, pair.auto_delete) {
+                    delete_local(&f, pair.delete_mode);
+                }
+                let delivered_bytes: u64 = delivered.iter().filter_map(|f| pre.get(f)).map(|(sz, _)| *sz).sum();
+                let _ = batch_bytes;
+                session_done += delivered.len() as u32;
+                let remaining = queue.lock().unwrap().len();
+                set_status(&status, FolderState::Idle, None, 0.0, None);
+                // Hold the burst counters across the gap before the next file
+                // (set_status leaves these new fields alone) so the bar shows
+                // a steady "N of M", not a reset between files.
+                if let Ok(mut s) = status.lock() {
+                    s.session_done_files = session_done;
+                    s.session_total_files = session_done + remaining as u32;
+                }
+                manager.emit_status(&pair_id);
+                session_bytes += delivered_bytes;
+                // Cue the UI to optionally play a sound + flash the HUD.
+                // `remaining` lets the UI ding ONCE when the whole drop is
+                // done, not once per file.
+                // Relative names of the files this batch moved, for the
+                // chat timeline (GitHub #23). Additive — older UIs ignore it.
+                let synced_names: Vec<String> = delivered
+                    .iter()
+                    .filter_map(|f| crate::iroh_net::folder_rel(Path::new(f), &pair.folder))
+                    .collect();
+                let _ = manager.app.emit(
+                    "folder-synced",
+                    serde_json::json!({ "pairId": pair_id, "direction": "send", "remaining": remaining, "files": synced_names, "bytes": delivered_bytes }),
+                );
+                // Whole drop finished → emit a completion summary (files, total
+                // bytes, elapsed, average speed) so the folder card can show it
+                // like the Send/Receive tab does, then re-check convergence.
+                if remaining == 0 {
+                    let elapsed_ms = session_start
+                        .map(|t| t.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
+                    let avg_bps = if elapsed_ms > 0 {
+                        (session_bytes as f64) / (elapsed_ms as f64 / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    let _ = manager.app.emit(
+                        "folder-complete",
+                        serde_json::json!({
+                            "pairId": pair_id,
+                            "direction": "send",
+                            "files": session_done,
+                            "bytes": session_bytes,
+                            "durationMs": elapsed_ms,
+                            "avgBps": avg_bps,
+                        }),
+                    );
+                    manager.nudge_reconcile(&pair_id);
+                    // Start the next drop's summary fresh — don't let a second
+                    // drop landing back-to-back inflate the next recap.
+                    session_done = 0;
+                    session_bytes = 0;
+                    session_start = None;
                 }
             }
         });
@@ -1450,9 +1614,27 @@ impl SyncManager {
         moves: Arc<Mutex<HashMap<String, MoveRec>>>,
         ino_index: Arc<Mutex<HashMap<u64, (String, u64, u64)>>>,
         paused: Arc<AtomicBool>,
+        inbound: Arc<Mutex<HashSet<String>>>,
+        queue: Arc<Mutex<SendQueue>>,
+        skipped: Arc<Mutex<HashMap<String, String>>>,
+        self_deleted: Arc<Mutex<HashMap<String, Instant>>>,
     ) {
         let manager = self.clone();
         let pair_id = config.lock().unwrap().id.clone();
+        let _ = (&queue, &self_deleted);
+        // D5: deletes made while DropBeam was CLOSED never produced a watcher event.
+        // Diff what we knew against the disk once at startup (re-verified after a
+        // settle), and propagate the real ones — stamped with the last time we saw
+        // the files, so a peer's NEWER edit made meanwhile still wins.
+        {
+            let (m, pid, st) = (self.clone(), pair_id.clone(), stopped.clone());
+            let ts = load_last_seen(&self.config_dir, &pair_id);
+            tauri::async_runtime::spawn(async move {
+                if let Some(ts) = ts {
+                    m.propagate_missed_deletes(&pid, ts, &st).await;
+                }
+            });
+        }
         tauri::async_runtime::spawn(async move {
             // One-time cleanup of the croc-era `.ctrl-out-<pair>.json` — it was written
             // every round and read by NOTHING (the real control payload dials the peer
@@ -1513,12 +1695,73 @@ impl SyncManager {
                 };
                 let dels: Vec<DeleteEvent> = pending_deletes.lock().unwrap().clone();
 
+                // D6: is the folder actually there? An unplugged drive must never be
+                // advertised as "I have nothing" (the peer would re-push everything
+                // into a path that recreates on the boot disk), and when it comes
+                // back the watcher has to be re-registered — restart the link.
+                let root_ok = Path::new(&pair.folder).is_dir();
+                let was_missing = status.lock().map(|s| s.folder_missing).unwrap_or(false);
+                if root_ok && was_missing {
+                    log::info!("folder {} is back — restarting its sync", pair.folder);
+                    let m = manager.clone();
+                    let pid = pair_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || m.restart_pair(&pid)).await;
+                    break;
+                }
+                if !root_ok && !was_missing {
+                    if let Ok(mut s) = status.lock() {
+                        s.folder_missing = true;
+                    }
+                    manager.emit_status(&pair_id);
+                }
+
                 // The self-heal reconcile snapshot: our full current file set +
                 // tombstones, so the peer can converge to identical (mirror only).
                 let forced = force_snapshot.swap(false, Ordering::SeqCst);
                 let request_reply = request_snapshot_reply.swap(false, Ordering::SeqCst);
-                let reconcile_json = if pair.mirror && (!is_paused || forced) {
+                let reconcile_json = if pair.mirror && root_ok && (!is_paused || forced) {
                     let lm = live_manifest_async(pair.folder.clone()).await;
+                    // "Suddenly empty" (a mount point whose drive isn't mounted, a
+                    // folder swapped for an empty one): withhold the snapshot rather
+                    // than tell the peer we have nothing.
+                    let known_rels = {
+                        let inb = inbound.lock().unwrap();
+                        inb.iter().filter_map(|s| sig_rel(s)).collect::<HashSet<String>>().len()
+                    };
+                    let suspicious = lm.is_empty() && known_rels >= 5;
+                    if !suspicious {
+                        // We just saw every file that's here — the D5 baseline.
+                        save_last_seen(&manager.config_dir, &pair_id, now_ms());
+                        // Forget "peer kept it" notes for versions that no longer
+                        // exist here (renamed/edited/deleted) so the warning is live.
+                        let mut sk = skipped.lock().unwrap();
+                        let before = sk.len();
+                        sk.retain(|sig, _| {
+                            let mut it = sig.rsplitn(3, '|');
+                            let mt = it.next().and_then(|x| x.parse::<u64>().ok());
+                            let sz = it.next().and_then(|x| x.parse::<u64>().ok());
+                            let rel = it.next().map(norm_rel);
+                            match (rel, sz, mt) {
+                                (Some(r), Some(sz), Some(mt)) => lm.get(&r).is_some_and(|e| e.size == sz && e.mtime == mt),
+                                _ => false,
+                            }
+                        });
+                        if sk.len() != before {
+                            let snap = sk.clone();
+                            drop(sk);
+                            save_skipped(&manager.config_dir, &pair_id, &snap);
+                            if let Ok(mut s) = status.lock() {
+                                s.warning = skipped_warning(&snap, &peer_label(&pair));
+                            }
+                        }
+                    }
+                    let lm = if suspicious {
+                        log::warn!("folder {} looks empty but we know {known_rels} files — not advertising an empty snapshot", pair.folder);
+                        None
+                    } else {
+                        Some(lm)
+                    };
+                    if let Some(lm) = lm {
                     // Refresh the inode index from disk each round so move detection
                     // also covers files that were RECEIVED this session (those skip
                     // the live add-branch that normally warms the index).
@@ -1573,6 +1816,9 @@ impl SyncManager {
                     let empty_dirs = tokio::task::spawn_blocking(move || live_empty_dirs(&folder))
                         .await.expect("empty directory scan panicked");
                     Some(serde_json::json!({ "files": files, "tombstones": tombs, "emptyDirs": empty_dirs, "requestReply": request_reply }))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -1582,10 +1828,10 @@ impl SyncManager {
                 let iroh_ok = match (pair.endpoint_id.clone(), manager.iroh_endpoint()) {
                     (Some(eid), Some(ep)) => {
                         // Paused → no deletes, no moves (hold them until Resume).
-                        let del_pairs: Vec<(String, u64)> = if is_paused {
+                        let del_pairs: Vec<(String, u64, Option<(u64, u64)>)> = if is_paused {
                             Vec::new()
                         } else {
-                            dels.iter().map(|d| (d.rel.clone(), d.ts)).collect()
+                            dels.iter().map(|d| (d.rel.clone(), d.ts, d.known)).collect()
                         };
                         // Recent intra-folder renames ride the beacon ALONGSIDE the
                         // deletes (applied first on the peer) so a moved file relocates
@@ -1604,9 +1850,14 @@ impl SyncManager {
                         };
                         let (group_id, roster, owner_eid, role_epoch) =
                             build_group_roster(&manager.config_dir, &pair, &ep, &my_name);
+                        let removed = if group_id.is_empty() {
+                            Vec::new()
+                        } else {
+                            pairing::removed_members(&manager.config_dir, &group_id)
+                        };
                         let ok = crate::iroh_net::send_folder_ctrl(
                             &ep, &eid, &pair_id, &my_name, &del_pairs, &move_ops, &group_id, &roster,
-                            owner_eid.as_deref(), role_epoch, is_paused, pause_epoch, false,
+                            owner_eid.as_deref(), role_epoch, is_paused, pause_epoch, false, &removed,
                         )
                         .await
                         .is_ok();
@@ -1703,7 +1954,7 @@ impl SyncManager {
         let pid = pair_id.to_string();
         tauri::async_runtime::spawn(async move {
             let _ = crate::iroh_net::send_folder_ctrl(
-                &ep, &eid, &pid, &my_name, &[], &[], "", &[], None, 0, false, 0, true,
+                &ep, &eid, &pid, &my_name, &[], &[], "", &[], None, 0, false, 0, true, &[],
             )
             .await;
         });
@@ -1760,7 +2011,8 @@ impl SyncManager {
         self: &Arc<Self>,
         pair_id: &str,
         name: &str,
-        deletes: &[(String, u64)],
+        // (rel, deleted-at ms, the version the deleter last had — newer peers).
+        deletes: &[(String, u64, Option<(u64, u64)>)],
         // Intra-folder renames (from, to, size, mtime) — applied BEFORE deletes so a
         // moved file relocates in place instead of being re-downloaded.
         moves: &[(String, String, u64, u64)],
@@ -1780,8 +2032,12 @@ impl SyncManager {
         // whose folder-hello hasn't landed) so the roster gossip below recognizes the
         // sender as already-meshed instead of adding them a SECOND time.
         sender_eid: Option<&str>,
+        // Group members the OWNER removed (honored only from the owner — D13).
+        removed: &[String],
+        // The sender uses versioned deletes (every file entry names its version).
+        deletes_versioned: bool,
     ) {
-        let (config, status, self_deleted, tombstones, queue, wake, inbound, paused_flag, last_peer_snapshot) = {
+        let (config, status, self_deleted, tombstones, queue, wake, inbound, paused_flag, last_peer_snapshot, skipped) = {
             let handles = self.handles.lock().unwrap();
             let Some(h) = handles.get(pair_id) else {
                 return; // not a folder we're actively managing
@@ -1796,12 +2052,17 @@ impl SyncManager {
                 h.inbound.clone(),
                 h.paused.clone(),
                 h.last_peer_snapshot.clone(),
+                h.skipped.clone(),
             )
         };
         // Adopt the shared pause state if the peer's toggle is NEWER than ours (the
         // newest-wins rule that makes pause a clean shared switch). Fans across the
         // whole folder's group links + wakes the workers so it takes effect at once.
-        if peer_pause_epoch > config.lock().unwrap().pause_epoch {
+        // An epoch more than a day in the FUTURE is ignored outright: a wild clock or
+        // a hostile peer stamping u64::MAX would otherwise win every toggle forever.
+        if peer_pause_epoch > now_ms().saturating_add(24 * 3600 * 1000) {
+            log::warn!("ignoring a far-future pause epoch from the peer on {pair_id}");
+        } else if peer_pause_epoch > config.lock().unwrap().pause_epoch {
             self.set_paused(pair_id, peer_paused, peer_pause_epoch);
         }
         // While WE are paused, ignore the peer's sync payload entirely (deletes,
@@ -1923,6 +2184,24 @@ impl SyncManager {
             }
         }
 
+        // D13: the folder OWNER's list of removed members is authoritative — drop our
+        // links to them (so they stop syncing with us too) and refuse to re-mesh
+        // with them via anyone's roster. Ignored from anyone but the owner.
+        if group_ok {
+            if let Some(seid) = sender_eid {
+                let my_eid = self.iroh_endpoint().map(|ep| ep.id().to_string()).unwrap_or_default();
+                let dropped = pairing::apply_owner_removals(&self.config_dir, group_id, seid, removed, &my_eid);
+                if !dropped.is_empty() {
+                    for (id, _) in &dropped {
+                        self.announce_unshare(id);
+                    }
+                    pairing::remove_links(&self.config_dir, &dropped.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>());
+                    self.clone().reconcile();
+                    let _ = self.app.emit("pairs://changed", ());
+                }
+            }
+        }
+
         // Role flags fresh from disk — apply_group_roles just wrote pairs.json, and
         // the in-memory worker handle isn't refreshed until the reconcile lands, so
         // re-read rather than trust the stale `config` snapshot.
@@ -1976,19 +2255,35 @@ impl SyncManager {
 
         // A VIEWER peer must never delete our files: ignore deletes coming FROM a
         // read-only member (they shouldn't be changing the folder at all).
-        if mirror && !peer_is_viewer && !locally_paused && !deletes.is_empty() {
-            let mut applied: Vec<(String, u64)> = Vec::new();
+        if mirror && !peer_is_viewer && !locally_paused && !deletes.is_empty() && Path::new(&folder).is_dir() {
+            let mut applied: Vec<(String, u64, Option<(u64, u64)>)> = Vec::new();
             let mut tomb_changed = false;
-            for (rel, ts) in deletes {
+            let mut deleted_sigs: Vec<String> = Vec::new();
+            // D4: a directory delete removes only what the deleter LISTED (its
+            // children ride the same beacon, each with the version it had) — never a
+            // file it never saw. Files first, directories after, so a directory is
+            // only removed once its listed children are gone and it's empty.
+            let listed: HashSet<String> = deletes.iter().map(|(r, _, _)| norm_rel(r)).collect();
+            let (dirs, files): (Vec<_>, Vec<_>) = deletes
+                .iter()
+                .partition(|(r, _, _)| Path::new(&folder).join(norm_rel(r)).is_dir());
+            for (rel, ts, known) in files.into_iter().chain(dirs) {
                 let mut removed_rels: Vec<String> = Vec::new();
-                let did =
-                    apply_remote_delete(&folder, rel, &self_deleted, &mut removed_rels, DELETE_GRACE_MS);
-                // If the target is a freshly-dropped file we refused to delete, do
-                // NOT tombstone or forward it — that would just spread the bogus
-                // delete to other members. Let the fresh re-add win instead.
                 let abs = Path::new(&folder).join(norm_rel(rel));
-                if !did && file_is_fresh(&abs, DELETE_GRACE_MS) {
+                let sig = file_sig(&abs.to_string_lossy(), &folder);
+                let guard = DeleteGuard { ts: *ts, known: *known, listed: Some(&listed), require_known: deletes_versioned };
+                let did = apply_remote_delete(&folder, rel, &self_deleted, &mut removed_rels, DELETE_GRACE_MS, &guard);
+                // If the target still exists — freshly dropped, a NEWER local edit,
+                // a different file under a case-variant name, or a directory with
+                // unlisted files — do NOT tombstone or forward it: that would just
+                // spread a delete that doesn't apply here. Let the local copy win.
+                if !did && std::fs::symlink_metadata(&abs).is_ok() {
                     continue;
+                }
+                if did {
+                    if let Some(sig) = sig {
+                        deleted_sigs.push(sig);
+                    }
                 }
                 // Tombstone the rel(s) so reconcile won't resurrect them and so the
                 // delete keeps propagating across a group. Always tombstone the
@@ -1998,7 +2293,7 @@ impl SyncManager {
                     tomb_changed |= note_tombstone(&tombstones, r, *ts);
                 }
                 if did {
-                    applied.push((rel.clone(), *ts));
+                    applied.push((rel.clone(), *ts, *known));
                 }
             }
             // ONE write for the whole beacon's deletes (a 1,000-file bulk delete used
@@ -2006,6 +2301,7 @@ impl SyncManager {
             if tomb_changed {
                 persist_tombstones(&self.config_dir, pair_id, &tombstones);
             }
+            record_deleted_versions(&self.config_dir, &folder, &deleted_sigs, now_ms());
             if !applied.is_empty() {
                 let _ = self.app.emit("folder-history://changed", pair_id);
                 // In a group, forward each delete WE just applied to our OTHER
@@ -2035,10 +2331,12 @@ impl SyncManager {
                 if let Ok(mut s) = status.lock() {
                     s.peer_files = rec.files.len() as u32;
                 }
-                self.reconcile_apply(
-                    pair_id, &folder, rec, &self_deleted, &tombstones, &queue, &wake, &inbound,
-                    !peer_is_viewer, !i_am_viewer,
-                );
+                if Path::new(&folder).is_dir() {
+                    self.reconcile_apply(
+                        pair_id, &folder, rec, &self_deleted, &tombstones, &queue, &wake, &inbound,
+                        &skipped, !peer_is_viewer, !i_am_viewer,
+                    );
+                }
                 self.emit_status(pair_id);
             }
         }
@@ -2062,9 +2360,10 @@ impl SyncManager {
         rec: &Reconcile,
         self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
         tombstones: &Arc<Mutex<HashMap<String, u64>>>,
-        queue: &Arc<Mutex<VecDeque<String>>>,
+        queue: &Arc<Mutex<SendQueue>>,
         wake: &Arc<Notify>,
         inbound: &Arc<Mutex<HashSet<String>>>,
+        skipped: &Arc<Mutex<HashMap<String, String>>>,
         // Per-member roles: don't apply a VIEWER peer's deletes/tombstones (they
         // can't change the folder); don't push if WE are a viewer (read-only).
         apply_peer_deletes: bool,
@@ -2072,7 +2371,14 @@ impl SyncManager {
     ) {
         let mine = live_manifest(folder);
         let my_tomb = tombstones.lock().unwrap().clone();
-        let plan = reconcile_plan(&mine, &rec.files, &rec.tombstones, &my_tomb, now_ms());
+        let plan = reconcile_plan_ci(
+            &mine,
+            &rec.files,
+            &rec.tombstones,
+            &my_tomb,
+            now_ms(),
+            folder_case_insensitive(folder),
+        );
 
         // 1) Apply peer tombstones we missed: delete a local file the peer deleted
         //    AFTER our copy. Archive first (recoverable from history).
@@ -2090,11 +2396,22 @@ impl SyncManager {
         let mut deleted_any = false;
         if apply_peer_deletes {
             let mut tomb_changed = false;
+            let mut deleted_sigs: Vec<String> = Vec::new();
             for rel in &plan.delete {
-                let tomb_ts = rec.tombstones.get(rel).copied().unwrap_or_else(now_ms);
+                let Some(tomb_ts) = rec.tombstones.get(rel).copied().or_else(|| {
+                    rec.tombstones.iter().find(|(k, _)| norm_rel(k) == *rel).map(|(_, v)| *v)
+                }) else {
+                    continue;
+                };
                 let mut removed: Vec<String> = Vec::new();
-                if apply_remote_delete(folder, rel, self_deleted, &mut removed, DELETE_GRACE_MS) {
+                let sig = file_sig(&Path::new(folder).join(rel).to_string_lossy(), folder);
+                // The precise placement version is re-checked inside (D4/D15): the
+                // plan's view can be a few ms stale, and on platforms without ctime
+                // a moved-in file is only "new" by first sight.
+                let guard = DeleteGuard { ts: tomb_ts, known: None, listed: None, require_known: false };
+                if apply_remote_delete(folder, rel, self_deleted, &mut removed, DELETE_GRACE_MS, &guard) {
                     deleted_any = true;
+                    deleted_sigs.extend(sig);
                     for r in &removed {
                         tomb_changed |= note_tombstone(tombstones, r, tomb_ts);
                         inbound
@@ -2112,11 +2429,18 @@ impl SyncManager {
             // ages past the window. (Skipped entirely for a viewer peer — we never
             // trust a read-only member's deletes.)
             for (rel, &ts) in &rec.tombstones {
-                if file_is_fresh(&Path::new(folder).join(norm_rel(rel)), DELETE_GRACE_MS) {
+                let abs = Path::new(folder).join(norm_rel(rel));
+                if file_is_fresh(&abs, DELETE_GRACE_MS) {
+                    continue;
+                }
+                // A local file NEWER than the tombstone survives it — don't adopt (and
+                // forward) a delete that doesn't apply to what we hold.
+                if abs.is_file() && !delete_allowed(&abs, ts, None) {
                     continue;
                 }
                 tomb_changed |= note_tombstone(tombstones, rel, ts);
             }
+            record_deleted_versions(&self.config_dir, folder, &deleted_sigs, now_ms());
             // ONE write for the whole snapshot (a new member adopting a 9k-entry
             // tombstone set used to rewrite the ~MB file once per entry ≈ GBs of IO).
             if tomb_changed {
@@ -2131,14 +2455,21 @@ impl SyncManager {
         //    WE are a viewer — a read-only member never sends.
         let mut queued = 0usize;
         if push_missing {
-            for rel in &plan.push {
-                let abs = Path::new(folder).join(rel).to_string_lossy().to_string();
-                if Path::new(&abs).is_file() {
-                    let mut q = queue.lock().unwrap();
-                    if !q.iter().any(|x| x == &abs) {
-                        q.push_back(abs);
-                        queued += 1;
-                    }
+            // Versions the peer already answered "kept" for (a name its disk can't
+            // hold, a case clash, a version it deleted) aren't re-pushed until the
+            // file changes — that's what keeps those from looping every round.
+            let sk = skipped.lock().unwrap().clone();
+            let cands: Vec<String> = plan
+                .push
+                .iter()
+                .map(|rel| Path::new(folder).join(rel).to_string_lossy().to_string())
+                .filter(|abs| Path::new(abs).is_file())
+                .filter(|abs| file_sig(abs, folder).map_or(true, |sig| !sk.contains_key(&sig)))
+                .collect();
+            let mut q = queue.lock().unwrap();
+            for abs in cands {
+                if q.push_back(abs) {
+                    queued += 1;
                 }
             }
         }
@@ -2181,7 +2512,7 @@ impl SyncManager {
     /// Forward a set of just-applied mirror deletes to every OTHER link in the
     /// same folder group, so a delete propagates across the whole mesh (not just
     /// the one hop from the origin). Dedups so a delete isn't queued twice.
-    fn fan_group_deletes(&self, from_pair: &str, group_id: &str, deletes: &[(String, u64)]) {
+    fn fan_group_deletes(&self, from_pair: &str, group_id: &str, deletes: &[(String, u64, Option<(u64, u64)>)]) {
         let other_ids: Vec<String> = pairing::members_of_group(&self.config_dir, group_id)
             .into_iter()
             .map(|p| p.id)
@@ -2192,11 +2523,12 @@ impl SyncManager {
             if let Some(h) = handles.get(&id) {
                 {
                     let mut pd = h.pending_deletes.lock().unwrap();
-                    for (rel, ts) in deletes {
+                    for (rel, ts, known) in deletes {
                         if !pd.iter().any(|d| d.rel == *rel && d.ts == *ts) {
                             pd.push(DeleteEvent {
                                 rel: rel.clone(),
                                 ts: *ts,
+                                known: *known,
                             });
                         }
                     }
@@ -2210,9 +2542,8 @@ impl SyncManager {
         save_manifest(&self.config_dir, pair_id, set);
     }
 
-    fn note_received(&self, pair: &Pair, files: &[String]) {
-        use crate::history;
-        use crate::models::{Direction, HistoryEntry, Locality, TransferState};
+    /// Per landed batch: provenance stamps + the chat timeline's "added" row.
+    fn note_received_batch(&self, pair: &Pair, files: &[String]) {
         // Stamp each received file with WHO it's from (your saved label, else their
         // broadcast name) as a macOS extended attribute, so the Finder Sync
         // extension — and Get Info — can show its provenance. Best-effort.
@@ -2224,6 +2555,32 @@ impl SyncManager {
         for f in files {
             crate::provenance::set_sender(Path::new(f), &from);
         }
+        let total: u64 = files
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok().map(|m| m.len()))
+            .sum();
+        // Relative names of the files just received, for the chat timeline (#23).
+        let synced_names: Vec<String> = files
+            .iter()
+            .filter_map(|f| crate::iroh_net::folder_rel(Path::new(f), &pair.folder))
+            .collect();
+        // `from` = who these files came from (your saved label for them, else their
+        // broadcast name), so the chat sync row can show provenance (#12). Only on the
+        // receive path; the send row already reads "You added". Carry it ONLY when
+        // non-empty — an unkeyed link can still have an empty peer_name until the name
+        // beacon lands, and a blank "from" would render an empty sender. Null lets the
+        // UI's `?? friendName` fallback fire.
+        let from_opt = (!from.trim().is_empty()).then(|| from.clone());
+        let _ = self.app.emit(
+            "folder-synced",
+            serde_json::json!({ "pairId": pair.id, "direction": "receive", "files": synced_names, "bytes": total, "from": from_opt }),
+        );
+    }
+
+    /// Per receive BURST: one History row + one notification.
+    fn note_received_burst(&self, pair: &Pair, files: &[String]) {
+        use crate::history;
+        use crate::models::{Direction, HistoryEntry, Locality, TransferState};
         let names: Vec<String> = files.iter().map(|f| file_name_of(f)).collect();
         let total: u64 = files
             .iter()
@@ -2247,22 +2604,6 @@ impl SyncManager {
             },
         );
         let _ = self.app.emit("history://changed", ());
-        // Relative names of the files just received, for the chat timeline (#23).
-        let synced_names: Vec<String> = files
-            .iter()
-            .filter_map(|f| crate::iroh_net::folder_rel(Path::new(f), &pair.folder))
-            .collect();
-        // `from` = who these files came from (your saved label for them, else their
-        // broadcast name), so the chat sync row can show provenance (#12). Only on the
-        // receive path; the send row already reads "You added". Carry it ONLY when
-        // non-empty — an unkeyed link can still have an empty peer_name until the name
-        // beacon lands, and a blank "from" would render an empty sender. Null lets the
-        // UI's `?? friendName` fallback fire.
-        let from_opt = (!from.trim().is_empty()).then(|| from.clone());
-        let _ = self.app.emit(
-            "folder-synced",
-            serde_json::json!({ "pairId": pair.id, "direction": "receive", "files": synced_names, "bytes": total, "from": from_opt }),
-        );
         let settings_notify = self
             .app
             .try_state::<Arc<AppState>>()
@@ -2326,18 +2667,6 @@ impl SyncManager {
         self.handles.lock().unwrap().contains_key(pair_id)
     }
 
-    /// True if the PEER on this link is a read-only viewer — a viewer must never
-    /// be able to push files INTO our folder. THE receive-side enforcement of the
-    /// role (the send-side suppression is only an optimization, and can be stale).
-    pub fn peer_is_viewer(&self, pair_id: &str) -> bool {
-        self.handles
-            .lock()
-            .unwrap()
-            .get(pair_id)
-            .map(|h| h.config.lock().unwrap().peer_is_viewer)
-            .unwrap_or(false)
-    }
-
     /// Live progress for an in-flight iroh folder RECEIVE — drives the same status
     /// bar (and Local/Internet badge) the croc receive path uses.
     /// On-disk path of a managed folder pair — used to drop a visible
@@ -2389,32 +2718,85 @@ impl SyncManager {
     /// Land iroh-received folder files: move them from the private staging dir into
     /// the shared folder using the EXACT same loop-protection / mirror / history
     /// rules as the croc path (shared `inbound` + `self_deleted` guards), then
-    /// update the manifest, record history, and reset status to Idle.
-    pub fn ingest_iroh_folder_files(&self, pair_id: &str, staging: &Path) -> Vec<String> {
-        let (config, inbound, self_deleted) = {
+    /// update the manifest, record history, and reset status to Idle. Returns what
+    /// happened to EVERY item — the receipt the sender trusts (D1).
+    pub(crate) fn ingest_iroh_folder_files(
+        &self,
+        pair_id: &str,
+        staging: &Path,
+        items: &serde_json::Value,
+    ) -> IngestReport {
+        let (config, inbound, self_deleted, recv_burst) = {
             let handles = self.handles.lock().unwrap();
             let Some(h) = handles.get(pair_id) else {
-                return Vec::new();
+                return IngestReport::default();
             };
-            // Paused → don't land incoming files (the staging copy is just dropped).
-            // The sender won't send while paused; this covers a brief propagation lag.
+            // Paused → don't land incoming files. The push is normally refused
+            // up front; this covers a toggle landing mid-receive. Nothing is
+            // reported as landed, so the sender keeps its copy and retries later.
             if h.paused.load(Ordering::Relaxed) {
                 drop(handles);
                 self.note_folder_receive_ended(pair_id);
-                return Vec::new();
+                return IngestReport::default();
             }
-            (h.config.clone(), h.inbound.clone(), h.self_deleted.clone())
+            (h.config.clone(), h.inbound.clone(), h.self_deleted.clone(), h.recv_burst.clone())
         };
         let (folder, mirror, group) = {
             let p = config.lock().unwrap();
             (p.folder.clone(), p.mirror, p.group_id.is_some())
         };
-        let moved = move_staged_into_folder(staging, &folder, &inbound, mirror, group, &self_deleted);
-        if !moved.is_empty() {
+        // The sender's placement version per item (newer senders), keyed like the
+        // ingest outcomes.
+        let vers: HashMap<String, u64> = items
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|it| {
+                        let raw = it.get("name")?.as_str()?;
+                        let ver = it.get("ver")?.as_u64()?;
+                        let rel = crate::iroh_net::folder_receive_rel(raw)?;
+                        Some((norm_rel(&rel.to_string_lossy()), ver))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cfg = self.config_dir.clone();
+        let f2 = folder.clone();
+        let ctx = LandCtx {
+            vers,
+            deleted_at: Some(Box::new(move |sig: &str| deleted_version_at(&cfg, &f2, sig))),
+        };
+        let report = move_staged_into_folder(staging, &folder, &inbound, mirror, group, &self_deleted, &ctx);
+        if !report.moved.is_empty() {
             let snapshot = inbound.lock().unwrap().clone();
             self.persist_manifest(pair_id, &snapshot);
             let pair = config.lock().unwrap().clone();
-            self.note_received(&pair, &moved);
+            self.note_received_batch(&pair, &report.moved);
+            // ONE History row + ONE notification per receive BURST (a 3,000-photo
+            // sync arrives as ~100 batches — that used to be 100 dings). Flushed
+            // once no batch has landed for a few seconds.
+            let gen = {
+                let mut b = recv_burst.lock().unwrap();
+                b.0.extend(report.moved.iter().cloned());
+                b.1 = b.1.wrapping_add(1);
+                b.1
+            };
+            if let Some(sm) = self.app.try_state::<Arc<SyncManager>>().map(|s| s.inner().clone()) {
+                let burst = recv_burst.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    let files = {
+                        let mut b = burst.lock().unwrap();
+                        if b.1 != gen {
+                            return; // more landed since — the later flush covers it
+                        }
+                        std::mem::take(&mut b.0)
+                    };
+                    if !files.is_empty() {
+                        sm.note_received_burst(&pair, &files);
+                    }
+                });
+            }
         }
         if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
             if let Ok(mut s) = h.status.lock() {
@@ -2428,7 +2810,167 @@ impl SyncManager {
         // manifest + tombstones so both sides re-verify they're identical (and any
         // delete/missed-file converges) instead of waiting out the idle cadence.
         self.nudge_reconcile(pair_id);
-        moved
+        report
+    }
+
+    /// S3: is `sender_eid` THIS link's peer? A folder message may only come from
+    /// the endpoint the link is keyed to. A still-unkeyed invite link is keyed
+    /// from the sender first (guarded: never a second slot for an existing
+    /// member), exactly as the beacon path does.
+    pub fn authorize_folder_peer(self: &Arc<Self>, pair_id: &str, sender_eid: &str) -> bool {
+        let Some(cfg) = self.handles.lock().unwrap().get(pair_id).map(|h| h.config.clone()) else {
+            return false;
+        };
+        let eid = cfg.lock().unwrap().endpoint_id.clone();
+        match eid {
+            Some(e) => e == sender_eid,
+            None => {
+                if !pairing::key_unkeyed_group_link(&self.config_dir, pair_id, sender_eid) {
+                    return false;
+                }
+                cfg.lock().unwrap().endpoint_id = Some(sender_eid.to_string());
+                pairing::dedup_group_links(&self.config_dir);
+                self.clone().reconcile();
+                let _ = self.app.emit("pairs://changed", ());
+                true
+            }
+        }
+    }
+
+    /// Why we won't accept a folder push from `sender_eid` right now, if we won't —
+    /// decided before reading any of it.
+    pub fn folder_push_refusal(self: &Arc<Self>, pair_id: &str, sender_eid: &str) -> Option<&'static str> {
+        if !self.has_pair(pair_id) {
+            return Some("unknown-pair");
+        }
+        if !self.authorize_folder_peer(pair_id, sender_eid) {
+            log::warn!("refusing folder push for {pair_id} from a non-member ({sender_eid})");
+            return Some("not-member");
+        }
+        let handles = self.handles.lock().unwrap();
+        let h = handles.get(pair_id)?;
+        let (peer_viewer, folder) = {
+            let c = h.config.lock().unwrap();
+            (c.peer_is_viewer, c.folder.clone())
+        };
+        // ROLE ENFORCEMENT (receive side): a read-only VIEWER must never push
+        // files into our folder — the authoritative check, not the sender's.
+        if peer_viewer {
+            return Some("viewer");
+        }
+        if h.paused.load(Ordering::Relaxed) {
+            return Some("paused");
+        }
+        if !Path::new(&folder).is_dir() {
+            return Some("folder-missing");
+        }
+        None
+    }
+
+    /// Stop and restart one link's workers (e.g. its folder came back after the
+    /// drive was reconnected — the watcher must be registered afresh).
+    fn restart_pair(self: &Arc<Self>, pair_id: &str) {
+        self.stop_pair(pair_id);
+        self.reconcile();
+    }
+
+    /// Pause/resume from THIS device's UI. The epoch is max(now, stored + 1) so a
+    /// toggle always beats the one it replaces even when our clock is behind the
+    /// device that set the last one (D16).
+    pub fn set_paused_now(self: &Arc<Self>, pair_id: &str, paused: bool) {
+        let stored = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(pair_id)
+            .map(|h| h.config.lock().unwrap().pause_epoch)
+            .or_else(|| {
+                pairing::load(&self.config_dir)
+                    .into_iter()
+                    .find(|p| p.id == pair_id)
+                    .map(|p| p.pause_epoch)
+            })
+            .unwrap_or(0);
+        self.set_paused(pair_id, paused, now_ms().max(stored.saturating_add(1)));
+    }
+
+    /// D5: find files we knew that vanished without a watcher event (deleted while
+    /// DropBeam was closed, or lost to a watcher overflow), re-verify after a
+    /// settle, and propagate them as ordinary deletes stamped `ts` (when we last
+    /// saw them) and carrying the exact version we had.
+    pub(crate) async fn propagate_missed_deletes(self: &Arc<Self>, pair_id: &str, ts: u64, stopped: &Arc<AtomicBool>) {
+        let grab = || {
+            let handles = self.handles.lock().ok()?;
+            let h = handles.get(pair_id)?;
+            let c = h.config.lock().ok()?.clone();
+            Some((
+                c,
+                h.inbound.clone(),
+                h.tombstones.clone(),
+                h.pending_deletes.clone(),
+                h.control_wake.clone(),
+                h.stop_notify.clone(),
+            ))
+        };
+        let Some((pair, inbound, tombstones, pending, cw, stop_notify)) = grab() else { return };
+        if !pair.mirror || pair.i_am_viewer {
+            return;
+        }
+        let scan = {
+            let (f, i, t) = (pair.folder.clone(), inbound.clone(), tombstones.clone());
+            move || {
+                let inb = i.lock().unwrap().clone();
+                let tb = t.lock().unwrap().clone();
+                missed_deletes(&f, &inb, &tb)
+            }
+        };
+        let first = tokio::task::spawn_blocking(scan.clone()).await.unwrap_or_default();
+        if first.is_empty() {
+            return;
+        }
+        // Settle like the live delete path does: a folder being replaced or a
+        // drive mid-remount must not read as a mass delete.
+        if !sleep_unless_stopped(&stop_notify, stopped, 20_000).await {
+            return;
+        }
+        let second = tokio::task::spawn_blocking(scan).await.unwrap_or_default();
+        let confirmed: Vec<(String, (u64, u64))> = first
+            .into_iter()
+            .filter(|(r, v)| second.get(r) == Some(v))
+            .collect();
+        if confirmed.is_empty() || stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        log::warn!(
+            "folder {}: {} file(s) were deleted while DropBeam wasn't watching — propagating{}",
+            pair.folder,
+            confirmed.len(),
+            if confirmed.len() <= 12 { format!(": {:?}", confirmed.iter().map(|(r, _)| r).collect::<Vec<_>>()) } else { String::new() }
+        );
+        let mut tomb_changed = false;
+        {
+            let mut pd = pending.lock().unwrap();
+            for (rel, known) in &confirmed {
+                tomb_changed |= note_tombstone(&tombstones, rel, ts);
+                if !pd.iter().any(|d| &d.rel == rel) {
+                    pd.push(DeleteEvent { rel: rel.clone(), ts, known: Some(*known) });
+                }
+            }
+        }
+        if tomb_changed {
+            persist_tombstones(&self.config_dir, pair_id, &tombstones);
+        }
+        let sigs: Vec<String> = confirmed.iter().map(|(r, (sz, mt))| format!("{r}|{sz}|{mt}")).collect();
+        record_deleted_versions(&self.config_dir, &pair.folder, &sigs, ts);
+        {
+            let gone: HashSet<&String> = confirmed.iter().map(|(r, _)| r).collect();
+            let mut inb = inbound.lock().unwrap();
+            inb.retain(|sig| sig_rel(sig).map_or(true, |r| !gone.contains(&norm_rel(&r))));
+            let snapshot = inb.clone();
+            drop(inb);
+            self.persist_manifest(pair_id, &snapshot);
+        }
+        cw.notify_one();
     }
 
     /// Kick the control beacon for `pair_id` to re-exchange its manifest + tombstones
@@ -2490,9 +3032,9 @@ impl SyncManager {
         status: &Arc<Mutex<StatusSnapshot>>,
         stopped: &Arc<AtomicBool>,
         skip_current: &Arc<AtomicBool>,
-    ) -> Option<Locality> {
-        let eid = pair.endpoint_id.clone()?;
-        let ep = self.iroh_endpoint()?;
+    ) -> FolderSendOutcome {
+        let Some(eid) = pair.endpoint_id.clone() else { return FolderSendOutcome::Failed };
+        let Some(ep) = self.iroh_endpoint() else { return FolderSendOutcome::Failed };
         // Final chokepoint: never send DropBeam's own control paths (the leaked
         // visible `dropbeam-history` etc.), whatever queued them. If that leaves
         // nothing to send, bail cleanly.
@@ -2506,7 +3048,11 @@ impl SyncManager {
             .cloned()
             .collect();
         if files.is_empty() {
-            return None;
+            return FolderSendOutcome::Report(crate::iroh_net::FolderSendReport {
+                locality: Locality::Unknown,
+                items: Vec::new(),
+                legacy: false,
+            });
         }
         let file = files.first().cloned().unwrap_or_default();
         let file = file.as_str();
@@ -2595,37 +3141,28 @@ impl SyncManager {
             }
         };
         match outcome {
-            Ok(loc) => {
+            Ok(report) => {
                 if let Ok(mut s) = status.lock() {
-                    if !matches!(loc, Locality::Unknown) {
-                        s.locality = loc;
+                    if !matches!(report.locality, Locality::Unknown) {
+                        s.locality = report.locality;
                     }
                 }
-                Some(loc)
+                FolderSendOutcome::Report(report)
             }
             Err(e) => {
-                let msg = format!("{e:#}");
-                // SOFT SUCCESS — ONLY the final-ack race: the whole body was streamed
-                // and finished (QUIC delivered it), the receiver landed the file and
-                // wrote "ok", but that 2-byte ack raced the connection teardown so we
-                // read an empty reply. "did not confirm receipt" is OUR sentinel,
-                // raised ONLY after the full body + finish() (iroh_net send_folder_file),
-                // so it can't be a mid-stream/header failure. Treat it as DELIVERED so
-                // the file leaves the queue instead of re-sending forever. If the peer
-                // truly lacks it, the next reconcile re-queues it (its snapshot shows
-                // it missing / wrong size) — no data lost.
-                //
-                // NOTE: a bare "stopped by peer: error 0" is NOT treated as success —
-                // in this codebase the receiver always reads the FULL body before it
-                // acks, so a stream stopped mid-send means a TRUNCATED file, which must
-                // be retried (and must never trip auto-delete of the local source).
-                if msg.contains("did not confirm receipt") {
-                    log::debug!("folder send treated as delivered (full body sent, ack raced teardown): {msg}");
-                    Some(Locality::Unknown)
-                } else {
-                    log::debug!("folder send failed, will retry on next reconcile: {msg}");
-                    None
+                // An explicit refusal (unshared, viewer, paused, drive missing) is
+                // its own outcome so the sender can explain it and back off.
+                if let Some(r) = e.downcast_ref::<crate::iroh_net::FolderRefused>() {
+                    log::info!("folder send refused by peer: {}", r.0);
+                    return FolderSendOutcome::Refused(r.0.clone());
                 }
+                // EVERYTHING else is "not delivered" — including an empty or
+                // unparseable final answer. (That used to be waved through as a
+                // soft success, which let "delete after delivery" delete files the
+                // peer never kept.) Identical re-deliveries are a cheap no-op on the
+                // receiver, so retrying is always safe.
+                log::debug!("folder send failed, will retry: {e:#}");
+                FolderSendOutcome::Failed
             }
         }
     }
@@ -2654,16 +3191,6 @@ impl SyncManager {
         {
             s.peer_name = Some(label);
         }
-        // A folder that isn't on disk outranks every other detail: nothing can sync
-        // until it's back, so say so rather than showing a hopeful "Waiting for …".
-        // Carried on the existing `detail` string (no new wire field, so the
-        // frontend contract is unchanged).
-        if s.folder_missing {
-            s.detail = Some(
-                "Folder not found — it was moved, renamed, or is on a drive that isn't connected."
-                    .to_string(),
-            );
-        }
         let status = FolderStatus {
             pair_id: pair_id.to_string(),
             state: s.state,
@@ -2685,8 +3212,10 @@ impl SyncManager {
             session_done_files: s.session_done_files,
             paused,
             conn_detail: None,
+            folder_missing: s.folder_missing,
+            warning: s.warning.clone(),
         };
-        let _ = self.app.emit("folder://status", status);
+        let _ = self.app.emit("folder://status", apply_missing_folder(status));
     }
 }
 
@@ -2694,11 +3223,112 @@ impl SyncManager {
 // croc send / receive runners
 // ---------------------------------------------------------------------------
 
-enum SendOutcome {
-    Delivered,
-    Offline,
-    Failed(String),
-    Stopped,
+/// Viewer → editor: record every file currently on disk as known (loop-guard
+/// manifest) and as "peer has its own copy" (so reconcile doesn't push it), until
+/// the user changes it. Returns how many files were baselined.
+fn baseline_on_promotion(config_dir: &Path, pair: &Pair) -> usize {
+    if !Path::new(&pair.folder).is_dir() {
+        return 0;
+    }
+    let mut manifest = load_manifest(config_dir, &pair.id);
+    let mut skipped = load_skipped(config_dir, &pair.id);
+    let mut n = 0;
+    for f in list_files_rec(Path::new(&pair.folder)) {
+        let p = f.to_string_lossy().to_string();
+        let Some(rel) = rel_path_of(&p, &pair.folder) else { continue };
+        if rel.split('/').any(|c| c.starts_with('.')) || crate::iroh_net::is_control_rel(&rel) {
+            continue;
+        }
+        if let Some(sig) = file_sig(&p, &pair.folder) {
+            manifest.insert(sig.clone());
+            skipped.entry(sig).or_insert_with(|| "promoted".to_string());
+            n += 1;
+        }
+    }
+    save_manifest(config_dir, &pair.id, &manifest);
+    save_skipped(config_dir, &pair.id, &skipped);
+    log::info!("folder {}: promoted to editor — {n} existing file(s) won't be pushed until changed", pair.folder);
+    n
+}
+
+/// A folder that isn't on disk outranks every other state (D6): nothing can sync
+/// until it's back, so the card must say so — an ERROR with the reason — instead of
+/// a reassuring "Up to date".
+fn apply_missing_folder(mut status: FolderStatus) -> FolderStatus {
+    if status.folder_missing {
+        status.state = FolderState::Error;
+        status.detail = Some(
+            "Folder not found — reconnect the drive it's on (or it was moved or renamed). Nothing syncs until it's back."
+                .to_string(),
+        );
+        status.percent = 0.0;
+        status.sending_file = None;
+    }
+    status
+}
+
+/// What one folder push means for each queued file (D1 + D2).
+#[derive(Default, Debug, Clone, PartialEq)]
+struct BatchSettle {
+    /// Landed on the peer AND still exactly the version we sent.
+    delivered: Vec<String>,
+    /// The peer deliberately kept its own copy (reason) — don't resend this version.
+    kept: Vec<(String, String)>,
+    /// Didn't land, or changed while sending — send again later.
+    retry: Vec<String>,
+    /// Vanished locally before it was sent.
+    gone: Vec<String>,
+}
+
+fn settle_batch(
+    batch: &[String],
+    pre: &HashMap<String, (u64, u64)>,
+    report: &crate::iroh_net::FolderSendReport,
+) -> BatchSettle {
+    use crate::iroh_net::FolderItemOutcome as O;
+    let reported: HashMap<String, O> = report
+        .items
+        .iter()
+        .map(|(p, o)| (p.to_string_lossy().to_string(), o.clone()))
+        .collect();
+    let mut out = BatchSettle::default();
+    for f in batch {
+        let now_v = std::fs::metadata(f).ok().map(|m| (m.len(), meta_mtime(&m)));
+        if now_v.is_none() {
+            out.gone.push(f.clone());
+            continue;
+        }
+        let unchanged = now_v == pre.get(f).copied();
+        match reported.get(f) {
+            Some(O::Landed) if unchanged => out.delivered.push(f.clone()),
+            Some(O::Kept(why)) if unchanged => out.kept.push((f.clone(), why.clone())),
+            Some(O::Landed) | Some(O::Kept(_)) => {
+                log::info!("folder send: {} changed during send — sending the new version", file_name_of(f));
+                out.retry.push(f.clone());
+            }
+            Some(O::Failed) | None => out.retry.push(f.clone()),
+        }
+    }
+    out
+}
+
+/// The files "delete after delivery" may remove: exactly the delivered ones, and
+/// only when the receiver vouched for each file (never on a legacy bare "ok").
+fn auto_delete_targets(settled: &BatchSettle, legacy: bool, auto_delete: bool) -> Vec<String> {
+    if !auto_delete || legacy {
+        return Vec::new();
+    }
+    settled.delivered.clone()
+}
+
+/// How one folder push ended, as the sender loop sees it.
+enum FolderSendOutcome {
+    /// The receiver answered; per-item outcomes inside (may be legacy "ok").
+    Report(crate::iroh_net::FolderSendReport),
+    /// Turned away before the body (reason code from the receiver).
+    Refused(String),
+    /// Unreachable, stalled, or no trustworthy answer — retry.
+    Failed,
 }
 
 // ---------------------------------------------------------------------------
@@ -2731,8 +3361,11 @@ async fn wait_until_stable(
         }
         last = now;
     }
+    // Still changing after ~25 s (a long copy, a live log, a render): NOT ready.
+    // Sending now would ship a half-written file. The idle rescan picks it up
+    // once it has actually settled (seed_existing checks stability too — D2).
     debounce.lock().unwrap().remove(path);
-    true
+    false
 }
 
 fn file_len(path: &str) -> Option<u64> {
@@ -2778,36 +3411,57 @@ fn is_sendable_candidate(path: &str, folder: &str, inbound: &Arc<Mutex<HashSet<S
 fn seed_existing(
     folder: &str,
     inbound: &Arc<Mutex<HashSet<String>>>,
-    queue: &Arc<Mutex<VecDeque<String>>>,
+    queue: &Arc<Mutex<SendQueue>>,
     wake: &Arc<Notify>,
+) -> bool {
+    seed_existing_with(folder, inbound, queue, wake, Duration::from_millis(1500))
+}
+
+/// `settle` = how long candidates must keep the same size + mtime before they're
+/// queued (one pause for the whole scan, not per file) — so a file still being
+/// copied in is never sent half-written (D2).
+fn seed_existing_with(
+    folder: &str,
+    inbound: &Arc<Mutex<HashSet<String>>>,
+    queue: &Arc<Mutex<SendQueue>>,
+    wake: &Arc<Notify>,
+    settle: Duration,
 ) -> bool {
     let files = list_files_rec(Path::new(folder));
     // Run the per-file candidate checks (they stat every file) WITHOUT the
     // queue lock — holding it across a thousands-file scan would block the
     // watcher's event handler and the sender for the whole walk. The lock is
     // taken once at the end, just for the dedupe + push.
-    let mut candidates: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, Option<(u64, u64)>)> = Vec::new();
     for f in files {
         let p = f.to_string_lossy().to_string();
         // Sweep a stale "<name>.dropbeam-incoming" placeholder left by a receive
         // that was interrupted (e.g. crash mid-transfer). It's never synced —
-        // just visible litter — so delete it on scan instead of leaving it.
+        // just visible litter. A LIVE receive's placeholder is left alone.
         if p.ends_with(".dropbeam-incoming") {
-            let _ = std::fs::remove_file(&f);
+            sweep_stale_placeholder(&f);
             continue;
         }
         if is_sendable_candidate(&p, folder, inbound) {
-            candidates.push(p);
+            let v = std::fs::metadata(&f).ok().map(|m| (m.len(), meta_mtime(&m)));
+            candidates.push((p, v));
         }
+    }
+    if candidates.is_empty() {
+        return false;
+    }
+    if !settle.is_zero() {
+        std::thread::sleep(settle);
+        candidates.retain(|(p, v)| {
+            let now = std::fs::metadata(p).ok().map(|m| (m.len(), meta_mtime(&m)));
+            now.is_some() && now == *v
+        });
     }
     let mut any = false;
     {
         let mut q = queue.lock().unwrap();
-        for p in candidates {
-            if !q.iter().any(|x| x == &p) {
-                q.push_back(p);
-                any = true;
-            }
+        for (p, _) in candidates {
+            any |= q.push_back(p);
         }
     }
     if any {
@@ -2847,8 +3501,26 @@ fn list_files_rec(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// What a folder receive did with each staged item (keyed by NFC rel) — the
+/// receiver's half of the per-item receipt (D1).
+#[derive(Default, Debug)]
+pub(crate) struct IngestReport {
+    /// Absolute paths now in the folder that were newly written.
+    pub moved: Vec<String>,
+    pub outcomes: HashMap<String, crate::iroh_net::FolderItemOutcome>,
+}
+
+/// Per-receive facts the landing decision needs beyond the staged bytes.
+#[derive(Default)]
+struct LandCtx {
+    /// rel → the SENDER's placement version (ms) of its copy, when it said.
+    vers: HashMap<String, u64>,
+    /// When this exact version (rel|size|mtime) was deleted here, if ever.
+    deleted_at: Option<Box<dyn Fn(&str) -> Option<u64> + Send + Sync>>,
+}
+
 /// Move everything received in `staging` into `folder`, collision-safe.
-/// Returns the final absolute paths and records them as inbound (loop guard).
+/// Returns what happened to each item and records landed ones as inbound (loop guard).
 fn move_staged_into_folder(
     staging: &Path,
     folder: &str,
@@ -2856,22 +3528,37 @@ fn move_staged_into_folder(
     mirror: bool,
     group: bool,
     self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
-) -> Vec<String> {
+    ctx: &LandCtx,
+) -> IngestReport {
+    use crate::iroh_net::FolderItemOutcome as O;
     let folder_str = folder;
     let folder_path = Path::new(folder);
-    let mut moved = Vec::new();
-    for src in list_files_rec(staging) {
+    let mut report = IngestReport::default();
+    let staged = list_files_rec(staging);
+    // The folder itself must be there (D6): never recreate a missing root (an
+    // unplugged drive) by landing into it.
+    if !folder_path.is_dir() {
+        for src in staged {
+            if let Ok(rel) = src.strip_prefix(staging) {
+                report.outcomes.insert(norm_rel(&rel.to_string_lossy()), O::Failed);
+            }
+        }
+        return report;
+    }
+    for src in staged {
         let Ok(rel) = src.strip_prefix(staging) else {
             continue;
         };
         let rel_str = norm_rel(&rel.to_string_lossy());
         let dest_path = folder_path.join(rel);
+        let sender_ver = ctx.vers.get(&rel_str).copied();
         // REVERSE TYPE SWAP: an ancestor of this incoming FILE exists locally as a
         // FILE (a peer kept a folder where we replaced it with a same-named file).
         // create_dir_all(parent) would fail (AlreadyExists) and the file could never
         // land → reconcile re-queues it forever. Archive the blocking ancestor file
         // to History (nothing lost), loop-guard its removal so our watcher doesn't
         // echo a spurious delete, then remove it so the dir chain can be created.
+        // If archiving fails, the ancestor stays and this item reports Failed.
         if mirror {
             let mut anc = rel.parent();
             while let Some(a) = anc {
@@ -2888,7 +3575,6 @@ fn move_staged_into_folder(
                         &arel,
                         "replaced",
                     );
-                    let _ = std::fs::remove_file(&anc_abs);
                 }
                 anc = a.parent();
             }
@@ -2903,6 +3589,70 @@ fn move_staged_into_folder(
         // the origin's value by the receive path, so it's comparable across members.
         let in_size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
         let in_mtime = std::fs::metadata(&src).ok().map(|m| meta_mtime(&m)).unwrap_or(0);
+
+        // A copy of a version WE DELETED, placed before we deleted it: a device
+        // that was offline past the tombstone TTL coming back with old files. Don't
+        // resurrect it (the sender keeps its copy — nothing is lost).
+        if std::fs::symlink_metadata(&dest_path).is_err() {
+            if let (Some(ver), Some(deleted_at)) = (sender_ver, ctx.deleted_at.as_ref()) {
+                let sig = format!("{rel_str}|{in_size}|{in_mtime}");
+                if let Some(del) = deleted_at(&sig) {
+                    if ver < del {
+                        log::warn!(
+                            "folder receive: not restoring {rel_str:?} — this exact version was deleted here \
+                             after the sender's copy was made (stale copy from a long-offline device)"
+                        );
+                        let _ = std::fs::remove_file(&src);
+                        report.outcomes.insert(rel_str, O::Kept("deleted".into()));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // D7: the name exists locally in DIFFERENT letter case (case-insensitive
+        // volume — both spellings open the same file). Decide explicitly instead of
+        // letting either spelling overwrite/archive the other in a loop.
+        if let (Some(ver), Some(actual)) = (sender_ver, case_variant_on_disk(&dest_path)) {
+            let actual_path = dest_path.with_file_name(&actual);
+            let local_ver = std::fs::metadata(&actual_path)
+                .map(|m| path_version_ms(&actual_path, &m))
+                .unwrap_or(u64::MAX);
+            let same = std::fs::metadata(&actual_path).map(|m| m.len()).ok() == Some(in_size)
+                && content_hash(&src) == content_hash(&actual_path);
+            let actual_rel = rel_path_of(&actual_path.to_string_lossy(), folder_str);
+            if ver <= local_ver {
+                // Ours is the newer spelling/version: keep it; tell the sender.
+                let _ = std::fs::remove_file(&src);
+                report.outcomes.insert(rel_str, O::Kept(if same { "case-same".into() } else { "case".into() }));
+                continue;
+            }
+            // The sender's is newer (a case-only rename, or a renamed+edited file):
+            // adopt it. Same bytes → just respell ours; different → archive ours.
+            if let Some(ar) = &actual_rel {
+                self_deleted.lock().unwrap().insert(ar.clone(), Instant::now());
+            }
+            if same {
+                let _ = std::fs::remove_file(&src);
+                if std::fs::rename(&actual_path, &dest_path).is_ok() {
+                    if let Some(sig) = file_sig(&dest_path.to_string_lossy(), folder_str) {
+                        inbound.lock().unwrap().insert(sig);
+                    }
+                    report.outcomes.insert(rel_str, O::Landed);
+                } else {
+                    report.outcomes.insert(rel_str, O::Failed);
+                }
+                continue;
+            }
+            let archived = actual_rel.as_deref().is_some_and(|ar| {
+                crate::folder_history::archive(folder_str, &actual_path.to_string_lossy(), ar, "replaced")
+            });
+            if !archived {
+                report.outcomes.insert(rel_str, O::Failed);
+                continue;
+            }
+            // fall through: dest is free now; land normally below.
+        }
 
         // RE-DELIVERY is a no-op in EVERY mode. If the sender never saw our "ok"
         // (ack lost to a path drop, or its stall watchdog fired) it re-sends a
@@ -2924,6 +3674,7 @@ fn move_staged_into_folder(
                     if let Some(sig) = file_sig(&dest_path.to_string_lossy(), folder_str) {
                         inbound.lock().unwrap().insert(sig);
                     }
+                    report.outcomes.insert(rel_str, O::Landed);
                     continue;
                 }
             }
@@ -2953,6 +3704,7 @@ fn move_staged_into_folder(
                 if let Some(sig) = file_sig(&dest_path.to_string_lossy(), folder_str) {
                     inbound.lock().unwrap().insert(sig);
                 }
+                report.outcomes.insert(rel_str, O::Landed);
                 continue;
             }
             let incoming_wins = if in_mtime != loc_mtime {
@@ -2970,21 +3722,25 @@ fn move_staged_into_folder(
                     "replaced",
                 );
                 let _ = std::fs::remove_file(&src);
+                report.outcomes.insert(rel_str, O::Kept("conflict".into()));
                 continue;
             }
-            // Incoming wins → archive the local copy, then replace it below.
+            // Incoming wins → archive the local copy, then replace it below. If the
+            // archive fails, NOTHING is replaced (the local copy must never be
+            // removed without a recoverable copy) and the item reports Failed.
             self_deleted
                 .lock()
                 .unwrap()
                 .insert(rel_str.clone(), Instant::now());
-            crate::folder_history::archive(
+            if !crate::folder_history::archive(
                 folder_str,
                 &dest_path.to_string_lossy(),
                 &rel_str,
                 "replaced",
-            );
-            if dest_path.exists() {
-                let _ = std::fs::remove_file(&dest_path);
+            ) && dest_path.exists()
+            {
+                report.outcomes.insert(rel_str, O::Failed);
+                continue;
             }
         } else if mirror && dest_path.is_file() {
             // Classic 1:1 mirror — UNCHANGED: the incoming file always replaces the
@@ -2994,14 +3750,15 @@ fn move_staged_into_folder(
                 .lock()
                 .unwrap()
                 .insert(rel_str.clone(), Instant::now());
-            crate::folder_history::archive(
+            if !crate::folder_history::archive(
                 folder_str,
                 &dest_path.to_string_lossy(),
                 &rel_str,
                 "replaced",
-            );
-            if dest_path.exists() {
-                let _ = std::fs::remove_file(&dest_path);
+            ) && dest_path.exists()
+            {
+                report.outcomes.insert(rel_str, O::Failed);
+                continue;
             }
         }
 
@@ -3011,6 +3768,7 @@ fn move_staged_into_folder(
         // dropped and reconcile re-queues it forever (permanent divergence). Archive
         // the directory's contents to History (nothing lost), loop-guard each removal
         // so our watcher doesn't echo it back, then clear it so the file can land.
+        // Only an EMPTIED tree is removed — anything that couldn't be archived stays.
         if mirror && dest_path.is_dir() {
             for child in list_files_rec(&dest_path) {
                 if let Some(crel) = rel_path_of(&child.to_string_lossy(), folder_str) {
@@ -3024,7 +3782,11 @@ fn move_staged_into_folder(
                 }
             }
             self_deleted.lock().unwrap().insert(rel_str.clone(), Instant::now());
-            let _ = std::fs::remove_dir_all(&dest_path);
+            prune_empty_tree(&dest_path);
+            if dest_path.exists() {
+                report.outcomes.insert(rel_str, O::Failed);
+                continue;
+            }
         }
 
         let dest = if mirror {
@@ -3050,10 +3812,13 @@ fn move_staged_into_folder(
             if let Some(sig) = file_sig(&dest_str, folder_str) {
                 inbound.lock().unwrap().insert(sig);
             }
-            moved.push(dest_str);
+            report.moved.push(dest_str);
+            report.outcomes.insert(rel_str, O::Landed);
+        } else {
+            report.outcomes.insert(rel_str, O::Failed);
         }
     }
-    moved
+    report
 }
 
 /// A file's modified-time as whole seconds since the epoch (0 if unavailable).
@@ -3132,7 +3897,7 @@ fn file_is_fresh(path: &Path, grace_ms: u64) -> bool {
         return false;
     }
     if let Ok(meta) = std::fs::metadata(path) {
-        return within_grace(meta_version_ms(&meta), now_ms(), grace_ms);
+        return within_grace(path_version_ms(path, &meta), now_ms(), grace_ms);
     }
     false
 }
@@ -3215,27 +3980,61 @@ fn prune_self_deleted(map: &mut HashMap<String, Instant>) {
     map.retain(|_, t| now.duration_since(*t) < Duration::from_secs(30));
 }
 
-/// Apply a delete the peer made (mirror mode): move the file to history (so it's
-/// recoverable) and mark it self-deleted so our watcher doesn't echo it back.
-/// Returns true if a file was archived to history.
+/// What a delete is allowed to remove (D4). `ts` = when the peer deleted it;
+/// `known` = the exact version (size, mtime) the deleter last had, when it said;
+/// `listed` = for a DIRECTORY delete, the rels the deleter itself enumerated —
+/// `Some` means "remove the directory only once it's empty; never a child the
+/// deleter didn't list" (its listed children arrive as their own entries).
+pub(crate) struct DeleteGuard<'a> {
+    pub ts: u64,
+    pub known: Option<(u64, u64)>,
+    pub listed: Option<&'a HashSet<String>>,
+    /// The deleter speaks the versioned-delete protocol: it names the version of
+    /// every FILE it deleted. An entry without one is a directory (or a name it
+    /// never had a synced version of) and must never remove a file here.
+    pub require_known: bool,
+}
+
+impl DeleteGuard<'static> {
+    /// Unconditional (tests / explicit user actions only).
+    #[cfg(test)]
+    fn any() -> Self {
+        DeleteGuard { ts: u64::MAX, known: None, listed: None, require_known: false }
+    }
+}
+
 /// Apply a delete the peer propagated. `rel` may name a FILE or a DIRECTORY (when
 /// the peer removed a whole folder). Every file removed is archived to history
 /// first (so nothing is unrecoverable) and recorded in `self_deleted` (loop
 /// guard) and `applied` (the rels we actually removed, for tombstoning). Returns
-/// true if anything was removed.
+/// true if anything was removed. Refuses (keeps the file) when it was just
+/// dropped in, when it's a different/newer version than the one deleted, or when
+/// the name only matches a local file in different letter case.
 fn apply_remote_delete(
     folder: &str,
     rel: &str,
     self_deleted: &Arc<Mutex<HashMap<String, Instant>>>,
     applied: &mut Vec<String>,
     grace_ms: u64,
+    guard: &DeleteGuard,
 ) -> bool {
     let rel_norm = norm_rel(rel);
     // Never let a peer reach outside the folder.
     if !rel_stays_inside(&rel_norm) {
         return false;
     }
+    // Never act on a folder that isn't there (unplugged drive).
+    if !Path::new(folder).is_dir() {
+        return false;
+    }
     let dest = Path::new(folder).join(&rel_norm);
+    // D7: on a case-insensitive volume "photo.jpg" also opens "Photo.jpg". A
+    // delete of one name must never remove a file that exists under ANOTHER
+    // spelling — that's a rename, not this delete.
+    if case_variant_on_disk(&dest).is_some() {
+        log::warn!("apply_remote_delete: {rel_norm:?} only matches a differently-capitalized local file — keeping it");
+        return false;
+    }
     let mut removed = false;
     if dest.is_file() {
         // DATA-LOSS GUARD: never wipe a file the user just dropped in. A delete
@@ -3250,6 +4049,15 @@ fn apply_remote_delete(
             );
             return false;
         }
+        // D4: only the version the peer deleted goes — a newer local edit wins.
+        if guard.require_known && guard.known.is_none() {
+            log::warn!("apply_remote_delete: kept {rel_norm:?} — the peer never had a version of this file");
+            return false;
+        }
+        if !delete_allowed(&dest, guard.ts, guard.known) {
+            log::warn!("apply_remote_delete: kept {rel_norm:?} — the local copy is a different/newer version than the one deleted");
+            return false;
+        }
         self_deleted
             .lock()
             .unwrap()
@@ -3260,54 +4068,104 @@ fn apply_remote_delete(
             removed = true;
         }
     } else if dest.is_dir() {
-        // A whole folder was removed on the peer. Archive + remove every file
-        // inside (recording each child rel), then prune the now-empty tree.
-        // BUT skip any freshly-dropped child (same guard as above) — so re-adding a
-        // folder that shares a name with a deleted one can't nuke the new contents.
-        let mut kept_fresh = 0usize;
-        for child_abs in list_files_rec(&dest) {
-            if file_is_fresh(&child_abs, grace_ms) {
-                kept_fresh += 1;
-                continue;
-            }
-            let Some(child_rel) = rel_path_of(&child_abs.to_string_lossy(), folder) else {
-                continue;
-            };
-            self_deleted
-                .lock()
-                .unwrap()
-                .insert(child_rel.clone(), Instant::now());
-            if crate::folder_history::archive(
-                folder,
-                &child_abs.to_string_lossy(),
-                &child_rel,
-                "deleted",
-            ) {
-                applied.push(child_rel);
+        if guard.listed.is_some() {
+            // The deleter enumerated the children it knew; each arrives as its own
+            // (version-checked) entry. All that's left for the directory itself is
+            // to go once it's EMPTY — anything still inside is something the
+            // deleter never saw (or a newer edit), and stays.
+            prune_empty_tree(&dest);
+            if !dest.exists() {
+                self_deleted.lock().unwrap().insert(rel_norm.clone(), Instant::now());
+                applied.push(rel_norm.clone());
                 removed = true;
             }
-        }
-        if kept_fresh > 0 {
-            log::warn!(
-                "apply_remote_delete: kept {kept_fresh} freshly-added file(s) under {rel_norm:?} \
-                 instead of deleting — protecting just-dropped data"
-            );
-        }
-        // Only obliterate the directory if NOTHING fresh survives inside it.
-        // Otherwise leave it in place (any now-empty subdirs are harmless).
-        if kept_fresh == 0 {
-            self_deleted
-                .lock()
-                .unwrap()
-                .insert(rel_norm.clone(), Instant::now());
-            let _ = std::fs::remove_dir_all(&dest);
-            removed = true;
+        } else {
+            // A whole folder was removed on the peer (legacy entry with no child
+            // list). Archive + remove every file inside that's OLDER than the
+            // delete (recording each child rel), then prune the now-empty tree.
+            // Skip any freshly-dropped or newer child — so re-adding a folder that
+            // shares a name with a deleted one can't nuke the new contents.
+            let mut kept = 0usize;
+            for child_abs in list_files_rec(&dest) {
+                if file_is_fresh(&child_abs, grace_ms) || !delete_allowed(&child_abs, guard.ts, None) {
+                    kept += 1;
+                    continue;
+                }
+                let Some(child_rel) = rel_path_of(&child_abs.to_string_lossy(), folder) else {
+                    kept += 1;
+                    continue;
+                };
+                self_deleted
+                    .lock()
+                    .unwrap()
+                    .insert(child_rel.clone(), Instant::now());
+                if crate::folder_history::archive(
+                    folder,
+                    &child_abs.to_string_lossy(),
+                    &child_rel,
+                    "deleted",
+                ) {
+                    applied.push(child_rel);
+                    removed = true;
+                } else {
+                    kept += 1;
+                }
+            }
+            if kept > 0 {
+                log::warn!(
+                    "apply_remote_delete: kept {kept} file(s) under {rel_norm:?} \
+                     instead of deleting — new or newer than the delete"
+                );
+            }
+            // Only remove the directory once NOTHING survives inside it — and only
+            // ever an empty tree (remove_dir, never remove_dir_all: a file that
+            // appeared a moment ago must not be swept away unarchived).
+            prune_empty_tree(&dest);
+            if !dest.exists() {
+                self_deleted
+                    .lock()
+                    .unwrap()
+                    .insert(rel_norm.clone(), Instant::now());
+                removed = true;
+            }
         }
     }
     // Tidy up: drop any now-empty parent directories up to (but not including)
     // the shared-folder root, so a removed subtree doesn't leave hollow folders.
     prune_empty_dirs(folder, &rel_norm);
     removed
+}
+
+/// Remove every EMPTY directory under (and including) `dir`, deepest first. Never
+/// removes a user file or a non-empty directory. OS litter (`.DS_Store`,
+/// `Thumbs.db`, `._x`…) doesn't count as content — Finder drops a `.DS_Store` into
+/// almost every folder it shows, and it must not keep a deleted folder alive.
+fn prune_empty_tree(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut junk: Vec<PathBuf> = Vec::new();
+    let mut other = false;
+    for e in entries.flatten() {
+        let ft = e.file_type();
+        if ft.as_ref().map(|t| t.is_dir()).unwrap_or(false) {
+            prune_empty_tree(&e.path());
+            if e.path().exists() {
+                other = true;
+            }
+        } else if ft.map(|t| t.is_file()).unwrap_or(false)
+            && crate::iroh_net::os_junk_name(&e.file_name().to_string_lossy())
+        {
+            junk.push(e.path());
+        } else {
+            other = true;
+        }
+    }
+    if other {
+        return;
+    }
+    for j in junk {
+        let _ = std::fs::remove_file(j);
+    }
+    let _ = std::fs::remove_dir(dir); // only succeeds when empty
 }
 
 /// Remove empty ancestor directories of `rel` within `folder` (never the root).
@@ -3399,13 +4257,6 @@ async fn wait_backoff(stop_notify: &Arc<Notify>, stopped: &Arc<AtomicBool>, atte
     let secs = (2u64.saturating_pow(attempt.min(6))).min(MAX_BACKOFF_SECS).max(2);
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_secs(secs)) => stopped.load(Ordering::SeqCst),
-        _ = stop_notify.notified() => true,
-    }
-}
-
-async fn wait_fixed(stop_notify: &Arc<Notify>, stopped: &Arc<AtomicBool>, ms: u64) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_millis(ms)) => stopped.load(Ordering::SeqCst),
         _ = stop_notify.notified() => true,
     }
 }
@@ -3705,6 +4556,32 @@ fn apply_remote_move(
     }
     let from_abs = Path::new(folder).join(&from);
     let to_abs = Path::new(folder).join(&to);
+    // D7: a CASE-ONLY rename ("photo.jpg" → "Photo.jpg"). On a case-insensitive
+    // volume `from` and `to` are the SAME file, so the "to already has the bytes →
+    // archive the duplicate from" branch below would delete the only copy. Rename
+    // in place instead (when our copy really is that file under the old spelling).
+    if from.to_lowercase() == to.to_lowercase() {
+        let Ok(fmeta) = std::fs::metadata(&from_abs) else { return false };
+        if !fmeta.is_file() || fmeta.len() != exp_size || meta_mtime(&fmeta) != exp_mtime {
+            return false;
+        }
+        if case_variant_on_disk(&from_abs).is_some() {
+            return false; // our copy isn't spelled like the peer's old name
+        }
+        // `to` exactly spelled already exists → it's a separate file (a
+        // case-sensitive volume) or the rename already happened: never overwrite.
+        if std::fs::symlink_metadata(&to_abs).is_ok() && case_variant_on_disk(&to_abs).is_none() {
+            return false;
+        }
+        self_deleted.lock().unwrap().insert(from.clone(), Instant::now());
+        if std::fs::rename(&from_abs, &to_abs).is_err() {
+            return false;
+        }
+        if let Some(sig) = file_sig(&to_abs.to_string_lossy(), folder) {
+            inbound.lock().unwrap().insert(sig);
+        }
+        return true;
+    }
     // Our `from` must BE the moved file (same size + mtime). A different file that
     // merely shares the old path (e.g. a coincidental new file, or an inode-recycle
     // mis-detection on the sender) won't match → we leave it untouched and let the
@@ -3724,6 +4601,11 @@ fn apply_remote_move(
         // is genuinely the SAME bytes; otherwise leave both alone (don't clobber a
         // real, different file that happens to sit at `to`).
         if !tmeta.is_file() || tmeta.len() != exp_size || meta_mtime(&tmeta) != exp_mtime {
+            return false;
+        }
+        // …and is a DIFFERENT file than `from` (never archive the only copy
+        // because two spellings resolve to one inode).
+        if meta_inode(&tmeta) != 0 && meta_inode(&tmeta) == meta_inode(&fmeta) {
             return false;
         }
         if file_is_fresh(&to_abs, grace_ms) {
@@ -3861,7 +4743,7 @@ fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
                 FileEntry {
                     size: meta.len(),
                     mtime: meta_mtime(&meta),
-                    version_ms: meta_version_ms(&meta),
+                    version_ms: path_version_ms(&abs, &meta),
                     inode: meta_inode(&meta),
                 },
             );
@@ -4023,11 +4905,38 @@ fn reconcile_plan(
     my_tombs: &HashMap<String, u64>,
     now: u64,
 ) -> ReconcilePlan {
+    reconcile_plan_ci(mine, peer_files, peer_tombs, my_tombs, now, false)
+}
+
+/// `reconcile_plan` for a folder on a case-INSENSITIVE volume (`ci`): a peer file
+/// whose name differs from ours only in letter case IS our file (both spellings
+/// open the same bytes here) — never "missing", so a case-only rename can't
+/// ping-pong between two Macs forever (D7). Deletes stay exact-name only.
+fn reconcile_plan_ci(
+    mine: &HashMap<String, FileEntry>,
+    peer_files: &HashMap<String, (u64, u64)>,
+    peer_tombs: &HashMap<String, u64>,
+    my_tombs: &HashMap<String, u64>,
+    now: u64,
+    ci: bool,
+) -> ReconcilePlan {
     // Compare on NFC-normalized keys so a subfolder name that macOS stored
     // decomposed (NFD) and the peer stored composed (NFC) is recognized as the
     // SAME file instead of "missing" → re-sent forever.
     let peer_files: HashMap<String, (u64, u64)> =
         peer_files.iter().map(|(k, v)| (norm_rel(k), *v)).collect();
+    // Case-folded index of the peer's files: lower → (count, entry).
+    let peer_folded: HashMap<String, (usize, (u64, u64))> = if ci {
+        let mut m: HashMap<String, (usize, (u64, u64))> = HashMap::new();
+        for (k, v) in &peer_files {
+            let e = m.entry(k.to_lowercase()).or_insert((0, *v));
+            e.0 += 1;
+            e.1 = *v;
+        }
+        m
+    } else {
+        HashMap::new()
+    };
     let peer_tombs: HashMap<String, u64> =
         peer_tombs.iter().map(|(k, v)| (norm_rel(k), *v)).collect();
     let my_tombs: HashMap<String, u64> =
@@ -4072,9 +4981,15 @@ fn reconcile_plan(
         // would re-send forever. mtime stays a tie-breaker for genuine conflicts
         // (in move_staged_into_folder), never the in-sync test. This is what makes
         // the sync actually converge instead of ping-ponging the same file.
-        let need = match peer_files.get(&rel) {
+        let peer_entry = peer_files.get(&rel).copied().or_else(|| {
+            peer_folded
+                .get(&rel.to_lowercase())
+                .filter(|(n, _)| *n == 1)
+                .map(|(_, v)| *v)
+        });
+        let need = match peer_entry {
             None => true,
-            Some(&(psize, pmtime)) => psize != entry.size && entry.mtime > pmtime,
+            Some((psize, pmtime)) => psize != entry.size && entry.mtime > pmtime,
         };
         if need {
             plan.push.push(rel);
@@ -4310,6 +5225,415 @@ fn build_group_roster(
     (gid, roster, owner_eid, role_epoch)
 }
 
+// ── Send queue (T14) ─────────────────────────────────────────────────────────
+/// The per-folder send queue: FIFO order + a set for O(1) "already queued?" checks.
+/// A 3,000-photo drop used to pay an O(n) `iter().any` scan per enqueue under a
+/// std Mutex — O(n²) with the async runtime blocked meanwhile.
+#[derive(Default)]
+pub(crate) struct SendQueue {
+    q: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl SendQueue {
+    /// Append unless already queued. Returns whether it was added.
+    fn push_back(&mut self, p: String) -> bool {
+        if self.set.insert(p.clone()) {
+            self.q.push_back(p);
+            true
+        } else {
+            false
+        }
+    }
+    fn front(&self) -> Option<&String> {
+        self.q.front()
+    }
+    fn len(&self) -> usize {
+        self.q.len()
+    }
+    fn iter(&self) -> std::collections::vec_deque::Iter<'_, String> {
+        self.q.iter()
+    }
+    fn remove(&mut self, p: &str) -> bool {
+        if !self.set.remove(p) {
+            return false;
+        }
+        if self.q.front().map(|f| f == p).unwrap_or(false) {
+            self.q.pop_front();
+        } else if let Some(pos) = self.q.iter().position(|x| x == p) {
+            self.q.remove(pos);
+        }
+        true
+    }
+    /// Move an item to the back (a file that keeps failing must not block the rest).
+    fn rotate_to_back(&mut self, p: &str) {
+        if let Some(pos) = self.q.iter().position(|x| x == p) {
+            if let Some(item) = self.q.remove(pos) {
+                self.q.push_back(item);
+            }
+        }
+    }
+}
+
+// ── Active receive placeholders ──────────────────────────────────────────────
+/// "<name>.dropbeam-incoming" placeholders owned by a receive that is still
+/// running. The litter sweeps skip these — they used to delete a live receive's
+/// placeholder on every idle rescan.
+fn active_placeholders() -> &'static Mutex<HashSet<PathBuf>> {
+    static SET: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn placeholder_active(path: &Path, on: bool) {
+    let mut set = active_placeholders().lock().unwrap_or_else(|e| e.into_inner());
+    if on {
+        set.insert(path.to_path_buf());
+    } else {
+        set.remove(path);
+    }
+}
+
+fn is_placeholder_active(path: &Path) -> bool {
+    active_placeholders()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(path)
+}
+
+/// Remove a crash-orphaned placeholder only when no live receive owns it and it's
+/// stale (> 10 min since it was created).
+fn sweep_stale_placeholder(f: &Path) {
+    if is_placeholder_active(f) {
+        return;
+    }
+    let stale = std::fs::metadata(f)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs() > 600)
+        .unwrap_or(true);
+    if stale {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+// ── Placement version (D15) ──────────────────────────────────────────────────
+/// When we first saw each path (non-Unix only). Windows has no ctime in std and
+/// a same-volume MOVE keeps a file's old creation time, so an old file moved INTO
+/// a synced folder read as "old" and a stale tombstone deleted it. Unix gets this
+/// from ctime; elsewhere we track first sight ourselves (in memory: after a
+/// restart every file simply reads as fresh for the grace window — the safe side).
+fn first_seen_map() -> &'static Mutex<HashMap<PathBuf, (u64, u64, u64)>> {
+    static MAP: OnceLock<Mutex<HashMap<PathBuf, (u64, u64, u64)>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// First-seen ms for `path` at this (size, mtime); records "now" the first time.
+fn first_seen_ms(path: &Path, size: u64, mtime: u64, now: u64) -> u64 {
+    let mut m = first_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    let e = m.entry(path.to_path_buf()).or_insert((now, size, mtime));
+    if e.1 != size || e.2 != mtime {
+        // A different file now lives here (or it was rewritten): that's new too.
+        *e = (now, size, mtime);
+    }
+    e.0
+}
+
+/// A file's placement version (ms): `meta_version_ms` plus, where the platform
+/// has no ctime, when we first saw it. The value every delete decision uses.
+pub(crate) fn path_version_ms(path: &Path, meta: &std::fs::Metadata) -> u64 {
+    let v = meta_version_ms(meta);
+    if cfg!(unix) {
+        return v;
+    }
+    v.max(first_seen_ms(path, meta.len(), meta_mtime(meta), now_ms()))
+}
+
+// ── Case-insensitive volumes (D7) ────────────────────────────────────────────
+/// Whether `folder` lives on a case-INSENSITIVE filesystem (APFS/HFS+ default,
+/// NTFS, FAT/exFAT). Probed once per folder with a dot-file (never synced).
+fn folder_case_insensitive(folder: &str) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(folder) {
+        return *v;
+    }
+    let root = Path::new(folder);
+    if !root.is_dir() {
+        return cfg!(any(target_os = "macos", target_os = "ios", windows));
+    }
+    let probe = root.join(format!(".dropbeam-case-{}", uuid::Uuid::new_v4().simple()));
+    let v = if std::fs::write(&probe, b"").is_ok() {
+        let upper = root.join(probe.file_name().unwrap().to_string_lossy().to_uppercase());
+        let ci = upper.exists();
+        let _ = std::fs::remove_file(&probe);
+        ci
+    } else {
+        cfg!(any(target_os = "macos", target_os = "ios", windows))
+    };
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(folder.to_string(), v);
+    v
+}
+
+/// The name this path's LAST component actually has on disk, when it exists under
+/// a different letter case (only possible on a case-insensitive volume). `None`
+/// if it doesn't exist or the on-disk name matches exactly.
+fn case_variant_on_disk(path: &Path) -> Option<std::ffi::OsString> {
+    let name = path.file_name()?;
+    if std::fs::symlink_metadata(path).is_err() {
+        return None;
+    }
+    let parent = path.parent()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    let mut variant = None;
+    for e in entries.flatten() {
+        let n = e.file_name();
+        if n == name {
+            return None; // exact match exists
+        }
+        if n.to_string_lossy().to_lowercase() == name.to_string_lossy().to_lowercase() {
+            variant = Some(n);
+        }
+    }
+    variant
+}
+
+// ── Per-link "peer won't take this version" memory (D7/D8) ──────────────────
+/// Signatures (rel|size|mtime) the PEER answered "kept" for — a name its disk
+/// can't hold, a case clash, a version it deleted… Reconcile doesn't re-push these
+/// until the file itself changes (new signature), so nothing loops.
+fn skipped_path(config_dir: &Path, pair_id: &str) -> PathBuf {
+    config_dir.join(format!("peer-skipped-{pair_id}.json"))
+}
+
+fn load_skipped(config_dir: &Path, pair_id: &str) -> HashMap<String, String> {
+    std::fs::read_to_string(skipped_path(config_dir, pair_id))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_skipped(config_dir: &Path, pair_id: &str, map: &HashMap<String, String>) {
+    if let Ok(txt) = serde_json::to_string(map) {
+        let _ = crate::settings::write_atomic(&skipped_path(config_dir, pair_id), txt.as_bytes());
+    }
+}
+
+/// One status line for what the peer refused to take, if anything user-actionable.
+fn skipped_warning(map: &HashMap<String, String>, peer: &str) -> Option<String> {
+    let mut names = 0usize;
+    let mut cases = 0usize;
+    let mut example: Option<String> = None;
+    for (sig, why) in map {
+        let hit = match why.as_str() {
+            "name" => {
+                names += 1;
+                true
+            }
+            "case" => {
+                cases += 1;
+                true
+            }
+            _ => false,
+        };
+        if hit && example.is_none() {
+            example = sig_rel(sig).map(|r| file_name_of(&r));
+        }
+    }
+    let ex = example.map(|e| format!(" (e.g. “{e}”)")).unwrap_or_default();
+    match (names, cases) {
+        (0, 0) => None,
+        (n, 0) => Some(format!(
+            "{n} file{} can't be copied to {peer} — the name isn't allowed on their computer{ex}. Rename {} to sync.",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" }
+        )),
+        (0, c) => Some(format!(
+            "{c} file{} can't be copied to {peer} — another file there has the same name in different capitals{ex}.",
+            if c == 1 { "" } else { "s" }
+        )),
+        (n, c) => Some(format!(
+            "{} files can't be copied to {peer} because of their names{ex}.",
+            n + c
+        )),
+    }
+}
+
+// ── Deleted-version memory (tombstone TTL backstop) ──────────────────────────
+/// Every version (rel|size|mtime) this folder deleted, with when — kept FAR longer
+/// than tombstones (which expire after 45 days). A device that was offline longer
+/// than that comes back still holding files everyone else deleted; with the
+/// tombstones gone, its reconcile would resurrect them. The receiver refuses an
+/// incoming copy whose exact version it deleted AFTER that copy was placed.
+const DELETED_SIG_TTL_MS: u64 = 400 * 24 * 3600 * 1000;
+const DELETED_SIG_CAP: usize = 50_000;
+
+fn deleted_sigs_path(config_dir: &Path, folder: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let h = hex::encode(&Sha256::digest(folder.as_bytes())[..8]);
+    config_dir.join(format!("deleted-versions-{h}.json"))
+}
+
+fn deleted_sigs_store() -> &'static Mutex<HashMap<PathBuf, HashMap<String, u64>>> {
+    static S: OnceLock<Mutex<HashMap<PathBuf, HashMap<String, u64>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn with_deleted_sigs<R>(config_dir: &Path, folder: &str, f: impl FnOnce(&mut HashMap<String, u64>) -> R) -> R {
+    let path = deleted_sigs_path(config_dir, folder);
+    let mut store = deleted_sigs_store().lock().unwrap_or_else(|e| e.into_inner());
+    let map = store.entry(path.clone()).or_insert_with(|| {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    });
+    f(map)
+}
+
+/// Remember that these exact versions were deleted at `ts`. One write per call.
+fn record_deleted_versions(config_dir: &Path, folder: &str, sigs: &[String], ts: u64) {
+    if sigs.is_empty() {
+        return;
+    }
+    let path = deleted_sigs_path(config_dir, folder);
+    let snapshot = with_deleted_sigs(config_dir, folder, |m| {
+        for s in sigs {
+            let e = m.entry(s.clone()).or_insert(0);
+            *e = (*e).max(ts);
+        }
+        let cutoff = now_ms().saturating_sub(DELETED_SIG_TTL_MS);
+        m.retain(|_, t| *t >= cutoff);
+        if m.len() > DELETED_SIG_CAP {
+            let mut v: Vec<(String, u64)> = m.iter().map(|(k, t)| (k.clone(), *t)).collect();
+            v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+            v.truncate(DELETED_SIG_CAP);
+            *m = v.into_iter().collect();
+        }
+        m.clone()
+    });
+    if let Ok(txt) = serde_json::to_string(&snapshot) {
+        let _ = crate::settings::write_atomic(&path, txt.as_bytes());
+    }
+}
+
+/// When this exact version was deleted here, if ever.
+fn deleted_version_at(config_dir: &Path, folder: &str, sig: &str) -> Option<u64> {
+    with_deleted_sigs(config_dir, folder, |m| m.get(sig).copied())
+}
+
+// ── Last full observation (D5) ───────────────────────────────────────────────
+fn seen_path(config_dir: &Path, pair_id: &str) -> PathBuf {
+    config_dir.join(format!("folder-seen-{pair_id}.json"))
+}
+
+/// When we last WALKED this folder and saw every file in it (ms).
+fn load_last_seen(config_dir: &Path, pair_id: &str) -> Option<u64> {
+    std::fs::read_to_string(seen_path(config_dir, pair_id))
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .or_else(|| {
+            // Upgrading from a build that didn't record it: the loop-guard manifest
+            // was last written when we last synced something — a time we had it all.
+            std::fs::metadata(manifest_path(config_dir, pair_id))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+        })
+}
+
+fn save_last_seen(config_dir: &Path, pair_id: &str, ts: u64) {
+    let _ = crate::settings::write_atomic(&seen_path(config_dir, pair_id), ts.to_string().as_bytes());
+}
+
+/// D5: files we KNEW (we sent or received them — they're in the loop-guard
+/// manifest) that are gone from disk with no tombstone: deleted while DropBeam
+/// was closed, or while the watcher overflowed. Returns rel → the last version we
+/// had. EMPTY when the folder isn't safely observable: the root is missing, or
+/// EVERY known file vanished at once (an unmounted drive / swapped mount point
+/// looks exactly like that — resurrection is the safe failure, never deletion).
+fn missed_deletes(
+    folder: &str,
+    inbound: &HashSet<String>,
+    tombstones: &HashMap<String, u64>,
+) -> HashMap<String, (u64, u64)> {
+    let root = Path::new(folder);
+    if !root.is_dir() {
+        return HashMap::new();
+    }
+    // Latest known version per rel.
+    let mut known: HashMap<String, (u64, u64)> = HashMap::new();
+    for sig in inbound {
+        let mut it = sig.rsplitn(3, '|');
+        let (Some(mt), Some(sz), Some(rel)) = (it.next(), it.next(), it.next()) else { continue };
+        let (Ok(mt), Ok(sz)) = (mt.parse::<u64>(), sz.parse::<u64>()) else { continue };
+        if rel.is_empty()
+            || rel.split('/').any(|c| c.starts_with('.'))
+            || crate::iroh_net::is_control_rel(rel)
+            || !rel_stays_inside(&norm_rel(rel))
+        {
+            continue;
+        }
+        let e = known.entry(norm_rel(rel)).or_insert((sz, mt));
+        if mt > e.1 {
+            *e = (sz, mt);
+        }
+    }
+    if known.is_empty() {
+        return HashMap::new();
+    }
+    // Compare against the folder's own (NFC-keyed) manifest, not by joining paths:
+    // on a normalization-SENSITIVE disk an NFD-stored name isn't found under its
+    // NFC key, and a case-only respelling isn't found on a case-sensitive one.
+    let present = live_manifest(folder);
+    let ci = folder_case_insensitive(folder);
+    let present_folded: HashSet<String> =
+        if ci { present.keys().map(|k| k.to_lowercase()).collect() } else { HashSet::new() };
+    let missing: HashMap<String, (u64, u64)> = known
+        .iter()
+        .filter(|(rel, _)| !tombstones.contains_key(*rel))
+        .filter(|(rel, _)| !present.contains_key(*rel) && !(ci && present_folded.contains(&rel.to_lowercase())))
+        .filter(|(rel, _)| std::fs::symlink_metadata(root.join(rel)).is_err())
+        .map(|(r, v)| (r.clone(), *v))
+        .collect();
+    // "Suddenly empty": every known file gone at once, or the folder has no files
+    // at all, is a drive/mount problem far more often than a deliberate delete.
+    let all_gone = missing.len() == known.len() && known.len() > 3;
+    if all_gone || (!missing.is_empty() && present.is_empty()) {
+        log::warn!(
+            "missed-delete scan of {folder}: {} of {} known files missing — looks like a \
+             missing/empty drive, NOT propagating any deletes",
+            missing.len(),
+            known.len()
+        );
+        return HashMap::new();
+    }
+    missing
+}
+
+/// Wait until `ms` elapses or the pair stops. Returns false if stopped.
+async fn sleep_unless_stopped(stop_notify: &Arc<Notify>, stopped: &Arc<AtomicBool>, ms: u64) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+        _ = stop_notify.notified() => {}
+    }
+    !stopped.load(Ordering::SeqCst)
+}
+
+/// Whether a delete may remove the local file at `abs`:
+///   • the deleter told us WHICH version it deleted (size, mtime) → only that
+///     exact version goes; anything else is a newer/different edit and stays,
+///   • otherwise (older peers, reconcile tombstones) only a file whose placement
+///     version is OLDER than the delete goes — a late delete never beats an edit.
+fn delete_allowed(abs: &Path, ts: u64, known: Option<(u64, u64)>) -> bool {
+    let Ok(meta) = std::fs::metadata(abs) else { return false };
+    match known {
+        Some((size, mtime)) => meta.len() == size && meta_mtime(&meta) == mtime,
+        None => ts > path_version_ms(abs, &meta),
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4366,8 +5690,8 @@ mod tests {
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut applied = Vec::new();
         let f = folder.to_str().unwrap();
-        assert!(!apply_remote_delete(f, "", &sd, &mut applied, 0));
-        assert!(!apply_remote_delete(f, "../Other", &sd, &mut applied, 0));
+        assert!(!apply_remote_delete(f, "", &sd, &mut applied, 0, &DeleteGuard::any()));
+        assert!(!apply_remote_delete(f, "../Other", &sd, &mut applied, 0, &DeleteGuard::any()));
         assert!(folder.is_dir() && outside.is_dir());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4413,7 +5737,9 @@ mod tests {
             true, // mirror
             true, // group → deterministic resolution
             &self_del,
+            &LandCtx::default(),
         )
+        .moved
     }
 
     #[test]
@@ -4494,7 +5820,9 @@ mod tests {
             true,  // mirror
             false, // NOT a group → old arrival-wins behavior
             &self_del,
-        );
+            &LandCtx::default(),
+        )
+        .moved;
         assert_eq!(std::fs::read(folder.join("a.txt")).unwrap(), b"incoming-older");
     }
 
@@ -4531,7 +5859,7 @@ mod tests {
 
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut applied = Vec::new();
-        let archived = apply_remote_delete(&folder_s, "sub/x.txt", &sd, &mut applied, 0);
+        let archived = apply_remote_delete(&folder_s, "sub/x.txt", &sd, &mut applied, 0, &DeleteGuard::any());
         assert!(archived, "a file should have been archived");
         assert_eq!(applied, vec!["sub/x.txt".to_string()]);
         assert!(!folder.join("sub/x.txt").exists(), "original is gone");
@@ -4561,9 +5889,9 @@ mod tests {
         let folder_s = folder.to_string_lossy().to_string();
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut ap = Vec::new();
-        assert!(!apply_remote_delete(&folder_s, "../escape.txt", &sd, &mut ap, 0));
-        assert!(!apply_remote_delete(&folder_s, "/etc/passwd", &sd, &mut ap, 0));
-        assert!(!apply_remote_delete(&folder_s, "a/../../b.txt", &sd, &mut ap, 0));
+        assert!(!apply_remote_delete(&folder_s, "../escape.txt", &sd, &mut ap, 0, &DeleteGuard::any()));
+        assert!(!apply_remote_delete(&folder_s, "/etc/passwd", &sd, &mut ap, 0, &DeleteGuard::any()));
+        assert!(!apply_remote_delete(&folder_s, "a/../../b.txt", &sd, &mut ap, 0, &DeleteGuard::any()));
         assert!(ap.is_empty());
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -4589,7 +5917,7 @@ mod tests {
 
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut applied = Vec::new();
-        let removed = apply_remote_delete(&folder_s, "clips", &sd, &mut applied, 0);
+        let removed = apply_remote_delete(&folder_s, "clips", &sd, &mut applied, 0, &DeleteGuard::any());
         assert!(removed, "the directory delete should report removal");
         assert!(!folder.join("clips").exists(), "whole subtree gone");
         assert!(folder.join("keep.txt").exists(), "sibling untouched");
@@ -4842,7 +6170,7 @@ mod tests {
         std::fs::write(folder.join("just-dropped.mp4"), b"brand new").unwrap();
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut applied = Vec::new();
-        let removed = apply_remote_delete(&folder_s, "just-dropped.mp4", &sd, &mut applied, DELETE_GRACE_MS);
+        let removed = apply_remote_delete(&folder_s, "just-dropped.mp4", &sd, &mut applied, DELETE_GRACE_MS, &DeleteGuard::any());
         assert!(!removed, "a just-created file must not be deleted");
         assert!(applied.is_empty());
         assert!(
@@ -5277,7 +6605,7 @@ mod tests {
         std::fs::write(folder.join("a.txt"), b"x").unwrap();
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let mut ap = Vec::new();
-        apply_remote_delete(&folder_s, "a.txt", &sd, &mut ap, 0);
+        apply_remote_delete(&folder_s, "a.txt", &sd, &mut ap, 0, &DeleteGuard::any());
         let inbound = Arc::new(Mutex::new(HashSet::new()));
         for f in list_files_rec(&folder) {
             let p = f.to_string_lossy().to_string();
@@ -5287,5 +6615,418 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    // ── Regression tests for the 2026-10-04 folder-sync audit ──────────────────
+
+    fn report(items: Vec<(&str, crate::iroh_net::FolderItemOutcome)>, legacy: bool) -> crate::iroh_net::FolderSendReport {
+        crate::iroh_net::FolderSendReport {
+            locality: Locality::Unknown,
+            items: items.into_iter().map(|(p, o)| (PathBuf::from(p), o)).collect(),
+            legacy,
+        }
+    }
+
+    fn version_of(p: &Path) -> (u64, u64) {
+        let m = std::fs::metadata(p).unwrap();
+        (m.len(), meta_mtime(&m))
+    }
+
+    #[test]
+    fn send_queue_dedupes_in_constant_time_and_keeps_order() {
+        let mut q = SendQueue::default();
+        assert!(q.push_back("a".into()));
+        assert!(q.push_back("b".into()));
+        assert!(!q.push_back("a".into()), "already queued");
+        assert!(q.push_back("c".into()));
+        q.rotate_to_back("a");
+        assert_eq!(q.iter().cloned().collect::<Vec<_>>(), vec!["b", "c", "a"]);
+        assert!(q.remove("c"));
+        assert!(!q.remove("c"));
+        assert_eq!(q.front().map(String::as_str), Some("b"));
+        assert_eq!(q.len(), 2);
+        assert!(q.push_back("c".into()), "re-queue after removal");
+    }
+
+    /// D1: only items the receiver confirmed LANDED may be auto-deleted — never a
+    /// kept/failed/unreported item, and nothing at all on a legacy bare "ok".
+    #[test]
+    fn auto_delete_only_ever_targets_confirmed_landed_items() {
+        use crate::iroh_net::FolderItemOutcome as O;
+        let dir = temp_dir("d1-settle");
+        let mk = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, n.as_bytes()).unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let (a, b, c, d) = (mk("a"), mk("b"), mk("c"), mk("d"));
+        let batch = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+        let pre: HashMap<String, (u64, u64)> =
+            batch.iter().map(|f| (f.clone(), version_of(Path::new(f)))).collect();
+        let r = report(
+            vec![(&a, O::Landed), (&b, O::Kept("conflict".into())), (&c, O::Failed)],
+            false,
+        );
+        let st = settle_batch(&batch, &pre, &r);
+        assert_eq!(st.delivered, vec![a.clone()]);
+        assert_eq!(st.kept, vec![(b.clone(), "conflict".to_string())]);
+        assert_eq!(st.retry, vec![c.clone(), d.clone()], "failed + unreported are retried");
+        assert_eq!(auto_delete_targets(&st, false, true), vec![a.clone()]);
+        assert!(auto_delete_targets(&st, false, false).is_empty(), "auto-delete off");
+        // A legacy receiver's bare "ok" can't vouch per file → delete nothing.
+        let legacy = report(batch.iter().map(|f| (f.as_str(), O::Landed)).collect(), true);
+        let st = settle_batch(&batch, &pre, &legacy);
+        assert_eq!(st.delivered.len(), 4);
+        assert!(auto_delete_targets(&st, true, true).is_empty());
+        // An EMPTY report (nothing confirmed) delivers nothing.
+        let st = settle_batch(&batch, &pre, &report(vec![], false));
+        assert!(st.delivered.is_empty() && auto_delete_targets(&st, false, true).is_empty());
+    }
+
+    /// D2: a file that changed while it was being sent is NOT delivered (the peer
+    /// has an older version) — it's re-sent, never recorded or auto-deleted.
+    #[test]
+    fn file_changed_during_send_is_resent_not_deleted() {
+        use crate::iroh_net::FolderItemOutcome as O;
+        let dir = temp_dir("d2-changed");
+        let f = dir.join("growing.mov");
+        std::fs::write(&f, b"first half").unwrap();
+        let fs_ = f.to_string_lossy().to_string();
+        let pre: HashMap<String, (u64, u64)> = [(fs_.clone(), version_of(&f))].into();
+        std::fs::write(&f, b"first half + second half").unwrap(); // still being written
+        let st = settle_batch(&[fs_.clone()], &pre, &report(vec![(&fs_, O::Landed)], false));
+        assert!(st.delivered.is_empty());
+        assert_eq!(st.retry, vec![fs_.clone()]);
+        assert!(auto_delete_targets(&st, false, true).is_empty());
+        // Vanished before sending → just dropped from the queue.
+        std::fs::remove_file(&f).unwrap();
+        let st = settle_batch(&[fs_.clone()], &pre, &report(vec![], false));
+        assert_eq!(st.gone, vec![fs_]);
+    }
+
+    /// D2: the idle rescan never queues a file that's still being written.
+    #[test]
+    fn seed_existing_skips_a_file_still_being_written() {
+        let dir = temp_dir("d2-seed");
+        let folder = dir.to_string_lossy().to_string();
+        std::fs::write(dir.join("done.txt"), b"complete").unwrap();
+        let growing = dir.join("copying.bin");
+        std::fs::write(&growing, b"x").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (g, st) = (growing.clone(), stop.clone());
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            while !st.load(Ordering::SeqCst) {
+                let mut f = std::fs::OpenOptions::new().append(true).open(&g).unwrap();
+                f.write_all(&[0u8; 4096]).unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        let queue = Arc::new(Mutex::new(SendQueue::default()));
+        let wake = Arc::new(Notify::new());
+        seed_existing_with(&folder, &inbound, &queue, &wake, Duration::from_millis(400));
+        stop.store(true, Ordering::SeqCst);
+        writer.join().unwrap();
+        let queued: Vec<String> = queue.lock().unwrap().iter().cloned().collect();
+        assert!(queued.iter().any(|p| p.ends_with("done.txt")));
+        assert!(!queued.iter().any(|p| p.ends_with("copying.bin")), "half-written file not queued");
+    }
+
+    /// D4: a delete only removes the VERSION the deleter had; a newer local edit
+    /// (different size/mtime) survives it.
+    #[test]
+    fn delete_with_known_version_spares_a_newer_local_edit() {
+        let dir = temp_dir("d4-known");
+        let folder = dir.to_string_lossy().to_string();
+        let f = dir.join("notes.txt");
+        write_with_mtime(&f, b"v1", 1_000_000);
+        let v1 = version_of(&f);
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        // We edited it after the peer deleted the old version.
+        write_with_mtime(&f, b"v2 - edited here", 2_000_000);
+        let mut ap = Vec::new();
+        let g = DeleteGuard { ts: now_ms() + 60_000, known: Some(v1), listed: None, require_known: false };
+        assert!(!apply_remote_delete(&folder, "notes.txt", &sd, &mut ap, 0, &g));
+        assert!(f.is_file(), "newer edit kept");
+        // The exact version the deleter had DOES go (archived, recoverable).
+        let g = DeleteGuard { ts: 1, known: Some(version_of(&f)), listed: None, require_known: false };
+        assert!(apply_remote_delete(&folder, "notes.txt", &sd, &mut ap, 0, &g));
+        assert!(!f.exists());
+        assert_eq!(crate::folder_history::load(&folder).len(), 1);
+    }
+
+    /// D4: without a known version (older peers / reconcile tombstones), a delete
+    /// older than the local copy's placement version is refused.
+    #[test]
+    fn late_delete_never_beats_a_newer_local_version() {
+        let dir = temp_dir("d4-late");
+        let folder = dir.to_string_lossy().to_string();
+        let f = dir.join("late.txt");
+        std::fs::write(&f, b"edited just now").unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let mut ap = Vec::new();
+        let stale = DeleteGuard { ts: now_ms() - 3_600_000, known: None, listed: None, require_known: false };
+        assert!(!apply_remote_delete(&folder, "late.txt", &sd, &mut ap, 0, &stale));
+        assert!(f.is_file());
+        let newer = DeleteGuard { ts: now_ms() + 60_000, known: None, listed: None, require_known: false };
+        assert!(apply_remote_delete(&folder, "late.txt", &sd, &mut ap, 0, &newer));
+    }
+
+    /// D4: a versioned-delete peer that names no version for an entry can only
+    /// remove an empty directory — never a file it never had.
+    #[test]
+    fn versioned_delete_without_a_version_never_removes_a_file() {
+        let dir = temp_dir("d4-require-known");
+        let folder = dir.to_string_lossy().to_string();
+        write_with_mtime(&dir.join("theirs-never-saw.txt"), b"mine", 1_000);
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let mut ap = Vec::new();
+        let g = DeleteGuard { ts: now_ms() + 60_000, known: None, listed: None, require_known: true };
+        assert!(!apply_remote_delete(&folder, "theirs-never-saw.txt", &sd, &mut ap, 0, &g));
+        assert!(dir.join("theirs-never-saw.txt").is_file());
+        std::fs::create_dir_all(dir.join("empty-dir")).unwrap();
+        let listed: HashSet<String> = ["empty-dir".to_string()].into();
+        let g = DeleteGuard { ts: now_ms() + 60_000, known: None, listed: Some(&listed), require_known: true };
+        assert!(apply_remote_delete(&folder, "empty-dir", &sd, &mut ap, 0, &g));
+        assert!(!dir.join("empty-dir").exists());
+    }
+
+    /// D4: a directory delete removes only what the deleter listed; a file it
+    /// never saw keeps the directory (and itself) alive.
+    #[test]
+    fn directory_delete_removes_only_listed_children() {
+        let dir = temp_dir("d4-dir");
+        let folder = dir.to_string_lossy().to_string();
+        write_with_mtime(&dir.join("trip/a.jpg"), b"a", 1_000);
+        write_with_mtime(&dir.join("trip/mine-only.jpg"), b"never synced", 1_000);
+        std::fs::write(dir.join("trip/.DS_Store"), b"junk").unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let listed: HashSet<String> = ["trip/a.jpg".to_string(), "trip".to_string()].into();
+        let mut ap = Vec::new();
+        let ga = DeleteGuard { ts: 1, known: Some(version_of(&dir.join("trip/a.jpg"))), listed: Some(&listed), require_known: false };
+        assert!(apply_remote_delete(&folder, "trip/a.jpg", &sd, &mut ap, 0, &ga));
+        let gd = DeleteGuard { ts: now_ms() + 60_000, known: None, listed: Some(&listed), require_known: false };
+        assert!(!apply_remote_delete(&folder, "trip", &sd, &mut ap, 0, &gd));
+        assert!(dir.join("trip/mine-only.jpg").is_file(), "unlisted file survives");
+        // Once only OS litter is left, the listed directory goes.
+        std::fs::remove_file(dir.join("trip/mine-only.jpg")).unwrap();
+        assert!(apply_remote_delete(&folder, "trip", &sd, &mut ap, 0, &gd));
+        assert!(!dir.join("trip").exists(), ".DS_Store doesn't keep a deleted folder alive");
+    }
+
+    /// D5: files we knew that vanished while DropBeam was closed are found — but
+    /// never when the whole folder vanished/emptied (unplugged drive), and never
+    /// for paths already tombstoned.
+    #[test]
+    fn missed_deletes_found_but_never_for_a_missing_or_emptied_folder() {
+        let dir = temp_dir("d5");
+        let folder = dir.to_string_lossy().to_string();
+        for n in ["a.txt", "b.txt", "c.txt", "d.txt", "sub/e.txt"] {
+            write_with_mtime(&dir.join(n), n.as_bytes(), 1_000);
+        }
+        let inbound: HashSet<String> = ["a.txt", "b.txt", "c.txt", "d.txt", "sub/e.txt"]
+            .iter()
+            .map(|n| file_sig(&dir.join(n).to_string_lossy(), &folder).unwrap())
+            .collect();
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        std::fs::remove_file(dir.join("sub/e.txt")).unwrap();
+        let mut tombs = HashMap::new();
+        let found = missed_deletes(&folder, &inbound, &tombs);
+        let mut keys: Vec<_> = found.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["b.txt", "sub/e.txt"]);
+        assert_eq!(found["b.txt"], (5, 1_000), "carries the version we had");
+        tombs.insert("b.txt".to_string(), 5);
+        assert_eq!(missed_deletes(&folder, &inbound, &tombs).len(), 1, "already tombstoned");
+        // Everything gone at once = drive problem, not a delete.
+        for n in ["a.txt", "c.txt", "d.txt"] {
+            std::fs::remove_file(dir.join(n)).unwrap();
+        }
+        assert!(missed_deletes(&folder, &inbound, &HashMap::new()).is_empty());
+        // Root missing entirely.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(missed_deletes(&folder, &inbound, &HashMap::new()).is_empty());
+    }
+
+    /// D6: a receive into a folder whose drive is unplugged lands nothing, never
+    /// recreates the path, and reports every item Failed (so the sender retries).
+    #[test]
+    fn receive_into_missing_folder_fails_and_never_recreates_it() {
+        let dir = temp_dir("d6");
+        let staging = dir.join("staging");
+        write_with_mtime(&staging.join("x/photo.jpg"), b"img", 1_000);
+        let folder = dir.join("Volumes/Unplugged/Shared");
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let r = move_staged_into_folder(&staging, &folder.to_string_lossy(), &inbound, true, false, &sd, &LandCtx::default());
+        assert!(r.moved.is_empty());
+        assert_eq!(r.outcomes.get("x/photo.jpg"), Some(&crate::iroh_net::FolderItemOutcome::Failed));
+        assert!(!folder.exists() && !dir.join("Volumes").exists(), "missing root not recreated");
+        let mut ap = Vec::new();
+        assert!(!apply_remote_delete(&folder.to_string_lossy(), "x/photo.jpg", &sd, &mut ap, 0, &DeleteGuard::any()));
+    }
+
+    /// D1 receiver side: a replace whose archive fails keeps the local file and
+    /// reports Failed — never removes the only copy.
+    #[cfg(unix)]
+    #[test]
+    fn replace_never_removes_local_copy_when_archive_fails() {
+        let dir = temp_dir("d1-archive-fail");
+        let folder = dir.join("f");
+        write_with_mtime(&folder.join("doc.txt"), b"local only copy", 1_000);
+        // Unreadable history index → archive refuses.
+        std::fs::create_dir_all(folder.join(".dropbeam-history/index.json")).unwrap();
+        let staging = dir.join("staging");
+        write_with_mtime(&staging.join("doc.txt"), b"incoming", 2_000);
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let r = move_staged_into_folder(&staging, &folder.to_string_lossy(), &inbound, true, false, &sd, &LandCtx::default());
+        assert_eq!(r.outcomes.get("doc.txt"), Some(&crate::iroh_net::FolderItemOutcome::Failed));
+        assert_eq!(std::fs::read(folder.join("doc.txt")).unwrap(), b"local only copy");
+    }
+
+    /// Tombstone-TTL backstop: a copy of a version we deleted, made BEFORE we
+    /// deleted it (a device offline > 45 days), isn't resurrected; a fresh re-add
+    /// of identical bytes is.
+    #[test]
+    fn stale_copy_of_a_deleted_version_is_not_resurrected() {
+        let dir = temp_dir("ttl");
+        let folder = dir.join("f");
+        std::fs::create_dir_all(&folder).unwrap();
+        let staging = dir.join("staging");
+        write_with_mtime(&staging.join("old.txt"), b"old", 1_000);
+        let sig = "old.txt|3|1000".to_string();
+        let deleted_at = 5_000_000u64;
+        let ctx = |ver: u64| LandCtx {
+            vers: [("old.txt".to_string(), ver)].into(),
+            deleted_at: Some(Box::new({
+                let sig = sig.clone();
+                move |s: &str| (s == sig).then_some(deleted_at)
+            })),
+        };
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let r = move_staged_into_folder(&staging, &folder.to_string_lossy(), &inbound, true, true, &sd, &ctx(1_000_000));
+        assert_eq!(r.outcomes.get("old.txt"), Some(&crate::iroh_net::FolderItemOutcome::Kept("deleted".into())));
+        assert!(!folder.join("old.txt").exists());
+        write_with_mtime(&staging.join("old.txt"), b"old", 1_000);
+        let r = move_staged_into_folder(&staging, &folder.to_string_lossy(), &inbound, true, true, &sd, &ctx(9_000_000));
+        assert_eq!(r.outcomes.get("old.txt"), Some(&crate::iroh_net::FolderItemOutcome::Landed));
+        assert!(folder.join("old.txt").is_file(), "a re-add after the delete lands");
+    }
+
+    /// D7: on a case-insensitive volume a peer file that differs only in letter
+    /// case is the SAME file — never "missing", so a case-only rename can't loop.
+    #[test]
+    fn case_only_difference_is_not_missing_on_case_insensitive_volume() {
+        let mine: HashMap<String, FileEntry> = [("Photo.jpg".to_string(), fe(10, 5))].into();
+        let peer: HashMap<String, (u64, u64)> = [("photo.jpg".to_string(), (10, 5))].into();
+        let none = HashMap::new();
+        assert_eq!(reconcile_plan_ci(&mine, &peer, &none, &none, TEST_NOW, false).push, vec!["Photo.jpg"]);
+        assert!(reconcile_plan_ci(&mine, &peer, &none, &none, TEST_NOW, true).push.is_empty());
+        // Two peer files folding to one name (a case-sensitive peer) → ambiguous:
+        // fall back to exact-name behaviour.
+        let peer2: HashMap<String, (u64, u64)> =
+            [("photo.jpg".to_string(), (10, 5)), ("PHOTO.jpg".to_string(), (11, 5))].into();
+        assert_eq!(reconcile_plan_ci(&mine, &peer2, &none, &none, TEST_NOW, true).push, vec!["Photo.jpg"]);
+    }
+
+    /// D7: on a case-insensitive volume, a case-only rename from the peer renames
+    /// in place (never archives the only copy), a delete of the OLD spelling never
+    /// removes the renamed file, and a newer incoming spelling is adopted.
+    #[test]
+    fn case_only_rename_is_a_rename_never_a_delete() {
+        let dir = temp_dir("d7");
+        let folder = dir.to_string_lossy().to_string();
+        if !folder_case_insensitive(&folder) {
+            return; // only meaningful on APFS/NTFS-style volumes
+        }
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        write_with_mtime(&dir.join("photo.jpg"), b"bytes", 1_000);
+        // Peer renamed photo.jpg → Photo.jpg.
+        assert!(apply_remote_move(&folder, "photo.jpg", "Photo.jpg", 5, 1_000, &sd, &inbound, 0));
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert!(names.contains(&"Photo.jpg".to_string()), "{names:?}");
+        assert!(crate::folder_history::load(&folder).is_empty(), "nothing archived");
+        // The backstop delete of the old spelling must not touch the renamed file.
+        let mut ap = Vec::new();
+        let g = DeleteGuard { ts: now_ms() + 60_000, known: Some((5, 1_000)), listed: None, require_known: false };
+        assert!(!apply_remote_delete(&folder, "photo.jpg", &sd, &mut ap, 0, &g));
+        assert!(dir.join("Photo.jpg").is_file());
+        // Receiving the old spelling from an older-version sender keeps ours…
+        let staging = dir.join("..").join(format!("stg-{}", std::process::id()));
+        write_with_mtime(&staging.join("photo.jpg"), b"bytes", 1_000);
+        let ctx = LandCtx { vers: [("photo.jpg".to_string(), 1)].into(), deleted_at: None };
+        let r = move_staged_into_folder(&staging, &folder, &inbound, true, false, &sd, &ctx);
+        assert!(matches!(r.outcomes.get("photo.jpg"), Some(crate::iroh_net::FolderItemOutcome::Kept(_))));
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert!(names.contains(&"Photo.jpg".to_string()));
+        // …but a NEWER spelling is adopted (renamed in place, same bytes).
+        write_with_mtime(&staging.join("PHOTO.jpg"), b"bytes", 1_000);
+        let ctx = LandCtx { vers: [("PHOTO.jpg".to_string(), now_ms() + 60_000)].into(), deleted_at: None };
+        let r = move_staged_into_folder(&staging, &folder, &inbound, true, false, &sd, &ctx);
+        assert_eq!(r.outcomes.get("PHOTO.jpg"), Some(&crate::iroh_net::FolderItemOutcome::Landed));
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| !n.starts_with('.')).collect();
+        assert_eq!(names, vec!["PHOTO.jpg".to_string()]);
+        let _ = std::fs::remove_dir_all(staging);
+    }
+
+    #[test]
+    fn peer_kept_warning_names_the_problem() {
+        let mut m = HashMap::new();
+        assert!(skipped_warning(&m, "Ethan").is_none());
+        m.insert("sub/a:b.txt|3|9".to_string(), "name".to_string());
+        m.insert("x.txt|1|1".to_string(), "conflict".to_string());
+        let w = skipped_warning(&m, "Ethan").unwrap();
+        assert!(w.contains("1 file") && w.contains("Ethan") && w.contains("a:b.txt"), "{w}");
+    }
+
+    /// P3: a viewer promoted to editor doesn't push what it changed while
+    /// read-only — those files are baselined until edited again.
+    #[test]
+    fn promotion_baselines_existing_files() {
+        let dir = temp_dir("promote");
+        let cfg = temp_dir("promote-cfg");
+        std::fs::write(dir.join("viewer-edit.txt"), b"local change").unwrap();
+        std::fs::write(dir.join(".hidden"), b"x").unwrap();
+        let pair = Pair {
+            id: "p1".into(), role: crate::models::PairRole::B, peer_name: String::new(), secret: "s".into(),
+            folder: dir.to_string_lossy().to_string(), two_way: true, mirror: true, auto_delete: false,
+            delete_mode: DeleteMode::Trash, created_at: 0, endpoint_id: None, group_id: None,
+            i_am_viewer: false, peer_is_viewer: false, owner_eid: None, role_epoch: 0, paused: false, pause_epoch: 0,
+        };
+        assert_eq!(baseline_on_promotion(&cfg, &pair), 1);
+        let inbound = Arc::new(Mutex::new(load_manifest(&cfg, "p1")));
+        assert!(!is_sendable_candidate(&dir.join("viewer-edit.txt").to_string_lossy(), &pair.folder, &inbound));
+        let sig = file_sig(&dir.join("viewer-edit.txt").to_string_lossy(), &pair.folder).unwrap();
+        assert!(load_skipped(&cfg, "p1").contains_key(&sig), "reconcile won't push it either");
+    }
+
+    #[test]
+    fn live_receive_placeholder_is_never_swept() {
+        let dir = temp_dir("placeholder");
+        let ph = dir.join("big.mov.dropbeam-incoming");
+        std::fs::write(&ph, b"").unwrap();
+        // Make it look old (a long receive).
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new().write(true).open(&ph).unwrap().set_modified(old).unwrap();
+        placeholder_active(&ph, true);
+        sweep_stale_placeholder(&ph);
+        assert!(ph.exists(), "active receive keeps its placeholder");
+        placeholder_active(&ph, false);
+        sweep_stale_placeholder(&ph);
+        assert!(!ph.exists(), "orphan swept once the receive is gone");
+    }
+
+    /// D15: where there's no ctime, a file first seen NOW reads as new even if its
+    /// own dates are old (a moved-in file), and a rewrite resets it.
+    #[test]
+    fn first_seen_marks_a_moved_in_old_file_as_new() {
+        let p = PathBuf::from("/nonexistent/first-seen-test.bin");
+        assert_eq!(first_seen_ms(&p, 10, 100, 5_000), 5_000);
+        assert_eq!(first_seen_ms(&p, 10, 100, 9_000), 5_000, "stable while unchanged");
+        assert_eq!(first_seen_ms(&p, 11, 100, 9_000), 9_000, "a different file there is new");
     }
 }

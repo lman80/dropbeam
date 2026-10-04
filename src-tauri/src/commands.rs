@@ -975,7 +975,9 @@ pub fn stop_folder_transfer(sync: State<'_, Arc<SyncManager>>, pair_id: String) 
 /// newest toggle wins. While paused nothing syncs; Resume runs the normal reconcile.
 #[tauri::command]
 pub fn set_folder_paused(sync: State<'_, Arc<SyncManager>>, pair_id: String, paused: bool) {
-    sync.set_paused(&pair_id, paused, chat::now_ms());
+    // max(now, last epoch + 1): a toggle must beat the one it replaces even when
+    // this clock runs behind the device that set the last one (D16).
+    sync.set_paused_now(&pair_id, paused);
 }
 
 #[tauri::command]
