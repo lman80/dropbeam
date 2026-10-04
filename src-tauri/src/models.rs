@@ -519,6 +519,9 @@ pub struct FolderHistorySummary {
     pub item_count: u64,
     /// Timestamp (ms) of the oldest saved copy, if any.
     pub oldest_ms: Option<u64>,
+    /// Copies the disk-safety limit had to move to the OS Trash (since launch).
+    #[serde(default)]
+    pub overflow_trashed: u64,
 }
 
 /// A friend — a named peer you can send files to directly, no code needed.
@@ -634,6 +637,13 @@ pub struct FolderStatus {
     /// Live connection detail for the active folder transfer (inspector data).
     #[serde(default)]
     pub conn_detail: Option<ConnDetail>,
+    /// The folder isn't on disk (unplugged drive, moved/renamed). Nothing syncs.
+    #[serde(default)]
+    pub folder_missing: bool,
+    /// Something worth telling the user that isn't an error — e.g. files the peer
+    /// can't hold under their names (Windows-illegal characters).
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// The honest answer to "are these two folders identical?", returned by the

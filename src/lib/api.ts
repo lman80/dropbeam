@@ -220,6 +220,8 @@ export interface FolderHistorySummary {
   bytes: number
   itemCount: number
   oldestMs: number | null
+  /** Older copies moved to the OS Trash because the disk was nearly full. */
+  overflowTrashed?: number
 }
 
 export type PairRole = 'a' | 'b'
@@ -422,6 +424,10 @@ export interface FolderStatus {
   paused?: boolean
   /** Live connection detail for the active folder transfer. */
   connDetail?: ConnDetail | null
+  /** The folder isn't on disk (unplugged drive / moved). Nothing syncs. */
+  folderMissing?: boolean
+  /** A non-error heads-up, e.g. files the peer can't hold under their names. */
+  warning?: string | null
 }
 
 /** The honest answer to "are these two folders identical?" from `verifyFolder`.

@@ -992,7 +992,9 @@ pub fn stop_folder_transfer(sync: State<'_, Arc<SyncManager>>, pair_id: String) 
 /// newest toggle wins. While paused nothing syncs; Resume runs the normal reconcile.
 #[tauri::command]
 pub fn set_folder_paused(sync: State<'_, Arc<SyncManager>>, pair_id: String, paused: bool) {
-    sync.set_paused(&pair_id, paused, chat::now_ms());
+    // max(now, last epoch + 1): a toggle must beat the one it replaces even when
+    // this clock runs behind the device that set the last one (D16).
+    sync.set_paused_now(&pair_id, paused);
 }
 
 #[tauri::command]
@@ -2038,6 +2040,7 @@ fn folder_history_summary_blocking(state: &Arc<AppState>) -> Vec<crate::models::
             let items = folder_history::load(&folder);
             let bytes = folder_history::folder_size(&folder);
             let oldest_ms = items.iter().map(|i| i.timestamp_ms).min();
+            let overflow_trashed = folder_history::overflow_notice(&folder).map(|n| n.0).unwrap_or(0);
             crate::models::FolderHistorySummary {
                 pair_id,
                 folder_name: folder_display_name(&folder),
@@ -2045,9 +2048,10 @@ fn folder_history_summary_blocking(state: &Arc<AppState>) -> Vec<crate::models::
                 bytes,
                 item_count: items.len() as u64,
                 oldest_ms,
+                overflow_trashed,
             }
         })
-        .filter(|s| s.item_count > 0)
+        .filter(|s| s.item_count > 0 || s.overflow_trashed > 0)
         .collect()
 }
 

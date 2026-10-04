@@ -160,7 +160,7 @@ export function RecoverableFilesView() {
           <div className="row-main">
             <div className="row-title tnum">{formatBytes(total)} used</div>
             <div className="row-sub">
-              {budget > 0 ? `Up to ${formatBytes(budget)} per folder · old copies are removed automatically` : 'No storage limit'}
+              {budget > 0 ? `Up to ${formatBytes(budget)} per folder · copies from the last 30 days are always kept` : 'No storage limit'}
             </div>
             {limit > 0 && <ProgressBar percent={(total / Math.max(total, limit, 1)) * 100} label="Storage used by saved copies" />}
           </div>
@@ -174,6 +174,23 @@ export function RecoverableFilesView() {
           </div>
         </div>
       </div>
+
+      {(() => {
+        const trashed = summaries.reduce((n, f) => n + (f.overflowTrashed ?? 0), 0)
+        return trashed > 0 ? (
+          <div className="group">
+            <div className="row">
+              <div className="row-main">
+                <div className="row-title">Some older copies were moved to the Trash</div>
+                <div className="row-sub">
+                  Your disk was nearly full, so {trashed} older saved cop{trashed === 1 ? 'y was' : 'ies were'} moved to the
+                  Trash to make room. {trashed === 1 ? 'It' : 'They'} can still be restored from there until you empty it.
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null
+      })()}
 
       {summaries.map((f) => (
         <FolderSection
