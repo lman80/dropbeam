@@ -220,6 +220,8 @@ export interface FolderHistorySummary {
   bytes: number
   itemCount: number
   oldestMs: number | null
+  /** Older copies moved to the OS Trash because the disk was nearly full. */
+  overflowTrashed?: number
 }
 
 export type PairRole = 'a' | 'b'

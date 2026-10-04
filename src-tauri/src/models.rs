@@ -519,6 +519,9 @@ pub struct FolderHistorySummary {
     pub item_count: u64,
     /// Timestamp (ms) of the oldest saved copy, if any.
     pub oldest_ms: Option<u64>,
+    /// Copies the disk-safety limit had to move to the OS Trash (since launch).
+    #[serde(default)]
+    pub overflow_trashed: u64,
 }
 
 /// A friend — a named peer you can send files to directly, no code needed.

@@ -1950,6 +1950,7 @@ fn folder_history_summary_blocking(state: &Arc<AppState>) -> Vec<crate::models::
             let items = folder_history::load(&folder);
             let bytes = folder_history::folder_size(&folder);
             let oldest_ms = items.iter().map(|i| i.timestamp_ms).min();
+            let overflow_trashed = folder_history::overflow_notice(&folder).map(|n| n.0).unwrap_or(0);
             crate::models::FolderHistorySummary {
                 pair_id,
                 folder_name: folder_display_name(&folder),
@@ -1957,9 +1958,10 @@ fn folder_history_summary_blocking(state: &Arc<AppState>) -> Vec<crate::models::
                 bytes,
                 item_count: items.len() as u64,
                 oldest_ms,
+                overflow_trashed,
             }
         })
-        .filter(|s| s.item_count > 0)
+        .filter(|s| s.item_count > 0 || s.overflow_trashed > 0)
         .collect()
 }
 
