@@ -1219,7 +1219,7 @@ pub(crate) fn completed_side_effects(
 /// edit/unsend/reaction — whether it arrived directly or through a Transfer
 /// Server (`via` = that server's name). Returns whether it applied (false for a
 /// stranger, or an op whose target we don't have). Emits to the UI when running.
-pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &str, req: &serde_json::Value, via: Option<&str>, _sent_ms: Option<u64>) -> bool {
+pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &str, req: &serde_json::Value, via: Option<&str>, _sent_ms: Option<u64>) -> Result<bool> {
     let app = state.app.get().cloned();
     let mut applied = true;
     let msg_kind = req.get("msgKind").and_then(|k| k.as_str()).unwrap_or("text");
@@ -1234,6 +1234,11 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
             "reaction" => {
                 if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
                     let emoji = req.get("emoji").and_then(|e| e.as_str()).unwrap_or("");
+                    // S8: an emoji is a few code points; anything longer is
+                    // junk — acknowledge it (so it isn't retried) and drop it.
+                    if emoji.is_empty() || emoji.chars().count() > crate::chat::MAX_EMOJI_CHARS {
+                        return Ok(true);
+                    }
                     let add = req.get("add").and_then(|a| a.as_bool()).unwrap_or(true);
                     // None = we don't have the target message yet → tell the
                     // sender (applied=false) so it KEEPS the op queued to
@@ -1250,7 +1255,8 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
             }
             "edit" => {
                 if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
-                    let new_text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    let new_text = crate::chat::cap_text(req.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                    let new_text = new_text.as_str();
                     // author_is_me=false: a remote edit may only touch
                     // the PEER's own message, never one we authored.
                     match crate::chat::apply_edit(config_dir, &peer_id, target, new_text, false)
@@ -1274,17 +1280,19 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
             }
             _ => {
                 // A new text / file / gif message.
-                let text =
-                    req.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                // S8: bound every field a peer controls before it's stored.
+                let text = crate::chat::cap_text(req.get("text").and_then(|t| t.as_str()).unwrap_or(""));
                 let files: Vec<String> = req
                     .get("files")
                     .and_then(|f| f.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(crate::chat::cap_file_name))
+                        .take(crate::chat::MAX_FILE_NAMES).collect())
                     .unwrap_or_default();
                 let bytes = req.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
                 let id = req
                     .get("id")
                     .and_then(|i| i.as_str())
+                    .filter(|i| !i.is_empty() && i.len() <= crate::chat::MAX_ID_LEN)
                     .map(String::from)
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let ts = req.get("ts").and_then(|t| t.as_u64()).unwrap_or_else(crate::chat::now_ms);
@@ -1292,17 +1300,20 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                 // everything we already have if its seq is stale/absent.
                 let recv_seq = req.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
                 let seq = recv_seq.max(crate::chat::next_seq(config_dir, &peer_id));
-                let reply_to = req.get("replyTo").and_then(|r| r.as_str()).map(String::from);
+                let reply_to = req.get("replyTo").and_then(|r| r.as_str())
+                    .filter(|r| r.len() <= crate::chat::MAX_ID_LEN).map(String::from);
                 let reply_preview =
-                    req.get("replyPreview").and_then(|r| r.as_str()).map(String::from);
+                    req.get("replyPreview").and_then(|r| r.as_str()).map(crate::chat::cap_preview);
                 let gif: Option<crate::chat::GifMeta> =
-                    req.get("gif").and_then(|g| serde_json::from_value(g.clone()).ok());
+                    req.get("gif").and_then(|g| serde_json::from_value(g.clone()).ok())
+                        .filter(crate::chat::gif_within_limits);
                 let is_file = msg_kind == "file" || msg_kind == "gif";
                 // #47: a preview the sender fetched — re-checked, never re-fetched.
                 let link_preview = if is_file { None } else {
                     req.get("linkPreview")
                         .and_then(|v| serde_json::from_value::<crate::link_preview::LinkPreview>(v.clone()).ok())
                         .and_then(crate::link_preview::sanitize)
+                        .and_then(|p| crate::link_preview::for_text(p, &text))
                 };
                 // Through a server the note can arrive before its bytes: the path
                 // is set when the file itself lands (land_server_files).
@@ -1341,8 +1352,13 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     via: via.map(String::from),
                     deliveries: vec![],
                     link_preview,
+                    text_rev: 0, reaction_revs: vec![],
                 };
-                if crate::chat::append(config_dir, &msg) {
+                // D11: acknowledged only once it's on disk (Err → no ack, so the
+                // sender / Transfer Server keeps its copy and retries).
+                let stored = crate::chat::append_durable(config_dir, &msg)
+                    .map_err(|e| anyhow::anyhow!("could not save the message: {e}"))?;
+                if stored {
                     // iPhone: the push banner may already have announced it.
                     let announced = crate::mailbox::push::already_announced(config_dir, &msg.id);
                     crate::mailbox::push::note_have(config_dir, &[msg.id.as_str()]);
@@ -1358,7 +1374,7 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
             }
         }
     }
-    applied
+    Ok(applied)
 }
 
 /// Where received files land: the configured download folder, else the OS
@@ -1435,6 +1451,7 @@ pub(crate) fn land_server_files(
             via: Some(server_name.to_owned()),
             deliveries: vec![],
             link_preview: None,
+            text_rev: 0, reaction_revs: vec![],
         };
         if crate::chat::append(config, &msg) {
             changed = Some(msg);
@@ -4020,7 +4037,7 @@ async fn serve_stream_inner(
             // — only then does it drop the op. Stays true for plain messages.
             let who = conn.remote_id().to_string();
             let applied = match location_config(state) {
-                Ok(config_dir) => apply_incoming_chat(state, &config_dir, &who, &req, None, None),
+                Ok(config_dir) => apply_incoming_chat(state, &config_dir, &who, &req, None, None)?,
                 Err(_) => true,
             };
             // Any inbound chat frame is proof the sender is ONLINE — kick the outbox
@@ -5427,7 +5444,7 @@ fn send_friend_inner(
                 u.bytes_total = total;
                 u.bytes_done = total;
                 u.percent = 100.0;
-                u.detail = Some(format!("Delivered to {} — reaches {} when they're online", held.name, friend_name));
+                u.detail = Some(format!("Held on {} — reaches {} when they're online", held.name, friend_name));
                 u.held_on = Some(held.name.clone());
                 emit(&app, &u);
                 crate::mailbox::client::wake();

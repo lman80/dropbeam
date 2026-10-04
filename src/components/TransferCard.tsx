@@ -369,6 +369,6 @@ function statusLabel(t: TransferUpdate): string {
     case 'paused':
       return 'Paused'
     case 'held':
-      return `Delivered to ${t.heldOn ?? 'your Transfer Server'} — reaches ${fn ?? 'them'} when they’re online`
+      return `Held on ${t.heldOn ?? 'your Transfer Server'} — reaches ${fn ?? 'them'} when they’re online`
   }
 }

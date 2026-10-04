@@ -1001,7 +1001,7 @@ enum ServerCopy {
         }
     }
     static func held(server: String?, friend: String) -> String {
-        "Delivered to \(server ?? "your Transfer Server") — reaches \(friend) when they’re online"
+        "Held on \(server ?? "your Transfer Server") — reaches \(friend) when they’re online"
     }
     static func firstName(_ name: String) -> String { name.split(separator: " ").first.map(String.init) ?? name }
 }

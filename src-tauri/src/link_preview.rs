@@ -193,7 +193,9 @@ pub async fn fetch(url: &str) -> Option<LinkPreview> {
         let (image, w, h) = thumbnail(bytes).await?;
         return Some(LinkPreview {
             site_name: final_url.host_str().map(display_host),
-            url: final_url.to_string(),
+            // The link as written: the receiver only shows a card whose host
+            // matches the link in the text (S6), so a redirect must not change it.
+            url: start.to_string(),
             title: None,
             description: None,
             image: Some(image),
@@ -207,7 +209,7 @@ pub async fn fetch(url: &str) -> Option<LinkPreview> {
     let body = read_capped(resp, MAX_HTML, true).await;
     let meta = parse_html(&String::from_utf8_lossy(&body));
     let mut preview = LinkPreview {
-        url: final_url.to_string(),
+        url: start.to_string(),
         title: meta.title,
         description: meta.description,
         site_name: meta.site_name.or_else(|| final_url.host_str().map(display_host)),
@@ -229,6 +231,15 @@ pub async fn fetch(url: &str) -> Option<LinkPreview> {
         }
     }
     sanitize(preview)
+}
+
+/// A friend's preview, kept only when it describes the link actually in the
+/// message text (same host, ignoring case and a leading "www."): otherwise a
+/// message linking evil.example could carry a card that claims to be a bank (S6).
+pub fn for_text(p: LinkPreview, text: &str) -> Option<LinkPreview> {
+    let host = |u: &str| Url::parse(u).ok().and_then(|u| u.host_str().map(|h| display_host(&h.to_ascii_lowercase())));
+    let linked = host(&first_url(text)?)?;
+    (host(&p.url)? == linked).then_some(p)
 }
 
 fn display_host(h: &str) -> String {
@@ -385,6 +396,17 @@ pub fn sanitize(p: LinkPreview) -> Option<LinkPreview> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_preview_must_describe_the_link_in_the_text() {
+        let p = |url: &str| LinkPreview { url: url.into(), title: Some("PayPal — Log in".into()), description: None,
+            site_name: Some("PayPal".into()), image: None, image_w: 0, image_h: 0 };
+        assert!(for_text(p("https://www.paypal.com/signin"), "pay here https://evil.example/login").is_none());
+        assert!(for_text(p("https://paypal.com.evil.example/"), "https://paypal.com").is_none());
+        assert!(for_text(p("https://paypal.com/"), "no link at all").is_none());
+        assert!(for_text(p("https://www.Example.com/a"), "see https://example.com/b").is_some());
+        assert!(for_text(p("https://example.com/a"), "see HTTPS://WWW.EXAMPLE.COM").is_some());
+    }
 
     #[test]
     fn finds_the_first_link() {

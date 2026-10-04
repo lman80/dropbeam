@@ -1357,6 +1357,7 @@ pub async fn send_chat_message(
         via: None,
         deliveries: vec![],
         link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1547,6 +1548,7 @@ pub(crate) fn post_file_note(
         via: None,
         deliveries: file_xfer_id_deliveries,
         link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1785,6 +1787,7 @@ pub async fn send_chat_gif(
         via: None,
         deliveries: vec![],
         link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);

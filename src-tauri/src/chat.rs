@@ -32,6 +32,36 @@ static CACHE: Mutex<Option<HashMap<PathBuf, HashMap<String, Vec<ChatMessage>>>>>
 /// Keep each conversation bounded so chats.json can't grow without limit.
 const MAX_PER_PEER: usize = 2000;
 
+// S8: bounds on every field a peer controls in an incoming chat frame (the
+// frame itself may be up to 1 MiB, and chats.json is rewritten per message).
+pub const MAX_TEXT_CHARS: usize = 4000;
+pub const MAX_PREVIEW_CHARS: usize = 160;
+pub const MAX_EMOJI_CHARS: usize = 16;
+pub const MAX_ID_LEN: usize = 128;
+pub const MAX_FILE_NAMES: usize = 1000;
+const MAX_FILE_NAME_CHARS: usize = 255;
+
+fn take_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+/// A message's text, bounded.
+pub fn cap_text(s: &str) -> String {
+    take_chars(s, MAX_TEXT_CHARS)
+}
+/// A reply's one-line quote, bounded.
+pub fn cap_preview(s: &str) -> String {
+    take_chars(s, MAX_PREVIEW_CHARS)
+}
+/// A shared file's display name, bounded.
+pub fn cap_file_name(s: &str) -> String {
+    take_chars(s, MAX_FILE_NAME_CHARS)
+}
+/// A GIF attachment whose fields are a sane size (else it's dropped).
+pub fn gif_within_limits(g: &GifMeta) -> bool {
+    g.provider.len() <= 32 && g.id.len() <= MAX_ID_LEN && g.url.len() <= 2048 && g.page.len() <= 2048
+        && g.w <= 10_000 && g.h <= 10_000
+}
+
 /// A GIF attached to a chat message (Giphy). Optional metadata that rides the
 /// wire frame so an updated peer can render a dedicated GIF bubble; older peers
 /// ignore it and just see the `.gif` file.
@@ -143,6 +173,30 @@ pub struct ChatMessage {
     /// contacts the site. Older builds ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_preview: Option<crate::link_preview::LinkPreview>,
+    /// Own-device sync clock for the TEXT alone (edit/unsend), so a reaction
+    /// made on one device and an edit made on another both survive the merge
+    /// instead of the newer whole record overwriting the other (D17).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub text_rev: u64,
+    /// Own-device sync clocks per reaction — including removed ones — so
+    /// concurrent reactions on two devices merge per reaction (D17).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reaction_revs: Vec<ReactionRev>,
+}
+
+/// When a reaction was last added or removed on this user's devices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionRev {
+    pub emoji: String,
+    pub from_me: bool,
+    pub at: u64,
+    /// false = removed (a tombstone, so an older copy can't bring it back).
+    pub on: bool,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Stable causal order: logical seq first, then wall-clock, then id as a final
@@ -179,6 +233,14 @@ fn store_mut<'a>(
 }
 
 fn save_all(config_dir: &Path, all: &HashMap<String, Vec<ChatMessage>>) {
+    if let Err(e) = try_save_all(config_dir, all) {
+        log::error!("chat::save_all failed to persist chats.json: {e}");
+    }
+}
+
+/// Persist the store, reporting failure (D11: an incoming message is only
+/// acknowledged once it is on disk — a Transfer Server deletes its copy on ack).
+fn try_save_all(config_dir: &Path, all: &HashMap<String, Vec<ChatMessage>>) -> Result<(), String> {
     crate::account::note_change();
     let _ = fs::create_dir_all(config_dir);
     // Compact JSON, not pretty: chats.json is machine-read only and can reach MBs
@@ -190,11 +252,9 @@ fn save_all(config_dir: &Path, all: &HashMap<String, Vec<ChatMessage>>) {
             // acked over the wire yet silently lost from chats.json (Windows handle
             // contention), so the thread looks complete in-session but is missing
             // after a restart. Log it so the diagnostics digest catches the loss.
-            if let Err(e) = write_atomic(&chats_path(config_dir), txt.as_bytes()) {
-                log::error!("chat::save_all failed to persist chats.json: {e}");
-            }
+            write_atomic(&chats_path(config_dir), txt.as_bytes()).map_err(|e| e.to_string())
         }
-        Err(e) => log::error!("chat::save_all failed to serialize chats: {e}"),
+        Err(e) => Err(format!("cannot serialize chats: {e}")),
     }
 }
 
@@ -211,28 +271,55 @@ pub fn messages(config_dir: &Path, peer_id: &str) -> Vec<ChatMessage> {
 /// `false` if it was a duplicate we'd already stored (so callers can skip the
 /// live event and avoid double-rendering).
 pub fn append(config_dir: &Path, msg: &ChatMessage) -> bool {
+    match append_inner(config_dir, msg, false) {
+        Ok(new) => new,
+        Err(e) => {
+            log::error!("chat::append failed to persist chats.json: {e}");
+            true
+        }
+    }
+}
+
+/// `append` for a message someone else sent us: Err (and the message is NOT
+/// kept) when it couldn't be written to disk, so the caller doesn't
+/// acknowledge it — the sender (or the Transfer Server holding it) keeps its
+/// copy and tries again instead of deleting the only one (D11).
+pub fn append_durable(config_dir: &Path, msg: &ChatMessage) -> Result<bool, String> {
+    append_inner(config_dir, msg, true)
+}
+
+fn append_inner(config_dir: &Path, msg: &ChatMessage, durable: bool) -> Result<bool, String> {
     let mut cache = CACHE.lock().unwrap();
     let all = store_mut(&mut cache, config_dir);
     let thread = all.entry(msg.peer_id.clone()).or_default();
     // Dedup scoped by direction: an incoming (peer-chosen) id can never collide
     // with one of OUR outgoing ids and silently suppress a real message.
     if thread.iter().any(|m| m.id == msg.id && m.from_me == msg.from_me) {
-        return false;
+        return Ok(false);
     }
     // A linked manifest is immutable, including across differently named notes.
     if let Some(link) = &msg.file_xfer_id {
         if thread.iter().any(|m| m.from_me == msg.from_me && m.file_xfer_id.as_ref() == Some(link)) {
-            return false;
+            return Ok(false);
         }
     }
     thread.push(msg.clone());
     thread.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
+    let mut trimmed = Vec::new();
     if thread.len() > MAX_PER_PEER {
         let drop = thread.len() - MAX_PER_PEER;
-        thread.drain(0..drop);
+        trimmed = thread.drain(0..drop).collect();
     }
-    save_all(config_dir, all);
-    true
+    if let Err(e) = try_save_all(config_dir, all) {
+        if durable {
+            // Undo in memory too, so memory never claims what disk lacks.
+            let thread = all.entry(msg.peer_id.clone()).or_default();
+            thread.retain(|m| !(m.id == msg.id && m.from_me == msg.from_me));
+            thread.splice(0..0, trimmed);
+        }
+        return Err(e);
+    }
+    Ok(true)
 }
 
 /// Drop a whole conversation (e.g. when a friend is removed).
@@ -501,10 +588,19 @@ pub fn apply_reaction(
     };
     if changed {
         msg.rev = bump_rev(msg.rev);
+        let at = msg.rev;
+        note_reaction_rev(msg, emoji, from_me, at, add);
     }
     let out = msg.clone();
     save_all(config_dir, &all);
     Some(out)
+}
+
+fn note_reaction_rev(msg: &mut ChatMessage, emoji: &str, from_me: bool, at: u64, on: bool) {
+    match msg.reaction_revs.iter_mut().find(|r| r.from_me == from_me && r.emoji == emoji) {
+        Some(r) => { r.at = r.at.max(at); r.on = on; }
+        None => msg.reaction_revs.push(ReactionRev { emoji: emoji.to_owned(), from_me, at, on }),
+    }
 }
 
 /// Edit a stored message's text (the author changed it). Marks it `edited`.
@@ -531,6 +627,7 @@ pub fn apply_edit(
     }
     msg.edited = true;
     msg.rev = bump_rev(msg.rev);
+    msg.text_rev = msg.rev;
     let out = msg.clone();
     save_all(config_dir, &all);
     Some(out)
@@ -559,13 +656,14 @@ pub fn apply_delete(
     msg.gif = None;
     msg.reactions.clear();
     msg.rev = bump_rev(msg.rev);
+    msg.text_rev = msg.rev;
     let out = msg.clone();
     save_all(config_dir, &all);
     Some(out)
 }
 
-/// Mark every message WE sent with `ts <= up_to` as "read" (a read receipt from
-/// the peer covers them). Returns the messages whose status actually changed so
+/// Mark every message WE sent with `ts <= up_to` that reached them as "read"
+/// (a read receipt from the peer covers them). Returns the messages whose status actually changed so
 /// the caller can re-emit just those to the UI.
 pub fn mark_read_up_to(config_dir: &Path, peer_id: &str, up_to: u64) -> Vec<ChatMessage> {
     let mut cache = CACHE.lock().unwrap();
@@ -573,7 +671,11 @@ pub fn mark_read_up_to(config_dir: &Path, peer_id: &str, up_to: u64) -> Vec<Chat
     let mut changed = Vec::new();
     if let Some(thread) = all.get_mut(peer_id) {
         for m in thread.iter_mut() {
-            if m.from_me && m.ts <= up_to && m.status.as_deref() != Some("read") {
+            // Only a message that actually reached them can be read: one still
+            // "sending"/"failed" (e.g. a link message waiting on its preview
+            // while a later one got through) must stay in the outbox (D12).
+            let reached = matches!(m.status.as_deref(), Some("delivered") | Some("held") | Some("sent"));
+            if m.from_me && m.ts <= up_to && reached {
                 m.status = Some("read".to_string());
                 changed.push(m.clone());
             }
@@ -819,7 +921,15 @@ pub(crate) fn sync_key(m: &ChatMessage) -> String {
 /// Fingerprint of a message's mutable state, for own-device sync digests.
 pub(crate) fn sync_hash(m: &ChatMessage) -> String {
     use sha2::{Digest, Sha256};
-    let state = format!("{}|{}|{}|{}", m.rev, status_rank(m.status.as_deref()), m.deleted, m.edited);
+    let mut state = format!("{}|{}|{}|{}", m.rev, status_rank(m.status.as_deref()), m.deleted, m.edited);
+    // Per-field clocks (D17): two copies with the same `rev` can still differ
+    // in a reaction or the text, so those clocks are part of the state. (Kept
+    // out of the hash when absent, so untouched messages hash as before.)
+    if m.text_rev > 0 || !m.reaction_revs.is_empty() {
+        let mut revs: Vec<String> = m.reaction_revs.iter().map(|r| format!("{}{}{}{}", u8::from(r.from_me), r.emoji, r.at, u8::from(r.on))).collect();
+        revs.sort();
+        state.push_str(&format!("|{}|{}", m.text_rev, revs.join(",")));
+    }
     hex::encode(&Sha256::digest(state.as_bytes())[..6])
 }
 
@@ -878,19 +988,7 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
             }
             Some(x) => {
                 let before = sync_hash(x);
-                let newer = !x.deleted && (m.deleted || m.rev > x.rev || (m.rev == x.rev && m.edited && !x.edited));
-                if newer {
-                    x.text = m.text;
-                    x.edited = m.edited;
-                    x.deleted = m.deleted;
-                    x.reactions = m.reactions;
-                    x.rev = m.rev;
-                    if x.deleted {
-                        x.files.clear();
-                        x.gif = None;
-                        x.path = None;
-                    }
-                }
+                merge_fields(x, m.clone());
                 if x.from_me && status_rank(m.status.as_deref()) > status_rank(x.status.as_deref()) {
                     x.status = m.status;
                 }
@@ -909,6 +1007,75 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
         save_all(config_dir, all);
     }
     changed
+}
+
+/// Merge another own device's copy `m` into ours field by field (D17): an
+/// unsend wins; the text follows its own clock (`text_rev`); each reaction
+/// follows its own clock (`reaction_revs`, tombstones included). Copies from
+/// older builds (no per-field clocks) fall back to the newer whole record.
+fn merge_fields(x: &mut ChatMessage, m: ChatMessage) {
+    if x.deleted {
+        x.rev = x.rev.max(m.rev);
+        return;
+    }
+    if m.deleted {
+        x.deleted = true;
+        x.text.clear();
+        x.files.clear();
+        x.gif = None;
+        x.path = None;
+        x.link_preview = None;
+        x.reactions.clear();
+        x.text_rev = x.text_rev.max(m.text_rev);
+        x.rev = x.rev.max(m.rev);
+        return;
+    }
+    let legacy = m.text_rev == 0 && x.text_rev == 0;
+    let text_newer = if legacy {
+        m.rev > x.rev || (m.rev == x.rev && m.edited && !x.edited)
+    } else {
+        m.text_rev > x.text_rev
+    };
+    if text_newer {
+        x.text = m.text.clone();
+        x.edited = m.edited;
+        x.link_preview = m.link_preview.clone();
+        x.text_rev = m.text_rev;
+    }
+    // Reactions: one clock per (author, emoji).
+    let mut revs: Vec<ReactionRev> = x.reaction_revs.clone();
+    for r in &m.reaction_revs {
+        match revs.iter_mut().find(|o| o.from_me == r.from_me && o.emoji == r.emoji) {
+            Some(o) if r.at > o.at || (r.at == o.at && !r.on) => *o = r.clone(),
+            Some(_) => {}
+            None => revs.push(r.clone()),
+        }
+    }
+    let clocked = |from_me: bool, emoji: &str| revs.iter().find(|o| o.from_me == from_me && o.emoji == emoji).cloned();
+    let mut live: Vec<Reaction> = Vec::new();
+    let newer_copy = if m.rev > x.rev { &m.reactions } else { &x.reactions };
+    for r in x.reactions.iter().chain(m.reactions.iter()) {
+        if live.contains(r) {
+            continue;
+        }
+        let keep = match clocked(r.from_me, &r.emoji) {
+            Some(c) => c.on,
+            // No clock (an older build's copy): the newer record decides.
+            None => newer_copy.contains(r),
+        };
+        if keep {
+            live.push(r.clone());
+        }
+    }
+    for c in revs.iter().filter(|c| c.on) {
+        let r = Reaction { emoji: c.emoji.clone(), from_me: c.from_me };
+        if !live.contains(&r) {
+            live.push(r);
+        }
+    }
+    x.reactions = live;
+    x.reaction_revs = revs;
+    x.rev = x.rev.max(m.rev);
 }
 
 pub fn now_ms() -> u64 {
@@ -958,6 +1125,7 @@ mod tests {
             via: None,
             deliveries: vec![],
             link_preview: None,
+            text_rev: 0, reaction_revs: vec![],
         }
     }
 
@@ -1046,6 +1214,8 @@ mod tests {
         append(&dir, &msg("a", p, 100, 1, true));
         append(&dir, &msg("b", p, 200, 2, true));
         append(&dir, &msg("c", p, 300, 3, false)); // their message — never "read" by us
+        set_status(&dir, p, "a", "delivered");
+        set_status(&dir, p, "b", "delivered");
         let changed = mark_read_up_to(&dir, p, 200);
         assert_eq!(changed.len(), 2);
         let all = messages(&dir, p);
@@ -1053,6 +1223,93 @@ mod tests {
         assert_eq!(all[1].status.as_deref(), Some("read"));
         assert_eq!(all[2].status, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_receipt_never_marks_an_undelivered_message_read() {
+        // D12 repro: a link message still "sending" (waiting on its preview)
+        // while a later message was delivered and read — the receipt's ts
+        // covers both, but the first must stay in the outbox.
+        let dir = test_dir("read-undelivered");
+        let p = "peer-d12";
+        append(&dir, &msg("link", p, 100, 1, true));
+        append(&dir, &msg("failed", p, 110, 2, true));
+        set_status(&dir, p, "failed", "failed");
+        append(&dir, &msg("held", p, 120, 3, true));
+        set_held(&dir, p, "held", "Box");
+        append(&dir, &msg("later", p, 150, 4, true));
+        set_status(&dir, p, "later", "delivered");
+        let changed: Vec<String> = mark_read_up_to(&dir, p, 1_000).into_iter().map(|m| m.id).collect();
+        assert_eq!(changed, vec!["held".to_string(), "later".to_string()]);
+        let all = messages(&dir, p);
+        assert_eq!(all[0].status.as_deref(), Some("sending"));
+        assert_eq!(all[1].status.as_deref(), Some("failed"));
+        let outbox: Vec<String> = outbox(&dir).into_iter().map(|m| m.id).collect();
+        assert!(outbox.contains(&"link".to_string()) && outbox.contains(&"failed".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_append_is_not_kept_when_the_disk_write_fails() {
+        // D11: chats.json can't be written (here: a directory squats its name).
+        let dir = test_dir("durable");
+        std::fs::create_dir_all(dir.join("chats.json").join("blocker")).unwrap();
+        let m = msg("x", "peer-d11", 1, 1, false);
+        assert!(append_durable(&dir, &m).is_err(), "a failed save is reported");
+        assert!(messages(&dir, "peer-d11").is_empty(), "and not kept in memory either");
+        std::fs::remove_dir_all(dir.join("chats.json")).unwrap();
+        assert_eq!(append_durable(&dir, &m), Ok(true));
+        assert_eq!(append_durable(&dir, &m), Ok(false), "dedup still works");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn own_device_merge_keeps_concurrent_reactions_and_edits() {
+        // D17: device A reacts 👍 and device B (later clock) reacts ❤️ and
+        // edits — every change survives on both, whichever order they merge.
+        let (a, b) = (test_dir("d17a"), test_dir("d17b"));
+        let p = "peer-d17";
+        let mut base = msg("m", p, 1, 1, true);
+        base.status = Some("delivered".into());
+        append(&a, &base);
+        append(&b, &base);
+        apply_reaction(&a, p, "m", "👍", true, true).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        apply_reaction(&b, p, "m", "❤️", true, true).unwrap();
+        apply_edit(&b, p, "m", "edited on b", true).unwrap();
+        let from_a = messages(&a, p);
+        let from_b = messages(&b, p);
+        merge_synced(&a, p, from_b);
+        merge_synced(&b, p, from_a);
+        for d in [&a, &b] {
+            let m = messages(d, p).remove(0);
+            let mut emojis: Vec<String> = m.reactions.iter().map(|r| r.emoji.clone()).collect();
+            emojis.sort();
+            assert_eq!(emojis, vec!["❤️".to_string(), "👍".to_string()]);
+            assert_eq!(m.text, "edited on b");
+        }
+        assert_eq!(sync_digest(&a, p), sync_digest(&b, p), "the devices converge");
+        // A removal later on A sticks on B (tombstone beats the older add).
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        apply_reaction(&a, p, "m", "👍", true, false).unwrap();
+        merge_synced(&b, p, messages(&a, p));
+        merge_synced(&a, p, messages(&b, p));
+        for d in [&a, &b] {
+            let emojis: Vec<String> = messages(d, p)[0].reactions.iter().map(|r| r.emoji.clone()).collect();
+            assert_eq!(emojis, vec!["❤️".to_string()]);
+        }
+        for d in [a, b] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    fn incoming_field_caps() {
+        assert_eq!(cap_text(&"x".repeat(10_000)).chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(cap_preview(&"é".repeat(500)).chars().count(), MAX_PREVIEW_CHARS);
+        assert_eq!(cap_file_name(&"a".repeat(5000)).len(), 255);
+        let ok = GifMeta { provider: "giphy".into(), id: "1".into(), url: "https://media.giphy.com/a.gif".into(), page: String::new(), w: 10, h: 10 };
+        assert!(gif_within_limits(&ok));
+        assert!(!gif_within_limits(&GifMeta { url: "h".repeat(100_000), ..ok.clone() }));
+        assert!(!gif_within_limits(&GifMeta { provider: "p".repeat(500), ..ok }));
     }
 
     fn op(peer: &str, target: &str, kind: &str, emoji: &str, add: bool, ts: u64) -> ChatOp {

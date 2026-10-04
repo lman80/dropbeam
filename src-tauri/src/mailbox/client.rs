@@ -1726,7 +1726,7 @@ async fn receive_one(net: &IrohState, config: &Path, ep: &iroh::Endpoint, conn: 
             if meta["kind"].as_str() != Some("chat") {
                 return Ok(Some((false, "malformed".into())));
             }
-            let applied = crate::iroh_net::apply_incoming_chat(net, config, &env.from, &meta, Some(server_name), Some(env.created_ms));
+            let applied = crate::iroh_net::apply_incoming_chat(net, config, &env.from, &meta, Some(server_name), Some(env.created_ms))?;
             if !applied && env.kind == "op" && now().saturating_sub(env.created_ms) < 3 * super::server::DAY_MS {
                 // Its message hasn't reached this device yet (another server, or
                 // still on its way): leave the edit/reaction there and try later.

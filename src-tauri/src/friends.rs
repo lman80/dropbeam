@@ -1254,6 +1254,7 @@ mod tests {
                 via: None,
                 deliveries: vec![],
                 link_preview: None,
+                text_rev: 0, reaction_revs: vec![],
             },
         );
     }
@@ -1607,6 +1608,10 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
         if f.device_kind.is_none() && r.device_kind.is_some() { f.device_kind = r.device_kind.map(str::to_owned); changed = true; }
         if f.device_os.is_none() && r.device_os.is_some() { f.device_os = r.device_os.map(str::to_owned); changed = true; }
         if f.account_pub.is_none() && r.account_pub.is_some() { f.account_pub = r.account_pub.map(str::to_owned); changed = true; }
+        // Lamport: remember the newest add any own device saw, so a removal made
+        // here later is stamped past it even if that device's clock ran ahead
+        // (otherwise the "newer" add would bring the friend back — D17).
+        if r.created_at > f.created_at { f.created_at = r.created_at; changed = true; }
         let out = f.clone();
         if changed { let _ = save(config_dir, &friends); }
         return (out, false);
