@@ -172,8 +172,10 @@ final class ShareInbox {
         guard !ready.isEmpty else { return }
         NSLog("DropBeam share inbox: %d job(s) waiting", ready.count)
         // The web store must be up (it owns sending) before anything can go out.
-        guard await waitUntil(seconds: 45, { Bridge.shared.webview != nil && Bridge.shared.settings != nil }) else {
-            NSLog("DropBeam share inbox: bridge not ready; will retry on next foreground")
+        // Not ready yet: the first settings snapshot re-runs this (Bridge.apply), and so
+        // does every return to the foreground — nothing is dropped.
+        guard Bridge.shared.webview != nil && Bridge.shared.settings != nil else {
+            NSLog("DropBeam share inbox: bridge not ready; will run when the engine is up")
             return
         }
         for (dir, job) in ready { await run(job, from: dir) }
@@ -200,6 +202,8 @@ final class ShareInbox {
             if fm.fileExists(atPath: claimed.path) { try fm.removeItem(at: claimed) }
             do { try fm.moveItem(at: dir, to: claimed) }
             catch { try fm.copyItem(at: dir, to: claimed); try? fm.removeItem(at: dir) }
+            // Swept like any other copy once sent (and never while still queued).
+            PickedMedia.mark(claimed, .send)
         } catch {
             NSLog("DropBeam share inbox: could not claim job: %@", error.localizedDescription)
             try? fm.removeItem(at: dir)
@@ -227,7 +231,7 @@ final class ShareInbox {
             guard !paths.isEmpty else { return }
             bridge.selectedTab = "send"
             if job.recipient == "quick" {
-                do { try await bridge.action("quickSend", ["paths": paths]) }
+                do { BackgroundTransfers.shared.userStartedSend(paths: paths, to: nil); try await bridge.action("quickSend", ["paths": paths]) }
                 catch { bridge.pickedToSend = paths }
             } else {
                 bridge.pickedToSend = paths // The Send To sheet lets them pick.

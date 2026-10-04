@@ -69,7 +69,7 @@ struct MediaPreparationOverlay: View {
                 Color.black.opacity(0.18).ignoresSafeArea()
                 VStack(spacing: 16) {
                     ProgressView(title)
-                    Text(title == "Preparing photo…" ? "Photos stored in iCloud may take a moment to download." : "Files stored online may take a moment to download.")
+                    Text(title.hasPrefix("Preparing files") || title.hasPrefix("Preparing folder") ? "Files stored online may take a moment to download." : "Photos stored in iCloud may take a moment to download.")
                         .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     Button("Cancel") { bridge.cancelMediaPreparation() }.beamButton()
                 }.padding(24).frame(maxWidth: 360).modifier(PanelGlass()).padding(32)

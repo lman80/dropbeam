@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		27BDE3A69F6E324AA019B8E2 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 18E427AA93C101F0F7758606 /* PrivacyInfo.xcprivacy */; };
 		299814393FFBF154FAD94CA8 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F3673D372C5ABDD1AD6E7067 /* QuartzCore.framework */; };
+		2C69940E37FABD60D6EB197C /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 7A73DB85C3F2B9947E5C1E16 /* PrivacyInfo.xcprivacy */; };
 		3036F7131E55779ABF15BD58 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 02B7F8347F94B067E6B27396 /* LaunchScreen.storyboard */; };
 		31585529C029A01BE249A285 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1E81BD6B453D87B7F7B1597B /* CoreGraphics.framework */; };
 		324A1E9A4258E7911D4DAC39 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9FACFFCB6E3743955F72464C /* Security.framework */; };
@@ -17,6 +18,7 @@
 		5C516481BCA83A182C2BCC94 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 3842AE2A64FB9933D0400EA4 /* assets */; };
 		618672DC8A5E0605441C9935 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0E2B15F176E4B041AE33EEEA /* UIKit.framework */; };
 		6B96CD5A9015534D2BC45958 /* ShareModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 598A37285EC23A07C6021F30 /* ShareModel.swift */; };
+		6E26EC9E3BDBC542100A30A5 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 95F6C8ED3566A964BAF51632 /* PrivacyInfo.xcprivacy */; };
 		7F587B89720397AD2197FB48 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FAB36C1E3E83FA445B8336C /* NotificationService.swift */; };
 		836D84C5F07860664DAF79C8 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D8F57162F5CC7AEDD55F173D /* WebKit.framework */; };
 		9572A76A6ED999ED7242CB4E /* ShareView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06BD8A4A24EF28F2AF2F6645 /* ShareView.swift */; };
@@ -77,6 +79,7 @@
 		107FF36667095FB22C84919B /* settings.rs */ = {isa = PBXFileReference; path = settings.rs; sourceTree = "<group>"; };
 		108E4CE92E55D87F9FBA235A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		10F698534D65B4A05EE9BFFE /* server.rs */ = {isa = PBXFileReference; path = server.rs; sourceTree = "<group>"; };
+		13D3237EA9CF3FC0E58CD92D /* device_activity.rs */ = {isa = PBXFileReference; path = device_activity.rs; sourceTree = "<group>"; };
 		1631E4CFBB715FFDBF919C8C /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
 		17B52554D60D361AFE791C3E /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
 		184AB4C19C7460DAD0FC0813 /* pairing.rs */ = {isa = PBXFileReference; path = pairing.rs; sourceTree = "<group>"; };
@@ -96,6 +99,7 @@
 		39F196D577817579BAFA9AB5 /* labkit.rs */ = {isa = PBXFileReference; path = labkit.rs; sourceTree = "<group>"; };
 		3BE9337AAC6F7B4835C5A46D /* link.rs */ = {isa = PBXFileReference; path = link.rs; sourceTree = "<group>"; };
 		3FAB36C1E3E83FA445B8336C /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		429A74191F03736E932C6379 /* link_preview.rs */ = {isa = PBXFileReference; path = link_preview.rs; sourceTree = "<group>"; };
 		4DDC17AC7FD6E2D6EAF940E6 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
 		4ED84DFEA2768BB78E03A21F /* lab.rs */ = {isa = PBXFileReference; path = lab.rs; sourceTree = "<group>"; };
 		5050E57A3F0E6DBA22C77BF1 /* tray_drag.rs */ = {isa = PBXFileReference; path = tray_drag.rs; sourceTree = "<group>"; };
@@ -107,12 +111,18 @@
 		598A37285EC23A07C6021F30 /* ShareModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareModel.swift; sourceTree = "<group>"; };
 		5ED0858E7B0B72533F19F5D4 /* chat.rs */ = {isa = PBXFileReference; path = chat.rs; sourceTree = "<group>"; };
 		682535EEFE1DA20BE07B123C /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		6D2D0E80E6FD402C4C6B4F27 /* clipboard_files.rs */ = {isa = PBXFileReference; path = clipboard_files.rs; sourceTree = "<group>"; };
+		6F3CA56AA6053C10750F5234 /* members.rs */ = {isa = PBXFileReference; path = members.rs; sourceTree = "<group>"; };
 		724908FF34F1FB6C7AF3B448 /* ios_log_policy.rs */ = {isa = PBXFileReference; path = ios_log_policy.rs; sourceTree = "<group>"; };
+		7A73DB85C3F2B9947E5C1E16 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		7BAFC636FC98BC527E8F5EA3 /* iroh_net.rs */ = {isa = PBXFileReference; path = iroh_net.rs; sourceTree = "<group>"; };
 		7C7B85EAC182832757119BCF /* automation.rs */ = {isa = PBXFileReference; path = automation.rs; sourceTree = "<group>"; };
 		7C8EE44E6025F78B4DFE3F20 /* mac_service.rs */ = {isa = PBXFileReference; path = mac_service.rs; sourceTree = "<group>"; };
 		81E326B61ED92E1D1EECF952 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		8DB3852B81A49342943946F0 /* fanout.rs */ = {isa = PBXFileReference; path = fanout.rs; sourceTree = "<group>"; };
 		8E21FB3B303456C0B991C640 /* DropBeamNotify.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = DropBeamNotify.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		95F6C8ED3566A964BAF51632 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		9788E9895B50DDD8CAAB0C55 /* chat_notify.rs */ = {isa = PBXFileReference; path = chat_notify.rs; sourceTree = "<group>"; };
 		9F187C4DA4D3BC74A5AD0E6A /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		9F1A1F3A757B8E63FA1AC808 /* locations.rs */ = {isa = PBXFileReference; path = locations.rs; sourceTree = "<group>"; };
 		9FACFFCB6E3743955F72464C /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
@@ -216,6 +226,7 @@
 				04EA5A634F74FF864343F3DE /* client.rs */,
 				0B80636D5952878DDA9F59D7 /* cmds.rs */,
 				31B6C4016A618427BAD16CCA /* keys.rs */,
+				6F3CA56AA6053C10750F5234 /* members.rs */,
 				01DDCEBA87FB2BDBA083B448 /* mod.rs */,
 				AE75ADFDB545D045E7AB4F9A /* push.rs */,
 				ADA9EA23DD2A5F3A86EA7E32 /* seal.rs */,
@@ -231,6 +242,7 @@
 				B59A2B453573A903AF6AD513 /* DropBeamNotify.entitlements */,
 				108E4CE92E55D87F9FBA235A /* Info.plist */,
 				3FAB36C1E3E83FA445B8336C /* NotificationService.swift */,
+				95F6C8ED3566A964BAF51632 /* PrivacyInfo.xcprivacy */,
 			);
 			path = DropBeamNotify;
 			sourceTree = "<group>";
@@ -258,10 +270,14 @@
 				19E87E5E8C84139A619353FD /* account.rs */,
 				7C7B85EAC182832757119BCF /* automation.rs */,
 				0F1ABED75399A7A71943E70F /* block.rs */,
+				9788E9895B50DDD8CAAB0C55 /* chat_notify.rs */,
 				5ED0858E7B0B72533F19F5D4 /* chat.rs */,
+				6D2D0E80E6FD402C4C6B4F27 /* clipboard_files.rs */,
 				FBAA48B3DA509BAF6CC39B2B /* codes.rs */,
 				09EA68E21FDCEDB93DEE503F /* commands.rs */,
+				13D3237EA9CF3FC0E58CD92D /* device_activity.rs */,
 				521590675694E1395FAE49D4 /* download_progress.rs */,
+				8DB3852B81A49342943946F0 /* fanout.rs */,
 				DBED1943226884A3717085D4 /* file_protocol.rs */,
 				2C5E95A83E7CC0EC8C2DE28F /* folder_history.rs */,
 				20476284DA7E942073FD3F1F /* friends.rs */,
@@ -275,6 +291,7 @@
 				4ED84DFEA2768BB78E03A21F /* lab.rs */,
 				39F196D577817579BAFA9AB5 /* labkit.rs */,
 				17B52554D60D361AFE791C3E /* lib.rs */,
+				429A74191F03736E932C6379 /* link_preview.rs */,
 				3BE9337AAC6F7B4835C5A46D /* link.rs */,
 				2F2F58DB8D18AE5642AF94D1 /* location_sync.rs */,
 				9F1A1F3A757B8E63FA1AC808 /* locations.rs */,
@@ -319,6 +336,7 @@
 			children = (
 				AD6A82936A81C88BFD68A81B /* DropBeamShare.entitlements */,
 				C8EB59D9FCDB819976CDB945 /* Info.plist */,
+				7A73DB85C3F2B9947E5C1E16 /* PrivacyInfo.xcprivacy */,
 				598A37285EC23A07C6021F30 /* ShareModel.swift */,
 				06BD8A4A24EF28F2AF2F6645 /* ShareView.swift */,
 				9F187C4DA4D3BC74A5AD0E6A /* ShareViewController.swift */,
@@ -363,7 +381,7 @@
 			path = app;
 			sourceTree = "<group>";
 		};
-		"TEMP_DFC3641B-AC04-4EC2-BCBD-8EF4E0712AA2" /* x86_64 */ = {
+		"TEMP_A9565FAF-6E97-4A06-BF1D-BB0126C4CA49" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
@@ -378,6 +396,7 @@
 			buildConfigurationList = D3CE612E8ADD296D517BF818 /* Build configuration list for PBXNativeTarget "DropBeamNotify" */;
 			buildPhases = (
 				B1D4F4D9CE8D89E975C41303 /* Sources */,
+				A05ADF59FAD18D46DDEC8B59 /* Resources */,
 				C5BFE895D244F74311B47744 /* Match App Version */,
 			);
 			buildRules = (
@@ -396,6 +415,7 @@
 			buildConfigurationList = 8FB378B9B4EB3532C36C7B0E /* Build configuration list for PBXNativeTarget "DropBeamShare" */;
 			buildPhases = (
 				857A0E98F806A7EB88F22EE9 /* Sources */,
+				1E1256CBD59AC745F311AFA9 /* Resources */,
 				A7A2E8A6D137E086F85FEA80 /* Match App Version */,
 			);
 			buildRules = (
@@ -474,6 +494,14 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		1E1256CBD59AC745F311AFA9 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2C69940E37FABD60D6EB197C /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		2FBCB8C3ED193E9C4A9FDB59 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -482,6 +510,14 @@
 				3036F7131E55779ABF15BD58 /* LaunchScreen.storyboard in Resources */,
 				27BDE3A69F6E324AA019B8E2 /* PrivacyInfo.xcprivacy in Resources */,
 				5C516481BCA83A182C2BCC94 /* assets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A05ADF59FAD18D46DDEC8B59 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6E26EC9E3BDBC542100A30A5 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

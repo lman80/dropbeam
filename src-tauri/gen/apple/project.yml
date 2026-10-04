@@ -52,7 +52,7 @@ targets:
           - UIInterfaceOrientationPortrait
         CFBundleDisplayName: DropBeam
         CFBundleShortVersionString: 0.52.2
-        CFBundleVersion: "0.52.2"
+        CFBundleVersion: "0.53.0"
         # --- DropBeam additions (mirrored into app_iOS/Info.plist) ---
         # iroh's mDNS peer discovery advertises/browses `_irohv1._udp` (see
         # iroh::address_lookup::mdns N0_SERVICE_NAME). Without BOTH of these iOS
@@ -60,6 +60,17 @@ targets:
         NSLocalNetworkUsageDescription: DropBeam looks for your devices and friends on this network so files go straight between them at full speed, without the internet.
         NSBonjourServices:
           - _irohv1._udp
+          # DropBeam's own Bonjour service (NativeUIPlugin LanDiscovery.swift): the
+          # iPhone advertises/browses it through the system mDNSResponder, which
+          # needs no multicast entitlement (raw multicast for _irohv1 does).
+          - _dropbeam._udp
+        # Export compliance: answered per build in App Store Connect as exempt; this
+        # key saves the question on every upload (docs/APPSTORE.md §1.3).
+        ITSAppUsesNonExemptEncryption: false
+        # iOS 26 BGContinuedProcessingTask: a user-started send keeps going (with the
+        # system's progress UI) after leaving the app (BackgroundTransfers.swift).
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.ashtonmiller.dropbeam.transfer.*
         # Friend codes are `dropbeam:<payload>` — registering the scheme makes an
         # invite link or a friend's QR scanned with the Camera app open DropBeam.
         CFBundleURLTypes:

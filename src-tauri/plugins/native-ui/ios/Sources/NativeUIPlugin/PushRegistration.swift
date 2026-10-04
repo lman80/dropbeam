@@ -76,6 +76,18 @@ enum PushRegistration {
         try? data.write(to: dir.appendingPathComponent("push-names.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
 
+    /// endpoint id → the chat a banner from that device belongs to (the person's thread
+    /// id), so tapping a Transfer Server push opens the right conversation.
+    private static var lastPeers: [String: String] = [:]
+    static func savePeers(_ pairs: [(String, String)]) {
+        var map: [String: String] = [:]
+        for (eid, chat) in pairs { map[eid] = chat }
+        guard map != lastPeers, let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup),
+              let data = try? JSONSerialization.data(withJSONObject: map) else { return }
+        lastPeers = map
+        try? data.write(to: dir.appendingPathComponent("push-peers.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
     /// Tell the engine where the App Group container is, so it and the
     /// notification extension can share which messages were already
     /// announced (one banner per message, never two).

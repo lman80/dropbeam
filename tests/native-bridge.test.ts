@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { changedSnapshots, dispatchNativeCall } from '../src/lib/nativeBridgeProtocol.ts'
+import { changedSnapshots, dispatchNativeCall, memoSnapshots, type SnapshotMemo } from '../src/lib/nativeBridgeProtocol.ts'
 
 test('native calls preserve correlation and JSON arguments including quotes and paths', async () => {
   const args = { name: '"; window.alert(1); //', paths: ['/tmp/a\nb.txt'] }
@@ -91,4 +91,26 @@ test('14 selected assets including two videos cross the native picker reply unch
     assert.deepEqual(reply.value, selected)
     delivered = true
   }, () => { assert.equal(delivered, true) })
+})
+
+test('memoSnapshots skips unchanged inputs without rebuilding, and unchanged output', () => {
+  const memo: SnapshotMemo = new Map()
+  const friends = [{ id: 'a' }]
+  let builds = 0
+  const sources = (list: unknown[], extra: unknown = null) => ({
+    friends: [[list], () => { builds++; return list }] as const,
+    clock: [null, () => extra] as const,
+  })
+  assert.deepEqual(memoSnapshots(memo, sources(friends)).map(c => c.key), ['friends', 'clock'])
+  assert.equal(builds, 1)
+  // Same array object: not rebuilt; clock rebuilt but identical output → not sent.
+  assert.deepEqual(memoSnapshots(memo, sources(friends)), [])
+  assert.equal(builds, 1)
+  // New object with equal content: rebuilt, but nothing to send.
+  assert.deepEqual(memoSnapshots(memo, sources([{ id: 'a' }])), [])
+  assert.equal(builds, 2)
+  assert.deepEqual(memoSnapshots(memo, sources([{ id: 'b' }], 1)), [{ key: 'friends', value: [{ id: 'b' }] }, { key: 'clock', value: 1 }])
+  // A forced resync (memo cleared) sends everything again.
+  memo.clear()
+  assert.equal(memoSnapshots(memo, sources([{ id: 'b' }], 1)).length, 2)
 })

@@ -6,7 +6,7 @@ Store. Status: ✅ done in the repo · ⚠️ done but needs a decision/check ·
 in App Store Connect (ASC) or outside the repo.
 
 App: **DropBeam** · bundle id `com.ashtonmiller.dropbeam` · team `R2RDA8476R` ·
-version from `tauri.conf.json` (currently 0.52.2) · iPhone only (`TARGETED_DEVICE_FAMILY 1`),
+version from `tauri.conf.json` (marketing 0.52.2, iOS build `bundle.iOS.bundleVersion` 0.53.0) · iPhone only (`TARGETED_DEVICE_FAMILY 1`),
 portrait · iOS 17+ (Liquid Glass on iOS 26+, materials before).
 
 ---
@@ -15,19 +15,21 @@ portrait · iOS 17+ (Liquid Glass on iOS 26+, materials before).
 
 | # | Item | Status | Notes |
 |---|---|---|---|
-| 1.1 | Usage strings are accurate and friendly | ✅ | `NSCameraUsageDescription` (QR scanning only), `NSPhotoLibraryAddUsageDescription` (Save Image from the share sheet), `NSLocalNetworkUsageDescription` + `NSBonjourServices = _irohv1._udp` (iroh mDNS; without both, LAN peers never appear). Photos are picked with PHPicker → no read-library permission, no `NSPhotoLibraryUsageDescription` needed. |
+| 1.1 | Usage strings are accurate and friendly | ✅ | `NSCameraUsageDescription` (QR scanning only), `NSPhotoLibraryAddUsageDescription` (Save Image from the share sheet), `NSLocalNetworkUsageDescription` + `NSBonjourServices = _irohv1._udp, _dropbeam._udp` (iroh mDNS + DropBeam's own system-Bonjour discovery, see §1.14; without both keys LAN peers never appear). Photos are picked with PHPicker → no read-library permission, no `NSPhotoLibraryUsageDescription` needed. |
 | 1.2 | No macOS-only keys in the iPhone Info.plist | ✅ | `src-tauri/Info.plist` is now shared keys only; `LSUIElement`, the folder-access prompts and `NSServices` moved to `src-tauri/Info.macos.plist` (`bundle.macOS.infoPlist`). tauri-cli 2.11 merges `Info.plist` **then** `bundle.macOS.infoPlist` for macOS (verified in `crates/tauri-cli/src/interface/rust.rs`), so the desktop bundle keeps every key. `gen/apple/app_iOS/Info.plist` cleaned to match. |
-| 1.3 | Export compliance key | ⚠️👤 | `ITSAppUsesNonExemptEncryption` is now **true**: DropBeam ships its own standard crypto (iroh/QUIC/rustls, ed25519) that isn't Apple-OS crypto, so `false` was not accurate. In ASC answer: *"Standard encryption algorithms instead of, or in addition to, using or accessing the encryption within Apple's operating system"*; mass-market, open source. **France:** either file the ANSSI declaration or exclude France from availability. If you'd rather not answer per build, ASC can issue an `ITSEncryptionExportComplianceCode` to add to Info.plist once approved. |
-| 1.4 | Privacy manifest (`gen/apple/app_iOS/PrivacyInfo.xcprivacy`) | ✅⚠️ | Required-reason APIs: File timestamp `C617.1` `3B52.1` `DDA9.1`; Disk space `E174.1` `85F4.1` (statvfs in `locations.rs`); UserDefaults `CA92.1`; System boot time `35F9.1`. Tracking: none. Collected data: see §3. ⚠️ See the diagnostics note in §3. |
+| 1.3 | Export compliance key | ✅⚠️ | `ITSAppUsesNonExemptEncryption = false` in the app's Info.plist (project.yml → app_iOS/Info.plist; verified in the built bundle). This matches the answer already given per build in App Store Connect (`usesNonExemptEncryption=false`): DropBeam only uses standard, published encryption (TLS 1.3/QUIC via rustls, Ed25519/X25519, ChaCha20-Poly1305) for authentication and end-to-end protection of the user's own data, which Apple treats as exempt; the key just stops ASC asking on every upload. ⚠️ If legal review ever concludes otherwise, delete the key and answer per build (`true` without an `ITSEncryptionExportComplianceCode` is rejected at upload, ITMS-90592). France: see Apple's export-compliance guidance. |
+| 1.4 | Privacy manifests | ✅ | App (`gen/apple/app_iOS/PrivacyInfo.xcprivacy`) required-reason APIs: File timestamp `C617.1` `3B52.1` `DDA9.1`; Disk space `E174.1` `85F4.1` (statvfs in `locations.rs`); UserDefaults `CA92.1`; System boot time `35F9.1`. Tracking: none. Collected data: see §3. The share extension (`DropBeamShare/PrivacyInfo.xcprivacy`: File timestamp `C617.1` for the copies it makes) and the notification extension (`DropBeamNotify/PrivacyInfo.xcprivacy`: nothing) ship their own. |
 | 1.5 | App icon set complete, opaque | ✅ | All iPhone sizes + 1024 marketing icon present; every PNG re-encoded **without an alpha channel** (ITMS-90717). If icons are ever regenerated with `tauri icon`, re-flatten them (the script used: draw into an `noneSkipLast` CGContext and re-save). Optional later: iOS 18 dark / tinted icon variants. |
 | 1.6 | Launch screen | ✅ | `LaunchScreen.storyboard`, plain `systemGroupedBackground` = the first screen's background (no logo flash, per HIG). |
 | 1.7 | Devices & orientation | ✅ | iPhone only, portrait only (`project.yml` + Info.plist). iPad keys removed. |
-| 1.8 | Background modes | ✅ | None declared — none needed. The app says plainly that transfers/sync pause in the background (Settings → Notifications footer, Shared Folders note). Do **not** add `audio`/`fetch`/`processing` to keep transfers alive — that's a 2.5.4 rejection. |
+| 1.8 | Background modes | ✅ | No `UIBackgroundModes`. A transfer that is moving when the user leaves the app continues under `beginBackgroundTask` (no mode needed; ended as soon as nothing moves or iOS expires it). On iOS 26+, a send the user starts that is ≥ 20 MB also submits a `BGContinuedProcessingTask` (identifiers `com.ashtonmiller.dropbeam.transfer.*` in `BGTaskSchedulerPermittedIdentifiers`; system progress UI; registered dynamically right before submit). ⚠️ Confirm on a device that submission isn't refused without a background mode; if it is, the code logs and falls back to the background task — never add `audio`/`fetch`/`processing` to keep transfers alive (2.5.4). |
 | 1.9 | No private APIs | ✅ | UI is public SwiftUI/UIKit/VisionKit/AVFoundation/PhotosUI. `shareddocuments://` (Open in Files) is a documented URL scheme. Rust side uses public ObjC classes via `objc2` (PHPicker, UIDocumentPicker). |
-| 1.10 | Files app visibility | ✅ | `UIFileSharingEnabled` + `LSSupportsOpeningDocumentsInPlace` → received files in Files › On My iPhone › DropBeam. |
-| 1.11 | Entitlements | ✅ | Empty (no push, no iCloud, no app groups). |
-| 1.12 | Version/build numbers | 👤 | CFBundleVersion must increase on every upload; Tauri syncs both from `tauri.conf.json`/Cargo version, so bump the version (or pass a build number) before each TestFlight/App Store upload. |
+| 1.10 | Files app visibility & storage | ✅ | `UIFileSharingEnabled` + `LSSupportsOpeningDocumentsInPlace` → received files (and Shared Folder copies, `Shared Folders/<name>`) in Files › On My iPhone › DropBeam. Copies of what the user picks/pastes/shares to send live in Application Support/`dropbeam-picked` instead: not visible in Files, excluded from backup, swept once sent (Send-tab copies 1 day after finishing, chat attachments 30 days, 2 GB cap, never while a send is unfinished or queued). |
+| 1.11 | Entitlements | ✅ | App: `aps-environment` (Transfer Server push; `scripts/enable-push.sh`, docs/PUSH-SETUP.md), `com.apple.security.application-groups = group.com.ashtonmiller.dropbeam` (share + notification extensions), `keychain-access-groups` = the app's own group + `superfeedback.shared` (one anonymous feedback voter id across the owner's apps). DropBeamShare / DropBeamNotify: the same App Group only. No iCloud, no multicast (see 1.14). |
+| 1.12 | Version/build numbers | 👤 | CFBundleVersion must increase on every upload: bump `bundle.iOS.bundleVersion` in `tauri.conf.json` (now 0.53.0); the extensions copy the app's versions at build time. |
 | 1.13 | Minimum functionality 4.2 / 2.1 completeness | ✅ | Native SwiftUI UI end-to-end (the hidden WebView is only a data bridge, never shown or interactive). |
+| 1.14 | LAN discovery / multicast entitlement | ✅ optional 👤 | iroh's own mDNS (swarm-discovery) sends raw multicast, which iOS only allows with `com.apple.developer.networking.multicast` (Apple grants it on request: developer.apple.com/contact/request/networking-multicast). Not needed to ship: the app advertises and browses `_dropbeam._udp` through the system Bonjour (NWListener/NWBrowser, `LanDiscovery.swift`) and hands found devices' LAN addresses to the engine (`lan_peer_found`). iPhone ↔ iPhone is found that way; desktop builds still use swarm-discovery (desktop advertising `_dropbeam._udp` is a follow-up). Requesting the entitlement later would let iOS also join iroh's own discovery. |
+| 1.15 | Share extension opens the app | ⚠️ | Share extensions have no supported API to open their containing app (`extensionContext.open` is for Today/iMessage). DropBeamShare tries `openURL` via the responder chain for our own `dropbeam://share` scheme; if iOS refuses, the job waits in the App Group, a "Ready to send — tap to finish" notification is shown, and the app sends it as soon as its engine is up (first settings snapshot) or on the next foreground. If Review objects, drop the responder-chain call: the notification + pickup path already covers it. |
 
 ## 2. In-app requirements
 
@@ -35,11 +37,11 @@ portrait · iOS 17+ (Liquid Glass on iOS 26+, materials before).
 |---|---|---|---|
 | 2.1 | Privacy policy link in the app | ✅ | Settings → Privacy & Support → Privacy & Your Data → Privacy Policy, and Diagnostics → Privacy Policy. URL: https://github.com/lman80/dropbeam/blob/main/PRIVACY.md |
 | 2.2 | Support link | ✅ | Settings → Help & Support → https://github.com/lman80/dropbeam/issues (also the ASC Support URL), plus Send Feedback. |
-| 2.3 | Account deletion (5.1.1(v)) | ✅ decision | **Not required, no button added.** DropBeam has no sign-up and no server-side account: identity is a key generated on the device, friends/chats live only on the user's own devices. Settings → *Privacy & Your Data* explains this and shows every way to remove data (remove friends, clear history, unlink this iPhone from linked devices, delete the app to erase everything). If Review still asks, add a Rust `erase_all_data` command (wipe the app-data dir + identity, then show onboarding) behind a destructive "Erase DropBeam on This iPhone" row in that screen. |
+| 2.3 | Data deletion (5.1.1(v)) | ✅ | There is no server account (identity is a key on the device), but Settings → Privacy & Your Data → **Erase All Data** deletes everything DropBeam keeps on the iPhone: withdraws the push token from every Transfer Server, removes the iPhone from the user's linked devices (the others keep their data), unregisters push, wipes identity/friends/chats/history/settings/received files in the DropBeam folder/picked copies/caches/App Group/preferences, then closes; the next launch is a fresh install. Files saved to another folder the user chose and items saved to Photos stay (said in the confirmation). |
 | 2.4 | User-generated content (1.2) | ✅ | See **§2a Moderation** below: **Block** (friend page, friend-list long-press/swipe, conversation ⋯ menu) and **Report** (friend page, conversation ⋯ menu, long-press on any received message or file) are built in, plus Settings → **Blocked** (unblock) and **Report a Problem**. Chat and files only flow between people who exchanged codes. GIFs use Giphy `rating=pg-13` and are off until the user adds their own key. |
 | 2.5 | Diagnostics are opt-out and honest | ✅⚠️ | Settings → Diagnostics → *Share Diagnostics* (default on, redacted daily digest + crash reports). Crash reports now follow that switch too (`SuperFeedback.setCrashReportingEnabled`). ⚠️ see §3. |
 | 2.6 | Floating feedback button | ✅ | On by default only in TestFlight/debug/simulator builds (App Store installs start with it off; Settings → Feedback Button turns it on). Docks half into the screen edge, keeps clear of nav/tab bars, hides with the keyboard and inside a conversation, never over row controls. |
-| 2.7 | Permissions asked in context | ✅ | Camera: only when a scanner opens (paste fallback + "Open Settings" if denied). Local Network: iOS prompts on first discovery. Notifications: requested by the notification plugin at first launch. Paste uses `PasteButton` (no "Allow Paste" prompt). |
+| 2.7 | Permissions asked in context | ✅ | Camera: only when a scanner opens (paste fallback + "Open Settings" if denied). Local Network: iOS prompts on first discovery. Notifications: requested by the notification plugin at first launch. Paste uses `PasteButton` everywhere, including Paste Image in a chat (no "Allow Paste" prompt). |
 | 2.8 | Accessibility | ✅ | Every icon-only button has a label; Dynamic Type (verified at XXXL; rows wrap instead of truncating); VoiceOver rows combine; Reduce Motion stops the background drift; light + dark. |
 
 ## 2a. Moderation (guideline 1.2) — how it works
@@ -57,15 +59,14 @@ Data **not** collected: files, photos you send, messages, contacts, location, id
 
 | Data type | Collected | Linked to user | Tracking | Purpose | Source |
 |---|---|---|---|---|---|
-| Other Diagnostic Data | Yes | Yes* | No | App Functionality | Share Diagnostics digest (opt-out) |
-| Performance Data | Yes | Yes* | No | App Functionality | same digest (speeds, relay vs direct) |
-| Name | Yes | Yes* | No | App Functionality | digest header includes the display name |
-| Device ID | Yes | Yes* | No | App Functionality | random per-install `diag-id` in the digest |
-| Crash Data | Yes | No | No | App Functionality | crash reports (follow Share Diagnostics) |
+| Other Diagnostic Data | Yes | No | No | App Functionality | Share Diagnostics digest (opt-out) |
+| Performance Data | Yes | No | No | App Functionality | same digest (speeds, relay vs direct) |
+| Device ID | Yes | No | No | App Functionality | random per-install `diag-id` in the digest |
+| Crash Data | Yes | No | No | App Functionality | crash reports incl. MetricKit crash stacks (follow Share Diagnostics) |
 | Customer Support | Yes | No | No | App Functionality | Send Feedback message + device info; a Report email the user sends (reason, their notes, optionally the reported message text, app version) |
 | Photos or Videos | Yes | No | No | App Functionality | optional screenshot/images attached to feedback |
 
-\* ⚠️ **Recommended fix (Rust, outside the iOS UI lane):** `src-tauri/src/telemetry.rs` puts `"name": display_name` in the digest header (two places, ~L541 and ~L597). PRIVACY.md calls the digest *anonymous*, which that contradicts. Drop the `name` field (the per-install `deviceId` already tells devices apart); then in the manifest and ASC change Other Diagnostic / Performance / Device ID to **not linked** and remove **Name**. Until then the manifest declares them as linked, which is accurate.
+The digest no longer carries the display name (`telemetry.rs` sends only the random per-install `deviceId`), so nothing collected is linked to the user and **Name** is not declared; the manifest matches this table.
 
 Optional: if you want to be conservative about the Giphy integration (off by default, user supplies the key, queries go from the phone to Giphy), declare **Search History — not linked — App Functionality**.
 
@@ -91,7 +92,7 @@ Expected result: **13+** under the 2025 age-rating system (messaging + UGC). �
 >
 > **Demo friend:** we keep a Mac running DropBeam online during review. Add it with **Friends → + → Add Friend → Enter Code Instead** and paste: `<REVIEW FRIEND CODE>`. It accepts files automatically and you can message it from **Chats**. (Please don't send large files.)
 >
-> Local Network access is used to find devices on the same Wi-Fi so transfers go directly; the camera is used only to scan QR codes. Transfers pause while the app is in the background (no background modes). Chat is only possible between people who exchanged codes.
+> Local Network access is used to find devices on the same Wi-Fi so transfers go directly; the camera is used only to scan QR codes. A transfer keeps going briefly if you leave the app (a standard background task; on iOS 26 a large send shows the system's progress); there are no background modes. Chat is only possible between people who exchanged codes.
 >
 > **Blocking and reporting (1.2):** open a friend's page (Friends → the friend) or a conversation's **⋯** menu → **Block** / **Report…**; long-press any received message → **Report…**. Blocking removes the person on all the user's devices and the app refuses their messages, files and invites from then on (they aren't notified); Settings → **Blocked** lists and unblocks. A report opens a pre-filled email to us (reason, optional message text — never files) and can block at the same time. We review every report within 24 hours. Feedback/support: Settings → Report a Problem, Send Feedback, or https://github.com/lman80/dropbeam/issues.
 
@@ -154,7 +155,7 @@ How they were made: captured from the iPhone 17 Pro simulator (1206 × 2622) and
 
 ## 8. Before submitting (owner)
 
-1. 👤 Decide the diagnostics `name` fix (§3) and update the App Privacy answers accordingly.
+1. 👤 Update the App Privacy answers to §3 (Name removed; diagnostics, performance and device id **not linked**).
 2. 👤 Export compliance answers (§1.3) + France decision.
 3. 👤 Review friend Mac + code in the review notes (§5).
 4. 👤 Age rating questionnaire (§4), pricing (Free), availability.

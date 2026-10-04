@@ -99,6 +99,8 @@ struct ChatRow: View {
     let unread: Bool
     var fallback: String?
     var online = false
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @ScaledMetric(relativeTo: .body) private var avatarSize: CGFloat = 52
     static func title(for friend: Friend) -> String { friend.displayName }
     static func subtitle(for friend: Friend, overview: ChatOverview?, fallback: String?) -> String {
         overview?.lastText ?? fallback ?? "No messages yet"
@@ -108,19 +110,29 @@ struct ChatRow: View {
         HStack(alignment: .center, spacing: 0) {
             Circle().fill(unread ? ChatPalette.sent : .clear).frame(width: 10, height: 10)
                 .frame(width: 22).accessibilityHidden(true)
-            Self.avatar(for: friend, size: 52).overlay(alignment: .bottomTrailing) { if online { OnlineDot(size: 14) } }
+            // Accessibility text sizes: a smaller avatar, the name gets the full width (it
+            // wraps instead of truncating) and the date moves under it.
+            Self.avatar(for: friend, size: typeSize.isAccessibilitySize ? 44 : min(avatarSize, 60)).overlay(alignment: .bottomTrailing) { if online { OnlineDot(size: 14) } }
                 .padding(.trailing, 12)
             VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(Self.title(for: friend)).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
-                    Spacer(minLength: 4)
+                if typeSize.isAccessibilitySize {
+                    Text(Self.title(for: friend)).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
                     if let ts = overview?.lastTs {
-                        Text(ChatDates.overview(ts)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                        Text(ChatDates.overview(ts)).font(.subheadline).foregroundStyle(.secondary)
                     }
-                    Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                } else {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(Self.title(for: friend)).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
+                        Spacer(minLength: 4)
+                        if let ts = overview?.lastTs {
+                            Text(ChatDates.overview(ts)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                    }
                 }
                 Text(Self.subtitle(for: friend, overview: overview, fallback: fallback))
-                    .font(.subheadline).foregroundStyle(.secondary).lineLimit(2, reservesSpace: true)
+                    .font(.subheadline).foregroundStyle(.secondary).lineLimit(typeSize.isAccessibilitySize ? 3 : 2, reservesSpace: !typeSize.isAccessibilitySize)
                     .multilineTextAlignment(.leading)
             }
             .padding(.vertical, 11)

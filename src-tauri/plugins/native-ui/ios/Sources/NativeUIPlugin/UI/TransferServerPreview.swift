@@ -9,6 +9,7 @@ import Foundation
     static func seedIfRequested() {
         let args = ProcessInfo.processInfo.arguments
         seedOtherDevicesAndHistory(args)
+        seedMediaChat(args)
         guard args.contains("-previewTransferServer") else { return }
         let b = Bridge.shared
         b.previewKeys.formUnion(["friends", "thread", "transferServers", "pendingFiles", "holdRoutes", "presence", "presenceSeen", "transfers", "chatOverview", "pushStatus"])
@@ -70,6 +71,30 @@ import Foundation
             let id = "qa-" + args[i + 1]
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { b.selectedTab = "chat"; b.chatPath = [id] }
         }
+    }
+    /// `-previewMediaChat`: Sam sent 3 photos + a video (files in Documents/qa-media,
+    /// copied there by the QA script). Opens the chat; `-openViewerAt N` opens the viewer
+    /// on item N (1-based) — the Save All button, the viewer and #71/#72 in one setup.
+    static func seedMediaChat(_ args: [String]) {
+        guard args.contains("-previewMediaChat") else { return }
+        let b = Bridge.shared
+        b.previewKeys.formUnion(["friends", "thread", "presence", "presenceSeen", "transfers", "chatOverview"])
+        let now = Date().timeIntervalSince1970 * 1000
+        let dir = SaveFolder.defaultFolder.appendingPathComponent("qa-media")
+        let names = ["IMG_0001.jpg", "IMG_0002.jpg", "IMG_0003.jpg", "IMG_0004.mov"]
+        var completed: [String: String] = [:]
+        for name in names { completed[name] = dir.appendingPathComponent(name).path }
+        b.friends = [Friend(id: "qa-sam", name: "Sam Carter", endpointId: "qa-sam-eid")]
+        b.presence = ["qa-sam": true]
+        b.chatOverview = [ChatOverview(peerId: "qa-sam", lastText: "Beach day!", lastTs: now - 60_000, lastFromMe: false, count: 2, unread: 0)]
+        b.transfers = [Transfer(id: "qa-media", direction: "receive", state: "completed", fileNames: names, fileCount: names.count,
+                                bytesTotal: 2_400_000, bytesDone: 2_400_000, percent: 100, friendName: "Sam Carter", chatOnly: true,
+                                chatTransfer: ChatTransferDetail(id: "qa-media", completedPaths: completed))]
+        b.threads["qa-sam"] = [
+            ChatMessage(id: "s1", peerId: "qa-sam", fromMe: false, ts: now - 120_000, kind: "text", text: "Beach day!", status: "delivered"),
+            ChatMessage(id: "s2", peerId: "qa-sam", fromMe: false, ts: now - 60_000, kind: "file", files: names, bytes: 2_400_000, status: "delivered", fileXferId: "qa-media"),
+        ]
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { b.selectedTab = "chat"; b.chatPath = ["qa-sam"] }
     }
     static func selectPreviewTab(_ args: [String]) {
         if let i = args.firstIndex(of: "-previewTab"), i + 1 < args.count {

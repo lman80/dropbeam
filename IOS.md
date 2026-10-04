@@ -92,7 +92,7 @@ frontend `MOBILE_UI` checks, not a claim that every desktop subsystem is removed
 | Tray / menu-bar popover | Tray construction and helpers in `lib.rs` are desktop-only; the macOS panel dependency is macOS-only. |
 | Autostart | Plugin dependency and registration are desktop-only (`Cargo.toml`, `lib.rs`); mobile ignores the startup preference. |
 | In-app updater / relaunch | Updater and process plugins are desktop-only. `store.ts` skips automatic update checks on mobile; `SettingsView.tsx` explains reinstalling a new build. |
-| Transfers while suspended | No iOS background transfer service or background task integration is configured. Keep DropBeam foregrounded during transfers; the live iroh endpoint does not grant background execution. |
+| Transfers while suspended | A moving transfer continues for a while after leaving the app (`beginBackgroundTask`, `BackgroundTransfers.swift`); on iOS 26 a user-started send ≥ 20 MB also gets a `BGContinuedProcessingTask` with system progress. A suspended app can't keep its iroh connections; returning resumes/retries and nudges iroh (`network_changed`). |
 | Desktop Trash | `sync.rs::delete_local` only uses the Trash crate on desktop; the mobile fallback removes the file directly. |
 
 The initial default name uses `UIDevice.currentDevice.name`, falling back to

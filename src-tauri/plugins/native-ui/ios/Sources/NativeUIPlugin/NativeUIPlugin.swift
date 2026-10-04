@@ -45,6 +45,16 @@ class NativeUIPlugin: Plugin {
             if let host = self.host { root.view.bringSubviewToFront(host.view) }
             // Anything shared to DropBeam while it wasn't running.
             ShareInbox.shared.ingestSoon()
+            // Old picked/pasted copies nothing points at any more.
+            PickedMedia.sweepSoon(after: 90)
+            // Keep moving transfers alive in the background; re-probe the network on return.
+            BackgroundTransfers.shared.start()
+            // System-Bonjour LAN discovery, once first-run setup is out of the way (it
+            // shares the Local Network prompt with iroh).
+            Task { @MainActor in
+                while Bridge.shared.onboarding || Bridge.shared.settings == nil { try? await Task.sleep(for: .seconds(2)) }
+                LanDiscovery.shared.start()
+            }
             webview.resignFirstResponder()
             webview.scrollView.isScrollEnabled = false
             webview.isHidden = true // JS bridge remains attached; no invisible touch surface.
@@ -61,6 +71,8 @@ class NativeUIPlugin: Plugin {
                 }
             }
             #endif
+            // MetricKit crash stacks join the crash reports (same opt-out switch).
+            CrashDiagnostics.shared.setEnabled(UserDefaults.standard.object(forKey: Self.diagnosticsKey) as? Bool ?? true)
             if !Self.feedbackStarted {
                 Self.feedbackStarted = true
                 var feedback = SuperFeedback.Config(
@@ -137,12 +149,28 @@ class NativeUIPlugin: Plugin {
         }
     }
     @objc func pickFolder(_ invoke: Invoke) {
+        let args = (try? JSONSerialization.jsonObject(with: Data(invoke.getRawArgs().utf8))) as? [String: Any]
+        let upload = args?["purpose"] as? String == "upload"
         DispatchQueue.main.async {
             Task { @MainActor in
-                do { let path = try await NativeFolderPicker.shared.pick(); invoke.resolve(["path": path as Any? ?? NSNull()]) }
+                do {
+                    let path: String?
+                    if upload { path = try await NativeFolderPicker.shared.pickFolderToSend() } else { path = try await NativeFolderPicker.shared.pick() }
+                    invoke.resolve(["path": path as Any? ?? NSNull()])
+                }
                 catch { invoke.reject(error.localizedDescription) }
             }
         }
+    }
+    /// Live transfer activity from the plugin's Rust half (works while the WebView sleeps).
+    @objc func transferActivity(_ invoke: Invoke) {
+        let args = (try? JSONSerialization.jsonObject(with: Data(invoke.getRawArgs().utf8))) as? [String: Any] ?? [:]
+        let activity = BackgroundTransfers.Activity(active: (args["active"] as? NSNumber)?.intValue ?? 0,
+                                                    sending: (args["sending"] as? NSNumber)?.intValue ?? 0,
+                                                    done: (args["bytesDone"] as? NSNumber)?.int64Value ?? 0,
+                                                    total: (args["bytesTotal"] as? NSNumber)?.int64Value ?? 0)
+        invoke.resolve()
+        DispatchQueue.main.async { BackgroundTransfers.shared.update(activity) }
     }
     @objc func reply(_ invoke: Invoke) {
         onMain(invoke) { args in
@@ -150,10 +178,19 @@ class NativeUIPlugin: Plugin {
             Bridge.shared.reply(id: id, ok: ok, value: args["value"] ?? NSNull())
         }
     }
+    /// Store snapshots are decoded on a serial background queue (a big history or thread
+    /// no longer stalls scrolling), then applied on the main thread in arrival order.
+    private static let snapshotQueue = DispatchQueue(label: "dropbeam.native.snapshots", qos: .userInitiated)
     @objc func state(_ invoke: Invoke) {
-        onMain(invoke) { args in
-            guard let key = args["key"] as? String else { throw self.invalidArgs() }
-            try Bridge.shared.update(key: key, value: args["value"] ?? NSNull())
+        let raw = Data(invoke.getRawArgs().utf8)
+        Self.snapshotQueue.async {
+            do {
+                let decoded = try Bridge.decodeSnapshot(raw: raw)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { Bridge.shared.apply(key: decoded.key, decoded.snapshot) }
+                    invoke.resolve()
+                }
+            } catch { invoke.reject(error.localizedDescription) }
         }
     }
     @objc func event(_ invoke: Invoke) {
