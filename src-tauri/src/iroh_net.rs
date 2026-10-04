@@ -3640,13 +3640,17 @@ async fn serve_stream_inner(
             // staging dir, then hand them to the SyncManager to land in the shared
             // folder with the exact same loop-protection / mirror / history rules
             // the croc receive path uses.
+            // Receipt protocol v1 sender: it understands per-item answers (and
+            // refusals); older senders get the legacy contract — see
+            // `refuse_folder_push` for how they're kept from misreading a refusal.
+            let strict = req.get("receipt").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
             let pair_id = req
                 .get("pair_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             let Some(app) = state.app.get().cloned() else {
-                return refuse_folder_push(send, recv, "not-ready").await;
+                return refuse_folder_push(send, recv, "not-ready", strict).await;
             };
             let sm = app
                 .try_state::<Arc<crate::sync::SyncManager>>()
@@ -3656,7 +3660,7 @@ async fn serve_stream_inner(
                 .map(|st| st.config_dir.clone())
                 .unwrap_or_else(std::env::temp_dir);
             let Some(sm) = sm else {
-                return refuse_folder_push(send, recv, "not-ready").await;
+                return refuse_folder_push(send, recv, "not-ready", strict).await;
             };
             // Who may push into this folder, decided BEFORE a byte of body is read:
             // only this link's own peer (S3 — bound to the connection's key, keying a
@@ -3671,11 +3675,8 @@ async fn serve_stream_inner(
                 tokio::task::spawn_blocking(move || sm.folder_push_refusal(&pid, &who)).await?
             };
             if let Some(reason) = refusal {
-                return refuse_folder_push(send, recv, reason).await;
+                return refuse_folder_push(send, recv, reason, strict).await;
             }
-            // Receipt protocol v1 sender: it understands per-item answers, so names
-            // this filesystem can't hold are REFUSED (reported) instead of mangled.
-            let strict = req.get("receipt").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
             // Each receive gets its OWN staging dir. A shared per-pair dir was a
             // data-loss race: two handlers for the same pair overlap routinely (a
             // group member pushing while another's send retries, or the sender's
@@ -3784,6 +3785,7 @@ async fn serve_stream_inner(
                             let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
                             return Ok(());
                         }
+                        stall_legacy_sender().await;
                         anyhow::bail!("folder receive: refusing control/degenerate path {raw:?}");
                     }
                 };
@@ -3893,7 +3895,11 @@ async fn serve_stream_inner(
                         // only when NOTHING failed to land — never a blanket ok.
                         let _ = send.write_all(b"ok").await;
                     } else {
-                        let _ = send.write_all(b"partial").await;
+                        // Older senders treat ANY non-"ok" answer after a full body
+                        // as delivered (and may auto-delete). Answer nothing: their
+                        // stall watchdog fails the send instead, so it's retried.
+                        stall_legacy_sender().await;
+                        return Ok(());
                     }
                     let _ = send.finish();
                     // Wait until the SENDER has actually consumed the answer before we
@@ -3908,6 +3914,11 @@ async fn serve_stream_inner(
                     clear_placeholders(false);
                     // Don't leave the folder frozen on "Receiving N%".
                     sm.note_folder_receive_ended(&pair_id);
+                    // An older sender would read our dropped stream as "delivered,
+                    // ack lost" — make its own watchdog fail the send instead.
+                    if !strict {
+                        stall_legacy_sender().await;
+                    }
                     anyhow::bail!("folder receive failed: {e}");
                 }
             }
@@ -3996,11 +4007,12 @@ async fn serve_stream_inner(
             let owner = req.get("owner").and_then(|v| v.as_str()).map(String::from);
             let role_epoch = req.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
             let deletes_versioned = req.get("deletes_v").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
-            let removed: Vec<String> = req
+            // Absent (an older owner build) ≠ "nobody is removed": only a present
+            // list may replace ours.
+            let removed: Option<Vec<String>> = req
                 .get("removed")
                 .and_then(|r| r.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
             if !pair_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
@@ -4020,7 +4032,7 @@ async fn serve_stream_inner(
                             sm.apply_remote_control(
                                 &pair_id, &name, &deletes, &moves, &group_id, &members,
                                 owner.as_deref(), role_epoch, peer_paused, peer_pause_epoch,
-                                None, unshared, Some(&sender_eid), &removed, deletes_versioned,
+                                None, unshared, Some(&sender_eid), removed.as_deref(), deletes_versioned,
                             );
                         }).await?;
                     }
@@ -4061,7 +4073,17 @@ async fn serve_stream_inner(
                 .and_then(|d| d.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            let reconcile = crate::sync::Reconcile { files, tombstones, empty_dirs };
+            // Present (even empty) = the peer tracks which version each tombstone
+            // deleted; absent = a legacy peer.
+            let tomb_versions = payload.get("tombVersions").and_then(|t| t.as_object()).map(|t| {
+                t.iter()
+                    .filter_map(|(rel, v)| {
+                        let a = v.as_array()?;
+                        Some((rel.clone(), (a.first()?.as_u64()?, a.get(1)?.as_u64()?)))
+                    })
+                    .collect()
+            });
+            let reconcile = crate::sync::Reconcile { files, tombstones, empty_dirs, tomb_versions };
             if !pair_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
@@ -4078,7 +4100,7 @@ async fn serve_stream_inner(
                             }
                             control_sm.apply_remote_control(
                                 &control_pair, "", &[], &[], "", &[], None, 0, false, 0,
-                                Some(&reconcile), false, Some(&sender_eid), &[], false,
+                                Some(&reconcile), false, Some(&sender_eid), None, false,
                             );
                             true
                         }).await?;
@@ -7260,10 +7282,14 @@ async fn read_folder_body<F: Fn(u64, u64)>(
     std::fs::create_dir_all(dest_dir)?;
 
     let strict = header.get("receipt").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
+    // Two items naming the SAME file here (case / NFC-NFD twins on APFS/NTFS) would
+    // be staged into one file with the second one's bytes under the first one's
+    // name — never land either twin; the receipt reports them kept.
+    let dups = folder_dup_items(&items);
     let mut got = 0u64;
     let mut out = Vec::new();
     let mut buf = vec![0u8; CHUNK];
-    for item in &items {
+    for (index, item) in items.iter().enumerate() {
         let raw = item["name"].as_str().unwrap_or("file");
         let size = item["size"].as_u64().unwrap_or(0);
         // Folder-safe rel: preserves the exact hidden/colon name, but REFUSES
@@ -7271,7 +7297,7 @@ async fn read_folder_body<F: Fn(u64, u64)>(
         // receipt-speaking sender, names this filesystem can't hold. A refused
         // item must still have its bytes drained so the next item stays framed;
         // the receipt reports it as kept (never landed).
-        let Ok(rel) = folder_item_rel(raw, strict) else {
+        let Some(rel) = folder_item_rel(raw, strict).ok().filter(|_| !dups.contains(&index)) else {
             log::debug!("folder receive: skipping control/degenerate rel {raw:?}");
             let mut remaining = size;
             while remaining > 0 {
@@ -7333,8 +7359,11 @@ async fn read_folder_body<F: Fn(u64, u64)>(
         // Buffer disk writes: QUIC delivers data in small pieces, and one blocking
         // write syscall per piece throttles big receives. A 1 MiB buffer batches
         // them into far fewer, larger writes. Flushed before the file is finalized.
-        let mut f =
-            tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&dest).await?);
+        // create_new: a staged name must never be shared by two items.
+        let mut f = tokio::io::BufWriter::with_capacity(
+            1 << 20,
+            tokio::fs::OpenOptions::new().write(true).create_new(true).open(&dest).await?,
+        );
         let mut remaining = size;
         let mut failed: Option<anyhow::Error> = None;
         while remaining > 0 {
@@ -7547,13 +7576,31 @@ pub(crate) fn is_control_rel(rel: &str) -> bool {
 /// Turn a folder push away BEFORE reading its body: a framed reason the sender
 /// decodes (never mistaken for delivery), then stop the stream so a classic body
 /// write fails fast instead of streaming gigabytes into the void.
-async fn refuse_folder_push(send: &mut SendStream, recv: &mut RecvStream, reason: &str) -> Result<()> {
+async fn refuse_folder_push(send: &mut SendStream, recv: &mut RecvStream, reason: &str, strict: bool) -> Result<()> {
     log::info!("folder push refused before body: {reason}");
+    if !strict {
+        // An OLDER sender (no receipt protocol) reads any answer that isn't "ok" —
+        // even an empty one, even a reset — as "delivered, ack lost", and with
+        // "delete after delivery" on it then deletes its only copy. The one outcome
+        // it treats as a failure is its own no-progress watchdog (45 s). So: read
+        // nothing, answer nothing, let that watchdog fire; it retries later. Costs
+        // one parked stream per retry, never a file.
+        let _ = recv;
+        let _ = send;
+        stall_legacy_sender().await;
+        return Ok(());
+    }
     let _ = write_frame(send, &serde_json::json!({ "kind": "refused", "reason": reason })).await;
     let _ = send.finish();
     let _ = recv.stop(0u32.into());
     let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
     Ok(())
+}
+
+/// Hold an older sender's push without answering until its no-progress watchdog
+/// (45 s) gives up — the only "not delivered" signal it understands.
+async fn stall_legacy_sender() {
+    tokio::time::sleep(Duration::from_secs(if cfg!(test) { 1 } else { 60 })).await;
 }
 
 /// Build the per-item receipt for a folder push from the ingest outcomes (keyed by
@@ -7567,8 +7614,14 @@ pub(crate) fn folder_receipt(
     let items = header["items"].as_array().cloned().unwrap_or_default();
     let (mut landed, mut kept, mut failed) = (Vec::new(), Vec::new(), Vec::new());
     let mut reasons = serde_json::Map::new();
+    let dups = folder_dup_items(&items);
     for (i, item) in items.iter().enumerate() {
         let raw = item["name"].as_str().unwrap_or("");
+        if dups.contains(&i) {
+            kept.push(i);
+            reasons.insert(i.to_string(), serde_json::json!("case"));
+            continue;
+        }
         match folder_item_rel(raw, strict) {
             Err(reason) => {
                 kept.push(i);
@@ -7591,6 +7644,26 @@ pub(crate) fn folder_receipt(
         "kind": "receipt", "v": 1, "n": items.len(),
         "landed": landed, "kept": kept, "failed": failed, "reasons": reasons,
     })
+}
+
+/// Header items that name the SAME file on this disk as another item in the batch:
+/// NFC/NFD twins everywhere, and case-only twins on case-insensitive platforms.
+/// ALL members of such a group are returned — staging them would overwrite one
+/// with the other, so none of them may be reported as landed.
+pub(crate) fn folder_dup_items(items: &[serde_json::Value]) -> std::collections::HashSet<usize> {
+    use unicode_normalization::UnicodeNormalization;
+    let fold_case = cfg!(any(target_os = "macos", target_os = "ios", windows));
+    let mut groups: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (i, item) in items.iter().enumerate() {
+        let raw = item["name"].as_str().unwrap_or("");
+        let Some(rel) = folder_receive_rel(raw) else { continue };
+        let mut key: String = rel.to_string_lossy().nfc().collect();
+        if fold_case {
+            key = key.to_lowercase();
+        }
+        groups.entry(key).or_default().push(i);
+    }
+    groups.into_values().filter(|v| v.len() > 1).flatten().collect()
 }
 
 /// True if this '/'-separated wire rel names something a WINDOWS filesystem can't
@@ -11335,6 +11408,28 @@ mod tests {
         assert_eq!(r["reasons"]["4"], "hidden");
     }
 
+    /// P1-b: case/NFC twins in one batch are never staged into one file and never
+    /// reported landed (the sender would delete bytes that exist nowhere).
+    #[test]
+    fn twin_names_in_one_batch_are_kept_not_landed() {
+        let header = serde_json::json!({"kind":"folder-files","items":[
+            {"name":"caf\u{e9}.txt","size":1},{"name":"cafe\u{301}.txt","size":1},
+            {"name":"a.txt","size":1},{"name":"A.txt","size":1},{"name":"b.txt","size":1}]});
+        let items = header["items"].as_array().unwrap().clone();
+        let dups = folder_dup_items(&items);
+        assert!(dups.contains(&0) && dups.contains(&1), "NFC/NFD twins everywhere");
+        assert_eq!(dups.contains(&2) && dups.contains(&3), cfg!(any(target_os = "macos", target_os = "ios", windows)));
+        assert!(!dups.contains(&4));
+        let mut outcomes = std::collections::HashMap::new();
+        for k in ["café.txt", "a.txt", "A.txt", "b.txt"] {
+            outcomes.insert(k.to_string(), FolderItemOutcome::Landed);
+        }
+        let r = folder_receipt(&header, &outcomes, true);
+        let landed: Vec<u64> = r["landed"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert!(!landed.contains(&0) && !landed.contains(&1));
+        assert!(landed.contains(&4));
+    }
+
     /// D8: names Windows can't hold are recognised (so a Windows receiver refuses
     /// them instead of landing a mangled copy that loops + duplicates).
     #[test]
@@ -12724,7 +12819,7 @@ mod loopback_tests {
                 assert!(header["items"][0]["ver"].as_u64().is_some(), "items carry their placement version");
                 match scenario {
                     "refuse" => {
-                        refuse_folder_push(&mut send, &mut recv, "paused").await.unwrap();
+                        refuse_folder_push(&mut send, &mut recv, "paused", true).await.unwrap();
                     }
                     other => {
                         let staged = read_folder_body(&mut recv, &header, &stage, &AtomicBool::new(false), |_, _| {}).await.unwrap();

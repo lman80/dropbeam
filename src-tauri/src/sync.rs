@@ -174,10 +174,14 @@ pub struct Reconcile {
     /// folder someone makes to organize (even an empty one) still appears on the
     /// peer. Purely additive on apply — only ever creates directories.
     pub empty_dirs: Vec<String>,
+    /// The version (size, mtime) each tombstone deleted, from a peer that tracks
+    /// them. `None` = a legacy peer (tombstones apply by timestamp).
+    pub tomb_versions: Option<HashMap<String, (u64, u64)>>,
 }
 
 impl SyncManager {
     pub fn new(app: AppHandle, config_dir: PathBuf) -> Arc<Self> {
+        let _ = sync_config_dir().set(config_dir.clone());
         Arc::new(SyncManager {
             app,
             viewer_warning_at: Mutex::new(HashMap::new()),
@@ -844,9 +848,7 @@ impl SyncManager {
                         }
                         // Note first sight (platforms without ctime, see D15) BEFORE
                         // the settle wait, so a moved-in old file reads as new.
-                        if let Ok(m) = std::fs::metadata(&p) {
-                            let _ = path_version_ms(Path::new(&p), &m);
-                        }
+                        note_appeared_now(Path::new(&p));
                         // Wait for quiet + confirm write-completion via size stability.
                         if !wait_until_stable(&p, &debounce2, gen, &stopped2).await {
                             return;
@@ -914,12 +916,8 @@ impl SyncManager {
                             .map(|f| f.to_string_lossy().to_string())
                             .filter(|fp| is_sendable_candidate(fp, &folder2, &inbound2))
                             .collect();
-                        if !cfg!(unix) {
-                            for c in &cands {
-                                if let Ok(m) = std::fs::metadata(c) {
-                                    let _ = path_version_ms(Path::new(c), &m);
-                                }
-                            }
+                        for c in &cands {
+                            note_appeared_now(Path::new(c));
                         }
                         let mut any = false;
                         {
@@ -1001,7 +999,7 @@ impl SyncManager {
                         // ROOT GUARD (D5/D6): an unplugged drive / unmounted share
                         // makes EVERY file "disappear". That is never a delete — with
                         // the folder itself gone, propagate nothing.
-                        if !Path::new(&folder2).is_dir() {
+                        if !folder_available(&folder2) {
                             log::warn!("folder {folder2} is not available — not treating {rel:?} as deleted");
                             return;
                         }
@@ -1063,7 +1061,7 @@ impl SyncManager {
                                     return;
                                 }
                             }
-                            if !Path::new(&folder2).is_dir() {
+                            if !folder_available(&folder2) {
                                 return; // the whole folder went away meanwhile
                             }
                         }
@@ -1085,6 +1083,9 @@ impl SyncManager {
                             let mut pend = pd.lock().unwrap();
                             for (t, known) in &targets {
                                 tomb_changed |= note_tombstone(&tomb2, t, ts);
+                                if let Some(v) = known {
+                                    note_tomb_version(&pidc2, t, *v, ts);
+                                }
                                 if !pend.iter().any(|d| &d.rel == t) {
                                     pend.push(DeleteEvent { rel: t.clone(), ts, known: *known });
                                 }
@@ -1094,6 +1095,7 @@ impl SyncManager {
                             // used to rewrite the entire tombstone file per target).
                             if tomb_changed {
                                 persist_tombstones(&cfgdir2, &pidc2, &tomb2);
+                                persist_tomb_versions(&pidc2);
                             }
                         }
                         record_deleted_versions(&cfgdir2, &folder2, &known_sigs, ts);
@@ -1170,7 +1172,7 @@ impl SyncManager {
                 // moved. Nothing can be read or sent; don't churn the queue (every
                 // queued file would read as "deleted" and be dropped).
                 let folder_now = config.lock().unwrap().folder.clone();
-                if !Path::new(&folder_now).is_dir() {
+                if !folder_available(&folder_now) {
                     if let Ok(mut s) = status.lock() {
                         s.folder_missing = true;
                     }
@@ -1471,6 +1473,7 @@ impl SyncManager {
                     let mut sk = skipped.lock().unwrap();
                     for f in &settled.delivered {
                         q.remove(f);
+                        q.note_ok(f);
                         if let Some(sig) = file_sig(f, &pair.folder) {
                             inb.insert(sig.clone());
                             sk.remove(&sig);
@@ -1491,7 +1494,9 @@ impl SyncManager {
                         q.remove(f);
                     }
                     for f in &settled.retry {
-                        q.rotate_to_back(f);
+                        if !q.note_failed(f) {
+                            q.rotate_to_back(f);
+                        }
                     }
                 }
                 {
@@ -1699,7 +1704,7 @@ impl SyncManager {
                 // advertised as "I have nothing" (the peer would re-push everything
                 // into a path that recreates on the boot disk), and when it comes
                 // back the watcher has to be re-registered — restart the link.
-                let root_ok = Path::new(&pair.folder).is_dir();
+                let root_ok = folder_available(&pair.folder);
                 let was_missing = status.lock().map(|s| s.folder_missing).unwrap_or(false);
                 if root_ok && was_missing {
                     log::info!("folder {} is back — restarting its sync", pair.folder);
@@ -1815,7 +1820,11 @@ impl SyncManager {
                     let folder = pair.folder.clone();
                     let empty_dirs = tokio::task::spawn_blocking(move || live_empty_dirs(&folder))
                         .await.expect("empty directory scan panicked");
-                    Some(serde_json::json!({ "files": files, "tombstones": tombs, "emptyDirs": empty_dirs, "requestReply": request_reply }))
+                    let tvers: serde_json::Map<String, serde_json::Value> = tomb_versions_of(&pair_id)
+                        .into_iter()
+                        .map(|(rel, (sz, mt))| (rel, serde_json::json!([sz, mt])))
+                        .collect();
+                    Some(serde_json::json!({ "files": files, "tombstones": tombs, "tombVersions": tvers, "emptyDirs": empty_dirs, "requestReply": request_reply }))
                     } else {
                         None
                     }
@@ -2033,7 +2042,7 @@ impl SyncManager {
         // sender as already-meshed instead of adding them a SECOND time.
         sender_eid: Option<&str>,
         // Group members the OWNER removed (honored only from the owner — D13).
-        removed: &[String],
+        removed: Option<&[String]>,
         // The sender uses versioned deletes (every file entry names its version).
         deletes_versioned: bool,
     ) {
@@ -2062,7 +2071,7 @@ impl SyncManager {
         // a hostile peer stamping u64::MAX would otherwise win every toggle forever.
         if peer_pause_epoch > now_ms().saturating_add(24 * 3600 * 1000) {
             log::warn!("ignoring a far-future pause epoch from the peer on {pair_id}");
-        } else if peer_pause_epoch > config.lock().unwrap().pause_epoch {
+        } else if peer_pause_epoch > sane_epoch(config.lock().unwrap().pause_epoch) {
             self.set_paused(pair_id, peer_paused, peer_pause_epoch);
         }
         // While WE are paused, ignore the peer's sync payload entirely (deletes,
@@ -2187,7 +2196,7 @@ impl SyncManager {
         // D13: the folder OWNER's list of removed members is authoritative — drop our
         // links to them (so they stop syncing with us too) and refuse to re-mesh
         // with them via anyone's roster. Ignored from anyone but the owner.
-        if group_ok {
+        if let (true, Some(removed)) = (group_ok, removed) {
             if let Some(seid) = sender_eid {
                 let my_eid = self.iroh_endpoint().map(|ep| ep.id().to_string()).unwrap_or_default();
                 let dropped = pairing::apply_owner_removals(&self.config_dir, group_id, seid, removed, &my_eid);
@@ -2255,7 +2264,7 @@ impl SyncManager {
 
         // A VIEWER peer must never delete our files: ignore deletes coming FROM a
         // read-only member (they shouldn't be changing the folder at all).
-        if mirror && !peer_is_viewer && !locally_paused && !deletes.is_empty() && Path::new(&folder).is_dir() {
+        if mirror && !peer_is_viewer && !locally_paused && !deletes.is_empty() && folder_available(&folder) {
             let mut applied: Vec<(String, u64, Option<(u64, u64)>)> = Vec::new();
             let mut tomb_changed = false;
             let mut deleted_sigs: Vec<String> = Vec::new();
@@ -2289,20 +2298,32 @@ impl SyncManager {
                 // delete keeps propagating across a group. Always tombstone the
                 // named rel (even a no-op re-delivery) at the peer's timestamp.
                 tomb_changed |= note_tombstone(&tombstones, rel, *ts);
+                if let Some(v) = known {
+                    note_tomb_version(pair_id, rel, *v, *ts);
+                }
                 for r in &removed_rels {
                     tomb_changed |= note_tombstone(&tombstones, r, *ts);
                 }
                 if did {
                     applied.push((rel.clone(), *ts, *known));
+                    // These files are gone by the peer's hand: forget them in the
+                    // loop-guard manifest too (else they'd read as "known but
+                    // missing" forever — the suspicious-empty check would withhold
+                    // our snapshot, and the startup scan would re-propagate them).
+                    let gone: HashSet<String> = removed_rels.iter().cloned().chain(std::iter::once(norm_rel(rel))).collect();
+                    inbound.lock().unwrap().retain(|sig| sig_rel(sig).map_or(true, |r| !gone.contains(&norm_rel(&r))));
                 }
             }
             // ONE write for the whole beacon's deletes (a 1,000-file bulk delete used
             // to rewrite the entire tombstone file per entry — gigabytes of IO).
             if tomb_changed {
                 persist_tombstones(&self.config_dir, pair_id, &tombstones);
+                persist_tomb_versions(pair_id);
             }
             record_deleted_versions(&self.config_dir, &folder, &deleted_sigs, now_ms());
             if !applied.is_empty() {
+                let snapshot = inbound.lock().unwrap().clone();
+                self.persist_manifest(pair_id, &snapshot);
                 let _ = self.app.emit("folder-history://changed", pair_id);
                 // In a group, forward each delete WE just applied to our OTHER
                 // links, so it reaches members not directly connected to the
@@ -2331,7 +2352,7 @@ impl SyncManager {
                 if let Ok(mut s) = status.lock() {
                     s.peer_files = rec.files.len() as u32;
                 }
-                if Path::new(&folder).is_dir() {
+                if folder_available(&folder) {
                     self.reconcile_apply(
                         pair_id, &folder, rec, &self_deleted, &tombstones, &queue, &wake, &inbound,
                         &skipped, !peer_is_viewer, !i_am_viewer,
@@ -2408,7 +2429,13 @@ impl SyncManager {
                 // The precise placement version is re-checked inside (D4/D15): the
                 // plan's view can be a few ms stale, and on platforms without ctime
                 // a moved-in file is only "new" by first sight.
-                let guard = DeleteGuard { ts: tomb_ts, known: None, listed: None, require_known: false };
+                // A peer that tracks tombstone versions names the version each one
+                // deleted; a tombstone it can't vouch for (a directory, a name it
+                // never had) never removes a FILE here (D4). Legacy peers: ts rule.
+                let Some(guard) = reconcile_delete_guard(rec, rel, tomb_ts) else {
+                    log::info!("reconcile[{pair_id}]: keeping {rel:?} — the peer's tombstone doesn't name a version we hold");
+                    continue;
+                };
                 if apply_remote_delete(folder, rel, self_deleted, &mut removed, DELETE_GRACE_MS, &guard) {
                     deleted_any = true;
                     deleted_sigs.extend(sig);
@@ -2435,16 +2462,21 @@ impl SyncManager {
                 }
                 // A local file NEWER than the tombstone survives it — don't adopt (and
                 // forward) a delete that doesn't apply to what we hold.
-                if abs.is_file() && !delete_allowed(&abs, ts, None) {
+                let version = rec.tomb_versions.as_ref().and_then(|tv| tv.get(rel).copied());
+                if abs.is_file() && !delete_allowed(&abs, ts, version) {
                     continue;
                 }
                 tomb_changed |= note_tombstone(tombstones, rel, ts);
+                if let Some(v) = version {
+                    note_tomb_version(pair_id, rel, v, ts);
+                }
             }
             record_deleted_versions(&self.config_dir, folder, &deleted_sigs, now_ms());
             // ONE write for the whole snapshot (a new member adopting a 9k-entry
             // tombstone set used to rewrite the ~MB file once per entry ≈ GBs of IO).
             if tomb_changed {
                 persist_tombstones(&self.config_dir, pair_id, tombstones);
+                persist_tomb_versions(pair_id);
             }
             if deleted_any {
                 let _ = self.app.emit("folder-history://changed", pair_id);
@@ -2822,10 +2854,29 @@ impl SyncManager {
             return false;
         };
         let eid = cfg.lock().unwrap().endpoint_id.clone();
+        // The live config can lag pairs.json (a folder-hello keyed the link a
+        // moment ago and the worker refresh hasn't landed): trust the file.
+        let on_disk = || {
+            pairing::load(&self.config_dir)
+                .into_iter()
+                .find(|p| p.id == pair_id)
+                .and_then(|p| p.endpoint_id)
+        };
         match eid {
-            Some(e) => e == sender_eid,
+            Some(e) if e == sender_eid => true,
+            Some(_) => {
+                if on_disk().as_deref() == Some(sender_eid) {
+                    cfg.lock().unwrap().endpoint_id = Some(sender_eid.to_string());
+                    return true;
+                }
+                false
+            }
             None => {
                 if !pairing::key_unkeyed_group_link(&self.config_dir, pair_id, sender_eid) {
+                    if on_disk().as_deref() == Some(sender_eid) {
+                        cfg.lock().unwrap().endpoint_id = Some(sender_eid.to_string());
+                        return true;
+                    }
                     return false;
                 }
                 cfg.lock().unwrap().endpoint_id = Some(sender_eid.to_string());
@@ -2861,7 +2912,7 @@ impl SyncManager {
         if h.paused.load(Ordering::Relaxed) {
             return Some("paused");
         }
-        if !Path::new(&folder).is_dir() {
+        if !folder_available(&folder) {
             return Some("folder-missing");
         }
         None
@@ -2891,7 +2942,7 @@ impl SyncManager {
                     .map(|p| p.pause_epoch)
             })
             .unwrap_or(0);
-        self.set_paused(pair_id, paused, now_ms().max(stored.saturating_add(1)));
+        self.set_paused(pair_id, paused, next_pause_epoch(now_ms(), stored));
     }
 
     /// D5: find files we knew that vanished without a watcher event (deleted while
@@ -2952,6 +3003,7 @@ impl SyncManager {
             let mut pd = pending.lock().unwrap();
             for (rel, known) in &confirmed {
                 tomb_changed |= note_tombstone(&tombstones, rel, ts);
+                note_tomb_version(pair_id, rel, *known, ts);
                 if !pd.iter().any(|d| &d.rel == rel) {
                     pd.push(DeleteEvent { rel: rel.clone(), ts, known: Some(*known) });
                 }
@@ -2959,6 +3011,7 @@ impl SyncManager {
         }
         if tomb_changed {
             persist_tombstones(&self.config_dir, pair_id, &tombstones);
+            persist_tomb_versions(pair_id);
         }
         let sigs: Vec<String> = confirmed.iter().map(|(r, (sz, mt))| format!("{r}|{sz}|{mt}")).collect();
         record_deleted_versions(&self.config_dir, &pair.folder, &sigs, ts);
@@ -3223,15 +3276,51 @@ impl SyncManager {
 // croc send / receive runners
 // ---------------------------------------------------------------------------
 
+/// How a reconcile tombstone may delete `rel` here (D4): by the version the peer
+/// says it deleted, or — legacy peers only — by timestamp. `None` = it may not.
+fn reconcile_delete_guard(rec: &Reconcile, rel: &str, tomb_ts: u64) -> Option<DeleteGuard<'static>> {
+    match &rec.tomb_versions {
+        Some(tv) => {
+            let v = tv
+                .get(rel)
+                .or_else(|| tv.iter().find(|(k, _)| norm_rel(k) == rel).map(|(_, v)| v))?;
+            Some(DeleteGuard { ts: tomb_ts, known: Some(*v), listed: None, require_known: true })
+        }
+        None => Some(DeleteGuard { ts: tomb_ts, known: None, listed: None, require_known: false }),
+    }
+}
+
+/// A stored pause epoch from a far-future clock (or a hostile beacon accepted by an
+/// older build) would win every comparison forever: treat it as 0.
+fn sane_epoch(e: u64) -> u64 {
+    if e > now_ms().saturating_add(24 * 3600 * 1000) { 0 } else { e }
+}
+
+/// D16: a local toggle beats the one it replaces even when our clock is behind.
+fn next_pause_epoch(now: u64, stored: u64) -> u64 {
+    let stored = if stored > now.saturating_add(24 * 3600 * 1000) { 0 } else { stored };
+    now.max(stored.saturating_add(1))
+}
+
 /// Viewer → editor: record every file currently on disk as known (loop-guard
 /// manifest) and as "peer has its own copy" (so reconcile doesn't push it), until
 /// the user changes it. Returns how many files were baselined.
 fn baseline_on_promotion(config_dir: &Path, pair: &Pair) -> usize {
-    if !Path::new(&pair.folder).is_dir() {
+    if !folder_available(&pair.folder) {
         return 0;
     }
     let mut manifest = load_manifest(config_dir, &pair.id);
     let mut skipped = load_skipped(config_dir, &pair.id);
+    // Deletes made while read-only aren't the editor's to propagate either: forget
+    // known files that are gone, so the startup missed-delete scan doesn't read
+    // them as "deleted while closed" and push them to everyone.
+    let present = live_manifest(&pair.folder);
+    let before = manifest.len();
+    manifest.retain(|sig| sig_rel(sig).is_some_and(|r| present.contains_key(&norm_rel(&r))));
+    let forgotten = before - manifest.len();
+    if forgotten > 0 {
+        log::info!("folder {}: promoted to editor — not propagating {forgotten} read-only-era deletion(s)", pair.folder);
+    }
     let mut n = 0;
     for f in list_files_rec(Path::new(&pair.folder)) {
         let p = f.to_string_lossy().to_string();
@@ -3537,7 +3626,7 @@ fn move_staged_into_folder(
     let staged = list_files_rec(staging);
     // The folder itself must be there (D6): never recreate a missing root (an
     // unplugged drive) by landing into it.
-    if !folder_path.is_dir() {
+    if !folder_available(folder) {
         for src in staged {
             if let Ok(rel) = src.strip_prefix(staging) {
                 report.outcomes.insert(norm_rel(&rel.to_string_lossy()), O::Failed);
@@ -3613,7 +3702,10 @@ fn move_staged_into_folder(
         // D7: the name exists locally in DIFFERENT letter case (case-insensitive
         // volume — both spellings open the same file). Decide explicitly instead of
         // letting either spelling overwrite/archive the other in a loop.
-        if let (Some(ver), Some(actual)) = (sender_ver, case_variant_on_disk(&dest_path)) {
+        // Mirror folders only: a plain drop folder keeps its "name (1)" behaviour.
+        if let (true, Some(ver), Some(actual)) =
+            (mirror, sender_ver, if mirror { case_variant_on_disk(&dest_path) } else { None })
+        {
             let actual_path = dest_path.with_file_name(&actual);
             let local_ver = std::fs::metadata(&actual_path)
                 .map(|m| path_version_ms(&actual_path, &m))
@@ -4024,7 +4116,7 @@ fn apply_remote_delete(
         return false;
     }
     // Never act on a folder that isn't there (unplugged drive).
-    if !Path::new(folder).is_dir() {
+    if !folder_available(folder) {
         return false;
     }
     let dest = Path::new(folder).join(&rel_norm);
@@ -5225,6 +5317,44 @@ fn build_group_roster(
     (gid, roster, owner_eid, role_epoch)
 }
 
+// ── Folder availability (D6) ─────────────────────────────────────────────────
+/// Is the synced folder really there? Not just "a directory exists at that path":
+/// on Linux an unmounted drive leaves its EMPTY mount-point directory behind, which
+/// would read as "every file deleted". We remember folders that are their own
+/// mount (different device from their parent) and treat them as missing whenever
+/// they're back on the parent's device.
+pub(crate) fn folder_available(folder: &str) -> bool {
+    let root = Path::new(folder);
+    if !root.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        static MOUNTS: OnceLock<Mutex<Option<HashSet<String>>>> = OnceLock::new();
+        let file = sync_config_dir().get().map(|d| d.join("folder-mounts.json"));
+        let (Ok(meta), Some(parent)) = (std::fs::metadata(root), root.parent()) else { return true };
+        let Ok(pmeta) = std::fs::metadata(parent) else { return true };
+        let mut guard = MOUNTS.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|e| e.into_inner());
+        let set = guard.get_or_insert_with(|| {
+            file.as_ref()
+                .and_then(|f| std::fs::read_to_string(f).ok())
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default()
+        });
+        if meta.dev() != pmeta.dev() {
+            if set.insert(folder.to_string()) {
+                if let (Some(f), Ok(txt)) = (file, serde_json::to_string(&*set)) {
+                    let _ = crate::settings::write_atomic(&f, txt.as_bytes());
+                }
+            }
+        } else if set.contains(folder) {
+            return false; // was its own mount, now the bare mount point
+        }
+    }
+    true
+}
+
 // ── Send queue (T14) ─────────────────────────────────────────────────────────
 /// The per-folder send queue: FIFO order + a set for O(1) "already queued?" checks.
 /// A 3,000-photo drop used to pay an O(n) `iter().any` scan per enqueue under a
@@ -5233,11 +5363,23 @@ fn build_group_roster(
 pub(crate) struct SendQueue {
     q: VecDeque<String>,
     set: HashSet<String>,
+    /// Consecutive per-item failures the PEER reported (or changed-while-sending).
+    fails: HashMap<String, u32>,
+    /// Items parked after repeated failures (a file the peer can't land — e.g. a
+    /// folder in the way holding hidden files, or an unreadable History index on
+    /// their side): not re-queued by the rescan/reconcile until this time.
+    cooldown: HashMap<String, Instant>,
 }
 
 impl SendQueue {
-    /// Append unless already queued. Returns whether it was added.
+    /// Append unless already queued (or parked). Returns whether it was added.
     fn push_back(&mut self, p: String) -> bool {
+        if let Some(until) = self.cooldown.get(&p) {
+            if Instant::now() < *until {
+                return false;
+            }
+            self.cooldown.remove(&p);
+        }
         if self.set.insert(p.clone()) {
             self.q.push_back(p);
             true
@@ -5264,6 +5406,28 @@ impl SendQueue {
             self.q.remove(pos);
         }
         true
+    }
+    /// The peer couldn't land this item. After 3 in a row it's parked with an
+    /// exponential cool-down (2 min doubling, max 1 h) instead of re-sending its
+    /// bytes every round forever. Returns whether it was parked.
+    fn note_failed(&mut self, p: &str) -> bool {
+        let n = {
+            let e = self.fails.entry(p.to_string()).or_insert(0);
+            *e += 1;
+            *e
+        };
+        if n < 3 {
+            return false;
+        }
+        let mins = (2u64 << (n - 3).min(5)).min(60);
+        self.cooldown.insert(p.to_string(), Instant::now() + Duration::from_secs(mins * 60));
+        self.remove(p);
+        log::warn!("folder send: peer keeps failing to save {} — retrying in {mins} min", file_name_of(p));
+        true
+    }
+    fn note_ok(&mut self, p: &str) {
+        self.fails.remove(p);
+        self.cooldown.remove(p);
     }
     /// Move an item to the back (a file that keeps failing must not block the rest).
     fn rotate_to_back(&mut self, p: &str) {
@@ -5318,35 +5482,90 @@ fn sweep_stale_placeholder(f: &Path) {
 }
 
 // ── Placement version (D15) ──────────────────────────────────────────────────
-/// When we first saw each path (non-Unix only). Windows has no ctime in std and
-/// a same-volume MOVE keeps a file's old creation time, so an old file moved INTO
-/// a synced folder read as "old" and a stale tombstone deleted it. Unix gets this
-/// from ctime; elsewhere we track first sight ourselves (in memory: after a
-/// restart every file simply reads as fresh for the grace window — the safe side).
-fn first_seen_map() -> &'static Mutex<HashMap<PathBuf, (u64, u64, u64)>> {
-    static MAP: OnceLock<Mutex<HashMap<PathBuf, (u64, u64, u64)>>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+/// When a path genuinely APPEARED in a synced folder (non-Unix only). Windows has
+/// no ctime in std and a same-volume MOVE keeps a file's old creation time, so an
+/// old file moved INTO a synced folder read as "old" and a stale tombstone deleted
+/// it. Unix gets this from ctime. Elsewhere the watcher records the moment it saw
+/// a path appear (never a startup scan — that would make every file look "placed
+/// at launch" and block real deletes), persisted so it survives a restart.
+const FIRST_SEEN_TTL_MS: u64 = 45 * 24 * 3600 * 1000;
+const FIRST_SEEN_CAP: usize = 100_000;
+
+fn sync_config_dir() -> &'static OnceLock<PathBuf> {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    &DIR
 }
 
-/// First-seen ms for `path` at this (size, mtime); records "now" the first time.
-fn first_seen_ms(path: &Path, size: u64, mtime: u64, now: u64) -> u64 {
-    let mut m = first_seen_map().lock().unwrap_or_else(|e| e.into_inner());
-    let e = m.entry(path.to_path_buf()).or_insert((now, size, mtime));
-    if e.1 != size || e.2 != mtime {
-        // A different file now lives here (or it was rewritten): that's new too.
-        *e = (now, size, mtime);
+fn first_seen_map() -> &'static Mutex<Option<HashMap<String, (u64, u64, u64)>>> {
+    static MAP: OnceLock<Mutex<Option<HashMap<String, (u64, u64, u64)>>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(None))
+}
+
+fn first_seen_file() -> Option<PathBuf> {
+    sync_config_dir().get().map(|d| d.join("first-seen.json"))
+}
+
+fn with_first_seen<R>(f: impl FnOnce(&mut HashMap<String, (u64, u64, u64)>) -> R) -> R {
+    let mut guard = first_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(|| {
+        first_seen_file()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    });
+    f(map)
+}
+
+/// Record that `path` (size, mtime) just appeared. Persisted.
+fn note_appeared(path: &Path, size: u64, mtime: u64, now: u64) {
+    let key = path.to_string_lossy().to_string();
+    let snapshot = with_first_seen(|m| {
+        if m.get(&key).is_some_and(|e| e.1 == size && e.2 == mtime) {
+            return None; // already known at this version
+        }
+        m.insert(key, (now, size, mtime));
+        let cutoff = now.saturating_sub(FIRST_SEEN_TTL_MS);
+        m.retain(|_, e| e.0 >= cutoff);
+        if m.len() > FIRST_SEEN_CAP {
+            let mut v: Vec<_> = m.iter().map(|(k, e)| (k.clone(), *e)).collect();
+            v.sort_by_key(|(_, e)| std::cmp::Reverse(e.0));
+            v.truncate(FIRST_SEEN_CAP);
+            *m = v.into_iter().collect();
+        }
+        Some(m.clone())
+    });
+    if let (Some(snap), Some(file)) = (snapshot, first_seen_file()) {
+        if let Ok(txt) = serde_json::to_string(&snap) {
+            let _ = crate::settings::write_atomic(&file, txt.as_bytes());
+        }
     }
-    e.0
+}
+
+/// When `path` appeared at THIS (size, mtime), if the watcher saw it appear.
+fn appeared_at(path: &Path, size: u64, mtime: u64) -> Option<u64> {
+    let key = path.to_string_lossy().to_string();
+    with_first_seen(|m| m.get(&key).filter(|e| e.1 == size && e.2 == mtime).map(|e| e.0))
+}
+
+/// The watcher saw `path` appear/change: note it where the platform lacks ctime.
+fn note_appeared_now(path: &Path) {
+    if cfg!(unix) {
+        return;
+    }
+    if let Ok(m) = std::fs::metadata(path) {
+        note_appeared(path, m.len(), meta_mtime(&m), now_ms());
+    }
 }
 
 /// A file's placement version (ms): `meta_version_ms` plus, where the platform
-/// has no ctime, when we first saw it. The value every delete decision uses.
+/// has no ctime, when the watcher saw it appear. The value every delete decision
+/// uses. A pure lookup — scanning a folder never makes files look new.
 pub(crate) fn path_version_ms(path: &Path, meta: &std::fs::Metadata) -> u64 {
     let v = meta_version_ms(meta);
     if cfg!(unix) {
         return v;
     }
-    v.max(first_seen_ms(path, meta.len(), meta_mtime(meta), now_ms()))
+    v.max(appeared_at(path, meta.len(), meta_mtime(meta)).unwrap_or(0))
 }
 
 // ── Case-insensitive volumes (D7) ────────────────────────────────────────────
@@ -5522,6 +5741,54 @@ fn deleted_version_at(config_dir: &Path, folder: &str, sig: &str) -> Option<u64>
     with_deleted_sigs(config_dir, folder, |m| m.get(sig).copied())
 }
 
+// ── Tombstone versions (D4, reconcile path) ─────────────────────────────────
+/// rel → (size, mtime, ts): the exact version each tombstone deleted, when known.
+/// Rides the reconcile snapshot as `tombVersions`, so a peer's self-heal deletes
+/// only THAT version — never a same-named file the deleter never had.
+fn tomb_vers_store() -> &'static Mutex<HashMap<String, HashMap<String, (u64, u64, u64)>>> {
+    static S: OnceLock<Mutex<HashMap<String, HashMap<String, (u64, u64, u64)>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tomb_vers_file(pair_id: &str) -> Option<PathBuf> {
+    sync_config_dir().get().map(|d| d.join(format!("tombstone-versions-{pair_id}.json")))
+}
+
+fn with_tomb_vers<R>(pair_id: &str, f: impl FnOnce(&mut HashMap<String, (u64, u64, u64)>) -> R) -> R {
+    let mut store = tomb_vers_store().lock().unwrap_or_else(|e| e.into_inner());
+    let map = store.entry(pair_id.to_string()).or_insert_with(|| {
+        tomb_vers_file(pair_id)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    });
+    f(map)
+}
+
+fn note_tomb_version(pair_id: &str, rel: &str, version: (u64, u64), ts: u64) {
+    with_tomb_vers(pair_id, |m| {
+        let e = m.entry(norm_rel(rel)).or_insert((version.0, version.1, ts));
+        if ts >= e.2 {
+            *e = (version.0, version.1, ts);
+        }
+    });
+}
+
+fn persist_tomb_versions(pair_id: &str) {
+    let cutoff = now_ms().saturating_sub(TOMBSTONE_TTL_MS);
+    let snap = with_tomb_vers(pair_id, |m| {
+        m.retain(|_, e| e.2 >= cutoff);
+        m.clone()
+    });
+    if let (Some(file), Ok(txt)) = (tomb_vers_file(pair_id), serde_json::to_string(&snap)) {
+        let _ = crate::settings::write_atomic(&file, txt.as_bytes());
+    }
+}
+
+fn tomb_versions_of(pair_id: &str) -> HashMap<String, (u64, u64)> {
+    with_tomb_vers(pair_id, |m| m.iter().map(|(k, e)| (k.clone(), (e.0, e.1))).collect())
+}
+
 // ── Last full observation (D5) ───────────────────────────────────────────────
 fn seen_path(config_dir: &Path, pair_id: &str) -> PathBuf {
     config_dir.join(format!("folder-seen-{pair_id}.json"))
@@ -5559,7 +5826,7 @@ fn missed_deletes(
     tombstones: &HashMap<String, u64>,
 ) -> HashMap<String, (u64, u64)> {
     let root = Path::new(folder);
-    if !root.is_dir() {
+    if !folder_available(folder) {
         return HashMap::new();
     }
     // Latest known version per rel.
@@ -5594,8 +5861,53 @@ fn missed_deletes(
         .iter()
         .filter(|(rel, _)| !tombstones.contains_key(*rel))
         .filter(|(rel, _)| !present.contains_key(*rel) && !(ci && present_folded.contains(&rel.to_lowercase())))
-        .filter(|(rel, _)| std::fs::symlink_metadata(root.join(rel)).is_err())
+        // Truly gone = NotFound. Any other error (permission, I/O on a flaky NAS)
+        // proves nothing.
+        .filter(|(rel, _)| {
+            matches!(std::fs::symlink_metadata(root.join(rel)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        })
+        // Under a symlinked directory (its target may be offline) — the walker
+        // never lists those, so absence there proves nothing either.
+        .filter(|(rel, _)| {
+            let mut anc = Path::new(rel.as_str()).parent();
+            while let Some(a) = anc {
+                if a.as_os_str().is_empty() {
+                    return true;
+                }
+                if std::fs::symlink_metadata(root.join(a)).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                    return false;
+                }
+                anc = a.parent();
+            }
+            true
+        })
         .map(|(r, v)| (r.clone(), *v))
+        .collect();
+    // Subtree guard: a directory that still EXISTS but is now empty while we knew
+    // several files in it is an unmounted sub-volume / offline share far more
+    // often than a deliberate delete — skip that whole subtree.
+    let mut by_dir: HashMap<String, (usize, usize)> = HashMap::new();
+    for rel in known.keys() {
+        if let Some(parent) = Path::new(rel).parent().filter(|p| !p.as_os_str().is_empty()) {
+            let e = by_dir.entry(parent.to_string_lossy().to_string()).or_insert((0, 0));
+            e.0 += 1;
+            if missing.contains_key(rel) {
+                e.1 += 1;
+            }
+        }
+    }
+    let hollow: Vec<String> = by_dir
+        .into_iter()
+        .filter(|(dir, (known_n, missing_n))| {
+            *known_n >= 2
+                && known_n == missing_n
+                && std::fs::read_dir(root.join(dir)).map(|mut it| it.next().is_none()).unwrap_or(false)
+        })
+        .map(|(d, _)| d)
+        .collect();
+    let missing: HashMap<String, (u64, u64)> = missing
+        .into_iter()
+        .filter(|(rel, _)| !hollow.iter().any(|d| rel.starts_with(&format!("{d}/"))))
         .collect();
     // "Suddenly empty": every known file gone at once, or the folder has no files
     // at all, is a drive/mount problem far more often than a deliberate delete.
@@ -5629,7 +5941,14 @@ async fn sleep_unless_stopped(stop_notify: &Arc<Notify>, stopped: &Arc<AtomicBoo
 fn delete_allowed(abs: &Path, ts: u64, known: Option<(u64, u64)>) -> bool {
     let Ok(meta) = std::fs::metadata(abs) else { return false };
     match known {
-        Some((size, mtime)) => meta.len() == size && meta_mtime(&meta) == mtime,
+        // The exact version — unless this copy was clearly PLACED well after the
+        // delete (restored from History, re-added identical bytes): a late or
+        // re-sent delete must not undo that. 10 min of slack absorbs clock skew.
+        Some((size, mtime)) => {
+            meta.len() == size
+                && meta_mtime(&meta) == mtime
+                && path_version_ms(abs, &meta) <= ts.saturating_add(10 * 60 * 1000)
+        }
         None => ts > path_version_ms(abs, &meta),
     }
 }
@@ -6646,6 +6965,14 @@ mod tests {
         assert_eq!(q.front().map(String::as_str), Some("b"));
         assert_eq!(q.len(), 2);
         assert!(q.push_back("c".into()), "re-queue after removal");
+        // P3-d: an item the peer keeps failing to land is parked, not resent forever.
+        assert!(!q.note_failed("b"));
+        assert!(!q.note_failed("b"));
+        assert!(q.note_failed("b"));
+        assert!(!q.iter().any(|x| x == "b"));
+        assert!(!q.push_back("b".into()), "parked: rescan/reconcile can't re-queue it");
+        q.note_ok("b");
+        assert!(q.push_back("b".into()));
     }
 
     /// D1: only items the receiver confirmed LANDED may be auto-deleted — never a
@@ -6750,10 +7077,24 @@ mod tests {
         assert!(!apply_remote_delete(&folder, "notes.txt", &sd, &mut ap, 0, &g));
         assert!(f.is_file(), "newer edit kept");
         // The exact version the deleter had DOES go (archived, recoverable).
-        let g = DeleteGuard { ts: 1, known: Some(version_of(&f)), listed: None, require_known: false };
+        let g = DeleteGuard { ts: now_ms(), known: Some(version_of(&f)), listed: None, require_known: false };
         assert!(apply_remote_delete(&folder, "notes.txt", &sd, &mut ap, 0, &g));
         assert!(!f.exists());
         assert_eq!(crate::folder_history::load(&folder).len(), 1);
+    }
+
+    /// A late/re-sent delete never undoes a restore of the identical version.
+    #[test]
+    fn late_known_delete_spares_a_restored_identical_file() {
+        let dir = temp_dir("d4-restored");
+        let folder = dir.to_string_lossy().to_string();
+        let f = dir.join("restored.txt");
+        write_with_mtime(&f, b"same bytes", 1_000); // placed (ctime) now
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let mut ap = Vec::new();
+        let g = DeleteGuard { ts: now_ms() - 3_600_000, known: Some(version_of(&f)), listed: None, require_known: true };
+        assert!(!apply_remote_delete(&folder, "restored.txt", &sd, &mut ap, 0, &g));
+        assert!(f.is_file());
     }
 
     /// D4: without a known version (older peers / reconcile tombstones), a delete
@@ -6804,7 +7145,7 @@ mod tests {
         let sd = Arc::new(Mutex::new(HashMap::new()));
         let listed: HashSet<String> = ["trip/a.jpg".to_string(), "trip".to_string()].into();
         let mut ap = Vec::new();
-        let ga = DeleteGuard { ts: 1, known: Some(version_of(&dir.join("trip/a.jpg"))), listed: Some(&listed), require_known: false };
+        let ga = DeleteGuard { ts: now_ms(), known: Some(version_of(&dir.join("trip/a.jpg"))), listed: Some(&listed), require_known: false };
         assert!(apply_remote_delete(&folder, "trip/a.jpg", &sd, &mut ap, 0, &ga));
         let gd = DeleteGuard { ts: now_ms() + 60_000, known: None, listed: Some(&listed), require_known: false };
         assert!(!apply_remote_delete(&folder, "trip", &sd, &mut ap, 0, &gd));
@@ -6839,6 +7180,18 @@ mod tests {
         assert_eq!(found["b.txt"], (5, 1_000), "carries the version we had");
         tombs.insert("b.txt".to_string(), 5);
         assert_eq!(missed_deletes(&folder, &inbound, &tombs).len(), 1, "already tombstoned");
+        // A sub-folder that's still there but EMPTY (an unmounted sub-volume)
+        // while we knew several files in it: not a delete.
+        for n in ["mnt/x.txt", "mnt/y.txt"] {
+            write_with_mtime(&dir.join(n), n.as_bytes(), 1_000);
+        }
+        let mut inbound2 = inbound.clone();
+        for n in ["mnt/x.txt", "mnt/y.txt"] {
+            inbound2.insert(file_sig(&dir.join(n).to_string_lossy(), &folder).unwrap());
+        }
+        std::fs::remove_file(dir.join("mnt/x.txt")).unwrap();
+        std::fs::remove_file(dir.join("mnt/y.txt")).unwrap();
+        assert!(!missed_deletes(&folder, &inbound2, &tombs).contains_key("mnt/x.txt"));
         // Everything gone at once = drive problem, not a delete.
         for n in ["a.txt", "c.txt", "d.txt"] {
             std::fs::remove_file(dir.join(n)).unwrap();
@@ -6973,6 +7326,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(staging);
     }
 
+    /// P3-e: a versioned peer's tombstone without a version never removes a file;
+    /// with one, only that version.
+    #[test]
+    fn reconcile_tombstone_deletes_only_a_named_version() {
+        let dir = temp_dir("p3e");
+        let folder = dir.to_string_lossy().to_string();
+        write_with_mtime(&dir.join("mine.txt"), b"independent", 1_000);
+        let mut rec = Reconcile { tomb_versions: Some(HashMap::new()), ..Default::default() };
+        assert!(reconcile_delete_guard(&rec, "mine.txt", now_ms() + 60_000).is_none());
+        rec.tomb_versions = Some([("mine.txt".to_string(), (999, 1))].into());
+        let g = reconcile_delete_guard(&rec, "mine.txt", now_ms() + 60_000).unwrap();
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let mut ap = Vec::new();
+        assert!(!apply_remote_delete(&folder, "mine.txt", &sd, &mut ap, 0, &g), "different version kept");
+        rec.tomb_versions = None;
+        assert!(reconcile_delete_guard(&rec, "mine.txt", 5).is_some_and(|g| !g.require_known), "legacy peers: ts rule");
+        assert!(folder_available(&folder));
+        assert!(!folder_available(&dir.join("nope").to_string_lossy()));
+    }
+
+    #[test]
+    fn pause_epoch_beats_the_last_toggle_and_ignores_poisoned_values() {
+        assert_eq!(next_pause_epoch(1_000, 0), 1_000);
+        assert_eq!(next_pause_epoch(1_000, 5_000), 5_001, "clock behind the last toggle");
+        assert_eq!(next_pause_epoch(1_000, u64::MAX), 1_000, "poisoned epoch reset");
+        assert_eq!(sane_epoch(u64::MAX), 0);
+    }
+
     #[test]
     fn peer_kept_warning_names_the_problem() {
         let mut m = HashMap::new();
@@ -6991,6 +7372,8 @@ mod tests {
         let cfg = temp_dir("promote-cfg");
         std::fs::write(dir.join("viewer-edit.txt"), b"local change").unwrap();
         std::fs::write(dir.join(".hidden"), b"x").unwrap();
+        // A file it knew and deleted while read-only.
+        save_manifest(&cfg, "p1", &["gone.txt|3|1000".to_string()].into());
         let pair = Pair {
             id: "p1".into(), role: crate::models::PairRole::B, peer_name: String::new(), secret: "s".into(),
             folder: dir.to_string_lossy().to_string(), two_way: true, mirror: true, auto_delete: false,
@@ -7002,6 +7385,9 @@ mod tests {
         assert!(!is_sendable_candidate(&dir.join("viewer-edit.txt").to_string_lossy(), &pair.folder, &inbound));
         let sig = file_sig(&dir.join("viewer-edit.txt").to_string_lossy(), &pair.folder).unwrap();
         assert!(load_skipped(&cfg, "p1").contains_key(&sig), "reconcile won't push it either");
+        assert!(!load_manifest(&cfg, "p1").contains("gone.txt|3|1000"), "read-only-era delete not propagated");
+        let tombs = HashMap::new();
+        assert!(missed_deletes(&pair.folder, &load_manifest(&cfg, "p1"), &tombs).is_empty());
     }
 
     #[test]
@@ -7025,8 +7411,14 @@ mod tests {
     #[test]
     fn first_seen_marks_a_moved_in_old_file_as_new() {
         let p = PathBuf::from("/nonexistent/first-seen-test.bin");
-        assert_eq!(first_seen_ms(&p, 10, 100, 5_000), 5_000);
-        assert_eq!(first_seen_ms(&p, 10, 100, 9_000), 5_000, "stable while unchanged");
-        assert_eq!(first_seen_ms(&p, 11, 100, 9_000), 9_000, "a different file there is new");
+        // A scan/lookup never records anything (P1-a: no "everything is new at launch").
+        assert_eq!(appeared_at(&p, 10, 100), None);
+        note_appeared(&p, 10, 100, 5_000);
+        assert_eq!(appeared_at(&p, 10, 100), Some(5_000));
+        note_appeared(&p, 10, 100, 9_000);
+        assert_eq!(appeared_at(&p, 10, 100), Some(5_000), "stable while unchanged");
+        assert_eq!(appeared_at(&p, 11, 100), None, "a different version there isn't covered");
+        note_appeared(&p, 11, 100, 9_000);
+        assert_eq!(appeared_at(&p, 11, 100), Some(9_000));
     }
 }

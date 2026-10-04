@@ -861,7 +861,10 @@ pub fn set_pause(config_dir: &Path, pair_id: &str, paused: bool, epoch: u64) -> 
             None => p.id == pair_id,
         };
         // Only move FORWARD in epoch so a stale beacon can't un-pause us.
-        if in_scope && epoch >= p.pause_epoch {
+        // A poisoned far-future stored epoch (older builds accepted any value)
+        // must not freeze the switch forever.
+        let stored = if p.pause_epoch > now_ms().saturating_add(24 * 3600 * 1000) { 0 } else { p.pause_epoch };
+        if in_scope && epoch >= stored {
             p.paused = paused;
             p.pause_epoch = epoch;
             affected.push(p.id.clone());
