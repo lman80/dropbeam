@@ -1,4 +1,3 @@
-/* eslint-disable react-refresh/only-export-components -- entry point, not a component module */
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import { api, HAS_TAURI } from './lib/api'
