@@ -334,7 +334,7 @@ const handlers: BridgeHandlers = {
   acceptFolderInvite: async a => {
     const folder = await pickNativeFolder()
     if (!folder) return false
-    await api.acceptPair(string(a, 'code'), folder)
+    await api.acceptPair(string(a, 'code'), folder, typeof a.folderName === 'string' ? a.folderName : null)
     await st().reloadPairs()
     return true
   },

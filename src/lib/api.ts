@@ -515,14 +515,20 @@ const realApi = {
   lanNetworkBlocked: () => invoke<boolean>('lan_network_blocked'),
   /** Open System Settings → Privacy & Security → Local Network. */
   openLocalNetworkSettings: () => invoke<void>('open_local_network_settings'),
+  /** Open the OS settings page that fixes a refused permission. */
+  openPrivacySettings: (pane: 'files' | 'full-disk' | 'notifications' | 'local-network') =>
+    invoke<void>('open_privacy_settings', { pane }),
   openUrl: (url: string) => invoke<void>('open_url', { url }),
   getDefaultDownloadDir: () => invoke<string>('get_default_download_dir'),
   // Shared Drop Folders. Tauri v2 maps camelCase JS keys → snake_case Rust params,
   // so the keys here MUST be camelCase (e.g. twoWay, not two_way).
   createPair: (folder: string, twoWay: boolean, peerName?: string, mirror?: boolean) =>
     invoke<{ pair: Pair; invite: string }>('create_pair', { folder, twoWay, peerName, mirror }),
-  acceptPair: (invite: string, folder: string) =>
-    invoke<Pair>('accept_pair', { invite, folder }),
+  /** Join a shared folder. `folder` is where the person chose to keep it: if it
+   *  already holds other things, the engine makes a subfolder named `folderName`
+   *  (or after the sharer) inside it. The returned pair has the real folder. */
+  acceptPair: (invite: string, folder: string, folderName?: string | null) =>
+    invoke<Pair>('accept_pair', { invite, folder, folderName: folderName || null }),
   listPairs: () => invoke<Pair[]>('list_pairs'),
   updatePair: (u: PairUpdate) =>
     invoke<Pair>('update_pair', {

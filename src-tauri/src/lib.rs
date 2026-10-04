@@ -928,6 +928,7 @@ pub fn run() {
             commands::restart_app,
             commands::lan_network_blocked,
             commands::open_local_network_settings,
+            commands::open_privacy_settings,
             commands::open_url,
             commands::open_mailto,
             commands::open_main_window,

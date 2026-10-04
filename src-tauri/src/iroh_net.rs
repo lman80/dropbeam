@@ -1207,15 +1207,24 @@ pub(crate) fn completed_side_effects(
                 } else {
                     format!("{} files", names.len())
                 };
+                // Say WHERE it went ("Saved in Downloads") — "where did it go?"
+                // is the first question after a file arrives.
+                let place = if cfg!(target_os = "ios") {
+                    None
+                } else {
+                    out_dir
+                        .as_deref()
+                        .and_then(|d| std::path::Path::new(d).file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .filter(|n| !n.is_empty())
+                };
+                let body = match place {
+                    Some(p) => format!("Saved in {p}. Click to open DropBeam."),
+                    None => "Saved. Tap to open DropBeam.".to_string(),
+                };
                 let (title, body) = match who {
-                    Some(name) => (
-                        format!("{name} sent you {what}"),
-                        "Saved — click to open DropBeam".to_string(),
-                    ),
-                    None => (
-                        format!("Received {what}"),
-                        "Saved — click to open DropBeam".to_string(),
-                    ),
+                    Some(name) => (format!("{name} sent you {what}"), body),
+                    None => (format!("Received {what}"), body),
                 };
                 // Audible (the silent-banner fix) — fires for every receive so a
                 // Quick Send can never slip by unnoticed.

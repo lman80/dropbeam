@@ -664,6 +664,7 @@ export const mockApi = {
   restartApp: async (): Promise<void> => {},
   lanNetworkBlocked: async (): Promise<boolean> => typeof location !== 'undefined' && new URLSearchParams(location.search).has('lan'),
   openLocalNetworkSettings: async (): Promise<void> => {},
+  openPrivacySettings: async (_pane: string): Promise<void> => {},
   openUrl: async (_url: string): Promise<void> => {},
   getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
 
@@ -703,7 +704,8 @@ export const mockApi = {
     }
     return { pair, invite: `dropbeam1:MOCK${id}invitecodewouldgohere0000` }
   },
-  acceptPair: async (_invite: string, folder: string): Promise<Pair> => {
+  acceptPair: async (_invite: string, chosen: string, folderName?: string | null): Promise<Pair> => {
+    const folder = folderName ? `${chosen}/${folderName}` : chosen
     const id = `p${++pairCounter}`
     const pair: Pair = {
       id,
