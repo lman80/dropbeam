@@ -16,12 +16,24 @@
  *          WORKER_SEAL_PRIV (X25519 private JWK from genkey.js).
  * Vars:    APNS_TOPIC (default com.ashtonmiller.dropbeam).
  * Rate limits (wrangler.toml `[[ratelimits]]`, no KV — KV's daily write quota
- * was a kill switch anyone could trip): RL_IP (per CF-Connecting-IP, checked
- * before any crypto), RL_GLOBAL (whole relay), RL_SERVER (per verified server
- * key), RL_TOKEN (per SHA-256 of the decrypted APNs token = per phone). Every
- * key is derived by the Worker, never chosen by the caller. Each binding is
- * optional; a missing one falls back to a per-isolate in-memory counter, and an
- * hourly per-isolate budget per phone/server backs the per-minute bindings.
+ * was a kill switch anyone could trip). Every key is derived by the Worker,
+ * never chosen by the caller:
+ *   RL_IP     per client network, checked before any crypto: a full IPv4
+ *             address, or an IPv6 /64 (one subscriber's allocation — keying the
+ *             full v6 address would let one host rotate through 2^64 buckets).
+ *             It only ever blocks that one network, so it isn't a global lever.
+ *   RL_SERVER per verified server key, RL_TOKEN per SHA-256 of the decrypted
+ *             APNs token (= per phone).
+ *   RL_GLOBAL the whole relay — charged LAST, only for requests that passed the
+ *             signature check, opened a token sealed for that server, and
+ *             passed their per-server / per-phone limits. Junk and forged
+ *             requests never touch it, so they can't use it to deny push to
+ *             everyone. (Residual: someone holding many genuinely sealed
+ *             tokens across many server keys could still fill it; each pair
+ *             is capped by RL_SERVER/RL_TOKEN, so it takes real phones.)
+ * Each binding is optional; a missing one falls back to a per-isolate in-memory
+ * counter, and an hourly per-isolate budget per phone/server backs the
+ * per-minute bindings.
  *
  * Logs only APNs status codes (for `wrangler tail`). See docs/PUSH-SETUP.md.
  */
@@ -42,9 +54,11 @@ export default {
     }
     if (request.method === 'POST' && url.pathname === '/push') {
       try {
-        // Cheap gates first: per-IP and global, before reading or verifying anything.
-        const ip = request.headers.get('cf-connecting-ip') || 'unknown'
-        if (!(await allowMinute(env, 'RL_IP', `ip:${ip}`)) || !(await allowMinute(env, 'RL_GLOBAL', 'all'))) {
+        // Cheap gate first: per client network (IPv4 address / IPv6 /64), before
+        // reading or verifying anything. The GLOBAL limit is charged inside
+        // push(), only once the request has fully verified.
+        const net = ipKey(request.headers.get('cf-connecting-ip'))
+        if (!(await allowMinute(env, 'RL_IP', `ip:${net}`))) {
           return json({ ok: false, reason: 'rate' }, 429)
         }
         return await push(request, env)
@@ -98,11 +112,13 @@ async function push(request, env) {
   if (raw === null) return json({ ok: false, reason: 'too_big' }, 413)
   let b
   try { b = JSON.parse(raw) } catch { return json({ ok: false, reason: 'invalid' }, 400) }
-  const fields = [b.v, b.server, b.sealed_token, b.collapse ?? '', b.payload ?? '', b.ts]
-  if (b.v !== 1 || typeof b.server !== 'string' || typeof b.sealed_token !== 'string' || typeof b.ts !== 'number' || typeof b.sig !== 'string') {
+  if (!b || b.v !== 1 || typeof b.server !== 'string' || typeof b.sealed_token !== 'string' || typeof b.ts !== 'number' || typeof b.sig !== 'string'
+    || (b.collapse != null && typeof b.collapse !== 'string') || (b.payload != null && typeof b.payload !== 'string')
+    || b.sealed_token.length > 2048 || b.sig.length > 128) {
     return json({ ok: false, reason: 'invalid' }, 400)
   }
   if (Math.abs(Date.now() - b.ts) > 10 * 60 * 1000) return json({ ok: false, reason: 'stale' }, 400)
+  const fields = [b.v, b.server, b.sealed_token, b.collapse ?? '', b.payload ?? '', b.ts]
   // 1) The call really comes from that server.
   const serverKey = hexBytes(b.server)
   if (!serverKey) return json({ ok: false, reason: 'invalid' }, 400)
@@ -125,6 +141,9 @@ async function push(request, env) {
     || !allowHour(`s:${b.server}`, PER_SERVER_HOUR) || !allowHour(`t:${phone}`, PER_TOKEN_HOUR)) {
     return json({ ok: false, reason: 'rate' }, 429)
   }
+  //    Only now — signed, sealed for this server, within its own limits — does
+  //    the request count against the relay-wide budget.
+  if (!(await allowMinute(env, 'RL_GLOBAL', 'all'))) return json({ ok: false, reason: 'rate' }, 429)
   // 4) APNs.
   const payload = typeof b.payload === 'string' && b.payload.length <= MAX_PAYLOAD ? b.payload : ''
   const body = {
@@ -180,6 +199,51 @@ async function jwt(env) {
   const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(`${head}.${claims}`))
   cachedJwt = { iat: now, token: `${head}.${claims}.${b64url(sig)}` }
   return cachedJwt.token
+}
+
+/** Rate-limit key for a client address: a full IPv4 address (IPv4-mapped IPv6
+ * counts as IPv4), or the first 4 hextets (/64) of an IPv6 address, expanded and
+ * lowercased so every spelling of one /64 shares a bucket. Unparseable input
+ * collapses to one shared 'unknown' bucket (Cloudflare always sends the header). */
+function ipKey(raw) {
+  let s = String(raw || '').trim().toLowerCase()
+  if (!s) return 'unknown'
+  if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1)
+  const pct = s.indexOf('%') // zone id
+  if (pct >= 0) s = s.slice(0, pct)
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) return validV4(s) ? `4:${s}` : 'unknown'
+  if (!s.includes(':') || !/^[0-9a-f:.]+$/.test(s)) return 'unknown'
+  // Trailing dotted IPv4 (e.g. ::ffff:1.2.3.4) → two hextets.
+  const v4tail = s.match(/^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/)
+  if (v4tail) {
+    if (!validV4(v4tail[2])) return 'unknown'
+    const o = v4tail[2].split('.').map(Number)
+    s = v4tail[1] + ((o[0] << 8) | o[1]).toString(16) + ':' + ((o[2] << 8) | o[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return 'unknown'
+  const part = (x) => (x === '' ? [] : x.split(':'))
+  const head = part(halves[0])
+  const tail = halves.length === 2 ? part(halves[1]) : []
+  let groups
+  if (halves.length === 2) {
+    const fill = 8 - head.length - tail.length
+    if (fill < 1) return 'unknown'
+    groups = [...head, ...Array(fill).fill('0'), ...tail]
+  } else {
+    groups = head
+  }
+  if (groups.length !== 8 || groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return 'unknown'
+  const h = groups.map((g) => parseInt(g, 16))
+  // IPv4-mapped (::ffff:a.b.c.d) → the IPv4 address itself.
+  if (h.slice(0, 5).every((x) => x === 0) && h[5] === 0xffff) {
+    return `4:${h[6] >> 8}.${h[6] & 255}.${h[7] >> 8}.${h[7] & 255}`
+  }
+  return `6:${h.slice(0, 4).map((x) => x.toString(16)).join(':')}::/64`
+}
+
+function validV4(s) {
+  return s.split('.').every((o) => Number(o) <= 255)
 }
 
 async function sha256hex(s) {

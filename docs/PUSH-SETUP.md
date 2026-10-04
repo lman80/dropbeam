@@ -93,9 +93,12 @@ before this change can't open the sealed form: it gets the generic
 
 The Worker no longer uses KV. Per-request KV writes let anyone burn the daily
 write quota and stop push for everyone. It now uses Workers Rate Limiting
-bindings, all keyed on values the Worker derives itself: client IP, global,
-verified server key, and a hash of the decrypted phone token. The bindings are
-in `wrangler.toml`. To deploy:
+bindings, all keyed on values the Worker derives itself: client network (an
+IPv4 address, or an IPv6 /64 so one host can't rotate addresses), global,
+verified server key, and a hash of the decrypted phone token. The global limit
+is charged only after a request passes the signature check, opens a token
+sealed for that server, and passes its per-server/per-phone limits, so forged
+or junk requests can't use it up. The bindings are in `wrangler.toml`. To deploy:
 
 ```sh
 cd push-worker && npx wrangler deploy
