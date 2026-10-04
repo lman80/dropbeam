@@ -380,7 +380,7 @@ function NameSetupModal() {
           <>
             {!MOBILE_UI && (
               <button className="btn btn-plain" onClick={() => setJoining(true)} style={{ marginLeft: -8 }}>
-                Link an Existing Device…
+                I Already Use DropBeam…
               </button>
             )}
             <span className="spacer" />

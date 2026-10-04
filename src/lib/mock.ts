@@ -229,7 +229,7 @@ let friends: Friend[] = EMPTY ? [] : [
   { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: T0 - 2 * DAY, autoAccept: false, endpointId: null, avatar: null, deviceKind: 'desktop', deviceOs: 'windows' },
   { id: 'f3', role: 'a', name: 'Jordan Kim', secret: 'mock', createdAt: T0 - 9 * DAY, autoAccept: true, endpointId: 'mock-jordan', avatar: null, deviceKind: 'laptop', deviceOs: 'linux' },
   { id: 'f4', role: 'b', name: 'Maximilian Alexander von Hohenzollern-Sigmaringen', secret: 'mock', createdAt: T0 - 1 * DAY, autoAccept: true, endpointId: null, avatar: null },
-  { id: 'f5', role: 'a', name: 'Priya Raman', secret: 'mock', createdAt: T0 - 60 * DAY, autoAccept: true, endpointId: 'mock-priya', avatar: null, deviceKind: 'phone', deviceOs: 'ios' },
+  { id: 'f5', role: 'a', name: 'Priya Raman', secret: 'mock', createdAt: T0 - 60 * DAY, autoAccept: true, endpointId: 'mock-priya', avatar: null, deviceKind: 'phone', deviceOs: 'ios', awaitingAccept: true },
   { id: 'f6', role: 'a', name: 'Chen Wei', secret: 'mock', createdAt: T0 - 90 * DAY, autoAccept: true, endpointId: 'mock-chen', avatar: null, deviceKind: 'desktop', deviceOs: 'linux' },
   { id: 'f7', role: 'a', name: 'Lab Peer', secret: 'mock', createdAt: T0 - 4 * HOUR, autoAccept: true, endpointId: 'mock-lab', avatar: null, deviceKind: 'laptop', deviceOs: 'macos' },
   { id: 'f8', role: 'b', name: 'Mom', secret: 'mock', createdAt: T0 - 200 * DAY, autoAccept: false, endpointId: 'mock-mom', avatar: null, deviceKind: 'phone', deviceOs: 'ios' },
@@ -387,7 +387,7 @@ if (typeof window !== 'undefined' && !EMPTY) {
         { eid: 'mock-endpoint-alex', label: 'Mac', kind: 'laptop', os: 'macos', state: 'sending' as const },
         { eid: 'mock-endpoint-alex-phone', label: 'iPhone', kind: 'phone', os: 'ios', state: 'uploading' as const, via: 'Linux Box' },
       ] })
-    emit('transfer://update', { ...base('cx-held', 'send', ['Parking map.pdf']), state: 'held', friendName: 'Priya Raman', heldOn: 'Linux Box', bytesTotal: 2_400_000, bytesDone: 2_400_000, percent: 100, detail: 'Held on Linux Box — reaches Priya Raman when they’re online', chatTransfer: { id: 'cx-held', attempt: 1, offset: 0, total: 2_400_000, last: true } })
+    emit('transfer://update', { ...base('cx-held', 'send', ['Parking map.pdf']), state: 'held', friendName: 'Priya Raman', heldOn: 'Linux Box', bytesTotal: 2_400_000, bytesDone: 2_400_000, percent: 100, detail: 'Waiting on Linux Box — Priya Raman gets it when they’re back', chatTransfer: { id: 'cx-held', attempt: 1, offset: 0, total: 2_400_000, last: true } })
   }, 600)
 }
 if (typeof window !== 'undefined') {
@@ -1035,6 +1035,7 @@ export const mockApi = {
   },
   sendTyping: async () => {},
   sendReadReceipt: async () => {},
+  chatMarkSeen: async () => {},
   downloadGif: async (url: string) => url,
   sendChatGif: async (
     friendId: string,

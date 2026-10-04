@@ -5884,7 +5884,7 @@ fn send_friend_inner(
                 u.bytes_total = total;
                 u.bytes_done = total;
                 u.percent = 100.0;
-                u.detail = Some(format!("Held on {} — reaches {} when they're online", held.name, friend_name));
+                u.detail = Some(format!("Waiting on {} — {} gets it when they're back", held.name, friend_name));
                 u.held_on = Some(held.name.clone());
                 emit(&app, &u);
                 crate::mailbox::client::wake();

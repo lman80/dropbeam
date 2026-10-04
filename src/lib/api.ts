@@ -307,6 +307,8 @@ export interface Friend {
   avatar: string | null
   /** True once you've renamed this friend locally (their broadcasts won't override). */
   nameCustom?: boolean
+  /** You added them, but they haven't accepted you yet: messages wait until they do. */
+  awaitingAccept?: boolean
 }
 
 /** A link preview the SENDER's device fetched (#47) — it travels with the
@@ -670,6 +672,8 @@ const realApi = {
   /** Send a read receipt: seen everything up to `upTo` (ms). Honors the toggle. */
   sendReadReceipt: (friendId: string, upTo: number) =>
     invoke<void>('send_read_receipt', { friendId, upTo }),
+  /** This conversation is on screen: your other devices clear its unread badge too. */
+  chatMarkSeen: (friendId: string) => invoke<void>('chat_mark_seen', { friendId }),
   /** Download a GIF's bytes (Giphy CDN) to a temp file; returns the local path. */
   downloadGif: (url: string, id: string) => invoke<string>('download_gif', { url, id }),
   /** Drop a GIF card in the thread (bytes already sent via the file transfer). */
@@ -810,6 +814,22 @@ export function onChatMessage(cb: (m: ChatMessage) => void): Promise<UnlistenFn>
   if (!HAS_TAURI) return mockListen('chat://message', (p) => cb(p as ChatMessage))
   return listen<ChatMessage>('chat://message', (e) => cb(e.payload))
 }
+
+/** Another of your devices read this conversation up to `upTo` (ms). */
+export interface ChatSeen { peerId: string; upTo: number }
+export function onChatSeen(cb: (s: ChatSeen) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('chat://seen', (p) => cb(p as ChatSeen))
+  return listen<ChatSeen>('chat://seen', (e) => cb(e.payload))
+}
+/** Messages from a friend that reached another of your devices first. */
+export interface ChatSyncedUnread { peerId: string; count: number }
+export function onChatSyncedUnread(cb: (s: ChatSyncedUnread) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('chat://synced-unread', (p) => cb(p as ChatSyncedUnread))
+  return listen<ChatSyncedUnread>('chat://synced-unread', (e) => cb(e.payload))
+}
+
+/** The conversation id a friend-request notification carries (opens Friends). */
+export const FRIEND_REQUESTS_TARGET = 'friend-requests'
 
 /** A friend started/stopped typing to us (ephemeral). */
 export interface ChatTyping {

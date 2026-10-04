@@ -32,7 +32,8 @@ function onLinkEvent<T>(name: string, cb: (payload: T) => void): Promise<() => v
 
 // 'confirm': this device scanned a code — check the safety code, then link.
 // 'incoming': the other device scanned OURS — check the safety code it shows.
-type Phase = 'show' | 'scan' | 'working' | 'confirm' | 'incoming' | 'done' | 'error'
+// 'mismatch': the user said the numbers differ — nothing was linked.
+type Phase = 'show' | 'scan' | 'working' | 'confirm' | 'incoming' | 'done' | 'error' | 'mismatch'
 
 /**
  * The one linking flow, whichever device it's opened on. This device shows
@@ -129,22 +130,29 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
     void api.linkConfirm(r.endpointId, accept).catch(() => {})
     if (accept) { setProgress(null); setPhase('working') } else onClose()
   }
+  // "No, they're different": stop right here and say what that means.
+  const mismatch = () => {
+    if (phase === 'incoming' && incoming) void api.linkConfirm(incoming.endpointId, false).catch(() => {})
+    else { void api.linkDeviceCancel().catch(() => {}); void api.linkHostCancel().catch(() => {}) }
+    setPreview(null); setIncoming(null); setPhase('mismatch')
+  }
   const retry = () => { setError(''); setProgress(null); if (via === 'scan') setPhase('scan'); else { setAttempt(a => a + 1); setPhase('show') } }
   const copy = () => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => setCodeError('Couldn’t copy the code. Select it and copy it instead.'))
 
-  if (phase === 'scan') return <QrScanner title="Scan your other device" hint="On your other device, open Settings → Devices → Link a device."
+  if (phase === 'scan') return <QrScanner title="Scan your other device" hint="On your other device, open DropBeam → Settings → Devices → Link a Device. Point the camera at the code it shows."
     validate={deviceCodeProblem} onResult={v => void scanned(v)} onClose={() => start === 'scan' ? closeRef.current() : setPhase('show')} />
 
-  const footer = phase === 'confirm' ? <>
+  const footer = phase === 'confirm' || phase === 'incoming' ? <>
+    <button className="btn btn-plain" onClick={() => phase === 'incoming' ? answerIncoming(false) : onClose()}>Cancel</button>
     <span className="spacer" />
-    <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
-    <button className="btn btn-primary" autoFocus onClick={() => void confirmScanned()}>Codes Match — Link</button>
-  </> : phase === 'incoming' ? <>
+    <button className="btn btn-secondary" onClick={mismatch}>No, They’re Different</button>
+    <button className="btn btn-primary" autoFocus onClick={() => phase === 'incoming' ? answerIncoming(true) : void confirmScanned()}>Yes, They Match</button>
+  </> : phase === 'mismatch' ? <>
     <span className="spacer" />
-    <button className="btn btn-secondary" onClick={() => answerIncoming(false)}>Cancel</button>
-    <button className="btn btn-primary" autoFocus onClick={() => answerIncoming(true)}>Codes Match — Link</button>
+    <button className="btn btn-secondary" onClick={onClose}>Close</button>
+    <button className="btn btn-primary" autoFocus onClick={() => { setVia('show'); setAttempt(a => a + 1); setPhase('show') }}>Start Again</button>
   </> : phase === 'show' ? <>
-    <button className="btn btn-plain" onClick={() => setPhase('scan')}>Scan Their Code Instead</button>
+    <button className="btn btn-plain" onClick={() => setPhase('scan')}>Scan the Other Device Instead</button>
     <span className="spacer" />
     {codeError
       ? <button className="btn btn-secondary" onClick={retry}>Try Again</button>
@@ -155,15 +163,20 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
     : <>
       {via === 'scan'
         ? <button className="btn btn-plain" onClick={() => { setError(''); setPhase('show') }}>Show This Device’s Code</button>
-        : <button className="btn btn-plain" onClick={() => { setError(''); setPhase('scan') }}>Scan Their Code Instead</button>}
+        : <button className="btn btn-plain" onClick={() => { setError(''); setPhase('scan') }}>Scan the Other Device Instead</button>}
       <span className="spacer" />
       <button className="btn btn-secondary" onClick={onClose}>Close</button>
       <button className="btn btn-primary" autoFocus onClick={retry}>Try Again</button>
     </>
 
-  return <LinkDialog title={phase === 'done' ? 'Devices linked' : title} onClose={onClose} footer={footer}>
+  const other = (name: string) => name && name !== 'Your other device' ? name : 'your other device'
+  return <LinkDialog title={phase === 'done' ? 'Devices linked' : phase === 'confirm' || phase === 'incoming' ? 'Check the numbers' : phase === 'mismatch' ? 'Not linked' : title} onClose={onClose} footer={footer}>
     {phase === 'show' && <div className="link-show">
-      <p className="link-instruction">On your other device, open <strong>Settings → Devices → Link a device</strong> and scan this code.</p>
+      <ol className="link-steps">
+        <li>Open DropBeam on your other device (phone or computer).</li>
+        <li>Go to <strong>Settings → Devices → Link a Device</strong>.</li>
+        <li>Choose <strong>Scan</strong> and point it at this code.</li>
+      </ol>
       <div className="link-qr-slot">
         {code ? <QrCodeView value={code} size={200} hint={null} label="QR code to link your other device" />
           : !codeError && <Spinner size={18} />}
@@ -172,21 +185,14 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
         ? <p role="alert" className="form-error link-status">{codeError}</p>
         : <p className="link-status" role="status">{code ? 'Waiting for your other device…' : 'Creating a code…'}</p>}
     </div>}
-    {phase === 'confirm' && preview && <div className="link-state" role="alertdialog" aria-label="Check the safety code">
-      <p className="link-state-sub">Make sure <strong>{preview.info.name}</strong> shows this code:</p>
-      <p className="link-state-title link-safety-code" aria-live="polite">{preview.info.safety}</p>
-      <p className="link-state-sub">{preview.info.direction === 'give'
-        ? `${preview.info.name} will get full access to your account: your friends, chats and devices.`
-        : `This device will join ${preview.info.name}’s account: this device’s friends and chats will be shared into that account, and it gets that account’s friends and chats.`}
-        {' '}Only continue if this is your own device{preview.info.peerShowsCode ? ' and the codes match' : ' (it needs an update to show the code)'}.</p>
-    </div>}
-    {phase === 'incoming' && incoming && <div className="link-state" role="alertdialog" aria-label="Check the safety code">
-      <p className="link-state-sub"><strong>{incoming.name}</strong> wants to link with this device. Make sure it shows this code:</p>
-      <p className="link-state-title link-safety-code" aria-live="polite">{incoming.safety}</p>
-      <p className="link-state-sub">{incoming.joining
-        ? `This device will join ${incoming.name}’s account: this device’s friends and chats will be shared into that account, and it gets that account’s friends and chats.`
-        : `${incoming.name} will get full access to your account: your friends, chats and devices.`}
-        {' '}Only continue if it’s your own device and the codes match.</p>
+    {(phase === 'confirm' && preview || phase === 'incoming' && incoming) && <SafetyCheck
+      name={phase === 'confirm' ? other(preview!.info.name) : other(incoming!.name)}
+      safety={phase === 'confirm' ? preview!.info.safety : incoming!.safety}
+      peerShowsCode={phase === 'confirm' ? preview!.info.peerShowsCode : true} />}
+    {phase === 'mismatch' && <div className="link-state" role="alert">
+      <AlertCircle className="link-state-bad" size={30} strokeWidth={1.75} />
+      <p className="link-state-title">Nothing was linked</p>
+      <p className="link-state-sub">If the numbers were different, a device that isn’t yours may have scanned your code. Nothing changed on either device. Put your two devices side by side and start again.</p>
     </div>}
     {phase === 'working' && <div className="link-state" role="status" aria-live="polite">
       <Spinner size={22} />
@@ -204,6 +210,17 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
       <p className="link-state-sub">{error}</p>
     </div>}
   </LinkDialog>
+}
+
+/** "Do the numbers match?" — the same 6 digits on both screens before anything links (S1). */
+function SafetyCheck({ name, safety, peerShowsCode }: { name: string; safety: string; peerShowsCode: boolean }) {
+  return <div className="link-state" role="alertdialog" aria-label="Check the numbers">
+    <p className="link-state-sub">Look at {name}. Does it show the same 6 numbers?</p>
+    <p className="link-state-title link-safety-code" aria-live="polite" aria-label={`Safety numbers ${safety.replace(/\s+/g, '').split('').join(' ')}`}>{safety}</p>
+    <p className="link-state-sub">{peerShowsCode
+      ? 'If they match, your friends and chats will be shared between the two devices. Only link devices that are yours.'
+      : `${name.charAt(0).toUpperCase()}${name.slice(1)} needs an update to show the numbers. Only continue if it’s yours.`}</p>
+  </div>
 }
 
 /** Show this device's code (a new device linking to an account you already use). */

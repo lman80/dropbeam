@@ -8,6 +8,9 @@ import {
   type ConnDetail,
   onChatMessage,
   onChatTyping,
+  onChatSeen,
+  onChatSyncedUnread,
+  FRIEND_REQUESTS_TARGET,
   onFolderComplete,
   onFolderStatus,
   onFolderSynced,
@@ -711,7 +714,8 @@ export const useStore = create<AppStore>((set, get) => ({
     // while the Dock stayed at 0 until the next message arrived (#27).
     const chatUnread = pruneChatUnread(get().chatUnread, new Set(friends.map((f) => f.id)))
     set({ settings, settingsFallback, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true, chatUnread })
-    void listenForChatNotifications((peerId) => get().openChat(peerId))
+    // A friend-request banner opens Friends (Accept/Decline live there).
+    void listenForChatNotifications(async (peerId) => { if (peerId === FRIEND_REQUESTS_TARGET) get().setView('friends'); else await get().openChat(peerId) })
 
     // Probe independently of mounted views, including while iroh starts up.
     // Each webview has its own store; successful probes feed the same presence input.
@@ -897,6 +901,24 @@ export const useStore = create<AppStore>((set, get) => ({
         // If it landed in the open + focused chat, it's been seen → read receipt.
         if (!m.fromMe && lookingHere) get().markChatRead(m.peerId)
       })
+      // Read on another of your devices: clear what that device has seen here too.
+      void onChatSeen(({ peerId, upTo }) => {
+        const s = get()
+        const have = s.chatUnread[peerId] ?? 0
+        if (!have) return
+        const thread = s.chats[peerId]
+        const left = thread
+          ? thread.filter((m) => !m.fromMe && !m.deleted && m.ts > upTo).length
+          : (s.chatOverview.find((o) => o.peerId === peerId)?.lastTs ?? Infinity) <= upTo ? 0 : have
+        if (left < have) set({ chatUnread: saveChatUnread({ ...s.chatUnread, [peerId]: left }) })
+      }).catch(() => {})
+      // A friend's message that reached another of your devices first is still
+      // unread here (unless you're looking at that very chat).
+      void onChatSyncedUnread(({ peerId, count }) => {
+        const s = get()
+        if (count <= 0 || (s.windowFocused && s.view === 'chat' && s.activeChatId === peerId)) return
+        set({ chatUnread: saveChatUnread({ ...s.chatUnread, [peerId]: (s.chatUnread[peerId] ?? 0) + count }) })
+      }).catch(() => {})
       if (HAS_TAURI) void listen<{ peerId: string }>('friend://presence', ({ payload }) => {
         const friend = get().friends.find((f) => f.id === payload.peerId)
         if (friend) get().markFriendSeen(friend.id)
@@ -1580,8 +1602,10 @@ export const useStore = create<AppStore>((set, get) => ({
     // guard also required window focus, so opening a conversation while the webview
     // wasn't reporting focus (a focus event the OS swallowed, a detached/menu-bar
     // window, a restored session) left "17 new" stuck forever.
-    if (s.view === 'chat' && s.activeChatId === friendId && (s.chatUnread[friendId] ?? 0) > 0) {
-      set({ chatUnread: saveChatUnread({ ...s.chatUnread, [friendId]: 0 }) })
+    if (s.view === 'chat' && s.activeChatId === friendId) {
+      if ((s.chatUnread[friendId] ?? 0) > 0) set({ chatUnread: saveChatUnread({ ...s.chatUnread, [friendId]: 0 }) })
+      // Your other devices clear this chat's badge too (a no-op when nothing new).
+      void api.chatMarkSeen(friendId).catch(() => {})
     }
     // TELLING THE FRIEND "I read it" keeps the stricter gate: a read receipt must
     // mean the thread was genuinely on screen in a focused window.
@@ -1751,7 +1775,7 @@ export const useStore = create<AppStore>((set, get) => ({
   addFriendByCode: async (code) => {
     const friend = await api.addFriendByCode(code)
     await get().reloadFriends()
-    get().toast('success', `Added ${friend.name}`)
+    get().toast('success', `Added ${friend.name}. If they haven’t added you yet, they get a friend request to accept.`)
   },
 
   renameFriend: async (id, name) => {

@@ -1,6 +1,8 @@
 import { deviceIcon, groupDevices, personGroups } from '../lib/deviceIcons'
 import { isEnterKey } from '../lib/keys'
 import { errorText } from '../lib/errors'
+import { relativeTime } from '../lib/dates'
+import { inviteMessage } from '../lib/invite'
 import { deliveryIconKind, personDevices } from '../lib/deliveries'
 
 const firstName = (name: string) => name.trim().split(/\s+/)[0] || name
@@ -110,14 +112,15 @@ function FriendRequests() {
     <SectionHeader count={requests.length}>Friend requests</SectionHeader>
     <div className="group fr-list">{requests.map((r) => <div className="row" key={r.endpointId}>
       <span className="fr-avatar" style={{ width: 32, height: 32, fontSize: 12, background: avatarColor(r.endpointId) }} aria-hidden>{initials(r.name)}</span>
-      <span className="row-main">
-        <span className="row-title">{r.name}</span>
-        <span className="row-sub">Wants to be your friend. Until you accept, they can’t message you and any file they send asks first.</span>
-      </span>
+      <div className="row-main">
+        <div className="row-title truncate-1" title={r.name}>{r.name}</div>
+        <div className="row-sub truncate-1">Wants to be your friend · {relativeTime(r.at)}</div>
+      </div>
       <button className="btn btn-plain btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.declineFriendRequest(r.endpointId, true))}>Block</button>
       <button className="btn btn-secondary btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.declineFriendRequest(r.endpointId, false))}>Decline</button>
       <button className="btn btn-primary btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.acceptFriendRequest(r.endpointId))}>Accept</button>
     </div>)}</div>
+    <p className="fr-lookalike">Only accept people you know. Until you do, they can’t message you, and any file they send asks first.</p>
   </>
 }
 
@@ -240,14 +243,17 @@ function YouSection() {
     }
   }, [])
 
+  // A friendly message with a tap-to-add link, not a bare code: whoever gets
+  // it in a text message knows what to do with it.
   const copyCode = async () => {
     if (!code) return
     try {
-      await navigator.clipboard.writeText(code)
+      await navigator.clipboard.writeText(inviteMessage(displayName, code))
       setCopied(true)
       setTimeout(() => setCopied(false), 1600)
+      toast('success', 'Invite copied — paste it in a message to a friend')
     } catch {
-      toast('error', 'Couldn’t copy the code')
+      toast('error', 'Couldn’t copy the invite')
     }
   }
 
@@ -277,17 +283,15 @@ function YouSection() {
       <div className="row">
         <span className="fr-avatar is-device" aria-hidden><QrCode size={16} /></span>
         <div className="row-main">
-          <div className="row-title">Your DropBeam code</div>
-          {code ? (
-            <div className="row-sub fr-code truncate-1 selectable" title={code}>{code}</div>
-          ) : (
-            <div className="row-sub">{code === null ? 'Loading…' : 'Appears once DropBeam has connected'}</div>
-          )}
+          <div className="row-title">Your invite</div>
+          <div className="row-sub truncate-1">
+            {code ? 'Send it to a friend so they can add you' : code === null ? 'Loading…' : 'Appears once DropBeam has connected'}
+          </div>
         </div>
         <div className="row-trailing">
           <button className="btn btn-secondary btn-sm fr-code-btn" disabled={!code} onClick={() => setDialog('qr')}>Show QR</button>
           <button className="btn btn-secondary btn-sm fr-code-btn" disabled={!code} onClick={() => void copyCode()}>
-            {copied ? <><Check /> Copied</> : 'Copy'}
+            {copied ? <><Check /> Copied</> : 'Copy Invite'}
           </button>
         </div>
       </div>
@@ -298,6 +302,7 @@ function YouSection() {
             key="name"
             title="Your name"
             label="Name"
+            hint="Friends see this name on all your devices."
             initial={displayName}
             onSave={(n) => { if (n !== displayName) void saveSettings({ displayName: n }) }}
             onClose={() => setDialog(null)}
@@ -306,19 +311,19 @@ function YouSection() {
         {dialog === 'qr' && code && (
           <Dialog
             key="qr"
-            title="Your DropBeam code"
+            title="Your invite"
             width={340}
             onClose={() => setDialog(null)}
             footer={
               <>
-                <button className="btn btn-secondary" onClick={() => void copyCode()}>{copied ? 'Copied' : 'Copy Code'}</button>
+                <button className="btn btn-secondary" onClick={() => void copyCode()}>{copied ? 'Copied' : 'Copy Invite'}</button>
                 <button className="btn btn-primary" autoFocus onClick={() => setDialog(null)}>Done</button>
               </>
             }
           >
             <div className="fr-qr">
               <QrCodeView value={code} size={200} hint={null} label="QR code for your DropBeam code" />
-              <p>Friends scan this in DropBeam → Add friend.</p>
+              <p>Your friend scans this in DropBeam → Friends → Add a Friend.</p>
             </div>
           </Dialog>
         )}
@@ -328,10 +333,11 @@ function YouSection() {
 }
 
 /** One-field rename dialog (friend or your own name). */
-function NameDialog({ title, label, initial, onSave, onClose }: {
+function NameDialog({ title, label, initial, hint, onSave, onClose }: {
   title: string
   label: string
   initial: string
+  hint?: string
   onSave: (name: string) => void
   onClose: () => void
 }) {
@@ -364,6 +370,7 @@ function NameDialog({ title, label, initial, onSave, onClose }: {
         onChange={(e) => setName(e.target.value)}
         onKeyDown={(e) => { if (isEnterKey(e)) { e.preventDefault(); save() } }}
       />
+      {hint && <p className="field-hint">{hint}</p>}
     </Dialog>
   )
 }
@@ -460,7 +467,9 @@ function FriendRow({ friend }: { friend: Friend }) {
   }
 
   // A live presence recovery clears a stale "No response" from an earlier check.
-  const status = pinging ? 'Checking…' : pingedOffline && !isOnline ? 'No response' : statusText(presence)
+  const status = pinging ? 'Checking…'
+    : friend.awaitingAccept ? `Hasn’t accepted your friend request yet`
+      : pingedOffline && !isOnline ? 'No response' : statusText(presence)
   const check15 = <span className="menu-check" aria-hidden />
   const items: MenuItem[] = [
     { label: 'Rename…', icon: check15, onSelect: () => setDialog('rename') },
@@ -513,6 +522,7 @@ function FriendRow({ friend }: { friend: Friend }) {
             key="rename"
             title={`Rename ${friend.name}`}
             label="Name"
+            hint="Only you see this name."
             initial={friend.name}
             onSave={(n) => { if (n !== friend.name) void renameFriend(friend.id, n) }}
             onClose={() => setDialog(null)}
@@ -526,8 +536,9 @@ function FriendRow({ friend }: { friend: Friend }) {
             onConfirm={() => removeFriend(friend.id)}
             onClose={() => setDialog(null)}
           >
-            Your chat history stays on this device.
-            {friend.endpointId && ' Add them again any time to pick up where you left off.'}
+            {ownLabel
+              ? 'It stops getting your friends and chats. What’s already on it stays there. You can link it again later.'
+              : `${label} is removed on all your devices. Your messages stay, and you can add them again any time with their invite.`}
           </ConfirmDialog>
         )}
         {dialog === 'invite' && invite && (
@@ -565,7 +576,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
   const submit = async (value = codeInput) => {
     setError('')
     if (!value.trim()) {
-      setError('Paste your friend’s code, or scan their QR code.')
+      setError('Paste your friend’s invite, or scan their QR code.')
       return
     }
     const parsed = parseCode(value)
@@ -602,13 +613,13 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
         </>
       }
     >
-      <label htmlFor="add-friend-code" className="field-label">Their DropBeam code</label>
+      <label htmlFor="add-friend-code" className="field-label">Their invite</label>
       <div className="fr-code-field">
         <input
           id="add-friend-code"
           className="input"
           autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" inputMode="text"
-          placeholder="dropbeam:…"
+          placeholder="Paste the invite they sent you"
           value={codeInput}
           autoFocus
           aria-invalid={!!error}
@@ -629,7 +640,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
       {error ? (
         <p role="alert" className="form-error">{error}</p>
       ) : (
-        <p className="field-hint">It’s on their Friends page, under You.</p>
+        <p className="field-hint">Ask them to send you their invite (Friends → Your invite → Copy Invite), or scan the QR code on their screen.</p>
       )}
     </Dialog>
   )

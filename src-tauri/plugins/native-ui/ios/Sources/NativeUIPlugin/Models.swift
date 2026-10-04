@@ -1052,7 +1052,7 @@ enum ServerCopy {
         }
     }
     static func held(server: String?, friend: String) -> String {
-        "Held on \(server ?? "your Transfer Server") — reaches \(friend) when they’re online"
+        "Waiting on \(server ?? "your Transfer Server") — \(friend) gets it when they’re back"
     }
     static func firstName(_ name: String) -> String { name.split(separator: " ").first.map(String.init) ?? name }
 }
