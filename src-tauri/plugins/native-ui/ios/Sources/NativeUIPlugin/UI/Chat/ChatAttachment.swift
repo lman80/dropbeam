@@ -101,12 +101,15 @@ struct ChatAttachment: View {
             }
         }.frame(maxWidth: 240, alignment: .leading)
         #if targetEnvironment(simulator)
-        // QA: `-openViewer` opens the first multi-photo message on its SECOND photo.
+        // QA: `-openViewer` opens the first multi-photo message on its SECOND photo;
+        // `-openViewerAt N` on item N.
         .task {
-            guard CommandLine.arguments.contains("-openViewer"), !Self.qaViewerOpened, availableMedia.count > 1 else { return }
+            let args = CommandLine.arguments
+            let at = args.firstIndex(of: "-openViewerAt").flatMap { args.indices.contains($0 + 1) ? Int(args[$0 + 1]) : nil }
+            guard args.contains("-openViewer") || at != nil, !Self.qaViewerOpened, availableMedia.count > 1 else { return }
             Self.qaViewerOpened = true
             try? await Task.sleep(for: .seconds(1.5))
-            selected = availableMedia[1]
+            selected = availableMedia[min(availableMedia.count - 1, max(0, (at ?? 2) - 1))]
         }
         #endif
         .fullScreenCover(item: $selected) { item in
