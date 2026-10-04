@@ -173,6 +173,7 @@ export default function App() {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       {MOBILE_UI && <ErrorBoundary region="window controls">
+        <SettingsFallbackBanner />
         <InstallBanner />
         <LocalNetworkBanner />
       </ErrorBoundary>}
@@ -186,6 +187,7 @@ export default function App() {
         {/* Notices sit at the top of the content column (the sidebar runs to the
             top of the window under the macOS traffic lights). */}
         {!MOBILE_UI && <ErrorBoundary region="window controls">
+          <SettingsFallbackBanner />
           <InstallBanner />
           <LocalNetworkBanner />
         </ErrorBoundary>}
@@ -390,6 +392,30 @@ function LocalNetworkBanner() {
       <IconButton label="Dismiss" size="sm" onClick={() => setDismissed(true)}>
         <X />
       </IconButton>
+    </div>
+  )
+}
+
+/** Startup couldn't read settings in time (D18), so the app is running on
+ *  defaults and saving is blocked. Say so, and offer to try again. */
+function SettingsFallbackBanner() {
+  const fallback = useStore((s) => s.settingsFallback)
+  const retry = useStore((s) => s.retryLoadSettings)
+  const [busy, setBusy] = useState(false)
+  if (!fallback) return null
+  return (
+    <div className="app-banner warn" role="status">
+      <AlertTriangle />
+      <span style={{ flex: 1, minWidth: 0 }}>Your settings haven’t loaded yet. Changes won’t be saved until they do.</span>
+      <button
+        className="btn btn-secondary btn-sm"
+        style={{ flexShrink: 0 }}
+        disabled={busy}
+        onClick={() => { setBusy(true); void retry().finally(() => setBusy(false)) }}
+      >
+        {busy ? <Spinner size={12} /> : null}
+        Try Again
+      </button>
     </div>
   )
 }

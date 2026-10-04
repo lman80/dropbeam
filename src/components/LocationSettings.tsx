@@ -1,3 +1,4 @@
+import { errorText } from '../lib/errors'
 /* eslint-disable react-refresh/only-export-components -- peopleLabel/accessLabel are shared with the Locations page */
 import { useEffect, useState } from 'react'
 import { Check, FolderOpen, HardDrive, Pencil, Server, Trash2 } from 'lucide-react'
@@ -83,7 +84,7 @@ function AddLocationWizard({ onCancel, onSaved }: { onCancel: () => void; onSave
   }
   const browse = async () => {
     try { const path = await api.pickDirectory(); if (path) choose(path) }
-    catch (e) { setError(String(e)) }
+    catch (e) { setError(errorText(e)) }
   }
   const save = async () => {
     if (busy) return
@@ -92,7 +93,7 @@ function AddLocationWizard({ onCancel, onSaved }: { onCancel: () => void; onSave
       const before = new Set((await locationsApi.listHosted()).map(l => l.id))
       const locations = await locationsApi.save({ ...draft, name: draft.name.trim() })
       onSaved(locations, locations.find(l => !before.has(l.id))?.id)
-    } catch (e) { setError(String(e)) }
+    } catch (e) { setError(errorText(e)) }
     finally { setBusy(false) }
   }
   const access = accessOf(draft.rights)
@@ -174,7 +175,7 @@ function EditLocation({ draft: initial, onClose, onSaved }: { draft: HostedLocat
     if (busy) return
     setBusy(true); setError('')
     try { onSaved(await locationsApi.save(draft)) }
-    catch (e) { setError(String(e)) }
+    catch (e) { setError(errorText(e)) }
     finally { setBusy(false) }
   }
   const footer = <>
@@ -195,7 +196,7 @@ function EditLocation({ draft: initial, onClose, onSaved }: { draft: HostedLocat
         <span className="location-inline">
           <input className="input" required placeholder="/Volumes/NAS/Shared" value={draft.path} title={draft.path} onChange={e => setDraft({ ...draft, path: e.target.value })} />
           <button type="button" className="btn btn-secondary" onClick={async () => {
-            try { const path = await api.pickDirectory(); if (path) setDraft(d => ({ ...d, path, name: d.name || nameFromPath(path) })) } catch (e) { setError(String(e)) }
+            try { const path = await api.pickDirectory(); if (path) setDraft(d => ({ ...d, path, name: d.name || nameFromPath(path) })) } catch (e) { setError(errorText(e)) }
           }}>Choose…</button>
         </span>
       </label>
@@ -235,7 +236,7 @@ export function LocationSettings() {
   const [loaded, setLoaded] = useState(false)
   useEffect(() => {
     let alive = true
-    locationsApi.listHosted().then(v => { if (alive) { setLocations(v); setLoaded(true) } }).catch(e => { if (alive) setError(String(e)) })
+    locationsApi.listHosted().then(v => { if (alive) { setLocations(v); setLoaded(true) } }).catch(e => { if (alive) setError(errorText(e)) })
     return () => { alive = false }
   }, [])
   useEffect(() => {
@@ -248,7 +249,7 @@ export function LocationSettings() {
   const stopSharing = async (l: HostedLocation) => {
     setBusy(true); setError('')
     try { setLocations(await locationsApi.remove(l.id)); if (draft?.id === l.id) setDraft(null); setRemoving(null) }
-    catch (e) { setError(String(e)); setRemoving(null) } finally { setBusy(false) }
+    catch (e) { setError(errorText(e)); setRemoving(null) } finally { setBusy(false) }
   }
   const nameOf = (id: string) => friends.find(f => f.id === id)?.name
   const shownActivity = allActivity ? activity : activity.slice(0, ACTIVITY_CAP)
@@ -274,7 +275,7 @@ export function LocationSettings() {
           <div className="row-trailing">
             <MenuButton label={`More for ${l.name}`} items={[
               { label: 'Edit…', icon: <Pencil />, disabled: busy, onSelect: () => { setError(''); setAdding(false); setDraft({ ...l, friendIds: [...l.friendIds], rights: { ...l.rights } }) } },
-              { label: IS_MAC ? 'Open in Finder' : 'Open folder', icon: <FolderOpen />, onSelect: () => { void api.openPath(l.path).catch(e => setError(String(e))) } },
+              { label: IS_MAC ? 'Open in Finder' : 'Open folder', icon: <FolderOpen />, onSelect: () => { void api.openPath(l.path).catch(e => setError(errorText(e))) } },
               { separator: true },
               { label: 'Stop sharing…', icon: <Trash2 />, danger: true, disabled: busy, onSelect: () => setRemoving(l) },
             ]} />

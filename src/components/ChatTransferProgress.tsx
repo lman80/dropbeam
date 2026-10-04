@@ -8,6 +8,7 @@ import { Server } from 'lucide-react'
 import type { Delivery } from '../lib/api'
 import { multiDevice } from '../lib/deliveries'
 import { DeliveryLine } from './Deliveries'
+import { useTransferMeter } from '../lib/useTransferMeter'
 
 const UNITS = ['B', 'kB', 'MB', 'GB', 'TB']
 /** "1.9 of 4.8 GB" — both figures in the total's unit, so the line doesn't jump. */
@@ -23,6 +24,7 @@ function ofBytes(done: number, total: number): string {
  *  Connection details sit behind the ⓘ, never inline. */
 export function ChatTransferProgress({ t, onRetry, deliveries, friendName }: { t: TransferUpdate; onRetry?: () => void; deliveries?: Delivery[] | null; friendName?: string }) {
   const megabits = useStore((s) => s.settings?.showMegabits ?? false)
+  const meter = useTransferMeter(t)
   const send = t.direction === 'send'
   // Sent to a friend's several devices: once nothing is moving, one line says
   // where it is on each ("Delivered to Alex’s Mac · iPhone: waiting …").
@@ -64,12 +66,12 @@ export function ChatTransferProgress({ t, onRetry, deliveries, friendName }: { t
   const moving = t.state === 'transferring'
   const paused = t.state === 'paused'
   const label = moving
-    ? `${t.heldOn ? `To ${t.heldOn} · ` : ''}${ofBytes(t.bytesDone, t.bytesTotal)}${t.etaSeconds != null && t.etaSeconds > 0 ? ` · ${formatEta(t.etaSeconds)} left` : ''}`
+    ? `${t.heldOn ? `To ${t.heldOn} · ` : ''}${ofBytes(t.bytesDone, t.bytesTotal)}${meter.etaSeconds != null && meter.etaSeconds > 0 ? ` · ${formatEta(meter.etaSeconds)} left` : ''}`
     : paused ? `Paused · ${ofBytes(t.bytesDone, t.bytesTotal)}`
       : t.state === 'waitingForAccept' ? (send ? `Waiting for ${t.friendName ?? 'them'} to accept` : 'Waiting to accept')
         : t.state === 'connecting' ? 'Connecting…'
           : t.detail || (send ? 'Waiting to send…' : 'Waiting…')
-  const speed = moving && t.speedBps > 0 ? formatSpeed(t.speedBps, megabits) : undefined
+  const speed = moving && meter.speedBps ? formatSpeed(meter.speedBps, megabits) : undefined
 
   return (
     <div className="xfer-status">

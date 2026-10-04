@@ -154,6 +154,7 @@ export function SettingsView() {
   const deviceDescription = myDevice ? `This device: ${settings.displayName || myDevice.name} · ${deviceKindLabel(myDevice.device_kind)}` : 'Loading this device…'
   const linkedDescription = myDevice ? `${myDevice.linked_devices} linked device${myDevice.linked_devices === 1 ? '' : 's'}` : ''
   const toast = useStore((s) => s.toast)
+  const toastError = useStore((s) => s.toastError)
   const [clearing, setClearing] = useState(false)
   const clearCache = async () => {
     setClearing(true)
@@ -603,7 +604,7 @@ export function SettingsView() {
             onClick={() =>
               api
                 .openMailto(contactMailto(appVer || null, platformLabel(navigator.userAgent)))
-                .catch((e) => toast('error', `Couldn’t open your mail app: ${String(e)}`))
+                .catch((e) => toastError('Couldn’t open your mail app.', e))
             }
           >
             Email Us…

@@ -1,4 +1,5 @@
 import { deviceIcon, groupDevices, personGroups } from '../lib/deviceIcons'
+import { errorText } from '../lib/errors'
 import { deliveryIconKind, personDevices } from '../lib/deliveries'
 
 const firstName = (name: string) => name.trim().split(/\s+/)[0] || name
@@ -541,7 +542,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
       else if (!(await openCode(parsed.code))) return
       onClose()
     } catch (e) {
-      setError(String(e))
+      setError(errorText(e))
     } finally {
       setBusy(false)
     }

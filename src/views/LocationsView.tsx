@@ -1,4 +1,5 @@
 import { loadLocations } from '../lib/locationsLoad'
+import { errorText } from '../lib/errors'
 import { MobileHeader } from '../components/MobileHeader'
 import { IS_WINDOWS, MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -48,7 +49,7 @@ function SharedFromThisDevice() {
       if (!mounted.current) return
       setHosted(list); setLoaded(true); setError('')
       return list
-    } catch (e) { if (mounted.current) { setError(String(e)); setLoaded(true) } }
+    } catch (e) { if (mounted.current) { setError(errorText(e)); setLoaded(true) } }
   }, [])
   // Status is cheap (one open + marker read + statvfs), so it can follow the
   // view: once on open, then every 30 s while it stays open.
@@ -58,7 +59,7 @@ function SharedFromThisDevice() {
         const status = await locationsApi.hostedStatus(l.id)
         if (mounted.current) setStatuses(prev => ({ ...prev, [l.id]: status }))
       } catch (e) {
-        if (mounted.current) setStatuses(prev => ({ ...prev, [l.id]: { id: l.id, reachable: false, freeBytes: 0, markerOk: false, error: String(e), lastActivity: prev[l.id]?.lastActivity ?? null } }))
+        if (mounted.current) setStatuses(prev => ({ ...prev, [l.id]: { id: l.id, reachable: false, freeBytes: 0, markerOk: false, error: errorText(e), lastActivity: prev[l.id]?.lastActivity ?? null } }))
       }
     }))
   }, [])
@@ -130,7 +131,7 @@ export function LocationsView() {
       friends: state.friends.filter(f => friendPresence(f.name, state.friendSeen, state.folderStatuses).status === 'online'),
       online: () => true,
       list: locationsApi.list,
-      errorText: (_friend, error) => String(error),
+      errorText: (_friend, error) => errorText(error),
       onResult: result => {
         if (!mounted.current) return
         if (result.error) setErrors(prev => ({ ...prev, [result.friendId]: result.error! }))

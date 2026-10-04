@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { errorText } from '../lib/errors'
 import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, ChevronLeft, ChevronRight, File, Folder, FolderPlus, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
 import { api, locationsApi, onLocationsChanged, onTransferUpdate, type LocationEntry, type LocationPage, type SharedLocation } from '../lib/api'
@@ -41,7 +42,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     try {
       const result = await request<LocationPage>('ls', { cursor: cursors.current[page], sort, query })
       if (token === generation.current) { cursors.current[page] = result.cursor; cursors.current[page + 1] = result.nextCursor; setData(result); setSelected(s => s.filter(name => result.entries.some(e => e.name === name))) }
-    } catch(e) { if (token === generation.current) { setError(String(e)); setData({ entries: [], page, hasMore: false }); setSelected([]) } }
+    } catch(e) { if (token === generation.current) { setError(errorText(e)); setData({ entries: [], page, hasMore: false }); setSelected([]) } }
     finally { if (token === generation.current) setLoading(false) }
   }, [page, request, sort, query])
   // eslint-disable-next-line react-hooks/set-state-in-effect, react-hooks/exhaustive-deps -- fetch on input change; the bump invalidates the in-flight page
@@ -89,7 +90,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
           try {
             const result = await request<{ trashPath: string }>('trash', { rel_path: join(path, item.name) })
             results.push({ name: item.name, trashPath: result.trashPath })
-          } catch(e) { results.push({ name: item.name, error: String(e) }) }
+          } catch(e) { results.push({ name: item.name, error: errorText(e) }) }
           setTrashResults([...results])
         }
         const failed = results.filter(r => r.error)
@@ -104,7 +105,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       }
       toast('success', dialog === 'mkdir' ? 'Folder created' : 'Renamed')
       setDialog(null); setSelected([])
-    } catch(e) { setActionError(String(e)) }
+    } catch(e) { setActionError(errorText(e)) }
     finally { actionBusy.current = false; setBusy(false); restart() }
   }
   const pick = async (folder: boolean) => {

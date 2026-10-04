@@ -1,3 +1,4 @@
+import { errorText } from '../lib/errors'
 /* eslint-disable react-refresh/only-export-components -- the offer card + servers list are shared with Chat */
 // Settings → Transfer Server. Before setup: what it is (animated), whether this
 // computer is a good home for it, one button. After setup: a calm status page —
@@ -223,7 +224,7 @@ export function SetupWizard({ check, current, startAt = 'storage', onClose, onSa
       if (editing) onClose()
       else setStep('done')
     } catch (e) {
-      setError(String(e))
+      setError(errorText(e))
     } finally {
       setBusy(false)
     }

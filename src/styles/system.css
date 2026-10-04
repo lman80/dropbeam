@@ -1255,7 +1255,31 @@ html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
 .toast-icon.success { color: var(--green); }
 .toast-icon.error { color: var(--red); }
 .toast-icon.info { color: var(--accent-text); }
-.toast-msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast-group { display: contents; }
+.toast-body { flex: 1; min-width: 0; }
+.toast-msg { min-width: 0; overflow-wrap: anywhere; }
+.toast-details-btn {
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--text-12);
+  color: var(--accent-text);
+  cursor: default;
+}
+.toast-details-btn:hover { text-decoration: underline; }
+.toast-details {
+  margin: 6px 0 0;
+  max-height: 120px;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-size: var(--text-11);
+  line-height: 1.4;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .toast .icon-btn { margin: -3px 0 -3px 0; }
 
 /* Shared desktop/mobile dialog layout. Keep actions outside the scroll body. */
