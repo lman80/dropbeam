@@ -29,6 +29,8 @@ mod friendly_failure_tests {
 
 #[cfg(test)]
 mod xfer_matrix;
+#[cfg(test)]
+mod engine_fix_tests;
 use receive_stage::{ReceiveStage, is_receive_stage};
 
 use std::collections::{HashMap, HashSet};
@@ -2562,6 +2564,15 @@ fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
 /// read signals, file pushes (and their stat/verify), folder invites and
 /// Locations. Quick Send pulls (they hold a code the user gave them), pings and
 /// the user's own account traffic are unaffected.
+/// `DropBeam --server` refuses plain friend pushes (nobody to show them to) but
+/// still hosts Location uploads.
+fn headless_refuses(req: &serde_json::Value) -> bool {
+    headless_refuses_in(crate::mailbox::is_headless(), req)
+}
+fn headless_refuses_in(headless: bool, req: &serde_json::Value) -> bool {
+    headless && !(req["kind"] == "files" && req.get("location").is_some())
+}
+
 fn is_blockable_kind(kind: &str) -> bool {
     matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite")
         || kind.starts_with("locations.")
@@ -2926,7 +2937,10 @@ async fn serve_stream_inner(
         }
         // `DropBeam --server` has no one to show files to: say so before a byte
         // moves (the sender shows a clear error instead of re-uploading forever).
-        Some("files" | "files.stat" | "files.verify") if crate::mailbox::is_headless() => {
+        // A Location upload is the one push a headless host DOES serve: it lands in
+        // the hosted folder, not in front of a user. It must reach the "files" arm
+        // below (receive_location_headless) — this refusal used to shadow it.
+        Some("files" | "files.stat" | "files.verify") if headless_refuses(&req) => {
             send_receiver_error(send, &anyhow::anyhow!("This computer is running in the background without the DropBeam app open. Try again when it's open.")).await;
             let _ = send.finish();
         }
