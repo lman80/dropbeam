@@ -83,7 +83,12 @@ pub(crate) fn friendly(dir: Direction, err: &str) -> String {
     // Already a sentence written for people: keep it.
     if has(&["their disk is full", "couldn't reach", "no direct connection", "lost the direct connection",
         "this link", "needs an update", "already running", "declined", "verification failed"]) {
-        return strip_internal_paths(err);
+        // The receiver's own disk-full sentence: say it like the sender's
+        // branch below (no "receiver: " plumbing tag on the card).
+        if !receiving && lower.contains("their disk is full") {
+            return "The recipient's disk is full — once they free up space, retry and it picks up where it stopped".into();
+        }
+        return strip_internal_paths(err.strip_prefix("receiver: ").unwrap_or(err));
     }
     if has(&["no space left on device", "os error 28", "not enough space on the disk", "os error 112"]) {
         return if receiving { "This device's disk is full — free up space, then retry and it picks up where it stopped".into() }
@@ -185,6 +190,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn receiver_disk_full_reads_as_a_sentence_on_the_sender() {
+        let e = "receiver: their disk is full — once they free up space, retry and it picks up where it stopped";
+        assert_eq!(friendly(Direction::Send, e), "The recipient's disk is full — once they free up space, retry and it picks up where it stopped");
+    }
+
+    #[test]
     fn t16_common_failures_read_as_sentences() {
         let r = Direction::Receive;
         let s = Direction::Send;
@@ -206,7 +217,7 @@ mod tests {
             assert!(got.contains(expect), "{raw:?} → {got:?}");
             assert!(!got.contains(".dropbeam-"), "{got}");
         }
-        assert_eq!(friendly(s, "their disk is full — once"), "their disk is full — once");
+        assert!(friendly(s, "their disk is full — once").starts_with("The recipient's disk is full"));
         let odd = friendly(r, "weird failure at C:\\Users\\x\\.dropbeam-recv-ab.part now");
         assert!(!odd.contains(".dropbeam") && odd.contains("a temporary file"), "{odd}");
     }
