@@ -332,6 +332,7 @@ select option {
 .btn:focus-visible { box-shadow: var(--focus-ring); }
 
 /* Icon buttons: 28px hit target, 16px glyph, tooltip from <IconButton>. */
+.icon-btn-slot { display: inline-block; width: 28px; height: 28px; flex-shrink: 0; }
 .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -1068,6 +1069,25 @@ html:not(.platform-mac) .sidebar-top { height: 12px; }
     background: var(--accent);
     box-shadow: 0 0 0 2px var(--sidebar);
   }
+  /* Unread keeps its number in the rail: a small pill on the icon's corner,
+     cut out from the icon by a ring in the sidebar colour. */
+  html:not(.mobile) .app-sidebar .nav-count.unread {
+    top: 1px;
+    right: 3px;
+    width: auto;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    box-sizing: border-box;
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 16px;
+    text-align: center;
+    color: #fff;
+  }
+  html:not(.mobile) .app-sidebar .nav-item.active .nav-count.unread { background: #fff; color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+  html:not(.mobile) .app-sidebar .nav-item.active .nav-count.active-dot { background: #fff; box-shadow: 0 0 0 2px var(--accent); }
   html:not(.mobile) .sidebar-foot { flex-direction: column-reverse; align-items: center; gap: 2px; }
   html:not(.mobile) .sidebar-me { flex: 0 0 auto; justify-content: center; padding: 0; width: 36px; }
 }

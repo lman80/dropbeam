@@ -402,13 +402,16 @@ function FolderRow({
             <FolderOpen />
           </IconButton>
         )}
-        {pair.mirror && (
+        {pair.mirror ? (
           <IconButton
             label={status?.paused ? 'Resume syncing' : 'Pause syncing'}
             onClick={() => void api.setFolderPaused(pair.id, !status?.paused)}
           >
             {status?.paused ? <PlayGlyph /> : <PauseGlyph />}
           </IconButton>
+        ) : (
+          // Keeps every row's action icons in the same columns.
+          <span className="icon-btn-slot" aria-hidden />
         )}
         <MenuButton label="More" items={menu} />
       </div>
