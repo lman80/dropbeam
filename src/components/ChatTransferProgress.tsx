@@ -10,7 +10,7 @@ import { multiDevice } from '../lib/deliveries'
 import { DeliveryLine } from './Deliveries'
 import { useTransferMeter } from '../lib/useTransferMeter'
 
-const UNITS = ['B', 'kB', 'MB', 'GB', 'TB']
+const UNITS = ['bytes', 'KB', 'MB', 'GB', 'TB']
 /** "1.9 of 4.8 GB" — both figures in the total's unit, so the line doesn't jump. */
 function ofBytes(done: number, total: number): string {
   const i = total > 0 ? Math.max(0, Math.min(Math.floor(Math.log(total) / Math.log(1000)), UNITS.length - 1)) : 0

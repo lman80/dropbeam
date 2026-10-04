@@ -34,14 +34,14 @@ test('invalid counters never leak NaN/Infinity into labels or animation widths',
   for (const n of [NaN, Infinity, -Infinity, undefined]) {
     const t = normalizeTransfer({ bytesDone: n, bytesTotal: n, speedBps: n, percent: n } as TransferUpdate)
     assert.equal(t.percent, 0)
-    assert.equal(formatBytes(t.bytesTotal), '0 B')
-    assert.equal(formatBytesLive(n as number), '0 B')
+    assert.equal(formatBytes(t.bytesTotal), 'Zero bytes')
+    assert.equal(formatBytesLive(n as number), '0 KB')
     assert.equal(formatSpeed(n as number), '—')
     assert.equal(formatEta(n), '—')
     assert.equal(formatRelativeTime(n as number), '—')
   }
-  assert.equal(formatBytes(0.5), '1 B')
-  assert.equal(formatBytes(1500), '1.5 kB')
+  assert.equal(formatBytes(0.5), '1 byte')
+  assert.equal(formatBytes(1500), '1.5 KB')
   assert.equal(normalizeTransfer({ bytesDone: 50, bytesTotal: 100 } as TransferUpdate).percent, 50)
   assert.equal(normalizeTransfer({ percent: 150 } as TransferUpdate).percent, 100)
 })

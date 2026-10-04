@@ -266,7 +266,7 @@ export function SettingsView() {
         {toggle('waitForDirect', 'Wait for direct connection', settings.requireDirect ? 'Unavailable while direct connections are required.' : 'Wait for a fast direct path before sending. You can choose the relay on each transfer.', settings.requireDirect)}
         {toggle('parallelStreams', 'Parallel streams', 'Send files over 16 MB using several connections. Turn off if transfers stall.')}
         <MobileSetting title="Upload limit" desc="Mbps; 0 means unlimited. Local transfers run at full speed. Start at 100 Mbps and adjust if your Wi-Fi stutters."><input className="input" aria-label="Upload limit in Mbps" type="number" min={0} max={100000} value={settings.uploadLimitMbps || 0} onChange={e => save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })} /></MobileSetting>
-        {toggle('showMegabits', 'Speeds in megabits', 'Use Mbps instead of kB/s or MB/s on this device.')}
+        {toggle('showMegabits', 'Speeds in megabits', 'Use Mbps instead of KB/s or MB/s on this device.')}
       </MobileSection>
       <MobileSection title="How transfers connect">
         <MobileSetting title="Local" desc="Same Wi-Fi or network. Files travel directly across your network, without the internet." />
