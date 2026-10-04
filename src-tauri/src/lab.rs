@@ -14,10 +14,39 @@
 //! authentication — a random peer can never drive Lab Mode even if they somehow
 //! learn the frame format. Off + no-operator (the defaults) accept nothing.
 
+// Lab Mode is compiled into debug builds and `--features lab` builds only;
+// a shipping release refuses every lab stream without the dispatcher (S10).
+#![cfg_attr(not(any(debug_assertions, feature = "lab")), allow(dead_code, unused_imports))]
+
 use anyhow::{bail, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 use crate::iroh_net::{read_frame_cap, write_frame, IrohState};
+
+/// Whether this build carries Lab Mode at all.
+pub(crate) const COMPILED_IN: bool = cfg!(any(debug_assertions, feature = "lab"));
+
+/// A lab-supplied relative path inside `root`, or an error. Only plain
+/// components; never absolute, `..`, a drive prefix, or a path that resolves
+/// (through a symlinked ancestor) outside `root` (S10).
+pub(crate) fn lab_path(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf> {
+    use std::path::Component;
+    let rel_path = std::path::Path::new(rel);
+    if rel.is_empty() || rel.contains('\\') || rel_path.components().any(|c| !matches!(c, Component::Normal(_))) {
+        bail!("lab: path must be relative and stay inside the folder");
+    }
+    let target = root.join(rel_path);
+    let root = std::fs::canonicalize(root)?;
+    // The deepest existing ancestor must still be inside the root.
+    let existing = target.ancestors().find(|a| a.exists()).map(std::fs::canonicalize).transpose()?;
+    if !existing.is_some_and(|e| e.starts_with(&root)) {
+        bail!("lab: path escapes the folder");
+    }
+    if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("lab: refusing to operate on a symlink");
+    }
+    Ok(target)
+}
 
 /// THE security gate, as a pure function so it can be exhaustively tested. A
 /// peer may drive Lab Mode iff the feature is enabled AND a non-empty operator
@@ -51,7 +80,7 @@ pub(crate) async fn handle_lab(
     req: &serde_json::Value,
     state: &IrohState,
 ) -> Result<()> {
-    if !authorized(conn, state) {
+    if !COMPILED_IN || !authorized(conn, state) {
         // Deliberately terse — don't leak whether lab mode is on or who the
         // operator is to an unauthorized caller.
         write_frame(send, &serde_json::json!({ "ok": false, "error": "unauthorized" })).await?;
@@ -59,7 +88,10 @@ pub(crate) async fn handle_lab(
         bail!("lab: unauthorized peer {}", conn.remote_id());
     }
     let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
+    #[cfg(any(debug_assertions, feature = "lab"))]
     let reply = dispatch(cmd, req, recv, state).await;
+    #[cfg(not(any(debug_assertions, feature = "lab")))]
+    let reply: Result<serde_json::Value> = { let _ = (cmd, recv); Err(anyhow::anyhow!("unavailable")) };
     let frame = match reply {
         Ok(v) => {
             let mut v = v;
@@ -145,6 +177,7 @@ fn folder_manifest(root: &std::path::Path) -> Vec<serde_json::Value> {
 
 /// Run one authorized lab command. Returns the JSON payload to reply with (the
 /// caller stamps `ok`). New commands slot in here.
+#[cfg(any(debug_assertions, feature = "lab"))]
 async fn dispatch(
     cmd: &str,
     req: &serde_json::Value,
@@ -285,9 +318,9 @@ async fn dispatch(
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
             let rel = str_field(req, "rel")?;
-            let size = req.get("size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+            let size = req.get("size").and_then(|v| v.as_u64()).unwrap_or(4096).min(1 << 30) as usize;
             let seed = req.get("seed").and_then(|v| v.as_u64()).unwrap_or(1);
-            let p = root.join(rel);
+            let p = lab_path(&root, rel)?;
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -299,7 +332,7 @@ async fn dispatch(
         "fs-delete" => {
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
-            let p = root.join(str_field(req, "rel")?);
+            let p = lab_path(&root, str_field(req, "rel")?)?;
             if p.is_dir() { std::fs::remove_dir_all(&p)?; } else { let _ = std::fs::remove_file(&p); }
             Ok(serde_json::json!({ "deleted": str_field(req, "rel")? }))
         }
@@ -308,8 +341,8 @@ async fn dispatch(
         "fs-move" => {
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
-            let from = root.join(str_field(req, "from")?);
-            let to = root.join(str_field(req, "to")?);
+            let from = lab_path(&root, str_field(req, "from")?)?;
+            let to = lab_path(&root, str_field(req, "to")?)?;
             if let Some(parent) = to.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -377,6 +410,24 @@ fn my_display_name(state: &IrohState) -> String {
 #[cfg(test)]
 mod tests {
     use super::gate;
+
+    #[test]
+    fn s10_lab_paths_stay_inside_the_folder() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-lab-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("share");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        assert!(super::lab_path(&root, "sub/a.txt").is_ok());
+        assert!(super::lab_path(&root, "new/dir/b.txt").is_ok());
+        for bad in ["", "../escape", "sub/../../escape", "/etc/passwd", "./x", "a\\..\\b"] {
+            assert!(super::lab_path(&root, bad).is_err(), "{bad:?}");
+        }
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(&dir, root.join("link")).unwrap();
+            assert!(super::lab_path(&root, "link/outside.txt").is_err(), "symlinked ancestor escapes");
+            assert!(super::lab_path(&root, "link").is_err());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     const OP: &str = "825e889fce001f39630c1ddf37a24de39c658ef9f0c466a33d650b1360030b70";
 

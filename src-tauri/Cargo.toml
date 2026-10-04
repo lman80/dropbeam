@@ -6,7 +6,7 @@ authors = ["DropBeam"]
 license = ""
 repository = ""
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.89"
 # The app binary is named EXACTLY `mainBinaryName` in tauri.conf.json ("DropBeam")
 # so tauri's bundler selects it unambiguously. With a second binary present and no
 # exact name match, tauri picked the WRONG one and shipped the CLI as the app
@@ -29,6 +29,11 @@ path = "src/main.rs"
 # Build the tool with: cargo build --release -p dropbeam-lab
 [workspace]
 members = ["labtool"]
+
+[features]
+# Lab Mode (remote test driver surface, lab.rs) is compiled into debug builds
+# only; a release build carries it only with `--features lab`.
+lab = []
 
 [build-dependencies]
 tauri-build = { version = "2.6.2", features = [] }
