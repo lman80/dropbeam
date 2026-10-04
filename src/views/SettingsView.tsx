@@ -25,6 +25,7 @@ import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbac
 // opens General, "Settings" under History's recoverable files opens Transfers —
 // otherwise it's the pane you last had open.
 type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'advanced'
+const DEV_KEY = 'dropbeam.developer'
 const TABS: { value: Tab; label: string }[] = [
   { value: 'general', label: 'General' },
   { value: 'devices', label: 'Devices' },
@@ -156,6 +157,26 @@ export function SettingsView() {
   const linkedDescription = myDevice ? `${myDevice.linked_devices} linked device${myDevice.linked_devices === 1 ? '' : 's'}` : ''
   const toast = useStore((s) => s.toast)
   const toastError = useStore((s) => s.toastError)
+  // Developer options (Giphy key, Lab Mode) stay out of normal Settings. They
+  // show when already in use, or after tapping the version number 7 times.
+  const [devMode, setDevModeState] = useState(() => {
+    try { return localStorage.getItem(DEV_KEY) === '1' || new URLSearchParams(location.search).get('dev') === '1' } catch { return false }
+  })
+  const setDevMode = (on: boolean) => {
+    setDevModeState(on)
+    try { if (on) localStorage.setItem(DEV_KEY, '1'); else localStorage.removeItem(DEV_KEY) } catch { /* storage unavailable */ }
+  }
+  const versionTaps = useRef<number[]>([])
+  const tapVersion = () => {
+    const now = Date.now()
+    versionTaps.current = [...versionTaps.current.filter((t) => now - t < 3000), now]
+    if (versionTaps.current.length >= 7 && !devMode) {
+      versionTaps.current = []
+      setDevMode(true)
+      setTab('advanced')
+      toast('info', 'Developer options are now in Advanced.')
+    }
+  }
   const [clearing, setClearing] = useState(false)
   const clearCache = async () => {
     setClearing(true)
@@ -375,26 +396,11 @@ export function SettingsView() {
           on={settings.linkPreviews}
           onChange={(v) => save({ linkPreviews: v })}
         />
-        <Row title="GIFs" sub="Add a free key from developers.giphy.com to turn on GIFs.">
-          <input
-            className="input set-field"
-            type="text"
-            aria-label="Giphy API key"
-            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-            placeholder="Giphy API key"
-            defaultValue={settings.giphyApiKey}
-            onBlur={(e) => {
-              const v = e.target.value.trim()
-              if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
-            }}
-            onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }}
-          />
-        </Row>
       </div>
 
       <SectionHeader>Updates</SectionHeader>
       <div className="group">
-        <UpdateRow />
+        <UpdateRow onVersionTap={tapVersion} />
       </div>
     </>
   )
@@ -660,8 +666,24 @@ export function SettingsView() {
         </Row>
       </div>
 
-      <SectionHeader>Lab Mode</SectionHeader>
+      {(devMode || settings.labModeEnabled) && <>
+      <SectionHeader action={<button className="btn btn-plain btn-sm" onClick={() => setDevMode(false)}>Hide</button>}>Developer</SectionHeader>
       <div className="group">
+        <Row title="GIFs" sub="A free key from developers.giphy.com turns on the GIF picker.">
+          <input
+            className="input set-field"
+            type="text"
+            aria-label="Giphy API key"
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+            placeholder="Giphy API key"
+            defaultValue={settings.giphyApiKey}
+            onBlur={(e) => {
+              const v = e.target.value.trim()
+              if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
+            }}
+            onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }}
+          />
+        </Row>
         <ToggleRow
           title="Allow Lab Mode"
           sub="Lets one trusted developer device run tests on this app. Turn on only if asked."
@@ -718,6 +740,7 @@ export function SettingsView() {
           </>
         )}
       </div>
+      </>}
       {scanOperator && (
         <QrScanner
           title="Scan operator ID"
@@ -776,7 +799,7 @@ function FeedbackSection() {
         />
         <Row
           title="Send feedback"
-          sub="Goes straight to the developer. DropBeam is built with AI, so a good suggestion can ship in an update within days."
+          sub="Goes straight to the developer. Good suggestions often ship in an update within days."
         >
           <button className="btn btn-secondary" onClick={openFeedback}>Send Feedback…</button>
         </Row>
@@ -794,7 +817,7 @@ function FeedbackSection() {
 }
 
 /** Version + update check + install progress, as one row. */
-function UpdateRow() {
+function UpdateRow({ onVersionTap }: { onVersionTap?: () => void }) {
   const appVer = useStore((s) => s.appVer)
   const update = useStore((s) => s.update)
   const checkingUpdate = useStore((s) => s.checkingUpdate)
@@ -836,7 +859,7 @@ function UpdateRow() {
       </button>
     )
   }
-  return <Row title={<span className="tnum">DropBeam {appVer || '…'}</span>} sub={sub}>{control}</Row>
+  return <Row title={<span className="tnum" onClick={onVersionTap}>DropBeam {appVer || '…'}</span>} sub={sub}>{control}</Row>
 }
 
 /** Upload cap: presets as a segmented control, plus a custom value. 0 = off. */
