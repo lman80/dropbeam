@@ -209,7 +209,11 @@ final class Bridge: ObservableObject {
             transfers = v
             reportTransferMoments()
         case .settings(let v):
+            let first = settings == nil && v != nil
             settings = v
+            // The engine is up: anything the share extension left (its "open DropBeam"
+            // can fail, or the app was launched cold) goes out now, not next foreground.
+            if first { ShareInbox.shared.ingestSoon() }
             if let share = settings?.shareDiagnostics {
                 UserDefaults.standard.set(share, forKey: NativeUIPlugin.diagnosticsKey)
                 SuperFeedback.setCrashReportingEnabled(share)

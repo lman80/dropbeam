@@ -172,8 +172,10 @@ final class ShareInbox {
         guard !ready.isEmpty else { return }
         NSLog("DropBeam share inbox: %d job(s) waiting", ready.count)
         // The web store must be up (it owns sending) before anything can go out.
-        guard await waitUntil(seconds: 45, { Bridge.shared.webview != nil && Bridge.shared.settings != nil }) else {
-            NSLog("DropBeam share inbox: bridge not ready; will retry on next foreground")
+        // Not ready yet: the first settings snapshot re-runs this (Bridge.apply), and so
+        // does every return to the foreground — nothing is dropped.
+        guard Bridge.shared.webview != nil && Bridge.shared.settings != nil else {
+            NSLog("DropBeam share inbox: bridge not ready; will run when the engine is up")
             return
         }
         for (dir, job) in ready { await run(job, from: dir) }

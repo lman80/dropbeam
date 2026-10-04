@@ -83,8 +83,9 @@ import UIKit
     private func beginBackgroundTask() {
         guard backgroundTask == .invalid else { return }
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "DropBeam transfer") {
-            // Time's up: hand control back (the engine resumes when the app returns).
-            Task { @MainActor in BackgroundTransfers.shared.endBackgroundTask() }
+            // Time's up: end it BEFORE returning (a late end gets the app killed by the
+            // watchdog). UIKit calls this on the main thread.
+            MainActor.assumeIsolated { BackgroundTransfers.shared.endBackgroundTask() }
         }
     }
     func endBackgroundTask() {
@@ -141,7 +142,8 @@ import UIKit
     private func run(_ task: BGTask) {
         guard let task = task as? BGContinuedProcessingTask else { task.setTaskCompleted(success: false); return }
         continued = task
-        task.expirationHandler = {
+        task.expirationHandler = { [weak task] in
+            task?.setTaskCompleted(success: false)
             Task { @MainActor in
                 let me = BackgroundTransfers.shared
                 if me.continued === task { me.continued = nil }
