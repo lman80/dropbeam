@@ -195,7 +195,13 @@ pub(super) fn tree(root: &Path) -> Vec<PathBuf> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Via { Push, Friend, Quick, Location }
+/// Every path this platform can serve. Hosting a Location is intentionally
+/// unix-only in Phase 1 (`HostedLocation::open` refuses on Windows — a Windows
+/// device can still UPLOAD to one), so Windows crosses the other three.
+#[cfg(unix)]
 pub(super) const ALL: [Via; 4] = [Via::Push, Via::Friend, Via::Quick, Via::Location];
+#[cfg(not(unix))]
+pub(super) const ALL: [Via; 3] = [Via::Push, Via::Friend, Via::Quick];
 
 /// What a Location host names a landed upload: the sender's rel verbatim
 /// (hidden files included — it is a backup). Every other path runs `receive_rel`.
@@ -486,6 +492,9 @@ async fn matrix_unicode_and_odd_names() {
         "a:colon.txt", "star*.txt", "q?.txt", "quote\".txt", "lt<gt>.txt", "pipe|.txt", "back\\slash.txt",
         "CON", "NUL.txt", "COM1.tar.gz", "aux", "trailing dot.", "percent %20 & $HOME ~.txt", "#hash;semi'apos.txt",
     ];
+    // A Windows SOURCE can't even hold the NTFS-forbidden names; how a Windows
+    // RECEIVER maps them is pinned by the `receive_parts(_, windows = true)` tests.
+    let names: Vec<&str> = names.into_iter().filter(|n| !cfg!(windows) || windows_safe_component(n) == *n).collect();
     let paths: Vec<_> = names.iter().enumerate().map(|(i, n)| put(&src.0, n, 100 + i, 50 + i as u64)).collect();
     over_all("odd-names", &paths, QUICK).await;
     // The same names inside a sent FOLDER (rel paths with parents).
@@ -1216,6 +1225,8 @@ fn bench_receive_stage_create() {
 /// pushes it from the pinned root to the requester (the app's
 /// `send_location_to_friend` with a snapshot). Everything selected must land
 /// byte-identical with the requester's naming rule and the host's mtimes.
+/// Unix-only: hosting a Location is intentionally unsupported on Windows (Phase 1).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_location_download_lands_every_selected_file() {
     let _gate = PACE_GATE.read().await;
@@ -1289,7 +1300,9 @@ async fn matrix_resend_after_collision_does_not_pile_up_copies() {
                 transfer(via, &paths, &dest, QUICK).await.unwrap_or_else(|e| panic!("{via:?} round {round}: {e:#}"));
             }
         }
-        let mut names: Vec<String> = tree(&dest).iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        // `/`-joined on every platform (Windows paths print with `\`).
+        let mut names: Vec<String> = tree(&dest).iter()
+            .map(|p| p.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")).collect();
         names.sort();
         assert_eq!(names, ["Trip/a (1).jpg", "Trip/a.jpg", "Trip/b.jpg", "movie (1).mov", "movie.mov", "notes (1).txt", "notes.txt"], "{via:?}");
         assert_eq!(sha(&dest.join("notes (1).txt")), sha(&small));
