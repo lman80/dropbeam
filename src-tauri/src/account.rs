@@ -247,6 +247,20 @@ struct ProfileApplied {
     want_avatar: bool,
 }
 
+/// The display name another own device replaced here (old → new), so a window
+/// still holding the old settings can't undo the synced rename by saving
+/// them (D17).
+static REPLACED_NAME: Mutex<Option<(String, String)>> = Mutex::new(None);
+fn note_replaced_name(old: &str, new: &str) {
+    *REPLACED_NAME.lock().unwrap_or_else(|p| p.into_inner()) = Some((old.trim().to_owned(), new.trim().to_owned()));
+}
+/// True when a settings save carrying `incoming` as the name is just a stale
+/// copy from before the synced rename to `current` (keep `current`).
+pub(crate) fn stale_display_name(incoming: &str, current: &str) -> bool {
+    let g = REPLACED_NAME.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref().is_some_and(|(old, new)| old == incoming.trim() && new == current.trim() && old != new)
+}
+
 fn save_settings(st: &AppState, s: &crate::models::Settings) {
     if let Err(e) = crate::settings::save(&st.config_dir, s) {
         log::warn!("account: cannot save the synced profile: {e}");
@@ -270,6 +284,7 @@ fn adopt_profile(st: &AppState, account: &str, theirs: &ProfileRec) -> ProfileAp
         let wins = theirs.name_at > p.name_at && (theirs.name_at > 1 || p.name_at == 0);
         if !name.is_empty() && theirs.name_at > 0 && wins {
             if name != p.name {
+                note_replaced_name(&s.display_name, &name);
                 s.display_name = name.clone();
                 save_settings(st, &s);
                 out.changed = true;
@@ -314,7 +329,7 @@ fn profile_avatar_payload(st: &AppState, account: &str) -> Option<Value> {
 fn adopt_profile_avatar(st: &AppState, account: &str, v: &Value) -> bool {
     let Some(at) = v["at"].as_u64().map(clamp) else { return false };
     let Some(bytes) = v["b64"].as_str().filter(|s| s.len() <= AVATAR_CAP * 4 / 3 + 4)
-        .and_then(|s| STANDARD.decode(s).ok()).filter(|b| !b.is_empty() && b.len() <= AVATAR_CAP) else { return false };
+        .and_then(|s| STANDARD.decode(s).ok()).filter(|b| b.len() <= AVATAR_CAP && friends::is_safe_avatar(b)) else { return false };
     let dir = st.config_dir.clone();
     with_book(&dir, account, |b| {
         let mut s = st.settings.lock().unwrap();
@@ -829,7 +844,7 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
 }
 
 /// This device is out of `account` (removed elsewhere, or leaving): forget the
-/// key, turn the former own devices into plain records, and remember that it
+/// key, drop the former own devices' records, and remember that it
 /// left so it can tell devices that were offline.
 fn leave_account(dir: &Path, account: &str, me: &str) {
     log::warn!("account: this device left its account; unlinking");
@@ -859,7 +874,7 @@ fn apply_avatars(dir: &Path, avatars: &Value) -> bool {
             continue;
         }
         let Some(bytes) = v["b64"].as_str().filter(|s| s.len() <= AVATAR_CAP * 4 / 3 + 4)
-            .and_then(|s| STANDARD.decode(s).ok()).filter(|b| !b.is_empty() && b.len() <= AVATAR_CAP) else { continue };
+            .and_then(|s| STANDARD.decode(s).ok()).filter(|b| b.len() <= AVATAR_CAP && friends::is_safe_avatar(b)) else { continue };
         let mtime = v["mtime"].as_u64().unwrap_or(0);
         let path = dir.join(format!("friend-avatar-{eid}.jpg"));
         let current = mtime_ms(&path.to_string_lossy());
@@ -1645,6 +1660,17 @@ mod tests {
 /// Real devices for tests: a config dir, an iroh endpoint on loopback and an
 /// AppState, plus one full account-sync exchange between two of them.
 #[cfg(test)]
+mod stale_name_tests {
+    #[test]
+    fn a_stale_window_cannot_undo_a_synced_rename() {
+        super::note_replaced_name("Old Name", "New Name");
+        assert!(super::stale_display_name("Old Name", "New Name"));
+        assert!(!super::stale_display_name("Something Else", "New Name"), "a real rename goes through");
+        assert!(!super::stale_display_name("Old Name", "Third"), "only right after that sync");
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod testkit {
     use super::*;
     use iroh::endpoint::presets;
@@ -2075,7 +2101,7 @@ mod edge_tests {
         leave_account(&c.dir, &account, &c.eid());
         assert!(my_pub(&c.dir).is_none());
         assert!(c.friend(&f).is_some(), "it keeps its friends");
-        assert!(c.friend(&a.eid()).is_some_and(|x| x.account_pub.is_none()), "former devices are plain contacts");
+        assert!(c.friend(&a.eid()).is_none(), "former devices don't linger as auto-accepting contacts");
         // Its next hello to the iPhone carries the notice.
         let notice = left_notice(&c.dir);
         assert!(apply_left_notice(&b.dir, &c.eid(), &notice));

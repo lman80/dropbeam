@@ -90,6 +90,14 @@ pub fn update_settings(
     // copy must not point it back at a replaced file.
     settings.avatar = state.settings.lock().unwrap().avatar.clone();
     settings.display_name = settings.display_name.trim().chars().take(64).collect();
+    // A window still holding the name from before another own device renamed
+    // the user must not rename them back by saving unrelated settings (D17).
+    {
+        let current = state.settings.lock().unwrap().display_name.clone();
+        if crate::account::stale_display_name(&settings.display_name, &current) {
+            settings.display_name = current;
+        }
+    }
 
     // Persist FIRST. If the disk write fails (e.g. Windows write contention), return
     // the error WITHOUT mutating in-memory state or applying any live side effect —
@@ -1177,9 +1185,16 @@ pub fn remove_friend(
         if let Some(eid) = f.endpoint_id.as_deref().filter(|e| crate::account::is_own_device(&state.config_dir, e)) {
             return crate::account::account_remove_device(app, state, eid.to_owned());
         }
+        // One person, all their devices: removing "Mong" must not leave Mong's
+        // iPhone behind as a friend (it would keep chatting and sending).
+        for other in friends::person_records(&state.config_dir, &id) {
+            crate::account::record_friend_removed(&state.config_dir, &other);
+            friends::remove(&state.config_dir, &other.id)?;
+        }
         crate::account::record_friend_removed(&state.config_dir, &f);
     }
     friends::remove(&state.config_dir, &id)?;
+    let _ = app.emit("friends://changed", ());
     // Soft-detach: friends::remove preserves the transcript and endpoint index.
     sync.reconcile_friends();
     // A Transfer Server we share with our friends hears about it right away.
@@ -1707,13 +1722,35 @@ pub async fn send_typing(
             });
             // A person with several devices: whichever of them answers.
             let eids = friends::person_endpoints(&state.config_dir, &friend_id);
+            // The ~3 s "still typing" heartbeat must not dial a friend who is
+            // offline over and over: only devices heard from recently get it,
+            // plus at most one quick probe per friend every 30 s.
+            let Some(eids) = typing_targets(&friend_id, eids) else { return Ok(()) };
             let iroh = iroh.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await;
+                let _ = crate::iroh_net::send_chat_any_within(&iroh, &ep, &eids, payload, Some(std::time::Duration::from_secs(3))).await;
             });
         }
     }
     Ok(())
+}
+
+/// Which of a friend's devices a typing signal may go to (None = skip it).
+fn typing_targets(friend_id: &str, eids: Vec<String>) -> Option<Vec<String>> {
+    use std::{collections::HashMap, time::{Duration, Instant}};
+    static PROBED: std::sync::Mutex<Option<HashMap<String, Instant>>> = std::sync::Mutex::new(None);
+    let live: Vec<String> = eids.iter().filter(|e| crate::mailbox::seen_within(e, Duration::from_secs(120))).cloned().collect();
+    if !live.is_empty() {
+        return Some(live);
+    }
+    let mut g = PROBED.lock().unwrap_or_else(|p| p.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    if map.get(friend_id).is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+        return None;
+    }
+    map.insert(friend_id.to_owned(), Instant::now());
+    map.retain(|_, t| t.elapsed() < Duration::from_secs(600));
+    (!eids.is_empty()).then_some(eids)
 }
 
 /// Send a read receipt: tell a friend we've seen everything up to `up_to` (ms).

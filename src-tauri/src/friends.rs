@@ -1047,6 +1047,16 @@ pub fn person_endpoints(config_dir: &Path, owner_id: &str) -> Vec<String> {
     out
 }
 
+/// The OTHER records of the person behind friend `id`: their devices that
+/// prove the same (someone else's) account. Never the user's own devices.
+pub fn person_records(config_dir: &Path, id: &str) -> Vec<Friend> {
+    let all = read_raw(config_dir);
+    let Some(f) = all.iter().find(|f| f.id == id) else { return vec![] };
+    let mine = crate::account::my_pub(config_dir);
+    let Some(account) = f.account_pub.as_deref().filter(|a| Some(*a) != mine.as_deref()) else { return vec![] };
+    all.iter().filter(|o| o.id != id && o.account_pub.as_deref() == Some(account)).cloned().collect()
+}
+
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
@@ -1104,6 +1114,24 @@ fn derive_friend_secret(pair_secret: &str) -> String {
 
 fn clean_name(name: &str, fallback: &str) -> String {
     sanitize_display_name(name, fallback)
+}
+
+/// A profile picture someone else sent is only stored when it really is a
+/// small raster image (JPEG/PNG/GIF/WebP whose header decodes to sane
+/// dimensions): anything else — HTML, SVG, a script, a huge bomb — is dropped
+/// before it touches disk, since the UI loads these files directly.
+pub(crate) fn is_safe_avatar(bytes: &[u8]) -> bool {
+    use image::ImageFormat as F;
+    if bytes.is_empty() || bytes.len() > 2_000_000 {
+        return false;
+    }
+    let Ok(format) = image::guess_format(bytes) else { return false };
+    if !matches!(format, F::Jpeg | F::Png | F::Gif | F::WebP) {
+        return false;
+    }
+    image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .is_ok_and(|(w, h)| w > 0 && h > 0 && w <= 8192 && h <= 8192)
 }
 
 /// Longest name a peer can give itself (characters).
@@ -1828,27 +1856,32 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
 }
 
 pub(crate) fn clear_account_for_endpoint(config_dir: &Path, endpoint_id: &str) {
+    // Read before taking LOCK (the account lock is taken inside it elsewhere).
+    let mine = crate::account::my_pub(config_dir);
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);
-    let mut changed = false;
+    let before = friends.len();
+    // A former OWN device ("Your iPhone") is not a friend: it was never added
+    // as one, so it must not linger as an auto-accepting contact — drop it
+    // (relinking or adding its code brings it back).
+    friends.retain(|f| !(f.endpoint_id.as_deref() == Some(endpoint_id) && mine.is_some() && f.account_pub == mine));
+    let mut changed = friends.len() != before;
+    // A FRIEND's device that left their account just stops counting as them.
     for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id) && f.account_pub.is_some()) {
         f.account_pub = None;
         changed = true;
     }
-    if changed { let _ = save(config_dir, &friends); }
+    if changed { let _ = save_inner(config_dir, &friends, true); }
 }
 
-/// Clear the account claim on every record that carries `account_pub` (this
-/// device left that account): they become ordinary contacts again.
+/// This device left `account_pub`: the records of its former own devices go
+/// (they were never friends, and must not become auto-accepting contacts).
 pub(crate) fn clear_account(config_dir: &Path, account_pub: &str) {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);
-    let mut changed = false;
-    for f in friends.iter_mut().filter(|f| f.account_pub.as_deref() == Some(account_pub)) {
-        f.account_pub = None;
-        changed = true;
-    }
-    if changed { let _ = save(config_dir, &friends); }
+    let before = friends.len();
+    friends.retain(|f| f.account_pub.as_deref() != Some(account_pub));
+    if friends.len() != before { let _ = save_inner(config_dir, &friends, true); }
 }
 
 #[cfg(test)]
@@ -1932,6 +1965,21 @@ mod request_tests {
     }
 
     #[test]
+    fn a_persons_other_devices_are_found_but_never_own_devices() {
+        let d = dir();
+        let theirs = hex::encode(iroh::SecretKey::generate().public().as_bytes());
+        let mac = upsert_by_endpoint(&d, "mac", "Mong");
+        let phone = upsert_by_endpoint(&d, "phone", "Mong's iPhone");
+        let other = upsert_by_endpoint(&d, "other", "Someone else");
+        set_device_info(&d, "mac", None, Some(&theirs));
+        set_device_info(&d, "phone", None, Some(&theirs));
+        let ids: Vec<String> = person_records(&d, &mac.id).into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![phone.id.clone()]);
+        assert!(person_records(&d, &other.id).is_empty(), "no account → just that record");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn pasting_your_own_code_is_refused() {
         let d = dir();
         let code = my_code("Me", "my-eid");
@@ -1939,6 +1987,25 @@ mod request_tests {
         assert!(load(&d).is_empty());
         assert!(add_by_code_for(&d, &my_code("Pal", "pal-eid"), Some("my-eid")).is_ok());
         let _ = fs::remove_dir_all(d);
+    }
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    use super::*;
+    #[test]
+    fn only_real_small_images_pass_as_avatars() {
+        let mut png = Vec::new();
+        image::RgbImage::new(4, 4).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        assert!(is_safe_avatar(&png));
+        assert!(!is_safe_avatar(b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>"));
+        assert!(!is_safe_avatar(b"<html><script>alert(1)</script></html>"));
+        assert!(!is_safe_avatar(&[]));
+        // A real PNG signature with a lying header (0x0 / absurd size) is refused.
+        let mut bad = png.clone();
+        bad[16..24].copy_from_slice(&[0, 1, 0, 0, 0, 1, 0, 0]); // 65536 x 65536
+        assert!(!is_safe_avatar(&bad));
+        assert!(!is_safe_avatar(&vec![0xFF; 3_000_000]), "too big");
     }
 }
 

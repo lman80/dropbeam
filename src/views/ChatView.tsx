@@ -938,7 +938,7 @@ function Conversation({ friendId }: { friendId: string }) {
                 const current = row.kind === 'msg' && searchMatches[searchIdx] === row.m.id
                 return (
                   <div
-                    key={row.kind === 'msg' ? row.m.id : row.ev.id}
+                    key={row.kind === 'msg' ? `${row.m.fromMe ? 'o' : 'i'}:${row.m.id}` : row.ev.id}
                     id={row.kind === 'msg' ? `msg-${row.m.id}` : undefined}
                     className={current ? 'chat-search-hit current' : hit ? 'chat-search-hit' : undefined}
                   >

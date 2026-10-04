@@ -184,7 +184,7 @@ pub async fn register_everywhere(net: &crate::iroh_net::IrohState, config: &Path
             continue;
         }
         let Ok(sealed) = seal_token(&d, &me, &s.eid, WORKER_SEAL_PUB) else { continue };
-        let ok = super::client::push_register(&ep, &s.eid, &sealed).await;
+        let ok = super::client::push_register_with(&ep, &s.eid, &sealed, push_key_advert(config, ep.secret_key())).await;
         if ok {
             let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
             if let crate::settings::StoreRead::Loaded(mut cur) = crate::settings::read_json_store::<Device>(&device_path(config)) {

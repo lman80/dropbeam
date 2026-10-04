@@ -742,7 +742,7 @@ fn adopt_offer(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<
             let bytes = STANDARD.decode(s).map_err(|_| "invalid avatar")?;
             if bytes.len() > MAX_AVATAR { return Err("avatar too large"); }
             Ok(bytes)
-        }).transpose()?;
+        }).transpose()?.filter(|b| friends::is_safe_avatar(b));
         validated.push((f, avatar));
     }
     let chats: HashMap<String, Vec<ChatMessage>> = serde_json::from_value(req["chats"].clone()).map_err(|_| "invalid chats")?;

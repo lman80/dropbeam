@@ -874,8 +874,20 @@ async fn server_rpc(ep: &iroh::Endpoint, config: &Path, server: &str, req: &Valu
 
 /// Hand our sealed push token to a server (it can only use it via the relay).
 pub async fn push_register(ep: &iroh::Endpoint, server: &str, sealed_token: &str) -> bool {
+    push_register_with(ep, server, sealed_token, None).await
+}
+
+/// `push_register`, also handing over this phone's signed notification key
+/// (`advert` = push_key, push_sig) so the server seals the sender id for the
+/// phone instead of sending it in the clear (P5).
+pub async fn push_register_with(ep: &iroh::Endpoint, server: &str, sealed_token: &str, advert: Option<(String, String)>) -> bool {
     let Some(conn) = connect(ep, server, Duration::from_secs(8)).await else { return false };
-    let reply = rpc(&conn, &json!({"kind": "mailbox.push-register", "v": super::VERSION, "sealed_token": sealed_token})).await;
+    let mut req = json!({"kind": "mailbox.push-register", "v": super::VERSION, "sealed_token": sealed_token});
+    if let Some((key, sig)) = advert {
+        req["push_key"] = json!(key);
+        req["push_sig"] = json!(sig);
+    }
+    let reply = rpc(&conn, &req).await;
     conn.close(0u32.into(), b"done");
     reply.is_ok_and(|r| r["ok"].as_bool() == Some(true))
 }

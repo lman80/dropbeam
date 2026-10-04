@@ -3646,21 +3646,23 @@ async fn serve_stream_inner(
                     // Only surface invites from a KNOWN FRIEND — this feature is
                     // friend-to-friend, and gating here stops a stranger who learned
                     // our endpoint id from popping invite prompts at us.
-                    let is_friend = app
+                    let friend = app
                         .try_state::<Arc<crate::AppState>>()
-                        .map(|st| {
+                        .and_then(|st| {
                             crate::friends::load(&st.config_dir)
-                                .iter()
-                                .any(|f| f.endpoint_id.as_deref() == Some(from_id.as_str()))
-                        })
-                        .unwrap_or(false);
-                    if is_friend {
+                                .into_iter()
+                                .find(|f| f.endpoint_id.as_deref() == Some(from_id.as_str()))
+                        });
+                    if let Some(friend) = friend {
+                        // Name them as THIS user knows them (their label for the
+                        // friend), not whatever name the sender put in the frame.
+                        let _ = from;
                         let _ = app.emit(
                             "folder-invite://incoming",
                             serde_json::json!({
                                 "code": code,
-                                "folderName": folder_name,
-                                "fromName": from,
+                                "folderName": crate::friends::sanitize_display_name(&folder_name, "Shared folder"),
+                                "fromName": friend.name,
                                 "fromId": from_id,
                             }),
                         );
@@ -5547,7 +5549,7 @@ fn send_friend_inner(
 fn store_friend_avatar(config_dir: &std::path::Path, who: &str, b64: &str) {
     use base64::Engine;
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else { return };
-    if bytes.is_empty() || bytes.len() > 2_000_000 || !crate::friends::load_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(who)) {
+    if !crate::friends::is_safe_avatar(&bytes) || !crate::friends::load_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(who)) {
         return;
     }
     let path = config_dir.join(format!("friend-avatar-{who}.jpg"));

@@ -1234,7 +1234,7 @@ export const useStore = create<AppStore>((set, get) => ({
       // on the card: flag "tap to resend" on failure, clear it on a successful resend.
       const link = loadChatFileXfer()[u.id]
       if (link) {
-        const card = (get().chats[link.peerId] ?? []).find((x) => x.id === link.msgId)
+        const card = (get().chats[link.peerId] ?? []).find((x) => x.id === link.msgId && x.fromMe)
         if (u.state === 'failed') {
           if (card) get().addChatMessage({ ...card, fileXferFailed: true })
         } else {
@@ -1307,7 +1307,7 @@ export const useStore = create<AppStore>((set, get) => ({
       // Re-send the BYTES only — api.sendToFriend (the raw transfer), NOT the store
       // action that also posts a fresh chat note. That avoids a duplicate file card
       // on every resend; the recipient's engine dedup prevents a double-delivery.
-      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId)
+      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId && x.fromMe)
       const linkId = card?.fileXferId ?? xferId
       const current = get().chatTransfers[linkId]
       if (current && current.state !== 'failed') return
@@ -1590,13 +1590,15 @@ export const useStore = create<AppStore>((set, get) => ({
     }
     set((s) => {
       const thread = s.chats[m.peerId] ?? []
-      const idx = thread.findIndex((x) => x.id === m.id)
+      // Matched by id AND direction (an incoming id is chosen by the peer and
+      // must never replace — or be swallowed by — one of our own messages).
+      const idx = thread.findIndex((x) => x.id === m.id && x.fromMe === m.fromMe)
       // A repeat id is an UPDATE (a status change, edit, delete, reaction), not a
       // new message — replace it in place and don't re-bump unread/count.
       const isNew = idx < 0
       const nextThread = isNew
         ? [...thread, m].sort(byOrder)
-        : thread.map((x) => (x.id === m.id ? m : x))
+        : thread.map((x) => (x.id === m.id && x.fromMe === m.fromMe ? m : x))
       const prev = s.chatOverview.find((o) => o.peerId === m.peerId)
       const last = nextThread[nextThread.length - 1]
       const row: ChatOverview = {
