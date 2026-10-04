@@ -164,7 +164,10 @@
     },
     "publisher": "Ashton Miller",
     "copyright": "© 2026 Ashton Miller",
-    "homepage": "https://github.com/lman80/dropbeam"
+    "homepage": "https://github.com/lman80/dropbeam",
+    "resources": {
+      "../THIRD-PARTY-NOTICES.md": "THIRD-PARTY-NOTICES.md"
+    }
   },
   "plugins": {
     "updater": {
