@@ -51,6 +51,15 @@ if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
   document.documentElement.classList.add('dark')
 }
 
+// IME: WebKit delivers the Enter that CONFIRMS a Chinese/Japanese composition as
+// a keydown with keyCode 229 — which would also submit the surrounding form,
+// sending half-typed text. Swallow just that keydown for form fields.
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.keyCode !== 229 || e.isComposing) return
+  const t = e.target as HTMLElement | null
+  if (t && t.tagName === 'INPUT' && (t as HTMLInputElement).form) e.preventDefault()
+}, true)
+
 // Browser preview only: expose the store so screenshot scripts can reach every state.
 if (!HAS_TAURI) (window as unknown as { __store?: typeof useStore }).__store = useStore
 

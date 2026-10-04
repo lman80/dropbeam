@@ -1,4 +1,5 @@
 import { MobileHeader } from '../components/MobileHeader'
+import { isEnterKey } from '../lib/keys'
 import { TransferCard } from '../components/TransferCard'
 import { ChevronLeft } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
@@ -892,7 +893,7 @@ function Conversation({ friendId }: { friendId: string }) {
               onChange={(e) => setSearchQ(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Escape') closeSearch()
-                else if (e.key === 'Enter') jumpToMatch(searchIdx + (e.shiftKey ? -1 : 1))
+                else if (isEnterKey(e)) jumpToMatch(searchIdx + (e.shiftKey ? -1 : 1))
               }}
             />
           </label>
@@ -1062,7 +1063,7 @@ function Conversation({ friendId }: { friendId: string }) {
             onChange={(e) => onType(e.target.value)}
             onPaste={(e) => void onPaste(e)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              if (isEnterKey(e) && !e.shiftKey) {
                 e.preventDefault()
                 submit()
               } else if (e.key === 'Escape' && editing) {

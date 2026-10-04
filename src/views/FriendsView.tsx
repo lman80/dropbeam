@@ -1,4 +1,5 @@
 import { deviceIcon, groupDevices, personGroups } from '../lib/deviceIcons'
+import { isEnterKey } from '../lib/keys'
 import { errorText } from '../lib/errors'
 import { deliveryIconKind, personDevices } from '../lib/deliveries'
 
@@ -323,7 +324,7 @@ function NameDialog({ title, label, initial, onSave, onClose }: {
         autoFocus
         onFocus={(e) => e.currentTarget.select()}
         onChange={(e) => setName(e.target.value)}
-        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); save() } }}
+        onKeyDown={(e) => { if (isEnterKey(e)) { e.preventDefault(); save() } }}
       />
     </Dialog>
   )
@@ -574,7 +575,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
           autoFocus
           aria-invalid={!!error}
           onChange={(e) => { setCodeInput(e.target.value); if (error) setError('') }}
-          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void submit() } }}
+          onKeyDown={(e) => { if (isEnterKey(e)) { e.preventDefault(); void submit() } }}
         />
         <ScanCodeButton
           className="btn btn-plain"
@@ -695,7 +696,7 @@ function YouCard() {
     <div className="mobile-profile">
       <button className="mobile-avatar-button" aria-label="Change picture" onClick={() => void pickAvatar()}><Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={64} radius={20} /></button>
       <div className="mobile-grow">
-        {editing ? <input className="input" aria-label="Your name" value={name} autoFocus onChange={e => setName(e.target.value)} onBlur={saveName} onKeyDown={e => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') { setName(displayName); setEditing(false) } }} /> : <button className="mobile-name ios-headline" onClick={() => setEditing(true)}>{displayName || 'You'}<Pencil size={16} /></button>}
+        {editing ? <input className="input" aria-label="Your name" value={name} autoFocus onChange={e => setName(e.target.value)} onBlur={saveName} onKeyDown={e => { if (isEnterKey(e)) saveName(); if (e.key === 'Escape') { setName(displayName); setEditing(false) } }} /> : <button className="mobile-name ios-headline" onClick={() => setEditing(true)}>{displayName || 'You'}<Pencil size={16} /></button>}
         <p className="ios-footnote">The name and picture your friends see.</p>
       </div>
     </div>

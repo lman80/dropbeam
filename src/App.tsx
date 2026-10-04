@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useState } from 'react'
+import { isEnterKey } from './lib/keys'
 import { JoinAccountModal } from './components/DevicesPanel'
 import { motion } from 'framer-motion'
 import { AlertTriangle, X } from 'lucide-react'
@@ -346,7 +347,7 @@ function NameSetupModal() {
             className="input onboard-input"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && name.trim() && finish()}
+            onKeyDown={(e) => isEnterKey(e) && name.trim() && finish()}
             placeholder="Your name"
             aria-label="Your name"
             maxLength={40}

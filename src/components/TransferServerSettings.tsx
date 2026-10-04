@@ -1,5 +1,6 @@
 /* eslint-disable react-refresh/only-export-components -- the offer card + servers list are shared with Chat */
 import { errorText } from '../lib/errors'
+import { isEnterKey } from '../lib/keys'
 // Settings → Transfer Server. Before setup: what it is (animated), whether this
 // computer is a good home for it, one button. After setup: a calm status page —
 // storage, who uses it, what's waiting — plus the servers this device can use.
@@ -369,7 +370,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
           <input className="input set-field" aria-label="Server name" value={name} maxLength={40}
             onChange={(e) => setName(e.target.value)}
             onBlur={() => { const n = name.trim(); if (n && n !== c.name) void patch({ name: n }); else setName(c.name) }}
-            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }} />
+            onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }} />
         </Row>
         <Row title="Storage" sub={status.storageOk ? storageLabel : <span className="srv-error">{status.storageError}</span>}>
           {status.storageOk && (
@@ -408,7 +409,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
               if (n !== 0 && (n < 1024 || n > 65535)) { toast('error', 'Pick a port from 1024 to 65535.'); setPort(c.udpPort ? String(c.udpPort) : ''); return }
               void patch({ udpPort: n }).then(() => setPortChanged(true))
             }}
-            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }} />
+            onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }} />
         </Row>
         {IS_LINUX && (
           <Row title="Keep running when no one is logged in" sub="Runs the server in the background after a restart. The app takes over whenever it’s open.">

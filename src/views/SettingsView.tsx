@@ -1,4 +1,5 @@
 import { deviceKindLabel } from '../lib/deviceIcons'
+import { isEnterKey } from '../lib/keys'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { DevicesPanel } from '../components/DevicesPanel'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
@@ -386,7 +387,7 @@ export function SettingsView() {
               const v = e.target.value.trim()
               if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
             }}
-            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+            onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }}
           />
         </Row>
       </div>
@@ -913,7 +914,7 @@ function DisplayNameInput({ value, onSave }: { value: string; onSave: (name: str
       onFocus={() => setDraft(value)}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}
-      onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+      onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }}
     />
   )
 }
