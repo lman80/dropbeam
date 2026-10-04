@@ -483,6 +483,15 @@ function setRetryPayload(id: string, p: RetryPayload): void {
 export function rememberLocationUpload(transferId: string, friendId: string, locationId: string, relPath: string, paths: string[]) {
   setRetryPayload(transferId, { kind: 'location', id: friendId, locationId, relPath, paths })
 }
+/** The friend a send went to (from its retry payload), if known. */
+export function retryFriendId(id: string): string | null {
+  const p = loadRetryPayloads()[id]
+  return p && p.kind !== 'quick' ? p.id : null
+}
+/** Can this stopped card be replayed with one tap? */
+export function hasRetryPayload(id: string): boolean {
+  return !!loadRetryPayloads()[id]
+}
 function deleteRetryPayload(id: string): void {
   try {
     const all = loadRetryPayloads()

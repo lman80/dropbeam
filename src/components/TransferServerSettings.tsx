@@ -1,5 +1,5 @@
-import { errorText } from '../lib/errors'
 /* eslint-disable react-refresh/only-export-components -- the offer card + servers list are shared with Chat */
+import { errorText } from '../lib/errors'
 // Settings → Transfer Server. Before setup: what it is (animated), whether this
 // computer is a good home for it, one button. After setup: a calm status page —
 // storage, who uses it, what's waiting — plus the servers this device can use.
@@ -7,6 +7,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Check, FolderOpen, HardDrive, Monitor, Server } from 'lucide-react'
 import { api, locationsApi, type MountCandidate } from '../lib/api'
 import { formatBytes } from '../lib/format'
+import { personGroups } from '../lib/deviceIcons'
 import { folderLabel } from '../lib/humanize'
 import { IS_LINUX, IS_MAC, IS_WINDOWS } from '../lib/platform'
 import {
@@ -26,12 +27,23 @@ const DAYS = [
 ] as const
 const COMPUTER = IS_MAC ? 'Mac' : IS_WINDOWS ? 'PC' : 'computer'
 
-/** Friends (not the user's own devices), for access pickers. */
+/** Friends (not the user's own devices), ONE entry per person for access
+ *  pickers and the People list. `ids` holds every device record of that person:
+ *  access is granted per record, so a person counts as in when any of theirs is,
+ *  and choosing/removing them applies to all of them. */
 function usePeople() {
   const friends = useStore((s) => s.friends)
   const account = useStore((s) => s.myDevice?.account_pub)
-  return useMemo(() => friends.filter((f) => !account || f.accountPub !== account), [friends, account])
+  return useMemo(() => {
+    const owners = personGroups(friends, account)
+    const theirs = friends.filter((f) => !account || f.accountPub !== account)
+    return theirs
+      .filter((f) => !owners[f.id])
+      .map((f) => ({ ...f, ids: [f.id, ...theirs.filter((m) => owners[m.id] === f.id).map((m) => m.id)] }))
+  }, [friends, account])
 }
+const hasAny = (list: string[], ids: string[]) => ids.some((id) => list.includes(id))
+const without = (list: string[], ids: string[]) => list.filter((id) => !ids.includes(id))
 
 function Row({ title, sub, children, className }: { title: React.ReactNode; sub?: React.ReactNode; children?: React.ReactNode; className?: string }) {
   return (
@@ -149,10 +161,10 @@ function PeoplePicker({ ids, onChange }: { ids: string[]; onChange: (ids: string
   return (
     <div className="location-chips" role="group" aria-label="People">
       {people.map((f) => {
-        const on = ids.includes(f.id)
+        const on = hasAny(ids, f.ids)
         return (
           <button type="button" key={f.id} className={`pick-chip${on ? ' on' : ''}`} aria-pressed={on} title={f.name}
-            onClick={() => onChange(on ? ids.filter((id) => id !== f.id) : [...ids, f.id])}>
+            onClick={() => onChange(on ? without(ids, f.ids) : [...without(ids, f.ids), ...f.ids])}>
             {on && <Check size={12} aria-hidden />}<span className="truncate-1">{f.name}</span>
           </button>
         )
@@ -319,7 +331,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
   const people = usePeople()
   const c = status.config
   const [edit, setEdit] = useState<'storage' | 'people' | null>(null)
-  const [confirm, setConfirm] = useState<'wipe' | 'off' | { remove: string; name: string } | null>(null)
+  const [confirm, setConfirm] = useState<'wipe' | 'off' | { remove: string[]; name: string } | null>(null)
   const [alsoDelete, setAlsoDelete] = useState(false)
   const [port, setPort] = useState(c.udpPort ? String(c.udpPort) : '')
   const [portChanged, setPortChanged] = useState(false)
@@ -330,15 +342,20 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
     try { setStatus(await serverApi.configure(p)) } catch (e) { toast('error', String(e)) }
   }
   const pct = c.capBytes > 0 ? Math.min(100, (status.used / c.capBytes) * 100) : 0
-  const members = c.access === 'all' ? people : c.access === 'chosen' ? people.filter((p) => c.allowed.includes(p.id)) : []
+  const members = c.access === 'all' ? people : c.access === 'chosen' ? people.filter((p) => hasAny(c.allowed, p.ids)) : []
   const usage = new Map(status.people.map((p) => [p.id, p]))
+  // A person's waiting items, summed over all of their devices.
+  const usageOf = (ids: string[]) => {
+    const rows = ids.map((id) => usage.get(id)).filter((u): u is NonNullable<typeof u> => !!u)
+    return rows.length ? { items: rows.reduce((n, u) => n + u.items, 0), bytes: rows.reduce((n, u) => n + u.bytes, 0) } : undefined
+  }
   const own = usage.get('own')
   const denied = [
-    ...people.filter((p) => c.denied.includes(p.id)),
+    ...people.filter((p) => hasAny(c.denied, p.ids)).map((p) => ({ id: p.id, name: p.name })),
     ...status.people.filter((p) => p.viaOwner && p.removed),
   ]
   // Friends of the owner (vouched by the owner's devices) who aren't this computer's friends.
-  const theirs = status.people.filter((p) => p.viaOwner && !p.removed && !members.some((m) => m.id === p.id))
+  const theirs = status.people.filter((p) => p.viaOwner && !p.removed && !members.some((m) => m.ids.includes(p.id)))
   const ownerName = status.owner?.name
   const storageLabel = c.root ? folderLabel(c.root) : `This ${COMPUTER}`
   return (
@@ -408,18 +425,18 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
       <div className="group">
         <Row className="srv-person" title="You" sub={own ? `${own.items} waiting · ${formatBytes(own.bytes)}` : 'Your devices'} />
         {members.map((p) => {
-          const u = usage.get(p.id)
-          const through = c.through.includes(p.id)
+          const u = usageOf(p.ids)
+          const through = hasAny(c.through, p.ids)
           return (
             <Row key={p.id} className="srv-person"
               title={<>{p.name}{through && <span className="srv-tag">Can send to anyone</span>}</>}
               sub={u && u.items > 0 ? `${u.items} waiting · ${formatBytes(u.bytes)}` : 'Nothing waiting'}>
               <MenuButton label={`Options for ${p.name}`} size="sm" items={[
                 through
-                  ? { label: 'Only send to people who use this server', onSelect: () => void patch({ through: c.through.filter((id) => id !== p.id) }) }
-                  : { label: 'Let them send to anyone', onSelect: () => void patch({ through: [...c.through, p.id] }) },
+                  ? { label: 'Only Send to People Who Use This Server', onSelect: () => void patch({ through: without(c.through, p.ids) }) }
+                  : { label: 'Let Them Send to Anyone', onSelect: () => void patch({ through: [...without(c.through, p.ids), ...p.ids] }) },
                 { separator: true },
-                { label: 'Remove', danger: true, onSelect: () => setConfirm({ remove: p.id, name: p.name }) },
+                { label: 'Remove…', danger: true, onSelect: () => setConfirm({ remove: p.ids, name: p.name }) },
               ]} />
             </Row>
           )
@@ -428,7 +445,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
           <Row key={p.id} className="srv-person" title={p.name}
             sub={`${ownerName ? `${ownerName}’s friend` : 'Owner’s friend'} · ${p.items > 0 ? `${p.items} waiting · ${formatBytes(p.bytes)}` : 'Nothing waiting'}`}>
             <MenuButton label={`Options for ${p.name}`} size="sm" items={[
-              { label: 'Remove', danger: true, onSelect: () => setConfirm({ remove: p.id, name: p.name }) },
+              { label: 'Remove…', danger: true, onSelect: () => setConfirm({ remove: [p.id], name: p.name }) },
             ]} />
           </Row>
         ))}
@@ -471,7 +488,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
       {confirm && typeof confirm === 'object' && (
         <Confirm title={`Remove ${confirm.name}?`} danger action="Remove"
           body={`${confirm.name} can’t use ${c.name} anymore. Anything they left for other people is deleted; things they left for you still arrive.`}
-          onClose={() => setConfirm(null)} onConfirm={async () => { setStatus(await serverApi.removePerson(confirm.remove)) }} />
+          onClose={() => setConfirm(null)} onConfirm={async () => { let s: ServerStatus | null = null; for (const id of confirm.remove) s = await serverApi.removePerson(id); if (s) setStatus(s) }} />
       )}
     </>
   )

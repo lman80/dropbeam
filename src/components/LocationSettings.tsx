@@ -1,5 +1,5 @@
-import { errorText } from '../lib/errors'
 /* eslint-disable react-refresh/only-export-components -- peopleLabel/accessLabel are shared with the Locations page */
+import { errorText } from '../lib/errors'
 import { useEffect, useState } from 'react'
 import { Check, FolderOpen, HardDrive, Pencil, Server, Trash2 } from 'lucide-react'
 import { api, locationsApi, onLocationActivity, type LocationActivity, type HostedLocation, type LocationRights, type MountCandidate } from '../lib/api'

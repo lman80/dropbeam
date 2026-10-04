@@ -295,13 +295,16 @@ function NameSetupModal() {
   const [show, setShow] = useState(false)
   const [name, setName] = useState('')
   const [joining, setJoining] = useState(false)
-
-  useEffect(() => {
-    if (settings && !localStorage.getItem('dropbeam.namedSelf')) {
+  // Decide ONCE, when settings first arrive. Re-running on every settings change
+  // (a synced name, a toggle in another window) overwrote what you were typing.
+  const [decided, setDecided] = useState(false)
+  if (settings && !decided) {
+    setDecided(true)
+    if (!localStorage.getItem('dropbeam.namedSelf')) {
       setName(suggestedName(settings.displayName || ''))
       setShow(true)
     }
-  }, [settings])
+  }
 
   if (!show || !settings) return null
   const finish = () => {

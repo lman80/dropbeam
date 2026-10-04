@@ -10,12 +10,16 @@ import {
   ArrowUp,
   Check,
   Copy,
+  Pause,
+  Play,
   Power,
   QrCode,
+  RotateCw,
   ScanLine,
   Search,
   Send,
   Settings,
+  X,
 } from 'lucide-react'
 import { api, HAS_TAURI, isActive, type TransferUpdate } from '../lib/api'
 import { useStore } from '../store'
@@ -29,6 +33,10 @@ import { avatarColor } from '../lib/avatar'
 import { friendPresence, presenceLabel } from '../lib/presence'
 import { peerLabel } from '../lib/humanize'
 import { formatSpeed as formatSpeedValue } from '../lib/format'
+import { sendTargets } from '../lib/deviceIcons'
+import { useOwnDeviceLabels } from '../lib/ownDevices'
+import { useTransferMeter } from '../lib/useTransferMeter'
+import { hasRetryPayload } from '../store'
 
 const openMain = () => invoke('open_main_window').catch(() => {})
 const hideSelf = () => invoke('hide_popover').catch(() => {})
@@ -43,6 +51,8 @@ export function Popover() {
   const init = useStore((s) => s.init)
   const ready = useStore((s) => s.ready)
   const friends = useStore((s) => s.friends)
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
+  const ownLabels = useOwnDeviceLabels()
   const friendSeen = useStore((s) => s.friendSeen)
   const folderStatuses = useStore((s) => s.folderStatuses)
   const transfers = useStore((s) => s.transfers)
@@ -74,15 +84,22 @@ export function Popover() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  // One row per PERSON: your own devices, then each friend once (a friend's
+  // extra devices fold into one row; sending to it reaches all of them).
+  const people = useMemo(() => {
+    const { myDevices, others } = sendTargets(friends, myAccount)
+    return [...myDevices, ...others]
+  }, [friends, myAccount])
+  const labelOf = (f: { id: string; name: string }) => ownLabels[f.id] ?? f.name
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
-    return q ? friends.filter((f) => f.name.toLowerCase().includes(q)) : friends
-  }, [friends, query])
+    return q ? people.filter((f) => (ownLabels[f.id] ?? f.name).toLowerCase().includes(q)) : people
+  }, [people, query, ownLabels])
 
   // Which friend row is under this drag position? Tauri reports physical pixels,
   // but to be robust across displays/versions we try the position both as-is and
-  // divided by the device pixel ratio, and fall back to the nearest row in the
-  // contacts column — so a drop that lands a little off still sends.
+  // divided by the device pixel ratio. Only a drop ON a row counts — guessing the
+  // nearest row sent files to the wrong person.
   const friendIdAtPoint = (pos: { x: number; y: number }): string | null => {
     const dpr = window.devicePixelRatio || 1
     const candidates = [
@@ -97,19 +114,6 @@ export function Popover() {
         if (c.x >= r.left && c.x <= r.right && c.y >= r.top && c.y <= r.bottom) return f.id
       }
     }
-    // Near-miss: pick the closest row whose horizontal band the drop is within.
-    for (const c of candidates) {
-      let best: { id: string; dist: number } | null = null
-      for (const f of filtered) {
-        const el = rowRefs.current[f.id]
-        if (!el) continue
-        const r = el.getBoundingClientRect()
-        if (c.x < r.left - 24 || c.x > r.right + 24) continue
-        const dist = Math.abs(c.y - (r.top + r.bottom) / 2)
-        if (!best || dist < best.dist) best = { id: f.id, dist }
-      }
-      if (best && best.dist < 64) return best.id
-    }
     return null
   }
 
@@ -122,16 +126,7 @@ export function Popover() {
       const r = el.getBoundingClientRect()
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return f.id
     }
-    let best: { id: string; dist: number } | null = null
-    for (const f of filtered) {
-      const el = rowRefs.current[f.id]
-      if (!el) continue
-      const r = el.getBoundingClientRect()
-      if (x < r.left - 24 || x > r.right + 24) continue
-      const dist = Math.abs(y - (r.top + r.bottom) / 2)
-      if (!best || dist < best.dist) best = { id: f.id, dist }
-    }
-    return best && best.dist < 80 ? best.id : null
+    return null
   }
 
   // Native menu-bar drag → the popover's native drop view forwards drag moves and
@@ -246,7 +241,7 @@ export function Popover() {
       const paths = await api.pickFiles()
       if (paths.length) await sendToFriend(id, paths)
     } catch (e) {
-      useStore.getState().toast('error', String(e))
+      useStore.getState().toast('error', e)
     } finally {
       setPickingFor(null)
     }
@@ -259,7 +254,7 @@ export function Popover() {
       const paths = await api.pickFiles()
       if (paths.length) sendPaths(paths)
     } catch (e) {
-      useStore.getState().toast('error', String(e))
+      useStore.getState().toast('error', e)
     } finally {
       setPickingFor(null)
     }
@@ -305,7 +300,10 @@ export function Popover() {
       order
         .map((id) => transfers[id])
         .filter(Boolean)
-        .filter((t) => isActive(t.state) || t.state === 'completed')
+        // Sends that stopped stay listed too — a failed menu-bar send must say so
+        // (with Retry), and a paused one should read as paused, not vanish.
+        .filter((t) => isActive(t.state) || t.state === 'completed' || t.state === 'held' ||
+          (t.direction === 'send' && (t.state === 'failed' || t.state === 'paused')))
         .reverse()
         .slice(0, 4),
     [order, transfers],
@@ -357,14 +355,14 @@ export function Popover() {
                     className={`pop-contact${hot ? ' drop' : ''}`}
                     onClick={() => beamToFriend(f.id)}
                     disabled={pickingFor !== null}
-                    title={`Send files to ${f.name}`}
+                    title={`Send files to ${labelOf(f)}`}
                   >
                     <span className="pop-contact-av" style={{ background: avatarColor(f.id) }}>
                       {pickingFor === f.id ? <Spinner size={12} /> : <FriendAvatar friend={f} />}
                       {online && <span className="pop-online-dot" />}
                     </span>
                     <span className="pop-contact-text">
-                      <span className="pop-contact-name">{f.name}</span>
+                      <span className="pop-contact-name">{labelOf(f)}</span>
                       <span className="pop-contact-sub">
                         {hot ? 'Drop to send' : online ? 'Online' : presenceLabel(presence)}
                       </span>
@@ -381,6 +379,12 @@ export function Popover() {
               </button>
             </div>
           ) : null}
+
+          {/* A drag that isn't over anyone yet: say where to let go (a drop
+              anywhere else is refused rather than guessed). */}
+          {dragActive && !dragHoverId && filtered.length > 0 && (
+            <div className="pop-drop-hint" role="status">Drop on a person to send</div>
+          )}
 
           {!ready && (
             <div className="pop-loading">
@@ -431,7 +435,7 @@ export function Popover() {
           </button>
           <button className="btn btn-primary" onClick={pickAndSend} disabled={pickingFor !== null}>
             {pickingFor === '__quick__' ? <Spinner size={12} /> : <Send />}
-            Send File…
+            Send Files…
           </button>
         </footer>
       </div>
@@ -448,6 +452,9 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
   const showMegabits = useStore((s) => s.settings?.showMegabits ?? false)
   const formatSpeed = (bps: number) => formatSpeedValue(bps, showMegabits)
 
+  const meter = useTransferMeter(t)
+  const retryTransfer = useStore((s) => s.retryTransfer)
+  const removeTransfer = useStore((s) => s.removeTransfer)
   const [copied, setCopied] = useState(false)
   const [showQr, setShowQr] = useState(false)
   const name = t.fileNames[0] ?? (t.direction === 'receive' ? 'Incoming' : 'Files')
@@ -462,8 +469,14 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
         ? who ? `Sent to ${who}` : 'Sent'
         : who ? `Received from ${who}` : 'Received'
       : t.state === 'transferring'
-        ? `${Math.round(t.percent)}% · ${formatSpeed(t.speedBps)}`
-        : isSendWaiting
+        ? `${Math.round(t.percent)}%${meter.speedBps ? ` · ${formatSpeed(meter.speedBps)}` : ''}`
+        : t.state === 'failed'
+          ? who ? `Couldn’t send to ${who}` : 'Couldn’t send'
+          : t.state === 'paused'
+            ? who ? `Paused · to ${who}` : 'Paused'
+            : t.state === 'held'
+              ? `Waiting on ${t.heldOn ?? 'your Transfer Server'}`
+              : isSendWaiting
           ? 'Waiting — share the code'
           : who
             ? t.direction === 'send' ? `Waiting for ${who}` : `Connecting to ${who}…`
@@ -483,18 +496,28 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
   }
 
   return (
-    <div className="pop-xfer">
+    <div className={`pop-xfer${t.state === 'failed' ? ' is-failed' : ''}`}>
       <div className="pop-xfer-line">
         <span className="pop-xfer-icon" aria-hidden>
-          {t.state === 'completed' ? <Check /> : t.direction === 'send' ? <ArrowUp /> : <ArrowDown />}
+          {t.state === 'completed' ? <Check /> : t.state === 'failed' ? <X /> : t.state === 'paused' ? <Pause /> : t.direction === 'send' ? <ArrowUp /> : <ArrowDown />}
         </span>
         <div className="pop-xfer-text">
           <div className="pop-xfer-name" title={t.fileNames.join(', ')}>
             <span className="truncate-1">{name}</span>
             {more && <span className="pop-xfer-more tnum">{more}</span>}
           </div>
-          <div className="pop-xfer-sub tnum">{label}</div>
+          <div className="pop-xfer-sub tnum" title={t.state === 'failed' ? t.error ?? undefined : undefined}>{label}</div>
         </div>
+        {(t.state === 'failed' || t.state === 'paused') && hasRetryPayload(t.id) && (
+          <IconButton size="sm" label={t.state === 'paused' ? 'Resume' : 'Retry'} side="top" onClick={() => void retryTransfer(t.id)}>
+            {t.state === 'paused' ? <Play /> : <RotateCw />}
+          </IconButton>
+        )}
+        {t.state === 'failed' && (
+          <IconButton size="sm" label="Remove from list" side="top" onClick={() => removeTransfer(t.id)}>
+            <X />
+          </IconButton>
+        )}
         {isSendWaiting && (
           <IconButton
             size="sm"

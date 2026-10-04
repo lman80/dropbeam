@@ -75,3 +75,20 @@ export function personGroups<T extends { id: string; createdAt: number; accountP
   }
   return out
 }
+
+/**
+ * Who you can send to, one entry per PERSON: your own devices (each its own
+ * entry — "Your iPhone", "Your Mac") and every friend once, however many
+ * devices they have (their extra devices fold into the record that owns the
+ * conversation, and a send to it reaches all of them).
+ */
+export function sendTargets<T extends { id: string; createdAt: number; accountPub?: string | null; endpointId?: string | null }>(friends: readonly T[], myAccount?: string | null): { myDevices: T[]; others: T[] } {
+  const grouped = personGroups(friends, myAccount)
+  return groupDevices(friends.filter((f) => !grouped[f.id]), myAccount)
+}
+
+/** The stable id a person's avatar colour is keyed by: the record that owns
+ *  their conversation (so every device of one friend shares one colour). */
+export function personKey<T extends { id: string; createdAt: number; accountPub?: string | null; endpointId?: string | null }>(friends: readonly T[], id: string, myAccount?: string | null): string {
+  return personGroups(friends, myAccount)[id] ?? id
+}

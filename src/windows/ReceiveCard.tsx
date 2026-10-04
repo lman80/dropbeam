@@ -11,13 +11,17 @@ import {
   FileText,
   FileVideo,
   Send as SendIcon,
+  X,
 } from 'lucide-react'
 import { HAS_TAURI, api, type TransferUpdate } from '../lib/api'
 import { avatarColor } from '../lib/avatar'
 import { peerLabel } from '../lib/humanize'
 import { MenuPopover, Spinner, type MenuItem } from '../components/ui'
+import { FriendAvatar } from '../components/FriendAvatar'
+import { personKey } from '../lib/deviceIcons'
+import { useTransferMeter } from '../lib/useTransferMeter'
 import { IS_MAC, IS_WINDOWS } from '../lib/platform'
-import { useStore } from '../store'
+import { hasRetryPayload, retryFriendId, useStore } from '../store'
 
 // Pick a file-type glyph from the extension (audio waveform, image, video…).
 function glyphFor(name: string) {
@@ -39,11 +43,6 @@ function etaText(seconds: number | null | undefined): string | null {
   return `${Math.floor(mins / 60)} h ${mins % 60} min`
 }
 
-function initialOf(name: string | null | undefined): string {
-  const n = (name ?? '').trim()
-  return n ? n[0]!.toUpperCase() : '?'
-}
-
 // Truncate a long filename in the MIDDLE so the extension stays visible. The
 // card is fixed-width and centered, so the name is cut to fit rather than being
 // allowed to stretch the layout off-centre (CSS can only ellipsize the end).
@@ -59,6 +58,7 @@ interface SaveDir {
 }
 
 const SENDING_STATES = ['starting', 'waitingForPeer', 'connecting', 'transferring'] as const
+const NO_TRANSFER = { id: '', state: 'starting', bytesDone: 0, bytesTotal: 0, speedBps: 0, etaSeconds: null } as const
 
 // Card window size (logical px). The window has native macOS traffic-light
 // controls (titleBarStyle Overlay) — yellow minimizes it into the Dock, red
@@ -110,33 +110,25 @@ export function ReceiveCard() {
     return live[0] ?? null
   }, [order, transfers])
 
-  // Track a send through to completion so we can flash "Sent ✓" briefly. We only
-  // celebrate a send the card was actively showing (so opening the app later
-  // doesn't resurface an old completed send).
-  const shownSendId = useRef<string | null>(null)
+  // Follow a send the card was showing through to its end: "Sent ✓" flashes
+  // briefly; "Couldn't send" stays (with Retry) until you deal with it. Only a
+  // send the card was actively showing gets an ending, so opening the app later
+  // doesn't resurface an old one. (State adjusted during render, React-style.)
+  const [trackedId, setTrackedId] = useState<string | null>(null)
   const [justSent, setJustSent] = useState<TransferUpdate | null>(null)
-  useEffect(() => {
-    if (outgoing) {
-      shownSendId.current = outgoing.id
-      if (justSent) setJustSent(null)
+  if (outgoing && outgoing.id !== trackedId) {
+    setTrackedId(outgoing.id)
+    if (justSent) setJustSent(null)
+  } else if (!outgoing && trackedId) {
+    const t = transfers[trackedId]
+    if (!t || !(SENDING_STATES as readonly string[]).includes(t.state)) {
+      setTrackedId(null)
+      if (t && (t.state === 'completed' || t.state === 'held' || t.state === 'failed')) setJustSent(t)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [outgoing?.id])
+  }
+  // Auto-dismiss the "Sent ✓" celebration after a few seconds (a failure stays).
   useEffect(() => {
-    const id = shownSendId.current
-    if (!id) return
-    const t = transfers[id]
-    if (!t) return
-    if (t.state === 'completed') {
-      shownSendId.current = null
-      setJustSent(t)
-    } else if (t.state === 'failed' || t.state === 'canceled') {
-      shownSendId.current = null
-    }
-  }, [transfers])
-  // Auto-dismiss the "Sent ✓" celebration after a few seconds.
-  useEffect(() => {
-    if (!justSent) return
+    if (!justSent || justSent.state === 'failed') return
     const h = setTimeout(() => setJustSent(null), 4500)
     return () => clearTimeout(h)
   }, [justSent])
@@ -200,7 +192,9 @@ export function ReceiveCard() {
   // The native-close listener registers ONCE (below), so it must reach the
   // latest closeCard — not the one captured at mount (when cardKey was null).
   const closeCardRef = useRef(closeCard)
-  closeCardRef.current = closeCard
+  useLayoutEffect(() => { closeCardRef.current = closeCard })
+  // A hidden card never keeps a "Save to" menu open.
+  if (!visible && menuAnchor) setMenuAnchor(null)
 
   useEffect(() => {
     if (!HAS_TAURI) return
@@ -213,7 +207,6 @@ export function ReceiveCard() {
       void win.show()
       return
     }
-    closeMenu()
     void win.hide()
     // Debounce dropping the Dock icon: back-to-back transfers shouldn't flap the
     // activation policy off→on→off. Only revert to menu-bar-only after a quiet
@@ -237,7 +230,6 @@ export function ReceiveCard() {
         unlisten = u
       })
     return () => unlisten?.()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // A genuinely NEW transfer should surface even if the previous card was
@@ -270,10 +262,19 @@ export function ReceiveCard() {
 
   // ── Render data for whichever card is active ──────────────────────────────
   const t = visible ? active : null
-  const rates = useStore((s) => (t ? s.transferRates[t.id] : undefined))
-  const etaMode = useStore((s) => s.etaMode)
+  const meterOf = useTransferMeter(t ?? NO_TRANSFER)
+  const friends = useStore((s) => s.friends)
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
+  const retryTransfer = useStore((s) => s.retryTransfer)
   const sending = !incoming && showSend
-  const done = sending && !outgoing && !!justSent // a send that just completed
+  const ended = sending && !outgoing && !!justSent
+  const failed = ended && justSent?.state === 'failed'
+  const done = ended && !failed // a send that just landed (or reached the Transfer Server)
+  // The person, for the SAME avatar (photo or colour) every other screen shows.
+  const friend = t
+    ? friends.find((f) => f.id === retryFriendId(t.id)) ??
+      (t.friendName ? friends.find((f) => f.name === t.friendName) : undefined)
+    : undefined
 
   const name = t?.fileNames[0] ?? (sending ? 'File' : 'Incoming file')
   const extra = (t?.fileCount ?? 1) - 1
@@ -283,13 +284,15 @@ export function ReceiveCard() {
   const who = t ? t.friendName ?? peerLabel(t.peer) : null
   const sub = incoming
     ? `From ${who || 'someone nearby'}`
-    : done
-      ? who ? `Sent to ${who}` : 'Sent'
-      : who ? `To ${who}` : 'Sending'
+    : failed
+      ? who ? `Couldn’t send to ${who}` : 'Couldn’t send'
+      : done
+        ? justSent?.state === 'held'
+          ? `On ${justSent.heldOn ?? 'your Transfer Server'}`
+          : who ? `Sent to ${who}` : 'Sent'
+        : who ? `To ${who}` : 'Sending'
   // One human line under the bar: how far, and how long is left.
-  const eta = t?.state === 'transferring'
-    ? etaText((etaMode === 'avg' ? rates?.avgEta ?? rates?.liveEta : rates?.liveEta ?? rates?.avgEta) ?? t.etaSeconds)
-    : null
+  const eta = t?.state === 'transferring' ? etaText(meterOf.etaSeconds) : null
   const meter = t?.state === 'transferring'
     ? [`${Math.round(pct)}%`, eta && `${eta} left`].filter(Boolean).join(' · ')
     : t?.state === 'connecting' || t?.state === 'starting'
@@ -308,7 +311,8 @@ export function ReceiveCard() {
   // The whole card border is the progress bar (#35, Blip-style): it fills
   // clockwise from the top while bytes move and closes into a full ring when a
   // send lands. No ring on an offer — nothing is moving yet.
-  const ringPct = !t || pendingOffer ? null : pct
+  const ringPct = !t || pendingOffer || failed ? null : pct
+  const canRetry = failed && !!justSent && hasRetryPayload(justSent.id)
 
   return (
     <div className="rc-root">
@@ -329,10 +333,13 @@ export function ReceiveCard() {
             <div className="rc-art" data-tauri-drag-region aria-hidden>
               <div className="rc-file">{glyphFor(name)}</div>
               <div
-                className={`rc-avatar${done ? ' done' : ''}`}
-                style={done ? undefined : { background: who ? avatarColor(who) : undefined }}
+                className={`rc-avatar${done ? ' done' : failed ? ' failed' : ''}`}
+                style={done || failed ? undefined : { background: friend ? avatarColor(personKey(friends, friend.id, myAccount)) : undefined }}
               >
-                {done ? <Check size={13} strokeWidth={3} /> : sending && !who ? <SendIcon size={11} /> : initialOf(who)}
+                {done ? <Check size={13} strokeWidth={3} />
+                  : failed ? <X size={13} strokeWidth={3} />
+                    : friend ? <FriendAvatar friend={friend} />
+                      : sending ? <SendIcon size={11} /> : '?'}
               </div>
             </div>
 
@@ -367,6 +374,17 @@ export function ReceiveCard() {
                     </button>
                   </div>
                 </div>
+              ) : failed ? (
+                <div className="rc-actions">
+                  <button className="btn btn-secondary btn-sm" onClick={() => setJustSent(null)}>
+                    Dismiss
+                  </button>
+                  {canRetry && (
+                    <button className="btn btn-primary btn-sm" onClick={() => { const id = justSent!.id; setJustSent(null); void retryTransfer(id) }}>
+                      Retry
+                    </button>
+                  )}
+                </div>
               ) : done ? (
                 <button className="btn btn-secondary btn-sm rc-done" onClick={() => setJustSent(null)}>
                   Done
@@ -396,13 +414,15 @@ export function ReceiveCard() {
   )
 }
 
-/** Corner radius of the card WINDOW, which the OS draws: the ring has to follow
- *  it. macOS titled windows ≈12 pt, Windows 11 8 px, Linux (WebKitGTK, square
- *  client area) 0. */
-const WINDOW_RADIUS = IS_MAC ? 12 : IS_WINDOWS ? 8 : 0
-const RING_W = 4
+/** The ring is a thin rounded outline INSET from the window edge, so it never
+ *  depends on (or gets clipped by) the corner radius the OS draws — that varies
+ *  by OS version (macOS 26 windows are far rounder than 12 pt) and is 0 on
+ *  Linux. 2 px stroke, 5 px in, 14 px corners: inside every window shape. */
+const RING_W = 2
+const RING_INSET = 5
+const RING_RADIUS = IS_MAC ? 14 : IS_WINDOWS ? 10 : 8
 
-/** A progress stroke that runs around the inside of the card's border,
+/** A progress stroke that runs around the inside of the card,
  *  starting top-centre and going clockwise. `pct` null = hidden. */
 function BorderRing({ pct }: { pct: number | null }) {
   const ref = useRef<SVGSVGElement>(null)
@@ -417,8 +437,8 @@ function BorderRing({ pct }: { pct: number | null }) {
     return () => ro.disconnect()
   }, [])
   const { w, h } = size
-  const i = RING_W / 2 + 0.5 // stroke centre, half a px in from the edge
-  const r = Math.max(0, WINDOW_RADIUS - i)
+  const i = RING_INSET + RING_W / 2 // stroke centre
+  const r = RING_RADIUS
   const d = `M ${w / 2} ${i} H ${w - i - r} A ${r} ${r} 0 0 1 ${w - i} ${i + r} V ${h - i - r} `
     + `A ${r} ${r} 0 0 1 ${w - i - r} ${h - i} H ${i + r} A ${r} ${r} 0 0 1 ${i} ${h - i - r} `
     + `V ${i + r} A ${r} ${r} 0 0 1 ${i + r} ${i} Z`
