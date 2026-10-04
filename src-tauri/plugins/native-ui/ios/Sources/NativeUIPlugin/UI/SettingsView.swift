@@ -17,16 +17,21 @@ struct SettingsView: View {
     @State private var qaSaveFolder = false
     @State private var qaPrivacy = false
     @State private var pendingStrings: [String: String] = [:]
+    @Environment(\.dynamicTypeSize) private var typeSize
     var body: some View {
         NavigationStack {
           ScrollViewReader { proxy in
             List {
                 Section {
                     NavigationLink { ProfileView() } label: {
-                        HStack(spacing: 16) {
-                            MyAvatar(size: 62)
+                        // Accessibility sizes: photo above the name so neither truncates.
+                        let stacked = typeSize.isAccessibilitySize
+                        let layout = stacked ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10)) : AnyLayout(HStackLayout(spacing: 16))
+                        layout {
+                            MyAvatar(size: stacked ? 52 : 62)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(bridge.settings?.displayName ?? "Your Profile").font(.title3.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
+                                Text(bridge.settings?.displayName ?? "Your Profile").font(.title3.weight(.semibold)).foregroundStyle(.primary)
+                                    .lineLimit(stacked ? 3 : 1).fixedSize(horizontal: false, vertical: stacked)
                                     .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
                                 Text("Name, photo & DropBeam code").font(.subheadline).foregroundStyle(.secondary)
                             }
@@ -61,7 +66,7 @@ struct SettingsView: View {
                 Section {
                     SettingToggle(title: "Files", symbol: "bell.badge.fill", color: .red, key: "notifyOnComplete", value: bridge.settings?.notifyOnComplete)
                     SettingToggle(title: "Messages", symbol: "message.fill", color: .green, key: "notifyOnMessage", value: bridge.settings?.notifyOnMessage)
-                } header: { Text("Notifications") } footer: { Text("Keep DropBeam open while transferring. iOS can pause transfers in the background.") }
+                } header: { Text("Notifications") } footer: { Text("A transfer keeps going for a while after you leave DropBeam; for big ones, keep it open (iOS pauses apps in the background).") }
                 Section {
                     SettingToggle(title: "Read Receipts", symbol: "checkmark.message.fill", color: .blue, key: "sendReadReceipts", value: bridge.settings?.sendReadReceipts)
                     SettingToggle(title: "Link Previews", symbol: "link", color: .teal, key: "linkPreviews", value: bridge.settings?.linkPreviews ?? true)
