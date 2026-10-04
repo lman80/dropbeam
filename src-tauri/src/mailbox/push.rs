@@ -173,6 +173,8 @@ pub fn import_token_file(config: &Path) -> bool {
 
 /// Register (or refresh) this phone at every server that holds our messages.
 pub async fn register_everywhere(net: &crate::iroh_net::IrohState, config: &Path) {
+    // Runs every few minutes: keep the extension's blocked list current.
+    share_blocked(config);
     let Some(d) = device(config) else { return };
     let Some(ep) = net.get().cloned() else { return };
     let me = ep.id().to_string();
@@ -271,6 +273,11 @@ pub fn register(config: &Path, c: &ServerConfig, who: &str, req: &Value) -> Valu
     if !super::server::rights_for(config, c, who).any() {
         return json!({"ok": false, "reason": "denied"});
     }
+    register_unchecked(config, c, who, req)
+}
+
+/// `register` after the rights check.
+fn register_unchecked(config: &Path, _c: &ServerConfig, who: &str, req: &Value) -> Value {
     let Some(root) = root_of(config) else { return json!({"ok": false, "reason": "storage"}) };
     let path = reg_dir(&root).join(format!("{who}.json"));
     if req["remove"].as_bool() == Some(true) {
@@ -281,11 +288,24 @@ pub fn register(config: &Path, c: &ServerConfig, who: &str, req: &Value) -> Valu
         return json!({"ok": false, "reason": "invalid"});
     };
     let _ = std::fs::create_dir_all(reg_dir(&root));
-    let rec = json!({"sealed_token": token, "at": now()});
+    let mut rec = json!({"sealed_token": token, "at": now()});
+    // Optional: the phone's notification key, signed by the phone's endpoint key
+    // (newer clients). With it this server seals the sender id for the phone's
+    // eyes only; older clients fall back to the push key from the phone's hello.
+    if let Some(pk) = verified_push_key(who, req) {
+        rec["push_key"] = json!(pk);
+    }
     match crate::settings::write_atomic(&path, rec.to_string().as_bytes()) {
         Ok(()) => json!({"ok": true}),
         Err(_) => json!({"ok": false, "reason": "storage"}),
     }
+}
+
+/// A `push_key`/`push_sig` pair in a request, if it verifies against `who`.
+fn verified_push_key(who: &str, req: &Value) -> Option<String> {
+    let pk = req["push_key"].as_str()?;
+    let k = seal::key32(pk).ok()?;
+    seal::verify_mailbox_key(who, &k, req["push_sig"].as_str()?).then(|| pk.to_owned())
 }
 
 fn identity(config: &Path) -> Option<iroh::SecretKey> {
@@ -344,32 +364,77 @@ fn short(eid: &str) -> String {
     eid.chars().take(6).collect()
 }
 
+/// A device's push registration here: the sealed APNs token (only the relay
+/// can open it) and, when known, the phone's notification key.
+struct Registration {
+    path: PathBuf,
+    token: String,
+    push_key: Option<[u8; 32]>,
+}
+
 /// The sealed APNs registration a device left here, if any.
-fn registration(config: &Path, to: &str) -> Option<(PathBuf, String)> {
+fn registration(config: &Path, to: &str) -> Option<Registration> {
     let path = reg_dir(&root_of(config)?).join(format!("{to}.json"));
-    let token = std::fs::read(&path).ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v["sealed_token"].as_str().map(String::from))?;
-    Some((path, token))
+    let rec = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())?;
+    let token = rec["sealed_token"].as_str().map(String::from)?;
+    // The key the phone registered with, else the one its (signature-checked)
+    // hello advertised to this device.
+    let push_key = rec["push_key"].as_str().map(String::from)
+        .or_else(|| super::keys::peers(config).get(to).and_then(|p| p.push_key.clone()))
+        .and_then(|k| seal::key32(&k).ok());
+    Some(Registration { path, token, push_key })
+}
+
+/// The relay forwards at most this much payload to APNs (push-worker MAX_PAYLOAD).
+const MAX_PAYLOAD: usize = 3000;
+
+/// What the relay and Apple see of a wake-up. When this server knows the
+/// phone's notification key the sender id (and the sender's sealed preview)
+/// travel sealed to that key: `{"s": seal({"f": from, "e": preview})}` — the
+/// relay and APNs see only ciphertext. Otherwise (a phone that never told us
+/// its key) the legacy `{"f": from, "e": preview}` is sent so its banner still
+/// names the sender.
+fn wake_payload(from: &str, preview: Option<&String>, push_key: Option<&[u8; 32]>) -> String {
+    let inner = |with_preview: bool| match preview.filter(|_| with_preview) {
+        Some(sealed) => json!({"f": from, "e": sealed}).to_string(),
+        None => json!({"f": from}).to_string(),
+    };
+    let Some(pk) = push_key else { return inner(true) };
+    for with_preview in [true, false] {
+        if let Ok(s) = seal::seal_small(pk, inner(with_preview).as_bytes()) {
+            let out = json!({"s": s}).to_string();
+            if out.len() <= MAX_PAYLOAD {
+                return out;
+            }
+        }
+    }
+    // Can't seal (bad key): say nothing identifying — the phone shows the generic banner.
+    String::new()
+}
+
+/// Notification thread for (sender → this phone). Salted with the recipient so
+/// the relay/Apple can't link one sender across different phones.
+fn thread_tag(from: &str, to: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"dropbeam-push-thread-v2\n");
+    h.update(to.as_bytes());
+    h.update(b"\n");
+    h.update(from.as_bytes());
+    hex::encode(&h.finalize()[..8])
 }
 
 /// The signed relay request that wakes `to` about `item` (None = not a phone
 /// that registered here, or no server identity).
 pub(crate) fn wake_request(config: &Path, item: &Item, to: &str) -> Option<(PathBuf, Value)> {
-    let (path, token) = registration(config, to)?;
+    let reg = registration(config, to)?;
     let signer = identity(config)?;
     // Same sender → one notification thread on the phone.
-    let collapse = {
-        use sha2::{Digest, Sha256};
-        hex::encode(&Sha256::digest(item.from.as_bytes())[..8])
-    };
+    let collapse = thread_tag(&item.from, to);
     // The sender id is the one the server verified on the item; the phone
     // names the banner from its own contacts and checks the preview matches.
-    let payload = match item.push.get(to) {
-        Some(sealed) => json!({"f": item.from, "e": sealed}).to_string(),
-        None => json!({"f": item.from}).to_string(),
-    };
-    Some((path, signed_request(&signer, &token, &collapse, &payload)))
+    let payload = wake_payload(&item.from, item.push.get(to), reg.push_key.as_ref());
+    Some((reg.path, signed_request(&signer, &reg.token, &collapse, &payload)))
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -428,6 +493,12 @@ pub fn on_stored(config: &Path, item: &Item) {
     if item.kind == "op" {
         return;
     }
+    // Never ring a phone for someone this account blocked (the block list
+    // rides account sync, so an own Transfer Server has the phone's list).
+    if crate::block::is_blocked(config, &item.from) {
+        log::info!("push: no wake-up for an item from a blocked sender");
+        return;
+    }
     for to in &item.to {
         if registration(config, to).is_none() {
             continue;
@@ -450,6 +521,7 @@ pub fn on_unreachable(config: &Path, eid: &str) {
     let t = now();
     let mut due: Vec<Item> = super::server::waiting_items(config, eid).into_iter()
         .filter(|i| i.kind != "op" && t.saturating_sub(i.created_ms) < 15 * 60 * 1000 && !was_pushed(&i.id, eid))
+        .filter(|i| !crate::block::is_blocked(config, &i.from))
         .collect();
     if due.is_empty() {
         return;
@@ -481,6 +553,24 @@ fn read_ids(path: &Path) -> HashMap<String, u64> {
     map.into_iter().map(|(k, v)| (k, v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)).unwrap_or(0))).collect()
 }
 
+/// Hand the Notification Service Extension this account's blocked endpoints
+/// (`push-blocked.json`, a JSON array) so a push about a blocked sender — e.g.
+/// from a friend's Transfer Server that doesn't know our block list — never
+/// shows their name or text. Rewritten only when it changed. No-op off iOS.
+pub fn share_blocked(config: &Path) {
+    let Some(dir) = group_dir(config) else { return };
+    let mut ids: Vec<String> = crate::block::snapshot(config).into_iter().filter(|(_, r)| r.blocked).map(|(e, _)| e).collect();
+    ids.sort();
+    let path = dir.join("push-blocked.json");
+    let cur: Option<Vec<String>> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if cur.as_ref() == Some(&ids) {
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(&ids) {
+        let _ = crate::settings::write_atomic(&path, &bytes);
+    }
+}
+
 /// The extension already announced this message.
 pub fn already_announced(config: &Path, msg_id: &str) -> bool {
     group_dir(config).is_some_and(|d| read_ids(&d.join("nse-notified.json")).contains_key(msg_id))
@@ -492,6 +582,7 @@ pub fn note_have(config: &Path, ids: &[&str]) {
     if ids.is_empty() {
         return;
     }
+    share_blocked(config);
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = dir.join("app-have.json");
     let mut map = read_ids(&path);
@@ -572,6 +663,122 @@ mod tests {
         let sealed = v[&eid].as_str().expect("a preview for the phone");
         let plain: Value = serde_json::from_slice(&seal::open_small(&phone_sk, sealed).unwrap()).unwrap();
         assert_eq!((plain["i"].as_str(), plain["b"].as_str()), (Some("msg-1"), Some("hi")));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A server set up in a temp dir, with its identity key on disk.
+    fn test_server() -> PathBuf {
+        let config = std::env::temp_dir().join(format!("dropbeam-pushsrv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&config).unwrap();
+        let mut c = super::super::server::load_config(&config);
+        super::super::server::init_root(&config, &mut c).unwrap();
+        super::super::server::save_config(&config, &c).unwrap();
+        std::fs::write(config.join("iroh-identity.key"), iroh::SecretKey::generate().to_bytes()).unwrap();
+        config
+    }
+
+    fn item(from: &str, to: &str) -> Item {
+        serde_json::from_value(json!({"id": uuid::Uuid::new_v4().to_string(), "from": from, "person": "p", "to": [to],
+            "kind": "chat", "ctSize": 1, "headerSha": "", "createdMs": now(), "expiresMs": now() + 60_000, "state": "held",
+            "push": {to: "c2VhbGVk"}})).unwrap()
+    }
+
+    fn sent_to(to: &str) -> Vec<Value> {
+        SENT_FOR_TESTS.lock().unwrap().iter().filter(|(t, _)| t == to).map(|(_, b)| b.clone()).collect()
+    }
+
+    #[test]
+    fn the_sender_id_travels_sealed_to_the_phone() {
+        let phone_sk: [u8; 32] = rand::random();
+        let pk = seal::x25519_public(&phone_sk);
+        let preview = "c2VhbGVkLXByZXZpZXc=".to_owned();
+        let p = wake_payload("SENDER-EID", Some(&preview), Some(&pk));
+        assert!(!p.contains("SENDER-EID"), "relay/APNs never see the sender id");
+        let v: Value = serde_json::from_str(&p).unwrap();
+        let inner: Value = serde_json::from_slice(&seal::open_small(&phone_sk, v["s"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!((inner["f"].as_str(), inner["e"].as_str()), (Some("SENDER-EID"), Some(preview.as_str())));
+        // An oversized preview is dropped (still sealed, still names the sender).
+        let big = "A".repeat(4000);
+        let p = wake_payload("SENDER-EID", Some(&big), Some(&pk));
+        assert!(p.len() <= MAX_PAYLOAD && !p.contains("SENDER-EID"));
+        let v: Value = serde_json::from_str(&p).unwrap();
+        let inner: Value = serde_json::from_slice(&seal::open_small(&phone_sk, v["s"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(inner["f"], "SENDER-EID");
+        assert!(inner.get("e").is_none());
+        // No key known: the legacy shape (older phones still get named banners).
+        let legacy: Value = serde_json::from_str(&wake_payload("SENDER-EID", Some(&preview), None)).unwrap();
+        assert_eq!(legacy["f"], "SENDER-EID");
+    }
+
+    #[test]
+    fn thread_tags_are_per_recipient() {
+        assert_eq!(thread_tag("a", "phone1"), thread_tag("a", "phone1"));
+        assert_ne!(thread_tag("a", "phone1"), thread_tag("a", "phone2"));
+        assert_ne!(thread_tag("a", "phone1"), thread_tag("b", "phone1"));
+        assert_eq!(thread_tag("a", "phone1").len(), 16);
+    }
+
+    #[test]
+    fn registration_with_a_signed_push_key_seals_wakeups() {
+        let config = test_server();
+        let c = super::super::server::load_config(&config);
+        let phone = iroh::SecretKey::generate();
+        let who = phone.public().to_string();
+        let phone_sk: [u8; 32] = rand::random();
+        let pk = seal::x25519_public(&phone_sk);
+        // A forged key (signed by someone else) is ignored.
+        let other = iroh::SecretKey::generate();
+        let bad = json!({"sealed_token": seal::b64(b"tok"), "push_key": seal::b64(&pk), "push_sig": seal::sign_mailbox_key(&other, &pk)});
+        assert_eq!(register_unchecked(&config, &c, &who, &bad)["ok"], true);
+        assert!(registration(&config, &who).unwrap().push_key.is_none());
+        let good = json!({"sealed_token": seal::b64(b"tok"), "push_key": seal::b64(&pk), "push_sig": seal::sign_mailbox_key(&phone, &pk)});
+        assert_eq!(register_unchecked(&config, &c, &who, &good)["ok"], true);
+        assert_eq!(registration(&config, &who).unwrap().push_key, Some(pk));
+        let from = iroh::SecretKey::generate().public().to_string();
+        let (_, body) = wake_request(&config, &item(&from, &who), &who).unwrap();
+        let payload = body["payload"].as_str().unwrap();
+        assert!(!payload.contains(&from) && !body["collapse"].as_str().unwrap().contains(&from));
+        let v: Value = serde_json::from_str(payload).unwrap();
+        let inner: Value = serde_json::from_slice(&seal::open_small(&phone_sk, v["s"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(inner["f"].as_str(), Some(from.as_str()));
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn no_banner_for_a_blocked_sender() {
+        let config = test_server();
+        let c = super::super::server::load_config(&config);
+        let phone = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(register_unchecked(&config, &c, &phone, &json!({"sealed_token": seal::b64(b"tok")}))["ok"], true);
+        let (friend, spammer) = (iroh::SecretKey::generate().public().to_string(), iroh::SecretKey::generate().public().to_string());
+        let f = crate::friends::upsert_by_endpoint(&config, &spammer, "Spam");
+        crate::block::block_friend(&config, &f.id).unwrap();
+        on_stored(&config, &item(&spammer, &phone));
+        assert!(sent_to(&phone).is_empty(), "a blocked sender never wakes the phone");
+        on_unreachable(&config, &phone);
+        assert!(sent_to(&phone).is_empty(), "not even later");
+        on_stored(&config, &item(&friend, &phone));
+        assert_eq!(sent_to(&phone).len(), 1, "anyone else still does");
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn the_extension_gets_the_blocked_list() {
+        let base = std::env::temp_dir().join(format!("dropbeam-nseblk-{}", uuid::Uuid::new_v4()));
+        let (config, group) = (base.join("config"), base.join("group"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&group).unwrap();
+        std::fs::write(config.join("app-group-path"), group.to_string_lossy().as_bytes()).unwrap();
+        let spam = iroh::SecretKey::generate().public().to_string();
+        let f = crate::friends::upsert_by_endpoint(&config, &spam, "Spam");
+        crate::block::block_friend(&config, &f.id).unwrap();
+        share_blocked(&config);
+        let list: Vec<String> = serde_json::from_slice(&std::fs::read(group.join("push-blocked.json")).unwrap()).unwrap();
+        assert_eq!(list, vec![spam.clone()]);
+        crate::block::unblock(&config, &spam).unwrap();
+        share_blocked(&config);
+        let list: Vec<String> = serde_json::from_slice(&std::fs::read(group.join("push-blocked.json")).unwrap()).unwrap();
+        assert!(list.is_empty(), "an unblock clears it");
         let _ = std::fs::remove_dir_all(base);
     }
 

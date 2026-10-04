@@ -42,4 +42,65 @@ The entitlement says `development`; Xcode switches it to production when it expo
 That's it. Phones register with the Transfer Servers they use; when a server holds
 something for a phone that isn't connected it asks the Worker to send
 "New message" and the phone's extension replaces it with the real sender and text
-(sealed end to end — the server and Worker only see ciphertext).
+(sealed end to end — the server and Worker only see ciphertext; see below for
+exactly what the relay and Apple can see).
+
+## What the relay and Apple can see
+
+A wake-up request carries:
+
+- `sealed_token`: the phone's APNs token, sealed to the Worker. Only the Worker
+  can open it, and only for the Transfer Server it was registered with.
+- `collapse`: a 16-hex-char thread tag, `SHA-256("dropbeam-push-thread-v2" ‖
+  phone ‖ sender)`. It is the same for every message from one sender to one
+  phone, and it differs for every other phone, so it can't be used to link a
+  sender across people.
+- `payload`: `{"s": …}`. This is the sender's DropBeam device id plus the
+  sender's sealed preview, sealed together to the phone's own notification key.
+  The Worker and Apple see only ciphertext. The phone's Notification Service
+  Extension opens it, checks the preview really came from that sender, and
+  titles the banner with your own name for them.
+
+The Worker also sees the signing server's public key and the caller's IP. It
+logs only APNs status codes. Apple sees the device token (it has to, to deliver)
+and the generic alert "DropBeam / New message", which the extension replaces
+on the phone.
+
+**One exception.** If a Transfer Server doesn't know the phone's notification
+key yet, it sends the older `{"f": sender id, "e": sealed preview}` form, and
+then the sender's device id is visible to the Worker and to Apple. This happens
+when the phone's signed key hasn't reached the server, either in the push
+registration or in a hello. On current builds the server learns the key from
+the phone's hellos (own devices and friends). A phone running a build from
+before this change can't open the sealed form: it gets the generic
+"DropBeam / New message" banner until it updates.
+
+## Blocked senders
+
+- **Your own Transfer Servers** sync your block list with your account, and they
+  never send a push for an item from someone you blocked.
+- **A friend's Transfer Server** doesn't know your block list. Block lists are
+  never shared outside your own devices. There, the phone's extension checks
+  `push-blocked.json`, which the app keeps in the App Group. Without Apple's
+  filtering entitlement it turns the push into a silent, passive "DropBeam /
+  New activity" with no name, no text and no sound. To drop such pushes
+  entirely, request `com.apple.developer.usernotifications.filtering` from Apple
+  (developer.apple.com/contact/request/notification-service). Once it's granted,
+  add it to `DropBeamNotify.entitlements` and set the Boolean `DropBeamCanFilter`
+  = YES in `DropBeamNotify/Info.plist`.
+
+## Redeploying the Worker (rate limits)
+
+The Worker no longer uses KV. Per-request KV writes let anyone burn the daily
+write quota and stop push for everyone. It now uses Workers Rate Limiting
+bindings, all keyed on values the Worker derives itself: client IP, global,
+verified server key, and a hash of the decrypted phone token. The bindings are
+in `wrangler.toml`. To deploy:
+
+```sh
+cd push-worker && npx wrangler deploy
+curl -s https://dropbeam-push.ashton-mcp-worker.workers.dev/health
+```
+
+Once that works, the old `PUSH_RL` KV namespace can be deleted
+(`npx wrangler kv namespace delete --namespace-id 01482baf090e4b7c994c4010d5e251b7`).

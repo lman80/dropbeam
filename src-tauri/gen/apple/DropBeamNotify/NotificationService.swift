@@ -9,9 +9,10 @@ import UserNotifications
 ///
 /// Layout (Rust `mailbox::seal::seal_small`): eph_pub(32) ‖ nonce(12) ‖ ct ‖ tag,
 /// key = HKDF-SHA256(X25519(push_key, eph_pub), salt: eph_pub ‖ my_pub,
-/// info: "dropbeam-push-v1"), ChaCha20-Poly1305. Plaintext {"t","b","th"}.
-/// Plaintext {"t","b","f","i"} ("i" = message id, newer senders). Anything
-/// unexpected leaves the generic banner.
+/// info: "dropbeam-push-v1"), ChaCha20-Poly1305. The same layout carries the
+/// server's sealed wrap {"f","e"} and the sender's preview {"t","b","f","i"}
+/// ("i" = message id, newer senders). Anything unexpected leaves the generic
+/// banner.
 final class NotificationService: UNNotificationServiceExtension {
     private var handler: ((UNNotificationContent) -> Void)?
     private var content: UNMutableNotificationContent?
@@ -23,12 +24,34 @@ final class NotificationService: UNNotificationServiceExtension {
             return
         }
         content = best
-        // "e" = {"f": sender (checked by the server against the item's signature),
-        //        "e": preview sealed by that sender to this phone}.
-        if let outer = request.content.userInfo["e"] as? String,
-           let wrap = try? JSONSerialization.jsonObject(with: Data(outer.utf8)) as? [String: Any],
-           let from = wrap["f"] as? String, let sealed = wrap["e"] as? String,
-           let name = Self.names()[from] {
+        // "e" = {"s": sealed wrap} from current servers — the wrap is sealed to
+        // this phone's push key so the relay and Apple never see who sent it —
+        // or the legacy clear {"f": sender, "e": preview} from older servers.
+        // Inside: {"f": sender (checked by the server against the item's
+        // signature), "e": preview sealed by that sender to this phone}.
+        guard let outer = request.content.userInfo["e"] as? String,
+              var wrap = try? JSONSerialization.jsonObject(with: Data(outer.utf8)) as? [String: Any] else {
+            contentHandler(best)
+            return
+        }
+        if let s = wrap["s"] as? String {
+            guard let inner = Self.open(s) else {
+                contentHandler(best)
+                return
+            }
+            wrap = inner
+        }
+        guard let from = wrap["f"] as? String else {
+            contentHandler(best)
+            return
+        }
+        // Someone you blocked: no name, no text, no sound. (A friend's Transfer
+        // Server doesn't know your block list; your own servers never push these.)
+        if Self.blocked().contains(from) {
+            contentHandler(Self.suppressed())
+            return
+        }
+        if let sealed = wrap["e"] as? String, let name = Self.names()[from] {
             // The title is always YOUR name for them; the text only if the sealed
             // preview really is from that sender.
             best.title = name
@@ -47,6 +70,8 @@ final class NotificationService: UNNotificationServiceExtension {
                     }
                 }
             }
+        } else if let name = Self.names()[from] {
+            best.title = name
         }
         contentHandler(best)
     }
@@ -82,6 +107,31 @@ final class NotificationService: UNNotificationServiceExtension {
 
     static var group: URL? {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.ashtonmiller.dropbeam")
+    }
+
+    /// Endpoint ids this account blocked (the app keeps `push-blocked.json` current).
+    static func blocked() -> Set<String> {
+        guard let url = group?.appendingPathComponent("push-blocked.json"),
+              let data = try? Data(contentsOf: url),
+              let list = try? JSONSerialization.jsonObject(with: data) as? [String] else { return [] }
+        return Set(list)
+    }
+
+    /// What a blocked sender's push turns into. With Apple's
+    /// `com.apple.developer.usernotifications.filtering` entitlement (flagged by
+    /// `DropBeamCanFilter` = YES in this extension's Info.plist) empty content
+    /// drops the notification entirely; without it iOS would show the original
+    /// for empty content, so deliver a silent, passive, anonymous one instead.
+    static func suppressed() -> UNNotificationContent {
+        if Bundle.main.object(forInfoDictionaryKey: "DropBeamCanFilter") as? Bool == true {
+            return UNNotificationContent()
+        }
+        let quiet = UNMutableNotificationContent()
+        quiet.title = "DropBeam"
+        quiet.body = "New activity"
+        quiet.sound = nil
+        if #available(iOS 15.0, *) { quiet.interruptionLevel = .passive }
+        return quiet
     }
 
     static func names() -> [String: String] {

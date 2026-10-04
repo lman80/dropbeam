@@ -13,6 +13,10 @@ DropBeam is a peer-to-peer file transfer and chat app for Mac, Windows, Linux an
 - **Local network.** DropBeam uses your local network to find your own devices and friends nearby so transfers can go directly. It does not scan or store information about other devices.
 - **Camera.** The camera is used only when you choose to scan a QR code to add a friend or link a device. No images are stored.
 
+## Notifications on iPhone
+
+When one of your devices or a friend's computer holds a message for your iPhone while it is asleep (a "Transfer Server"), it asks our small push relay (a Cloudflare Worker) to send an Apple Push Notification. The text of the notification and who sent it are encrypted to a key that only your iPhone has. The relay and Apple see only an encrypted blob, your phone's push token (which Apple needs to deliver it), and a short tag that groups messages from the same person on your phone. The relay keeps no logs beyond delivery status codes. In one case the sender's device id is visible to the relay and Apple: when a Transfer Server doesn't know your phone's notification key yet, which can happen with older app versions. Pushes about people you blocked are not sent by your own Transfer Servers. If one arrives through a friend's server, your phone shows it without the name or text and without a sound. You can turn off message text in notifications in Settings, or turn notifications off in iOS Settings.
+
 ## Diagnostics
 
 DropBeam can send a small anonymous diagnostics digest so we can find bugs and slowness. It contains error and performance lines from the app's own log. Before anything is sent, file names, paths, device identifiers, network addresses and email addresses are removed. Diagnostics can be turned off at any time in Settings.
