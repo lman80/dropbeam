@@ -119,7 +119,10 @@ pub(crate) fn record(config: &Path, sender: &str, name: &str, path: &Path) {
     let mut all = LEDGERS.lock().unwrap_or_else(|p| p.into_inner());
     let ledger = all.entry(config.to_path_buf()).or_default();
     let entries = ledger.senders.entry(sender.to_owned()).or_default();
-    entries.retain(|e| !(e.name == name && e.path == path));
+    // Re-delivery of the same file: refresh it (only the recent tail is
+    // checked — scanning 50k entries per landed file was quadratic).
+    let tail = entries.len().saturating_sub(256);
+    if let Some(i) = entries.range(tail..).position(|e| e.name == name && e.path == path) { entries.remove(tail + i); }
     entries.push_back(Entry { name: name.to_owned(), path: path.to_path_buf(), at: now_ms() });
     while entries.len() > PER_SENDER { entries.pop_front(); }
     if ledger.senders.len() > MAX_SENDERS { prune(&mut ledger.senders, now_ms()); }

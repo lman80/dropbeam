@@ -18,6 +18,14 @@ use super::*;
 
 /// Manifests whose estimated JSON exceeds this go out of band.
 pub(super) const INLINE_LIMIT: usize = 256 * 1024;
+/// An inline link this big still leaves room for the rest of a push header
+/// (items, dirs) under the 1 MiB frame cap.
+const INLINE_FALLBACK_MAX: usize = 640 * 1024;
+/// Per-manifest bounds a peer can make us hold.
+const MAX_NAME_BYTES: usize = 4096;
+const MAX_MANIFEST_BYTES: usize = 64 << 20;
+/// Manifests being received at once (all peers).
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// One page frame stays far below the 1 MiB frame cap.
 const PAGE_BYTES: usize = 384 * 1024;
 const PAGE_ITEMS: usize = 4000;
@@ -96,10 +104,15 @@ pub(super) async fn header_value(conn: &Connection, link: &crate::models::ChatTr
             stored
         }
     };
-    if stored { Ok(Some(compact(link)?)) } else {
-        log::warn!("receiver predates paged chat manifests; sending {} files without a chat link", link.manifest.len());
-        Ok(None)
+    if stored { return Ok(Some(compact(link)?)); }
+    // An older receiver: inline still works while the push header fits one
+    // frame (what every build did before) — only beyond that drop the link.
+    let inline = serde_json::to_value(link)?;
+    if serde_json::to_vec(&inline)?.len() < INLINE_FALLBACK_MAX {
+        return Ok(Some(inline));
     }
+    log::warn!("receiver predates paged chat manifests; sending {} files without a chat link", link.manifest.len());
+    Ok(None)
 }
 
 /// Page the manifest to the receiver. Ok(false) = it doesn't speak this.
@@ -148,7 +161,7 @@ fn pages(link: &crate::models::ChatTransferLink) -> Vec<serde_json::Value> {
 }
 
 /// Receiver: take a paged manifest from `peer` and keep it for its pushes.
-pub(super) async fn serve(peer: &str, req: &serde_json::Value, send: &mut SendStream, recv: &mut RecvStream) -> Result<()> {
+pub(super) async fn serve(peer: &str, friend: bool, req: &serde_json::Value, send: &mut SendStream, recv: &mut RecvStream) -> Result<()> {
     let refuse = |e: &str| serde_json::json!({"ok": false, "error": e});
     let id = req["id"].as_str().unwrap_or("");
     let attempt = req["attempt"].as_u64().unwrap_or(0);
@@ -158,21 +171,42 @@ pub(super) async fn serve(peer: &str, req: &serde_json::Value, send: &mut SendSt
         let _ = send.finish();
         return Ok(());
     }
+    // Only friends park manifests here (a stranger's big send degrades to
+    // plain pushes), and only a few at a time.
+    if !friend {
+        write_frame(send, &refuse("unknown sender")).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+    struct Slot;
+    impl Drop for Slot { fn drop(&mut self) { IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
+    if IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 4 {
+        IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        write_frame(send, &refuse("busy")).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+    let _slot = Slot;
     write_frame(send, &serde_json::json!({"ready": true, "chat_manifest_v": 1})).await?;
     let mut files = Vec::with_capacity(count.min(50_000) as usize);
     let mut all_dirs = Vec::with_capacity(dirs.min(50_000) as usize);
+    let mut bytes = 0usize;
     let read = async {
         loop {
             let page = read_frame(recv).await?;
             for f in page["files"].as_array().context("bad page")? {
-                files.push(crate::models::ChatFile {
-                    name: f["name"].as_str().context("bad name")?.to_owned(),
-                    size: f["size"].as_u64().context("bad size")?,
-                });
+                let name = f["name"].as_str().context("bad name")?;
+                anyhow::ensure!(name.len() <= MAX_NAME_BYTES, "name too long");
+                bytes += name.len() + 32;
+                files.push(crate::models::ChatFile { name: name.to_owned(), size: f["size"].as_u64().context("bad size")? });
             }
             for d in page["dirs"].as_array().context("bad page")? {
-                all_dirs.push(d.as_str().context("bad dir")?.to_owned());
+                let d = d.as_str().context("bad dir")?;
+                anyhow::ensure!(d.len() <= MAX_NAME_BYTES, "name too long");
+                bytes += d.len() + 32;
+                all_dirs.push(d.to_owned());
             }
+            anyhow::ensure!(bytes <= MAX_MANIFEST_BYTES, "manifest too large");
             anyhow::ensure!(files.len() as u64 <= count && all_dirs.len() as u64 <= dirs, "manifest longer than announced");
             if page["last"] == true { break; }
         }

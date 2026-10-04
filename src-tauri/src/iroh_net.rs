@@ -112,6 +112,9 @@ pub struct IrohState {
     /// cancel. Marked before the flag flips, so the send loop that unwinds on the
     /// cancel can report Paused (and keep every partial) instead of Canceled.
     paused: Mutex<HashSet<String>>,
+    /// Transfers the USER canceled here (not a pause, not a dead back-channel):
+    /// only these may throw away their resumable partial.
+    user_canceled: Mutex<HashSet<String>>,
     /// Location uploads in flight, keyed by (peer, location, rel path, source
     /// paths) → transfer id, so the same folder is never uploaded twice at once
     /// (a Retry click and a scripted restart raced into two parallel sends).
@@ -321,6 +324,9 @@ impl IrohState {
             // A cancel after a pause request wins: never resurrect a stale mark.
             CancelReason::Cancel => {
                 self.paused.lock().unwrap().remove(id);
+                let mut c = self.user_canceled.lock().unwrap();
+                if c.len() > 512 { c.clear(); }
+                c.insert(id.to_owned());
             }
         }
         let was_staged = {
@@ -2636,7 +2642,7 @@ fn headless_refuses_in(headless: bool, req: &serde_json::Value) -> bool {
 }
 
 fn is_blockable_kind(kind: &str) -> bool {
-    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite")
+    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite" | "chat-manifest")
         || kind.starts_with("locations.")
         || kind.starts_with("mailbox.")
 }
@@ -2773,7 +2779,7 @@ async fn serve_stream_inner(
             // Expired, canceled, used, or owned by another device: say so in a
             // frame the puller stops on (T13/T6) instead of dropping the stream.
             if let Err(refusal) = quick::admit(pending.as_ref(), token, &conn.remote_id().to_string(), Instant::now()) {
-                if pending.as_ref().is_some_and(|p| Instant::now() >= p.expires_at) {
+                if pending.as_ref().is_some_and(|p| Instant::now() >= p.expires_at && p.puller.lock().unwrap_or_else(|e| e.into_inner()).is_none()) {
                     state.pending.lock().unwrap().remove(token);
                 }
                 write_frame(send, &refusal).await?;
@@ -3034,7 +3040,12 @@ async fn serve_stream_inner(
             let _ = send.finish();
         }
         Some("chat-manifest") => {
-            chat_manifest::serve(&conn.remote_id().to_string(), &req, send, recv).await?;
+            let who = conn.remote_id().to_string();
+            let friend = location_config(state).is_ok_and(|c| crate::friends::load(&c).iter().any(|f| f.endpoint_id.as_deref() == Some(who.as_str())));
+            // Windowless test nodes (test_inbox) have no friends list.
+            #[cfg(test)]
+            let friend = friend || state.test_inbox.get().is_some();
+            chat_manifest::serve(&who, friend, &req, send, recv).await?;
         }
         Some("files") => {
             // A friend pushed files straight to us. Receive into the download
@@ -3202,12 +3213,15 @@ async fn serve_stream_inner(
                         let Some(batch) = batches.get_mut(&link.id) else { break; };
                         if batch.link.attempt != link.attempt { break; }
                         if batch.touched.elapsed() < TRANSFER_STALL { continue; }
+                        // Only a batch that had started moving bytes is a stalled
+                        // transfer (not one waiting on the user's accept dialog).
+                        let started = !batch.landed.is_empty() || batch.snapshot.bytes_done > 0;
                         if let Some(update) = batch.expire(Instant::now()) {
                             let _ = watch_app.emit("transfer://update", &update);
                             // The card now says Failed: end this attempt for real
                             // so no bytes keep landing behind it (the sender
                             // reconnects and resumes instead).
-                            watch_conn.close(1u32.into(), b"stalled");
+                            if started { watch_conn.close(1u32.into(), b"stalled"); }
                         }
                         // Retain bounded terminal tombstones so a late same-attempt
                         // push cannot revive an interrupted batch.
@@ -3537,9 +3551,11 @@ async fn serve_stream_inner(
                 // The RECEIVER canceled (not paused, not a stalled back-channel):
                 // the partial will never be resumed — don't leave a hidden
                 // multi-GB file sitting in Downloads for 7 days.
+                // (A dead progress back-channel also sets `cancel`, and a
+                // reconnecting sender re-registers this card id — neither is a
+                // user cancel, and both must keep the partial for the resume.)
                 if res.is_err() && resumable && cancel.load(Ordering::SeqCst)
-                    && !state.cancels.lock().unwrap().get(&id).is_some_and(|c| Arc::ptr_eq(c, &cancel))
-                    && !state.paused.lock().unwrap().contains(&id) {
+                    && state.user_canceled.lock().unwrap().remove(&id) {
                     discard_partial_owned(&dest, &fp);
                 }
                 drop(owner);
@@ -4489,7 +4505,7 @@ pub fn start_receive(
                     .await
                     // The sender canceled: a terminal "canceled", never a retry (T6).
                     .map_err(|e| errors::peer_stopped(&conn).map(errors::peer_stop_error).unwrap_or(e));
-                    if paths.is_err() && cancel.load(Ordering::SeqCst) && !cleanup.paused.lock().unwrap().contains(&id) {
+                    if paths.is_err() && cancel.load(Ordering::SeqCst) && cleanup.user_canceled.lock().unwrap().remove(&id) {
                         // WE canceled: drop the resumable partial of this pull now.
                         let item0 = &header["items"][0];
                         if header["items"].as_array().map(|a| a.len()) == Some(1) {

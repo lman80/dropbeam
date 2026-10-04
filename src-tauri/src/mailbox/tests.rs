@@ -1365,6 +1365,10 @@ async fn t11_unreadable_held_file_is_quarantined_not_deleted() {
     assert_eq!(server_items(&w), 0);
     let kept = walk(&root.join("quarantine"));
     assert!(kept.iter().any(|p| p.ends_with("payload")), "the payload is set aside: {kept:?}");
+    // A gc right after must not age it out by the folder's old mtime.
+    for d in std::fs::read_dir(root.join("quarantine")).unwrap().flatten() { iroh_net::set_mtime_secs(&d.path(), 1_000_000_000); }
+    server::gc(&w.s.config);
+    assert!(walk(&root.join("quarantine")).iter().any(|p| p.ends_with("payload")), "kept for recovery");
 }
 
 /// An upload nobody resumed for hours releases its space (not after 7 days).
@@ -1385,8 +1389,8 @@ async fn t11_abandoned_upload_frees_its_space_after_idle() {
     assert_eq!(server::gc(&w.s.config), 0, "a fresh partial is kept");
     let root = server::root(&w.s.config, &server::load_config(&w.s.config)).unwrap();
     let part = walk(&root.join("items")).into_iter().find(|p| p.ends_with("payload.part")).unwrap();
-    iroh_net::set_mtime_secs(&part, (crate::chat::now_ms() / 1000).saturating_sub(7 * 3600));
-    server::age_all_for_tests(&w.s.config, 7 * 3600 * 1000);
+    iroh_net::set_mtime_secs(&part, (crate::chat::now_ms() / 1000).saturating_sub(49 * 3600));
+    server::age_all_for_tests(&w.s.config, 49 * 3600 * 1000);
     assert_eq!(server::gc(&w.s.config), 1);
     assert_eq!(server_items(&w), 0);
 }

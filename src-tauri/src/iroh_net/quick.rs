@@ -54,10 +54,12 @@ pub(crate) fn admit(pending: Option<&PendingSend>, token: &str, puller: &str, no
         return Err(if was_canceled(token) { refusal("The sender canceled this transfer.", true) }
             else { refusal("This link has expired or was already used — ask for a new one.", false) });
     };
-    if now >= p.expires_at {
+    let mut owner = p.puller.lock().unwrap_or_else(|e| e.into_inner());
+    // The TTL limits how long a link waits to be OPENED; a pull already under
+    // way (its device resuming after a blip) is never cut off by it.
+    if now >= p.expires_at && owner.is_none() {
         return Err(refusal("This link has expired — ask for a new one.", false));
     }
-    let mut owner = p.puller.lock().unwrap_or_else(|e| e.into_inner());
     match owner.as_deref() {
         Some(o) if o != puller => Err(refusal("This link is already being received on another device.", false)),
         _ => { *owner = Some(puller.to_owned()); Ok(()) }
@@ -158,7 +160,9 @@ mod tests {
         assert!(admit(Some(&p), "tok", "dev-a", now).is_ok(), "the same device may re-pull (resume)");
         let busy = admit(Some(&p), "tok", "dev-b", now).unwrap_err();
         assert!(busy["error"].as_str().unwrap().contains("another device"));
-        let expired = admit(Some(&p), "tok", "dev-a", now + Duration::from_secs(61)).unwrap_err();
+        assert!(admit(Some(&p), "tok", "dev-a", now + Duration::from_secs(61)).is_ok(), "a running pull still resumes after the TTL");
+        let unopened = pending(Duration::from_secs(60));
+        let expired = admit(Some(&unopened), "tok", "dev-a", now + Duration::from_secs(61)).unwrap_err();
         assert!(expired["error"].as_str().unwrap().contains("expired"));
         note_canceled("gone-tok");
         assert_eq!(admit(None, "gone-tok", "dev-a", now).unwrap_err()["canceled"], true);

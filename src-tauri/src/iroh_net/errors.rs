@@ -95,6 +95,7 @@ pub(crate) fn friendly(dir: Direction, err: &str) -> String {
     }
     if has(&["permission denied", "os error 13", "access is denied", "os error 5)", "read-only file system", "os error 30"]) {
         return if receiving { "DropBeam isn't allowed to save into that folder — pick a different folder in Settings".into() }
+            else if lower.starts_with("receiver:") { "The recipient's DropBeam isn't allowed to save into its download folder — they can pick another one in Settings".into() }
             else { "DropBeam couldn't read one of the files — check it still exists and you can open it".into() };
     }
     if has(&["frame too large", "frame exceeds", "header too large", "message too large"]) {
@@ -103,7 +104,7 @@ pub(crate) fn friendly(dir: Direction, err: &str) -> String {
     if has(&["invalid ticket", "parse ticket", "bad ticket", "invalid code"]) {
         return "That code or link isn't valid — check you copied all of it".into();
     }
-    if has(&["no pending send for token", "expired"]) {
+    if has(&["no pending send for token", "link has expired"]) {
         return "This link has expired or was already used — ask for a new one".into();
     }
     if has(&["inactivity timeout", "stalled", "no data for", "receiver stopped", "progress output stalled"]) {

@@ -35,8 +35,11 @@ const RECEIPT_MS: u64 = 30 * DAY_MS;
 const RECEIPT_MAX: usize = 50_000;
 /// An upload nobody resumed for this long is abandoned.
 const STALE_UPLOAD_MS: u64 = 7 * DAY_MS;
-/// An upload nobody has touched for this long is abandoned: free its space.
-const IDLE_UPLOAD_MS: u64 = 6 * 3600 * 1000;
+/// An upload nobody has touched for this long is abandoned: free its space
+/// (long enough for a laptop that slept overnight to come back and resume).
+const IDLE_UPLOAD_MS: u64 = 48 * 3600 * 1000;
+/// Quarantined (unreadable at startup) items are kept this long for recovery.
+const QUARANTINE_MS: u64 = 30 * DAY_MS;
 const MAX_ITEMS_PER_RECIPIENT: usize = 2000;
 /// Items one (non-owner) person may leave waiting for one device.
 const MAX_ITEMS_PER_PAIR: usize = 500;
@@ -445,11 +448,10 @@ pub fn rights_for(config: &Path, c: &ServerConfig, eid: &str) -> Rights {
 }
 
 /// A device that may no longer collect anything: removed from this account, or
-/// a device/person the owner denied.
+/// that exact device denied by the owner. (Denying a PERSON only stops their
+/// deposits — what is held FOR them still reaches them.)
 fn removed_device(config: &Path, c: &ServerConfig, eid: &str) -> bool {
-    if crate::account::device_was_removed(config, eid) { return true; }
-    let person = person_of(config, c, eid);
-    c.denied.iter().any(|d| d.strip_prefix("e:") == Some(eid) || Some(d) == person.as_ref())
+    crate::account::device_was_removed(config, eid) || c.denied.iter().any(|d| d.strip_prefix("e:") == Some(eid))
 }
 
 /// Whether items may be left for this device without "send through".
@@ -1028,18 +1030,22 @@ pub fn gc(config: &Path) -> usize {
     if !c.enabled {
         return 0;
     }
-    with_store(config, |s| {
-        let t = now();
-        let idle = |i: &Item| {
-            // Last byte written (or the item's creation, before any byte).
-            let touched = std::fs::metadata(item_dir(&s.root, &i.id).join("payload.part")).and_then(|m| m.modified()).ok()
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(i.created_ms, |d| d.as_millis() as u64);
-            touched.max(i.created_ms) + IDLE_UPLOAD_MS <= t
-        };
+    // Stat paused uploads OUTSIDE the store lock (a slow NAS must not stall
+    // every other store user): which have had no byte for IDLE_UPLOAD_MS?
+    let t = now();
+    let paused: Vec<(String, PathBuf, u64)> = with_store(config, |s| s.items.values()
+        .filter(|i| i.state == "uploading" && !s.uploading.contains(&i.id) && i.created_ms + IDLE_UPLOAD_MS <= t)
+        .map(|i| (i.id.clone(), item_dir(&s.root, &i.id).join("payload.part"), i.created_ms)).collect()).unwrap_or_default();
+    let idle: HashSet<String> = paused.into_iter().filter(|(_, part, created)| {
+        let touched = std::fs::metadata(part).and_then(|m| m.modified()).ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(*created, |d| d.as_millis() as u64);
+        touched.max(*created) + IDLE_UPLOAD_MS <= t
+    }).map(|(id, _, _)| id).collect();
+    let removed = with_store(config, |s| {
         let expired: Vec<String> = s.items.values()
             .filter(|i| !s.uploading.contains(&i.id))
             .filter(|i| (i.state == "held" && i.expires_ms <= t)
-                || (i.state == "uploading" && (i.created_ms + STALE_UPLOAD_MS <= t || idle(i))))
+                || (i.state == "uploading" && (i.created_ms + STALE_UPLOAD_MS <= t || idle.contains(&i.id))))
             .map(|i| i.id.clone())
             .collect();
         for id in &expired {
@@ -1058,7 +1064,19 @@ pub fn gc(config: &Path) -> usize {
         }
         expired.len()
     })
-    .unwrap_or(0)
+    .unwrap_or(0);
+    // Quarantined items age out after a month (kept that long for recovery).
+    if let Ok(root) = root(config, &c) {
+        for e in std::fs::read_dir(root.join("quarantine")).into_iter().flatten().flatten() {
+            // Age from when it was SET ASIDE (the "-<ms>" suffix), never the
+            // folder's own mtime, which a rename keeps from long before.
+            let name = e.file_name().to_string_lossy().into_owned();
+            let set_aside = name.rsplit('-').next().and_then(|ms| ms.parse::<u64>().ok());
+            let old = set_aside.is_some_and(|at| t.saturating_sub(at) > QUARANTINE_MS);
+            if old { let _ = std::fs::remove_dir_all(e.path()); }
+        }
+    }
+    removed
 }
 
 /// Recipient devices with items waiting, and how many.

@@ -334,3 +334,14 @@ fn windows_reserved_names_are_complete() {
         assert_eq!(windows_safe_component(name), name);
     }
 }
+
+/// Review fix: a dead progress back-channel or a reconnecting sender is not a
+/// user cancel — only `cancel_with(Cancel)` marks one (and pause never does).
+#[test]
+fn user_cancel_is_explicit() {
+    let state = IrohState::default();
+    let _ = state.cancel_with("x", CancelReason::Pause);
+    assert!(!state.user_canceled.lock().unwrap().contains("x"));
+    let _ = state.cancel_with("x", CancelReason::Cancel);
+    assert!(state.user_canceled.lock().unwrap().contains("x"));
+}
