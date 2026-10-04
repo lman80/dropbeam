@@ -16,11 +16,11 @@ import { IconButton, Spinner } from './ui'
  *  direction (the account that already has devices wins) and refuses two
  *  different accounts, so both commands take any device code. */
 // eslint-disable-next-line react-refresh/only-export-components -- shared helper
-export async function linkWithCode(code: string) {
+export async function linkWithCode(code: string, confirm: string) {
   const c = code.trim()
   const problem = deviceCodeProblem(c)
   if (problem) throw new Error(problem)
-  return /^dropbeamjoin1:/i.test(c) ? api.linkDeviceJoin(c) : api.linkDeviceSend(c)
+  return /^dropbeamjoin1:/i.test(c) ? api.linkDeviceJoin(c, confirm) : api.linkDeviceSend(c, confirm)
 }
 // eslint-disable-next-line react-refresh/only-export-components -- shared helper
 export { isDeviceCode }
@@ -120,7 +120,7 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   const confirmScanned = async () => {
     if (!preview) return
     setPhase('working')
-    try { finished(await linkWithCode(preview.code)) }
+    try { finished(await linkWithCode(preview.code, preview.info.confirmToken)) }
     catch (e) { if (phaseRef.current !== 'done') { setError(linkErrorText(e)); setPhase('error') } }
   }
   const answerIncoming = (accept: boolean) => {
@@ -177,14 +177,14 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
       <p className="link-state-title link-safety-code" aria-live="polite">{preview.info.safety}</p>
       <p className="link-state-sub">{preview.info.direction === 'give'
         ? `${preview.info.name} will get full access to your account: your friends, chats and devices.`
-        : `This device will join ${preview.info.name}’s account and share its friends and chats.`}
+        : `This device will join ${preview.info.name}’s account: this device’s friends and chats will be shared into that account, and it gets that account’s friends and chats.`}
         {' '}Only continue if this is your own device{preview.info.peerShowsCode ? ' and the codes match' : ' (it needs an update to show the code)'}.</p>
     </div>}
     {phase === 'incoming' && incoming && <div className="link-state" role="alertdialog" aria-label="Check the safety code">
       <p className="link-state-sub"><strong>{incoming.name}</strong> wants to link with this device. Make sure it shows this code:</p>
       <p className="link-state-title link-safety-code" aria-live="polite">{incoming.safety}</p>
       <p className="link-state-sub">{incoming.joining
-        ? `This device will join ${incoming.name}’s account and share its friends and chats.`
+        ? `This device will join ${incoming.name}’s account: this device’s friends and chats will be shared into that account, and it gets that account’s friends and chats.`
         : `${incoming.name} will get full access to your account: your friends, chats and devices.`}
         {' '}Only continue if it’s your own device and the codes match.</p>
     </div>}

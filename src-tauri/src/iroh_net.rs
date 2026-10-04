@@ -3544,7 +3544,7 @@ async fn serve_stream_inner(
             crate::link::serve_join(state, &conn.remote_id().to_string(), &req, send, recv).await?;
         }
         Some("link-safety") => {
-            crate::link::serve_safety(state, &conn.remote_id().to_string(), &req, send).await?;
+            crate::link::serve_safety(state, &conn.remote_id().to_string(), &req, send, recv).await?;
         }
         Some("account-sync") => {
             crate::account::serve(state, &conn.remote_id().to_string(), &req, send, recv).await?;

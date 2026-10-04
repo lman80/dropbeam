@@ -29,6 +29,9 @@ declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
 }
 const st = () => useStore.getState()
+/** Device-link confirm tokens from linkDevicePrepare, by code (S1 / #10). */
+const confirmTokens = new Map<string, string>()
+const takeConfirm = (code: string) => { const t = confirmTokens.get(code.trim()) ?? ''; confirmTokens.delete(code.trim()); return t }
 const retryPayloads = () => { try { return localStorage.getItem('dropbeam-retry-payloads') } catch { return null } }
 const string = (a: BridgeArgs, key: string) => {
   if (typeof a[key] !== 'string') throw new Error(`Missing ${key}`)
@@ -235,16 +238,21 @@ const handlers: BridgeHandlers = {
   linkDeviceCancel: () => api.linkDeviceCancel(),
   // S1: step 1 with a scanned code → { name, safety, direction, peerShowsCode };
   // Swift shows the safety code and calls linkDeviceSend only once confirmed.
-  linkDevicePrepare: a => api.linkDevicePrepare(string(a, 'code')),
+  linkDevicePrepare: async a => {
+    const info = await api.linkDevicePrepare(string(a, 'code'))
+    // The confirm step's token stays here; linkDeviceSend hands it back (#10).
+    confirmTokens.set(string(a, 'code').trim(), info.confirmToken)
+    return info
+  },
   // The answer to a 'link://confirm' prompt (the other device scanned ours).
   linkConfirm: a => {
     if (typeof a.bool !== 'boolean') throw new Error('Invalid confirmation')
     return api.linkConfirm(string(a, 'endpointId'), a.bool)
   },
-  linkDeviceSend: async a => linked(await linkWithCode(string(a, 'code'))),
+  linkDeviceSend: async a => linked(await linkWithCode(string(a, 'code'), takeConfirm(string(a, 'code')))),
   linkHostBegin: () => api.linkHostBegin(),
   linkHostCancel: () => api.linkHostCancel(),
-  linkDeviceJoin: async a => linked(await linkWithCode(string(a, 'code'))),
+  linkDeviceJoin: async a => linked(await linkWithCode(string(a, 'code'), takeConfirm(string(a, 'code')))),
   accountSyncNow: async () => { await api.accountSyncNow(); await st().refreshMyDevice() },
   accountRemoveDevice: async a => { await api.accountRemoveDevice(string(a, 'endpointId')); await st().reloadFriends() },
   // S4: a device in Settings → Devices marked needs_approval (myDevice.devices[].needs_approval).

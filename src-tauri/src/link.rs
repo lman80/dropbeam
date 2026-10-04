@@ -56,12 +56,16 @@ pub struct PendingLink {
     /// code here (S1), and whether this device's user confirmed it matches.
     asked: Option<String>,
     confirmed: Option<String>,
+    /// The safety code shown here for `asked`, and the commit–reveal state
+    /// (scanner's commitment, our nonce) of that exchange.
+    safety: Option<String>,
+    exchange: Option<([u8; 32], [u8; 16])>,
 }
 impl PendingLink {
-    fn new(token: [u8; 16]) -> PendingLink { PendingLink { token, created_at: Instant::now(), asked: None, confirmed: None } }
+    fn new(token: [u8; 16]) -> PendingLink { PendingLink { token, created_at: Instant::now(), asked: None, confirmed: None, safety: None, exchange: None } }
     #[cfg(test)]
     fn confirmed_for(token: [u8; 16], who: &str) -> PendingLink {
-        PendingLink { asked: Some(who.to_owned()), confirmed: Some(who.to_owned()), ..PendingLink::new(token) }
+        PendingLink { asked: Some(who.to_owned()), confirmed: Some(who.to_owned()), safety: Some("000 000".into()), ..PendingLink::new(token) }
     }
 }
 /// A code is on screen (either kind): an offer may arrive, so allow a big frame.
@@ -102,15 +106,33 @@ fn token_error(e: &str) -> bool {
     matches!(e, "no pending link" | "link expired" | "invalid link token")
 }
 
-/// The short safety code both devices show before an account key moves (S1):
-/// derived from both endpoint ids and the code's one-time token, so it only
-/// matches when the two screens really are talking to each other.
+/// The short safety code both devices show before an account key moves (S1),
+/// for a scanner that skipped the safety-code step (older builds): derived
+/// from both endpoint ids and the code's one-time token.
 pub(crate) fn safety_code(a: &str, b: &str, token_hex: &str) -> String {
+    sas_digits(&format!("dropbeam-link-safety/1|{}|{}", sorted(a, b), token_hex.to_ascii_lowercase()))
+}
+
+/// The safety code with commit–reveal (review #5): the scanner commits to its
+/// random nonce BEFORE this device reveals its own, so nobody can grind
+/// endpoint keys to make a rival device show the same six digits — each try
+/// costs a full round trip and a fresh nonce from the device showing the code.
+pub(crate) fn safety_code_v2(a: &str, b: &str, token_hex: &str, scanner_nonce: &[u8], shower_nonce: &[u8]) -> String {
+    sas_digits(&format!("dropbeam-link-safety/2|{}|{}|{}|{}", sorted(a, b), token_hex.to_ascii_lowercase(),
+        hex::encode(scanner_nonce), hex::encode(shower_nonce)))
+}
+fn sorted(a: &str, b: &str) -> String {
+    if a <= b { format!("{a}|{b}") } else { format!("{b}|{a}") }
+}
+fn sas_digits(input: &str) -> String {
     use sha2::{Digest, Sha256};
-    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    let h = Sha256::digest(format!("dropbeam-link-safety/1|{lo}|{hi}|{}", token_hex.to_ascii_lowercase()).as_bytes());
+    let h = Sha256::digest(input.as_bytes());
     let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 1_000_000;
     format!("{:03} {:03}", n / 1000, n % 1000)
+}
+fn commitment(nonce: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest([b"dropbeam-link-commit/1|".as_slice(), nonce].concat()).into()
 }
 
 /// Run `f` on the code on screen whose token is `token` (either kind), if any
@@ -125,34 +147,64 @@ fn with_slot<T>(st: &AppState, token: &str, f: impl FnOnce(&mut PendingLink, boo
     }
     with_host(&st.config_dir, |slot| slot.as_mut().filter(|p| matches(p)).map(|p| f(p, true)))
 }
+/// Kill the code with this token (both slots), e.g. a second device tried it.
+fn kill_code(st: &AppState, token: &str) {
+    let bytes: Option<[u8; 16]> = hex::decode(token).ok().and_then(|v| v.try_into().ok());
+    let Some(bytes) = bytes else { return };
+    let kill = |slot: &mut Option<PendingLink>| { if slot.as_ref().is_some_and(|p| p.token == bytes) { *slot = None; } };
+    kill(&mut st.pending_link.lock().unwrap());
+    with_host(&st.config_dir, kill);
+}
 
 #[cfg(not(test))]
 const CONFIRM_WAIT: Duration = Duration::from_secs(120);
 #[cfg(test)]
 const CONFIRM_WAIT: Duration = Duration::from_secs(3);
 const NOT_CONFIRMED: &str = "link not confirmed";
+const CONCURRENT: &str = "another device used this code";
+const CONCURRENT_TEXT: &str = "Another device tried to use this code at the same time, so it was cancelled. Show a new code and scan it with your own device.";
+
+/// What the code on screen is doing when `who` presents it: the first device
+/// to present it owns it; a SECOND device kills it (review #5) so the prompt
+/// can never switch to a different requester.
+enum Claim { Mine, Fresh, Taken }
+fn claim(p: &mut PendingLink, who: &str) -> Claim {
+    match p.asked.as_deref() {
+        Some(w) if w == who => Claim::Mine,
+        Some(_) => Claim::Taken,
+        None => { p.asked = Some(who.to_owned()); p.confirmed = None; Claim::Fresh }
+    }
+}
 
 /// Hold an incoming link until this device's user confirmed the safety code
 /// for exactly this device (S1). A device that skipped the safety-code step
-/// (an older build) gets the prompt shown now. Err when declined, expired or
-/// not confirmed in time.
+/// (an older build) gets the prompt shown now. Err when declined, expired, not
+/// confirmed in time, or another device tried the same code.
 async fn wait_confirmed(st: &AppState, app: Option<&AppHandle>, me: &str, who: &str, token: &str, name: &str) -> Result<(), String> {
     let deadline = Instant::now() + CONFIRM_WAIT;
     loop {
         let state = with_slot(st, token, |p, host| {
-            if p.confirmed.as_deref() == Some(who) { return (true, None); }
-            if p.asked.as_deref() != Some(who) {
-                p.asked = Some(who.to_owned());
-                p.confirmed = None;
-                return (false, Some(host));
+            if p.confirmed.as_deref() == Some(who) { return Ok(None); }
+            match claim(p, who) {
+                Claim::Taken => Err(()),
+                Claim::Fresh => {
+                    let code = safety_code(me, who, token);
+                    p.safety = Some(code.clone());
+                    Ok(Some((host, code)))
+                }
+                Claim::Mine => Ok(Some((host, String::new()))),
             }
-            (false, None)
         });
         match state {
             None => return Err("no pending link".into()),
-            Some((true, _)) => return Ok(()),
-            Some((false, Some(host))) => ask_to_confirm(app, me, who, token, name, host),
-            Some((false, None)) => {}
+            Some(Err(())) => {
+                kill_code(st, token);
+                if let Some(app) = app { let _ = app.emit("link://failed", CONCURRENT_TEXT); }
+                return Err(CONCURRENT.into());
+            }
+            Some(Ok(None)) => return Ok(()),
+            Some(Ok(Some((host, code)))) if !code.is_empty() => ask_to_confirm(app, who, &code, name, host),
+            Some(Ok(Some(_))) => {}
         }
         if Instant::now() >= deadline { return Err(NOT_CONFIRMED.into()); }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -160,10 +212,10 @@ async fn wait_confirmed(st: &AppState, app: Option<&AppHandle>, me: &str, who: &
 }
 
 /// Show "Link <name>? Safety code 123 456" on this device.
-fn ask_to_confirm(app: Option<&AppHandle>, me: &str, who: &str, token: &str, name: &str, host: bool) {
+fn ask_to_confirm(app: Option<&AppHandle>, who: &str, safety: &str, name: &str, host: bool) {
     if let Some(app) = app {
         let _ = app.emit("link://confirm", json!({"endpointId": who, "name": friends::sanitize_display_name(name, "Your other device"),
-            "safety": safety_code(me, who, token), "joining": !host}));
+            "safety": safety, "joining": !host}));
     }
 }
 
@@ -175,7 +227,8 @@ pub fn link_confirm(app: AppHandle, state: State<'_, Arc<AppState>>, endpoint_id
 }
 fn confirm_slots(st: &AppState, who: &str, accept: bool) {
     let apply = |slot: &mut Option<PendingLink>| {
-        if slot.as_ref().is_some_and(|p| p.asked.as_deref() == Some(who)) {
+        // Only a prompt that was actually shown (a safety code exists) can be confirmed.
+        if slot.as_ref().is_some_and(|p| p.asked.as_deref() == Some(who) && p.safety.is_some()) {
             if accept { if let Some(p) = slot.as_mut() { p.confirmed = Some(who.to_owned()); } } else { *slot = None; }
         }
     };
@@ -183,27 +236,65 @@ fn confirm_slots(st: &AppState, who: &str, accept: bool) {
     with_host(&st.config_dir, apply);
 }
 
-/// A scanner presenting a code's token, before anything moves (S1): show the
-/// safety code here and tell the scanner it's on screen.
-pub(crate) async fn serve_safety(net: &IrohState, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream) -> anyhow::Result<()> {
+/// The device-showing-the-code half of the safety-code exchange (S1, #5):
+///   scanner → {kind:"link-safety", v:2, token, device, commit: H(Ns)}
+///   here    → {kind:"link-safety-nonce", nonce: Nd}      (random, after the commit)
+///   scanner → {reveal: Ns}                              (must match the commit)
+///   here    → {kind:"link-safety-ok", name}             and the prompt shows the code
+pub(crate) async fn serve_safety(net: &IrohState, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<()> {
     let app = net.app.get().ok_or_else(|| anyhow::anyhow!("app unavailable"))?.clone();
     let st = app.state::<Arc<AppState>>();
     let token = req["token"].as_str().unwrap_or("").to_owned();
     let name = req["device"]["name"].as_str().unwrap_or("").to_owned();
+    let commit: Option<[u8; 32]> = req["commit"].as_str().and_then(|c| hex::decode(c).ok()).and_then(|v| v.try_into().ok());
     let me = device(&st, net).map(|d| (d.endpoint_id, d.name));
-    let reply = match (me, with_slot(&st, &token, |p, host| {
-        p.asked = Some(who.to_owned());
-        p.confirmed = None;
-        host
-    })) {
-        (Ok((me, my_name)), Some(host)) => {
-            ask_to_confirm(Some(&app), &me, who, &token, &name, host);
-            json!({"kind": "link-safety-ok", "safety": safety_code(&me, who, &token), "name": my_name})
-        }
-        (Err(e), _) => json!({"kind": "link-error", "reason": e}),
-        (_, None) => json!({"kind": "link-error", "reason": "no pending link"}),
+    let fail = |reason: &str| json!({"kind": "link-error", "reason": reason});
+    let (me, my_name) = match me { Ok(v) => v, Err(e) => { iroh_net::write_frame(send, &fail(&e)).await?; send.finish()?; return Ok(()) } };
+    let Some(commit) = commit.filter(|_| req["v"].as_u64() == Some(2)) else {
+        iroh_net::write_frame(send, &fail("unsupported link version")).await?;
+        send.finish()?;
+        return Ok(());
     };
-    iroh_net::write_frame(send, &reply).await?;
+    let nonce: [u8; 16] = rand::random();
+    let claimed = with_slot(&st, &token, |p, host| match claim(p, who) {
+        Claim::Taken => None,
+        Claim::Fresh | Claim::Mine => { p.confirmed = None; p.safety = None; p.exchange = Some((commit, nonce)); Some(host) }
+    });
+    let host = match claimed {
+        None => { iroh_net::write_frame(send, &fail("no pending link")).await?; send.finish()?; return Ok(()); }
+        Some(None) => {
+            kill_code(&st, &token);
+            let _ = app.emit("link://failed", CONCURRENT_TEXT);
+            iroh_net::write_frame(send, &fail(CONCURRENT)).await?;
+            send.finish()?;
+            return Ok(());
+        }
+        Some(Some(host)) => host,
+    };
+    iroh_net::write_frame(send, &json!({"kind": "link-safety-nonce", "nonce": hex::encode(nonce)})).await?;
+    let reveal = tokio::time::timeout(Duration::from_secs(20), iroh_net::read_frame(recv)).await??;
+    let scanner_nonce = reveal["reveal"].as_str().and_then(|r| hex::decode(r).ok()).filter(|n| n.len() == 16);
+    let Some(scanner_nonce) = scanner_nonce.filter(|n| commitment(n) == commit) else {
+        kill_code(&st, &token);
+        let _ = app.emit("link://failed", "The other device's safety code didn't check out, so the code was cancelled. Show a new code and try again.");
+        iroh_net::write_frame(send, &fail("invalid link token")).await?;
+        send.finish()?;
+        return Ok(());
+    };
+    let code = safety_code_v2(&me, who, &token, &scanner_nonce, &nonce);
+    let ok = with_slot(&st, &token, |p, _| {
+        if p.asked.as_deref() != Some(who) || p.exchange != Some((commit, nonce)) { return false; }
+        p.safety = Some(code.clone());
+        true
+    }) == Some(true);
+    if !ok {
+        iroh_net::write_frame(send, &fail("no pending link")).await?;
+        send.finish()?;
+        return Ok(());
+    }
+    ask_to_confirm(Some(&app), who, &code, &name, host);
+    iroh_net::write_frame(send, &json!({"kind": "link-safety-ok", "name": my_name})).await?;
     send.finish()?;
     Ok(())
 }
@@ -219,18 +310,27 @@ pub struct LinkPreviewInfo {
     direction: &'static str,
     /// False when the other device is on an older build that can't show it.
     peer_shows_code: bool,
+    /// Hand back to `link_device_send` once the user confirmed (review #10).
+    confirm_token: String,
 }
 
-/// Codes the user confirmed the safety code for on this device: (config dir
-/// → token, other device, when). `link_device_send` refuses anything else.
-static PREPARED: Mutex<Option<HashMap<std::path::PathBuf, (String, String, Instant)>>> = Mutex::new(None);
-fn note_prepared(dir: &Path, token: &str, eid: &str) {
-    PREPARED.lock().unwrap().get_or_insert_with(HashMap::new).insert(dir.to_path_buf(), (token.to_owned(), eid.to_owned(), Instant::now()));
+/// Codes the user is checking the safety code for on this device: (config dir
+/// → token, other device, confirm token, when). `link_device_send` refuses
+/// anything else, and needs the confirm token the confirm step got.
+type Prepared = (String, String, String, Instant);
+static PREPARED: Mutex<Option<HashMap<std::path::PathBuf, Prepared>>> = Mutex::new(None);
+fn note_prepared(dir: &Path, token: &str, eid: &str) -> String {
+    let confirm = hex::encode(rand::random::<[u8; 16]>());
+    PREPARED.lock().unwrap().get_or_insert_with(HashMap::new)
+        .insert(dir.to_path_buf(), (token.to_owned(), eid.to_owned(), confirm.clone(), Instant::now()));
+    confirm
 }
-fn take_prepared(dir: &Path, token: &str, eid: &str) -> bool {
+fn take_prepared(dir: &Path, token: &str, eid: &str, confirm: &str) -> bool {
     let mut g = PREPARED.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
-    let ok = map.get(dir).is_some_and(|(t, e, at)| t == token && e == eid && at.elapsed() < TTL);
+    #[allow(deprecated)]
+    let ok = map.get(dir).is_some_and(|(t, e, c, at)| t == token && e == eid && at.elapsed() < TTL
+        && ring::constant_time::verify_slices_are_equal(c.as_bytes(), confirm.as_bytes()).is_ok());
     if ok { map.remove(dir); }
     ok
 }
@@ -238,9 +338,10 @@ const CONFIRM_FIRST: &str = "Check the safety code on both devices first, then t
 const CANCELLED: &str = "Linking was cancelled on this device.";
 const JOIN_WOULD_LEAVE: &str = "This device already shares an account with your other devices, so it can't join another one. Scan this device's code from the other device instead (Settings → Devices).";
 
-/// Step 1 of linking with a scanned code: reach the other device, have it show
-/// the safety code, and return what this device should show (S1). Nothing
-/// about either account moves until the user confirms (`link_device_send`).
+/// Step 1 of linking with a scanned code: reach the other device, run the
+/// commit–reveal safety-code exchange with it, and return what this device
+/// should show (S1). Nothing about either account moves until the user
+/// confirms (`link_device_send` with the returned confirm token).
 #[tauri::command]
 pub async fn link_device_prepare(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>, code: String) -> Result<LinkPreviewInfo, String> {
     let st = state.inner();
@@ -249,25 +350,36 @@ pub async fn link_device_prepare(state: State<'_, Arc<AppState>>, iroh: State<'_
         if e == ALREADY { crate::account::account_sync_now(); }
     })?;
     let ep = iroh.get().ok_or(NOT_READY)?.clone();
-    let dialed = tokio::time::timeout(Duration::from_secs(20), async {
+    let mine: [u8; 16] = rand::random();
+    let dialed = tokio::time::timeout(Duration::from_secs(30), async {
         let conn = ep.connect(iroh_net::dial_addr(code.eid.parse()?), iroh_net::ALPN).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
-        iroh_net::write_frame(&mut send, &json!({"kind": "link-safety", "v": 1, "token": code.token, "device": me})).await?;
+        iroh_net::write_frame(&mut send, &json!({"kind": "link-safety", "v": 2, "token": code.token, "device": me,
+            "commit": hex::encode(commitment(&mine))})).await?;
+        let first = iroh_net::read_frame(&mut recv).await?;
+        if first["kind"] != "link-safety-nonce" {
+            let _ = send.finish();
+            return anyhow::Ok((conn, first, None));
+        }
+        let theirs = first["nonce"].as_str().and_then(|n| hex::decode(n).ok()).filter(|n| n.len() == 16)
+            .ok_or_else(|| anyhow::anyhow!("invalid nonce"))?;
+        iroh_net::write_frame(&mut send, &json!({"reveal": hex::encode(mine)})).await?;
         send.finish()?;
         let reply = iroh_net::read_frame(&mut recv).await?;
-        anyhow::Ok((conn, reply))
+        anyhow::Ok((conn, reply, Some(theirs)))
     }).await;
-    let reply = match dialed { Ok(Ok((_conn, reply))) => reply, _ => return Err(UNREACHABLE.into()) };
-    let peer_shows_code = match reply["kind"].as_str() {
-        Some("link-safety-ok") => true,
-        // An older build acks kinds it doesn't know: it can't show the code.
-        Some("ok") => false,
+    let (reply, theirs) = match dialed { Ok(Ok((_conn, reply, theirs))) => (reply, theirs), _ => return Err(UNREACHABLE.into()) };
+    let (peer_shows_code, safety) = match (reply["kind"].as_str(), theirs) {
+        (Some("link-safety-ok"), Some(theirs)) => (true, safety_code_v2(&me.endpoint_id, &code.eid, &code.token, &mine, &theirs)),
+        // An older build acks kinds it doesn't know: it can't show the code
+        // (it shows the legacy one when the link request arrives).
+        (Some("ok"), _) => (false, safety_code(&me.endpoint_id, &code.eid, &code.token)),
+        (Some("link-error"), _) if reply["reason"] == CONCURRENT => return Err(CONCURRENT_TEXT.into()),
         _ => return Err(explain(reply["reason"].as_str().unwrap_or(""))),
     };
-    note_prepared(&st.config_dir, &code.token, &code.eid);
-    Ok(LinkPreviewInfo { name: friends::sanitize_display_name(&code.name, "Your other device"),
-        safety: safety_code(&me.endpoint_id, &code.eid, &code.token),
-        direction: if way == Direction::Give { "give" } else { "take" }, peer_shows_code })
+    let confirm_token = note_prepared(&st.config_dir, &code.token, &code.eid);
+    Ok(LinkPreviewInfo { name: friends::sanitize_display_name(&code.name, "Your other device"), safety,
+        direction: if way == Direction::Give { "give" } else { "take" }, peer_shows_code, confirm_token })
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -490,13 +602,13 @@ fn direction(kind: CodeKind, code: &LinkCode, mine: &Option<String>, my_devices:
 
 /// Link with a scanned device code of either kind. The Tauri commands for both
 /// codes land here, so a code scanned on the "wrong" screen still works.
-async fn link_with_code(app: &AppHandle, st: &Arc<AppState>, iroh: &Arc<IrohState>, code: &str) -> Result<LinkResult, String> {
+async fn link_with_code(app: &AppHandle, st: &Arc<AppState>, iroh: &Arc<IrohState>, code: &str, confirm: &str) -> Result<LinkResult, String> {
     let me = device(st, iroh)?;
     let (code, way) = plan_link(&st.config_dir, &me.endpoint_id, code).inspect_err(|e| {
         if e == ALREADY { crate::account::account_sync_now(); }
     })?;
     // S1: only after this device's user saw and confirmed the safety code.
-    if !take_prepared(&st.config_dir, &code.token, &code.eid) { return Err(CONFIRM_FIRST.into()); }
+    if !take_prepared(&st.config_dir, &code.token, &code.eid, confirm) { return Err(CONFIRM_FIRST.into()); }
     match way {
         Direction::Give => give(app, st, iroh, &code).await,
         Direction::Take => take(app, st, iroh, me, &code).await,
@@ -515,8 +627,8 @@ fn plan_link(dir: &Path, me: &str, code: &str) -> Result<(LinkCode, Direction), 
     Ok((code, way))
 }
 #[tauri::command]
-pub async fn link_device_send(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>, code: String) -> Result<LinkResult, String> {
-    link_with_code(&app, state.inner(), iroh.inner(), &code).await
+pub async fn link_device_send(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>, code: String, confirm: Option<String>) -> Result<LinkResult, String> {
+    link_with_code(&app, state.inner(), iroh.inner(), &code, confirm.as_deref().unwrap_or("")).await
 }
 
 /// This device gives its account to the device whose code was scanned: push
@@ -594,8 +706,8 @@ pub fn link_host_cancel(state: State<'_, Arc<AppState>>) { with_host(&state.conf
 
 /// Link with a scanned device code (either kind — see `link_with_code`).
 #[tauri::command]
-pub async fn link_device_join(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>, code: String) -> Result<LinkResult, String> {
-    link_with_code(&app, state.inner(), iroh.inner(), &code).await
+pub async fn link_device_join(app: AppHandle, state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>, code: String, confirm: Option<String>) -> Result<LinkResult, String> {
+    link_with_code(&app, state.inner(), iroh.inner(), &code, confirm.as_deref().unwrap_or("")).await
 }
 
 /// This device takes the account of the device whose code was scanned: it
@@ -1288,12 +1400,10 @@ mod edge_tests {
     #[tokio::test]
     async fn an_unconfirmed_join_is_refused_and_a_declined_code_dies() {
         let (host, newbie) = (Dev::new("Mac", "laptop", None).await, Dev::new("iPhone", "phone", None).await);
-        // Confirmed for a DIFFERENT device: the newcomer still waits, then is refused.
-        with_host(&host.dir, |p| *p = Some(PendingLink::confirmed_for([3; 16], &eid())));
-        let req = json!({"kind":"link-join", "v":1, "token":hex::encode([3u8; 16]), "device":me(&newbie)});
+        // Nobody confirms: refused after the wait.
+        with_host(&host.dir, |p| *p = Some(PendingLink::new([3; 16])));
         let out = wait_confirmed(&host.st, None, &host.eid(), &newbie.eid(), &hex::encode([3u8; 16]), "iPhone").await;
         assert_eq!(out.unwrap_err(), NOT_CONFIRMED);
-        let _ = req;
         // Declining clears the code entirely.
         confirm_slots(&host.st, &newbie.eid(), false);
         assert!(with_slot(&host.st, &hex::encode([3u8; 16]), |_, _| ()).is_none());
@@ -1306,6 +1416,39 @@ mod edge_tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         confirm_slots(&host.st, &newbie.eid(), true);
         waiting.await.unwrap().unwrap();
+    }
+
+    /// Review #5: the first device to present a code owns it; a second one
+    /// kills the code (the prompt can never switch to another requester).
+    #[tokio::test]
+    async fn a_second_requester_kills_the_code() {
+        let host = Dev::new("Mac", "laptop", None).await;
+        let token = hex::encode([6u8; 16]);
+        with_host(&host.dir, |p| *p = Some(PendingLink::new([6; 16])));
+        let (first, second) = (eid(), eid());
+        let st = host.st.clone();
+        let (h, f, t) = (host.eid(), first.clone(), token.clone());
+        let waiting = tokio::spawn(async move { wait_confirmed(&st, None, &h, &f, &t, "Mine").await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let rival = wait_confirmed(&host.st, None, &host.eid(), &second, &token, "Attacker").await;
+        assert_eq!(rival.unwrap_err(), CONCURRENT);
+        assert!(with_slot(&host.st, &token, |_, _| ()).is_none(), "the code is dead");
+        assert!(waiting.await.unwrap().is_err(), "and the first can't finish on it either");
+        // Confirming a device that was never shown a code does nothing.
+        with_host(&host.dir, |p| *p = Some(PendingLink::new([7; 16])));
+        confirm_slots(&host.st, &first, true);
+        assert!(with_slot(&host.st, &hex::encode([7u8; 16]), |p, _| p.confirmed.is_none()).unwrap());
+    }
+
+    #[test]
+    fn commit_reveal_code_depends_on_both_nonces() {
+        let (a, b, t) = (eid(), eid(), hex::encode([1u8; 16]));
+        let (n1, n2) = ([1u8; 16], [2u8; 16]);
+        let code = safety_code_v2(&a, &b, &t, &n1, &n2);
+        assert_eq!(code, safety_code_v2(&b, &a, &t, &n1, &n2));
+        assert_ne!(code, safety_code_v2(&a, &b, &t, &n1, &[3u8; 16]), "the shower's fresh nonce changes it");
+        assert_ne!(code, safety_code_v2(&a, &b, &t, &[4u8; 16], &n2));
+        assert_ne!(commitment(&n1), commitment(&n2));
     }
 
     #[test]
@@ -1325,11 +1468,12 @@ mod edge_tests {
         let other = eid();
         let c = code(CodeKind::Link, &other, None, Some(0));
         let token = hex::encode([9u8; 16]);
-        assert!(!take_prepared(&d.dir, &token, &other));
-        note_prepared(&d.dir, &token, &other);
-        assert!(!take_prepared(&d.dir, &token, &eid()), "bound to the device");
-        assert!(take_prepared(&d.dir, &token, &other));
-        assert!(!take_prepared(&d.dir, &token, &other), "one use");
+        assert!(!take_prepared(&d.dir, &token, &other, ""));
+        let confirm = note_prepared(&d.dir, &token, &other);
+        assert!(!take_prepared(&d.dir, &token, &eid(), &confirm), "bound to the device");
+        assert!(!take_prepared(&d.dir, &token, &other, "guessed"), "needs the confirm step's token (#10)");
+        assert!(take_prepared(&d.dir, &token, &other, &confirm));
+        assert!(!take_prepared(&d.dir, &token, &other, &confirm), "one use");
         let _ = c;
     }
 }

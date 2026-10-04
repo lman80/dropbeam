@@ -264,7 +264,9 @@ export interface HistoryItem {
 /** A successfully linked device; command and link wire fields use snake_case. */
 /** What the scanner shows before linking (S1): who, which way, and the
  *  safety code both screens must show before an account key moves. */
-export interface LinkPreviewInfo { name: string; safety: string; direction: 'give' | 'take'; peerShowsCode: boolean }
+export interface LinkPreviewInfo { name: string; safety: string; direction: 'give' | 'take'; peerShowsCode: boolean
+  /** Proof that the user went through the confirm step: hand it to linkDeviceSend. */
+  confirmToken: string }
 /** The other device presented this device's code: confirm its safety code. */
 export interface LinkConfirmRequest { endpointId: string; name: string; safety: string; joining: boolean }
 export interface LinkResult { endpoint_id: string; name: string; device_kind: string; device_os?: string
@@ -581,12 +583,12 @@ const realApi = {
   linkDevicePrepare: (code: string) => invoke<LinkPreviewInfo>('link_device_prepare', { code }),
   /** This device's answer to a "Link <name>? Safety code …" prompt. */
   linkConfirm: (endpointId: string, accept: boolean) => invoke<void>('link_confirm', { endpointId, accept }),
-  linkDeviceSend: (code: string) => invoke<LinkResult>('link_device_send', { code }),
+  linkDeviceSend: (code: string, confirm: string) => invoke<LinkResult>('link_device_send', { code, confirm }),
   /** Show a code a NEW device scans to join this device's account. */
   linkHostBegin: () => invoke<string>('link_host_begin'),
   linkHostCancel: () => invoke<void>('link_host_cancel'),
   /** This (new) device joins the account whose `dropbeamjoin1:` code was scanned. */
-  linkDeviceJoin: (code: string) => invoke<LinkResult>('link_device_join', { code }),
+  linkDeviceJoin: (code: string, confirm: string) => invoke<LinkResult>('link_device_join', { code, confirm }),
   accountSyncNow: () => invoke<void>('account_sync_now'),
   accountRemoveDevice: (endpointId: string) => invoke<void>('account_remove_device', { endpointId }),
   accountApproveDevice: (endpointId: string) => invoke<void>('account_approve_device', { endpointId }),
@@ -704,7 +706,7 @@ const backend: typeof realApi = HAS_TAURI ? realApi : ({
   linkDevicePrepare: async (code: string) => {
     await new Promise(r => setTimeout(r, 500))
     if (/fail/i.test(code)) throw 'Couldn’t reach your other device. Make sure DropBeam is open on it and both devices are online, then try again.'
-    return { name: 'iPhone', safety: '482 913', direction: /^dropbeamjoin1:/i.test(code) ? 'take' : 'give', peerShowsCode: true } satisfies LinkPreviewInfo
+    return { name: 'iPhone', safety: '482 913', direction: /^dropbeamjoin1:/i.test(code) ? 'take' : 'give', peerShowsCode: true, confirmToken: 'preview' } satisfies LinkPreviewInfo
   },
   linkConfirm: async () => {},
   listFriendRequests: async () => previewParam('requests') === '1' ? [{ endpointId: 'preview-req', name: 'Jordan', at: Date.now() - 60_000 }] : [],
