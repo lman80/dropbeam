@@ -249,7 +249,10 @@ final class Bridge: ObservableObject {
     private func reportTransferMoments() {
         let done = transfers.filter { $0.state == "completed" }
         defer { finishedTransfers = (finishedTransfers ?? []).union(done.map(\.id)) }
-        guard let seen = finishedTransfers, !launching else { return }
+        guard let seen = finishedTransfers else { return }
+        // Something finished: copies made only for sending may be cleaned up now.
+        if done.contains(where: { !seen.contains($0.id) }) { PickedMedia.sweepSoon(after: 30) }
+        guard !launching else { return }
         for transfer in done where !seen.contains(transfer.id) {
             if transfer.chatOnly == true { if transfer.direction == "send" { SuperFeedback.moment("chat-file-delivered") } }
             else { SuperFeedback.moment(transfer.direction == "send" ? "files-sent" : "files-received") }
@@ -293,24 +296,45 @@ final class Bridge: ObservableObject {
         try await action("sendChatText", args)
     }
     func sendChatFiles(friendId: String, source: String) async throws {
-        let paths = try await pickFiles(source: source)
+        let paths = try await pickFiles(source: source, purpose: .chat)
         guard !paths.isEmpty, chatPath.last == friendId else { return }
         // Staging is a separate action AFTER the picker reply, including resume.
         try await action("stageChatFiles", ["friendId": friendId, "paths": paths])
     }
-    func pickFiles(source: String) async throws -> [String] {
+    /// Photos / Files / a folder, copied into PickedMedia (Application Support, out of
+    /// Files and backups, swept once sent). `purpose` .chat keeps copies longer: the
+    /// conversation shows them.
+    func pickFiles(source: String, purpose: PickedMedia.Purpose = .send) async throws -> [String] {
         guard mediaTask == nil else { throw failure("A selection is still finishing. Please try again in a moment.") }
         let token = UUID(); mediaToken = token
-        preparingMedia = source == "photos" ? "Preparing photo…" : source == "folder" ? "Preparing folder…" : "Preparing files…"
         let task = Task<[String], Error> {
             try await NativePresentation.waitForPickerDismissal()
-            // A whole folder is picked natively (a temporary copy the engine can read).
-            if source == "folder" { return try await NativeFolderPicker.shared.pickFolderToSend().map { [$0] } ?? [] }
-            return try await call("pickFiles", ["source": source])
+            switch source {
+            // A whole folder is picked natively (a private copy the engine can read).
+            case "folder":
+                preparingMedia = "Preparing folder…"
+                return try await NativeFolderPicker.shared.pickFolderToSend(purpose: purpose).map { [$0] } ?? []
+            case "photos":
+                let result = try await NativePhotoPicker.shared.pick(purpose: purpose) { [weak self] done, total in
+                    guard let self, self.mediaToken == token else { return }
+                    self.preparingMedia = total > 1 ? "Preparing \(min(done + 1, total)) of \(total)…" : "Preparing photo…"
+                }
+                if result.failed > 0 {
+                    showToast(result.failed == 1 ? "1 item couldn’t be loaded" : "\(result.failed) items couldn’t be loaded")
+                }
+                return result.paths
+            default:
+                // The overlay appears only once the picker hands files over (not while browsing).
+                return try await NativeFolderPicker.shared.pickFiles(purpose: purpose) { [weak self] in
+                    if self?.mediaToken == token { self?.preparingMedia = "Preparing files…" }
+                }
+            }
         }
         mediaTask = task
         defer { if mediaToken == token { mediaTask = nil; preparingMedia = nil; mediaToken = nil } }
-        return try await task.value
+        let paths = try await task.value
+        if Task.isCancelled || task.isCancelled { throw CancellationError() }
+        return paths
     }
     func cancelMediaPreparation() {
         mediaTask?.cancel()

@@ -200,6 +200,8 @@ final class ShareInbox {
             if fm.fileExists(atPath: claimed.path) { try fm.removeItem(at: claimed) }
             do { try fm.moveItem(at: dir, to: claimed) }
             catch { try fm.copyItem(at: dir, to: claimed); try? fm.removeItem(at: dir) }
+            // Swept like any other copy once sent (and never while still queued).
+            PickedMedia.mark(claimed, .send)
         } catch {
             NSLog("DropBeam share inbox: could not claim job: %@", error.localizedDescription)
             try? fm.removeItem(at: dir)

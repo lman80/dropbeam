@@ -263,7 +263,7 @@ const handlers: BridgeHandlers = {
     checkLocation(a, 'upload')
     const source = string(a, 'source')
     let picked: string[]
-    if (source === 'folder') { const folder = await pickNativeFolder(); picked = folder ? [folder] : [] }
+    if (source === 'folder') { const folder = await pickNativeFolder('upload'); picked = folder ? [folder] : [] }
     else { nativeChatSource(a); picked = paths(a) }
     if (!picked.length) return null
     checkLocation(a, 'upload')
@@ -511,8 +511,10 @@ function locationRequest<T>(a: BridgeArgs, kind: string, extra: Record<string, u
   checkLocation(a, 'read')
   return locationsApi.request<T>(string(a, 'friendId'), { kind: `locations.${kind}`, id: string(a, 'locationId'), rel_path: string(a, 'path'), ...extra })
 }
-async function pickNativeFolder(): Promise<string | null> {
-  const result = await invoke<{ path: string | null }>('plugin:native-ui|pick_folder')
+/** `upload`: a folder to send (private copy, swept once sent); otherwise a Shared
+ *  Folder's local copy (Documents/Shared Folders, visible in Files). */
+async function pickNativeFolder(purpose?: 'upload'): Promise<string | null> {
+  const result = await invoke<{ path: string | null }>('plugin:native-ui|pick_folder', { purpose: purpose ?? null })
   return result.path
 }
 function recoveryItem(a: BridgeArgs) {

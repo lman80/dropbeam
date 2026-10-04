@@ -45,6 +45,8 @@ class NativeUIPlugin: Plugin {
             if let host = self.host { root.view.bringSubviewToFront(host.view) }
             // Anything shared to DropBeam while it wasn't running.
             ShareInbox.shared.ingestSoon()
+            // Old picked/pasted copies nothing points at any more.
+            PickedMedia.sweepSoon(after: 90)
             webview.resignFirstResponder()
             webview.scrollView.isScrollEnabled = false
             webview.isHidden = true // JS bridge remains attached; no invisible touch surface.
@@ -137,9 +139,15 @@ class NativeUIPlugin: Plugin {
         }
     }
     @objc func pickFolder(_ invoke: Invoke) {
+        let args = (try? JSONSerialization.jsonObject(with: Data(invoke.getRawArgs().utf8))) as? [String: Any]
+        let upload = args?["purpose"] as? String == "upload"
         DispatchQueue.main.async {
             Task { @MainActor in
-                do { let path = try await NativeFolderPicker.shared.pick(); invoke.resolve(["path": path as Any? ?? NSNull()]) }
+                do {
+                    let path: String?
+                    if upload { path = try await NativeFolderPicker.shared.pickFolderToSend() } else { path = try await NativeFolderPicker.shared.pick() }
+                    invoke.resolve(["path": path as Any? ?? NSNull()])
+                }
                 catch { invoke.reject(error.localizedDescription) }
             }
         }

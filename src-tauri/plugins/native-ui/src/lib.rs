@@ -57,9 +57,11 @@ async fn event<R: Runtime>(
         .map_err(|e| e.to_string())
 }
 
+/// `purpose`: "upload" = a folder to send (private copy, swept once sent); anything
+/// else = a Shared Folder's local copy (Documents/Shared Folders, visible in Files).
 #[tauri::command]
-async fn pick_folder<R: Runtime>(app: AppHandle<R>) -> Result<Value, String> {
-    app.state::<NativeUI<R>>().0.run_mobile_plugin("pickFolder", json!({})).map_err(|e| e.to_string())
+async fn pick_folder<R: Runtime>(app: AppHandle<R>, purpose: Option<String>) -> Result<Value, String> {
+    app.state::<NativeUI<R>>().0.run_mobile_plugin("pickFolder", json!({"purpose": purpose})).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
