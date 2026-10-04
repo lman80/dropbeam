@@ -361,7 +361,7 @@ impl Default for Settings {
             minimize_to_tray: true,
             // Always ready: new installs auto-start (silently, in the menu bar) so
             // a friend's file can land without the app being open first.
-            launch_at_login: true,
+            launch_at_login: !cfg!(target_os = "linux"), // Linux: opt-in (see lib.rs setup)
             prefer_direct_p2p: true,
             custom_relay: String::new(),
             custom_relay_pass: String::new(),

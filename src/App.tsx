@@ -9,6 +9,7 @@ import { useStore } from './store'
 import { parseCode } from './lib/codes'
 import { IS_MAC, MOBILE_UI } from './lib/platform'
 import { startNativeBridge } from './lib/nativeBridge'
+import { startDesktopDeepLinks } from './lib/deepLinks'
 import { nativeShellActive } from './lib/nativeShell'
 import { Sidebar } from './components/Sidebar'
 import { MobileTabBar } from './components/MobileTabBar'
@@ -90,6 +91,9 @@ export default function App() {
   useEffect(() => {
     init()
   }, [init])
+
+  // `dropbeam:` links opened on macOS/Windows/Linux → the normal confirm flow.
+  useEffect(() => startDesktopDeepLinks(), [])
 
   // Drive the Windows/Linux taskbar progress from the most relevant active
   // transfer (macOS shows this on the Downloads stack instead — no-op there).

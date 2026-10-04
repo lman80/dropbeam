@@ -1,10 +1,11 @@
 [package]
 name = "app"
 version = "0.53.0"
-description = "DropBeam — seamless peer-to-peer file transfer"
-authors = ["DropBeam"]
+description = "DropBeam — fast, private peer-to-peer file transfer"
+authors = ["Ashton Miller <imamiller64@gmail.com>"]
 license = ""
-repository = ""
+repository = "https://github.com/lman80/dropbeam"
+homepage = "https://github.com/lman80/dropbeam"
 edition = "2021"
 rust-version = "1.77.2"
 # The app binary is named EXACTLY `mainBinaryName` in tauri.conf.json ("DropBeam")
@@ -98,7 +99,9 @@ tauri-plugin-process = "2.3.1"
 # Single-instance: forwards a second launch's file argument to the running app,
 # powering the Windows "Send with DropBeam" right-click menu. Used on Windows
 # only (macOS already single-instances .app bundles + uses the menu-bar drag).
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+# `dropbeam:` links on macOS/Windows/Linux (scheme from plugins.deep-link in tauri.conf.json).
+tauri-plugin-deep-link = "2"
 trash = "5"
 
 # Windows only: iroh's `wmi` dep (via netwatch) declares windows + windows-core

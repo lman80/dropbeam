@@ -795,6 +795,15 @@ pub(crate) fn apply_autostart(app: &AppHandle, enable: bool) {
     // registered does nothing and macOS stays silent. The plist is still (re)written
     // on a genuine first-enable or if something deleted it — so updates are covered.
     let current = manager.is_enabled().unwrap_or(false);
+    // A login item that points at an OLD location of the app (moved to another
+    // folder, AppImage replaced by a newer file) silently stops launching it.
+    // Rewrite it — rare, so the one-off macOS "Background items" notice is fine.
+    if enable && current && crate::desktop_shell::autostart_entry_stale(&app.package_info().name) {
+        log::info!("autostart: login item points at an old app location — refreshing it");
+        let _ = manager.disable();
+        let _ = manager.enable();
+        return;
+    }
     if enable == current {
         return;
     }
