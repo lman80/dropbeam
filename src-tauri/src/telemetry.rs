@@ -128,34 +128,40 @@ pub fn prune_logs(log_dir: &Path) {
     }
 }
 
-/// Compiled redaction patterns (built once).
+/// Redaction patterns that run BEFORE the path scanner (built once).
+fn pre_path_redactors() -> &'static [(Regex, &'static str)] {
+    static R: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    R.get_or_init(|| {
+        vec![
+            // ANY double-quoted string → "<q>". DropBeam logs put the variable (file/
+            // peer/folder name, path) in quotes and the static text outside, so this
+            // scrubs names/paths while preserving the message for grouping. Honors
+            // `\"` escapes so a Debug-formatted name containing a quote can't split
+            // the match and leak its tail. Longer quoted strings fall through to the
+            // path scanner (which stops at `"`) and the rules below.
+            (Regex::new(r#""(?:[^"\\\r\n]|\\.){0,400}""#).unwrap(), "\"<q>\""),
+            // URLs → <url>. iroh logs the home-relay/dial URL (wss://…, https://…) on
+            // connect and on relay fallback; the region code in the host is coarse geo.
+            // Before the path scanner so a URL's `/a/b` isn't treated as a path.
+            (Regex::new(r#"(?:https?|wss?)://[^\s"']+"#).unwrap(), "<url>"),
+        ]
+    })
+}
+
+/// Redaction patterns that run AFTER the path scanner (built once).
 fn redactors() -> &'static [(Regex, &'static str)] {
     static R: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     R.get_or_init(|| {
         vec![
-            // ANY quoted string → "<q>". DropBeam logs put the variable (file/peer/
-            // folder name, path) in quotes and the static text outside, so this scrubs
-            // names/paths while preserving the message for grouping. Run FIRST so a
-            // quoted path/id is caught here before the looser rules below.
-            (Regex::new(r#""[^"]{0,200}""#).unwrap(), "\"<q>\""),
-            // Some logs quote the variable with single quotes — scrub those too.
+            // Some logs quote the variable with single quotes — scrub those too. Runs
+            // after the path scanner so an apostrophe INSIDE a path ("Bob's Files")
+            // can't pair with a later quote and split the path.
             // {1,200} (not 0) so a lone apostrophe in prose isn't a match start.
             (Regex::new(r#"'[^']{1,200}'"#).unwrap(), "'<q>'"),
-            // URLs → <url>. iroh logs the home-relay/dial URL (wss://…, https://…) on
-            // connect and on relay fallback; the region code in the host is coarse geo.
-            (Regex::new(r#"(?:https?|wss?)://[^\s"']+"#).unwrap(), "<url>"),
             // Bare hostnames that identify a device or its region: iroh relay/pkarr
             // hosts (*.iroh.network / *.dns.iroh.link) and .local mDNS names (which
             // routinely embed the user's real name, e.g. Mong-MacBook-Pro.local).
             (Regex::new(r"(?i)\b(?:[\w-]+\.)+(?:iroh\.(?:network|link)|local)\.?").unwrap(), "<host>"),
-            // Any absolute filesystem path (prefix-agnostic: /Users, /Volumes,
-            // /System/Volumes/Data firmlinks, /home, Windows drives) → <path>.
-            (Regex::new(r"(?:/[\w.+\- ]+){2,}/?").unwrap(), "<path>"),
-            (Regex::new(r"[A-Za-z]:\\[\w.+\\\- ]*").unwrap(), "<path>"),
-            // Windows paths WITHOUT a drive letter: UNC shares (\\srv\share\…) and
-            // relative backslash paths (\Users\name\…) — these leak the OS username and
-            // the drive rule above misses them.
-            (Regex::new(r"(?:\\[\w.$+\- ]+){2,}\\?").unwrap(), "<path>"),
             // iroh's SHORT node id (fmt_short = first 5 bytes as 10 lowercase-hex chars)
             // is logged as a structured field — remote_id=, peer=, me=, dst_endpoint=, …
             // — on nearly every connection-lifecycle line at DEBUG/WARN. The {40,} rule
@@ -181,41 +187,201 @@ fn redactors() -> &'static [(Regex, &'static str)] {
     })
 }
 
-/// Sender-facing errors retain filenames, identifiers and the full error chain.
-/// Quoted paths may contain spaces; bare paths end at whitespace or punctuation
-/// (spaces within directory components are supported). No telemetry filters apply.
-pub(crate) fn redact_paths_only(s: &str) -> String {
-    static TOKENS: OnceLock<Regex> = OnceLock::new();
-    let tokens = TOKENS.get_or_init(|| {
-        Regex::new(r#"(?x)
-            "[^"\r\n]*" | '[^'\r\n]*'
-            | (?:[A-Za-z]:[\\/]|\\\\|/)
-              (?:[^\s\\/:"',;()\[\]{}]+(?:[\x20\t]+[^\s\\/:"',;()\[\]{}]+)*[\\/])*
-              [^\s\\/:"',;()\[\]{}]*
-            | [^\s"'=,;()\[\]{}]+
-        "#).unwrap()
-    });
-    tokens.replace_all(s, |caps: &regex::Captures<'_>| {
-        let token = &caps[0];
-        let quote = token.chars().next().filter(|c| matches!(c, '\'' | '"'));
-        let path = if quote.is_some() { &token[1..token.len() - 1] } else { token };
-        let bytes = path.as_bytes();
-        let absolute = path.starts_with('/') || path.starts_with(r"\\")
-            || (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic()
-                && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\'));
-        if absolute {
-            match quote {
-                Some(q) => format!("{q}<path>{q}"),
-                None => "<path>".to_string(),
-            }
-        } else {
-            token.to_string()
+/// Which path shapes the scanner treats as a path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathMode {
+    /// Telemetry: absolute paths plus drive-less Windows paths (`\Users\bob\…`).
+    Telemetry,
+    /// Sender-facing errors: absolute paths only (relative ones are kept).
+    AbsoluteOnly,
+}
+
+/// Words that sit BETWEEN two paths ("rename /a to /b") — kept as log text when
+/// the scanner stops because a second path begins.
+const PATH_CONNECTIVES: &[&str] = &["to", "from", "and", "or", "into", "onto", "as", "vs", "over", "with", "->", "=>", "→"];
+
+/// A char that can't be part of a path start's body (so `/ ` or `\'` isn't a path).
+fn path_body(ch: Option<char>) -> bool {
+    matches!(ch, Some(c) if !c.is_whitespace() && c != '"' && c != '\'')
+}
+
+/// Does a path start at `c[i]`? Returns the length of its prefix (`/`, `~/`, `\\`,
+/// `C:\`, `\`). Requires a word boundary before it, so `MB/s`, `relay/internet`,
+/// `./x`, `a/b` and a URL's `//host` are never path starts.
+fn path_start(c: &[char], i: usize, mode: PathMode) -> Option<usize> {
+    let at = |k: usize| c.get(i + k).copied();
+    let boundary = match i.checked_sub(1).map(|p| c[p]) {
+        None => true,
+        Some(p) if p.is_whitespace() => true,
+        Some(p) if "([{=\"',;|".contains(p) => true,
+        // `key:/Users/…` yes, a URL's `scheme://` no.
+        Some(':') => !(at(0) == Some('/') && at(1) == Some('/')),
+        Some(_) => false,
+    };
+    if !boundary {
+        return None;
+    }
+    match at(0)? {
+        '/' => path_body(at(1)).then_some(1),
+        '~' => (at(1) == Some('/') && path_body(at(2))).then_some(2),
+        '\\' if at(1) == Some('\\') => path_body(at(2)).then_some(2),
+        '\\' if mode == PathMode::Telemetry => path_body(at(1)).then_some(1),
+        d if d.is_ascii_alphabetic()
+            && at(1) == Some(':')
+            && matches!(at(2), Some('\\' | '/'))
+            && path_body(at(3)) =>
+        {
+            Some(3)
         }
-    }).into_owned()
+        _ => None,
+    }
+}
+
+fn starts_with_at(c: &[char], i: usize, pat: &str) -> bool {
+    let mut k = i;
+    for p in pat.chars() {
+        if c.get(k) != Some(&p) {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+/// Where does the path starting at `start` end? Paths may contain spaces, quotes
+/// (`Bob's`), parens, `&`, `,`, unicode — anything but a line break — so the scan
+/// is privacy-first: it runs until something that clearly ends a path:
+///   • a line break / tab, or a `"`;
+///   • `: ` or a trailing `:` (anyhow's `context: cause` separator);
+///   • the closing quote when the path was opened by `'` (a `'` not followed by a
+///     letter/digit, so `Bob's` stays inside);
+///   • ` (os error`, ` -> `, ` => `, ` → `;
+///   • whitespace followed by ANOTHER path start (then a connective like `to`
+///     between the two is handed back as log text).
+/// Over-redaction (a trailing word swallowed into `<path>`) is preferred to
+/// leaking part of a name.
+fn path_end(c: &[char], start: usize, prefix: usize, mode: PathMode) -> usize {
+    let opener = start.checked_sub(1).map(|p| c[p]);
+    let mut j = start + prefix;
+    let mut next_path = false;
+    // `'`-opened path: a `'` followed by a space may be a quote INSIDE the name
+    // ("Name 'quoted' here.mp4"), so only remember it; a `'` at the end or before
+    // punctuation closes for sure. Any other stop falls back to the LAST such `'`.
+    let mut quote_close: Option<usize> = None;
+    let mut closed = false;
+    while j < c.len() {
+        let ch = c[j];
+        match ch {
+            '\n' | '\r' | '\t' | '"' => break,
+            '\'' if opener == Some('\'') && !c.get(j + 1).is_some_and(|n| n.is_alphanumeric()) => {
+                if c.get(j + 1).is_none_or(|n| !n.is_whitespace()) {
+                    closed = true;
+                    break;
+                }
+                quote_close = Some(j);
+            }
+            ':' if c.get(j + 1).is_none_or(|n| n.is_whitespace()) => break,
+            w if w.is_whitespace() => {
+                let mut k = j;
+                while k < c.len() && c[k].is_whitespace() && !matches!(c[k], '\n' | '\r' | '\t') {
+                    k += 1;
+                }
+                if k >= c.len()
+                    || ["(os error", "-> ", "=> ", "→ "].iter().any(|p| starts_with_at(c, k, p))
+                {
+                    break;
+                }
+                if path_start(c, k, mode).is_some() {
+                    next_path = true;
+                    break;
+                }
+                j = k;
+                continue;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    if let (false, Some(q)) = (closed, quote_close) {
+        j = q;
+        next_path = false;
+    }
+    let mut end = j;
+    let trim_ws = |end: &mut usize| {
+        while *end > start + prefix && c[*end - 1].is_whitespace() {
+            *end -= 1;
+        }
+    };
+    trim_ws(&mut end);
+    if next_path {
+        // "rename /a to /b": give the connective back to the log text.
+        if let Some(ws) = (start + prefix..end).rev().find(|&k| c[k].is_whitespace()) {
+            let word: String = c[ws + 1..end].iter().collect();
+            if PATH_CONNECTIVES.contains(&word.to_lowercase().as_str()) {
+                end = ws;
+                trim_ws(&mut end);
+            }
+        }
+    }
+    // Sentence punctuation after a path ("see /tmp/x.", "(at /tmp/x)") stays text.
+    loop {
+        if end <= start + prefix {
+            break;
+        }
+        let span = &c[start..end];
+        let last = c[end - 1];
+        let unbalanced = |open: char, close: char| {
+            last == close
+                && span.iter().filter(|&&x| x == close).count() > span.iter().filter(|&&x| x == open).count()
+        };
+        if matches!(last, '.' | ',' | ';') || unbalanced('(', ')') || unbalanced('[', ']') || unbalanced('{', '}') {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// Replace every path in `s` with `<path>` (see `path_end` for what a path is).
+fn scan_paths(s: &str, mode: PathMode) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < c.len() {
+        if let Some(prefix) = path_start(&c, i, mode) {
+            let end = path_end(&c, i, prefix, mode);
+            // A lone leading `\` (drive-less Windows path) needs a second separator,
+            // so an escape like `\n` in a message isn't taken for a path.
+            let lone_backslash = prefix == 1 && c[i] == '\\';
+            if !lone_backslash || c[i + 1..end].contains(&'\\') {
+                out.push_str("<path>");
+                i = end;
+                continue;
+            }
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Sender-facing errors retain filenames, identifiers and the full error chain;
+/// only ABSOLUTE paths (`/…`, `~/…`, `C:\…`, `\\server\…`), quoted or bare, are
+/// replaced by `<path>`. Paths may contain spaces, quotes, parens, `&`, `,` and
+/// unicode — see `path_end`. No telemetry filters apply.
+pub(crate) fn redact_paths_only(s: &str) -> String {
+    scan_paths(s, PathMode::AbsoluteOnly)
 }
 
 pub(crate) fn redact(s: &str) -> String {
     let mut out = s.to_string();
+    for (re, rep) in pre_path_redactors() {
+        out = re.replace_all(&out, *rep).into_owned();
+    }
+    // Any filesystem path (prefix-agnostic: /Users, /Volumes, /System/Volumes/Data
+    // firmlinks, /home, ~/, Windows drives, UNC shares, drive-less `\Users\…`).
+    out = scan_paths(&out, PathMode::Telemetry);
     for (re, rep) in redactors() {
         out = re.replace_all(&out, *rep).into_owned();
     }
@@ -701,6 +867,116 @@ mod tests {
         let zbase = " d2k4nq8rj7m3wv6abch5ftue9psyx2gz4lq7nm8rj3kv6wd5ab2 "; // 52 z-base-32
         let r = redact(&format!("ignoring folder-invite from{zbase}"));
         assert!(r.contains("<id>"), "z-base-32 node id not redacted: {r}");
+    }
+
+    /// Awkward/malicious paths: apostrophes, parens, `&`, commas, unicode, spaces,
+    /// Windows drives/UNC/drive-less, /Volumes, firmlinks, ~/. Each carries a few
+    /// "secret" words that must never survive redaction.
+    const AWKWARD_PATHS: &[(&str, &[&str])] = &[
+        ("/Users/bob/Bob's Files (old)/a & b, c.txt", &["bob", "Bob", "Files", "old", "a & b", "c.txt"]),
+        (r"C:\Users\Bob\My (Docs)\x.txt", &["Bob", "Docs", "x.txt"]),
+        (r"C:\Users\Bob's PC\Tom & Jerry, Inc\report (final).docx", &["Bob", "Tom", "Jerry", "Inc", "report", "(final)"]),
+        ("/Volumes/Mong's Drive/Taxes, 2025 (draft)/Ünïcödé 影片 🎬.mov", &["Mong", "Drive", "Taxes", "draft", "Ünïcödé", "影片"]),
+        ("/System/Volumes/Data/Users/kim/Desktop/Kim's [secret] {x}/y;z.pdf", &["kim", "Kim", "secret", "y;z", "pdf"]),
+        (r"\\nas\share\Jane Doe\O'Neil & Sons (2024), ltd\plan.xlsx", &["nas", "Jane", "Doe", "Neil", "Sons", "ltd", "plan"]),
+        ("~/Documents/Ana's stuff/a=b;c (1).txt", &["Documents", "Ana", "stuff", "a=b", "c (1)"]),
+        ("/home/zoe/it's/(paren/&amp/x", &["zoe", "it's", "paren", "&amp"]),
+        ("D:/Private Folder/Name 'quoted' here.mp4", &["Private", "Folder", "Name", "quoted", "here"]),
+    ];
+
+    fn assert_no_leak(out: &str, secrets: &[&str], ctx: &str) {
+        for s in secrets {
+            assert!(!out.contains(s), "leaked {s:?} from {ctx:?} -> {out:?}");
+        }
+    }
+
+    #[test]
+    fn redact_scrubs_awkward_paths_everywhere() {
+        for (path, secrets) in AWKWARD_PATHS {
+            for line in [
+                format!("REFUSED delete of {path}"),
+                format!("finalize {path}: Permission denied (os error 13)"),
+                format!("open '{path}': failed"),
+                format!("open \"{path}\" failed"),
+                format!("rename {path} to {path}: failed"),
+                format!("stat {path} (os error 2)"),
+                format!("key={path}"),
+                format!("(at {path})"),
+                format!("{path}"),
+                format!("open {path:?}: failed"),
+            ] {
+                let r = redact(&line);
+                assert_no_leak(&r, secrets, &line);
+                assert!(r.contains("<path>") || r.contains("<q>"), "nothing redacted: {line:?} -> {r:?}");
+            }
+        }
+        // Error reasons and connectives survive.
+        assert_eq!(redact("finalize /Users/bob/Bob's Files (old)/a & b, c.txt: Permission denied (os error 13)"),
+            "finalize <path>: Permission denied (os error 13)");
+        assert_eq!(redact(r"rename C:\Users\Bob\My (Docs)\x.txt to D:\a b\c.txt: failed"),
+            "rename <path> to <path>: failed");
+        assert_eq!(redact("stat /Volumes/X (old)/y.txt (os error 2)"), "stat <path> (os error 2)");
+        assert_eq!(redact("watching (/Users/bob/My Stuff)"), "watching (<path>)");
+    }
+
+    #[test]
+    fn redact_paths_only_scrubs_awkward_paths() {
+        for (path, secrets) in AWKWARD_PATHS {
+            for line in [
+                format!("finalize {path}: Permission denied (os error 13)"),
+                format!("open '{path}': failed"),
+                format!("open \"{path}\" failed"),
+                format!("rename {path} to {path}: failed"),
+                format!("{path}"),
+            ] {
+                let r = redact_paths_only(&line);
+                assert_no_leak(&r, secrets, &line);
+                assert!(r.contains("<path>"), "nothing redacted: {line:?} -> {r:?}");
+            }
+            assert_eq!(redact_paths_only(&format!("finalize {path}: Permission denied (os error 13)")),
+                "finalize <path>: Permission denied (os error 13)");
+            assert_eq!(redact_paths_only(&format!("open '{path}': failed")), "open '<path>': failed");
+            assert_eq!(redact_paths_only(&format!("open \"{path}\" failed")), "open \"<path>\" failed");
+            assert_eq!(redact_paths_only(&format!("rename {path} to {path}: failed")), "rename <path> to <path>: failed");
+        }
+    }
+
+    #[test]
+    fn path_scanner_leaves_normal_log_text_alone() {
+        for msg in [
+            "send: 4.0 MB/s (10 MB in 5s) · RELAY/internet · rtt=80ms",
+            "recv: 5.1 MB/s · DIRECT/p2p",
+            "re-queued 7 file(s) the peer was missing, 1/2 done",
+            "app_lib::sync reconcile done at 03:41:03",
+            "can't open it: and/or ./foo.mp4 ../bar a/b",
+            "ratio 3 / 4 and \\n escapes",
+        ] {
+            assert_eq!(redact_paths_only(msg), msg);
+            assert_eq!(scan_paths(msg, PathMode::Telemetry), msg);
+        }
+        // A URL is not a path in the sender-facing redaction.
+        let url = "fetch https://example.com/a/b failed";
+        assert_eq!(redact_paths_only(url), url);
+        assert_eq!(redact(url), "fetch <url> failed");
+    }
+
+    #[test]
+    fn digest_never_carries_awkward_paths() {
+        let dir = std::env::temp_dir().join(format!("dbdiag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut log = String::new();
+        for (path, _) in AWKWARD_PATHS {
+            log.push_str(&format!("[2026-06-13][03:41:03][app_lib::sync][ERROR] finalize {path}: Permission denied (os error 13)\n"));
+            log.push_str(&format!("[2026-06-13][03:41:04][app_lib::sync][WARN] REFUSED delete of '{path}'\n"));
+        }
+        std::fs::write(dir.join("DropBeam.log"), log).unwrap();
+        let (digest, _) = build_digest(&dir, "", &serde_json::json!({})).unwrap();
+        let text = digest.to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        for (path, secrets) in AWKWARD_PATHS {
+            assert_no_leak(&text, secrets, path);
+        }
+        assert!(text.contains("finalize <path>: Permission denied"), "{text}");
     }
 
     #[test]
