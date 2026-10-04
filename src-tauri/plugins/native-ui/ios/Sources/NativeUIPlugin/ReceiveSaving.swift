@@ -138,7 +138,8 @@ private let saveLog = Logger(subsystem: "com.dropbeam.app", category: "receive-s
         guard !urls.isEmpty else { return 0 }
         let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         guard status == .authorized || status == .limited else {
-            Bridge.shared.showToast("Allow Photos access in Settings → Apps → DropBeam to save photos")
+            // An alert, not a toast: it carries an Open Settings button (RootView).
+            Bridge.shared.errorMessage = "DropBeam isn’t allowed to add to Photos, so this couldn’t be saved there. Turn on Photos for DropBeam in the Settings app. Your files are still in the Files app."
             return 0
         }
         // Never ask for full access just for an album — only use one if it's already granted.

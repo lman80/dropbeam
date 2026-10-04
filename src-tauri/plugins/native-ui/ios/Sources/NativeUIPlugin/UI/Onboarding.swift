@@ -176,6 +176,7 @@ private struct WelcomeStep: View {
                 FeatureRow(symbol: "arrow.left.arrow.right", title: "Device to device", detail: "Files go straight to the other device, never through a server.")
                 FeatureRow(symbol: "lock.fill", title: "Private", detail: "Everything is end-to-end encrypted.")
                 FeatureRow(symbol: "antenna.radiowaves.left.and.right", title: "Both need DropBeam open", detail: "With no server in between, the other device needs DropBeam open to connect.")
+                FeatureRow(symbol: "wifi", title: "Tap Allow when asked", detail: "If your iPhone asks to find devices on your network, tap Allow — nearby devices then send at full speed.")
             }.padding(.top, 4)
         } actions: {
             PrimaryButton(title: "Get Started", action: next)

@@ -19,8 +19,11 @@ import UIKit
 /// device's key; the engine only accepts private/link-local addresses.
 /// Desktop builds keep iroh's swarm-discovery; advertising `_dropbeam._udp` from desktop
 /// too is a follow-up (then iPhone ↔ Mac is found both ways).
-@MainActor final class LanDiscovery {
+@MainActor final class LanDiscovery: ObservableObject {
     static let shared = LanDiscovery()
+    /// She tapped Don't Allow on the Local Network prompt (or turned it off later):
+    /// nearby devices then only connect the slow way. The Send tab offers Settings.
+    @Published var localNetworkDenied = false
     nonisolated static let serviceType = "_dropbeam._udp"
     private var listener: NWListener?
     private var browser: NWBrowser?
@@ -128,6 +131,17 @@ import UIKit
         }
         browser.stateUpdateHandler = { state in
             if case .failed(let error) = state { NSLog("DropBeam Bonjour: browsing failed: %@", "\(error)") }
+            // Local Network permission off shows up as a browser waiting on PolicyDenied.
+            let denied: Bool? = {
+                switch state {
+                case .waiting(let error), .failed(let error):
+                    if case .dns(let code) = error, code == -65570 /* kDNSServiceErr_PolicyDenied */ { return true }
+                    return nil
+                case .ready: return false
+                default: return nil
+                }
+            }()
+            if let denied { Task { @MainActor in if LanDiscovery.shared.localNetworkDenied != denied { LanDiscovery.shared.localNetworkDenied = denied } } }
         }
         browser.start(queue: .main)
         self.browser = browser
