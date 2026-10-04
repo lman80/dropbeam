@@ -867,6 +867,11 @@ fn is_disk_full(error: &anyhow::Error) -> bool {
 /// A receive failure as the SENDER will read it (shown verbatim on their card):
 /// plain words for a full disk, the redacted technical chain otherwise.
 fn receiver_error_text(error: &anyhow::Error) -> String {
+    // The receiver's own Cancel: tell the sender in words its classifier reads
+    // as a deliberate stop by the other side ("Canceled by X"), not a failure.
+    if error.chain().any(|e| e.to_string() == "canceled") {
+        return errors::PEER_CANCELED.into();
+    }
     if is_disk_full(error) {
         return "their disk is full — once they free up space, retry and it picks up where it stopped".into();
     }
@@ -1695,7 +1700,9 @@ fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
     emit(app, &u);
 }
 
+#[track_caller]
 fn emit_canceled(app: &AppHandle, id: &str, dir: Direction) {
+    log::info!("transfer {id}: canceled ({dir:?}, reported at line {})", std::panic::Location::caller().line());
     let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
     u.state = TransferState::Canceled;
     emit(app, &u);
@@ -1704,6 +1711,7 @@ fn emit_canceled(app: &AppHandle, id: &str, dir: Direction) {
 /// Canceled, saying who stopped it when it was the OTHER side (T6): "Canceled
 /// by Alex" instead of "Failed: connection lost".
 fn emit_canceled_by(app: &AppHandle, id: &str, dir: Direction, err: &str, who: Option<&str>) {
+    log::info!("transfer {id}: stopped by the other side ({dir:?}): {err}");
     let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
     u.state = TransferState::Canceled;
     u.detail = errors::peer_stop_detail(err, who);
@@ -1733,6 +1741,7 @@ pub fn stopped_state(reason: CancelReason) -> TransferState {
 
 /// Report a user-stopped transfer. A pause carries its byte counts so the card
 /// can say how far it got (and the retry record stays put for Resume).
+#[track_caller]
 fn emit_stopped(
     app: &AppHandle,
     id: &str,
@@ -2950,6 +2959,17 @@ async fn serve_stream_inner(
                                 );
                             }
                         }
+                        // The receiver canceled: end now, not after 150 s of
+                        // "Connecting" waiting for a resume that won't come (T6).
+                        // Before the generic arm — its error text says "canceled" too.
+                        Err(e) if !p.cancel.load(Ordering::SeqCst)
+                            && (errors::peer_stopped(conn).is_some() || errors::error_peer_stopped(&e).is_some()
+                                || e.to_string().contains(errors::PEER_CANCELED)) =>
+                        {
+                            state.pending.lock().unwrap().remove(token);
+                            let err = errors::peer_stop_error(CancelReason::Cancel).to_string();
+                            emit_canceled_by(&app, &p.transfer_id, Direction::Send, &err, None);
+                        }
                         Err(e)
                             if p.cancel.load(Ordering::SeqCst)
                                 || e.to_string().contains("canceled") =>
@@ -3684,13 +3704,20 @@ async fn serve_stream_inner(
                     // Bounded so a truly-dead peer can't hang us — the data is on disk.
                     let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
                 }
-                Err(e) if e.to_string().contains("canceled") => {
-                    emit_canceled(&app, &id, Direction::Receive)
-                }
                 // The sender canceled/paused: say so, not "connection lost" (T6).
-                Err(_) if errors::peer_stopped(conn).is_some() => {
-                    let err = errors::peer_stop_error(errors::peer_stopped(conn).unwrap_or(CancelReason::Cancel)).to_string();
+                // Checked BEFORE the generic "canceled" arm: the close reason
+                // text ("canceled") can appear in the read error itself.
+                // No local-flag guard: a dead progress back-channel sets `cancel`
+                // too, and a PEER close reason can only come from the sender (our
+                // own cancel closes the connection locally).
+                Err(e) if errors::peer_stopped(conn).is_some() || errors::error_peer_stopped(&e).is_some() => {
+                    let reason = errors::peer_stopped(conn).or_else(|| errors::error_peer_stopped(&e)).unwrap_or(CancelReason::Cancel);
+                    let err = errors::peer_stop_error(reason).to_string();
                     emit_canceled_by(&app, &id, Direction::Receive, &err, sender.as_deref());
+                }
+                Err(e) if e.to_string().contains("canceled") => {
+                    log::info!("friend-recv {id}: canceled: {e:#} (local flag {})", cancel.load(Ordering::SeqCst));
+                    emit_canceled(&app, &id, Direction::Receive)
                 }
                 Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
             }
@@ -14145,6 +14172,20 @@ mod loopback_tests {
             client.close().await;
             server.close().await;
         }
+    }
+
+    /// A receiver's own Cancel reaches the sender as a deliberate stop by the
+    /// other side ("Canceled by Mong"), not a bare "Canceled" (live QA 0.53.0).
+    #[test]
+    fn receiver_cancel_reads_as_peer_stop_on_the_sender() {
+        let text = receiver_error_text(&anyhow::anyhow!("canceled"));
+        assert_eq!(text, errors::PEER_CANCELED);
+        let sender_side = format!("receiver: {text}");
+        assert_eq!(errors::peer_stop_detail(&sender_side, Some("Mong")).as_deref(), Some("Canceled by Mong"));
+        let wrapped = anyhow::anyhow!("canceled").context("landing");
+        assert_eq!(receiver_error_text(&wrapped), errors::PEER_CANCELED);
+        // Other receiver errors pass through untouched.
+        assert!(!receiver_error_text(&anyhow::anyhow!("boom")).contains("canceled"));
     }
 
     #[tokio::test]

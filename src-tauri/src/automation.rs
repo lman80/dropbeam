@@ -26,8 +26,11 @@ fn results_path(dir: &Path) -> PathBuf {
 fn record(dir: &Path, mut v: Value) {
     use std::io::Write;
     v["t"] = json!(crate::chat::now_ms());
+    // One write per line: listeners on other threads append concurrently.
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(results_path(dir)) {
-        let _ = writeln!(f, "{v}");
+        let _ = f.write_all(format!("{v}\n").as_bytes());
     }
 }
 
@@ -59,7 +62,7 @@ pub fn spawn(app: AppHandle, config_dir: PathBuf) {
             };
             record(&dir, json!({"event": "done", "op": op, "id": id, "state": state,
                 "bytes": u["bytesTotal"], "files": u["fileCount"], "ms": at.elapsed().as_millis() as u64,
-                "locality": u["locality"], "error": u["error"]}));
+                "locality": u["locality"], "error": u["error"], "detail": u["detail"]}));
         });
     }
     tauri::async_runtime::spawn(async move {
@@ -79,7 +82,7 @@ pub fn spawn(app: AppHandle, config_dir: PathBuf) {
                 let result = run(&app, &st, &net, &cmd).await;
                 match result {
                     Ok((op, id, code)) => {
-                        started.lock().unwrap().insert(id.clone(), (op.clone(), Instant::now()));
+                        if op != "cancel" { started.lock().unwrap().insert(id.clone(), (op.clone(), Instant::now())); }
                         record(&config_dir, json!({"event": "started", "op": op, "id": id, "code": code, "cmd": cmd}));
                     }
                     Err(e) => record(&config_dir, json!({"event": "error", "cmd": cmd, "error": e})),
