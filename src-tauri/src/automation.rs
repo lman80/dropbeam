@@ -39,12 +39,24 @@ pub fn spawn(app: AppHandle, config_dir: PathBuf) {
     {
         // Terminal states of our transfers → results file.
         let (started, dir) = (started.clone(), config_dir.clone());
+        let app_for_seen = app.clone();
         app.listen_any("transfer://update", move |e| {
             let Ok(u) = serde_json::from_str::<Value>(e.payload()) else { return };
             let state = u["state"].as_str().unwrap_or("");
             if !matches!(state, "completed" | "failed" | "canceled") { return; }
             let id = u["id"].as_str().unwrap_or("").to_owned();
-            let Some((op, at)) = started.lock().unwrap().remove(&id) else { return };
+            let Some((op, at)) = started.lock().unwrap().remove(&id) else {
+                // Not ours (e.g. the RECEIVING side of a test send): still log the
+                // terminal state while Lab Mode is on, so a driver can check both
+                // ends ("Canceled by X" etc.).
+                let lab = app_for_seen.try_state::<Arc<AppState>>().is_some_and(|st| st.settings.lock().unwrap().lab_mode_enabled);
+                if lab {
+                    record(&dir, json!({"event": "seen", "id": id, "state": state, "direction": u["direction"],
+                        "peer": u["peer"], "friend": u["friendName"], "bytes": u["bytesTotal"], "done": u["bytesDone"],
+                        "files": u["fileCount"], "locality": u["locality"], "error": u["error"], "detail": u["detail"]}));
+                }
+                return;
+            };
             record(&dir, json!({"event": "done", "op": op, "id": id, "state": state,
                 "bytes": u["bytesTotal"], "files": u["fileCount"], "ms": at.elapsed().as_millis() as u64,
                 "locality": u["locality"], "error": u["error"]}));
@@ -118,6 +130,17 @@ async fn run(app: &AppHandle, st: &Arc<AppState>, net: &Arc<IrohState>, cmd: &Va
                 crate::commands::post_file_note(st, net, app, &f.id, names, u.bytes_total, paths, None, Some(u.id.clone()));
             }
             Ok((op.into(), u.id, None))
+        }
+        // Cancel one transfer by id, or every running one with "*".
+        "cancel" => {
+            let id = cmd["id"].as_str().unwrap_or("");
+            let ids = if id == "*" { net.active_transfer_ids() } else { vec![id.to_owned()] };
+            for id in &ids {
+                if let crate::iroh_net::CancelKind::Staged = net.cancel(id) {
+                    crate::iroh_net::emit_canceled_send(app, id);
+                }
+            }
+            Ok(("cancel".into(), ids.join(","), None))
         }
         "quicksend" => {
             let u = crate::iroh_net::start_send(app.clone(), net.clone(), paths_of(cmd)?)?;

@@ -300,6 +300,16 @@ impl IrohState {
         }
     }
 
+    /// Ids of every transfer currently running (lab automation: cancel-all).
+    #[allow(dead_code)]
+    pub(crate) fn active_transfer_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.cancels.lock().unwrap().keys().cloned().collect();
+        for id in self.conns.lock().unwrap().keys() {
+            if !ids.contains(id) { ids.push(id.clone()); }
+        }
+        ids
+    }
+
     /// Signal cancellation for a transfer id. Drops a still-staged send so it
     /// can't be pulled, and flips the in-flight flag for a running transfer.
     pub fn cancel(&self, id: &str) -> CancelKind {
