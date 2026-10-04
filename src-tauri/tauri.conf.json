@@ -79,15 +79,25 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self' https://esm.sh",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob: dbfile: http://dbfile.localhost https://*.giphy.com",
+        "media-src": "'self' data: blob: dbfile: http://dbfile.localhost",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost dbfile: http://dbfile.localhost https://api.giphy.com https://*.giphy.com https://superfeedback.ashton-mcp-worker.workers.dev https://esm.sh",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'none'"
+      },
+      "devCsp": null,
+      "dangerousDisableAssetCspModification": [
+        "style-src"
+      ],
       "assetProtocol": {
-        "enable": true,
-        "scope": [
-          "**",
-          "/**",
-          "$HOME/**",
-          "$APPCONFIG/**"
-        ]
+        "enable": false
       }
     }
   },

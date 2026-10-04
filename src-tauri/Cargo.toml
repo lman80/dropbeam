@@ -38,7 +38,7 @@ netwatch = "0.19.3"
 # Already cached/locked through Tauri; match its asset URL and Range decoding.
 percent-encoding = "2"
 http-range = "0.1"
-tauri = { version = "2.11.2", features = ["tray-icon", "image-png", "macos-private-api", "protocol-asset"] }
+tauri = { version = "2.11.2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
