@@ -1,4 +1,4 @@
-import { MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { folderName as baseFolderName } from '../lib/syncedFolders'
 import { useEffect, useState, type ReactNode } from 'react'
 import { AnimatePresence } from 'framer-motion'
@@ -397,7 +397,7 @@ function FolderRow({
 
       <div className="row-trailing folder-actions">
         {!MOBILE_UI && (
-          <IconButton label="Open folder" tooltip="Show in Finder" onClick={() => api.openPath(pair.folder)}>
+          <IconButton label={OPEN_FOLDER_LABEL} onClick={() => api.openPath(pair.folder)}>
             <FolderOpen />
           </IconButton>
         )}

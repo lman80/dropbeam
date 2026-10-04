@@ -1,7 +1,7 @@
 import { MobileHeader } from '../components/MobileHeader'
 import { integrityLabel } from '../lib/integrity'
 import { ChevronRight } from 'lucide-react'
-import { MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { useMemo, useState } from 'react'
 import { AnimatePresence } from 'framer-motion'
 import { FolderOpen, History as HistoryIcon, Search, Trash2, X } from 'lucide-react'
@@ -254,7 +254,7 @@ function RecentRow({ e }: { e: HistoryEntry }) {
         {e.state === 'canceled' && <span className="history-state">Canceled</span>}
         {canReveal && (
           <IconButton
-            label={e.fileNames.length === 1 ? 'Show in Finder' : 'Open folder'}
+            label={e.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL}
             onClick={() => {
               const sep = e.outDir!.includes('\\') ? '\\' : '/'
               if (e.fileNames.length === 1) {

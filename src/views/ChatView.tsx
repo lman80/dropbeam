@@ -2,7 +2,7 @@ import { MobileHeader } from '../components/MobileHeader'
 import { isEnterKey } from '../lib/keys'
 import { TransferCard } from '../components/TransferCard'
 import { ChevronLeft } from 'lucide-react'
-import { MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI, REVEAL_LABEL } from '../lib/platform'
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -1278,7 +1278,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
       const mv = ev.moves[0]
       const to = mv.to.split('\\').join('/')
       const from = mv.from.split('\\').join('/')
-      const item = <SyncLink title="Show in Finder" onOpen={reveal(to)}>{baseOf(to)}</SyncLink>
+      const item = <SyncLink title={REVEAL_LABEL} onOpen={reveal(to)}>{baseOf(to)}</SyncLink>
       line = dirOf(from) === dirOf(to)
         ? <>renamed {baseOf(from)} to {item}</>
         : <>moved {item} to {dirOf(to) ? baseOf(dirOf(to)) : folderName}</>
@@ -1289,7 +1289,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
     const e = entries[0]
     line = e.kind === 'dir'
       ? <>added <SyncLink title={`Open ${e.name}`} onOpen={() => void api.openPath(full(e.name)).catch(() => {})}>{e.name}</SyncLink> ({e.count} item{e.count === 1 ? '' : 's'}) to {folderLink}</>
-      : <>added <SyncLink title="Show in Finder" onOpen={reveal(e.rel)}>{baseOf(e.rel)}</SyncLink> to {folderLink}</>
+      : <>added <SyncLink title={REVEAL_LABEL} onOpen={reveal(e.rel)}>{baseOf(e.rel)}</SyncLink> to {folderLink}</>
   } else {
     line = <>added {ev.files.length} items to {folderLink}</>
   }

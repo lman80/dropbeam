@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { Check, FolderOpen, HardDrive, Pencil, Server, Trash2 } from 'lucide-react'
 import { api, locationsApi, onLocationActivity, type LocationActivity, type HostedLocation, type LocationRights, type MountCandidate } from '../lib/api'
 import { formatBytes, formatRelativeTime } from '../lib/format'
-import { IS_MAC, IS_WINDOWS } from '../lib/platform'
+import { IS_WINDOWS, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { useStore } from '../store'
 import { Dialog } from './Dialog'
 import { MenuButton, SectionHeader } from './ui'
@@ -12,8 +12,8 @@ import { MenuButton, SectionHeader } from './ui'
 const DEFAULT_CAP = 500_000_000_000
 const empty = (): HostedLocation => ({ id: '', name: '', path: '', friendIds: [], rights: { upload: true, manage: false }, byteCap: DEFAULT_CAP })
 /** The folder's own name, so "where is it?" already answers "what's it called?". */
-const nameFromPath = (path: string): string => path.split('/').filter(Boolean).pop() || 'Shared folder'
-const baseName = (path: string): string => path.split('/').filter(Boolean).pop() || path
+const nameFromPath = (path: string): string => path.split(/[\\/]/).filter(Boolean).pop() || 'Shared folder'
+const baseName = (path: string): string => path.split(/[\\/]/).filter(Boolean).pop() || path
 /** What a friend may do, as plain-language choices instead of two checkboxes. */
 const ACCESS = [
   { id: 'read', label: 'View and download', hint: 'They can open it and copy things out.', rights: { upload: false, manage: false } },
@@ -275,7 +275,7 @@ export function LocationSettings() {
           <div className="row-trailing">
             <MenuButton label={`More for ${l.name}`} items={[
               { label: 'Edit…', icon: <Pencil />, disabled: busy, onSelect: () => { setError(''); setAdding(false); setDraft({ ...l, friendIds: [...l.friendIds], rights: { ...l.rights } }) } },
-              { label: IS_MAC ? 'Open in Finder' : 'Open folder', icon: <FolderOpen />, onSelect: () => { void api.openPath(l.path).catch(e => setError(errorText(e))) } },
+              { label: OPEN_FOLDER_LABEL, icon: <FolderOpen />, onSelect: () => { void api.openPath(l.path).catch(e => setError(errorText(e))) } },
               { separator: true },
               { label: 'Stop sharing…', icon: <Trash2 />, danger: true, disabled: busy, onSelect: () => setRemoving(l) },
             ]} />

@@ -71,10 +71,10 @@ export function formatRelativeTime(ms: number): string {
 
 export function shortPath(p: string, max = 42): string {
   if (p.length <= max) return p
-  const parts = p.split('/')
+  const sep = p.includes('\\') && !p.includes('/') ? '\\' : '/'
+  const parts = p.split(/[\\/]/)
   if (parts.length <= 2) return '…' + p.slice(-(max - 1))
   const last = parts[parts.length - 1]
-  return `${parts[0]}/…/${last}`.length <= max
-    ? `${parts[0]}/…/${last}`
-    : '…/' + last
+  const short = `${parts[0]}${sep}…${sep}${last}`
+  return short.length <= max ? short : `…${sep}${last}`
 }

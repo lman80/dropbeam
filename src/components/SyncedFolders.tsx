@@ -7,7 +7,7 @@ import {
   type SharedLocation, type SyncedFolder, type SyncedFolderStatus,
 } from '../lib/api'
 import { formatRelativeTime } from '../lib/format'
-import { IS_MAC } from '../lib/platform'
+import { OPEN_FOLDER_LABEL } from '../lib/platform'
 import { destinationLabel, folderName, statusPill, type Pill } from '../lib/syncedFolders'
 import { useStore } from '../store'
 
@@ -92,7 +92,7 @@ export function SyncedFolders({ shared }: { shared: SharedByFriend }) {
         const working = busy === folder.id
         const items: MenuItem[] = [
           { label: 'Sync now', icon: <RefreshCw />, disabled: working || !folder.enabled, onSelect: () => void act(folder.id, () => syncedFoldersApi.syncNow(folder.id)) },
-          { label: IS_MAC ? 'Open in Finder' : 'Open folder', icon: <FolderOpen />, onSelect: () => { void api.openPath(folder.localPath) } },
+          { label: OPEN_FOLDER_LABEL, icon: <FolderOpen />, onSelect: () => { void api.openPath(folder.localPath) } },
           { separator: true },
           { heading: 'When you delete a file here' },
           { label: `Keep the copy on ${where.location}`, icon: folder.deleteRemote ? <span className="location-menu-space" /> : <Check />, disabled: working,

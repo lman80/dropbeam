@@ -1,6 +1,6 @@
 import { FileIcon } from './FileIcon'
 import { integrityLabel } from '../lib/integrity'
-import { MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -265,7 +265,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
               )}
               {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} moving={transferring} />}
               {completed && t.direction === 'receive' && t.outDir && (
-                <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in Finder' : 'Open Folder'} onClick={showInFolder}>
+                <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL} onClick={showInFolder}>
                   <FolderOpen />
                 </IconButton>
               )}
