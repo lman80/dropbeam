@@ -477,7 +477,7 @@ const linked = async (r: LinkResult) => {
 const deviceSnapshot = () => {
   const d = st().myDevice
   return d ? { name: d.name, displayName: d.display_name ?? st().settings?.displayName ?? null, endpointId: d.endpoint_id, deviceKind: d.device_kind, deviceOs: d.device_os ?? null, accountPub: d.account_pub, linkedDevices: d.linked_devices,
-    devices: (d.devices ?? []).map(x => ({ friendId: x.friend_id, endpointId: x.endpoint_id, name: x.name, deviceKind: x.device_kind, deviceOs: x.device_os, lastSyncMs: x.last_sync_ms, thisDevice: x.this_device })) } : null
+    devices: (d.devices ?? []).map(x => ({ friendId: x.friend_id, endpointId: x.endpoint_id, name: x.name, deviceKind: x.device_kind, deviceOs: x.device_os, lastSyncMs: x.last_sync_ms, thisDevice: x.this_device, needsApproval: x.needs_approval === true })) } : null
 }
 /** Friends as Swift sees them: own devices flagged and labelled "Your Mac" etc. */
 const friendSnapshot = (friends: Friend[], accountPub?: string | null) => {
