@@ -104,11 +104,42 @@ struct Book {
     /// account key alone (a removed or stolen device, or a fresh endpoint made
     /// with that key) no longer gets anyone in.
     #[serde(default)]
-    link_proofs: HashMap<String, Stamp>,
+    link_proofs: HashMap<String, Vec<Stamp>>,
     /// 0 = a book from before link proofs (legacy rules until upgraded).
     #[serde(default)]
     proofs_v: u8,
+    /// This device's endpoint id: the root every membership chain must reach
+    /// (a proof only counts while its signer is itself a member — so removing
+    /// a device also drops every device only IT vouched for).
+    #[serde(default)]
+    me: String,
+    /// Signed removals (S4): removal times only arrive as these, signed by the
+    /// removed device itself (it left) or by a device still in the account.
+    /// They are also what friends are told, so a removed device can no longer
+    /// pose as the user to them.
+    #[serde(default)]
+    removal_proofs: HashMap<String, Stamp>,
+    /// Devices that prove the account key but no device vouched for (linked by
+    /// an older build, or by a device since removed): shown in Devices as
+    /// "Needs approval" until the user approves or removes them.
+    #[serde(default)]
+    pending_devices: HashMap<String, PendingDevice>,
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub(crate) struct PendingDevice {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    at: u64,
+}
+
+/// Vouchers kept per device (one per signer, newest first).
+const MAX_VOUCHERS: usize = 8;
 
 /// A device's link time, signed by another device of the account (S4).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -119,21 +150,41 @@ pub(crate) struct Stamp {
     sig: String,
 }
 
+impl Stamp {
+    pub(crate) fn new(at: u64, by: &str, sig: &str) -> Stamp {
+        Stamp { at, by: by.to_owned(), sig: sig.to_owned() }
+    }
+}
+
 fn stamp_message(account: &str, eid: &str, at: u64) -> String {
     format!("dropbeam-account-link/1|{account}|{eid}|{at}")
+}
+fn removal_message(account: &str, eid: &str, at: u64) -> String {
+    format!("dropbeam-account-remove/1|{account}|{eid}|{at}")
 }
 
 fn sign_stamp(signer: &iroh::SecretKey, account: &str, eid: &str, at: u64) -> Stamp {
     Stamp { at, by: signer.public().to_string(), sig: hex::encode(signer.sign(stamp_message(account, eid, at).as_bytes()).to_bytes()) }
 }
+fn sign_removal(signer: &iroh::SecretKey, account: &str, eid: &str, at: u64) -> Stamp {
+    Stamp { at, by: signer.public().to_string(), sig: hex::encode(signer.sign(removal_message(account, eid, at).as_bytes()).to_bytes()) }
+}
+
+fn sig_ok(by: &str, message: &str, sig: &str) -> bool {
+    let Ok(key) = by.parse::<iroh::PublicKey>() else { return false };
+    let Some(sig) = hex::decode(sig).ok().and_then(|v| <[u8; 64]>::try_from(v).ok()) else { return false };
+    key.verify(message.as_bytes(), &iroh::Signature::from_bytes(&sig)).is_ok()
+}
 
 /// A well-formed proof for `eid`, signed by some OTHER device (membership of
 /// the signer is the caller's check).
 fn stamp_valid(account: &str, eid: &str, s: &Stamp) -> bool {
-    if s.by == eid { return false; }
-    let Ok(key) = s.by.parse::<iroh::PublicKey>() else { return false };
-    let Some(sig) = hex::decode(&s.sig).ok().and_then(|v| <[u8; 64]>::try_from(v).ok()) else { return false };
-    key.verify(stamp_message(account, eid, s.at).as_bytes(), &iroh::Signature::from_bytes(&sig)).is_ok()
+    s.by != eid && sig_ok(&s.by, &stamp_message(account, eid, s.at), &s.sig)
+}
+/// A well-formed removal of `eid` (signer membership is the caller's check;
+/// a device may always remove itself).
+pub(crate) fn removal_valid(account: &str, eid: &str, s: &Stamp) -> bool {
+    sig_ok(&s.by, &removal_message(account, eid, s.at), &s.sig)
 }
 
 /// The account-wide profile: ONE name and picture for the person, the same on
@@ -205,36 +256,85 @@ impl Book {
         self.removed_devices.get(eid).is_some_and(|r| *r >= self.linked.get(eid).copied().unwrap_or(0))
     }
     /// One of the account's devices right now (S4): not removed and, once
-    /// proofs are in use, vouched for by another device.
+    /// proofs are in use, vouched for by a chain of proofs that reaches this
+    /// device through devices that are all still in the account.
     fn is_member(&self, eid: &str) -> bool {
-        !self.is_removed(eid) && (self.proofs_v == 0 || self.link_proofs.contains_key(eid))
+        if self.is_removed(eid) { return false; }
+        if self.proofs_v == 0 { return true; }
+        if self.me.is_empty() { return self.link_proofs.get(eid).is_some_and(|v| !v.is_empty()); }
+        self.members().contains(eid)
+    }
+    fn members(&self) -> HashSet<String> {
+        let mut set = HashSet::new();
+        if !self.me.is_empty() && !self.is_removed(&self.me) { set.insert(self.me.clone()); }
+        loop {
+            let before = set.len();
+            for (eid, stamps) in &self.link_proofs {
+                if !set.contains(eid) && !self.is_removed(eid) && stamps.iter().any(|p| set.contains(&p.by)) {
+                    set.insert(eid.clone());
+                }
+            }
+            if set.len() == before { return set; }
+        }
+    }
+    /// Merge removals another device sent: only signed ones, by the removed
+    /// device itself or a device still in the account. True if anything changed.
+    fn merge_removals(&mut self, account: &str, me: &str, removals: &HashMap<String, Stamp>) -> bool {
+        let mut changed = false;
+        for (eid, s) in removals {
+            if self.removal_proofs.get(eid).is_some_and(|cur| cur.at >= s.at) { continue; }
+            let signer_ok = s.by == *eid || s.by == me || self.is_member(&s.by);
+            if !signer_ok || !removal_valid(account, eid, s) { continue; }
+            let at = clamp(s.at);
+            let x = self.removed_devices.entry(eid.clone()).or_default();
+            *x = (*x).max(at);
+            self.removal_proofs.insert(eid.clone(), Stamp { at, ..s.clone() });
+            self.pending_devices.remove(eid);
+            changed = true;
+        }
+        changed
     }
     /// Merge link proofs from another device: only ones signed by a device that
     /// is (by this book) still in the account, or by `me`. Repeats until no
     /// more apply, since one proof can vouch for the signer of another.
-    fn merge_proofs(&mut self, account: &str, me: &str, proofs: &HashMap<String, Stamp>) -> bool {
+    fn merge_proofs(&mut self, account: &str, me: &str, proofs: &HashMap<String, Vec<Stamp>>) -> bool {
         let mut changed = false;
         loop {
             let mut progress = false;
-            for (eid, s) in proofs {
-                // (A proof for `me` is kept too: this device forwards it, so a
-                // device that hasn't heard of a relink yet can learn it.)
-                if self.link_proofs.get(eid).is_some_and(|cur| cur.at >= s.at) {
-                    continue;
+            for (eid, stamps) in proofs {
+                for s in stamps.iter().take(MAX_VOUCHERS) {
+                    // One voucher per signer per device; a newer one replaces it.
+                    // (A proof for `me` is kept too: this device forwards it, so
+                    // a device that hasn't heard of a relink yet can learn it.)
+                    if self.link_proofs.get(eid).is_some_and(|v| v.iter().any(|c| c.by == s.by && c.at >= s.at)) {
+                        continue;
+                    }
+                    let signer_ok = s.by == me || self.is_member(&s.by);
+                    if !signer_ok || !stamp_valid(account, eid, s) {
+                        continue;
+                    }
+                    let at = clamp(s.at);
+                    let x = self.linked.entry(eid.clone()).or_default();
+                    *x = (*x).max(at);
+                    self.add_voucher(eid, Stamp { at, ..s.clone() });
+                    self.pending_devices.remove(eid);
+                    progress = true;
+                    changed = true;
                 }
-                let signer_ok = s.by == me || self.is_member(&s.by);
-                if !signer_ok || !stamp_valid(account, eid, s) {
-                    continue;
-                }
-                let at = clamp(s.at);
-                let x = self.linked.entry(eid.clone()).or_default();
-                *x = (*x).max(at);
-                self.link_proofs.insert(eid.clone(), Stamp { at, ..s.clone() });
-                progress = true;
-                changed = true;
             }
             if !progress { return changed; }
         }
+    }
+    fn add_voucher(&mut self, eid: &str, s: Stamp) {
+        let v = self.link_proofs.entry(eid.to_owned()).or_default();
+        v.retain(|c| c.by != s.by);
+        v.push(s);
+        // Bounded: keep the newest few vouchers.
+        v.sort_by_key(|c| std::cmp::Reverse(c.at));
+        v.truncate(MAX_VOUCHERS);
+    }
+    fn my_voucher(&self, eid: &str) -> Option<&Stamp> {
+        self.link_proofs.get(eid).and_then(|v| v.iter().find(|c| c.by == self.me))
     }
 }
 
@@ -250,6 +350,10 @@ fn ensure_proofs(dir: &Path, account: &str, signer: &iroh::SecretKey) {
     let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut b = read_book(dir, account);
     let mut changed = false;
+    if b.me != me {
+        b.me = me.clone();
+        changed = true;
+    }
     if b.proofs_v == 0 {
         // Upgrading: the devices this one already trusted keep their place.
         for eid in own {
@@ -260,11 +364,20 @@ fn ensure_proofs(dir: &Path, account: &str, signer: &iroh::SecretKey) {
         b.proofs_v = 1;
         changed = true;
     }
+    // Vouch only for devices linked HERE (no voucher at all yet), and renew our
+    // own voucher after a relink. Never auto-vouch for a device whose only
+    // vouchers came from devices since removed — that's what transitive
+    // revocation means; the user approves it again in Devices.
     let due: Vec<(String, u64)> = b.linked.iter()
-        .filter(|(e, at)| **e != me && !b.is_removed(e) && b.link_proofs.get(*e).is_none_or(|p| p.at < **at))
+        .filter(|(e, at)| **e != me && !b.is_removed(e) && match b.link_proofs.get(*e) {
+            None => true,
+            Some(v) if v.is_empty() => true,
+            Some(_) => b.my_voucher(e).is_some_and(|p| p.at < **at),
+        })
         .map(|(e, at)| (e.clone(), *at)).collect();
     for (eid, at) in due {
-        b.link_proofs.insert(eid.clone(), sign_stamp(signer, account, &eid, at));
+        let st = sign_stamp(signer, account, &eid, at);
+        b.add_voucher(&eid, st);
         changed = true;
     }
     if changed { write_book(dir, &b); }
@@ -547,9 +660,11 @@ fn read_left(dir: &Path) -> HashMap<String, Value> {
     std::fs::read(left_path(dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-fn record_left(dir: &Path, account: &str, at: u64, since: u64) {
+fn record_left(dir: &Path, account: &str, at: u64, since: u64, proof: Option<Stamp>) {
     let mut all = read_left(dir);
-    all.insert(account.to_owned(), json!({"at": at, "since": since}));
+    // The signed removal (when this device left on its own) rides along, so the
+    // devices that hear the notice can pass it on to the rest (S4).
+    all.insert(account.to_owned(), json!({"at": at, "since": since, "proof": proof}));
     all.retain(|_, v| chat::now_ms().saturating_sub(v["at"].as_u64().unwrap_or(0)) < 365 * 24 * 3600 * 1000);
     if let Ok(bytes) = serde_json::to_vec(&all) {
         let _ = crate::settings::write_atomic(&left_path(dir), &bytes);
@@ -592,6 +707,10 @@ pub(crate) fn apply_left_notice(dir: &Path, who: &str, notice: &Value) -> bool {
         }
         let x = b.removed_devices.entry(who.to_owned()).or_default();
         *x = (*x).max(clamp(at)).max(linked.saturating_add(1));
+        // Signed by the device itself: keep it, so it reaches the other devices.
+        if let Some(p) = serde_json::from_value::<Stamp>(n["proof"].clone()).ok().filter(|p| p.by == who && removal_valid(&account, who, p)) {
+            b.removal_proofs.insert(who.to_owned(), p);
+        }
         true
     });
     if removed {
@@ -616,10 +735,13 @@ fn merge_roster_times_as(dir: &Path, account: &str, me: &str, roster: &Roster, r
     with_book(dir, account, |b| {
         if b.proofs_v == 0 {
             for (e, t) in &roster.linked { let x = b.linked.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
+            for (e, t) in &roster.removed { let x = b.removed_devices.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
         } else {
             b.merge_proofs(account, me, &roster.link_proofs);
+            // Removals only as signed statements (unsigned ones — any device
+            // could make them up — are ignored).
+            b.merge_removals(account, me, &roster.removal_proofs);
         }
-        for (e, t) in &roster.removed { let x = b.removed_devices.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
         for (e, t) in removed_friends { let x = b.removed_friends.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
         b.clone()
     })
@@ -690,7 +812,10 @@ struct Roster {
     removed: HashMap<String, u64>,
     /// Signed link times (S4); older builds ignore them.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    link_proofs: HashMap<String, Stamp>,
+    link_proofs: HashMap<String, Vec<Stamp>>,
+    /// Signed removals (S4); older builds ignore them.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    removal_proofs: HashMap<String, Stamp>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -798,7 +923,7 @@ fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
         account: account.to_owned(),
         me: me.to_owned(),
         meta: Meta {
-            roster: Roster { me: device.clone(), devices, linked: book.linked, removed: book.removed_devices, link_proofs: book.link_proofs },
+            roster: Roster { me: device.clone(), devices, linked: book.linked, removed: book.removed_devices, link_proofs: book.link_proofs, removal_proofs: book.removal_proofs },
             friends: recs,
             removed_friends: book.removed_friends,
             profile: None,
@@ -889,6 +1014,9 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
         // Only devices vouched for in the account (S4); the sender itself was
         // verified before anything was merged.
         if d.eid == local.me || d.eid.parse::<iroh::EndpointId>().is_err() || !(book.is_member(&d.eid) || d.eid == from) {
+            if d.eid != local.me && !book.is_removed(&d.eid) && d.eid.parse::<iroh::EndpointId>().is_ok() {
+                note_pending_device(dir, &d.eid, &d.name, d.kind.as_deref(), d.os.as_deref());
+            }
             continue;
         }
         device_ids.insert(d.eid.clone());
@@ -966,8 +1094,9 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
 /// left so it can tell devices that were offline.
 fn leave_account(dir: &Path, account: &str, me: &str) {
     log::warn!("account: this device left its account; unlinking");
-    let since = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(dir, account).linked.get(me).copied().unwrap_or(0) };
-    record_left(dir, account, chat::now_ms(), since);
+    let (since, proof) = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); let b = read_book(dir, account);
+        (b.linked.get(me).copied().unwrap_or(0), b.removal_proofs.get(me).filter(|p| p.by == me).cloned()) };
+    record_left(dir, account, proof.as_ref().map_or_else(chat::now_ms, |p| p.at), since, proof);
     crate::link::forget_key(dir);
     friends::clear_account(dir, account);
     let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1212,7 +1341,17 @@ async fn client_exchange(ctx: &Ctx, eid: &str, send: &mut iroh::endpoint::SendSt
     match reply["kind"].as_str() {
         Some("account-sync-ok") => {}
         Some("account-sync-removed") => {
-            // The other device removed this one from the account.
+            // The other device says this one was removed. Only believed with a
+            // signed removal from a device this one still counts in the
+            // account (or from itself) — a bare reply would let any key holder
+            // knock devices out (S4).
+            let proof: Option<Stamp> = serde_json::from_value(reply["proof"].clone()).ok();
+            let accepted = proof.is_some_and(|p| with_book(dir, &account, |b| {
+                b.merge_removals(&account, &ctx.me, &HashMap::from([(ctx.me.clone(), p)])) && b.is_removed(&ctx.me)
+            }));
+            if !accepted {
+                anyhow::bail!("account sync refused (unsigned removal)");
+            }
             leave_account(dir, &account, &ctx.me);
             return Ok(Outcome::left());
         }
@@ -1274,7 +1413,12 @@ async fn server_exchange(ctx: &Ctx, who: &str, req: &Value, send: &mut iroh::end
             return Ok(None);
         }
     } else if book.is_removed(who) {
-        iroh_net::write_frame(send, &json!({"kind": "account-sync-removed"})).await?;
+        // Tell it with the signed removal (it won't leave on our word alone).
+        let reply = match book.removal_proofs.get(who) {
+            Some(p) => json!({"kind": "account-sync-removed", "proof": p}),
+            None => json!({"kind": "account-sync-denied"}),
+        };
+        iroh_net::write_frame(send, &reply).await?;
         send.finish()?;
         return Ok(None);
     } else if !book.is_member(who) {
@@ -1431,18 +1575,28 @@ pub struct DeviceView {
     device_os: Option<String>,
     last_sync_ms: Option<u64>,
     this_device: bool,
+    /// Proves the account key but no remaining device vouched for it: the user
+    /// approves (or removes) it before it gets anything.
+    needs_approval: bool,
 }
 
 pub(crate) fn device_views(st: &AppState, me: &str) -> Vec<DeviceView> {
     let s = st.settings.lock().unwrap();
     let mut out = vec![DeviceView { friend_id: None, endpoint_id: me.to_owned(), name: device_name(&s.device_kind),
         device_kind: Some(s.device_kind.clone()), device_os: Some(std::env::consts::OS.to_owned()),
-        last_sync_ms: None, this_device: true }];
+        last_sync_ms: None, this_device: true, needs_approval: false }];
     drop(s);
     for f in own_devices(&st.config_dir) {
         let eid = f.endpoint_id.clone().unwrap_or_default();
         out.push(DeviceView { friend_id: Some(f.id), last_sync_ms: last_sync(&eid), endpoint_id: eid, name: f.name,
-            device_kind: f.device_kind, device_os: f.device_os, this_device: false });
+            device_kind: f.device_kind, device_os: f.device_os, this_device: false, needs_approval: false });
+    }
+    if let Some(account) = my_pub(&st.config_dir) {
+        let b = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(&st.config_dir, &account) };
+        for (eid, p) in b.pending_devices.iter().filter(|(e, _)| !b.is_member(e) && !b.is_removed(e)) {
+            out.push(DeviceView { friend_id: None, endpoint_id: eid.clone(), name: p.name.clone(), device_kind: p.kind.clone(),
+                device_os: p.os.clone(), last_sync_ms: None, this_device: false, needs_approval: true });
+        }
     }
     out
 }
@@ -1463,17 +1617,82 @@ pub fn account_sync_now() {
 #[tauri::command]
 pub fn account_remove_device(app: AppHandle, state: State<'_, Arc<AppState>>, endpoint_id: String) -> Result<(), String> {
     let dir = &state.config_dir;
+    let net = app.try_state::<Arc<IrohState>>().map(|n| n.inner().clone());
+    let signer = net.as_ref().and_then(|n| n.get().map(|e| e.secret_key().clone()));
+    remove_device(dir, &endpoint_id, signer.as_ref())?;
+    let _ = app.emit("friends://changed", ());
+    account_sync_now();
+    // Friends hear it in our next hello (S4): the removed device can no longer
+    // speak for this person to them.
+    if let Some(net) = net { iroh_net::broadcast_profile(app.clone(), net); }
+    Ok(())
+}
+
+/// Remove `eid` from the account here, with a removal signed by this device
+/// (the other devices and friends only believe signed removals).
+pub(crate) fn remove_device(dir: &Path, eid: &str, signer: Option<&iroh::SecretKey>) -> Result<(), String> {
     let account = my_pub(dir).ok_or("This device isn't linked to an account.")?;
     with_book(dir, &account, |b| {
-        let at = b.removed_devices.entry(endpoint_id.clone()).or_default();
-        *at = (*at).max(chat::now_ms()).max(b.linked.get(&endpoint_id).map_or(0, |l| l.saturating_add(1)));
+        let at = chat::now_ms().max(b.removed_devices.get(eid).copied().unwrap_or(0)).max(b.linked.get(eid).map_or(0, |l| l.saturating_add(1)));
+        b.removed_devices.insert(eid.to_owned(), at);
+        if let Some(k) = signer { b.removal_proofs.insert(eid.to_owned(), sign_removal(k, &account, eid, at)); }
+        b.pending_devices.remove(eid);
     });
-    if let Some(f) = friends::load(dir).into_iter().find(|f| f.endpoint_id.as_deref() == Some(endpoint_id.as_str())) {
+    if let Some(f) = friends::load(dir).into_iter().find(|f| f.endpoint_id.as_deref() == Some(eid)) {
         friends::remove(dir, &f.id)?;
     }
+    note_change();
+    Ok(())
+}
+
+/// The user approved a device that proves the account key but that no
+/// remaining device had vouched for ("Needs approval" in Devices): vouch for it.
+pub(crate) fn approve_device(dir: &Path, eid: &str, signer: &iroh::SecretKey) -> Result<(), String> {
+    let account = my_pub(dir).ok_or("This device isn't linked to an account.")?;
+    let pending = with_book(dir, &account, |b| {
+        let p = b.pending_devices.remove(eid);
+        let at = chat::now_ms().max(b.linked.get(eid).copied().unwrap_or(0).saturating_add(1))
+            .max(b.removed_devices.get(eid).map_or(0, |r| r.saturating_add(1)));
+        if p.is_some() { b.linked.insert(eid.to_owned(), at); }
+        if p.is_some() { b.add_voucher(eid, sign_stamp(signer, &account, eid, at)); }
+        p
+    }).ok_or("That device isn't waiting for approval.")?;
+    friends::upsert_own_device(dir, eid, &pending.name, pending.kind.as_deref(), pending.os.as_deref(), &account, chat::now_ms(), true);
+    note_change();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn account_approve_device(app: AppHandle, state: State<'_, Arc<AppState>>, endpoint_id: String) -> Result<(), String> {
+    let signer = app.try_state::<Arc<IrohState>>().and_then(|n| n.get().map(|e| e.secret_key().clone())).ok_or("DropBeam is still connecting — try again in a moment.")?;
+    approve_device(&state.config_dir, &endpoint_id, &signer)?;
     let _ = app.emit("friends://changed", ());
     account_sync_now();
     Ok(())
+}
+
+/// A device proved this account's key (signed hello) but isn't vouched for:
+/// list it as "Needs approval" (never as one of the user's devices yet).
+pub(crate) fn note_pending_device(dir: &Path, eid: &str, name: &str, kind: Option<&str>, os: Option<&str>) {
+    let Some(account) = my_pub(dir) else { return };
+    with_book(dir, &account, |b| {
+        if b.proofs_v == 0 || b.is_member(eid) || b.is_removed(eid) || eid == b.me { return; }
+        if b.pending_devices.len() >= 16 && !b.pending_devices.contains_key(eid) { return; }
+        b.pending_devices.insert(eid.to_owned(), PendingDevice { name: friends::sanitize_display_name(name, "Unknown device"),
+            kind: kind.map(|k| k.chars().take(16).collect()), os: os.map(|o| o.chars().take(16).collect()), at: chat::now_ms() });
+    });
+}
+
+/// The signed removals of this account's devices, for friends (S4): told in
+/// every hello, so a removed device can't keep speaking for this person.
+pub(crate) fn revocation_notice(dir: &Path) -> Value {
+    let Some(account) = my_pub(dir) else { return Value::Null };
+    let b = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(dir, &account) };
+    let mut list: Vec<(&String, &Stamp)> = b.removal_proofs.iter().filter(|(e, _)| b.is_removed(e)).collect();
+    list.sort_by_key(|(_, s)| std::cmp::Reverse(s.at));
+    list.truncate(32);
+    if list.is_empty() { return Value::Null; }
+    json!(list.into_iter().map(|(e, s)| json!({"eid": e, "at": s.at, "by": s.by, "sig": s.sig})).collect::<Vec<_>>())
 }
 
 /// Take this device out of its account (it keeps its data as a standalone device).
@@ -1482,8 +1701,14 @@ pub async fn account_leave(app: AppHandle, state: State<'_, Arc<AppState>>, iroh
     let dir = state.config_dir.clone();
     let account = my_pub(&dir).ok_or("This device isn't linked to an account.")?;
     let me = iroh.get().ok_or("Network not ready")?.id().to_string();
-    // Tell the other devices first (best effort), then forget the key.
-    with_book(&dir, &account, |b| { b.removed_devices.insert(me.clone(), chat::now_ms().max(b.linked.get(&me).map_or(0, |l| l.saturating_add(1)))); });
+    // Tell the other devices first (best effort), then forget the key. The
+    // removal is signed by this device, so they believe it.
+    let signer = iroh.get().map(|e| e.secret_key().clone());
+    with_book(&dir, &account, |b| {
+        let at = chat::now_ms().max(b.linked.get(&me).map_or(0, |l| l.saturating_add(1)));
+        b.removed_devices.insert(me.clone(), at);
+        if let Some(k) = &signer { b.removal_proofs.insert(me.clone(), sign_removal(k, &account, &me, at)); }
+    });
     let net = iroh.inner().clone();
     let targets: Vec<String> = own_devices(&dir).into_iter().filter_map(|f| f.endpoint_id).collect();
     let handles: Vec<_> = targets.into_iter().map(|eid| {
@@ -2235,7 +2460,7 @@ mod edge_tests {
         let ck = c.ep.secret_key().clone();
         with_book(&c.dir, &account, |bk| {
             bk.linked.insert(c.eid(), u64::MAX / 2);
-            bk.link_proofs.insert(c.eid(), sign_stamp(&ck, &account, &c.eid(), u64::MAX / 2));
+            bk.link_proofs.insert(c.eid(), vec![sign_stamp(&ck, &account, &c.eid(), u64::MAX / 2)]);
             bk.removed_devices.insert(b.eid(), u64::MAX / 2);
         });
         let out = sync_unvouched(&c, &a).await;
@@ -2256,12 +2481,99 @@ mod edge_tests {
         friends::apply_device_hello(&a.dir, &w.eid(), &hello);
         assert!(!is_own_device(&a.dir, &w.eid()));
         // A proof for the fake device signed by the removed iPad doesn't help.
-        let forged = HashMap::from([(w.eid(), sign_stamp(&ck, &account, &w.eid(), chat::now_ms()))]);
+        let forged = HashMap::from([(w.eid(), vec![sign_stamp(&ck, &account, &w.eid(), chat::now_ms())])]);
         with_book(&a.dir, &account, |bk| { assert!(!bk.merge_proofs(&account, &a.eid(), &forged)); });
         // But the iPhone (still in) vouching for a real new device works.
         let bk_key = b.ep.secret_key().clone();
-        let real = HashMap::from([(w.eid(), sign_stamp(&bk_key, &account, &w.eid(), chat::now_ms()))]);
+        let real = HashMap::from([(w.eid(), vec![sign_stamp(&bk_key, &account, &w.eid(), chat::now_ms())])]);
         with_book(&a.dir, &account, |bk| { assert!(bk.merge_proofs(&account, &a.eid(), &real)); assert!(bk.is_member(&w.eid())); });
+    }
+
+    /// S4: removing a device also drops every device only IT vouched for
+    /// (until a remaining device approves it again), and removals only count
+    /// when signed by a device still in the account.
+    #[tokio::test]
+    async fn removal_is_transitive_and_must_be_signed() {
+        let k = key();
+        let (a, b, c) = (Dev::new("Mac", "laptop", Some(&k)).await, Dev::new("iPhone", "phone", Some(&k)).await,
+            Dev::new("iPad", "tablet", Some(&k)).await);
+        assert!(sync(&b, &a).await.client.is_ok());
+        assert!(sync(&c, &a).await.client.is_ok());
+        assert!(sync(&b, &a).await.client.is_ok());
+        let account = my_pub(&a.dir).unwrap();
+        // The iPad vouches for a device W (as if it linked it) — the Mac learns it.
+        let w = eid();
+        let ck = c.ep.secret_key().clone();
+        let voucher = HashMap::from([(w.clone(), vec![sign_stamp(&ck, &account, &w, chat::now_ms())])]);
+        with_book(&a.dir, &account, |bk| { assert!(bk.merge_proofs(&account, &a.eid(), &voucher)); assert!(bk.is_member(&w)); });
+        // An unsigned removal, or one signed by a non-member, changes nothing.
+        let stranger = iroh::SecretKey::generate();
+        let fake = HashMap::from([(b.eid(), sign_removal(&stranger, &account, &b.eid(), chat::now_ms()))]);
+        with_book(&a.dir, &account, |bk| { assert!(!bk.merge_removals(&account, &a.eid(), &fake)); assert!(bk.is_member(&b.eid())); });
+        // The Mac removes the iPad: W, vouched for only by the iPad, is out too…
+        remove_device(&a.dir, &c.eid(), Some(a.ep.secret_key())).unwrap();
+        with_book(&a.dir, &account, |bk| { assert!(!bk.is_member(&c.eid())); assert!(!bk.is_member(&w), "transitively revoked"); });
+        // …and ensure_proofs doesn't quietly vouch for it again.
+        ensure_proofs(&a.dir, &account, a.ep.secret_key());
+        with_book(&a.dir, &account, |bk| assert!(!bk.is_member(&w)));
+        // The iPhone learns the signed removal; the removed iPad's own removal of
+        // the iPhone (signed after it was removed) is refused there.
+        assert!(sync(&b, &a).await.client.is_ok());
+        let late = HashMap::from([(a.eid(), sign_removal(&ck, &account, &a.eid(), chat::now_ms()))]);
+        with_book(&b.dir, &account, |bk| {
+            assert!(bk.is_removed(&c.eid()));
+            assert!(!bk.merge_removals(&account, &b.eid(), &late));
+            assert!(bk.is_member(&a.eid()));
+        });
+        // A device that proves the key but isn't vouched for waits for approval.
+        let hello = json!({"device_kind": "tablet", "device_os": "ios", "device_name": "Old iPad", "account_pub": account,
+            "account_sig": crate::link::sign_endpoint(&a.dir, &w).unwrap()});
+        friends::apply_device_hello(&b.dir, &w, &hello);
+        let views = device_views(&b.st, &b.eid());
+        assert!(views.iter().any(|v| v.endpoint_id == w && v.needs_approval));
+        approve_device(&b.dir, &w, b.ep.secret_key()).unwrap();
+        assert!(is_own_device(&b.dir, &w), "approved");
+        assert!(!device_views(&b.st, &b.eid()).iter().any(|v| v.needs_approval));
+    }
+
+    /// S4 toward friends: a friend's removed device stops being that friend.
+    #[tokio::test]
+    async fn friends_drop_a_device_its_owner_removed() {
+        let k = key();
+        let account = hex::encode(k.public().as_bytes());
+        let (mac, phone) = (Dev::new("Mac", "laptop", Some(&k)).await, Dev::new("Stolen", "phone", Some(&k)).await);
+        let friend = Dev::new("Friend", "laptop", None).await;
+        let sig = |d: &Dev| crate::link::sign_endpoint(&d.dir, &d.eid()).unwrap();
+        let f_mac = friends::upsert_by_endpoint(&friend.dir, &mac.eid(), "Mong");
+        friends::apply_device_hello(&friend.dir, &mac.eid(), &json!({"account_pub": account, "account_sig": sig(&mac)}));
+        // The phone joined the person as a proven device.
+        let hello = json!({"account_pub": account, "account_sig": sig(&phone)});
+        assert_eq!(friends::apply_hello_from(&friend.dir, "", &phone.eid(), "Mong", &hello), friends::HelloOutcome::AddedDevice);
+        friends::apply_device_hello(&friend.dir, &phone.eid(), &hello);
+        let p_rec = friend.friend(&phone.eid()).unwrap();
+        chat::append(&friend.dir, &text("p1", &p_rec.id, false, 5));
+        // The Mac removes the phone and says so in its hello.
+        let at = chat::now_ms();
+        let rm = sign_removal(mac.ep.secret_key(), &account, &phone.eid(), at);
+        let mac_hello = json!({"account_pub": account, "account_sig": sig(&mac),
+            "revoked": [{"eid": phone.eid(), "at": at, "by": rm.by, "sig": rm.sig}]});
+        // A forged revocation (signed by a stranger) is ignored first.
+        let stranger = iroh::SecretKey::generate();
+        let bad = sign_removal(&stranger, &account, &phone.eid(), at);
+        assert!(!friends::apply_revocations(&friend.dir, &mac.eid(), &json!({"account_pub": account, "account_sig": sig(&mac),
+            "revoked": [{"eid": phone.eid(), "at": at, "by": bad.by, "sig": bad.sig}]})));
+        assert!(friends::apply_revocations(&friend.dir, &mac.eid(), &mac_hello));
+        assert!(friend.friend(&phone.eid()).is_none(), "no longer poses as Mong");
+        assert!(friend.thread(&mac.eid()).iter().any(|m| m.id == "p1"), "the conversation stays with the person");
+        // Its next hello (still signed with the account key) is just a request.
+        assert_eq!(friends::apply_hello_from(&friend.dir, "", &phone.eid(), "Mong", &hello), friends::HelloOutcome::Requested);
+        friends::apply_device_hello(&friend.dir, &phone.eid(), &hello);
+        assert!(friends::chat_sender(&friend.dir, &phone.eid()).is_none());
+        // And it can't revoke the Mac in turn.
+        let back = sign_removal(phone.ep.secret_key(), &account, &mac.eid(), chat::now_ms());
+        assert!(!friends::apply_revocations(&friend.dir, &phone.eid(), &json!({"account_pub": account, "account_sig": sig(&phone),
+            "revoked": [{"eid": mac.eid(), "at": back.at, "by": back.by, "sig": back.sig}]})));
+        assert_eq!(friends::chat_sender(&friend.dir, &mac.eid()).unwrap().id, f_mac.id);
     }
 
     /// Removing a device: every device drops it, it learns it left, and it
@@ -2277,8 +2589,8 @@ mod edge_tests {
         // The Mac removes the iPad.
         std::thread::sleep(Duration::from_millis(5));
         let account = my_pub(&a.dir).unwrap();
-        with_book(&a.dir, &account, |bk| { bk.removed_devices.insert(c.eid(), chat::now_ms()); });
-        friends::remove(&a.dir, &a.friend(&c.eid()).unwrap().id).unwrap();
+        remove_device(&a.dir, &c.eid(), Some(a.ep.secret_key())).unwrap();
+        assert!(a.friend(&c.eid()).is_none());
         assert!(sync(&b, &a).await.client.is_ok());
         assert_eq!(b.own_device_ids(), [a.eid()], "the iPhone drops it too");
         // The iPad reaches the iPhone: it's told, and leaves (keeping its data).
@@ -2311,7 +2623,12 @@ mod edge_tests {
         assert!(sync(&b, &a).await.client.is_ok());
         // The iPad leaves with nobody reachable.
         let account = my_pub(&c.dir).unwrap();
-        with_book(&c.dir, &account, |bk| { bk.removed_devices.insert(c.eid(), chat::now_ms()); });
+        let ck = c.ep.secret_key().clone();
+        with_book(&c.dir, &account, |bk| {
+            let at = chat::now_ms();
+            bk.removed_devices.insert(c.eid(), at);
+            bk.removal_proofs.insert(c.eid(), sign_removal(&ck, &account, &c.eid(), at));
+        });
         leave_account(&c.dir, &account, &c.eid());
         assert!(my_pub(&c.dir).is_none());
         assert!(c.friend(&f).is_some(), "it keeps its friends");

@@ -54,6 +54,10 @@ export function DevicesPanel() {
     try { await api.accountRemoveDevice(d.endpoint_id); useStore.getState().toast('success', `${label} was removed from your account`); await useStore.getState().reloadFriends() }
     catch (e) { useStore.getState().toast('error', String(e)) }
   }
+  const approve = async (d: AccountDevice) => {
+    try { await api.accountApproveDevice(d.endpoint_id); useStore.getState().toast('success', `${d.name} is now one of your devices`); await useStore.getState().reloadFriends() }
+    catch (e) { useStore.getState().toast('error', String(e)) }
+  }
   const leave = async () => {
     try { await api.accountLeave(); useStore.getState().toast('success', `This ${myNoun} left your account`); await useStore.getState().reloadFriends() }
     catch (e) { useStore.getState().toast('error', String(e)) }
@@ -68,7 +72,8 @@ export function DevicesPanel() {
       {inAccount ? devices.map(d => {
         const title = d.this_device ? thisTitle : labels[d.endpoint_id] ?? `Your ${deviceNoun(d.device_kind, d.device_os)}`
         const on = !d.this_device && online(d)
-        const sub = d.this_device ? d.name : [on ? 'Online' : 'Offline', d.last_sync_ms ? `Synced ${ago(d.last_sync_ms)}` : 'Not synced yet'].join(' · ')
+        const sub = d.this_device ? d.name : d.needs_approval ? `${d.name} · Needs approval — only approve it if it’s yours`
+          : [on ? 'Online' : 'Offline', d.last_sync_ms ? `Synced ${ago(d.last_sync_ms)}` : 'Not synced yet'].join(' · ')
         return <div key={d.endpoint_id} className="row">
           <DeviceGlyph d={d} online={on} />
           <div className="row-main">
@@ -76,6 +81,7 @@ export function DevicesPanel() {
             <div className="row-sub truncate-1">{sub}</div>
           </div>
           <div className="row-trailing">
+            {d.needs_approval && <button className="btn btn-secondary btn-sm" onClick={() => void approve(d)}>Approve</button>}
             <MenuButton
               label={`Options for ${title}`}
               items={d.this_device

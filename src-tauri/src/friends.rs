@@ -801,6 +801,7 @@ pub fn apply_hello_from(config_dir: &Path, friend_id: &str, endpoint_id: &str, n
     // with their auto-accept choice, so one person stays one person.
     let proven = req["account_pub"].as_str().filter(|key| {
         crate::link::verify_account(key, req["account_sig"].as_str().unwrap_or(""), endpoint_id)
+            && !is_revoked(config_dir, key, endpoint_id)
     });
     if let Some(account) = proven.filter(|a| crate::account::my_pub(config_dir).as_deref() != Some(*a)) {
         let person = read_raw(config_dir).into_iter().find(|f| f.account_pub.as_deref() == Some(account) && f.endpoint_id.is_some());
@@ -813,6 +814,77 @@ pub fn apply_hello_from(config_dir: &Path, friend_id: &str, endpoint_id: &str, n
     }
     add_request(config_dir, endpoint_id, name, proven);
     HelloOutcome::Requested
+}
+
+// ── friends' removed devices (S4) ──────────────────────────────────────────
+
+/// Devices friends removed from THEIR accounts: account → device → when. A
+/// removed (e.g. stolen) device still holds that account's key, so without
+/// this it could keep posing as the person to every friend.
+fn revocations_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("account-revocations.json")
+}
+fn read_revocations(config_dir: &Path) -> HashMap<String, HashMap<String, u64>> {
+    fs::read(revocations_path(config_dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// A friend removed `eid` from their account `account`.
+pub(crate) fn is_revoked(config_dir: &Path, account: &str, eid: &str) -> bool {
+    read_revocations(config_dir).get(account).is_some_and(|m| m.contains_key(eid))
+}
+
+/// The signed removals a friend's device `who` lists in its hello (`revoked`):
+/// believed when signed by the removed device itself, by `who` (which proves
+/// the account in this very hello), or by another device we know as that
+/// person — and the signer isn't itself removed (first removal wins). The
+/// removed device stops counting as the person: its record goes (its thread
+/// folds into the person's). Returns true if anything changed.
+pub(crate) fn apply_revocations(config_dir: &Path, who: &str, req: &serde_json::Value) -> bool {
+    let Some(list) = req["revoked"].as_array() else { return false };
+    let Some(account) = req["account_pub"].as_str().filter(|key| {
+        crate::link::verify_account(key, req["account_sig"].as_str().unwrap_or(""), who)
+    }) else { return false };
+    if crate::account::my_pub(config_dir).as_deref() == Some(account) || is_revoked(config_dir, account, who) {
+        return false;
+    }
+    let known: Vec<String> = read_raw(config_dir).into_iter()
+        .filter(|f| f.account_pub.as_deref() == Some(account)).filter_map(|f| f.endpoint_id).collect();
+    let mut all = read_revocations(config_dir);
+    let mut newly = vec![];
+    for r in list.iter().take(64) {
+        let (Some(eid), Some(at), Some(by), Some(sig)) = (r["eid"].as_str(), r["at"].as_u64(), r["by"].as_str(), r["sig"].as_str()) else { continue };
+        if eid == who || all.get(account).is_some_and(|m| m.contains_key(eid)) { continue; }
+        let signer_known = by == eid || by == who || known.iter().any(|k| k == by);
+        let signer_removed = all.get(account).is_some_and(|m| m.contains_key(by));
+        let stamp = crate::account::Stamp::new(at, by, sig);
+        if !signer_known || signer_removed || !crate::account::removal_valid(account, eid, &stamp) { continue; }
+        let m = all.entry(account.to_owned()).or_default();
+        if m.len() >= 64 { continue; }
+        m.insert(eid.to_owned(), at);
+        newly.push(eid.to_owned());
+    }
+    if newly.is_empty() { return false; }
+    if all.len() > 256 {
+        let mut keys: Vec<String> = all.keys().cloned().collect();
+        keys.sort();
+        for k in keys.into_iter().take(all.len() - 256) { if k != account { all.remove(&k); } }
+    }
+    if let Ok(bytes) = serde_json::to_vec(&all) {
+        let _ = crate::settings::write_atomic(&revocations_path(config_dir), &bytes);
+    }
+    for eid in newly {
+        let records = read_raw(config_dir);
+        let Some(rec) = records.iter().find(|f| f.endpoint_id.as_deref() == Some(eid.as_str()) && f.account_pub.as_deref() == Some(account)).cloned() else { continue };
+        // Keep the conversation with the person: fold it into one of their
+        // remaining devices before the removed device's record goes.
+        if let Some(heir) = records.iter().filter(|f| f.id != rec.id && f.account_pub.as_deref() == Some(account) && f.endpoint_id.is_some())
+            .min_by_key(|f| f.endpoint_id.clone()) {
+            crate::chat::fold_thread(config_dir, &rec.id, &heir.id);
+        }
+        let _ = remove(config_dir, &rec.id);
+    }
+    fold_person_threads(config_dir);
+    true
 }
 
 // ── friend requests (S2) ───────────────────────────────────────────────────
@@ -1706,9 +1778,21 @@ pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &ser
     let key = req["account_pub"].as_str().filter(|key| {
         crate::link::verify_account(key, req["account_sig"].as_str().unwrap_or(""), endpoint_id)
     });
+    // One of OUR account's devices that no remaining device vouched for (an
+    // older build linked it, or the device that did was removed): list it for
+    // approval instead of trusting the key alone (S4).
+    if let Some(k) = key {
+        if crate::account::my_pub(config_dir).as_deref() == Some(k) && crate::account::is_removed_device(config_dir, k, endpoint_id)
+            && !crate::account::device_was_removed(config_dir, endpoint_id) {
+            crate::account::note_pending_device(config_dir, endpoint_id, req["device_name"].as_str().unwrap_or(""),
+                req["device_kind"].as_str(), req["device_os"].as_str());
+        }
+    }
     // A device the user removed from their account stays a plain contact even
-    // though it still holds the key, until it is linked again.
-    let key = key.filter(|k| !crate::account::is_removed_device(config_dir, k, endpoint_id));
+    // though it still holds the key, until it is linked again — and a device a
+    // FRIEND removed from their account (signed revocation) no longer counts
+    // as that friend (S4).
+    let key = key.filter(|k| !crate::account::is_removed_device(config_dir, k, endpoint_id) && !is_revoked(config_dir, k, endpoint_id));
     set_device_info(config_dir, endpoint_id, req["device_kind"].as_str(), key);
     // A device that no longer proves an account (left it, or was removed) stops
     // counting as part of that person / as one of our devices. Only a hello from

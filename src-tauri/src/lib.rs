@@ -952,6 +952,7 @@ pub fn run() {
             link::link_device_send,
             link::link_device_prepare,
             link::link_confirm,
+            crate::account::account_approve_device,
             link::my_device_info,
             commands::verify_folders,
             commands::verify_folder,

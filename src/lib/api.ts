@@ -279,6 +279,9 @@ export interface AccountDevice {
   device_os: string | null
   last_sync_ms: number | null
   this_device: boolean
+  /** Proves the account key but no remaining device vouched for it (linked by
+   *  an older build, or by a device since removed): approve or remove it. */
+  needs_approval?: boolean
 }
 export interface MyDeviceInfo extends LinkResult { account_pub: string; linked_devices: number; device_os?: string; devices?: AccountDevice[]
   /** The person's name — the same on every device in the account. `name` is this device's own name. */
@@ -586,6 +589,7 @@ const realApi = {
   linkDeviceJoin: (code: string) => invoke<LinkResult>('link_device_join', { code }),
   accountSyncNow: () => invoke<void>('account_sync_now'),
   accountRemoveDevice: (endpointId: string) => invoke<void>('account_remove_device', { endpointId }),
+  accountApproveDevice: (endpointId: string) => invoke<void>('account_approve_device', { endpointId }),
   accountLeave: () => invoke<void>('account_leave'),
   myDeviceInfo: () => invoke<MyDeviceInfo>('my_device_info'),
   // Friends — named peers you send to directly.
@@ -711,6 +715,7 @@ const backend: typeof realApi = HAS_TAURI ? realApi : ({
   linkDeviceJoin: previewLink,
   accountSyncNow: async () => {},
   accountRemoveDevice: async () => {},
+  accountApproveDevice: async () => {},
   accountLeave: async () => {},
   myDeviceInfo: async () => previewParam('devices') === '0' ? ({
     endpoint_id: 'preview', name: "Ashton's MacBook Pro", device_kind: 'laptop', account_pub: '', linked_devices: 0, device_os: 'macos', devices: [], display_name: 'Ashton',

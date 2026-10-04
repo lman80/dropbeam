@@ -247,6 +247,8 @@ const handlers: BridgeHandlers = {
   linkDeviceJoin: async a => linked(await linkWithCode(string(a, 'code'))),
   accountSyncNow: async () => { await api.accountSyncNow(); await st().refreshMyDevice() },
   accountRemoveDevice: async a => { await api.accountRemoveDevice(string(a, 'endpointId')); await st().reloadFriends() },
+  // S4: a device in Settings → Devices marked needs_approval (myDevice.devices[].needs_approval).
+  accountApproveDevice: async a => { await api.accountApproveDevice(string(a, 'endpointId')); await st().reloadFriends() },
   accountLeave: async () => { await api.accountLeave(); await st().reloadFriends() },
   updateSettings: a => {
     if (!a.patch || typeof a.patch !== 'object' || Array.isArray(a.patch)) throw new Error('Invalid settings patch')

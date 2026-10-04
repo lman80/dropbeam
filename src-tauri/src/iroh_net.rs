@@ -3572,6 +3572,8 @@ async fn serve_stream_inner(
                     }
                     let outcome = crate::friends::apply_hello_from(&st.config_dir, friend_id, &who, name, &req);
                     crate::friends::apply_device_hello(&st.config_dir, &who, &req);
+                    // A friend's devices they removed from their account (S4).
+                    crate::friends::apply_revocations(&st.config_dir, &who, &req);
                     // S2: someone new is a request the user accepts or declines.
                     if outcome == crate::friends::HelloOutcome::Requested {
                         let _ = app.emit("friend-requests://changed", ());

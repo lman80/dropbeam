@@ -372,6 +372,10 @@ pub(crate) fn profile(state: &IrohState, endpoint: &str) -> Value {
     drop(_guard);
     let left = crate::account::left_notice(&st.config_dir);
     if !left.is_null() { out["left_accounts"] = left; }
+    // Devices removed from this account, signed, so friends stop treating a
+    // removed (maybe stolen) device as this person (S4).
+    let revoked = crate::account::revocation_notice(&st.config_dir);
+    if !revoked.is_null() { out["revoked"] = revoked; }
     out
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
