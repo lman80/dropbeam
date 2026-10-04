@@ -7885,7 +7885,9 @@ fn fit_name(name: &str, suffix: &str) -> String {
 /// visible it self-synced), plus any `.dropbeam-*` staging/incoming placeholder.
 /// Match is on ANY path component so a nested `sub/.dropbeam-history/x` is caught.
 pub(crate) fn is_control_rel(rel: &str) -> bool {
-    rel.split('/').any(|c| {
+    // `\` too: a Windows-built rel (`PathBuf::to_string_lossy`) joins with it,
+    // and "sub\.dropbeam-incoming" must still be recognised as ours.
+    rel.split(['/', '\\']).any(|c| {
         c.starts_with(".dropbeam") || c == "dropbeam-history"
     })
 }
@@ -8133,7 +8135,9 @@ fn receive_candidates(natural: &Path, limit: usize) -> impl Iterator<Item = Path
 /// Split a receive name into (parent dir under `dir`, leaf name) using the
 /// same sanitising as every other landing path; never escapes `dir`.
 fn unique_in_parts(dir: &Path, name: &str) -> (PathBuf, String) {
-    // `name` is already receive_rel'd by the caller; receive_rel is idempotent.
+    // `name` is already receive_rel_wire'd by the caller (`/`-joined — a
+    // `\`-joined Windows PathBuf string would be ONE mangled name here);
+    // the mapping is idempotent on it.
     // (sanitize_rel here dropped any component containing ':' — a big parallel
     // "Meeting 9:23.mov" landed as a bare "file".)
     let rel = receive_rel(name);
@@ -11716,14 +11720,16 @@ mod tests {
     fn unique_in_parts_keeps_colon_names_and_subfolders() {
         use std::path::Path;
         let dir = Path::new("/dl");
-        #[cfg(not(windows))]
+        // (Windows can't hold the colon: it lands mangled, never as "file".)
         assert_eq!(
-            unique_in_parts(dir, &receive_rel("Meeting 9:23.mov").to_string_lossy()),
-            (dir.to_path_buf(), "Meeting 9:23.mov".to_string()),
+            unique_in_parts(dir, &receive_rel_wire("Meeting 9:23.mov")),
+            (dir.to_path_buf(), if cfg!(windows) { "Meeting 9-23.mov" } else { "Meeting 9:23.mov" }.to_string()),
             "a big (parallel) colon file must not land as a bare 'file'"
         );
+        // Callers hand it the `/`-joined wire form (a Windows `\\`-joined
+        // receive_rel would read as one name containing backslashes).
         assert_eq!(
-            unique_in_parts(dir, &receive_rel("Project/clips/a.mp4").to_string_lossy()),
+            unique_in_parts(dir, &receive_rel_wire("Project/clips/a.mp4")),
             (dir.join("Project/clips"), "a.mp4".to_string())
         );
         // Idempotent on already-mapped names; traversal still can't escape.
@@ -11860,11 +11866,10 @@ mod tests {
         // leading dot (stays hidden) and a colon (kept on macOS).
         assert_eq!(folder_receive_rel("sub/a.txt").as_deref(), Some(Path::new("sub/a.txt")));
         assert_eq!(folder_receive_rel(".hidden.bin").as_deref(), Some(Path::new(".hidden.bin")));
-        #[cfg(not(windows))]
         assert_eq!(
             folder_receive_rel("report 7:3.pdf").as_deref(),
-            Some(Path::new("report 7:3.pdf")),
-            "colon preserved on macOS — no corruption to 'file'"
+            Some(Path::new(if cfg!(windows) { "report 7-3.pdf" } else { "report 7:3.pdf" })),
+            "colon preserved on macOS (mangled to a real name on Windows) — no corruption to 'file'"
         );
         // Traversal still blocked.
         assert_eq!(folder_receive_rel("../../etc/passwd").as_deref(), Some(Path::new("etc/passwd")));
@@ -11880,6 +11885,8 @@ mod tests {
         assert!(is_control_rel(".dropbeam-history/data/abc"));
         assert!(is_control_rel("dropbeam-history/index.json")); // dotless leaked form
         assert!(is_control_rel("a/.dropbeam-incoming"));
+        assert!(is_control_rel("dropbeam-history\\index.json")); // a Windows-joined rel
+        assert!(is_control_rel("a\\.dropbeam-incoming"));
         assert!(!is_control_rel("normal/file.txt"));
         assert!(!is_control_rel("my-history/notes.txt")); // similar name, not ours
     }
@@ -14299,7 +14306,10 @@ mod loopback_tests {
                             let written = std::fs::metadata(&disk_path).map(|m| m.len()).unwrap_or_else(|_| {
                                 std::fs::read_dir(disk_path.parent().unwrap()).unwrap().flatten()
                                     .filter(|e| e.file_name().to_string_lossy().starts_with(".dropbeam-recv-"))
-                                    .map(|e| e.metadata().unwrap().len()).sum()
+                                    // A fresh stat, not the dir entry's: Windows
+                                    // directory listings report a file's size as of
+                                    // its last close, not the bytes written so far.
+                                    .map(|e| std::fs::metadata(e.path()).unwrap().len()).sum()
                             });
                             assert!(written >= done, "classic progress includes unflushed buffer bytes");
                         }
