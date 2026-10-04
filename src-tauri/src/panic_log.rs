@@ -173,9 +173,11 @@ mod tests {
         assert!(text.contains("original worker panic"));
         assert!(text.contains("PoisonError"));
         assert!(text.contains("non-string panic payload"));
-        // Exactly one backtrace, attached to the first (root-cause) panic.
-        assert_eq!(text.matches("backtrace:").count(), 1, "{text}");
-        let first_bt = text.find("backtrace:").unwrap();
+        // Exactly one backtrace, attached to the first (root-cause) panic. Match
+        // the header LINE: symbolized frames ("std::backtrace_rs::backtrace::…",
+        // as Windows prints them) contain "backtrace:" too.
+        assert_eq!(text.matches("\nbacktrace:\n").count(), 1, "{text}");
+        let first_bt = text.find("\nbacktrace:\n").unwrap();
         assert!(first_bt > text.find("original worker panic").unwrap());
         assert!(first_bt < text.find("PoisonError").unwrap());
         assert!(disk.ends_with(b"\n"));

@@ -917,6 +917,9 @@ fn remote_error_is_independent(remote: &anyhow::Error) -> bool {
         "connection lost",
         "unexpected end of stream",
         "aborted",
+        // A range stream that our side abandoned mid-segment (an aborted sibling
+        // of the failed one) reads as a short segment on the receiver.
+        "ended early",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -931,7 +934,20 @@ async fn write_and_receipt<T>(
     tokio::pin!(write, receipt);
     tokio::select! {
         biased;
-        r = &mut receipt => { r?; write.await }
+        r = &mut receipt => match r {
+            Ok(()) => write.await,
+            // The receiver saw our stream die before our writer surfaced WHY
+            // (a range task's error reaches us via the worker drain). Prefer
+            // our own diagnosis — "changed while sending", "canceled" — when
+            // the remote error is only that echo.
+            Err(remote) if !remote_error_is_independent(&remote) => {
+                match tokio::time::timeout(Duration::from_secs(5), &mut write).await {
+                    Ok(Err(local)) => Err(local),
+                    _ => Err(remote),
+                }
+            }
+            Err(remote) => Err(remote),
+        },
         w = &mut write => {
             match w {
                 Ok(value) => { receipt.await?; Ok(value) }
@@ -7906,7 +7922,9 @@ fn fit_name(name: &str, suffix: &str) -> String {
 /// visible it self-synced), plus any `.dropbeam-*` staging/incoming placeholder.
 /// Match is on ANY path component so a nested `sub/.dropbeam-history/x` is caught.
 pub(crate) fn is_control_rel(rel: &str) -> bool {
-    rel.split('/').any(|c| {
+    // `\` too: a Windows-built rel (`PathBuf::to_string_lossy`) joins with it,
+    // and "sub\.dropbeam-incoming" must still be recognised as ours.
+    rel.split(['/', '\\']).any(|c| {
         c.starts_with(".dropbeam") || c == "dropbeam-history"
     })
 }
@@ -8154,7 +8172,9 @@ fn receive_candidates(natural: &Path, limit: usize) -> impl Iterator<Item = Path
 /// Split a receive name into (parent dir under `dir`, leaf name) using the
 /// same sanitising as every other landing path; never escapes `dir`.
 fn unique_in_parts(dir: &Path, name: &str) -> (PathBuf, String) {
-    // `name` is already receive_rel'd by the caller; receive_rel is idempotent.
+    // `name` is already receive_rel_wire'd by the caller (`/`-joined — a
+    // `\`-joined Windows PathBuf string would be ONE mangled name here);
+    // the mapping is idempotent on it.
     // (sanitize_rel here dropped any component containing ':' — a big parallel
     // "Meeting 9:23.mov" landed as a bare "file".)
     let rel = receive_rel(name);
@@ -9001,10 +9021,21 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
     leaves: Option<integrity::Leaves>,
 ) -> Result<()> {
     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(base));
+    // The receiver finalizes the moment every byte is covered, so a file written
+    // to mid-send (same inode) must be caught BEFORE the last byte of any range
+    // leaves — else a mix of two versions lands (and passes integrity, which
+    // hashes what was read). One stamp for the whole plan; each range holds back
+    // its final chunk until its own handle still matches it.
+    let stamp = if plan.iter().any(|&(_, len)| len > 0) {
+        let m = open_for_send(path).await?.metadata().await?;
+        Some((m.modified().ok(), m.len()))
+    } else { None };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
     for &(start, len) in plan {
         let conn = conn.clone();
         let path = path.to_path_buf();
+        let name = name.clone();
         let progress = progress.clone();
         let leaves = leaves.clone();
         let source = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten();
@@ -9012,34 +9043,49 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
             let mut hash = leaves.map(|l| integrity::Blocks::new(start, l)).transpose()?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut uni = conn.open_uni().await?;
-            // The explicit length lets the receiver write EXACTLY its region and
-            // reject an over- or under-sending peer, instead of trusting EOF.
-            uni.write_all(&start.to_be_bytes()).await?;
-            uni.write_all(&len.to_be_bytes()).await?;
-            if len > 0 {
-                let mut f = open_for_send(&path).await?;
-                f.seek(std::io::SeekFrom::Start(start)).await?;
-                let mut remaining = len;
-                let mut buf = vec![0u8; CHUNK];
-                while remaining > 0 {
-                    let want = remaining.min(CHUNK as u64) as usize;
-                    let k = f.read(&mut buf[..want]).await?;
-                    if k == 0 {
-                        anyhow::bail!("file ended early while sending segment");
+            let body: Result<()> = async {
+                // The explicit length lets the receiver write EXACTLY its region and
+                // reject an over- or under-sending peer, instead of trusting EOF.
+                uni.write_all(&start.to_be_bytes()).await?;
+                uni.write_all(&len.to_be_bytes()).await?;
+                if len > 0 {
+                    let mut f = open_for_send(&path).await?;
+                    f.seek(std::io::SeekFrom::Start(start)).await?;
+                    let mut remaining = len;
+                    let mut buf = vec![0u8; CHUNK];
+                    while remaining > 0 {
+                        let want = remaining.min(CHUNK as u64) as usize;
+                        let k = f.read(&mut buf[..want]).await?;
+                        if k == 0 {
+                            anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
+                        }
+                        if k as u64 == remaining {
+                            let now = f.metadata().await?;
+                            anyhow::ensure!(stamp == Some((now.modified().ok(), now.len())),
+                                "\"{name}\" changed while sending — try again");
+                        }
+                        if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
+                        if pace {
+                            pace_bytes(k as u64).await;
+                        }
+                        write_payload(&mut uni, &buf[..k], |n| {
+                            progress.fetch_add(n, Ordering::Relaxed);
+                        })
+                        .await?;
+                        remaining -= k as u64;
                     }
-                    if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
-                    if pace {
-                        pace_bytes(k as u64).await;
-                    }
-                    write_payload(&mut uni, &buf[..k], |n| {
-                        progress.fetch_add(n, Ordering::Relaxed);
-                    })
-                    .await?;
-                    remaining -= k as u64;
                 }
+                if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(&path)?; }
+                if let Some(hash) = hash { hash.finish(); }
+                Ok(())
+            }.await;
+            if body.is_err() {
+                // Dropping an unfinished stream FINISHES it gracefully: the
+                // receiver would read a short segment ("ended early") instead
+                // of the reset that marks it as our own failure's echo.
+                let _ = uni.reset(1u32.into());
             }
-            if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(&path)?; }
-            if let Some(hash) = hash { hash.finish(); }
+            body?;
             uni.finish()?;
             // Keep the stream alive until the peer has acked the segment, so the
             // last bytes aren't dropped by an early reset when the task ends.
@@ -9112,7 +9158,7 @@ fn spawn_range_reader(
             match uni.read(&mut buf[..want]).await? {
                 Some(k) if k > 0 => {
                     #[cfg(test)]
-                    xfer_matrix::throttle(&part).await;
+                    xfer_matrix::throttle(&part, k).await;
                     f.write_all(&buf[..k]).await?;
                     if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
                     done += k as u64;
@@ -9676,6 +9722,22 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             if n == 0 {
                 anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
             }
+            // Written to WHILE we read it (same inode, new mtime or length): what
+            // we read mixes two versions, and would still pass the integrity check
+            // (it hashes what was READ). The receiver publishes an item the moment
+            // its LAST advertised byte arrives, so the check must happen BEFORE
+            // that byte leaves: hold the final chunk back until the source is
+            // proven unchanged since we opened it, else fail (the reset below
+            // makes the receiver drop its stage — nothing mixed ever lands; the
+            // retry re-reads it whole). An atomic save (new inode) keeps our
+            // handle on the old, consistent version; an edit before we opened it
+            // simply sends the newer bytes.
+            if n as u64 == remaining {
+                if let (Some(before), Ok(after)) = (opened, f.metadata().await) {
+                    anyhow::ensure!(before == (after.modified().ok(), after.len()),
+                        "\"{name}\" changed while sending — try again");
+                }
+            }
             if let Some(hash) = &mut hash { hash.update(&buf[..n]); }
             if let Some(plain) = &mut plain { plain.update(&buf[..n]); }
             if pace {
@@ -9687,15 +9749,6 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             })
             .await?;
             remaining -= n as u64;
-        }
-        // Written to WHILE we read it (same inode, new mtime or length): what
-        // went out mixes two versions, and would still pass the integrity check
-        // (it hashes what was READ). Fail loudly — the retry re-reads it whole.
-        // An atomic save (new inode) keeps our handle on the old, consistent
-        // version; an edit before we opened it simply sends the newer bytes.
-        if let (Some(before), Ok(after)) = (opened, f.metadata().await) {
-            anyhow::ensure!(before == (after.modified().ok(), after.len()),
-                "\"{name}\" changed while sending — try again");
         }
         if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(path)?; }
         if let Some(hash) = hash {
@@ -9809,7 +9862,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             match read {
                 Ok(Some(n)) if n > 0 => {
                     #[cfg(test)]
-                    xfer_matrix::throttle(&dest).await;
+                    xfer_matrix::throttle(&dest, n).await;
                     if let Err(e) = f.write_all(&buf[..n]).await {
                         failed = Some(e.into());
                         break;
@@ -11704,14 +11757,16 @@ mod tests {
     fn unique_in_parts_keeps_colon_names_and_subfolders() {
         use std::path::Path;
         let dir = Path::new("/dl");
-        #[cfg(not(windows))]
+        // (Windows can't hold the colon: it lands mangled, never as "file".)
         assert_eq!(
-            unique_in_parts(dir, &receive_rel("Meeting 9:23.mov").to_string_lossy()),
-            (dir.to_path_buf(), "Meeting 9:23.mov".to_string()),
+            unique_in_parts(dir, &receive_rel_wire("Meeting 9:23.mov")),
+            (dir.to_path_buf(), if cfg!(windows) { "Meeting 9-23.mov" } else { "Meeting 9:23.mov" }.to_string()),
             "a big (parallel) colon file must not land as a bare 'file'"
         );
+        // Callers hand it the `/`-joined wire form (a Windows `\\`-joined
+        // receive_rel would read as one name containing backslashes).
         assert_eq!(
-            unique_in_parts(dir, &receive_rel("Project/clips/a.mp4").to_string_lossy()),
+            unique_in_parts(dir, &receive_rel_wire("Project/clips/a.mp4")),
             (dir.join("Project/clips"), "a.mp4".to_string())
         );
         // Idempotent on already-mapped names; traversal still can't escape.
@@ -11848,11 +11903,10 @@ mod tests {
         // leading dot (stays hidden) and a colon (kept on macOS).
         assert_eq!(folder_receive_rel("sub/a.txt").as_deref(), Some(Path::new("sub/a.txt")));
         assert_eq!(folder_receive_rel(".hidden.bin").as_deref(), Some(Path::new(".hidden.bin")));
-        #[cfg(not(windows))]
         assert_eq!(
             folder_receive_rel("report 7:3.pdf").as_deref(),
-            Some(Path::new("report 7:3.pdf")),
-            "colon preserved on macOS — no corruption to 'file'"
+            Some(Path::new(if cfg!(windows) { "report 7-3.pdf" } else { "report 7:3.pdf" })),
+            "colon preserved on macOS (mangled to a real name on Windows) — no corruption to 'file'"
         );
         // Traversal still blocked.
         assert_eq!(folder_receive_rel("../../etc/passwd").as_deref(), Some(Path::new("etc/passwd")));
@@ -11868,6 +11922,8 @@ mod tests {
         assert!(is_control_rel(".dropbeam-history/data/abc"));
         assert!(is_control_rel("dropbeam-history/index.json")); // dotless leaked form
         assert!(is_control_rel("a/.dropbeam-incoming"));
+        assert!(is_control_rel("dropbeam-history\\index.json")); // a Windows-joined rel
+        assert!(is_control_rel("a\\.dropbeam-incoming"));
         assert!(!is_control_rel("normal/file.txt"));
         assert!(!is_control_rel("my-history/notes.txt")); // similar name, not ours
     }
@@ -14301,7 +14357,10 @@ mod loopback_tests {
                             let written = std::fs::metadata(&disk_path).map(|m| m.len()).unwrap_or_else(|_| {
                                 std::fs::read_dir(disk_path.parent().unwrap()).unwrap().flatten()
                                     .filter(|e| e.file_name().to_string_lossy().starts_with(".dropbeam-recv-"))
-                                    .map(|e| e.metadata().unwrap().len()).sum()
+                                    // A fresh stat, not the dir entry's: Windows
+                                    // directory listings report a file's size as of
+                                    // its last close, not the bytes written so far.
+                                    .map(|e| std::fs::metadata(e.path()).unwrap().len()).sum()
                             });
                             assert!(written >= done, "classic progress includes unflushed buffer bytes");
                         }
