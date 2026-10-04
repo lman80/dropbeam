@@ -44,6 +44,17 @@ const MAX_FILE_NAME_CHARS: usize = 255;
 fn take_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
+/// A peer's Lamport `seq`, bounded: at most a million ahead of ours, so a
+/// forged u64::MAX can't pin (or overflow) the thread's ordering clock.
+pub fn cap_seq(theirs: u64, next_local: u64) -> u64 {
+    theirs.min(next_local.saturating_add(1_000_000)).max(next_local)
+}
+/// A peer's wall-clock `ts`, bounded to at most a day in the future (it orders
+/// the thread and read receipts compare against it).
+pub fn cap_ts(theirs: u64) -> u64 {
+    theirs.min(now_ms().saturating_add(24 * 3600 * 1000))
+}
+
 /// A message's text, bounded.
 pub fn cap_text(s: &str) -> String {
     take_chars(s, MAX_TEXT_CHARS)
@@ -555,7 +566,7 @@ pub fn next_seq(config_dir: &Path, peer_id: &str) -> u64 {
     let mut cache = CACHE.lock().unwrap();
     store_mut(&mut cache, config_dir)
         .get(peer_id)
-        .map(|t| t.iter().map(|m| m.seq).max().unwrap_or(0) + 1)
+        .map(|t| t.iter().map(|m| m.seq).max().unwrap_or(0).saturating_add(1))
         .unwrap_or(1)
 }
 
@@ -1013,7 +1024,32 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
 /// unsend wins; the text follows its own clock (`text_rev`); each reaction
 /// follows its own clock (`reaction_revs`, tombstones included). Copies from
 /// older builds (no per-field clocks) fall back to the newer whole record.
-fn merge_fields(x: &mut ChatMessage, m: ChatMessage) {
+/// A copy from an older build has no per-field clocks; when the other copy
+/// does, read the legacy copy's state as of its whole-record `rev` (its last
+/// change), so a newer edit or reaction change there still wins (review #13).
+fn legacy_clocks(c: &mut ChatMessage, other: &ChatMessage) {
+    if c.rev == 0 || (c.text_rev > 0 || !c.reaction_revs.is_empty()) {
+        return;
+    }
+    if other.text_rev == 0 && other.reaction_revs.is_empty() {
+        return; // both legacy: the whole-record rule below applies
+    }
+    if c.edited {
+        c.text_rev = c.rev;
+    }
+    for r in &c.reactions {
+        c.reaction_revs.push(ReactionRev { emoji: r.emoji.clone(), from_me: r.from_me, at: c.rev, on: true });
+    }
+    for o in &other.reaction_revs {
+        if !c.reactions.iter().any(|r| r.from_me == o.from_me && r.emoji == o.emoji) {
+            c.reaction_revs.push(ReactionRev { emoji: o.emoji.clone(), from_me: o.from_me, at: c.rev, on: false });
+        }
+    }
+}
+
+fn merge_fields(x: &mut ChatMessage, mut m: ChatMessage) {
+    legacy_clocks(&mut m, x);
+    legacy_clocks(x, &m.clone());
     if x.deleted {
         x.rev = x.rev.max(m.rev);
         return;
@@ -1299,6 +1335,44 @@ mod tests {
             assert_eq!(emojis, vec!["❤️".to_string()]);
         }
         for d in [a, b] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    fn an_older_builds_newer_edit_and_reaction_still_win() {
+        let dir = test_dir("legacy-merge");
+        let p = "peer-legacy";
+        let mut base = msg("m", p, 1, 1, true);
+        base.status = Some("delivered".into());
+        append(&dir, &base);
+        apply_reaction(&dir, p, "m", "👍", true, true).unwrap(); // clocked here
+        let mine = messages(&dir, p).remove(0);
+        // An older build edited it later and removed the 👍 (no per-field clocks).
+        let mut old = mine.clone();
+        old.text_rev = 0;
+        old.reaction_revs.clear();
+        old.reactions.clear();
+        old.text = "edited on the old build".into();
+        old.edited = true;
+        old.rev = mine.rev + 10_000;
+        merge_synced(&dir, p, vec![old]);
+        let got = messages(&dir, p).remove(0);
+        assert_eq!(got.text, "edited on the old build");
+        assert!(got.reactions.is_empty(), "its newer removal wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hostile_seq_and_ts_are_bounded() {
+        assert_eq!(cap_seq(u64::MAX, 5), 1_000_005);
+        assert_eq!(cap_seq(0, 5), 5);
+        assert_eq!(cap_seq(7, 5), 7);
+        assert!(cap_ts(u64::MAX) <= now_ms() + 24 * 3600 * 1000);
+        let dir = test_dir("seqmax");
+        let mut m = msg("big", "p", 1, u64::MAX, false);
+        m.seq = u64::MAX;
+        append(&dir, &m);
+        assert_eq!(next_seq(&dir, "p"), u64::MAX, "saturates instead of overflowing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

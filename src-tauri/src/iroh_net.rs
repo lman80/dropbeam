@@ -1295,11 +1295,11 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     .filter(|i| !i.is_empty() && i.len() <= crate::chat::MAX_ID_LEN)
                     .map(String::from)
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let ts = req.get("ts").and_then(|t| t.as_u64()).unwrap_or_else(crate::chat::now_ms);
+                let ts = crate::chat::cap_ts(req.get("ts").and_then(|t| t.as_u64()).unwrap_or_else(crate::chat::now_ms));
                 // Lamport merge: order this incoming message after
                 // everything we already have if its seq is stale/absent.
                 let recv_seq = req.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
-                let seq = recv_seq.max(crate::chat::next_seq(config_dir, &peer_id));
+                let seq = crate::chat::cap_seq(recv_seq, crate::chat::next_seq(config_dir, &peer_id));
                 let reply_to = req.get("replyTo").and_then(|r| r.as_str())
                     .filter(|r| r.len() <= crate::chat::MAX_ID_LEN).map(String::from);
                 let reply_preview =

@@ -585,140 +585,6 @@ pub fn add_by_code(config_dir: &Path, code: &str) -> Result<Friend, String> {
     Ok(f)
 }
 
-/// Self-heal the contact behind an incoming chat message so the conversation is
-/// always visible AND replyable, even if the friend record was lost across an
-/// update (GitHub #18/#19). Given the sender's cryptographic `endpoint_id`
-/// (`conn.remote_id()`), an optional display `name`, and the `claimed_id` the
-/// messages may already be keyed under, return a reachable [`Friend`] keyed to
-/// the right id — recreating it if missing.
-///
-/// Dedup invariants (mirror `reconcile`, so we NEVER duplicate a person):
-///   * a record with this **endpoint id** already exists → reuse it (refresh the
-///     name if we have a better one and the user hasn't locally renamed them),
-///     even if it's filed under a *different* record id than `claimed_id`;
-///   * else a record with `claimed_id` exists (an invite-friend whose endpoint
-///     wasn't keyed yet) → key it to this endpoint id so future dials work;
-///   * else create a minimal reachable record. We reuse `claimed_id` as the new
-///     record's id when present so it lines up with the thread the messages were
-///     already stored under (no orphaned conversation); otherwise a fresh uuid.
-/// The name falls back to "Unknown contact" so the row is never blank.
-pub fn self_heal_chat_sender(
-    config_dir: &Path,
-    endpoint_id: &str,
-    name: &str,
-    claimed_id: Option<&str>,
-) -> Option<Friend> {
-    if endpoint_id.trim().is_empty() || crate::block::is_blocked(config_dir, endpoint_id) {
-        return None;
-    }
-    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut friends = read_raw(config_dir);
-    let name = name.trim();
-
-    // 1) Already reachable under this endpoint id (anywhere in the list) → reuse.
-    if let Some(f) = friends
-        .iter_mut()
-        .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
-    {
-        if !name.is_empty() && !f.name_custom && f.name != name {
-            f.name = name.to_string();
-        }
-        let out = f.clone();
-        let _ = save(config_dir, &friends);
-        return Some(out);
-    }
-
-    // 2) An invite-friend filed under the claimed id but not yet keyed → key it.
-    if let Some(id) = claimed_id.filter(|id| !id.is_empty()) {
-        if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
-            f.account_pub = None;
-            f.device_kind = None;
-            f.endpoint_id = Some(endpoint_id.to_string());
-            if !name.is_empty() && !f.name_custom && f.name != name {
-                f.name = name.to_string();
-            }
-            let out = f.clone();
-            let _ = save(config_dir, &friends);
-            return Some(out);
-        }
-    }
-
-    // 2b) A real record for this person already exists but is endpoint-UNKEYED and
-    //     was filed under a DIFFERENT id than `claimed_id` (the classic phantom case:
-    //     a permanent-code / folder-pairing friend whose wire `friendId` is the
-    //     SENDER's foreign per-device uuid, so steps 1 & 2 both miss). Adopt it by
-    //     NAME and key it to this endpoint id instead of spawning a phantom. Mirrors
-    //     plan_reconcile's name-merge rule (the `either_unkeyed && !is_placeholder &&
-    //     name-match && !both_have_chat` invariant) and carries the SAME guards so two
-    //     distinct people can never be fused: a real non-placeholder name, the
-    //     candidate must be endpoint-UNKEYED (a record keyed to a different eid is a
-    //     provably different device — never touched), the UNIQUE name match only
-    //     (ambiguous → fall through to a fresh record), and refuse when BOTH the
-    //     candidate and the claimed-id thread already hold chat history.
-    if !name.is_empty() && !is_placeholder(name) {
-        let matches: Vec<usize> = friends
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.endpoint_id.is_none() && f.name.trim().eq_ignore_ascii_case(name))
-            .map(|(i, _)| i)
-            .collect();
-        if matches.len() == 1 {
-            let i = matches[0];
-            let cand_id = friends[i].id.clone();
-            let claimed_has_chat = claimed_id
-                .filter(|id| !id.is_empty())
-                .map(|id| !crate::chat::messages(config_dir, id).is_empty())
-                .unwrap_or(false);
-            let cand_has_chat = !crate::chat::messages(config_dir, &cand_id).is_empty();
-            if !(claimed_has_chat && cand_has_chat) {
-                // Key the existing record to the sender's cryptographic endpoint id so
-                // replies dial back AND future messages resolve by eid (step 1).
-                friends[i].account_pub = None;
-                friends[i].device_kind = None;
-                friends[i].endpoint_id = Some(endpoint_id.to_string());
-                if !friends[i].name_custom && friends[i].name != name {
-                    friends[i].name = name.to_string();
-                }
-                let out = friends[i].clone();
-                let _ = save(config_dir, &friends);
-                // Fold any messages a PRIOR buggy build already stored under the
-                // foreign claimed id onto this canonical record (idempotent union;
-                // no-op when the claimed thread is empty — the common live case,
-                // since resolution runs BEFORE chat::append).
-                if let Some(id) = claimed_id.filter(|id| !id.is_empty() && *id != out.id) {
-                    crate::chat::merge_threads(config_dir, id, &out.id);
-                }
-                return Some(out);
-            }
-        }
-    }
-
-    // 3) No record at all — recreate a minimal reachable one. Reuse the claimed id
-    //    when we have it so the new friend lines up with the already-stored thread.
-    let friend = Friend {
-        id: claimed_id
-            .filter(|id| !id.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        role: PairRole::B,
-        name: clean_name(name, "Unknown contact"),
-        secret: random_secret(),
-        created_at: now_ms(),
-        auto_accept: true,
-        endpoint_id: Some(endpoint_id.to_string()),
-        avatar: None,
-        name_custom: false,
-        name_at: 0,
-        progress_v: None,
-        device_kind: None,
-        account_pub: None,
-        device_os: None,
-    };
-    friends.push(friend.clone());
-    let _ = save(config_dir, &friends);
-    Some(friend)
-}
-
 /// What an incoming friend-hello did.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum HelloOutcome {
@@ -933,26 +799,56 @@ pub fn add_request(config_dir: &Path, endpoint_id: &str, name: &str, account_pub
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut all = read_requests(config_dir);
     let name = sanitize_display_name(name, "Someone");
-    let now = now_ms();
-    let new = match all.iter_mut().find(|r| r.endpoint_id == endpoint_id) {
-        Some(r) => {
-            if r.name == name && now.saturating_sub(r.at) < 60_000 && r.account_pub.as_deref() == account_pub {
-                return false;
-            }
-            r.name = name;
-            r.at = now;
-            r.account_pub = account_pub.map(str::to_owned);
-            false
+    if let Some(r) = all.iter_mut().find(|r| r.endpoint_id == endpoint_id) {
+        // A repeat: keep its place (first seen); only a real change is written.
+        if r.name == name && (r.account_pub.is_some() || account_pub.is_none()) {
+            return false;
         }
-        None => {
-            all.push(FriendRequest { endpoint_id: endpoint_id.to_owned(), name, at: now, account_pub: account_pub.map(str::to_owned) });
-            true
-        }
-    };
-    all.sort_by_key(|r| std::cmp::Reverse(r.at));
-    all.truncate(MAX_REQUESTS);
+        r.name = name;
+        if account_pub.is_some() { r.account_pub = account_pub.map(str::to_owned); }
+        write_requests(config_dir, &all);
+        return false;
+    }
+    // Flood guard: the list keeps the OLDEST requests (a burst of new endpoint
+    // ids can't push out the real one waiting), and only so many new ones a
+    // minute are recorded at all.
+    if all.len() >= MAX_REQUESTS || !request_budget(config_dir) {
+        log::warn!("friends: dropped a friend request (list full or too many at once)");
+        return false;
+    }
+    all.push(FriendRequest { endpoint_id: endpoint_id.to_owned(), name, at: now_ms(), account_pub: account_pub.map(str::to_owned) });
     write_requests(config_dir, &all);
-    new
+    true
+}
+
+/// New friend requests recorded per minute, across everyone (endpoint ids
+/// are free to mint, so a per-sender limit alone wouldn't hold).
+const REQUESTS_PER_MINUTE: usize = 20;
+fn request_budget(config_dir: &Path) -> bool {
+    use std::time::{Duration, Instant};
+    static RECENT: Mutex<Option<HashMap<PathBuf, Vec<Instant>>>> = Mutex::new(None);
+    let mut g = RECENT.lock().unwrap_or_else(|p| p.into_inner());
+    let recent = g.get_or_insert_with(HashMap::new).entry(config_dir.to_path_buf()).or_default();
+    recent.retain(|t| t.elapsed() < Duration::from_secs(60));
+    if recent.len() >= REQUESTS_PER_MINUTE { return false; }
+    recent.push(Instant::now());
+    true
+}
+
+/// Someone met through a shared folder's member roster (gossip from another
+/// member, not anyone the user chose): a friend we already have just gets
+/// their name refreshed; anyone else becomes a pending friend request — never
+/// an auto-accepting friend — and a blocked person is skipped (S2 / review #4).
+pub fn note_folder_member(config_dir: &Path, endpoint_id: &str, name: &str) -> bool {
+    if endpoint_id.trim().is_empty() || crate::block::is_blocked(config_dir, endpoint_id)
+        || crate::account::is_own_device(config_dir, endpoint_id) {
+        return false;
+    }
+    if read_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        upsert_by_endpoint(config_dir, endpoint_id, name);
+        return false;
+    }
+    add_request(config_dir, endpoint_id, name, None)
 }
 
 /// Pending requests, newest first (anyone who became a friend or was blocked
@@ -1445,71 +1341,6 @@ mod tests {
         std::env::temp_dir().join(format!("db-friends-test-{tag}-{}", now_ms()))
     }
 
-    #[test]
-    fn self_heal_recreates_lost_contact_keyed_to_thread() {
-        // The "lost my friend's contact after update" case: friends.json is empty
-        // but a chat thread exists under the claimed id "thread1". A message lands
-        // → recreate a reachable friend filed under that same id so the stored
-        // conversation isn't orphaned, with the sender's endpoint id + name.
-        let dir = tmp("recreate");
-        let f = self_heal_chat_sender(&dir, "EIDX", "Mong", Some("thread1")).unwrap();
-        assert_eq!(f.id, "thread1"); // lines up with the existing thread
-        assert_eq!(f.name, "Mong");
-        assert_eq!(f.endpoint_id.as_deref(), Some("EIDX"));
-        assert_eq!(load(&dir).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_blank_name_falls_back() {
-        // No display name on the wire → a non-blank fallback so the chat row is
-        // never empty/invisible.
-        let dir = tmp("fallback");
-        let f = self_heal_chat_sender(&dir, "EIDY", "", None).unwrap();
-        assert_eq!(f.name, "Unknown contact");
-        assert_eq!(f.endpoint_id.as_deref(), Some("EIDY"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_dedups_by_endpoint_no_duplicate() {
-        // A record for this endpoint id already exists (under a DIFFERENT record id
-        // than the claimed one) → reuse it, never add a second. This preserves the
-        // reconcile invariant that endpoint id IS the identity.
-        let dir = tmp("dedup");
-        let _ = save(&dir, &[f("orig", "Mong", Some("EIDZ"), 5)]);
-        let healed = self_heal_chat_sender(&dir, "EIDZ", "Mong", Some("different-claim")).unwrap();
-        assert_eq!(healed.id, "orig"); // reused the existing record, not a new one
-        assert_eq!(load(&dir).len(), 1); // NO duplicate
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_keys_unkeyed_invite_friend() {
-        // An invite-friend exists under the claimed id but has no endpoint id yet
-        // (so replies couldn't dial back) → learn the endpoint id in place.
-        let dir = tmp("keyinvite");
-        let _ = save(&dir, &[f("invite1", "Mong", None, 5)]);
-        let healed = self_heal_chat_sender(&dir, "NEWEID", "Mong", Some("invite1")).unwrap();
-        assert_eq!(healed.id, "invite1");
-        assert_eq!(healed.endpoint_id.as_deref(), Some("NEWEID"));
-        assert_eq!(load(&dir).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_keeps_user_renamed_label() {
-        // The user locally renamed this friend (name_custom) → an incoming
-        // broadcast name must NOT overwrite their chosen label.
-        let dir = tmp("renamed");
-        let mut custom = f("c", "My Bestie", Some("EIDR"), 5);
-        custom.name_custom = true;
-        let _ = save(&dir, &[custom]);
-        let healed = self_heal_chat_sender(&dir, "EIDR", "RawDeviceName", None).unwrap();
-        assert_eq!(healed.name, "My Bestie");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     // Seed a received chat message under `peer` so the both-have-chat guard can be
     // exercised (a real conversation already exists under that record id).
     fn seed_msg(dir: &Path, peer: &str) {
@@ -1590,72 +1421,6 @@ mod tests {
         assert_eq!(crate::chat::overview(&dir).len(), 1);
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_dir_all(sender_dir);
-    }
-
-    #[test]
-    fn self_heal_adopts_unkeyed_name_match_no_phantom() {
-        // #19/#18: an inbound message from a permanent-code friend whose wire friendId
-        // is a FOREIGN per-device uuid must ADOPT the existing endpoint-unkeyed record
-        // (the one the open ChatView is subscribed to), NOT spawn a phantom.
-        let dir = tmp("adopt");
-        let _ = save(&dir, &[f("local-uuid", "Mong", None, 5)]);
-        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert_eq!(healed.id, "local-uuid"); // reused the existing record
-        assert_eq!(healed.endpoint_id.as_deref(), Some("EID")); // …now keyed
-        assert_eq!(load(&dir).len(), 1); // NO phantom
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_does_not_adopt_when_two_share_name() {
-        // Ambiguous: two endpoint-unkeyed records share the name → never guess; fall
-        // through to a fresh record rather than fuse the wrong one.
-        let dir = tmp("ambiguous");
-        let _ = save(&dir, &[f("u1", "Mong", None, 5), f("u2", "Mong", None, 6)]);
-        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert!(healed.id != "u1" && healed.id != "u2"); // a new record
-        assert_eq!(load(&dir).len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_does_not_adopt_record_keyed_to_other_eid() {
-        // A record already keyed to a DIFFERENT endpoint id is a provably different
-        // device — never adopt it by name.
-        let dir = tmp("otherkey");
-        let _ = save(&dir, &[f("x", "Mong", Some("OTHER_EID"), 5)]);
-        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert!(healed.id != "x"); // a new record, the OTHER_EID one untouched
-        assert_eq!(load(&dir).len(), 2);
-        let other = load(&dir).into_iter().find(|fr| fr.id == "x").unwrap();
-        assert_eq!(other.endpoint_id.as_deref(), Some("OTHER_EID"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_refuses_name_adopt_when_both_have_chat() {
-        // Two REAL conversations (one under the unkeyed candidate, one under the
-        // claimed id) must never be fused — mirrors reconcile_refuses_name_merge.
-        let dir = tmp("bothchat");
-        let _ = save(&dir, &[f("cand", "Mong", None, 5)]);
-        seed_msg(&dir, "cand");
-        seed_msg(&dir, "foreign-uuid");
-        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert!(healed.id != "cand"); // refused adoption → fresh record
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_name_adopt_is_idempotent() {
-        // After the first adoption keys the record, a second inbound resolves by
-        // endpoint id (step 1) — same record, no new writes, no duplicate.
-        let dir = tmp("adopt-idem");
-        let _ = save(&dir, &[f("local-uuid", "Mong", None, 5)]);
-        let first = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        let second = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert_eq!(first.id, second.id);
-        assert_eq!(load(&dir).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1999,14 +1764,16 @@ mod request_tests {
     #[test]
     fn requests_are_bounded_deduped_and_skip_friends_and_blocked() {
         let d = dir();
-        for i in 0..80 { add_request(&d, &format!("e{i}"), "Spam", None); }
-        assert_eq!(requests(&d).len(), MAX_REQUESTS);
-        assert!(!add_request(&d, "e79", "Spam", None), "a repeat isn't new");
+        // A burst: only so many a minute, and the first ones are kept.
+        let added = (0..80).filter(|i| add_request(&d, &format!("e{i}"), "Spam", None)).count();
+        assert!(added <= REQUESTS_PER_MINUTE, "{added}");
+        assert!(requests(&d).iter().any(|r| r.endpoint_id == "e0"), "the oldest stays");
+        assert!(!add_request(&d, "e0", "Spam", None), "a repeat isn't new");
         upsert_by_endpoint(&d, "friend", "Pal");
         assert!(!add_request(&d, "friend", "Pal", None));
         // Someone added by code meanwhile drops out of the list.
-        upsert_by_endpoint(&d, "e79", "Now a friend");
-        assert!(!requests(&d).iter().any(|r| r.endpoint_id == "e79"));
+        upsert_by_endpoint(&d, "e0", "Now a friend");
+        assert!(!requests(&d).iter().any(|r| r.endpoint_id == "e0"));
         let _ = fs::remove_dir_all(d);
     }
 
@@ -2060,6 +1827,21 @@ mod request_tests {
         let ids: Vec<String> = person_records(&d, &mac.id).into_iter().map(|f| f.id).collect();
         assert_eq!(ids, vec![phone.id.clone()]);
         assert!(person_records(&d, &other.id).is_empty(), "no account → just that record");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn folder_roster_members_are_requests_not_friends() {
+        let d = dir();
+        assert!(note_folder_member(&d, "member", "Folder Member"));
+        assert!(load(&d).is_empty() && chat_sender(&d, "member").is_none());
+        assert_eq!(requests(&d).len(), 1);
+        crate::block::block_endpoint(&d, "blocked", "B", None).unwrap();
+        assert!(!note_folder_member(&d, "blocked", "B"));
+        assert!(!requests(&d).iter().any(|r| r.endpoint_id == "blocked"));
+        let f = upsert_by_endpoint(&d, "pal", "Pal");
+        assert!(!note_folder_member(&d, "pal", "Pal Renamed"));
+        assert_eq!(get(&d, &f.id).unwrap().name, "Pal Renamed");
         let _ = fs::remove_dir_all(d);
     }
 

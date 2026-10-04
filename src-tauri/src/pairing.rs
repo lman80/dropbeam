@@ -444,6 +444,10 @@ pub fn ensure_member(
     if load_removed(config_dir).get(group_id).is_some_and(|r| r.iter().any(|e| e == endpoint_id)) {
         return None;
     }
+    // A blocked person is never meshed with, whoever lists them.
+    if crate::block::is_blocked(config_dir, endpoint_id) {
+        return None;
+    }
     let new = Pair {
         // CRITICAL: both ends must derive the SAME id, because the folder-files /
         // folder-ctrl handlers authorize by matching the wire pair_id to a local
@@ -473,8 +477,10 @@ pub fn ensure_member(
     };
     pairs.push(new.clone());
     let _ = save(config_dir, &pairs);
-    // Folder partners are friends, so they show up by name + you can chat them.
-    friends::upsert_by_endpoint(config_dir, endpoint_id, &new.peer_name);
+    // A member another member listed is NOT made a friend (that would let any
+    // member hand out auto-accepting friendships): someone new is a friend
+    // request the user can accept.
+    friends::note_folder_member(config_dir, endpoint_id, &new.peer_name);
     Some(new)
 }
 

@@ -2002,7 +2002,9 @@ impl SyncManager {
             // somehow don't have their endpoint id yet.
             match &eid {
                 Some(e) => {
-                    let _ = friends::upsert_by_endpoint(&self.config_dir, e, name);
+                    // A friend gets the new name; someone not (yet) a friend
+                    // becomes a request — a folder link never makes a friend.
+                    friends::note_folder_member(&self.config_dir, e, name);
                 }
                 None => friends::upsert_from_pairing(&self.config_dir, name, &secret, role),
             }

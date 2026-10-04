@@ -287,7 +287,6 @@ mod tests {
         crate::friends::apply_hello(&d, &f.id, &e, "Spammer");
         assert!(crate::friends::load(&d).is_empty());
         assert!(crate::friends::chat_sender(&d, &e).is_none());
-        assert!(crate::friends::self_heal_chat_sender(&d, &e, "Spammer", Some(&f.id)).is_none());
         assert!(crate::friends::add_by_code(&d, &crate::friends::my_code("Spammer", &e)).is_err());
         let listed = list(&d);
         assert_eq!(listed.len(), 1);
