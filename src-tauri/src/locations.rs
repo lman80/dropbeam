@@ -1916,7 +1916,11 @@ mod tests {
         request["paths"] = json!(["folder/file", "folder/empty", "absent", "escape/friends.json"]);
         let now = Instant::now();
         error_message(dispatch_at(&f.config, "stranger", &request, now), "Location access denied");
-        let reply = dispatch_at(&f.config, "owner-device", &request, now).unwrap();
+        let mut reply = dispatch_at(&f.config, "owner-device", &request, now).unwrap();
+        // Each entry also carries its mtime (synced folders compare it — D9).
+        for e in reply["entries"].as_array_mut().unwrap() {
+            assert!(e.as_object_mut().unwrap().remove("mtime").and_then(|m| m.as_u64()).is_some());
+        }
         assert_eq!(reply["entries"], json!([
             {"rel_path":"folder/file","is_dir":false,"size":4},
             {"rel_path":"folder/empty","is_dir":true,"size":0}]));
