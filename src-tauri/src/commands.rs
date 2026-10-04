@@ -1115,6 +1115,43 @@ pub fn list_friends(state: State<'_, Arc<AppState>>) -> Vec<Friend> {
     friends::load(&state.config_dir)
 }
 
+/// People who introduced themselves but aren't friends yet (S2).
+#[tauri::command]
+pub fn list_friend_requests(state: State<'_, Arc<AppState>>) -> Vec<friends::FriendRequest> {
+    friends::requests(&state.config_dir)
+}
+
+/// Accept a friend request: they become a friend (and hear back from us).
+#[tauri::command]
+pub fn accept_friend_request(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    endpoint_id: String,
+) -> Result<Friend, String> {
+    let friend = friends::accept_request(&state.config_dir, &endpoint_id)?;
+    sync.reconcile_friends();
+    let my_name = state.settings.lock().unwrap().display_name.clone();
+    crate::iroh_net::say_hello_to_endpoint(iroh.inner().clone(), endpoint_id, my_name);
+    let _ = app.emit("friends://changed", ());
+    let _ = app.emit("friend-requests://changed", ());
+    Ok(friend)
+}
+
+/// Decline a friend request (optionally blocking them so they can't ask again).
+#[tauri::command]
+pub fn decline_friend_request(app: AppHandle, state: State<'_, Arc<AppState>>, endpoint_id: String, block: bool) -> Result<(), String> {
+    let request = friends::remove_request(&state.config_dir, &endpoint_id);
+    if block {
+        let (name, account) = request.map(|r| (r.name, r.account_pub)).unwrap_or_default();
+        crate::block::block_endpoint(&state.config_dir, &endpoint_id, &name, account)?;
+        let _ = app.emit("blocked://changed", ());
+    }
+    let _ = app.emit("friend-requests://changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn rename_friend(
     state: State<'_, Arc<AppState>>,
@@ -1848,7 +1885,9 @@ pub fn add_friend_by_code(
     app: AppHandle,
     code: String,
 ) -> Result<Friend, String> {
-    let friend = friends::add_by_code(&state.config_dir, &code)?;
+    let me = iroh.get().map(|e| e.id().to_string());
+    let friend = friends::add_by_code_for(&state.config_dir, &code, me.as_deref())?;
+    let _ = app.emit("friend-requests://changed", ());
     // Reverse direction: tell them who we are so they add us too.
     if let Some(eid) = friend.endpoint_id.clone() {
         let my_name = state.settings.lock().unwrap().display_name.clone();

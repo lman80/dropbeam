@@ -89,6 +89,7 @@ html:not(.mobile) .device-link-dialog { width: 420px; }
 .link-state { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px 8px 4px; text-align: center; }
 .link-state > svg, .link-state > .spinner { margin-bottom: 6px; }
 .link-state-title { margin: 0; font-size: var(--text-13); font-weight: 600; color: var(--text); }
+.link-safety-code { font-size: 28px; font-weight: 700; letter-spacing: 0.08em; font-variant-numeric: tabular-nums; margin: 6px 0; }
 .link-state-sub { margin: 0; font-size: var(--text-12); color: var(--text-muted); line-height: 1.45; max-width: 320px; overflow-wrap: anywhere; }
 .link-state-ok { color: var(--green); }
 .link-state-bad { color: var(--red); }

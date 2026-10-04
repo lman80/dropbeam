@@ -15,7 +15,7 @@ import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRi
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
 import { ownDeviceLabels, personGroups } from './deviceIcons'
-import { routeCode, parseCode, friendCodeName } from './codes'
+import { routeCode, parseCode, friendCodeName, DEVICE_CODE_ELSEWHERE } from './codes'
 import { nativeFolders, folderLinks } from './nativeFolders'
 import { linkedDetail, linkedTitle } from './deviceLink'
 import { startOtherDevices, useOtherDevices } from './otherDevices'
@@ -74,10 +74,8 @@ const handlers: BridgeHandlers = {
       case 'addFriend': { const f = await api.addFriendByCode(route.code); await st().reloadFriends(); return { kind: 'friend', friendId: f.id, name: f.name, code: route.code } }
       case 'acceptFriendInvite': { const f = await api.acceptFriend(route.code); await st().reloadFriends(); return { kind: 'friend', friendId: f.id, name: f.name } }
       case 'acceptFolderInvite': return { kind: 'folderInvite', code: route.code }
-      case 'linkDevice': {
-        const r = /^dropbeamjoin1:/i.test(route.code) ? await handlers.linkDeviceJoin({ code: route.code }) : await handlers.linkDeviceSend({ code: route.code })
-        return { kind: 'linked', name: (r as { name?: string } | undefined)?.name ?? null }
-      }
+      // S1: a device code is never acted on here — only from Settings → Devices.
+      case 'linkDevice': throw new Error(DEVICE_CODE_ELSEWHERE)
       case 'invalid': throw new Error(route.message)
     }
   },
@@ -221,10 +219,23 @@ const handlers: BridgeHandlers = {
   },
   myInviteCode: () => api.myInviteCode(),
   addFriendByCode: a => storeAction(() => st().addFriendByCode(string(a, 'code'))),
+  // S2: people asking to be friends → [{ endpointId, name, at }]; accept/decline
+  // (decline with bool:true also blocks them). Swift re-asks on 'friend-requests://changed'.
+  listFriendRequests: () => api.listFriendRequests(),
+  acceptFriendRequest: a => storeAction(() => st().acceptFriendRequest(string(a, 'endpointId'))),
+  declineFriendRequest: a => storeAction(() => st().declineFriendRequest(string(a, 'endpointId'), a.bool === true)),
   acceptFriend: a => storeAction(() => st().acceptFriend(string(a, 'code'))),
   shareFiles: a => api.shareFiles(paths(a)),
   linkDeviceBegin: () => api.linkDeviceBegin(),
   linkDeviceCancel: () => api.linkDeviceCancel(),
+  // S1: step 1 with a scanned code → { name, safety, direction, peerShowsCode };
+  // Swift shows the safety code and calls linkDeviceSend only once confirmed.
+  linkDevicePrepare: a => api.linkDevicePrepare(string(a, 'code')),
+  // The answer to a 'link://confirm' prompt (the other device scanned ours).
+  linkConfirm: a => {
+    if (typeof a.bool !== 'boolean') throw new Error('Invalid confirmation')
+    return api.linkConfirm(string(a, 'endpointId'), a.bool)
+  },
   linkDeviceSend: async a => linked(await linkWithCode(string(a, 'code'))),
   linkHostBegin: () => api.linkHostBegin(),
   linkHostCancel: () => api.linkHostCancel(),
@@ -440,7 +451,7 @@ const friendSnapshot = (friends: Friend[], accountPub?: string | null) => {
 }
 /** Presence per friend; a person reads online when ANY of their devices is. */
 const presenceSnapshot = (s: ReturnType<typeof st>) => {
-  const out: Record<string, boolean> = Object.fromEntries(s.friends.map(f => [f.id, friendOnlineState(f.name, s.friendSeen, s.folderStatuses) === true]))
+  const out: Record<string, boolean> = Object.fromEntries(s.friends.map(f => [f.id, friendOnlineState(f, s.friendSeen, s.folderStatuses) === true]))
   for (const [member, owner] of Object.entries(personGroups(s.friends, s.myDevice?.account_pub))) if (out[member]) out[owner] = true
   return out
 }
@@ -453,7 +464,7 @@ const presenceSeenSnapshot = (s: ReturnType<typeof st>, online: Record<string, b
   for (const f of s.friends) {
     const owner = groups[f.id] ?? f.id
     if (online[owner]) continue
-    const seen = friendPresence(f.name, s.friendSeen, s.folderStatuses).lastSeen
+    const seen = friendPresence(f, s.friendSeen, s.folderStatuses).lastSeen
     if (seen != null && seen > (out[owner] ?? 0)) out[owner] = seen
   }
   return out
@@ -464,8 +475,8 @@ const personDevices = (id: string) => {
   const groups = personGroups(s.friends, s.myDevice?.account_pub)
   return s.friends.filter(f => f.id === id || groups[f.id] === id).map(f => f.id)
 }
-const presenceOf = (name: string) => friendOnlineState(name, st().friendSeen, st().folderStatuses) === true
-const locationSnapshot = () => nativeLocationRows(st().friends, { presence: f => presenceOf(f.name), results: locationResults, shared, checking: locationChecking, now: Date.now() })
+const presenceOf = (f: { id: string; name: string }) => friendOnlineState(f, st().friendSeen, st().folderStatuses) === true
+const locationSnapshot = () => nativeLocationRows(st().friends, { presence: f => presenceOf(f), results: locationResults, shared, checking: locationChecking, now: Date.now() })
 // Tauri command errors arrive as plain strings; the engine already words them
 // for people ("Couldn’t reach this device…"), and Swift shows them under the
 // friend's own heading, so no name prefix.
@@ -480,7 +491,7 @@ function refreshLocations(force = false) {
       pushLocations?.()
       await loadLocations({
         friends,
-        online: f => presenceOf(f.name),
+        online: f => presenceOf(f),
         probe: id => st().pingFriend(id),
         list: locationsApi.list,
         cached: shared,
@@ -653,7 +664,7 @@ async function start() {
     try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}); void refreshLookAlikes().then(() => resnapshot?.()) })) } catch { /* store also refreshes */ }
   }
   void refreshLookAlikes().then(() => resnapshot?.())
-  for (const name of ['link://linked', 'account://left', 'link://failed', 'link://progress']) {
+  for (const name of ['link://linked', 'account://left', 'link://failed', 'link://progress', 'link://confirm', 'friend-requests://changed']) {
     try { stops.push(await listen(name, ({ payload }) => send('event', { name, payload }))) } catch { /* optional event */ }
   }
 }

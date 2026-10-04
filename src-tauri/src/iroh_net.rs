@@ -2567,6 +2567,10 @@ fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
     }
 }
 
+/// Largest push someone who isn't a friend may offer (they're always asked
+/// about first; anything bigger is refused before a byte moves) — S2.
+const STRANGER_MAX_BYTES: u64 = 2 << 30;
+
 /// Stream kinds a blocked person is kept out of: introductions, chat, typing /
 /// read signals, file pushes (and their stat/verify), folder invites and
 /// Locations. Quick Send pulls (they hold a code the user gave them), pings and
@@ -3007,20 +3011,22 @@ async fn serve_stream_inner(
             let from_name = req.get("fromName").and_then(|v| v.as_str()).unwrap_or("").trim();
             let (sender, auto_accept) = match &friend {
                 Some(f) => (Some(f.name.clone()), location_upload.is_some() || f.auto_accept),
-                None if !from_name.is_empty() && !who.is_empty() => {
-                    // Add them so the relationship is two-way — but DON'T grant silent
-                    // standing access. A stranger who has your link is now a named
-                    // friend whose FUTURE sends still prompt (auto_accept=false). The
-                    // current file still lands (true), matching the prior behavior for
-                    // an unknown sender.
-                    let f = crate::friends::upsert_by_endpoint(&config_dir, &who, from_name);
-                    let _ = crate::friends::set_auto_accept(&config_dir, &f.id, false);
-                    let _ = app.emit("friends://changed", ());
-                    (Some(f.name.clone()), true)
+                None => {
+                    // S2: someone who isn't a friend never sends silently — every
+                    // push asks first (a pending friend request is recorded so the
+                    // user can add them), and an oversized one is refused outright.
+                    let total = req["total"].as_u64().unwrap_or(0);
+                    if total > STRANGER_MAX_BYTES {
+                        let e = anyhow::anyhow!("Only friends can send files this large. Ask them to add you as a friend first.");
+                        send_receiver_error(send, &e).await;
+                        return Err(e);
+                    }
+                    if !who.is_empty() && crate::friends::add_request(&config_dir, &who, from_name, None) {
+                        let _ = app.emit("friend-requests://changed", ());
+                    }
+                    let name = crate::friends::sanitize_display_name(from_name, "Someone");
+                    (Some(format!("{name} (not a friend)")), false)
                 }
-                // A friend with manual-accept on must approve before we receive; an
-                // unknown sender with no name still defaults to auto-accept.
-                None => (None, true),
             };
             let total = req["total"].as_u64().unwrap_or(0);
             let names: Vec<String> = req["items"]
@@ -3537,6 +3543,9 @@ async fn serve_stream_inner(
         Some("link-join") => {
             crate::link::serve_join(state, &conn.remote_id().to_string(), &req, send, recv).await?;
         }
+        Some("link-safety") => {
+            crate::link::serve_safety(state, &conn.remote_id().to_string(), &req, send).await?;
+        }
         Some("account-sync") => {
             crate::account::serve(state, &conn.remote_id().to_string(), &req, send, recv).await?;
         }
@@ -3561,8 +3570,12 @@ async fn serve_stream_inner(
                     if let Some(left) = req.get("left_accounts") {
                         crate::account::apply_left_notice(&st.config_dir, &who, left);
                     }
-                    crate::friends::apply_hello(&st.config_dir, friend_id, &who, name);
+                    let outcome = crate::friends::apply_hello_from(&st.config_dir, friend_id, &who, name, &req);
                     crate::friends::apply_device_hello(&st.config_dir, &who, &req);
+                    // S2: someone new is a request the user accepts or declines.
+                    if outcome == crate::friends::HelloOutcome::Requested {
+                        let _ = app.emit("friend-requests://changed", ());
+                    }
                     // Cache their profile picture (if they sent one) and point the
                     // friend record at it.
                     if let Some(b64) = avatar_b64 {

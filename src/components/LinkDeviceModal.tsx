@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
-import { api, HAS_TAURI } from '../lib/api'
+import { api, HAS_TAURI, type LinkConfirmRequest, type LinkPreviewInfo } from '../lib/api'
 import { mockListen } from '../lib/mock'
 import { MOBILE_UI } from '../lib/platform'
 import { deviceCodeProblem, isDeviceCode, linkedDetail, linkedTitle, linkErrorText, progressText, type LinkedDevice, type LinkProgress } from '../lib/deviceLink'
@@ -28,7 +28,9 @@ function onLinkEvent<T>(name: string, cb: (payload: T) => void): Promise<() => v
   return listen<T>(name, e => cb(e.payload))
 }
 
-type Phase = 'show' | 'scan' | 'working' | 'done' | 'error'
+// 'confirm': this device scanned a code — check the safety code, then link.
+// 'incoming': the other device scanned OURS — check the safety code it shows.
+type Phase = 'show' | 'scan' | 'working' | 'confirm' | 'incoming' | 'done' | 'error'
 
 /**
  * The one linking flow, whichever device it's opened on. This device shows
@@ -49,6 +51,9 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   const [linked, setLinked] = useState<LinkedDevice | null>(null)
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
+  // The safety-code step (S1): what this device scanned, or who scanned us.
+  const [preview, setPreview] = useState<{ code: string; info: LinkPreviewInfo } | null>(null)
+  const [incoming, setIncoming] = useState<LinkConfirmRequest | null>(null)
   // How the last attempt was made (this device scanning, or showing its code).
   const [via, setVia] = useState<'show' | 'scan'>(start)
   const phaseRef = useRef(phase)
@@ -73,6 +78,10 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
         if (phaseRef.current === 'show') { setVia('show'); setPhase('working') }
       }))
       await add(onLinkEvent<LinkedDevice>('link://linked', d => { if (alive && phaseRef.current !== 'done') finished(d) }))
+      await add(onLinkEvent<LinkConfirmRequest>('link://confirm', r => {
+        if (!alive || phaseRef.current === 'done') return
+        setIncoming(r); setVia('show'); setPhase('incoming')
+      }))
       await add(onLinkEvent<string>('link://failed', e => {
         if (!alive || phaseRef.current === 'done') return
         setError(linkErrorText(e)); setPhase('error')
@@ -94,10 +103,28 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   // Whatever happens, no code stays live after the dialog closes.
   useEffect(() => () => { void api.linkHostCancel().catch(() => {}); void api.linkDeviceCancel().catch(() => {}) }, [])
 
+  // Scanned the other device's code: it shows the safety code now, and this
+  // device shows the same one — nothing moves until the user confirms (S1).
   const scanned = async (value: string) => {
-    setPhase('working'); setVia('scan'); setProgress(null); setError('')
-    try { finished(await linkWithCode(value)) }
+    setPhase('working'); setVia('scan'); setProgress(null); setError(''); setPreview(null)
+    try {
+      const problem = deviceCodeProblem(value.trim())
+      if (problem) throw new Error(problem)
+      const info = await api.linkDevicePrepare(value.trim())
+      if (phaseRef.current === 'working') { setPreview({ code: value.trim(), info }); setPhase('confirm') }
+    } catch (e) { if (phaseRef.current !== 'done') { setError(linkErrorText(e)); setPhase('error') } }
+  }
+  const confirmScanned = async () => {
+    if (!preview) return
+    setPhase('working')
+    try { finished(await linkWithCode(preview.code)) }
     catch (e) { if (phaseRef.current !== 'done') { setError(linkErrorText(e)); setPhase('error') } }
+  }
+  const answerIncoming = (accept: boolean) => {
+    const r = incoming
+    if (!r) return
+    void api.linkConfirm(r.endpointId, accept).catch(() => {})
+    if (accept) { setProgress(null); setPhase('working') } else onClose()
   }
   const retry = () => { setError(''); setProgress(null); if (via === 'scan') setPhase('scan'); else { setAttempt(a => a + 1); setPhase('show') } }
   const copy = () => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => setCodeError('Couldn’t copy the code. Select it and copy it instead.'))
@@ -105,7 +132,15 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   if (phase === 'scan') return <QrScanner title="Scan your other device" hint="On your other device, open Settings → Devices → Link a device."
     validate={deviceCodeProblem} onResult={v => void scanned(v)} onClose={() => start === 'scan' ? closeRef.current() : setPhase('show')} />
 
-  const footer = phase === 'show' ? <>
+  const footer = phase === 'confirm' ? <>
+    <span className="spacer" />
+    <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+    <button className="btn btn-primary" autoFocus onClick={() => void confirmScanned()}>Codes match — link</button>
+  </> : phase === 'incoming' ? <>
+    <span className="spacer" />
+    <button className="btn btn-secondary" onClick={() => answerIncoming(false)}>Cancel</button>
+    <button className="btn btn-primary" autoFocus onClick={() => answerIncoming(true)}>Codes match — link</button>
+  </> : phase === 'show' ? <>
     <button className="btn btn-plain" onClick={() => setPhase('scan')}>Scan their code instead</button>
     <span className="spacer" />
     {codeError
@@ -133,6 +168,22 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
       {codeError
         ? <p role="alert" className="form-error link-status">{codeError}</p>
         : <p className="link-status" role="status">{code ? 'Waiting for your other device…' : 'Creating a code…'}</p>}
+    </div>}
+    {phase === 'confirm' && preview && <div className="link-state" role="alertdialog" aria-label="Check the safety code">
+      <p className="link-state-sub">Make sure <strong>{preview.info.name}</strong> shows this code:</p>
+      <p className="link-state-title link-safety-code" aria-live="polite">{preview.info.safety}</p>
+      <p className="link-state-sub">{preview.info.direction === 'give'
+        ? `${preview.info.name} will get full access to your account: your friends, chats and devices.`
+        : `This device will join ${preview.info.name}’s account and share its friends and chats.`}
+        {' '}Only continue if this is your own device{preview.info.peerShowsCode ? ' and the codes match' : ' (it needs an update to show the code)'}.</p>
+    </div>}
+    {phase === 'incoming' && incoming && <div className="link-state" role="alertdialog" aria-label="Check the safety code">
+      <p className="link-state-sub"><strong>{incoming.name}</strong> wants to link with this device. Make sure it shows this code:</p>
+      <p className="link-state-title link-safety-code" aria-live="polite">{incoming.safety}</p>
+      <p className="link-state-sub">{incoming.joining
+        ? `This device will join ${incoming.name}’s account and share its friends and chats.`
+        : `${incoming.name} will get full access to your account: your friends, chats and devices.`}
+        {' '}Only continue if it’s your own device and the codes match.</p>
     </div>}
     {phase === 'working' && <div className="link-state" role="status" aria-live="polite">
       <Spinner size={22} />

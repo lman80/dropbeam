@@ -260,6 +260,11 @@ export interface HistoryItem {
 }
 
 /** A successfully linked device; command and link wire fields use snake_case. */
+/** What the scanner shows before linking (S1): who, which way, and the
+ *  safety code both screens must show before an account key moves. */
+export interface LinkPreviewInfo { name: string; safety: string; direction: 'give' | 'take'; peerShowsCode: boolean }
+/** The other device presented this device's code: confirm its safety code. */
+export interface LinkConfirmRequest { endpointId: string; name: string; safety: string; joining: boolean }
 export interface LinkResult { endpoint_id: string; name: string; device_kind: string; device_os?: string
   /** What the link brought over (friends and chat messages), when known. */
   friends?: number; messages?: number }
@@ -560,6 +565,13 @@ const realApi = {
   clearAllFolderHistory: () => invoke<number>('clear_all_folder_history'),
   linkDeviceBegin: () => invoke<string>('link_device_begin'),
   linkDeviceCancel: () => invoke<void>('link_device_cancel'),
+  listFriendRequests: () => invoke<FriendRequest[]>('list_friend_requests'),
+  acceptFriendRequest: (endpointId: string) => invoke<Friend>('accept_friend_request', { endpointId }),
+  declineFriendRequest: (endpointId: string, block: boolean) => invoke<void>('decline_friend_request', { endpointId, block }),
+  /** Step 1 with a scanned code: the other device shows the safety code; nothing moves yet. */
+  linkDevicePrepare: (code: string) => invoke<LinkPreviewInfo>('link_device_prepare', { code }),
+  /** This device's answer to a "Link <name>? Safety code …" prompt. */
+  linkConfirm: (endpointId: string, accept: boolean) => invoke<void>('link_confirm', { endpointId, accept }),
   linkDeviceSend: (code: string) => invoke<LinkResult>('link_device_send', { code }),
   /** Show a code a NEW device scans to join this device's account. */
   linkHostBegin: () => invoke<string>('link_host_begin'),
@@ -679,6 +691,15 @@ const backend: typeof realApi = HAS_TAURI ? realApi : ({
   linkDeviceBegin: async () => 'dropbeamlink1:eyJ2IjoxLCJlaWQiOiJwcmV2aWV3IiwibmFtZSI6IlByZXZpZXciLCJ0b2tlbiI6IjAwIn0',
   linkDeviceCancel: async () => {},
   linkDeviceSend: previewLink,
+  linkDevicePrepare: async (code: string) => {
+    await new Promise(r => setTimeout(r, 500))
+    if (/fail/i.test(code)) throw 'Couldn’t reach your other device. Make sure DropBeam is open on it and both devices are online, then try again.'
+    return { name: 'iPhone', safety: '482 913', direction: /^dropbeamjoin1:/i.test(code) ? 'take' : 'give', peerShowsCode: true } satisfies LinkPreviewInfo
+  },
+  linkConfirm: async () => {},
+  listFriendRequests: async () => previewParam('requests') === '1' ? [{ endpointId: 'preview-req', name: 'Jordan', at: Date.now() - 60_000 }] : [],
+  acceptFriendRequest: async () => { throw 'Not available in preview' },
+  declineFriendRequest: async () => {},
   linkHostBegin: async () => 'dropbeamjoin1:eyJ2IjoxLCJlaWQiOiJwcmV2aWV3IiwibmFtZSI6IlByZXZpZXciLCJ0b2tlbiI6IjAwIn0',
   linkHostCancel: async () => {},
   linkDeviceJoin: previewLink,
@@ -798,6 +819,14 @@ export type BlockedPerson = { id: string; name: string; at: number; endpointIds:
 export function onBlockedChanged(cb: () => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('blocked://changed', () => cb())
   return listen('blocked://changed', () => cb())
+}
+
+/** Someone who introduced themselves but isn't a friend yet (S2). */
+export type FriendRequest = { endpointId: string; name: string; at: number; accountPub?: string }
+
+export function onFriendRequestsChanged(cb: () => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('friend-requests://changed', () => cb())
+  return listen('friend-requests://changed', () => cb())
 }
 
 export function onFriendsChanged(cb: () => void): Promise<UnlistenFn> {

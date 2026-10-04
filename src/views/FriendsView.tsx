@@ -63,6 +63,7 @@ export function FriendsView() {
 
   if (MOBILE_UI) return <div className="mobile-page mobile-friends">
     <MobileHeader title="Friends" actions={<button className="ios-icon" aria-label="Add friend" onClick={() => setAdding(true)}><Plus size={22} /></button>} />
+    <FriendRequests />
     {devices}
     <h2 className="ios-section-title">You</h2><YouCard />
     <h2 className="ios-section-title">{others.length ? `Friends · ${others.length}` : 'Friends'}</h2>
@@ -82,6 +83,41 @@ export function FriendsView() {
 // one row — avatar, name, one quiet status line — with Send, Message and a "…"
 // menu for everything else. Dialogs handle rename / invite / remove so rows
 // never change height.
+
+/** People who introduced themselves but aren't friends yet (S2). They can't
+ *  message you and every file they send asks first, until you accept. */
+function FriendRequests() {
+  const requests = useStore((s) => s.friendRequests)
+  const [busy, setBusy] = useState<string | null>(null)
+  if (!requests.length) return null
+  const act = async (endpointId: string, fn: () => Promise<void>) => {
+    setBusy(endpointId)
+    try { await fn() } finally { setBusy(null) }
+  }
+  const s = useStore.getState()
+  if (MOBILE_UI) return <>
+    <h2 className="ios-section-title">Friend requests · {requests.length}</h2>
+    <div className="ios-list">{requests.map((r) => <div className="ios-row" key={r.endpointId}>
+      <span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{r.name}</span>
+        <span className="ios-footnote">Wants to be your friend</span></span>
+      <button className="ios-button" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.declineFriendRequest(r.endpointId, false))}>Decline</button>
+      <button className="ios-button ios-primary" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.acceptFriendRequest(r.endpointId))}>Accept</button>
+    </div>)}</div>
+  </>
+  return <>
+    <SectionHeader count={requests.length}>Friend requests</SectionHeader>
+    <div className="group fr-list">{requests.map((r) => <div className="row" key={r.endpointId}>
+      <span className="fr-avatar" style={{ width: 32, height: 32, fontSize: 12, background: avatarColor(r.endpointId) }} aria-hidden>{initials(r.name)}</span>
+      <span className="row-main">
+        <span className="row-title">{r.name}</span>
+        <span className="row-sub">Wants to be your friend. Until you accept, they can’t message you and any file they send asks first.</span>
+      </span>
+      <button className="btn btn-plain btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.declineFriendRequest(r.endpointId, true))}>Block</button>
+      <button className="btn btn-secondary btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.declineFriendRequest(r.endpointId, false))}>Decline</button>
+      <button className="btn btn-primary btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.acceptFriendRequest(r.endpointId))}>Accept</button>
+    </div>)}</div>
+  </>
+}
 
 /** Round avatar with at most one overlay: a small green dot when online. */
 function PersonAvatar({ friend, online, device, size = 32 }: {
@@ -126,6 +162,8 @@ function DesktopFriends() {
           </button>
         </div>
       </div>
+
+      <FriendRequests />
 
       <SectionHeader>You</SectionHeader>
       <YouSection />
@@ -353,7 +391,7 @@ function FriendRow({ friend }: { friend: Friend }) {
   const [pingedOffline, setPingedOffline] = useState(false)
   const [conn, setConn] = useState<ConnDetail | null>(null)
 
-  const presence = friendPresence(friend.name, friendSeen, folderStatuses)
+  const presence = friendPresence(friend, friendSeen, folderStatuses)
   const isOnline = presence.status === 'online'
   const channel = Object.values(folderStatuses).find(
     (s) => s.peerName?.trim().toLowerCase() === friend.name.trim().toLowerCase(),
@@ -727,7 +765,7 @@ function FriendCard({ friend }: { friend: Friend }) {
   const [loadingInvite, setLoadingInvite] = useState(false)
   const [pinging, setPinging] = useState(false)
 
-  const presence = friendPresence(friend.name, friendSeen, folderStatuses)
+  const presence = friendPresence(friend, friendSeen, folderStatuses)
   const isOnline = presence.status === 'online'
   const check = async () => {
     setPinging(true)

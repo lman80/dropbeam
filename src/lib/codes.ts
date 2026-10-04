@@ -154,6 +154,11 @@ export function routeCode(raw: string): CodeRoute {
   }
 }
 
+/** A device-link code anywhere but Settings → Devices (S1): it is never acted
+ *  on there — linking hands over the whole account, so it only happens from
+ *  the screen made for it, after both devices show the same safety code. */
+export const DEVICE_CODE_ELSEWHERE = 'This is a device-link code — open Settings → Devices to link your own device.'
+
 /** QR sizing: long codes (Quick Send tickets carry the sender's addresses and
  *  run to several hundred chars) get lower error correction and more pixels so
  *  modules stay big enough for a phone camera across a desk. */
