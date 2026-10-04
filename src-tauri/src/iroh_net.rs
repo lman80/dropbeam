@@ -1839,8 +1839,16 @@ fn on_local_subnet(peer: std::net::IpAddr, subnets: &[netwatch::interfaces::IpNe
 fn addr_is_lan(dbg: &str) -> bool {
     let Some(addr) = dbg.strip_prefix("Ip(").and_then(|s| s.strip_suffix(')'))
         .and_then(|s| s.parse::<std::net::SocketAddr>().ok()) else { return false; };
+    #[cfg(test)]
+    if TEST_LOOPBACK_IS_LAN.load(Ordering::SeqCst) && addr.ip().is_loopback() { return true; }
     on_local_subnet(addr.ip(), &LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner()))
 }
+
+/// Test-only: make loopback paths classify as `Locality::Local`, so the LAN
+/// branches (one resumable stream, no pacing) are exercised over two in-process
+/// endpoints. Only set while holding `xfer_matrix::PACE_GATE` exclusively.
+#[cfg(test)]
+pub(crate) static TEST_LOOPBACK_IS_LAN: AtomicBool = AtomicBool::new(false);
 
 async fn refresh_local_subnets() {
     let state = netwatch::interfaces::State::new().await;
@@ -7632,20 +7640,28 @@ pub fn set_parallel_streams(on: bool) {
     PARALLEL_ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// How many streams to fan a transfer across: only a SINGLE file at least
-/// PARALLEL_MIN big, and never so many that a stream would carry under ~4 MiB.
-/// Returns 0 = "send the classic single-stream way".
 /// Streams for a send on `conn`: parallel only helps over the internet. Measured
 /// 2026-09-25 (256 MiB, 4 alternating pairs each): same-Wi-Fi Mac→Mac single stream
 /// 4.9 MB/s vs 3.3 MB/s parallel; Korea←US internet parallel 7.8 vs 6.6 MB/s. So a
-/// LAN path sends one stream (still resumable), everything else fans out.
+/// LAN path uses ONE range stream, everything else fans out.
+///
+/// The LAN answer must be 1, never 0: 0 means the classic body, which has no
+/// coverage sidecar and so CANNOT resume — a 40 GB copy over Wi-Fi restarted from
+/// zero after any blip (regression 540a837). One range stream is the same wire
+/// speed as the classic body and keeps the resumable/integrity path.
 fn parallel_streams_for(conn: &Connection, item_count: usize, total: u64) -> u64 {
-    if matches!(conn_locality(conn), crate::models::Locality::Local) {
-        return 0;
-    }
-    parallel_stream_count(item_count, total)
+    local_stream_cap(matches!(conn_locality(conn), crate::models::Locality::Local), parallel_stream_count(item_count, total))
 }
 
+/// LAN caps the fan-out at one stream but never turns a resumable send (n ≥ 1)
+/// into the classic, non-resumable body (n = 0).
+fn local_stream_cap(local: bool, n: u64) -> u64 {
+    if local { n.min(1) } else { n }
+}
+
+/// How many streams to fan a transfer across: only a SINGLE file at least
+/// PARALLEL_MIN big, and never so many that a stream would carry under ~4 MiB.
+/// Returns 0 = "send the classic single-stream way".
 fn parallel_stream_count(item_count: usize, total: u64) -> u64 {
     // Kill-switch first: off → 0 → every path sends the classic single stream, and
     // the receiver (which only forks parallel on an advertised `parallel > 0`)
