@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useState } from 'react'
 import { isEnterKey, isPrimaryMod } from './lib/keys'
 import { NAV_ORDER } from './components/Sidebar'
 import { JoinAccountModal } from './components/DevicesPanel'
@@ -25,14 +25,25 @@ import { IconButton, Spinner } from './components/ui'
 import { Dialog } from './components/Dialog'
 import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
-import { HistoryView } from './views/HistoryView'
-import { SettingsView } from './views/SettingsView'
-import { LocationsView } from './views/LocationsView'
-import { FoldersView } from './views/FoldersView'
-import { FriendsView } from './views/FriendsView'
-import { ChatView } from './views/ChatView'
-import { MobileApp } from './mobile/MobileApp'
-import { MobileOnboarding } from './mobile/Onboarding'
+// Route-level code splitting: Send & Receive (the landing page) ships in the main
+// chunk; every other page loads on first visit (and is prefetched once idle, so a
+// click never waits on the network-free-but-still-async import).
+const loadViews = {
+  history: () => import('./views/HistoryView').then((m) => ({ default: m.HistoryView })),
+  settings: () => import('./views/SettingsView').then((m) => ({ default: m.SettingsView })),
+  locations: () => import('./views/LocationsView').then((m) => ({ default: m.LocationsView })),
+  folders: () => import('./views/FoldersView').then((m) => ({ default: m.FoldersView })),
+  friends: () => import('./views/FriendsView').then((m) => ({ default: m.FriendsView })),
+  chat: () => import('./views/ChatView').then((m) => ({ default: m.ChatView })),
+}
+const HistoryView = lazy(loadViews.history)
+const SettingsView = lazy(loadViews.settings)
+const LocationsView = lazy(loadViews.locations)
+const FoldersView = lazy(loadViews.folders)
+const FriendsView = lazy(loadViews.friends)
+const ChatView = lazy(loadViews.chat)
+const MobileApp = lazy(() => import('./mobile/MobileApp').then((m) => ({ default: m.MobileApp })))
+const MobileOnboarding = lazy(() => import('./mobile/Onboarding').then((m) => ({ default: m.MobileOnboarding })))
 
 export default function App() {
   const [nativeShell, setNativeShell] = useState(false)
@@ -92,6 +103,15 @@ export default function App() {
   useEffect(() => {
     init()
   }, [init])
+
+  // Warm the other pages once the window is idle.
+  useEffect(() => {
+    if (MOBILE_UI) return
+    const warm = () => { for (const load of Object.values(loadViews)) void load().catch(() => {}) }
+    const ric = (window as unknown as { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback
+    const id = ric ? ric(warm) : window.setTimeout(warm, 1500)
+    return () => { if (!ric) window.clearTimeout(id) }
+  }, [])
 
   // Keyboard shortcuts (main window, desktop): ⌘/Ctrl+, Settings · ⌘1–7 pages ·
   // ⌘F find in Chat/History · ⌘N new message · ⌘O send files.
@@ -236,6 +256,7 @@ export default function App() {
           <ErrorBoundary region={`content:${view}`} key={view}>
             {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
                 so it never deadlocks on a view that has its own AnimatePresence. */}
+            <Suspense fallback={null}>
             {MOBILE_UI ? <MobileApp bridgeOnly={nativeShell} /> : <motion.div
               initial={MOBILE_UI ? false : { opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -250,6 +271,7 @@ export default function App() {
               {view === 'history' && <HistoryView />}
               {view === 'settings' && <SettingsView />}
             </motion.div>}
+            </Suspense>
           </ErrorBoundary>
         </main>
         </div>
@@ -261,7 +283,7 @@ export default function App() {
       )}
       <ErrorBoundary region="overlays" fallbackStyle={{ position: 'fixed', bottom: 12, left: 12, zIndex: 201 }}>
         {!nativeShell && <SendToChooser />}
-        {MOBILE_UI ? (!nativeShell && <MobileOnboarding />) : <NameSetupModal />}
+        {MOBILE_UI ? (!nativeShell && <Suspense fallback={null}><MobileOnboarding /></Suspense>) : <NameSetupModal />}
         {!nativeShell && <FolderInviteModal />}
         {!nativeShell && <SafetyDialogHost />}
         {!MOBILE_UI && <PopoverCodeHandoff />}
