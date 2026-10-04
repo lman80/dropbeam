@@ -531,7 +531,7 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
           </IconButton>
         )}
         {isSendWaiting && (
-          <IconButton size="sm" label={copied ? 'Copied' : 'Copy code'} side="top" onClick={copy}>
+          <IconButton size="sm" label={copied ? 'Copied' : 'Copy Code'} side="top" onClick={copy}>
             {copied ? <Check /> : <Copy />}
           </IconButton>
         )}

@@ -19,7 +19,7 @@ type Confirm =
   | { kind: 'all' }
   | { kind: 'folder'; pairId: string; name: string; bytes: number }
 
-/** The "Recoverable files" tab: every shared folder's saved copies of deleted /
+/** The "Recoverable Files" tab: every shared folder's saved copies of deleted /
  *  replaced files, with a storage summary and ways to free space. */
 export function RecoverableFilesView() {
   const toast = useStore((s) => s.toast)
@@ -169,7 +169,7 @@ export function RecoverableFilesView() {
               <SettingsIcon />
             </IconButton>
             <button className="btn btn-danger btn-sm" onClick={() => setConfirm({ kind: 'all' })} disabled={total === 0}>
-              Free up space…
+              Free Up Space…
             </button>
           </div>
         </div>
@@ -201,7 +201,7 @@ export function RecoverableFilesView() {
                   onClick={() => (confirm.kind === 'all' ? freeAll() : emptyFolder(confirm.pairId))}
                 >
                   {busy ? <Spinner size={13} /> : null}
-                  {confirm.kind === 'all' ? 'Free up space' : 'Empty'}
+                  {confirm.kind === 'all' ? 'Free Up Space' : 'Empty'}
                 </button>
               </>
             }
@@ -299,7 +299,7 @@ function FolderSection({
           <MenuButton
             size="sm"
             label={`${summary.folderName} options`}
-            items={[{ label: 'Empty saved copies…', icon: <Trash2 />, danger: true, onSelect: onAskEmpty }]}
+            items={[{ label: 'Empty Saved Copies…', icon: <Trash2 />, danger: true, onSelect: onAskEmpty }]}
           />
         }
       >
@@ -342,7 +342,7 @@ function FolderSection({
                     <MenuButton
                       size="sm"
                       label={`More for ${name}`}
-                      items={[{ label: 'Delete forever…', icon: <Trash2 />, danger: true, onSelect: () => setForgetting(item) }]}
+                      items={[{ label: 'Delete Forever…', icon: <Trash2 />, danger: true, onSelect: () => setForgetting(item) }]}
                     />
                   </div>
                 </div>

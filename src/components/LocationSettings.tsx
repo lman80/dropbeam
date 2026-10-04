@@ -123,7 +123,7 @@ function AddLocationWizard({ onCancel, onSaved }: { onCancel: () => void; onSave
         </button>)}
         <button type="button" className="row location-pick" onClick={() => { void browse() }}>
           <span className="location-glyph" aria-hidden><FolderOpen /></span>
-          <span className="row-main"><span className="row-title">Choose another folder…</span></span>
+          <span className="row-main"><span className="row-title">Choose Another Folder…</span></span>
         </button>
       </div>}
 
@@ -255,7 +255,7 @@ export function LocationSettings() {
   const shownActivity = allActivity ? activity : activity.slice(0, ACTIVITY_CAP)
 
   return <section className="location-settings" aria-label="Locations">
-    <SectionHeader action={!IS_WINDOWS && <button className="btn btn-secondary btn-sm" disabled={!loaded || busy || adding} onClick={startAdding}>Share a folder…</button>}>
+    <SectionHeader action={!IS_WINDOWS && <button className="btn btn-secondary btn-sm" disabled={!loaded || busy || adding} onClick={startAdding}>Share a Folder…</button>}>
       Locations</SectionHeader>
     {error && <p className="form-error location-settings-error" role="alert">{error}</p>}
     <div className="group">
@@ -277,7 +277,7 @@ export function LocationSettings() {
               { label: 'Edit…', icon: <Pencil />, disabled: busy, onSelect: () => { setError(''); setAdding(false); setDraft({ ...l, friendIds: [...l.friendIds], rights: { ...l.rights } }) } },
               { label: OPEN_FOLDER_LABEL, icon: <FolderOpen />, onSelect: () => { void api.openPath(l.path).catch(e => setError(errorText(e))) } },
               { separator: true },
-              { label: 'Stop sharing…', icon: <Trash2 />, danger: true, disabled: busy, onSelect: () => setRemoving(l) },
+              { label: 'Stop Sharing…', icon: <Trash2 />, danger: true, disabled: busy, onSelect: () => setRemoving(l) },
             ]} />
           </div>
         </div>
@@ -303,7 +303,7 @@ export function LocationSettings() {
     {removing && <Dialog title={`Stop sharing “${removing.name}”?`} width={380} busy={busy} onClose={() => setRemoving(null)}
       footer={<>
         <button className="btn btn-secondary" disabled={busy} onClick={() => setRemoving(null)}>Cancel</button>
-        <button className="btn btn-destructive" disabled={busy} onClick={() => void stopSharing(removing)}>Stop sharing</button>
+        <button className="btn btn-destructive" disabled={busy} onClick={() => void stopSharing(removing)}>Stop Sharing</button>
       </>}>
       <p className="dialog-text">Friends lose access. Nothing in the folder is deleted.</p>
     </Dialog>}

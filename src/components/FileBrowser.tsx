@@ -133,12 +133,12 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
   const trashTitle = trashCount === 1 ? `Move “${selectedEntries[0].name}” to Trash?` : `Move ${trashCount} items to Trash?`
   const failures = trashResults.filter(r => r.error)
   const actionSheet = dialog && <Dialog width={400} busy={busy} onClose={() => setDialog(null)} className="location-dialog"
-    title={dialog === 'trash' ? (trashCount ? trashTitle : 'Move to Trash') : dialog === 'rename' ? 'Rename' : 'New folder'}
+    title={dialog === 'trash' ? (trashCount ? trashTitle : 'Move to Trash') : dialog === 'rename' ? 'Rename' : 'New Folder'}
     footer={<>
       <button type="button" className="btn btn-secondary" disabled={busy} autoFocus={dialog === 'trash'} onClick={() => setDialog(null)}>{failures.length ? 'Close' : 'Cancel'}</button>
       <button type="submit" form="location-action-form" className={dialog === 'trash' ? 'btn btn-destructive' : 'btn btn-primary'}
         disabled={busy || (dialog !== 'trash' && !validName) || (dialog === 'trash' && !trashCount)}>
-        {busy ? 'Working…' : dialog === 'trash' ? (failures.length ? 'Try again' : 'Move to Trash') : dialog === 'mkdir' ? 'Create' : 'Rename'}</button>
+        {busy ? 'Working…' : dialog === 'trash' ? (failures.length ? 'Try Again' : 'Move to Trash') : dialog === 'mkdir' ? 'Create' : 'Rename'}</button>
     </>}>
     <form id="location-action-form" onSubmit={e => { e.preventDefault(); void run() }}>
       {dialog === 'trash'
@@ -197,7 +197,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       </div>
       <div className="page-actions">
         <IconButton label="Refresh" disabled={loading || busy} onClick={restart}><RefreshCw /></IconButton>
-        {location.rights.manage && <IconButton label="New folder" disabled={!canAct} onClick={() => openDialog('mkdir')}><FolderPlus /></IconButton>}
+        {location.rights.manage && <IconButton label="New Folder" disabled={!canAct} onClick={() => openDialog('mkdir')}><FolderPlus /></IconButton>}
         {location.rights.upload && <UploadButton disabled={!canAct} onPick={folder => void pick(folder)} />}
       </div>
     </div>
@@ -252,7 +252,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       </table>
       {error
         ? <div className="location-table-note" role="alert"><span className="truncate-1" title={error}>Couldn’t open this folder</span>
-          <button type="button" className="btn btn-plain btn-sm" disabled={busy || loading} onClick={restart}>Try again</button></div>
+          <button type="button" className="btn btn-plain btn-sm" disabled={busy || loading} onClick={restart}>Try Again</button></div>
         : loading && !entries.length
           ? <div className="location-table-note" role="status"><Spinner /> Loading…</div>
           : !entries.length && <div className="location-table-note">{query ? 'No matches' : location.rights.upload ? 'Empty folder · drop files here to upload' : 'Empty folder'}</div>}

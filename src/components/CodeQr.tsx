@@ -65,7 +65,7 @@ function QrEnlarged({ value, level, name, onClose }: { value: string; level: 'L'
 
 /** QR + text code + Copy. `layout="row"` puts the QR beside the text (wide
  *  cards); "stack" puts it on top (dialogs, narrow panes). */
-export function ShareCode({ code, instructions, footer, layout = 'row', size = 200, copyLabel = 'Copy code', hint = QR_HINT, copyVariant = 'primary' }: {
+export function ShareCode({ code, instructions, footer, layout = 'row', size = 200, copyLabel = 'Copy Code', hint = QR_HINT, copyVariant = 'primary' }: {
   code: string
   /** 'secondary' when the surrounding dialog already has its own primary button. */
   copyVariant?: 'primary' | 'secondary'

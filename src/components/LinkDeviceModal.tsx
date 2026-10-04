@@ -109,21 +109,21 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
     validate={deviceCodeProblem} onResult={v => void scanned(v)} onClose={() => start === 'scan' ? closeRef.current() : setPhase('show')} />
 
   const footer = phase === 'show' ? <>
-    <button className="btn btn-plain" onClick={() => setPhase('scan')}>Scan their code instead</button>
+    <button className="btn btn-plain" onClick={() => setPhase('scan')}>Scan Their Code Instead</button>
     <span className="spacer" />
     {codeError
-      ? <button className="btn btn-secondary" onClick={retry}>Try again</button>
-      : <button className="btn btn-secondary" disabled={!code} onClick={copy}>{copied ? 'Copied' : 'Copy code'}</button>}
+      ? <button className="btn btn-secondary" onClick={retry}>Try Again</button>
+      : <button className="btn btn-secondary" disabled={!code} onClick={copy}>{copied ? 'Copied' : 'Copy Code'}</button>}
     <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
   </> : phase === 'working' ? <button className="btn btn-secondary" onClick={onClose}>Cancel Linking</button>
     : phase === 'done' ? <button className="btn btn-primary" autoFocus onClick={onClose}>Done</button>
     : <>
       {via === 'scan'
-        ? <button className="btn btn-plain" onClick={() => { setError(''); setPhase('show') }}>Show this device’s code</button>
-        : <button className="btn btn-plain" onClick={() => { setError(''); setPhase('scan') }}>Scan their code instead</button>}
+        ? <button className="btn btn-plain" onClick={() => { setError(''); setPhase('show') }}>Show This Device’s Code</button>
+        : <button className="btn btn-plain" onClick={() => { setError(''); setPhase('scan') }}>Scan Their Code Instead</button>}
       <span className="spacer" />
       <button className="btn btn-secondary" onClick={onClose}>Close</button>
-      <button className="btn btn-primary" autoFocus onClick={retry}>Try again</button>
+      <button className="btn btn-primary" autoFocus onClick={retry}>Try Again</button>
     </>
 
   return <LinkDialog title={phase === 'done' ? 'Devices linked' : title} onClose={onClose} footer={footer}>

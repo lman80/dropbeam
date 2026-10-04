@@ -355,7 +355,7 @@ function NameSetupModal() {
           <>
             {!MOBILE_UI && (
               <button className="btn btn-plain" onClick={() => setJoining(true)} style={{ marginLeft: -8 }}>
-                Link an existing device…
+                Link an Existing Device…
               </button>
             )}
             <span className="spacer" />

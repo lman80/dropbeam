@@ -116,7 +116,7 @@ export function SendToChooser() {
             >
               <span className="chooser-avatar chooser-glyph" aria-hidden><UserPlus size={16} /></span>
               <span className="chooser-text">
-                <span className="chooser-name">Add a friend</span>
+                <span className="chooser-name">Add a Friend</span>
                 <span className="chooser-sub">Then send to them by name</span>
               </span>
             </button>

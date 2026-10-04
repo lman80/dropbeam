@@ -173,12 +173,12 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
         {notice && <p className="qrs-notice" role="alert">{notice}</p>}
         {paste ? <form className="qrs-paste" onSubmit={e => { e.preventDefault(); e.stopPropagation(); rejected.current = ''; finish(code) }}>
           <input className="input" aria-label="Paste a code" placeholder="Paste the code" autoFocus autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={code} onChange={e => { setCode(e.target.value); setNotice('') }} />
-          <button className="btn btn-primary" disabled={!code.trim()}>Use code</button>
+          <button className="btn btn-primary" disabled={!code.trim()}>Use Code</button>
         </form> : null}
       </div>
       <div className="dialog-actions dialog-footer qrs-actions">
-        <button className="btn btn-plain" type="button" disabled={reading} onClick={() => fileInput.current?.click()}>Choose image…</button>
-        {!paste && <button className="btn btn-plain" type="button" onClick={() => setPaste(true)}>Paste code</button>}
+        <button className="btn btn-plain" type="button" disabled={reading} onClick={() => fileInput.current?.click()}>Choose Image…</button>
+        {!paste && <button className="btn btn-plain" type="button" onClick={() => setPaste(true)}>Paste Code</button>}
         <span className="spacer" />
         <button className="btn btn-secondary" type="button" onClick={close}>Cancel</button>
         <input ref={fileInput} type="file" accept="image/*" hidden onChange={e => { const f = e.target.files?.[0] ?? null; e.target.value = ''; void readImage(f) }} />

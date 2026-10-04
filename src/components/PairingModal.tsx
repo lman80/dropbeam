@@ -138,14 +138,14 @@ export function PairingModal({
         footer={<button className="btn btn-secondary" onClick={onClose}>Done</button>}
       >
         <p className="dialog-text">In DropBeam, they choose Accept invite and scan or paste this.</p>
-        <ShareCode code={createdInvite} layout="stack" copyLabel="Copy invite" />
+        <ShareCode code={createdInvite} layout="stack" copyLabel="Copy Invite" />
       </Dialog>
     )
   }
 
   return (
     <Dialog
-      title={mode === 'create' ? 'New shared folder' : 'Accept a folder invite'}
+      title={mode === 'create' ? 'New Shared Folder' : 'Accept a Folder Invite'}
       width={460}
       className="folder-dialog"
       onClose={onClose}
@@ -161,7 +161,7 @@ export function PairingModal({
             {busy ? <Spinner size={13} /> : null}
             {mode === 'create'
               ? invitees.length > 0
-                ? `Create & invite ${invitees.length}`
+                ? `Create & Invite ${invitees.length}`
                 : 'Create'
               : 'Accept'}
           </button>
@@ -196,7 +196,7 @@ export function PairingModal({
         <label className="field-label">{mode === 'create' ? 'Folder to share' : 'Save into'}</label>
         <button className="btn btn-secondary folder-picker" onClick={pickFolder} title={folder || undefined}>
           <FolderOpen />
-          <span className={folder ? undefined : 'placeholder'}>{folder ? folderName : 'Choose a folder…'}</span>
+          <span className={folder ? undefined : 'placeholder'}>{folder ? folderName : 'Choose a Folder…'}</span>
         </button>
       </div>
 

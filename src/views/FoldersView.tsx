@@ -84,7 +84,7 @@ export function FoldersView() {
         <h1 className="page-title">Shared Folders</h1>
         <div className="page-actions">
           <button className="btn btn-secondary" onClick={() => setModal('accept')}>
-            Accept invite…
+            Accept Invite…
           </button>
           <button className="btn btn-primary" onClick={() => setModal('create')}>
             New folder…
@@ -329,14 +329,14 @@ function FolderRow({
   const statusTitle = lastSynced ? `Last synced ${midSentence(formatRelativeTime(lastSynced))}` : undefined
 
   const menu: MenuItem[] = [
-    { label: 'Add person…', icon: <UserPlus />, onSelect: () => setDialog('add'), disabled: addingPerson },
-    { label: 'Show invite…', icon: <QrCode />, onSelect: () => void showInvite(), hidden: pair.role !== 'a', disabled: loadingInvite },
+    { label: 'Add Person…', icon: <UserPlus />, onSelect: () => setDialog('add'), disabled: addingPerson },
+    { label: 'Show Invite…', icon: <QrCode />, onSelect: () => void showInvite(), hidden: pair.role !== 'a', disabled: loadingInvite },
     { separator: true },
-    { label: 'Folder history', icon: <History />, onSelect: () => focusFolderHistory(pair.id), hidden: !pair.mirror },
+    { label: 'Folder History', icon: <History />, onSelect: () => focusFolderHistory(pair.id), hidden: !pair.mirror },
     { label: 'Verify', icon: <FolderCheck />, onSelect: () => void runVerify(), hidden: !pair.mirror, disabled: verifying },
     { label: 'Settings…', icon: <Settings2 />, onSelect: () => setDialog('settings') },
     { separator: true },
-    { label: isGroup ? 'Leave folder…' : 'Unpair…', icon: <Unlink />, danger: true, onSelect: () => setDialog('unpair') },
+    { label: isGroup ? 'Leave Folder…' : 'Stop Sharing…', icon: <Unlink />, danger: true, onSelect: () => setDialog('unpair') },
   ]
 
   return (
@@ -354,7 +354,7 @@ function FolderRow({
           </span>
           {pendingInvite && (
             <button className="btn btn-plain btn-sm folder-status-action" onClick={showInvite} disabled={loadingInvite}>
-              Show invite…
+              Show Invite…
             </button>
           )}
         </div>
@@ -444,14 +444,14 @@ function FolderRow({
         {dialog === 'unpair' && (
           <Dialog
             key="unpair"
-            title={isGroup ? `Leave “${folderName}”?` : `Unpair “${folderName}”?`}
+            title={isGroup ? `Leave “${folderName}”?` : `Stop sharing “${folderName}”?`}
             width={380}
             onClose={() => setDialog(null)}
             footer={
               <>
                 <button className="btn btn-secondary" onClick={() => setDialog(null)}>Cancel</button>
                 <button className="btn btn-destructive" onClick={() => { setDialog(null); removeGroup() }}>
-                  {isGroup ? 'Leave' : 'Unpair'}
+                  {isGroup ? 'Leave Folder' : 'Stop Sharing'}
                 </button>
               </>
             }
@@ -566,7 +566,7 @@ function FolderSettingsDialog({
       footer={
         <>
           <button className="btn btn-danger" onClick={onUnpair}>
-            {isGroup ? 'Leave folder…' : 'Unpair…'}
+            {isGroup ? 'Leave Folder…' : 'Stop Sharing…'}
           </button>
           <span className="spacer" />
           <button className="btn btn-primary" onClick={onClose}>Done</button>
@@ -629,7 +629,7 @@ function FolderSettingsDialog({
         })}
         <button type="button" className="row folder-add-row" onClick={onAddPerson}>
           <span className="folder-avatar add"><UserPlus /></span>
-          <span className="row-main row-title">Add person…</span>
+          <span className="row-main row-title">Add Person…</span>
         </button>
       </div>
 
@@ -761,7 +761,7 @@ function AddPersonDialog({
       footer={
         <>
           <button className="btn btn-secondary" disabled={!!busy} onClick={onShareCode}>
-            <QrCode /> Share an invite code…
+            <QrCode /> Share an Invite Code…
           </button>
           <span className="spacer" />
           <button className="btn btn-secondary" disabled={!!busy} onClick={onClose}>Cancel</button>
@@ -813,7 +813,7 @@ function InviteModal({
       footer={<button className="btn btn-secondary" onClick={onClose}>Done</button>}
     >
       <p className="dialog-text">In DropBeam, they choose Accept invite and scan or paste this.</p>
-      <ShareCode code={code} layout="stack" copyLabel="Copy invite" />
+      <ShareCode code={code} layout="stack" copyLabel="Copy Invite" />
     </Dialog>
   )
 }

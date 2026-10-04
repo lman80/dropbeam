@@ -14,7 +14,7 @@ import { useStore } from '../store'
 /** Friends' locations, as the Locations view already has them loaded. */
 export type SharedByFriend = Record<string, SharedLocation[]>
 
-/** Open the "Sync a folder" sheet from anywhere on the Locations page. */
+/** Open the "Sync a Folder" sheet from anywhere on the Locations page. */
 const OPEN_EVENT = 'dropbeam:sync-folder'
 // eslint-disable-next-line react-refresh/only-export-components -- tiny event helper shared with the page header
 export function openSyncFolderSheet() { window.dispatchEvent(new CustomEvent(OPEN_EVENT)) }
@@ -91,16 +91,16 @@ export function SyncedFolders({ shared }: { shared: SharedByFriend }) {
         const words = statusWords(folder, status, pill)
         const working = busy === folder.id
         const items: MenuItem[] = [
-          { label: 'Sync now', icon: <RefreshCw />, disabled: working || !folder.enabled, onSelect: () => void act(folder.id, () => syncedFoldersApi.syncNow(folder.id)) },
+          { label: 'Sync Now', icon: <RefreshCw />, disabled: working || !folder.enabled, onSelect: () => void act(folder.id, () => syncedFoldersApi.syncNow(folder.id)) },
           { label: OPEN_FOLDER_LABEL, icon: <FolderOpen />, onSelect: () => { void api.openPath(folder.localPath) } },
           { separator: true },
           { heading: 'When you delete a file here' },
           { label: `Keep the copy on ${where.location}`, icon: folder.deleteRemote ? <span className="location-menu-space" /> : <Check />, disabled: working,
             onSelect: () => { if (folder.deleteRemote) void act(folder.id, () => syncedFoldersApi.update(folder.id, { deleteRemote: false })) } },
-          { label: 'Move the copy to Trash too', icon: folder.deleteRemote ? <Check /> : <span className="location-menu-space" />, disabled: working,
+          { label: 'Move the Copy to Trash Too', icon: folder.deleteRemote ? <Check /> : <span className="location-menu-space" />, disabled: working,
             onSelect: () => { if (!folder.deleteRemote) void act(folder.id, () => syncedFoldersApi.update(folder.id, { deleteRemote: true })) } },
           { separator: true },
-          { label: 'Stop syncing…', icon: <Trash2 />, danger: true, disabled: working, onSelect: () => setConfirmRemove(folder) },
+          { label: 'Stop Syncing…', icon: <Trash2 />, danger: true, disabled: working, onSelect: () => setConfirmRemove(folder) },
         ]
         return <div className="row location-row" key={folder.id}>
           <span className="location-glyph" aria-hidden><Folder /></span>
@@ -129,7 +129,7 @@ export function SyncedFolders({ shared }: { shared: SharedByFriend }) {
       footer={<>
         <button className="btn btn-secondary" disabled={busy === confirmRemove.id} onClick={() => setConfirmRemove(null)}>Cancel</button>
         <button className="btn btn-destructive" disabled={busy === confirmRemove.id}
-          onClick={() => { const f = confirmRemove; void act(f.id, () => syncedFoldersApi.remove(f.id)).then(() => setConfirmRemove(null)) }}>Stop syncing</button>
+          onClick={() => { const f = confirmRemove; void act(f.id, () => syncedFoldersApi.remove(f.id)).then(() => setConfirmRemove(null)) }}>Stop Syncing</button>
       </>}>
       <p className="dialog-text">Nothing is deleted. The folder stays on this device and the copies stay on {removing.location}.</p>
     </Dialog>}
@@ -182,9 +182,9 @@ function SyncSheet({ shared, onClose, onDone }: { shared: SharedByFriend; onClos
   const footer = <>
     <button className="btn btn-secondary" disabled={busy} onClick={onClose}>Cancel</button>
     <button className="btn btn-primary" disabled={busy || !picked || !localPath} onClick={() => void save()}>
-      {busy ? 'Starting…' : 'Start syncing'}</button>
+      {busy ? 'Starting…' : 'Start Syncing'}</button>
   </>
-  return <Dialog title="Sync a folder" width={440} onClose={onClose} busy={busy} className="location-dialog" footer={footer}>
+  return <Dialog title="Sync a Folder" width={440} onClose={onClose} busy={busy} className="location-dialog" footer={footer}>
     <div className="location-form">
       <div className="location-field">
         <span className="field-label">Folder on this device</span>

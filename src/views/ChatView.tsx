@@ -222,7 +222,7 @@ export function ChatView() {
         <EmptyState
           title="No conversations yet"
           hint="Add a friend to start chatting."
-          action={<button className="btn btn-primary" onClick={() => setView('friends')}>Add a friend</button>}
+          action={<button className="btn btn-primary" onClick={() => setView('friends')}>Add a Friend</button>}
           style={{ paddingTop: 96 }}
         />
       </div>

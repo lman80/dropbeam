@@ -495,7 +495,7 @@ export function SettingsView() {
       </div>
 
       <SectionHeader>
-        Recoverable files
+        Recoverable Files
           <InfoTip label="About recoverable files">
             <p>When a file in a shared folder is deleted or replaced, DropBeam keeps a copy you can restore from History. Old copies are removed automatically.</p>
           </InfoTip>
@@ -629,7 +629,7 @@ export function SettingsView() {
           <InfoTip label="About relays">
             <p>When two devices can’t connect directly, data goes through a relay. Point both devices at your own relay for a faster, steadier fallback.</p>
             <button className="btn btn-plain btn-sm set-info-link" onClick={() => api.openUrl(RELAY_GUIDE).catch(() => {})}>
-              Relay setup guide
+              Relay Setup Guide
             </button>
           </InfoTip>
       </SectionHeader>

@@ -136,7 +136,7 @@ function StorageStep({ draft, setDraft, check }: { draft: Draft; setDraft: (d: D
           )}
           <button type="button" className="row location-pick" onClick={browse}>
             <span className="location-glyph" aria-hidden><FolderOpen /></span>
-            <span className="row-main"><span className="row-title">Choose a folder…</span></span>
+            <span className="row-main"><span className="row-title">Choose a Folder…</span></span>
           </button>
         </div>
       </div>

@@ -81,7 +81,7 @@ export function HistoryView() {
           <div className="page-actions">
             <MenuButton
               label="More"
-              items={[{ label: 'Clear list…', icon: <Trash2 />, onSelect: () => setConfirmClear(true) }]}
+              items={[{ label: 'Clear List…', icon: <Trash2 />, onSelect: () => setConfirmClear(true) }]}
             />
           </div>
         )}
@@ -95,7 +95,7 @@ export function HistoryView() {
           onChange={setTab}
           options={[
             { value: 'recents', label: 'Recents' },
-            { value: 'recoverable', label: 'Recoverable files' },
+            { value: 'recoverable', label: 'Recoverable Files' },
           ]}
         />
         {tab === 'recents' && history.length > 0 && (
@@ -129,7 +129,7 @@ export function HistoryView() {
             footer={
               <>
                 <button className="btn btn-secondary" onClick={() => setConfirmClear(false)}>Cancel</button>
-                <button className="btn btn-destructive" onClick={() => { setConfirmClear(false); void clearAll() }}>Clear list</button>
+                <button className="btn btn-destructive" onClick={() => { setConfirmClear(false); void clearAll() }}>Clear List</button>
               </>
             }
           >
