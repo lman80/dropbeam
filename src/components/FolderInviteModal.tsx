@@ -43,7 +43,9 @@ export function FolderInviteModal() {
   // Remove a SPECIFIC invite: an accept that finishes after the user already
   // closed the prompt must not pop the NEXT queued invite unseen.
   const drop = (code: string) => setQueue((q) => q.filter((x) => x.code !== code))
-  const dismiss = () => { if (!busy && invite) { rememberDeclined(invite.code); drop(invite.code) } }
+  // × / Esc just put it away (it can come back with the next beacon); Decline sticks.
+  const dismiss = () => { if (!busy && invite) drop(invite.code) }
+  const decline = () => { if (!busy && invite) { rememberDeclined(invite.code); drop(invite.code) } }
 
   const accept = async () => {
     if (!invite || busy) return
@@ -80,7 +82,7 @@ export function FolderInviteModal() {
           busy={busy}
           footer={
             <>
-              <button className="btn btn-secondary" onClick={dismiss} disabled={busy}>
+              <button className="btn btn-secondary" onClick={decline} disabled={busy}>
                 Decline
               </button>
               <button className="btn btn-primary" onClick={accept} disabled={busy}>
