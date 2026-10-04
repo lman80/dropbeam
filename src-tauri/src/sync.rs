@@ -3439,16 +3439,23 @@ async fn wait_until_stable(
     if debounce.lock().unwrap().get(path) != Some(&gen) {
         return false;
     }
-    let mut last = file_len(path);
+    let mut last = file_state(path);
     for _ in 0..40 {
         if stopped.load(Ordering::SeqCst) {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(600)).await;
-        let now = file_len(path);
-        if now.is_some() && now == last {
-            debounce.lock().unwrap().remove(path);
-            return now.unwrap_or(0) > 0 || Path::new(path).is_file();
+        let now = file_state(path);
+        // Same size AND mtime across the sample, and the last write is at least
+        // WRITE_QUIET old: a copier that writes in bursts with pauses longer than
+        // one sample (slow network/NAS copies, throttled downloads) used to look
+        // "stable" mid-copy, so the peer received truncated versions first
+        // (live QA 0.53.0: 31 MB and 73 MB copies of a 200 MB file).
+        if let Some((len, mtime)) = now.filter(|_| now == last) {
+            if written_long_enough_ago(mtime, std::time::SystemTime::now()) {
+                debounce.lock().unwrap().remove(path);
+                return len > 0 || Path::new(path).is_file();
+            }
         }
         last = now;
     }
@@ -3459,8 +3466,20 @@ async fn wait_until_stable(
     false
 }
 
-fn file_len(path: &str) -> Option<u64> {
-    std::fs::metadata(path).ok().map(|m| m.len())
+/// How long a file must have gone unwritten before the watcher sends it.
+const WRITE_QUIET: Duration = Duration::from_millis(2000);
+
+fn file_state(path: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
+    std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
+}
+
+/// The last write is WRITE_QUIET old. A missing or FUTURE mtime (clock skew, a
+/// copy that preserved a future timestamp) can't be judged — don't hold it back.
+fn written_long_enough_ago(mtime: Option<std::time::SystemTime>, now: std::time::SystemTime) -> bool {
+    match mtime {
+        Some(m) => now.duration_since(m).map_or(true, |age| age >= WRITE_QUIET),
+        None => true,
+    }
 }
 
 fn viewer_warning_due(last: Option<Instant>, now: Instant) -> bool {
@@ -5965,6 +5984,39 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live QA 0.53.0: a copier writing 10 MB bursts once a second looked
+    /// "stable" between bursts, so the peer got truncated versions first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bursty_writer_is_not_sent_mid_copy() {
+        let dir = std::env::temp_dir().join(format!("db-stable-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("growing.bin");
+        std::fs::write(&path, vec![1u8; 1024]).unwrap();
+        let p = path.clone();
+        let writer = tokio::spawn(async move {
+            use std::io::Write;
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+                f.write_all(&vec![2u8; 4096]).unwrap();
+            }
+        });
+        let debounce: Arc<Mutex<HashMap<String, u64>>> = Default::default();
+        let key = path.to_string_lossy().to_string();
+        debounce.lock().unwrap().insert(key.clone(), 1);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        assert!(wait_until_stable(&key, &debounce, 1, &stopped).await);
+        assert!(writer.is_finished(), "declared stable after {:?} while the writer was still writing", t0.elapsed());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024 + 4 * 4096);
+        let now = std::time::SystemTime::now();
+        assert!(!written_long_enough_ago(Some(now), now));
+        assert!(written_long_enough_ago(Some(now - Duration::from_secs(3)), now));
+        assert!(written_long_enough_ago(Some(now + Duration::from_secs(60)), now), "future mtime is not held back");
+        assert!(written_long_enough_ago(None, now));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// A "now" far in the future for reconcile_plan tests, so the small epoch-second
     /// mtimes used below read as ancient (non-fresh) and exercise the normal rules.
