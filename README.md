@@ -1,179 +1,88 @@
 # DropBeam
 
-A polished, cross‑platform desktop app for sending files directly between
-computers — on your local network or anywhere over the internet — with
-end‑to‑end encryption. Built on [croc](https://github.com/schollz/croc).
+DropBeam sends files, folders, photos and messages **directly between your devices and your friends' devices**, on your local network or across the internet, over end-to-end encrypted peer-to-peer connections. You don't need a cloud account, and there's no upload-then-download.
 
-## ⬇️ Download
+It runs on **macOS, Windows, Linux** and **iPhone/iPad** (TestFlight).
 
-Grab the latest installer from the **[Releases page](https://github.com/lman80/dropbeam/releases/latest)**:
+- **Send to friends by name.** Add a friend once by code or QR. After that you pick their name and send. Big files resume after interruptions, and the result is checked end to end.
+- **Quick Send.** Get a link or QR code for someone who isn't a friend yet.
+- **Chat.** Messages, reactions, replies, edits, read receipts, GIFs, link previews, and files inline.
+- **Shared folders.** A folder that stays in sync with friends (two-way or view-only), with per-person roles, pause/resume and recoverable deletes.
+- **Locations.** Share a NAS or folder with friends so they can browse it and upload to it.
+- **Your devices, one account.** Link your Mac, PC, Linux box and iPhone. Friends and conversations stay in step between them directly, with no server.
+- **Transfer Server (optional).** An always-on DropBeam device (a home PC, NAS or Linux box) holds encrypted items for devices that are offline and passes them on later. It can also wake an iPhone with a push notification.
 
-- **macOS** (Apple Silicon & Intel) → download the **`.dmg`**, open it, drag **DropBeam** to Applications.
-- **Windows** → download the **`.exe`** installer and run it.
+The full guide is [docs/FEATURES.md](docs/FEATURES.md).
 
-> **First launch only** — the app isn't signed with a paid developer certificate, so the OS blocks it once.
->
-> **macOS (Sequoia 15 / macOS 26 and newer):**
-> 1. Double‑click **DropBeam** → you'll see *"Apple could not verify…"* → click **Done**.
-> 2. Open  menu → **System Settings → Privacy & Security**, scroll to **Security**.
-> 3. Click **Open Anyway** next to the DropBeam message → authenticate → **Open Anyway** again.
->
-> (On macOS 14 and older, you can instead just **right‑click the app → Open → Open**. Or, in Terminal: `xattr -dr com.apple.quarantine /Applications/DropBeam.app`.)
->
-> **Windows:** on the SmartScreen prompt, click **More info → Run anyway**.
->
-> It opens normally after that, and **updates install themselves** from inside the app — no re‑downloading.
+## Download
 
-Two modes:
+Get the latest version from the **[Releases page](https://github.com/lman80/dropbeam/releases/latest)**:
 
-- **Quick Send** — drag a file in, get a short code, the other side enters it. Works
-  on the LAN (full speed) or across the internet (direct P2P, relay fallback).
-- **Shared Drop Folders** — pair a folder with a friend; anything dropped in is
-  auto‑beamed to their paired folder, with an optional "self‑emptying outbox"
-  (delete the local copy once delivery is confirmed).
+| Platform | Download |
+|---|---|
+| macOS 10.15+ (Apple Silicon & Intel) | `.dmg`. Open it and drag DropBeam to Applications. |
+| Windows 10/11 (x64) | `-setup.exe` (or `.msi` for managed installs) |
+| Windows on ARM | `arm64-setup.exe`, when a release includes it |
+| Linux x86_64 / aarch64 | `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE) or `.AppImage` (any distro) |
 
-No accounts, no telemetry, no server to host. Files never touch our servers — the
-public croc relay only brokers the encrypted connection (PAKE), it can't read data.
+After that, **updates install themselves** from inside the app.
 
----
+**Linux notes**
+- **AppImage** needs FUSE 2. On Ubuntu 22.04 run `sudo apt install libfuse2`; on 24.04 and later run `sudo apt install libfuse2t64`. Then `chmod +x DropBeam_*.AppImage` and run it.
+- **Tray icon:** GNOME needs the *AppIndicator and KStatusNotifierItem Support* extension (Ubuntu ships it). Without a tray, DropBeam keeps its window, and closing the window minimizes it instead of hiding it.
+- **Right-click → Send with DropBeam** works in KDE Dolphin and Cinnamon Nemo with the `.deb`/`.rpm`. In GNOME Files use *Open With… → DropBeam*.
+- **Blank window on NVIDIA:** DropBeam disables WebKitGTK's DMA-BUF renderer automatically on NVIDIA's driver. Elsewhere, start it with `DROPBEAM_SOFTWARE_RENDER=1`.
+- **Wayland:** the compositor decides where windows go, so the small transfer pop-ups may not sit exactly in the corner.
 
-## Stack
+**Unsigned builds.** Releases built before code signing is set up (see [docs/SIGNING-SETUP.md](docs/SIGNING-SETUP.md)) are blocked once by the OS:
+- **macOS:** open DropBeam → *"Apple could not verify…"* → **Done**, then go to **System Settings → Privacy & Security → Open Anyway**.
+- **Windows:** SmartScreen → **More info → Run anyway**.
 
-- **Tauri v2** (Rust backend + web frontend) — small, fast, native.
-- **React 19 + TypeScript + Vite + Tailwind v4 + Framer Motion** frontend.
-- **croc** bundled as a Tauri *external binary* (sidecar), one per platform.
-- Rust: `tokio` (process orchestration), `notify` (folder watching), `regex`
-  (progress parsing), `trash` (recoverable delete), `sha2` (code derivation).
+**Headless Transfer Server (Linux):** the `.deb` installs a systemd unit. Enable it with `sudo systemctl enable --now dropbeam-server@$USER` to run `DropBeam --server` without a window.
 
-## Build & run
+## Privacy
 
-Prereqs: Rust (stable) and Node 18+.
+Your files and messages go device to device and are never stored on our servers. Some things do leave your device. Diagnostics are **on by default** (a redacted error/performance summary; turn them off in Settings → Privacy). Feedback you send becomes a **public** GitHub issue. Relay and discovery servers see your IP address and device id. Read **[PRIVACY.md](PRIVACY.md)** for the full list.
+
+## How it works
+
+- **Transport:** [iroh](https://iroh.computer) (QUIC) with NAT hole-punching. Devices on the same network find each other with mDNS and connect directly. Across the internet they connect directly when possible and fall back to an encrypted relay otherwise. Relays are number0's public ones by default, or your own ([RELAY-SETUP.md](RELAY-SETUP.md)).
+- **Identity:** each install has an Ed25519 key, which doubles as its device id. Friends are pinned keys exchanged by code or QR. Linked devices are recorded as one account and sync friends and chats with each other directly.
+- **Integrity:** received files are hashed (SHA-256) and verified, partial transfers resume, and shared-folder deletes have a freshness guard plus a local recovery archive.
+- **Transfer Server:** items are sealed (X25519) to the recipient device before upload, so the server holds ciphertext only. Held items expire after 14 days (files) and 30 days (chat) by default.
+
+### Stack
+
+- **Tauri v2.** The Rust backend is in `src-tauri/`; the web UI is React 19 + TypeScript + Vite + Tailwind v4 + Framer Motion in `src/`.
+- **iOS:** a native SwiftUI shell over the same Rust engine (Tauri plugin `src-tauri/plugins/native-ui`). See [IOS.md](IOS.md).
+- **Vendored crates** with small DropBeam patches, each with a `DROPBEAM-PATCH.md` or a "DropBeam patch" comment: `iroh`, `noq`, `noq-proto`, `netwatch`, `tauri-plugin-notification` (in `src-tauri/vendor/`).
+
+Main Rust modules: `iroh_net.rs` (transport, transfers, chat wire), `sync.rs` (shared folders), `locations.rs` / `location_sync.rs`, `mailbox/` (Transfer Server), `link.rs` / `account.rs` (device linking), `friends.rs`, `chat.rs`, `telemetry.rs` (diagnostics), `desktop_shell.rs` (tray, popover, deep links), and `commands.rs` (UI commands).
+
+## Build from source
+
+Prerequisites:
+- **Rust.** The version is pinned in `rust-toolchain.toml`; rustup installs it automatically.
+- **Node 22.**
+- **Linux:** `sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf`
 
 ```bash
-npm install
-npx tauri dev            # hot‑reload dev app
-npx tauri build          # release .app + .dmg (macOS), .msi/.exe (Windows)
+npm ci
+npx tauri dev                       # hot-reload dev app
+npx tauri build                     # release installers for this OS
+cd src-tauri && cargo test --lib -- --test-threads=1   # unit + loopback engine tests
 ```
 
-> **Build from a path without spaces or parentheses.** macOS `.dmg`/codesign
-> tooling breaks on paths like `…/DropBeam (Blip but Better)/`. This project is
-> developed in `~/DropBeam` for that reason.
+On macOS, build from a path **without spaces or parentheses**, because the DMG and codesign tools break on them.
 
-### The croc sidecars
+**Releases:** bump the version in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `package.json` (CI refuses a tag that doesn't match all three). Then push a `vX.Y.Z` tag. `.github/workflows/release.yml` builds every platform into a draft release and publishes it once the builds succeed. The in-app updater picks it up from `latest.json`. Code signing is set up in [docs/SIGNING-SETUP.md](docs/SIGNING-SETUP.md).
 
-`src-tauri/binaries/` holds the croc binary for each target, named with the Rust
-target triple so Tauri bundles the right one:
+Third-party licences are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). To regenerate the file, run `node scripts/third-party-notices.mjs`.
 
-```
-croc-aarch64-apple-darwin        # macOS Apple Silicon
-croc-x86_64-apple-darwin         # macOS Intel
-croc-x86_64-pc-windows-msvc.exe  # Windows x64
-```
+## Licence
 
-`scripts/fetch-croc.sh` downloads the current release for each platform.
+DropBeam's own licence hasn't been chosen yet. See [docs/LICENSE-DECISION.md](docs/LICENSE-DECISION.md). Until a licence is added, all rights are reserved. Third-party components are under their own licences ([THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
 
----
+## Feedback
 
-## croc integration — the specifics
-
-These are the three things worth calling out (per the original spec).
-
-### 1. Prompt‑free recurring transfers between paired peers
-
-croc is normally one code phrase per transfer. To make a *paired folder* sync
-without codes, each pair stores a shared high‑entropy `secret` (created at pairing
-time, carried in the invite). Per‑direction transfer codes are **derived** from it:
-
-```
-code = hex( sha256(secret ":" channel) )[..24]      # ≥ 6 chars, croc's minimum
-```
-
-The inviter is role **A**, the accepter is role **B**. A sends on channel `a2b`
-and listens on `b2a`; B is the mirror — so the two directions never collide, and
-both sides compute the *same* code for a given direction without any signaling
-(unit‑tested in `src/pairing.rs`).
-
-Rendezvous uses croc's natural asymmetry: **the sender parks** (`croc send` waits
-for a receiver), **the receiver polls** (`croc <code>` gives up after ~2s if no
-sender, so the listener loop re‑polls with an adaptive backoff). When a file is
-queued, the sender keeps trying; the listener catches it on its next poll. The
-shared code is passed via the `CROC_SECRET` env var (never argv, so it can't leak
-in the process list).
-
-### 2. Confirming delivery before auto‑delete
-
-`croc send` blocks until the receiver sends its `TypeFinished` handshake, i.e. it
-**exits 0 only after the receiver has the whole file**. So the engine gates
-auto‑delete on the sender process exit code: a local copy is trashed *only* after
-`exit == 0`. If a transfer is interrupted or the peer is offline, the file stays
-queued and is retried — it is **never** deleted before confirmed receipt.
-
-### 3. Local (LAN) vs internet detection
-
-croc prints the connected peer endpoint to stderr (`Sending (->192.168.1.74:…)` /
-`Receiving (<-…)`). The engine parses that IP and classifies it: an RFC‑1918 /
-link‑local address → **Local network** badge; a public address → **Internet**
-badge. (All of croc's human output — code, progress bar, peer line — is on
-**stderr**, repainted with `\r`; the engine reads stderr raw and splits on `\r`/`\n`
-to surface true live progress. See `src/croc.rs`, with parser unit tests.)
-
----
-
-## Architecture
-
-**Rust core** (`src-tauri/src/`):
-
-| module | responsibility |
-|---|---|
-| `croc.rs` | Quick Send/receive engine — spawn croc, parse progress, emit events, cancel |
-| `sync.rs` | Shared Drop Folder runtime — watcher, send queue, listener loop, auto‑delete, loop guard |
-| `pairing.rs` | Pair persistence, invite encode/decode, derived codes |
-| `settings.rs` / `history.rs` | JSON persistence (atomic writes) |
-| `commands.rs` | Tauri commands invoked from the UI |
-| `lib.rs` | App wiring, tray/menu‑bar, hide‑to‑tray, autostart |
-
-**Frontend** (`src/`): `store.ts` (zustand) subscribes to backend events
-(`transfer://update`, `folder://status`, `history://changed`); views in `views/`,
-components in `components/`. `lib/mock.ts` lets the UI run in a plain browser for
-development (auto‑activates when the Tauri APIs are absent).
-
-### Shared Drop Folder runtime (per pair)
-
-- A `notify` watcher (debounced + write‑completion via size‑stability) feeds an
-  ordered send queue. The queue is effectively the folder itself: undelivered files
-  stay on disk and are re‑queued on launch.
-- A **persistent manifest** (`synced-<id>.json`) records the signature
-  (`relpath|size|mtime`) of every file sent or received, so restarts don't re‑send
-  delivered files and a two‑way folder never beams a *received* file back.
-- The listener receives into a hidden `.dropbeam-incoming/` staging dir, then moves
-  arrivals into the folder collision‑safely (`name (1).ext`).
-- Auto‑delete routes to the OS Trash by default (recoverable), with a verify‑then‑
-  fallback so it still clears files from locations Trash can't handle.
-
----
-
-## Security & privacy
-
-- All transfers are end‑to‑end encrypted by croc (PAKE‑derived keys); the relay
-  can't read file contents.
-- Shared Drop Folders only auto‑accept on the derived codes of explicitly paired
-  peers. Incoming files are written into a staging dir and validated before moving
-  into the folder.
-- Pairing secrets are stored in the app's private config dir. (A future hardening
-  is to move them into the OS keychain.)
-- No analytics, no accounts, no data leaves your machines except the transfer.
-
-## Windows
-
-The bundle config and the Windows croc sidecar are in place; `npx tauri build` on
-a Windows machine produces `.msi`/`.exe`. (Cross‑compiling a signed Windows
-installer from macOS is out of scope — build on Windows.)
-
-## Known limitations / future work
-
-- Paired folders keep a lightweight background connection (the listener polls);
-  this is intentional given croc's model. Polling eases off when idle.
-- Multi‑peer folders (one folder → several friends) are not in v1; the pairing
-  model is designed to allow it later.
-- Code signing/notarization needs an Apple Developer ID (not included). The app
-  runs locally unsigned; for distribution, sign + notarize from a clean path.
+Use **Send Feedback** inside the app, or open an issue at <https://github.com/lman80/dropbeam/issues>. Both are public.
