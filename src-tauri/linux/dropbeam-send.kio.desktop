@@ -1,0 +1,13 @@
+# KDE Dolphin: right-click → "Send with DropBeam" for files and folders.
+# Installed to /usr/share/kio/servicemenus/ by the .deb/.rpm.
+[Desktop Entry]
+Type=Service
+MimeType=application/octet-stream;inode/directory;all/allfiles;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Priority=TopLevel
+Actions=sendWithDropBeam
+
+[Desktop Action sendWithDropBeam]
+Name=Send with DropBeam
+Icon=DropBeam
+Exec=DropBeam %u

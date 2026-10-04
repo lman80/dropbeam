@@ -105,13 +105,15 @@
     "active": true,
     "createUpdaterArtifacts": true,
     "targets": "all",
-    "category": "public.app-category.utilities",
-    "shortDescription": "Seamless peer-to-peer file transfer",
-    "longDescription": "DropBeam sends files directly between computers — on your local network or across the internet — with end-to-end encryption. Includes Shared Drop Folders that auto-beam files to a paired friend.",
+    "category": "Utility",
+    "shortDescription": "Fast, private peer-to-peer file transfer",
+    "longDescription": "DropBeam sends files and folders straight between your devices and your friends' devices — on your local network or across the internet — over end-to-end encrypted peer-to-peer connections. Add friends by code or QR, chat, keep shared folders in sync, and link your own computers and phone.",
     "icon": [
       "icons/32x32.png",
+      "icons/64x64.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
     ],
@@ -130,15 +132,39 @@
     "windows": {
       "nsis": {
         "installerHooks": "windows/hooks.nsh"
+      },
+      "wix": {
+        "fragmentPaths": [
+          "windows/wix/context-menu.wxs"
+        ],
+        "componentRefs": [
+          "DropBeamContextMenu"
+        ]
       }
     },
     "linux": {
       "deb": {
         "files": {
-          "/usr/lib/systemd/system/dropbeam-server@.service": "linux/dropbeam-server@.service"
-        }
+          "/usr/lib/systemd/system/dropbeam-server@.service": "linux/dropbeam-server@.service",
+          "/usr/share/kio/servicemenus/dropbeam-send.desktop": "linux/dropbeam-send.kio.desktop",
+          "/usr/share/nemo/actions/dropbeam-send.nemo_action": "linux/dropbeam-send.nemo_action"
+        },
+        "desktopTemplate": "linux/dropbeam.desktop.hbs",
+        "section": "net",
+        "priority": "optional"
+      },
+      "rpm": {
+        "files": {
+          "/usr/lib/systemd/system/dropbeam-server@.service": "linux/dropbeam-server@.service",
+          "/usr/share/kio/servicemenus/dropbeam-send.desktop": "linux/dropbeam-send.kio.desktop",
+          "/usr/share/nemo/actions/dropbeam-send.nemo_action": "linux/dropbeam-send.nemo_action"
+        },
+        "desktopTemplate": "linux/dropbeam.desktop.hbs"
       }
-    }
+    },
+    "publisher": "Ashton Miller",
+    "copyright": "© 2026 Ashton Miller",
+    "homepage": "https://github.com/lman80/dropbeam"
   },
   "plugins": {
     "updater": {
@@ -146,6 +172,13 @@
       "endpoints": [
         "https://github.com/lman80/dropbeam/releases/latest/download/latest.json"
       ]
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "dropbeam"
+        ]
+      }
     }
   }
 }
