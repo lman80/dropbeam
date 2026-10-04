@@ -1130,6 +1130,8 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   applyTheme: (theme) => {
+    // Cache for index.html's pre-paint theme script (next launch, every window).
+    try { localStorage.setItem('dropbeam-theme', theme) } catch { /* storage unavailable */ }
     const root = document.documentElement
     const sysDark = window.matchMedia('(prefers-color-scheme: dark)').matches
     const dark = theme === 'dark' || (theme === 'system' && sysDark)

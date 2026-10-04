@@ -46,8 +46,9 @@ if (MOBILE_UI) {
   document.documentElement.classList.add(`platform-${DESKTOP_OS}`)
 }
 
-// Apply the OS theme immediately to avoid a flash; App refines it from settings.
-if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+// index.html already applied the CACHED theme before first paint; with no
+// cache yet, follow the OS. App refines it from settings (and re-caches it).
+if (!localStorage.getItem('dropbeam-theme') && window.matchMedia('(prefers-color-scheme: dark)').matches) {
   document.documentElement.classList.add('dark')
 }
 
