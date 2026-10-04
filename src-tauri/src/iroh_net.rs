@@ -16,6 +16,7 @@
 mod integrity;
 pub(crate) mod receive_stage;
 pub(crate) mod delivered;
+mod chat_manifest;
 #[cfg(test)]
 mod friendly_failure_tests {
     use super::*;
@@ -2950,9 +2951,14 @@ async fn serve_stream_inner(
             send_receiver_error(send, &anyhow::anyhow!("This computer is running in the background without the DropBeam app open. Try again when it's open.")).await;
             let _ = send.finish();
         }
+        Some("chat-manifest") => {
+            chat_manifest::serve(&conn.remote_id().to_string(), &req, send, recv).await?;
+        }
         Some("files") => {
             // A friend pushed files straight to us. Receive into the download
             // folder and surface it like any other receive.
+            // A compact chat link gets its once-sent manifest back (T1).
+            let req = chat_manifest::hydrate(&conn.remote_id().to_string(), req.clone());
             if req.get("location").is_some() && state.app.get().is_none() {
                 let config = location_config(state)?;
                 let peer = conn.remote_id().to_string(); let header = req.clone();
@@ -9247,7 +9253,12 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     let mut header = files_header(&items, &dirs, total, n, my_name, true);
     header["integrity_v"] = serde_json::json!(1);
     if let Some(link) = chat_link {
-        header["chatTransfer"] = serde_json::to_value(link)?;
+        // Big manifests travel once, out of band (T1); `None` = an older
+        // receiver that can't take one: push without the chat link.
+        match chat_manifest::header_value(conn, link).await? {
+            Some(v) => header["chatTransfer"] = v,
+            None => header["location_item_offset"] = serde_json::json!(link.item_offset),
+        }
     }
     if let Some(location) = location {
         header["locations_v"] = serde_json::json!(crate::locations::VERSION);

@@ -61,3 +61,97 @@ fn s7_stat_and_verify_only_see_the_senders_own_deliveries() {
     let _ = std::fs::remove_dir_all(config);
     let _ = std::fs::remove_dir_all(downloads);
 }
+
+use super::xfer_matrix::{dial, endpoint, friend_send, scratch as mscratch, PACE_GATE};
+
+/// 20,000 files with long paths: a manifest (~2 MB) far over the 1 MiB header
+/// cap that used to fail every such send.
+fn many_files(root: &Path, n: usize) -> PathBuf {
+    let top = root.join("Big folder");
+    for i in 0..n {
+        let dir = top.join(format!("a fairly long subfolder name number {:03}", i % 200));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("photo with a long descriptive name {i:05}.jpg")), format!("{i}")).unwrap();
+    }
+    top
+}
+
+fn count_files(dir: &Path) -> usize {
+    let mut n = 0;
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let t = e.file_type().unwrap();
+        if t.is_dir() { n += count_files(&e.path()); } else if t.is_file() { n += 1; }
+    }
+    n
+}
+
+/// T1: a 20k-file friend send to a CURRENT receiver: the manifest goes once
+/// over `chat-manifest`, every push header stays small, all files land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t1_twenty_thousand_file_friend_send_lands() {
+    let _gate = PACE_GATE.read().await;
+    let src = mscratch("t1-src");
+    let rx = mscratch("t1-rx");
+    let top = many_files(&src.0, 20_000);
+    let (items, dirs, total) = gather_items(&[top.clone()]).unwrap();
+    let link = super::xfer_matrix::chat_link(&items, &dirs, total);
+    assert!(chat_manifest::needs_out_of_band(&link));
+    assert!(serde_json::to_vec(&link).unwrap().len() > MAX_HEADER, "the inline manifest alone exceeds the frame cap");
+
+    let server = endpoint(true).await;
+    let client = endpoint(false).await;
+    let state = Arc::new(IrohState::default());
+    let _ = state.test_inbox.set(rx.0.clone());
+    let accept = tokio::spawn(accept_loop(server.clone(), state));
+    let conn = dial(&client, &server).await;
+    tokio::time::timeout(Duration::from_secs(240), friend_send(&conn, &server.id().to_string(), &[top], &AtomicBool::new(false)))
+        .await.expect("20k-file send hung").expect("20k-file send failed");
+    conn.close(0u32.into(), b"done");
+    assert_eq!(count_files(&rx.0), 20_000);
+    assert_eq!(chat_manifest::held_for(&client.id().to_string()), 1, "the manifest went over once, out of band");
+    accept.abort();
+    client.close().await;
+    server.close().await;
+}
+
+/// T1 compatibility: a receiver that predates `chat-manifest` answers the
+/// unknown kind with `{"kind":"ok"}` (every shipped build does). The send must
+/// still deliver every file — as plain pushes at the right item offsets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t1_big_manifest_to_old_receiver_degrades_not_fails() {
+    let _gate = PACE_GATE.read().await;
+    let src = mscratch("t1old-src");
+    let rx = mscratch("t1old-rx");
+    let top = many_files(&src.0, 12_000);
+    let server = endpoint(true).await;
+    let client = endpoint(false).await;
+    let dest = rx.0.clone();
+    let srv = server.clone();
+    let old = tokio::spawn(async move {
+        let conn = srv.accept().await.unwrap().await.unwrap();
+        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+            let Ok(header) = read_frame(&mut recv).await else { continue };
+            match header["kind"].as_str() {
+                Some("files.stat") => {
+                    let _ = write_frame(&mut send, &friend_stat_reply(&dest, &header).unwrap()).await;
+                }
+                Some("files") => {
+                    assert!(header.get("chatTransfer").is_none(), "an old receiver never gets a compact link");
+                    integrity::scope(read_files_negotiated(&conn, &mut send, &mut recv, &header, &dest,
+                        &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {})).await.expect("plain push lands");
+                }
+                _ => { let _ = write_frame(&mut send, &serde_json::json!({"kind": "ok"})).await; }
+            }
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+        }
+    });
+    let conn = dial(&client, &server).await;
+    tokio::time::timeout(Duration::from_secs(240), friend_send(&conn, &server.id().to_string(), &[top], &AtomicBool::new(false)))
+        .await.expect("send hung").expect("send to an old receiver must still deliver");
+    conn.close(0u32.into(), b"done");
+    let _ = tokio::time::timeout(Duration::from_secs(10), old).await;
+    assert_eq!(count_files(&rx.0), 12_000);
+    client.close().await;
+    server.close().await;
+}
