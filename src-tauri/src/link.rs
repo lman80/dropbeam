@@ -33,7 +33,7 @@ const SELF_CODE: &str = "That's this device's own code. Scan it with your other 
 const EXPIRED: &str = "That code has expired or was already used. Show a new code on the other device and scan it again.";
 const UNREACHABLE: &str = "Couldn't reach your other device. Make sure DropBeam is open on it and both devices are online, then try again.";
 const DROPPED: &str = "The connection to your other device dropped while linking. Keep DropBeam open on both devices and try again.";
-const BOTH_ACCOUNTS: &str = "Both devices already belong to different accounts, so they can't be linked. On the device you want to move, open Settings → Devices → Remove This Device from Account, then try again.";
+const BOTH_ACCOUNTS: &str = "Each of these devices is already linked to other devices, so they can't be linked to each other. On the one you want to move, open Settings → Devices and choose Remove This Device from My Devices, then try again.";
 const ALREADY: &str = "These devices are already linked.";
 const NOT_READY: &str = "DropBeam is still connecting — try again in a moment.";
 
@@ -336,7 +336,7 @@ fn take_prepared(dir: &Path, token: &str, eid: &str, confirm: &str) -> bool {
 }
 const CONFIRM_FIRST: &str = "Check the safety code on both devices first, then try again.";
 const CANCELLED: &str = "Linking was cancelled on this device.";
-const JOIN_WOULD_LEAVE: &str = "This device already shares an account with your other devices, so it can't join another one. Scan this device's code from the other device instead (Settings → Devices).";
+const JOIN_WOULD_LEAVE: &str = "This device is already linked to your other devices. Scan this device's code from the new device instead (Settings → Devices → Link a Device).";
 
 /// Step 1 of linking with a scanned code: reach the other device, run the
 /// commit–reveal safety-code exchange with it, and return what this device

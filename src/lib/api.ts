@@ -691,7 +691,7 @@ const realApi = {
 // containing "fail" shows the error screen, anything else the progress + success.
 const previewParam = (k: string) => typeof location === 'undefined' ? null : new URLSearchParams(location.search).get(k)
 const previewLink = async (code: string): Promise<LinkResult> => {
-  if (/fail/i.test(code)) { await new Promise(r => setTimeout(r, 900)); throw 'Both devices already belong to different accounts, so they can’t be linked. On the device you want to move, open Settings → Devices → Remove This Device from Account, then try again.' }
+  if (/fail/i.test(code)) { await new Promise(r => setTimeout(r, 900)); throw 'Each of these devices is already linked to other devices, so they can’t be linked to each other. On the one you want to move, open Settings → Devices and choose Remove This Device from My Devices, then try again.' }
   mockEmit('link://progress', { stage: 'waiting', friends: 0, messages: 0 })
   await new Promise(r => setTimeout(r, 900))
   mockEmit('link://progress', { stage: 'importing', friends: 7, messages: 309 })

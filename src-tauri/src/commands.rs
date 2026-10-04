@@ -1795,6 +1795,15 @@ pub async fn send_read_receipt(
     Ok(())
 }
 
+/// The user has seen this conversation (it's open on screen): remember how far
+/// it's read, so the user's other devices clear their unread badge for it too.
+#[tauri::command]
+pub fn chat_mark_seen(state: State<'_, Arc<AppState>>, friend_id: String) {
+    if chat::mark_seen(&state.config_dir, &friend_id).is_some() {
+        crate::account::note_change();
+    }
+}
+
 /// Download a GIF's bytes (from Giphy's CDN) into a temp file so it can be sent
 /// over the normal P2P file path. Returns the local path. Fetched in Rust to
 /// avoid webview CORS/CSP and keep the key/usage server-agnostic.
