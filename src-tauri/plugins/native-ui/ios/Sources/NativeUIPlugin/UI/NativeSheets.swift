@@ -252,21 +252,21 @@ struct FolderInviteSheet: View {
             ContentUnavailableView {
                 Label(invite.folderName, systemImage: "folder.fill.badge.person.crop")
             } description: {
-                Text("\(invite.fromName) wants to share this folder with you. Choose a folder in Files to keep in sync with theirs.")
+                Text("\(invite.fromName) wants to share the folder “\(invite.folderName)” with you. When anyone adds or changes a file in it, everyone gets the change.\n\nChoose where to keep it — DropBeam makes a “\(invite.folderName)” folder there.")
             } actions: {
                 VStack(spacing: 12) {
                     Button {
                         busy = true
-                        Task { defer { busy = false }; do { let accepted: Bool = try await bridge.call("acceptFolderInvite", ["code": invite.code]); if accepted { Haptics.success(); bridge.showToast("Joined shared folder"); dismiss() } } catch { self.error = error.localizedDescription } }
-                    } label: { Text(busy ? "Joining…" : "Choose Folder & Join").frame(minWidth: 220, minHeight: 32) }
+                        Task { defer { busy = false }; do { let accepted: Bool = try await bridge.call("acceptFolderInvite", ["code": invite.code, "folderName": invite.folderName]); if accepted { Haptics.success(); bridge.showToast("Joined “\(invite.folderName)”"); dismiss() } } catch { self.error = PlainError.humanize(error.localizedDescription) } }
+                    } label: { Text(busy ? "Joining…" : "Choose Where to Keep It").frame(minWidth: 220, minHeight: 32) }
                         .beamButton(prominent: true).disabled(busy)
                     if let error { Text(error).font(.subheadline).foregroundStyle(.red) }
                 }
             }
             .beamCanvas()
-            .navigationTitle("Shared Folder Invite").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Join a Shared Folder").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Decline") { dismiss() }.disabled(busy) } }
-        }.tint(.beam).interactiveDismissDisabled(busy).presentationDetents([.medium, .large])
+        }.tint(.beam).interactiveDismissDisabled(busy).presentationDetents([.large])
     }
 }
 

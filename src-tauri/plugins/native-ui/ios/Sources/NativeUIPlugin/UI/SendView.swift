@@ -13,11 +13,13 @@ struct SendView: View {
     @State private var scanning = false
     @State private var adding = false
     @FocusState private var codeFocused: Bool
+    @ObservedObject private var lan = LanDiscovery.shared
     private var active: [Transfer] { bridge.sendTransfers.filter(\.active) }
     private var finished: [Transfer] { bridge.sendTransfers.filter { !$0.active } }
     var body: some View {
         NavigationStack {
             List {
+                if lan.localNetworkDenied { LocalNetworkNotice() }
                 Section { SendSourceGrid(picking: $picking, pick: pick) }
                     .clearRow(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 Section {
@@ -45,7 +47,9 @@ struct SendView: View {
                     Button { scanning = true; Haptics.tap() } label: {
                         Label("Scan a QR Code", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity, minHeight: 32, alignment: .leading).contentShape(Rectangle())
                     }
-                } header: { Text("Receive") }.headerProminence(.increased)
+                } header: { Text("Receive") } footer: {
+                    Text("Someone sent you a code? Paste it here, or scan their QR code, to get their files.")
+                }.headerProminence(.increased)
                 Section {
                     if bridge.sendTransfers.isEmpty { emptyState }
                     ForEach(finished) { transfer in TransferRow(transfer: transfer) }
@@ -254,6 +258,7 @@ struct TransferRow: View {
     @EnvironmentObject private var bridge: Bridge
     let transfer: Transfer
     @State private var copied = false
+    @State private var viewing: LocalMedia?
     private var failed: Bool { transfer.state == "failed" }
     private var canRetry: Bool { (failed || transfer.state == "paused") && (transfer.direction == "send" || transfer.code?.isEmpty == false) }
     private var canShare: Bool { transfer.state == "completed" && transfer.sharePaths?.isEmpty == false }
@@ -284,7 +289,7 @@ struct TransferRow: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) { ProgressView().controlSize(.small); Text(detail).font(.footnote).foregroundStyle(.secondary) }
                     if transfer.state == "waitingForPeer" {
-                        Button("Send Through a Relay Now") { bridge.perform { try await bridge.action("forceRelay", ["id": transfer.id]) } }
+                        Button("Send Now Through a Relay (slower, still encrypted)") { bridge.perform { try await bridge.action("forceRelay", ["id": transfer.id]) } }
                             .font(.footnote.weight(.semibold)).buttonStyle(.borderless)
                     }
                 }
@@ -293,6 +298,13 @@ struct TransferRow: View {
                 DeliveryRows(deliveries: devices)
             }
             if transfer.state == "completed" { completedDetails }
+            if canShare && transfer.direction == "receive" { receivedPlace }
+            // Sending to a friend who isn't around: say it will go by itself.
+            if transfer.direction == "send", transfer.code == nil, ["waitingForPeer", "connecting"].contains(transfer.state ?? ""),
+               (transfer.detail ?? "").isEmpty, let name = transfer.friendName, !name.isEmpty {
+                Text("It sends by itself as soon as \(name) opens DropBeam. Keep DropBeam open on this iPhone until then.")
+                    .font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             if failed || transfer.state == "paused", let error = transfer.error {
                 Text(error).font(.footnote).foregroundStyle(.secondary)
             }
@@ -324,7 +336,8 @@ struct TransferRow: View {
             if canShare { Button("Share", systemImage: "square.and.arrow.up", action: share) }
             if canRetry { Button(transfer.state == "paused" ? "Resume" : "Retry", systemImage: "arrow.clockwise", action: retry) }
             if canPause { Button("Pause", systemImage: "pause", action: pause) }
-            if canVerify { Button("Verify Copy", systemImage: "checkmark.shield", action: verify) }
+            if canShare && transfer.direction == "receive" { Button("Show in Files", systemImage: "folder", action: showInFiles) }
+            if canVerify { Button("Check the Copy", systemImage: "checkmark.shield", action: verify) }
             if let code = transfer.code, transfer.state == "waitingForPeer" { Button("Copy Code", systemImage: "doc.on.doc") { UIPasteboard.general.string = code; Haptics.tap() } }
             if transfer.active { Button("Cancel Transfer", systemImage: "xmark", role: .destructive, action: cancel) }
             else { Button("Remove", systemImage: "trash", role: .destructive, action: dismiss) }
@@ -335,7 +348,9 @@ struct TransferRow: View {
         let who = name.map { (transfer.direction == "receive" ? "From " : "To ") + $0 }
         let status: String
         switch transfer.state {
-        case "waitingForPeer" where transfer.direction == "send" && transfer.code != nil: status = "Waiting for a receiver"
+        case "waitingForPeer" where transfer.direction == "send" && transfer.code != nil: status = "Waiting for someone to use the code"
+        case "waitingForAccept" where transfer.direction == "receive": status = "Wants to send you this"
+        case "waitingForAccept": status = "Waiting for them to accept"
         case "failed": status = transfer.direction == "send" ? "Couldn’t send" : "Couldn’t receive"
         default: status = transfer.status
         }
@@ -355,7 +370,7 @@ struct TransferRow: View {
         if (transfer.speedBps ?? 0) > 0 { parts.append(Formatters.speed(transfer.speedBps, megabits: bridge.settings?.showMegabits == true)) }
         if let eta = Formatters.eta(transfer.etaSeconds) { parts.append(eta) }
         // The route only matters to people when it explains a slow transfer.
-        if transfer.routeLabel?.hasPrefix("Relay") == true { parts.append("via relay") }
+        if transfer.routeLabel?.hasPrefix("Relay") == true { parts.append("via relay (slower)") }
         return parts.joined(separator: " · ")
     }
     private var icon: some View {
@@ -400,6 +415,8 @@ struct TransferRow: View {
     }
     private func codeBlock(_ code: String) -> some View {
         VStack(spacing: 12) {
+            Text("Ask them to open DropBeam and scan this code (Send → Scan a QR Code), or send them the code to paste. Keep DropBeam open until it’s done.")
+                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             QRCodeView(code: code, side: 168)
             CodeLine(code: code).padding(.horizontal, 8)
             HStack(spacing: 12) {
@@ -432,7 +449,7 @@ struct TransferRow: View {
             let report = transfer.verify!
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("Verifying… \(report.checked) of \(report.total) files").font(.footnote).foregroundStyle(.secondary).monospacedDigit()
+                    Text("Checking… \(report.checked) of \(report.total) files").font(.footnote).foregroundStyle(.secondary).monospacedDigit()
                     Spacer()
                     Button("Cancel") { bridge.perform { try await bridge.action("cancelVerify", ["id": transfer.id]) } }.font(.footnote).buttonStyle(.borderless)
                 }
@@ -446,15 +463,38 @@ struct TransferRow: View {
                 ForEach(report.mismatched, id: \.self) { Text("Different: \($0)").font(.caption) }
                 ForEach(report.missing, id: \.self) { Text("Missing: \($0)").font(.caption) }
             } label: { Label("\(report.mismatched.count + report.missing.count) of \(report.total) files don’t match", systemImage: "xmark.shield.fill").font(.footnote.weight(.semibold)).foregroundStyle(.red) }
-            Button("Verify Again", action: verify).font(.footnote.weight(.semibold)).buttonStyle(.borderless)
+            Button("Check Again", action: verify).font(.footnote.weight(.semibold)).buttonStyle(.borderless)
         default:
             HStack {
-                Text(transfer.verify?.error ?? "Couldn’t verify the copy.").font(.footnote).foregroundStyle(.red)
+                Text(transfer.verify?.error ?? "Couldn’t check the copy.").font(.footnote).foregroundStyle(.red)
                 Spacer(minLength: 8)
                 Button("Try Again", action: verify).font(.footnote.weight(.semibold)).buttonStyle(.borderless)
             }
         }
     }
+    /// Right after something arrives: where it is, and the three things people do next.
+    private var receivedPaths: [String] { (transfer.sharePaths ?? []).map(LocalPaths.resolve) }
+    private var receivedMedia: [URL] { receivedPaths.map { URL(fileURLWithPath: $0) }.filter { ReceivedMediaSaver.kind(of: $0) != nil } }
+    @ViewBuilder private var receivedPlace: some View {
+        let folder = SaveFolder.shared
+        VStack(alignment: .leading, spacing: 8) {
+            Label("In the Files app: \(folder.place) › \(folder.displayName)" + (!receivedMedia.isEmpty && ReceivedMediaSaver.shared.choice == .on ? ", and in Photos" : ""), systemImage: "folder")
+                .font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                if receivedPaths.count == 1, let item = receivedPaths.first.flatMap(LocalMedia.init(path:)) {
+                    Button("Open") { viewing = item }.beamButton(prominent: true)
+                } else {
+                    Button("Open", action: share).beamButton(prominent: true)
+                }
+                Button("Show in Files", action: showInFiles).beamButton()
+                if !receivedMedia.isEmpty && ReceivedMediaSaver.shared.choice != .on {
+                    Button("Save to Photos") { Task { _ = await ReceivedMediaSaver.shared.save(receivedMedia) } }.beamButton()
+                }
+            }.controlSize(.small).font(.footnote.weight(.semibold))
+        }
+        .fullScreenCover(item: $viewing) { item in MediaViewer(path: item.path, name: item.name, video: item.video) }
+    }
+    private func showInFiles() { Haptics.tap(); SaveFolder.shared.showInFiles() }
     private func pause() { bridge.perform { try await bridge.action("pauseTransfer", ["id": transfer.id]) } }
     private func verify() { bridge.perform { try await bridge.action("verifyTransfer", ["id": transfer.id]) } }
     private func cancel() { bridge.perform { try await bridge.cancelTransfer(id: transfer.id) } }
@@ -492,5 +532,20 @@ struct RouteBadge: View {
         Label(label, systemImage: symbol).font(.caption2.weight(.semibold)).foregroundStyle(color)
             .padding(.horizontal, 8).padding(.vertical, 3).background(color.opacity(0.14), in: Capsule())
             .lineLimit(1).accessibilityLabel("Route: \(label)")
+    }
+}
+
+/// Shown on the Send tab while Local Network access is off for DropBeam.
+private struct LocalNetworkNotice: View {
+    var body: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Nearby devices can’t connect directly", systemImage: "wifi.exclamationmark")
+                    .font(.headline).foregroundStyle(.orange)
+                Text("Files still send, but slower. To send at full speed on the same Wi-Fi, turn on Local Network for DropBeam in Settings.")
+                    .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button("Open Settings") { SystemSettings.open() }.beamButton(prominent: true).controlSize(.small)
+            }.padding(.vertical, 4)
+        }
     }
 }
