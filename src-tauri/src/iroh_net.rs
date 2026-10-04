@@ -2572,7 +2572,10 @@ fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
 /// Locations. Quick Send pulls (they hold a code the user gave them), pings and
 /// the user's own account traffic are unaffected.
 fn is_blockable_kind(kind: &str) -> bool {
-    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite")
+    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite"
+        // S11: a blocked person can't push into, delete from or steer a shared
+        // folder either (they're refused exactly like an unknown folder).
+        | "folder-hello" | "folder-files" | "folder-ctrl" | "folder-reconcile")
         || kind.starts_with("locations.")
         || kind.starts_with("mailbox.")
 }
@@ -2598,6 +2601,10 @@ async fn serve_blocked(kind: &str, req: &serde_json::Value, send: &mut SendStrea
         k if k.starts_with("locations.") => {
             write_frame(send, &serde_json::json!({ "ok": false, "error": "Location access denied" })).await?;
         }
+        // Never acknowledged (an ack could read as "delivered" and let the
+        // sender clean up its copy): the stream just fails, as for a folder
+        // this device doesn't have.
+        "folder-files" | "folder-ctrl" | "folder-reconcile" | "folder-hello" => anyhow::bail!("folder access denied"),
         _ => write_frame(send, &serde_json::json!({ "kind": "ok" })).await?,
     }
     let _ = send.finish();
@@ -14320,6 +14327,14 @@ mod chat_transfer_link_tests {
 #[cfg(test)]
 mod block_loopback_tests {
     use super::*;
+
+    #[test]
+    fn folder_streams_are_blockable() {
+        for k in ["folder-files", "folder-ctrl", "folder-reconcile", "folder-hello", "folder-invite", "chat", "files"] {
+            assert!(is_blockable_kind(k), "{k}");
+        }
+        assert!(!is_blockable_kind("pull") && !is_blockable_kind("account-sync"));
+    }
 
     async fn ep() -> Endpoint {
         Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
