@@ -24,7 +24,7 @@
   <!-- iroh's mDNS peer discovery (N0_SERVICE_NAME). Without BOTH of these the OS
        silently drops multicast and LAN peers never appear (macOS 15+ and iOS). -->
   <key>NSBonjourServices</key>
-  <array><string>_irohv1._udp</string></array>
+  <array><string>_irohv1._udp</string><string>_dropbeam._udp</string></array>
   <key>NSLocalNetworkUsageDescription</key>
   <string>DropBeam looks for your devices and friends on this network so files go straight between them at full speed, without the internet.</string>
 </dict>

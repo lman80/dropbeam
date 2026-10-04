@@ -2,16 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleURLTypes</key>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<dict>
-			<key>CFBundleURLName</key>
-			<string>com.ashtonmiller.dropbeam.invite</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>dropbeam</string>
-			</array>
-		</dict>
+		<string>com.ashtonmiller.dropbeam.transfer.*</string>
 	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
@@ -29,8 +22,21 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>0.52.2</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.ashtonmiller.dropbeam.invite</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>dropbeam</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
-	<string>0.52.4</string>
+	<string>0.53.0</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
@@ -38,6 +44,7 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_irohv1._udp</string>
+		<string>_dropbeam._udp</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>DropBeam uses the camera only to scan QR codes for adding friends, linking your devices and joining shared folders.</string>
