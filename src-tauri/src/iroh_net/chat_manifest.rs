@@ -34,10 +34,12 @@ struct Stored {
 }
 
 /// Receiver side: `(peer endpoint id, sender's link id, attempt)` → manifest.
-static STORE: std::sync::LazyLock<Mutex<HashMap<(String, String, u64), Stored>>> = std::sync::LazyLock::new(Default::default);
+type StoreKey = (String, String, u64);
+static STORE: std::sync::LazyLock<Mutex<HashMap<StoreKey, Stored>>> = std::sync::LazyLock::new(Default::default);
 /// Sender side: `(connection, link id, attempt)` → receiver stored it (true) or
 /// doesn't speak this (false). One offer per connection and attempt.
-static OFFERED: std::sync::LazyLock<Mutex<HashMap<(usize, String, u64), bool>>> = std::sync::LazyLock::new(Default::default);
+type OfferKey = (usize, String, u64);
+static OFFERED: std::sync::LazyLock<Mutex<HashMap<OfferKey, bool>>> = std::sync::LazyLock::new(Default::default);
 
 fn estimate(link: &crate::models::ChatTransferLink) -> usize {
     link.manifest.iter().map(|f| f.name.len() + 40).sum::<usize>()
@@ -53,7 +55,7 @@ pub(super) fn needs_out_of_band(link: &crate::models::ChatTransferLink) -> bool 
 pub(super) fn light(link: &crate::models::ChatTransferLink) -> crate::models::ChatTransferLink {
     crate::models::ChatTransferLink {
         id: link.id.clone(), attempt: link.attempt, manifest: vec![], directories: vec![],
-        batch_state: link.batch_state.clone(), bytes_done: link.bytes_done,
+        batch_state: link.batch_state, bytes_done: link.bytes_done,
         completed_files: vec![], completed_paths: Default::default(),
         item_offset: link.item_offset, offset: link.offset, total: link.total, last: link.last,
     }

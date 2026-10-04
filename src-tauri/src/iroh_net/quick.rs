@@ -171,7 +171,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.txt");
         std::fs::write(&f, b"one").unwrap();
-        let (items, _, _) = gather_items(&[f.clone()]).unwrap();
+        let (items, _, _) = gather_items(std::slice::from_ref(&f)).unwrap();
         assert!(unchanged(&items).is_ok());
         std::fs::write(&f, b"longer now").unwrap();
         assert!(unchanged(&items).unwrap_err().contains("a.txt"));

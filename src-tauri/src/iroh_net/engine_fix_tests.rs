@@ -93,7 +93,7 @@ async fn t1_twenty_thousand_file_friend_send_lands() {
     let src = mscratch("t1-src");
     let rx = mscratch("t1-rx");
     let top = many_files(&src.0, 20_000);
-    let (items, dirs, total) = gather_items(&[top.clone()]).unwrap();
+    let (items, dirs, total) = gather_items(std::slice::from_ref(&top)).unwrap();
     let link = super::xfer_matrix::chat_link(&items, &dirs, total);
     assert!(chat_manifest::needs_out_of_band(&link));
     assert!(serde_json::to_vec(&link).unwrap().len() > MAX_HEADER, "the inline manifest alone exceeds the frame cap");

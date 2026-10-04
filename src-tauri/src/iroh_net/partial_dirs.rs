@@ -163,14 +163,6 @@ pub(super) fn all() -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
-pub(super) fn persisted_for_tests() -> Vec<PathBuf> {
-    save_now();
-    let config = lock().config.clone().unwrap();
-    let list: Vec<Root> = std::fs::read(config.join(FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    list.into_iter().map(|r| r.path).collect()
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

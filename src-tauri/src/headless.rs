@@ -124,7 +124,7 @@ fn lock_for_app_with(config: &Path, tick: Duration) -> Option<EngineLock> {
     }
     let mut tries = 0u32;
     loop {
-        if tries % 20 == 0 || tries == TAKEOVER_FORCE_AFTER {
+        if tries.is_multiple_of(20) || tries == TAKEOVER_FORCE_AFTER {
             if let Some((pid, mode)) = holder(config) {
                 if mode == "server" && pid > 1 && pid as u32 != std::process::id() {
                     let force = tries >= TAKEOVER_FORCE_AFTER;

@@ -1136,7 +1136,6 @@ async fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String> {
 }
 
 /// Leave a friend file send (`xfer_id` = the chat transfer id) on a server.
-#[allow(clippy::too_many_arguments)]
 /// Seal and upload files for `peer_id` (see `deposit_files_once`). A file the
 /// user is still editing changes mid-upload: that used to be a permanent
 /// "refused". Now the deposit starts over with the file as it is now (twice at

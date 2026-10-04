@@ -4677,6 +4677,7 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
 
 /// Only exact regular-file matches are safe to skip; preserve normal landing
 /// (including collision naming) for every other destination.
+#[cfg(test)]
 fn friend_file_landed(dest: &Path, name: &str, size: u64, mtime: u64) -> bool {
     landed_match(&dest_candidates(dest, name), size, mtime)
 }
@@ -4770,6 +4771,7 @@ where
 /// folder, in request order. `None` = absent, not a regular file (a symlink is
 /// never followed, and never hashed), or unreadable — one bad file reports as a
 /// missing copy instead of failing the whole run.
+#[cfg(test)]
 fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool,
     hashed: &AtomicU64) -> Result<Vec<Option<String>>> {
     friend_verify_reply_with(req, cancel, hashed, |name| dest_candidates(dest, name))
