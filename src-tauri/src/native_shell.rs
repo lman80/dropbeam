@@ -86,6 +86,16 @@ pub async fn push_unregister_all(
     Ok(crate::mailbox::push::unregister_everywhere(&iroh, &config).await)
 }
 
+/// Erase All Data, last engine step: close the network endpoint so nothing new arrives
+/// (or gets written for it) while the shell wipes the files and closes the app.
+#[tauri::command]
+pub async fn network_shutdown(iroh: State<'_, Arc<IrohState>>) -> Result<(), String> {
+    if let Some(ep) = iroh.get().cloned() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), ep.close()).await;
+    }
+    Ok(())
+}
+
 fn lan_sockets(addrs: &[String]) -> Vec<SocketAddr> {
     let mut out: Vec<SocketAddr> = addrs
         .iter()

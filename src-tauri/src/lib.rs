@@ -834,6 +834,7 @@ pub fn run() {
             native_shell::lan_self_info,
             native_shell::lan_peer_found,
             native_shell::push_unregister_all,
+            native_shell::network_shutdown,
             commands::pick_directory,
             commands::set_profile_avatar,
             commands::clear_profile_avatar,

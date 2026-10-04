@@ -394,6 +394,8 @@ final class Bridge: ObservableObject {
     }
     func cancelMediaPreparation() {
         mediaTask?.cancel()
+        // Free the slot now: a load that ignores cancellation must not block later picks.
+        mediaTask = nil; mediaToken = nil
         preparingMedia = nil
     }
     func pickAvatar() async throws {

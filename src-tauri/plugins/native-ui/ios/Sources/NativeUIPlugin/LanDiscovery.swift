@@ -34,14 +34,18 @@ import UIKit
     func start() {
         guard !running else { refresh(); return }
         running = true
+        if !observing { observing = true; observe() }
+        startBrowser()
+        refresh()
+    }
+    private var observing = false
+    private func observe() {
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in LanDiscovery.shared.stop() }
         }
         NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in LanDiscovery.shared.start() }
         }
-        startBrowser()
-        refresh()
     }
 
     func stop() {

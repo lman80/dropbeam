@@ -29,6 +29,7 @@ declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
 }
 const st = () => useStore.getState()
+const retryPayloads = () => { try { return localStorage.getItem('dropbeam-retry-payloads') } catch { return null } }
 const string = (a: BridgeArgs, key: string) => {
   if (typeof a[key] !== 'string') throw new Error(`Missing ${key}`)
   return a[key] as string
@@ -396,6 +397,7 @@ const handlers: BridgeHandlers = {
     const bounded = (p: Promise<unknown>, ms: number) => Promise.race([p.catch(() => {}), new Promise(r => setTimeout(r, ms))])
     await bounded(invoke('push_unregister_all'), 15_000)
     if (st().myDevice?.account_pub) await bounded(api.accountLeave(), 25_000)
+    await bounded(invoke('network_shutdown'), 4_000)
     return true
   },
   folderInviteFriend: async a => {
@@ -611,7 +613,8 @@ async function start() {
     // Each snapshot lists the store slices it is built from; unchanged inputs = no work.
     const snapshots: Record<string, SnapshotSource> = {
       friends: [[s.friends, s.myDevice?.account_pub, lookAlikeGroups()], () => friendSnapshot(s.friends, s.myDevice?.account_pub)],
-      transfers: [[s.order, s.transfers, chatId, activeThread, s.history, s.chatTransfers], () => nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
+      // sharePaths also come from the retry payloads saved in localStorage (string compare).
+      transfers: [[s.order, s.transfers, chatId, activeThread, s.history, s.chatTransfers, retryPayloads()], () => nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
         .filter(t => !(t.state === 'canceled' && !t.fileNames.length)),
         Object.assign({}, ...(activeThread ?? []).map(m => {
           const restored = restoredChatTransfer(m, s.history)

@@ -124,7 +124,9 @@ enum PickedMedia {
         var removed = 0
         for session in sessions.sorted(by: { $0.age > $1.age }) where !session.protected {
             let expired = session.age > (session.purpose == .send ? sendRetention : chatRetention)
-            if expired || total > capBytes {
+            // A session younger than an hour may still be importing, or be on its way
+            // into a send/draft: the size cap never takes it.
+            if expired || (total > capBytes && session.age > 3600) {
                 if (try? fm.removeItem(at: session.url)) != nil { total -= session.bytes; removed += 1 }
             }
         }
@@ -209,7 +211,7 @@ enum PickedMedia {
                 guard next < providers.count else { return }
                 let index = next, provider = providers[index]
                 next += 1
-                group.addTask { (index, try? await MediaImport.load(provider, into: dir)) }
+                group.addTask { (index, try? await MediaImport.load(provider, into: dir, index: index)) }
             }
             for _ in 0..<3 { launch() }
             while let (index, paths) = await group.next() {
@@ -225,18 +227,53 @@ enum PickedMedia {
 }
 
 private final class ProgressBox: @unchecked Sendable { var value: Progress? }
+/// Resumes a continuation exactly once, whoever gets there first.
+private final class OnceGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<[String], Error>?
+    private var early: Result<[String], Error>?
+    private var done = false
+    func set(_ c: CheckedContinuation<[String], Error>) {
+        lock.lock()
+        if let early { lock.unlock(); c.resume(with: early); return }
+        continuation = c; lock.unlock()
+    }
+    @discardableResult func finish(_ result: Result<[String], Error>) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !done else { return false }
+        done = true
+        if let c = continuation { continuation = nil; c.resume(with: result) } else { early = result }
+        return true
+    }
+}
 
 /// Loading one picked asset out of its NSItemProvider (off the main actor).
 enum MediaImport {
     static let timeout: Duration = .seconds(120)
 
-    static func load(_ provider: NSItemProvider, into dir: URL) async throws -> [String] {
-        try await withThrowingTaskGroup(of: [String].self) { group in
-            group.addTask { try await loadUntimed(provider, into: dir) }
-            group.addTask { try await Task.sleep(for: timeout); throw NativePhotoPicker.failure("Timed out loading a photo.") }
-            defer { group.cancelAll() }
-            guard let first = try await group.next() else { throw NativePhotoPicker.failure("Nothing loaded.") }
-            return first
+    /// First of {the load, the 2-minute limit} wins; a loader that never answers
+    /// (a stalled iCloud download) is abandoned instead of holding up the pick.
+    /// Each item writes into its own subfolder, so two picks with the same name
+    /// (two IMG_1234 Live Photos) can never touch each other's files.
+    static func load(_ provider: NSItemProvider, into dir: URL, index: Int) async throws -> [String] {
+        let itemDir = dir.appendingPathComponent(String(index), isDirectory: true)
+        try FileManager.default.createDirectory(at: itemDir, withIntermediateDirectories: true)
+        let gate = OnceGate()
+        let loader = Task { try await loadUntimed(provider, into: itemDir) }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
+                gate.set(continuation)
+                Task {
+                    do { gate.finish(.success(try await loader.value)) } catch { gate.finish(.failure(error)) }
+                }
+                Task {
+                    try? await Task.sleep(for: timeout)
+                    if gate.finish(.failure(NativePhotoPicker.failure("Timed out loading a photo."))) { loader.cancel() }
+                }
+            }
+        } onCancel: {
+            loader.cancel()
+            gate.finish(.failure(CancellationError()))
         }
     }
 

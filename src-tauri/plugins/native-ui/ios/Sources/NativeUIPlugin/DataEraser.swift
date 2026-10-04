@@ -37,7 +37,7 @@ import WebKit
     nonisolated static func wipeFiles() {
         let fm = FileManager.default
         var roots: [URL] = []
-        roots += fm.urls(for: .documentDirectory, in: .userDomainMask)
+        // Engine state first (identity, friends, chats), the received files last.
         roots += fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)
         roots += fm.urls(for: .cachesDirectory, in: .userDomainMask)
         roots.append(fm.temporaryDirectory)
@@ -46,12 +46,15 @@ import WebKit
             roots.append(library.appendingPathComponent("Cookies", isDirectory: true))
         }
         if let group = fm.containerURL(forSecurityApplicationGroupIdentifier: PushRegistration.appGroup) {
-            // Leave the group's own Library (system-managed preferences/caches dirs) in place.
             roots.append(group)
+            roots.append(group.appendingPathComponent("Library/Caches", isDirectory: true))
         }
+        roots += fm.urls(for: .documentDirectory, in: .userDomainMask)
         for root in roots {
             for name in (try? fm.contentsOfDirectory(atPath: root.path)) ?? [] {
-                if root.lastPathComponent == "Library" && name == "Preferences" { continue }
+                // The group's own Library (Preferences/Caches dirs) belongs to the system;
+                // its caches are emptied above, its preferences via removePersistentDomain.
+                if root.lastPathComponent != "Caches" && name == "Library" { continue }
                 try? fm.removeItem(at: root.appendingPathComponent(name))
             }
         }

@@ -259,11 +259,11 @@ struct PagedMediaViewer: View {
     /// still also takes its video (when the message has it), so it lands as one Live Photo.
     private func save(_ paths: [String]) {
         saving = true
-        let all = items.map(\.path)
+        // Same grouping as saving itself: only a real still + .MOV pair rides along.
+        let assets = ReceivedMediaSaver.assets(from: items.map { ChatAttachment.fileURL($0.path) })
         var chosen = paths
-        for path in paths {
-            let base = (path as NSString).deletingPathExtension.lowercased()
-            for other in all where other != path && (other as NSString).deletingPathExtension.lowercased() == base && !chosen.contains(other) { chosen.append(other) }
+        for asset in assets where asset.files.count == 2 && asset.files.contains(where: { paths.contains($0.url.path) }) {
+            for file in asset.files where !chosen.contains(file.url.path) { chosen.append(file.url.path) }
         }
         Task {
             await ReceivedMediaSaver.shared.save(chosen.map { ChatAttachment.fileURL($0) })

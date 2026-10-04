@@ -143,7 +143,7 @@ import UIKit
         guard let task = task as? BGContinuedProcessingTask else { task.setTaskCompleted(success: false); return }
         continued = task
         task.expirationHandler = { [weak task] in
-            task?.setTaskCompleted(success: false)
+            if let task { ContinuedOnce.complete(task, success: false) }
             Task { @MainActor in
                 let me = BackgroundTransfers.shared
                 if me.continued === task { me.continued = nil }
@@ -167,7 +167,7 @@ import UIKit
         } else if continuedSawActivity || Date().timeIntervalSince(continuedSubmittedAt ?? .distantPast) > 60 {
             // Done (or it never started): close the system's progress UI.
             task.progress.completedUnitCount = task.progress.totalUnitCount
-            task.setTaskCompleted(success: continuedSawActivity)
+            ContinuedOnce.complete(task, success: continuedSawActivity)
             continued = nil
         }
     }
@@ -186,5 +186,18 @@ import UIKit
             }
         }
         return total
+    }
+}
+
+/// setTaskCompleted exactly once per task (expiry runs on another thread and can race
+/// a final progress update).
+enum ContinuedOnce {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var completed = Set<ObjectIdentifier>()
+    static func complete(_ task: BGTask, success: Bool) {
+        lock.lock()
+        let first = completed.insert(ObjectIdentifier(task)).inserted
+        lock.unlock()
+        if first { task.setTaskCompleted(success: success) }
     }
 }

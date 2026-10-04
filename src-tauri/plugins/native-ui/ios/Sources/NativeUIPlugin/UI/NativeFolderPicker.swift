@@ -40,7 +40,7 @@ import PhotosUI
         guard !urls.isEmpty else { return [] }
         onImport?()
         let dir = try PickedMedia.session(purpose)
-        do { return try await Self.importItems(urls, to: { PickedMedia.unique($0.lastPathComponent, in: dir) }, removeOnFailure: dir) }
+        do { return try await Self.importItems(urls, to: { PickedMedia.unique($0.lastPathComponent, in: dir) }, removeOnFailure: dir, move: true) }
         catch { try? FileManager.default.removeItem(at: dir); throw error }
     }
     /// A folder to SEND (Send tab, Location upload): a private copy, swept once sent.
@@ -65,7 +65,8 @@ import PhotosUI
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { finish(.success([])) }
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { finish(.success(urls)) }
     /// Copy each picked item (coordinated, inside its security scope) off the main actor.
-    private static func importItems(_ urls: [URL], to destination: @escaping @Sendable (URL) -> URL, removeOnFailure: URL) async throws -> [String] {
+    /// `move`: the items are UIKit's own temporary copies (asCopy pickers) — move, don't copy twice.
+    private static func importItems(_ urls: [URL], to destination: @escaping @Sendable (URL) -> URL, removeOnFailure: URL, move: Bool = false) async throws -> [String] {
         try await Task.detached(priority: .userInitiated) {
             var imported: [String] = []
             let fm = FileManager.default
@@ -82,7 +83,10 @@ import PhotosUI
                 var coordinationError: NSError?
                 var copyError: Error?
                 NSFileCoordinator().coordinate(readingItemAt: source, options: [], error: &coordinationError) { url in
-                    do { try fm.copyItem(at: url, to: target) } catch { copyError = error }
+                    do {
+                        if move, (try? fm.moveItem(at: url, to: target)) != nil { return }
+                        try fm.copyItem(at: url, to: target)
+                    } catch { copyError = error }
                 }
                 if let error = coordinationError ?? copyError as NSError? {
                     if removeOnFailure.path == target.path { try? fm.removeItem(at: target) }
