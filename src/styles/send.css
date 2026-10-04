@@ -21,6 +21,7 @@
   cursor: default;
   transition: background var(--dur-fast), box-shadow var(--dur-fast);
 }
+.dropzone.short { min-height: 220px; }
 .dropzone:hover { background: color-mix(in srgb, var(--text) 2.5%, transparent); }
 .dropzone:focus-visible { box-shadow: var(--focus-ring); }
 .dropzone-glyph { width: 34px; height: 34px; color: var(--text-faint); margin-bottom: 8px; }

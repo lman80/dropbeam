@@ -120,8 +120,9 @@ export function SendView() {
 
       {list.length === 0 ? (
         <>
-          {/* Compact while another device's transfer is showing, so it's in view. */}
-          <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} compact={othersBusy} />
+          {/* Shorter while another device's transfer is showing, so both are in view —
+              but always a visible drop target. */}
+          <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} short={othersBusy} />
           <OtherDevices />
         </>
       ) : (

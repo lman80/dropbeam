@@ -177,7 +177,8 @@ function Recents({
   </>
 
   if (history.length === 0) {
-    return <EmptyState icon={<HistoryIcon />} title="No transfers yet" hint="Files you send and receive show up here." />
+    return <EmptyState icon={<HistoryIcon />} title="No transfers yet" hint="Files you send and receive show up here."
+      action={<button className="btn btn-secondary" onClick={() => void api.pickFiles().then((p) => { if (p.length) useStore.getState().setPendingSend(p) }, (e) => useStore.getState().toast('error', e))}>Send Files…</button>} />
   }
 
   if (groups.length === 0) {

@@ -87,7 +87,7 @@ export function FoldersView() {
             Accept Invite…
           </button>
           <button className="btn btn-primary" onClick={() => setModal('create')}>
-            New folder…
+            New Folder…
           </button>
         </div>
       </div>
@@ -97,6 +97,7 @@ export function FoldersView() {
           icon={<FolderSync />}
           title="No shared folders"
           hint="Keep a folder in sync with friends."
+          action={<button className="btn btn-secondary" onClick={() => setModal('create')}>New Shared Folder…</button>}
         />
       ) : (
         <div className="group folder-list">

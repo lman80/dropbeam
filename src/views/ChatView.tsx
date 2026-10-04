@@ -220,10 +220,10 @@ export function ChatView() {
           <h1 className="page-title">Chat</h1>
         </div>
         <EmptyState
+          icon={<MessageCircle />}
           title="No conversations yet"
           hint="Add a friend to start chatting."
-          action={<button className="btn btn-primary" onClick={() => setView('friends')}>Add a Friend</button>}
-          style={{ paddingTop: 96 }}
+          action={<button className="btn btn-secondary" onClick={() => setView('friends')}>Add a Friend</button>}
         />
       </div>
     )

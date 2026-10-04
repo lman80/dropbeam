@@ -675,7 +675,8 @@ button.row:hover,
   align-items: center;
   justify-content: center;
   text-align: center;
-  padding: 48px 24px;
+  /* Every page's empty state sits at the same height under its header. */
+  padding: 64px 24px 48px;
   color: var(--text-muted);
 }
 .empty-glyph { color: var(--text-faint); margin-bottom: 12px; }
