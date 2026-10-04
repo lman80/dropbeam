@@ -36,9 +36,9 @@ private let saveLog = Logger(subsystem: "com.dropbeam.app", category: "receive-s
         choice = Choice(rawValue: UserDefaults.standard.string(forKey: Self.key) ?? "") ?? .ask
     }
 
-    static let imageExtensions: Set<String> = ["jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "webp", "bmp", "dng"]
-    static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "3gp", "hevc"]
-    static func kind(of url: URL) -> PHAssetResourceType? {
+    nonisolated static let imageExtensions: Set<String> = ["jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "webp", "bmp", "dng"]
+    nonisolated static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "3gp", "hevc"]
+    nonisolated static func kind(of url: URL) -> PHAssetResourceType? {
         let ext = url.pathExtension.lowercased()
         if imageExtensions.contains(ext) { return .photo }
         if videoExtensions.contains(ext) { return .video }
@@ -68,22 +68,46 @@ private let saveLog = Logger(subsystem: "com.dropbeam.app", category: "receive-s
         case .on: Task { await save(urls) }
         case .ask:
             waiting += urls
+            // A prompt that vanished without an answer (its presenter was dismissed
+            // under it) must not block every later prompt: ask again.
+            if asking, let alert = prompt, alert.presentingViewController == nil, !alert.isBeingPresented { asking = false; prompt = nil }
             if !asking { ask() }
         }
     }
-    private func ask() {
-        guard let presenter = topPresenter() else { return }
+    private weak var prompt: UIAlertController?
+    /// Present "Save to Photos?" over whatever is on screen. A presenter that is mid
+    /// transition (a sheet closing, the picker animating) is retried shortly instead of
+    /// silently dropping the alert — that left `asking` stuck and no prompt ever again.
+    private func ask(attempt: Int = 0) {
+        guard choice == .ask, !waiting.isEmpty else { asking = false; return }
         asking = true
+        guard UIApplication.shared.applicationState == .active, let presenter = topPresenter(),
+              !presenter.isBeingPresented, !presenter.isBeingDismissed, presenter.presentedViewController == nil,
+              !(presenter is UIAlertController) else {
+            // Try for a while (e.g. until the app is foreground again), then give up for
+            // now; the next arriving file asks again.
+            if attempt < 120 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.ask(attempt: attempt + 1) }
+            } else { asking = false }
+            return
+        }
         let alert = UIAlertController(title: "Save to Photos?",
                                       message: "Add photos and videos you receive to your photo library. They also stay in your DropBeam folder. You can change this in Settings.",
                                       preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "Don’t Save", style: .cancel) { _ in Task { @MainActor in self.answer(false) } })
         let save = UIAlertAction(title: "Save to Photos", style: .default) { _ in Task { @MainActor in self.answer(true) } }
         alert.addAction(save); alert.preferredAction = save
-        presenter.present(alert, animated: true)
+        prompt = alert
+        presenter.present(alert, animated: true) { [weak self, weak alert] in
+            // Presentation can fail silently (presenter left the window meanwhile).
+            Task { @MainActor in
+                guard let self, self.asking else { return }
+                if alert?.presentingViewController == nil { self.prompt = nil; self.ask(attempt: attempt + 1) }
+            }
+        }
     }
     private func answer(_ save: Bool) {
-        asking = false
+        asking = false; prompt = nil
         let urls = waiting; waiting = []
         set(save ? .on : .off)
         if save { Task { await self.save(urls) } }
@@ -105,43 +129,86 @@ private let saveLog = Logger(subsystem: "com.dropbeam.app", category: "receive-s
         }
     }
 
-    /// Add each file as a new asset. The file stays where it is.
-    func save(_ urls: [URL]) async {
-        guard !urls.isEmpty else { return }
+    /// Add each file as a new asset. The file stays where it is. A still and a video
+    /// with the same name from the same folder (IMG_1234.HEIC + IMG_1234.MOV, how a
+    /// Live Photo travels) are saved together as ONE Live Photo.
+    /// `announce` = show the "Saved…" toast (Save All / Save buttons, auto-save).
+    @discardableResult
+    func save(_ urls: [URL], announce: Bool = true) async -> Int {
+        guard !urls.isEmpty else { return 0 }
         let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         guard status == .authorized || status == .limited else {
-            Bridge.shared.showToast("Allow Photos access in Settings to save received photos")
-            return
+            Bridge.shared.showToast("Allow Photos access in Settings → Apps → DropBeam to save photos")
+            return 0
         }
         // Never ask for full access just for an album — only use one if it's already granted.
         let album = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized ? await Self.dropBeamAlbum() : nil
-        var photos = 0, videos = 0, failed = 0
-        for url in urls {
-            guard let kind = Self.kind(of: url), FileManager.default.fileExists(atPath: url.path) else { failed += 1; continue }
+        var photos = 0, videos = 0, live = 0, failed = 0
+        for item in Self.assets(from: urls) {
+            guard item.files.allSatisfy({ FileManager.default.fileExists(atPath: $0.url.path) }) else { failed += 1; continue }
             do {
-                try await PHPhotoLibrary.shared().performChanges {
-                    let request = PHAssetCreationRequest.forAsset()
-                    let options = PHAssetResourceCreationOptions()
-                    options.originalFilename = url.lastPathComponent
-                    options.shouldMoveFile = false // keep the received file in the save folder
-                    request.addResource(with: kind, fileURL: url, options: options)
-                    if let album, let placeholder = request.placeholderForCreatedAsset {
-                        PHAssetCollectionChangeRequest(for: album)?.addAssets([placeholder] as NSArray)
-                    }
-                }
-                if kind == .video { videos += 1 } else { photos += 1 }
+                try await Self.add(item.files, to: album)
+                if item.files.count == 2 { live += 1 } else if item.files.first?.kind == .video { videos += 1 } else { photos += 1 }
             } catch {
-                failed += 1
-                saveLog.error("save to Photos failed for \(url.lastPathComponent, privacy: .private): \(error.localizedDescription, privacy: .public)")
+                // A pair whose halves don't match (not really a Live Photo): save both alone.
+                if item.files.count == 2 {
+                    for file in item.files {
+                        do { try await Self.add([file], to: album); if file.kind == .video { videos += 1 } else { photos += 1 } }
+                        catch { failed += 1 }
+                    }
+                } else { failed += 1 }
+                saveLog.error("save to Photos failed: \(error.localizedDescription, privacy: .public)")
             }
         }
-        let saved = photos + videos
+        let saved = photos + videos + live
+        guard announce else { return saved }
         if saved > 0 {
-            let what = videos == 0 ? (photos == 1 ? "photo" : "\(photos) photos")
-                : photos == 0 ? (videos == 1 ? "video" : "\(videos) videos") : "\(saved) items"
+            let what: String
+            if photos + live == 0 { what = videos == 1 ? "video" : "\(videos) videos" }
+            else if videos == 0 && live == 0 { what = photos == 1 ? "photo" : "\(photos) photos" }
+            else if videos == 0 && photos == 0 { what = live == 1 ? "Live Photo" : "\(live) Live Photos" }
+            else { what = "\(saved) items" }
             Bridge.shared.showToast(failed > 0 ? "Saved \(what) to Photos · \(failed) couldn’t be saved" : "Saved \(what) to Photos")
         } else if failed > 0 {
             Bridge.shared.showToast(failed == 1 ? "Couldn’t save that file to Photos" : "Couldn’t save \(failed) files to Photos")
+        }
+        return saved
+    }
+    struct AssetFile { let url: URL; let kind: PHAssetResourceType }
+    struct AssetItem { var files: [AssetFile] }
+    /// Group files into library assets: a lone photo/video, or a Live Photo pair.
+    nonisolated static func assets(from urls: [URL]) -> [AssetItem] {
+        var items: [AssetItem] = []
+        var pairIndex: [String: Int] = [:]
+        for url in urls {
+            guard let kind = kind(of: url) else { continue }
+            let key = url.deletingPathExtension().path.lowercased()
+            if let index = pairIndex[key], items[index].files.count == 1, items[index].files[0].kind != kind,
+               [items[index].files[0].url.pathExtension.lowercased(), url.pathExtension.lowercased()].contains(where: { ["heic", "heif", "jpg", "jpeg"].contains($0) }),
+               [items[index].files[0].url.pathExtension.lowercased(), url.pathExtension.lowercased()].contains("mov") {
+                items[index].files.append(AssetFile(url: url, kind: kind))
+                // Photo first, then its paired video.
+                items[index].files.sort { $0.kind == .photo && $1.kind != .photo }
+            } else {
+                pairIndex[key] = items.count
+                items.append(AssetItem(files: [AssetFile(url: url, kind: kind)]))
+            }
+        }
+        return items
+    }
+    nonisolated private static func add(_ files: [AssetFile], to album: PHAssetCollection?) async throws {
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            for (index, file) in files.enumerated() {
+                let options = PHAssetResourceCreationOptions()
+                options.originalFilename = file.url.lastPathComponent
+                options.shouldMoveFile = false // keep the received file in the save folder
+                // The second half of a pair is the Live Photo's motion.
+                request.addResource(with: files.count == 2 && index == 1 ? .pairedVideo : file.kind, fileURL: file.url, options: options)
+            }
+            if let album, let placeholder = request.placeholderForCreatedAsset {
+                PHAssetCollectionChangeRequest(for: album)?.addAssets([placeholder] as NSArray)
+            }
         }
     }
     private static func dropBeamAlbum() async -> PHAssetCollection? {

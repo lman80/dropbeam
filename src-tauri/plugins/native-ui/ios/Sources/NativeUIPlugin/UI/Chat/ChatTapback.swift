@@ -36,6 +36,15 @@ struct TapbackOverlay: View {
         if mine && message.kind != "file" { list.append(Action(title: "Edit", symbol: "pencil") { onEdit() }) }
         if message.kind == "file" {
             let paths = ChatAttachment.availablePaths(message, bridge: bridge)
+            // #79: one tap puts every photo/video of the message in the library (a
+            // Live Photo's still + motion are kept together as one Live Photo).
+            let media = paths.filter { ReceivedMediaSaver.kind(of: ChatAttachment.fileURL($0)) != nil }
+            if !media.isEmpty {
+                let count = ReceivedMediaSaver.assets(from: media.map { ChatAttachment.fileURL($0) }).count
+                list.append(Action(title: count > 1 ? "Save All \(count) to Photos" : "Save to Photos", symbol: "square.and.arrow.down") {
+                    Task { await ReceivedMediaSaver.shared.save(media.map { ChatAttachment.fileURL($0) }) }
+                })
+            }
             if !paths.isEmpty { list.append(Action(title: "Save or Share", symbol: "square.and.arrow.up") { bridge.perform { try await bridge.shareFiles(paths: paths) } }) }
         }
         if !mine, let onReport {

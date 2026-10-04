@@ -15,6 +15,7 @@ struct ChatAttachment: View {
     /// A held send from a friend who needs your OK first (Download / Decline).
     private var pending: PendingFile? { message.fromMe || transfer != nil ? nil : bridge.pendingFiles.first { $0.linkId == message.fileXferId } }
     @State private var deciding = false
+    @State private var savingAll = false
     /// This session's answer to a pending file (the engine then updates the message).
     @State private var accepted: Bool?
     private struct Item: Identifiable {
@@ -56,6 +57,18 @@ struct ChatAttachment: View {
                     .padding(.horizontal, 12).padding(.vertical, 10)
                     .background(ChatPalette.fill(message.fromMe), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 }.buttonStyle(.plain).disabled(item.path == nil)
+            }
+            // #79: a received album gets one button that saves every item to Photos.
+            if !message.fromMe, !active, availableMedia.count > 1 {
+                Button {
+                    savingAll = true
+                    Task { await ReceivedMediaSaver.shared.save(availableMedia.map { Self.fileURL($0.path) }); savingAll = false }
+                } label: {
+                    Label(savingAll ? "Saving…" : "Save All to Photos", systemImage: "square.and.arrow.down")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderless).tint(ChatPalette.sent).disabled(savingAll)
+                .accessibilityLabel("Save all \(ReceivedMediaSaver.assets(from: availableMedia.map { Self.fileURL($0.path) }).count) to Photos")
             }
             if message.fromMe, !active, !failed, let devices = DeliveryCopy.multi(transfer?.deliveries ?? message.deliveries) {
                 // Sent to their Mac AND iPhone: where it is on each, in one line.
@@ -167,12 +180,19 @@ struct ChatAttachment: View {
 /// Photos-style viewer for a message's media: opens on the tapped item, swipes
 /// between the others, pinch/double-tap to zoom (a zoomed photo pans instead of
 /// paging until it's back at 1x), tap to hide the bars.
+///
+/// Memory: a photo is decoded at about twice the screen's point size (sharp at 1x),
+/// only the visible page and its direct neighbours keep their image, and the full
+/// resolution is decoded only while the user is zoomed in.
+/// Video (#71): the player sits BETWEEN our bar and the home indicator, so its own
+/// controls never land under Done/Share; audio plays even with the silent switch on (#72).
 struct PagedMediaViewer: View {
     @EnvironmentObject private var bridge: Bridge
     @Environment(\.dismiss) private var dismiss
     let items: [LocalMedia]
     @State private var selection: String
     @State private var chromeHidden = false
+    @State private var saving = false
     init(items: [LocalMedia], initialPath: String) {
         self.items = items
         // Start ON the tapped page: setting it after appearing made the pager
@@ -180,11 +200,13 @@ struct PagedMediaViewer: View {
         _selection = State(initialValue: items.contains { $0.path == initialPath } ? initialPath : items.first?.path ?? initialPath)
     }
     private var index: Int? { items.firstIndex { $0.path == selection } }
+    private var current: LocalMedia? { items.first { $0.path == selection } }
     var body: some View {
         NavigationStack {
             TabView(selection: $selection) {
-                ForEach(items) { item in
-                    MediaPage(item: item, active: selection == item.path, toggleChrome: { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } })
+                ForEach(Array(items.enumerated()), id: \.element.id) { offset, item in
+                    MediaPage(item: item, active: selection == item.path, nearby: abs(offset - (index ?? 0)) <= 1,
+                              toggleChrome: { withAnimation(.easeInOut(duration: 0.2)) { chromeHidden.toggle() } })
                         .tag(item.path)
                 }
             }
@@ -198,19 +220,53 @@ struct PagedMediaViewer: View {
             .statusBarHidden(chromeHidden)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    saveButton
                     Button { bridge.perform { try await bridge.shareFiles(paths: [selection]) } } label: {
                         Image(systemName: "square.and.arrow.up")
                     }.accessibilityLabel("Share").disabled(selection.isEmpty)
                 }
             }
+            // A video page always shows our bar: the player's own controls own the taps there.
+            .onChange(of: selection) { _, _ in if current?.video == true && chromeHidden { chromeHidden = false } }
             .accessibilityAction(named: "Next") { step(1) }
             .accessibilityAction(named: "Previous") { step(-1) }
             #if targetEnvironment(simulator)
             // QA: `-viewerStep` pages forward after appearing (no touch input in CI).
             .task { if CommandLine.arguments.contains("-viewerStep") { try? await Task.sleep(for: .seconds(2)); withAnimation { step(1) } } }
             #endif
-        }.tint(.white).preferredColorScheme(.dark)
+        }
+        .tint(.white).preferredColorScheme(.dark)
+        .onDisappear { MediaAudio.deactivate() }
+    }
+    @ViewBuilder private var saveButton: some View {
+        let kind = current?.video == true ? "Video" : "Photo"
+        if items.count > 1 {
+            Menu {
+                Button("Save \(kind)", systemImage: "square.and.arrow.down") { save([selection]) }
+                Button("Save All \(items.count) to Photos", systemImage: "square.and.arrow.down.on.square") { save(items.map(\.path)) }
+            } label: { Image(systemName: "square.and.arrow.down") }
+                .accessibilityLabel("Save to Photos").disabled(saving)
+        } else {
+            Button { save([selection]) } label: { Image(systemName: "square.and.arrow.down") }
+                .accessibilityLabel("Save \(kind) to Photos").disabled(saving || selection.isEmpty)
+        }
+    }
+    /// A Live Photo's still + motion travel as two files with one name: saving the
+    /// still also takes its video (when the message has it), so it lands as one Live Photo.
+    private func save(_ paths: [String]) {
+        saving = true
+        let all = items.map(\.path)
+        var chosen = paths
+        for path in paths {
+            let base = (path as NSString).deletingPathExtension.lowercased()
+            for other in all where other != path && (other as NSString).deletingPathExtension.lowercased() == base && !chosen.contains(other) { chosen.append(other) }
+        }
+        Task {
+            await ReceivedMediaSaver.shared.save(chosen.map { ChatAttachment.fileURL($0) })
+            Haptics.success()
+            saving = false
+        }
     }
     private func step(_ delta: Int) {
         guard let index, items.indices.contains(index + delta) else { return }
@@ -226,20 +282,52 @@ struct MediaViewer: View {
         if let item = LocalMedia(path: path) { PagedMediaViewer(items: [item], initialPath: path) }
     }
 }
+
+/// Audio for in-app video: `.playback` so a video is heard with the ring/silent switch
+/// on (#72), and other apps' audio resumes when the viewer closes.
+enum MediaAudio {
+    @MainActor private static var active = false
+    @MainActor static func activate() {
+        guard !active else { return }
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try AVAudioSession.sharedInstance().setActive(true)
+            active = true
+        } catch { NSLog("DropBeam: audio session unavailable: %@", error.localizedDescription) }
+    }
+    @MainActor static func deactivate() {
+        guard active else { return }
+        active = false
+        // Deactivating can block briefly while the session winds down: never on main.
+        DispatchQueue.global(qos: .utility).async {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
+    }
+}
+
 private struct MediaPage: View {
     let item: LocalMedia
     let active: Bool
+    /// This page or a direct neighbour of the visible one: only these hold a decoded image.
+    let nearby: Bool
     let toggleChrome: () -> Void
     @State private var player: AVPlayer?
     @State private var image: UIImage?
+    @State private var fullImage: UIImage?
+    @State private var zoomed = false
     @State private var unavailable = false
+    /// About twice the screen's point size: sharp at 1x without decoding a 48 MP original.
+    private static var screenPoints: CGFloat {
+        let size = (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.screen.bounds.size) ?? CGSize(width: 440, height: 956)
+        return max(size.width, size.height)
+    }
     var body: some View {
         ZStack {
             Color.black
             if item.video {
-                NativeVideoPlayer(player: player)
-            } else if let image {
-                ImageViewer(image: image, onTap: toggleChrome)
+                VideoPage(player: player)
+            } else if let shown = fullImage ?? image {
+                ImageViewer(image: shown, onTap: toggleChrome, onZoom: { zoomed = $0 })
             } else if unavailable {
                 Text("This image is no longer available.").foregroundStyle(.white.opacity(0.8))
             } else {
@@ -250,17 +338,28 @@ private struct MediaPage: View {
                 ProgressView().tint(.white)
             }
         }
-        // Neighbours load too (the pager builds them just before they slide in), and a
-        // page keeps its photo when it scrolls away — no reset, no reload on return.
-        .task(id: item.path) {
-            guard !item.video, image == nil else { return }
-            let preview = await ThumbnailProvider.shared.image(path: item.path, points: 400, fullSize: true)
+        // The visible page and its neighbours decode a screen-sized image; anything
+        // further away lets go of it (a long album can't build up in memory).
+        .task(id: nearby) {
+            guard !item.video else { return }
+            guard nearby else { image = nil; fullImage = nil; return }
+            guard image == nil else { return }
+            let preview = await ThumbnailProvider.shared.image(path: item.path, points: Self.screenPoints)
             if !Task.isCancelled { image = preview?.image; unavailable = preview == nil }
+        }
+        // Full resolution only while zoomed in on the visible page.
+        .task(id: zoomed && active) {
+            guard !item.video else { return }
+            guard zoomed && active else { if fullImage != nil { fullImage = nil }; return }
+            guard fullImage == nil else { return }
+            let full = await ThumbnailProvider.shared.image(path: item.path, points: Self.screenPoints, fullSize: true)
+            if !Task.isCancelled, zoomed { fullImage = full?.image }
         }
         .task(id: active) {
             guard item.video else { return }
             if active {
                 if player == nil { player = AVPlayer(url: ChatAttachment.fileURL(item.path)) }
+                MediaAudio.activate()
                 player?.play()
             } else { player?.pause() }
         }
@@ -268,9 +367,31 @@ private struct MediaPage: View {
     }
 }
 
+/// The player laid out inside the safe areas, below our navigation bar: its own
+/// transport controls (scrubber, AirPlay, volume) never sit under Done/Share.
+private struct VideoPage: View {
+    let player: AVPlayer?
+    private static let barHeight: CGFloat = 44
+    var body: some View {
+        GeometryReader { _ in
+            let insets = Self.windowInsets
+            NativeVideoPlayer(player: player)
+                .padding(.top, insets.top + Self.barHeight)
+                .padding(.bottom, insets.bottom)
+        }
+    }
+    @MainActor private static var windowInsets: UIEdgeInsets {
+        (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first { $0.isKeyWindow })?.safeAreaInsets
+            ?? UIEdgeInsets(top: 59, left: 0, bottom: 34, right: 0)
+    }
+}
+
 struct ImageViewer: UIViewRepresentable {
     let image: UIImage
     var onTap: (() -> Void)? = nil
+    /// Zoomed in past ~1.5x (true) or back near 1x (false): the page swaps in the
+    /// full-resolution decode only while it can actually be seen.
+    var onZoom: ((Bool) -> Void)? = nil
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeUIView(context: Context) -> ImageScrollView {
         let scroll = ImageScrollView()
@@ -293,13 +414,21 @@ struct ImageViewer: UIViewRepresentable {
     }
     func updateUIView(_ scroll: ImageScrollView, context: Context) {
         context.coordinator.onTap = onTap
+        context.coordinator.onZoom = onZoom
+        // A sharper decode of the same photo keeps the current zoom and position.
         if scroll.imageView.image !== image { scroll.imageView.image = image; scroll.setNeedsLayout() }
     }
     final class Coordinator: NSObject, UIScrollViewDelegate {
         weak var scroll: ImageScrollView?
         var onTap: (() -> Void)?
+        var onZoom: ((Bool) -> Void)?
+        private var zoomed = false
         func viewForZooming(in scrollView: UIScrollView) -> UIView? { (scrollView as? ImageScrollView)?.imageView }
-        func scrollViewDidZoom(_ scrollView: UIScrollView) { (scrollView as? ImageScrollView)?.centerImage() }
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            (scrollView as? ImageScrollView)?.centerImage()
+            let now = scrollView.zoomScale > 1.5
+            if now != zoomed { zoomed = now; onZoom?(now) }
+        }
         @objc func singleTap(_ gesture: UITapGestureRecognizer) { onTap?() }
         /// Photos: double-tap zooms in on that spot, or back out.
         @objc func doubleTap(_ gesture: UITapGestureRecognizer) {
@@ -316,16 +445,19 @@ struct ImageViewer: UIViewRepresentable {
     }
     /// The image view is sized to the photo's fitted rect (not the whole page), so
     /// at 1x there is nothing to scroll and every horizontal swipe goes to the pager.
+    /// Layout depends on the photo's SHAPE, not its pixel count, so swapping in a
+    /// sharper decode doesn't reset the zoom.
     final class ImageScrollView: UIScrollView {
         let imageView = UIImageView()
         private var laidOut = CGSize.zero
-        private var imageSize = CGSize.zero
+        private var aspect: CGFloat = 0
         override func layoutSubviews() {
             super.layoutSubviews()
             let size = imageView.image?.size ?? .zero
             guard bounds.width > 0, bounds.height > 0 else { return }
-            if bounds.size != laidOut || size != imageSize {
-                laidOut = bounds.size; imageSize = size
+            let shape = size.height > 0 ? size.width / size.height : 0
+            if bounds.size != laidOut || abs(shape - aspect) > 0.01 {
+                laidOut = bounds.size; aspect = shape
                 zoomScale = 1
                 let fit = size.width > 0 && size.height > 0 ? min(bounds.width / size.width, bounds.height / size.height) : 1
                 imageView.frame = CGRect(origin: .zero, size: CGSize(width: size.width * fit, height: size.height * fit))
@@ -344,8 +476,16 @@ struct ImageViewer: UIViewRepresentable {
 
 struct NativeVideoPlayer: UIViewControllerRepresentable {
     let player: AVPlayer?
-    func makeUIViewController(context: Context) -> AVPlayerViewController { let controller = AVPlayerViewController(); controller.player = player; return controller }
-    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) { controller.player = player }
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        controller.view.backgroundColor = .black
+        // Inline in the page: no second "close" button competing with our Done.
+        controller.entersFullScreenWhenPlaybackBegins = false
+        controller.exitsFullScreenWhenPlaybackEnds = true
+        return controller
+    }
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) { if controller.player !== player { controller.player = player } }
     static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator: ()) { controller.player?.pause(); controller.player = nil }
 }
 struct LocalMedia: Identifiable {
