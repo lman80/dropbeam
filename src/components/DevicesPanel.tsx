@@ -1,4 +1,5 @@
 import { createElement, useEffect, useMemo, useState } from 'react'
+import { relativeTime } from '../lib/dates'
 import { AnimatePresence } from 'framer-motion'
 import { Plus, QrCode } from 'lucide-react'
 import { api, type AccountDevice } from '../lib/api'
@@ -12,13 +13,7 @@ import { MenuButton } from './ui'
 // eslint-disable-next-line react-refresh/only-export-components -- re-exported helpers for existing importers
 export { linkWithCode, isDeviceCode } from './LinkDeviceModal'
 
-function ago(ms: number) {
-  const s = Math.max(0, (Date.now() - ms) / 1000)
-  if (s < 60) return 'just now'
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`
-  if (s < 86400) return `${Math.floor(s / 3600)} hr ago`
-  return new Date(ms).toLocaleDateString()
-}
+const ago = (ms: number) => relativeTime(ms).replace(/^Just now$/, 'just now')
 
 /** Device glyph in a neutral disc (a tiny green dot when that device is online). */
 function DeviceGlyph({ d, online }: { d: Pick<AccountDevice, 'device_kind' | 'device_os'>; online?: boolean }) {

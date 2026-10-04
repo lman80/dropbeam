@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { dateTime } from '../lib/dates'
 import { errorText } from '../lib/errors'
 import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, ChevronLeft, ChevronRight, File, Folder, FolderPlus, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
@@ -245,7 +246,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
                 : <span className="location-filename"><File className="location-icon-file" aria-hidden /><span className="truncate-1" title={entry.name}>{entry.name}</span></span>}
             </td>
             <td className="location-col-size tnum">{entry.isDir ? '—' : formatBytes(entry.size)}</td>
-            <td className="location-col-date tnum">{entry.modified ? new Date(entry.modified).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—'}</td>
+            <td className="location-col-date tnum">{entry.modified ? dateTime(entry.modified) : '—'}</td>
           </tr>
         })}</tbody>
       </table>

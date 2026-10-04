@@ -1,4 +1,5 @@
 import { MobileHeader } from '../components/MobileHeader'
+import { clockTime, shortDate } from '../lib/dates'
 import { shortcutLabel } from '../lib/keys'
 import { integrityLabel } from '../lib/integrity'
 import { ChevronRight } from 'lucide-react'
@@ -25,20 +26,11 @@ function entryTitle(e: HistoryEntry): string {
   return e.direction === 'receive' ? 'Received files' : 'Files'
 }
 
-function timeOfDay(ms: number): string {
-  return new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
-}
-
 /** Time for today/yesterday (the section says which day), a short date before that. */
 function whenLabel(ms: number): string {
   const group = dayGroup(ms)
-  if (group === 'Today' || group === 'Yesterday') return timeOfDay(ms)
-  const d = new Date(ms)
-  return d.toLocaleDateString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
-  })
+  if (group === 'Today' || group === 'Yesterday') return clockTime(ms)
+  return shortDate(ms)
 }
 
 /** Files-app style date buckets: Today / Yesterday / Last 7 days / month. */

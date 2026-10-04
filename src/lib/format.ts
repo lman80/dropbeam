@@ -1,3 +1,4 @@
+import { relativeTime } from './dates.ts'
 // Display formatting helpers. Bytes use decimal units (1000) to match croc.
 
 const UNITS = ['bytes', 'KB', 'MB', 'GB', 'TB', 'PB']
@@ -65,22 +66,9 @@ export function formatEta(seconds: number | null | undefined): string {
   return rm ? `${h}h ${rm}m` : `${h}h`
 }
 
+/** "Just now", "5 min ago", "Today 7:25 PM", "Oct 2" — see lib/dates. */
 export function formatRelativeTime(ms: number): string {
-  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return '—'
-  const now = Date.now()
-  const diff = now - ms
-  const sec = Math.floor(diff / 1000)
-  if (sec < 45) return 'Just now'
-  const min = Math.floor(sec / 60)
-  if (min < 60) return `${min}m ago`
-  const d = new Date(ms)
-  const today = new Date()
-  const yesterday = new Date()
-  yesterday.setDate(today.getDate() - 1)
-  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
-  if (d.toDateString() === today.toDateString()) return `Today ${time}`
-  if (d.toDateString() === yesterday.toDateString()) return `Yesterday ${time}`
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ` ${time}`
+  return relativeTime(ms)
 }
 
 export function shortPath(p: string, max = 42): string {

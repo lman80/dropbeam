@@ -1,4 +1,5 @@
 import { deviceKindLabel } from '../lib/deviceIcons'
+import { shortDate } from '../lib/dates'
 import { isEnterKey } from '../lib/keys'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { DevicesPanel } from '../components/DevicesPanel'
@@ -965,7 +966,7 @@ function SafetySection() {
             <Row
               key={p.id}
               title={<span className="truncate-1 set-block-name" title={p.name}>{p.name}</span>}
-              sub={`${p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}Blocked ${new Date(p.at).toLocaleDateString()}`}
+              sub={`${p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}Blocked ${shortDate(p.at)}`}
             >
               <button
                 className="btn btn-secondary"

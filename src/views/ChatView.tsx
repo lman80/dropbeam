@@ -1,4 +1,5 @@
 import { MobileHeader } from '../components/MobileHeader'
+import { clockTime, dateTime, dayHeading, listDate, startOfDay } from '../lib/dates'
 import { isEnterKey, shortcutLabel } from '../lib/keys'
 import { TransferCard } from '../components/TransferCard'
 import { ChevronLeft } from 'lucide-react'
@@ -72,49 +73,18 @@ function fileKind(name: string | undefined): Kind {
   return 'file'
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000
 /** Within one day, a quiet time label appears after a pause this long. */
 const TIME_GAP_MS = 60 * 60 * 1000
 
 /** A short wall-clock label, e.g. "3:42 PM". */
-function clock(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-}
-const startOfDay = (ms: number) => {
-  const d = new Date(ms)
-  d.setHours(0, 0, 0, 0)
-  return d.getTime()
-}
+const clock = clockTime
 const sameDay = (a: number, b: number) => startOfDay(a) === startOfDay(b)
 /** A day label: Today / Yesterday / weekday (this week) / a date. */
-function dayLabel(ms: number): string {
-  const today = startOfDay(Date.now())
-  const day = startOfDay(ms)
-  if (day === today) return 'Today'
-  if (day === today - DAY_MS) return 'Yesterday'
-  if (today - day < 6 * DAY_MS) return new Date(ms).toLocaleDateString([], { weekday: 'long' })
-  const d = new Date(ms)
-  return d.toLocaleDateString([], {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
-  })
-}
-/** The time column of the conversation list: 3:42 PM / Yesterday / Tuesday / 9/18/26. */
-function listTime(ms: number | undefined): string {
-  if (!ms) return ''
-  const today = startOfDay(Date.now())
-  const day = startOfDay(ms)
-  if (day === today) return clock(ms)
-  if (day === today - DAY_MS) return 'Yesterday'
-  if (today - day < 6 * DAY_MS) return new Date(ms).toLocaleDateString([], { weekday: 'long' })
-  return new Date(ms).toLocaleDateString([], { month: 'numeric', day: 'numeric', year: '2-digit' })
-}
+const dayLabel = dayHeading
+/** The time column of the conversation list: 3:42 PM / Yesterday / Tuesday / Oct 2. */
+const listTime = listDate
 /** Full timestamp for a tooltip. */
-function fullTime(ms: number): string {
-  return `${dayLabel(ms)} ${clock(ms)}`
-}
+const fullTime = dateTime
 
 /** The engine's list preview carries emoji markers ("📎 Beach.jpg", "🎞️ GIF").
  *  Say it in words instead. */
