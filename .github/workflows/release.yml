@@ -1,18 +1,79 @@
 name: Release
 
-# Push a version tag (e.g. v0.1.1) to build installers for macOS + Windows + Linux (.deb/.AppImage),
-# sign them for the in-app updater, and publish a GitHub Release.
+# Push a version tag (e.g. v0.53.0) to build installers for macOS, Windows and
+# Linux, sign them for the in-app updater, and publish ONE GitHub Release.
+#
+#   create-release  → a DRAFT release for the tag (invisible to users + updater)
+#   build (matrix)  → each platform uploads its installers + updater entries to it
+#   publish         → only after every required build succeeded, un-draft it
+#
+# The updater reads releases/latest/download/latest.json, which only resolves
+# for a PUBLISHED release, so users never see a half-uploaded release.
+#
+# Code signing is optional and switched on by repository secrets (see
+# docs/SIGNING-SETUP.md). Without them the build still works: macOS is ad-hoc
+# signed (signingIdentity "-") and Windows is unsigned, exactly as before.
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.53.0"
+        required: true
 
 permissions:
   contents: write
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  create-release:
+    runs-on: ubuntu-22.04
+    outputs:
+      release_id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Verify tag matches the app version everywhere
+        shell: bash
+        run: |
+          V="${TAG#v}"
+          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          PKG=$(node -p "require('./package.json').version")
+          CARGO=$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "tag=$V tauri.conf=$CONF package.json=$PKG Cargo.toml=$CARGO"
+          for x in "$CONF" "$PKG" "$CARGO"; do
+            test "$V" = "$x" || { echo "::error::tag $TAG does not match every manifest (tauri.conf=$CONF package.json=$PKG Cargo.toml=$CARGO)"; exit 1; }
+          done
+
+      # Reuse the draft if this tag's workflow is re-run; otherwise create it.
+      - name: Create (or reuse) the draft release
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                 --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1)
+          if [ -z "$id" ]; then
+            id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+                   -f tag_name="$TAG" -f name="DropBeam $TAG" -F draft=true \
+                   -f body="$(cat .github/release-notes.md)" --jq .id)
+          fi
+          echo "release $TAG → id $id"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -25,50 +86,57 @@ jobs:
           - platform: macos-15 # universal: Apple Silicon + Intel in one .dmg
             args: "--target universal-apple-darwin"
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
-          - platform: windows-latest # Windows x64 (.exe / .msi)
+            experimental: false
+          - platform: windows-latest # Windows x64 (.exe NSIS + .msi)
             args: ""
             rust-targets: ""
-          - platform: ubuntu-22.04 # Linux x86_64 (.deb / .AppImage)
-            args: "--bundles deb,appimage"
+            experimental: false
+          - platform: ubuntu-22.04 # Linux x86_64 (.deb / .rpm / .AppImage)
+            args: "--bundles deb,rpm,appimage"
             rust-targets: ""
+            experimental: false
+          # Windows on ARM: cross-compiled on x64. NSIS only (WiX/MSI has no arm64).
+          - platform: windows-latest
+            args: "--target aarch64-pc-windows-msvc --bundles nsis"
+            rust-targets: "aarch64-pc-windows-msvc"
+            experimental: true
+          # Linux aarch64 (Raspberry Pi 5, ARM servers/NAS): native arm runner.
+          - platform: ubuntu-22.04-arm
+            args: "--bundles deb,rpm,appimage"
+            rust-targets: ""
+            experimental: true
 
+    # A failing experimental (ARM) build doesn't hold back the release.
+    continue-on-error: ${{ matrix.experimental }}
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Verify tag matches app version
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          CARGO=$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
-          echo "tag=$TAG conf=$CONF cargo=$CARGO"
-          test "$TAG" = "$CONF" || { echo "::error::tag v$TAG != tauri.conf.json $CONF"; exit 1; }
-          test "$TAG" = "$CARGO" || { echo "::error::tag v$TAG != Cargo.toml $CARGO"; exit 1; }
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          ref: ${{ env.TAG }}
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Same version as rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.rust-targets }}
 
-      - name: Cache Rust
-        uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+          key: ${{ matrix.args }}
 
       - name: Install frontend dependencies
-        run: npm install
+        run: npm ci
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf binutils
 
       # macOS only: Spotlight auto-mounts + indexes the DMG while tauri's
       # bundle_dmg.sh is still attaching it, which intermittently fails the bundle
@@ -79,27 +147,115 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo mdutil -a -i off || true
 
-      - name: Build, sign, and publish release
+      # Developer ID signing + notarization, ONLY when the secrets exist. Tauri
+      # treats a present-but-empty APPLE_CERTIFICATE as "import this cert" and
+      # fails, so the variables are exported to later steps only when set.
+      - name: Configure macOS signing + notarization (if secrets are set)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::warning::No Developer ID secrets — building ad-hoc signed, NOT notarized (Gatekeeper will warn)."
+            exit 0
+          fi
+          {
+            echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+          } >> "$GITHUB_ENV"
+          if [ -n "$APPLE_API_KEY" ] && [ -n "$APPLE_API_ISSUER" ] && [ -n "$APPLE_API_PRIVATE_KEY" ]; then
+            key="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+            printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$key"
+            {
+              echo "APPLE_API_KEY=$APPLE_API_KEY"
+              echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+              echo "APPLE_API_KEY_PATH=$key"
+            } >> "$GITHUB_ENV"
+            echo "Developer ID signing + notarization enabled."
+          else
+            echo "::warning::Signing with Developer ID but NOT notarizing (APPLE_API_* secrets missing)."
+          fi
+
+      # Windows code signing via Azure Trusted Signing, ONLY when the secrets
+      # exist: tauri runs bundle.windows.signCommand on every exe/installer.
+      - name: Configure Windows signing (if secrets are set)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          TRUSTED_SIGNING_ENDPOINT: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          TRUSTED_SIGNING_PROFILE: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+        run: |
+          if [ -z "$AZURE_CLIENT_ID" ] || [ -z "$TRUSTED_SIGNING_ACCOUNT" ]; then
+            echo "::warning::No Azure Trusted Signing secrets — Windows installers are unsigned (SmartScreen will warn)."
+            exit 0
+          fi
+          cargo install trusted-signing-cli --locked
+          {
+            echo "AZURE_CLIENT_ID=$AZURE_CLIENT_ID"
+            echo "AZURE_CLIENT_SECRET=$AZURE_CLIENT_SECRET"
+            echo "AZURE_TENANT_ID=$AZURE_TENANT_ID"
+          } >> "$GITHUB_ENV"
+          conf="$(cygpath -m "$RUNNER_TEMP")/tauri.signing.json"
+          cat > "$conf" <<JSON
+          {"bundle":{"windows":{"signCommand":"trusted-signing-cli -e $TRUSTED_SIGNING_ENDPOINT -a $TRUSTED_SIGNING_ACCOUNT -c $TRUSTED_SIGNING_PROFILE -d DropBeam %1"}}}
+          JSON
+          echo "SIGN_ARGS=--config $conf" >> "$GITHUB_ENV"
+          echo "Windows signing enabled."
+
+      - name: Build, sign, and upload to the draft release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "DropBeam ${{ github.ref_name }}"
-          releaseBody: |
-            ## Download DropBeam
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.args }} ${{ env.SIGN_ARGS }}
 
-            - **macOS** (Apple Silicon & Intel): grab the **`.dmg`**, open it, drag DropBeam to Applications.
-            - **Windows**: grab the **`.exe`** installer and run it.
-            - **Linux**: install the **`.deb`**, or make the **`.AppImage`** executable and run it.
+      # Symbols for crash symbolication — kept as workflow artifacts (90 days),
+      # not shipped. macOS: packed dSYMs; Windows: PDBs; Linux: the .debug files
+      # split off by scripts/split-linux-debug.sh.
+      - name: Collect debug symbols
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p debug-symbols
+          shopt -s nullglob globstar
+          for f in src-tauri/target/**/release/DropBeam.dSYM src-tauri/target/**/release/DropBeam.pdb src-tauri/target/debug-symbols/*.debug; do
+            # Prefix with the target dir (e.g. aarch64-apple-darwin) so the two
+            # halves of the universal build don't overwrite each other.
+            triple=$(basename "$(dirname "$(dirname "$f")")")
+            cp -R "$f" "debug-symbols/${triple}-$(basename "$f")"
+          done
+          ls -la debug-symbols
 
-            **First launch (the app is unsigned, so the OS blocks it once):**
-            - **macOS (newest):** double‑click → "Apple could not verify…" → **Done**. Then **System Settings → Privacy & Security → Open Anyway** (authenticate, Open Anyway again). *(Older macOS: right‑click → Open.)*
-            - **Windows:** SmartScreen → **More info → Run anyway**.
+      - name: Upload debug symbols
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-symbols-${{ matrix.platform }}-${{ matrix.rust-targets || 'native' }}
+          path: debug-symbols/
+          if-no-files-found: warn
+          retention-days: 90
 
-            After that it opens normally and **updates install themselves** from inside the app — no re‑downloading.
-          releaseDraft: false
-          prerelease: false
-          args: ${{ matrix.args }}
+  publish:
+    needs: [create-release, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Publish the release (un-draft, mark latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false -f make_latest=true --jq '.html_url'
