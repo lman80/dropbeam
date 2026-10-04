@@ -1,4 +1,6 @@
-import { useEffect, useLayoutEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useState } from 'react'
+import { isEnterKey, isPrimaryMod } from './lib/keys'
+import { NAV_ORDER } from './components/Sidebar'
 import { JoinAccountModal } from './components/DevicesPanel'
 import { motion } from 'framer-motion'
 import { AlertTriangle, X } from 'lucide-react'
@@ -24,14 +26,25 @@ import { IconButton, Spinner } from './components/ui'
 import { Dialog } from './components/Dialog'
 import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
-import { HistoryView } from './views/HistoryView'
-import { SettingsView } from './views/SettingsView'
-import { LocationsView } from './views/LocationsView'
-import { FoldersView } from './views/FoldersView'
-import { FriendsView } from './views/FriendsView'
-import { ChatView } from './views/ChatView'
-import { MobileApp } from './mobile/MobileApp'
-import { MobileOnboarding } from './mobile/Onboarding'
+// Route-level code splitting: Send & Receive (the landing page) ships in the main
+// chunk; every other page loads on first visit (and is prefetched once idle, so a
+// click never waits on the network-free-but-still-async import).
+const loadViews = {
+  history: () => import('./views/HistoryView').then((m) => ({ default: m.HistoryView })),
+  settings: () => import('./views/SettingsView').then((m) => ({ default: m.SettingsView })),
+  locations: () => import('./views/LocationsView').then((m) => ({ default: m.LocationsView })),
+  folders: () => import('./views/FoldersView').then((m) => ({ default: m.FoldersView })),
+  friends: () => import('./views/FriendsView').then((m) => ({ default: m.FriendsView })),
+  chat: () => import('./views/ChatView').then((m) => ({ default: m.ChatView })),
+}
+const HistoryView = lazy(loadViews.history)
+const SettingsView = lazy(loadViews.settings)
+const LocationsView = lazy(loadViews.locations)
+const FoldersView = lazy(loadViews.folders)
+const FriendsView = lazy(loadViews.friends)
+const ChatView = lazy(loadViews.chat)
+const MobileApp = lazy(() => import('./mobile/MobileApp').then((m) => ({ default: m.MobileApp })))
+const MobileOnboarding = lazy(() => import('./mobile/Onboarding').then((m) => ({ default: m.MobileOnboarding })))
 
 export default function App() {
   const [nativeShell, setNativeShell] = useState(false)
@@ -94,6 +107,44 @@ export default function App() {
 
   // `dropbeam:` links opened on macOS/Windows/Linux → the normal confirm flow.
   useEffect(() => startDesktopDeepLinks(), [])
+  // Warm the other pages once the window is idle.
+  useEffect(() => {
+    if (MOBILE_UI) return
+    const warm = () => { for (const load of Object.values(loadViews)) void load().catch(() => {}) }
+    const ric = (window as unknown as { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback
+    const id = ric ? ric(warm) : window.setTimeout(warm, 1500)
+    return () => { if (!ric) window.clearTimeout(id) }
+  }, [])
+
+  // Keyboard shortcuts (main window, desktop): ⌘/Ctrl+, Settings · ⌘1–7 pages ·
+  // ⌘F find in Chat/History · ⌘N new message · ⌘O send files.
+  useEffect(() => {
+    if (MOBILE_UI) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.repeat || !isPrimaryMod(e) || e.shiftKey) return
+      // A modal owns the keyboard while it's open.
+      if (document.querySelector('[aria-modal="true"]')) return
+      const st = useStore.getState()
+      const key = e.key.toLowerCase()
+      const n = Number(e.key)
+      if (key === ',') {
+        e.preventDefault(); st.setView('settings')
+      } else if (Number.isInteger(n) && n >= 1 && n <= NAV_ORDER.length) {
+        e.preventDefault(); st.setView(NAV_ORDER[n - 1])
+      } else if (key === 'f' && (st.view === 'chat' || st.view === 'history')) {
+        e.preventDefault(); window.dispatchEvent(new CustomEvent('dropbeam:find'))
+      } else if (key === 'n') {
+        e.preventDefault()
+        if (st.view !== 'chat') st.setView('chat')
+        window.setTimeout(() => window.dispatchEvent(new CustomEvent('dropbeam:new-message')), 0)
+      } else if (key === 'o') {
+        e.preventDefault()
+        void api.pickFiles().then((paths) => { if (paths.length) st.setPendingSend(paths) }, (err) => st.toast('error', err))
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   // Drive the Windows/Linux taskbar progress from the most relevant active
   // transfer (macOS shows this on the Downloads stack instead — no-op there).
@@ -177,6 +228,7 @@ export default function App() {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       {MOBILE_UI && <ErrorBoundary region="window controls">
+        <SettingsFallbackBanner />
         <InstallBanner />
         <LocalNetworkBanner />
       </ErrorBoundary>}
@@ -190,6 +242,7 @@ export default function App() {
         {/* Notices sit at the top of the content column (the sidebar runs to the
             top of the window under the macOS traffic lights). */}
         {!MOBILE_UI && <ErrorBoundary region="window controls">
+          <SettingsFallbackBanner />
           <InstallBanner />
           <LocalNetworkBanner />
         </ErrorBoundary>}
@@ -206,6 +259,7 @@ export default function App() {
           <ErrorBoundary region={`content:${view}`} key={view}>
             {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
                 so it never deadlocks on a view that has its own AnimatePresence. */}
+            <Suspense fallback={null}>
             {MOBILE_UI ? <MobileApp bridgeOnly={nativeShell} /> : <motion.div
               initial={MOBILE_UI ? false : { opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -220,6 +274,7 @@ export default function App() {
               {view === 'history' && <HistoryView />}
               {view === 'settings' && <SettingsView />}
             </motion.div>}
+            </Suspense>
           </ErrorBoundary>
         </main>
         </div>
@@ -231,7 +286,7 @@ export default function App() {
       )}
       <ErrorBoundary region="overlays" fallbackStyle={{ position: 'fixed', bottom: 12, left: 12, zIndex: 201 }}>
         {!nativeShell && <SendToChooser />}
-        {MOBILE_UI ? (!nativeShell && <MobileOnboarding />) : <NameSetupModal />}
+        {MOBILE_UI ? (!nativeShell && <Suspense fallback={null}><MobileOnboarding /></Suspense>) : <NameSetupModal />}
         {!nativeShell && <FolderInviteModal />}
         {!nativeShell && <SafetyDialogHost />}
         {!MOBILE_UI && <PopoverCodeHandoff />}
@@ -297,13 +352,16 @@ function NameSetupModal() {
   const [show, setShow] = useState(false)
   const [name, setName] = useState('')
   const [joining, setJoining] = useState(false)
-
-  useEffect(() => {
-    if (settings && !localStorage.getItem('dropbeam.namedSelf')) {
+  // Decide ONCE, when settings first arrive. Re-running on every settings change
+  // (a synced name, a toggle in another window) overwrote what you were typing.
+  const [decided, setDecided] = useState(false)
+  if (settings && !decided) {
+    setDecided(true)
+    if (!localStorage.getItem('dropbeam.namedSelf')) {
       setName(suggestedName(settings.displayName || ''))
       setShow(true)
     }
-  }, [settings])
+  }
 
   if (!show || !settings) return null
   const finish = () => {
@@ -322,7 +380,7 @@ function NameSetupModal() {
           <>
             {!MOBILE_UI && (
               <button className="btn btn-plain" onClick={() => setJoining(true)} style={{ marginLeft: -8 }}>
-                Link an existing device…
+                Link an Existing Device…
               </button>
             )}
             <span className="spacer" />
@@ -345,7 +403,7 @@ function NameSetupModal() {
             className="input onboard-input"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && name.trim() && finish()}
+            onKeyDown={(e) => isEnterKey(e) && name.trim() && finish()}
             placeholder="Your name"
             aria-label="Your name"
             maxLength={40}
@@ -394,6 +452,30 @@ function LocalNetworkBanner() {
       <IconButton label="Dismiss" size="sm" onClick={() => setDismissed(true)}>
         <X />
       </IconButton>
+    </div>
+  )
+}
+
+/** Startup couldn't read settings in time (D18), so the app is running on
+ *  defaults and saving is blocked. Say so, and offer to try again. */
+function SettingsFallbackBanner() {
+  const fallback = useStore((s) => s.settingsFallback)
+  const retry = useStore((s) => s.retryLoadSettings)
+  const [busy, setBusy] = useState(false)
+  if (!fallback) return null
+  return (
+    <div className="app-banner warn" role="status">
+      <AlertTriangle />
+      <span style={{ flex: 1, minWidth: 0 }}>Your settings haven’t loaded yet. Changes won’t be saved until they do.</span>
+      <button
+        className="btn btn-secondary btn-sm"
+        style={{ flexShrink: 0 }}
+        disabled={busy}
+        onClick={() => { setBusy(true); void retry().finally(() => setBusy(false)) }}
+      >
+        {busy ? <Spinner size={12} /> : null}
+        Try Again
+      </button>
     </div>
   )
 }

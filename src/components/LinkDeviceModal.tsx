@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
@@ -9,18 +9,20 @@ import { deviceCodeProblem, isDeviceCode, linkedDetail, linkedTitle, linkErrorTe
 import { useStore } from '../store'
 import { QrCodeView } from './CodeQr'
 import { QrScanner } from './QrScanner'
-import { useEscape } from './Dialog'
+import { useEscape, useModalFocus } from './Dialog'
 import { IconButton, Spinner } from './ui'
 
 /** Link with a scanned/pasted device code of either kind. The engine picks the
  *  direction (the account that already has devices wins) and refuses two
  *  different accounts, so both commands take any device code. */
+// eslint-disable-next-line react-refresh/only-export-components -- shared helper
 export async function linkWithCode(code: string) {
   const c = code.trim()
   const problem = deviceCodeProblem(c)
   if (problem) throw new Error(problem)
   return /^dropbeamjoin1:/i.test(c) ? api.linkDeviceJoin(c) : api.linkDeviceSend(c)
 }
+// eslint-disable-next-line react-refresh/only-export-components -- shared helper
 export { isDeviceCode }
 
 function onLinkEvent<T>(name: string, cb: (payload: T) => void): Promise<() => void> {
@@ -52,7 +54,7 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   // How the last attempt was made (this device scanning, or showing its code).
   const [via, setVia] = useState<'show' | 'scan'>(start)
   const phaseRef = useRef(phase)
-  phaseRef.current = phase
+  useLayoutEffect(() => { phaseRef.current = phase }, [phase])
   const closeRef = useRef(onClose)
   useEffect(() => { closeRef.current = onClose }, [onClose])
 
@@ -86,6 +88,7 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   useEffect(() => {
     if (!showing) return
     let alive = true
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- a fresh code screen starts blank
     setCode(''); setCodeError(''); setCopied(false)
     const begin = hosting ? api.linkHostBegin : api.linkDeviceBegin
     begin().then(c => { if (alive) setCode(c) }).catch(e => { if (alive) setCodeError(`Couldn’t create a code. ${linkErrorText(e)}`) })
@@ -106,21 +109,21 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
     validate={deviceCodeProblem} onResult={v => void scanned(v)} onClose={() => start === 'scan' ? closeRef.current() : setPhase('show')} />
 
   const footer = phase === 'show' ? <>
-    <button className="btn btn-plain" onClick={() => setPhase('scan')}>Scan their code instead</button>
+    <button className="btn btn-plain" onClick={() => setPhase('scan')}>Scan Their Code Instead</button>
     <span className="spacer" />
     {codeError
-      ? <button className="btn btn-secondary" onClick={retry}>Try again</button>
-      : <button className="btn btn-secondary" disabled={!code} onClick={copy}>{copied ? 'Copied' : 'Copy code'}</button>}
+      ? <button className="btn btn-secondary" onClick={retry}>Try Again</button>
+      : <button className="btn btn-secondary" disabled={!code} onClick={copy}>{copied ? 'Copied' : 'Copy Code'}</button>}
     <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
-  </> : phase === 'working' ? <button className="btn btn-secondary" onClick={onClose}>Hide</button>
+  </> : phase === 'working' ? <button className="btn btn-secondary" onClick={onClose}>Cancel Linking</button>
     : phase === 'done' ? <button className="btn btn-primary" autoFocus onClick={onClose}>Done</button>
     : <>
       {via === 'scan'
-        ? <button className="btn btn-plain" onClick={() => { setError(''); setPhase('show') }}>Show this device’s code</button>
-        : <button className="btn btn-plain" onClick={() => { setError(''); setPhase('scan') }}>Scan their code instead</button>}
+        ? <button className="btn btn-plain" onClick={() => { setError(''); setPhase('show') }}>Show This Device’s Code</button>
+        : <button className="btn btn-plain" onClick={() => { setError(''); setPhase('scan') }}>Scan Their Code Instead</button>}
       <span className="spacer" />
       <button className="btn btn-secondary" onClick={onClose}>Close</button>
-      <button className="btn btn-primary" autoFocus onClick={retry}>Try again</button>
+      <button className="btn btn-primary" autoFocus onClick={retry}>Try Again</button>
     </>
 
   return <LinkDialog title={phase === 'done' ? 'Devices linked' : title} onClose={onClose} footer={footer}>
@@ -165,7 +168,9 @@ export function LinkNewDeviceModal({ onClose }: { onClose: () => void }) {
 function LinkDialog({ title, onClose, footer, children }: { title: string; onClose?: () => void; footer?: React.ReactNode; children: React.ReactNode }) {
   // Stacks with the scanner and any dialog that opened this one: Esc peels the topmost.
   useEscape(onClose)
-  return createPortal(<div className="dialog-overlay device-link-overlay" onMouseDown={e => { if (onClose && e.target === e.currentTarget) onClose() }}>
+  const ref = useRef<HTMLDivElement>(null)
+  useModalFocus(ref)
+  return createPortal(<div ref={ref} className="dialog-overlay device-link-overlay" onMouseDown={e => { if (onClose && e.target === e.currentTarget) onClose() }}>
     <div className={MOBILE_UI ? 'dialog mobile-sheet device-link-dialog' : 'dialog dialog-panel device-link-dialog'} role="dialog" aria-modal="true" aria-label={title}>
       <div className="dialog-head">
         <h2 className="dialog-title">{title}</h2>

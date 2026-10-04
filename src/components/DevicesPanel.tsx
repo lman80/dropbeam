@@ -1,4 +1,5 @@
 import { createElement, useEffect, useMemo, useState } from 'react'
+import { relativeTime } from '../lib/dates'
 import { AnimatePresence } from 'framer-motion'
 import { Plus, QrCode } from 'lucide-react'
 import { api, type AccountDevice } from '../lib/api'
@@ -9,15 +10,10 @@ import { LinkFlow } from './LinkDeviceModal'
 import { ConfirmDialog } from './SafetyDialogs'
 import { MenuButton } from './ui'
 
+// eslint-disable-next-line react-refresh/only-export-components -- re-exported helpers for existing importers
 export { linkWithCode, isDeviceCode } from './LinkDeviceModal'
 
-function ago(ms: number) {
-  const s = Math.max(0, (Date.now() - ms) / 1000)
-  if (s < 60) return 'just now'
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`
-  if (s < 86400) return `${Math.floor(s / 3600)} hr ago`
-  return new Date(ms).toLocaleDateString()
-}
+const ago = (ms: number) => relativeTime(ms).replace(/^Just now$/, 'just now')
 
 /** Device glyph in a neutral disc (a tiny green dot when that device is online). */
 function DeviceGlyph({ d, online }: { d: Pick<AccountDevice, 'device_kind' | 'device_os'>; online?: boolean }) {
@@ -66,7 +62,7 @@ export function DevicesPanel() {
   return <section className="account-devices">
     <div className="section-row">
       <h2 className="section-title">Devices</h2>
-      {inAccount && <button className="btn btn-plain btn-sm account-sync" disabled={syncing} onClick={() => void syncNow()}>{syncing ? 'Syncing…' : 'Sync now'}</button>}
+      {inAccount && <button className="btn btn-plain btn-sm account-sync" disabled={syncing} onClick={() => void syncNow()}>{syncing ? 'Syncing…' : 'Sync Now'}</button>}
     </div>
     <div className="group account-device-list">
       {inAccount ? devices.map(d => {
@@ -84,7 +80,7 @@ export function DevicesPanel() {
               label={`Options for ${title}`}
               items={d.this_device
                 ? [{ label: `Remove this ${myNoun} from account…`, danger: true, onSelect: () => setConfirm({ kind: 'leave' }) }]
-                : [{ label: 'Remove from account…', danger: true, onSelect: () => setConfirm({ kind: 'remove', device: d }) }]}
+                : [{ label: 'Remove from Account…', danger: true, onSelect: () => setConfirm({ kind: 'remove', device: d }) }]}
             />
           </div>
         </div>
@@ -98,16 +94,16 @@ export function DevicesPanel() {
       <button className="row account-device-add" onClick={() => setMode('show')}>
         <span className="account-device-glyph" aria-hidden><Plus size={16} /></span>
         <span className="row-main">
-          <span className="row-title">Link a device…</span>
+          <span className="row-title">Link a Device…</span>
           {!inAccount && <span className="row-sub">Get your friends and chats on your phone or another computer</span>}
         </span>
       </button>
       {!inAccount && <button className="row account-device-add" onClick={() => setMode('scan')}>
         <span className="account-device-glyph" aria-hidden><QrCode size={16} /></span>
-        <span className="row-main"><span className="row-title">Scan another device’s code…</span></span>
+        <span className="row-main"><span className="row-title">Scan Another Device’s Code…</span></span>
       </button>}
     </div>
-    {mode && <LinkFlow start={mode} title="Link a device" onClose={() => { setMode(null); void useStore.getState().refreshMyDevice().catch(() => {}) }} />}
+    {mode && <LinkFlow start={mode} title="Link a Device" onClose={() => { setMode(null); void useStore.getState().refreshMyDevice().catch(() => {}) }} />}
     <AnimatePresence>
       {confirm?.kind === 'remove' && <ConfirmDialog key="remove"
         title={`Remove ${labels[confirm.device.endpoint_id] ?? confirm.device.name} from your account?`}
@@ -125,7 +121,7 @@ export function DevicesPanel() {
 
 /** Show this device's code; the other device scans it (or this one scans theirs). */
 export function AddDeviceModal({ onClose }: { onClose: () => void }) {
-  return <LinkFlow start="show" title="Link a device" onClose={onClose} />
+  return <LinkFlow start="show" title="Link a Device" onClose={onClose} />
 }
 
 /** A new device joining: straight to the camera, with "show my code" as the way back. */

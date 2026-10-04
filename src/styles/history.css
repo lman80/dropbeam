@@ -8,8 +8,8 @@
   margin-bottom: 4px;
 }
 .history-search { width: 200px; flex-shrink: 1; min-width: 120px; }
-.history-toolbar + section > .section-title,
-.history-toolbar + .rf > .section-title:first-child { margin-top: 16px; }
+.history-toolbar + [role='tabpanel'] > section:first-child > .section-title,
+.history-toolbar + [role='tabpanel'] > .rf > .section-title:first-child { margin-top: 16px; }
 .rf .section-title { min-width: 0; }
 .rf .section-row > .icon-btn { margin-right: 8px; }
 

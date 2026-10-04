@@ -9,6 +9,7 @@ export function MobileOnboarding() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- first-run prompt once settings load
     if (settings && !localStorage.getItem('dropbeam.namedSelf')) { setName(settings.displayName || ''); setShow(true) }
   }, [settings])
   if (!settings || !show) return null

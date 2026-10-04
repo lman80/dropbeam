@@ -8,6 +8,7 @@ export function DropZone({
   onPick,
   onPickPhotos,
   compact = false,
+  short = false,
 }: {
   hovering: boolean
   picking?: boolean
@@ -15,6 +16,8 @@ export function DropZone({
   onPickPhotos?: () => void
   /** Transfers are listed below: no big target, just the drag overlay. */
   compact?: boolean
+  /** Still the drop target, just shorter (another device's transfer is listed below). */
+  short?: boolean
 }) {
   if (MOBILE_UI) return (
     <section className="mobile-send-hero" data-testid="dropzone" aria-busy={picking}>
@@ -35,7 +38,7 @@ export function DropZone({
           disabled={picking}
           aria-busy={picking}
           data-testid="dropzone"
-          className={`dropzone${hovering ? ' hovering' : ''}`}
+          className={`dropzone${hovering ? ' hovering' : ''}${short ? ' short' : ''}`}
           aria-label="Choose files to send"
         >
           <FileUp className="dropzone-glyph" strokeWidth={1.5} />

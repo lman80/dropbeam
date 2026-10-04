@@ -8,6 +8,7 @@ import { api } from '../lib/api'
 import { useStore } from '../store'
 import { friendOnlineState } from '../lib/presence'
 import { Spinner } from './bits'
+import { sendTargets } from '../lib/deviceIcons'
 
 export function PairingModal({
   mode,
@@ -23,6 +24,9 @@ export function PairingModal({
   const reloadFriends = useStore((s) => s.reloadFriends)
   const toast = useStore((s) => s.toast)
   const friends = useStore((s) => s.friends)
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
+  // One chip per PERSON, and never your own devices (they aren't invitees).
+  const invitable = sendTargets(friends, myAccount).others
   const [folder, setFolder] = useState('')
   const [syncMode, setSyncMode] = useState<'mirror' | 'twoway' | 'oneway'>('twoway')
   const [peerName, setPeerName] = useState('')
@@ -134,14 +138,14 @@ export function PairingModal({
         footer={<button className="btn btn-secondary" onClick={onClose}>Done</button>}
       >
         <p className="dialog-text">In DropBeam, they choose Accept invite and scan or paste this.</p>
-        <ShareCode code={createdInvite} layout="stack" copyLabel="Copy invite" />
+        <ShareCode code={createdInvite} layout="stack" copyLabel="Copy Invite" />
       </Dialog>
     )
   }
 
   return (
     <Dialog
-      title={mode === 'create' ? 'New shared folder' : 'Accept a folder invite'}
+      title={mode === 'create' ? 'New Shared Folder' : 'Accept a Folder Invite'}
       width={460}
       className="folder-dialog"
       onClose={onClose}
@@ -157,7 +161,7 @@ export function PairingModal({
             {busy ? <Spinner size={13} /> : null}
             {mode === 'create'
               ? invitees.length > 0
-                ? `Create & invite ${invitees.length}`
+                ? `Create & Invite ${invitees.length}`
                 : 'Create'
               : 'Accept'}
           </button>
@@ -190,9 +194,9 @@ export function PairingModal({
 
       <div className="folder-field">
         <label className="field-label">{mode === 'create' ? 'Folder to share' : 'Save into'}</label>
-        <button className="btn btn-secondary folder-picker" onClick={pickFolder} title={folder || undefined}>
+        <button className="btn btn-secondary folder-picker" data-autofocus onClick={pickFolder} title={folder || undefined}>
           <FolderOpen />
-          <span className={folder ? undefined : 'placeholder'}>{folder ? folderName : 'Choose a folder…'}</span>
+          <span className={folder ? undefined : 'placeholder'}>{folder ? folderName : 'Choose a Folder…'}</span>
         </button>
       </div>
 
@@ -222,13 +226,13 @@ export function PairingModal({
         </div>
       )}
 
-      {mode === 'create' && friends.length > 0 && (
+      {mode === 'create' && invitable.length > 0 && (
         <div className="folder-field">
           <label className="field-label">
             Invite friends <span className="optional">(optional)</span>
           </label>
           <div className="folder-chips">
-            {friends.map((f) => {
+            {invitable.map((f) => {
               const on = invitees.includes(f.id)
               return (
                 <button
@@ -256,7 +260,7 @@ export function PairingModal({
       {mode === 'create' && (
         <div className="folder-field">
           <label className="field-label" htmlFor="folder-peer-name">
-            {friends.length > 0 ? 'Or someone new' : 'Their name'} <span className="optional">(optional)</span>
+            {invitable.length > 0 ? 'Or someone new' : 'Their name'} <span className="optional">(optional)</span>
           </label>
           <input
             id="folder-peer-name"

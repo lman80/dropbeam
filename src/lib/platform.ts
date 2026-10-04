@@ -48,3 +48,8 @@ export const IS_LINUX = DESKTOP_OS === 'linux'
 
 /** "menu bar" on macOS, the system tray elsewhere. */
 export const TRAY_NAME = IS_MAC ? 'menu bar' : 'system tray'
+
+/** Reveal a file selected in the system file manager — named the OS's way. */
+export const REVEAL_LABEL = IS_MAC ? 'Show in Finder' : IS_WINDOWS ? 'Show in File Explorer' : 'Show in Folder'
+/** Open a folder in the system file manager — named the OS's way. */
+export const OPEN_FOLDER_LABEL = IS_MAC ? 'Open in Finder' : IS_WINDOWS ? 'Open in File Explorer' : 'Open Folder'

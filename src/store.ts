@@ -40,6 +40,7 @@ import { parseCode, routeCode, wrongCodeMessage } from './lib/codes'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 import { MOBILE_UI } from './lib/platform'
 import { feedbackMoment } from './lib/feedback'
+import { humanError, humanErrorIn, rawErrorText } from './lib/errors'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
 // Wire the periodic/online update re-check listeners exactly once.
@@ -63,6 +64,10 @@ export interface TransferRates {
   ageMs: number
   /** Below two samples the engine's own speedBps/etaSeconds stand in. */
   samples: number
+  /** True once the run has been measured for ~3 s of WALL time — flipped by a
+   *  timer too, so a card whose progress frames pause never sits on
+   *  "calculating…" forever. */
+  settled: boolean
 }
 
 // The two display toggles are GLOBAL (not per card) and outlive a restart.
@@ -133,6 +138,25 @@ import { playError, playIncoming, playOffer, playReceived, playSent } from './li
 /** Leading-edge throttle (per pair+direction) so a burst of synced files cues once. */
 const folderSoundThrottle = new Map<string, number>()
 
+/** Auto-dismiss timers per toast; cleared while the pointer rests on them. */
+const toastTimers = new Map<string, ReturnType<typeof setTimeout>>()
+let toastsHeld = false
+function scheduleToast(id: string, ms: number, dismiss: (id: string) => void): void {
+  if (toastsHeld) return
+  const prev = toastTimers.get(id)
+  if (prev) clearTimeout(prev)
+  toastTimers.set(id, setTimeout(() => dismiss(id), ms))
+}
+
+/** Transfers this window canceled itself — their end gets no error sound. */
+export const ownCancels = new Set<string>()
+
+/** True in the menu-bar popover, HUD and receive-card webviews. Checked lazily:
+ *  main.tsx adds the class after this module is evaluated. */
+function isOverlayWindow(): boolean {
+  return typeof document !== 'undefined' && document.documentElement.classList.contains('overlay-window')
+}
+
 /** When each transfer started moving bytes, to compute a final average speed. */
 const transferStart = new Map<string, number>()
 
@@ -195,6 +219,8 @@ export interface Toast {
   id: string
   kind: 'info' | 'success' | 'error'
   message: string
+  /** Raw technical text behind an error, shown under a "Details" disclosure. */
+  details?: string | null
 }
 
 interface AppStore {
@@ -274,6 +300,8 @@ interface AppStore {
   setPendingFolderInvite: (code: string | null) => void
   upsertTransfer: (u: TransferUpdate) => void
   removeTransfer: (id: string) => void
+  /** Cancel a transfer you started or accepted (no error sound when it ends). */
+  cancelTransfer: (id: string) => Promise<void>
   /** Re-run a failed friend/Quick Send with the same files + recipient (one tap).
    *  No-op if the original payload is no longer known or the card isn't failed. */
   retryTransfer: (id: string) => Promise<void>
@@ -335,8 +363,19 @@ interface AppStore {
   unstageChatFile: (path: string) => void
   clearChatDraftFiles: () => void
   markChatRead: (friendId: string) => void
-  toast: (kind: Toast['kind'], message: string) => void
+  /** Error toasts accept anything thrown: it's mapped to a plain sentence, with
+   *  the raw text kept under "Details". */
+  toast: (kind: Toast['kind'], message: unknown) => void
+  /** An error toast with context: "Couldn’t save settings." + the cause. */
+  toastError: (context: string, e: unknown) => void
   dismissToast: (id: string) => void
+  /** Pause (hover) / resume auto-dismiss of every visible toast. */
+  holdToasts: (hold: boolean) => void
+  /** Settings came from the startup fallback (the engine didn't answer in time):
+   *  saving would write DEFAULTS over the real file, so saves are blocked until
+   *  a real load succeeds. */
+  settingsFallback: boolean
+  retryLoadSettings: () => Promise<boolean>
 }
 
 /** A short one-line preview of a message, for reply quotes + list rows. */
@@ -443,6 +482,15 @@ function setRetryPayload(id: string, p: RetryPayload): void {
 }
 export function rememberLocationUpload(transferId: string, friendId: string, locationId: string, relPath: string, paths: string[]) {
   setRetryPayload(transferId, { kind: 'location', id: friendId, locationId, relPath, paths })
+}
+/** The friend a send went to (from its retry payload), if known. */
+export function retryFriendId(id: string): string | null {
+  const p = loadRetryPayloads()[id]
+  return p && p.kind !== 'quick' ? p.id : null
+}
+/** Can this stopped card be replayed with one tap? */
+export function hasRetryPayload(id: string): boolean {
+  return !!loadRetryPayloads()[id]
 }
 function deleteRetryPayload(id: string): void {
   try {
@@ -619,14 +667,29 @@ export const useStore = create<AppStore>((set, get) => ({
     // we ALWAYS reach ready:true, so a slow or failing backend renders the app
     // (with defaults) rather than hanging on the loading screen forever. Any
     // failure is logged to the app log file (frontend_log) for diagnosis.
-    const [settings, history, pairs, friends, statuses, defaultDownloadDir] = await Promise.all([
-      guarded(api.getSettings(), DEFAULT_SETTINGS, 'getSettings'),
+    // Settings are special (D18): if the first read is slow, the app renders on
+    // DEFAULTS — and a save from that state would write those defaults over the
+    // real file. So remember it was a fallback (saves are blocked, a banner
+    // offers Retry) and adopt the real settings the moment the slow read lands.
+    const settingsRead = api.getSettings()
+    const [loadedSettings, history, pairs, friends, statuses, defaultDownloadDir] = await Promise.all([
+      guarded(settingsRead, null as Settings | null, 'getSettings'),
       guarded(api.getHistory(), [], 'getHistory'),
       guarded(api.listPairs(), [], 'listPairs'),
       guarded(api.listFriends(), [], 'listFriends'),
       guarded(api.getFolderStatuses(), [], 'getFolderStatuses'),
       guarded(api.getDefaultDownloadDir(), '', 'getDefaultDownloadDir'),
     ])
+    const settings = loadedSettings ?? DEFAULT_SETTINGS
+    const settingsFallback = !loadedSettings
+    if (settingsFallback) {
+      void settingsRead.then((real) => {
+        if (!get().settingsFallback) return
+        setSpeedUnit(real.showMegabits)
+        set({ settings: real, settingsFallback: false })
+        get().applyTheme(real.theme)
+      }, () => {})
+    }
     try {
       get().applyTheme(settings.theme)
     } catch {
@@ -640,7 +703,7 @@ export const useStore = create<AppStore>((set, get) => ({
     // push the OS badge once — otherwise a restored backlog showed in the sidebar
     // while the Dock stayed at 0 until the next message arrived (#27).
     const chatUnread = pruneChatUnread(get().chatUnread, new Set(friends.map((f) => f.id)))
-    set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true, chatUnread })
+    set({ settings, settingsFallback, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true, chatUnread })
     void listenForChatNotifications((peerId) => get().openChat(peerId))
 
     // Probe independently of mounted views, including while iroh starts up.
@@ -671,15 +734,22 @@ export const useStore = create<AppStore>((set, get) => ({
         await listen<Settings>('settings://changed', ({ payload }) => {
           settingsEventReceived = true
           setSpeedUnit(payload.showMegabits)
-          set({ settings: payload })
+          set({ settings: payload, settingsFallback: false })
           get().applyTheme(payload.theme)
         }).catch(() => {})
         // Close the snapshot/listener gap for settings in newly opened HUDs.
         const latest = await guarded(api.getSettings(), null, 'getSettings refresh')
         if (latest && !settingsEventReceived) {
           setSpeedUnit(latest.showMegabits)
-          set({ settings: latest })
+          set({ settings: latest, settingsFallback: false })
         }
+        // A send started natively (menu-bar drag on macOS) never went through
+        // sendToFriend, so remember its payload here for one-tap Retry.
+        await listen<{ transferId: string; friendId: string; paths: string[] }>('dropbeam://send-started', ({ payload }) => {
+          if (payload?.transferId && payload.friendId && Array.isArray(payload.paths)) {
+            setRetryPayload(payload.transferId, { kind: 'friend', id: payload.friendId, paths: payload.paths })
+          }
+        }).catch(() => {})
       }
     }
 
@@ -929,7 +999,7 @@ export const useStore = create<AppStore>((set, get) => ({
       })
       // The app relaunches inside runInstall on success.
     } catch (e) {
-      get().toast('error', `Update failed: ${e}`)
+      get().toastError('Couldn’t install the update.', e)
       const cur = get().update
       if (cur) set({ update: { ...cur, installing: false } })
     }
@@ -1060,6 +1130,8 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   applyTheme: (theme) => {
+    // Cache for index.html's pre-paint theme script (next launch, every window).
+    try { localStorage.setItem('dropbeam-theme', theme) } catch { /* storage unavailable */ }
     const root = document.documentElement
     const sysDark = window.matchMedia('(prefers-color-scheme: dark)').matches
     const dark = theme === 'dark' || (theme === 'system' && sysDark)
@@ -1076,6 +1148,12 @@ export const useStore = create<AppStore>((set, get) => ({
   saveSettings: async (patch) => {
     const current = get().settings
     if (!current) return
+    if (get().settingsFallback) {
+      // Never persist a change on top of startup DEFAULTS (D18) — it would
+      // overwrite every real setting with its default.
+      get().toast('error', 'Your settings haven’t finished loading, so this change wasn’t saved. Try again in a moment.')
+      return
+    }
     const next = { ...current, ...patch }
     set({ settings: next })
     if (patch.theme) get().applyTheme(patch.theme)
@@ -1092,7 +1170,7 @@ export const useStore = create<AppStore>((set, get) => ({
       set({ settings: current })
       if (patch.theme) get().applyTheme(current.theme)
       if (patch.showMegabits !== undefined) setSpeedUnit(current.showMegabits)
-      get().toast('error', `Couldn't save settings: ${e}`)
+      get().toastError('Couldn’t save settings.', e)
     }
   },
 
@@ -1101,7 +1179,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const saved = await api.setProfileAvatar()
       set({ settings: saved })
     } catch (e) {
-      get().toast('error', `Couldn't set picture: ${e}`)
+      get().toastError('Couldn’t set your picture.', e)
     }
   },
   clearAvatar: async () => {
@@ -1109,7 +1187,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const saved = await api.clearProfileAvatar()
       set({ settings: saved })
     } catch (e) {
-      get().toast('error', `Couldn't remove picture: ${e}`)
+      get().toastError('Couldn’t remove your picture.', e)
     }
   },
 
@@ -1128,7 +1206,17 @@ export const useStore = create<AppStore>((set, get) => ({
       // The card's own live/average rates. A run that just restarted (resumed
       // after Paused/Failed, or rewound) starts its clock again here.
       let rate = continuing ? rateTrackers.get(u.id) : undefined
-      rate ??= new TransferRate()
+      if (!rate) {
+        rate = new TransferRate()
+        const fresh = rate
+        const id = u.id
+        setTimeout(() => set((s) => {
+          const cur = s.transferRates[id]
+          return cur && !cur.settled && rateTrackers.get(id) === fresh
+            ? { transferRates: { ...s.transferRates, [id]: { ...cur, settled: true } } }
+            : s
+        }), 3000)
+      }
       rateTrackers.set(u.id, rate)
       rate.update(now, u.bytesDone)
       const liveBps = rate.live()
@@ -1140,6 +1228,7 @@ export const useStore = create<AppStore>((set, get) => ({
         avgEta: etaAt(u.bytesDone, u.bytesTotal, avgBps),
         ageMs: rate.startedAt == null ? 0 : now - rate.startedAt,
         samples: rate.count,
+        settled: (continuing && !!get().transferRates[u.id]?.settled) || (rate.startedAt != null && now - rate.startedAt >= 3000),
       }
     } else {
       etaSpeeds.delete(u.id)
@@ -1171,13 +1260,17 @@ export const useStore = create<AppStore>((set, get) => ({
         get().markFriendSeen(u.friendName)
       }
     }
-    // Sounds fire on meaningful state changes only (not on every progress tick).
-    if ((get().settings?.playSounds ?? true) && (!prev || prev.state !== u.state)) {
+    // Sounds fire on meaningful state changes only (not on every progress tick),
+    // and only from the MAIN window: the popover, HUD and receive card run their
+    // own copy of this store and would otherwise chime two or three times.
+    const ownCancel = u.state === 'canceled' && ownCancels.delete(u.id)
+    if (!isOverlayWindow() && (get().settings?.playSounds ?? true) && (!prev || prev.state !== u.state)) {
       if (u.state === 'completed') {
         if (u.direction === 'send') playSent()
         else playReceived()
-      } else if (u.state === 'failed' || u.state === 'canceled') {
-        // A transfer errored out or was canceled — a soft descending "uh-oh".
+      } else if (u.state === 'failed' || (u.state === 'canceled' && !ownCancel)) {
+        // A transfer errored out, or the OTHER side stopped it — a soft "uh-oh".
+        // Your own Cancel is silent: you know you did it.
         playError()
       } else if (u.state === 'held' && u.direction === 'send') {
         playSent()
@@ -1246,6 +1339,16 @@ export const useStore = create<AppStore>((set, get) => ({
         transferRates,
       }
     })
+  },
+
+  cancelTransfer: async (id) => {
+    ownCancels.add(id)
+    try {
+      await api.cancelTransfer(id)
+    } catch (e) {
+      ownCancels.delete(id)
+      get().toastError('Couldn’t cancel.', e)
+    }
   },
 
   removeTransfer: (id) => {
@@ -1705,6 +1808,7 @@ export const useStore = create<AppStore>((set, get) => ({
   respondToOffer: async (id, accept) => {
     // Reflect the choice immediately; the backend then drives the real states.
     const t = get().transfers[id]
+    if (!accept) ownCancels.add(id)
     if (t) {
       get().upsertTransfer({
         ...t,
@@ -1720,10 +1824,48 @@ export const useStore = create<AppStore>((set, get) => ({
 
   toast: (kind, message) => {
     const id = crypto.randomUUID()
-    set((s) => ({ toasts: [...s.toasts, { id, kind, message }] }))
-    setTimeout(() => get().dismissToast(id), kind === 'error' ? 6000 : 3500)
+    const h = kind === 'error' ? humanError(message) : { message: rawErrorText(message), details: null }
+    set((s) => ({ toasts: [...s.toasts, { id, kind, message: h.message, details: h.details }] }))
+    scheduleToast(id, kind === 'error' ? 6000 : 3500, get().dismissToast)
+  },
+  toastError: (context, e) => {
+    const id = crypto.randomUUID()
+    const h = humanErrorIn(context, e)
+    set((s) => ({ toasts: [...s.toasts, { id, kind: 'error', message: h.message, details: h.details }] }))
+    scheduleToast(id, 6000, get().dismissToast)
   },
 
-  dismissToast: (id) =>
-    set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+  dismissToast: (id) => {
+    const t = toastTimers.get(id)
+    if (t) clearTimeout(t)
+    toastTimers.delete(id)
+    set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }))
+    // Dismissing the hovered toast removes it before any mouseleave can fire —
+    // release the hold so the rest still time out.
+    if (toastsHeld) get().holdToasts(false)
+  },
+  holdToasts: (hold) => {
+    toastsHeld = hold
+    if (hold) {
+      for (const t of toastTimers.values()) clearTimeout(t)
+      toastTimers.clear()
+    } else {
+      // Resume with a short grace so a toast you just read doesn't vanish instantly.
+      for (const t of get().toasts) scheduleToast(t.id, t.kind === 'error' ? 4000 : 2500, get().dismissToast)
+    }
+  },
+
+  settingsFallback: false,
+  retryLoadSettings: async () => {
+    try {
+      const settings = await api.getSettings()
+      setSpeedUnit(settings.showMegabits)
+      set({ settings, settingsFallback: false })
+      get().applyTheme(settings.theme)
+      return true
+    } catch (e) {
+      get().toastError('Still couldn’t load your settings.', e)
+      return false
+    }
+  },
 }))

@@ -1,10 +1,5 @@
-/* eslint-disable react-refresh/only-export-components -- entry point, not a component module */
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import App from './App'
-import { Popover } from './windows/Popover'
-import { Hud } from './windows/Hud'
-import { ReceiveCard } from './windows/ReceiveCard'
 import { api, HAS_TAURI } from './lib/api'
 import { DESKTOP_OS, IS_IOS, MOBILE_UI } from './lib/platform'
 import { setFeedbackCrashReports, startFeedback } from './lib/feedback'
@@ -46,18 +41,35 @@ if (MOBILE_UI) {
   document.documentElement.classList.add(`platform-${DESKTOP_OS}`)
 }
 
-// Apply the OS theme immediately to avoid a flash; App refines it from settings.
-if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+// index.html already applied the CACHED theme before first paint; with no
+// cache yet, follow the OS. App refines it from settings (and re-caches it).
+if (!localStorage.getItem('dropbeam-theme') && window.matchMedia('(prefers-color-scheme: dark)').matches) {
   document.documentElement.classList.add('dark')
 }
+
+// IME: WebKit delivers the Enter that CONFIRMS a Chinese/Japanese composition as
+// a keydown with keyCode 229 — which would also submit the surrounding form,
+// sending half-typed text. Swallow just that keydown for form fields.
+window.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.keyCode !== 229 || e.isComposing) return
+  const t = e.target as HTMLElement | null
+  if (t && t.tagName === 'INPUT' && (t as HTMLInputElement).form) e.preventDefault()
+}, true)
 
 // Browser preview only: expose the store so screenshot scripts can reach every state.
 if (!HAS_TAURI) (window as unknown as { __store?: typeof useStore }).__store = useStore
 
-const Root =
-  label === 'popover' ? Popover : label === 'hud' ? Hud : label === 'receive' ? ReceiveCard : App
+// Each window loads only its own UI: the menu-bar popover, HUD and receive card
+// don't parse the whole main window, and vice versa.
+async function loadRoot(): Promise<() => React.JSX.Element | null> {
+  if (label === 'popover') return (await import('./windows/Popover')).Popover
+  if (label === 'hud') return (await import('./windows/Hud')).Hud
+  if (label === 'receive') return (await import('./windows/ReceiveCard')).ReceiveCard
+  return (await import('./App')).default
+}
 async function renderApp() {
   if (MOBILE_UI) await import('./mobile.css')
+  const Root = await loadRoot()
   createRoot(document.getElementById('root')!).render(
     <ErrorBoundary region={`window:${label}`}><Root /></ErrorBoundary>,
   )

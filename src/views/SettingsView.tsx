@@ -1,4 +1,6 @@
 import { deviceKindLabel } from '../lib/deviceIcons'
+import { shortDate } from '../lib/dates'
+import { isEnterKey } from '../lib/keys'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { DevicesPanel } from '../components/DevicesPanel'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
@@ -24,6 +26,7 @@ import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbac
 // opens General, "Settings" under History's recoverable files opens Transfers —
 // otherwise it's the pane you last had open.
 type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'advanced'
+const DEV_KEY = 'dropbeam.developer'
 const TABS: { value: Tab; label: string }[] = [
   { value: 'general', label: 'General' },
   { value: 'devices', label: 'Devices' },
@@ -154,6 +157,27 @@ export function SettingsView() {
   const deviceDescription = myDevice ? `This device: ${settings.displayName || myDevice.name} · ${deviceKindLabel(myDevice.device_kind)}` : 'Loading this device…'
   const linkedDescription = myDevice ? `${myDevice.linked_devices} linked device${myDevice.linked_devices === 1 ? '' : 's'}` : ''
   const toast = useStore((s) => s.toast)
+  const toastError = useStore((s) => s.toastError)
+  // Developer options (Giphy key, Lab Mode) stay out of normal Settings. They
+  // show when already in use, or after tapping the version number 7 times.
+  const [devMode, setDevModeState] = useState(() => {
+    try { return localStorage.getItem(DEV_KEY) === '1' || new URLSearchParams(location.search).get('dev') === '1' } catch { return false }
+  })
+  const setDevMode = (on: boolean) => {
+    setDevModeState(on)
+    try { if (on) localStorage.setItem(DEV_KEY, '1'); else localStorage.removeItem(DEV_KEY) } catch { /* storage unavailable */ }
+  }
+  const versionTaps = useRef<number[]>([])
+  const tapVersion = () => {
+    const now = Date.now()
+    versionTaps.current = [...versionTaps.current.filter((t) => now - t < 3000), now]
+    if (versionTaps.current.length >= 7 && !devMode) {
+      versionTaps.current = []
+      setDevMode(true)
+      setTab('advanced')
+      toast('info', 'Developer options are now in Advanced.')
+    }
+  }
   const [clearing, setClearing] = useState(false)
   const clearCache = async () => {
     setClearing(true)
@@ -243,7 +267,7 @@ export function SettingsView() {
         {toggle('waitForDirect', 'Wait for direct connection', settings.requireDirect ? 'Unavailable while direct connections are required.' : 'Wait for a fast direct path before sending. You can choose the relay on each transfer.', settings.requireDirect)}
         {toggle('parallelStreams', 'Parallel streams', 'Send files over 16 MB using several connections. Turn off if transfers stall.')}
         <MobileSetting title="Upload limit" desc="Mbps; 0 means unlimited. Local transfers run at full speed. Start at 100 Mbps and adjust if your Wi-Fi stutters."><input className="input" aria-label="Upload limit in Mbps" type="number" min={0} max={100000} value={settings.uploadLimitMbps || 0} onChange={e => save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })} /></MobileSetting>
-        {toggle('showMegabits', 'Speeds in megabits', 'Use Mbps instead of kB/s or MB/s on this device.')}
+        {toggle('showMegabits', 'Speeds in megabits', 'Use Mbps instead of KB/s or MB/s on this device.')}
       </MobileSection>
       <MobileSection title="How transfers connect">
         <MobileSetting title="Local" desc="Same Wi-Fi or network. Files travel directly across your network, without the internet." />
@@ -373,26 +397,11 @@ export function SettingsView() {
           on={settings.linkPreviews}
           onChange={(v) => save({ linkPreviews: v })}
         />
-        <Row title="GIFs" sub="Add a free key from developers.giphy.com to turn on GIFs.">
-          <input
-            className="input set-field"
-            type="text"
-            aria-label="Giphy API key"
-            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-            placeholder="Giphy API key"
-            defaultValue={settings.giphyApiKey}
-            onBlur={(e) => {
-              const v = e.target.value.trim()
-              if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
-            }}
-            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
-          />
-        </Row>
       </div>
 
       <SectionHeader>Updates</SectionHeader>
       <div className="group">
-        <UpdateRow />
+        <UpdateRow onVersionTap={tapVersion} />
       </div>
     </>
   )
@@ -603,7 +612,7 @@ export function SettingsView() {
             onClick={() =>
               api
                 .openMailto(contactMailto(appVer || null, platformLabel(navigator.userAgent)))
-                .catch((e) => toast('error', `Couldn’t open your mail app: ${String(e)}`))
+                .catch((e) => toastError('Couldn’t open your mail app.', e))
             }
           >
             Email Us…
@@ -620,7 +629,7 @@ export function SettingsView() {
           <InfoTip label="About relays">
             <p>When two devices can’t connect directly, data goes through a relay. Point both devices at your own relay for a faster, steadier fallback.</p>
             <button className="btn btn-plain btn-sm set-info-link" onClick={() => api.openUrl(RELAY_GUIDE).catch(() => {})}>
-              Relay setup guide
+              Relay Setup Guide
             </button>
           </InfoTip>
       </SectionHeader>
@@ -658,8 +667,24 @@ export function SettingsView() {
         </Row>
       </div>
 
-      <SectionHeader>Lab Mode</SectionHeader>
+      {(devMode || settings.labModeEnabled) && <>
+      <SectionHeader action={<button className="btn btn-plain btn-sm" onClick={() => setDevMode(false)}>Hide</button>}>Developer</SectionHeader>
       <div className="group">
+        <Row title="GIFs" sub="A free key from developers.giphy.com turns on the GIF picker.">
+          <input
+            className="input set-field"
+            type="text"
+            aria-label="Giphy API key"
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+            placeholder="Giphy API key"
+            defaultValue={settings.giphyApiKey}
+            onBlur={(e) => {
+              const v = e.target.value.trim()
+              if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
+            }}
+            onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }}
+          />
+        </Row>
         <ToggleRow
           title="Allow Lab Mode"
           sub="Lets one trusted developer device run tests on this app. Turn on only if asked."
@@ -716,6 +741,7 @@ export function SettingsView() {
           </>
         )}
       </div>
+      </>}
       {scanOperator && (
         <QrScanner
           title="Scan operator ID"
@@ -732,14 +758,14 @@ export function SettingsView() {
 
   return (
     <div className="page settings-page" ref={rootRef}>
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Settings</h1>
         <div className="page-actions">
-          <Segmented role="tablist" label="Settings sections" value={tab} onChange={setTab} options={visibleTabs} className="settings-tabs" />
+          <Segmented role="tablist" label="Settings sections" value={tab} onChange={setTab} options={visibleTabs} className="settings-tabs" idBase="settings" />
         </div>
       </div>
       {deviceModals}
-      <div role="tabpanel" aria-label={TABS.find((t) => t.value === tab)?.label} className={`settings-pane settings-pane-${tab}`}>
+      <div role="tabpanel" id="settings-panel" aria-labelledby={`settings-tab-${tab}`} className={`settings-pane settings-pane-${tab}`}>
         {tab === 'general' && general}
         {tab === 'devices' && <DevicesPanel />}
         {tab === 'locations' && <LocationSettings />}
@@ -774,7 +800,7 @@ function FeedbackSection() {
         />
         <Row
           title="Send feedback"
-          sub="Goes straight to the developer. DropBeam is built with AI, so a good suggestion can ship in an update within days."
+          sub="Goes straight to the developer. Good suggestions often ship in an update within days."
         >
           <button className="btn btn-secondary" onClick={openFeedback}>Send Feedback…</button>
         </Row>
@@ -792,7 +818,7 @@ function FeedbackSection() {
 }
 
 /** Version + update check + install progress, as one row. */
-function UpdateRow() {
+function UpdateRow({ onVersionTap }: { onVersionTap?: () => void }) {
   const appVer = useStore((s) => s.appVer)
   const update = useStore((s) => s.update)
   const checkingUpdate = useStore((s) => s.checkingUpdate)
@@ -834,7 +860,7 @@ function UpdateRow() {
       </button>
     )
   }
-  return <Row title={<span className="tnum">DropBeam {appVer || '…'}</span>} sub={sub}>{control}</Row>
+  return <Row title={<span className="tnum" onClick={onVersionTap}>DropBeam {appVer || '…'}</span>} sub={sub}>{control}</Row>
 }
 
 /** Upload cap: presets as a segmented control, plus a custom value. 0 = off. */
@@ -912,7 +938,7 @@ function DisplayNameInput({ value, onSave }: { value: string; onSave: (name: str
       onFocus={() => setDraft(value)}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}
-      onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+      onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }}
     />
   )
 }
@@ -940,7 +966,7 @@ function SafetySection() {
             <Row
               key={p.id}
               title={<span className="truncate-1 set-block-name" title={p.name}>{p.name}</span>}
-              sub={`${p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}Blocked ${new Date(p.at).toLocaleDateString()}`}
+              sub={`${p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}Blocked ${shortDate(p.at)}`}
             >
               <button
                 className="btn btn-secondary"

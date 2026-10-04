@@ -1,6 +1,6 @@
 import { FileIcon } from './FileIcon'
 import { integrityLabel } from '../lib/integrity'
-import { MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -25,6 +25,8 @@ import { ConnInfo } from './ConnInspector'
 import { useStore } from '../store'
 import { deliverySummary, multiDevice } from '../lib/deliveries'
 import { DeliveryRows } from './Deliveries'
+import { useTransferMeter } from '../lib/useTransferMeter'
+import { errorText } from '../lib/errors'
 
 function title(t: TransferUpdate): string {
   if (t.fileNames.length === 1) return t.fileNames[0]
@@ -45,9 +47,9 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   const respondToOffer = useStore((s) => s.respondToOffer)
   const toast = useStore((s) => s.toast)
   const summary = useStore((s) => s.transferSummaries[t.id])
-  const rates = useStore((s) => s.transferRates[t.id])
-  const speedMode = useStore((s) => s.speedMode)
-  const etaMode = useStore((s) => s.etaMode)
+  const meter = useTransferMeter(t)
+  const { speedMode, etaMode } = meter
+  const cancelTransfer = useStore((s) => s.cancelTransfer)
   const toggleSpeedMode = useStore((s) => s.toggleSpeedMode)
   const toggleEtaMode = useStore((s) => s.toggleEtaMode)
   const [copied, setCopied] = useState(false)
@@ -85,17 +87,13 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   // By default the SPEED is live (what the link is doing right now) and the TIME
   // LEFT is based on the whole-transfer average (which doesn't swing with every
   // hiccup). Clicking either swaps its basis; both choices are global and stick.
-  const engineBps = t.speedBps > 0 ? t.speedBps : null
-  const shownBps =
-    (speedMode === 'live' ? rates?.liveBps ?? rates?.avgBps : rates?.avgBps ?? rates?.liveBps) ??
-    engineBps
-  const shownEta =
-    (etaMode === 'avg' ? rates?.avgEta ?? rates?.liveEta : rates?.liveEta ?? rates?.avgEta) ??
-    t.etaSeconds
   // Neither figure blinks between frames: the live rate holds its last reading
   // across a frame it can't measure, and a stall is named rather than shown as a
-  // dash. Only the first few seconds say "calculating…".
-  const settling = (rates?.ageMs ?? 0) < 3000
+  // dash. Only the first few seconds (by the clock) say "calculating…", and time
+  // left is always derived from the speed on screen.
+  const shownBps = meter.speedBps
+  const shownEta = meter.etaSeconds
+  const settling = meter.settling
   const speedText =
     shownBps == null
       ? settling
@@ -125,7 +123,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           else if (show) void api.shareFiles(t.fileNames.map(n => `${t.outDir}/${n}`)).catch(e => toast('error', String(e)))
           else if (retry) { if (onRetry) onRetry(); else void retryTransfer(t.id) }
           else if (isOffer) void respondToOffer(t.id, false)
-          else if (active) void api.cancelTransfer(t.id)
+          else if (active) void cancelTransfer(t.id)
           else removeTransfer(t.id)
         }}>{show ? <FolderOpen size={21} /> : retry ? <RotateCw size={21} /> : <X size={21} />}</button>}
       </div>
@@ -201,7 +199,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   } else if (paused) {
     meta = <>Paused{who ? ` · to ${who}` : ''}{t.bytesTotal > 0 ? <> · <span className="tnum">{formatBytes(t.bytesDone)} of {formatBytes(t.bytesTotal)}</span></> : ''}</>
   } else if (failed) {
-    meta = <span className="xfer-error" title={t.error ?? undefined}>{t.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}{t.error ? ` — ${t.error}` : ''}</span>
+    meta = <span className="xfer-error" title={t.error ?? undefined}>{t.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}{t.error ? ` — ${errorText(t.error, 'Something went wrong.')}` : ''}</span>
   } else if (reach && (completed || held)) {
     // "Delivered to Alex’s Mac · iPhone: waiting (Linux Box is holding it)"
     meta = <span title={reach.text}>{reach.text}{t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}</span>
@@ -267,7 +265,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
               )}
               {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} moving={transferring} />}
               {completed && t.direction === 'receive' && t.outDir && (
-                <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in Finder' : 'Open Folder'} onClick={showInFolder}>
+                <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL} onClick={showInFolder}>
                   <FolderOpen />
                 </IconButton>
               )}
@@ -285,7 +283,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
               )}
               <IconButton
                 label={active ? 'Cancel' : 'Remove from list'}
-                onClick={() => (active ? api.cancelTransfer(t.id) : removeTransfer(t.id))}
+                onClick={() => (active ? void cancelTransfer(t.id) : removeTransfer(t.id))}
               >
                 <X />
               </IconButton>

@@ -75,6 +75,7 @@ function BlockDialog({ friend, onClose }: { friend: Friend; onClose: () => void 
 function ReportDialog({ friend, message, onClose }: { friend: Friend; message?: ChatMessage; onClose: () => void }) {
   const blockFriend = useStore((s) => s.blockFriend)
   const toast = useStore((s) => s.toast)
+  const toastError = useStore((s) => s.toastError)
   const [reason, setReason] = useState<ReportReason | ''>('')
   const [includeText, setIncludeText] = useState(true)
   const [notes, setNotes] = useState('')
@@ -107,7 +108,7 @@ function ReportDialog({ friend, message, onClose }: { friend: Friend; message?: 
       toast('success', 'Your email is ready — send it to finish the report. We respond within 24 hours.')
       onClose()
     } catch (e) {
-      toast('error', `Couldn’t open your mail app: ${String(e)}`)
+      toastError('Couldn’t open your mail app.', e)
     } finally {
       setBusy(false)
     }

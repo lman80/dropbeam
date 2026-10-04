@@ -616,6 +616,10 @@ html:not(.mobile) .chat-list-pane {
   max-width: 280px;
 }
 .att.mine { align-items: stretch; }
+/* A wide status line under a file can make the column wider than the 240px card:
+   keep the card on the bubble's own edge (right for yours, left for theirs). */
+.att > .att-card { align-self: flex-start; }
+.att.mine > .att-card { align-self: flex-end; }
 .att .chat-bubble.caption { align-self: flex-start; max-width: 100%; }
 .att.mine .chat-bubble.caption { align-self: flex-end; }
 .att-media {

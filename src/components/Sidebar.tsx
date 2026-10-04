@@ -15,7 +15,10 @@ import { FriendAvatar } from './FriendAvatar'
 import { openFeedback, useFeedbackButton } from '../lib/feedback'
 import { avatarColor } from '../lib/avatar'
 import { IconButton } from './ui'
+import { shortcutLabel } from '../lib/keys'
 
+// eslint-disable-next-line react-refresh/only-export-components -- shared with the ⌘1–7 shortcuts
+export const NAV_ORDER: View[] = ['send', 'friends', 'chat', 'locations', 'folders', 'history', 'settings']
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
   { id: 'friends', label: 'Friends', icon: Users },
@@ -43,7 +46,7 @@ export function Sidebar() {
     <nav className="app-sidebar" aria-label="Main">
       {/* macOS: clears the traffic lights and drags the window. */}
       <div className="sidebar-top titlebar-drag" data-tauri-drag-region />
-      {NAV.map((item) => {
+      {NAV.map((item, i) => {
         const active = view === item.id
         const Icon = item.icon
         const count = item.id === 'send' ? activeCount : item.id === 'chat' ? unreadCount : 0
@@ -53,7 +56,7 @@ export function Sidebar() {
             data-testid={`nav-${item.id}`}
             className={`nav-item${active ? ' active' : ''}`}
             aria-current={active ? 'page' : undefined}
-            title={item.label}
+            title={`${item.label}  ${shortcutLabel(String(NAV_ORDER.indexOf(item.id) + 1 || i + 1))}`}
             onClick={() => setView(item.id)}
           >
             <Icon strokeWidth={1.75} />

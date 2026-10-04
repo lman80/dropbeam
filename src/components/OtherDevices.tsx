@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { createElement, useEffect } from 'react'
 import { Check, X } from 'lucide-react'
 import { deviceIcon } from '../lib/deviceIcons'
 import { formatBytesLive, formatSpeed } from '../lib/format'
@@ -22,7 +22,7 @@ export function OtherDevices() {
 }
 
 function Row({ device, t }: { device: DeviceActivity; t: DeviceTransfer }) {
-  const Icon = deviceIcon(device.os === 'macos' && device.kind !== 'desktop' ? 'laptop' : device.kind ?? undefined)
+  const icon = deviceIcon(device.os === 'macos' && device.kind !== 'desktop' ? 'laptop' : device.kind ?? undefined)
   const done = t.state === 'completed'
   const bad = t.state === 'failed' || t.state === 'canceled'
   const live = !done && !bad && t.state !== 'held'
@@ -34,7 +34,7 @@ function Row({ device, t }: { device: DeviceActivity; t: DeviceTransfer }) {
     <div className={`xfer-row other-device-row${bad ? ' is-muted' : ''}`}>
       <div className="xfer-head">
         <span className="xfer-icon other-device-icon" aria-hidden>
-          <Icon size={18} strokeWidth={1.7} />
+          {createElement(icon, { size: 18, strokeWidth: 1.7 })}
           {(done || bad) && <span className={`xfer-badge ${done ? 'ok' : 'bad'}`}>{done ? <Check size={9} strokeWidth={3} /> : <X size={9} strokeWidth={3} />}</span>}
         </span>
         <div className="xfer-main">

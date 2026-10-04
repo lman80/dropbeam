@@ -1,4 +1,4 @@
-import { MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { folderName as baseFolderName } from '../lib/syncedFolders'
 import { useEffect, useState, type ReactNode } from 'react'
 import { AnimatePresence } from 'framer-motion'
@@ -32,6 +32,7 @@ import { baseName } from '../lib/humanize'
 import { PairingModal } from '../components/PairingModal'
 import { Dialog } from '../components/Dialog'
 import { avatarColor, initials } from '../lib/avatar'
+import { personKey } from '../lib/deviceIcons'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { friendOnlineState } from '../lib/presence'
 import { ConnInfo } from '../components/ConnInspector'
@@ -79,14 +80,14 @@ export function FoldersView() {
 
   return (
     <div className="page">
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Shared Folders</h1>
         <div className="page-actions">
           <button className="btn btn-secondary" onClick={() => setModal('accept')}>
-            Accept invite…
+            Accept Invite…
           </button>
           <button className="btn btn-primary" onClick={() => setModal('create')}>
-            New folder…
+            New Shared Folder…
           </button>
         </div>
       </div>
@@ -96,6 +97,7 @@ export function FoldersView() {
           icon={<FolderSync />}
           title="No shared folders"
           hint="Keep a folder in sync with friends."
+          action={<button className="btn btn-secondary" onClick={() => setModal('create')}>New Shared Folder…</button>}
         />
       ) : (
         <div className="group folder-list">
@@ -328,14 +330,14 @@ function FolderRow({
   const statusTitle = lastSynced ? `Last synced ${midSentence(formatRelativeTime(lastSynced))}` : undefined
 
   const menu: MenuItem[] = [
-    { label: 'Add person…', icon: <UserPlus />, onSelect: () => setDialog('add'), disabled: addingPerson },
-    { label: 'Show invite…', icon: <QrCode />, onSelect: () => void showInvite(), hidden: pair.role !== 'a', disabled: loadingInvite },
+    { label: 'Add Person…', icon: <UserPlus />, onSelect: () => setDialog('add'), disabled: addingPerson },
+    { label: 'Show Invite…', icon: <QrCode />, onSelect: () => void showInvite(), hidden: pair.role !== 'a', disabled: loadingInvite },
     { separator: true },
-    { label: 'Folder history', icon: <History />, onSelect: () => focusFolderHistory(pair.id), hidden: !pair.mirror },
+    { label: 'Folder History', icon: <History />, onSelect: () => focusFolderHistory(pair.id), hidden: !pair.mirror },
     { label: 'Verify', icon: <FolderCheck />, onSelect: () => void runVerify(), hidden: !pair.mirror, disabled: verifying },
     { label: 'Settings…', icon: <Settings2 />, onSelect: () => setDialog('settings') },
     { separator: true },
-    { label: isGroup ? 'Leave folder…' : 'Unpair…', icon: <Unlink />, danger: true, onSelect: () => setDialog('unpair') },
+    { label: isGroup ? 'Leave Folder…' : 'Stop Sharing…', icon: <Unlink />, danger: true, onSelect: () => setDialog('unpair') },
   ]
 
   return (
@@ -353,7 +355,7 @@ function FolderRow({
           </span>
           {pendingInvite && (
             <button className="btn btn-plain btn-sm folder-status-action" onClick={showInvite} disabled={loadingInvite}>
-              Show invite…
+              Show Invite…
             </button>
           )}
         </div>
@@ -396,17 +398,20 @@ function FolderRow({
 
       <div className="row-trailing folder-actions">
         {!MOBILE_UI && (
-          <IconButton label="Open folder" tooltip="Show in Finder" onClick={() => api.openPath(pair.folder)}>
+          <IconButton label={OPEN_FOLDER_LABEL} onClick={() => api.openPath(pair.folder)}>
             <FolderOpen />
           </IconButton>
         )}
-        {pair.mirror && (
+        {pair.mirror ? (
           <IconButton
             label={status?.paused ? 'Resume syncing' : 'Pause syncing'}
             onClick={() => void api.setFolderPaused(pair.id, !status?.paused)}
           >
             {status?.paused ? <PlayGlyph /> : <PauseGlyph />}
           </IconButton>
+        ) : (
+          // Keeps every row's action icons in the same columns.
+          <span className="icon-btn-slot" aria-hidden />
         )}
         <MenuButton label="More" items={menu} />
       </div>
@@ -443,14 +448,14 @@ function FolderRow({
         {dialog === 'unpair' && (
           <Dialog
             key="unpair"
-            title={isGroup ? `Leave “${folderName}”?` : `Unpair “${folderName}”?`}
+            title={isGroup ? `Leave “${folderName}”?` : `Stop sharing “${folderName}”?`}
             width={380}
             onClose={() => setDialog(null)}
             footer={
               <>
                 <button className="btn btn-secondary" onClick={() => setDialog(null)}>Cancel</button>
                 <button className="btn btn-destructive" onClick={() => { setDialog(null); removeGroup() }}>
-                  {isGroup ? 'Leave' : 'Unpair'}
+                  {isGroup ? 'Leave Folder' : 'Stop Sharing'}
                 </button>
               </>
             }
@@ -535,6 +540,13 @@ function FolderSettingsDialog({
   onClose: () => void
 }) {
   const myName = useStore((s) => s.settings?.displayName || 'You')
+  const friends = useStore((s) => s.friends)
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
+  // The member's avatar colour comes from the same person id as everywhere else.
+  const colorKey = (m: Pair) => {
+    const f = friends.find((x) => !!m.endpointId && x.endpointId === m.endpointId) ?? friends.find((x) => x.name === m.peerName)
+    return f ? personKey(friends, f.id, myAccount) : m.peerName
+  }
   const [soundOn, toggleSound] = useFolderSound(pair.id)
   // Per-member removal (incl. clearing a stuck "waiting to join" invite).
   const [confirmMember, setConfirmMember] = useState<string | null>(null)
@@ -558,7 +570,7 @@ function FolderSettingsDialog({
       footer={
         <>
           <button className="btn btn-danger" onClick={onUnpair}>
-            {isGroup ? 'Leave folder…' : 'Unpair…'}
+            {isGroup ? 'Leave Folder…' : 'Stop Sharing…'}
           </button>
           <span className="spacer" />
           <button className="btn btn-primary" onClick={onClose}>Done</button>
@@ -583,7 +595,7 @@ function FolderSettingsDialog({
             <div className="row" key={m.id}>
               <span
                 className={`folder-avatar${pending ? ' pending' : ''}`}
-                style={pending ? undefined : { background: avatarColor(m.peerName) }}
+                style={pending ? undefined : { background: avatarColor(colorKey(m)) }}
               >
                 {pending ? <Clock /> : initials(m.peerName)}
                 {!pending && <span className={`folder-avatar-dot${online ? ' online' : ''}`} />}
@@ -621,7 +633,7 @@ function FolderSettingsDialog({
         })}
         <button type="button" className="row folder-add-row" onClick={onAddPerson}>
           <span className="folder-avatar add"><UserPlus /></span>
-          <span className="row-main row-title">Add person…</span>
+          <span className="row-main row-title">Add Person…</span>
         </button>
       </div>
 
@@ -753,7 +765,7 @@ function AddPersonDialog({
       footer={
         <>
           <button className="btn btn-secondary" disabled={!!busy} onClick={onShareCode}>
-            <QrCode /> Share an invite code…
+            <QrCode /> Share an Invite Code…
           </button>
           <span className="spacer" />
           <button className="btn btn-secondary" disabled={!!busy} onClick={onClose}>Cancel</button>
@@ -805,7 +817,7 @@ function InviteModal({
       footer={<button className="btn btn-secondary" onClick={onClose}>Done</button>}
     >
       <p className="dialog-text">In DropBeam, they choose Accept invite and scan or paste this.</p>
-      <ShareCode code={code} layout="stack" copyLabel="Copy invite" />
+      <ShareCode code={code} layout="stack" copyLabel="Copy Invite" />
     </Dialog>
   )
 }

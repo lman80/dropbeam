@@ -5,10 +5,13 @@
 .settings-page .page-header { flex-wrap: wrap; row-gap: 8px; }
 .settings-tabs { flex-shrink: 0; }
 
-/* The first header in a pane sits close to the toolbar; embedded panels too. */
-.settings-pane > .section-title:first-child,
-.settings-pane > .section-row:first-child,
-.settings-pane > .location-settings { margin-top: 4px; }
+/* The first header in a pane sits close to the toolbar — also when it's nested
+   inside an embedded panel (Devices, Locations, Server), so switching tabs never
+   shifts the content down. */
+.settings-pane > :first-child { margin-top: 0; }
+.settings-pane > :is(.section-title, .section-row):first-child,
+.settings-pane > :first-child > :is(.section-title, .section-row):first-child,
+.settings-pane > :first-child > :first-child > :is(.section-title, .section-row):first-child { margin-top: 4px; }
 
 .set-row { gap: 16px; }
 .set-row .row-main { min-width: 120px; }

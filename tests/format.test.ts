@@ -7,18 +7,25 @@ test('above 1 GB the counter keeps two decimals so it visibly moves', () => {
   assert.equal(formatBytesLive(5.114e9), '5.11 GB')
   assert.equal(formatBytesLive(5.117e9), '5.12 GB')
   assert.equal(formatBytesLive(56.653e9), '56.65 GB')
-  assert.equal(formatBytes(2.5e12), '2.50 TB')
+  assert.equal(formatBytesLive(2.5e12), '2.50 TB')
+  // A static size reads like Finder: no trailing zeros.
+  assert.equal(formatBytes(2.5e12), '2.5 TB')
   assert.notEqual(formatBytesLive(5.114e9), formatBytesLive(5.124e9))
 })
 
-test('below 1 GB keeps the old formatting', () => {
-  assert.equal(formatBytes(0), '0 B')
-  assert.equal(formatBytes(-1), '0 B')
-  assert.equal(formatBytes(999), '999 B')
-  assert.equal(formatBytes(1500), '1.5 kB')
+test('static sizes read like Finder (no trailing zeros); live ones keep fixed decimals', () => {
+  assert.equal(formatBytes(0), 'Zero bytes')
+  assert.equal(formatBytes(-1), 'Zero bytes')
+  assert.equal(formatBytes(999), '999 bytes')
+  assert.equal(formatBytes(1500), '1.5 KB')
+  assert.equal(formatBytes(640e3), '640 KB')
+  assert.equal(formatBytes(2e6), '2 MB')
+  assert.equal(formatBytes(14.2e9), '14.2 GB')
   assert.equal(formatBytes(1.25e6), '1.3 MB')
-  assert.equal(formatBytes(999e6), '999.0 MB')
+  assert.equal(formatBytes(999e6), '999 MB')
+  assert.equal(formatBytes(999_999), '1 MB')
   assert.equal(formatBytesLive(1.25e6), '1.3 MB')
+  assert.equal(formatBytesLive(2e6), '2.0 MB')
   // An explicit request still wins.
   assert.equal(formatBytes(5.114e9, 1), '5.1 GB')
 })

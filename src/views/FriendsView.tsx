@@ -1,4 +1,6 @@
 import { deviceIcon, groupDevices, personGroups } from '../lib/deviceIcons'
+import { isEnterKey } from '../lib/keys'
+import { errorText } from '../lib/errors'
 import { deliveryIconKind, personDevices } from '../lib/deliveries'
 
 const firstName = (name: string) => name.trim().split(/\s+/)[0] || name
@@ -118,11 +120,11 @@ function DesktopFriends() {
 
   return (
     <div className="page friends-page">
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Friends</h1>
         <div className="page-actions">
           <button className="btn btn-primary" onClick={() => setAdding(true)}>
-            <UserPlus /> Add friend
+            <UserPlus /> Add a Friend
           </button>
         </div>
       </div>
@@ -132,7 +134,7 @@ function DesktopFriends() {
 
       <SectionHeader
         count={myDevices.length}
-        action={myDevices.length ? <button className="btn btn-plain btn-sm" onClick={() => setLinking(true)}>Link a device…</button> : undefined}
+        action={myDevices.length ? <button className="btn btn-plain btn-sm" onClick={() => setLinking(true)}>Link a Device…</button> : undefined}
       >
         My devices
       </SectionHeader>
@@ -142,7 +144,7 @@ function DesktopFriends() {
           <button className="row fr-add-row" onClick={() => setLinking(true)}>
             <span className="fr-avatar is-device" aria-hidden><Plus size={16} /></span>
             <span className="row-main">
-              <span className="row-title">Link a device…</span>
+              <span className="row-title">Link a Device…</span>
               <span className="row-sub">Use DropBeam on your phone or another computer</span>
             </span>
           </button>
@@ -156,7 +158,7 @@ function DesktopFriends() {
             icon={<Users />}
             title="No friends yet"
             hint="Add a friend with their DropBeam code."
-            action={<button className="btn btn-secondary" onClick={() => setAdding(true)}>Add friend</button>}
+            action={<button className="btn btn-secondary" onClick={() => setAdding(true)}>Add a Friend</button>}
             style={{ padding: '32px 24px' }}
           />
         </div>
@@ -227,9 +229,9 @@ function YouSection() {
           <MenuButton
             label="Edit profile"
             items={[
-              { label: 'Edit name…', onSelect: () => setDialog('name') },
-              { label: 'Change picture…', onSelect: () => void pickAvatar() },
-              { label: 'Remove picture', onSelect: () => void clearAvatar(), hidden: !settings?.avatar },
+              { label: 'Edit Name…', onSelect: () => setDialog('name') },
+              { label: 'Change Picture…', onSelect: () => void pickAvatar() },
+              { label: 'Remove Picture', onSelect: () => void clearAvatar(), hidden: !settings?.avatar },
             ]}
           />
         </div>
@@ -271,7 +273,7 @@ function YouSection() {
             onClose={() => setDialog(null)}
             footer={
               <>
-                <button className="btn btn-secondary" onClick={() => void copyCode()}>{copied ? 'Copied' : 'Copy code'}</button>
+                <button className="btn btn-secondary" onClick={() => void copyCode()}>{copied ? 'Copied' : 'Copy Code'}</button>
                 <button className="btn btn-primary" autoFocus onClick={() => setDialog(null)}>Done</button>
               </>
             }
@@ -322,7 +324,7 @@ function NameDialog({ title, label, initial, onSave, onClose }: {
         autoFocus
         onFocus={(e) => e.currentTarget.select()}
         onChange={(e) => setName(e.target.value)}
-        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); save() } }}
+        onKeyDown={(e) => { if (isEnterKey(e)) { e.preventDefault(); save() } }}
       />
     </Dialog>
   )
@@ -424,13 +426,13 @@ function FriendRow({ friend }: { friend: Friend }) {
   const check15 = <span className="menu-check" aria-hidden />
   const items: MenuItem[] = [
     { label: 'Rename…', icon: check15, onSelect: () => setDialog('rename') },
-    { label: 'Show invite…', icon: check15, onSelect: () => void showInvite(), disabled: loadingInvite },
+    { label: 'Show Invite…', icon: check15, onSelect: () => void showInvite(), disabled: loadingInvite },
     {
       label: 'Auto-accept files',
       icon: <span className="menu-check" aria-hidden>{friend.autoAccept && <Check />}</span>,
       onSelect: () => void setFriendAutoAccept(friend.id, !friend.autoAccept),
     },
-    { label: 'Check if online', icon: check15, onSelect: () => void check(), disabled: pinging },
+    { label: 'Check If Online', icon: check15, onSelect: () => void check(), disabled: pinging },
     ...(theirDevices.length > 1 ? [
       { separator: true } as MenuItem,
       { heading: 'Send to one device' } as MenuItem,
@@ -441,7 +443,7 @@ function FriendRow({ friend }: { friend: Friend }) {
     ] : []),
   ]
   const removeItem: MenuItem[] = [
-    { label: ownLabel ? 'Remove device…' : 'Remove friend…', icon: check15, danger: true, onSelect: () => setDialog('remove') },
+    { label: ownLabel ? 'Remove Device…' : 'Remove Friend…', icon: check15, danger: true, onSelect: () => setDialog('remove') },
   ]
 
   return (
@@ -503,7 +505,7 @@ function FriendRow({ friend }: { friend: Friend }) {
               layout="stack"
               size={180}
               hint={null}
-              copyLabel="Copy invite"
+              copyLabel="Copy Invite"
               copyVariant="secondary"
               instructions={<>{friend.name} can scan this or paste it in Add friend.</>}
             />
@@ -541,7 +543,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
       else if (!(await openCode(parsed.code))) return
       onClose()
     } catch (e) {
-      setError(String(e))
+      setError(errorText(e))
     } finally {
       setBusy(false)
     }
@@ -549,7 +551,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
 
   return (
     <Dialog
-      title="Add a friend"
+      title="Add a Friend"
       onClose={onClose}
       busy={busy}
       width={420}
@@ -573,11 +575,11 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
           autoFocus
           aria-invalid={!!error}
           onChange={(e) => { setCodeInput(e.target.value); if (error) setError('') }}
-          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void submit() } }}
+          onKeyDown={(e) => { if (isEnterKey(e)) { e.preventDefault(); void submit() } }}
         />
         <ScanCodeButton
           className="btn btn-plain"
-          label="Scan QR…"
+          label="Scan QR Code…"
           disabled={busy}
           hint="Hold your friend’s QR code up to the camera."
           title="Scan a friend’s code"
@@ -658,6 +660,7 @@ function YouCard() {
   const [showQR, setShowQR] = useState(false)
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- mirror the saved name while not editing
     if (!editing) setName(displayName)
   }, [displayName, editing])
 
@@ -693,7 +696,7 @@ function YouCard() {
     <div className="mobile-profile">
       <button className="mobile-avatar-button" aria-label="Change picture" onClick={() => void pickAvatar()}><Avatar name={displayName || 'You'} seed={displayName || 'you'} picture={settings?.avatar} size={64} radius={20} /></button>
       <div className="mobile-grow">
-        {editing ? <input className="input" aria-label="Your name" value={name} autoFocus onChange={e => setName(e.target.value)} onBlur={saveName} onKeyDown={e => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') { setName(displayName); setEditing(false) } }} /> : <button className="mobile-name ios-headline" onClick={() => setEditing(true)}>{displayName || 'You'}<Pencil size={16} /></button>}
+        {editing ? <input className="input" aria-label="Your name" value={name} autoFocus onChange={e => setName(e.target.value)} onBlur={saveName} onKeyDown={e => { if (isEnterKey(e)) saveName(); if (e.key === 'Escape') { setName(displayName); setEditing(false) } }} /> : <button className="mobile-name ios-headline" onClick={() => setEditing(true)}>{displayName || 'You'}<Pencil size={16} /></button>}
         <p className="ios-footnote">The name and picture your friends see.</p>
       </div>
     </div>

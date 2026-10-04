@@ -1,7 +1,9 @@
 import { MobileHeader } from '../components/MobileHeader'
+import { clockTime, dateTime, dayHeading, listDate, startOfDay } from '../lib/dates'
+import { isEnterKey, shortcutLabel } from '../lib/keys'
 import { TransferCard } from '../components/TransferCard'
 import { ChevronLeft } from 'lucide-react'
-import { MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI, REVEAL_LABEL } from '../lib/platform'
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -71,49 +73,18 @@ function fileKind(name: string | undefined): Kind {
   return 'file'
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000
 /** Within one day, a quiet time label appears after a pause this long. */
 const TIME_GAP_MS = 60 * 60 * 1000
 
 /** A short wall-clock label, e.g. "3:42 PM". */
-function clock(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-}
-const startOfDay = (ms: number) => {
-  const d = new Date(ms)
-  d.setHours(0, 0, 0, 0)
-  return d.getTime()
-}
+const clock = clockTime
 const sameDay = (a: number, b: number) => startOfDay(a) === startOfDay(b)
 /** A day label: Today / Yesterday / weekday (this week) / a date. */
-function dayLabel(ms: number): string {
-  const today = startOfDay(Date.now())
-  const day = startOfDay(ms)
-  if (day === today) return 'Today'
-  if (day === today - DAY_MS) return 'Yesterday'
-  if (today - day < 6 * DAY_MS) return new Date(ms).toLocaleDateString([], { weekday: 'long' })
-  const d = new Date(ms)
-  return d.toLocaleDateString([], {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
-  })
-}
-/** The time column of the conversation list: 3:42 PM / Yesterday / Tuesday / 9/18/26. */
-function listTime(ms: number | undefined): string {
-  if (!ms) return ''
-  const today = startOfDay(Date.now())
-  const day = startOfDay(ms)
-  if (day === today) return clock(ms)
-  if (day === today - DAY_MS) return 'Yesterday'
-  if (today - day < 6 * DAY_MS) return new Date(ms).toLocaleDateString([], { weekday: 'long' })
-  return new Date(ms).toLocaleDateString([], { month: 'numeric', day: 'numeric', year: '2-digit' })
-}
+const dayLabel = dayHeading
+/** The time column of the conversation list: 3:42 PM / Yesterday / Tuesday / Oct 2. */
+const listTime = listDate
 /** Full timestamp for a tooltip. */
-function fullTime(ms: number): string {
-  return `${dayLabel(ms)} ${clock(ms)}`
-}
+const fullTime = dateTime
 
 /** The engine's list preview carries emoji markers ("📎 Beach.jpg", "🎞️ GIF").
  *  Say it in words instead. */
@@ -215,6 +186,13 @@ export function ChatView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // ⌘N: open the "New message to…" menu.
+  useEffect(() => {
+    const open = () => document.querySelector<HTMLButtonElement>('.chat-list-head [aria-label="New message"]')?.click()
+    window.addEventListener('dropbeam:new-message', open)
+    return () => window.removeEventListener('dropbeam:new-message', open)
+  }, [])
+
   // A remembered selection is only being viewed while Chat is mounted.
   useEffect(() => {
     void api.setActiveChat(activeChatId)
@@ -238,14 +216,14 @@ export function ChatView() {
   if (rows.length === 0 && !activeChatId) {
     return (
       <div className="page">
-        <div className="page-header titlebar-drag">
+        <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
           <h1 className="page-title">Chat</h1>
         </div>
         <EmptyState
+          icon={<MessageCircle />}
           title="No conversations yet"
           hint="Add a friend to start chatting."
-          action={<button className="btn btn-primary" onClick={() => setView('friends')}>Add a friend</button>}
-          style={{ paddingTop: 96 }}
+          action={<button className="btn btn-secondary" onClick={() => setView('friends')}>Add a Friend</button>}
         />
       </div>
     )
@@ -261,7 +239,7 @@ export function ChatView() {
   return (
     <div className={`chat-layout${activeChatId ? ' thread-open' : ''}`}>
       <div className="chat-list-pane">
-        <div className="chat-list-head titlebar-drag">
+        <div className="chat-list-head titlebar-drag" data-tauri-drag-region="deep">
           <h1 className="chat-list-title">Chat</h1>
           {conversations.length > 0 && startable.length > 0 && (
             <MenuButton
@@ -311,7 +289,7 @@ export function ChatView() {
           <Conversation key={activeChatId} friendId={activeChatId} />
         ) : (
           <>
-            <div className="titlebar-drag chat-header" />
+            <div className="titlebar-drag chat-header" data-tauri-drag-region="deep" />
             <EmptyState title="No conversation selected" style={{ flex: 1 }} />
           </>
         )}
@@ -371,6 +349,7 @@ function Conversation({ friendId }: { friendId: string }) {
   // A successful ping also makes the engine flush messages queued for them.
   useEffect(() => {
     if (!windowFocused) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset when the window loses focus
       setChecking(false)
       return
     }
@@ -424,6 +403,15 @@ function Conversation({ friendId }: { friendId: string }) {
   // client-side; ↑/↓ jump between matches, Esc closes. Reaches the same ~2000-message
   // window the thread itself keeps — no backend.
   const [searchOpen, setSearchOpen] = useState(false)
+  // ⌘F: open (or re-focus) this conversation's search.
+  useEffect(() => {
+    const find = () => {
+      setSearchOpen(true)
+      window.setTimeout(() => document.querySelector<HTMLInputElement>('.chat-search-field input')?.select(), 0)
+    }
+    window.addEventListener('dropbeam:find', find)
+    return () => window.removeEventListener('dropbeam:find', find)
+  }, [])
   const [searchQ, setSearchQ] = useState('')
   const [searchIdx, setSearchIdx] = useState(0)
 
@@ -440,6 +428,7 @@ function Conversation({ friendId }: { friendId: string }) {
   // Shown only on request (the ⓘ in the header).
   useEffect(() => {
     if (!onlineNow) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clear the stale path when they go offline
       setConn(null)
       return
     }
@@ -488,8 +477,8 @@ function Conversation({ friendId }: { friendId: string }) {
   // On open, jump to bottom.
   useLayoutEffect(() => {
     atBottomRef.current = true
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- jump to the newest message on open (clears the pill)
     scrollToBottom()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [friendId])
 
   // Stay anchored to the newest message while the thread settles: images, video
@@ -624,6 +613,7 @@ function Conversation({ friendId }: { friendId: string }) {
   }
   // Start at the oldest match; down always moves toward newer messages.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- move the cursor for a new query
     if (searchMatches.length) jumpToMatch(0)
     else setSearchIdx(0)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -832,7 +822,7 @@ function Conversation({ friendId }: { friendId: string }) {
   return (
     <>
       {MOBILE_UI ? <header className="mobile-header-compact visible mobile-conversation-header"><button className="ios-button mobile-back" aria-label="Back to chats" onClick={() => useStore.getState().closeChat()}><ChevronLeft />Chats</button><span className="mobile-chat-avatar compact"><FriendAvatar friend={friend} /></span><div className="mobile-grow"><h1 className="ios-headline mobile-ellipsis">{friend.name}</h1><p className="ios-footnote">{typing ? 'typing…' : presenceText}</p></div><button className="ios-icon" aria-label="Search conversation" onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}><Search size={20} /></button></header> : (
-        <div className="titlebar-drag chat-header">
+        <div className="titlebar-drag chat-header" data-tauri-drag-region="deep">
           <span className="chat-avatar sm" style={{ background: avatarGradient(friend.id) }}>
             <FriendAvatar friend={friend} />
           </span>
@@ -847,7 +837,7 @@ function Conversation({ friendId }: { friendId: string }) {
             {online && conn && <ConnInfo detail={conn} align="end" />}
             <IconButton
               label="Search this conversation"
-              tooltip="Search"
+              tooltip={`Search  ${shortcutLabel('f')}`}
               active={searchOpen}
               onClick={() => (searchOpen ? closeSearch() : setSearchOpen(true))}
             >
@@ -889,7 +879,7 @@ function Conversation({ friendId }: { friendId: string }) {
               onChange={(e) => setSearchQ(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Escape') closeSearch()
-                else if (e.key === 'Enter') jumpToMatch(searchIdx + (e.shiftKey ? -1 : 1))
+                else if (isEnterKey(e)) jumpToMatch(searchIdx + (e.shiftKey ? -1 : 1))
               }}
             />
           </label>
@@ -1059,7 +1049,7 @@ function Conversation({ friendId }: { friendId: string }) {
             onChange={(e) => onType(e.target.value)}
             onPaste={(e) => void onPaste(e)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              if (isEnterKey(e) && !e.shiftKey) {
                 e.preventDefault()
                 submit()
               } else if (e.key === 'Escape' && editing) {
@@ -1274,7 +1264,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
       const mv = ev.moves[0]
       const to = mv.to.split('\\').join('/')
       const from = mv.from.split('\\').join('/')
-      const item = <SyncLink title="Show in Finder" onOpen={reveal(to)}>{baseOf(to)}</SyncLink>
+      const item = <SyncLink title={REVEAL_LABEL} onOpen={reveal(to)}>{baseOf(to)}</SyncLink>
       line = dirOf(from) === dirOf(to)
         ? <>renamed {baseOf(from)} to {item}</>
         : <>moved {item} to {dirOf(to) ? baseOf(dirOf(to)) : folderName}</>
@@ -1285,7 +1275,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
     const e = entries[0]
     line = e.kind === 'dir'
       ? <>added <SyncLink title={`Open ${e.name}`} onOpen={() => void api.openPath(full(e.name)).catch(() => {})}>{e.name}</SyncLink> ({e.count} item{e.count === 1 ? '' : 's'}) to {folderLink}</>
-      : <>added <SyncLink title="Show in Finder" onOpen={reveal(e.rel)}>{baseOf(e.rel)}</SyncLink> to {folderLink}</>
+      : <>added <SyncLink title={REVEAL_LABEL} onOpen={reveal(e.rel)}>{baseOf(e.rel)}</SyncLink> to {folderLink}</>
   } else {
     line = <>added {ev.files.length} items to {folderLink}</>
   }
@@ -1868,6 +1858,7 @@ function FileMessage({
     !!t.outDir && t.fileNames.includes(name) &&
     `${t.outDir.replace(/\\/g, '/').replace(/\/$/, '')}/${name}` === path?.replace(/\\/g, '/')
   )?.id)
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- retry the preview when the file lands
   useEffect(() => setBroken(false), [path, landedTransfer, transfer?.state])
   const available = mine || !!landedPath || !!m.path && (!transfer || transfer.state === 'completed')
   const canPreview = !!path && (HAS_TAURI || path.startsWith('/mock-media/')) && !broken && available

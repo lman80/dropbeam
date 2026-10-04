@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- imperative picker helpers, not a component module */
 import { createRoot } from 'react-dom/client'
 import { ActionSheet } from '../mobile/kit'
 

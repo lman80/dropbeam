@@ -295,6 +295,7 @@ export function Segmented<T extends string>({
   block,
   role = 'radiogroup',
   className,
+  idBase,
 }: {
   value: T
   options: { value: T; label: ReactNode; title?: string }[]
@@ -304,24 +305,48 @@ export function Segmented<T extends string>({
   /** 'tablist' when the control switches views. */
   role?: 'radiogroup' | 'tablist'
   className?: string
+  /** tablist: id prefix tying each tab to its panel (`${idBase}-panel`). */
+  idBase?: string
 }) {
   const itemRole = role === 'tablist' ? 'tab' : 'radio'
+  // One tab stop for the whole control; arrows/Home/End move the selection
+  // (WAI-ARIA tabs and radio-group pattern).
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const i = options.findIndex((o) => o.value === value)
+    let next = -1
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (i + 1) % options.length
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (i - 1 + options.length) % options.length
+    else if (e.key === 'Home') next = 0
+    else if (e.key === 'End') next = options.length - 1
+    if (next < 0) return
+    e.preventDefault()
+    onChange(options[next].value)
+    const buttons = e.currentTarget.querySelectorAll<HTMLButtonElement>('button')
+    buttons[next]?.focus()
+  }
   return (
-    <div className={`seg${block ? ' seg-block' : ''}${className ? ` ${className}` : ''}`} role={role} aria-label={label}>
-      {options.map((o) => (
-        <button
-          key={o.value}
-          type="button"
-          role={itemRole}
-          aria-selected={itemRole === 'tab' ? value === o.value : undefined}
-          aria-checked={itemRole === 'radio' ? value === o.value : undefined}
-          title={o.title}
-          className={value === o.value ? 'active' : ''}
-          onClick={() => onChange(o.value)}
-        >
-          {o.label}
-        </button>
-      ))}
+    <div className={`seg${block ? ' seg-block' : ''}${className ? ` ${className}` : ''}`} role={role} aria-label={label} onKeyDown={onKeyDown}>
+      {options.map((o, idx) => {
+        const on = value === o.value
+        const tabStop = on || (idx === 0 && !options.some((x) => x.value === value))
+        return (
+          <button
+            key={o.value}
+            type="button"
+            role={itemRole}
+            id={idBase && itemRole === 'tab' ? `${idBase}-tab-${o.value}` : undefined}
+            aria-controls={idBase && itemRole === 'tab' ? `${idBase}-panel` : undefined}
+            aria-selected={itemRole === 'tab' ? on : undefined}
+            aria-checked={itemRole === 'radio' ? on : undefined}
+            tabIndex={tabStop ? 0 : -1}
+            title={o.title}
+            className={on ? 'active' : ''}
+            onClick={() => onChange(o.value)}
+          >
+            {o.label}
+          </button>
+        )
+      })}
     </div>
   )
 }

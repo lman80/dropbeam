@@ -28,7 +28,7 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSArray, NSPoint, NSRect, NSSize, NSString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_nspanel::{CollectionBehavior, ManagerExt, PanelLevel, StyleMask, WebviewWindowExt};
 
 // Declare our non-activating panel type (so the menu can float over full-screen
@@ -182,27 +182,24 @@ pub fn set_rows(rows: Vec<RowRect>) {
     }
 }
 
-/// Which friend id is at this drop point (CSS px), with a small nearest-row
-/// fallback so an imperfect drop still lands on the right person.
+/// Which friend id is at this drop point (CSS px). Only a drop ON a row counts:
+/// a "nearest row" guess sent files to the wrong person, so a miss is refused
+/// (the drag slides back and the menu stays open to try again).
 fn friend_at(x: f64, y: f64) -> Option<String> {
     let rows = POPOVER_ROWS.lock().ok()?;
-    for r in rows.iter() {
-        if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom {
-            return Some(r.id.clone());
-        }
+    rows.iter()
+        .find(|r| x >= r.left && x <= r.right && y >= r.top && y <= r.bottom)
+        .map(|r| r.id.clone())
+}
+
+/// The drag operation to advertise at this point: Copy over a person's row,
+/// None elsewhere (so the cursor shows the drop is not accepted there).
+fn drop_op_at(x: f64, y: f64) -> NSDragOperation {
+    if friend_at(x, y).is_some() {
+        NSDragOperation::Copy
+    } else {
+        NSDragOperation::None
     }
-    // Nearest row whose horizontal band contains x.
-    let mut best: Option<(&str, f64)> = None;
-    for r in rows.iter() {
-        if x < r.left - 24.0 || x > r.right + 24.0 {
-            continue;
-        }
-        let dist = (y - (r.top + r.bottom) / 2.0).abs();
-        if best.map(|(_, d)| dist < d).unwrap_or(true) {
-            best = Some((&r.id, dist));
-        }
-    }
-    best.filter(|(_, d)| *d < 80.0).map(|(id, _)| id.to_string())
 }
 
 /// Send the dropped files to a friend by id — the same logic as the
@@ -249,6 +246,12 @@ fn send_drop_to_friend(app: &AppHandle, friend_id: &str, paths: Vec<String>) {
                 .collect();
             let _ = eid;
             if let Ok(t) = crate::fanout::send(app.clone(), iroh.inner().clone(), &state.config_dir, friend_id, paths.clone(), None, None, None) {
+                // Let the windows remember who + what, so a failed send can offer
+                // one-tap Retry (the JS store keeps retry payloads by transfer id).
+                let _ = app.emit(
+                    "dropbeam://send-started",
+                    serde_json::json!({ "transferId": t.id, "friendId": friend_id, "paths": paths }),
+                );
                 crate::commands::post_file_note(&state, &iroh, app, friend_id, names, t.bytes_total, paths, None, Some(t.id));
             }
         }
@@ -510,14 +513,14 @@ define_class!(
             bump_drag_gen();
             let (x, y) = self.css_point(sender);
             self.update_hover(x, y);
-            NSDragOperation::Copy
+            drop_op_at(x, y)
         }
 
         #[unsafe(method(draggingUpdated:))]
         fn dragging_updated(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
             let (x, y) = self.css_point(sender);
             self.update_hover(x, y);
-            NSDragOperation::Copy
+            drop_op_at(x, y)
         }
 
         #[unsafe(method(prepareForDragOperation:))]
@@ -528,12 +531,18 @@ define_class!(
         #[unsafe(method(performDragOperation:))]
         fn perform(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
             let (x, y) = self.css_point(sender);
-            let paths = drag_paths(sender);
-            log::info!("[traydrag] popover performDrag ({x:.0},{y:.0}) paths={}", paths.len());
-            (self.ivars().on_drop)(paths, x, y);
             self.clear_hover();
-            self.setHidden(true);
-            true
+            // Not on a person: refuse, so the files slide back and the menu stays.
+            let hit = friend_at(x, y).is_some();
+            if hit {
+                let paths = drag_paths(sender);
+                log::info!("[traydrag] popover performDrag ({x:.0},{y:.0}) paths={}", paths.len());
+                (self.ivars().on_drop)(paths, x, y);
+                self.setHidden(true);
+            } else {
+                log::info!("[traydrag] drop ({x:.0},{y:.0}) hit no friend row");
+            }
+            hit
         }
 
         #[unsafe(method(draggingExited:))]
@@ -662,13 +671,13 @@ fn attach_popover_drop(app: &AppHandle) -> bool {
         // Highlight is drawn natively (so it shows on the first pass while the menu
         // is inactive); the send happens entirely in Rust.
         Box::new(move |paths, x, y| {
-            match friend_at(x, y) {
-                Some(id) => send_drop_to_friend(&app_drop, &id, paths),
-                None => log::info!("[traydrag] drop ({x:.0},{y:.0}) hit no friend row"),
+            // performDragOperation already refused a miss, so this is a row.
+            if let Some(id) = friend_at(x, y) {
+                send_drop_to_friend(&app_drop, &id, paths);
+                // Blip behavior: close the menu after the drop. The transfer card
+                // is the confirmation.
+                close_popover(&app_drop);
             }
-            // Blip behavior: close the menu after the drop. The native "Sending to
-            // X" notification is the confirmation.
-            close_popover(&app_drop);
         }),
     );
     view.setHidden(true);
