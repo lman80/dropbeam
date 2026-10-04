@@ -32,6 +32,7 @@ import { baseName } from '../lib/humanize'
 import { PairingModal } from '../components/PairingModal'
 import { Dialog } from '../components/Dialog'
 import { avatarColor, initials } from '../lib/avatar'
+import { personKey } from '../lib/deviceIcons'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { friendOnlineState } from '../lib/presence'
 import { ConnInfo } from '../components/ConnInspector'
@@ -535,6 +536,13 @@ function FolderSettingsDialog({
   onClose: () => void
 }) {
   const myName = useStore((s) => s.settings?.displayName || 'You')
+  const friends = useStore((s) => s.friends)
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
+  // The member's avatar colour comes from the same person id as everywhere else.
+  const colorKey = (m: Pair) => {
+    const f = friends.find((x) => !!m.endpointId && x.endpointId === m.endpointId) ?? friends.find((x) => x.name === m.peerName)
+    return f ? personKey(friends, f.id, myAccount) : m.peerName
+  }
   const [soundOn, toggleSound] = useFolderSound(pair.id)
   // Per-member removal (incl. clearing a stuck "waiting to join" invite).
   const [confirmMember, setConfirmMember] = useState<string | null>(null)
@@ -583,7 +591,7 @@ function FolderSettingsDialog({
             <div className="row" key={m.id}>
               <span
                 className={`folder-avatar${pending ? ' pending' : ''}`}
-                style={pending ? undefined : { background: avatarColor(m.peerName) }}
+                style={pending ? undefined : { background: avatarColor(colorKey(m)) }}
               >
                 {pending ? <Clock /> : initials(m.peerName)}
                 {!pending && <span className={`folder-avatar-dot${online ? ' online' : ''}`} />}
