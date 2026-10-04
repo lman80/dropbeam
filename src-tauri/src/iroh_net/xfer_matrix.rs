@@ -789,7 +789,12 @@ async fn interrupted_big_send_resumes_paced(how: Break, per_chunk: Duration) {
     let hook: Hook = {
         let (srv, cli, live, cancel, fired) = (server.clone(), client.clone(), live.clone(), cancel.clone(), fired.clone());
         Arc::new(move |done, _| {
-            if done > total as u64 * 6 / 10 && !fired.swap(true, Ordering::SeqCst) {
+            // A cancel is only seen between writes: break it while the rest of
+            // the file can't already sit in the 4 × 8 MB flow-control windows
+            // (at 60% the whole remainder often fit, and the "interrupted"
+            // send simply finished — a pre-existing timing flake).
+            let at = if matches!(how, Break::Cancel) { 4 } else { 6 };
+            if done > total as u64 * at / 10 && !fired.swap(true, Ordering::SeqCst) {
                 match how {
                     Break::NetworkDrop => live.get().unwrap().close(9u32.into(), b"wifi gone"),
                     Break::Cancel => cancel.store(true, Ordering::SeqCst),
@@ -835,7 +840,10 @@ async fn matrix_resume_after_receiver_restart() { let _gate = PACE_GATE.read().a
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_resume_after_sender_restart() { let _gate = PACE_GATE.read().await; interrupted_big_send_resumes(Break::SenderRestart).await; }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_resume_after_cancel_or_pause() { let _gate = PACE_GATE.read().await; interrupted_big_send_resumes(Break::Cancel).await; }
+async fn matrix_resume_after_cancel_or_pause() {
+    let _gate = PACE_GATE.read().await;
+    interrupted_big_send_resumes_paced(Break::Cancel, Duration::from_millis(1)).await;
+}
 
 /// T2 regression (540a837): on a LAN path the big file used to go out as the
 /// classic, sidecar-less body, so a Wi-Fi blip restarted it from zero. The LAN
