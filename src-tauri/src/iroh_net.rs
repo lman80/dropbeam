@@ -15,6 +15,7 @@
 
 mod integrity;
 pub(crate) mod receive_stage;
+pub(crate) mod delivered;
 #[cfg(test)]
 mod friendly_failure_tests {
     use super::*;
@@ -1400,6 +1401,12 @@ pub(crate) fn land_server_files(
     server_name: &str,
     created_ms: u64,
 ) {
+    // The sender can resume/verify what reached us through its server too (S7).
+    for (key, path) in landed {
+        if let Some((_, name)) = key.strip_prefix("file:").and_then(|r| r.split_once(':')) {
+            delivered::record(config, from, name, path);
+        }
+    }
     let Some(friend) = crate::friends::chat_sender(config, from) else { return };
     let link_id = incoming_chat_id(from, xfer);
     let total: u64 = manifest.iter().map(|(_, s)| *s).sum();
@@ -2896,11 +2903,11 @@ async fn serve_stream_inner(
                 let who = conn.remote_id().to_string();
                 anyhow::ensure!(crate::friends::load(&config).iter()
                     .any(|f| f.endpoint_id.as_deref() == Some(who.as_str())), "Friend access denied");
-                let dest = if configured.trim().is_empty() {
-                    app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
-                } else { PathBuf::from(configured) };
+                let _ = configured;
+                // Only what THIS sender delivered, wherever it landed (S7, T5).
                 let request = req.clone();
-                tokio::task::spawn_blocking(move || friend_stat_reply(&dest, &request)).await?
+                tokio::task::spawn_blocking(move || friend_stat_reply_with(&request,
+                    |name| delivered::lookup(&config, &who, name))).await?
             }.await;
             let reply = result.unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}));
             write_frame(send, &reply).await?;
@@ -2910,7 +2917,7 @@ async fn serve_stream_inner(
             // "Verify copy": the friend who sent us these files wants a full
             // SHA-256 of what actually landed. Same known-friend gate and same
             // destination resolution as files.stat.
-            let prepared: Result<(PathBuf, serde_json::Value)> = async {
+            let prepared: Result<(PathBuf, String, serde_json::Value)> = async {
                 let app = state.app.get().context("Application is not ready")?;
                 let (config, configured) = app.try_state::<Arc<crate::AppState>>()
                     .map(|st| (st.config_dir.clone(), st.settings.lock().unwrap().download_dir.clone()))
@@ -2918,14 +2925,13 @@ async fn serve_stream_inner(
                 let who = conn.remote_id().to_string();
                 anyhow::ensure!(crate::friends::load(&config).iter()
                     .any(|f| f.endpoint_id.as_deref() == Some(who.as_str())), "Friend access denied");
-                let dest = if configured.trim().is_empty() {
-                    app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
-                } else { PathBuf::from(configured) };
-                Ok((dest, req.clone()))
+                let _ = configured;
+                Ok((config, who, req.clone()))
             }.await;
             let served = match prepared {
-                Ok((dest, request)) => serve_verify(send, move |cancel, hashed| {
-                    friend_verify_reply(&dest, &request, &cancel, &hashed)
+                // Only what THIS sender delivered, wherever it landed (S7, T5).
+                Ok((config, who, request)) => serve_verify(send, move |cancel, hashed| {
+                    friend_verify_reply_with(&request, &cancel, &hashed, |name| delivered::lookup(&config, &who, name))
                 }).await,
                 Err(e) => Err(e),
             };
@@ -3405,7 +3411,7 @@ async fn serve_stream_inner(
                                         let r = landed_receive!(
                                             send, recv; progress_mode, total, &cancel, cb,
                                             finish_location_receive(location_upload.clone(), req.clone(), cancel.clone(), &cb, read_body_with_landed(recv, &req, item_offset, &id, &dest, &cancel, |d, t| cb(location_receive_progress(&req, d), t),
-                            |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); } }))
+                            |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); delivered::record(&config_dir, &who, name, path); } }))
                                         );
                                         // The file arrived classically — a kept
                                         // partial would only make a LATER send of
@@ -3441,7 +3447,7 @@ async fn serve_stream_inner(
                     landed_receive!(
                         send, recv; progress_mode, total, &cancel, cb,
                         finish_location_receive(location_upload.clone(), req.clone(), cancel.clone(), &cb, read_body_with_landed(recv, &req, item_offset, &id, &dest, &cancel, |d, t| cb(location_receive_progress(&req, d), t),
-                            |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); } }))
+                            |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); delivered::record(&config_dir, &who, name, path); } }))
                     )
                 }
                 .await
@@ -3462,6 +3468,7 @@ async fn serve_stream_inner(
                     }
                     for (index, (name, path)) in names.iter().zip(&paths).enumerate() {
                         chat_file_landed(state, &id, Some(received_item_index(item_offset, index)), name, path);
+                        if location_upload.is_none() { delivered::record(&config_dir, &who, name, path); }
                     }
                     // Location uploads are hosted payloads, not "files sent to me".
                     if location_upload.is_none() {
@@ -4511,9 +4518,21 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
 /// Only exact regular-file matches are safe to skip; preserve normal landing
 /// (including collision naming) for every other destination.
 fn friend_file_landed(dest: &Path, name: &str, size: u64, mtime: u64) -> bool {
-    occupied_siblings(&dest.join(receive_rel(name))).any(|(_, meta)|
-        meta.file_type().is_file() && meta.len() == size
-            && (mtime == 0 || mtime_secs(&meta) == mtime))
+    landed_match(&dest_candidates(dest, name), size, mtime)
+}
+
+/// Same size AND same (known) modified time on a regular file. An unknown
+/// mtime (0) is NOT a wildcard: "any same-size file" would skip a file that was
+/// never delivered. (The re-send is cheap: `identical_landed` reuses the copy.)
+fn landed_match(candidates: &[PathBuf], size: u64, mtime: u64) -> bool {
+    mtime != 0 && candidates.iter().any(|p| std::fs::symlink_metadata(p).is_ok_and(|meta|
+        meta.file_type().is_file() && meta.len() == size && mtime_secs(&meta) == mtime))
+}
+
+/// Lab/test resolution: the natural name under `dest` and its occupied
+/// collision siblings. Production answers from the per-sender ledger instead.
+fn dest_candidates(dest: &Path, name: &str) -> Vec<PathBuf> {
+    occupied_siblings(&dest.join(receive_rel(name))).map(|(p, _)| p).collect()
 }
 
 /// `natural` and its "name (n)" siblings, in landing order, for as long as they
@@ -4536,6 +4555,12 @@ pub(crate) fn identical_landed(part: &Path, natural: &Path) -> Option<PathBuf> {
 }
 
 fn friend_stat_reply(dest: &Path, req: &serde_json::Value) -> Result<serde_json::Value> {
+    friend_stat_reply_with(req, |name| dest_candidates(dest, name))
+}
+
+/// `files.stat` answered only from `candidates(name)` — in the app, the paths
+/// the asking sender itself delivered under that name (S7).
+fn friend_stat_reply_with(req: &serde_json::Value, candidates: impl Fn(&str) -> Vec<PathBuf>) -> Result<serde_json::Value> {
     anyhow::ensure!(req["files_v"] == 1, "Unsupported files stat version");
     let items = req["items"].as_array().context("Invalid stat items")?;
     anyhow::ensure!(items.len() <= 1000, "Too many stat items");
@@ -4544,7 +4569,7 @@ fn friend_stat_reply(dest: &Path, req: &serde_json::Value) -> Result<serde_json:
         let name = item["name"].as_str().context("Invalid stat name")?;
         let size = item["size"].as_u64().context("Invalid stat size")?;
         let mtime = item["mtime"].as_u64().context("Invalid stat mtime")?;
-        if friend_file_landed(dest, name, size, mtime) { landed.push(index); }
+        if landed_match(&candidates(name), size, mtime) { landed.push(index); }
     }
     Ok(serde_json::json!({"ok":true,"landed":landed}))
 }
@@ -4587,21 +4612,42 @@ where
 /// missing copy instead of failing the whole run.
 fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool,
     hashed: &AtomicU64) -> Result<Vec<Option<String>>> {
+    friend_verify_reply_with(req, cancel, hashed, |name| dest_candidates(dest, name))
+}
+
+/// `files.verify` over `candidates(name)` (newest delivery first). Each distinct
+/// path is hashed at most once per request, however often it is named — a
+/// request repeating one big name thousands of times costs one read.
+fn friend_verify_reply_with(req: &serde_json::Value, cancel: &AtomicBool,
+    hashed: &AtomicU64, candidates: impl Fn(&str) -> Vec<PathBuf>) -> Result<Vec<Option<String>>> {
     anyhow::ensure!(req["files_v"] == 1, "Unsupported files verify version");
     let items = req["items"].as_array().context("Invalid verify items")?;
     anyhow::ensure!(items.len() <= crate::verify::MAX_ITEMS, "Too many verify items");
     let mut digests = Vec::with_capacity(items.len());
+    let mut done: HashMap<PathBuf, Option<String>> = HashMap::new();
     let mut base = 0u64;
     for item in items {
         anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
         let name = item["name"].as_str().context("Invalid verify name")?;
         let size = item["size"].as_u64().unwrap_or(0);
-        // Where recv_files landed it: the natural name, or — if that was taken
-        // by an unrelated file — the first collision sibling of the right size.
-        let natural = dest.join(receive_rel(name));
-        let sibling = occupied_siblings(&natural)
-            .find(|(_, m)| m.is_file() && m.len() == size).map(|(p, _)| p);
-        let path = sibling.unwrap_or(natural);
+        // Where it landed: the first candidate of the right size (a "name (n)"
+        // collision sibling, an older delivery), else the newest candidate (a
+        // changed copy then reports as differing, not missing).
+        let found = candidates(name);
+        let sized = found.iter().find(|p| std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() == size)).cloned();
+        let Some(path) = sized.or_else(|| found.into_iter().next()) else {
+            base += size;
+            hashed.fetch_max(base, Ordering::Relaxed);
+            digests.push(None);
+            continue;
+        };
+        if let Some(digest) = done.get(&path) {
+            base += size;
+            hashed.fetch_max(base, Ordering::Relaxed);
+            digests.push(digest.clone());
+            continue;
+        }
         let mut digest = None;
         if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
             if let Ok(file) = std::fs::File::open(&path) {
@@ -4617,6 +4663,7 @@ fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool
         // requester's bar still reaches the end on a partly missing copy.
         base += size;
         hashed.fetch_max(base, Ordering::Relaxed);
+        done.insert(path, digest.clone());
         digests.push(digest);
     }
     Ok(digests)
@@ -10576,7 +10623,7 @@ mod tests {
         assert!(friend_file_landed(&dir, "file", 3, 1_700_000_000));
         assert!(!friend_file_landed(&dir, "file", 4, 1_700_000_000));
         assert!(!friend_file_landed(&dir, "file", 3, 1_700_000_001));
-        assert!(friend_file_landed(&dir, "file", 3, 0));
+        assert!(!friend_file_landed(&dir, "file", 3, 0), "an unknown mtime is not a wildcard");
         assert!(!friend_file_landed(&dir, "missing", 0, 0));
         std::fs::create_dir(dir.join("folder")).unwrap();
         let size = std::fs::metadata(dir.join("folder")).unwrap().len();
