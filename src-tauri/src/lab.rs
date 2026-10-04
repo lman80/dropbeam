@@ -274,10 +274,11 @@ async fn dispatch(
             let dir = str_field(req, "dir")?;
             std::fs::create_dir_all(dir)?;
             let mirror = req.get("mirror").and_then(|v| v.as_bool()).unwrap_or(true);
+            let two_way = req.get("twoWay").and_then(|v| v.as_bool()).unwrap_or(true);
             let name = my_display_name(state);
             let my_id = state.get().map(|ep| ep.id().to_string());
             let (pair, invite) = crate::pairing::create(
-                &cfg, dir.to_string(), name, true, "Lab Peer".into(), mirror, my_id,
+                &cfg, dir.to_string(), name, two_way, "Lab Peer".into(), mirror, my_id,
             )
             .map_err(|e| anyhow::anyhow!(e))?;
             let sm = sync_manager(state)?;
@@ -301,6 +302,73 @@ async fn dispatch(
             let sm = sync_manager(state)?;
             tokio::task::spawn_blocking(move || sm.reconcile()).await?;
             Ok(serde_json::json!({ "pairId": pair.id }))
+        }
+
+        // Change a folder's options (one-way / auto-delete / mirror).
+        "pair-update" => {
+            let cfg = config_dir(state)?;
+            let id = str_field(req, "pairId")?;
+            let b = |k: &str| req.get(k).and_then(|v| v.as_bool());
+            let pair = crate::pairing::update(&cfg, id, b("twoWay"), b("autoDelete"), None, None, b("mirror"))
+                .map_err(|e| anyhow::anyhow!(e))?;
+            sync_manager(state)?.reconcile();
+            Ok(serde_json::to_value(&pair)?)
+        }
+        // Pause / resume a folder (the shared switch).
+        "pair-pause" => {
+            let id = str_field(req, "pairId")?.to_owned();
+            let paused = req.get("paused").and_then(|v| v.as_bool()).unwrap_or(true);
+            sync_manager(state)?.set_paused_now(&id, paused);
+            Ok(serde_json::json!({ "paused": paused }))
+        }
+        // Stop sharing (announce + forget the link), like the UI's Unshare.
+        "pair-remove" => {
+            let cfg = config_dir(state)?;
+            let id = str_field(req, "pairId")?;
+            let sm = sync_manager(state)?;
+            sm.announce_unshare(id);
+            crate::pairing::remove(&cfg, id).map_err(|e| anyhow::anyhow!(e))?;
+            sm.reconcile();
+            Ok(serde_json::json!({ "removed": id }))
+        }
+        // Invite one more person into an existing folder (group of 3+).
+        "pair-add-person" => {
+            let cfg = config_dir(state)?;
+            let id = str_field(req, "pairId")?;
+            let my_id = state.get().map(|ep| ep.id().to_string());
+            let invite = crate::pairing::group_invite(&cfg, id, my_display_name(state), my_id)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            sync_manager(state)?.reconcile();
+            Ok(serde_json::json!({ "invite": invite }))
+        }
+        // Owner: make the member on this link a viewer (or an editor again).
+        "pair-role" => {
+            let cfg = config_dir(state)?;
+            let id = str_field(req, "pairId")?;
+            let viewer = req.get("viewer").and_then(|v| v.as_bool()).unwrap_or(true);
+            let my_id = state.get().map(|ep| ep.id().to_string());
+            let ok = crate::pairing::set_peer_viewer(&cfg, id, viewer, my_id.as_deref());
+            sync_manager(state)?.reconcile();
+            Ok(serde_json::json!({ "ok_role": ok }))
+        }
+        // Full pair records + live folder statuses.
+        "pair-dump" => {
+            let cfg = config_dir(state)?;
+            let statuses = sync_manager(state)?.statuses();
+            Ok(serde_json::json!({ "pairs": crate::pairing::load(&cfg), "statuses": statuses }))
+        }
+        // A folder's History (deleted/overwritten copies) and restoring one.
+        "history-list" => {
+            let cfg = config_dir(state)?;
+            let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
+            Ok(serde_json::json!({ "items": crate::folder_history::load(&root.to_string_lossy()) }))
+        }
+        "history-restore" => {
+            let cfg = config_dir(state)?;
+            let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
+            let to = crate::folder_history::restore(&root.to_string_lossy(), str_field(req, "itemId")?)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok(serde_json::json!({ "restored": to }))
         }
 
         // List shared folders on this device.
