@@ -346,6 +346,8 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .setup(|app| {
+            // #67: install the chat-notification click handler before launch finishes.
+            chat_notify::init(app.handle());
             // Always-on logging to a FILE so we can diagnose issues on machines we
             // can't access (e.g. a tester's Windows box — the log lands in
             // %APPDATA%\com.dropbeam.app\logs\DropBeam.log, or ~/Library/Logs/
