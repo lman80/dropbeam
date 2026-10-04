@@ -95,13 +95,13 @@ html.overlay-window #root {
 .pop-contact-av .avatar-device { width: 14px; height: 14px; }
 .pop-online-dot {
   position: absolute;
-  right: -1px;
-  bottom: -1px;
-  width: 9px;
-  height: 9px;
+  right: -2px;
+  bottom: -2px;
+  width: 7px;
+  height: 7px;
   border-radius: 999px;
   background: var(--green-dot);
-  box-shadow: 0 0 0 2px var(--surface);
+  box-shadow: 0 0 0 1.5px var(--surface);
 }
 .dark .pop-online-dot { box-shadow: 0 0 0 2px #2c2c2f; }
 .pop-contact-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }

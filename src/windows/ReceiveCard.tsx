@@ -20,6 +20,7 @@ import { MenuPopover, Spinner, type MenuItem } from '../components/ui'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { personKey } from '../lib/deviceIcons'
 import { useTransferMeter } from '../lib/useTransferMeter'
+import { formatEta } from '../lib/format'
 import { IS_MAC, IS_WINDOWS } from '../lib/platform'
 import { hasRetryPayload, retryFriendId, useStore } from '../store'
 
@@ -34,13 +35,10 @@ function glyphFor(name: string) {
   return <FileIcon {...props} />
 }
 
-/** "3 s", "2 min", "1 h 5 min" — or null when there's no useful estimate. */
+/** Time left in the app's one format ("15s", "2m 5s") — or null when there's no useful estimate. */
 function etaText(seconds: number | null | undefined): string | null {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0.5) return null
-  if (seconds < 60) return `${Math.ceil(seconds)} s`
-  const mins = Math.round(seconds / 60)
-  if (mins < 60) return `${mins} min`
-  return `${Math.floor(mins / 60)} h ${mins % 60} min`
+  return formatEta(seconds)
 }
 
 // Truncate a long filename in the MIDDLE so the extension stays visible. The

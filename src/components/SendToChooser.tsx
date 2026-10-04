@@ -150,7 +150,7 @@ export function SendToChooser() {
               ))}
               {/* Honest, said once: friend file sends retry ~90s then fail — there is
                   no store-and-forward for files (chat messages DO queue). */}
-              {anyUnheldOffline && <p className="chooser-note">If someone’s offline, DropBeam keeps trying for about 2 minutes.</p>}
+              {anyUnheldOffline && <p className="chooser-note">Offline people: DropBeam keeps trying for about 2 minutes.</p>}
             </>
           )}
         </Dialog>

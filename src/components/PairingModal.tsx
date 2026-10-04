@@ -194,7 +194,7 @@ export function PairingModal({
 
       <div className="folder-field">
         <label className="field-label">{mode === 'create' ? 'Folder to share' : 'Save into'}</label>
-        <button className="btn btn-secondary folder-picker" onClick={pickFolder} title={folder || undefined}>
+        <button className="btn btn-secondary folder-picker" data-autofocus onClick={pickFolder} title={folder || undefined}>
           <FolderOpen />
           <span className={folder ? undefined : 'placeholder'}>{folder ? folderName : 'Choose a Folder…'}</span>
         </button>

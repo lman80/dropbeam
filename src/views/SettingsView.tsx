@@ -495,7 +495,7 @@ export function SettingsView() {
       </div>
 
       <SectionHeader>
-        Recoverable Files
+        Recoverable files
           <InfoTip label="About recoverable files">
             <p>When a file in a shared folder is deleted or replaced, DropBeam keeps a copy you can restore from History. Old copies are removed automatically.</p>
           </InfoTip>

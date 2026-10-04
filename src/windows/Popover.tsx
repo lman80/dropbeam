@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
+  AlertCircle,
   AppWindow,
   ArrowDown,
   ArrowDownToLine,
@@ -499,7 +500,7 @@ function PopoverTransfer({ t }: { t: TransferUpdate }) {
     <div className={`pop-xfer${t.state === 'failed' ? ' is-failed' : ''}`}>
       <div className="pop-xfer-line">
         <span className="pop-xfer-icon" aria-hidden>
-          {t.state === 'completed' ? <Check /> : t.state === 'failed' ? <X /> : t.state === 'paused' ? <Pause /> : t.direction === 'send' ? <ArrowUp /> : <ArrowDown />}
+          {t.state === 'completed' ? <Check /> : t.state === 'failed' ? <AlertCircle /> : t.state === 'paused' ? <Pause /> : t.direction === 'send' ? <ArrowUp /> : <ArrowDown />}
         </span>
         <div className="pop-xfer-text">
           <div className="pop-xfer-name" title={t.fileNames.join(', ')}>

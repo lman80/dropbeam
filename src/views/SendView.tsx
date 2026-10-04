@@ -170,7 +170,7 @@ export function SendView() {
                 onChange={(e) => setCode(e.target.value)}
               />
               <ScanCodeButton
-                label="Scan…"
+                label="Scan QR Code…"
                 hint="Hold the sender’s QR code up to your camera."
                 title="Scan to receive"
                 accept={['receive']}

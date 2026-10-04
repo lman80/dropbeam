@@ -124,7 +124,7 @@ function DesktopFriends() {
         <h1 className="page-title">Friends</h1>
         <div className="page-actions">
           <button className="btn btn-primary" onClick={() => setAdding(true)}>
-            <UserPlus /> Add Friend
+            <UserPlus /> Add a Friend
           </button>
         </div>
       </div>
@@ -158,7 +158,7 @@ function DesktopFriends() {
             icon={<Users />}
             title="No friends yet"
             hint="Add a friend with their DropBeam code."
-            action={<button className="btn btn-secondary" onClick={() => setAdding(true)}>Add Friend</button>}
+            action={<button className="btn btn-secondary" onClick={() => setAdding(true)}>Add a Friend</button>}
             style={{ padding: '32px 24px' }}
           />
         </div>
@@ -579,7 +579,7 @@ function AddFriendModal({ onClose }: { onClose: () => void }) {
         />
         <ScanCodeButton
           className="btn btn-plain"
-          label="Scan QR…"
+          label="Scan QR Code…"
           disabled={busy}
           hint="Hold your friend’s QR code up to the camera."
           title="Scan a friend’s code"

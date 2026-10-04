@@ -107,7 +107,7 @@ export function ShareCode({ code, instructions, footer, layout = 'row', size = 2
  *  field uses; a different DropBeam code goes to `onOther` (e.g. the universal
  *  router) or, without one, gets a clear "that's X — use it in Y" message and
  *  the scanner keeps looking. `onCode` gets the NORMALIZED code. */
-export function ScanCodeButton({ onCode, accept, onOther, hint, title, label = 'Scan QR code', className, small = false, iconOnly = false, disabled, style }: {
+export function ScanCodeButton({ onCode, accept, onOther, hint, title, label = 'Scan QR Code…', className, small = false, iconOnly = false, disabled, style }: {
   onCode: (code: string, parsed: ParsedCode) => void
   accept: readonly CodeKind[]
   onOther?: (parsed: ParsedCode) => void

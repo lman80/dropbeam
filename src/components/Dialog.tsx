@@ -48,6 +48,12 @@ export function useEscape(onClose: (() => void) | undefined) {
 // ── Modal focus: trap, inert background, initial focus, restore ──────────────
 const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
 const modalStack: HTMLElement[] = []
+/** Was the last input a pointer? Then a restored focus shouldn't draw a ring. */
+let lastInputPointer = false
+if (typeof window !== 'undefined') {
+  window.addEventListener('pointerdown', () => { lastInputPointer = true }, true)
+  window.addEventListener('keydown', () => { lastInputPointer = false }, true)
+}
 /** How many open modals made each background element inert (nested dialogs). */
 const inertCount = new WeakMap<Element, number>()
 
@@ -124,7 +130,10 @@ export function useModalFocus(panelRef: RefObject<HTMLElement | null>, overlayRe
         if (n <= 0) { inertCount.delete(el); el.removeAttribute('inert') }
         else inertCount.set(el, n)
       }
-      if (previous && previous.isConnected && typeof previous.focus === 'function') previous.focus({ preventScroll: true })
+      if (previous && previous.isConnected && typeof previous.focus === 'function') {
+        // focusVisible is honoured by Chromium/WebView2; WebKit ignores it harmlessly.
+        previous.focus({ preventScroll: true, focusVisible: !lastInputPointer } as FocusOptions)
+      }
     }
     // Mount/unmount only: the trap follows the panel element itself.
     // eslint-disable-next-line react-hooks/exhaustive-deps
