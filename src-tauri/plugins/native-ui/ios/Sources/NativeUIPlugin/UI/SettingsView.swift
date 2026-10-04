@@ -99,6 +99,7 @@ struct SettingsView: View {
             .beamList()
             .navigationTitle("Settings")
             .navigationDestination(isPresented: $qaSaveFolder) { SaveFolderView() }
+            .navigationDestination(isPresented: $bridge.showDevices) { DevicesView() }
             #if targetEnvironment(simulator)
             .onAppear { if CommandLine.arguments.contains("-openSaveFolder") { qaSaveFolder = true } }
             // QA: `-scrollToServers` brings the Transfer Servers section into view.
@@ -198,67 +199,6 @@ struct InviteQRCode: View {
         Group { if let image { Image(uiImage: image).interpolation(.none).resizable().scaledToFit() } else { Image(systemName: "qrcode").resizable().scaledToFit() } }
             .padding(14).frame(maxWidth: 220).background(.white, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             .accessibilityLabel("DropBeam QR code")
-    }
-}
-struct LinkThisDeviceSheet: View {
-    @EnvironmentObject private var bridge: Bridge
-    @Environment(\.dismiss) private var dismiss
-    @State private var code = ""
-    @State private var error: String?
-    @State private var baseline = Set<String>()
-    @State private var watching = false
-    @State private var closed = false
-    var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    VStack(spacing: 10) {
-                        Image(systemName: "link.circle.fill").font(.system(size: 48)).foregroundStyle(.tint).accessibilityHidden(true)
-                        Text("Bring your devices together.").font(.title3.weight(.semibold))
-                        Text("On your other device, choose Link a New Device and scan this code.").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    }.frame(maxWidth: .infinity)
-                }.clearRow()
-                Section {
-                    VStack(spacing: 16) {
-                        if code.isEmpty && error == nil { ProgressView().frame(height: 240) }
-                        if !code.isEmpty {
-                            InviteQRCode(code: code)
-                            CodeLine(code: code).padding(.horizontal, 12)
-                            Button { UIPasteboard.general.string = code; Haptics.success() } label: { Label("Copy Code", systemImage: "doc.on.doc") }.beamButton()
-                        }
-                        if let error {
-                            Text(error).foregroundStyle(.red).multilineTextAlignment(.center)
-                            Button("Try Again") { Task { await begin() } }.beamButton(prominent: true)
-                        }
-                    }.frame(maxWidth: .infinity).padding(.vertical, 12)
-                }
-            }
-            .beamList()
-            .navigationTitle("Link This Device").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
-            .task { await begin() }
-            .onChange(of: linkedIDs) { _, ids in
-                if watching && !ids.subtracting(baseline).isEmpty { Haptics.success(); bridge.showToast("Device linked successfully"); dismiss() }
-            }
-            .onDisappear { closed = true; Task { try? await bridge.linkDeviceCancel() } }
-        }.tint(.beam)
-    }
-    private var linkedIDs: Set<String> {
-        guard let account = bridge.myDevice?.accountPub, !account.isEmpty else { return [] }
-        return Set(bridge.friends.filter { $0.accountPub == account }.map(\.id))
-    }
-    private func begin() async {
-        error = nil
-        do {
-            if !watching {
-                try await bridge.action("myDeviceInfo")
-                guard !closed else { return }
-                baseline = linkedIDs; watching = true
-            }
-            let next = try await bridge.linkDeviceBegin()
-            if closed { try? await bridge.linkDeviceCancel() } else { code = next }
-        }
-        catch { self.error = error.localizedDescription }
     }
 }
 struct TextSettingView: View {

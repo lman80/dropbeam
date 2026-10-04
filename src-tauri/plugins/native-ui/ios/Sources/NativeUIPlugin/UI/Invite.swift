@@ -328,6 +328,12 @@ struct AddFriendSheet: View {
         if let error {
             Label(error, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(.red)
                 .frame(maxWidth: .infinity, alignment: .leading).accessibilityAddTraits(.updatesFrequently)
+            // A device-link code isn't a friend (S1): only Settings → Devices links devices.
+            if Bridge.isDeviceCodeMessage(error) {
+                Button { dismiss(); bridge.openDevicesSettings() } label: {
+                    Label("Open Settings → Devices", systemImage: "laptopcomputer.and.iphone").frame(maxWidth: .infinity, minHeight: 36)
+                }.beamButton()
+            }
         }
         PeerToPeerNote(text: "DropBeam connects your phones directly — there’s no server. Your friend needs DropBeam open too, until you’re connected.")
             .padding(.top, 6)
@@ -349,6 +355,8 @@ struct AddFriendSheet: View {
     private func submit(_ raw: String) {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        // Never link a device from here (S1); the engine refuses too.
+        if Bridge.isLinkCode(text) { error = Bridge.deviceCodeElsewhere; phase = .entry; fieldFocused = false; Haptics.warning(); return }
         error = nil; phase = .working; fieldFocused = false
         Task {
             do {
@@ -361,8 +369,6 @@ struct AddFriendSheet: View {
                     let accepted: Bool = try await bridge.call("acceptFolderInvite", ["code": result.code ?? text])
                     if accepted { bridge.showToast("Joined shared folder") }
                     dismiss()
-                case "linked":
-                    bridge.showToast("Linked with \(result.name ?? "your device") — syncing friends and chats"); dismiss()
                 default:
                     bridge.showToast("Receiving files…"); dismiss()
                 }

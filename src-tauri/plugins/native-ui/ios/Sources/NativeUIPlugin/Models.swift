@@ -218,6 +218,40 @@ struct LinkResult: Decodable {
     var deviceKind: String?
     var deviceOs: String?
 }
+/// `linkDevicePrepare`: whose device-link code was scanned, and the safety code
+/// both devices show before anything is linked (S1).
+struct LinkPreviewInfo: Decodable {
+    var name: String
+    var safety: String
+    /// "give": that device gets this account; "take": this device joins theirs.
+    var direction: String
+    /// False when the other device is too old to show the safety code.
+    var peerShowsCode: Bool
+}
+/// `link://confirm`: another device scanned this one's code and waits for a yes.
+struct LinkConfirmRequest: Equatable {
+    var endpointId: String
+    var name: String
+    var safety: String
+    var joining: Bool
+    init?(_ payload: Any?) {
+        guard let p = payload as? [String: Any], let eid = p["endpointId"] as? String, !eid.isEmpty,
+              let safety = p["safety"] as? String, !safety.isEmpty else { return nil }
+        endpointId = eid
+        let n = (p["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        name = n.isEmpty ? "Your other device" : n
+        self.safety = safety
+        joining = p["joining"] as? Bool ?? false
+    }
+}
+/// Someone new who introduced themselves: a request, not yet a friend (S2).
+struct FriendRequest: Decodable, Identifiable, Equatable {
+    var endpointId: String
+    var name: String
+    /// When they asked (ms since 1970).
+    var at: Double?
+    var id: String { endpointId }
+}
 // Accept any JSON result for actions whose return value the UI doesn't need.
 struct IgnoredResult: Decodable { init(from decoder: Decoder) throws {} }
 
@@ -550,6 +584,16 @@ extension ConnectionCheck {
         self.online = (try? c.decode(Bool.self, forKey: BridgeKey("online")))
         self.path = (try? c.decode(String.self, forKey: BridgeKey("path")))
         self.rttMs = (try? c.decode(Double.self, forKey: BridgeKey("rttMs"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+    }
+}
+
+extension FriendRequest {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.endpointId = try c.decode(String.self, forKey: BridgeKey("endpointId"))
+        let name = ((try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        self.name = name.isEmpty ? "Someone" : name
+        self.at = (try? c.decode(Double.self, forKey: BridgeKey("at"))).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
     }
 }
 

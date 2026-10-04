@@ -65,6 +65,12 @@ struct QRScannerSheet: View {
                     if let error {
                         Label(error, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(.red)
                             .frame(maxWidth: .infinity, alignment: .leading).accessibilityAddTraits(.updatesFrequently)
+                        // A device-link code scanned here (S1): only Settings → Devices links devices.
+                        if Bridge.isDeviceCodeMessage(error) {
+                            Button { dismiss(); Bridge.shared.openDevicesSettings() } label: {
+                                Label("Open Settings → Devices", systemImage: "laptopcomputer.and.iphone").frame(maxWidth: .infinity, minHeight: 32)
+                            }.beamButton()
+                        }
                     }
                     // A QR saved as a screenshot or sent as a picture (invite cards).
                     PhotosPicker(selection: $photo, matching: .images, photoLibrary: .shared()) {

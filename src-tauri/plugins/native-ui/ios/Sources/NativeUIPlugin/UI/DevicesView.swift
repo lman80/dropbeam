@@ -162,8 +162,10 @@ struct LinkDeviceSheet: View {
     @Environment(\.dismiss) private var dismiss
     let start: LinkStart
     let title: String
-    private enum Phase: Equatable { case show, working, done, failed }
+    private enum Phase: Equatable { case show, working, confirm, done, failed }
     @State private var phase: Phase = .show
+    /// The safety code both devices show before anything is linked (S1).
+    @State private var safety: LinkSafety?
     /// How the last attempt was made: this device scanning, or showing its code.
     @State private var via: LinkStart = .show
     @State private var code = ""
@@ -191,6 +193,8 @@ struct LinkDeviceSheet: View {
                                 Text("Keep DropBeam open on both devices.").font(.subheadline).foregroundStyle(.secondary)
                             }.frame(maxWidth: .infinity).padding(.vertical, 12)
                         }.accessibilityElement(children: .combine)
+                    case .confirm:
+                        if let safety { LinkSafetyCheck(safety: safety, confirm: { confirmLink(safety) }, cancel: { cancelLink(safety) }) }
                     case .done:
                         BeamEmpty(symbol: "checkmark.circle.fill", title: doneTitle, detail: doneDetail)
                         Button { dismiss() } label: { Text("Done").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
@@ -210,7 +214,8 @@ struct LinkDeviceSheet: View {
                     }
                 }.padding(20)
             }
-            .navigationTitle(phase == .done ? "Devices Linked" : title).navigationBarTitleDisplayMode(.inline).beamCanvas()
+            .navigationBarTitleDisplayMode(.inline).beamCanvas()
+            .navigationTitle(phase == .done ? "Devices Linked" : phase == .confirm ? "Check the Code" : title)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button(phase == .done ? "Close" : phase == .working ? "Hide" : "Cancel") { dismiss() } } }
             // A fresh one-time code each time the code screen opens (or on Try Again).
             .task(id: attempt) { if phase == .show { await begin() } }
@@ -221,6 +226,19 @@ struct LinkDeviceSheet: View {
                 guard phase == .show || phase == .working else { return }
                 progress = note.userInfo?["payload"] as? [String: Any]
                 if phase == .show { via = .show; scanning = false; withAnimation(.smooth) { phase = .working } }
+            }
+            // The other device scanned this one's code: compare safety codes before linking.
+            .onReceive(NotificationCenter.default.publisher(for: Notification.Name("DropBeam.link://confirm"))) { note in
+                guard let request = LinkConfirmRequest(note.userInfo?["payload"]) else { return }
+                // Busy with our own scan (or already done): this request isn't ours to answer yes.
+                guard phase == .show || (phase == .working && via == .show) || phase == .failed else {
+                    Task { try? await bridge.linkConfirm(endpointId: request.endpointId, accept: false) }
+                    return
+                }
+                via = .show; scanning = false; error = ""
+                safety = LinkSafety(name: request.name, safety: request.safety, joining: request.joining, peerShowsCode: true, endpointId: request.endpointId, code: nil)
+                withAnimation(.smooth) { phase = .confirm }
+                UINotificationFeedbackGenerator().notificationOccurred(.warning)
             }
             .onReceive(NotificationCenter.default.publisher(for: Notification.Name("DropBeam.link://linked"))) { note in
                 guard phase != .done else { return }
@@ -246,8 +264,15 @@ struct LinkDeviceSheet: View {
                     Task { await link(value) }
                 }
             }
-            .onDisappear { closed = true; Task { try? await bridge.linkHostCancel(); try? await bridge.linkDeviceCancel() } }
-        }.interactiveDismissDisabled(phase == .working)
+            .onDisappear {
+                closed = true
+                let unanswered = phase == .confirm ? safety?.endpointId : nil
+                Task {
+                    if let unanswered { try? await bridge.linkConfirm(endpointId: unanswered, accept: false) }
+                    try? await bridge.linkHostCancel(); try? await bridge.linkDeviceCancel()
+                }
+            }
+        }.interactiveDismissDisabled(phase == .working || phase == .confirm)
     }
     @ViewBuilder private var showing: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -275,13 +300,48 @@ struct LinkDeviceSheet: View {
             if closed { try? await bridge.linkHostCancel(); try? await bridge.linkDeviceCancel() } else { code = next }
         } catch { codeError = "Couldn't create a code. \(error.localizedDescription)" }
     }
+    /// Step 1 of linking with a scanned code: who it is and the safety code to compare.
+    /// Nothing is linked until the user confirms the codes match.
     private func link(_ value: String) async {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            let outcome: LinkOutcome = try await bridge.call(trimmed.lowercased().hasPrefix("dropbeamjoin1:") ? "linkDeviceJoin" : "linkDeviceSend", ["code": trimmed])
-            finish(title: outcome.title ?? LinkWords.title(kind: outcome.deviceKind, os: outcome.deviceOs, name: outcome.name),
-                   detail: outcome.detail ?? LinkWords.detail(outcome.friends, outcome.messages))
+            let preview = try await bridge.linkDevicePrepare(code: trimmed)
+            guard !closed, phase == .working, via == .scan else { return }
+            safety = LinkSafety(name: preview.name.isEmpty ? "Your other device" : preview.name, safety: preview.safety,
+                                joining: preview.direction == "take", peerShowsCode: preview.peerShowsCode, endpointId: nil, code: trimmed)
+            withAnimation(.smooth) { phase = .confirm }
         } catch { if phase != .done { fail(error.localizedDescription) } }
+    }
+    private func confirmLink(_ s: LinkSafety) {
+        Haptics.tap(); progress = nil
+        withAnimation(.smooth) { phase = .working }
+        if let code = s.code {
+            // Step 2 (this device scanned): the engine only links a prepared code.
+            Task {
+                do {
+                    let outcome: LinkOutcome = try await bridge.call("linkDeviceSend", ["code": code])
+                    finish(title: outcome.title ?? LinkWords.title(kind: outcome.deviceKind, os: outcome.deviceOs, name: outcome.name),
+                           detail: outcome.detail ?? LinkWords.detail(outcome.friends, outcome.messages))
+                } catch { if phase != .done { fail(error.localizedDescription) } }
+            }
+        } else if let eid = s.endpointId {
+            // The other device scanned ours: say yes; progress/linked/failed events follow.
+            Task {
+                do { try await bridge.linkConfirm(endpointId: eid, accept: true) }
+                catch { if phase != .done { fail(error.localizedDescription) } }
+            }
+        }
+    }
+    private func cancelLink(_ s: LinkSafety) {
+        Haptics.tap(); safety = nil
+        if let eid = s.endpointId {
+            // Refused: this code no longer works (a link://failed follows); offer a fresh one.
+            Task { try? await bridge.linkConfirm(endpointId: eid, accept: false) }
+            fail("Linking was canceled, so that code no longer works. Show a new code to try again.")
+        } else {
+            Task { try? await bridge.linkDeviceCancel(); try? await bridge.linkHostCancel() }
+            fail("Linking was canceled. Nothing was changed on either device.")
+        }
     }
     private func finish(title: String, detail: String) {
         doneTitle = title; doneDetail = detail; scanning = false
@@ -296,6 +356,53 @@ struct LinkDeviceSheet: View {
     private func retry() {
         error = ""; progress = nil; phase = .show
         if via == .scan { scanning = true } else { attempt += 1 }
+    }
+}
+
+/// The confirmation both linking devices show: the same safety code on each.
+struct LinkSafety: Equatable {
+    var name: String
+    var safety: String
+    /// This device joins `name`'s account (else `name` gets this account).
+    var joining: Bool
+    var peerShowsCode: Bool
+    /// Set when the other device scanned ours (answer with linkConfirm).
+    var endpointId: String?
+    /// Set when this device scanned theirs (continue with linkDeviceSend).
+    var code: String?
+}
+
+/// "Make sure <name> shows this code" — compare, then link or cancel.
+struct LinkSafetyCheck: View {
+    let safety: LinkSafety
+    let confirm: () -> Void
+    let cancel: () -> Void
+    private var warning: String {
+        safety.joining ? "This device will join \(safety.name)’s account and share its friends and chats."
+            : "\(safety.name) will get full access to your account: your friends, chats and devices."
+    }
+    var body: some View {
+        VStack(spacing: 22) {
+            VStack(spacing: 8) {
+                Image(systemName: "checkmark.shield.fill").font(.system(size: 46)).foregroundStyle(.tint).accessibilityHidden(true)
+                Text("Make sure \(safety.name) shows this code").font(.title3.weight(.semibold)).multilineTextAlignment(.center)
+            }
+            GlassCard {
+                Text(safety.safety)
+                    .font(.system(size: 46, weight: .semibold, design: .monospaced)).monospacedDigit()
+                    .lineLimit(1).minimumScaleFactor(0.5)
+                    .frame(maxWidth: .infinity).padding(.vertical, 10)
+                    .accessibilityLabel("Safety code \(safety.safety.filter { !$0.isWhitespace }.map(String.init).joined(separator: " "))")
+            }
+            Label { Text(warning) } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                .font(.subheadline).frame(maxWidth: .infinity, alignment: .leading)
+            Text("Only continue if this is your own device and the codes match." + (safety.peerShowsCode ? "" : " (\(safety.name) needs an update to show the code.)"))
+                .font(.subheadline).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            VStack(spacing: 10) {
+                Button(action: confirm) { Text("Codes Match — Link").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
+                Button(role: .cancel, action: cancel) { Text("Cancel").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
+            }
+        }
     }
 }
 

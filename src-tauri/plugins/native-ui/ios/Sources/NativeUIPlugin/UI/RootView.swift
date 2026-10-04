@@ -8,7 +8,7 @@ struct RootView: View {
     private var tabs: some View {
         TabView(selection: $bridge.selectedTab) {
             SendView().tabItem { Label("Send", systemImage: "paperplane.fill") }.tag("send")
-            FriendsView().tabItem { Label("Friends", systemImage: "person.2.fill") }.tag("friends")
+            FriendsView().tabItem { Label("Friends", systemImage: "person.2.fill") }.tag("friends").badge(bridge.friendRequests.count)
             ChatsView()
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }.tag("chat").badge(bridge.unread)
             HistoryView().tabItem { Label("History", systemImage: "clock.fill") }.tag("history")
@@ -45,7 +45,7 @@ struct RootView: View {
         .animation(.snappy, value: bridge.toast)
         .onChange(of: bridge.toast) { _, toast in if let toast { UIAccessibility.post(notification: .announcement, argument: toast) } }
         .preferredColorScheme(bridge.settings?.theme == "dark" ? .dark : bridge.settings?.theme == "light" ? .light : nil)
-        .task { try? await bridge.nativeChatFocus(scenePhase == .active); await bridge.mailboxFetchNow() }
+        .task { try? await bridge.nativeChatFocus(scenePhase == .active); await bridge.mailboxFetchNow(); await bridge.refreshFriendRequests() }
         .onChange(of: bridge.selectedTab) { _, tab in
             SuperFeedback.setContext(["route": tab]) // sent as the report's url
             bridge.perform { try await bridge.setView(name: tab) }
@@ -56,6 +56,10 @@ struct RootView: View {
             if phase == .active { Task { await bridge.mailboxFetchNow() } }
         }
         .alert("Couldn’t complete that", isPresented: showsError) {
+            // A device-link code used outside Settings → Devices (S1): offer the way there.
+            if Bridge.isDeviceCodeMessage(bridge.errorMessage) {
+                Button("Open Settings → Devices") { bridge.errorMessage = nil; bridge.openDevicesSettings() }
+            }
             Button("OK", role: .cancel) { bridge.errorMessage = nil }
         } message: { Text(bridge.errorMessage ?? "Please try again.") }
     }
