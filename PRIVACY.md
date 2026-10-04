@@ -40,7 +40,8 @@ A Transfer Server is an always-on DropBeam device that you or a friend set up (f
 When a Transfer Server holds something for a sleeping iPhone, it asks our push relay (a Cloudflare Worker, `dropbeam-push`) to send an Apple Push Notification.
 
 - The message preview is sealed to the phone's own key, and the phone's push token is sealed to the Worker's key. The Worker can't read the preview, and the server can't read the token.
-- The Worker and **Apple** do see that a notification was sent to that phone, when it was sent, the sending server's device id, and a conversation identifier used to group notifications. The visible notification text is the generic "New message"; the phone decrypts the real preview on the device, and you can turn previews off.
+- The Worker and **Apple** do see that a notification was sent to that phone, when it was sent, and a short tag that groups notifications from the same person. Who sent it is sealed to the phone's key along with the preview, except when a Transfer Server doesn't know your phone's notification key yet (older app versions), in which case the sender's device id is visible to them. The phone decrypts the real preview on the device, and you can turn previews off.
+- Your own Transfer Servers don't send pushes about people you blocked. If one arrives through a friend's server, your phone shows it without the name, text or sound.
 - The Worker keeps only rate-limit counters and logs only Apple's status codes.
 
 ## 5. Diagnostics (on by default)

@@ -122,13 +122,13 @@ export function LocationsView() {
   const inFlight = useRef(false)
   const queued = useRef(false)
   const friendKey = friends.map(f => `${f.id}:${f.endpointId}`).join('|')
-  const presenceKey = friends.map(f => `${f.id}:${friendPresence(f.name, seen, statuses).status}`).join('|')
+  const presenceKey = friends.map(f => `${f.id}:${friendPresence(f, seen, statuses).status}`).join('|')
   const refresh = useCallback(async function reload() {
     if (inFlight.current) { queued.current = true; return }
     inFlight.current = true; setBusy(true)
     const state = useStore.getState()
     await loadLocations({
-      friends: state.friends.filter(f => friendPresence(f.name, state.friendSeen, state.folderStatuses).status === 'online'),
+      friends: state.friends.filter(f => friendPresence(f, state.friendSeen, state.folderStatuses).status === 'online'),
       online: () => true,
       list: locationsApi.list,
       errorText: (_friend, error) => errorText(error),
@@ -175,15 +175,15 @@ export function LocationsView() {
   const location = active && shared[active.friend]?.find(l => l.id === active.location)
   const count = friends.reduce((sum,f) => sum + (shared[f.id]?.length || 0), 0)
   if (MOBILE_UI) return <div className="mobile-page mobile-locations">
-    {active && friend && location ? <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} online={presenceLabel(friendPresence(friend.name, seen, statuses))} onBack={() => setActive(null)} /> : <>
+    {active && friend && location ? <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} online={presenceLabel(friendPresence(friend, seen, statuses))} onBack={() => setActive(null)} /> : <>
       <MobileHeader title="Locations" actions={<button className="ios-icon" aria-label="Refresh locations" disabled={busy} onClick={() => void refresh()}><RefreshCw size={20} /></button>} />
-      <div className="ios-list">{friends.flatMap(f => (shared[f.id] || []).map(l => <button className="ios-row" key={`${f.id}:${l.id}`} onClick={() => setActive({ friend: f.id, location: l.id })}><span className="mobile-tinted-icon"><HardDrive size={24} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{l.name}</span><span className="ios-footnote mobile-presence"><i className={friendPresence(f.name, seen, statuses).status === 'online' ? 'online' : ''} />{f.name} · {presenceLabel(friendPresence(f.name, seen, statuses))}</span></span><ChevronRight size={18} /></button>))}</div>
+      <div className="ios-list">{friends.flatMap(f => (shared[f.id] || []).map(l => <button className="ios-row" key={`${f.id}:${l.id}`} onClick={() => setActive({ friend: f.id, location: l.id })}><span className="mobile-tinted-icon"><HardDrive size={24} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{l.name}</span><span className="ios-footnote mobile-presence"><i className={friendPresence(f, seen, statuses).status === 'online' ? 'online' : ''} />{f.name} · {presenceLabel(friendPresence(f, seen, statuses))}</span></span><ChevronRight size={18} /></button>))}</div>
       {!count && <div className="mobile-empty"><HardDrive /><h2 className="ios-title2">A place for everything</h2><p className="ios-footnote">Folders shared by friends appear here.</p><button className="ios-button ios-primary" onClick={() => setView('friends')}>Find a friend</button></div>}
       {!!Object.keys(errors).length && <p className="ios-footnote mobile-inset">Some devices are unavailable. Open a location to retry.</p>}
     </>}
   </div>
-  const presenceWords = (f: { name: string }) => {
-    const p = friendPresence(f.name, seen, statuses)
+  const presenceWords = (f: { id: string; name: string }) => {
+    const p = friendPresence(f, seen, statuses)
     return { online: p.status === 'online', words: p.status === 'online' ? 'Online' : presenceLabel(p) }
   }
   if (active) return <div className="locations-view page">

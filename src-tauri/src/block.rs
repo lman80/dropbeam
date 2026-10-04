@@ -158,6 +158,20 @@ pub(crate) fn block_friend(dir: &Path, friend_id: &str) -> Result<Vec<String>, S
     Ok(eids)
 }
 
+/// Block someone who isn't a friend (a declined friend request) by endpoint id.
+pub(crate) fn block_endpoint(dir: &Path, eid: &str, name: &str, account: Option<String>) -> Result<(), String> {
+    if crate::account::is_own_device(dir, eid) {
+        return Err("That's one of your own devices. Remove it from Devices instead.".into());
+    }
+    let account = account.filter(|a| crate::account::my_pub(dir).as_deref() != Some(a.as_str()));
+    with(dir, |all| {
+        let at = stamp(all.get(eid));
+        all.insert(eid.to_owned(), BlockRec { name: name.to_owned(), account, blocked: true, at });
+    })?;
+    remove_friend_records(dir, &[eid.to_owned()]);
+    Ok(())
+}
+
 fn remove_friend_records(dir: &Path, eids: &[String]) {
     for f in crate::friends::load_raw(dir) {
         if f.endpoint_id.as_ref().is_some_and(|e| eids.contains(e)) {

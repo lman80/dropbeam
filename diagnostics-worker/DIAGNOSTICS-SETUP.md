@@ -64,6 +64,34 @@ happened and when it last occurred. Errors are sorted to the top.
 
 ---
 
+## Abuse limits (built in)
+
+The ingest URL ships inside the app, so the Worker treats it as public:
+
+- Bodies over 64 KB are refused, counted on the bytes actually received (a
+  chunked upload or a wrong `Content-Length` can't get past it).
+- Each IP gets 10 uploads a minute. For a limit shared across the isolates in a
+  Cloudflare location, add a rate-limit binding to the Worker (a `wrangler.toml`
+  next to `worker.js`):
+
+  ```toml
+  [[ratelimits]]
+  name = "RL_IP"
+  namespace_id = "7201"
+  simple = { limit = 10, period = 60 }
+  ```
+
+- KV writes stay under the free tier's 1,000 a day whatever anyone sends. Each
+  device's record is rewritten at most once every 2 hours, and at most 60 device
+  ids are accepted (listed in one `index` key, which the dashboard reads instead
+  of `list()`). Tune with the plain variables `DEVICE_MIN_INTERVAL_MIN` and
+  `MAX_DEVICES`. A device that uploads too soon gets HTTP 429; the app keeps
+  those log lines and sends them with its next digest, so nothing is lost.
+  **Send test** twice within 2 hours reports that 429. That's expected.
+
+To remove a device for good, delete its `dev:…` key **and** its entry in the
+`index` key (KV → `dropbeam-diag`).
+
 ## What's collected (and what isn't)
 
 **Sent:** a random per-install id, your chosen display name, app version, OS/arch,

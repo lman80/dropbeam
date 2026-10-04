@@ -387,7 +387,7 @@ if (typeof window !== 'undefined' && !EMPTY) {
         { eid: 'mock-endpoint-alex', label: 'Mac', kind: 'laptop', os: 'macos', state: 'sending' as const },
         { eid: 'mock-endpoint-alex-phone', label: 'iPhone', kind: 'phone', os: 'ios', state: 'uploading' as const, via: 'Linux Box' },
       ] })
-    emit('transfer://update', { ...base('cx-held', 'send', ['Parking map.pdf']), state: 'held', friendName: 'Priya Raman', heldOn: 'Linux Box', bytesTotal: 2_400_000, bytesDone: 2_400_000, percent: 100, detail: 'Delivered to Linux Box — reaches Priya Raman when they’re online', chatTransfer: { id: 'cx-held', attempt: 1, offset: 0, total: 2_400_000, last: true } })
+    emit('transfer://update', { ...base('cx-held', 'send', ['Parking map.pdf']), state: 'held', friendName: 'Priya Raman', heldOn: 'Linux Box', bytesTotal: 2_400_000, bytesDone: 2_400_000, percent: 100, detail: 'Held on Linux Box — reaches Priya Raman when they’re online', chatTransfer: { id: 'cx-held', attempt: 1, offset: 0, total: 2_400_000, last: true } })
   }, 600)
 }
 if (typeof window !== 'undefined') {

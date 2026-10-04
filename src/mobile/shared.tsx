@@ -28,7 +28,7 @@ export function usePresence() {
     const timer = setInterval(() => setNow(Date.now()), 30_000)
     return () => clearInterval(timer)
   }, [])
-  return (friend: Friend) => presenceText(friendPresence(friend.name, seen, statuses), now)
+  return (friend: Friend) => presenceText(friendPresence(friend, seen, statuses), now)
 }
 export function NameAlert({ title = 'Name', initial, onSave, onClose }: { title?: string; initial: string; onSave: (name: string) => Promise<void>; onClose: () => void }) {
   const [name, setName] = useState(initial)

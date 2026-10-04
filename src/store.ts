@@ -1,5 +1,4 @@
 import { emit, listen } from '@tauri-apps/api/event'
-import { contentSummary, linkedTitle } from './lib/deviceLink'
 import { create } from 'zustand'
 import { listenForChatNotifications } from './lib/chatNotifications'
 import {
@@ -13,6 +12,8 @@ import {
   onFolderStatus,
   onFolderSynced,
   onFriendsChanged,
+  onFriendRequestsChanged,
+  type FriendRequest,
   onBlockedChanged,
   onHistoryChanged,
   onOpenFileSend,
@@ -36,7 +37,7 @@ import { setSpeedUnit } from './lib/format'
 import { LandedEta, TransferRate, etaAt } from './lib/eta'
 import { chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTransfers } from './lib/chatTransfer'
 import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
-import { parseCode, routeCode, wrongCodeMessage } from './lib/codes'
+import { DEVICE_CODE_ELSEWHERE, parseCode, routeCode, wrongCodeMessage } from './lib/codes'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
 import { MOBILE_UI } from './lib/platform'
 import { feedbackMoment } from './lib/feedback'
@@ -283,7 +284,8 @@ interface AppStore {
   clearHistoryFocus: () => void
   setDragHovering: (v: boolean) => void
   setPendingSend: (paths: string[] | null) => void
-  markFriendSeen: (name: string) => void
+  /** A friend id (preferred) or a display name. */
+  markFriendSeen: (who: string) => void
   applyTheme: (theme: Settings['theme']) => void
   saveSettings: (patch: Partial<Settings>) => Promise<void>
   pickAvatar: () => Promise<void>
@@ -313,6 +315,11 @@ interface AppStore {
   updatePair: (u: PairUpdate) => Promise<void>
   removePair: (id: string) => Promise<void>
   reloadFriends: () => Promise<void>
+  /** People asking to be friends (S2): they can't chat or send silently until accepted. */
+  friendRequests: FriendRequest[]
+  reloadFriendRequests: () => Promise<void>
+  acceptFriendRequest: (endpointId: string) => Promise<void>
+  declineFriendRequest: (endpointId: string, block: boolean) => Promise<void>
   /** Resolves true once a transfer actually started (false: nothing to send, a
    *  de-duped double-fire, or an error already toasted). */
   /** Files to a friend: every one of their devices, or just `device` (endpoint id). */
@@ -892,11 +899,11 @@ export const useStore = create<AppStore>((set, get) => ({
       })
       if (HAS_TAURI) void listen<{ peerId: string }>('friend://presence', ({ payload }) => {
         const friend = get().friends.find((f) => f.id === payload.peerId)
-        if (friend) get().markFriendSeen(friend.name)
+        if (friend) get().markFriendSeen(friend.id)
       })
       onChatTyping((t) => {
         const friend = get().friends.find((f) => f.id === t.peerId)
-        if (friend) get().markFriendSeen(friend.name)
+        if (friend) get().markFriendSeen(friend.id)
         set((s) => ({ chatTyping: { ...s.chatTyping, [t.peerId]: t.on } }))
         // Receiver-side safety net: the "stopped typing" signal is fire-once and can
         // be lost (peer goes offline / relay flap), which left "typing…" stuck on
@@ -924,6 +931,8 @@ export const useStore = create<AppStore>((set, get) => ({
     // so the folder shows who's in it (and clears the stale "waiting" state).
     onPairsChanged(() => get().reloadPairs())
     onFriendsChanged(() => get().reloadFriends())
+    void onFriendRequestsChanged(() => { void get().reloadFriendRequests() }).catch(() => {})
+    void get().reloadFriendRequests()
     onBlockedChanged(() => void get().reloadBlocked())
     void get().reloadBlocked()
 
@@ -1042,16 +1051,11 @@ export const useStore = create<AppStore>((set, get) => ({
           get().setView('folders')
           get().toast('info', 'That’s a shared-folder invite — choose where to keep the folder to join it.')
           return true
-        case 'linkDevice': {
-          // Either code works whichever device scans it: the engine picks the
-          // direction (the account that already has devices wins) and refuses
-          // two different accounts before touching anything.
-          const linked = /^dropbeamjoin1:/i.test(route.code) ? await api.linkDeviceJoin(route.code) : await api.linkDeviceSend(route.code)
-          const what = contentSummary(linked.friends, linked.messages)
-          get().toast('success', `${linkedTitle(linked)}${what ? ` — ${what} now on both` : ''}. Friends and chats stay in sync.`)
-          void get().reloadFriends()
-          return true
-        }
+        case 'linkDevice':
+          // S1: never linked from here (Add Friend, Have a code, the popover,
+          // a QR scan, a dropbeam:// link) — only from Settings → Devices.
+          get().toast('error', DEVICE_CODE_ELSEWHERE)
+          return false
         case 'invalid':
           get().toast('error', route.message)
           return false
@@ -1062,8 +1066,17 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  markFriendSeen: (name) => {
-    const key = name.trim().toLowerCase()
+  markFriendSeen: (who) => {
+    // Presence is kept per friend id (#44). Callers that only know a display
+    // name (a transfer card, a folder beacon) resolve it to the ONE friend with
+    // that name; an ambiguous or unknown name keeps a name entry instead.
+    const friends = get().friends
+    let key = who.trim()
+    if (!friends.some(f => f.id === key)) {
+      const lower = key.toLowerCase()
+      const named = friends.filter(f => f.name.trim().toLowerCase() === lower)
+      key = named.length === 1 ? named[0].id : lower
+    }
     if (key) {
       const friendSeen = { ...get().friendSeen, [key]: Date.now() }
       try { localStorage.setItem('dropbeam-friend-seen', JSON.stringify(friendSeen)) } catch { /* storage unavailable */ }
@@ -1254,7 +1267,8 @@ export const useStore = create<AppStore>((set, get) => ({
       u.friendName &&
       (u.state === 'transferring' || u.state === 'completed' || !!u.connDetail)
     ) {
-      const key = u.friendName.trim().toLowerCase()
+      const named = get().friends.filter(f => f.name.trim().toLowerCase() === u.friendName!.trim().toLowerCase())
+      const key = named.length === 1 ? named[0].id : u.friendName.trim().toLowerCase()
       const last = get().friendSeen[key] ?? 0
       if (Date.now() - last > 5000) {
         get().markFriendSeen(u.friendName)
@@ -1313,7 +1327,7 @@ export const useStore = create<AppStore>((set, get) => ({
       // on the card: flag "tap to resend" on failure, clear it on a successful resend.
       const link = loadChatFileXfer()[u.id]
       if (link) {
-        const card = (get().chats[link.peerId] ?? []).find((x) => x.id === link.msgId)
+        const card = (get().chats[link.peerId] ?? []).find((x) => x.id === link.msgId && x.fromMe)
         if (u.state === 'failed') {
           if (card) get().addChatMessage({ ...card, fileXferFailed: true })
         } else {
@@ -1396,7 +1410,7 @@ export const useStore = create<AppStore>((set, get) => ({
       // Re-send the BYTES only — api.sendToFriend (the raw transfer), NOT the store
       // action that also posts a fresh chat note. That avoids a duplicate file card
       // on every resend; the recipient's engine dedup prevents a double-delivery.
-      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId)
+      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId && x.fromMe)
       const linkId = card?.fileXferId ?? xferId
       const current = get().chatTransfers[linkId]
       if (current && current.state !== 'failed') return
@@ -1444,6 +1458,24 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
+  friendRequests: [],
+  reloadFriendRequests: async () => {
+    const friendRequests = await api.listFriendRequests().catch(() => null)
+    if (friendRequests) set({ friendRequests })
+  },
+  acceptFriendRequest: async (endpointId) => {
+    try {
+      const f = await api.acceptFriendRequest(endpointId)
+      get().toast('success', `${f.name} is now your friend.`)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+    await Promise.all([get().reloadFriends(), get().reloadFriendRequests()])
+  },
+  declineFriendRequest: async (endpointId, block) => {
+    try { await api.declineFriendRequest(endpointId, block) } catch (e) { get().toast('error', String(e)) }
+    await get().reloadFriendRequests()
+  },
   reloadFriends: async () => {
     await get().refreshMyDevice().catch(() => {})
     const friends = await api.listFriends()
@@ -1657,17 +1689,19 @@ export const useStore = create<AppStore>((set, get) => ({
     // An incoming message means that friend is reachable right now.
     if (!m.fromMe) {
       const f = get().friends.find((fr) => fr.id === m.peerId)
-      if (f) get().markFriendSeen(f.name)
+      if (f) get().markFriendSeen(f.id)
     }
     set((s) => {
       const thread = s.chats[m.peerId] ?? []
-      const idx = thread.findIndex((x) => x.id === m.id)
+      // Matched by id AND direction (an incoming id is chosen by the peer and
+      // must never replace — or be swallowed by — one of our own messages).
+      const idx = thread.findIndex((x) => x.id === m.id && x.fromMe === m.fromMe)
       // A repeat id is an UPDATE (a status change, edit, delete, reaction), not a
       // new message — replace it in place and don't re-bump unread/count.
       const isNew = idx < 0
       const nextThread = isNew
         ? [...thread, m].sort(byOrder)
-        : thread.map((x) => (x.id === m.id ? m : x))
+        : thread.map((x) => (x.id === m.id && x.fromMe === m.fromMe ? m : x))
       const prev = s.chatOverview.find((o) => o.peerId === m.peerId)
       const last = nextThread[nextThread.length - 1]
       const row: ChatOverview = {
@@ -1785,7 +1819,7 @@ export const useStore = create<AppStore>((set, get) => ({
     if (pending) return pending
     const probe = api.probeConnection(id).then((detail) => {
       const friend = get().friends.find((f) => f.id === id)
-      if (detail && friend) get().markFriendSeen(friend.name)
+      if (detail && friend) get().markFriendSeen(friend.id)
       return detail
     }).finally(() => presenceProbes.delete(id))
     presenceProbes.set(id, probe)
@@ -1797,7 +1831,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const online = await api.pingFriend(id)
       if (online) {
         const f = get().friends.find((x) => x.id === id)
-        if (f) get().markFriendSeen(f.name)
+        if (f) get().markFriendSeen(f.id)
       }
       return online
     } catch {

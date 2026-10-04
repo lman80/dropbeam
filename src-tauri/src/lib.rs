@@ -386,6 +386,8 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .setup(|app| {
+            // #67: install the chat-notification click handler before launch finishes.
+            chat_notify::init(app.handle());
             // Always-on logging to a FILE so we can diagnose issues on machines we
             // can't access (e.g. a tester's Windows box — the log lands in
             // %APPDATA%\com.dropbeam.app\logs\DropBeam.log, or ~/Library/Logs/
@@ -948,6 +950,8 @@ pub fn run() {
             account::account_leave,
             link::link_device_cancel,
             link::link_device_send,
+            link::link_device_prepare,
+            link::link_confirm,
             link::my_device_info,
             commands::verify_folders,
             commands::verify_folder,
@@ -969,6 +973,9 @@ pub fn run() {
             commands::create_friend,
             commands::accept_friend,
             commands::list_friends,
+            commands::list_friend_requests,
+            commands::accept_friend_request,
+            commands::decline_friend_request,
             commands::rename_friend,
             commands::remove_friend,
             commands::block_friend,

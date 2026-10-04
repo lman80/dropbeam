@@ -200,7 +200,7 @@ export function ChatView() {
     return () => { void api.setActiveChat(null) }
   }, [activeChatId])
 
-  const online = (f: Friend) => friendOnlineState(f.name, friendSeen, folderStatuses) === true
+  const online = (f: Friend) => friendOnlineState(f, friendSeen, folderStatuses) === true
   const ownLabels = useOwnDeviceLabels()
 
   if (MOBILE_UI) return activeChatId ? <div className="mobile-page mobile-conversation"><Conversation key={activeChatId} friendId={activeChatId} /></div> : <div className="mobile-page mobile-chats"><MobileHeader title="Chats" /><div className="ios-list">{rows.map(({ friend, last }) => {
@@ -332,13 +332,13 @@ function Conversation({ friendId }: { friendId: string }) {
   // record-level subscription re-rendered this entire (up to 2000-row) thread on
   // every tick. A boolean/string only re-renders when presence actually changes.
   const onlineNow = useStore((s) =>
-    friend ? friendOnlineState(friend.name, s.friendSeen, s.folderStatuses) === true : false,
+    friend ? friendOnlineState(friend, s.friendSeen, s.folderStatuses) === true : false,
   )
   // An active check of this friend is in flight (thread just opened / refocused).
   const [checking, setChecking] = useState(() => !onlineNow)
   const presenceText = useStore((s) => {
     if (!friend) return ''
-    const p = friendPresence(friend.name, s.friendSeen, s.folderStatuses)
+    const p = friendPresence(friend, s.friendSeen, s.folderStatuses)
     return p.status === 'online' ? 'Online' : checking ? 'Connecting…' : presenceLabel(p)
   })
   const windowFocused = useStore((s) => s.windowFocused)
@@ -928,7 +928,7 @@ function Conversation({ friendId }: { friendId: string }) {
                 const current = row.kind === 'msg' && searchMatches[searchIdx] === row.m.id
                 return (
                   <div
-                    key={row.kind === 'msg' ? row.m.id : row.ev.id}
+                    key={row.kind === 'msg' ? `${row.m.fromMe ? 'o' : 'i'}:${row.m.id}` : row.ev.id}
                     id={row.kind === 'msg' ? `msg-${row.m.id}` : undefined}
                     className={current ? 'chat-search-hit current' : hit ? 'chat-search-hit' : undefined}
                   >
@@ -1304,8 +1304,10 @@ const FolderSyncRow = memo(function FolderSyncRow({
 /** The preview card under a message with a link (#47). Everything in it came
  *  with the message — nothing is fetched here. */
 function LinkCard({ p }: { p: LinkPreview }) {
-  let host = p.siteName || ''
-  if (!host) try { host = new URL(p.url).hostname.replace(/^www\./, '') } catch { /* keep blank */ }
+  // The host shown is ALWAYS the card's real address, never the page's own
+  // claim (siteName), so a card can't pass itself off as another site (S6).
+  let host = ''
+  try { host = new URL(p.url).hostname.replace(/^www\./, '') } catch { /* keep blank */ }
   const ratio = p.imageW && p.imageH ? Math.max(p.imageW / p.imageH, 1.2) : 1.91
   return (
     <a
@@ -1321,7 +1323,7 @@ function LinkCard({ p }: { p: LinkPreview }) {
     >
       {p.image && <img className="chat-linkcard-img" src={p.image} alt="" draggable={false} style={{ aspectRatio: String(ratio) }} />}
       <span className="chat-linkcard-text">
-        <span className="chat-linkcard-title">{p.title || host}</span>
+        <span className="chat-linkcard-title">{p.title || p.siteName || host}</span>
         {host && <span className="chat-linkcard-site truncate-1">{host}</span>}
       </span>
     </a>
@@ -1586,7 +1588,7 @@ const MessageRow = memo(function MessageRow({
     if (meta && !(m.kind === 'file' && (inFlight || m.fileXferFailed))) {
       const s = m.status
       const note = s === 'failed' ? serverNoteText(m.serverNote, friend.name.split(' ')[0], m.heldOn) : null
-      if (s === 'held') parts.push(`Delivered to ${m.heldOn ?? 'your Transfer Server'} — reaches ${friend.name.split(' ')[0]} when they’re online`)
+      if (s === 'held') parts.push(`Held on ${m.heldOn ?? 'your Transfer Server'} — reaches ${friend.name.split(' ')[0]} when they’re online`)
       else if (note) parts.push(note)
       else if (meta === 'pending' || s === 'sending' || s === 'failed' || s == null) parts.push(waiting ? 'Waiting to send' : 'Sending…')
       else parts.push(s === 'read' ? 'Read' : 'Delivered')

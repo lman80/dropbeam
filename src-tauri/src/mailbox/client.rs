@@ -874,8 +874,20 @@ async fn server_rpc(ep: &iroh::Endpoint, config: &Path, server: &str, req: &Valu
 
 /// Hand our sealed push token to a server (it can only use it via the relay).
 pub async fn push_register(ep: &iroh::Endpoint, server: &str, sealed_token: &str) -> bool {
+    push_register_with(ep, server, sealed_token, None).await
+}
+
+/// `push_register`, also handing over this phone's signed notification key
+/// (`advert` = push_key, push_sig) so the server seals the sender id for the
+/// phone instead of sending it in the clear (P5).
+pub async fn push_register_with(ep: &iroh::Endpoint, server: &str, sealed_token: &str, advert: Option<(String, String)>) -> bool {
     let Some(conn) = connect(ep, server, Duration::from_secs(8)).await else { return false };
-    let reply = rpc(&conn, &json!({"kind": "mailbox.push-register", "v": super::VERSION, "sealed_token": sealed_token})).await;
+    let mut req = json!({"kind": "mailbox.push-register", "v": super::VERSION, "sealed_token": sealed_token});
+    if let Some((key, sig)) = advert {
+        req["push_key"] = json!(key);
+        req["push_sig"] = json!(sig);
+    }
+    let reply = rpc(&conn, &req).await;
     conn.close(0u32.into(), b"done");
     reply.is_ok_and(|r| r["ok"].as_bool() == Some(true))
 }
@@ -1734,7 +1746,7 @@ async fn receive_one(net: &IrohState, config: &Path, ep: &iroh::Endpoint, conn: 
             if meta["kind"].as_str() != Some("chat") {
                 return Ok(Some((false, "malformed".into())));
             }
-            let applied = crate::iroh_net::apply_incoming_chat(net, config, &env.from, &meta, Some(server_name), Some(env.created_ms));
+            let applied = crate::iroh_net::apply_incoming_chat(net, config, &env.from, &meta, Some(server_name), Some(env.created_ms))?;
             if !applied && env.kind == "op" && now().saturating_sub(env.created_ms) < 3 * super::server::DAY_MS {
                 // Its message hasn't reached this device yet (another server, or
                 // still on its way): leave the edit/reaction there and try later.

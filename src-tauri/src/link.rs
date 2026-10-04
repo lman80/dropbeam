@@ -42,13 +42,28 @@ fn explain(reason: &str) -> String {
     match reason {
         "no pending link" | "link expired" | "invalid link token" => EXPIRED.into(),
         "already linked to another account" => BOTH_ACCOUNTS.into(),
+        NOT_CONFIRMED => "The safety code wasn't confirmed on your other device. Try again and tap “Codes match” on both devices.".into(),
         "" | "link rejected" => "Your other device turned the link down. Show a new code on it and try again.".into(),
         r if r.starts_with("invalid") || r.starts_with("unsupported") => "Your other device couldn't read that link. Update DropBeam on both devices and try again.".into(),
         r => r.to_owned(),
     }
 }
 
-pub struct PendingLink { token: [u8; 16], created_at: Instant }
+pub struct PendingLink {
+    token: [u8; 16],
+    created_at: Instant,
+    /// The device that presented this code's token and was shown the safety
+    /// code here (S1), and whether this device's user confirmed it matches.
+    asked: Option<String>,
+    confirmed: Option<String>,
+}
+impl PendingLink {
+    fn new(token: [u8; 16]) -> PendingLink { PendingLink { token, created_at: Instant::now(), asked: None, confirmed: None } }
+    #[cfg(test)]
+    fn confirmed_for(token: [u8; 16], who: &str) -> PendingLink {
+        PendingLink { asked: Some(who.to_owned()), confirmed: Some(who.to_owned()), ..PendingLink::new(token) }
+    }
+}
 /// A code is on screen (either kind): an offer may arrive, so allow a big frame.
 pub(crate) fn pending_active(st: &AppState) -> bool {
     let active = |p: &mut Option<PendingLink>| {
@@ -67,23 +82,192 @@ fn consume(pending: &mut Option<PendingLink>, token: &str) -> Result<(), String>
     *pending = None;
     Ok(())
 }
-/// Accept the token of whichever code this device has on screen (the scanning
-/// device may have chosen either direction). One use, then both are cleared.
-fn consume_any(st: &AppState, token: &str) -> Result<(), String> {
+/// Accept the token of the code on screen of the kind this request needs
+/// (S12): a "link me" code only takes an incoming account (`link-offer`), a
+/// "join me" code only hands this device's account out (`link-join`) — so a
+/// code shown to bring a device IN can never move this device out, or vice
+/// versa. One use, then both are cleared.
+fn consume_slot(st: &AppState, token: &str, host: bool) -> Result<(), String> {
     let mut link = st.pending_link.lock().unwrap();
-    with_host(&st.config_dir, |host| {
-    let a = consume(&mut link, token);
-    if a.is_ok() { *host = None; return Ok(()); }
-    let b = consume(host, token);
-    if b.is_ok() { *link = None; return Ok(()); }
-    // The more telling reason: a code that was on screen beats "no code".
-    Err(if a.as_ref().err().map(String::as_str) == Some("no pending link") { b.unwrap_err() } else { a.unwrap_err() })
+    with_host(&st.config_dir, |host_slot| {
+        let (wanted, other) = if host { (host_slot, &mut *link) } else { (&mut *link, host_slot) };
+        let out = consume(wanted, token);
+        if out.is_ok() { *other = None; }
+        out
     })
 }
 /// A refusal about the token itself (a stale or foreign scan): the code on
 /// screen, if any, is still good, so the screen showing it shouldn't fail.
 fn token_error(e: &str) -> bool {
     matches!(e, "no pending link" | "link expired" | "invalid link token")
+}
+
+/// The short safety code both devices show before an account key moves (S1):
+/// derived from both endpoint ids and the code's one-time token, so it only
+/// matches when the two screens really are talking to each other.
+pub(crate) fn safety_code(a: &str, b: &str, token_hex: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let h = Sha256::digest(format!("dropbeam-link-safety/1|{lo}|{hi}|{}", token_hex.to_ascii_lowercase()).as_bytes());
+    let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
+/// Run `f` on the code on screen whose token is `token` (either kind), if any
+/// and not expired. `f` gets the slot and whether it's the "join me" one.
+fn with_slot<T>(st: &AppState, token: &str, f: impl FnOnce(&mut PendingLink, bool) -> T) -> Option<T> {
+    let bytes: [u8; 16] = hex::decode(token).ok().and_then(|v| v.try_into().ok())?;
+    #[allow(deprecated)]
+    let matches = |p: &PendingLink| p.created_at.elapsed() < TTL && ring::constant_time::verify_slices_are_equal(&p.token, &bytes).is_ok();
+    {
+        let mut link = st.pending_link.lock().unwrap();
+        if let Some(p) = link.as_mut().filter(|p| matches(p)) { return Some(f(p, false)); }
+    }
+    with_host(&st.config_dir, |slot| slot.as_mut().filter(|p| matches(p)).map(|p| f(p, true)))
+}
+
+#[cfg(not(test))]
+const CONFIRM_WAIT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const CONFIRM_WAIT: Duration = Duration::from_secs(3);
+const NOT_CONFIRMED: &str = "link not confirmed";
+
+/// Hold an incoming link until this device's user confirmed the safety code
+/// for exactly this device (S1). A device that skipped the safety-code step
+/// (an older build) gets the prompt shown now. Err when declined, expired or
+/// not confirmed in time.
+async fn wait_confirmed(st: &AppState, app: Option<&AppHandle>, me: &str, who: &str, token: &str, name: &str) -> Result<(), String> {
+    let deadline = Instant::now() + CONFIRM_WAIT;
+    loop {
+        let state = with_slot(st, token, |p, host| {
+            if p.confirmed.as_deref() == Some(who) { return (true, None); }
+            if p.asked.as_deref() != Some(who) {
+                p.asked = Some(who.to_owned());
+                p.confirmed = None;
+                return (false, Some(host));
+            }
+            (false, None)
+        });
+        match state {
+            None => return Err("no pending link".into()),
+            Some((true, _)) => return Ok(()),
+            Some((false, Some(host))) => ask_to_confirm(app, me, who, token, name, host),
+            Some((false, None)) => {}
+        }
+        if Instant::now() >= deadline { return Err(NOT_CONFIRMED.into()); }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Show "Link <name>? Safety code 123 456" on this device.
+fn ask_to_confirm(app: Option<&AppHandle>, me: &str, who: &str, token: &str, name: &str, host: bool) {
+    if let Some(app) = app {
+        let _ = app.emit("link://confirm", json!({"endpointId": who, "name": friends::sanitize_display_name(name, "Your other device"),
+            "safety": safety_code(me, who, token), "joining": !host}));
+    }
+}
+
+/// The user's answer to the safety-code prompt for `endpoint_id`.
+#[tauri::command]
+pub fn link_confirm(app: AppHandle, state: State<'_, Arc<AppState>>, endpoint_id: String, accept: bool) {
+    confirm_slots(&state, &endpoint_id, accept);
+    if !accept { let _ = app.emit("link://failed", CANCELLED); }
+}
+fn confirm_slots(st: &AppState, who: &str, accept: bool) {
+    let apply = |slot: &mut Option<PendingLink>| {
+        if slot.as_ref().is_some_and(|p| p.asked.as_deref() == Some(who)) {
+            if accept { if let Some(p) = slot.as_mut() { p.confirmed = Some(who.to_owned()); } } else { *slot = None; }
+        }
+    };
+    apply(&mut st.pending_link.lock().unwrap());
+    with_host(&st.config_dir, apply);
+}
+
+/// A scanner presenting a code's token, before anything moves (S1): show the
+/// safety code here and tell the scanner it's on screen.
+pub(crate) async fn serve_safety(net: &IrohState, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream) -> anyhow::Result<()> {
+    let app = net.app.get().ok_or_else(|| anyhow::anyhow!("app unavailable"))?.clone();
+    let st = app.state::<Arc<AppState>>();
+    let token = req["token"].as_str().unwrap_or("").to_owned();
+    let name = req["device"]["name"].as_str().unwrap_or("").to_owned();
+    let me = device(&st, net).map(|d| (d.endpoint_id, d.name));
+    let reply = match (me, with_slot(&st, &token, |p, host| {
+        p.asked = Some(who.to_owned());
+        p.confirmed = None;
+        host
+    })) {
+        (Ok((me, my_name)), Some(host)) => {
+            ask_to_confirm(Some(&app), &me, who, &token, &name, host);
+            json!({"kind": "link-safety-ok", "safety": safety_code(&me, who, &token), "name": my_name})
+        }
+        (Err(e), _) => json!({"kind": "link-error", "reason": e}),
+        (_, None) => json!({"kind": "link-error", "reason": "no pending link"}),
+    };
+    iroh_net::write_frame(send, &reply).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// What the scanner shows before linking: who, which way, and the safety code.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPreviewInfo {
+    name: String,
+    safety: String,
+    /// "give": this device's account goes to the other one; "take": this
+    /// device joins the other one's account.
+    direction: &'static str,
+    /// False when the other device is on an older build that can't show it.
+    peer_shows_code: bool,
+}
+
+/// Codes the user confirmed the safety code for on this device: (config dir
+/// → token, other device, when). `link_device_send` refuses anything else.
+static PREPARED: Mutex<Option<HashMap<std::path::PathBuf, (String, String, Instant)>>> = Mutex::new(None);
+fn note_prepared(dir: &Path, token: &str, eid: &str) {
+    PREPARED.lock().unwrap().get_or_insert_with(HashMap::new).insert(dir.to_path_buf(), (token.to_owned(), eid.to_owned(), Instant::now()));
+}
+fn take_prepared(dir: &Path, token: &str, eid: &str) -> bool {
+    let mut g = PREPARED.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    let ok = map.get(dir).is_some_and(|(t, e, at)| t == token && e == eid && at.elapsed() < TTL);
+    if ok { map.remove(dir); }
+    ok
+}
+const CONFIRM_FIRST: &str = "Check the safety code on both devices first, then try again.";
+const CANCELLED: &str = "Linking was cancelled on this device.";
+const JOIN_WOULD_LEAVE: &str = "This device already shares an account with your other devices, so it can't join another one. Scan this device's code from the other device instead (Settings → Devices).";
+
+/// Step 1 of linking with a scanned code: reach the other device, have it show
+/// the safety code, and return what this device should show (S1). Nothing
+/// about either account moves until the user confirms (`link_device_send`).
+#[tauri::command]
+pub async fn link_device_prepare(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>, code: String) -> Result<LinkPreviewInfo, String> {
+    let st = state.inner();
+    let me = device(st, &iroh)?;
+    let (code, way) = plan_link(&st.config_dir, &me.endpoint_id, &code).inspect_err(|e| {
+        if e == ALREADY { crate::account::account_sync_now(); }
+    })?;
+    let ep = iroh.get().ok_or(NOT_READY)?.clone();
+    let dialed = tokio::time::timeout(Duration::from_secs(20), async {
+        let conn = ep.connect(iroh_net::dial_addr(code.eid.parse()?), iroh_net::ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        iroh_net::write_frame(&mut send, &json!({"kind": "link-safety", "v": 1, "token": code.token, "device": me})).await?;
+        send.finish()?;
+        let reply = iroh_net::read_frame(&mut recv).await?;
+        anyhow::Ok((conn, reply))
+    }).await;
+    let reply = match dialed { Ok(Ok((_conn, reply))) => reply, _ => return Err(UNREACHABLE.into()) };
+    let peer_shows_code = match reply["kind"].as_str() {
+        Some("link-safety-ok") => true,
+        // An older build acks kinds it doesn't know: it can't show the code.
+        Some("ok") => false,
+        _ => return Err(explain(reply["reason"].as_str().unwrap_or(""))),
+    };
+    note_prepared(&st.config_dir, &code.token, &code.eid);
+    Ok(LinkPreviewInfo { name: friends::sanitize_display_name(&code.name, "Your other device"),
+        safety: safety_code(&me.endpoint_id, &code.eid, &code.token),
+        direction: if way == Direction::Give { "give" } else { "take" }, peer_shows_code })
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -232,7 +416,7 @@ fn new_code(st: &AppState, net: &IrohState) -> Result<(LinkCode, [u8; 16]), Stri
 #[tauri::command]
 pub fn link_device_begin(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>) -> Result<String, String> {
     let (code, token) = new_code(&state, &iroh)?;
-    *state.pending_link.lock().unwrap() = Some(PendingLink { token, created_at: Instant::now() });
+    *state.pending_link.lock().unwrap() = Some(PendingLink::new(token));
     Ok(encode(&code))
 }
 #[tauri::command]
@@ -288,17 +472,16 @@ fn progress(app: Option<&AppHandle>, stage: &str, counts: (usize, usize)) {
 #[derive(Debug, PartialEq)]
 enum Direction { Give, Take }
 fn direction(kind: CodeKind, code: &LinkCode, mine: &Option<String>, my_devices: u32) -> Result<Direction, &'static str> {
-    let by_code = if kind == CodeKind::Link { Direction::Give } else { Direction::Take };
-    // An older build's code doesn't say, and only accepts its own direction.
-    let Some(theirs) = code.devices else { return Ok(by_code) };
-    let theirs_shared = theirs > 0;
+    // The code decides (S12): a "link me" code receives this device's account,
+    // a "join me" code hands over its own — each shower only accepts its own
+    // direction, so a code can never be turned around.
+    let way = if kind == CodeKind::Link { Direction::Give } else { Direction::Take };
+    let theirs_shared = code.devices.is_some_and(|d| d > 0);
     let same = code.acct.is_some() && code.acct == *mine;
     if my_devices > 0 && theirs_shared && !same { return Err(BOTH_ACCOUNTS); }
-    // The account that already spans devices is the one both end up in; with
-    // none (or the same one), the code decides.
-    Ok(if my_devices > 0 && !theirs_shared { Direction::Give }
-        else if theirs_shared && my_devices == 0 { Direction::Take }
-        else { by_code })
+    // Joining another account would take this device out of the one it shares.
+    if way == Direction::Take && my_devices > 0 && !same { return Err(JOIN_WOULD_LEAVE); }
+    Ok(way)
 }
 
 /// Link with a scanned device code of either kind. The Tauri commands for both
@@ -308,6 +491,8 @@ async fn link_with_code(app: &AppHandle, st: &Arc<AppState>, iroh: &Arc<IrohStat
     let (code, way) = plan_link(&st.config_dir, &me.endpoint_id, code).inspect_err(|e| {
         if e == ALREADY { crate::account::account_sync_now(); }
     })?;
+    // S1: only after this device's user saw and confirmed the safety code.
+    if !take_prepared(&st.config_dir, &code.token, &code.eid) { return Err(CONFIRM_FIRST.into()); }
     match way {
         Direction::Give => give(app, st, iroh, &code).await,
         Direction::Take => take(app, st, iroh, me, &code).await,
@@ -397,7 +582,7 @@ fn with_host<T>(dir: &Path, f: impl FnOnce(&mut Option<PendingLink>) -> T) -> T 
 #[tauri::command]
 pub fn link_host_begin(state: State<'_, Arc<AppState>>, iroh: State<'_, Arc<IrohState>>) -> Result<String, String> {
     let (code, token) = new_code(&state, &iroh)?;
-    with_host(&state.config_dir, |p| *p = Some(PendingLink { token, created_at: Instant::now() }));
+    with_host(&state.config_dir, |p| *p = Some(PendingLink::new(token)));
     Ok(encode_join(&code))
 }
 #[tauri::command]
@@ -483,8 +668,18 @@ pub(crate) async fn serve_join(net: &IrohState, who: &str, req: &Value, send: &m
 async fn host_join_over(st: &AppState, app: Option<&AppHandle>, net: &IrohState, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Result<(iroh::SecretKey, LinkResult), String>> {
     let token = req["token"].as_str().unwrap_or("").to_owned();
+    // Nothing leaves this device until its user confirmed the safety code for
+    // exactly this device (S1).
+    let me = net.get().map(|e| e.id().to_string()).unwrap_or_default();
+    let name = req["device"]["name"].as_str().unwrap_or("").to_owned();
+    let confirmed = if with_slot(st, &token, |_, host| host) == Some(true) {
+        wait_confirmed(st, app, &me, who, &token, &name).await
+    } else {
+        Err("no pending link".to_owned())
+    };
     let prepared = (|| -> Result<(iroh::SecretKey, Value), String> {
-        consume_any(st, &token)?;
+        confirmed?;
+        consume_slot(st, &token, true)?;
         if req["v"] != 1 { return Err("unsupported link version".into()); }
         let newcomer: LinkResult = serde_json::from_value(req["device"].clone()).map_err(|_| "invalid device")?;
         if newcomer.endpoint_id != who { return Err("invalid device identity".into()); }
@@ -519,7 +714,7 @@ async fn host_join_over(st: &AppState, app: Option<&AppHandle>, net: &IrohState,
 }
 
 fn receive(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<Value, String> {
-    consume_any(st, req["token"].as_str().unwrap_or(""))?;
+    consume_slot(st, req["token"].as_str().unwrap_or(""), false)?;
     adopt_offer(st, me, who, req)
 }
 /// Apply an authenticated link offer (the caller has already checked it is the
@@ -547,7 +742,7 @@ fn adopt_offer(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<
             let bytes = STANDARD.decode(s).map_err(|_| "invalid avatar")?;
             if bytes.len() > MAX_AVATAR { return Err("avatar too large"); }
             Ok(bytes)
-        }).transpose()?;
+        }).transpose()?.filter(|b| friends::is_safe_avatar(b));
         validated.push((f, avatar));
     }
     let chats: HashMap<String, Vec<ChatMessage>> = serde_json::from_value(req["chats"].clone()).map_err(|_| "invalid chats")?;
@@ -600,8 +795,17 @@ pub(crate) async fn serve(net: &IrohState, who: &str, req: &Value, send: &mut ir
     let app = net.app.get().ok_or_else(|| anyhow::anyhow!("app unavailable"))?;
     let st = app.state::<Arc<AppState>>();
     let counts = offer_counts(req);
-    if pending_active(&st) { progress(Some(app), "importing", counts); }
-    let result = device(&st, net).and_then(|me| receive(&st, me, who, req));
+    let token = req["token"].as_str().unwrap_or("").to_owned();
+    let sender = req["sender"]["name"].as_str().unwrap_or("").to_owned();
+    // A "link me" code only (S12), and only once this device's user confirmed
+    // the safety code for this sender (S1).
+    let confirmed = match (device(&st, net), with_slot(&st, &token, |_, host| host)) {
+        (Ok(me), Some(false)) => wait_confirmed(&st, Some(app), &me.endpoint_id, who, &token, &sender).await,
+        (Err(e), _) => Err(e),
+        _ => Err("no pending link".to_owned()),
+    };
+    if confirmed.is_ok() && pending_active(&st) { progress(Some(app), "importing", counts); }
+    let result = confirmed.and_then(|()| device(&st, net)).and_then(|me| receive(&st, me, who, req));
     let reply = result.as_ref().cloned().unwrap_or_else(|e| json!({"kind":"link-error", "reason":e}));
     let written = iroh_net::write_frame(send, &reply).await;
     match &result {
@@ -643,11 +847,11 @@ mod tests {
     }
     #[test]
     fn pending_token_is_single_use_and_expires() {
-        let mut p = Some(PendingLink { token: [4;16], created_at: Instant::now() });
+        let mut p = Some(PendingLink::new([4;16]));
         assert!(consume(&mut p, &hex::encode([5;16])).is_err()); assert!(p.is_some());
         assert!(consume(&mut p, &hex::encode([4;16])).is_ok());
         assert!(consume(&mut p, &hex::encode([4;16])).is_err());
-        p = Some(PendingLink { token: [4;16], created_at: Instant::now() - TTL });
+        p = Some(PendingLink { created_at: Instant::now() - TTL, ..PendingLink::new([4;16]) });
         assert!(consume(&mut p, &hex::encode([4;16])).is_err()); assert!(p.is_none());
     }
     #[test]
@@ -690,7 +894,7 @@ mod receive_tests {
         let config_dir = std::env::temp_dir().join(format!("db-link-receive-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&config_dir).unwrap();
         AppState { config_dir, settings: Mutex::new(Default::default()),
-            pending_link: Mutex::new(Some(PendingLink { token: [7;16], created_at: Instant::now() })),
+            pending_link: Mutex::new(Some(PendingLink::new([7;16]))),
             transfers: Mutex::new(HashMap::new()), offers: Mutex::new(HashMap::new()),
             force_quit: AtomicBool::new(false), main_focused: AtomicBool::new(false), active_chat: Mutex::new(None) }
     }
@@ -725,7 +929,7 @@ mod receive_tests {
         let req = offer(&key, &who);
         assert_eq!(receive(&st, me(), &who, &req).unwrap_err(), "already linked to another account");
         assert_eq!(read_key(&st.config_dir).unwrap().unwrap().to_bytes(), old.to_bytes());
-        *st.pending_link.lock().unwrap() = Some(PendingLink { token: [7;16], created_at: Instant::now() });
+        *st.pending_link.lock().unwrap() = Some(PendingLink::new([7;16]));
         assert_eq!(receive(&st, me(), "imposter", &req).unwrap_err(), "invalid sender identity");
         assert_eq!(friends::load(&st.config_dir).len(), 1);
         std::fs::remove_dir_all(st.config_dir).unwrap();
@@ -781,7 +985,7 @@ mod receive_tests {
         let run = |token: [u8; 16], shown: [u8; 16]| {
             let (h, n, host_net, host_ep, new_ep) = (h.clone(), n.clone(), host_net.clone(), host_ep.clone(), new_ep.clone());
             async move {
-                with_host(&h.config_dir, |p| *p = Some(PendingLink { token, created_at: Instant::now() }));
+                with_host(&h.config_dir, |p| *p = Some(PendingLink::confirmed_for(token, &new_ep.id().to_string())));
                 let addr = host_ep.addr();
                 let host_id = host_ep.id().to_string();
                 let server = tokio::spawn(async move {
@@ -903,15 +1107,16 @@ mod edge_tests {
         // Neither has devices: the code decides.
         assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Link, &other, None, Some(0))).unwrap().1, Direction::Give);
         assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Join, &other, None, Some(0))).unwrap().1, Direction::Take);
-        // They have devices, we don't: we join them even from their "link me" code.
-        assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Link, &other, theirs.clone(), Some(2))).unwrap().1, Direction::Take);
-        // We have devices, they don't: they join us even from their "join me" code.
+        // The code decides (S12): a "link me" code always takes our account…
+        assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Link, &other, theirs.clone(), Some(2))).unwrap().1, Direction::Give);
+        // …and a device that shares its account never joins another one.
         let mine = shared(&d, &mine_key);
-        assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Join, &other, None, Some(0))).unwrap().1, Direction::Give);
+        assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Join, &other, None, Some(0))).unwrap_err(), JOIN_WOULD_LEAVE);
+        assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Link, &other, None, Some(0))).unwrap().1, Direction::Give);
         // Both have devices in different accounts: refused before dialing.
         assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Join, &other, theirs.clone(), Some(1))).unwrap_err(), BOTH_ACCOUNTS);
-        // An older code (no device count) keeps its own direction.
-        assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Join, &other, None, None)).unwrap().1, Direction::Take);
+        // An older code (no device count): still never out of a shared account.
+        assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Join, &other, None, None)).unwrap_err(), JOIN_WOULD_LEAVE);
         // Already one of our devices: nothing to do.
         let ours = own_eid(&d);
         assert_eq!(plan_link(&d.dir, &me, &code(CodeKind::Join, &ours, Some(mine.clone()), Some(1))).unwrap_err(), ALREADY);
@@ -921,24 +1126,22 @@ mod edge_tests {
         crate::account::own_devices(&d.dir)[0].endpoint_id.clone().unwrap()
     }
 
-    /// A "join me" code works for a device that GIVES its account too (the
-    /// scanner had the devices), and a "link me" code for one that takes.
+    /// S12: a "join me" code never takes an incoming account (that would move
+    /// the device that meant to bring someone in OUT of its own account).
     #[tokio::test]
-    async fn either_code_accepts_either_direction_once() {
+    async fn a_join_code_never_accepts_an_incoming_account() {
         let (giver, shower) = (Dev::new("iPhone", "phone", None).await, Dev::new("Mac", "laptop", None).await);
         let key = iroh::SecretKey::generate();
         shared(&giver, &key);
-        let mong = eid();
-        friends::upsert_by_endpoint(&giver.dir, &mong, "Mong");
-        // The Mac shows a JOIN code; the iPhone (with devices) pushes its account instead.
-        with_host(&shower.dir, |p| *p = Some(PendingLink { token: [5; 16], created_at: Instant::now() }));
+        with_host(&shower.dir, |p| *p = Some(PendingLink::confirmed_for([5; 16], &giver.eid())));
         let c = LinkCode { v: 1, eid: shower.eid(), name: "Mac".into(), token: hex::encode([5u8; 16]), acct: None, devices: Some(0) };
         let o = offer(&giver.st, &net(&giver), &c, &key).unwrap();
+        assert_eq!(receive(&shower.st, me(&shower), &giver.eid(), &o).unwrap_err(), "no pending link");
+        assert!(account_pub(&shower.dir).is_none(), "nothing adopted");
+        // …while the same offer to a "link me" code is taken, once.
+        *shower.st.pending_link.lock().unwrap() = Some(PendingLink::new([5; 16]));
         receive(&shower.st, me(&shower), &giver.eid(), &o).unwrap();
         assert_eq!(account_pub(&shower.dir), account_pub(&giver.dir));
-        assert!(shower.friend(&mong).is_some());
-        assert!(shower.friend(&giver.eid()).unwrap().account_pub.is_some(), "the giver is its own device now");
-        // One use only, whichever slot it came from.
         assert_eq!(receive(&shower.st, me(&shower), &giver.eid(), &o).unwrap_err(), "no pending link");
     }
 
@@ -1016,7 +1219,7 @@ mod edge_tests {
         // The new device goes away after the offer: the host records nothing.
         let srv_st = host.st.clone();
         let host_net = net(&host);
-        with_host(&host.dir, |p| *p = Some(PendingLink { token: [7; 16], created_at: Instant::now() }));
+        with_host(&host.dir, |p| *p = Some(PendingLink::confirmed_for([7; 16], &newbie.eid())));
         let srv = host.ep.clone();
         let server = tokio::spawn(async move {
             let conn = srv.accept().await.unwrap().await.unwrap();
@@ -1045,7 +1248,7 @@ mod edge_tests {
     /// code, else a "link me" one) with `token`; the new device scans `shown`.
     async fn join(host: &Dev, newbie: &Dev, token: [u8; 16], shown: [u8; 16], host_slot: bool)
         -> (Result<LinkResult, String>, Result<String, String>) {
-        let pending = PendingLink { token, created_at: Instant::now() };
+        let pending = PendingLink::confirmed_for(token, &newbie.eid());
         if host_slot { with_host(&host.dir, |p| *p = Some(pending)); } else { *host.st.pending_link.lock().unwrap() = Some(pending); }
         let (srv, st, host_net) = (host.ep.clone(), host.st.clone(), net(host));
         let server = tokio::spawn(async move {
@@ -1065,17 +1268,64 @@ mod edge_tests {
         (joined, server.await.unwrap())
     }
 
-    /// A "link me" code on a device that already has the account: the scanner
-    /// joins it instead (its pending "link me" token answers a join request).
+    /// S12: a "link me" code never hands this device's account out to a
+    /// device that answers it with a join request.
     #[tokio::test]
-    async fn a_link_me_code_can_be_joined() {
+    async fn a_link_me_code_never_gives_the_account_away() {
         let (host, newbie) = (Dev::new("Mac", "laptop", None).await, Dev::new("iPhone", "phone", None).await);
         shared(&host, &iroh::SecretKey::generate());
         let (joined, hosted) = join(&host, &newbie, [2; 16], [2; 16], false).await;
-        joined.unwrap();
-        hosted.unwrap();
-        assert_eq!(account_pub(&newbie.dir), account_pub(&host.dir));
-        // The account's other device came over as an own device, not a contact.
-        assert_eq!(crate::account::own_devices(&newbie.dir).len(), 2);
+        assert!(joined.is_err() && hosted.is_err());
+        assert!(account_pub(&newbie.dir).is_none(), "nothing came over");
+    }
+
+    /// S1: nothing moves until the user on the device holding the account
+    /// confirmed the safety code for exactly this device.
+    #[tokio::test]
+    async fn an_unconfirmed_join_is_refused_and_a_declined_code_dies() {
+        let (host, newbie) = (Dev::new("Mac", "laptop", None).await, Dev::new("iPhone", "phone", None).await);
+        // Confirmed for a DIFFERENT device: the newcomer still waits, then is refused.
+        with_host(&host.dir, |p| *p = Some(PendingLink::confirmed_for([3; 16], &eid())));
+        let req = json!({"kind":"link-join", "v":1, "token":hex::encode([3u8; 16]), "device":me(&newbie)});
+        let out = wait_confirmed(&host.st, None, &host.eid(), &newbie.eid(), &hex::encode([3u8; 16]), "iPhone").await;
+        assert_eq!(out.unwrap_err(), NOT_CONFIRMED);
+        let _ = req;
+        // Declining clears the code entirely.
+        confirm_slots(&host.st, &newbie.eid(), false);
+        assert!(with_slot(&host.st, &hex::encode([3u8; 16]), |_, _| ()).is_none());
+        assert!(account_pub(&host.dir).is_none() && host.friend(&newbie.eid()).is_none());
+        // Confirming the asking device lets it through.
+        with_host(&host.dir, |p| *p = Some(PendingLink::new([4; 16])));
+        let token = hex::encode([4u8; 16]);
+        let (st, h, n, t) = (host.st.clone(), host.eid(), newbie.eid(), token.clone());
+        let waiting = tokio::spawn(async move { wait_confirmed(&st, None, &h, &n, &t, "iPhone").await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        confirm_slots(&host.st, &newbie.eid(), true);
+        waiting.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn safety_code_is_symmetric_six_digits_and_bound_to_both_ids_and_token() {
+        let (a, b, t) = (eid(), eid(), hex::encode([1u8; 16]));
+        let code = safety_code(&a, &b, &t);
+        assert_eq!(code, safety_code(&b, &a, &t), "both screens agree");
+        assert_eq!(code.len(), 7);
+        assert!(code.chars().enumerate().all(|(i, c)| if i == 3 { c == ' ' } else { c.is_ascii_digit() }));
+        assert_ne!(code, safety_code(&a, &eid(), &t), "another device shows another code");
+        assert_ne!(code, safety_code(&a, &b, &hex::encode([2u8; 16])), "another token too");
+    }
+
+    #[tokio::test]
+    async fn linking_without_a_confirmed_safety_code_is_refused() {
+        let d = Dev::new("Mac", "laptop", None).await;
+        let other = eid();
+        let c = code(CodeKind::Link, &other, None, Some(0));
+        let token = hex::encode([9u8; 16]);
+        assert!(!take_prepared(&d.dir, &token, &other));
+        note_prepared(&d.dir, &token, &other);
+        assert!(!take_prepared(&d.dir, &token, &eid()), "bound to the device");
+        assert!(take_prepared(&d.dir, &token, &other));
+        assert!(!take_prepared(&d.dir, &token, &other), "one use");
+        let _ = c;
     }
 }

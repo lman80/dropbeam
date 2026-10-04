@@ -44,7 +44,7 @@ export function DevicesPanel() {
   const labels = useMemo(() => ownDeviceLabels(devices.filter(d => !d.this_device)
     .map(d => ({ id: d.endpoint_id, name: d.name, deviceKind: d.device_kind, deviceOs: d.device_os }))), [devices])
   useEffect(() => { void useStore.getState().refreshMyDevice().catch(() => {}) }, [])
-  const online = (d: AccountDevice) => { const f = friends.find(x => x.id === d.friend_id); return f ? friendOnlineState(f.name, friendSeen, folderStatuses) === true : false }
+  const online = (d: AccountDevice) => { const f = friends.find(x => x.id === d.friend_id); return f ? friendOnlineState(f, friendSeen, folderStatuses) === true : false }
   const syncNow = async () => {
     setSyncing(true)
     try { await api.accountSyncNow(); await new Promise(r => setTimeout(r, 2500)); await useStore.getState().refreshMyDevice() } finally { setSyncing(false) }

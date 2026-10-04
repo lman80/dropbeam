@@ -73,6 +73,10 @@ final class Bridge: ObservableObject {
     @Published var presenceSeen: [String: Double] = [:]
     @Published var selectedTab = "send"
     @Published var errorMessage: String?
+    /// Opens Settings → Devices (the only place a device-link code is used).
+    @Published var showDevices = false
+    /// People asking to be friends (S2): not friends until accepted.
+    @Published var friendRequests: [FriendRequest] = []
     /// A `dropbeam:` link the app was opened with (invite link, Camera-scanned QR).
     @Published var incomingLink: IncomingLink?
     /// First-run setup is showing (persisted, so a relaunch mid-setup resumes it).
@@ -250,6 +254,7 @@ final class Bridge: ObservableObject {
         if name == "view", let tab = object["name"] as? String,
            ["send", "friends", "chat", "history", "settings"].contains(tab) { selectedTab = tab }
         if name == "error" { errorMessage = object["message"] as? String }
+        if name == "friend-requests://changed" { Task { await refreshFriendRequests() } }
         if name == "openURL", let url = object["url"] as? String {
             if ShareInbox.isShareURL(url) { ShareInbox.shared.ingestSoon() }
             else { incomingLink = IncomingLink(value: url) }
@@ -322,13 +327,14 @@ final class Bridge: ObservableObject {
         try await action("sendToFriend", args)
     }
     func receiveWithCode(code: String) async throws { try await action("receiveWithCode", ["code": code]) }
-    /// Any DropBeam code (Quick Send, friend, friend invite, folder invite, device link),
-    /// routed like desktop's "Have a code?". Folder invites open the folder picker here.
+    /// Any DropBeam code (Quick Send, friend, friend invite, folder invite), routed
+    /// like desktop's "Have a code?". Folder invites open the folder picker here.
+    /// Device-link codes are refused (S1): only Settings → Devices links a device.
     func openAnyCode(_ code: String) async throws {
+        if Bridge.isLinkCode(code) { throw failure(Bridge.deviceCodeElsewhere) }
         let result: OpenCodeResult = try await call("openAnyCode", ["code": code])
         switch result.kind {
         case "friend": showToast("Friend added")
-        case "linked": showToast("Linked with \(result.name ?? "your device") — syncing friends and chats")
         case "folderInvite":
             let accepted: Bool = try await call("acceptFolderInvite", ["code": result.code ?? code])
             if accepted { showToast("Joined shared folder") }
@@ -445,10 +451,14 @@ final class Bridge: ObservableObject {
     func shareFiles(paths: [String]) async throws { try await action("shareFiles", ["paths": paths]) }
     func linkDeviceBegin() async throws -> String { try await call("linkDeviceBegin") }
     func linkDeviceCancel() async throws { try await action("linkDeviceCancel") }
+    /// Step 1 with the other device's code: its name and the safety code to compare.
+    func linkDevicePrepare(code: String) async throws -> LinkPreviewInfo { try await call("linkDevicePrepare", ["code": code]) }
+    /// This device's answer to a `link://confirm` (the other device scanned ours).
+    func linkConfirm(endpointId: String, accept: Bool) async throws { try await action("linkConfirm", ["endpointId": endpointId, "bool": accept]) }
+    /// Step 2, only after the user confirmed the safety code (the engine refuses otherwise).
     func linkDeviceSend(code: String) async throws -> LinkResult { try await call("linkDeviceSend", ["code": code]) }
     func linkHostBegin() async throws -> String { try await call("linkHostBegin") }
     func linkHostCancel() async throws { try await action("linkHostCancel") }
-    func linkDeviceJoin(code: String) async throws -> LinkResult { try await call("linkDeviceJoin", ["code": code]) }
     func accountSyncNow() async throws { try await action("accountSyncNow") }
     func accountRemoveDevice(endpointId: String) async throws { try await action("accountRemoveDevice", ["endpointId": endpointId]) }
     func accountLeave() async throws { try await action("accountLeave") }
@@ -457,14 +467,31 @@ final class Bridge: ObservableObject {
         let c = code.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return c.hasPrefix("dropbeamjoin1:") || c.hasPrefix("dropbeamlink1:")
     }
-    /// Link with whichever device-link code was scanned: a code shown by a device
-    /// that has the account ("dropbeamjoin1:") makes THIS device join it; a code
-    /// shown by a new device ("dropbeamlink1:") adds that device to this account.
-    func linkWithScannedCode(_ code: String) async throws -> LinkResult {
-        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.lowercased().hasPrefix("dropbeamjoin1:") { return try await linkDeviceJoin(code: trimmed) }
-        if trimmed.lowercased().hasPrefix("dropbeamlink1:") { return try await linkDeviceSend(code: trimmed) }
-        throw NSError(domain: "DropBeam", code: 1, userInfo: [NSLocalizedDescriptionKey: "That isn't a DropBeam device code. On your other device open Settings → Devices."])
+    /// What every entry point but Settings → Devices says about a device-link code
+    /// (the same words nativeBridge's openAnyCode throws).
+    static let deviceCodeElsewhere = "This is a device-link code — open Settings → Devices to link your own device."
+    static func isDeviceCodeMessage(_ message: String?) -> Bool { message?.contains("device-link code") == true }
+    /// Settings → Devices, from anywhere (e.g. after a device code was used elsewhere).
+    func openDevicesSettings() {
+        selectedTab = "settings"
+        Task { try? await Task.sleep(for: .milliseconds(350)); showDevices = true }
+    }
+    // MARK: Friend requests (S2)
+    func refreshFriendRequests() async {
+        if previewKeys.contains("friendRequests") { return }
+        guard let list: LossyArray<FriendRequest> = try? await call("listFriendRequests") else { return }
+        friendRequests = list.values.sorted { ($0.at ?? 0) > ($1.at ?? 0) }
+    }
+    func acceptFriendRequest(endpointId: String) async throws {
+        try await action("acceptFriendRequest", ["endpointId": endpointId])
+        friendRequests.removeAll { $0.endpointId == endpointId }
+        await refreshFriendRequests()
+    }
+    /// Decline; `block` also blocks them on all your devices.
+    func declineFriendRequest(endpointId: String, block: Bool) async throws {
+        try await action("declineFriendRequest", ["endpointId": endpointId, "bool": block])
+        friendRequests.removeAll { $0.endpointId == endpointId }
+        await refreshFriendRequests()
     }
     func updateSettings(patch: [String: Any]) async throws { try await action("updateSettings", ["patch": patch]) }
     // MARK: Transfer Servers

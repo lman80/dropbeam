@@ -77,13 +77,13 @@ export function SendToChooser() {
   }
 
   if (MOBILE_UI) return open ? <Sheet title="Send to" onClose={close}>
-    {[{ title: 'My Devices', items: myDevices }, { title: 'Friends', items: others }].map(group => <Section key={group.title} title={group.title} footer={!group.items.length ? (group.title === 'My Devices' ? 'Your linked devices appear here.' : 'Add a friend to send by name.') : undefined}>{group.items.map(friend => <Row key={friend.id} avatar={<MobileAvatar friend={friend} />} title={friend.name} subtitle={presenceText(friendPresence(friend.name, friendSeen, folderStatuses))} onPress={() => toFriend(friend.id)} />)}</Section>)}
+    {[{ title: 'My Devices', items: myDevices }, { title: 'Friends', items: others }].map(group => <Section key={group.title} title={group.title} footer={!group.items.length ? (group.title === 'My Devices' ? 'Your linked devices appear here.' : 'Add a friend to send by name.') : undefined}>{group.items.map(friend => <Row key={friend.id} avatar={<MobileAvatar friend={friend} />} title={friend.name} subtitle={presenceText(friendPresence(friend, friendSeen, folderStatuses))} onPress={() => toFriend(friend.id)} />)}</Section>)}
     <Section title="Or"><Row icon={<IconSquare><QrCode /></IconSquare>} title="Quick Send (code)" accessory="chevron" onPress={withCode} /></Section>
   </Sheet> : null
 
   const people = [{ title: 'My devices', items: myDevices }, { title: 'Friends', items: others }].filter((g) => g.items.length)
   const targets = [...myDevices, ...others]
-  const isOffline = (f: (typeof targets)[number]) => friendPresence(f.name, friendSeen, folderStatuses).status !== 'online'
+  const isOffline = (f: (typeof targets)[number]) => friendPresence(f, friendSeen, folderStatuses).status !== 'online'
   // The "keeps trying" note only matters for someone offline with no server to hold it.
   const anyUnheldOffline = targets.some((f) => isOffline(f) && !holds[f.id])
 
@@ -126,7 +126,7 @@ export function SendToChooser() {
                 <Fragment key={group.title}>
                   <h3 className="chooser-section">{group.title}</h3>
                   {group.items.map((f) => {
-                    const presence = friendPresence(f.name, friendSeen, folderStatuses)
+                    const presence = friendPresence(f, friendSeen, folderStatuses)
                     const online = presence.status === 'online'
                     const name = ownLabels[f.id] ?? f.name
                     const own = !!ownLabels[f.id]

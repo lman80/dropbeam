@@ -90,6 +90,14 @@ pub fn update_settings(
     // copy must not point it back at a replaced file.
     settings.avatar = state.settings.lock().unwrap().avatar.clone();
     settings.display_name = settings.display_name.trim().chars().take(64).collect();
+    // A window still holding the name from before another own device renamed
+    // the user must not rename them back by saving unrelated settings (D17).
+    {
+        let current = state.settings.lock().unwrap().display_name.clone();
+        if crate::account::stale_display_name(&settings.display_name, &current) {
+            settings.display_name = current;
+        }
+    }
 
     // Persist FIRST. If the disk write fails (e.g. Windows write contention), return
     // the error WITHOUT mutating in-memory state or applying any live side effect —
@@ -1124,6 +1132,43 @@ pub fn list_friends(state: State<'_, Arc<AppState>>) -> Vec<Friend> {
     friends::load(&state.config_dir)
 }
 
+/// People who introduced themselves but aren't friends yet (S2).
+#[tauri::command]
+pub fn list_friend_requests(state: State<'_, Arc<AppState>>) -> Vec<friends::FriendRequest> {
+    friends::requests(&state.config_dir)
+}
+
+/// Accept a friend request: they become a friend (and hear back from us).
+#[tauri::command]
+pub fn accept_friend_request(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    endpoint_id: String,
+) -> Result<Friend, String> {
+    let friend = friends::accept_request(&state.config_dir, &endpoint_id)?;
+    sync.reconcile_friends();
+    let my_name = state.settings.lock().unwrap().display_name.clone();
+    crate::iroh_net::say_hello_to_endpoint(iroh.inner().clone(), endpoint_id, my_name);
+    let _ = app.emit("friends://changed", ());
+    let _ = app.emit("friend-requests://changed", ());
+    Ok(friend)
+}
+
+/// Decline a friend request (optionally blocking them so they can't ask again).
+#[tauri::command]
+pub fn decline_friend_request(app: AppHandle, state: State<'_, Arc<AppState>>, endpoint_id: String, block: bool) -> Result<(), String> {
+    let request = friends::remove_request(&state.config_dir, &endpoint_id);
+    if block {
+        let (name, account) = request.map(|r| (r.name, r.account_pub)).unwrap_or_default();
+        crate::block::block_endpoint(&state.config_dir, &endpoint_id, &name, account)?;
+        let _ = app.emit("blocked://changed", ());
+    }
+    let _ = app.emit("friend-requests://changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn rename_friend(
     state: State<'_, Arc<AppState>>,
@@ -1149,9 +1194,16 @@ pub fn remove_friend(
         if let Some(eid) = f.endpoint_id.as_deref().filter(|e| crate::account::is_own_device(&state.config_dir, e)) {
             return crate::account::account_remove_device(app, state, eid.to_owned());
         }
+        // One person, all their devices: removing "Mong" must not leave Mong's
+        // iPhone behind as a friend (it would keep chatting and sending).
+        for other in friends::person_records(&state.config_dir, &id) {
+            crate::account::record_friend_removed(&state.config_dir, &other);
+            friends::remove(&state.config_dir, &other.id)?;
+        }
         crate::account::record_friend_removed(&state.config_dir, &f);
     }
     friends::remove(&state.config_dir, &id)?;
+    let _ = app.emit("friends://changed", ());
     // Soft-detach: friends::remove preserves the transcript and endpoint index.
     sync.reconcile_friends();
     // A Transfer Server we share with our friends hears about it right away.
@@ -1366,6 +1418,7 @@ pub async fn send_chat_message(
         via: None,
         deliveries: vec![],
         link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1556,6 +1609,7 @@ pub(crate) fn post_file_note(
         via: None,
         deliveries: file_xfer_id_deliveries,
         link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1677,13 +1731,35 @@ pub async fn send_typing(
             });
             // A person with several devices: whichever of them answers.
             let eids = friends::person_endpoints(&state.config_dir, &friend_id);
+            // The ~3 s "still typing" heartbeat must not dial a friend who is
+            // offline over and over: only devices heard from recently get it,
+            // plus at most one quick probe per friend every 30 s.
+            let Some(eids) = typing_targets(&friend_id, eids) else { return Ok(()) };
             let iroh = iroh.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await;
+                let _ = crate::iroh_net::send_chat_any_within(&iroh, &ep, &eids, payload, Some(std::time::Duration::from_secs(3))).await;
             });
         }
     }
     Ok(())
+}
+
+/// Which of a friend's devices a typing signal may go to (None = skip it).
+fn typing_targets(friend_id: &str, eids: Vec<String>) -> Option<Vec<String>> {
+    use std::{collections::HashMap, time::{Duration, Instant}};
+    static PROBED: std::sync::Mutex<Option<HashMap<String, Instant>>> = std::sync::Mutex::new(None);
+    let live: Vec<String> = eids.iter().filter(|e| crate::mailbox::seen_within(e, Duration::from_secs(120))).cloned().collect();
+    if !live.is_empty() {
+        return Some(live);
+    }
+    let mut g = PROBED.lock().unwrap_or_else(|p| p.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    if map.get(friend_id).is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+        return None;
+    }
+    map.insert(friend_id.to_owned(), Instant::now());
+    map.retain(|_, t| t.elapsed() < Duration::from_secs(600));
+    (!eids.is_empty()).then_some(eids)
 }
 
 /// Send a read receipt: tell a friend we've seen everything up to `up_to` (ms).
@@ -1794,6 +1870,7 @@ pub async fn send_chat_gif(
         via: None,
         deliveries: vec![],
         link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1854,7 +1931,9 @@ pub fn add_friend_by_code(
     app: AppHandle,
     code: String,
 ) -> Result<Friend, String> {
-    let friend = friends::add_by_code(&state.config_dir, &code)?;
+    let me = iroh.get().map(|e| e.id().to_string());
+    let friend = friends::add_by_code_for(&state.config_dir, &code, me.as_deref())?;
+    let _ = app.emit("friend-requests://changed", ());
     // Reverse direction: tell them who we are so they add us too.
     if let Some(eid) = friend.endpoint_id.clone() {
         let my_name = state.settings.lock().unwrap().display_name.clone();

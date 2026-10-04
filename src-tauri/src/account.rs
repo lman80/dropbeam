@@ -97,6 +97,43 @@ struct Book {
     /// The person's name + picture as last agreed with the other own devices.
     #[serde(default)]
     profile: Profile,
+    /// S4: each device's link time, signed by a DIFFERENT device's endpoint key.
+    /// Once `proofs_v` is 1, a device counts as one of the account's devices
+    /// only with such a proof, and link times arrive from other devices only
+    /// as proofs signed by a device still in the account — holding the
+    /// account key alone (a removed or stolen device, or a fresh endpoint made
+    /// with that key) no longer gets anyone in.
+    #[serde(default)]
+    link_proofs: HashMap<String, Stamp>,
+    /// 0 = a book from before link proofs (legacy rules until upgraded).
+    #[serde(default)]
+    proofs_v: u8,
+}
+
+/// A device's link time, signed by another device of the account (S4).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub(crate) struct Stamp {
+    at: u64,
+    /// The signing device's endpoint id.
+    by: String,
+    sig: String,
+}
+
+fn stamp_message(account: &str, eid: &str, at: u64) -> String {
+    format!("dropbeam-account-link/1|{account}|{eid}|{at}")
+}
+
+fn sign_stamp(signer: &iroh::SecretKey, account: &str, eid: &str, at: u64) -> Stamp {
+    Stamp { at, by: signer.public().to_string(), sig: hex::encode(signer.sign(stamp_message(account, eid, at).as_bytes()).to_bytes()) }
+}
+
+/// A well-formed proof for `eid`, signed by some OTHER device (membership of
+/// the signer is the caller's check).
+fn stamp_valid(account: &str, eid: &str, s: &Stamp) -> bool {
+    if s.by == eid { return false; }
+    let Ok(key) = s.by.parse::<iroh::PublicKey>() else { return false };
+    let Some(sig) = hex::decode(&s.sig).ok().and_then(|v| <[u8; 64]>::try_from(v).ok()) else { return false };
+    key.verify(stamp_message(account, eid, s.at).as_bytes(), &iroh::Signature::from_bytes(&sig)).is_ok()
 }
 
 /// The account-wide profile: ONE name and picture for the person, the same on
@@ -167,6 +204,70 @@ impl Book {
     fn is_removed(&self, eid: &str) -> bool {
         self.removed_devices.get(eid).is_some_and(|r| *r >= self.linked.get(eid).copied().unwrap_or(0))
     }
+    /// One of the account's devices right now (S4): not removed and, once
+    /// proofs are in use, vouched for by another device.
+    fn is_member(&self, eid: &str) -> bool {
+        !self.is_removed(eid) && (self.proofs_v == 0 || self.link_proofs.contains_key(eid))
+    }
+    /// Merge link proofs from another device: only ones signed by a device that
+    /// is (by this book) still in the account, or by `me`. Repeats until no
+    /// more apply, since one proof can vouch for the signer of another.
+    fn merge_proofs(&mut self, account: &str, me: &str, proofs: &HashMap<String, Stamp>) -> bool {
+        let mut changed = false;
+        loop {
+            let mut progress = false;
+            for (eid, s) in proofs {
+                // (A proof for `me` is kept too: this device forwards it, so a
+                // device that hasn't heard of a relink yet can learn it.)
+                if self.link_proofs.get(eid).is_some_and(|cur| cur.at >= s.at) {
+                    continue;
+                }
+                let signer_ok = s.by == me || self.is_member(&s.by);
+                if !signer_ok || !stamp_valid(account, eid, s) {
+                    continue;
+                }
+                let at = clamp(s.at);
+                let x = self.linked.entry(eid.clone()).or_default();
+                *x = (*x).max(at);
+                self.link_proofs.insert(eid.clone(), Stamp { at, ..s.clone() });
+                progress = true;
+                changed = true;
+            }
+            if !progress { return changed; }
+        }
+    }
+}
+
+/// Bring this device's book onto link proofs (S4), signing as `signer`: every
+/// device THIS device knows locally to be in the account (its own link records
+/// and own-device records — never anything merely heard from the wire) gets a
+/// proof from it. Runs before every exchange; cheap when nothing is new.
+fn ensure_proofs(dir: &Path, account: &str, signer: &iroh::SecretKey) {
+    let me = signer.public().to_string();
+    // Read the friend list before BOOK_LOCK (friends::load can take it).
+    let own: Vec<String> = friends::load_raw(dir).into_iter()
+        .filter(|f| f.account_pub.as_deref() == Some(account)).filter_map(|f| f.endpoint_id).collect();
+    let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut b = read_book(dir, account);
+    let mut changed = false;
+    if b.proofs_v == 0 {
+        // Upgrading: the devices this one already trusted keep their place.
+        for eid in own {
+            if eid != me && !b.is_removed(&eid) && !b.linked.contains_key(&eid) {
+                b.linked.insert(eid, 1);
+            }
+        }
+        b.proofs_v = 1;
+        changed = true;
+    }
+    let due: Vec<(String, u64)> = b.linked.iter()
+        .filter(|(e, at)| **e != me && !b.is_removed(e) && b.link_proofs.get(*e).is_none_or(|p| p.at < **at))
+        .map(|(e, at)| (e.clone(), *at)).collect();
+    for (eid, at) in due {
+        b.link_proofs.insert(eid.clone(), sign_stamp(signer, account, &eid, at));
+        changed = true;
+    }
+    if changed { write_book(dir, &b); }
 }
 
 pub(crate) fn my_pub(dir: &Path) -> Option<String> {
@@ -247,6 +348,20 @@ struct ProfileApplied {
     want_avatar: bool,
 }
 
+/// The display name another own device replaced here (old → new), so a window
+/// still holding the old settings can't undo the synced rename by saving
+/// them (D17).
+static REPLACED_NAME: Mutex<Option<(String, String)>> = Mutex::new(None);
+fn note_replaced_name(old: &str, new: &str) {
+    *REPLACED_NAME.lock().unwrap_or_else(|p| p.into_inner()) = Some((old.trim().to_owned(), new.trim().to_owned()));
+}
+/// True when a settings save carrying `incoming` as the name is just a stale
+/// copy from before the synced rename to `current` (keep `current`).
+pub(crate) fn stale_display_name(incoming: &str, current: &str) -> bool {
+    let g = REPLACED_NAME.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref().is_some_and(|(old, new)| old == incoming.trim() && new == current.trim() && old != new)
+}
+
 fn save_settings(st: &AppState, s: &crate::models::Settings) {
     if let Err(e) = crate::settings::save(&st.config_dir, s) {
         log::warn!("account: cannot save the synced profile: {e}");
@@ -270,6 +385,7 @@ fn adopt_profile(st: &AppState, account: &str, theirs: &ProfileRec) -> ProfileAp
         let wins = theirs.name_at > p.name_at && (theirs.name_at > 1 || p.name_at == 0);
         if !name.is_empty() && theirs.name_at > 0 && wins {
             if name != p.name {
+                note_replaced_name(&s.display_name, &name);
                 s.display_name = name.clone();
                 save_settings(st, &s);
                 out.changed = true;
@@ -314,7 +430,7 @@ fn profile_avatar_payload(st: &AppState, account: &str) -> Option<Value> {
 fn adopt_profile_avatar(st: &AppState, account: &str, v: &Value) -> bool {
     let Some(at) = v["at"].as_u64().map(clamp) else { return false };
     let Some(bytes) = v["b64"].as_str().filter(|s| s.len() <= AVATAR_CAP * 4 / 3 + 4)
-        .and_then(|s| STANDARD.decode(s).ok()).filter(|b| !b.is_empty() && b.len() <= AVATAR_CAP) else { return false };
+        .and_then(|s| STANDARD.decode(s).ok()).filter(|b| b.len() <= AVATAR_CAP && friends::is_safe_avatar(b)) else { return false };
     let dir = st.config_dir.clone();
     with_book(&dir, account, |b| {
         let mut s = st.settings.lock().unwrap();
@@ -359,7 +475,8 @@ pub(crate) fn is_removed_device(dir: &Path, account_pub: &str, eid: &str) -> boo
         return false;
     }
     let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    read_book(dir, account_pub).is_removed(eid)
+    // Also "not vouched for" (S4): proving the account key isn't enough.
+    !read_book(dir, account_pub).is_member(eid)
 }
 
 /// A device joined the account now (either end of a link): record it and clear
@@ -391,7 +508,7 @@ pub(crate) fn own_devices(dir: &Path) -> Vec<Friend> {
     let book = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(dir, &account) };
     friends::load(dir).into_iter()
         .filter(|f| f.account_pub.as_deref() == Some(account.as_str()))
-        .filter(|f| f.endpoint_id.as_deref().is_some_and(|e| !book.is_removed(e)))
+        .filter(|f| f.endpoint_id.as_deref().is_some_and(|e| book.is_member(e)))
         .collect()
 }
 
@@ -489,8 +606,19 @@ pub(crate) fn apply_left_notice(dir: &Path, who: &str, notice: &Value) -> bool {
 
 /// Merge another device's link/removal times into ours (clamped, by max).
 fn merge_roster_times(dir: &Path, account: &str, roster: &Roster, removed_friends: &HashMap<String, u64>) -> Book {
+    merge_roster_times_as(dir, account, "", roster, removed_friends)
+}
+
+/// Merge what a VERIFIED, still-linked device told us (callers check that
+/// first). Link times only arrive as proofs signed by a device in the account
+/// (S4); an older book (no proofs yet) still takes them unsigned.
+fn merge_roster_times_as(dir: &Path, account: &str, me: &str, roster: &Roster, removed_friends: &HashMap<String, u64>) -> Book {
     with_book(dir, account, |b| {
-        for (e, t) in &roster.linked { let x = b.linked.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
+        if b.proofs_v == 0 {
+            for (e, t) in &roster.linked { let x = b.linked.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
+        } else {
+            b.merge_proofs(account, me, &roster.link_proofs);
+        }
         for (e, t) in &roster.removed { let x = b.removed_devices.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
         for (e, t) in removed_friends { let x = b.removed_friends.entry(e.clone()).or_default(); *x = (*x).max(clamp(*t)); }
         b.clone()
@@ -560,6 +688,9 @@ struct Roster {
     linked: HashMap<String, u64>,
     #[serde(default)]
     removed: HashMap<String, u64>,
+    /// Signed link times (S4); older builds ignore them.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    link_proofs: HashMap<String, Stamp>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -647,7 +778,7 @@ fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
             continue;
         }
         if f.account_pub.as_deref() == Some(account) {
-            if !book.is_removed(&eid) {
+            if book.is_member(&eid) {
                 devices.push(DeviceRec { eid, name: f.name, kind: f.device_kind, os: f.device_os });
             }
             continue;
@@ -667,7 +798,7 @@ fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
         account: account.to_owned(),
         me: me.to_owned(),
         meta: Meta {
-            roster: Roster { me: device.clone(), devices, linked: book.linked, removed: book.removed_devices },
+            roster: Roster { me: device.clone(), devices, linked: book.linked, removed: book.removed_devices, link_proofs: book.link_proofs },
             friends: recs,
             removed_friends: book.removed_friends,
             profile: None,
@@ -737,7 +868,7 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
     let account = &local.account;
     let mut out = Applied { new_friends: vec![], new_devices: vec![], want_avatars: vec![], left_account: false, changed: false };
     // 1. Tombstones + link times, merged by max.
-    let book = merge_roster_times(dir, account, &meta.roster, &meta.removed_friends);
+    let book = merge_roster_times_as(dir, account, &local.me, &meta.roster, &meta.removed_friends);
     if book.is_removed(&local.me) {
         leave_account(dir, account, &local.me);
         return Applied::left();
@@ -755,7 +886,9 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
         .filter(|f| f.account_pub.as_deref() == Some(account.as_str())).filter_map(|f| f.endpoint_id).collect();
     let mut device_ids = HashSet::new();
     for d in &devices {
-        if d.eid == local.me || d.eid.parse::<iroh::EndpointId>().is_err() || book.is_removed(&d.eid) {
+        // Only devices vouched for in the account (S4); the sender itself was
+        // verified before anything was merged.
+        if d.eid == local.me || d.eid.parse::<iroh::EndpointId>().is_err() || !(book.is_member(&d.eid) || d.eid == from) {
             continue;
         }
         device_ids.insert(d.eid.clone());
@@ -829,7 +962,7 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
 }
 
 /// This device is out of `account` (removed elsewhere, or leaving): forget the
-/// key, turn the former own devices into plain records, and remember that it
+/// key, drop the former own devices' records, and remember that it
 /// left so it can tell devices that were offline.
 fn leave_account(dir: &Path, account: &str, me: &str) {
     log::warn!("account: this device left its account; unlinking");
@@ -859,7 +992,7 @@ fn apply_avatars(dir: &Path, avatars: &Value) -> bool {
             continue;
         }
         let Some(bytes) = v["b64"].as_str().filter(|s| s.len() <= AVATAR_CAP * 4 / 3 + 4)
-            .and_then(|s| STANDARD.decode(s).ok()).filter(|b| !b.is_empty() && b.len() <= AVATAR_CAP) else { continue };
+            .and_then(|s| STANDARD.decode(s).ok()).filter(|b| b.len() <= AVATAR_CAP && friends::is_safe_avatar(b)) else { continue };
         let mtime = v["mtime"].as_u64().unwrap_or(0);
         let path = dir.join(format!("friend-avatar-{eid}.jpg"));
         let current = mtime_ms(&path.to_string_lossy());
@@ -1012,13 +1145,19 @@ pub(crate) struct Ctx {
     device: DeviceRec,
     /// Settings owner, for the shared profile (None: don't share a profile).
     st: Option<Arc<AppState>>,
+    /// This device's endpoint key, to sign link proofs (S4).
+    signer: Option<iroh::SecretKey>,
 }
 
 impl Ctx {
     fn from_app(app: &AppHandle, net: &IrohState) -> anyhow::Result<Ctx> {
         let st = app.try_state::<Arc<AppState>>().ok_or_else(|| anyhow::anyhow!("app unavailable"))?.inner().clone();
-        let me = net.get().ok_or_else(|| anyhow::anyhow!("network not ready"))?.id().to_string();
-        Ok(Ctx { dir: st.config_dir.clone(), device: this_device(&st, &me), me, st: Some(st) })
+        let ep = net.get().ok_or_else(|| anyhow::anyhow!("network not ready"))?;
+        let me = ep.id().to_string();
+        Ok(Ctx { dir: st.config_dir.clone(), device: this_device(&st, &me), me, st: Some(st), signer: Some(ep.secret_key().clone()) })
+    }
+    fn ensure_proofs(&self, account: &str) {
+        if let Some(k) = &self.signer { ensure_proofs(&self.dir, account, k); }
     }
     fn gather(&self, account: &str) -> Local {
         let mut local = gather(&self.dir, account, &self.me, &self.device);
@@ -1060,6 +1199,7 @@ async fn client_exchange(ctx: &Ctx, eid: &str, send: &mut iroh::endpoint::SendSt
     recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Outcome> {
     let dir = &ctx.dir;
     let account = my_pub(dir).ok_or_else(|| anyhow::anyhow!("no account"))?;
+    ctx.ensure_proofs(&account);
     let local = ctx.gather(&account);
     let hello = json!({
         "kind": "account-sync", "v": SYNC_V, "account": account,
@@ -1117,11 +1257,29 @@ async fn server_exchange(ctx: &Ctx, who: &str, req: &Value, send: &mut iroh::end
         return Ok(None);
     };
     let meta: Meta = serde_json::from_value(req["meta"].clone())?;
-    // Learn the caller's link/removal times FIRST: a device relinked elsewhere
-    // must not be told it's removed by a device that hasn't heard yet.
-    let removed = merge_roster_times(dir, &account, &meta.roster, &meta.removed_friends).is_removed(who);
-    if removed {
+    ctx.ensure_proofs(&account);
+    // S4: decide whether the caller is still one of our devices BEFORE merging
+    // anything it says. Only its SIGNED link proofs are taken first (a device
+    // relinked elsewhere must not be told it's removed by a device that hasn't
+    // heard yet — and a removed device can't forge another device's signature).
+    let book = with_book(dir, &account, |b| {
+        if b.proofs_v > 0 { b.merge_proofs(&account, &ctx.me, &meta.roster.link_proofs); }
+        b.clone()
+    });
+    if book.proofs_v == 0 {
+        // A book from before link proofs: the old order (link times first).
+        if merge_roster_times(dir, &account, &meta.roster, &meta.removed_friends).is_removed(who) {
+            iroh_net::write_frame(send, &json!({"kind": "account-sync-removed"})).await?;
+            send.finish()?;
+            return Ok(None);
+        }
+    } else if book.is_removed(who) {
         iroh_net::write_frame(send, &json!({"kind": "account-sync-removed"})).await?;
+        send.finish()?;
+        return Ok(None);
+    } else if !book.is_member(who) {
+        // Holds the account key but no device of the account vouched for it.
+        iroh_net::write_frame(send, &json!({"kind": "account-sync-denied"})).await?;
         send.finish()?;
         return Ok(None);
     }
@@ -1192,6 +1350,7 @@ async fn round(app: &AppHandle, net: &Arc<IrohState>, force: bool) {
     let Ok(ctx) = Ctx::from_app(app, net) else { return };
     let dir = ctx.dir.clone();
     let Some(account) = my_pub(&dir) else { return };
+    ctx.ensure_proofs(&account);
     let fp = fingerprint(&dir, &ctx.gather(&account));
     let devices: Vec<String> = own_devices(&dir).into_iter().filter_map(|f| f.endpoint_id).collect();
     let targets: Vec<String> = {
@@ -1581,8 +1740,8 @@ mod tests {
         let fb = friends::upsert_by_endpoint(&b, &f2, "Ethan");
         chat::append(&b, &text("b1", &fb.id, false, 3));
         let dev = |me: &str, name: &str| DeviceRec { eid: me.to_owned(), name: name.into(), kind: Some("laptop".into()), os: Some("macos".into()) };
-        let ctx_a = Ctx { dir: a.clone(), me: me_a.clone(), device: dev(&me_a, "Mac"), st: None };
-        let ctx_b = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone"), st: None };
+        let ctx_a = Ctx { dir: a.clone(), me: me_a.clone(), device: dev(&me_a, "Mac"), st: None, signer: None };
+        let ctx_b = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone"), st: None, signer: None };
         let addr = server.addr();
         let srv = server.clone();
         let served = tokio::spawn(async move {
@@ -1609,7 +1768,7 @@ mod tests {
         assert_eq!(mac_on_b.device_os.as_deref(), Some("macos"));
         // A second exchange has nothing left to move.
         let srv = server.clone();
-        let ctx_b2 = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone"), st: None };
+        let ctx_b2 = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone"), st: None, signer: None };
         let served = tokio::spawn(async move {
             let conn = srv.accept().await.unwrap().await.unwrap();
             let who = conn.remote_id().to_string();
@@ -1624,9 +1783,9 @@ mod tests {
         // A device with a different account key is refused.
         let c = dir();
         crate::link::adopt_key_for_tests(&c, &iroh::SecretKey::generate());
-        let ctx_c = Ctx { dir: c.clone(), me: me_a.clone(), device: dev(&me_a, "Stranger"), st: None };
+        let ctx_c = Ctx { dir: c.clone(), me: me_a.clone(), device: dev(&me_a, "Stranger"), st: None, signer: None };
         let srv = server.clone();
-        let ctx_b3 = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone"), st: None };
+        let ctx_b3 = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone"), st: None, signer: None };
         let served = tokio::spawn(async move {
             let conn = srv.accept().await.unwrap().await.unwrap();
             let who = conn.remote_id().to_string();
@@ -1644,6 +1803,17 @@ mod tests {
 
 /// Real devices for tests: a config dir, an iroh endpoint on loopback and an
 /// AppState, plus one full account-sync exchange between two of them.
+#[cfg(test)]
+mod stale_name_tests {
+    #[test]
+    fn a_stale_window_cannot_undo_a_synced_rename() {
+        super::note_replaced_name("Old Name", "New Name");
+        assert!(super::stale_display_name("Old Name", "New Name"));
+        assert!(!super::stale_display_name("Something Else", "New Name"), "a real rename goes through");
+        assert!(!super::stale_display_name("Old Name", "Third"), "only right after that sync");
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testkit {
     use super::*;
@@ -1672,7 +1842,7 @@ pub(crate) mod testkit {
         }
         pub(crate) fn ctx(&self) -> Ctx {
             let kind = self.st.settings.lock().unwrap().device_kind.clone();
-            Ctx { dir: self.dir.clone(), me: self.eid(), st: Some(self.st.clone()),
+            Ctx { dir: self.dir.clone(), me: self.eid(), st: Some(self.st.clone()), signer: Some(self.ep.secret_key().clone()),
                 device: DeviceRec { eid: self.eid(), name: self.label.clone(), kind: Some(kind), os: Some("macos".into()) } }
         }
         pub(crate) fn friend(&self, eid: &str) -> Option<Friend> {
@@ -1705,6 +1875,18 @@ pub(crate) mod testkit {
     /// `a` dials `b` and they run one full account-sync exchange.
     /// Each side reports (messages merged, profile changed, left the account).
     pub(crate) async fn sync(a: &Dev, b: &Dev) -> Synced {
+        // Two test devices made with the same key were "linked" before: each
+        // vouches for the other the first time they meet (a real link does
+        // this in link.rs). Never for a device the book already knows of —
+        // removals and relinks stay exactly as the test set them up.
+        vouch(a, b);
+        vouch(b, a);
+        sync_unvouched(a, b).await
+    }
+
+    /// `sync` without the test-only vouching: what a device that was never
+    /// linked (it just holds the account key) gets.
+    pub(crate) async fn sync_unvouched(a: &Dev, b: &Dev) -> Synced {
         let (srv, ctx_b) = (b.ep.clone(), b.ctx());
         let served = tokio::spawn(async move {
             let conn = srv.accept().await.ok_or_else(|| anyhow::anyhow!("closed"))?.await?;
@@ -1724,6 +1906,14 @@ pub(crate) mod testkit {
         }.await;
         let server = served.await.ok().and_then(|r| r.ok()).and_then(|(o, _conn)| o);
         Synced { client, server }
+    }
+
+    pub(crate) fn vouch(d: &Dev, other: &Dev) {
+        let Some(account) = my_pub(&d.dir) else { return };
+        if my_pub(&other.dir).as_deref() != Some(account.as_str()) { return; }
+        let known = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); let b = read_book(&d.dir, &account);
+            b.linked.contains_key(&other.eid()) || b.removed_devices.contains_key(&other.eid()) };
+        if !known { mark_linked(&d.dir, &other.eid()); }
     }
 
     pub(crate) fn text(id: &str, peer: &str, from_me: bool, ts: u64) -> chat::ChatMessage {
@@ -2024,6 +2214,56 @@ mod edge_tests {
         assert_eq!(ids(&chat::messages(&a.dir, &fl.id)), ["1", "2"], "their shared history stays with the person");
     }
 
+    /// S4: a removed (or stolen) device still holds the account key, but it
+    /// can't re-link itself, can't remove the others, and a brand-new endpoint
+    /// made with the key alone gets nothing.
+    #[tokio::test]
+    async fn a_removed_device_or_a_key_holder_cannot_get_back_in_or_kick_others() {
+        let k = key();
+        let (a, b, c) = (Dev::new("Mac", "laptop", Some(&k)).await, Dev::new("iPhone", "phone", Some(&k)).await,
+            Dev::new("Stolen iPad", "tablet", Some(&k)).await);
+        let pal = eid();
+        friends::upsert_by_endpoint(&a.dir, &pal, "Pal");
+        assert!(sync(&c, &a).await.client.is_ok());
+        assert!(sync(&b, &a).await.client.is_ok());
+        let account = my_pub(&a.dir).unwrap();
+        // The Mac removes the iPad; the iPad hasn't heard.
+        std::thread::sleep(Duration::from_millis(5));
+        with_book(&a.dir, &account, |bk| { bk.removed_devices.insert(c.eid(), chat::now_ms()); });
+        // The thief forges: a far-future link for itself (unsigned and
+        // self-signed) and a removal of the iPhone.
+        let ck = c.ep.secret_key().clone();
+        with_book(&c.dir, &account, |bk| {
+            bk.linked.insert(c.eid(), u64::MAX / 2);
+            bk.link_proofs.insert(c.eid(), sign_stamp(&ck, &account, &c.eid(), u64::MAX / 2));
+            bk.removed_devices.insert(b.eid(), u64::MAX / 2);
+        });
+        let out = sync_unvouched(&c, &a).await;
+        assert!(out.server.is_none(), "refused before anything merged");
+        with_book(&a.dir, &account, |bk| {
+            assert!(bk.is_removed(&c.eid()), "still removed");
+            assert!(bk.is_member(&b.eid()), "the iPhone wasn't kicked out");
+        });
+        assert_eq!(a.own_device_ids(), [b.eid()]);
+        // A fresh endpoint holding the account key, never linked by anyone.
+        let w = Dev::new("Fake", "laptop", Some(&k)).await;
+        let out = sync_unvouched(&w, &a).await;
+        assert!(out.server.is_none() && out.client.is_err(), "the key alone gets nothing");
+        assert!(a.friend(&pal).is_some() && w.friend(&pal).is_none(), "no friends leaked");
+        // …and its signed hello doesn't make it one of our devices either.
+        let hello = json!({"device_kind": "laptop", "device_os": "macos", "account_pub": account,
+            "account_sig": crate::link::sign_endpoint(&w.dir, &w.eid()).unwrap()});
+        friends::apply_device_hello(&a.dir, &w.eid(), &hello);
+        assert!(!is_own_device(&a.dir, &w.eid()));
+        // A proof for the fake device signed by the removed iPad doesn't help.
+        let forged = HashMap::from([(w.eid(), sign_stamp(&ck, &account, &w.eid(), chat::now_ms()))]);
+        with_book(&a.dir, &account, |bk| { assert!(!bk.merge_proofs(&account, &a.eid(), &forged)); });
+        // But the iPhone (still in) vouching for a real new device works.
+        let bk_key = b.ep.secret_key().clone();
+        let real = HashMap::from([(w.eid(), sign_stamp(&bk_key, &account, &w.eid(), chat::now_ms()))]);
+        with_book(&a.dir, &account, |bk| { assert!(bk.merge_proofs(&account, &a.eid(), &real)); assert!(bk.is_member(&w.eid())); });
+    }
+
     /// Removing a device: every device drops it, it learns it left, and it
     /// can be linked again later (the relink beats the old removal).
     #[tokio::test]
@@ -2075,7 +2315,7 @@ mod edge_tests {
         leave_account(&c.dir, &account, &c.eid());
         assert!(my_pub(&c.dir).is_none());
         assert!(c.friend(&f).is_some(), "it keeps its friends");
-        assert!(c.friend(&a.eid()).is_some_and(|x| x.account_pub.is_none()), "former devices are plain contacts");
+        assert!(c.friend(&a.eid()).is_none(), "former devices don't linger as auto-accepting contacts");
         // Its next hello to the iPhone carries the notice.
         let notice = left_notice(&c.dir);
         assert!(apply_left_notice(&b.dir, &c.eid(), &notice));
