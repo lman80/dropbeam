@@ -91,6 +91,7 @@ export function HistoryView() {
         <Segmented
           role="tablist"
           label="History"
+          idBase="history"
           value={tab}
           onChange={setTab}
           options={[
@@ -114,11 +115,13 @@ export function HistoryView() {
         )}
       </div>
 
-      {tab === 'recents' ? (
-        <Recents history={history} query={query} setQuery={setQuery} />
-      ) : (
-        <RecoverableFilesView />
-      )}
+      <div role="tabpanel" id="history-panel" aria-labelledby={`history-tab-${tab}`}>
+        {tab === 'recents' ? (
+          <Recents history={history} query={query} setQuery={setQuery} />
+        ) : (
+          <RecoverableFilesView />
+        )}
+      </div>
 
       <AnimatePresence>
         {confirmClear && (

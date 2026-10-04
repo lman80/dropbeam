@@ -761,11 +761,11 @@ export function SettingsView() {
       <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Settings</h1>
         <div className="page-actions">
-          <Segmented role="tablist" label="Settings sections" value={tab} onChange={setTab} options={visibleTabs} className="settings-tabs" />
+          <Segmented role="tablist" label="Settings sections" value={tab} onChange={setTab} options={visibleTabs} className="settings-tabs" idBase="settings" />
         </div>
       </div>
       {deviceModals}
-      <div role="tabpanel" aria-label={TABS.find((t) => t.value === tab)?.label} className={`settings-pane settings-pane-${tab}`}>
+      <div role="tabpanel" id="settings-panel" aria-labelledby={`settings-tab-${tab}`} className={`settings-pane settings-pane-${tab}`}>
         {tab === 'general' && general}
         {tab === 'devices' && <DevicesPanel />}
         {tab === 'locations' && <LocationSettings />}
