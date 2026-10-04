@@ -322,3 +322,15 @@ fn t14_stage_dirs_listed_only_while_live() {
     assert!(!load_partial_dirs().contains(&dir), "a published stage leaves no registration");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Smaller: every Windows device name is mangled, including COM¹–³, LPT¹–³,
+/// CONIN$/CONOUT$ and a stem with trailing spaces.
+#[test]
+fn windows_reserved_names_are_complete() {
+    for name in ["COM\u{b9}", "lpt\u{b3}.txt", "CONIN$", "conout$.log", "COM0", "LPT0.bin", "CON .txt", "nul"] {
+        assert!(windows_safe_component(name).starts_with('_'), "{name}");
+    }
+    for name in ["COM10", "console.txt", "CONINX", "Company.pdf"] {
+        assert_eq!(windows_safe_component(name), name);
+    }
+}

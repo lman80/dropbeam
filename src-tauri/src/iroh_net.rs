@@ -3186,6 +3186,7 @@ async fn serve_stream_inner(
                 }));
                 let watch_state = app.state::<Arc<IrohState>>().inner().clone();
                 let watch_app = app.clone();
+                let watch_conn = conn.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
                         let delay = {
@@ -3201,6 +3202,10 @@ async fn serve_stream_inner(
                         if batch.touched.elapsed() < TRANSFER_STALL { continue; }
                         if let Some(update) = batch.expire(Instant::now()) {
                             let _ = watch_app.emit("transfer://update", &update);
+                            // The card now says Failed: end this attempt for real
+                            // so no bytes keep landing behind it (the sender
+                            // reconnects and resumes instead).
+                            watch_conn.close(1u32.into(), b"stalled");
                         }
                         // Retain bounded terminal tombstones so a late same-attempt
                         // push cannot revive an interrupted batch.
@@ -3527,6 +3532,14 @@ async fn serve_stream_inner(
                     }
                     Err(e) => Err(e),
                 };
+                // The RECEIVER canceled (not paused, not a stalled back-channel):
+                // the partial will never be resumed — don't leave a hidden
+                // multi-GB file sitting in Downloads for 7 days.
+                if res.is_err() && resumable && cancel.load(Ordering::SeqCst)
+                    && !state.cancels.lock().unwrap().get(&id).is_some_and(|c| Arc::ptr_eq(c, &cancel))
+                    && !state.paused.lock().unwrap().contains(&id) {
+                    discard_partial_owned(&dest, &fp);
+                }
                 drop(owner);
                 res
             } else {
@@ -4473,7 +4486,17 @@ pub fn start_receive(
                     )
                     .await
                     // The sender canceled: a terminal "canceled", never a retry (T6).
-                    .map_err(|e| errors::peer_stopped(&conn).map(errors::peer_stop_error).unwrap_or(e))?;
+                    .map_err(|e| errors::peer_stopped(&conn).map(errors::peer_stop_error).unwrap_or(e));
+                    if paths.is_err() && cancel.load(Ordering::SeqCst) && !cleanup.paused.lock().unwrap().contains(&id) {
+                        // WE canceled: drop the resumable partial of this pull now.
+                        let item0 = &header["items"][0];
+                        if header["items"].as_array().map(|a| a.len()) == Some(1) {
+                            let fp = transfer_fingerprint(&conn.remote_id().to_string(), item0["name"].as_str().unwrap_or("file"),
+                                header["total"].as_u64().unwrap_or(0), item0["mtime"].as_u64().unwrap_or(0));
+                            if let Some(_owner) = claim_partial(&fp, Duration::from_secs(5)).await { discard_partial_owned(&dest, &fp); }
+                        }
+                    }
+                    let paths = paths?;
                     let loc = conn_locality(&conn);
                     let bytes: u64 = paths
                         .iter()
@@ -7326,11 +7349,15 @@ pub(crate) fn windows_safe_component(comp: &str) -> String {
     }
     // "CON", "con.txt", "COM1.tar.gz" are all reserved — the check is on the
     // portion before the first dot, case-insensitive.
+    // Includes the superscript-digit ports (COM¹…LPT³), COM0/LPT0 and the
+    // console devices — all refused by Windows like the classic names.
     const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}", "CONIN$", "CONOUT$",
     ];
-    let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+    // Windows ignores trailing spaces before the extension too ("CON .txt").
+    let stem = s.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
     if RESERVED.contains(&stem.as_str()) {
         s.insert(0, '_');
     }
@@ -7794,23 +7821,31 @@ async fn pace_bytes(n: u64) {
     loop {
         let wait = {
             let mut g = bucket.lock().unwrap();
-            let now = Instant::now();
-            let elapsed = now.duration_since(g.1).as_secs_f64();
-            // Refill, capping banked burst at ~0.5s of rate so a paused transfer
-            // can't resume with a giant spike. CRITICAL: never below one CHUNK, or a
-            // full-chunk request at a low limit could NEVER be granted (the bucket
-            // would top out under `n` and the loop would spin forever).
-            let cap = (rate as f64 * 0.5).max(CHUNK as f64);
-            g.0 = (g.0 + elapsed * rate as f64).min(cap);
-            g.1 = now;
-            if g.0 >= n as f64 {
-                g.0 -= n as f64;
-                return;
+            match bucket_take(&mut g, Instant::now(), rate, n) {
+                None => return,
+                Some(wait) => wait,
             }
-            Duration::from_secs_f64((n as f64 - g.0) / rate as f64)
         };
         tokio::time::sleep(wait).await;
     }
+}
+
+/// The token bucket behind the upload cap, as a pure step: refill for the time
+/// since the last call, then grant `n` bytes (None) or say how long to wait.
+fn bucket_take(g: &mut (f64, Instant), now: Instant, rate: u64, n: u64) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(g.1).as_secs_f64();
+    // Refill, capping banked burst at ~0.5s of rate so a paused transfer
+    // can't resume with a giant spike. CRITICAL: never below one CHUNK, or a
+    // full-chunk request at a low limit could NEVER be granted (the bucket
+    // would top out under `n` and the loop would spin forever).
+    let cap = (rate as f64 * 0.5).max(CHUNK as f64);
+    g.0 = (g.0 + elapsed * rate as f64).min(cap);
+    g.1 = now;
+    if g.0 >= n as f64 {
+        g.0 -= n as f64;
+        return None;
+    }
+    Some(Duration::from_secs_f64((n as f64 - g.0) / rate as f64))
 }
 
 /// Parallel transfer tuning. A single QUIC stream tops out around ~40% of link
@@ -8055,6 +8090,14 @@ async fn claim_partial(fp: &str, budget: Duration) -> Option<PartialOwner> {
         if let Some(owner) = claim_partial_now(fp) { return Some(owner); }
     }
     None
+}
+
+/// Delete a fingerprint's partial + sidecar. Caller must own `fp` (or have
+/// just claimed it): a receiver cancel ends that resume for good.
+fn discard_partial_owned(dir: &Path, fp: &str) {
+    let (part, side) = partial_paths(dir, fp);
+    let _ = std::fs::remove_file(&side);
+    let _ = std::fs::remove_file(&part);
 }
 
 fn partial_paths(dir: &Path, fp: &str) -> (PathBuf, PathBuf) {
@@ -11247,20 +11290,27 @@ mod tests {
 
     #[tokio::test]
     async fn upload_limiter_throttles_and_never_stalls() {
+        // Deterministic (simulated clock): the real bucket is process-global and
+        // other tests' sends drew from it, which made the wall-clock version flaky.
         // 16 Mbps = 2 MB/s. A 1 MB chunk must be grantable (cap >= CHUNK), and
-        // pushing several chunks must take roughly bytes/rate — proving the cap
-        // both throttles AND can never deadlock a full-chunk request at a low rate.
-        let _exclusive = super::xfer_matrix::PACE_GATE.write().await;
-        set_upload_limit_mbps(16);
-        let t0 = Instant::now();
+        // pushing 4 chunks must take roughly bytes/rate — proving the cap both
+        // throttles AND can never deadlock a full-chunk request at a low rate.
+        let rate = 16 * 1_000_000 / 8;
+        let start = Instant::now();
+        let mut bucket = (0.0, start);
+        let mut now = start + Duration::from_secs(10); // a long idle banks only the cap
+        let t0 = now;
         for _ in 0..4 {
-            pace_bytes(CHUNK as u64).await; // 4 × 1 MB = 4 MB
+            let mut spins = 0;
+            while let Some(wait) = bucket_take(&mut bucket, now, rate, CHUNK as u64) {
+                now += wait;
+                spins += 1;
+                assert!(spins < 3, "a full chunk must be granted after one wait");
+            }
         }
-        let secs = t0.elapsed().as_secs_f64();
-        set_upload_limit_mbps(0); // reset so other tests are unaffected
-        // 4 MB at 2 MB/s ≈ 2s, minus the initial ~1 MB burst → expect ~1.5s+.
-        assert!(secs >= 1.3, "limiter should throttle 4 MB @ 2 MB/s, took {secs:.2}s");
-        assert!(secs < 4.0, "but not stall: {secs:.2}s");
+        let secs = now.duration_since(t0).as_secs_f64();
+        // 4 MB at 2 MB/s minus the ~1 MB banked burst ≈ 1.5 s.
+        assert!((1.3..2.0).contains(&secs), "limiter should throttle 4 MB @ 2 MB/s, took {secs:.2}s");
         // And unlimited (0) must be an instant no-op.
         let t1 = Instant::now();
         pace_bytes(CHUNK as u64).await;
