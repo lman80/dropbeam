@@ -76,7 +76,7 @@ export function HistoryView() {
 
   return (
     <div className="page">
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">History</h1>
         {tab === 'recents' && history.length > 0 && (
           <div className="page-actions">

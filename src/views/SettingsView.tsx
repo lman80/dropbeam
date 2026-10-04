@@ -733,7 +733,7 @@ export function SettingsView() {
 
   return (
     <div className="page settings-page" ref={rootRef}>
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Settings</h1>
         <div className="page-actions">
           <Segmented role="tablist" label="Settings sections" value={tab} onChange={setTab} options={visibleTabs} className="settings-tabs" />

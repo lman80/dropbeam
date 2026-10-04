@@ -119,7 +119,7 @@ function DesktopFriends() {
 
   return (
     <div className="page friends-page">
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Friends</h1>
         <div className="page-actions">
           <button className="btn btn-primary" onClick={() => setAdding(true)}>

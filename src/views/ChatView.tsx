@@ -238,7 +238,7 @@ export function ChatView() {
   if (rows.length === 0 && !activeChatId) {
     return (
       <div className="page">
-        <div className="page-header titlebar-drag">
+        <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
           <h1 className="page-title">Chat</h1>
         </div>
         <EmptyState
@@ -261,7 +261,7 @@ export function ChatView() {
   return (
     <div className={`chat-layout${activeChatId ? ' thread-open' : ''}`}>
       <div className="chat-list-pane">
-        <div className="chat-list-head titlebar-drag">
+        <div className="chat-list-head titlebar-drag" data-tauri-drag-region="deep">
           <h1 className="chat-list-title">Chat</h1>
           {conversations.length > 0 && startable.length > 0 && (
             <MenuButton
@@ -311,7 +311,7 @@ export function ChatView() {
           <Conversation key={activeChatId} friendId={activeChatId} />
         ) : (
           <>
-            <div className="titlebar-drag chat-header" />
+            <div className="titlebar-drag chat-header" data-tauri-drag-region="deep" />
             <EmptyState title="No conversation selected" style={{ flex: 1 }} />
           </>
         )}
@@ -835,7 +835,7 @@ function Conversation({ friendId }: { friendId: string }) {
   return (
     <>
       {MOBILE_UI ? <header className="mobile-header-compact visible mobile-conversation-header"><button className="ios-button mobile-back" aria-label="Back to chats" onClick={() => useStore.getState().closeChat()}><ChevronLeft />Chats</button><span className="mobile-chat-avatar compact"><FriendAvatar friend={friend} /></span><div className="mobile-grow"><h1 className="ios-headline mobile-ellipsis">{friend.name}</h1><p className="ios-footnote">{typing ? 'typing…' : presenceText}</p></div><button className="ios-icon" aria-label="Search conversation" onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}><Search size={20} /></button></header> : (
-        <div className="titlebar-drag chat-header">
+        <div className="titlebar-drag chat-header" data-tauri-drag-region="deep">
           <span className="chat-avatar sm" style={{ background: avatarGradient(friend.id) }}>
             <FriendAvatar friend={friend} />
           </span>

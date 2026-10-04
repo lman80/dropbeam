@@ -100,7 +100,7 @@ export function SendView() {
 
   return (
     <div className="page send-page">
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Send &amp; Receive</h1>
         <div className="page-actions">
           <button className="btn btn-secondary" onClick={() => setShowReceive(true)}>

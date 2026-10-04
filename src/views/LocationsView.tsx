@@ -191,7 +191,7 @@ export function LocationsView() {
       ? <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} host={friend.name}
         online={presenceWords(friend).words} onBack={() => setActive(null)} />
       : <>
-        <div className="page-header titlebar-drag"><div className="location-crumbs">
+        <div className="page-header titlebar-drag" data-tauri-drag-region="deep"><div className="location-crumbs">
           <IconButton label="All locations" onClick={() => setActive(null)}><ChevronLeft /></IconButton>
           <h1 className="page-title">Locations</h1></div></div>
         <EmptyState icon={<HardDrive />} title="This location isn’t shared with you anymore" />
@@ -199,7 +199,7 @@ export function LocationsView() {
   </div>
   const unavailable = friends.filter(f => errors[f.id])
   return <div className="locations-view page">
-    <div className="page-header titlebar-drag"><h1 className="page-title">Locations</h1><div className="page-actions">
+    <div className="page-header titlebar-drag" data-tauri-drag-region="deep"><h1 className="page-title">Locations</h1><div className="page-actions">
       {!IS_WINDOWS && <button className="btn btn-secondary" onClick={() => setView('settings')}>Share a folder…</button>}
       {count > 0 && <button className="btn btn-primary" onClick={openSyncFolderSheet}>Sync a folder…</button>}
     </div></div>

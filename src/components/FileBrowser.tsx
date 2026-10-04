@@ -176,7 +176,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
   const pageable = page > 0 || data.hasMore
   const here = parts.at(-1) ?? location.name
   return <section className="location-browser" aria-label={`${location.name} file browser`}>
-    <div className="page-header titlebar-drag location-browser-head">
+    <div className="page-header titlebar-drag location-browser-head" data-tauri-drag-region="deep">
       <div className="location-crumbs">
         <IconButton label="All locations" onClick={onBack} disabled={!onBack}><ChevronLeft /></IconButton>
         <nav aria-label="Folder path" className="location-breadcrumbs">
