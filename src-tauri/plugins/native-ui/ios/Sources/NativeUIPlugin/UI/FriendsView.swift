@@ -10,6 +10,7 @@ struct FriendsView: View {
     @State private var sendingTo: Friend?
     @State private var blocking: Friend?
     @State private var reporting: ReportTarget?
+    @State private var blockingRequest: FriendRequest?
     @Namespace private var avatars
     private var filtered: [Friend] {
         bridge.friends.filter { $0.groupedUnder == nil }.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.displayName.localizedCaseInsensitiveContains(search) }
@@ -29,6 +30,8 @@ struct FriendsView: View {
     var body: some View {
         NavigationStack {
             List {
+                // S2: people who introduced themselves aren't friends until accepted.
+                if search.isEmpty && !bridge.friendRequests.isEmpty { requestsSection }
                 if search.isEmpty {
                     Section {
                         NavigationLink { LocationsView() } label: { RowLabel(title: "Locations", symbol: "externaldrive.fill", color: .teal) }
@@ -66,7 +69,8 @@ struct FriendsView: View {
             .overlay { if !search.isEmpty && filtered.isEmpty { ContentUnavailableView.search(text: search) } }
             .navigationTitle("Friends")
             .searchable(text: $search, prompt: "Find a friend or device")
-            .refreshable { try? await bridge.action("refreshRecipients") }
+            .refreshable { try? await bridge.action("refreshRecipients"); await bridge.refreshFriendRequests() }
+            .task { await bridge.refreshFriendRequests() }
             .animation(.smooth, value: filtered.map(\.id))
             .toolbar { ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -97,12 +101,54 @@ struct FriendsView: View {
                 }
             } message: { friend in Text(friend.ownDevice ? "It stops syncing your friends and chats." : "You can add \(friend.name) again with their code.") }
             .safetyPrompts(block: $blocking, report: $reporting)
+            .modifier(BlockRequestPrompt(request: $blockingRequest))
             .confirmationDialog(sendingTo.map { "Send to \($0.displayName)" } ?? "", isPresented: Binding(get: { sendingTo != nil }, set: { if !$0 { sendingTo = nil } }), titleVisibility: .visible, presenting: sendingTo) { friend in
                 Button("Photos") { bridge.perform { try await bridge.pickAndSend(source: "photos", friendId: friend.id) } }
                 Button("Files") { bridge.perform { try await bridge.pickAndSend(source: "files", friendId: friend.id) } }
                 Button("Folder") { bridge.perform { try await bridge.pickAndSend(source: "folder", friendId: friend.id) } }
             }
         }
+    }
+    private var requestsSection: some View {
+        Section {
+            ForEach(bridge.friendRequests) { request in requestRow(request) }
+        } header: { Text("Friend Requests") } footer: {
+            Text("They can’t message you, and their files always ask first, until you accept.")
+        }.headerProminence(.increased)
+    }
+    private func requestRow(_ request: FriendRequest) -> some View {
+        HStack(spacing: 14) {
+            ContactAvatar(friend: Friend(id: request.endpointId, name: request.name), size: 46)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(request.name).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(2)
+                    .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
+                Text(requestSubtitle(request)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Button("Accept") {
+                bridge.perform { try await bridge.acceptFriendRequest(endpointId: request.endpointId); Haptics.success(); bridge.showToast("\(request.name) is now your friend") }
+            }.beamButton(prominent: true).controlSize(.small)
+            Menu {
+                Button("Decline", systemImage: "xmark") { bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: false) } }
+                Button("Decline and Block…", systemImage: "hand.raised", role: .destructive) { blockingRequest = request }
+            } label: { Image(systemName: "ellipsis.circle").font(.title3).frame(width: 44, height: 44).contentShape(Rectangle()) }
+                .buttonStyle(.borderless).accessibilityLabel("Decline \(request.name)")
+        }
+        .padding(.vertical, 2)
+        .swipeActions(edge: .trailing) {
+            Button(role: .destructive) { bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: false) } } label: { Label("Decline", systemImage: "xmark") }
+            Button { blockingRequest = request } label: { Label("Block", systemImage: "hand.raised.fill") }.tint(.orange)
+        }
+        .contextMenu {
+            Button("Accept", systemImage: "checkmark") { bridge.perform { try await bridge.acceptFriendRequest(endpointId: request.endpointId) } }
+            Button("Decline", systemImage: "xmark") { bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: false) } }
+            Button("Decline and Block…", systemImage: "hand.raised", role: .destructive) { blockingRequest = request }
+        }
+    }
+    private func requestSubtitle(_ request: FriendRequest) -> String {
+        guard let ms = request.at else { return "Wants to be your friend" }
+        let date = Date(timeIntervalSince1970: ms / 1000)
+        return "Wants to be your friend · " + (Date().timeIntervalSince(date) < 60 ? "just now" : date.formatted(.relative(presentation: .named)))
     }
     private func row(_ friend: Friend) -> some View {
         NavigationLink {
@@ -142,6 +188,19 @@ struct FriendsView: View {
             }
             Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", systemImage: "person.fill.xmark", role: .destructive) { removing = friend }
         }
+    }
+}
+
+/// "Block Jordan?" for a friend request: declines it and blocks them everywhere.
+private struct BlockRequestPrompt: ViewModifier {
+    @EnvironmentObject private var bridge: Bridge
+    @Binding var request: FriendRequest?
+    func body(content: Content) -> some View {
+        content.confirmationDialog(request.map { "Block \($0.name)?" } ?? "", isPresented: Binding(get: { request != nil }, set: { if !$0 { request = nil } }), titleVisibility: .visible, presenting: request) { request in
+            Button("Decline and Block", role: .destructive) {
+                bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: true); bridge.showToast("\(request.name) was blocked") }
+            }
+        } message: { _ in Text("Their requests, messages and files are stopped on all your devices. They aren’t told.") }
     }
 }
 
