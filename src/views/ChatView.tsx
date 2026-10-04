@@ -371,6 +371,7 @@ function Conversation({ friendId }: { friendId: string }) {
   // A successful ping also makes the engine flush messages queued for them.
   useEffect(() => {
     if (!windowFocused) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset when the window loses focus
       setChecking(false)
       return
     }
@@ -440,6 +441,7 @@ function Conversation({ friendId }: { friendId: string }) {
   // Shown only on request (the ⓘ in the header).
   useEffect(() => {
     if (!onlineNow) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clear the stale path when they go offline
       setConn(null)
       return
     }
@@ -488,8 +490,8 @@ function Conversation({ friendId }: { friendId: string }) {
   // On open, jump to bottom.
   useLayoutEffect(() => {
     atBottomRef.current = true
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- jump to the newest message on open (clears the pill)
     scrollToBottom()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [friendId])
 
   // Stay anchored to the newest message while the thread settles: images, video
@@ -624,6 +626,7 @@ function Conversation({ friendId }: { friendId: string }) {
   }
   // Start at the oldest match; down always moves toward newer messages.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- move the cursor for a new query
     if (searchMatches.length) jumpToMatch(0)
     else setSearchIdx(0)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1868,6 +1871,7 @@ function FileMessage({
     !!t.outDir && t.fileNames.includes(name) &&
     `${t.outDir.replace(/\\/g, '/').replace(/\/$/, '')}/${name}` === path?.replace(/\\/g, '/')
   )?.id)
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- retry the preview when the file lands
   useEffect(() => setBroken(false), [path, landedTransfer, transfer?.state])
   const available = mine || !!landedPath || !!m.path && (!transfer || transfer.state === 'completed')
   const canPreview = !!path && (HAS_TAURI || path.startsWith('/mock-media/')) && !broken && available

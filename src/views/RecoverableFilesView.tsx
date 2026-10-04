@@ -45,6 +45,7 @@ export function RecoverableFilesView() {
   }, [])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch; state is set when it resolves
     void load()
     const un = onFolderHistoryChanged(() => void load())
     return () => {
@@ -56,6 +57,7 @@ export function RecoverableFilesView() {
   useEffect(() => {
     if (focusPair && summaries) {
       if (summaries.some((s) => s.pairId === focusPair)) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot deep link consumed from the store
         setOpen(focusPair)
         setFocused(focusPair)
       }

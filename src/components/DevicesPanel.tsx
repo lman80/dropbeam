@@ -9,6 +9,7 @@ import { LinkFlow } from './LinkDeviceModal'
 import { ConfirmDialog } from './SafetyDialogs'
 import { MenuButton } from './ui'
 
+// eslint-disable-next-line react-refresh/only-export-components -- re-exported helpers for existing importers
 export { linkWithCode, isDeviceCode } from './LinkDeviceModal'
 
 function ago(ms: number) {

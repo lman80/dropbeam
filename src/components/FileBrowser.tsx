@@ -44,6 +44,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     } catch(e) { if (token === generation.current) { setError(String(e)); setData({ entries: [], page, hasMore: false }); setSelected([]) } }
     finally { if (token === generation.current) setLoading(false) }
   }, [page, request, sort, query])
+  // eslint-disable-next-line react-hooks/set-state-in-effect, react-hooks/exhaustive-deps -- fetch on input change; the bump invalidates the in-flight page
   useEffect(() => { void refresh(); return () => { ++generation.current } }, [refresh])
   useEffect(() => {
     let alive = true; const cleanup: (() => void)[] = []

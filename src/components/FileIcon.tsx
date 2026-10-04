@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- icon component + its file-kind helpers */
 import {
   File,
   FileArchive,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, X } from 'lucide-react'
 import { listen } from '@tauri-apps/api/event'
@@ -15,12 +15,14 @@ import { IconButton, Spinner } from './ui'
 /** Link with a scanned/pasted device code of either kind. The engine picks the
  *  direction (the account that already has devices wins) and refuses two
  *  different accounts, so both commands take any device code. */
+// eslint-disable-next-line react-refresh/only-export-components -- shared helper
 export async function linkWithCode(code: string) {
   const c = code.trim()
   const problem = deviceCodeProblem(c)
   if (problem) throw new Error(problem)
   return /^dropbeamjoin1:/i.test(c) ? api.linkDeviceJoin(c) : api.linkDeviceSend(c)
 }
+// eslint-disable-next-line react-refresh/only-export-components -- shared helper
 export { isDeviceCode }
 
 function onLinkEvent<T>(name: string, cb: (payload: T) => void): Promise<() => void> {
@@ -52,7 +54,7 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   // How the last attempt was made (this device scanning, or showing its code).
   const [via, setVia] = useState<'show' | 'scan'>(start)
   const phaseRef = useRef(phase)
-  phaseRef.current = phase
+  useLayoutEffect(() => { phaseRef.current = phase }, [phase])
   const closeRef = useRef(onClose)
   useEffect(() => { closeRef.current = onClose }, [onClose])
 
@@ -86,6 +88,7 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
   useEffect(() => {
     if (!showing) return
     let alive = true
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- a fresh code screen starts blank
     setCode(''); setCodeError(''); setCopied(false)
     const begin = hosting ? api.linkHostBegin : api.linkDeviceBegin
     begin().then(c => { if (alive) setCode(c) }).catch(e => { if (alive) setCodeError(`Couldn’t create a code. ${linkErrorText(e)}`) })

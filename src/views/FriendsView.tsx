@@ -658,6 +658,7 @@ function YouCard() {
   const [showQR, setShowQR] = useState(false)
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- mirror the saved name while not editing
     if (!editing) setName(displayName)
   }, [displayName, editing])
 

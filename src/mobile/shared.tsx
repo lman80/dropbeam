@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { createElement, useEffect, useState } from 'react'
 import { fileSrc, type Friend } from '../lib/api'
 import { deviceIcon } from '../lib/deviceIcons'
 import { friendPresence, claimPresenceChecks } from '../lib/presence'
@@ -6,15 +6,17 @@ import { useStore } from '../store'
 import { Alert, Avatar, TextField } from './kit'
 import { presenceText } from './helpers'
 
+// eslint-disable-next-line react-refresh/only-export-components -- shared phone helpers
 export function reportError(error: unknown) { useStore.getState().toast('error', String(error)) }
+// eslint-disable-next-line react-refresh/only-export-components -- shared phone helpers
 export async function copyText(text: string) {
   try { await navigator.clipboard.writeText(text); useStore.getState().toast('success', 'Code copied') }
   catch (error) { reportError(error) }
 }
 export function FriendAvatar({ friend, size = 40 }: { friend: Friend; size?: number }) {
-  const Device = deviceIcon(friend.deviceKind || undefined)
-  return <Avatar name={friend.name} src={friend.avatar ? fileSrc(friend.avatar) : undefined} size={size} badge={<Device />} />
+  return <Avatar name={friend.name} src={friend.avatar ? fileSrc(friend.avatar) : undefined} size={size} badge={createElement(deviceIcon(friend.deviceKind || undefined))} />
 }
+// eslint-disable-next-line react-refresh/only-export-components -- shared phone hook
 export function usePresence() {
   const seen = useStore(s => s.friendSeen)
   const statuses = useStore(s => s.folderStatuses)

@@ -55,6 +55,7 @@ export function SyncedFolders({ shared }: { shared: SharedByFriend }) {
   }, [toast])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch; state is set when it resolves
     void reload()
     const open = () => setSheet(true)
     window.addEventListener(OPEN_EVENT, open)
