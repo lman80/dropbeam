@@ -228,7 +228,7 @@ struct SendToSheet: View {
             defer { busy = false }
             do {
                 if let friend { try await bridge.sendToFriend(friendId: friend, paths: paths, device: device) }
-                else { try await bridge.action("quickSend", ["paths": paths]) }
+                else { BackgroundTransfers.shared.userStartedSend(paths: paths, to: nil); try await bridge.action("quickSend", ["paths": paths]) }
                 bridge.pickedToSend = []; bridge.pendingSend = []; Haptics.success(); dismiss()
             } catch { self.error = error.localizedDescription; Haptics.warning() }
         }

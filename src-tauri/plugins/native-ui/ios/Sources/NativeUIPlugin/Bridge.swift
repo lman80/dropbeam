@@ -117,7 +117,7 @@ final class Bridge: ObservableObject {
             }
             pending[id] = Pending(continuation: continuation, name: name, timeout: timeout)
             // Picker calls include the time the user spends browsing Photos/Files; never cut them short.
-            let seconds: Double = ["pickFiles", "sendChatFiles"].contains(name) ? 1800 : ["setAvatar", "browserUpload", "acceptFolderInvite"].contains(name) ? 1800 : name.hasPrefix("browser") || ["locationsList", "locationsRefresh"].contains(name) ? 180 : 30
+            let seconds: Double = ["pickFiles", "sendChatFiles"].contains(name) ? 1800 : ["setAvatar", "browserUpload", "acceptFolderInvite"].contains(name) ? 1800 : name == "eraseAllData" ? 60 : name.hasPrefix("browser") || ["locationsList", "locationsRefresh"].contains(name) ? 180 : 30
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: timeout)
             webview.evaluateJavaScript("window.__dbBridge.call(...\(json)); void 0") { [weak self] _, error in
                 if let error { self?.finish(id, .failure(error)) }
@@ -143,52 +143,101 @@ final class Bridge: ObservableObject {
             else { finish(id, .failure(failure(value as? String ?? "The action failed."))) }
         } catch { finish(id, .failure(error)) }
     }
-    func update(key: String, value: Any) throws {
-        if previewKeys.contains(key) { return }
-        let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
+    /// A store snapshot decoded OFF the main thread (NativeUIPlugin.state), applied here.
+    enum Snapshot {
+        case history([HistoryEntry]), locations([FriendLocations]), needsName(Bool), pendingSend([String])
+        case friends([Friend]), myDevice(MyDevice?), transfers([Transfer]), settings(Settings?)
+        case chatOverview([ChatOverview]), chatUnread([String: Int]), chatTyping([String: Bool]), chatDraftFiles([String])
+        case thread(ChatThread?), presence([String: Bool]), presenceSeen([String: Double]), folders([SharedFolder])
+        case blocked([BlockedPerson]), servers([UsableServer]), pendingFiles([PendingFile]), otherDevices([DeviceActivity])
+        case unknown
+    }
+    private struct Envelope<T: Decodable>: Decodable { let value: T }
+    private struct KeyOnly: Decodable { let key: String }
+    /// Decode `{"key": …, "value": …}` straight from the plugin's raw arguments.
+    nonisolated static func decodeSnapshot(raw: Data) throws -> (key: String, snapshot: Snapshot) {
+        let decoder = JSONDecoder()
+        let key = try decoder.decode(KeyOnly.self, from: raw).key
+        func value<T: Decodable>(_: T.Type) throws -> T { try decoder.decode(Envelope<T>.self, from: raw).value }
+        let snapshot: Snapshot
         switch key {
-        case "history": history = try decoder.decode(LossyArray<HistoryEntry>.self, from: data).values
-        case "locations": locations = try decoder.decode(LossyArray<FriendLocations>.self, from: data).values
-        case "needsName":
-            needsName = try decoder.decode(Bool.self, from: data)
+        case "history": snapshot = .history(try value(LossyArray<HistoryEntry>.self).values)
+        case "locations": snapshot = .locations(try value(LossyArray<FriendLocations>.self).values)
+        case "needsName": snapshot = .needsName(try value(Bool.self))
+        case "pendingSend": snapshot = .pendingSend(try value(LossyArray<String>.self).values)
+        case "friends": snapshot = .friends(try value(LossyArray<Friend>.self).values)
+        case "myDevice": snapshot = .myDevice(try value(MyDevice?.self))
+        case "transfers": snapshot = .transfers(try value(LossyArray<Transfer>.self).values)
+        case "settings": snapshot = .settings(try value(Settings?.self))
+        case "chatOverview": snapshot = .chatOverview(try value(LossyArray<ChatOverview>.self).values)
+        case "chatUnread": snapshot = .chatUnread(try value([String: Int].self))
+        case "chatTyping": snapshot = .chatTyping(try value([String: Bool].self))
+        case "chatDraftFiles": snapshot = .chatDraftFiles(try value(LossyArray<String>.self).values)
+        case "thread": snapshot = .thread(try value(ChatThread?.self))
+        case "presence": snapshot = .presence(try value([String: Bool].self))
+        case "presenceSeen": snapshot = .presenceSeen(try value([String: Double].self))
+        case "folders": snapshot = .folders(try value(LossyArray<SharedFolder>.self).values)
+        case "blocked": snapshot = .blocked(try value(LossyArray<BlockedPerson>.self).values)
+        case "transferServers": snapshot = .servers(try value(LossyArray<UsableServer>.self).values)
+        case "pendingFiles": snapshot = .pendingFiles(try value(LossyArray<PendingFile>.self).values)
+        case "otherDevices": snapshot = .otherDevices(try value(LossyArray<DeviceActivity>.self).values.filter { !$0.items.isEmpty })
+        default: snapshot = .unknown // Forward-compatible snapshots.
+        }
+        return (key, snapshot)
+    }
+    /// Main-thread half: assign + the side effects some snapshots carry.
+    func apply(key: String, _ snapshot: Snapshot) {
+        if previewKeys.contains(key) { return }
+        switch snapshot {
+        case .history(let v): history = v
+        case .locations(let v): locations = v
+        case .needsName(let v):
+            needsName = v
             // Only a brand-new install is asked its name: that starts first-run setup,
             // which then stays up (name saved or not) until the user finishes it.
             if needsName && !onboarding { onboarding = true }
-        case "pendingSend": pendingSend = try decoder.decode(LossyArray<String>.self, from: data).values
-        case "friends":
-            friends = try decoder.decode(LossyArray<Friend>.self, from: data).values
+        case .pendingSend(let v): pendingSend = v
+        case .friends(let v):
+            friends = v
             // SuperFeedback moment of value: a new friend (not the launch snapshot).
             if let known = knownFriends, !launching, friends.contains(where: { !known.contains($0.id) }) { SuperFeedback.moment("friend-added") }
             knownFriends = Set(friends.map(\.id))
             PushRegistration.saveNames(friends.compactMap { f in f.endpointId.map { ($0, f.name) } })
-        case "myDevice": myDevice = try decoder.decode(MyDevice?.self, from: data)
-        case "transfers":
-            transfers = try decoder.decode(LossyArray<Transfer>.self, from: data).values
+            PushRegistration.savePeers(friends.compactMap { f in f.endpointId.map { ($0, f.id) } })
+        case .myDevice(let v): myDevice = v
+        case .transfers(let v):
+            transfers = v
             reportTransferMoments()
-        case "settings":
-            settings = try decoder.decode(Settings?.self, from: data)
+        case .settings(let v):
+            settings = v
             if let share = settings?.shareDiagnostics {
                 UserDefaults.standard.set(share, forKey: NativeUIPlugin.diagnosticsKey)
                 SuperFeedback.setCrashReportingEnabled(share)
+                CrashDiagnostics.shared.setEnabled(share)
             }
             SaveFolder.shared.sync(engineDir: settings?.downloadDir)
-        case "chatOverview": chatOverview = try decoder.decode(LossyArray<ChatOverview>.self, from: data).values
-        case "chatUnread": chatUnread = try decoder.decode([String: Int].self, from: data)
-        case "chatTyping": chatTyping = try decoder.decode([String: Bool].self, from: data)
-        case "chatDraftFiles": chatDraftFiles = try decoder.decode(LossyArray<String>.self, from: data).values
-        case "thread":
-            if let thread = try decoder.decode(ChatThread?.self, from: data) { threads[thread.friendId] = thread.messages }
-        case "presence": presence = try decoder.decode([String: Bool].self, from: data)
-        case "presenceSeen": presenceSeen = try decoder.decode([String: Double].self, from: data)
-        case "folders": folders = try decoder.decode(LossyArray<SharedFolder>.self, from: data).values
-        case "blocked": blocked = try decoder.decode(LossyArray<BlockedPerson>.self, from: data).values
-        case "transferServers": servers = try decoder.decode(LossyArray<UsableServer>.self, from: data).values
-        case "pendingFiles": pendingFiles = try decoder.decode(LossyArray<PendingFile>.self, from: data).values
-        case "otherDevices": otherDevices = try decoder.decode(LossyArray<DeviceActivity>.self, from: data).values.filter { !$0.items.isEmpty }
-        default: break // Forward-compatible snapshots.
+        case .chatOverview(let v): chatOverview = v
+        case .chatUnread(let v): chatUnread = v
+        case .chatTyping(let v): chatTyping = v
+        case .chatDraftFiles(let v): chatDraftFiles = v
+        case .thread(let v): if let thread = v { threads[thread.friendId] = thread.messages }
+        case .presence(let v): presence = v
+        case .presenceSeen(let v): presenceSeen = v
+        case .folders(let v): folders = v
+        case .blocked(let v): blocked = v
+        case .servers(let v): servers = v
+        case .pendingFiles(let v): pendingFiles = v
+        case .otherDevices(let v): otherDevices = v
+        case .unknown: break
         }
         // The share extension lists friends from a snapshot in the App Group.
         if ["friends", "presence", "myDevice"].contains(key) { ShareInbox.shared.recipientsChanged() }
+    }
+    /// Synchronous variant (previews/tests): decode + apply on the main thread.
+    func update(key: String, value: Any) throws {
+        let raw = try JSONSerialization.data(withJSONObject: ["key": key, "value": value], options: [.fragmentsAllowed])
+        let decoded = try Self.decodeSnapshot(raw: raw)
+        apply(key: decoded.key, decoded.snapshot)
     }
     func event(name: String, payload: Any) {
         let object = payload as? [String: Any] ?? [:]
@@ -265,6 +314,7 @@ final class Bridge: ObservableObject {
     func sendToFriend(friendId: String, paths: [String], device: String? = nil) async throws {
         var args: [String: Any] = ["friendId": friendId, "paths": paths]
         if let device { args["device"] = device }
+        BackgroundTransfers.shared.userStartedSend(paths: paths, to: friends.first { $0.id == friendId }?.displayName)
         try await action("sendToFriend", args)
     }
     func receiveWithCode(code: String) async throws { try await action("receiveWithCode", ["code": code]) }
@@ -291,6 +341,8 @@ final class Bridge: ObservableObject {
     }
     func closeChat(friendId: String) async throws { try await action("closeChat", ["friendId": friendId]) }
     func sendChatText(friendId: String, text: String, replyTo: String? = nil) async throws {
+        // Staged attachments ride along with this send (a big video keeps going in the background).
+        if !chatDraftFiles.isEmpty { BackgroundTransfers.shared.userStartedSend(paths: chatDraftFiles, to: friends.first { $0.id == friendId }?.displayName) }
         var args: [String: Any] = ["friendId": friendId, "text": text]
         if let replyTo { args["replyTo"] = replyTo }
         try await action("sendChatText", args)

@@ -194,6 +194,22 @@ pub async fn register_everywhere(net: &crate::iroh_net::IrohState, config: &Path
     }
 }
 
+/// Erase All Data: ask every server we registered with to forget this phone's push
+/// token (best effort, a few seconds per server), then drop the local registration.
+/// Returns how many servers confirmed.
+pub async fn unregister_everywhere(net: &crate::iroh_net::IrohState, config: &Path) -> usize {
+    let Some(d) = device(config) else { return 0 };
+    let Some(ep) = net.get().cloned() else { return 0 };
+    let mut done = 0;
+    for server in d.registered.keys() {
+        if super::client::push_unregister(&ep, server).await { done += 1; }
+    }
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = std::fs::remove_file(device_path(config));
+    let _ = std::fs::remove_file(config.join("push-token.json"));
+    done
+}
+
 // ── sender side: sealed previews ─────────────────────────────────────────────
 
 fn my_name(config: &Path) -> String {

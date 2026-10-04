@@ -880,6 +880,14 @@ pub async fn push_register(ep: &iroh::Endpoint, server: &str, sealed_token: &str
     reply.is_ok_and(|r| r["ok"].as_bool() == Some(true))
 }
 
+/// Withdraw our push token from a server (Settings → Erase All Data).
+pub async fn push_unregister(ep: &iroh::Endpoint, server: &str) -> bool {
+    let Some(conn) = connect(ep, server, Duration::from_secs(6)).await else { return false };
+    let reply = rpc(&conn, &json!({"kind": "mailbox.push-register", "v": super::VERSION, "remove": true})).await;
+    conn.close(0u32.into(), b"done");
+    reply.is_ok_and(|r| r["ok"].as_bool() == Some(true))
+}
+
 /// Ask `server` what we may do there (None = unreachable / not a server).
 pub async fn server_hello(ep: &iroh::Endpoint, server: &str) -> Option<Value> {
     let conn = connect(ep, server, Duration::from_secs(6)).await?;

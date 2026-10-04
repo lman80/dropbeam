@@ -7,7 +7,7 @@ import { MOBILE_UI } from './platform'
 import { friendOnlineState, friendPresence } from './presence'
 import { transferSharePaths } from './mobilePick'
 import { setNativeShellActive } from './nativeShell'
-import { changedSnapshots, dispatchNativeCall, deliverNativeReply, pickNativeMedia, nativeAvatarPath, type BridgeArgs, type BridgeHandlers } from './nativeBridgeProtocol'
+import { memoSnapshots, type SnapshotMemo, type SnapshotSource, dispatchNativeCall, deliverNativeReply, pickNativeMedia, nativeAvatarPath, type BridgeArgs, type BridgeHandlers } from './nativeBridgeProtocol'
 import { nativeReply, nativeChatSource, nativeTransfers, nativeThread } from './nativeChatBridge'
 import { withMobileFileSource } from '../components/MobileFileSheet'
 import { restoredChatTransfer } from './chatTransfer'
@@ -189,9 +189,13 @@ const handlers: BridgeHandlers = {
   checkPresence: async a => {
     const ids = personDevices(string(a, 'id'))
     if (!ids.length) return { online: false }
+    // Always answers: a ping that throws counts as "no", and the whole check gives up
+    // after 12 s (Swift's bridge call would otherwise wait out its 30 s timeout).
     const online = await new Promise<boolean>(resolve => {
       let left = ids.length
-      for (const id of ids) void st().pingFriend(id).then(ok => { if (ok) resolve(true); else if (--left === 0) resolve(false) })
+      const timer = setTimeout(() => resolve(false), 12_000)
+      const done = (ok: boolean) => { if (ok) { clearTimeout(timer); resolve(true) } else if (--left === 0) { clearTimeout(timer); resolve(false) } }
+      for (const id of ids) st().pingFriend(id).then(ok => done(!!ok), () => done(false))
     })
     return { online }
   },
@@ -321,11 +325,11 @@ const handlers: BridgeHandlers = {
   },
   folderSetPaused: async a => {
     if (typeof a.bool !== 'boolean') throw new Error('Invalid pause value')
-    await api.setFolderPaused(folderLinks(st().pairs, string(a, 'folderId'))[0].id, a.bool)
+    await api.setFolderPaused(folderLink(a).id, a.bool)
     await st().reloadPairs()
   },
   folderStop: async a => { for (const link of folderLinks(st().pairs, string(a, 'folderId'))) await api.stopFolderTransfer(link.id).catch(() => {}) },
-  folderVerify: a => api.verifyFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id),
+  folderVerify: a => api.verifyFolder(folderLink(a).id),
   folderLeave: async a => {
     for (const link of folderLinks(st().pairs, string(a, 'folderId'))) await storeAction(() => st().removePair(link.id))
   },
@@ -341,7 +345,7 @@ const handlers: BridgeHandlers = {
   folderShowInvite: a => api.pairInvite(folderMember(a).id),
   /** A fresh invite code for one more person (desktop "Add person"). */
   folderAddPerson: async a => {
-    const code = await api.folderAddPerson(folderLinks(st().pairs, string(a, 'folderId'))[0].id)
+    const code = await api.folderAddPerson(folderLink(a).id)
     await st().reloadPairs()
     return code
   },
@@ -376,8 +380,26 @@ const handlers: BridgeHandlers = {
     await invoke('push_set_previews', { on: a.on })
     return nativePushStatus(await invoke<unknown>('push_status').catch(() => null))
   },
+  /** Foreground / Wi-Fi ↔ cellular: let iroh re-probe its addresses now. */
+  networkChanged: () => invoke('network_changed'),
+  /** iOS Bonjour (no multicast entitlement needed): our id + LAN addresses to advertise… */
+  lanSelfInfo: () => invoke('lan_self_info'),
+  /** …and a nearby device the shell found, for the next direct dial. */
+  lanPeerFound: a => {
+    if (!Array.isArray(a.addrs) || !a.addrs.every(x => typeof x === 'string')) throw new Error('Invalid addresses')
+    return invoke('lan_peer_found', { endpointId: string(a, 'endpointId'), addrs: a.addrs })
+  },
+  /** Settings → Erase All Data, step 1 (Swift then wipes the files and quits):
+   *  withdraw the push token from Transfer Servers and leave the account, so the
+   *  user's other devices drop this iPhone. Both best effort, bounded. */
+  eraseAllData: async () => {
+    const bounded = (p: Promise<unknown>, ms: number) => Promise.race([p.catch(() => {}), new Promise(r => setTimeout(r, ms))])
+    await bounded(invoke('push_unregister_all'), 15_000)
+    if (st().myDevice?.account_pub) await bounded(api.accountLeave(), 25_000)
+    return true
+  },
   folderInviteFriend: async a => {
-    await api.inviteFriendToFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id, string(a, 'friendId'))
+    await api.inviteFriendToFolder(folderLink(a).id, string(a, 'friendId'))
     await st().reloadPairs()
   },
 }
@@ -392,6 +414,12 @@ async function refreshPending() {
   resnapshot?.()
 }
 const folderSnapshot = () => { const s = st(); return nativeFolders(s.pairs, s.folderStatuses, s.folderSummaries, s.folderLastSynced, s.myEid, s.friends) }
+/** The folder's first link — a folder left on another screen has none any more. */
+function folderLink(a: BridgeArgs) {
+  const link = folderLinks(st().pairs, string(a, 'folderId'))[0]
+  if (!link) throw new Error('This shared folder no longer exists.')
+  return link
+}
 /** A member link, checked to belong to the named folder (never act on a stale id). */
 function folderMember(a: BridgeArgs) {
   const link = folderLinks(st().pairs, string(a, 'folderId')).find(p => p.id === string(a, 'pairId'))
@@ -543,7 +571,7 @@ async function start() {
   const stops: UnlistenFn[] = []
   let running = true
   let queue = Promise.resolve()
-  const previous = new Map<string, string>()
+  const previous: SnapshotMemo = new Map()
   const send = (command: 'state' | 'event', payload: Record<string, unknown>) => {
     queue = queue.then(async () => {
       if (running) await invoke(`plugin:native-ui|${command}`, payload)
@@ -575,35 +603,42 @@ async function start() {
       useStore.setState({ windowFocused: nativeFocused })
       return
     }
-    const presence = presenceSnapshot(s)
-    const snapshots = {
-      friends: friendSnapshot(s.friends, s.myDevice?.account_pub),
-      transfers: nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
+    const chatId = s.activeChatId
+    const activeThread = chatId ? s.chats[chatId] : undefined
+    const others = useOtherDevices.getState().devices
+    let presence: Record<string, boolean> | undefined
+    const presenceNow = () => (presence ??= presenceSnapshot(s))
+    // Each snapshot lists the store slices it is built from; unchanged inputs = no work.
+    const snapshots: Record<string, SnapshotSource> = {
+      friends: [[s.friends, s.myDevice?.account_pub, lookAlikeGroups()], () => friendSnapshot(s.friends, s.myDevice?.account_pub)],
+      transfers: [[s.order, s.transfers, chatId, activeThread, s.history, s.chatTransfers], () => nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
         .filter(t => !(t.state === 'canceled' && !t.fileNames.length)),
-        Object.assign({}, ...(s.activeChatId ? s.chats[s.activeChatId] ?? [] : []).map(m => {
+        Object.assign({}, ...(activeThread ?? []).map(m => {
           const restored = restoredChatTransfer(m, s.history)
           return restored && m.fileXferId ? { [m.fileXferId]: restored } : {}
-        }), s.chatTransfers)).map(t => ({ ...t, sharePaths: t.direction === 'send' || t.state === 'completed' ? transferSharePaths(t) : [] })),
-      settings: s.settings,
-      history: s.history,
-      locations: locationSnapshot(),
-      needsName: needsName(),
-      pendingSend: s.pendingSend ?? [],
-      chatOverview: s.chatOverview.map(o => ({ ...o, unread: s.chatUnread[o.peerId] ?? 0 })),
-      chatUnread: s.chatUnread,
-      chatTyping: s.chatTyping,
-      thread: nativeThread(s.activeChatId, s.chats),
-      chatDraftFiles: s.chatDraftFiles,
-      presence,
-      presenceSeen: presenceSeenSnapshot(s, presence),
-      myDevice: deviceSnapshot(),
-      folders: folderSnapshot(),
-      blocked: s.blocked,
-      transferServers: usableServers,
-      pendingFiles,
-      otherDevices: useOtherDevices.getState().devices,
+        }), s.chatTransfers)).map(t => ({ ...t, sharePaths: t.direction === 'send' || t.state === 'completed' ? transferSharePaths(t) : [] }))],
+      settings: [[s.settings], () => s.settings],
+      history: [[s.history], () => s.history],
+      // Built from module state (results, cache, checking set) and the clock: always.
+      locations: [null, () => locationSnapshot()],
+      needsName: [null, () => needsName()],
+      pendingSend: [[s.pendingSend], () => s.pendingSend ?? []],
+      chatOverview: [[s.chatOverview, s.chatUnread], () => s.chatOverview.map(o => ({ ...o, unread: s.chatUnread[o.peerId] ?? 0 }))],
+      chatUnread: [[s.chatUnread], () => s.chatUnread],
+      chatTyping: [[s.chatTyping], () => s.chatTyping],
+      thread: [[chatId, activeThread], () => nativeThread(chatId, s.chats)],
+      chatDraftFiles: [[s.chatDraftFiles], () => s.chatDraftFiles],
+      // Presence expires with time (the 15 s timer re-runs this): always rebuilt.
+      presence: [null, presenceNow],
+      presenceSeen: [null, () => presenceSeenSnapshot(s, presenceNow())],
+      myDevice: [[s.myDevice, s.settings?.displayName], () => deviceSnapshot()],
+      folders: [[s.pairs, s.folderStatuses, s.folderSummaries, s.folderLastSynced, s.myEid, s.friends], () => folderSnapshot()],
+      blocked: [[s.blocked], () => s.blocked],
+      transferServers: [[usableServers], () => usableServers],
+      pendingFiles: [[pendingFiles], () => pendingFiles],
+      otherDevices: [[others], () => others],
     }
-    for (const change of changedSnapshots(previous, snapshots)) send('state', change)
+    for (const change of memoSnapshots(previous, snapshots)) send('state', change)
     if (s.activeChatId !== activeChat) {
       activeChat = s.activeChatId
       if (!markingRead || (activeChat && activeChat !== markingRead)) send('event', { name: 'chatOpen', payload: { friendId: activeChat } })
@@ -619,15 +654,16 @@ async function start() {
   resnapshot = sync
   // Store staging is path-only. Coalesce synchronous store notifications into
   // the next turn so serialization cannot hold the picker/staging reply hostage.
+  // Progress ticks arrive several times a second per transfer: at most ~8 syncs/s.
   let syncTimer: ReturnType<typeof setTimeout> | undefined
-  stops.push(useStore.subscribe(() => {
-    syncTimer ??= setTimeout(() => { syncTimer = undefined; if (running) sync() }, 0)
-  }))
+  let lastSync = 0
+  const schedule = () => {
+    syncTimer ??= setTimeout(() => { syncTimer = undefined; lastSync = Date.now(); if (running) sync() }, Math.max(0, 120 - (Date.now() - lastSync)))
+  }
+  stops.push(useStore.subscribe(schedule))
   // "On your other devices" (#31) lives in its own small store.
   startOtherDevices()
-  stops.push(useOtherDevices.subscribe(() => {
-    syncTimer ??= setTimeout(() => { syncTimer = undefined; if (running) sync() }, 0)
-  }))
+  stops.push(useOtherDevices.subscribe(schedule))
   sync() // Full initial snapshot, even when init is still in progress.
   void st().refreshMyDevice().catch(() => {})
   const timer = window.setInterval(sync, 15_000) // Presence must expire without a store mutation.

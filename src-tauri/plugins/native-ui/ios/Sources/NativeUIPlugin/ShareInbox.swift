@@ -229,7 +229,7 @@ final class ShareInbox {
             guard !paths.isEmpty else { return }
             bridge.selectedTab = "send"
             if job.recipient == "quick" {
-                do { try await bridge.action("quickSend", ["paths": paths]) }
+                do { BackgroundTransfers.shared.userStartedSend(paths: paths, to: nil); try await bridge.action("quickSend", ["paths": paths]) }
                 catch { bridge.pickedToSend = paths }
             } else {
                 bridge.pickedToSend = paths // The Send To sheet lets them pick.

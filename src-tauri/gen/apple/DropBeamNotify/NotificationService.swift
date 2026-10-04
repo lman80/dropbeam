@@ -32,6 +32,14 @@ final class NotificationService: UNNotificationServiceExtension {
             // The title is always YOUR name for them; the text only if the sealed
             // preview really is from that sender.
             best.title = name
+            // Tapping the banner opens this person's conversation (the app reads
+            // `__EXTRA__.chatPeerId` like its own chat banners), grouped per person.
+            if let chat = Self.peers()[from] {
+                var info = best.userInfo
+                info["__EXTRA__"] = ["chatPeerId": chat]
+                best.userInfo = info
+                best.threadIdentifier = "chat-" + chat
+            }
             if let preview = Self.open(sealed), preview["f"] as? String == from {
                 if let b = preview["b"] as? String, !b.isEmpty {
                     best.body = b
@@ -82,6 +90,14 @@ final class NotificationService: UNNotificationServiceExtension {
 
     static var group: URL? {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.ashtonmiller.dropbeam")
+    }
+
+    /// endpoint id → chat (thread) id, written by the app (PushRegistration.savePeers).
+    static func peers() -> [String: String] {
+        guard let url = group?.appendingPathComponent("push-peers.json"),
+              let data = try? Data(contentsOf: url),
+              let map = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return [:] }
+        return map
     }
 
     static func names() -> [String: String] {

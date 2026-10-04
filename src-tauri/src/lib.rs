@@ -37,6 +37,7 @@ mod mac_service;
 mod models;
 // What is mounted right now (NAS shares, external disks), for the Add-a-location wizard.
 mod mounts;
+mod native_shell;
 mod pairing;
 mod panic_log;
 #[cfg(any(target_os = "ios", test))]
@@ -829,6 +830,10 @@ pub fn run() {
             ios_media::pick_photos,
             #[cfg(target_os = "ios")]
             ios_media::share_files,
+            native_shell::network_changed,
+            native_shell::lan_self_info,
+            native_shell::lan_peer_found,
+            native_shell::push_unregister_all,
             commands::pick_directory,
             commands::set_profile_avatar,
             commands::clear_profile_avatar,

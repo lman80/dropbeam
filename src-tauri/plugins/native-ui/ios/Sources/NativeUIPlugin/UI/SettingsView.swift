@@ -15,6 +15,8 @@ struct SettingsView: View {
     @ObservedObject private var saveFolder = SaveFolder.shared
     @ObservedObject private var mediaSaver = ReceivedMediaSaver.shared
     @State private var qaSaveFolder = false
+    @State private var qaPrivacy = false
+    @State private var pendingStrings: [String: String] = [:]
     var body: some View {
         NavigationStack {
           ScrollViewReader { proxy in
@@ -99,8 +101,11 @@ struct SettingsView: View {
             .beamList()
             .navigationTitle("Settings")
             .navigationDestination(isPresented: $qaSaveFolder) { SaveFolderView() }
+            .navigationDestination(isPresented: $qaPrivacy) { PrivacyView() }
             #if targetEnvironment(simulator)
             .onAppear { if CommandLine.arguments.contains("-openSaveFolder") { qaSaveFolder = true } }
+            // QA: `-openPrivacy` opens Privacy & Your Data (Erase All Data).
+            .onAppear { if CommandLine.arguments.contains("-openPrivacy") { qaPrivacy = true } }
             // QA: `-scrollToServers` brings the Transfer Servers section into view.
             // QA: `-scrollToFeedback` brings the Feedback section into view.
             .task { if CommandLine.arguments.contains("-scrollToFeedback") { try? await Task.sleep(for: .seconds(1)); proxy.scrollTo("feedbackSection", anchor: .top) } }
@@ -128,9 +133,16 @@ struct SettingsView: View {
         if others.isEmpty { return "Link your other devices to share friends and chats" }
         return "This iPhone and " + ListFormatter.localizedString(byJoining: others.map { "your " + deviceNoun($0.deviceKind, os: $0.deviceOs) })
     }
-    private func settingString(_ key: String, _ value: String) -> Binding<String> { Binding(get: { value }, set: { next in bridge.perform { try await bridge.updateSettings(patch: [key: next]) } }) }
+    private func settingString(_ key: String, _ value: String) -> Binding<String> {
+        Binding(get: { pendingStrings[key] ?? value }, set: { next in
+            pendingStrings[key] = next
+            bridge.perform { await OptimisticSetting.save(key: key, value: next, bridge: bridge) { pendingStrings[key] = nil } }
+        })
+    }
 }
-/// A settings toggle row that writes straight through to the engine.
+/// A settings toggle row that writes straight through to the engine. It flips at once
+/// (optimistic) and only snaps back if the engine refuses — no flicker while the
+/// round trip through the bridge and the next settings snapshot completes.
 struct SettingToggle: View {
     @EnvironmentObject private var bridge: Bridge
     let title: String
@@ -138,10 +150,30 @@ struct SettingToggle: View {
     var color: Color = .beam
     let key: String
     let value: Bool?
+    @State private var pending: Bool?
     var body: some View {
-        let binding = Binding(get: { value ?? false }, set: { next in bridge.perform { try await bridge.updateSettings(patch: [key: next]) } })
-        if let symbol { IconToggle(title: title, symbol: symbol, color: color, isOn: binding) }
-        else { Toggle(title, isOn: binding).tint(.green) }
+        let binding = Binding(get: { pending ?? value ?? false }, set: { next in
+            pending = next
+            bridge.perform { await OptimisticSetting.save(key: key, value: next, bridge: bridge) { pending = nil } }
+        })
+        Group {
+            if let symbol { IconToggle(title: title, symbol: symbol, color: color, isOn: binding) }
+            else { Toggle(title, isOn: binding).tint(.green) }
+        }
+        .onChange(of: value) { _, now in if now == pending { pending = nil } }
+    }
+}
+/// Save one setting; `settle` runs when the optimistic value should give way to the
+/// engine's (refused right away, or the snapshot had time to arrive).
+enum OptimisticSetting {
+    @MainActor static func save(key: String, value: Any, bridge: Bridge, settle: @escaping @MainActor () -> Void) async {
+        do {
+            try await bridge.updateSettings(patch: [key: value])
+            try? await Task.sleep(for: .seconds(3))
+        } catch {
+            bridge.errorMessage = error.localizedDescription
+        }
+        settle()
     }
 }
 struct MyAvatar: View {
@@ -392,11 +424,19 @@ struct ConnectionInfoView: View {
 struct RecoverySettingsView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var clearing = false
+    @State private var keepDays: Int?
+    @State private var budget: Double?
     var body: some View {
         Form {
             Section {
-                Picker("Keep Copies For", selection: Binding(get: { bridge.settings?.folderHistoryKeepDays ?? 30 }, set: { n in bridge.perform { try await bridge.updateSettings(patch: ["folderHistoryKeepDays": n]) } })) { Text("7 Days").tag(7); Text("30 Days").tag(30); Text("90 Days").tag(90); Text("Forever").tag(0) }
-                Picker("Storage per Folder", selection: Binding(get: { bridge.settings?.folderHistoryBudgetBytes ?? 2147483648 }, set: { n in bridge.perform { try await bridge.updateSettings(patch: ["folderHistoryBudgetBytes": n]) } })) { Text("500 MB").tag(524288000.0); Text("2 GB").tag(2147483648.0); Text("5 GB").tag(5368709120.0); Text("No Limit").tag(0.0) }
+                Picker("Keep Copies For", selection: Binding(get: { keepDays ?? bridge.settings?.folderHistoryKeepDays ?? 30 }, set: { n in
+                    keepDays = n
+                    bridge.perform { await OptimisticSetting.save(key: "folderHistoryKeepDays", value: n, bridge: bridge) { keepDays = nil } }
+                })) { Text("7 Days").tag(7); Text("30 Days").tag(30); Text("90 Days").tag(90); Text("Forever").tag(0) }
+                Picker("Storage per Folder", selection: Binding(get: { budget ?? bridge.settings?.folderHistoryBudgetBytes ?? 2147483648 }, set: { n in
+                    budget = n
+                    bridge.perform { await OptimisticSetting.save(key: "folderHistoryBudgetBytes", value: n, bridge: bridge) { budget = nil } }
+                })) { Text("500 MB").tag(524288000.0); Text("2 GB").tag(2147483648.0); Text("5 GB").tag(5368709120.0); Text("No Limit").tag(0.0) }
             } footer: { Text("When a file in a shared folder is deleted or replaced, DropBeam keeps a copy until these limits remove the oldest. Your live files are never touched. Browse copies in History → Recoverable.") }
             Section { Button("Free Up Space Now", role: .destructive) { clearing = true } }
         }
@@ -409,6 +449,8 @@ struct RecoverySettingsView: View {
 /// (App Review 5.1.1: DropBeam has no server account — identity is a key on the device).
 struct PrivacyView: View {
     @EnvironmentObject private var bridge: Bridge
+    @State private var confirmErase = false
+    @State private var erasing = false
     var body: some View {
         List {
             Section {
@@ -425,11 +467,42 @@ struct PrivacyView: View {
                 NavigationLink { DevicesView() } label: { RowLabel(title: "Linked Devices", symbol: "laptopcomputer.and.iphone", color: .gray) }
                 NavigationLink { RecoverySettingsView() } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }
             } header: { Text("Your Data") } footer: {
-                Text("Remove friends by swiping in Friends, clear transfers in History, and unlink this iPhone in Linked Devices. Deleting DropBeam erases everything it stored on this iPhone.")
+                Text("Remove friends by swiping in Friends, clear transfers in History, and unlink this iPhone in Linked Devices.")
+            }
+            Section {
+                Button(role: .destructive) { confirmErase = true } label: {
+                    Label("Erase All Data", systemImage: "trash.fill").foregroundStyle(.red)
+                }.disabled(erasing)
+            } footer: {
+                Text("Deletes everything DropBeam keeps on this iPhone — your DropBeam identity, friends, chats, history, settings and the files in the DropBeam folder — removes this iPhone from your linked devices and stops notifications. Your other devices keep their data. DropBeam then closes and starts fresh.")
             }
         }
         .beamList()
         .navigationTitle("Privacy & Your Data").navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("Erase all DropBeam data on this iPhone?", isPresented: $confirmErase, titleVisibility: .visible) {
+            Button("Erase All Data", role: .destructive) {
+                erasing = true
+                Task { await DataEraser.eraseAndQuit() }
+            }
+        } message: {
+            Text("This can’t be undone. Received files in On My iPhone › DropBeam are deleted too; files in another folder you chose and photos already saved to Photos stay.")
+        }
+        .overlay {
+            if erasing {
+                ZStack {
+                    Color.black.opacity(0.25).ignoresSafeArea()
+                    VStack(spacing: 14) {
+                        ProgressView()
+                        Text("Erasing…").font(.headline)
+                        Text("DropBeam will close when it’s done.").font(.footnote).foregroundStyle(.secondary)
+                    }.padding(28).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                }.accessibilityElement(children: .combine).accessibilityAddTraits(.updatesFrequently)
+            }
+        }
+        #if targetEnvironment(simulator)
+        // QA: `-showErase` opens the confirmation (no touch input in CI).
+        .task { if CommandLine.arguments.contains("-showErase") { try? await Task.sleep(for: .seconds(1)); confirmErase = true } }
+        #endif
     }
     private func point(_ symbol: String, _ color: Color, _ title: String, _ detail: String) -> some View {
         HStack(alignment: .top, spacing: 14) {
