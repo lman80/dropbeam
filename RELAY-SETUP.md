@@ -93,17 +93,23 @@ On **BOTH** devices:
 2. Set **Relay server URL** to `https://yourname.duckdns.org`.
 3. Click **Restart**.
 
-Both devices must use the **same** URL. After restart, internet transfers that can't go direct will route through your own relay instead of the public ones.
+Your relay is added **in front of** the public relays, which stay as a fallback — so if your VM is down, transfers still get through. The devices do **not** need the same list: each device announces its own home relay, and peers reach it there. You can list several relays separated by commas. After restart, internet transfers that can't go direct prefer your relay.
+
+### Shipping a relay to everyone (built-in list)
+Once a DropBeam-run relay is deployed, add its URL to `BAKED_RELAYS` in
+`src-tauri/src/iroh_net.rs`. Every build then tries it first, with the public
+relays kept as the fallback; users' own "Custom relay" entries are added on top.
+Nothing is deployed by the app itself.
 
 ---
 
 ## Verify it's working
 1. Turn on **Detailed logging** (Settings → Diagnostics) on both, Restart.
 2. Do an internet transfer.
-3. Export logs → you should see `using CUSTOM relay https://yourname.duckdns.org` near startup, and the relay traffic going to your hostname instead of `*.iroh-canary.iroh.link`.
+3. Export logs → you should see `relays = https://yourname.duckdns.org/ (+ public fallback)` near startup, and the relay traffic going to your hostname instead of `*.iroh-canary.iroh.link`.
 
 ## Notes / gotchas
-- **Leave it blank to go back** to the public relays — the field is opt-in.
+- **Leave it blank to go back** to the built-in relays — the field is opt-in.
 - If the cert fails: confirm port 80 is reachable from the internet and the DuckDNS name resolves to the VM's IP (`dig yourname.duckdns.org`).
 - The relay is **forwarding-only** and end-to-end encrypted — it can't read your files.
 - Cost: $0 on Oracle Always Free. Bandwidth on the free tier is generous (10 TB/mo on Oracle) — plenty for personal use.

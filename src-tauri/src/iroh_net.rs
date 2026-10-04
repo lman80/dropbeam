@@ -17,6 +17,10 @@ mod integrity;
 pub(crate) mod receive_stage;
 pub(crate) mod delivered;
 mod chat_manifest;
+mod quick;
+mod rate;
+mod partial_dirs;
+pub(crate) mod errors;
 #[cfg(test)]
 mod friendly_failure_tests {
     use super::*;
@@ -25,7 +29,7 @@ mod friendly_failure_tests {
         assert!(friendly_failure(Direction::Receive, "write: No space left on device (os error 28)").starts_with("This device's disk is full"));
         assert!(friendly_failure(Direction::Send, "peer: No space left on device (os error 28)").starts_with("The recipient's disk is full"));
         assert_eq!(friendly_failure(Direction::Send, "their disk is full — once"), "their disk is full — once");
-        assert_eq!(friendly_failure(Direction::Send, "connection lost"), "connection lost");
+        assert!(friendly_failure(Direction::Send, "connection lost").contains("connection to the other device was lost"));
     }
 }
 
@@ -78,6 +82,13 @@ struct PendingSend {
     /// tell it is no longer the owner — it must not emit Failed, retire the
     /// token, or tear down the live attempt's cancel/conn registrations.
     gen: Arc<AtomicU64>,
+    /// The file list frozen when the link was made (T13).
+    items: Arc<Vec<SendItem>>,
+    dirs: Arc<Vec<String>>,
+    /// After this the link is gone (T13, default 24 h).
+    expires_at: Instant,
+    /// The device that pulled first owns the link (T13).
+    puller: Arc<Mutex<Option<String>>>,
 }
 
 /// Shared iroh state, managed by Tauri as `Arc<IrohState>`. The boot task fills
@@ -318,9 +329,11 @@ impl IrohState {
             // Flip the shared flag BEFORE dropping the entry — an in-flight pull
             // of this staged send holds a clone of the same Arc, so this is the
             // only way the cancel reliably reaches it.
-            p.retain(|_, ps| {
+            p.retain(|token, ps| {
                 if ps.transfer_id == id {
                     ps.cancel.store(true, Ordering::SeqCst);
+                    // A late puller is told "canceled", not "connection lost".
+                    quick::note_canceled(token);
                     false
                 } else {
                     true
@@ -339,7 +352,9 @@ impl IrohState {
         // Tear down the connection so a write stuck on QUIC flow-control aborts
         // immediately — this is what lets the SENDER cancel a stalled transfer.
         if let Some(conn) = self.conns.lock().unwrap().remove(id) {
-            conn.close(0u32.into(), b"canceled");
+            // The reason travels in CONNECTION_CLOSE: the far side reads it to
+            // show "Canceled by …" / "… paused" instead of a lost connection.
+            conn.close(0u32.into(), errors::close_reason_for(reason));
             active = true;
         }
         if was_staged {
@@ -709,8 +724,24 @@ fn emit(app: &AppHandle, u: &TransferUpdate) {
             }
         }
     }
+    if let Some(link) = u.chat_transfer.as_mut() { slim_for_ui(link); }
     let _ = app.emit("transfer://update", &u);
 }
+
+/// Progress events carry counters, not the transfer's whole file list (T14):
+/// a 15k-file folder re-serialized its manifest into every 5-per-second UI
+/// event. Nothing in the UI reads the manifest; landed paths are kept for small
+/// batches (opened from the chat card while they arrive) and on the final event.
+fn slim_for_ui(link: &mut crate::models::ChatTransferLink) {
+    link.manifest = vec![];
+    link.directories = vec![];
+    link.completed_files = vec![];
+    let terminal = matches!(link.batch_state, Some(TransferState::Completed | TransferState::Failed | TransferState::Canceled));
+    if !terminal && link.completed_paths.len() > UI_PATHS_WHILE_ACTIVE {
+        link.completed_paths.clear();
+    }
+}
+const UI_PATHS_WHILE_ACTIVE: usize = 500;
 
 // One owner writes all progress frames; the receive future keeps its existing
 // disk writes, cancellation, coverage, and finalization semantics.
@@ -1049,7 +1080,8 @@ fn progress_cb(
     conn: Connection,
     files: usize,
 ) -> impl Fn(u64, u64) {
-    let start = Instant::now();
+    // Speed from THIS attempt's recent bytes (T15), never the resume base.
+    let rate = Mutex::new(rate::RollingRate::default());
     // (when we last emitted, and what we emitted) — both halves matter.
     let last_emit = Mutex::new(None::<(Instant, u64, u64)>);
     move |done: u64, total: u64| {
@@ -1069,7 +1101,7 @@ fn progress_cb(
         }
         *previous = Some((Instant::now(), done, total));
         drop(previous);
-        let secs = start.elapsed().as_secs_f64().max(0.001);
+        let speed = rate.lock().map(|mut r| r.observe(Instant::now(), done)).unwrap_or(0.0);
         let mut u = TransferUpdate::new(id.clone(), dir, names.clone());
         u.file_count = files.max(u.file_count);
         u.state = TransferState::Transferring;
@@ -1080,7 +1112,8 @@ fn progress_cb(
         } else {
             0.0
         };
-        u.speed_bps = done as f64 / secs;
+        u.speed_bps = speed;
+        u.eta_seconds = (speed > 0.0).then(|| total.saturating_sub(done) as f64 / speed);
         u.locality = conn_locality(&conn); // live Direct/Relay badge
         u.conn_detail = Some(conn_detail(&conn)); // inspector: path, rtt, upgrading
         u.friend_name = friend.clone();
@@ -1594,16 +1627,7 @@ fn folder_name(dir: &Path) -> String {
 
 /// Plain words for the failures people can act on; everything else verbatim.
 fn friendly_failure(dir: Direction, err: &str) -> String {
-    let lower = err.to_ascii_lowercase();
-    let disk_full = lower.contains("no space left on device") || lower.contains("os error 28")
-        || lower.contains("not enough space on the disk") || lower.contains("os error 112");
-    if disk_full && !lower.contains("their disk is full") {
-        return match dir {
-            Direction::Receive => "This device's disk is full — free up space, then retry and it picks up where it stopped".into(),
-            _ => "The recipient's disk is full — once they free up space, retry and it picks up where it stopped".into(),
-        };
-    }
-    err.to_string()
+    errors::friendly(dir, err)
 }
 
 fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
@@ -1641,6 +1665,15 @@ fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
 fn emit_canceled(app: &AppHandle, id: &str, dir: Direction) {
     let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
     u.state = TransferState::Canceled;
+    emit(app, &u);
+}
+
+/// Canceled, saying who stopped it when it was the OTHER side (T6): "Canceled
+/// by Alex" instead of "Failed: connection lost".
+fn emit_canceled_by(app: &AppHandle, id: &str, dir: Direction, err: &str, who: Option<&str>) {
+    let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
+    u.state = TransferState::Canceled;
+    u.detail = errors::peer_stop_detail(err, who);
     emit(app, &u);
 }
 
@@ -2335,6 +2368,7 @@ async fn start_with(config_dir: &Path, allow_fixed_port: bool) -> Result<Endpoin
     load_peer_addrs(config_dir);
     // Publish the tiny registry path before receives can record a destination.
     let _ = PARTIAL_DIRS_PATH.set(config_dir.join("partial-dirs.json"));
+    partial_dirs::init(config_dir);
     // Throughput tuning, balanced against NOT wrecking the user's whole connection.
     // BBR congestion control replaces quinn's CUBIC default (iroh benchmark
     // n0-computer/iroh#4286: up to ~30x single-stream throughput, no "fill the
@@ -2367,27 +2401,22 @@ async fn start_with(config_dir: &Path, allow_fixed_port: bool) -> Result<Endpoin
         .alpns(vec![ALPN.to_vec()])
         .transport_config(tcfg.build());
 
-    // OPT-IN custom relay (Settings → "Custom relay"). iroh's bundled public
-    // relays are number0's CANARY servers, which can be unstable for far-apart
-    // peers (constant resets show up as stalled internet transfers). Pointing both
-    // ends at your OWN iroh-relay (a free VM — see RELAY-SETUP.md) makes the
-    // internet fallback reliable. Empty = unchanged default (the public relays).
-    // Both peers must use the SAME relay URL. Only ever ADDITIVE: a blank or
-    // unparseable value leaves the default path exactly as it was.
-    let custom_relay = crate::settings::load(config_dir, "", "")
-        .custom_relay
-        .trim()
-        .to_string();
-    if !custom_relay.is_empty() {
-        match custom_relay.parse::<iroh::RelayUrl>() {
-            Ok(url) => {
-                log::warn!("iroh: using CUSTOM relay {url} (overrides the default public relays)");
-                builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
-            }
-            Err(e) => {
-                log::warn!("iroh: custom relay {custom_relay:?} is not a valid URL ({e}) — falling back to the default relays");
-            }
-        }
+    // Relays (T10): our own baked-in relay(s) plus any the user adds in
+    // Settings ("Custom relay": one or more https URLs), IN FRONT of n0's public
+    // relays — which stay in the map as the fallback, so a dead custom relay
+    // never strands a device. Each device publishes its home relay, so peers do
+    // NOT need the same list. See RELAY-SETUP.md. Unparseable entries are logged
+    // and skipped; with nothing extra configured this is exactly N0's default.
+    let custom_relay = crate::settings::load(config_dir, "", "").custom_relay;
+    let (extra, invalid) = relay_urls(&custom_relay);
+    for bad in invalid {
+        log::warn!("iroh: ignoring relay {bad:?} — not a valid https URL");
+    }
+    if !extra.is_empty() {
+        let map: iroh::RelayMap = extra.iter().cloned().collect();
+        map.extend(&iroh::defaults::prod::default_relay_map());
+        log::info!("iroh: relays = {} (+ public fallback)", extra.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", "));
+        builder = builder.relay_mode(iroh::RelayMode::Custom(map));
     }
 
     // Transfer Server option: a FIXED UDP port the owner can forward on their
@@ -2452,6 +2481,31 @@ async fn start_with(config_dir: &Path, allow_fixed_port: bool) -> Result<Endpoin
         }
     }
     Ok(ep)
+}
+
+/// Relay servers shipped with the app, tried before n0's public ones. Add our
+/// own relay here once it is deployed (RELAY-SETUP.md) — e.g.
+/// "https://relay.dropbeam.app". Empty = n0's public relays only.
+const BAKED_RELAYS: &[&str] = &[];
+
+/// Baked-in relays + the user's `custom_relay` list (comma/space separated),
+/// deduplicated, as (valid URLs, invalid entries).
+fn relay_urls(custom: &str) -> (Vec<iroh::RelayUrl>, Vec<String>) {
+    let mut ok: Vec<iroh::RelayUrl> = vec![];
+    let mut bad = vec![];
+    let entries = BAKED_RELAYS.iter().map(|s| s.to_string())
+        .chain(custom.split([',', ' ', '\n', '\t', ';']).map(str::trim).filter(|s| !s.is_empty()).map(String::from));
+    for entry in entries {
+        // A bare host (the old host:port field) gets https://.
+        let candidate = if entry.contains("://") { entry.clone() } else { format!("https://{entry}") };
+        match candidate.parse::<iroh::RelayUrl>() {
+            Ok(url) if candidate.starts_with("https://") || candidate.starts_with("http://") => {
+                if !ok.contains(&url) { ok.push(url); }
+            }
+            _ => bad.push(entry),
+        }
+    }
+    (ok, bad)
 }
 
 /// Accept incoming connections forever, dispatching each to the protocol handler.
@@ -2716,7 +2770,25 @@ async fn serve_stream_inner(
             // to RESUME after a dropped connection — a huge Quick Send must survive a
             // path blip. We remove the token only once delivery is confirmed.
             let pending = state.pending.lock().unwrap().get(token).cloned();
+            // Expired, canceled, used, or owned by another device: say so in a
+            // frame the puller stops on (T13/T6) instead of dropping the stream.
+            if let Err(refusal) = quick::admit(pending.as_ref(), token, &conn.remote_id().to_string(), Instant::now()) {
+                if pending.as_ref().is_some_and(|p| Instant::now() >= p.expires_at) {
+                    state.pending.lock().unwrap().remove(token);
+                }
+                write_frame(send, &refusal).await?;
+                send.finish()?;
+                let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+                return Ok(());
+            }
             let p = pending.ok_or_else(|| anyhow::anyhow!("no pending send for token"))?;
+            if let Err(text) = quick::unchanged(&p.items) {
+                write_frame(send, &quick::refusal(&text, false)).await?;
+                send.finish()?;
+                let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+                return Ok(());
+            }
+            let pages_ok = req["pages_v"] == 1;
             // This attempt now OWNS the transfer: bump the generation so any
             // older serve task for the same token knows it has been superseded.
             let my_gen = p.gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2769,10 +2841,11 @@ async fn serve_stream_inner(
                             "No direct connection — and \"Only send over direct connections\" is on, so the slow relay wasn't used. Try the same Wi-Fi network, or turn that setting off in Settings."
                         ))
                     } else {
+                        let frozen = (&p.items[..], &p.dirs[..], p.total);
                         if integrity::enabled(&req) {
-                            serve_pull_verified(conn, send, recv, &p.paths, want_parallel, &p.cancel, cb).await
+                            serve_pull_verified_items(conn, send, recv, frozen, want_parallel, pages_ok, &p.cancel, cb).await
                         } else {
-                            serve_pull_negotiated(conn, send, recv, &p.paths, want_parallel, &p.cancel, cb).await
+                            serve_pull_negotiated_items(conn, send, recv, frozen, want_parallel, pages_ok, &p.cancel, cb).await
                         }
                     };
                     // Did this attempt end in CONFIRMED delivery? Only a real ack
@@ -2845,6 +2918,13 @@ async fn serve_stream_inner(
                         Err(e) if e.to_string().contains(integrity::FAILED) => {
                             state.pending.lock().unwrap().remove(token);
                             emit_failed(&app, &p.transfer_id, Direction::Send, &e.to_string());
+                        }
+                        // The receiver canceled: end now, not after 150 s of
+                        // "Connecting" waiting for a resume that won't come (T6).
+                        Err(_) if errors::peer_stopped(conn).is_some() => {
+                            state.pending.lock().unwrap().remove(token);
+                            let err = errors::peer_stop_error(CancelReason::Cancel).to_string();
+                            emit_canceled_by(&app, &p.transfer_id, Direction::Send, &err, None);
                         }
                         Err(e) => unconfirmed_err = Some(e.to_string()),
                     }
@@ -3011,6 +3091,12 @@ async fn serve_stream_inner(
                     Err(e) => { send_receiver_error(send, &e).await; return Err(e); }
                 }
             } else { None };
+            // A FAT32 destination can't hold a ≥ 4 GiB file: refuse before a byte
+            // moves, not after 4 GB of it (T16).
+            if let Err(e) = errors::check_fits(&dest, &req) {
+                send_receiver_error(send, &e).await;
+                return Err(e);
+            }
             // Auto-add an unknown sender as a friend (issue #6) — receiving a file
             // from someone makes the relationship two-way without a separate pairing
             // step. Needs their name, which the sender now puts in the header.
@@ -3529,6 +3615,11 @@ async fn serve_stream_inner(
                 }
                 Err(e) if e.to_string().contains("canceled") => {
                     emit_canceled(&app, &id, Direction::Receive)
+                }
+                // The sender canceled/paused: say so, not "connection lost" (T6).
+                Err(_) if errors::peer_stopped(conn).is_some() => {
+                    let err = errors::peer_stop_error(errors::peer_stopped(conn).unwrap_or(CancelReason::Cancel)).to_string();
+                    emit_canceled_by(&app, &id, Direction::Receive, &err, sender.as_deref());
                 }
                 Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
             }
@@ -4209,7 +4300,11 @@ pub fn start_send(
         .cloned()
         .ok_or("DropBeam is still connecting — try again in a moment.")?;
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let (names, total) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
+    let (names, _) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
+    // Freeze exactly what is being shared (T13): a puller gets this list, not
+    // whatever the folder holds when they finally open the link.
+    let (items, dirs, total) = gather_items(&pathbufs).map_err(|e| e.to_string())?;
+    let ttl = quick::ttl(app.try_state::<Arc<crate::AppState>>().map(|st| st.config_dir.clone()).as_deref());
     let id = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
     let ticket = make_ticket(&ep, &token).map_err(|e| e.to_string())?;
@@ -4220,7 +4315,7 @@ pub fn start_send(
         .unwrap()
         .insert(id.clone(), cancel.clone());
     state.pending.lock().unwrap().insert(
-        token,
+        token.clone(),
         PendingSend {
             transfer_id: id.clone(),
             paths: pathbufs,
@@ -4228,8 +4323,26 @@ pub fn start_send(
             total,
             cancel,
             gen: Arc::new(AtomicU64::new(0)),
+            items: Arc::new(items),
+            dirs: Arc::new(dirs),
+            expires_at: Instant::now() + ttl,
+            puller: Arc::default(),
         },
     );
+    // Retire the link when its time is up, unless it was used or canceled.
+    {
+        let (state, app, id, token) = (state.clone(), app.clone(), id.clone(), token.clone());
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            let expired = state.pending.lock().unwrap().get(&token)
+                .is_some_and(|p| p.transfer_id == id && p.gen.load(Ordering::SeqCst) == 0);
+            if expired {
+                state.pending.lock().unwrap().remove(&token);
+                state.cancels.lock().unwrap().remove(&id);
+                emit_failed(&app, &id, Direction::Send, "This link expired — nobody opened it in time. Send again to make a new one.");
+            }
+        });
+    }
     let mut update = TransferUpdate::new(id, Direction::Send, names);
     update.state = TransferState::WaitingForPeer;
     update.code = Some(ticket);
@@ -4308,11 +4421,18 @@ pub fn start_receive(
                     // resume; an older sender just ignores it.
                     write_frame(
                         &mut send,
-                        &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1 }),
+                        &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1, "pages_v": 1 }),
                     )
                     .await?;
                     let __t0 = std::time::Instant::now();
-                    let header = read_frame(&mut recv).await?;
+                    let first = read_frame(&mut recv).await?;
+                    // A refusal (canceled / expired / in use) is final; a huge
+                    // header arrives in pages (T1, T13).
+                    let header = quick::read_header(&mut recv, first).await?;
+                    if let Err(e) = errors::check_fits(&dest, &header) {
+                        let _ = send.reset(1u32.into());
+                        return Err(e);
+                    }
                     // Native macOS Dock download-progress for a single incoming file.
                     let items = header.get("items").and_then(|i| i.as_array());
                     let dl = match items {
@@ -4351,7 +4471,9 @@ pub fn start_receive(
                         &engaged_ever,
                         cb,
                     )
-                    .await?;
+                    .await
+                    // The sender canceled: a terminal "canceled", never a retry (T6).
+                    .map_err(|e| errors::peer_stopped(&conn).map(errors::peer_stop_error).unwrap_or(e))?;
                     let loc = conn_locality(&conn);
                     let bytes: u64 = paths
                         .iter()
@@ -4364,7 +4486,11 @@ pub fn start_receive(
                 match one {
                     Ok(r) => break Ok(r),
                     Err(e) => {
-                        if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") || e.to_string().contains(integrity::FAILED) {
+                        if let Some(reason) = errors::error_peer_stopped(&e).filter(|_| !cancel.load(Ordering::SeqCst)) {
+                            break Err(errors::peer_stop_error(reason));
+                        }
+                        if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") || e.to_string().contains(integrity::FAILED)
+                            || e.to_string().contains(quick::REFUSED) {
                             break Err(e);
                         }
                         // Never auto-retry a pull that hasn't gone resumable: the
@@ -4415,6 +4541,9 @@ pub fn start_receive(
                     .sum();
                 emit_received_files(&app, &id, &paths, false);
                 emit_completed(&app, &id, Direction::Receive, names, total, loc, None, Some(out_dir), 0);
+            }
+            Err(e) if !cancel.load(Ordering::SeqCst) && errors::peer_stop_detail(&e.to_string(), None).is_some() => {
+                emit_canceled_by(&app, &id, Direction::Receive, &e.to_string(), None)
             }
             Err(e) if e.to_string().contains("canceled") => {
                 emit_canceled(&app, &id, Direction::Receive)
@@ -5357,6 +5486,12 @@ fn send_friend_inner(
                         return Ok(conn_locality(&conn));
                     }
                     Err(e) => {
+                        // The receiver canceled/paused on purpose: never auto-
+                        // resume into a transfer they just stopped (T6).
+                        if let Some(reason) = errors::peer_stopped(&conn).filter(|_| !cancel.load(Ordering::SeqCst)) {
+                            log::info!("friend-send: the receiver stopped the transfer ({reason:?})");
+                            return Err(errors::peer_stop_error(reason));
+                        }
                         let canceled = cancel.load(Ordering::SeqCst)
                             || e.to_string().contains("canceled")
                             || e.to_string().contains("declined")
@@ -5533,6 +5668,9 @@ fn send_friend_inner(
             // so trust the flag too. Whether that stop was a cancel or a PAUSE is
             // whatever the command recorded; either way the partials stay on disk,
             // so a paused send resumes from where it stopped.
+            Err(e) if !cancel.load(Ordering::SeqCst) && errors::peer_stop_detail(&e.to_string(), None).is_some() => {
+                emit_canceled_by(&app, &id, Direction::Send, &e.to_string(), Some(&friend_name));
+            }
             Err(e) if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") => {
                 let reason = cleanup.take_reason(&id);
                 if matches!(reason, CancelReason::Cancel) && first_dial.is_none() {
@@ -7435,7 +7573,9 @@ fn publish_unique_limit(part: &Path, natural: &Path, limit: usize) -> Result<Pat
     publish_unique_owned(part, natural, limit, None)
 }
 fn publish_unique_owned(part: &Path, natural: &Path, limit: usize, identity: Option<receive_stage::Identity>) -> Result<PathBuf> {
-    if let Some(dir) = natural.parent() { note_partial_dir(dir); }
+    // A stage's own directory is tracked while it is live (receive_stage.rs);
+    // only an untracked part (a finalized resumable partial) registers here.
+    if identity.is_none() { if let Some(dir) = natural.parent() { note_partial_dir(dir); } }
     // One atomic attempt per candidate. Case-insensitive aliases are reported
     // by the filesystem as the same occupied candidate; never restart the scan.
     for destination in receive_candidates(natural, limit) {
@@ -8021,33 +8161,12 @@ fn gc_stale_partials_at(dir: &Path, config: &Path) {
 static PARTIAL_DIRS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn load_partial_dirs() -> Vec<PathBuf> {
-    let Some(path) = PARTIAL_DIRS_PATH.get() else {
-        return Vec::new();
-    };
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    // In memory, bounded and aged (T14) — see partial_dirs.rs.
+    partial_dirs::all()
 }
 
 fn note_partial_dir(dir: &Path) {
-    let Some(path) = PARTIAL_DIRS_PATH.get() else {
-        return;
-    };
-    static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
-    let _lock = REGISTRY_LOCK.lock().unwrap();
-    let mut dirs = load_partial_dirs();
-    if dirs.first().map(|d| d.as_path()) == Some(dir) {
-        return;
-    }
-    dirs.retain(|d| d != dir);
-    dirs.insert(0, dir.to_path_buf());
-    // Nested destinations remain registered for crash recovery.
-
-    if let Ok(json) = serde_json::to_vec(&dirs) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() { let _ = std::fs::rename(tmp, path); }
-    }
+    partial_dirs::note_root(dir);
 }
 
 // A process-unique prefix lets the background sweep distinguish crash litter
@@ -9118,7 +9237,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             stage.remove()?;
             return Err(e);
         }
-        let landed = if let Some(existing) = identical_landed(&dest, &natural) {
+        let landed = if let Some(existing) = stage.identical_landed(&natural) {
             stage.remove()?;
             existing
         } else {
@@ -9210,8 +9329,10 @@ async fn send_files_linked<F: Fn(u64, u64)>(
     location: Option<&LocationSend>,
 ) -> Result<u64> {
     let source = location.and_then(|l| l.snapshot.as_ref()).map(|s| s.source.clone());
-    let result = LOCATION_SOURCE.scope(source, integrity::ensure_scope(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
-        parallel_engaged, activity, friend_state, chat_link, location))).await;
+    // Boxed: this state machine is large in debug builds, and callers nest it
+    // inside their own (a test body on a 2 MiB thread overflowed its stack).
+    let result = LOCATION_SOURCE.scope(source, integrity::ensure_scope(Box::pin(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
+        parallel_engaged, activity, friend_state, chat_link, location)))).await;
     if result.as_ref().is_err_and(|e| e.to_string().contains("inactivity timeout")) {
         conn.close(1u32.into(), b"receiver stalled");
     }
@@ -9255,7 +9376,7 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     if let Some(link) = chat_link {
         // Big manifests travel once, out of band (T1); `None` = an older
         // receiver that can't take one: push without the chat link.
-        match chat_manifest::header_value(conn, link).await? {
+        match Box::pin(chat_manifest::header_value(conn, link)).await? {
             Some(v) => header["chatTransfer"] = v,
             None => header["location_item_offset"] = serde_json::json!(link.item_offset),
         }
@@ -9779,8 +9900,9 @@ pub async fn pull_files<F: Fn(u64, u64)>(
     let (addr, token) = parse_ticket(ticket)?;
     let conn = client.connect(addr, ALPN).await.context("dial ticket")?;
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1 })).await?;
-    let header = read_frame(&mut recv).await?;
+    write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1, "pages_v": 1 })).await?;
+    let first = read_frame(&mut recv).await?;
+    let header = quick::read_header(&mut recv, first).await?;
     read_pull_files_negotiated(&conn, &mut send, &mut recv, &header, dest_dir,
         cancel, &AtomicBool::new(false), on_progress).await
 }
@@ -10022,13 +10144,22 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
 
 /// Only used after the pull REQUEST advertised integrity. Legacy pull traffic
 /// retains its original header, body and raw trailing receipt.
+#[cfg(test)]
 async fn serve_pull_verified<F: Fn(u64, u64)>(conn: &Connection, send: &mut SendStream,
     recv: &mut RecvStream, paths: &[PathBuf], parallel: bool, cancel: &AtomicBool, progress: F) -> Result<u64> {
     let (items, dirs, total) = gather_items(paths)?;
+    serve_pull_verified_items(conn, send, recv, (&items, &dirs, total), parallel, true, cancel, progress).await
+}
+
+/// Serve a pull of a frozen item list (T13), paging a huge header (T1).
+#[allow(clippy::too_many_arguments)]
+async fn serve_pull_verified_items<F: Fn(u64, u64)>(conn: &Connection, send: &mut SendStream,
+    recv: &mut RecvStream, frozen: (&[SendItem], &[String], u64), parallel: bool, pages_ok: bool, cancel: &AtomicBool, progress: F) -> Result<u64> {
+    let (items, dirs, total) = frozen;
     let n = if parallel { parallel_streams_for(conn, items.len(), total) } else { 0 };
-    let mut header = files_header(&items, &dirs, total, n, "", false);
+    let mut header = files_header(items, dirs, total, n, "", false);
     header["integrity_v"] = serde_json::json!(1);
-    write_frame(send, &header).await?;
+    Box::pin(quick::write_header(send, &header, pages_ok)).await?;
     let reply = read_frame(recv).await?;
     anyhow::ensure!(reply["ready"] == true && integrity::enabled(&reply), "missing integrity ready");
     let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
@@ -10061,6 +10192,7 @@ async fn serve_pull_verified<F: Fn(u64, u64)>(conn: &Connection, send: &mut Send
 /// only when the puller said it understands it), then negotiate exactly like a
 /// friend send — parallel + resume when the receiver replies ready, classic
 /// single-stream otherwise.
+#[cfg(test)]
 async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     conn: &Connection,
     send: &mut SendStream,
@@ -10071,6 +10203,21 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     on_progress: F,
 ) -> Result<u64> {
     let (items, dirs, total) = gather_items(paths)?;
+    serve_pull_negotiated_items(conn, send, recv, (&items, &dirs, total), allow_parallel, true, cancel, on_progress).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_pull_negotiated_items<F: Fn(u64, u64)>(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    frozen: (&[SendItem], &[String], u64),
+    allow_parallel: bool,
+    pages_ok: bool,
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<u64> {
+    let (items, dirs, total) = frozen;
     let n = if allow_parallel {
         parallel_streams_for(conn, items.len(), total)
     } else {
@@ -10078,7 +10225,7 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     };
     // Internet Quick Send respects the upload cap; LAN stays full speed.
     let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
-    write_frame(send, &files_header(&items, &dirs, total, n, "", false)).await?;
+    Box::pin(quick::write_header(send, &files_header(items, dirs, total, n, "", false), pages_ok)).await?;
     if n > 0 {
         let reply = match tokio::time::timeout(Duration::from_secs(6), read_frame(recv)).await {
             Ok(Ok(v)) => Some(v),
@@ -11557,6 +11704,10 @@ mod tests {
                 total: data.len() as u64,
                 cancel: Arc::new(AtomicBool::new(false)),
                 gen: Arc::new(AtomicU64::new(0)),
+                items: Arc::new(gather_items(std::slice::from_ref(&src)).unwrap().0),
+                dirs: Arc::default(),
+                expires_at: Instant::now() + Duration::from_secs(3600),
+                puller: Arc::default(),
             },
         );
         let ticket = make_ticket(&server, &token).unwrap();

@@ -218,7 +218,8 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   } else if (held) {
     meta = <span><Server className="srv-glyph" aria-hidden />{statusLabel(t)}{t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}</span>
   } else if (canceled) {
-    meta = statusLabel(t)
+    // "Canceled by Alex" when the OTHER side stopped it (engine sets detail).
+    meta = t.detail ?? statusLabel(t)
   } else {
     meta = statusLabel(t)
   }
