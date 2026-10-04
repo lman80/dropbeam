@@ -35,6 +35,11 @@ const RECEIPT_MS: u64 = 30 * DAY_MS;
 const RECEIPT_MAX: usize = 50_000;
 /// An upload nobody resumed for this long is abandoned.
 const STALE_UPLOAD_MS: u64 = 7 * DAY_MS;
+/// An upload nobody has touched for this long is abandoned: free its space
+/// (long enough for a laptop that slept overnight to come back and resume).
+const IDLE_UPLOAD_MS: u64 = 48 * 3600 * 1000;
+/// Quarantined (unreadable at startup) items are kept this long for recovery.
+const QUARANTINE_MS: u64 = 30 * DAY_MS;
 const MAX_ITEMS_PER_RECIPIENT: usize = 2000;
 /// Items one (non-owner) person may leave waiting for one device.
 const MAX_ITEMS_PER_PAIR: usize = 500;
@@ -254,6 +259,39 @@ fn read_receipts(root: &Path) -> HashMap<String, Receipt> {
     out
 }
 
+/// What a startup scan may do with an item folder it can't load.
+#[derive(Debug, PartialEq, Eq)]
+enum Unloadable {
+    /// Provably finished or never written: safe to delete.
+    Delete,
+    /// Couldn't be READ (I/O error — a NAS waking up, a permissions hiccup):
+    /// never delete a possibly-held item on a read error. Set aside instead.
+    Quarantine,
+}
+
+/// Classify an item folder whose record didn't load cleanly.
+fn unloadable(path: &Path, finished: bool) -> Unloadable {
+    if finished { return Unloadable::Delete; }
+    let io_error = |p: PathBuf| matches!(std::fs::metadata(&p), Err(e) if e.kind() != std::io::ErrorKind::NotFound);
+    match std::fs::read(path.join("item.json")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Unloadable::Quarantine,
+        _ if io_error(path.join("payload")) || io_error(path.join("header.json")) => Unloadable::Quarantine,
+        // A complete payload with an unreadable/garbled record is still someone's file.
+        _ if std::fs::metadata(path.join("payload")).is_ok_and(|m| m.len() > 0) => Unloadable::Quarantine,
+        _ => Unloadable::Delete,
+    }
+}
+
+fn quarantine(root: &Path, path: &Path) {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let target = root.join("quarantine").join(format!("{name}-{}", now()));
+    let moved = std::fs::create_dir_all(root.join("quarantine")).and_then(|_| std::fs::rename(path, &target));
+    match moved {
+        Ok(()) => log::warn!("transfer-server: an item couldn't be read at startup; set aside in quarantine (not deleted)"),
+        Err(_) => log::warn!("transfer-server: an item couldn't be read at startup; left in place (not deleted)"),
+    }
+}
+
 fn load_store(root: &Path) -> Store {
     let receipts = read_receipts(root);
     let mut items = HashMap::new();
@@ -263,6 +301,8 @@ fn load_store(root: &Path) -> Store {
             let path = dir.path();
             let record: Option<Item> = std::fs::read(path.join("item.json")).ok()
                 .and_then(|b| serde_json::from_slice(&b).ok());
+            let finished = record.as_ref().is_some_and(|it| receipts.contains_key(&it.id))
+                || path.file_name().is_some_and(|n| receipts.contains_key(n.to_string_lossy().as_ref()));
             let keep = record.filter(|it| {
                 let name_ok = path.file_name().is_some_and(|n| n.to_string_lossy() == it.id);
                 let bytes_ok = match it.state.as_str() {
@@ -277,10 +317,13 @@ fn load_store(root: &Path) -> Store {
                 Some(it) => {
                     items.insert(it.id.clone(), it);
                 }
-                None => {
-                    log::warn!("transfer-server: removing an incomplete item folder");
-                    let _ = std::fs::remove_dir_all(&path);
-                }
+                None => match unloadable(&path, finished) {
+                    Unloadable::Delete => {
+                        log::warn!("transfer-server: removing an incomplete item folder");
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
+                    Unloadable::Quarantine => quarantine(root, &path),
+                },
             }
         }
     }
@@ -404,6 +447,13 @@ pub fn rights_for(config: &Path, c: &ServerConfig, eid: &str) -> Rights {
     Rights { own: false, member, through: member && c.through.contains(&person), owner: false }
 }
 
+/// A device that may no longer collect anything: removed from this account, or
+/// that exact device denied by the owner. (Denying a PERSON only stops their
+/// deposits — what is held FOR them still reaches them.)
+fn removed_device(config: &Path, c: &ServerConfig, eid: &str) -> bool {
+    crate::account::device_was_removed(config, eid) || c.denied.iter().any(|d| d.strip_prefix("e:") == Some(eid))
+}
+
 /// Whether items may be left for this device without "send through".
 fn is_member_device(config: &Path, c: &ServerConfig, eid: &str) -> bool {
     rights_for(config, c, eid).any()
@@ -468,18 +518,29 @@ pub async fn serve(config: &Path, me: Option<&str>, conn: &Connection, send: &mu
     }
     match kind {
         "mailbox.deposit" => serve_deposit(config, &c, &who, me, send, recv, req).await?,
+        "mailbox.get" if removed_device(config, &c, &who) => write_frame(send, &refuse("gone")).await?,
         "mailbox.get" => serve_get(config, &who, send, req).await?,
+        "mailbox.fetch" | "mailbox.ack" if removed_device(config, &c, &who) => {
+            // A device removed from the account (or a denied person's device)
+            // can't collect what is still held here.
+            write_frame(send, &refuse("denied")).await?;
+        }
         other => {
-            let reply = match other {
-                "mailbox.hello" => hello_reply(config, &c, &who),
-                "mailbox.cancel" => cancel(config, &who, req),
-                "mailbox.status" => status_reply(config, &who, req),
-                "mailbox.fetch" => fetch_reply(config, &who),
-                "mailbox.ack" => ack(config, &who, req),
-                "mailbox.push-register" => super::push::register(config, &c, &who, req),
-                "mailbox.members" => super::members::receive(config, &c, me, &who, req),
-                _ => refuse("unknown"),
-            };
+            let (config, other, who, req, me) = (config.to_path_buf(), other.to_owned(), who.clone(), req.clone(), me.map(str::to_owned));
+            // Store work touches the disk (a slow NAS): never on an async worker.
+            let reply = tokio::task::spawn_blocking(move || {
+                let config = config.as_path();
+                match other.as_str() {
+                    "mailbox.hello" => hello_reply(config, &c, &who),
+                    "mailbox.cancel" => cancel(config, &who, &req),
+                    "mailbox.status" => status_reply(config, &who, &req),
+                    "mailbox.fetch" => fetch_reply(config, &who),
+                    "mailbox.ack" => ack(config, &who, &req),
+                    "mailbox.push-register" => super::push::register(config, &c, &who, &req),
+                    "mailbox.members" => super::members::receive(config, &c, me.as_deref(), &who, &req),
+                    _ => refuse("unknown"),
+                }
+            }).await?;
             write_frame(send, &reply).await?;
         }
     }
@@ -647,6 +708,30 @@ fn admit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, req: &Val
     })
 }
 
+/// A running upload's "stop" bell: a re-deposit of the same item by the same
+/// sender (its connection blipped and it came back) takes over at once instead
+/// of being told "busy" while the dead stream waits out its read timeout.
+static STOPS: Mutex<Option<HashMap<String, Arc<tokio::sync::Notify>>>> = Mutex::new(None);
+fn stop_bell(id: &str) -> Arc<tokio::sync::Notify> {
+    STOPS.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(HashMap::new)
+        .entry(id.to_owned()).or_default().clone()
+}
+
+/// If `who` is already uploading this exact item, stop that stale upload and
+/// wait (bounded) for it to let go.
+async fn supersede_stale_upload(config: &Path, who: &str, req: &Value) {
+    let Some(id) = req["header"]["item_id"].as_str().map(str::to_owned) else { return };
+    let busy = || with_store(config, |s| s.uploading.contains(&id) && s.items.get(&id).is_some_and(|it| it.from == who)).unwrap_or(false);
+    if !busy() { return; }
+    log::info!("transfer-server: the sender came back for an upload still marked in progress; taking over");
+    stop_bell(&id).notify_waiters();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !busy() { return; }
+        stop_bell(&id).notify_waiters();
+    }
+}
+
 struct UploadGuard<'a> {
     config: &'a Path,
     id: String,
@@ -654,11 +739,18 @@ struct UploadGuard<'a> {
 impl Drop for UploadGuard<'_> {
     fn drop(&mut self) {
         let _ = with_store(self.config, |s| s.uploading.remove(&self.id));
+        STOPS.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(HashMap::new).remove(&self.id);
     }
 }
 
 async fn serve_deposit(config: &Path, c: &ServerConfig, who: &str, me: Option<&str>, send: &mut SendStream, recv: &mut RecvStream, req: &Value) -> Result<()> {
-    let (item, have, root) = match admit(config, c, who, me, req) {
+    supersede_stale_upload(config, who, req).await;
+    let admitted = {
+        let (config, c, who, me, req) = (config.to_path_buf(), c.clone(), who.to_owned(), me.map(str::to_owned), req.clone());
+        // Disk work (a sleeping NAS can take seconds) off the async workers.
+        tokio::task::spawn_blocking(move || admit(&config, &c, &who, me.as_deref(), &req)).await?
+    };
+    let (item, have, root) = match admitted {
         Ok(v) => v,
         Err(reply) => {
             write_frame(send, &reply).await?;
@@ -666,6 +758,7 @@ async fn serve_deposit(config: &Path, c: &ServerConfig, who: &str, me: Option<&s
         }
     };
     let _guard = UploadGuard { config, id: item.id.clone() };
+    let bell = stop_bell(&item.id);
     write_frame(send, &json!({"ok": true, "have": have})).await?;
     let dir = item_dir(&root, &item.id);
     let part = dir.join("payload.part");
@@ -678,9 +771,11 @@ async fn serve_deposit(config: &Path, c: &ServerConfig, who: &str, me: Option<&s
         let mut buf = vec![0u8; 256 * 1024];
         while remaining > 0 {
             let want = remaining.min(buf.len() as u64) as usize;
-            let n = tokio::time::timeout(Duration::from_secs(90), recv.read(&mut buf[..want])).await
-                .context("upload stalled")??
-                .context("upload ended early")?;
+            let n = tokio::select! {
+                r = tokio::time::timeout(Duration::from_secs(90), recv.read(&mut buf[..want])) =>
+                    r.context("upload stalled")??.context("upload ended early")?,
+                _ = bell.notified() => anyhow::bail!("superseded by the sender's new connection"),
+            };
             f.write_all(&buf[..n]).await?;
             remaining -= n as u64;
         }
@@ -691,6 +786,16 @@ async fn serve_deposit(config: &Path, c: &ServerConfig, who: &str, me: Option<&s
     }
     .await;
     if let Err(e) = result {
+        // Canceled while it streamed: release its quota NOW, not after 7 days.
+        let canceled = with_store(config, |s| {
+            let asked = s.cancel_requested.remove(&item.id);
+            if asked { finish_item(s, &item.id, "canceled"); }
+            asked
+        }).unwrap_or(false);
+        if canceled {
+            log::info!("transfer-server: a canceled upload stopped; its space is free again");
+            return Ok(());
+        }
         log::info!("transfer-server: upload interrupted (resumable): {e:#}");
         let _ = write_frame(send, &refuse("interrupted")).await;
         return Ok(());
@@ -780,8 +885,10 @@ fn cancel(config: &Path, who: &str, req: &Value) -> Value {
                     s.cancel_requested.insert(id.clone());
                     return json!({"ok": true, "canceled": true});
                 }
+                // Devices that already took it: an unsend must still reach them.
+                let delivered = it.delivered.clone();
                 finish_item(s, &id, "canceled");
-                json!({"ok": true, "canceled": true})
+                json!({"ok": true, "canceled": true, "delivered_to": delivered})
             }
             Some(_) => refuse("denied"),
             None => json!({"ok": true, "canceled": false,
@@ -815,7 +922,8 @@ fn fetch_reply(config: &Path, who: &str) -> Value {
         let mut mine: Vec<&Item> = s.items.values()
             .filter(|i| i.state == "held" && i.waiting_for(who))
             .collect();
-        mine.sort_by(|a, b| (a.created_ms, &a.id).cmp(&(b.created_ms, &b.id)));
+        // Chat/ops first: a message must never wait behind a big file.
+        mine.sort_by(|a, b| (a.ct_size > 0, a.created_ms, &a.id).cmp(&(b.ct_size > 0, b.created_ms, &b.id)));
         let mut inline_budget: i64 = 600 * 1024;
         let items: Vec<Value> = mine.iter().take(500).map(|it| {
             let mut v = json!({"item_id": it.id, "kind": it.kind, "from": it.from, "ct_size": it.ct_size, "created_ms": it.created_ms});
@@ -922,11 +1030,22 @@ pub fn gc(config: &Path) -> usize {
     if !c.enabled {
         return 0;
     }
-    with_store(config, |s| {
-        let t = now();
+    // Stat paused uploads OUTSIDE the store lock (a slow NAS must not stall
+    // every other store user): which have had no byte for IDLE_UPLOAD_MS?
+    let t = now();
+    let paused: Vec<(String, PathBuf, u64)> = with_store(config, |s| s.items.values()
+        .filter(|i| i.state == "uploading" && !s.uploading.contains(&i.id) && i.created_ms + IDLE_UPLOAD_MS <= t)
+        .map(|i| (i.id.clone(), item_dir(&s.root, &i.id).join("payload.part"), i.created_ms)).collect()).unwrap_or_default();
+    let idle: HashSet<String> = paused.into_iter().filter(|(_, part, created)| {
+        let touched = std::fs::metadata(part).and_then(|m| m.modified()).ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(*created, |d| d.as_millis() as u64);
+        touched.max(*created) + IDLE_UPLOAD_MS <= t
+    }).map(|(id, _, _)| id).collect();
+    let removed = with_store(config, |s| {
         let expired: Vec<String> = s.items.values()
             .filter(|i| !s.uploading.contains(&i.id))
-            .filter(|i| (i.state == "held" && i.expires_ms <= t) || (i.state == "uploading" && i.created_ms + STALE_UPLOAD_MS <= t))
+            .filter(|i| (i.state == "held" && i.expires_ms <= t)
+                || (i.state == "uploading" && (i.created_ms + STALE_UPLOAD_MS <= t || idle.contains(&i.id))))
             .map(|i| i.id.clone())
             .collect();
         for id in &expired {
@@ -945,7 +1064,19 @@ pub fn gc(config: &Path) -> usize {
         }
         expired.len()
     })
-    .unwrap_or(0)
+    .unwrap_or(0);
+    // Quarantined items age out after a month (kept that long for recovery).
+    if let Ok(root) = root(config, &c) {
+        for e in std::fs::read_dir(root.join("quarantine")).into_iter().flatten().flatten() {
+            // Age from when it was SET ASIDE (the "-<ms>" suffix), never the
+            // folder's own mtime, which a rename keeps from long before.
+            let name = e.file_name().to_string_lossy().into_owned();
+            let set_aside = name.rsplit('-').next().and_then(|ms| ms.parse::<u64>().ok());
+            let old = set_aside.is_some_and(|at| t.saturating_sub(at) > QUARANTINE_MS);
+            if old { let _ = std::fs::remove_dir_all(e.path()); }
+        }
+    }
+    removed
 }
 
 /// Recipient devices with items waiting, and how many.

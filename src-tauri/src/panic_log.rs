@@ -29,7 +29,20 @@ impl std::fmt::Write for Line {
     }
 }
 
+/// The panic log only ever grew. At startup, once it passes `max` bytes keep
+/// just its newest `keep` bytes (from a line start).
+fn prune(path: &Path, max: u64, keep: u64) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.len() <= max { return; }
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let start = bytes.len().saturating_sub(keep as usize);
+    let start = bytes[start..].iter().position(|&b| b == b'\n').map_or(start, |i| start + i + 1);
+    let tmp = path.with_extension("log.tmp");
+    if std::fs::write(&tmp, &bytes[start..]).is_ok() { let _ = std::fs::rename(&tmp, path); }
+}
+
 pub(crate) fn install(log_dir: Option<&Path>) {
+    if let Some(dir) = log_dir { prune(&dir.join("DropBeam-panic.log"), 1 << 20, 256 << 10); }
     // Open once before installing the hook. A separate append-only file avoids
     // the rotating logger's locks; telemetry already scans DropBeam*.log.
     let log = log_dir.and_then(|dir| {
@@ -108,6 +121,20 @@ pub(crate) fn install(log_dir: Option<&Path>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panic_log_is_pruned_to_its_newest_lines() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-panic-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("DropBeam-panic.log");
+        let text: String = (0..1000).map(|i| format!("line {i:04}\n")).collect();
+        std::fs::write(&path, &text).unwrap();
+        super::prune(&path, 100_000, 1000);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "under the cap: untouched");
+        super::prune(&path, 5000, 1000);
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(kept.len() <= 1000 && kept.starts_with("line ") && kept.ends_with("line 0999\n"), "{kept}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn hook_survives_with_logger_and_stderr_locks_held() {
         const CHILD: &str = "DROPBEAM_PANIC_HOOK_TEST";

@@ -1346,3 +1346,103 @@ async fn a_server_heard_about_from_a_friend_is_never_treated_as_ours() {
     let e = client::servers(&w.f.config).into_iter().find(|s| s.eid == w.s.eid()).unwrap();
     assert!(e.revoked && e.via.is_empty(), "{e:?}");
 }
+
+// ── T11 (2026-10-04 audit) ──────────────────────────────────────────────────
+
+/// A held file whose record can't be read at startup is set aside, never deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11_unreadable_held_file_is_quarantined_not_deleted() {
+    let w = world("t11-quarantine").await;
+    let src = w.base.join("src/keep.bin");
+    write(&src, 5000, 9);
+    let xfer = uuid::Uuid::new_v4().to_string();
+    client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &deposit_files_of(&[(src, "keep.bin")]), &[], &["keep.bin".into()],
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
+    let root = server::root(&w.s.config, &server::load_config(&w.s.config)).unwrap();
+    let item = walk(&root.join("items")).into_iter().find(|p| p.ends_with("item.json")).unwrap();
+    std::fs::write(&item, b"{torn").unwrap();
+    server::unload(&w.s.config);
+    assert_eq!(server_items(&w), 0);
+    let kept = walk(&root.join("quarantine"));
+    assert!(kept.iter().any(|p| p.ends_with("payload")), "the payload is set aside: {kept:?}");
+    // A gc right after must not age it out by the folder's old mtime.
+    for d in std::fs::read_dir(root.join("quarantine")).unwrap().flatten() { iroh_net::set_mtime_secs(&d.path(), 1_000_000_000); }
+    server::gc(&w.s.config);
+    assert!(walk(&root.join("quarantine")).iter().any(|p| p.ends_with("payload")), "kept for recovery");
+}
+
+/// An upload nobody resumed for hours releases its space (not after 7 days).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11_abandoned_upload_frees_its_space_after_idle() {
+    let w = world("t11-idle").await;
+    let src = w.base.join("src/big.bin");
+    write(&src, (seal::SEG as usize) * 4, 3);
+    let files = deposit_files_of(&[(src, "big.bin")]);
+    let xfer = uuid::Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c2 = cancel.clone();
+    let progress = move |d: u64, _t: u64| { if d >= seal::SEG { c2.store(true, Ordering::SeqCst); } };
+    let _ = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["big.bin".into()],
+        &progress, &|_| {}, &cancel, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server_items(&w), 1, "a paused upload stays resumable");
+    assert_eq!(server::gc(&w.s.config), 0, "a fresh partial is kept");
+    let root = server::root(&w.s.config, &server::load_config(&w.s.config)).unwrap();
+    let part = walk(&root.join("items")).into_iter().find(|p| p.ends_with("payload.part")).unwrap();
+    iroh_net::set_mtime_secs(&part, (crate::chat::now_ms() / 1000).saturating_sub(49 * 3600));
+    server::age_all_for_tests(&w.s.config, 49 * 3600 * 1000);
+    assert_eq!(server::gc(&w.s.config), 1);
+    assert_eq!(server_items(&w), 0);
+}
+
+/// Modified times survive the trip; a chat queued after a file is listed first;
+/// a device the owner removed can't collect anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11_mtime_chat_first_and_removed_device() {
+    let w = world("t11-misc").await;
+    let src = w.base.join("src/photo.jpg");
+    write(&src, 3000, 5);
+    iroh_net::set_mtime_secs(&src, 1_600_000_000);
+    let xfer = uuid::Uuid::new_v4().to_string();
+    client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &deposit_files_of(&[(src, "photo.jpg")]), &[], &["photo.jpg".into()],
+        &|_, _| {}, &|_| {}, &AtomicBool::new(false), None).await.unwrap();
+    let m = uuid::Uuid::new_v4().to_string();
+    client::deposit_chat(&w.a.state, &w.a.config, &w.b_for_a, "chat", &chat_frame(&m, "after the file"), Some(&m)).await.unwrap();
+    let conn = w.b.ep.connect(iroh_net::dial_addr(w.s.ep.id()), iroh_net::ALPN).await.unwrap();
+    let list = rpc(&conn, json!({"kind": "mailbox.fetch", "v": super::VERSION})).await;
+    assert_eq!(list["items"][0]["kind"], "chat", "{list}");
+    // The owner denies B's device: it can no longer fetch.
+    let mut c = server::load_config(&w.s.config);
+    c.denied.push(format!("e:{}", w.b.eid()));
+    server::save_config(&w.s.config, &c).unwrap();
+    let refused = rpc(&conn, json!({"kind": "mailbox.fetch", "v": super::VERSION})).await;
+    assert_eq!(refused["reason"], "denied", "{refused}");
+    conn.close(0u32.into(), b"done");
+    c.denied.clear();
+    server::save_config(&w.s.config, &c).unwrap();
+    assert_eq!(fetch(&w).await, 2);
+    let landed = std::fs::metadata(w.b.config.join("Downloads/photo.jpg")).unwrap();
+    assert_eq!(iroh_net::mtime_secs(&landed), 1_600_000_000);
+    assert!(walk(&w.b.config.join("mailbox-in")).is_empty(), "no ciphertext left behind");
+}
+
+/// Startup sweep: week-old partial ciphertext and day-old landing stages go;
+/// anything else stays.
+#[test]
+fn t11_startup_sweep_removes_only_stale_leftovers() {
+    let base = std::env::temp_dir().join(format!("dropbeam-mbx-sweep-{}", uuid::Uuid::new_v4()));
+    let (config, dl) = (base.join("cfg"), base.join("dl"));
+    std::fs::create_dir_all(config.join("mailbox-in")).unwrap();
+    std::fs::create_dir_all(dl.join("Folder")).unwrap();
+    let old = (crate::chat::now_ms() / 1000).saturating_sub(8 * 24 * 3600);
+    let mk = |p: PathBuf, stale: bool| { std::fs::write(&p, b"x").unwrap(); if stale { iroh_net::set_mtime_secs(&p, old); } p };
+    let stale_ct = mk(config.join("mailbox-in/a.ct"), true);
+    let fresh_ct = mk(config.join("mailbox-in/b.ct"), false);
+    let stale_part = mk(dl.join("Folder/.dropbeam-mbx-1.part"), true);
+    let fresh_part = mk(dl.join(".dropbeam-mbx-2.part"), false);
+    let user = mk(dl.join("notes.txt"), true);
+    client::sweep_leftovers(&config, &dl);
+    assert!(!stale_ct.exists() && !stale_part.exists());
+    assert!(fresh_ct.exists() && fresh_part.exists() && user.exists());
+    let _ = std::fs::remove_dir_all(base);
+}

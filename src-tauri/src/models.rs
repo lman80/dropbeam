@@ -239,7 +239,9 @@ pub struct Settings {
     pub launch_at_login: bool,
     /// Prefer direct peer-to-peer connections over the relay.
     pub prefer_direct_p2p: bool,
-    /// Custom relay address (host:port). Empty = use the public relay.
+    /// Extra relay server URL(s) — comma/space separated `https://…` — added in
+    /// front of the built-in relays (which stay as the fallback). Empty = the
+    /// built-in list. Applied at startup. See RELAY-SETUP.md.
     pub custom_relay: String,
     /// Custom relay password. Empty = default.
     pub custom_relay_pass: String,
@@ -282,6 +284,9 @@ pub struct Settings {
     /// a feature gate, so it never changes the wire format — the receiver follows.
     #[serde(default = "default_true")]
     pub parallel_streams: bool,
+    /// How long a Quick Send link stays valid, in hours (0 = the default, 24).
+    #[serde(default)]
+    pub quick_send_ttl_hours: u32,
     /// Absolute path to the user's chosen profile picture (copied into the app
     /// config dir). Empty = no picture (we render initials instead). Local-only.
     #[serde(default)]
@@ -373,6 +378,7 @@ impl Default for Settings {
             require_direct: false,
             wait_for_direct: false,
             parallel_streams: true,
+            quick_send_ttl_hours: 0,
             avatar: String::new(),
             notify_on_message: true,
             send_read_receipts: true,

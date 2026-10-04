@@ -368,14 +368,41 @@ pub(crate) fn publish_noreplace_owned(source: &Path, destination: &Path, expecte
             &to, destination.file_name().context("destination name missing")?, expected)
     }
     #[cfg(not(unix))] {
-        // A new hard link is atomic and never replaces an existing directory entry.
         let file = fs::File::open(source)?;
         let identity = crate::iroh_net::receive_stage::Identity::of(&file)?;
+        drop(file);
         ensure!(expected.is_none_or(|id| id == identity), "Receive stage identity changed before publication");
+        // A rename WITHOUT MOVEFILE_REPLACE_EXISTING is atomic and fails on an
+        // occupied name — and unlike a hard link it works on FAT32/exFAT drives,
+        // where every receive used to fail (T3).
+        #[cfg(windows)]
+        match windows_move_noreplace(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+            Err(e) => log::debug!("no-replace rename failed ({e}); publishing with a hard link"),
+        }
+        // A new hard link is atomic and never replaces an existing directory entry.
         fs::hard_link(source, destination)?;
         if let Err(e) = identity.remove(source) { log::warn!("Published hard link; stage cleanup deferred: {e:#}"); }
         Ok(())
     }
+}
+
+/// `MoveFileExW` with no flags: never replaces an existing destination.
+#[cfg(windows)]
+fn windows_move_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (from, to) = (wide(source), wide(destination));
+    unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVE_FILE_FLAGS(0)) }.map_err(|e| {
+        // HRESULT_FROM_WIN32(code) → the Win32 code, so ERROR_ALREADY_EXISTS /
+        // ERROR_FILE_EXISTS read as io::ErrorKind::AlreadyExists.
+        let hr = e.code().0 as u32;
+        let raw = if hr & 0xFFFF_0000 == 0x8007_0000 { (hr & 0xFFFF) as i32 } else { hr as i32 };
+        std::io::Error::from_raw_os_error(raw)
+    })
 }
 
 /// Only call for registered ordinary receive directories, never NAS roots.

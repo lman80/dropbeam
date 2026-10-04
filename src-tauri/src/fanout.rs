@@ -117,6 +117,21 @@ pub struct Record {
     #[serde(default)]
     pub updated_ms: u64,
     pub devices: Vec<Delivery>,
+    /// What the paths held when sent (sizes + modified times). A re-send of the
+    /// same paths only "resumes" this record when the content is unchanged.
+    #[serde(default)]
+    pub sig: String,
+}
+
+/// Content signature of a selection: every file's name, size and mtime.
+pub(crate) fn content_sig(paths: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let Ok((items, dirs)) = crate::iroh_net::lab_manifest(&bufs) else { return String::new() };
+    let mut h = Sha256::new();
+    for (_, name, size, mtime) in &items { h.update(format!("{name}\0{size}\0{mtime}\n").as_bytes()); }
+    for d in &dirs { h.update(format!("dir\0{d}\n").as_bytes()); }
+    hex::encode(h.finalize())
 }
 
 fn now() -> u64 {
@@ -758,8 +773,13 @@ impl Engine {
         let stop = if reason == CancelReason::Pause { PAUSED } else { CANCELED };
         let had_held = rec.devices.iter().any(|d| d.state == HELD || d.state == UPLOADING);
         update(&self.config, id, |r| {
-            for d in r.devices.iter_mut().filter(|d| !running.contains(&d.eid)) {
-                if d.state == WAITING || d.state == OFFLINE || (d.state == HELD && reason == CancelReason::Cancel) {
+            for d in r.devices.iter_mut() {
+                if running.contains(&d.eid) {
+                    // Persist the stop NOW: if the app quits before the leg
+                    // unwinds, recover() must not requeue a canceled device.
+                    // (The leg's own end still records Delivered if it won the race.)
+                    if d.busy() { d.state = stop.into(); }
+                } else if d.state == WAITING || d.state == OFFLINE || (d.state == HELD && reason == CancelReason::Cancel) {
                     d.state = stop.into();
                 }
             }
@@ -1122,8 +1142,12 @@ pub fn send(app: tauri::AppHandle, net: Arc<IrohState>, config: &Path, friend_id
     // Resume/Retry of a recent send to them: only the devices still owed it
     // (a paused or failed device), never the ones that already have it.
     let t = now();
+    // Same paths but changed content is a NEW send that every device needs —
+    // not a resume that skips the devices that got the old version (T12).
+    let sig = content_sig(&paths);
     let resumable = records(config).into_iter().filter(|r| {
-        (chat_transfer_id.as_deref() == Some(r.chat_id.as_str()) || (r.paths == paths && t.saturating_sub(r.created_ms) < 24 * 3600 * 1000))
+        (chat_transfer_id.as_deref() == Some(r.chat_id.as_str())
+            || (r.paths == paths && !sig.is_empty() && r.sig == sig && t.saturating_sub(r.created_ms) < 24 * 3600 * 1000))
             && thread_of(config, &r.peer_id) == owner.id
             && !r.devices.iter().any(Delivery::busy)
             && r.devices.iter().any(|d| d.state == PAUSED || d.state == FAILED)
@@ -1148,7 +1172,7 @@ pub fn send(app: tauri::AppHandle, net: Arc<IrohState>, config: &Path, friend_id
     let rec = Record {
         chat_id: chat_transfer_id.unwrap_or_else(|| id.clone()),
         id, peer_id: owner.id.clone(), friend_name: owner.name.clone(), paths, names, total,
-        attempt: chat_attempt.unwrap_or(1).max(now()), devices, ..Default::default()
+        attempt: chat_attempt.unwrap_or(1).max(now()), devices, sig, ..Default::default()
     };
     log::info!("fanout: sending to {} devices of one friend", rec.devices.len());
     note_targets_set(&rec.chat_id, rec.devices.iter().map(|d| d.eid.clone()).collect());
@@ -1168,6 +1192,50 @@ mod tests {
 
     fn dev(eid: &str, state: &str) -> Delivery {
         Delivery { eid: eid.into(), label: eid.into(), state: state.into(), ..Default::default() }
+    }
+
+    struct NullEnv;
+    impl Env for NullEnv {
+        fn direct(&self, _job: Job, _progress: Progress) -> BoxFut<Outcome> { Box::pin(async { Outcome::Offline }) }
+        fn changed(&self, _: &Path, _: &Record, _: &HashMap<String, (u64, f64)>, _: bool) {}
+        fn stop_legs(&self, _: &str, _: CancelReason) {}
+    }
+
+    /// T12: a leg canceled while running stays canceled if the app quits
+    /// before the leg unwinds — recover() must not requeue it.
+    #[test]
+    fn t12_canceled_running_leg_is_not_requeued_after_restart() {
+        let config = std::env::temp_dir().join(format!("dropbeam-fanout-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&config).unwrap();
+        let id = format!("stop-{}", uuid::Uuid::new_v4());
+        let rec = Record { id: id.clone(), chat_id: id.clone(), created_ms: now(),
+            devices: vec![dev("a", SENDING), dev("b", WAITING)], ..Default::default() };
+        save(&config, &BTreeMap::from([(id.clone(), rec)]));
+        with_live(|l| { l.insert(id.clone(), Live { cancel: Arc::default(), reason: None,
+            running: HashSet::from(["a".to_string()]), bytes: HashMap::new(), last_emit: None }); });
+        let engine = engine_for_tests(Arc::new(NullEnv), Arc::new(IrohState::default()), config.clone());
+        assert!(engine.stop(&id, CancelReason::Cancel));
+        with_live(|l| { l.remove(&id); }); // the app quits before the leg ends
+        engine.recover();
+        let after = get(&config, &id).unwrap();
+        assert!(after.devices.iter().all(|d| d.state == CANCELED), "{:?}", after.devices);
+        let _ = std::fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn t12_content_signature_tracks_changes() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-fanout-sig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.txt");
+        std::fs::write(&f, b"v1").unwrap();
+        crate::iroh_net::set_mtime_secs(&f, 1_700_000_000);
+        let paths = vec![f.to_string_lossy().into_owned()];
+        let one = content_sig(&paths);
+        assert!(!one.is_empty());
+        assert_eq!(one, content_sig(&paths));
+        std::fs::write(&f, b"v2!").unwrap();
+        assert_ne!(one, content_sig(&paths), "changed content must not match the old send");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

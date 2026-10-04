@@ -769,14 +769,15 @@ enum Break { NetworkDrop, ReceiverRestart, SenderRestart, Cancel }
 /// then sent again: the second attempt must RESUME (send well under the full
 /// size), land one byte-identical file with the sender's mtime, and leave no
 /// partial, sidecar or duplicate behind.
-async fn interrupted_big_send_resumes(how: Break) {
+async fn interrupted_big_send_resumes(how: Break) { interrupted_big_send_resumes_paced(how, Duration::from_millis(1)).await }
+async fn interrupted_big_send_resumes_paced(how: Break, per_chunk: Duration) {
     let src = scratch("resume");
     let rx = scratch("resume-rx");
     let dest = rx.0.join("dest");
     let total = 4 * PARALLEL_MIN as usize + 12345;
     let file = put(&src.0, "movie.mov", total, 7);
     std::fs::create_dir_all(&dest).unwrap();
-    let slow = Throttle::new(&dest, Duration::from_millis(1));
+    let slow = Throttle::new(&dest, per_chunk);
     let (server_key, client_key) = (SecretKey::generate(), SecretKey::generate());
     let server = endpoint_with(true, server_key.clone()).await;
     let client = endpoint_with(false, client_key.clone()).await;
@@ -788,7 +789,12 @@ async fn interrupted_big_send_resumes(how: Break) {
     let hook: Hook = {
         let (srv, cli, live, cancel, fired) = (server.clone(), client.clone(), live.clone(), cancel.clone(), fired.clone());
         Arc::new(move |done, _| {
-            if done > total as u64 * 6 / 10 && !fired.swap(true, Ordering::SeqCst) {
+            // A cancel is only seen between writes: break it while the rest of
+            // the file can't already sit in the 4 × 8 MB flow-control windows
+            // (at 60% the whole remainder often fit, and the "interrupted"
+            // send simply finished — a pre-existing timing flake).
+            let at = if matches!(how, Break::Cancel) { 4 } else { 6 };
+            if done > total as u64 * at / 10 && !fired.swap(true, Ordering::SeqCst) {
                 match how {
                     Break::NetworkDrop => live.get().unwrap().close(9u32.into(), b"wifi gone"),
                     Break::Cancel => cancel.store(true, Ordering::SeqCst),
@@ -803,7 +809,7 @@ async fn interrupted_big_send_resumes(how: Break) {
     live.set(conn.clone()).unwrap();
     let first = tokio::time::timeout(QUICK, friend_send(&conn, &server.id().to_string(), &[file.clone()], &cancel))
         .await.expect("the interrupted send must end, not hang");
-    assert!(fired.load(Ordering::SeqCst), "{how:?}: the break never fired");
+    assert!(fired.load(Ordering::SeqCst), "{how:?}: the break never fired: {first:?}");
     assert!(first.is_err(), "{how:?}: the interrupted attempt reports failure");
     conn.close(0u32.into(), b"retry");
     let _ = tokio::time::timeout(Duration::from_secs(20), receiver).await.expect("receiver must notice the break");
@@ -834,7 +840,26 @@ async fn matrix_resume_after_receiver_restart() { let _gate = PACE_GATE.read().a
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_resume_after_sender_restart() { let _gate = PACE_GATE.read().await; interrupted_big_send_resumes(Break::SenderRestart).await; }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_resume_after_cancel_or_pause() { let _gate = PACE_GATE.read().await; interrupted_big_send_resumes(Break::Cancel).await; }
+async fn matrix_resume_after_cancel_or_pause() {
+    let _gate = PACE_GATE.read().await;
+    interrupted_big_send_resumes_paced(Break::Cancel, Duration::from_millis(1)).await;
+}
+
+/// T2 regression (540a837): on a LAN path the big file used to go out as the
+/// classic, sidecar-less body, so a Wi-Fi blip restarted it from zero. The LAN
+/// path must stay ONE stream but resumable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_resume_on_lan_path_after_network_drop() {
+    let _gate = PACE_GATE.write().await;
+    struct Lan;
+    impl Drop for Lan { fn drop(&mut self) { TEST_LOOPBACK_IS_LAN.store(false, Ordering::SeqCst); } }
+    TEST_LOOPBACK_IS_LAN.store(true, Ordering::SeqCst);
+    let _lan = Lan;
+    assert_eq!(local_stream_cap(true, parallel_stream_count(1, 4 * PARALLEL_MIN)), 1);
+    assert_eq!(local_stream_cap(true, parallel_stream_count(3, 4 * PARALLEL_MIN)), 0, "multi-file stays classic");
+    assert_eq!(local_stream_cap(false, parallel_stream_count(1, 4 * PARALLEL_MIN)), PARALLEL_STREAMS);
+    interrupted_big_send_resumes_paced(Break::NetworkDrop, Duration::from_millis(15)).await;
+}
 
 /// A folder of small files canceled (or paused) part-way, then re-sent: every
 /// file that already landed is recognised (`files.stat`: size + mtime) and
