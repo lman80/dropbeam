@@ -767,7 +767,7 @@ function AddPersonDialog({
       ) : (
         <div className="group folder-pick">
           {candidates.map((f) => {
-            const online = friendOnlineState(f.name, friendSeen, folderStatuses) === true
+            const online = friendOnlineState(f, friendSeen, folderStatuses) === true
             return (
               <button key={f.id} type="button" className="row" disabled={!!busy} onClick={() => void invite(f.id, f.name)}>
                 <span className="folder-avatar" style={{ background: avatarColor(f.id) }}>

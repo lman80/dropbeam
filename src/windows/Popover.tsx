@@ -345,7 +345,7 @@ export function Popover() {
           {filtered.length ? (
             <div className="pop-contacts">
               {filtered.map((f) => {
-                const presence = friendPresence(f.name, friendSeen, folderStatuses)
+                const presence = friendPresence(f, friendSeen, folderStatuses)
                 const online = presence.status === 'online'
                 const hot = dragHoverId === f.id
                 return (

@@ -8,13 +8,17 @@ const ONLINE_WINDOW_MS = 120_000
  * Returns null when we simply don't know (no recent contact).
  */
 export function friendOnlineState(
-  name: string,
+  who: PresenceWho,
   friendSeen: Record<string, number>,
   folderStatuses: Record<string, FolderStatus>,
 ): boolean | null {
-  const presence = friendPresence(name, friendSeen, folderStatuses)
+  const presence = friendPresence(who, friendSeen, folderStatuses)
   return presence.status === 'unknown' ? null : presence.status === 'online'
 }
+
+/** A friend (preferred: presence is kept per friend id) or, for callers that
+ *  only know one, a display name. */
+export type PresenceWho = string | { id: string; name: string }
 
 export type PresenceStatus = 'online' | 'offline' | 'unknown'
 export interface Presence {
@@ -29,12 +33,14 @@ export interface Presence {
  * offline) but not recently; "unknown" means we've genuinely never had contact.
  */
 export function friendPresence(
-  name: string,
+  who: PresenceWho,
   friendSeen: Record<string, number>,
   folderStatuses: Record<string, FolderStatus>,
 ): Presence {
+  const name = typeof who === 'string' ? who : who.name
   const key = name.trim().toLowerCase()
-  if (!key) return { status: 'unknown', lastSeen: null }
+  const id = typeof who === 'string' ? null : who.id
+  if (!key && !id) return { status: 'unknown', lastSeen: null }
   let folderOnline: boolean | null = null
   for (const s of Object.values(folderStatuses)) {
     if (s.peerName && s.peerName.trim().toLowerCase() === key) {
@@ -45,7 +51,9 @@ export function friendPresence(
       folderOnline = false // we share a folder but their control channel is quiet
     }
   }
-  const seen = friendSeen[key] ?? null
+  // Keyed by friend id (#44): two friends with the same name, or a friend who
+  // renames, keep their own presence. A name entry is a pre-#44 leftover.
+  const seen = (id ? friendSeen[id] : undefined) ?? friendSeen[key] ?? null
   const recentlySeen = seen != null && Date.now() - seen < ONLINE_WINDOW_MS
   if (folderOnline === true || recentlySeen) return { status: 'online', lastSeen: seen }
   if (folderOnline === false || seen != null) return { status: 'offline', lastSeen: seen }
@@ -93,7 +101,7 @@ export function claimPresenceChecks(
   const due: string[] = []
   for (const f of friends) {
     if (!f.endpointId) continue // paired pre-Direct-mode: there's nothing to dial
-    if (friendPresence(f.name, friendSeen, folderStatuses).status === 'online') continue
+    if (friendPresence(f, friendSeen, folderStatuses).status === 'online') continue
     if (now - (checkedAt.get(f.id) ?? -Infinity) < RECHECK_COOLDOWN_MS) continue
     checkedAt.set(f.id, now)
     due.push(f.id)

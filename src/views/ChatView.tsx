@@ -222,7 +222,7 @@ export function ChatView() {
     return () => { void api.setActiveChat(null) }
   }, [activeChatId])
 
-  const online = (f: Friend) => friendOnlineState(f.name, friendSeen, folderStatuses) === true
+  const online = (f: Friend) => friendOnlineState(f, friendSeen, folderStatuses) === true
   const ownLabels = useOwnDeviceLabels()
 
   if (MOBILE_UI) return activeChatId ? <div className="mobile-page mobile-conversation"><Conversation key={activeChatId} friendId={activeChatId} /></div> : <div className="mobile-page mobile-chats"><MobileHeader title="Chats" /><div className="ios-list">{rows.map(({ friend, last }) => {
@@ -354,13 +354,13 @@ function Conversation({ friendId }: { friendId: string }) {
   // record-level subscription re-rendered this entire (up to 2000-row) thread on
   // every tick. A boolean/string only re-renders when presence actually changes.
   const onlineNow = useStore((s) =>
-    friend ? friendOnlineState(friend.name, s.friendSeen, s.folderStatuses) === true : false,
+    friend ? friendOnlineState(friend, s.friendSeen, s.folderStatuses) === true : false,
   )
   // An active check of this friend is in flight (thread just opened / refocused).
   const [checking, setChecking] = useState(() => !onlineNow)
   const presenceText = useStore((s) => {
     if (!friend) return ''
-    const p = friendPresence(friend.name, s.friendSeen, s.folderStatuses)
+    const p = friendPresence(friend, s.friendSeen, s.folderStatuses)
     return p.status === 'online' ? 'Online' : checking ? 'Connecting…' : presenceLabel(p)
   })
   const windowFocused = useStore((s) => s.windowFocused)

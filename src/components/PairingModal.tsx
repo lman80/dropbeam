@@ -78,7 +78,7 @@ export function PairingModal({
         const offline = invitees
           .map((fid) => friends.find((f) => f.id === fid))
           .filter((f) => f && invitedNames.includes(f.name))
-          .filter((f) => friendOnlineState(f!.name, friendSeen, folderStatuses) !== true)
+          .filter((f) => friendOnlineState(f!, friendSeen, folderStatuses) !== true)
           .map((f) => f!.name)
         const online = invitedNames.filter((n) => !offline.includes(n))
         if (online.length) toast('success', `Invited ${online.join(', ')} to “${folderName}”.`)
