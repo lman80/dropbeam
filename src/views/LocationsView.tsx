@@ -90,7 +90,7 @@ function SharedFromThisDevice() {
       const reach = !status ? null
         : ok ? <span className="location-reach" title={status.freeBytes > 0 ? `${formatBytes(status.freeBytes)} free` : undefined}><Dot tone="ok" /><span className="truncate-1">Available{status.freeBytes > 0 ? ` · ${formatBytes(status.freeBytes)} free` : ''}</span></span>
           : <span className="location-reach warn" title={status.error || (status.reachable ? 'The drive at this path isn’t the one you shared.' : undefined)}>
-            <Dot tone="warn" /><span className="truncate-1">{status.reachable ? 'Drive changed' : 'Not reachable'}</span></span>
+            <Dot tone="warn" /><span className="truncate-1">{status.reachable ? 'Drive changed' : 'Drive not connected'}</span></span>
       return <div className="row location-row" key={l.id}>
         <span className="location-glyph" aria-hidden><HardDrive /></span>
         <div className="row-main">
@@ -200,8 +200,8 @@ export function LocationsView() {
   const unavailable = friends.filter(f => errors[f.id])
   return <div className="locations-view page">
     <div className="page-header titlebar-drag" data-tauri-drag-region="deep"><h1 className="page-title">Locations</h1><div className="page-actions">
-      {!IS_WINDOWS && <button className="btn btn-secondary" onClick={() => setView('settings')}>Share a folder…</button>}
-      {count > 0 && <button className="btn btn-primary" onClick={openSyncFolderSheet}>Sync a folder…</button>}
+      {!IS_WINDOWS && <button className="btn btn-secondary" onClick={() => setView('settings')}>Share a Folder…</button>}
+      <button className="btn btn-primary" onClick={openSyncFolderSheet}>Sync a Folder…</button>
     </div></div>
 
     {count > 0
@@ -209,8 +209,11 @@ export function LocationsView() {
         <SectionHeader>Shared with you</SectionHeader>
         <div className="group">{friends.flatMap(f => (shared[f.id] || []).map(l => {
           const p = presenceWords(f)
-          const room = l.reachable === false
-            ? <span className="location-reach warn"><Dot tone="warn" />Not reachable</span>
+          // The friend is reachable but the folder's drive isn't (unplugged NAS,
+          // ejected disk): say THAT, instead of "Online" next to "Not reachable".
+          const driveGone = l.reachable === false
+          const room = driveGone
+            ? <span className="location-reach warn"><Dot tone="warn" />Drive not connected</span>
             : l.reachable && l.freeBytes != null && l.totalBytes
               ? <span className="location-reach" title={`${formatBytes(l.freeBytes)} free of ${formatBytes(l.totalBytes)}`}>{formatBytes(l.freeBytes)} free</span>
               : null
@@ -221,7 +224,7 @@ export function LocationsView() {
               {(() => {
                 // This device's uploads into it (#30): say so right on the tile.
                 const up = outgoingForLocation(transfers, f.id, l.id)
-                if (!up.length) return <span className="row-sub location-presence truncate-1"><Dot tone={p.online ? 'online' : 'off'} />{f.name} · {p.words}</span>
+                if (!up.length) return <span className="row-sub location-presence truncate-1">{driveGone ? <>{f.name}</> : <><Dot tone={p.online ? 'online' : 'off'} />{f.name} · {p.words}</>}</span>
                 const done = up.reduce((n, t) => n + (t.bytesDone || 0), 0)
                 const total = up.reduce((n, t) => n + (t.bytesTotal || 0), 0)
                 const paused = up.every(t => t.state === 'paused')
