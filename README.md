@@ -35,8 +35,9 @@ After that, **updates install themselves** from inside the app.
 - **Wayland:** the compositor decides where windows go, so the small transfer pop-ups may not sit exactly in the corner.
 
 **Unsigned builds.** Releases built before code signing is set up (see [docs/SIGNING-SETUP.md](docs/SIGNING-SETUP.md)) are blocked once by the OS:
-- **macOS:** open DropBeam → *"Apple could not verify…"* → **Done**, then go to **System Settings → Privacy & Security → Open Anyway**.
-- **Windows:** SmartScreen → **More info → Run anyway**.
+- **macOS:** 1. Open DropBeam. 2. When it says *"Apple could not verify…"*, click **Done**. 3. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to DropBeam. 4. Click **Open Anyway** again and enter your Mac password. You only do this once.
+- **Windows:** 1. Run the installer. 2. If a blue *"Windows protected your PC"* box appears, click **More info**. 3. Click **Run anyway**. You only do this once.
+- **First launch on a Mac:** when macOS asks to let DropBeam *find devices on your local network*, click **Allow** — otherwise sending to computers in the same house is slow. If you clicked Don't Allow, DropBeam shows a banner with an **Open Settings** button.
 
 **Headless Transfer Server (Linux):** the `.deb` installs a systemd unit. Enable it with `sudo systemctl enable --now dropbeam-server@$USER` to run `DropBeam --server` without a window.
 
