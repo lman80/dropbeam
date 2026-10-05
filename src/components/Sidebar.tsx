@@ -17,8 +17,8 @@ import { avatarColor } from '../lib/avatar'
 import { IconButton } from './ui'
 import { shortcutLabel } from '../lib/keys'
 
-// eslint-disable-next-line react-refresh/only-export-components -- shared with the ⌘1–7 shortcuts
 // Everyday pages first; Locations (NAS / always-on computers, optional) after them.
+// eslint-disable-next-line react-refresh/only-export-components -- shared with the ⌘1–7 shortcuts
 export const NAV_ORDER: View[] = ['send', 'friends', 'chat', 'folders', 'history', 'locations', 'settings']
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
