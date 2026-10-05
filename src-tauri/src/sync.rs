@@ -2403,7 +2403,7 @@ impl SyncManager {
     ) {
         let mine = live_manifest(folder);
         let my_tomb = tombstones.lock().unwrap().clone();
-        let plan = reconcile_plan_ci(
+        let mut plan = reconcile_plan_ci(
             &mine,
             &rec.files,
             &rec.tombstones,
@@ -2411,6 +2411,24 @@ impl SyncManager {
             now_ms(),
             folder_case_insensitive(folder),
         );
+        // A versioned tombstone that names a DIFFERENT version than ours means the
+        // peer deleted a copy it had and never saw ours (e.g. we re-wrote the file
+        // while its app was closed and it then deleted the old one). The delete
+        // can't apply here (D4), and the tombstone's newer timestamp would also
+        // stop the push — a permanent split. Our version survives: send it.
+        let survivors = version_mismatch_survivors(folder, &plan.delete, rec);
+        if !survivors.is_empty() {
+            plan.delete.retain(|r| !survivors.contains(r));
+            let missing: Vec<String> = survivors
+                .into_iter()
+                .filter(|r| !rec.files.keys().any(|k| norm_rel(k) == *r))
+                .collect();
+            if !missing.is_empty() {
+                log::info!("reconcile[{pair_id}]: peer deleted an older version of {} file(s) — sending ours: {:?}",
+                    missing.len(), missing.iter().take(12).collect::<Vec<_>>());
+                plan.push.extend(missing);
+            }
+        }
 
         // 1) Apply peer tombstones we missed: delete a local file the peer deleted
         //    AFTER our copy. Archive first (recoverable from history).
@@ -3340,6 +3358,26 @@ impl SyncManager {
 
 /// How a reconcile tombstone may delete `rel` here (D4): by the version the peer
 /// says it deleted, or — legacy peers only — by timestamp. `None` = it may not.
+/// Rels in `deletes` whose peer tombstone names a version (size, mtime) that is
+/// NOT what we hold — the delete can't apply to our copy (D4). The caller pushes
+/// the ones the peer lacks (it never saw our version) instead of leaving the two
+/// folders split forever. Legacy peers (no tombstone versions) and unversioned
+/// entries are left alone.
+fn version_mismatch_survivors(folder: &str, deletes: &[String], rec: &Reconcile) -> Vec<String> {
+    let Some(tv) = rec.tomb_versions.as_ref() else { return Vec::new() };
+    deletes
+        .iter()
+        .filter(|rel| {
+            let Some(v) = tv.get(rel.as_str()).or_else(|| tv.iter().find(|(k, _)| norm_rel(k) == **rel).map(|(_, v)| v)) else {
+                return false;
+            };
+            let Ok(meta) = std::fs::metadata(Path::new(folder).join(rel.as_str())) else { return false };
+            meta.is_file() && (meta.len(), meta_mtime(&meta)) != *v
+        })
+        .cloned()
+        .collect()
+}
+
 fn reconcile_delete_guard(rec: &Reconcile, rel: &str, tomb_ts: u64) -> Option<DeleteGuard<'static>> {
     match &rec.tomb_versions {
         Some(tv) => {
@@ -6619,6 +6657,28 @@ mod tests {
         // Not fresh → nothing to re-check.
         assert_eq!(fresh_recheck_delay_ms(now - g - 1, now, g), None);
         assert_eq!(fresh_recheck_delay_ms(0, now, g), None);
+    }
+
+    #[test]
+    fn a_tombstone_for_an_older_version_pushes_ours_instead() {
+        let dir = std::env::temp_dir().join(format!("db-vsurv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("closed")).unwrap();
+        std::fs::write(dir.join("closed/x.txt"), vec![7u8; 2222]).unwrap();
+        std::fs::write(dir.join("same.txt"), b"abc").unwrap();
+        let folder = dir.to_string_lossy().to_string();
+        let mt = |r: &str| meta_mtime(&std::fs::metadata(dir.join(r)).unwrap());
+        let mut rec = Reconcile::default();
+        // Peer deleted an OLDER x.txt (same size, earlier mtime) and the exact same.txt.
+        rec.tomb_versions = Some(HashMap::from([
+            ("closed/x.txt".to_string(), (2222, mt("closed/x.txt") - 18_000)),
+            ("same.txt".to_string(), (3, mt("same.txt"))),
+        ]));
+        let dels = vec!["closed/x.txt".to_string(), "same.txt".to_string()];
+        assert_eq!(version_mismatch_survivors(&folder, &dels, &rec), vec!["closed/x.txt".to_string()]);
+        // A legacy peer (no versions) keeps the timestamp rule.
+        rec.tomb_versions = None;
+        assert!(version_mismatch_survivors(&folder, &dels, &rec).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
