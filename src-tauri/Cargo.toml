@@ -119,7 +119,8 @@ windows-core = "0.62"
 # `Win32_UI_Shell` gates SetCurrentProcessExplicitAppUserModelID (ties the process
 # to the installer's Start-menu AppUserModelID so chat toast notifications show).
 # `Win32_System_DataExchange`: reading copied Explorer files (CF_HDROP) for paste (#37).
-windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_DataExchange"] }
+# `Win32_System_Power`: SetThreadExecutionState keeps the PC awake while files move.
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Power"] }
 # Clickable chat notifications (#67): a WinRT toast with an Activated handler —
 # the same crate notify-rust uses under the plugin.
 tauri-winrt-notification = "0.7"

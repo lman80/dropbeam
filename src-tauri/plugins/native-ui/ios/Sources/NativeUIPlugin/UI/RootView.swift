@@ -7,7 +7,9 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     private var tabs: some View {
         TabView(selection: $bridge.selectedTab) {
+            // Files someone wants to send her wait for Accept on the Send tab: say so from any tab.
             SendView().tabItem { Label("Send", systemImage: "paperplane.fill") }.tag("send")
+                .badge(bridge.sendTransfers.filter { $0.direction == "receive" && $0.state == "waitingForAccept" }.count)
             FriendsView().tabItem { Label("Friends", systemImage: "person.2.fill") }.tag("friends").badge(bridge.friendRequests.count)
             ChatsView()
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }.tag("chat").badge(bridge.unread)
@@ -25,7 +27,8 @@ struct RootView: View {
         .overlay { MediaPreparationOverlay() }
         .safeAreaInset(edge: .top) {
             if bridge.networkAvailable == false {
-                Label("You’re Offline", systemImage: "wifi.slash")
+                Label("Offline — transfers resume when you reconnect", systemImage: "wifi.slash")
+                    .multilineTextAlignment(.leading)
                     .font(.footnote.weight(.semibold))
                     .accessibilityHint("Connect to Wi-Fi or cellular to reach other devices.")
                     .padding(.horizontal, 16).padding(.vertical, 10).glassCapsule()
@@ -55,13 +58,17 @@ struct RootView: View {
             // Anything a Transfer Server held for us while we were away.
             if phase == .active { Task { await bridge.mailboxFetchNow() } }
         }
-        .alert("Couldn’t complete that", isPresented: showsError) {
+        .alert("That Didn’t Work", isPresented: showsError) {
             // A device-link code used outside Settings → Devices (S1): offer the way there.
             if Bridge.isDeviceCodeMessage(bridge.errorMessage) {
                 Button("Open Settings → Devices") { bridge.errorMessage = nil; bridge.openDevicesSettings() }
             }
+            // A permission she turned off: one tap to the place that turns it back on.
+            if PlainError.needsSettings(bridge.errorMessage) {
+                Button("Open Settings") { bridge.errorMessage = nil; SystemSettings.open() }
+            }
             Button("OK", role: .cancel) { bridge.errorMessage = nil }
-        } message: { Text(bridge.errorMessage ?? "Please try again.") }
+        } message: { Text(bridge.errorMessage.map(PlainError.humanize) ?? "Please try again.") }
     }
 }
 
@@ -124,13 +131,18 @@ private struct RootPresentations: ViewModifier {
             .sheet(item: link) { link in AddFriendSheet(initialCode: link.value).environmentObject(bridge) }
             // The floating feedback button would sit over the setup copy.
             .onChange(of: settingUp, initial: true) { _, now in SuperFeedback.setSuppressed(now) }
-            .task(id: settingUp) {
+            .task(id: settingUp || !bridge.nameKnown) {
                 // Existing installs that never answered the notification prompt get it
                 // once here (new ones are asked inside setup, at the moment it's explained).
-                guard !settingUp else { return }
+                // Wait until the engine says whether this is a new install: asking before
+                // that popped the system prompt over the Welcome screen, unexplained.
+                guard bridge.nameKnown, !settingUp else { return }
+                #if targetEnvironment(simulator)
+                if ProcessInfo.processInfo.arguments.contains("-previewAccounts") { return } // QA screenshots
+                #endif
                 try? await Task.sleep(for: .seconds(2))
                 let center = UNUserNotificationCenter.current()
-                if !settingUp, await center.notificationSettings().authorizationStatus == .notDetermined {
+                if bridge.nameKnown, !settingUp, await center.notificationSettings().authorizationStatus == .notDetermined {
                     _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
                     PushRegistration.permissionGranted()
                 }

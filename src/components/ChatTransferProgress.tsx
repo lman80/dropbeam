@@ -58,7 +58,7 @@ export function ChatTransferProgress({ t, onRetry, deliveries, friendName }: { t
     return (
       <div className="xfer-line srv-held" title={t.detail ?? undefined}>
         <Server className="srv-glyph" aria-hidden />
-        <span>Held on {t.heldOn ?? 'your Transfer Server'} — reaches {t.friendName?.split(' ')[0] ?? 'them'} when they’re online</span>
+        <span>Waiting on {t.heldOn ?? 'your Transfer Server'} — {t.friendName?.split(' ')[0] ?? 'they'} gets it when they’re back</span>
       </div>
     )
   }

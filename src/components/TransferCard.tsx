@@ -1,6 +1,6 @@
 import { FileIcon } from './FileIcon'
 import { integrityLabel } from '../lib/integrity'
-import { MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
+import { DOWNLOAD_URL, MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -265,10 +265,12 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                 </button>
               )}
               {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} moving={transferring} />}
+              {/* "Where did it go?" is the first question after a file arrives —
+                  a labelled button, not an icon to discover. */}
               {completed && t.direction === 'receive' && t.outDir && (
-                <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL} onClick={showInFolder}>
-                  <FolderOpen />
-                </IconButton>
+                <button className="btn btn-secondary btn-sm" onClick={showInFolder}>
+                  <FolderOpen /> {t.fileCount === 1 && t.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL}
+                </button>
               )}
               {completed && t.direction === 'send' && verify?.state !== 'running' && (
                 <MenuButton
@@ -308,8 +310,16 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             size={132}
             hint={null}
             copyVariant="secondary"
-            instructions="On the other device, open DropBeam, choose Receive, and scan this code — or paste it."
-            footer={<span className="xfer-connecting"><Spinner size={11} />Waiting for the other device…</span>}
+            instructions="On the other device, open DropBeam, choose Receive…, and scan this code — or paste it. Keep DropBeam open here until it’s done."
+            footer={<>
+              <span className="xfer-connecting"><Spinner size={11} />Waiting for the other device…</span>
+              <span className="xfer-getapp">
+                They don’t have DropBeam? It’s free:{' '}
+                <button className="btn btn-plain btn-sm" onClick={() => navigator.clipboard.writeText(DOWNLOAD_URL).then(() => toast('success', 'Download link copied — send it to them'), () => toast('error', DOWNLOAD_URL))}>
+                  Copy Download Link
+                </button>
+              </span>
+            </>}
           />
         </div>
       )}
@@ -368,6 +378,6 @@ function statusLabel(t: TransferUpdate): string {
     case 'paused':
       return 'Paused'
     case 'held':
-      return `Held on ${t.heldOn ?? 'your Transfer Server'} — reaches ${fn ?? 'them'} when they’re online`
+      return `Waiting on ${t.heldOn ?? 'your Transfer Server'} — ${fn ?? 'they'} gets it when they’re back`
   }
 }

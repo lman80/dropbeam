@@ -42,9 +42,9 @@ export function DropZone({
           aria-label="Choose files to send"
         >
           <FileUp className="dropzone-glyph" strokeWidth={1.5} />
-          <span className="dropzone-title">Drop files here to send</span>
+          <span className="dropzone-title">Drop files here, or click to choose</span>
           <span className="dropzone-hint">
-            Send to a friend by name, or to anyone with a code. Files sent to you appear here.
+            Next, pick who gets them — a friend, your other devices, or anyone with a code. Files people send you show up here too.
           </span>
         </button>
       )}

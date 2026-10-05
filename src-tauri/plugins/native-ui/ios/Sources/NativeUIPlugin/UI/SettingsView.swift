@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 import CoreImage.CIFilterBuiltins
 
 enum DropBeamLinks {
@@ -17,7 +18,9 @@ struct SettingsView: View {
     @State private var qaSaveFolder = false
     @State private var qaPrivacy = false
     @State private var pendingStrings: [String: String] = [:]
+    @State private var notificationsOff = false
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.scenePhase) private var scenePhase
     var body: some View {
         NavigationStack {
           ScrollViewReader { proxy in
@@ -53,9 +56,8 @@ struct SettingsView: View {
                     }
                     IconToggle(title: "Save Photos & Videos", symbol: "photo.fill.on.rectangle.fill", color: .orange,
                                isOn: Binding(get: { mediaSaver.choice == .on }, set: { on in Task { await mediaSaver.setEnabled(on) } }))
-                    NavigationLink { TransferSettingsView() } label: { RowLabel(title: "Connection & Speed", symbol: "arrow.up.arrow.down", color: .teal) }
-                } header: { Text("Transfers") } footer: {
-                    Text("Received photos and videos are also added to your photo library. The originals stay in your save folder.")
+                } header: { Text("Receiving") } footer: {
+                    Text("Files you receive go to the folder above, in the Files app. With Save Photos & Videos on, photos and videos also appear in your Photos app.")
                 }
                 Section("General") {
                     Picker(selection: settingString("theme", bridge.settings?.theme ?? "system")) {
@@ -64,25 +66,29 @@ struct SettingsView: View {
                     SettingToggle(title: "Sounds", symbol: "speaker.wave.2.fill", color: .pink, key: "playSounds", value: bridge.settings?.playSounds)
                 }
                 Section {
+                    if notificationsOff {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Notifications are turned off for DropBeam", systemImage: "bell.slash.fill").font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
+                            Text("You won’t hear when files or messages arrive. Turn them on in Settings → Notifications.").font(.footnote).foregroundStyle(.secondary)
+                            Button("Open Settings") { SystemSettings.open() }.beamButton(prominent: true).controlSize(.small)
+                        }.padding(.vertical, 4)
+                    }
                     SettingToggle(title: "Files", symbol: "bell.badge.fill", color: .red, key: "notifyOnComplete", value: bridge.settings?.notifyOnComplete)
                     SettingToggle(title: "Messages", symbol: "message.fill", color: .green, key: "notifyOnMessage", value: bridge.settings?.notifyOnMessage)
-                } header: { Text("Notifications") } footer: { Text("A transfer keeps going for a while after you leave DropBeam; for big ones, keep it open (iOS pauses apps in the background).") }
+                } header: { Text("Notifications") } footer: { Text("A transfer keeps going for a little while after you leave DropBeam. For big ones, keep DropBeam open until they finish — iPhone pauses apps in the background.") }
                 Section {
                     SettingToggle(title: "Read Receipts", symbol: "checkmark.message.fill", color: .blue, key: "sendReadReceipts", value: bridge.settings?.sendReadReceipts)
                     SettingToggle(title: "Link Previews", symbol: "link", color: .teal, key: "linkPreviews", value: bridge.settings?.linkPreviews ?? true)
-                    NavigationLink { TextSettingView(title: "GIF Search", key: "giphyApiKey", value: bridge.settings?.giphyApiKey ?? "", placeholder: "Giphy API key", footer: "Add a free key from developers.giphy.com to search GIFs in chats. Leave blank to hide the GIF button.") } label: {
-                        RowLabel(title: "GIF Search", symbol: "sparkles.rectangle.stack.fill", color: .purple, value: (bridge.settings?.giphyApiKey ?? "").isEmpty ? "Off" : "On")
-                    }
                 } header: { Text("Chat") } footer: { Text("Friends see when you’ve read their messages while Read Receipts is on. With Link Previews, this iPhone fetches a small preview of a link you send; friends never contact the site.") }
-                TransferServersSection()
-                Section("Storage") {
+                // Optional: only here once a friend has shared one; otherwise under Advanced.
+                if !bridge.servers.isEmpty { TransferServersSection() }
+                Section {
                     NavigationLink { RecoverySettingsView() } label: { RowLabel(title: "Recoverable Files", symbol: "clock.arrow.circlepath", color: .teal) }
-                    ActionRow(title: "Clear Transfer Cache", symbol: "trash.fill", color: .gray) { clearCache = true }
-                }
+                    ActionRow(title: "Clear Unfinished Transfers", symbol: "trash.fill", color: .gray) { clearCache = true }
+                } header: { Text("Storage") } footer: { Text("Recoverable Files keeps copies of deleted shared-folder files so you can bring them back.") }
                 Section {
                     NavigationLink { PrivacyView() } label: { RowLabel(title: "Privacy & Your Data", symbol: "hand.raised.fill", color: .blue) }
                     NavigationLink { BlockedView() } label: { RowLabel(title: "Blocked", symbol: "nosign", color: .gray, value: bridge.blocked.isEmpty ? nil : "\(bridge.blocked.count)") }
-                    NavigationLink { DiagnosticsView() } label: { RowLabel(title: "Diagnostics", symbol: "waveform.path.ecg", color: .red) }
                     LinkRow(title: "Help & Support", symbol: "questionmark.circle.fill", color: .green, url: DropBeamLinks.support)
                     ActionRow(title: "Report a Problem", symbol: "envelope.fill", color: .orange) { contact() }
                 } header: { Text("Privacy & Support") }
@@ -97,6 +103,9 @@ struct SettingsView: View {
                 } header: { Text("Feedback") } footer: {
                     Text("Feedback goes straight to the developer, and you can vote on what gets built next in Ideas & Roadmap. DropBeam is built with AI, so a good suggestion can ship in an update within days.")
                 }
+                Section {
+                    NavigationLink { TransferSettingsView() } label: { RowLabel(title: "Advanced", symbol: "slider.horizontal.3", color: .gray) }
+                } footer: { Text("Connection, speed, Transfer Servers, diagnostics and other settings most people never need.") }
                 Section {
                     LabeledContent("Version", value: version.isEmpty ? "…" : version)
                 } footer: {
@@ -119,9 +128,11 @@ struct SettingsView: View {
             #endif
             .task { version = (try? await bridge.call("appVersion")) ?? ""; try? await bridge.action("myDeviceInfo") }
             .onAppear { feedbackButton = SuperFeedback.isEnabled }
-            .confirmationDialog("Clear interrupted transfer leftovers?", isPresented: $clearCache, titleVisibility: .visible) {
-                Button("Clear Transfer Cache", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("clearTransferCache"); bridge.showToast(freed > 0 ? "Cleared \(Formatters.bytes(freed))" : "No transfer leftovers to clear") } }
-            } message: { Text("Partly received files are removed. Finished files aren’t affected.") }
+            // Notifications switched off in iOS Settings (or Don't Allow): say so, with a way back.
+            .task(id: scenePhase) { notificationsOff = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied }
+            .confirmationDialog("Clear unfinished transfers?", isPresented: $clearCache, titleVisibility: .visible) {
+                Button("Clear Unfinished Transfers", role: .destructive) { bridge.perform { let freed: Double = try await bridge.call("clearTransferCache"); bridge.showToast(freed > 0 ? "Cleared \(Formatters.bytes(freed))" : "No unfinished transfers to clear") } }
+            } message: { Text("Parts of files that never finished arriving are removed, and those transfers start over if they’re sent again. Files you already received aren’t touched.") }
           }
         }
     }
@@ -382,7 +393,7 @@ struct RecoverySettingsView: View {
                     budget = n
                     bridge.perform { await OptimisticSetting.save(key: "folderHistoryBudgetBytes", value: n, bridge: bridge) { budget = nil } }
                 })) { Text("500 MB").tag(524288000.0); Text("2 GB").tag(2147483648.0); Text("5 GB").tag(5368709120.0); Text("No Limit").tag(0.0) }
-            } footer: { Text("When a file in a shared folder is deleted or replaced, DropBeam keeps a copy until these limits remove the oldest. Your live files are never touched. Browse copies in History → Recoverable.") }
+            } footer: { Text("When a file in a shared folder is deleted or replaced, DropBeam keeps a copy until these limits remove the oldest. Your live files are never touched. Find them in History → Recoverable Files.") }
             Section { Button("Free Up Space Now", role: .destructive) { clearing = true } }
         }
         .scrollContentBackground(.hidden).background { BeamBackground() }
@@ -457,7 +468,8 @@ struct PrivacyView: View {
     }
 }
 
-/// Settings → Transfers: routing and speed switches most people never touch.
+/// Settings → Advanced: routing, speed, relay, Transfer Servers, diagnostics and the
+/// GIF key — switches most people never touch.
 struct TransferSettingsView: View {
     @EnvironmentObject private var bridge: Bridge
     var body: some View {
@@ -469,22 +481,32 @@ struct TransferSettingsView: View {
                         .disabled(bridge.settings?.requireDirect == true)
                 }
                 NavigationLink { ConnectionInfoView() } label: { RowLabel(title: "How Transfers Connect", symbol: "antenna.radiowaves.left.and.right", color: .blue) }
-            } header: { Text("Connections") } footer: { Text("Direct Connections Only fails a send when no direct path can be made. Shared folders always use the best available path.") }
+            } header: { Text("Connections") } footer: { Text("When two devices can’t connect directly, DropBeam uses a relay (slower, still encrypted). Direct Connections Only never uses one, so those sends fail instead. Wait for a Direct Link tries a direct connection for a little longer first. Shared folders always use the best way available.") }
             Section {
                 SettingToggle(title: "Parallel Streams", symbol: "square.stack.3d.up.fill", color: .indigo, key: "parallelStreams", value: bridge.settings?.parallelStreams)
                 NavigationLink { UploadLimitView() } label: {
                     RowLabel(title: "Upload Limit", symbol: "speedometer", color: .orange, value: (bridge.settings?.uploadLimitMbps ?? 0) > 0 ? "\(Int(bridge.settings?.uploadLimitMbps ?? 0)) Mbps" : "None")
                 }
                 SettingToggle(title: "Show Speeds in Megabits", symbol: "gauge.with.dots.needle.67percent", color: .gray, key: "showMegabits", value: bridge.settings?.showMegabits)
-            } header: { Text("Speed") } footer: { Text("Parallel streams can speed up files over 16 MB. Turn off if transfers stall.") }
+            } header: { Text("Speed") } footer: { Text("Parallel Streams sends big files in several pieces at once, which is usually faster. Turn it off if transfers get stuck.") }
             Section("Relay") {
-                NavigationLink { TextSettingView(title: "Custom Relay", key: "customRelay", value: bridge.settings?.customRelay ?? "", placeholder: "https://relay.example.com", footer: "Use the same relay URL on both devices. Leave blank to use the public relays. Close and reopen DropBeam to apply.", link: ("Relay setup guide", DropBeamLinks.relaySetup)) } label: {
+                NavigationLink { TextSettingView(title: "Custom Relay", key: "customRelay", value: bridge.settings?.customRelay ?? "", placeholder: "https://relay.example.com", footer: "Use the same relay address on both devices. Leave blank to use the standard relays. Close and reopen DropBeam to apply.", link: ("Relay setup guide", DropBeamLinks.relaySetup)) } label: {
                     RowLabel(title: "Custom Relay", symbol: "server.rack", color: .gray, value: (bridge.settings?.customRelay ?? "").isEmpty ? "Off" : "On")
                 }
             }
+            // Optional: a friend's always-on computer can hold files while you're offline.
+            if bridge.servers.isEmpty { TransferServersSection() }
+            Section {
+                NavigationLink { TextSettingView(title: "GIF Search", key: "giphyApiKey", value: bridge.settings?.giphyApiKey ?? "", placeholder: "Giphy API key", footer: "Add a free key from developers.giphy.com to search GIFs in chats. Leave blank to hide the GIF button.") } label: {
+                    RowLabel(title: "GIF Search", symbol: "sparkles.rectangle.stack.fill", color: .purple, value: (bridge.settings?.giphyApiKey ?? "").isEmpty ? "Off" : "On")
+                }
+            } header: { Text("Chat") }
+            Section {
+                NavigationLink { DiagnosticsView() } label: { RowLabel(title: "Diagnostics", symbol: "waveform.path.ecg", color: .red) }
+            } header: { Text("Help Fix Problems") }
         }
         .beamList()
-        .navigationTitle("Transfers").navigationBarTitleDisplayMode(.inline)
+        .navigationTitle("Advanced").navigationBarTitleDisplayMode(.inline)
     }
 }
 

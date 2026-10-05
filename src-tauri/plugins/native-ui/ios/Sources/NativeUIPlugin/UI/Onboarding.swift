@@ -172,10 +172,12 @@ private struct WelcomeStep: View {
         OnboardingPage {
             PeerToPeerDemo().padding(.top, 8)
             PageTitle(title: "Welcome to DropBeam", detail: "Send photos, videos and files to friends and your own devices.")
-            VStack(alignment: .leading, spacing: 20) {
-                FeatureRow(symbol: "arrow.left.arrow.right", title: "Device to device", detail: "Files go straight to the other device, never through a server.")
-                FeatureRow(symbol: "lock.fill", title: "Private", detail: "Everything is end-to-end encrypted.")
-                FeatureRow(symbol: "antenna.radiowaves.left.and.right", title: "Both need DropBeam open", detail: "With no server in between, the other device needs DropBeam open to connect.")
+            VStack(alignment: .leading, spacing: 14) {
+                // Three short rows so the last one — the permission to say yes to — is
+                // on screen without scrolling.
+                FeatureRow(symbol: "lock.fill", title: "Private, device to device", detail: "Straight to the other device, encrypted.")
+                FeatureRow(symbol: "antenna.radiowaves.left.and.right", title: "Both need DropBeam open", detail: "They open DropBeam too, then it connects.")
+                FeatureRow(symbol: "wifi", title: "Tap Allow when asked", detail: "When your iPhone asks to find nearby devices, tap Allow.")
             }.padding(.top, 4)
         } actions: {
             PrimaryButton(title: "Get Started", action: next)
@@ -382,7 +384,7 @@ private struct DevicesStep: View {
                       detail: linked ? "Friends, chats, your name and photo now stay in sync between them."
                                      : "Link your Mac, PC or another phone to share your friends and chats between them. Send files to them in one tap.")
             if !linked {
-                PeerToPeerNote(text: "Open DropBeam on the other device too. On a computer, go to Settings → Devices → Link a Device.")
+                PeerToPeerNote(text: "On your computer, open DropBeam → Settings → Devices → Link a Device. A square code appears. Then tap Link a Device below and choose Scan the Other Device.")
             }
         } actions: {
             if linked { PrimaryButton(title: "Continue", action: next) }

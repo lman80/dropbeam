@@ -1241,15 +1241,24 @@ pub(crate) fn completed_side_effects(
                 } else {
                     format!("{} files", names.len())
                 };
+                // Say WHERE it went ("Saved in Downloads") — "where did it go?"
+                // is the first question after a file arrives.
+                let place = if cfg!(target_os = "ios") {
+                    None
+                } else {
+                    out_dir
+                        .as_deref()
+                        .and_then(|d| std::path::Path::new(d).file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .filter(|n| !n.is_empty())
+                };
+                let body = match place {
+                    Some(p) => format!("Saved in {p}. Click to open DropBeam."),
+                    None => "Saved. Tap to open DropBeam.".to_string(),
+                };
                 let (title, body) = match who {
-                    Some(name) => (
-                        format!("{name} sent you {what}"),
-                        "Saved — click to open DropBeam".to_string(),
-                    ),
-                    None => (
-                        format!("Received {what}"),
-                        "Saved — click to open DropBeam".to_string(),
-                    ),
+                    Some(name) => (format!("{name} sent you {what}"), body),
+                    None => (format!("Received {what}"), body),
                 };
                 // Audible (the silent-banner fix) — fires for every receive so a
                 // Quick Send can never slip by unnoticed.
@@ -1307,6 +1316,12 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
     }
     if let Some(friend) = friend {
         let peer_id = friend.id.clone();
+        // They message us, so they've accepted us: stop showing "waiting".
+        for eid in [Some(who), friend.endpoint_id.as_deref()].into_iter().flatten() {
+            if crate::friends::set_awaiting_accept(config_dir, eid, false) {
+                if let Some(app) = &app { let _ = app.emit("friends://changed", ()); }
+            }
+        }
         match msg_kind {
             "reaction" => {
                 if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
@@ -1439,9 +1454,22 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     // iPhone: the push banner may already have announced it.
                     let announced = crate::mailbox::push::already_announced(config_dir, &msg.id);
                     crate::mailbox::push::note_have(config_dir, &[msg.id.as_str()]);
+                    // Already read on another of your devices (a Transfer Server
+                    // copy landing late): store it, but no badge, chime or banner —
+                    // one message rings once, wherever you are.
+                    let already_read = crate::chat::read_markers(config_dir)
+                        .get(&msg.peer_id).is_some_and(|&t| t >= msg.ts);
                     if let Some(app) = &app {
-                        let _ = app.emit("chat://message", &msg);
-                        if announced {
+                        match serde_json::to_value(&msg) {
+                            Ok(mut v) if already_read => {
+                                v["alreadyRead"] = serde_json::Value::Bool(true);
+                                let _ = app.emit("chat://message", v);
+                            }
+                            _ => { let _ = app.emit("chat://message", &msg); }
+                        }
+                        if already_read {
+                            log::info!("chat notification skipped: already read on another of your devices");
+                        } else if announced {
                             log::info!("chat notification skipped: the push already showed it");
                         } else {
                             maybe_notify_chat(app, &friend.name, &msg);
@@ -3783,6 +3811,7 @@ async fn serve_stream_inner(
                     if let Some(left) = req.get("left_accounts") {
                         crate::account::apply_left_notice(&st.config_dir, &who, left);
                     }
+                    let was_pending = crate::friends::has_request(&st.config_dir, &who);
                     let outcome = crate::friends::apply_hello_from(&st.config_dir, friend_id, &who, name, &req);
                     crate::friends::apply_device_hello(&st.config_dir, &who, &req);
                     // A friend's devices they removed from their account (S4).
@@ -3790,6 +3819,15 @@ async fn serve_stream_inner(
                     // S2: someone new is a request the user accepts or declines.
                     if outcome == crate::friends::HelloOutcome::Requested {
                         let _ = app.emit("friend-requests://changed", ());
+                        if !was_pending && crate::friends::has_request(&st.config_dir, &who) {
+                            notify_friend_request(app, &crate::friends::sanitize_display_name(name, "Someone"));
+                        }
+                    }
+                    // A friend greeting us has us as a friend: anything we were
+                    // waiting on them to accept can go now.
+                    if outcome == crate::friends::HelloOutcome::Known
+                        && crate::friends::set_awaiting_accept(&st.config_dir, &who, false) {
+                        wake_chat_outbox();
                     }
                     // Cache their profile picture (if they sent one) and point the
                     // friend record at it.
@@ -3817,7 +3855,14 @@ async fn serve_stream_inner(
                 (Ok(config), Some(ep)) if !blocked => Some(crate::mailbox::hello_fields(&config, ep.secret_key(), &who)),
                 _ => None,
             };
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox })).await?;
+            // Whether we take their messages (a friend, not a pending request),
+            // so someone who added us can show "waiting for you to accept".
+            // A blocked person gets no answer here, so a block isn't revealed.
+            let accepts_chat = match state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>()) {
+                Some(st) if !blocked => Some(crate::friends::chat_sender(&st.config_dir, &who).is_some()),
+                _ => None,
+            };
+            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat })).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -5917,7 +5962,7 @@ fn send_friend_inner(
                 u.bytes_total = total;
                 u.bytes_done = total;
                 u.percent = 100.0;
-                u.detail = Some(format!("Held on {} — reaches {} when they're online", held.name, friend_name));
+                u.detail = Some(format!("Waiting on {} — {} gets it when they're back", held.name, friend_name));
                 u.held_on = Some(held.name.clone());
                 emit(&app, &u);
                 crate::mailbox::client::wake();
@@ -6131,6 +6176,13 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    // Older builds don't say; a null answer changes nothing.
+                    if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
+                        if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
+                            if let Some(app) = state.app.get() { let _ = app.emit("friends://changed", ()); }
+                            if accepts { wake_chat_outbox(); }
+                        }
+                    }
                     if let Some(config) = &config {
                         crate::mailbox::on_hello(&state, config, &conn.remote_id().to_string(), &reply);
                     }
@@ -6174,6 +6226,13 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
                     apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    // Older builds don't say; a null answer changes nothing.
+                    if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
+                        if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
+                            if let Some(app) = state.app.get() { let _ = app.emit("friends://changed", ()); }
+                            if accepts { wake_chat_outbox(); }
+                        }
+                    }
                     if let Some(config) = &config {
                         crate::mailbox::on_hello(&state, config, &conn.remote_id().to_string(), &reply);
                     }
@@ -6369,6 +6428,34 @@ pub async fn send_folder_reconcile(
     // (bounded) for that ack.
     let _ = tokio::time::timeout(Duration::from_secs(60), recv.read_to_end(64)).await;
     Ok(())
+}
+
+/// Conversation id a friend-request notification carries: a click opens
+/// Friends (where Accept/Decline are) instead of a chat.
+pub const FRIEND_REQUESTS_TARGET: &str = "friend-requests";
+
+/// "Jordan wants to be your friend" — a request is easy to miss on a page
+/// nobody opens, so it gets a banner like a message does (same setting).
+pub(crate) fn notify_friend_request(app: &AppHandle, name: &str) {
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else { return };
+    if !st.settings.lock().unwrap().notify_on_message {
+        return;
+    }
+    let title = "Friend request";
+    let body = format!("{name} wants to be your friend. Open DropBeam to accept or decline.");
+    #[cfg(desktop)]
+    if crate::chat_notify::show(app, title, &body, FRIEND_REQUESTS_TARGET) {
+        return;
+    }
+    use tauri_plugin_notification::NotificationExt;
+    let notification = app.notification().builder().title(title).body(body);
+    #[cfg(not(target_os = "linux"))]
+    let notification = notification.sound("default");
+    #[cfg(target_os = "ios")]
+    let notification = notification.extra("chatPeerId", FRIEND_REQUESTS_TARGET);
+    if let Err(err) = notification.show() {
+        log::warn!("friend request notification failed: {err}");
+    }
 }
 
 /// Pop a native OS notification for an inbound chat message — the iMessage rule:

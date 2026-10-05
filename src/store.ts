@@ -8,6 +8,9 @@ import {
   type ConnDetail,
   onChatMessage,
   onChatTyping,
+  onChatSeen,
+  onChatSyncedUnread,
+  FRIEND_REQUESTS_TARGET,
   onFolderComplete,
   onFolderStatus,
   onFolderSynced,
@@ -39,9 +42,9 @@ import { chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTran
 import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
 import { DEVICE_CODE_ELSEWHERE, parseCode, routeCode, wrongCodeMessage } from './lib/codes'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
-import { MOBILE_UI } from './lib/platform'
+import { IS_MAC, IS_WINDOWS, MOBILE_UI } from './lib/platform'
 import { feedbackMoment } from './lib/feedback'
-import { humanError, humanErrorIn, rawErrorText } from './lib/errors'
+import { PERMISSION_MESSAGE, humanError, humanErrorIn, rawErrorText } from './lib/errors'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
 // Wire the periodic/online update re-check listeners exactly once.
@@ -222,6 +225,8 @@ export interface Toast {
   message: string
   /** Raw technical text behind an error, shown under a "Details" disclosure. */
   details?: string | null
+  /** A one-click fix shown as a button ("Open Settings"). */
+  action?: { label: string; run: () => void } | null
 }
 
 interface AppStore {
@@ -605,6 +610,21 @@ function deleteChatFileXfer(id: string): void {
 
 const restoredPaused = loadPausedTransfers()
 
+/** A refused file permission (macOS Files & Folders, Windows Controlled Folder
+ *  Access) is fixable in one place — say where, and offer to open it. */
+function permissionFix(message: string): { message: string; action: Toast['action'] } | null {
+  if (!message.includes(PERMISSION_MESSAGE) || MOBILE_UI) return null
+  if (IS_MAC) return {
+    message: `${message} In System Settings → Privacy & Security → Files & Folders, turn on DropBeam for that folder, then try again.`,
+    action: { label: 'Open Settings', run: () => { void api.openPrivacySettings('files').catch(() => {}) } },
+  }
+  if (IS_WINDOWS) return {
+    message: `${message} If Windows Security blocked it, open Windows Security → Virus & threat protection → Ransomware protection → Allow an app, and add DropBeam.`,
+    action: null,
+  }
+  return null
+}
+
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
   view: 'send',
@@ -711,7 +731,8 @@ export const useStore = create<AppStore>((set, get) => ({
     // while the Dock stayed at 0 until the next message arrived (#27).
     const chatUnread = pruneChatUnread(get().chatUnread, new Set(friends.map((f) => f.id)))
     set({ settings, settingsFallback, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true, chatUnread })
-    void listenForChatNotifications((peerId) => get().openChat(peerId))
+    // A friend-request banner opens Friends (Accept/Decline live there).
+    void listenForChatNotifications(async (peerId) => { if (peerId === FRIEND_REQUESTS_TARGET) get().setView('friends'); else await get().openChat(peerId) })
 
     // Probe independently of mounted views, including while iroh starts up.
     // Each webview has its own store; successful probes feed the same presence input.
@@ -891,12 +912,30 @@ export const useStore = create<AppStore>((set, get) => ({
         // uses the same gate, so the two never double up.
         const lookingHere =
           get().windowFocused && get().view === 'chat' && get().activeChatId === m.peerId
-        if (!m.fromMe && !lookingHere && (get().settings?.playSounds ?? true)) {
+        if (!m.fromMe && !m.alreadyRead && !lookingHere && (get().settings?.playSounds ?? true)) {
           playIncoming()
         }
         // If it landed in the open + focused chat, it's been seen → read receipt.
         if (!m.fromMe && lookingHere) get().markChatRead(m.peerId)
       })
+      // Read on another of your devices: clear what that device has seen here too.
+      void onChatSeen(({ peerId, upTo }) => {
+        const s = get()
+        const have = s.chatUnread[peerId] ?? 0
+        if (!have) return
+        const thread = s.chats[peerId]
+        const left = thread
+          ? thread.filter((m) => !m.fromMe && !m.deleted && m.ts > upTo).length
+          : (s.chatOverview.find((o) => o.peerId === peerId)?.lastTs ?? Infinity) <= upTo ? 0 : have
+        if (left < have) set({ chatUnread: saveChatUnread({ ...s.chatUnread, [peerId]: left }) })
+      }).catch(() => {})
+      // A friend's message that reached another of your devices first is still
+      // unread here (unless you're looking at that very chat).
+      void onChatSyncedUnread(({ peerId, count }) => {
+        const s = get()
+        if (count <= 0 || (s.windowFocused && s.view === 'chat' && s.activeChatId === peerId)) return
+        set({ chatUnread: saveChatUnread({ ...s.chatUnread, [peerId]: (s.chatUnread[peerId] ?? 0) + count }) })
+      }).catch(() => {})
       if (HAS_TAURI) void listen<{ peerId: string }>('friend://presence', ({ payload }) => {
         const friend = get().friends.find((f) => f.id === payload.peerId)
         if (friend) get().markFriendSeen(friend.id)
@@ -1580,8 +1619,10 @@ export const useStore = create<AppStore>((set, get) => ({
     // guard also required window focus, so opening a conversation while the webview
     // wasn't reporting focus (a focus event the OS swallowed, a detached/menu-bar
     // window, a restored session) left "17 new" stuck forever.
-    if (s.view === 'chat' && s.activeChatId === friendId && (s.chatUnread[friendId] ?? 0) > 0) {
-      set({ chatUnread: saveChatUnread({ ...s.chatUnread, [friendId]: 0 }) })
+    if (s.view === 'chat' && s.activeChatId === friendId) {
+      if ((s.chatUnread[friendId] ?? 0) > 0) set({ chatUnread: saveChatUnread({ ...s.chatUnread, [friendId]: 0 }) })
+      // Your other devices clear this chat's badge too (a no-op when nothing new).
+      void api.chatMarkSeen(friendId).catch(() => {})
     }
     // TELLING THE FRIEND "I read it" keeps the stricter gate: a read receipt must
     // mean the thread was genuinely on screen in a focused window.
@@ -1726,7 +1767,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const inOpenThread =
         s.windowFocused && s.view === 'chat' && s.activeChatId === m.peerId
       let chatUnread = s.chatUnread
-      if (isNew && !m.fromMe && !inOpenThread) {
+      if (isNew && !m.fromMe && !m.alreadyRead && !inOpenThread) {
         chatUnread = { ...s.chatUnread, [m.peerId]: (s.chatUnread[m.peerId] ?? 0) + 1 }
       } else if (inOpenThread && (s.chatUnread[m.peerId] ?? 0) > 0) {
         chatUnread = { ...s.chatUnread, [m.peerId]: 0 }
@@ -1751,7 +1792,7 @@ export const useStore = create<AppStore>((set, get) => ({
   addFriendByCode: async (code) => {
     const friend = await api.addFriendByCode(code)
     await get().reloadFriends()
-    get().toast('success', `Added ${friend.name}`)
+    get().toast('success', `Added ${friend.name}. If they haven’t added you yet, they get a friend request to accept.`)
   },
 
   renameFriend: async (id, name) => {
@@ -1859,14 +1900,16 @@ export const useStore = create<AppStore>((set, get) => ({
   toast: (kind, message) => {
     const id = crypto.randomUUID()
     const h = kind === 'error' ? humanError(message) : { message: rawErrorText(message), details: null }
-    set((s) => ({ toasts: [...s.toasts, { id, kind, message: h.message, details: h.details }] }))
-    scheduleToast(id, kind === 'error' ? 6000 : 3500, get().dismissToast)
+    const fix = kind === 'error' ? permissionFix(h.message) : null
+    set((s) => ({ toasts: [...s.toasts, { id, kind, message: fix?.message ?? h.message, details: h.details, action: fix?.action }] }))
+    scheduleToast(id, fix ? 15000 : kind === 'error' ? 6000 : 3500, get().dismissToast)
   },
   toastError: (context, e) => {
     const id = crypto.randomUUID()
     const h = humanErrorIn(context, e)
-    set((s) => ({ toasts: [...s.toasts, { id, kind: 'error', message: h.message, details: h.details }] }))
-    scheduleToast(id, 6000, get().dismissToast)
+    const fix = permissionFix(h.message)
+    set((s) => ({ toasts: [...s.toasts, { id, kind: 'error', message: fix?.message ?? h.message, details: h.details, action: fix?.action }] }))
+    scheduleToast(id, fix ? 15000 : 6000, get().dismissToast)
   },
 
   dismissToast: (id) => {

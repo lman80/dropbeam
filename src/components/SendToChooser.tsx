@@ -101,7 +101,7 @@ export function SendToChooser() {
               <span className="chooser-avatar chooser-glyph" aria-hidden><QrCode size={16} /></span>
               <span className="chooser-text">
                 <span className="chooser-name">Share with a code or QR code</span>
-                <span className="chooser-sub">For anyone, even without DropBeam friends</span>
+                <span className="chooser-sub">For anyone — they enter the code in their DropBeam</span>
               </span>
             </button>
           }
@@ -150,7 +150,7 @@ export function SendToChooser() {
               ))}
               {/* Honest, said once: friend file sends retry ~90s then fail — there is
                   no store-and-forward for files (chat messages DO queue). */}
-              {anyUnheldOffline && <p className="chooser-note">Offline people: DropBeam keeps trying for about 2 minutes.</p>}
+              {anyUnheldOffline && <p className="chooser-note">Someone offline? DropBeam keeps trying for about 2 minutes, then stops — send again when they’re online.</p>}
             </>
           )}
         </Dialog>

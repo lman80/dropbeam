@@ -144,7 +144,7 @@ export function RecoverableFilesView() {
       <EmptyState
         icon={<HardDrive />}
         title="Nothing to recover"
-        hint="Files deleted from shared folders show up here."
+        hint="When a file in a shared folder is deleted or replaced, a copy is kept here for a while so you can bring it back."
       />
     )
   }
@@ -153,6 +153,7 @@ export function RecoverableFilesView() {
 
   return (
     <div className="rf">
+      <p className="rf-intro">Deleted or replaced a file in a shared folder by mistake? Find it below and choose <b>Restore</b> to put it back.</p>
       <SectionHeader>Storage</SectionHeader>
       <div className="group rf-storage">
         <div className="row">

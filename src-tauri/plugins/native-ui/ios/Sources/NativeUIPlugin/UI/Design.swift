@@ -245,10 +245,12 @@ struct FriendAvatar: View {
 }
 struct PresenceLabel: View {
     let online: Bool
+    /// They haven't accepted our friend request yet (says so instead of Online/Offline).
+    var notAccepted = false
     var body: some View {
         HStack(spacing: 6) {
-            Circle().fill(online ? Color.green : Color(uiColor: .tertiaryLabel)).frame(width: 7, height: 7)
-            Text(online ? "Online" : "Offline").font(.subheadline).foregroundStyle(.secondary)
+            Circle().fill(online && !notAccepted ? Color.green : Color(uiColor: .tertiaryLabel)).frame(width: 7, height: 7)
+            Text(notAccepted ? "Hasn’t accepted your request yet" : online ? "Online" : "Offline").font(.subheadline).foregroundStyle(.secondary)
         }.accessibilityElement(children: .combine)
     }
 }

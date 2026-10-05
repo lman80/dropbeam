@@ -334,7 +334,7 @@ const handlers: BridgeHandlers = {
   acceptFolderInvite: async a => {
     const folder = await pickNativeFolder()
     if (!folder) return false
-    await api.acceptPair(string(a, 'code'), folder)
+    await api.acceptPair(string(a, 'code'), folder, typeof a.folderName === 'string' ? a.folderName : null)
     await st().reloadPairs()
     return true
   },
@@ -645,7 +645,9 @@ async function start() {
       history: [[s.history], () => s.history],
       // Built from module state (results, cache, checking set) and the clock: always.
       locations: [null, () => locationSnapshot()],
-      needsName: [null, () => needsName()],
+      // null until settings load: "no name needed" must not be guessed (it let iOS ask for
+      // notifications over the Welcome screen of a brand-new install).
+      needsName: [null, () => st().settings ? needsName() : null],
       pendingSend: [[s.pendingSend], () => s.pendingSend ?? []],
       chatOverview: [[s.chatOverview, s.chatUnread], () => s.chatOverview.map(o => ({ ...o, unread: s.chatUnread[o.peerId] ?? 0 }))],
       chatUnread: [[s.chatUnread], () => s.chatUnread],

@@ -120,7 +120,7 @@ pub fn create(
     let _guard = LOCK.lock().unwrap();
     let mut pairs = load(config_dir);
     if pairs.iter().any(|p| same_path(&p.folder, &folder)) {
-        return Err("That folder is already a Shared Drop Folder.".into());
+        return Err("That folder is already shared. Choose a different folder.".into());
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -181,6 +181,32 @@ pub fn create(
 
 /// Accept an invite (this device is B).
 pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pair, String> {
+    accept_inner(config_dir, invite_str, folder, None)
+}
+
+/// Join a shared folder the way a person does it: they pick WHERE to keep it
+/// ("Documents", "Desktop"…), not an empty folder made for the purpose. If the
+/// chosen folder already holds other things, the shared files go into a new
+/// subfolder named after the shared folder instead of being mixed in with (and,
+/// in a two-way folder, sent along with) everything already there. `folder_name`
+/// is the shared folder's name when the invite came with one; otherwise the
+/// subfolder is named after the person who shared it.
+pub fn accept_joining(
+    config_dir: &Path,
+    invite_str: &str,
+    chosen: String,
+    folder_name: Option<String>,
+) -> Result<Pair, String> {
+    accept_inner(config_dir, invite_str, chosen, Some(folder_name.unwrap_or_default()))
+}
+
+fn accept_inner(
+    config_dir: &Path,
+    invite_str: &str,
+    folder: String,
+    // Some(name) = choose a safe spot inside `folder` (see accept_joining).
+    join_as: Option<String>,
+) -> Result<Pair, String> {
     validate_folder(&folder)?;
     let body = crate::codes::strip_prefix(invite_str, INVITE_PREFIX)
         .ok_or("That doesn't look like a DropBeam invite code.")?;
@@ -193,10 +219,27 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
     let _guard = LOCK.lock().unwrap();
     let mut pairs = load(config_dir);
     if pairs.iter().any(|p| p.id == invite.id) {
-        return Err("You're already paired with this invite.".into());
+        return Err("You've already joined this shared folder.".into());
     }
+    let folder = match join_as {
+        None => folder,
+        Some(name) => {
+            let name = if name.trim().is_empty() {
+                let who = friends::sanitize_display_name(&invite.name, "");
+                if who.is_empty() { "Shared Folder".to_string() } else { format!("Shared by {who}") }
+            } else {
+                name
+            };
+            let target = join_target(Path::new(&folder), &name);
+            if !target.is_dir() {
+                fs::create_dir_all(&target)
+                    .map_err(|e| format!("Couldn't make a folder for the shared files there: {e}"))?;
+            }
+            target.to_string_lossy().into_owned()
+        }
+    };
     if pairs.iter().any(|p| same_path(&p.folder, &folder)) {
-        return Err("That folder is already a Shared Drop Folder.".into());
+        return Err("That folder is already a shared folder. Choose a different place.".into());
     }
 
     let pair = Pair {
@@ -1113,6 +1156,45 @@ fn validate_folder(folder: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Files an OS drops into folders on its own — they don't make a folder "in use".
+fn os_clutter(name: &str) -> bool {
+    matches!(name, ".DS_Store" | ".localized" | "desktop.ini" | "Thumbs.db" | ".directory")
+}
+
+fn dir_is_empty(p: &Path) -> bool {
+    match fs::read_dir(p) {
+        Ok(mut it) => it.all(|e| e.map(|e| os_clutter(&e.file_name().to_string_lossy())).unwrap_or(false)),
+        Err(_) => false,
+    }
+}
+
+/// Where a joined shared folder should live, given the folder the person picked
+/// (see `accept_joining`): the picked folder itself when it's empty or already
+/// named after the share; otherwise a new subfolder `<name>` (or `<name> 2`, …
+/// when that name is taken by something non-empty). Never returns a folder that
+/// already holds unrelated files.
+pub(crate) fn join_target(chosen: &Path, name: &str) -> PathBuf {
+    let clean = crate::iroh_net::windows_safe_component(&friends::sanitize_display_name(name, "Shared Folder"));
+    if dir_is_empty(chosen) {
+        return chosen.to_path_buf();
+    }
+    let same_name = chosen
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase() == clean.to_lowercase())
+        .unwrap_or(false);
+    if same_name {
+        return chosen.to_path_buf();
+    }
+    let free = |p: &Path| !p.exists() || (p.is_dir() && dir_is_empty(p));
+    let mut candidate = chosen.join(&clean);
+    let mut n = 2;
+    while !free(&candidate) && n < 1000 {
+        candidate = chosen.join(format!("{clean} {n}"));
+        n += 1;
+    }
+    candidate
+}
+
 fn same_path(a: &str, b: &str) -> bool {
     let norm = |s: &str| s.trim_end_matches('/').to_string();
     norm(a) == norm(b)
@@ -1243,6 +1325,51 @@ mod tests {
         // One-way: A sends only, B listens only.
         assert!(runs_sender(&a) && !runs_listener(&a));
         assert!(!runs_sender(&b) && runs_listener(&b));
+    }
+
+    #[test]
+    fn joining_into_a_busy_folder_makes_a_subfolder() {
+        let dir = role_test_dir("join-target");
+        // Empty folder: used as-is (only OS clutter inside).
+        let empty = dir.join("Empty");
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(empty.join(".DS_Store"), b"x").unwrap();
+        assert_eq!(join_target(&empty, "Family Photos"), empty);
+        // A folder already named after the share: used as-is.
+        let named = dir.join("family photos");
+        fs::create_dir_all(&named).unwrap();
+        fs::write(named.join("a.jpg"), b"x").unwrap();
+        assert_eq!(join_target(&named, "Family Photos"), named);
+        // Documents with other things in it: a new "Family Photos" inside.
+        let docs = dir.join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("taxes.pdf"), b"x").unwrap();
+        assert_eq!(join_target(&docs, "Family Photos"), docs.join("Family Photos"));
+        // That name taken by something non-empty: "Family Photos 2".
+        fs::create_dir_all(docs.join("Family Photos")).unwrap();
+        fs::write(docs.join("Family Photos").join("old.jpg"), b"x").unwrap();
+        assert_eq!(join_target(&docs, "Family Photos"), docs.join("Family Photos 2"));
+        // Unsafe names can't escape the chosen folder.
+        let t = join_target(&docs, "../../etc");
+        assert_eq!(t.parent().unwrap(), docs.as_path());
+    }
+
+    #[test]
+    fn accept_joining_never_mixes_into_existing_files() {
+        let dir = role_test_dir("accept-joining");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let (_pair, code) = create(&dir, src.to_string_lossy().into(), "Alex".into(),
+            true, String::new(), false, Some("alex-eid".into())).unwrap();
+        // The joiner is a different device with its own config dir.
+        let other = dir.join("other-config");
+        fs::create_dir_all(&other).unwrap();
+        let docs = dir.join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("letter.txt"), b"x").unwrap();
+        let pair = accept_joining(&other, &code, docs.to_string_lossy().into(), Some("Trip".into())).unwrap();
+        assert_eq!(Path::new(&pair.folder), docs.join("Trip").as_path());
+        assert!(docs.join("Trip").is_dir());
     }
 
     fn role_test_dir(tag: &str) -> PathBuf {

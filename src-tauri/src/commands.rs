@@ -695,6 +695,41 @@ pub fn open_local_network_settings(app: AppHandle) -> Result<(), String> {
     }
 }
 
+/// Hold off idle sleep while files are moving (the UI turns it on/off as the
+/// number of active transfers crosses zero). See keep_awake.rs.
+#[tauri::command]
+pub fn set_keep_awake(on: bool) {
+    crate::keep_awake::set(on);
+}
+
+/// Open the system settings page that fixes a permission DropBeam was refused,
+/// so a "not allowed" message can carry a one-click fix. Only these known pages:
+/// `files` (macOS Files & Folders), `full-disk` (macOS Full Disk Access),
+/// `notifications` (macOS / Windows notification settings), `local-network`.
+#[tauri::command]
+pub fn open_privacy_settings(app: AppHandle, pane: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let url: Option<&str> = if cfg!(target_os = "macos") {
+        match pane.as_str() {
+            "files" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"),
+            "full-disk" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"),
+            "notifications" => Some("x-apple.systempreferences:com.apple.preference.notifications"),
+            "local-network" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork"),
+            _ => None,
+        }
+    } else if cfg!(target_os = "windows") {
+        match pane.as_str() {
+            "notifications" => Some("ms-settings:notifications"),
+            "files" => Some("ms-settings:privacy-broadfilesystemaccess"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let url = url.ok_or_else(|| "That settings page isn't available on this computer.".to_string())?;
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
 /// On macOS, return a one-line warning if the app is running from a spot that
 /// makes the system forget folder permissions every launch — App Translocation
 /// (a quarantined app run from a randomized read-only path) or straight from the
@@ -866,8 +901,11 @@ pub fn accept_pair(
     iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     invite: String,
     folder: String,
+    folder_name: Option<String>,
 ) -> Result<Pair, String> {
-    let pair = pairing::accept(&state.config_dir, &invite, folder)?;
+    // `folder` is where the person chose to KEEP it; a busy folder gets a new
+    // subfolder for the shared files (pairing::accept_joining).
+    let pair = pairing::accept_joining(&state.config_dir, &invite, folder, folder_name)?;
     // Dial the creator back to hand them our iroh id (the invite gave us theirs),
     // so both directions of this folder can push directly over iroh.
     if let Some(inviter_eid) = pair.endpoint_id.clone() {
@@ -1793,6 +1831,15 @@ pub async fn send_read_receipt(
         }
     }
     Ok(())
+}
+
+/// The user has seen this conversation (it's open on screen): remember how far
+/// it's read, so the user's other devices clear their unread badge for it too.
+#[tauri::command]
+pub fn chat_mark_seen(state: State<'_, Arc<AppState>>, friend_id: String) {
+    if chat::mark_seen(&state.config_dir, &friend_id).is_some() {
+        crate::account::note_change();
+    }
 }
 
 /// Download a GIF's bytes (from Giphy's CDN) into a temp file so it can be sent

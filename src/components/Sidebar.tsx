@@ -17,15 +17,16 @@ import { avatarColor } from '../lib/avatar'
 import { IconButton } from './ui'
 import { shortcutLabel } from '../lib/keys'
 
+// Everyday pages first; Locations (NAS / always-on computers, optional) after them.
 // eslint-disable-next-line react-refresh/only-export-components -- shared with the ⌘1–7 shortcuts
-export const NAV_ORDER: View[] = ['send', 'friends', 'chat', 'locations', 'folders', 'history', 'settings']
+export const NAV_ORDER: View[] = ['send', 'friends', 'chat', 'folders', 'history', 'locations', 'settings']
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
   { id: 'friends', label: 'Friends', icon: Users },
   { id: 'chat', label: 'Chat', icon: MessageCircle },
-  { id: 'locations', label: 'Locations', icon: HardDrive },
   { id: 'folders', label: 'Shared Folders', icon: FolderSync },
   { id: 'history', label: 'History', icon: History },
+  { id: 'locations', label: 'Locations', icon: HardDrive },
   { id: 'settings', label: 'Settings', icon: Settings },
 ]
 
@@ -41,6 +42,8 @@ export function Sidebar() {
   const unreadCount = useStore((s) =>
     Object.values(s.chatUnread).reduce((a, b) => a + b, 0),
   )
+  // Friend requests wait on the Friends page: say so where she'll see it.
+  const requestCount = useStore((s) => s.friendRequests.length)
 
   return (
     <nav className="app-sidebar" aria-label="Main">
@@ -49,7 +52,7 @@ export function Sidebar() {
       {NAV.map((item, i) => {
         const active = view === item.id
         const Icon = item.icon
-        const count = item.id === 'send' ? activeCount : item.id === 'chat' ? unreadCount : 0
+        const count = item.id === 'send' ? activeCount : item.id === 'chat' ? unreadCount : item.id === 'friends' ? requestCount : 0
         return (
           <button
             key={item.id}
@@ -63,8 +66,8 @@ export function Sidebar() {
             <span className="nav-label">{item.label}</span>
             {count > 0 && (
               <span
-                className={`nav-count${item.id === 'chat' ? ' unread' : ' active-dot'}`}
-                aria-label={item.id === 'send' ? `${count} in progress` : `${count} unread`}
+                className={`nav-count${item.id === 'send' ? ' active-dot' : ' unread'}`}
+                aria-label={item.id === 'send' ? `${count} in progress` : item.id === 'friends' ? `${count} friend request${count === 1 ? '' : 's'}` : `${count} unread`}
               >
                 {count > 99 ? '99+' : count}
               </span>

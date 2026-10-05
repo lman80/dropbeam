@@ -131,6 +131,9 @@ class NativeUIPlugin: Plugin {
             if args.contains("-forceDark") { root.view.window?.overrideUserInterfaceStyle = .dark }
             // QA hook: `-previewTransferServer` seeds Transfer Server states (no server in the simulator).
             TransferServerPreview.seedIfRequested()
+            EverydayPreview.seedIfRequested()
+            // QA hook: `-previewAccounts` / `-openDevices` (accounts, friends, messages).
+            AccountsPreview.seedIfRequested()
             // QA hook: `-openTab settings` starts on a tab (screenshots without touch input).
             if let i = args.firstIndex(of: "-openTab"), i + 1 < args.count {
                 let tab = args[i + 1]

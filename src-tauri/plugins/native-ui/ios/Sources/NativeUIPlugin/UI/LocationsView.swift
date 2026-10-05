@@ -18,6 +18,12 @@ struct LocationsView: View {
     private var settled: Bool { !rows.isEmpty && rows.allSatisfy { !$0.checking && $0.status != "pending" } }
     var body: some View {
         List {
+            if friendID == nil && !sharing.isEmpty {
+                Section {
+                    Text("Optional: folders and drives a friend chose to share from their computer (like a home storage drive), to browse and download from. You don’t need this to send files.")
+                        .font(.subheadline).foregroundStyle(.secondary).listRowBackground(Color.clear)
+                }
+            }
             ForEach(sharing) { friend in section(friend) }
             if friendID == nil && !others.isEmpty && !bridge.friends.isEmpty { otherFriends }
         }
@@ -29,7 +35,7 @@ struct LocationsView: View {
                 ContentUnavailableView("No Friends Yet", systemImage: "person.2", description: Text("Add a friend who shares a folder or NAS, and it shows up here."))
             } else if sharing.isEmpty && others.isEmpty {
                 if settled {
-                    ContentUnavailableView("No Shared Locations", systemImage: "externaldrive", description: Text("When a friend shares a folder or NAS with this iPhone, it appears here. They set it up in DropBeam on their computer: Settings → Locations."))
+                    ContentUnavailableView("No Shared Locations", systemImage: "externaldrive", description: Text("Optional — you don’t need this to send files. If a friend shares a folder or storage drive from their computer (in DropBeam → Settings → Locations), you can browse it here."))
                 } else { ProgressView("Looking for shared folders…") }
             }
         }

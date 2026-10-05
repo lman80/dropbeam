@@ -575,6 +575,11 @@ pub struct Friend {
     /// None until hello/ready negotiation; zero denotes a legacy peer.
     #[serde(default)]
     pub progress_v: Option<u64>,
+    /// We added them, but their device says it doesn't accept us yet (a
+    /// friend request waiting on their side): our messages wait until they
+    /// do. Device-local; cleared as soon as they greet or message us.
+    #[serde(default)]
+    pub awaiting_accept: bool,
 }
 
 fn default_true() -> bool {

@@ -142,3 +142,4 @@
 .delivery-check { width: 12px; height: 12px; color: var(--green); }
 .delivery-row.is-failed .delivery-status, .delivery-row.is-declined .delivery-status { color: var(--red); }
 .xfer-meta .srv-glyph { width: 12px; height: 12px; vertical-align: -2px; margin-right: 4px; display: inline-block; }
+.xfer-getapp { display: block; margin-top: 6px; font-size: var(--text-12); color: var(--text-muted); }

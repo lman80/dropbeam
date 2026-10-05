@@ -29,6 +29,7 @@ mod friends;
 mod fs_walk;
 mod history;
 mod iroh_net;
+mod keep_awake;
 // Gated remote test-and-update surface (Settings → Lab Mode). Off by default;
 // only a named operator device can drive it. See lab.rs for the trust model.
 mod lab;
@@ -808,6 +809,7 @@ pub fn run() {
                 #[cfg(desktop)]
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
+                    #[cfg(desktop)]
                     let _ = w.minimize();
                 }
             } else if autostart_launch {
@@ -931,6 +933,8 @@ pub fn run() {
             commands::restart_app,
             commands::lan_network_blocked,
             commands::open_local_network_settings,
+            commands::open_privacy_settings,
+            commands::set_keep_awake,
             commands::open_url,
             commands::open_mailto,
             commands::open_main_window,
@@ -1040,6 +1044,7 @@ pub fn run() {
             commands::delete_chat_message,
             commands::send_typing,
             commands::send_read_receipt,
+            commands::chat_mark_seen,
             commands::download_gif,
             commands::send_chat_gif,
             commands::set_active_chat,

@@ -54,6 +54,11 @@ function ToastItem({ t }: { t: Toast }) {
       <Icon className={`toast-icon ${t.kind}`} aria-hidden />
       <div className="toast-body">
         <div className="toast-msg selectable">{t.message}</div>
+        {t.action && (
+          <button type="button" className="btn btn-secondary btn-sm toast-action" onClick={() => { t.action!.run(); dismiss(t.id) }}>
+            {t.action.label}
+          </button>
+        )}
         {t.details && (
           <>
             <button type="button" className="toast-details-btn" aria-expanded={open} onClick={() => setOpen((v) => !v)}>

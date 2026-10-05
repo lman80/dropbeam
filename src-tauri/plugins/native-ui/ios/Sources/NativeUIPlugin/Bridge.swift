@@ -35,6 +35,9 @@ final class Bridge: ObservableObject {
     @Published var history: [HistoryEntry] = []
     @Published var locations: [FriendLocations] = []
     @Published var needsName = false
+    /// The engine has said whether this install still needs a name — until then a
+    /// brand-new install can't be told apart from an existing one.
+    @Published var nameKnown = false
     @Published var pendingSend: [String] = []
     /// Paths the user just picked on the Send tab, owned by Swift. The web store's
     /// `pendingSend` snapshot (re-pushed right after every pick reply) must not be able to
@@ -51,7 +54,7 @@ final class Bridge: ObservableObject {
     @Published var otherDevices: [DeviceActivity] = []
     @Published var settings: Settings?
     @Published var chatOverview: [ChatOverview] = []
-    @Published var chatUnread: [String: Int] = [:] { didSet { updateAppBadge() } }
+    @Published var chatUnread: [String: Int] = [:] { didSet { updateAppBadge(); clearReadBanners(was: oldValue) } }
     @Published var folders: [SharedFolder] = []
     @Published var blocked: [BlockedPerson] = []
     @Published var chatTyping: [String: Bool] = [:]
@@ -98,6 +101,24 @@ final class Bridge: ObservableObject {
     /// Unread chats on the app icon. Badge permission is requested together with
     /// alerts/sounds at first launch (notification plugin: [.badge, .alert, .sound]);
     /// without it iOS simply ignores the count.
+    /// A chat read here (or on another of your devices) shouldn't leave its
+    /// banners in Notification Center: drop the ones for chats now at 0.
+    private func clearReadBanners(was old: [String: Int]) {
+        let cleared = Set(old.filter { $0.value > 0 && (chatUnread[$0.key] ?? 0) == 0 }.map(\.key))
+        guard !cleared.isEmpty else { return }
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let ids = delivered.filter { n in
+                let content = n.request.content
+                let thread = content.threadIdentifier.hasPrefix("chat-") ? String(content.threadIdentifier.dropFirst(5)) : nil
+                let extra = (content.userInfo["chatPeerId"] as? String)
+                    ?? ((content.userInfo["extra"] as? [String: Any])?["chatPeerId"] as? String)
+                return [thread, extra].compactMap { $0 }.contains(where: cleared.contains)
+            }.map(\.request.identifier)
+            if !ids.isEmpty { center.removeDeliveredNotifications(withIdentifiers: ids) }
+        }
+    }
+
     func updateAppBadge(force: Bool = false) {
         let count = unread
         guard force || count != appliedBadge else { return }
@@ -149,7 +170,7 @@ final class Bridge: ObservableObject {
     }
     /// A store snapshot decoded OFF the main thread (NativeUIPlugin.state), applied here.
     enum Snapshot {
-        case history([HistoryEntry]), locations([FriendLocations]), needsName(Bool), pendingSend([String])
+        case history([HistoryEntry]), locations([FriendLocations]), needsName(Bool?), pendingSend([String])
         case friends([Friend]), myDevice(MyDevice?), transfers([Transfer]), settings(Settings?)
         case chatOverview([ChatOverview]), chatUnread([String: Int]), chatTyping([String: Bool]), chatDraftFiles([String])
         case thread(ChatThread?), presence([String: Bool]), presenceSeen([String: Double]), folders([SharedFolder])
@@ -167,7 +188,7 @@ final class Bridge: ObservableObject {
         switch key {
         case "history": snapshot = .history(try value(LossyArray<HistoryEntry>.self).values)
         case "locations": snapshot = .locations(try value(LossyArray<FriendLocations>.self).values)
-        case "needsName": snapshot = .needsName(try value(Bool.self))
+        case "needsName": snapshot = .needsName(try value(Bool?.self)) // null = settings not loaded yet
         case "pendingSend": snapshot = .pendingSend(try value(LossyArray<String>.self).values)
         case "friends": snapshot = .friends(try value(LossyArray<Friend>.self).values)
         case "myDevice": snapshot = .myDevice(try value(MyDevice?.self))
@@ -195,8 +216,10 @@ final class Bridge: ObservableObject {
         switch snapshot {
         case .history(let v): history = v
         case .locations(let v): locations = v
-        case .needsName(let v):
+        case .needsName(let known):
+            guard let v = known else { break }
             needsName = v
+            nameKnown = true
             // Only a brand-new install is asked its name: that starts first-run setup,
             // which then stays up (name saved or not) until the user finishes it.
             if needsName && !onboarding { onboarding = true }
