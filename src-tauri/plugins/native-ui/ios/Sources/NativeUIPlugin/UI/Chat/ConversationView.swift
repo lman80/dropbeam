@@ -292,6 +292,7 @@ struct ConversationView: View {
 
     /// "Online", "Connecting…", "Last seen 5 min ago" or "Offline" under the name.
     private var presenceText: String {
+        if notAccepted { return "Hasn’t accepted your request yet" }
         if online { return "Online" }
         if probing { return "Connecting…" }
         guard let seen = bridge.presenceSeen[friendID] else { return "Offline" }
@@ -428,7 +429,7 @@ struct ConversationView: View {
         let name = firstName
         switch message.status {
         case "read": return "\(name) has opened the chat and seen your message."
-        case "delivered", "sent": return "It’s on \(name)’s device. You’ll see “Read” once they open the chat (if they share read receipts)."
+        case "delivered", "sent": return "It’s on \(name)’s device. You’ll see “Read” once they open the chat (unless they’ve turned that off)."
         case "held": return "\(name) isn’t online, so \(message.heldOn ?? "your Transfer Server") is keeping your message safe. \(name) gets it the moment they’re back."
         default:
             if notAccepted { return "\(name) hasn’t accepted your friend request yet. Your message is saved and arrives as soon as they do." }

@@ -113,7 +113,7 @@ struct FriendsView: View {
         Section {
             ForEach(bridge.friendRequests) { request in requestRow(request) }
         } header: { Text("Friend Requests") } footer: {
-            Text("Only accept people you know. Until you do, they can’t message you, and any file they send asks first.")
+            Text("Only accept people you know. Until you do, they can’t message you, and any file they send asks first. To block someone, swipe their request.")
         }.headerProminence(.increased)
     }
     private func requestRow(_ request: FriendRequest) -> some View {
@@ -128,11 +128,8 @@ struct FriendsView: View {
             Button("Accept") {
                 bridge.perform { try await bridge.acceptFriendRequest(endpointId: request.endpointId); Haptics.success(); bridge.showToast("\(request.name) is now your friend") }
             }.beamButton(prominent: true).controlSize(.small)
-            Menu {
-                Button("Decline", systemImage: "xmark") { bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: false) } }
-                Button("Decline and Block…", systemImage: "hand.raised", role: .destructive) { blockingRequest = request }
-            } label: { Image(systemName: "ellipsis.circle").font(.title3).frame(width: 44, height: 44).contentShape(Rectangle()) }
-                .buttonStyle(.borderless).accessibilityLabel("Decline \(request.name)")
+            Button("Decline") { bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: false) } }
+                .buttonStyle(.bordered).controlSize(.small)
         }
         .padding(.vertical, 2)
         .swipeActions(edge: .trailing) {
@@ -146,9 +143,9 @@ struct FriendsView: View {
         }
     }
     private func requestSubtitle(_ request: FriendRequest) -> String {
-        guard let ms = request.at else { return "Wants to be your friend" }
+        guard let ms = request.at else { return "Friend request" }
         let date = Date(timeIntervalSince1970: ms / 1000)
-        return "Wants to be your friend · " + (Date().timeIntervalSince(date) < 60 ? "just now" : date.formatted(.relative(presentation: .named)))
+        return Date().timeIntervalSince(date) < 60 ? "Just now" : { let r = date.formatted(.relative(presentation: .named)); return r.prefix(1).uppercased() + r.dropFirst() }()
     }
     private func row(_ friend: Friend) -> some View {
         NavigationLink {

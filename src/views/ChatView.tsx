@@ -340,6 +340,7 @@ function Conversation({ friendId }: { friendId: string }) {
   const presenceText = useStore((s) => {
     if (!friend) return ''
     const p = friendPresence(friend, s.friendSeen, s.folderStatuses)
+    if (friend.awaitingAccept) return 'Hasn’t accepted your friend request yet'
     return p.status === 'online' ? 'Online' : checking ? 'Connecting…' : presenceLabel(p)
   })
   const windowFocused = useStore((s) => s.windowFocused)

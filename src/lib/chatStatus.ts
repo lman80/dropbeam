@@ -10,7 +10,7 @@ export function statusExplanation(state: MessageState, friend: string, server?: 
     case 'waiting': return `${friend} isn’t online right now. Your message is saved and goes out by itself as soon as you’re both online with DropBeam open.`
     case 'notAccepted': return `${friend} hasn’t accepted your friend request yet. Your message is saved and arrives as soon as they do.`
     case 'held': return `${friend} isn’t online, so ${server || 'your Transfer Server'} is keeping your message safe. ${friend} gets it the moment they’re back.`
-    case 'delivered': return `It’s on ${friend}’s device. You’ll see “Read” once they open the chat (if they share read receipts).`
+    case 'delivered': return `It’s on ${friend}’s device. You’ll see “Read” once they open the chat (unless they’ve turned that off).`
     case 'read': return `${friend} has opened the chat and seen your message.`
     case 'serverNote': return `Your message is saved on this device and DropBeam keeps trying. You don’t need to do anything.`
   }

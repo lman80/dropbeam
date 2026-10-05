@@ -37,7 +37,7 @@ struct DevicesView: View {
                 }
                 Section {
                     Button("Remove This \(myNoun) from My Devices", role: .destructive) { leaving = true }
-                } footer: { Text("Lost a phone or computer? Remove it above (swipe or tap ⋯). It stops getting new messages; what’s already on it stays on it.\n\nFriends, chats, your name and photo sync directly between your devices, end-to-end encrypted.") }
+                } footer: { Text("Lost a phone or computer? Remove it above (swipe or tap ⋯) so it gets no new messages. Messages already on it stay there, so also lock or erase it with Find My.\n\nFriends, chats, your name and photo sync directly between your devices, end-to-end encrypted.") }
             } else {
                 Section {
                     Button { linking = .show; Haptics.tap() } label: { Label("Link a Device", systemImage: "plus.circle") }
@@ -58,7 +58,7 @@ struct DevicesView: View {
         .confirmationDialog(approving.map { "Is “\($0.name)” yours?" } ?? "", isPresented: Binding(get: { approving != nil }, set: { if !$0 { approving = nil } }), titleVisibility: .visible, presenting: approving) { device in
             Button("Yes, It’s Mine") { approve(device) }
             Button("No — Remove It", role: .destructive) { removing = device }
-        } message: { _ in Text("It was linked by an older version of DropBeam or by a device you removed. Approving gives it all your friends and chats.") }
+        } message: { _ in Text("Only say yes if you set up DropBeam on this device yourself. Saying yes gives it all your friends and chats. Not sure? Remove it — you can link it again later.") }
         .confirmationDialog("Remove this \(myNoun) from your devices?", isPresented: $leaving, titleVisibility: .visible) {
             Button("Remove", role: .destructive) { bridge.perform { try await bridge.accountLeave(); bridge.showToast("This \(myNoun) is no longer linked to your other devices") } }
         } message: { Text("Your friends and chats stay on this \(myNoun), but stop syncing with your other devices. Devices that are offline are told the next time they see this one.") }
@@ -115,8 +115,8 @@ struct DevicesView: View {
                 Text("Needs approval. It says it’s yours, but none of your devices added it. Don’t recognize it? Remove it.")
                     .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 10) {
-                    Button("Approve…") { approving = device }.buttonStyle(.borderedProminent)
-                    Button("Remove", role: .destructive) { removing = device }.buttonStyle(.bordered)
+                    Button("Remove", role: .destructive) { removing = device }.buttonStyle(.borderedProminent).tint(.red)
+                    Button("It’s Mine…") { approving = device }.buttonStyle(.bordered)
                 }.controlSize(.small).padding(.top, 4)
             }
         }
@@ -241,7 +241,7 @@ struct LinkDeviceSheet: View {
                         if let safety { LinkSafetyCheck(safety: safety, confirm: { confirmLink(safety) }, cancel: { cancelLink(safety) }, mismatch: { mismatch(safety) }) }
                     case .mismatch:
                         BeamEmpty(symbol: "xmark.shield.fill", title: "Nothing Was Linked",
-                                  detail: "If the numbers were different, a device that isn’t yours may have scanned your code. Nothing changed on either device. Put your two devices side by side and start again.")
+                                  detail: "If the numbers were different, a device that isn’t yours may have scanned your code. Nothing changed on either device. Put your two devices side by side and start again. If the numbers are different again, stop and ask someone you trust for help.")
                         Button { retry() } label: { Text("Start Again").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
                     case .done:
                         BeamEmpty(symbol: "checkmark.circle.fill", title: doneTitle, detail: doneDetail)
@@ -326,7 +326,7 @@ struct LinkDeviceSheet: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("1. Open DropBeam on your other device.")
             Text("2. Go to **Settings → Devices → Link a Device**. On a phone you’re just setting up, tap **I Already Use DropBeam**.")
-            Text("3. Choose **Scan** and point it at this code.")
+            Text("3. Choose **Scan the Other Device** and point it at this code.")
         }.frame(maxWidth: .infinity, alignment: .leading).foregroundStyle(.secondary)
         GlassCard {
             VStack(spacing: 16) {
@@ -435,6 +435,13 @@ struct LinkSafetyCheck: View {
     let confirm: () -> Void
     let cancel: () -> Void
     var mismatch: () -> Void = {}
+    /// "iPhone" → "your iPhone"; a name someone chose stays as is.
+    static func yours(_ name: String) -> String {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        if n.isEmpty || n == "Your other device" { return "your other device" }
+        let first = n.split(separator: " ").first.map { $0.lowercased() } ?? ""
+        return ["iphone", "ipad", "mac", "macbook", "pc", "computer", "phone"].contains(first) ? "your \(n)" : n
+    }
     private var warning: String {
         "If they match, your friends and chats will be shared between the two devices. Only link devices that are yours."
     }
@@ -442,7 +449,8 @@ struct LinkSafetyCheck: View {
         VStack(spacing: 22) {
             VStack(spacing: 8) {
                 Image(systemName: "checkmark.shield.fill").font(.system(size: 46)).foregroundStyle(.tint).accessibilityHidden(true)
-                Text("Look at \(safety.name). Does it show the same 6 numbers?").font(.title3.weight(.semibold)).multilineTextAlignment(.center)
+                Text("Look at \(LinkSafetyCheck.yours(safety.name)). Does it show these same 6 numbers?").font(.title3.weight(.semibold)).multilineTextAlignment(.center)
+                Text("Choose the same answer on both devices.").font(.subheadline).foregroundStyle(.secondary)
             }
             GlassCard {
                 Text(safety.safety)

@@ -30,7 +30,7 @@ import {
   UserPlus,
   Users,
 } from 'lucide-react'
-import { api, fileSrc, HAS_TAURI, type ConnDetail, type Friend } from '../lib/api'
+import { api, fileSrc, HAS_TAURI, type ConnDetail, type Friend, type FriendRequest } from '../lib/api'
 import { useStore } from '../store'
 import { parseCode, wrongCodeMessage } from '../lib/codes'
 import { MobileHeader } from '../components/MobileHeader'
@@ -93,6 +93,7 @@ export function FriendsView() {
 function FriendRequests() {
   const requests = useStore((s) => s.friendRequests)
   const [busy, setBusy] = useState<string | null>(null)
+  const [blocking, setBlocking] = useState<FriendRequest | null>(null)
   if (!requests.length) return null
   const act = async (endpointId: string, fn: () => Promise<void>) => {
     setBusy(endpointId)
@@ -116,11 +117,17 @@ function FriendRequests() {
         <div className="row-title truncate-1" title={r.name}>{r.name}</div>
         <div className="row-sub truncate-1">Wants to be your friend · {relativeTime(r.at)}</div>
       </div>
-      <button className="btn btn-plain btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.declineFriendRequest(r.endpointId, true))}>Block</button>
+      <button className="btn btn-plain btn-sm" disabled={busy === r.endpointId} onClick={() => setBlocking(r)}>Block…</button>
       <button className="btn btn-secondary btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.declineFriendRequest(r.endpointId, false))}>Decline</button>
       <button className="btn btn-primary btn-sm" disabled={busy === r.endpointId} onClick={() => void act(r.endpointId, () => s.acceptFriendRequest(r.endpointId))}>Accept</button>
     </div>)}</div>
     <p className="fr-lookalike">Only accept people you know. Until you do, they can’t message you, and any file they send asks first.</p>
+    <AnimatePresence>
+      {blocking && <ConfirmDialog key="block-request" title={`Block ${blocking.name}?`} confirmLabel="Block"
+        onConfirm={() => act(blocking.endpointId, () => s.declineFriendRequest(blocking.endpointId, true))} onClose={() => setBlocking(null)}>
+        They can’t ask again, message you or send you files, on any of your devices. They aren’t told.
+      </ConfirmDialog>}
+    </AnimatePresence>
   </>
 }
 
@@ -198,7 +205,7 @@ function DesktopFriends() {
           <EmptyState
             icon={<Users />}
             title="No friends yet"
-            hint="Add a friend with their DropBeam code."
+            hint="Add a friend with the invite they sent you, or send them yours."
             action={<button className="btn btn-secondary" onClick={() => setAdding(true)}>Add a Friend</button>}
             style={{ padding: '32px 24px' }}
           />

@@ -382,7 +382,7 @@ private struct DevicesStep: View {
                       detail: linked ? "Friends, chats, your name and photo now stay in sync between them."
                                      : "Link your Mac, PC or another phone to share your friends and chats between them. Send files to them in one tap.")
             if !linked {
-                PeerToPeerNote(text: "Open DropBeam on the other device too. On a computer, go to Settings → Devices → Link a Device.")
+                PeerToPeerNote(text: "On your computer, open DropBeam → Settings → Devices → Link a Device. A square code appears. Then tap Link a Device below and choose Scan the Other Device.")
             }
         } actions: {
             if linked { PrimaryButton(title: "Continue", action: next) }

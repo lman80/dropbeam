@@ -169,13 +169,15 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
       <button className="btn btn-primary" autoFocus onClick={retry}>Try Again</button>
     </>
 
-  const other = (name: string) => name && name !== 'Your other device' ? name : 'your other device'
+  // "iPhone" → "your iPhone"; a name someone chose ("Rose’s Mac") stays as is.
+  const other = (name: string) => !name || name === 'Your other device' ? 'your other device'
+    : /^(iphone|ipad|mac|macbook|pc|computer|phone)\b/i.test(name.trim()) ? `your ${name.trim()}` : name
   return <LinkDialog title={phase === 'done' ? 'Devices linked' : phase === 'confirm' || phase === 'incoming' ? 'Check the numbers' : phase === 'mismatch' ? 'Not linked' : title} onClose={onClose} footer={footer}>
     {phase === 'show' && <div className="link-show">
       <ol className="link-steps">
         <li>Open DropBeam on your other device (phone or computer).</li>
         <li>Go to <strong>Settings → Devices → Link a Device</strong>.</li>
-        <li>Choose <strong>Scan</strong> and point it at this code.</li>
+        <li>Choose <strong>Scan the Other Device</strong> and point it at this code.</li>
       </ol>
       <div className="link-qr-slot">
         {code ? <QrCodeView value={code} size={200} hint={null} label="QR code to link your other device" />
@@ -192,7 +194,7 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
     {phase === 'mismatch' && <div className="link-state" role="alert">
       <AlertCircle className="link-state-bad" size={30} strokeWidth={1.75} />
       <p className="link-state-title">Nothing was linked</p>
-      <p className="link-state-sub">If the numbers were different, a device that isn’t yours may have scanned your code. Nothing changed on either device. Put your two devices side by side and start again.</p>
+      <p className="link-state-sub">If the numbers were different, a device that isn’t yours may have scanned your code. Nothing changed on either device. Put your two devices side by side and start again. If the numbers are different again, stop and ask someone you trust for help.</p>
     </div>}
     {phase === 'working' && <div className="link-state" role="status" aria-live="polite">
       <Spinner size={22} />
@@ -215,7 +217,7 @@ export function LinkFlow({ onClose, start, title }: { onClose: () => void; start
 /** "Do the numbers match?" — the same 6 digits on both screens before anything links (S1). */
 function SafetyCheck({ name, safety, peerShowsCode }: { name: string; safety: string; peerShowsCode: boolean }) {
   return <div className="link-state" role="alertdialog" aria-label="Check the numbers">
-    <p className="link-state-sub">Look at {name}. Does it show the same 6 numbers?</p>
+    <p className="link-state-sub">Look at {name}. Does it show these same 6 numbers? Choose the same answer on both devices.</p>
     <p className="link-state-title link-safety-code" aria-live="polite" aria-label={`Safety numbers ${safety.replace(/\s+/g, '').split('').join(' ')}`}>{safety}</p>
     <p className="link-state-sub">{peerShowsCode
       ? 'If they match, your friends and chats will be shared between the two devices. Only link devices that are yours.'
