@@ -39,9 +39,9 @@ import { chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTran
 import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
 import { DEVICE_CODE_ELSEWHERE, parseCode, routeCode, wrongCodeMessage } from './lib/codes'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
-import { MOBILE_UI } from './lib/platform'
+import { IS_MAC, IS_WINDOWS, MOBILE_UI } from './lib/platform'
 import { feedbackMoment } from './lib/feedback'
-import { humanError, humanErrorIn, rawErrorText } from './lib/errors'
+import { PERMISSION_MESSAGE, humanError, humanErrorIn, rawErrorText } from './lib/errors'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
 // Wire the periodic/online update re-check listeners exactly once.
@@ -222,6 +222,8 @@ export interface Toast {
   message: string
   /** Raw technical text behind an error, shown under a "Details" disclosure. */
   details?: string | null
+  /** A one-click fix shown as a button ("Open Settings"). */
+  action?: { label: string; run: () => void } | null
 }
 
 interface AppStore {
@@ -604,6 +606,21 @@ function deleteChatFileXfer(id: string): void {
 }
 
 const restoredPaused = loadPausedTransfers()
+
+/** A refused file permission (macOS Files & Folders, Windows Controlled Folder
+ *  Access) is fixable in one place — say where, and offer to open it. */
+function permissionFix(message: string): { message: string; action: Toast['action'] } | null {
+  if (!message.includes(PERMISSION_MESSAGE) || MOBILE_UI) return null
+  if (IS_MAC) return {
+    message: `${message} In System Settings → Privacy & Security → Files & Folders, turn on DropBeam for that folder, then try again.`,
+    action: { label: 'Open Settings', run: () => { void api.openPrivacySettings('files').catch(() => {}) } },
+  }
+  if (IS_WINDOWS) return {
+    message: `${message} If Windows Security blocked it, open Windows Security → Virus & threat protection → Ransomware protection → Allow an app, and add DropBeam.`,
+    action: null,
+  }
+  return null
+}
 
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
@@ -1859,14 +1876,16 @@ export const useStore = create<AppStore>((set, get) => ({
   toast: (kind, message) => {
     const id = crypto.randomUUID()
     const h = kind === 'error' ? humanError(message) : { message: rawErrorText(message), details: null }
-    set((s) => ({ toasts: [...s.toasts, { id, kind, message: h.message, details: h.details }] }))
-    scheduleToast(id, kind === 'error' ? 6000 : 3500, get().dismissToast)
+    const fix = kind === 'error' ? permissionFix(h.message) : null
+    set((s) => ({ toasts: [...s.toasts, { id, kind, message: fix?.message ?? h.message, details: h.details, action: fix?.action }] }))
+    scheduleToast(id, fix ? 15000 : kind === 'error' ? 6000 : 3500, get().dismissToast)
   },
   toastError: (context, e) => {
     const id = crypto.randomUUID()
     const h = humanErrorIn(context, e)
-    set((s) => ({ toasts: [...s.toasts, { id, kind: 'error', message: h.message, details: h.details }] }))
-    scheduleToast(id, 6000, get().dismissToast)
+    const fix = permissionFix(h.message)
+    set((s) => ({ toasts: [...s.toasts, { id, kind: 'error', message: fix?.message ?? h.message, details: h.details, action: fix?.action }] }))
+    scheduleToast(id, fix ? 15000 : 6000, get().dismissToast)
   },
 
   dismissToast: (id) => {

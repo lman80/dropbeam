@@ -53,3 +53,6 @@ export const TRAY_NAME = IS_MAC ? 'menu bar' : 'system tray'
 export const REVEAL_LABEL = IS_MAC ? 'Show in Finder' : IS_WINDOWS ? 'Show in File Explorer' : 'Show in Folder'
 /** Open a folder in the system file manager — named the OS's way. */
 export const OPEN_FOLDER_LABEL = IS_MAC ? 'Open in Finder' : IS_WINDOWS ? 'Open in File Explorer' : 'Open Folder'
+
+/** Where someone without DropBeam gets it (all platforms). */
+export const DOWNLOAD_URL = 'https://github.com/lman80/dropbeam/releases/latest'

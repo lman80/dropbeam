@@ -3,7 +3,8 @@ import { isEnterKey, isPrimaryMod } from './lib/keys'
 import { NAV_ORDER } from './components/Sidebar'
 import { JoinAccountModal } from './components/DevicesPanel'
 import { motion } from 'framer-motion'
-import { AlertTriangle, X } from 'lucide-react'
+import { AlertTriangle, Download, WifiOff, X } from 'lucide-react'
+import { InstallUpdateButton } from './components/UpdateInstall'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { api, HAS_TAURI, onFileDrop } from './lib/api'
 import { setTaskbarProgress } from './lib/taskbar'
@@ -244,7 +245,9 @@ export default function App() {
         {!MOBILE_UI && <ErrorBoundary region="window controls">
           <SettingsFallbackBanner />
           <InstallBanner />
+          <OfflineBanner />
           <LocalNetworkBanner />
+          <UpdateBanner />
         </ErrorBoundary>}
         <main
           className={MOBILE_UI ? `scroll-area mobile-main${view === 'chat' ? ' mobile-main-chat' : ''}` : "scroll-area"}
@@ -379,8 +382,8 @@ function NameSetupModal() {
         footer={
           <>
             {!MOBILE_UI && (
-              <button className="btn btn-plain" onClick={() => setJoining(true)} style={{ marginLeft: -8 }}>
-                Link an Existing Device…
+              <button className="btn btn-plain btn-sm" onClick={() => setJoining(true)} style={{ marginLeft: -8 }} title="Already use DropBeam on another computer or phone? Link this one to it.">
+                I Already Use DropBeam…
               </button>
             )}
             <span className="spacer" />
@@ -394,10 +397,9 @@ function NameSetupModal() {
           <BeamLogo size={44} />
           <h2 className="onboard-title">Welcome to DropBeam</h2>
           <p className="onboard-text">
-            {MOBILE_UI
-              ? 'Choose the name friends see when you send them something.'
-              : 'Choose the name friends see when you send files or share a folder.'}
+            Send photos and files straight to family, friends and your other devices — nearby or far away, no account or cloud needed.
           </p>
+          <p className="onboard-text">What name should people see when you send them something?</p>
           <input
             autoFocus
             className="input onboard-input"
@@ -443,8 +445,8 @@ function LocalNetworkBanner() {
       <AlertTriangle />
       <span style={{ flex: 1, minWidth: 0 }}>
         {IS_MAC
-          ? <>Transfers to devices nearby are slow. Allow DropBeam under <b>Local Network</b> on both devices.</>
-          : <>Transfers to devices nearby are slow. Allow DropBeam through the firewall on private networks, on both devices.</>}
+          ? <>Sending to computers on the same Wi-Fi is slow because DropBeam isn’t allowed on your local network. Click <b>Open Settings</b>, turn on <b>DropBeam</b>, then do the same on the other computer.</>
+          : <>Sending to computers on the same Wi-Fi is slow. When Windows asks, allow DropBeam on <b>private networks</b> — or add it in Windows Security → Firewall → Allow an app — on both computers.</>}
       </span>
       {IS_MAC && <button className="btn btn-secondary btn-sm" style={{ flexShrink: 0 }} onClick={() => api.openLocalNetworkSettings().catch(() => {})}>
         Open Settings
@@ -491,6 +493,43 @@ function InstallBanner() {
       <AlertTriangle />
       <span style={{ flex: 1, minWidth: 0 }}>{hint}</span>
       <IconButton label="Dismiss" size="sm" onClick={() => setDismissed(true)}>
+        <X />
+      </IconButton>
+    </div>
+  )
+}
+
+/** The computer has no network at all. Said plainly, because otherwise every
+ *  friend just quietly turns "offline" and sends sit waiting. */
+function OfflineBanner() {
+  const [online, setOnline] = useState(() => typeof navigator === 'undefined' || navigator.onLine !== false)
+  useEffect(() => {
+    const on = () => setOnline(true)
+    const off = () => setOnline(false)
+    window.addEventListener('online', on)
+    window.addEventListener('offline', off)
+    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off) }
+  }, [])
+  if (online) return null
+  return (
+    <div className="app-banner warn" role="status">
+      <WifiOff />
+      <span style={{ flex: 1, minWidth: 0 }}>You’re not connected to the internet. Computers on the same Wi-Fi can still send to each other; everything else waits until you’re back online.</span>
+    </div>
+  )
+}
+
+/** A new version is ready: say so where it's seen, not only deep in Settings. */
+function UpdateBanner() {
+  const update = useStore((s) => s.update)
+  const [dismissed, setDismissed] = useState(false)
+  if (!update || update.installing || dismissed) return null
+  return (
+    <div className="app-banner info" role="status">
+      <Download />
+      <span style={{ flex: 1, minWidth: 0 }}>A new version of DropBeam ({update.version}) is ready.</span>
+      <InstallUpdateButton className="btn btn-secondary btn-sm" label="Restart to Update" />
+      <IconButton label="Later" size="sm" onClick={() => setDismissed(true)}>
         <X />
       </IconButton>
     </div>

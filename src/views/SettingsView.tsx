@@ -16,6 +16,7 @@ import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
 import { TransferServerPane } from '../components/TransferServerSettings'
+import { InstallUpdateButton } from '../components/UpdateInstall'
 import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spinner, Toggle } from '../components/ui'
 import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbackButton } from '../lib/feedback'
 
@@ -824,7 +825,6 @@ function UpdateRow({ onVersionTap }: { onVersionTap?: () => void }) {
   const checkingUpdate = useStore((s) => s.checkingUpdate)
   const updateError = useStore((s) => s.updateError)
   const checkForUpdates = useStore((s) => s.checkForUpdates)
-  const installUpdate = useStore((s) => s.installUpdate)
 
   let sub: ReactNode
   let control: ReactNode
@@ -834,9 +834,7 @@ function UpdateRow({ onVersionTap }: { onVersionTap?: () => void }) {
   } else if (update) {
     sub = `Version ${update.version} is available.`
     control = (
-      <button className="btn btn-primary" onClick={() => installUpdate()}>
-        Install and Restart
-      </button>
+      <InstallUpdateButton />
     )
   } else if (updateError) {
     sub = 'Couldn’t reach the update server.'

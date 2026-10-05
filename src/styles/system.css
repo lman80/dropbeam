@@ -1368,3 +1368,7 @@ html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin-top: 10px; }
 .kv dt { color: var(--text-muted); }
 .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.app-banner.info { background: color-mix(in srgb, var(--accent) 9%, var(--surface)); }
+.app-banner.info > svg { color: var(--accent-text); }
+.app-banner.info .icon-btn { color: var(--text-muted); }
+.toast-action { margin-top: 6px; margin-right: 8px; }

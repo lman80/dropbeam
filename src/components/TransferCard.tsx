@@ -1,6 +1,6 @@
 import { FileIcon } from './FileIcon'
 import { integrityLabel } from '../lib/integrity'
-import { MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
+import { DOWNLOAD_URL, MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -310,8 +310,16 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             size={132}
             hint={null}
             copyVariant="secondary"
-            instructions="On the other device, open DropBeam, choose Receive, and scan this code — or paste it."
-            footer={<span className="xfer-connecting"><Spinner size={11} />Waiting for the other device…</span>}
+            instructions="On the other device, open DropBeam, choose Receive…, and scan this code — or paste it. Keep DropBeam open here until it’s done."
+            footer={<>
+              <span className="xfer-connecting"><Spinner size={11} />Waiting for the other device…</span>
+              <span className="xfer-getapp">
+                They don’t have DropBeam? It’s free:{' '}
+                <button className="btn btn-plain btn-sm" onClick={() => navigator.clipboard.writeText(DOWNLOAD_URL).then(() => toast('success', 'Download link copied — send it to them'), () => toast('error', DOWNLOAD_URL))}>
+                  Copy Download Link
+                </button>
+              </span>
+            </>}
           />
         </div>
       )}

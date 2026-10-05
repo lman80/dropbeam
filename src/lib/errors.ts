@@ -24,12 +24,15 @@ export function rawErrorText(e: unknown): string {
   return String(e)
 }
 
+/** The sentence for a refused file permission — the UI adds an Open Settings fix. */
+export const PERMISSION_MESSAGE = 'DropBeam doesn’t have permission to use that file or folder.'
+
 // Ordered: the first pattern that matches wins.
 const RULES: [RegExp, string][] = [
   [/cancel+ed|aborted by user/i, 'Canceled.'],
   [/no space left|disk (is )?full|os error 28|not enough (free )?space|ENOSPC/i, 'There isn’t enough free space on the disk.'],
   [/file too large|EFBIG|os error 27|FAT32|4 ?GB limit/i, 'That file is too big for the drive it’s going to (FAT32 drives can’t hold files over 4 GB).'],
-  [/permission denied|operation not permitted|os error (1|13)\b|EACCES|EPERM|access is denied/i, 'DropBeam doesn’t have permission to use that file or folder.'],
+  [/permission denied|operation not permitted|os error (1|13)\b|EACCES|EPERM|access is denied|Files and Folders/i, PERMISSION_MESSAGE],
   [/no such file|not ?found.*(file|path|directory)|os error 2\b|ENOENT|cannot find the (file|path)/i, 'That file or folder isn’t there anymore.'],
   [/read-only file system|os error 30|EROFS/i, 'That drive is read-only.'],
   [/(iroh|engine|network|endpoint).{0,20}(not ready|not started|starting)|still starting/i, 'DropBeam is still starting up. Try again in a moment.'],
