@@ -28,13 +28,14 @@ import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbac
 // otherwise it's the pane you last had open.
 type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'advanced'
 const DEV_KEY = 'dropbeam.developer'
+// Everyday tabs first; the optional/advanced features after Privacy.
 const TABS: { value: Tab; label: string }[] = [
   { value: 'general', label: 'General' },
-  { value: 'devices', label: 'Devices' },
-  { value: 'locations', label: 'Locations' },
   { value: 'transfers', label: 'Transfers' },
-  { value: 'server', label: 'Server' },
+  { value: 'devices', label: 'Devices' },
   { value: 'privacy', label: 'Privacy' },
+  { value: 'locations', label: 'Locations' },
+  { value: 'server', label: 'Transfer Server' },
   { value: 'advanced', label: 'Advanced' },
 ]
 let lastTab: Tab = 'general'
@@ -376,6 +377,13 @@ export function SettingsView() {
           on={settings.notifyOnComplete}
           onChange={(v) => save({ notifyOnComplete: v })}
         />
+        {(IS_MAC || IS_WINDOWS) && (
+          <Row title="Not seeing notifications?" sub={IS_MAC ? 'Make sure DropBeam is allowed in System Settings → Notifications.' : 'Make sure DropBeam is turned on in Windows Settings → Notifications.'}>
+            <button className="btn btn-secondary" onClick={() => api.openPrivacySettings('notifications').catch(() => {})}>
+              Open Settings…
+            </button>
+          </Row>
+        )}
         <ToggleRow
           title="When a message arrives"
           sub="Only while you’re not looking at DropBeam."
@@ -411,13 +419,13 @@ export function SettingsView() {
     <>
       <SectionHeader>Downloads</SectionHeader>
       <div className="group">
-        <Row title="Save files to">
+        <Row title="Save files to" sub="Files from friends save here automatically. To be asked first, turn off “Accept automatically” for that friend under Friends.">
           <button className="btn btn-secondary set-dir" onClick={changeDir} title={settings.downloadDir}>
             <FolderOpen />
             <span className="truncate-1">{folderLabel(settings.downloadDir)}</span>
           </button>
         </Row>
-        <Row title="Transfer leftovers" sub="Lets interrupted transfers resume. Cleared after a week.">
+        <Row title="Unfinished transfers" sub="Parts of files that didn’t finish arriving, kept so they can pick up where they stopped. Removed after a week.">
           <button className="btn btn-secondary" onClick={clearCache} disabled={clearing}>
             {clearing && <Spinner size={12} />}
             Clear Now
@@ -457,29 +465,6 @@ export function SettingsView() {
             </InfoTip>
           </Row>
         )}
-        <ToggleRow
-          title="Only send over direct connections"
-          sub="If there’s no direct path, the send stops instead of using a relay."
-          on={settings.requireDirect}
-          onChange={(v) => save({ requireDirect: v })}
-        />
-        <ToggleRow
-          title="Wait for a direct connection"
-          sub={
-            settings.requireDirect
-              ? 'Not needed while only direct connections are allowed.'
-              : 'Hold sends until a direct path forms, instead of using a relay.'
-          }
-          on={settings.requireDirect ? false : settings.waitForDirect}
-          disabled={settings.requireDirect}
-          onChange={(v) => save({ waitForDirect: v })}
-        />
-        <ToggleRow
-          title="Parallel streams"
-          sub="Faster sends for files over 16 MB. Turn off if transfers stall."
-          on={settings.parallelStreams}
-          onChange={(v) => save({ parallelStreams: v })}
-        />
       </div>
 
       <SectionHeader>Speed</SectionHeader>
@@ -564,38 +549,6 @@ export function SettingsView() {
           on={settings.shareDiagnostics}
           onChange={(v) => save({ shareDiagnostics: v })}
         />
-        {settings.shareDiagnostics && (
-          <Row
-            title="Custom collector"
-            sub={diagUrlInvalid ? <span className="set-status-error">Use an https:// address.</span> : 'Leave empty to use the built-in one.'}
-          >
-            <input
-              className="input set-field"
-              aria-label="Diagnostics endpoint"
-              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-              placeholder="https://"
-              value={settings.diagnosticsUrl}
-              onChange={(e) => save({ diagnosticsUrl: e.target.value })}
-            />
-            <button
-              className="btn btn-secondary"
-              disabled={testingDiag || diagUrlInvalid}
-              onClick={async () => {
-                setTestingDiag(true)
-                try {
-                  toast('info', await api.diagnosticsTest())
-                } catch (e) {
-                  toast('error', String(e))
-                } finally {
-                  setTestingDiag(false)
-                }
-              }}
-            >
-              {testingDiag && <Spinner size={12} />}
-              Send Test
-            </button>
-          </Row>
-        )}
       </div>
 
       <FeedbackSection />
@@ -625,6 +578,34 @@ export function SettingsView() {
 
   const advanced = (
     <>
+      <p className="set-advanced-note">You don’t need anything on this page for everyday use. These are for fixing connection problems.</p>
+      <SectionHeader>Connection</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="Only send over direct connections"
+          sub="If there’s no direct path, the send stops instead of using a relay."
+          on={settings.requireDirect}
+          onChange={(v) => save({ requireDirect: v })}
+        />
+        <ToggleRow
+          title="Wait for a direct connection"
+          sub={
+            settings.requireDirect
+              ? 'Not needed while only direct connections are allowed.'
+              : 'Hold sends until a direct path forms, instead of using a relay.'
+          }
+          on={settings.requireDirect ? false : settings.waitForDirect}
+          disabled={settings.requireDirect}
+          onChange={(v) => save({ waitForDirect: v })}
+        />
+        <ToggleRow
+          title="Parallel streams"
+          sub="Faster sends for files over 16 MB. Turn off if transfers stall."
+          on={settings.parallelStreams}
+          onChange={(v) => save({ parallelStreams: v })}
+        />
+      </div>
+
       <SectionHeader>
         Relay
           <InfoTip label="About relays">
@@ -653,6 +634,39 @@ export function SettingsView() {
 
       <SectionHeader>Logs</SectionHeader>
       <div className="group">
+        {settings.shareDiagnostics && (
+          <Row
+            title="Diagnostics collector"
+            sub={diagUrlInvalid ? <span className="set-status-error">Use an https:// address.</span> : 'Leave empty to use the built-in one.'}
+          >
+            <input
+              className="input set-field"
+              aria-label="Diagnostics endpoint"
+              autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+              placeholder="https://"
+              value={settings.diagnosticsUrl}
+              onChange={(e) => save({ diagnosticsUrl: e.target.value })}
+            />
+            <button
+              className="btn btn-secondary"
+              disabled={testingDiag || diagUrlInvalid}
+              onClick={async () => {
+                setTestingDiag(true)
+                try {
+                  toast('info', await api.diagnosticsTest())
+                } catch (e) {
+                  toast('error', String(e))
+                } finally {
+                  setTestingDiag(false)
+                }
+              }}
+            >
+              {testingDiag && <Spinner size={12} />}
+              Send Test
+            </button>
+          </Row>
+        )}
+
         <ToggleRow
           title="Detailed logging"
           sub={verboseChanged ? 'Restart DropBeam to apply.' : 'Adds network internals while you reproduce a connection problem.'}

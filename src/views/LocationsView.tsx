@@ -238,7 +238,7 @@ export function LocationsView() {
         }))}</div>
       </section>
       : <EmptyState icon={<HardDrive />} title={busy ? 'Looking for locations…' : 'No locations yet'}
-        hint="Folders friends share with you appear here." />}
+        hint={busy ? undefined : <>A location is a folder on an always-on computer or network drive (NAS) that a friend lets you open from here — to look through, download from, or add to. When someone shares one with you, it appears here.<br /><br />This is optional; most people never need it. To send files, use Send &amp; Receive.</>} />}
     {unavailable.length > 0 && <div className="location-note">
       <span className="truncate-1">{unavailable.length === 1 ? `Couldn’t load ${unavailable[0].name}’s locations` : `Couldn’t load locations from ${unavailable.length} friends`}</span>
       <InfoButton label="Details" icon={<Info />} width={280}>

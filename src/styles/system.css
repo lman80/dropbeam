@@ -1372,3 +1372,4 @@ html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
 .app-banner.info > svg { color: var(--accent-text); }
 .app-banner.info .icon-btn { color: var(--text-muted); }
 .toast-action { margin-top: 6px; margin-right: 8px; }
+.set-advanced-note { margin: 0 4px 4px; font-size: var(--text-13); color: var(--text-muted); }

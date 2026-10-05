@@ -18,14 +18,15 @@ import { IconButton } from './ui'
 import { shortcutLabel } from '../lib/keys'
 
 // eslint-disable-next-line react-refresh/only-export-components -- shared with the ⌘1–7 shortcuts
-export const NAV_ORDER: View[] = ['send', 'friends', 'chat', 'locations', 'folders', 'history', 'settings']
+// Everyday pages first; Locations (NAS / always-on computers, optional) after them.
+export const NAV_ORDER: View[] = ['send', 'friends', 'chat', 'folders', 'history', 'locations', 'settings']
 const NAV: { id: View; label: string; icon: LucideIcon }[] = [
   { id: 'send', label: 'Send & Receive', icon: Send },
   { id: 'friends', label: 'Friends', icon: Users },
   { id: 'chat', label: 'Chat', icon: MessageCircle },
-  { id: 'locations', label: 'Locations', icon: HardDrive },
   { id: 'folders', label: 'Shared Folders', icon: FolderSync },
   { id: 'history', label: 'History', icon: History },
+  { id: 'locations', label: 'Locations', icon: HardDrive },
   { id: 'settings', label: 'Settings', icon: Settings },
 ]
 
