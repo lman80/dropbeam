@@ -133,7 +133,17 @@ struct SharedFolderDetailView: View {
         List {
             Section { header }.clearRow()
             Section { actions }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 8, trailing: 20))
-            Section("Status") { statusCard }
+            Section("Status") {
+                statusCard
+                if folder.mirror {
+                    Button {
+                        verify = nil
+                        run("verify") { verify = try await bridge.call("folderVerify", ["folderId": folderID]) }
+                    } label: {
+                        HStack { Label(busy == "verify" ? "Checking…" : "Check Everything Matches", systemImage: "checkmark.shield"); Spacer(); if busy == "verify" { ProgressView() } }
+                    }.disabled(busy != nil)
+                }
+            }
             if let verify { Section { verifyCard(verify) } }
             members
             if folder.mirror {
@@ -215,12 +225,6 @@ struct SharedFolderDetailView: View {
                 }.disabled(busy != nil)
             }
             ActionTile(title: "Open in Files", symbol: "folder") { openInFiles() }.disabled(busy != nil)
-            if folder.mirror {
-                ActionTile(title: busy == "verify" ? "Checking…" : "Check Everything Matches", symbol: "checkmark.shield") {
-                    verify = nil
-                    run("verify") { verify = try await bridge.call("folderVerify", ["folderId": folderID]) }
-                }.disabled(busy != nil)
-            }
         }
     }
     private func verifyCard(_ r: FolderVerify) -> some View {
