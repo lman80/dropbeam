@@ -28,7 +28,10 @@ mod friendly_failure_tests {
     fn disk_full_reads_in_plain_words_for_either_side() {
         assert!(friendly_failure(Direction::Receive, "write: No space left on device (os error 28)").starts_with("This device's disk is full"));
         assert!(friendly_failure(Direction::Send, "peer: No space left on device (os error 28)").starts_with("The recipient's disk is full"));
-        assert_eq!(friendly_failure(Direction::Send, "their disk is full — once"), "their disk is full — once");
+        // The receiver's own disk-full sentence reaches the sender card in the sender's words.
+        assert!(friendly_failure(Direction::Send, "receiver: their disk is full — once").starts_with("The recipient's disk is full"));
+        // Any other already-human sentence passes through untouched.
+        assert_eq!(friendly_failure(Direction::Send, "couldn't reach Mong"), "couldn't reach Mong");
         assert!(friendly_failure(Direction::Send, "connection lost").contains("connection to the other device was lost"));
     }
 }
