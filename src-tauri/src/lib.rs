@@ -29,6 +29,7 @@ mod friends;
 mod fs_walk;
 mod history;
 mod iroh_net;
+mod keep_awake;
 // Gated remote test-and-update surface (Settings → Lab Mode). Off by default;
 // only a named operator device can drive it. See lab.rs for the trust model.
 mod lab;
@@ -932,6 +933,7 @@ pub fn run() {
             commands::lan_network_blocked,
             commands::open_local_network_settings,
             commands::open_privacy_settings,
+            commands::set_keep_awake,
             commands::open_url,
             commands::open_mailto,
             commands::open_main_window,

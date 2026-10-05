@@ -695,6 +695,13 @@ pub fn open_local_network_settings(app: AppHandle) -> Result<(), String> {
     }
 }
 
+/// Hold off idle sleep while files are moving (the UI turns it on/off as the
+/// number of active transfers crosses zero). See keep_awake.rs.
+#[tauri::command]
+pub fn set_keep_awake(on: bool) {
+    crate::keep_awake::set(on);
+}
+
 /// Open the system settings page that fixes a permission DropBeam was refused,
 /// so a "not allowed" message can carry a one-click fix. Only these known pages:
 /// `files` (macOS Files & Folders), `full-disk` (macOS Full Disk Access),

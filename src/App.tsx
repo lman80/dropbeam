@@ -153,6 +153,7 @@ export default function App() {
   // EVERY progress event, and root-level selectors re-rendered the entire app tree
   // per tick. The taskbar is a side effect — it needs no React render at all.
   useEffect(() => {
+    let keepAwake = false
     const drive = (s: ReturnType<typeof useStore.getState>) => {
       const active = s.order
         .map((id) => s.transfers[id])
@@ -166,9 +167,16 @@ export default function App() {
         if (f) pct = f.percent
       }
       setTaskbarProgress(pct)
+      // Something is moving → don't let the computer idle to sleep mid-transfer.
+      const moving = pct != null || active.length > 0
+      if (moving !== keepAwake) {
+        keepAwake = moving
+        if (!MOBILE_UI) void api.setKeepAwake(moving).catch(() => {})
+      }
     }
     drive(useStore.getState())
-    return useStore.subscribe(drive)
+    const un = useStore.subscribe(drive)
+    return () => { un(); if (keepAwake && !MOBILE_UI) void api.setKeepAwake(false).catch(() => {}) }
   }, [])
 
   useEffect(() => {

@@ -665,6 +665,7 @@ export const mockApi = {
   lanNetworkBlocked: async (): Promise<boolean> => typeof location !== 'undefined' && new URLSearchParams(location.search).has('lan'),
   openLocalNetworkSettings: async (): Promise<void> => {},
   openPrivacySettings: async (_pane: string): Promise<void> => {},
+  setKeepAwake: async (_on: boolean): Promise<void> => {},
   openUrl: async (_url: string): Promise<void> => {},
   getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
 

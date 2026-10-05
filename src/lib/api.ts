@@ -515,6 +515,8 @@ const realApi = {
   lanNetworkBlocked: () => invoke<boolean>('lan_network_blocked'),
   /** Open System Settings → Privacy & Security → Local Network. */
   openLocalNetworkSettings: () => invoke<void>('open_local_network_settings'),
+  /** Keep the computer from idle-sleeping while files are moving. */
+  setKeepAwake: (on: boolean) => invoke<void>('set_keep_awake', { on }),
   /** Open the OS settings page that fixes a refused permission. */
   openPrivacySettings: (pane: 'files' | 'full-disk' | 'notifications' | 'local-network') =>
     invoke<void>('open_privacy_settings', { pane }),
