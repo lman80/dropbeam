@@ -65,6 +65,15 @@ pub fn spawn(app: AppHandle, config_dir: PathBuf) {
                 "locality": u["locality"], "error": u["error"], "detail": u["detail"]}));
         });
     }
+    {
+        // Typing indicators are ephemeral: log them (Lab Mode only) for drivers.
+        let (dir, app2) = (config_dir.clone(), app.clone());
+        app.listen_any("chat://typing", move |e| {
+            if app2.try_state::<Arc<AppState>>().is_some_and(|st| st.settings.lock().unwrap().lab_mode_enabled) {
+                record(&dir, json!({"event": "typing", "payload": serde_json::from_str::<Value>(e.payload()).unwrap_or_default()}));
+            }
+        });
+    }
     tauri::async_runtime::spawn(async move {
         let queue = config_dir.join("automation-queue.json");
         loop {
@@ -82,7 +91,7 @@ pub fn spawn(app: AppHandle, config_dir: PathBuf) {
                 let result = run(&app, &st, &net, &cmd).await;
                 match result {
                     Ok((op, id, code)) => {
-                        if op != "cancel" { started.lock().unwrap().insert(id.clone(), (op.clone(), Instant::now())); }
+                        if op != "cancel" && !op.starts_with("chat-") { started.lock().unwrap().insert(id.clone(), (op.clone(), Instant::now())); }
                         record(&config_dir, json!({"event": "started", "op": op, "id": id, "code": code, "cmd": cmd}));
                     }
                     Err(e) => record(&config_dir, json!({"event": "error", "cmd": cmd, "error": e})),
@@ -110,6 +119,40 @@ async fn run(app: &AppHandle, st: &Arc<AppState>, net: &Arc<IrohState>, cmd: &Va
             let text = cmd["text"].as_str().unwrap_or("").to_owned();
             let m = crate::commands::send_chat_message(app.state(), app.state(), app.clone(), f.id, text, None, None).await?;
             Ok(("chat".into(), m.id, None))
+        }
+        // Chat actions on a message (friend by endpoint id or name):
+        //   {"op":"chat-edit","to":…,"id":msgId,"text":…} / chat-unsend / chat-react
+        //   {"op":"chat-reply","to":…,"id":msgId,"text":…} / chat-read {"upTo":ms}
+        //   chat-typing {"on":bool} / chat-log → records the thread in the results.
+        op @ ("chat-edit" | "chat-unsend" | "chat-react" | "chat-reply" | "chat-read" | "chat-typing" | "chat-log") => {
+            let to = cmd["to"].as_str().unwrap_or("");
+            let f = friends::load(&st.config_dir).into_iter()
+                .find(|f| f.endpoint_id.as_deref() == Some(to) || f.name == to)
+                .ok_or_else(|| format!("no friend {to:?}"))?;
+            let mid = cmd["id"].as_str().unwrap_or("").to_owned();
+            let text = cmd["text"].as_str().unwrap_or("").to_owned();
+            match op {
+                "chat-edit" => crate::commands::edit_chat_message(app.state(), app.clone(), f.id.clone(), mid.clone(), text).await?,
+                "chat-unsend" => crate::commands::delete_chat_message(app.state(), app.clone(), f.id.clone(), mid.clone()).await?,
+                "chat-react" => crate::commands::react_to_message(app.state(), app.clone(), f.id.clone(), mid.clone(),
+                    cmd["emoji"].as_str().unwrap_or("👍").to_owned(), cmd["add"].as_bool().unwrap_or(true)).await?,
+                "chat-reply" => {
+                    let m = crate::commands::send_chat_message(app.state(), app.state(), app.clone(), f.id.clone(), text, Some(mid), Some("reply".into())).await?;
+                    return Ok((op.into(), m.id, None));
+                }
+                "chat-read" => crate::commands::send_read_receipt(app.state(), app.state(), f.id.clone(), cmd["upTo"].as_u64().unwrap_or_else(crate::chat::now_ms)).await?,
+                "chat-typing" => crate::commands::send_typing(app.state(), app.state(), f.id.clone(), cmd["on"].as_bool().unwrap_or(true)).await?,
+                _ => {
+                    let owner = friends::thread_owner(&st.config_dir, &f.id).map(|o| o.id).unwrap_or(f.id.clone());
+                    let n = cmd["last"].as_u64().unwrap_or(10) as usize;
+                    let msgs = crate::chat::messages(&st.config_dir, &owner);
+                    let tail: Vec<Value> = msgs.iter().rev().take(n).rev().map(|m| json!({"id": m.id, "text": m.text,
+                        "fromMe": m.from_me, "status": m.status, "edited": m.edited, "deleted": m.deleted,
+                        "reactions": m.reactions, "replyTo": m.reply_to, "kind": m.kind, "heldOn": m.held_on, "ts": m.ts})).collect();
+                    record(&st.config_dir, json!({"event": "chatlog", "to": to, "messages": tail}));
+                }
+            }
+            Ok((op.into(), mid, None))
         }
         "addfriend" => {
             let code = cmd["code"].as_str().unwrap_or("");
