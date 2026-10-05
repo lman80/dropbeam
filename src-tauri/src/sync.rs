@@ -4802,14 +4802,29 @@ fn handle_move_candidate(
         return false;
     }
     let prev = ino_index.lock().unwrap().get(&inode).cloned();
+    // D7 on a case-INSENSITIVE volume: after "a.txt" → "A.txt" the old spelling
+    // still opens the file, so (1) an event for the OLD spelling looks like a
+    // live add/change — sending it would recreate "a.txt" next to "A.txt" on a
+    // case-sensitive peer (Linux) — and (2) "old path gone" never held, so the
+    // rename was never sent as a move (live QA 0.53.0: Linux kept both). Judge
+    // existence by the exact on-disk spelling. Only when this inode is already
+    // indexed under the same name ignoring case, so bulk adds pay nothing.
+    if let Some((old_rel, _, _)) = &prev {
+        if old_rel.to_lowercase() == new_rel.to_lowercase() && case_variant_on_disk(Path::new(p)).is_some() {
+            return true; // this spelling is gone; the real one gets its own event
+        }
+    }
     if let Some((old_rel, old_size, old_mtime)) = prev {
+        let old_abs = Path::new(folder).join(&old_rel);
+        let old_gone = !old_abs.exists()
+            || (old_rel.to_lowercase() == new_rel.to_lowercase() && case_variant_on_disk(&old_abs).is_some());
         // Same inode now at a DIFFERENT rel, same size AND mtime (a rename preserves
         // both), old path gone = a same-volume move. The mtime check matches the
         // apply-side gate so inode recycling into a same-size file can't false-trigger.
         if old_rel != new_rel
             && old_size == size
             && old_mtime == mtime
-            && !Path::new(folder).join(&old_rel).exists()
+            && old_gone
         {
             note_move(config_dir, pair_id, moves, &old_rel, &new_rel, size, mtime, now_ms());
             ino_index.lock().unwrap().insert(inode, (new_rel.clone(), size, mtime));
@@ -6702,6 +6717,32 @@ mod tests {
             detect_moves_from_index(&idx, &prev, &lm).is_empty(),
             "inode recycle into a same-size, different-mtime file is NOT a move"
         );
+    }
+
+    /// D7 live QA: a case-only rename on a case-insensitive volume is sent as a
+    /// MOVE, and an event for the old spelling never re-sends it.
+    #[test]
+    fn case_only_rename_on_ci_volume_is_a_move_not_an_add() {
+        let folder = temp_dir("ci-move");
+        let fs = folder.to_string_lossy().to_string();
+        let old = folder.join("a4.txt");
+        std::fs::write(&old, b"payload").unwrap();
+        let (sz, mt) = sig_of(&old);
+        let ino = meta_inode(&std::fs::metadata(&old).unwrap());
+        if ino == 0 { return; } // no file ids (Windows): move detection is off by design
+        let moves: Arc<Mutex<HashMap<String, MoveRec>>> = Arc::new(Mutex::new(HashMap::new()));
+        let ino_index = Arc::new(Mutex::new(HashMap::from([(ino, ("a4.txt".to_string(), sz, mt))])));
+        let cw = Arc::new(Notify::new());
+        std::fs::rename(&old, folder.join("A4.txt")).unwrap();
+        let ci = folder_case_insensitive(&fs);
+        // The stale spelling's event: on a ci volume it's handled (skipped), never sent.
+        let did_old = handle_move_candidate(&old.to_string_lossy(), &fs, &folder, "pid", &moves, &ino_index, &cw);
+        if ci { assert!(did_old, "old spelling must not be queued for sending"); }
+        // The real spelling's event: recorded as a move a4 → A4.
+        let did_new = handle_move_candidate(&folder.join("A4.txt").to_string_lossy(), &fs, &folder, "pid", &moves, &ino_index, &cw);
+        assert!(did_new, "case-only rename must be detected as a move");
+        assert!(moves.lock().unwrap().get("a4.txt").is_some_and(|(to, ..)| to == "A4.txt"));
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]
