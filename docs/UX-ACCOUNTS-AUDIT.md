@@ -103,10 +103,29 @@ automatically (they proved they got it from you), while a hello from anyone else
 request. Codes stay reusable; changing them invalidates the old secret. Needs a code-format
 bump (v2) — design only.
 
-**D3 — Notify on every device vs. one.** Messages via a Transfer Server ring every device
+**D3 — Notify on every device vs. one.** *(Partly settled in pass 2: a copy that lands after the
+chat was already read on another of your devices is now silent — no banner, chime or badge.
+Remaining residual: on iPhone, an APNs banner shown by the push extension before the app wakes
+can't know the Mac already read it; it is cleared the next time that chat's unread drops to 0.)*
+Original question: Messages via a Transfer Server ring every device
 (iMessage-style); messages sent directly reach one device and sync to the others silently.
 With 5.4 the badge is right everywhere; whether the synced-in device should also show a
 banner is a product choice (risk: late banners for old messages).
+
+## Pass 2 (after merging `ios`)
+
+| # | Item | Status |
+|---|---|---|
+| 7.1 | One notification per message across devices: a Transfer Server copy reaching a device after the chat was read elsewhere (shared read marker ≥ message time) is stored silently — no banner, chime or unread (`alreadyRead` on the live event). | Fixed |
+| 7.2 | Unread counts synced across own devices (5.4), incl. messages synced in from another of my devices (counted only if newer than the shared read marker). | OK (verified in code) |
+| 7.3 | Lost / replaced phone: Remove + "also lock or erase it with Find My" copy on both platforms; new phone = link like any device. Only-device-lost recovery needs real design → D1 (not half-built). | Fixed copy / Design D1 |
+| 7.4 | Friend with several devices is one row and one thread (`thread_owner`); blocking blocks every device of theirs we know (by verified account). | OK |
+| 7.5 | Mixed app versions: `accepts_chat` absent from older friends → no "waiting to accept" shown (never a false one); read markers absent from older own devices (`serde(default)`) → their badge just doesn't clear remotely; `alreadyRead` is a live-event-only field. | OK, degrades quietly |
+| 7.6 | Blocking a friend request: desktop Block now asks first; iPhone "Decline" asks "Decline / Decline and Block" (blocking was only reachable by a hidden swipe). | Fixed |
+| 7.7 | Code mismatch when linking: "choose the same answer on both devices"; mismatch screen says to stop and ask someone you trust if it repeats; device names read "your iPhone". | Fixed |
+| 7.8 | Unknown "needs approval" device: Remove is now the prominent button; "It's Mine…" is secondary with a plainer confirm. | Fixed |
+| 7.9 | Request row time was truncated ("2 minutes a…") on iPhone → "2 min. ago". | Fixed |
+| 7.10 | Two own devices with the same name read "Your iPhone 1 / Your iPhone 2" (desktop); only online/last-sync tells them apart. | P3, Deferred |
 
 ## Deferred (P3)
 - Unsend confirmation / undo (5.7).

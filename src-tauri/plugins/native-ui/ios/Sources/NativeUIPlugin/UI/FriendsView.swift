@@ -11,6 +11,7 @@ struct FriendsView: View {
     @State private var blocking: Friend?
     @State private var reporting: ReportTarget?
     @State private var blockingRequest: FriendRequest?
+    @State private var decliningRequest: FriendRequest?
     @Namespace private var avatars
     private var filtered: [Friend] {
         bridge.friends.filter { $0.groupedUnder == nil }.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.displayName.localizedCaseInsensitiveContains(search) }
@@ -102,6 +103,7 @@ struct FriendsView: View {
             } message: { friend in Text(friend.ownDevice ? "It stops getting your new messages and friends. What’s already on it stays there." : "\(friend.name) is removed on all your devices. Your messages stay, and you can add them again with their invite.") }
             .safetyPrompts(block: $blocking, report: $reporting)
             .modifier(BlockRequestPrompt(request: $blockingRequest))
+            .modifier(DeclineRequestPrompt(request: $decliningRequest))
             .confirmationDialog(sendingTo.map { "Send to \($0.displayName)" } ?? "", isPresented: Binding(get: { sendingTo != nil }, set: { if !$0 { sendingTo = nil } }), titleVisibility: .visible, presenting: sendingTo) { friend in
                 Button("Photos") { bridge.perform { try await bridge.pickAndSend(source: "photos", friendId: friend.id) } }
                 Button("Files") { bridge.perform { try await bridge.pickAndSend(source: "files", friendId: friend.id) } }
@@ -113,7 +115,7 @@ struct FriendsView: View {
         Section {
             ForEach(bridge.friendRequests) { request in requestRow(request) }
         } header: { Text("Friend Requests") } footer: {
-            Text("Only accept people you know. Until you do, they can’t message you, and any file they send asks first. To block someone, swipe their request.")
+            Text("Only accept people you know. Until you do, they can’t message you, and any file they send asks first.")
         }.headerProminence(.increased)
     }
     private func requestRow(_ request: FriendRequest) -> some View {
@@ -128,7 +130,7 @@ struct FriendsView: View {
             Button("Accept") {
                 bridge.perform { try await bridge.acceptFriendRequest(endpointId: request.endpointId); Haptics.success(); bridge.showToast("\(request.name) is now your friend") }
             }.beamButton(prominent: true).controlSize(.small)
-            Button("Decline") { bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: false) } }
+            Button("Decline") { decliningRequest = request }
                 .buttonStyle(.bordered).controlSize(.small)
         }
         .padding(.vertical, 2)
@@ -145,7 +147,7 @@ struct FriendsView: View {
     private func requestSubtitle(_ request: FriendRequest) -> String {
         guard let ms = request.at else { return "Friend request" }
         let date = Date(timeIntervalSince1970: ms / 1000)
-        return Date().timeIntervalSince(date) < 60 ? "Just now" : { let r = date.formatted(.relative(presentation: .named)); return r.prefix(1).uppercased() + r.dropFirst() }()
+        return Date().timeIntervalSince(date) < 60 ? "Just now" : date.formatted(.relative(presentation: .numeric, unitsStyle: .abbreviated))
     }
     private func row(_ friend: Friend) -> some View {
         NavigationLink {
@@ -189,6 +191,20 @@ struct FriendsView: View {
 }
 
 /// "Block Jordan?" for a friend request: declines it and blocks them everywhere.
+/// Decline (they may ask again) or decline and block, in one plain choice.
+private struct DeclineRequestPrompt: ViewModifier {
+    @EnvironmentObject private var bridge: Bridge
+    @Binding var request: FriendRequest?
+    func body(content: Content) -> some View {
+        content.confirmationDialog(request.map { "Decline \($0.name)’s request?" } ?? "", isPresented: Binding(get: { request != nil }, set: { if !$0 { request = nil } }), titleVisibility: .visible, presenting: request) { request in
+            Button("Decline") { bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: false) } }
+            Button("Decline and Block", role: .destructive) {
+                bridge.perform { try await bridge.declineFriendRequest(endpointId: request.endpointId, block: true); bridge.showToast("\(request.name) was blocked") }
+            }
+        } message: { _ in Text("Declining lets them ask again later. Blocking stops their requests, messages and files on all your devices. They aren’t told either way.") }
+    }
+}
+
 private struct BlockRequestPrompt: ViewModifier {
     @EnvironmentObject private var bridge: Bridge
     @Binding var request: FriendRequest?
