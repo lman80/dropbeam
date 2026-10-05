@@ -37,6 +37,11 @@ pub struct SyncManager {
     /// both `start_pair` it — the second insert orphaned the first worker, which
     /// then ignored Pause/remove and kept syncing until restart.
     reconcile_lock: Mutex<()>,
+    /// pair id → when (epoch ms) a peer delete we refused as "freshly added" can
+    /// apply. One timer per pair re-asks the peer for its snapshot then, so the
+    /// delete lands right after the grace window instead of on the next idle
+    /// beacon (up to 5 min later).
+    fresh_rechecks: Mutex<HashMap<String, u64>>,
 }
 
 struct FriendHandle {
@@ -189,6 +194,7 @@ impl SyncManager {
             handles: Mutex::new(HashMap::new()),
             friend_handles: Mutex::new(HashMap::new()),
             reconcile_lock: Mutex::new(()),
+            fresh_rechecks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2289,6 +2295,9 @@ impl SyncManager {
                 // unlisted files — do NOT tombstone or forward it: that would just
                 // spread a delete that doesn't apply here. Let the local copy win.
                 if !did && std::fs::symlink_metadata(&abs).is_ok() {
+                    if abs.is_file() && file_is_fresh(&abs, DELETE_GRACE_MS) {
+                        self.recheck_fresh_delete(pair_id, &abs);
+                    }
                     continue;
                 }
                 if did {
@@ -2447,6 +2456,11 @@ impl SyncManager {
                             .lock()
                             .unwrap()
                             .retain(|sig| sig_rel(sig).as_deref() != Some(r.as_str()));
+                    }
+                } else {
+                    let abs = Path::new(folder).join(rel);
+                    if abs.is_file() && file_is_fresh(&abs, DELETE_GRACE_MS) {
+                        self.recheck_fresh_delete(pair_id, &abs);
                     }
                 }
             }
@@ -3036,6 +3050,52 @@ impl SyncManager {
         if let Some(h) = self.handles.lock().unwrap().get(pair_id) {
             h.control_wake.notify_one();
         }
+    }
+
+    /// A peer delete of `path` was just refused because the file is freshly
+    /// added. The tombstone still stands, so once the grace window passes the
+    /// delete is genuine — re-exchange snapshots with the peer then (both ways:
+    /// we beacon ours and ask for theirs) so it lands promptly. Coalesced: one
+    /// timer per pair, pushed out to the latest refused file's deadline.
+    fn recheck_fresh_delete(self: &Arc<Self>, pair_id: &str, path: &Path) {
+        let Some(delay) = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| fresh_recheck_delay_ms(path_version_ms(path, &m), now_ms(), DELETE_GRACE_MS))
+        else {
+            return;
+        };
+        let due = now_ms() + delay;
+        {
+            let mut map = self.fresh_rechecks.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get_mut(pair_id) {
+                // A timer is already pending: just make it wait for this file too.
+                Some(at) => {
+                    *at = (*at).max(due);
+                    return;
+                }
+                None => {
+                    map.insert(pair_id.to_owned(), due);
+                }
+            }
+        }
+        let (me, pair_id) = (self.clone(), pair_id.to_owned());
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let due = me.fresh_rechecks.lock().unwrap_or_else(|e| e.into_inner()).get(&pair_id).copied();
+                let Some(due) = due else { return };
+                let now = now_ms();
+                if now >= due {
+                    me.fresh_rechecks.lock().unwrap_or_else(|e| e.into_inner()).remove(&pair_id);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(due - now)).await;
+            }
+            if let Some(h) = me.handles.lock().unwrap().get(&pair_id) {
+                log::info!("sync[{pair_id}]: grace window passed — re-checking a refused peer delete");
+                h.request_snapshot_reply.store(true, Ordering::SeqCst);
+                h.control_wake.notify_one();
+            }
+        });
     }
 
     /// Kick the file-SENDER worker for `pair_id` — used the moment the peer comes
@@ -4005,6 +4065,15 @@ fn within_grace(v: u64, now: u64, grace_ms: u64) -> bool {
 /// True if `path` exists and was placed/modified within `grace_ms` — i.e. it's a
 /// freshly-added file that must NOT be wiped by an incoming delete. `grace_ms` is
 /// a parameter (not the constant directly) so tests can disable the protection.
+/// How long until a file stamped `v` stops being "freshly added" (plus a small
+/// margin for clock granularity), or None when it isn't fresh now.
+fn fresh_recheck_delay_ms(v: u64, now: u64, grace_ms: u64) -> Option<u64> {
+    if !within_grace(v, now, grace_ms) {
+        return None;
+    }
+    Some((v + grace_ms).saturating_sub(now) + 3_000)
+}
+
 fn file_is_fresh(path: &Path, grace_ms: u64) -> bool {
     if grace_ms == 0 {
         return false;
@@ -6532,6 +6601,20 @@ mod tests {
         let plan = reconcile_plan(&mine, &HashMap::new(), &peer_tombs, &HashMap::new(), now);
         assert_eq!(plan.delete, vec!["old/settled.mov".to_string()]);
         assert!(plan.push.is_empty());
+    }
+
+    #[test]
+    fn refused_fresh_delete_rechecks_right_after_the_grace_window() {
+        let now = 1_000_000_000u64;
+        let g = DELETE_GRACE_MS;
+        // Added 15 s ago → re-check when the 2-min window closes (+3 s margin),
+        // not on the next idle beacon minutes later.
+        assert_eq!(fresh_recheck_delay_ms(now - 15_000, now, g), Some(g - 15_000 + 3_000));
+        // Slight future stamp (clock skew): wait for the window measured from it.
+        assert_eq!(fresh_recheck_delay_ms(now + 1_000, now, g), Some(g + 1_000 + 3_000));
+        // Not fresh → nothing to re-check.
+        assert_eq!(fresh_recheck_delay_ms(now - g - 1, now, g), None);
+        assert_eq!(fresh_recheck_delay_ms(0, now, g), None);
     }
 
     #[test]
