@@ -1427,9 +1427,22 @@ pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &st
                     // iPhone: the push banner may already have announced it.
                     let announced = crate::mailbox::push::already_announced(config_dir, &msg.id);
                     crate::mailbox::push::note_have(config_dir, &[msg.id.as_str()]);
+                    // Already read on another of your devices (a Transfer Server
+                    // copy landing late): store it, but no badge, chime or banner —
+                    // one message rings once, wherever you are.
+                    let already_read = crate::chat::read_markers(config_dir)
+                        .get(&msg.peer_id).is_some_and(|&t| t >= msg.ts);
                     if let Some(app) = &app {
-                        let _ = app.emit("chat://message", &msg);
-                        if announced {
+                        match serde_json::to_value(&msg) {
+                            Ok(mut v) if already_read => {
+                                v["alreadyRead"] = serde_json::Value::Bool(true);
+                                let _ = app.emit("chat://message", v);
+                            }
+                            _ => { let _ = app.emit("chat://message", &msg); }
+                        }
+                        if already_read {
+                            log::info!("chat notification skipped: already read on another of your devices");
+                        } else if announced {
                             log::info!("chat notification skipped: the push already showed it");
                         } else {
                             maybe_notify_chat(app, &friend.name, &msg);

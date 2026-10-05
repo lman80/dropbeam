@@ -895,7 +895,7 @@ export const useStore = create<AppStore>((set, get) => ({
         // uses the same gate, so the two never double up.
         const lookingHere =
           get().windowFocused && get().view === 'chat' && get().activeChatId === m.peerId
-        if (!m.fromMe && !lookingHere && (get().settings?.playSounds ?? true)) {
+        if (!m.fromMe && !m.alreadyRead && !lookingHere && (get().settings?.playSounds ?? true)) {
           playIncoming()
         }
         // If it landed in the open + focused chat, it's been seen → read receipt.
@@ -1750,7 +1750,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const inOpenThread =
         s.windowFocused && s.view === 'chat' && s.activeChatId === m.peerId
       let chatUnread = s.chatUnread
-      if (isNew && !m.fromMe && !inOpenThread) {
+      if (isNew && !m.fromMe && !m.alreadyRead && !inOpenThread) {
         chatUnread = { ...s.chatUnread, [m.peerId]: (s.chatUnread[m.peerId] ?? 0) + 1 }
       } else if (inOpenThread && (s.chatUnread[m.peerId] ?? 0) > 0) {
         chatUnread = { ...s.chatUnread, [m.peerId]: 0 }

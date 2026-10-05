@@ -345,6 +345,8 @@ export interface ChatMessage {
   /** The friend id this conversation belongs to. */
   peerId: string
   fromMe: boolean
+  /** Live event only: you already read this on another of your devices (no badge/chime). */
+  alreadyRead?: boolean
   /** "text" or "file". */
   kind: 'text' | 'file'
   text: string
