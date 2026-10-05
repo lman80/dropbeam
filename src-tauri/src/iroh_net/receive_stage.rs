@@ -143,6 +143,12 @@ impl ReceiveStage {
         // If its unlink failed, retain the record for later recovery, never retry
         // that unlink from Drop.
         self.armed = false;
+        // The lock only marks a LIVE stage for recovery; the bytes now sit under
+        // their real name. On Windows the lock is mandatory: holding it past
+        // publication left the landed file unreadable ("another process has
+        // locked a portion of the file") to the user and to our own same-name
+        // checks until this guard dropped.
+        let _ = self._file.unlock();
         if !self.identity.matches(&self.path) { self.forget_registry(); }
     }
     fn forget_registry(&mut self) {

@@ -207,7 +207,21 @@ async fn interrupted_upload_resumes_and_restart_keeps_items() {
     let cancel = Arc::new(AtomicBool::new(false));
     let c2 = cancel.clone();
     let stop_at = seal::SEG * 2;
-    let progress = move |d: u64, _t: u64| { if d >= stop_at { c2.store(true, Ordering::SeqCst); } };
+    // Pause only once the SERVER holds a whole sealed segment on disk: what the
+    // sender has merely handed to QUIC is dropped by the pause's connection
+    // close, so on a slow runner (Windows CI) the server could hold nothing yet
+    // and the "resume" would rightly start over.
+    let root = server::root(&w.s.config, &server::load_config(&w.s.config)).unwrap();
+    let progress = move |d: u64, _t: u64| {
+        if d >= stop_at && !c2.load(Ordering::SeqCst) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < deadline
+                && !walk(&root).iter().any(|p| p.ends_with("payload.part") && std::fs::metadata(p).is_ok_and(|m| m.len() >= seal::CT_SEG)) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            c2.store(true, Ordering::SeqCst);
+        }
+    };
     let r = client::deposit_files(&w.a.state, &w.a.config, &w.b_for_a, &xfer, &xfer, &files, &[], &["big.bin".into()],
         &progress, &|_| {}, &cancel, None).await;
     assert_eq!(r.unwrap_err(), DepositError::Canceled);
