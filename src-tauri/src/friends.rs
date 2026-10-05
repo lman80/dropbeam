@@ -126,6 +126,7 @@ pub fn create(
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: None,
         account_pub: None,
         device_os: None,
@@ -177,6 +178,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: None,
         account_pub: None,
         device_os: None,
@@ -228,6 +230,7 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: None,
         account_pub: None,
         device_os: None,
@@ -543,6 +546,7 @@ pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, o
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: None,
         account_pub: None,
         device_os: None,
@@ -924,6 +928,27 @@ pub fn set_auto_accept(config_dir: &Path, id: &str, auto_accept: bool) -> Result
     save(config_dir, &friends)
 }
 
+/// Record whether the friend on `endpoint` has accepted us yet (their hello
+/// reply says). Own devices never wait. True when the stored value changed.
+pub fn set_awaiting_accept(config_dir: &Path, endpoint: &str, awaiting: bool) -> bool {
+    if awaiting && crate::account::is_own_device(config_dir, endpoint) {
+        return false;
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut friends = read_raw(config_dir);
+    let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(endpoint)) else { return false };
+    if f.awaiting_accept == awaiting {
+        return false;
+    }
+    f.awaiting_accept = awaiting;
+    save(config_dir, &friends).is_ok()
+}
+
+/// Whether a friend request from `endpoint_id` is already waiting here.
+pub fn has_request(config_dir: &Path, endpoint_id: &str) -> bool {
+    read_requests(config_dir).iter().any(|r| r.endpoint_id == endpoint_id)
+}
+
 pub fn set_progress_version(config_dir: &Path, endpoint: &str, version: u64) {
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
@@ -1168,6 +1193,7 @@ mod tests {
             name_custom: false,
             name_at: 0,
             progress_v: None,
+            awaiting_accept: false,
             device_kind: None,
             account_pub: None,
             device_os: None,
@@ -1197,6 +1223,7 @@ mod tests {
             name_custom: false,
             name_at: 0,
             progress_v: None,
+            awaiting_accept: false,
             device_kind: None,
             account_pub: None,
             device_os: None,
@@ -1621,6 +1648,7 @@ pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: kind.map(str::to_owned),
         account_pub: Some(account_pub.to_owned()),
         device_os: os.map(str::to_owned),
@@ -1695,6 +1723,7 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
         name_custom: r.name_custom,
         name_at: r.name_at,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: r.device_kind.map(str::to_owned),
         account_pub: r.account_pub.map(str::to_owned),
         device_os: r.device_os.map(str::to_owned),
@@ -2139,3 +2168,42 @@ mod look_alike_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod awaiting_accept_tests {
+    use super::*;
+
+    fn dir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("db-awaiting-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn waiting_for_a_friend_to_accept_is_remembered_and_cleared() {
+        let d = dir();
+        let f = upsert_by_endpoint(&d, "alex-eid", "Alex");
+        assert!(!f.awaiting_accept);
+        assert!(set_awaiting_accept(&d, "alex-eid", true));
+        assert!(!set_awaiting_accept(&d, "alex-eid", true), "no change, no write");
+        assert!(get(&d, &f.id).unwrap().awaiting_accept);
+        assert!(!set_awaiting_accept(&d, "nobody", true), "only friends");
+        assert!(set_awaiting_accept(&d, "alex-eid", false));
+        assert!(!get(&d, &f.id).unwrap().awaiting_accept);
+        // An old friends.json without the field reads as not waiting.
+        let raw = serde_json::to_string(&load(&d)).unwrap().replace(",\"awaitingAccept\":false", "");
+        std::fs::write(d.join("friends.json"), raw).unwrap();
+        assert!(!load(&d)[0].awaiting_accept);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_new_request_is_told_apart_from_a_repeat() {
+        let d = dir();
+        assert!(!has_request(&d, "jo"));
+        assert_eq!(apply_hello(&d, "", "jo", "Jordan"), HelloOutcome::Requested);
+        assert!(has_request(&d, "jo"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+

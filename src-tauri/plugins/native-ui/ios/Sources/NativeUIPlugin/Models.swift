@@ -17,6 +17,8 @@ struct Friend: Decodable, Identifiable {
     var groupedUnder: String?
     /// Other contacts this one might be (same name or photo, not linked): a hint only.
     var lookAlikeWith: [String] = []
+    /// We added them but they haven't accepted us yet: messages wait until they do.
+    var awaitingAccept: Bool?
     /// The name to show: "Your iPhone" for an own device, else the friend's name.
     var displayName: String { ownDevice ? (ownLabel ?? name) : name }
 }
@@ -396,6 +398,7 @@ extension Friend {
         self.ownLabel = (try? c.decode(String.self, forKey: BridgeKey("ownLabel")))
         self.groupedUnder = (try? c.decode(String.self, forKey: BridgeKey("groupedUnder")))
         self.lookAlikeWith = (try? c.decode([String].self, forKey: BridgeKey("lookAlikeWith"))) ?? []
+        self.awaitingAccept = (try? c.decode(Bool.self, forKey: BridgeKey("awaitingAccept")))
     }
 }
 extension BlockedPerson {
@@ -1052,7 +1055,7 @@ enum ServerCopy {
         }
     }
     static func held(server: String?, friend: String) -> String {
-        "Held on \(server ?? "your Transfer Server") — reaches \(friend) when they’re online"
+        "Waiting on \(server ?? "your Transfer Server") — \(friend) gets it when they’re back"
     }
     static func firstName(_ name: String) -> String { name.split(separator: " ").first.map(String.init) ?? name }
 }

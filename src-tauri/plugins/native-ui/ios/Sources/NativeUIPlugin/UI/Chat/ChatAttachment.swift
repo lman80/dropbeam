@@ -81,7 +81,7 @@ struct ChatAttachment: View {
                 }.font(.caption).foregroundStyle(.secondary).disabled(!message.fromMe)
             } else if transfer?.state == "held" {
                 // Short: the thread's status line under the latest message says the rest.
-                Label { Text("Held on \(transfer?.heldOn ?? "your Transfer Server")") } icon: { Image(systemName: "server.rack") }
+                Label { Text("Waiting on \(transfer?.heldOn ?? "your Transfer Server")") } icon: { Image(systemName: "server.rack") }
                     .labelStyle(ServerLineStyle())
             } else if active {
                 ProgressView(value: min(1, max(0, (transfer?.percent ?? 0) / 100))).tint(ChatPalette.sent)

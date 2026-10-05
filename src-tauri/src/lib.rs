@@ -1043,6 +1043,7 @@ pub fn run() {
             commands::delete_chat_message,
             commands::send_typing,
             commands::send_read_receipt,
+            commands::chat_mark_seen,
             commands::download_gif,
             commands::send_chat_gif,
             commands::set_active_chat,

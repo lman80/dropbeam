@@ -84,12 +84,16 @@ html:not(.mobile) .device-link-dialog { width: 420px; }
 .link-show { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; }
 .link-instruction { margin: 0; font-size: var(--text-13); color: var(--text); line-height: 1.45; max-width: 320px; }
 .link-instruction strong { font-weight: 600; }
+/* "1. Open DropBeam… 2. Settings → Devices… 3. Scan" — numbered, left-aligned. */
+.link-steps { list-style: decimal; margin: 0; padding-left: 22px; text-align: left; font-size: var(--text-13); color: var(--text); line-height: 1.5; max-width: 340px; align-self: center; }
+.link-steps li + li { margin-top: 2px; }
+.link-steps strong { font-weight: 600; }
 .link-qr-slot { display: grid; place-items: center; min-height: 212px; }
 .link-status { margin: 0; font-size: var(--text-12); color: var(--text-muted); }
 .link-state { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px 8px 4px; text-align: center; }
 .link-state > svg, .link-state > .spinner { margin-bottom: 6px; }
 .link-state-title { margin: 0; font-size: var(--text-13); font-weight: 600; color: var(--text); }
-.link-safety-code { font-size: 28px; font-weight: 700; letter-spacing: 0.08em; font-variant-numeric: tabular-nums; margin: 6px 0; }
+.link-safety-code { font-size: 34px; font-weight: 700; letter-spacing: 0.08em; font-variant-numeric: tabular-nums; margin: 6px 0; }
 .link-state-sub { margin: 0; font-size: var(--text-12); color: var(--text-muted); line-height: 1.45; max-width: 320px; overflow-wrap: anywhere; }
 .link-state-ok { color: var(--green); }
 .link-state-bad { color: var(--red); }
@@ -218,3 +222,7 @@ html:not(.mobile) .qrs-actions { padding-top: 16px; }
 }
 .blocked-row .blocked-name { flex: 1; min-width: 0; font-weight: 500; font-size: var(--text-13); }
 .blocked-row .blocked-when { font-size: var(--text-11); color: var(--text-faint); white-space: nowrap; }
+
+/* Settings → Devices: what linking means (above) and what to do about a lost device (below). */
+.account-devices-note { margin: 8px 16px 0; font-size: var(--text-12); color: var(--text-muted); line-height: 1.45; text-wrap: pretty; }
+.account-devices-note.intro { margin: -2px 16px 10px; }

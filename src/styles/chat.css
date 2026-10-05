@@ -439,6 +439,21 @@ html:not(.mobile) .chat-list-pane {
   white-space: nowrap;
 }
 
+/* A status you can click for "what does this mean?". */
+.chat-meta-explain {
+  display: block;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: var(--text-11);
+  color: var(--text-faint);
+  cursor: help;
+  text-align: inherit;
+}
+.chat-line.mine .chat-meta-explain { margin-left: auto; }
+.chat-meta-explain:hover { color: var(--text-muted); text-decoration: underline dotted; }
+
 /* Typing indicator: a small bubble with three soft dots. */
 .chat-typing {
   display: inline-flex;

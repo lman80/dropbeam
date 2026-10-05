@@ -865,6 +865,10 @@ struct Meta {
     /// builds, which ignore it; they still drop the person via `removed_friends`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     blocked: HashMap<String, crate::block::BlockRec>,
+    /// How far each conversation has been read (friend endpoint id → the
+    /// newest friend message seen, ms), merged by max (absent from older builds).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    read: HashMap<String, u64>,
 }
 
 /// Everything this device shares about the account, plus thread summaries.
@@ -919,6 +923,8 @@ fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
     }
     recs.sort_by(|a, b| a.eid.cmp(&b.eid));
     devices.sort_by(|a, b| a.eid.cmp(&b.eid));
+    let markers = chat::read_markers(dir);
+    let read = threads.iter().filter_map(|(eid, fid)| markers.get(fid).filter(|&&t| t > 0).map(|&t| (eid.clone(), t))).collect();
     Local {
         account: account.to_owned(),
         me: me.to_owned(),
@@ -928,6 +934,7 @@ fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
             removed_friends: book.removed_friends,
             profile: None,
             blocked: crate::block::snapshot(dir),
+            read,
         },
         threads,
         avatars,
@@ -967,6 +974,9 @@ fn fingerprint(dir: &Path, local: &Local) -> String {
     let mut blocks: Vec<_> = local.meta.blocked.iter().map(|(e, r)| (e, r.blocked, r.at)).collect();
     blocks.sort();
     h.update(serde_json::to_vec(&blocks).unwrap_or_default());
+    let mut read: Vec<_> = local.meta.read.iter().collect();
+    read.sort();
+    h.update(serde_json::to_vec(&read).unwrap_or_default());
     hex::encode(&h.finalize()[..12])
 }
 
@@ -1208,7 +1218,33 @@ fn wanted_messages(dir: &Path, local: &Local, want: &Value) -> HashMap<String, V
     out
 }
 
+/// Read markers from another own device: raise ours (never lower). Returns the
+/// conversations whose marker moved, with the new marker.
+fn apply_read(dir: &Path, read: &HashMap<String, u64>) -> Vec<(String, u64)> {
+    let mut moved = vec![];
+    if read.is_empty() {
+        return moved;
+    }
+    let all = friends::load(dir);
+    for (eid, &at) in read {
+        let Some(friend) = all.iter().find(|f| f.endpoint_id.as_deref() == Some(eid.as_str())) else { continue };
+        let owner = friends::thread_owner(dir, &friend.id).map_or_else(|| friend.id.clone(), |o| o.id);
+        if chat::raise_read_marker(dir, &owner, clamp(at)) {
+            moved.push((owner, clamp(at)));
+        }
+    }
+    moved
+}
+
 fn apply_messages(dir: &Path, messages: &Value) -> usize {
+    apply_messages_counting(dir, messages).0
+}
+
+/// `apply_messages`, plus how many of the friend's messages arrived new here
+/// and are newer than what the user has read (per conversation): unread.
+fn apply_messages_counting(dir: &Path, messages: &Value) -> (usize, HashMap<String, usize>) {
+    let mut unread: HashMap<String, usize> = HashMap::new();
+    let markers = chat::read_markers(dir);
     let mut changed = 0;
     for (eid, msgs) in messages.as_object().into_iter().flatten() {
         let Some(friend) = friends::load(dir).into_iter().find(|f| f.endpoint_id.as_deref() == Some(eid.as_str())) else { continue };
@@ -1218,9 +1254,15 @@ fn apply_messages(dir: &Path, messages: &Value) -> usize {
         // iPhone: a push for one of these later must not ring again.
         let ids: Vec<&str> = msgs.iter().filter(|m| !m.from_me).map(|m| m.id.as_str()).collect();
         crate::mailbox::push::note_have(dir, &ids);
-        changed += chat::merge_synced(dir, &owner, msgs);
+        let (n, fresh) = chat::merge_synced_counting(dir, &owner, msgs);
+        changed += n;
+        let read_to = markers.get(&owner).copied().unwrap_or(0);
+        let count = fresh.iter().filter(|&&ts| ts > read_to).count();
+        if count > 0 {
+            *unread.entry(owner).or_default() += count;
+        }
     }
-    changed
+    (changed, unread)
 }
 
 fn announce(app: &AppHandle, net: &Arc<IrohState>, out: &Outcome) {
@@ -1232,6 +1274,14 @@ fn announce(app: &AppHandle, net: &Arc<IrohState>, out: &Outcome) {
     }
     if out.chats > 0 {
         let _ = app.emit("chat://changed", ());
+    }
+    // Reading a chat on one device clears it on the others; a friend's message
+    // that reached another device first still counts as unread here.
+    for (peer, up_to) in &out.seen {
+        let _ = app.emit("chat://seen", json!({"peerId": peer, "upTo": up_to}));
+    }
+    for (peer, count) in &out.unread {
+        let _ = app.emit("chat://synced-unread", json!({"peerId": peer, "count": count}));
     }
     if applied.left_account {
         let _ = app.emit("account://left", ());
@@ -1313,13 +1363,17 @@ impl Ctx {
 struct Outcome {
     applied: Applied,
     chats: usize,
+    /// Conversations read further on the other device (friend id, read through).
+    seen: Vec<(String, u64)>,
+    /// New unread messages that arrived through the other device, per conversation.
+    unread: HashMap<String, usize>,
     /// The shared display name or picture changed on this device.
     profile_changed: bool,
 }
 
 impl Outcome {
     fn left() -> Outcome {
-        Outcome { applied: Applied::left(), chats: 0, profile_changed: false }
+        Outcome { applied: Applied::left(), chats: 0, seen: vec![], unread: HashMap::new(), profile_changed: false }
     }
 }
 
@@ -1360,9 +1414,10 @@ async fn client_exchange(ctx: &Ctx, eid: &str, send: &mut iroh::endpoint::SendSt
     let meta: Meta = serde_json::from_value(reply["meta"].clone())?;
     let applied = apply_meta(dir, &local, eid, &meta);
     if applied.left_account {
-        return Ok(Outcome { applied, chats: 0, profile_changed: false });
+        return Ok(Outcome { applied, chats: 0, seen: vec![], unread: HashMap::new(), profile_changed: false });
     }
     let profile = ctx.adopt_profile(&account, meta.profile.as_ref());
+    let seen = apply_read(dir, &meta.read);
     let local = ctx.gather(&account);
     let lists: HashMap<String, Vec<(String, String)>> = serde_json::from_value(reply["lists"].clone()).unwrap_or_default();
     let (messages, want) = plan(dir, &local, &lists);
@@ -1375,10 +1430,10 @@ async fn client_exchange(ctx: &Ctx, eid: &str, send: &mut iroh::endpoint::SendSt
     })).await?;
     send.finish()?;
     let last = tokio::time::timeout(t, iroh_net::read_frame_cap(recv, FRAME_CAP)).await??;
-    let chats = apply_messages(dir, &last["messages"]);
+    let (chats, unread) = apply_messages_counting(dir, &last["messages"]);
     let avatars = apply_avatars(dir, &last["avatars"]);
     let got_avatar = ctx.adopt_avatar(&account, &last["profile_avatar"]);
-    Ok(Outcome { applied: Applied { changed: applied.changed || avatars, ..applied }, chats,
+    Ok(Outcome { applied: Applied { changed: applied.changed || avatars, ..applied }, chats, seen, unread,
         profile_changed: profile.changed || got_avatar })
 }
 
@@ -1432,9 +1487,10 @@ async fn server_exchange(ctx: &Ctx, who: &str, req: &Value, send: &mut iroh::end
     if applied.left_account {
         iroh_net::write_frame(send, &json!({"kind": "account-sync-denied"})).await?;
         send.finish()?;
-        return Ok(Some(Outcome { applied, chats: 0, profile_changed: false }));
+        return Ok(Some(Outcome { applied, chats: 0, seen: vec![], unread: HashMap::new(), profile_changed: false }));
     }
     let profile = ctx.adopt_profile(&account, meta.profile.as_ref());
+    let seen = apply_read(dir, &meta.read);
     let local = ctx.gather(&account);
     let theirs: HashMap<String, String> = serde_json::from_value(req["summaries"].clone()).unwrap_or_default();
     iroh_net::write_frame(send, &json!({
@@ -1444,7 +1500,7 @@ async fn server_exchange(ctx: &Ctx, who: &str, req: &Value, send: &mut iroh::end
     })).await?;
     let t = Duration::from_secs(60);
     let third = tokio::time::timeout(t, iroh_net::read_frame_cap(recv, FRAME_CAP)).await??;
-    let chats = apply_messages(dir, &third["messages"]);
+    let (chats, unread) = apply_messages_counting(dir, &third["messages"]);
     let avatars = apply_avatars(dir, &third["avatars"]);
     let got_avatar = ctx.adopt_avatar(&account, &third["profile_avatar"]);
     let their_wants: Vec<String> = serde_json::from_value(third["want_avatars"].clone()).unwrap_or_default();
@@ -1456,7 +1512,7 @@ async fn server_exchange(ctx: &Ctx, who: &str, req: &Value, send: &mut iroh::end
     })).await?;
     send.finish()?;
     let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
-    Ok(Some(Outcome { applied: Applied { changed: applied.changed || avatars, ..applied }, chats,
+    Ok(Some(Outcome { applied: Applied { changed: applied.changed || avatars, ..applied }, chats, seen, unread,
         profile_changed: profile.changed || got_avatar }))
 }
 
@@ -1758,6 +1814,49 @@ mod tests {
         assert!(!b.is_removed("x"), "a relink after the removal wins");
         b.removed_devices.insert("x".into(), 11);
         assert!(b.is_removed("x"), "a removal at the link instant removes");
+    }
+
+    #[test]
+    fn reading_on_one_device_clears_unread_on_the_other() {
+        let (a, b) = (dir(), dir());
+        let key = iroh::SecretKey::generate();
+        let account = hex::encode(key.public().as_bytes());
+        for d in [&a, &b] { crate::link::adopt_key_for_tests(d, &key); }
+        let (me_a, me_b, f1) = (eid(), eid(), eid());
+        let fa = friends::upsert_by_endpoint(&a, &f1, "Mong");
+        let fb = friends::upsert_by_endpoint(&b, &f1, "Mong");
+        // The friend's messages reached A only; B gets them through A.
+        chat::append(&a, &text("1", &fa.id, false, 100));
+        chat::append(&a, &text("2", &fa.id, false, 200));
+        let la = local(&a, &account, &me_a);
+        let lb = local(&b, &account, &me_b);
+        assert!(lb.meta.read.is_empty(), "nothing read yet");
+        let (to_b, _) = plan(&a, &la, &differing_lists(&b, &lb, &summaries(&a, &la)));
+        let (_, unread) = apply_messages_counting(&b, &serde_json::to_value(&to_b).unwrap());
+        assert_eq!(unread.get(&fb.id), Some(&2), "new to B and unread there");
+        // Read on A up to the first message: A's marker travels to B by max.
+        assert!(chat::raise_read_marker(&a, &fa.id, 100));
+        let la = local(&a, &account, &me_a);
+        assert_eq!(la.meta.read.get(&f1), Some(&100));
+        assert_eq!(apply_read(&b, &la.meta.read), vec![(fb.id.clone(), 100)]);
+        assert!(apply_read(&b, &la.meta.read).is_empty(), "idempotent");
+        // A stale (lower) marker never lowers what B has read.
+        assert!(apply_read(&b, &HashMap::from([(f1.clone(), 50)])).is_empty());
+        assert_eq!(chat::read_markers(&b).get(&fb.id), Some(&100));
+        // The fingerprint moves with a marker, so the change gets synced.
+        let before = fingerprint(&a, &local(&a, &account, &me_a));
+        chat::mark_seen(&a, &fa.id).unwrap();
+        assert_ne!(before, fingerprint(&a, &local(&a, &account, &me_a)));
+        // A message B learns about that A has already read isn't unread on B.
+        chat::append(&a, &text("3", &fa.id, false, 300));
+        chat::mark_seen(&a, &fa.id).unwrap();
+        let la = local(&a, &account, &me_a);
+        apply_read(&b, &la.meta.read);
+        let lb = local(&b, &account, &me_b);
+        let (to_b, _) = plan(&a, &la, &differing_lists(&b, &lb, &summaries(&a, &la)));
+        let (_, unread) = apply_messages_counting(&b, &serde_json::to_value(&to_b).unwrap());
+        assert!(unread.is_empty(), "already read on A: {unread:?}");
+        for d in [a, b] { let _ = std::fs::remove_dir_all(d); }
     }
 
     #[test]

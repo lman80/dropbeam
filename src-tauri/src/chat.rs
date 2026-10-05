@@ -972,6 +972,13 @@ pub(crate) fn sync_messages(config_dir: &Path, peer_id: &str, keys: &std::collec
 /// message both have keeps the newer content (higher `rev`) and the furthest
 /// delivery status. Returns how many messages changed.
 pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatMessage>) -> usize {
+    merge_synced_counting(config_dir, peer_id, incoming).0
+}
+
+/// `merge_synced`, also returning the times of the friend's messages that are
+/// new on this device (so its unread badge can count them).
+pub(crate) fn merge_synced_counting(config_dir: &Path, peer_id: &str, incoming: Vec<ChatMessage>) -> (usize, Vec<u64>) {
+    let mut fresh_incoming = vec![];
     let mut cache = CACHE.lock().unwrap();
     let all = store_mut(&mut cache, config_dir);
     let thread = all.entry(peer_id.to_owned()).or_default();
@@ -994,6 +1001,9 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
                 // numbers mean nothing here: slot the message in by its time,
                 // right after the latest local message that isn't newer.
                 m.seq = slot_seq(thread, m.ts);
+                if !m.from_me && !m.deleted {
+                    fresh_incoming.push(m.ts);
+                }
                 thread.push(m);
                 changed += 1;
             }
@@ -1017,7 +1027,54 @@ pub(crate) fn merge_synced(config_dir: &Path, peer_id: &str, incoming: Vec<ChatM
         }
         save_all(config_dir, all);
     }
-    changed
+    (changed, fresh_incoming)
+}
+
+// ── read markers shared by the user's own devices ─────────────────────────
+//
+// How far the user has read each conversation: the time of the newest message
+// FROM the friend they've seen. Own devices merge these by max, so reading a
+// chat on the Mac clears its unread badge on the iPhone too. The times are the
+// friend's own message stamps, so this device's clock never enters into it.
+
+static READ_LOCK: Mutex<()> = Mutex::new(());
+
+fn read_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("chat-read.json")
+}
+
+/// friend id → read through (ms).
+pub fn read_markers(config_dir: &Path) -> HashMap<String, u64> {
+    fs::read(read_path(config_dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Raise the marker for `peer_id` to `up_to` (never lowers it). True if it moved.
+pub fn raise_read_marker(config_dir: &Path, peer_id: &str, up_to: u64) -> bool {
+    let up_to = cap_ts(up_to);
+    if peer_id.is_empty() || up_to == 0 {
+        return false;
+    }
+    let _g = READ_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut all = read_markers(config_dir);
+    if all.get(peer_id).is_some_and(|&t| t >= up_to) {
+        return false;
+    }
+    all.insert(peer_id.to_owned(), up_to);
+    match serde_json::to_vec(&all) {
+        Ok(bytes) => write_atomic(&read_path(config_dir), &bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// The user has seen `peer_id`'s conversation: mark it read up to the newest
+/// message the friend sent. Returns the new marker if it moved.
+pub fn mark_seen(config_dir: &Path, peer_id: &str) -> Option<u64> {
+    let newest = {
+        let mut cache = CACHE.lock().unwrap();
+        store_mut(&mut cache, config_dir).get(peer_id)
+            .and_then(|t| t.iter().filter(|m| !m.from_me).map(|m| m.ts).max())
+    }?;
+    raise_read_marker(config_dir, peer_id, newest).then_some(newest)
 }
 
 /// Merge another own device's copy `m` into ours field by field (D17): an

@@ -195,10 +195,12 @@ export function SafetyMenu({ friend, before = [], after = [], size, blankIcon }:
 
 /** A small "are you sure?" dialog: one line of consequence, Cancel + the
  *  destructive action. */
-export function ConfirmDialog({ title, children, confirmLabel, onConfirm, onClose }: {
+export function ConfirmDialog({ title, children, confirmLabel, onConfirm, onClose, danger = true }: {
   title: string
   children?: ReactNode
   confirmLabel: string
+  /** A destructive red button (default); false for a plain "yes". */
+  danger?: boolean
   onConfirm: () => void | Promise<unknown>
   onClose: () => void
 }) {
@@ -217,7 +219,7 @@ export function ConfirmDialog({ title, children, confirmLabel, onConfirm, onClos
       footer={
         <>
           <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
-          <button className="btn btn-destructive" autoFocus onClick={() => void confirm()} disabled={busy}>
+          <button className={danger ? 'btn btn-destructive' : 'btn btn-primary'} autoFocus={danger} onClick={() => void confirm()} disabled={busy}>
             {busy && <Spinner size={13} />} {confirmLabel}
           </button>
         </>

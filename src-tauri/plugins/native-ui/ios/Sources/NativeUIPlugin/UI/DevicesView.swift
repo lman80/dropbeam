@@ -5,6 +5,7 @@ struct DevicesView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var linking: LinkStart?
     @State private var removing: AccountDevice?
+    @State private var approving: AccountDevice?
     @State private var leaving = false
     @State private var syncing = false
     private var devices: [AccountDevice] { bridge.myDevice?.devices ?? [] }
@@ -15,6 +16,10 @@ struct DevicesView: View {
     var body: some View {
         List {
             Section { hero }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 4, trailing: 20))
+            Section {} footer: {
+                Text("Link your phone and computers so they’re all you: the same friends, chats, name and photo on each.")
+                    .frame(maxWidth: .infinity).multilineTextAlignment(.center)
+            }
             if inAccount {
                 Section {
                     ForEach(linkedDevices) { device in row(device) }
@@ -31,14 +36,14 @@ struct DevicesView: View {
                     }.disabled(syncing)
                 }
                 Section {
-                    Button("Remove This \(myNoun) from Account", role: .destructive) { leaving = true }
-                } footer: { Text("Friends, chats, your name and photo sync directly between your devices, end-to-end encrypted.") }
+                    Button("Remove This \(myNoun) from My Devices", role: .destructive) { leaving = true }
+                } footer: { Text("Lost a phone or computer? Remove it above (swipe or tap ⋯) so it gets no new messages. Messages already on it stay there, so also lock or erase it with Find My.\n\nFriends, chats, your name and photo sync directly between your devices, end-to-end encrypted.") }
             } else {
                 Section {
                     Button { linking = .show; Haptics.tap() } label: { Label("Link a Device", systemImage: "plus.circle") }
                     Button { linking = .scan; Haptics.tap() } label: { Label("Scan the Other Device’s Code", systemImage: "qrcode.viewfinder") }
                 } header: { Text("Use DropBeam on Another Device") } footer: {
-                    Text("Link your Mac, PC or another phone to share your friends and chats. They stay in sync directly between your devices, end-to-end encrypted.")
+                    Text("Link your Mac, PC or another phone to share your friends and chats. They stay in sync directly between your devices, end-to-end encrypted.\n\nYour friends and chats are only on your devices — there’s no online backup. Link a second device so losing one doesn’t lose them.")
                 }
             }
         }
@@ -48,10 +53,14 @@ struct DevicesView: View {
         .task { await refresh(sync: false) }
         .sheet(item: $linking, onDismiss: { Task { await refresh(sync: false) } }) { start in LinkDeviceSheet(start: start, title: "Link a Device") }
         .confirmationDialog(removing.map { "Remove \(label($0))?" } ?? "", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { device in
-            Button("Remove from Account", role: .destructive) { bridge.perform { try await bridge.accountRemoveDevice(endpointId: device.endpointId); bridge.showToast("\(label(device)) was removed from your account") } }
-        } message: { _ in Text("It stops getting your friends and chats, and it's told the next time it's online. You can link it again later.") }
-        .confirmationDialog("Remove this \(myNoun) from your account?", isPresented: $leaving, titleVisibility: .visible) {
-            Button("Remove", role: .destructive) { bridge.perform { try await bridge.accountLeave(); bridge.showToast("This \(myNoun) left your account") } }
+            Button("Remove Device", role: .destructive) { bridge.perform { try await bridge.accountRemoveDevice(endpointId: device.endpointId); bridge.showToast("\(label(device)) was removed from your devices") } }
+        } message: { _ in Text("It stops getting your new messages and friends, and it’s told the next time it’s online. What’s already on it stays there. You can link it again later.") }
+        .confirmationDialog(approving.map { "Is “\($0.name)” yours?" } ?? "", isPresented: Binding(get: { approving != nil }, set: { if !$0 { approving = nil } }), titleVisibility: .visible, presenting: approving) { device in
+            Button("Yes, It’s Mine") { approve(device) }
+            Button("No — Remove It", role: .destructive) { removing = device }
+        } message: { _ in Text("Only say yes if you set up DropBeam on this device yourself. Saying yes gives it all your friends and chats. Not sure? Remove it — you can link it again later.") }
+        .confirmationDialog("Remove this \(myNoun) from your devices?", isPresented: $leaving, titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { bridge.perform { try await bridge.accountLeave(); bridge.showToast("This \(myNoun) is no longer linked to your other devices") } }
         } message: { Text("Your friends and chats stay on this \(myNoun), but stop syncing with your other devices. Devices that are offline are told the next time they see this one.") }
     }
     private var hero: some View {
@@ -86,38 +95,36 @@ struct DevicesView: View {
             Spacer(minLength: 4)
             if !device.thisDevice {
                 Menu {
-                    Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device }
+                    Button("Remove Device", systemImage: "minus.circle", role: .destructive) { removing = device }
                 } label: { Image(systemName: "ellipsis.circle").font(.title3).frame(width: 44, height: 44).contentShape(Rectangle()) }
                     .buttonStyle(.borderless).accessibilityLabel("Options for \(label(device))")
             }
         }
         .padding(.vertical, 2)
         .swipeActions { if !device.thisDevice { Button("Remove", role: .destructive) { removing = device } } }
-        .contextMenu { if !device.thisDevice { Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device } } }
+        .contextMenu { if !device.thisDevice { Button("Remove Device", systemImage: "minus.circle", role: .destructive) { removing = device } } }
     }
     /// S4: a device that proves the account key but no linked device vouched for
     /// (linked by an older build, or by a device since removed). Approve or remove.
     @ViewBuilder private func pendingRow(_ device: AccountDevice) -> some View {
-        HStack(spacing: 14) {
+        HStack(alignment: .top, spacing: 14) {
             DeviceAvatar(kind: device.deviceKind, os: device.deviceOs, size: 42).opacity(0.6)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("\(device.name) · Needs approval").font(.body.weight(.semibold)).lineLimit(2)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(device.name).font(.body.weight(.semibold)).lineLimit(2)
                     .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
-                Text("Only approve it if it’s your own device.").font(.subheadline).foregroundStyle(.secondary)
+                Text("Needs approval. It says it’s yours, but none of your devices added it. Don’t recognize it? Remove it.")
+                    .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Button("Remove", role: .destructive) { removing = device }.buttonStyle(.borderedProminent).tint(.red)
+                    Button("It’s Mine…") { approving = device }.buttonStyle(.bordered)
+                }.controlSize(.small).padding(.top, 4)
             }
-            Spacer(minLength: 4)
-            Button("Approve") { approve(device) }.buttonStyle(.borderedProminent).controlSize(.small)
-            Menu {
-                Button("Approve", systemImage: "checkmark.circle") { approve(device) }
-                Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device }
-            } label: { Image(systemName: "ellipsis.circle").font(.title3).frame(width: 44, height: 44).contentShape(Rectangle()) }
-                .buttonStyle(.borderless).accessibilityLabel("Options for \(device.name)")
         }
         .padding(.vertical, 2)
         .swipeActions { Button("Remove", role: .destructive) { removing = device } }
         .contextMenu {
-            Button("Approve", systemImage: "checkmark.circle") { approve(device) }
-            Button("Remove from Account", systemImage: "minus.circle", role: .destructive) { removing = device }
+            Button("Approve…", systemImage: "checkmark.circle") { approving = device }
+            Button("Remove Device", systemImage: "minus.circle", role: .destructive) { removing = device }
         }
     }
     private func approve(_ device: AccountDevice) {
@@ -199,7 +206,7 @@ struct LinkDeviceSheet: View {
     @Environment(\.dismiss) private var dismiss
     let start: LinkStart
     let title: String
-    private enum Phase: Equatable { case show, working, confirm, done, failed }
+    private enum Phase: Equatable { case show, working, confirm, done, failed, mismatch }
     @State private var phase: Phase = .show
     /// The safety code both devices show before anything is linked (S1).
     @State private var safety: LinkSafety?
@@ -231,7 +238,11 @@ struct LinkDeviceSheet: View {
                             }.frame(maxWidth: .infinity).padding(.vertical, 12)
                         }.accessibilityElement(children: .combine)
                     case .confirm:
-                        if let safety { LinkSafetyCheck(safety: safety, confirm: { confirmLink(safety) }, cancel: { cancelLink(safety) }) }
+                        if let safety { LinkSafetyCheck(safety: safety, confirm: { confirmLink(safety) }, cancel: { cancelLink(safety) }, mismatch: { mismatch(safety) }) }
+                    case .mismatch:
+                        BeamEmpty(symbol: "xmark.shield.fill", title: "Nothing Was Linked",
+                                  detail: "If the numbers were different, a device that isn’t yours may have scanned your code. Nothing changed on either device. Put your two devices side by side and start again. If the numbers are different again, stop and ask someone you trust for help.")
+                        Button { retry() } label: { Text("Start Again").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
                     case .done:
                         BeamEmpty(symbol: "checkmark.circle.fill", title: doneTitle, detail: doneDetail)
                         Button { dismiss() } label: { Text("Done").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
@@ -252,8 +263,8 @@ struct LinkDeviceSheet: View {
                 }.padding(20)
             }
             .navigationBarTitleDisplayMode(.inline).beamCanvas()
-            .navigationTitle(phase == .done ? "Devices Linked" : phase == .confirm ? "Check the Code" : title)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button(phase == .done ? "Close" : phase == .working ? "Hide" : "Cancel") { dismiss() } } }
+            .navigationTitle(phase == .done ? "Devices Linked" : phase == .confirm ? "Check the Numbers" : phase == .mismatch ? "Not Linked" : title)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button(phase == .done ? "Close" : "Cancel") { dismiss() } } }
             // A fresh one-time code each time the code screen opens (or on Try Again).
             .task(id: attempt) { if phase == .show { await begin() } }
             // Opened to scan: the camera goes on top of this device's own code,
@@ -314,8 +325,8 @@ struct LinkDeviceSheet: View {
     @ViewBuilder private var showing: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("1. Open DropBeam on your other device.")
-            Text("2. Go to **Settings → Devices → Link a Device**. On a phone you're just setting up, tap **Link to Your Account**.")
-            Text("3. Scan this code.")
+            Text("2. Go to **Settings → Devices → Link a Device**. On a phone you’re just setting up, tap **I Already Use DropBeam**.")
+            Text("3. Choose **Scan the Other Device** and point it at this code.")
         }.frame(maxWidth: .infinity, alignment: .leading).foregroundStyle(.secondary)
         GlassCard {
             VStack(spacing: 16) {
@@ -325,7 +336,7 @@ struct LinkDeviceSheet: View {
                 Label("Waiting for your other device…", systemImage: "antenna.radiowaves.left.and.right").font(.subheadline).foregroundStyle(.secondary).opacity(code.isEmpty ? 0 : 1)
             }.frame(maxWidth: .infinity)
         }
-        Button { via = .scan; scanning = true; Haptics.tap() } label: { Label("Scan the Other Device's Code Instead", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
+        Button { via = .scan; scanning = true; Haptics.tap() } label: { Label("Scan the Other Device", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
         if !code.isEmpty { Button("Copy Code") { UIPasteboard.general.string = code; Haptics.tap(); bridge.showToast("Code copied") }.font(.subheadline) }
         Text("Either device can scan the other. The code works once, for 10 minutes. Your friends and chats come along, and nothing on either device is lost.")
             .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
@@ -380,6 +391,14 @@ struct LinkDeviceSheet: View {
             fail("Linking was canceled. Nothing was changed on either device.")
         }
     }
+    /// "No, they're different": stop, and say what that means.
+    private func mismatch(_ s: LinkSafety) {
+        Haptics.warning(); safety = nil
+        if let eid = s.endpointId { Task { try? await bridge.linkConfirm(endpointId: eid, accept: false) } }
+        else { Task { try? await bridge.linkDeviceCancel(); try? await bridge.linkHostCancel() } }
+        via = .show; scanning = false
+        withAnimation(.smooth) { phase = .mismatch }
+    }
     private func finish(title: String, detail: String) {
         doneTitle = title; doneDetail = detail; scanning = false
         withAnimation(.smooth) { phase = .done }
@@ -391,8 +410,9 @@ struct LinkDeviceSheet: View {
         UINotificationFeedbackGenerator().notificationOccurred(.error)
     }
     private func retry() {
+        let wasMismatch = phase == .mismatch
         error = ""; progress = nil; phase = .show
-        if via == .scan { scanning = true } else { attempt += 1 }
+        if via == .scan && !wasMismatch { scanning = true } else { attempt += 1 }
     }
 }
 
@@ -414,15 +434,23 @@ struct LinkSafetyCheck: View {
     let safety: LinkSafety
     let confirm: () -> Void
     let cancel: () -> Void
+    var mismatch: () -> Void = {}
+    /// "iPhone" → "your iPhone"; a name someone chose stays as is.
+    static func yours(_ name: String) -> String {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        if n.isEmpty || n == "Your other device" { return "your other device" }
+        let first = n.split(separator: " ").first.map { $0.lowercased() } ?? ""
+        return ["iphone", "ipad", "mac", "macbook", "pc", "computer", "phone"].contains(first) ? "your \(n)" : n
+    }
     private var warning: String {
-        safety.joining ? "This device will join \(safety.name)’s account: this device’s friends and chats will be shared into that account, and it gets that account’s friends and chats."
-            : "\(safety.name) will get full access to your account: your friends, chats and devices."
+        "If they match, your friends and chats will be shared between the two devices. Only link devices that are yours."
     }
     var body: some View {
         VStack(spacing: 22) {
             VStack(spacing: 8) {
                 Image(systemName: "checkmark.shield.fill").font(.system(size: 46)).foregroundStyle(.tint).accessibilityHidden(true)
-                Text("Make sure \(safety.name) shows this code").font(.title3.weight(.semibold)).multilineTextAlignment(.center)
+                Text("Look at \(LinkSafetyCheck.yours(safety.name)). Does it show these same 6 numbers?").font(.title3.weight(.semibold)).multilineTextAlignment(.center)
+                Text("Choose the same answer on both devices.").font(.subheadline).foregroundStyle(.secondary)
             }
             GlassCard {
                 Text(safety.safety)
@@ -433,11 +461,14 @@ struct LinkSafetyCheck: View {
             }
             Label { Text(warning) } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
                 .font(.subheadline).frame(maxWidth: .infinity, alignment: .leading)
-            Text("Only continue if this is your own device and the codes match." + (safety.peerShowsCode ? "" : " (\(safety.name) needs an update to show the code.)"))
-                .font(.subheadline).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            if !safety.peerShowsCode {
+                Text("\(safety.name) needs an update to show the numbers. Only continue if it’s yours.")
+                    .font(.subheadline).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            }
             VStack(spacing: 10) {
-                Button(action: confirm) { Text("Codes Match — Link").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
-                Button(role: .cancel, action: cancel) { Text("Cancel").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
+                Button(action: confirm) { Text("Yes, They Match").frame(maxWidth: .infinity, minHeight: 36) }.beamButton(prominent: true)
+                Button(action: mismatch) { Text("No, They’re Different").frame(maxWidth: .infinity, minHeight: 36) }.beamButton()
+                Button(role: .cancel, action: cancel) { Text("Cancel") }.font(.body).padding(.top, 2)
             }
         }
     }

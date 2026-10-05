@@ -390,7 +390,7 @@ function NameSetupModal() {
         footer={
           <>
             {!MOBILE_UI && (
-              <button className="btn btn-plain btn-sm" onClick={() => setJoining(true)} style={{ marginLeft: -8 }} title="Already use DropBeam on another computer or phone? Link this one to it.">
+              <button className="btn btn-plain" onClick={() => setJoining(true)} style={{ marginLeft: -8 }} title="Already use DropBeam on another computer or phone? Link this one to it.">
                 I Already Use DropBeam…
               </button>
             )}

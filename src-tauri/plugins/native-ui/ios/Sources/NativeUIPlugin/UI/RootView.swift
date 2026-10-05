@@ -137,6 +137,9 @@ private struct RootPresentations: ViewModifier {
                 // Wait until the engine says whether this is a new install: asking before
                 // that popped the system prompt over the Welcome screen, unexplained.
                 guard bridge.nameKnown, !settingUp else { return }
+                #if targetEnvironment(simulator)
+                if ProcessInfo.processInfo.arguments.contains("-previewAccounts") { return } // QA screenshots
+                #endif
                 try? await Task.sleep(for: .seconds(2))
                 let center = UNUserNotificationCenter.current()
                 if bridge.nameKnown, !settingUp, await center.notificationSettings().authorizationStatus == .notDetermined {

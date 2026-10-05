@@ -44,6 +44,7 @@ import { formatBytes } from '../lib/format'
 import { linkify } from '../lib/linkify'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 import { EmptyState, IconButton, MenuButton, MenuPopover, type MenuItem } from '../components/ui'
+import { statusExplanation, type MessageState } from '../lib/chatStatus'
 import { decideFile, isDeclined, onServersChanged, serverApi, serverNoteText, usePendingFile } from '../lib/transferServer'
 import { ServerOfferCard, useUsableServers } from '../components/TransferServerSettings'
 
@@ -339,6 +340,7 @@ function Conversation({ friendId }: { friendId: string }) {
   const presenceText = useStore((s) => {
     if (!friend) return ''
     const p = friendPresence(friend, s.friendSeen, s.folderStatuses)
+    if (friend.awaitingAccept) return 'Hasn’t accepted your friend request yet'
     return p.status === 'online' ? 'Online' : checking ? 'Connecting…' : presenceLabel(p)
   })
   const windowFocused = useStore((s) => s.windowFocused)
@@ -993,7 +995,11 @@ function Conversation({ friendId }: { friendId: string }) {
       </div>
 
       <div className={MOBILE_UI ? 'chat-composer mobile-composer' : 'chat-composer'}>
-        {!onlineNow && !checking && (
+        {friend.awaitingAccept ? (
+          <p className="chat-offline-note" role="status">
+            {`${displayName} hasn’t accepted your friend request yet. Your messages are saved and arrive as soon as they do.`}
+          </p>
+        ) : !onlineNow && !checking && (
           <p className="chat-offline-note" role="status">
             {holdOn
               ? `${displayName} is offline. Messages wait on ${holdOn} and arrive when they’re back.`
@@ -1582,18 +1588,23 @@ const MessageRow = memo(function MessageRow({
   }
 
   const inFlight = !!xferState && xferState !== 'completed'
-  const metaText = (() => {
+  const first = friend.name.split(' ')[0]
+  // The status line under your message, and (click it) what it means.
+  const [metaText, metaState] = ((): [string, MessageState | null] => {
     const parts: string[] = []
+    let state: MessageState | null = null
     if (m.edited && !m.deleted) parts.push('Edited')
     if (meta && !(m.kind === 'file' && (inFlight || m.fileXferFailed))) {
       const s = m.status
-      const note = s === 'failed' ? serverNoteText(m.serverNote, friend.name.split(' ')[0], m.heldOn) : null
-      if (s === 'held') parts.push(`Held on ${m.heldOn ?? 'your Transfer Server'} — reaches ${friend.name.split(' ')[0]} when they’re online`)
-      else if (note) parts.push(note)
-      else if (meta === 'pending' || s === 'sending' || s === 'failed' || s == null) parts.push(waiting ? 'Waiting to send' : 'Sending…')
-      else parts.push(s === 'read' ? 'Read' : 'Delivered')
+      const note = s === 'failed' ? serverNoteText(m.serverNote, first, m.heldOn) : null
+      const pending = meta === 'pending' || s === 'sending' || s === 'failed' || s == null
+      if (s === 'held') { state = 'held'; parts.push(`Waiting on ${m.heldOn ?? 'your Transfer Server'} — ${first} gets it when they’re back`) }
+      else if (note) { state = 'serverNote'; parts.push(note) }
+      else if (pending && friend.awaitingAccept) { state = 'notAccepted'; parts.push(`Waiting for ${first} to accept you`) }
+      else if (pending) { state = waiting ? 'waiting' : 'sending'; parts.push(waiting ? 'Waiting to send' : 'Sending…') }
+      else { state = s === 'read' ? 'read' : 'delivered'; parts.push(s === 'read' ? 'Read' : 'Delivered') }
     }
-    return parts.join(' · ')
+    return [parts.join(' · '), state]
   })()
 
   const pinned = !!tray || (!!menu && !menu.context)
@@ -1691,7 +1702,10 @@ const MessageRow = memo(function MessageRow({
           )}
         </motion.div>
 
-        {metaText && <div className="chat-meta">{metaText}</div>}
+        {metaText && (metaState
+          ? <button type="button" className="chat-meta chat-meta-explain" title="What does this mean?"
+              onClick={() => toast('info', statusExplanation(metaState, first, m.heldOn))}>{metaText}</button>
+          : <div className="chat-meta">{metaText}</div>)}
         {!mine && m.via && lastOfRun && !(m.kind === 'file' && !m.path) && <div className="chat-via">via {m.via}</div>}
       </div>
       {tray && <ReactionTray anchor={tray.anchor} trigger={tray.trigger} mine={mine} onPick={doReact} onClose={closeTray} />}
