@@ -169,6 +169,21 @@ async fn run(app: &AppHandle, st: &Arc<AppState>, net: &Arc<IrohState>, cmd: &Va
             let ids = crate::commands::block_friend(app.clone(), app.state(), app.state(), f.id.clone())?;
             Ok(("block".into(), ids.join(","), None))
         }
+        // Cleanup for request/block tests: {"op":"unblock","id":<eid>},
+        // {"op":"remove-friend","to":<friend eid or name>}.
+        "unblock" => {
+            let id = cmd["id"].as_str().unwrap_or("").to_owned();
+            crate::commands::unblock_person(app.clone(), app.state(), id.clone())?;
+            Ok(("unblock".into(), id, None))
+        }
+        "remove-friend" => {
+            let to = cmd["to"].as_str().unwrap_or("");
+            let f = friends::load(&st.config_dir).into_iter()
+                .find(|f| f.endpoint_id.as_deref() == Some(to) || f.name == to)
+                .ok_or_else(|| format!("no friend {to:?}"))?;
+            crate::commands::remove_friend(app.clone(), app.state(), app.state(), f.id.clone())?;
+            Ok(("remove-friend".into(), f.id, None))
+        }
         "addfriend" => {
             let code = cmd["code"].as_str().unwrap_or("");
             let f = friends::add_by_code(&st.config_dir, code)?;
