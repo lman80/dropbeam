@@ -35,6 +35,9 @@ final class Bridge: ObservableObject {
     @Published var history: [HistoryEntry] = []
     @Published var locations: [FriendLocations] = []
     @Published var needsName = false
+    /// The engine has said whether this install still needs a name — until then a
+    /// brand-new install can't be told apart from an existing one.
+    @Published var nameKnown = false
     @Published var pendingSend: [String] = []
     /// Paths the user just picked on the Send tab, owned by Swift. The web store's
     /// `pendingSend` snapshot (re-pushed right after every pick reply) must not be able to
@@ -149,7 +152,7 @@ final class Bridge: ObservableObject {
     }
     /// A store snapshot decoded OFF the main thread (NativeUIPlugin.state), applied here.
     enum Snapshot {
-        case history([HistoryEntry]), locations([FriendLocations]), needsName(Bool), pendingSend([String])
+        case history([HistoryEntry]), locations([FriendLocations]), needsName(Bool?), pendingSend([String])
         case friends([Friend]), myDevice(MyDevice?), transfers([Transfer]), settings(Settings?)
         case chatOverview([ChatOverview]), chatUnread([String: Int]), chatTyping([String: Bool]), chatDraftFiles([String])
         case thread(ChatThread?), presence([String: Bool]), presenceSeen([String: Double]), folders([SharedFolder])
@@ -167,7 +170,7 @@ final class Bridge: ObservableObject {
         switch key {
         case "history": snapshot = .history(try value(LossyArray<HistoryEntry>.self).values)
         case "locations": snapshot = .locations(try value(LossyArray<FriendLocations>.self).values)
-        case "needsName": snapshot = .needsName(try value(Bool.self))
+        case "needsName": snapshot = .needsName(try value(Bool?.self)) // null = settings not loaded yet
         case "pendingSend": snapshot = .pendingSend(try value(LossyArray<String>.self).values)
         case "friends": snapshot = .friends(try value(LossyArray<Friend>.self).values)
         case "myDevice": snapshot = .myDevice(try value(MyDevice?.self))
@@ -195,8 +198,10 @@ final class Bridge: ObservableObject {
         switch snapshot {
         case .history(let v): history = v
         case .locations(let v): locations = v
-        case .needsName(let v):
+        case .needsName(let known):
+            guard let v = known else { break }
             needsName = v
+            nameKnown = true
             // Only a brand-new install is asked its name: that starts first-run setup,
             // which then stays up (name saved or not) until the user finishes it.
             if needsName && !onboarding { onboarding = true }

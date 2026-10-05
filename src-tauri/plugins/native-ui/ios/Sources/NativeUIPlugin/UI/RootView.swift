@@ -131,13 +131,15 @@ private struct RootPresentations: ViewModifier {
             .sheet(item: link) { link in AddFriendSheet(initialCode: link.value).environmentObject(bridge) }
             // The floating feedback button would sit over the setup copy.
             .onChange(of: settingUp, initial: true) { _, now in SuperFeedback.setSuppressed(now) }
-            .task(id: settingUp) {
+            .task(id: settingUp || !bridge.nameKnown) {
                 // Existing installs that never answered the notification prompt get it
                 // once here (new ones are asked inside setup, at the moment it's explained).
-                guard !settingUp else { return }
+                // Wait until the engine says whether this is a new install: asking before
+                // that popped the system prompt over the Welcome screen, unexplained.
+                guard bridge.nameKnown, !settingUp else { return }
                 try? await Task.sleep(for: .seconds(2))
                 let center = UNUserNotificationCenter.current()
-                if !settingUp, await center.notificationSettings().authorizationStatus == .notDetermined {
+                if bridge.nameKnown, !settingUp, await center.notificationSettings().authorizationStatus == .notDetermined {
                     _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
                     PushRegistration.permissionGranted()
                 }

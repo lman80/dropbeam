@@ -5,8 +5,8 @@ import UIKit
 /// Simulator-only QA data for the everyday flows (no touch input in CI):
 /// `-previewEveryday` seeds friends, transfers (an offer to accept, a received photo,
 /// a send waiting for an offline friend, a Quick Send code) and shared folders.
-/// `-previewScreen folders|folder|invite|advanced|recoverable` opens that screen on top.
-/// `-previewLocalNetworkDenied` shows the Local Network notice.
+/// `-previewScreen folders|folder|invite|advanced|recoverable|quicksend` opens that screen on top.
+/// `-previewLocalNetworkDenied` shows the Local Network notice; `-previewSkipSetup` skips first-run setup.
 @MainActor enum EverydayPreview {
     static func seedIfRequested() {
         let args = ProcessInfo.processInfo.arguments
@@ -16,6 +16,9 @@ import UIKit
         guard args.contains("-previewEveryday") else { return }
         let b = Bridge.shared
         b.previewKeys.formUnion(["friends", "presence", "transfers", "folders"])
+        if args.contains("-previewSkipSetup") {
+            b.previewKeys.insert("needsName"); b.needsName = false; b.nameKnown = true; b.onboarding = false
+        }
         b.friends = [
             Friend(id: "qa-rose", name: "Rose", endpointId: "qa-rose-eid"),
             Friend(id: "qa-tom", name: "Tom", endpointId: "qa-tom-eid"),
@@ -58,6 +61,7 @@ import UIKit
         case "invite": view = AnyView(FolderInviteSheet(invite: FolderInvite(code: "qa", folderName: "Family Photos", fromName: "Rose")))
         case "advanced": view = AnyView(NavigationStack { TransferSettingsView() })
         case "recoverable": b.selectedTab = "history"; return
+        case "quicksend": view = AnyView(NavigationStack { List { if let t = b.transfers.first(where: { $0.id == "qa-code" }) { TransferRow(transfer: t) } }.navigationTitle("Quick Send") })
         default: return
         }
         let host = UIHostingController(rootView: view.environmentObject(b).tint(.beam))

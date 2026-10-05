@@ -425,6 +425,15 @@ struct TransferRow: View {
                 }.beamButton()
                 ShareLink(item: code) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity) }.beamButton()
             }
+            // The code only works inside DropBeam: say so, and hand over the way to get it.
+            VStack(spacing: 6) {
+                Text("They don’t have DropBeam? It’s free — send them the download link first.")
+                    .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                ShareLink(item: URL(string: "https://github.com/lman80/dropbeam/releases/latest")!,
+                          message: Text("Get DropBeam (free) so I can send you files")) {
+                    Label("Send Download Link", systemImage: "arrow.down.circle")
+                }.font(.footnote.weight(.semibold)).buttonStyle(.borderless)
+            }.padding(.top, 4)
         }.frame(maxWidth: .infinity).padding(.top, 4)
     }
     /// A finished transfer stays quiet unless something needs attention: files the
