@@ -3358,8 +3358,8 @@ impl SyncManager {
 
 /// How a reconcile tombstone may delete `rel` here (D4): by the version the peer
 /// says it deleted, or — legacy peers only — by timestamp. `None` = it may not.
-/// Rels in `deletes` whose peer tombstone names a version (size, mtime) that is
-/// NOT what we hold — the delete can't apply to our copy (D4). The caller pushes
+/// Rels in `deletes` whose peer tombstone names a version the delete can't
+/// apply to here (a different size, or ours placed after the delete — D4). The caller pushes
 /// the ones the peer lacks (it never saw our version) instead of leaving the two
 /// folders split forever. Legacy peers (no tombstone versions) and unversioned
 /// entries are left alone.
@@ -3371,8 +3371,11 @@ fn version_mismatch_survivors(folder: &str, deletes: &[String], rec: &Reconcile)
             let Some(v) = tv.get(rel.as_str()).or_else(|| tv.iter().find(|(k, _)| norm_rel(k) == **rel).map(|(_, v)| v)) else {
                 return false;
             };
-            let Ok(meta) = std::fs::metadata(Path::new(folder).join(rel.as_str())) else { return false };
-            meta.is_file() && (meta.len(), meta_mtime(&meta)) != *v
+            let abs = Path::new(folder).join(rel.as_str());
+            let ts = rec.tombstones.get(rel.as_str()).copied()
+                .or_else(|| rec.tombstones.iter().find(|(k, _)| norm_rel(k) == **rel).map(|(_, t)| *t))
+                .unwrap_or(0);
+            abs.is_file() && !delete_allowed(&abs, ts, Some(*v))
         })
         .cloned()
         .collect()
@@ -6091,11 +6094,15 @@ fn delete_allowed(abs: &Path, ts: u64, known: Option<(u64, u64)>) -> bool {
         // The exact version — unless this copy was clearly PLACED well after the
         // delete (restored from History, re-added identical bytes): a late or
         // re-sent delete must not undo that. 10 min of slack absorbs clock skew.
-        Some((size, mtime)) => {
-            meta.len() == size
-                && meta_mtime(&meta) == mtime
-                && path_version_ms(abs, &meta) <= ts.saturating_add(10 * 60 * 1000)
+        Some((size, mtime)) if meta_mtime(&meta) == mtime => {
+            meta.len() == size && path_version_ms(abs, &meta) <= ts.saturating_add(10 * 60 * 1000)
         }
+        // Same size, different mtime: sync never re-sends an mtime-only difference
+        // (machines round/stamp mtimes differently), so this is the file both
+        // sides showed as in sync — UNLESS ours was placed after the delete (a
+        // genuine concurrent edit). Without this, a delete of an identical file
+        // never propagated (live: closed-app delete on Linux, kept on the Mac).
+        Some((size, _)) => meta.len() == size && ts > path_version_ms(abs, &meta),
         None => ts > path_version_ms(abs, &meta),
     }
 }
@@ -6667,14 +6674,27 @@ mod tests {
         std::fs::write(dir.join("same.txt"), b"abc").unwrap();
         let folder = dir.to_string_lossy().to_string();
         let mt = |r: &str| meta_mtime(&std::fs::metadata(dir.join(r)).unwrap());
+        std::fs::write(dir.join("touched.txt"), b"abcd").unwrap();
         let mut rec = Reconcile::default();
-        // Peer deleted an OLDER x.txt (same size, earlier mtime) and the exact same.txt.
+        let now = now_ms();
+        // x.txt: the peer deleted a DIFFERENT-size version → ours survives.
+        // same.txt: the exact version. touched.txt: same size, mtime-only
+        // difference, deleted after ours was placed → the same file, delete applies.
         rec.tomb_versions = Some(HashMap::from([
-            ("closed/x.txt".to_string(), (2222, mt("closed/x.txt") - 18_000)),
+            ("closed/x.txt".to_string(), (1111, mt("closed/x.txt") - 18_000)),
             ("same.txt".to_string(), (3, mt("same.txt"))),
+            ("touched.txt".to_string(), (4, mt("touched.txt") - 18_000)),
         ]));
-        let dels = vec!["closed/x.txt".to_string(), "same.txt".to_string()];
+        rec.tombstones = HashMap::from([
+            ("closed/x.txt".to_string(), now + 5_000),
+            ("same.txt".to_string(), now + 5_000),
+            ("touched.txt".to_string(), now + 5_000),
+        ]);
+        let dels = vec!["closed/x.txt".to_string(), "same.txt".to_string(), "touched.txt".to_string()];
         assert_eq!(version_mismatch_survivors(&folder, &dels, &rec), vec!["closed/x.txt".to_string()]);
+        // Same size but deleted BEFORE ours was placed (a concurrent edit) → ours survives.
+        rec.tombstones.insert("touched.txt".to_string(), now - 60_000);
+        assert_eq!(version_mismatch_survivors(&folder, &dels[2..], &rec), vec!["touched.txt".to_string()]);
         // A legacy peer (no versions) keeps the timestamp rule.
         rec.tomb_versions = None;
         assert!(version_mismatch_survivors(&folder, &dels, &rec).is_empty());
