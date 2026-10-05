@@ -1176,6 +1176,7 @@ html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
   line-height: 1.4;
   margin-top: 6px;
 }
+.field-hint-warn { color: var(--amber); }
 .optional { color: var(--text-faint); font-weight: 400; }
 /* Toggleable chip (pick friends, filters). */
 .pick-chip {

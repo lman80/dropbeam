@@ -75,3 +75,4 @@
 }
 .from-chip-avatar.is-device { background: transparent; color: var(--text-muted); }
 .from-chip-avatar .avatar-device { width: 12px; height: 12px; color: var(--text-muted); }
+.rf-intro { margin: 0 4px 4px; font-size: var(--text-13); color: var(--text-muted); line-height: 1.45; }

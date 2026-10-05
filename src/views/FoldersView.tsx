@@ -10,7 +10,6 @@ import {
   Folder,
   FolderCheck,
   FolderOpen,
-  FolderSync,
   History,
   QrCode,
   Settings2,
@@ -32,6 +31,8 @@ import { baseName } from '../lib/humanize'
 import { PairingModal } from '../components/PairingModal'
 import { Dialog } from '../components/Dialog'
 import { avatarColor, initials } from '../lib/avatar'
+import { SameFolderArt } from '../components/bits'
+import { FOLDER_MODES, ROLE_WORDS, folderMode, type FolderMode } from '../lib/folderWords'
 import { personKey } from '../lib/deviceIcons'
 import { FriendAvatar } from '../components/FriendAvatar'
 import { friendOnlineState } from '../lib/presence'
@@ -83,8 +84,8 @@ export function FoldersView() {
       <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Shared Folders</h1>
         <div className="page-actions">
-          <button className="btn btn-secondary" onClick={() => setModal('accept')}>
-            Accept Invite…
+          <button className="btn btn-secondary" onClick={() => setModal('accept')} title="Someone sent you a shared-folder invite code">
+            Join a Folder…
           </button>
           <button className="btn btn-primary" onClick={() => setModal('create')}>
             New Shared Folder…
@@ -94,10 +95,18 @@ export function FoldersView() {
 
       {pairs.length === 0 ? (
         <EmptyState
-          icon={<FolderSync />}
-          title="No shared folders"
-          hint="Keep a folder in sync with friends."
-          action={<button className="btn btn-secondary" onClick={() => setModal('create')}>New Shared Folder…</button>}
+          icon={<SameFolderArt />}
+          title="The same folder on everyone’s computer"
+          hint={
+            <div className="folder-explain">
+              <p>Put a photo in a shared folder and it shows up in the same folder for everyone you share it with — and stays up to date.</p>
+              <p>To send something just once, use Send &amp; Receive instead.</p>
+            </div>
+          }
+          action={<>
+            <button className="btn btn-primary" onClick={() => setModal('create')}>Share a Folder…</button>
+            <button className="btn btn-secondary" onClick={() => setModal('accept')}>I Have an Invite…</button>
+          </>}
         />
       ) : (
         <div className="group folder-list">
@@ -337,8 +346,8 @@ function FolderRow({
     { label: 'Add Person…', icon: <UserPlus />, onSelect: () => setDialog('add'), disabled: addingPerson },
     { label: 'Show Invite…', icon: <QrCode />, onSelect: () => void showInvite(), hidden: pair.role !== 'a', disabled: loadingInvite },
     { separator: true },
-    { label: 'Folder History', icon: <History />, onSelect: () => focusFolderHistory(pair.id), hidden: !pair.mirror },
-    { label: 'Verify', icon: <FolderCheck />, onSelect: () => void runVerify(), hidden: !pair.mirror, disabled: verifying },
+    { label: 'Recoverable Files', icon: <History />, onSelect: () => focusFolderHistory(pair.id) },
+    { label: 'Check Everything Matches', icon: <FolderCheck />, onSelect: () => void runVerify(), hidden: !pair.mirror, disabled: verifying },
     { label: 'Settings…', icon: <Settings2 />, onSelect: () => setDialog('settings') },
     { separator: true },
     { label: isGroup ? 'Leave Folder…' : 'Stop Sharing…', icon: <Unlink />, danger: true, onSelect: () => setDialog('unpair') },
@@ -571,6 +580,16 @@ function FolderSettingsDialog({
     }
   }
   const myRole = iAmOwner ? 'Owner' : viewOnly ? 'Viewer' : 'Editor'
+  const mode = folderMode(pair)
+  // Changes that delete files ask first, saying what will happen.
+  const [confirm, setConfirm] = useState<'mirror' | 'autodelete' | null>(null)
+  const applyMode = (m: FolderMode) =>
+    onUpdate(m === 'mirror' ? { mirror: true, twoWay: true } : m === 'twoway' ? { mirror: false, twoWay: true } : { mirror: false, twoWay: false })
+  const chooseMode = (m: FolderMode) => {
+    if (m === mode) return
+    if (m === 'mirror') setConfirm('mirror')
+    else applyMode(m)
+  }
 
   return (
     <Dialog
@@ -623,8 +642,8 @@ function FolderSettingsDialog({
                   label={`${m.peerName}’s access`}
                   value={m.peerIsViewer ? 'viewer' : 'editor'}
                   options={[
-                    { value: 'editor', label: 'Editor', title: 'Can add, change and delete files' },
-                    { value: 'viewer', label: 'Viewer', title: 'Can view and download, but not change the folder' },
+                    { value: 'editor', label: 'Editor', title: ROLE_WORDS.editor },
+                    { value: 'viewer', label: 'Viewer', title: ROLE_WORDS.viewer },
                   ]}
                   onChange={(v) => onSetRole(m, v === 'viewer')}
                 />
@@ -647,30 +666,36 @@ function FolderSettingsDialog({
           <span className="row-main row-title">Add Person…</span>
         </button>
       </div>
+      <p className="field-hint">Editors: {ROLE_WORDS.editor.toLowerCase()}. Viewers: {ROLE_WORDS.viewer.toLowerCase()}.</p>
 
-      <SectionHeader>Sync</SectionHeader>
+      <SectionHeader>What others can do</SectionHeader>
+      <div className="group folder-mode-group" role="radiogroup" aria-label="What others can do">
+        {(['twoway', 'mirror', 'oneway'] as const).map((m) => (
+          <button key={m} type="button" role="radio" aria-checked={mode === m} className="row" onClick={() => chooseMode(m)}>
+            <span className="folder-radio" aria-hidden />
+            <span className="row-main">
+              <span className="row-title" style={{ display: 'block' }}>{FOLDER_MODES[m].title}</span>
+              <span className="row-sub" style={{ display: 'block' }}>{FOLDER_MODES[m].desc}</span>
+            </span>
+          </button>
+        ))}
+      </div>
+
+      <SectionHeader>Options</SectionHeader>
       <div className="group folder-settings">
-        <SettingRow title="Total sync" desc="Adds, edits and deletes sync both ways. Removed or replaced files are saved in Recoverable files.">
-          <Toggle label="Total sync" on={pair.mirror} onChange={() => onUpdate({ mirror: !pair.mirror })} />
-        </SettingRow>
         {!pair.mirror && (
-          <SettingRow title="Two-way" desc="Receive their files too, not just send.">
-            <Toggle label="Two-way sync" on={pair.twoWay} onChange={() => onUpdate({ twoWay: !pair.twoWay })} />
-          </SettingRow>
-        )}
-        {!pair.mirror && (
-          <SettingRow title="Delete after delivery" desc="Remove your copy once they have it.">
-            <Toggle label="Delete after delivery" on={pair.autoDelete} onChange={() => onUpdate({ autoDelete: !pair.autoDelete })} />
+          <SettingRow title="Delete my copy after sending" desc="Once they have a file, it’s removed from this folder on your computer.">
+            <Toggle label="Delete my copy after sending" on={pair.autoDelete} onChange={() => (pair.autoDelete ? onUpdate({ autoDelete: false }) : setConfirm('autodelete'))} />
           </SettingRow>
         )}
         {!pair.mirror && pair.autoDelete && (
-          <SettingRow title="When deleting" desc="Trash can be recovered; permanent can’t.">
+          <SettingRow title="Where deleted copies go" desc="From the Trash you can still get them back; Permanently can’t be undone.">
             <Segmented
               label="When deleting"
               value={pair.deleteMode}
               options={[
                 { value: 'trash', label: 'Trash' },
-                { value: 'permanent', label: 'Permanent' },
+                { value: 'permanent', label: 'Permanently' },
               ]}
               onChange={(v) => onUpdate({ deleteMode: v })}
             />
@@ -681,6 +706,33 @@ function FolderSettingsDialog({
         </SettingRow>
       </div>
 
+      <AnimatePresence>
+        {confirm && (
+          <Dialog
+            key="confirm-change"
+            title={confirm === 'mirror' ? 'Let deletes sync too?' : 'Delete your copies after sending?'}
+            width={400}
+            onClose={() => setConfirm(null)}
+            footer={
+              <>
+                <button className="btn btn-secondary" onClick={() => setConfirm(null)}>Cancel</button>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => { if (confirm === 'mirror') applyMode('mirror'); else onUpdate({ autoDelete: true }); setConfirm(null) }}
+                >
+                  {confirm === 'mirror' ? 'Fully Sync' : 'Turn On'}
+                </button>
+              </>
+            }
+          >
+            <p className="dialog-text" style={{ margin: 0 }}>
+              {confirm === 'mirror'
+                ? `From now on, when anyone deletes a file in “${folderName}”, it’s deleted on every computer — yours too. Deleted files can be brought back from History → Recoverable Files.`
+                : `Each file in “${folderName}” will be removed from this computer once it reaches the other person. They keep their copy.`}
+            </p>
+          </Dialog>
+        )}
+      </AnimatePresence>
       <AnimatePresence>
         {memberToRemove && (
           <Dialog
@@ -701,7 +753,7 @@ function FolderSettingsDialog({
           >
             <p className="dialog-text" style={{ margin: 0 }}>
               {memberToRemove.peerName
-                ? `They’ll stop syncing “${folderName}” with you.`
+                ? `They’ll stop getting changes to “${folderName}”. The copy already on their computer stays with them.`
                 : 'Anyone you sent the invite to won’t be able to join with it.'}
             </p>
           </Dialog>
@@ -827,7 +879,7 @@ function InviteModal({
       onClose={onClose}
       footer={<button className="btn btn-secondary" onClick={onClose}>Done</button>}
     >
-      <p className="dialog-text">In DropBeam, they choose Accept invite and scan or paste this.</p>
+      <p className="dialog-text">Send this to them. In DropBeam they choose Shared Folders → Join a Folder… and scan or paste it.</p>
       <ShareCode code={code} layout="stack" copyLabel="Copy Invite" />
     </Dialog>
   )

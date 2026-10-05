@@ -4,6 +4,7 @@ import { Dialog } from './Dialog'
 import { api, onFolderInvite, type FolderInvite } from '../lib/api'
 import { useStore } from '../store'
 import { Spinner } from './bits'
+import { inviteMode, inviteModeForJoiner } from '../lib/folderWords'
 
 // There's no "declined" message in the protocol yet, so a Decline is remembered
 // HERE: the inviter's re-sent beacon for the same invite never pops it again.
@@ -61,9 +62,10 @@ export function FolderInviteModal() {
     }
     if (!folder) { setBusy(false); return } // picker cancelled — keep the prompt open
     try {
-      await api.acceptPair(current.code, folder)
+      const pair = await api.acceptPair(current.code, folder, current.folderName || null)
       await reloadPairs()
-      toast('success', `Joined “${current.folderName || 'shared folder'}”`)
+      const where = pair.folder.split(/[/\\]/).filter(Boolean).slice(-2).join(' › ')
+      toast('success', `Joined “${current.folderName || 'shared folder'}”. Its files go in ${where}.`)
       drop(current.code)
     } catch (e) {
       toast('error', e)
@@ -87,13 +89,17 @@ export function FolderInviteModal() {
               </button>
               <button className="btn btn-primary" onClick={accept} disabled={busy}>
                 {busy ? <Spinner size={13} /> : null}
-                Accept…
+                Join…
               </button>
             </>
           }
         >
+          <p className="dialog-text">
+            {invite.fromName || 'A friend'} wants to share a folder with you. It stays the same on both computers.
+          </p>
+          {(() => { const m = inviteMode(invite.code); return m ? <p className="dialog-text">{inviteModeForJoiner(m)}</p> : null })()}
           <p className="dialog-text" style={{ margin: 0 }}>
-            {invite.fromName || 'A friend'} wants to share this folder with you. Choose where to keep it.
+            Next, choose where to keep it — for example Documents. DropBeam makes a “{invite.folderName || 'Shared Folder'}” folder there, so nothing already in it gets shared.
           </p>
         </Dialog>
       )}
