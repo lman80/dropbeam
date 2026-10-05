@@ -30,6 +30,10 @@ struct ConversationView: View {
     @State private var lastProbe = Date.distantPast
     /// Bumped to restart the check loop (thread opened again / app foregrounded).
     @State private var probeRun = 0
+    /// "What does Delivered mean?" — a tapped status's one-line explanation.
+    @State private var statusHelp: String?
+    /// They haven't accepted our friend request yet: messages wait until they do.
+    private var notAccepted: Bool { friend.awaitingAccept == true }
     /// Reachable right now, as far as the latest evidence says.
     private var online: Bool { bridge.presence[friendID] == true && !probedOffline }
     /// Offline, and the check that says so has finished.
@@ -114,7 +118,7 @@ struct ConversationView: View {
             .modifier(ComposerBar {
                 VStack(spacing: 0) {
                     if searching { searchFooter(proxy) }
-                    if knownOffline && !searching { offlineNote.transition(.opacity) }
+                    if (knownOffline || notAccepted) && !searching { offlineNote.transition(.opacity) }
                     ChatComposer(friendID: friendID, reply: $reply, editing: $editing, text: $draft) { scrollDown(proxy) }
                 }
                 // The feedback button stays available here, parked above the composer
@@ -232,6 +236,7 @@ struct ConversationView: View {
                 .presentationBackground(.clear)
         }
         .safetyPrompts(block: $blocking, report: $reporting)
+        .modifier(StatusHelpAlert(text: $statusHelp))
         .sheet(isPresented: $showDetail) {
             NavigationStack {
                 FriendDetailView(friendID: friendID, initial: friend)
@@ -303,7 +308,8 @@ struct ConversationView: View {
 
     /// Calm inline note over the composer while the friend can't be reached.
     private var offlineNote: some View {
-        Text(holdOn.map { "\(friend.displayName) is offline. Messages wait on \($0) and arrive when they’re back." }
+        Text(notAccepted ? "\(friend.displayName) hasn’t accepted your friend request yet. Your messages are saved and arrive as soon as they do."
+             : holdOn.map { "\(friend.displayName) is offline. Messages wait on \($0) and arrive when they’re back." }
              ?? "\(friend.displayName) is offline. Messages will send when you’re both online with DropBeam open.")
             .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
             .fixedSize(horizontal: false, vertical: true)
@@ -382,11 +388,15 @@ struct ConversationView: View {
                             Text("via \(via)").font(.caption2).foregroundStyle(.secondary)
                         }
                         if lastMine, let status = delivery(message) {
-                            Group {
-                                if message.status == "held" { Text("\(Image(systemName: "server.rack")) \(status)") } else { Text(status) }
+                            Button { statusHelp = explanation(message) } label: {
+                                Group {
+                                    if message.status == "held" { Text("\(Image(systemName: "server.rack")) \(status)") } else { Text(status) }
+                                }
+                                .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                                .multilineTextAlignment(.trailing).fixedSize(horizontal: false, vertical: true)
                             }
-                            .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
-                            .multilineTextAlignment(.trailing).fixedSize(horizontal: false, vertical: true)
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Explains what this means")
                             .padding(.leading, 40)
                         }
                     }
@@ -408,8 +418,23 @@ struct ConversationView: View {
             return ServerCopy.note(message.serverNote, friend: firstName, server: message.heldOn)
         // The engine keeps every undelivered message queued and retries it until it
         // lands, so neither state is a failure; offline it is simply waiting.
+        case "sending", "failed" where notAccepted: return "Waiting for \(firstName) to accept you"
         case "sending", "failed": return knownOffline ? "Waiting to send" : "Sending…"
         default: return nil
+        }
+    }
+    /// One plain sentence for a tapped status (mirrors src/lib/chatStatus.ts).
+    private func explanation(_ message: ChatMessage) -> String {
+        let name = firstName
+        switch message.status {
+        case "read": return "\(name) has opened the chat and seen your message."
+        case "delivered", "sent": return "It’s on \(name)’s device. You’ll see “Read” once they open the chat (if they share read receipts)."
+        case "held": return "\(name) isn’t online, so \(message.heldOn ?? "your Transfer Server") is keeping your message safe. \(name) gets it the moment they’re back."
+        default:
+            if notAccepted { return "\(name) hasn’t accepted your friend request yet. Your message is saved and arrives as soon as they do." }
+            if message.status == "failed" && message.serverNote != nil { return "Your message is saved on this iPhone and DropBeam keeps trying. You don’t need to do anything." }
+            return knownOffline ? "\(name) isn’t online right now. Your message is saved and goes out by itself as soon as you’re both online with DropBeam open."
+                : "Sending now. It usually takes a second or two."
         }
     }
     /// Presents/dismisses the Tapback cover without the modal slide.
@@ -499,3 +524,12 @@ struct TypingBubble: View {
     }
 }
 
+/// "What this means" for a tapped message status (kept out of the long body chain).
+private struct StatusHelpAlert: ViewModifier {
+    @Binding var text: String?
+    func body(content: Content) -> some View {
+        content.alert("What this means", isPresented: Binding(get: { text != nil }, set: { if !$0 { text = nil } })) {
+            Button("OK", role: .cancel) { text = nil }
+        } message: { Text(text ?? "") }
+    }
+}

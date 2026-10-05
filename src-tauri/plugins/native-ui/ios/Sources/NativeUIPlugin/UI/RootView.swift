@@ -128,6 +128,9 @@ private struct RootPresentations: ViewModifier {
                 // Existing installs that never answered the notification prompt get it
                 // once here (new ones are asked inside setup, at the moment it's explained).
                 guard !settingUp else { return }
+                #if targetEnvironment(simulator)
+                if ProcessInfo.processInfo.arguments.contains("-previewAccounts") { return } // QA screenshots
+                #endif
                 try? await Task.sleep(for: .seconds(2))
                 let center = UNUserNotificationCenter.current()
                 if !settingUp, await center.notificationSettings().authorizationStatus == .notDetermined {

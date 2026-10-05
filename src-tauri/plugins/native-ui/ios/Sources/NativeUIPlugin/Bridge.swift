@@ -51,7 +51,7 @@ final class Bridge: ObservableObject {
     @Published var otherDevices: [DeviceActivity] = []
     @Published var settings: Settings?
     @Published var chatOverview: [ChatOverview] = []
-    @Published var chatUnread: [String: Int] = [:] { didSet { updateAppBadge() } }
+    @Published var chatUnread: [String: Int] = [:] { didSet { updateAppBadge(); clearReadBanners(was: oldValue) } }
     @Published var folders: [SharedFolder] = []
     @Published var blocked: [BlockedPerson] = []
     @Published var chatTyping: [String: Bool] = [:]
@@ -98,6 +98,24 @@ final class Bridge: ObservableObject {
     /// Unread chats on the app icon. Badge permission is requested together with
     /// alerts/sounds at first launch (notification plugin: [.badge, .alert, .sound]);
     /// without it iOS simply ignores the count.
+    /// A chat read here (or on another of your devices) shouldn't leave its
+    /// banners in Notification Center: drop the ones for chats now at 0.
+    private func clearReadBanners(was old: [String: Int]) {
+        let cleared = Set(old.filter { $0.value > 0 && (chatUnread[$0.key] ?? 0) == 0 }.map(\.key))
+        guard !cleared.isEmpty else { return }
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let ids = delivered.filter { n in
+                let content = n.request.content
+                let thread = content.threadIdentifier.hasPrefix("chat-") ? String(content.threadIdentifier.dropFirst(5)) : nil
+                let extra = (content.userInfo["chatPeerId"] as? String)
+                    ?? ((content.userInfo["extra"] as? [String: Any])?["chatPeerId"] as? String)
+                return [thread, extra].compactMap { $0 }.contains(where: cleared.contains)
+            }.map(\.request.identifier)
+            if !ids.isEmpty { center.removeDeliveredNotifications(withIdentifiers: ids) }
+        }
+    }
+
     func updateAppBadge(force: Bool = false) {
         let count = unread
         guard force || count != appliedBadge else { return }

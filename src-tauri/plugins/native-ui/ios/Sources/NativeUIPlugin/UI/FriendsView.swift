@@ -96,10 +96,10 @@ struct FriendsView: View {
             #endif
             .sheet(isPresented: $showingCode) { MyCodeSheet().environmentObject(bridge) }
             .confirmationDialog(removing.map { "Remove \($0.displayName)?" } ?? "", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { friend in
-                Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", role: .destructive) {
+                Button(friend.ownDevice ? "Remove Device" : "Remove Friend", role: .destructive) {
                     bridge.perform { try await bridge.removeFriend(id: friend.id) }
                 }
-            } message: { friend in Text(friend.ownDevice ? "It stops syncing your friends and chats." : "You can add \(friend.name) again with their code.") }
+            } message: { friend in Text(friend.ownDevice ? "It stops getting your new messages and friends. What’s already on it stays there." : "\(friend.name) is removed on all your devices. Your messages stay, and you can add them again with their invite.") }
             .safetyPrompts(block: $blocking, report: $reporting)
             .modifier(BlockRequestPrompt(request: $blockingRequest))
             .confirmationDialog(sendingTo.map { "Send to \($0.displayName)" } ?? "", isPresented: Binding(get: { sendingTo != nil }, set: { if !$0 { sendingTo = nil } }), titleVisibility: .visible, presenting: sendingTo) { friend in
@@ -113,7 +113,7 @@ struct FriendsView: View {
         Section {
             ForEach(bridge.friendRequests) { request in requestRow(request) }
         } header: { Text("Friend Requests") } footer: {
-            Text("They can’t message you, and their files always ask first, until you accept.")
+            Text("Only accept people you know. Until you do, they can’t message you, and any file they send asks first.")
         }.headerProminence(.increased)
     }
     private func requestRow(_ request: FriendRequest) -> some View {
@@ -161,7 +161,7 @@ struct FriendsView: View {
                     Text(friend.displayName).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(2)
                         .alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
                     if friend.ownDevice && friend.name != friend.displayName { Text(friend.name).font(.subheadline).foregroundStyle(.secondary).lineLimit(1) }
-                    PresenceLabel(online: bridge.presence[friend.id] == true)
+                    PresenceLabel(online: bridge.presence[friend.id] == true, notAccepted: friend.awaitingAccept == true)
                 }
                 Spacer(minLength: 4)
                 if !friend.ownDevice, let glyph = deviceSymbol(friend.deviceKind) { Image(systemName: glyph).foregroundStyle(.secondary).accessibilityHidden(true) }
@@ -186,7 +186,7 @@ struct FriendsView: View {
                 Button("Report…", systemImage: "exclamationmark.bubble") { reporting = ReportTarget(friend: friend) }
                 Button("Block…", systemImage: "hand.raised", role: .destructive) { blocking = friend }
             }
-            Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", systemImage: "person.fill.xmark", role: .destructive) { removing = friend }
+            Button(friend.ownDevice ? "Remove Device" : "Remove Friend", systemImage: "person.fill.xmark", role: .destructive) { removing = friend }
         }
     }
 }
@@ -256,7 +256,7 @@ struct FriendDetailView: View {
                     ContactAvatar(friend: friend, size: 96)
                     Text(friend.displayName).font(.title2.bold()).multilineTextAlignment(.center).lineLimit(3)
                     if friend.ownDevice && friend.name != friend.displayName { Text(friend.name).font(.subheadline).foregroundStyle(.secondary) }
-                    PresenceLabel(online: bridge.presence[friendID] == true)
+                    PresenceLabel(online: bridge.presence[friendID] == true, notAccepted: friend.awaitingAccept == true)
                 }.frame(maxWidth: .infinity).accessibilityElement(children: .combine)
             }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 4, trailing: 20))
             Section {
@@ -295,7 +295,7 @@ struct FriendDetailView: View {
                     Button("Report \(friend.displayName)…") { reporting = ReportTarget(friend: friend) }
                     Button("Block \(friend.displayName)", role: .destructive) { blocking = friend; Haptics.warning() }
                 }
-                Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", role: .destructive) { removing = true; Haptics.warning() }
+                Button(friend.ownDevice ? "Remove Device" : "Remove Friend", role: .destructive) { removing = true; Haptics.warning() }
             } footer: {
                 if !isMine { Text("Blocking stops their messages, files and invites on all your devices. They aren’t told.") }
             }
@@ -319,8 +319,8 @@ struct FriendDetailView: View {
                 .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: { Text("Only you see this name.") }
         .confirmationDialog("Remove \(friend.displayName)?", isPresented: $removing, titleVisibility: .visible) {
-            Button(friend.ownDevice ? "Remove from Account" : "Remove Friend", role: .destructive) { bridge.perform { try await bridge.removeFriend(id: friendID); if !bridge.friends.contains(where: { $0.id == friendID }) { dismiss() } } }
-        } message: { Text(friend.ownDevice ? "It stops syncing your friends and chats." : "You can add \(friend.name) again with their code.") }
+            Button(friend.ownDevice ? "Remove Device" : "Remove Friend", role: .destructive) { bridge.perform { try await bridge.removeFriend(id: friendID); if !bridge.friends.contains(where: { $0.id == friendID }) { dismiss() } } }
+        } message: { Text(friend.ownDevice ? "It stops getting your new messages and friends. What’s already on it stays there." : "\(friend.name) is removed on all your devices. Your messages stay, and you can add them again with their invite.") }
     }
     @State private var browsing = false
     private func pick(_ source: String) { bridge.perform { try await bridge.pickAndSend(source: source, friendId: friendID) } }

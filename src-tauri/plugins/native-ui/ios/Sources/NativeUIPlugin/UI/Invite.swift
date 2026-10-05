@@ -397,7 +397,10 @@ struct FriendConnectStatus: View {
             ContactAvatar(friend: friend, size: 96).padding(.top, 12)
             Text("You added \(friend.displayName)").font(.title2.bold()).multilineTextAlignment(.center)
             HStack(spacing: 8) {
-                if online || bridge.presence[friendID] == true {
+                if friend.awaitingAccept == true {
+                    Image(systemName: "hourglass").foregroundStyle(.secondary)
+                    Text("Waiting for \(friend.displayName) to accept you")
+                } else if online || bridge.presence[friendID] == true {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                     Text("Connected").fontWeight(.semibold)
                 } else {
@@ -409,7 +412,9 @@ struct FriendConnectStatus: View {
             .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
             .accessibilityElement(children: .combine).accessibilityAddTraits(.updatesFrequently)
             .animation(.smooth, value: online)
-            if !(online || bridge.presence[friendID] == true) {
+            if friend.awaitingAccept == true {
+                PeerToPeerNote(text: "\(friend.displayName) gets a friend request. Once they tap Accept, your messages reach them. You can close this.")
+            } else if !(online || bridge.presence[friendID] == true) {
                 PeerToPeerNote(text: "Ask \(friend.displayName) to open DropBeam. You can close this — you’ll connect automatically the next time you’re both online.")
             }
             Button { bridge.perform { try await bridge.openChat(friendId: friendID) }; dismiss() } label: {
