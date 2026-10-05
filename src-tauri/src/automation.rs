@@ -91,7 +91,7 @@ pub fn spawn(app: AppHandle, config_dir: PathBuf) {
                 let result = run(&app, &st, &net, &cmd).await;
                 match result {
                     Ok((op, id, code)) => {
-                        if op != "cancel" && !op.starts_with("chat-") { started.lock().unwrap().insert(id.clone(), (op.clone(), Instant::now())); }
+                        if !matches!(op.as_str(), "cancel" | "accept-request" | "block") && !op.starts_with("chat-") { started.lock().unwrap().insert(id.clone(), (op.clone(), Instant::now())); }
                         record(&config_dir, json!({"event": "started", "op": op, "id": id, "code": code, "cmd": cmd}));
                     }
                     Err(e) => record(&config_dir, json!({"event": "error", "cmd": cmd, "error": e})),
@@ -153,6 +153,21 @@ async fn run(app: &AppHandle, st: &Arc<AppState>, net: &Arc<IrohState>, cmd: &Va
                 }
             }
             Ok((op.into(), mid, None))
+        }
+        // Friend requests + blocking: {"op":"accept-request","eid":…},
+        // {"op":"block","to":<friend eid or name>}.
+        "accept-request" => {
+            let eid = cmd["eid"].as_str().unwrap_or("").to_owned();
+            let f = crate::commands::accept_friend_request(app.clone(), app.state(), app.state(), app.state(), eid)?;
+            Ok(("accept-request".into(), f.id, None))
+        }
+        "block" => {
+            let to = cmd["to"].as_str().unwrap_or("");
+            let f = friends::load(&st.config_dir).into_iter()
+                .find(|f| f.endpoint_id.as_deref() == Some(to) || f.name == to)
+                .ok_or_else(|| format!("no friend {to:?}"))?;
+            let ids = crate::commands::block_friend(app.clone(), app.state(), app.state(), f.id.clone())?;
+            Ok(("block".into(), ids.join(","), None))
         }
         "addfriend" => {
             let code = cmd["code"].as_str().unwrap_or("");
