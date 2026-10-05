@@ -1280,7 +1280,8 @@ pub fn hosted_status(config: &Path, id: &str) -> Result<HostedStatus> {
 }
 fn free_bytes(path: &Path) -> u64 { volume_bytes(path).map_or(0, |(free, total)| if plausible_volume(total) { free } else { 0 }) }
 /// (free, total) bytes on the volume `path` lives on; `None` when the mount is
-/// gone (or on a platform without statvfs).
+/// gone. Windows asks GetDiskFreeSpaceExW (a Windows Transfer Server used to
+/// get `None` here and never enforce its keep-free floor).
 pub(crate) fn volume_bytes(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)] {
         use std::{os::unix::ffi::OsStrExt, ffi::CString};
@@ -1291,7 +1292,16 @@ pub(crate) fn volume_bytes(path: &Path) -> Option<(u64, u64)> {
         let frsize = stat.f_frsize as u64;
         Some(((stat.f_bavail as u64).saturating_mul(frsize), (stat.f_blocks as u64).saturating_mul(frsize)))
     }
-    #[cfg(not(unix))] { let _ = path; None }
+    #[cfg(windows)] {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{core::PCWSTR, Win32::Storage::FileSystem::GetDiskFreeSpaceExW};
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let (mut free, mut total) = (0u64, 0u64);
+        // `free` = available to THIS user (honours quotas), like statvfs f_bavail.
+        unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free as *mut u64), Some(&mut total as *mut u64), None) }.ok()?;
+        Some((free, total))
+    }
+    #[cfg(not(any(unix, windows)))] { let _ = path; None }
 }
 
 pub struct Budget { remaining: u64, entries: usize }

@@ -6669,7 +6669,11 @@ mod tests {
         let ino_index = Arc::new(Mutex::new(HashMap::new()));
         let cw = Arc::new(Notify::new());
         let did = handle_move_candidate(&p.to_string_lossy(), &fs, &folder, "pid", &moves, &ino_index, &cw);
-        assert!(did, "an already-recorded move of THIS file ⇒ skip the byte-send");
+        // Only with a reliable file id: Windows has none here (meta_inode = 0), and
+        // by design never suppresses a byte-send on size+mtime alone.
+        let has_file_id = meta_inode(&std::fs::metadata(&p).unwrap()) != 0;
+        assert_eq!(has_file_id, cfg!(unix));
+        assert_eq!(did, has_file_id, "an already-recorded move of THIS file ⇒ skip the byte-send (when it has a file id)");
 
         // Critical: a genuinely DIFFERENT new file dropped at the same path (a move
         // op for a different-sized file lingers) must NOT be skipped — it must still
