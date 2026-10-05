@@ -387,6 +387,7 @@ pub fn run() {
     builder
         .setup(|app| {
             // #67: install the chat-notification click handler before launch finishes.
+            #[cfg(desktop)]
             chat_notify::init(app.handle());
             // Always-on logging to a FILE so we can diagnose issues on machines we
             // can't access (e.g. a tester's Windows box — the log lands in
@@ -806,6 +807,7 @@ pub fn run() {
                 log::info!("setup: launched at login with no tray host — minimized window");
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
+                    #[cfg(desktop)]
                     let _ = w.minimize();
                 }
             } else if autostart_launch {
@@ -865,6 +867,7 @@ pub fn run() {
                 if !force && minimize && !tray_available() {
                     // No tray host: hiding would leave no way back in. Keep it
                     // running (still receiving) as a minimized window instead.
+                    #[cfg(desktop)]
                     let _ = window.minimize();
                     api.prevent_close();
                 } else if !force && minimize {
