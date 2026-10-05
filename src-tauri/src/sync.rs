@@ -4920,6 +4920,10 @@ fn live_manifest(folder: &str) -> HashMap<String, FileEntry> {
     for abs in list_files_rec(Path::new(folder)) {
         let p = abs.to_string_lossy().to_string();
         if p.ends_with(".dropbeam-incoming") {
+            // Every control round walks here, so crash-orphaned placeholders go
+            // even while the folder is busy (the idle rescan's sweep is starved
+            // then: each beacon's wake_sender restarts its sleep).
+            sweep_stale_placeholder(&abs);
             continue;
         }
         let Some(rel) = rel_path_of(&p, folder) else {
