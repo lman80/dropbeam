@@ -33,12 +33,8 @@ jobs:
       - name: Type-check + build
         run: npm run build
 
-      # Reported as annotations but not yet blocking: the tree still has known
-      # lint errors (docs/AUDIT-2026-10-04.md). Remove continue-on-error once
-      # `npx eslint .` is clean.
       - name: ESLint
         run: npx eslint .
-        continue-on-error: true
 
   rust:
     strategy:
