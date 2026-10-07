@@ -1157,6 +1157,10 @@ impl SyncManager {
             // Consecutive idle rescans that queued nothing — drives the
             // seed_existing backoff below (fast after activity, slow when quiet).
             let mut idle_scans: u32 = 0;
+            // The idle rescan's DEADLINE, kept across loop turns: a wake (every
+            // control-beacon success kicks wake_sender) must not restart the wait,
+            // or the rescan never runs while the peer is online.
+            let mut next_scan = tokio::time::Instant::now() + Duration::from_secs(45);
             loop {
                 if stopped.load(Ordering::SeqCst) {
                     break;
@@ -1210,13 +1214,13 @@ impl SyncManager {
                     // BACKOFF: each rescan that finds nothing doubles the wait
                     // (45s → 90s → 180s cap) so a quiet thousands-file folder isn't
                     // re-walked every 45s forever; any real work snaps it back to
-                    // 45s. The cap MUST stay under the control beacon's ~300s
-                    // wake_sender kick — that wake restarts this sleep, so a cap
-                    // ≥300s would starve the rescan entirely while the peer is up.
+                    // 45s. The deadline survives wakes (see `next_scan`): beacons
+                    // wake this loop every round, which used to restart the sleep
+                    // and starve the rescan entirely while the peer was online.
                     tokio::select! {
                         _ = wake.notified() => {}
                         _ = stop_notify.notified() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(45u64 << idle_scans.min(2))) => {
+                        _ = tokio::time::sleep_until(next_scan) => {
                             let folder = config.lock().unwrap().folder.clone();
                             let scan_inbound = inbound.clone();
                             let scan_queue = queue.clone();
@@ -1228,6 +1232,7 @@ impl SyncManager {
                             } else {
                                 idle_scans = idle_scans.saturating_add(1);
                             }
+                            next_scan = tokio::time::Instant::now() + Duration::from_secs(45u64 << idle_scans.min(2));
                         }
                     }
                     continue;
@@ -1241,6 +1246,7 @@ impl SyncManager {
                 }
                 // Real work in the queue → snap the idle rescan back to 45s.
                 idle_scans = 0;
+                next_scan = tokio::time::Instant::now() + Duration::from_secs(45);
                 if file != current {
                     current = file.clone();
                     offline_attempts = 0;
@@ -2275,7 +2281,8 @@ impl SyncManager {
         if mirror && !peer_is_viewer && !locally_paused && !deletes.is_empty() && folder_available(&folder) {
             let mut applied: Vec<(String, u64, Option<(u64, u64)>)> = Vec::new();
             let mut tomb_changed = false;
-            let mut deleted_sigs: Vec<String> = Vec::new();
+            // (sig, the delete's own timestamp) — see record_deleted_versions_at.
+            let mut deleted_sigs: Vec<(String, u64)> = Vec::new();
             // D4: a directory delete removes only what the deleter LISTED (its
             // children ride the same beacon, each with the version it had) — never a
             // file it never saw. Files first, directories after, so a directory is
@@ -2302,7 +2309,7 @@ impl SyncManager {
                 }
                 if did {
                     if let Some(sig) = sig {
-                        deleted_sigs.push(sig);
+                        deleted_sigs.push((sig, *ts));
                     }
                 }
                 // Tombstone the rel(s) so reconcile won't resurrect them and so the
@@ -2331,7 +2338,7 @@ impl SyncManager {
                 persist_tombstones(&self.config_dir, pair_id, &tombstones);
                 persist_tomb_versions(pair_id);
             }
-            record_deleted_versions(&self.config_dir, &folder, &deleted_sigs, now_ms());
+            record_deleted_versions_at(&self.config_dir, &folder, &deleted_sigs);
             if !applied.is_empty() {
                 let snapshot = inbound.lock().unwrap().clone();
                 self.persist_manifest(pair_id, &snapshot);
@@ -2446,7 +2453,7 @@ impl SyncManager {
         let mut deleted_any = false;
         if apply_peer_deletes {
             let mut tomb_changed = false;
-            let mut deleted_sigs: Vec<String> = Vec::new();
+            let mut deleted_sigs: Vec<(String, u64)> = Vec::new();
             for rel in &plan.delete {
                 let Some(tomb_ts) = rec.tombstones.get(rel).copied().or_else(|| {
                     rec.tombstones.iter().find(|(k, _)| norm_rel(k) == *rel).map(|(_, v)| *v)
@@ -2467,7 +2474,7 @@ impl SyncManager {
                 };
                 if apply_remote_delete(folder, rel, self_deleted, &mut removed, DELETE_GRACE_MS, &guard) {
                     deleted_any = true;
-                    deleted_sigs.extend(sig);
+                    deleted_sigs.extend(sig.map(|s| (s, tomb_ts)));
                     for r in &removed {
                         tomb_changed |= note_tombstone(tombstones, r, tomb_ts);
                         inbound
@@ -2505,7 +2512,7 @@ impl SyncManager {
                     note_tomb_version(pair_id, rel, v, ts);
                 }
             }
-            record_deleted_versions(&self.config_dir, folder, &deleted_sigs, now_ms());
+            record_deleted_versions_at(&self.config_dir, folder, &deleted_sigs);
             // ONE write for the whole snapshot (a new member adopting a 9k-entry
             // tombstone set used to rewrite the ~MB file once per entry ≈ GBs of IO).
             if tomb_changed {
@@ -5862,14 +5869,27 @@ fn with_deleted_sigs<R>(config_dir: &Path, folder: &str, f: impl FnOnce(&mut Has
 
 /// Remember that these exact versions were deleted at `ts`. One write per call.
 fn record_deleted_versions(config_dir: &Path, folder: &str, sigs: &[String], ts: u64) {
+    let at: Vec<(String, u64)> = sigs.iter().map(|s| (s.clone(), ts)).collect();
+    record_deleted_versions_at(config_dir, folder, &at);
+}
+
+/// Like `record_deleted_versions`, each sig at its own delete time. A delete that
+/// arrived from a peer is recorded at the DELETE's timestamp (the tombstone's),
+/// never at the moment we got round to applying it: the receive-side refusal
+/// ("a copy of a version we deleted, placed before we deleted it") must use the
+/// same boundary the peer's `delete_allowed` uses to keep its copy. Recording the
+/// later apply time opened a window — a copy the peer placed after the delete
+/// (so it kept it and pushed it back) but before we applied it (so we refused
+/// it) — and the folder stayed split forever (live: closed-app delete, L3).
+fn record_deleted_versions_at(config_dir: &Path, folder: &str, sigs: &[(String, u64)]) {
     if sigs.is_empty() {
         return;
     }
     let path = deleted_sigs_path(config_dir, folder);
     let snapshot = with_deleted_sigs(config_dir, folder, |m| {
-        for s in sigs {
+        for (s, ts) in sigs {
             let e = m.entry(s.clone()).or_insert(0);
-            *e = (*e).max(ts);
+            *e = (*e).max(*ts);
         }
         let cutoff = now_ms().saturating_sub(DELETED_SIG_TTL_MS);
         m.retain(|_, t| *t >= cutoff);
@@ -7349,6 +7369,57 @@ mod tests {
         assert_eq!(crate::folder_history::load(&folder).len(), 1);
     }
 
+    /// Live fold2 `closed` (449ddd9): B deletes x.txt while DropBeam is CLOSED; on
+    /// launch its missed-delete scan propagates the version B knew. A holds the
+    /// same bytes under a different mtime (sync never re-sends an mtime-only
+    /// difference), so the delete names a version A doesn't hold exactly. It must
+    /// still apply on A (archived to History) and leave no survivor that would be
+    /// pushed back (the resurrection) — while a genuine concurrent re-add on A
+    /// (placed after the delete) still wins.
+    #[test]
+    fn closed_app_delete_of_an_identical_file_with_another_mtime_propagates() {
+        // B: knew x.txt (mtime 2000), deleted it while closed.
+        let b = temp_dir("closed-b");
+        let b_folder = b.to_string_lossy().to_string();
+        write_with_mtime(&b.join("closed/x.txt"), &[7u8; 2222], 2_000);
+        let inbound: HashSet<String> =
+            [file_sig(&b.join("closed/x.txt").to_string_lossy(), &b_folder).unwrap()].into();
+        write_with_mtime(&b.join("other.txt"), b"keeps the folder non-empty", 2_000);
+        std::fs::remove_file(b.join("closed/x.txt")).unwrap();
+        let found = missed_deletes(&b_folder, &inbound, &HashMap::new());
+        let known = found["closed/x.txt"];
+        assert_eq!(known, (2222, 2_000));
+        let ts = now_ms() + 1_000; // B's stamp: when it last saw the file
+
+        // A: the same bytes, an older mtime, placed (synced) before the delete.
+        let a = temp_dir("closed-a");
+        let a_folder = a.to_string_lossy().to_string();
+        let ax = a.join("closed/x.txt");
+        write_with_mtime(&ax, &[7u8; 2222], 1_000);
+        // Reconcile view: not a survivor (nothing would be pushed back to B).
+        let mut rec = Reconcile::default();
+        rec.tomb_versions = Some(HashMap::from([("closed/x.txt".to_string(), known)]));
+        rec.tombstones = HashMap::from([("closed/x.txt".to_string(), ts)]);
+        assert!(version_mismatch_survivors(&a_folder, &["closed/x.txt".to_string()], &rec).is_empty());
+        // Live delete path: applied and recoverable.
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let mut ap = Vec::new();
+        let g = DeleteGuard { ts, known: Some(known), listed: None, require_known: true };
+        assert!(apply_remote_delete(&a_folder, "closed/x.txt", &sd, &mut ap, 0, &g));
+        assert!(!ax.exists(), "the identical file is deleted on A");
+        assert!(crate::folder_history::load(&a_folder).iter().any(|h| h.rel_path == "closed/x.txt"));
+
+        // A concurrent re-add on A (placed AFTER B's delete) survives it…
+        write_with_mtime(&ax, &[7u8; 2222], 1_000);
+        let stale = DeleteGuard { ts: now_ms() - 60_000, known: Some(known), listed: None, require_known: true };
+        assert!(!apply_remote_delete(&a_folder, "closed/x.txt", &sd, &mut ap, 0, &stale));
+        assert!(ax.is_file());
+        // …and so does a different-size edit, whatever the timing.
+        write_with_mtime(&ax, &[7u8; 2223], 1_000);
+        assert!(!apply_remote_delete(&a_folder, "closed/x.txt", &sd, &mut ap, 0, &g));
+        assert!(ax.is_file());
+    }
+
     /// A late/re-sent delete never undoes a restore of the identical version.
     #[test]
     fn late_known_delete_spares_a_restored_identical_file() {
@@ -7533,6 +7604,57 @@ mod tests {
         let r = move_staged_into_folder(&staging, &folder.to_string_lossy(), &inbound, true, true, &sd, &ctx(9_000_000));
         assert_eq!(r.outcomes.get("old.txt"), Some(&crate::iroh_net::FolderItemOutcome::Landed));
         assert!(folder.join("old.txt").is_file(), "a re-add after the delete lands");
+    }
+
+    /// Live (L3, Mac↔Linux): a peer kept its copy against our tombstone because it
+    /// placed that copy > 10 min after the delete, and pushed it back as a
+    /// survivor — but we recorded our deleted version at the time we APPLIED the
+    /// (late) delete, so we refused it as "a stale copy of a version we deleted".
+    /// Both sides refused each other forever. The delete is now recorded at the
+    /// tombstone's own time, the same boundary the peer's `delete_allowed` used.
+    #[test]
+    fn survivor_the_peer_kept_is_accepted_after_a_late_applied_delete() {
+        let dir = temp_dir("late-del");
+        let folder = dir.join("f");
+        std::fs::create_dir_all(&folder).unwrap();
+        let cfg = dir.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let folder_s = folder.to_string_lossy().to_string();
+        let now = now_ms();
+        let tomb_ts = now - 30 * 60 * 1000; // deleted 30 min ago, applied by us only now
+        let mtime = (tomb_ts / 1000) - 60; // the version that was deleted
+        // The peer's copy: the exact deleted version, but placed just now (> 10 min
+        // after the delete) — its delete_allowed keeps it, so it is a survivor.
+        let peer = dir.join("peer").join("x.txt");
+        write_with_mtime(&peer, b"same", mtime);
+        assert!(!delete_allowed(&peer, tomb_ts, Some((4, mtime))), "the peer keeps a copy placed after the delete");
+        let peer_ver = path_version_ms(&peer, &std::fs::metadata(&peer).unwrap());
+        assert!(peer_ver > tomb_ts + 10 * 60 * 1000);
+        // We applied the delete late: what the apply sites record now.
+        let sig = format!("x.txt|4|{mtime}");
+        record_deleted_versions_at(&cfg, &folder_s, &[(sig.clone(), tomb_ts)]);
+        assert_eq!(deleted_version_at(&cfg, &folder_s, &sig), Some(tomb_ts));
+        let staging = dir.join("staging");
+        write_with_mtime(&staging.join("x.txt"), b"same", mtime);
+        let (c2, f2) = (cfg.clone(), folder_s.clone());
+        let ctx = LandCtx {
+            vers: [("x.txt".to_string(), peer_ver)].into(),
+            deleted_at: Some(Box::new(move |s: &str| deleted_version_at(&c2, &f2, s))),
+        };
+        let inbound = Arc::new(Mutex::new(HashSet::new()));
+        let sd = Arc::new(Mutex::new(HashMap::new()));
+        let r = move_staged_into_folder(&staging, &folder_s, &inbound, true, true, &sd, &ctx);
+        assert_eq!(r.outcomes.get("x.txt"), Some(&crate::iroh_net::FolderItemOutcome::Landed), "the peer's survivor lands — no split");
+        // A copy placed BEFORE the delete is still a stale copy and is refused.
+        write_with_mtime(&staging.join("x.txt"), b"same", mtime);
+        std::fs::remove_file(folder.join("x.txt")).unwrap();
+        let (c3, f3) = (cfg.clone(), folder_s.clone());
+        let ctx = LandCtx {
+            vers: [("x.txt".to_string(), tomb_ts - 1)].into(),
+            deleted_at: Some(Box::new(move |s: &str| deleted_version_at(&c3, &f3, s))),
+        };
+        let r = move_staged_into_folder(&staging, &folder_s, &inbound, true, true, &sd, &ctx);
+        assert_eq!(r.outcomes.get("x.txt"), Some(&crate::iroh_net::FolderItemOutcome::Kept("deleted".into())));
     }
 
     /// D7: on a case-insensitive volume a peer file that differs only in letter
