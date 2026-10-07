@@ -3004,22 +3004,43 @@ impl SyncManager {
                 h.stop_notify.clone(),
             ))
         };
-        let Some((pair, inbound, tombstones, pending, cw, stop_notify)) = grab() else { return };
+        // At startup this runs from spawn_control_sender, which is called BEFORE
+        // the pair's handle is registered — give the registration a moment instead
+        // of silently skipping the closed-app delete scan.
+        let mut grabbed = grab();
+        for _ in 0..40 {
+            if grabbed.is_some() || stopped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            grabbed = grab();
+        }
+        let Some((pair, inbound, tombstones, pending, cw, stop_notify)) = grabbed else { return };
         if !pair.mirror || pair.i_am_viewer {
             return;
         }
         let scan = {
             let (f, i, t) = (pair.folder.clone(), inbound.clone(), tombstones.clone());
+            let pid_scan = pair_id.to_string();
             move || {
                 let inb = i.lock().unwrap().clone();
                 let tb = t.lock().unwrap().clone();
-                missed_deletes(&f, &inb, &tb)
+                missed_deletes(&f, &inb, &tb, &tomb_versions_of(&pid_scan))
             }
         };
         let first = tokio::task::spawn_blocking(scan.clone()).await.unwrap_or_default();
         if first.is_empty() {
             return;
         }
+        // While the delete is being re-verified (the settle below), refuse the peer
+        // pushing these exact versions back: it still lists them, and a push landing
+        // inside the window would make the second scan see the file "present" — a
+        // resurrection of what the user deleted while we were closed.
+        let _pending = PendingMissed::hold(
+            &pair.folder,
+            first.iter().map(|(r, (sz, mt))| format!("{r}|{sz}|{mt}")).collect(),
+            ts,
+        );
         // Settle like the live delete path does: a folder being replaced or a
         // drive mid-remount must not read as a mass delete.
         if !sleep_unless_stopped(&stop_notify, stopped, 20_000).await {
@@ -5906,9 +5927,49 @@ fn record_deleted_versions_at(config_dir: &Path, folder: &str, sigs: &[(String, 
     }
 }
 
-/// When this exact version was deleted here, if ever.
+/// When this exact version was deleted here, if ever — including a delete made
+/// while DropBeam was closed that is still being re-verified (`PendingMissed`).
 fn deleted_version_at(config_dir: &Path, folder: &str, sig: &str) -> Option<u64> {
-    with_deleted_sigs(config_dir, folder, |m| m.get(sig).copied())
+    with_deleted_sigs(config_dir, folder, |m| m.get(sig).copied()).or_else(|| PendingMissed::get(folder, sig))
+}
+
+/// Versions found missing by the startup/overflow scan, held for the length of
+/// its re-verification. Cleared on drop (every return path of the scan).
+struct PendingMissed {
+    folder: String,
+    sigs: Vec<String>,
+}
+
+impl PendingMissed {
+    fn store() -> &'static Mutex<HashMap<String, HashMap<String, u64>>> {
+        static S: OnceLock<Mutex<HashMap<String, HashMap<String, u64>>>> = OnceLock::new();
+        S.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    fn hold(folder: &str, sigs: Vec<String>, ts: u64) -> Self {
+        let mut s = Self::store().lock().unwrap_or_else(|e| e.into_inner());
+        let m = s.entry(folder.to_string()).or_default();
+        for sig in &sigs {
+            m.insert(sig.clone(), ts);
+        }
+        PendingMissed { folder: folder.to_string(), sigs }
+    }
+    fn get(folder: &str, sig: &str) -> Option<u64> {
+        Self::store().lock().unwrap_or_else(|e| e.into_inner()).get(folder)?.get(sig).copied()
+    }
+}
+
+impl Drop for PendingMissed {
+    fn drop(&mut self) {
+        let mut s = Self::store().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = s.get_mut(&self.folder) {
+            for sig in &self.sigs {
+                m.remove(sig);
+            }
+            if m.is_empty() {
+                s.remove(&self.folder);
+            }
+        }
+    }
 }
 
 // ── Tombstone versions (D4, reconcile path) ─────────────────────────────────
@@ -5994,6 +6055,7 @@ fn missed_deletes(
     folder: &str,
     inbound: &HashSet<String>,
     tombstones: &HashMap<String, u64>,
+    tomb_vers: &HashMap<String, (u64, u64)>,
 ) -> HashMap<String, (u64, u64)> {
     let root = Path::new(folder);
     if !folder_available(folder) {
@@ -6029,7 +6091,7 @@ fn missed_deletes(
         if ci { present.keys().map(|k| k.to_lowercase()).collect() } else { HashSet::new() };
     let missing: HashMap<String, (u64, u64)> = known
         .iter()
-        .filter(|(rel, _)| !tombstones.contains_key(*rel))
+        .filter(|(rel, v)| !tombstone_covers(tombstones, tomb_vers, rel, **v))
         .filter(|(rel, _)| !present.contains_key(*rel) && !(ci && present_folded.contains(&rel.to_lowercase())))
         // Truly gone = NotFound. Any other error (permission, I/O on a flaky NAS)
         // proves nothing.
@@ -6092,6 +6154,26 @@ fn missed_deletes(
         return HashMap::new();
     }
     missing
+}
+
+/// Whether an existing tombstone for `rel` already accounts for the loss of
+/// version `v` (so the missed-delete scan needn't propagate it again). A
+/// tombstone for an EARLIER life of the same path (the file was re-added since)
+/// does not: live, a stale `closed/x.txt` tombstone hid a closed-app delete of
+/// the re-added file, and the peer pushed it straight back (a resurrection).
+fn tombstone_covers(
+    tombstones: &HashMap<String, u64>,
+    tomb_vers: &HashMap<String, (u64, u64)>,
+    rel: &str,
+    v: (u64, u64),
+) -> bool {
+    let Some(&ts) = tombstones.get(rel) else { return false };
+    match tomb_vers.get(rel) {
+        // The tombstone names the version it deleted: only that one is covered.
+        Some(tv) => *tv == v,
+        // Unversioned (legacy) tombstone: covered unless our version is newer.
+        None => ts >= v.1.saturating_mul(1000),
+    }
 }
 
 /// Wait until `ms` elapses or the pair stops. Returns false if stopped.
@@ -7386,7 +7468,7 @@ mod tests {
             [file_sig(&b.join("closed/x.txt").to_string_lossy(), &b_folder).unwrap()].into();
         write_with_mtime(&b.join("other.txt"), b"keeps the folder non-empty", 2_000);
         std::fs::remove_file(b.join("closed/x.txt")).unwrap();
-        let found = missed_deletes(&b_folder, &inbound, &HashMap::new());
+        let found = missed_deletes(&b_folder, &inbound, &HashMap::new(), &HashMap::new());
         let known = found["closed/x.txt"];
         assert_eq!(known, (2222, 2_000));
         let ts = now_ms() + 1_000; // B's stamp: when it last saw the file
@@ -7418,6 +7500,21 @@ mod tests {
         write_with_mtime(&ax, &[7u8; 2223], 1_000);
         assert!(!apply_remote_delete(&a_folder, "closed/x.txt", &sd, &mut ap, 0, &g));
         assert!(ax.is_file());
+    }
+
+    /// While a closed-app delete is re-verified, the peer pushing that exact
+    /// version back is refused (else the second scan sees it "present").
+    #[test]
+    fn pending_missed_delete_refuses_a_push_back_until_verified() {
+        let cfg = temp_dir("pending-cfg");
+        let folder = "/tmp/dropbeam-pending-missed-folder";
+        assert_eq!(deleted_version_at(&cfg, folder, "x.txt|4|100"), None);
+        {
+            let _hold = PendingMissed::hold(folder, vec!["x.txt|4|100".into()], 5_000);
+            assert_eq!(deleted_version_at(&cfg, folder, "x.txt|4|100"), Some(5_000));
+            assert_eq!(deleted_version_at(&cfg, folder, "x.txt|4|101"), None, "another version isn't held");
+        }
+        assert_eq!(deleted_version_at(&cfg, folder, "x.txt|4|100"), None, "released after verification");
     }
 
     /// A late/re-sent delete never undoes a restore of the identical version.
@@ -7510,13 +7607,23 @@ mod tests {
         std::fs::remove_file(dir.join("b.txt")).unwrap();
         std::fs::remove_file(dir.join("sub/e.txt")).unwrap();
         let mut tombs = HashMap::new();
-        let found = missed_deletes(&folder, &inbound, &tombs);
+        let found = missed_deletes(&folder, &inbound, &tombs, &HashMap::new());
         let mut keys: Vec<_> = found.keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, vec!["b.txt", "sub/e.txt"]);
         assert_eq!(found["b.txt"], (5, 1_000), "carries the version we had");
-        tombs.insert("b.txt".to_string(), 5);
-        assert_eq!(missed_deletes(&folder, &inbound, &tombs).len(), 1, "already tombstoned");
+        tombs.insert("b.txt".to_string(), 2_000_000);
+        assert_eq!(missed_deletes(&folder, &inbound, &tombs, &HashMap::new()).len(), 1, "already tombstoned");
+        // A tombstone that names the version it deleted covers only that version.
+        let tv = HashMap::from([("b.txt".to_string(), (5, 1_000))]);
+        assert_eq!(missed_deletes(&folder, &inbound, &tombs, &tv).len(), 1, "same version: covered");
+        // A STALE tombstone from an earlier life of the path (the file was re-added
+        // since — a newer version) must not hide this delete (live: closed/x.txt).
+        let tv = HashMap::from([("b.txt".to_string(), (5, 900))]);
+        assert!(missed_deletes(&folder, &inbound, &tombs, &tv).contains_key("b.txt"), "older tombstoned version");
+        tombs.insert("b.txt".to_string(), 500_000); // unversioned, older than our version
+        assert!(missed_deletes(&folder, &inbound, &tombs, &HashMap::new()).contains_key("b.txt"), "older legacy tombstone");
+        tombs.insert("b.txt".to_string(), 2_000_000);
         // A sub-folder that's still there but EMPTY (an unmounted sub-volume)
         // while we knew several files in it: not a delete.
         for n in ["mnt/x.txt", "mnt/y.txt"] {
@@ -7528,15 +7635,15 @@ mod tests {
         }
         std::fs::remove_file(dir.join("mnt/x.txt")).unwrap();
         std::fs::remove_file(dir.join("mnt/y.txt")).unwrap();
-        assert!(!missed_deletes(&folder, &inbound2, &tombs).contains_key("mnt/x.txt"));
+        assert!(!missed_deletes(&folder, &inbound2, &tombs, &HashMap::new()).contains_key("mnt/x.txt"));
         // Everything gone at once = drive problem, not a delete.
         for n in ["a.txt", "c.txt", "d.txt"] {
             std::fs::remove_file(dir.join(n)).unwrap();
         }
-        assert!(missed_deletes(&folder, &inbound, &HashMap::new()).is_empty());
+        assert!(missed_deletes(&folder, &inbound, &HashMap::new(), &HashMap::new()).is_empty());
         // Root missing entirely.
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(missed_deletes(&folder, &inbound, &HashMap::new()).is_empty());
+        assert!(missed_deletes(&folder, &inbound, &HashMap::new(), &HashMap::new()).is_empty());
     }
 
     /// D6: a receive into a folder whose drive is unplugged lands nothing, never
@@ -7775,7 +7882,7 @@ mod tests {
         assert!(load_skipped(&cfg, "p1").contains_key(&sig), "reconcile won't push it either");
         assert!(!load_manifest(&cfg, "p1").contains("gone.txt|3|1000"), "read-only-era delete not propagated");
         let tombs = HashMap::new();
-        assert!(missed_deletes(&pair.folder, &load_manifest(&cfg, "p1"), &tombs).is_empty());
+        assert!(missed_deletes(&pair.folder, &load_manifest(&cfg, "p1"), &tombs, &HashMap::new()).is_empty());
     }
 
     #[test]
