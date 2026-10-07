@@ -121,7 +121,7 @@ pub(super) async fn endpoint(accept: bool) -> Endpoint {
 pub(super) async fn endpoint_with(accept: bool, key: SecretKey) -> Endpoint {
     let mut b = Endpoint::builder(presets::Minimal)
         .secret_key(key)
-        .path_selector(Arc::new(super::DirectPathSelector))
+        .path_selector(Arc::new(super::DirectPathSelector::default()))
         .relay_mode(iroh::RelayMode::Disabled)
         .bind_addr("127.0.0.1:0")
         .unwrap();

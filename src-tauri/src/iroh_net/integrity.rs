@@ -34,6 +34,11 @@ pub fn rehashed(n: u64) {
     let _ = REHASH.try_with(|a| a.fetch_add(n, Ordering::Relaxed));
     let _ = ACTIVITY_HOOK.try_with(|hook| { if let Some(hook) = hook.lock().unwrap().as_ref() { hook(n); } });
 }
+/// The current transfer's activity hook, for a helper task outside this task's
+/// scope (task-locals don't follow `spawn`).
+pub fn activity_hook() -> Option<Arc<dyn Fn(u64) + Send + Sync>> {
+    ACTIVITY_HOOK.try_with(|h| h.lock().unwrap().clone()).ok().flatten()
+}
 pub fn set_activity_hook(hook: Arc<dyn Fn(u64) + Send + Sync>) {
     let _ = ACTIVITY_HOOK.try_with(|h| *h.lock().unwrap() = Some(hook));
 }
