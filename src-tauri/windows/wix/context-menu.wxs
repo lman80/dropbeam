@@ -4,6 +4,12 @@
      The MSI installs per-machine, so these go under HKLM\Software\Classes and are
      removed with the product. Referenced from tauri.conf.json →
      bundle.windows.wix.fragmentPaths / componentRefs. -->
+<!-- candle compiles each .wxs on its own, so main.wxs's Win64 define isn't visible here. -->
+<?if $(sys.BUILDARCH)="x86"?>
+    <?define Win64 = "no" ?>
+<?else?>
+    <?define Win64 = "yes" ?>
+<?endif?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Fragment>
     <DirectoryRef Id="INSTALLDIR">
