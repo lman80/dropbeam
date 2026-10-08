@@ -175,6 +175,16 @@ fn folder_manifest(root: &std::path::Path) -> Vec<serde_json::Value> {
     out
 }
 
+/// Run blocking work (file IO, hashing, a full `SyncManager::reconcile`) off the
+/// async workers. Lab ops hash/write files of hundreds of MB; doing that inline
+/// on a tokio worker starves the iroh endpoint sharing the runtime (relay pings,
+/// handshakes, the mDNS subscriber) — on a 4-core box that is enough to make the
+/// device look unreachable to the operator.
+#[cfg(any(debug_assertions, feature = "lab"))]
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f).await?
+}
+
 /// Run one authorized lab command. Returns the JSON payload to reply with (the
 /// caller stamps `ok`). New commands slot in here.
 #[cfg(any(debug_assertions, feature = "lab"))]
@@ -311,7 +321,8 @@ async fn dispatch(
             let b = |k: &str| req.get(k).and_then(|v| v.as_bool());
             let pair = crate::pairing::update(&cfg, id, b("twoWay"), b("autoDelete"), None, None, b("mirror"))
                 .map_err(|e| anyhow::anyhow!(e))?;
-            sync_manager(state)?.reconcile();
+            let sm = sync_manager(state)?;
+            blocking(move || Ok(sm.reconcile())).await?;
             Ok(serde_json::to_value(&pair)?)
         }
         // Pause / resume a folder (the shared switch).
@@ -328,7 +339,7 @@ async fn dispatch(
             let sm = sync_manager(state)?;
             sm.announce_unshare(id);
             crate::pairing::remove(&cfg, id).map_err(|e| anyhow::anyhow!(e))?;
-            sm.reconcile();
+            blocking(move || Ok(sm.reconcile())).await?;
             Ok(serde_json::json!({ "removed": id }))
         }
         // Invite one more person into an existing folder (group of 3+).
@@ -338,7 +349,8 @@ async fn dispatch(
             let my_id = state.get().map(|ep| ep.id().to_string());
             let invite = crate::pairing::group_invite(&cfg, id, my_display_name(state), my_id)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            sync_manager(state)?.reconcile();
+            let sm = sync_manager(state)?;
+            blocking(move || Ok(sm.reconcile())).await?;
             Ok(serde_json::json!({ "invite": invite }))
         }
         // Owner: make the member on this link a viewer (or an editor again).
@@ -348,27 +360,31 @@ async fn dispatch(
             let viewer = req.get("viewer").and_then(|v| v.as_bool()).unwrap_or(true);
             let my_id = state.get().map(|ep| ep.id().to_string());
             let ok = crate::pairing::set_peer_viewer(&cfg, id, viewer, my_id.as_deref());
-            sync_manager(state)?.reconcile();
+            let sm = sync_manager(state)?;
+            blocking(move || Ok(sm.reconcile())).await?;
             Ok(serde_json::json!({ "ok_role": ok }))
         }
         // Full pair records + live folder statuses.
         "pair-dump" => {
             let cfg = config_dir(state)?;
-            let statuses = sync_manager(state)?.statuses();
-            Ok(serde_json::json!({ "pairs": crate::pairing::load(&cfg), "statuses": statuses }))
+            let sm = sync_manager(state)?;
+            blocking(move || Ok(serde_json::json!({ "pairs": crate::pairing::load(&cfg), "statuses": sm.statuses() }))).await
         }
         // A folder's History (deleted/overwritten copies) and restoring one.
         "history-list" => {
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
-            Ok(serde_json::json!({ "items": crate::folder_history::load(&root.to_string_lossy()) }))
+            blocking(move || Ok(serde_json::json!({ "items": crate::folder_history::load(&root.to_string_lossy()) }))).await
         }
         "history-restore" => {
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
-            let to = crate::folder_history::restore(&root.to_string_lossy(), str_field(req, "itemId")?)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok(serde_json::json!({ "restored": to }))
+            let item = str_field(req, "itemId")?.to_owned();
+            blocking(move || {
+                let to = crate::folder_history::restore(&root.to_string_lossy(), &item).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(serde_json::json!({ "restored": to }))
+            })
+            .await
         }
 
         // List shared folders on this device.
@@ -390,10 +406,14 @@ async fn dispatch(
             let size = req.get("size").and_then(|v| v.as_u64()).unwrap_or(4096).min(1 << 30) as usize;
             let seed = req.get("seed").and_then(|v| v.as_u64()).unwrap_or(1);
             let p = lab_path(&root, rel)?;
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&p, crate::labkit::payload(size, seed))?;
+            blocking(move || {
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&p, crate::labkit::payload(size, seed))?;
+                Ok(())
+            })
+            .await?;
             Ok(serde_json::json!({ "wrote": rel, "bytes": size }))
         }
 
@@ -402,7 +422,11 @@ async fn dispatch(
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
             let p = lab_path(&root, str_field(req, "rel")?)?;
-            if p.is_dir() { std::fs::remove_dir_all(&p)?; } else { let _ = std::fs::remove_file(&p); }
+            blocking(move || {
+                if p.is_dir() { std::fs::remove_dir_all(&p)?; } else { let _ = std::fs::remove_file(&p); }
+                Ok(())
+            })
+            .await?;
             Ok(serde_json::json!({ "deleted": str_field(req, "rel")? }))
         }
 
@@ -412,10 +436,13 @@ async fn dispatch(
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
             let from = lab_path(&root, str_field(req, "from")?)?;
             let to = lab_path(&root, str_field(req, "to")?)?;
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(&from, &to)?;
+            blocking(move || {
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Ok(std::fs::rename(&from, &to)?)
+            })
+            .await?;
             Ok(serde_json::json!({ "moved": [str_field(req, "from")?, str_field(req, "to")?] }))
         }
 
@@ -423,7 +450,7 @@ async fn dispatch(
         "fs-manifest" => {
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
-            let files = folder_manifest(&root);
+            let files = blocking(move || Ok(folder_manifest(&root))).await?;
             Ok(serde_json::json!({ "count": files.len(), "files": files }))
         }
 

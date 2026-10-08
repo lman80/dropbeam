@@ -156,14 +156,26 @@ async fn t1_big_manifest_to_old_receiver_degrades_not_fails() {
     server.close().await;
 }
 
+/// Verification stall budget for the 20k-file pulls. These tests check paging,
+/// not stall detection; on a Windows CI runner (Defender scanning every new file)
+/// landing 20,000 files can go quiet longer than the production 60 s and failed
+/// as "verification inactivity timeout" (run 37546183791). The outer 240 s
+/// timeout still catches a real hang.
+const MANY_FILES_STALL: Duration = Duration::from_secs(240);
+
 /// Pull `staged` like the app's Quick Send receiver (pages_v + read_header).
 async fn quick_pull(staged: Vec<PathBuf>, dest: &Path, pages_ok: bool) -> (Result<Vec<PathBuf>>, Result<u64>) {
+    integrity::STALL_BUDGET.scope(MANY_FILES_STALL, quick_pull_inner(staged, dest, pages_ok)).await
+}
+
+async fn quick_pull_inner(staged: Vec<PathBuf>, dest: &Path, pages_ok: bool) -> (Result<Vec<PathBuf>>, Result<u64>) {
     let server = endpoint(true).await;
     let client = endpoint(false).await;
     let ticket = make_ticket(&server, "t1-token").unwrap();
     let (addr, token) = parse_ticket(&ticket).unwrap();
     let srv = server.clone();
-    let serve = tokio::spawn(async move {
+    // Task-locals don't follow tokio::spawn: scope the serving task too.
+    let serve = tokio::spawn(integrity::STALL_BUDGET.scope(MANY_FILES_STALL, async move {
         let conn = srv.accept().await.unwrap().await?;
         let (mut send, mut recv) = conn.accept_bi().await?;
         let req = read_frame(&mut recv).await?;
@@ -172,7 +184,7 @@ async fn quick_pull(staged: Vec<PathBuf>, dest: &Path, pages_ok: bool) -> (Resul
             true, pages_ok && req["pages_v"] == 1, &AtomicBool::new(false), |_, _| {})).await?;
         let _ = recv.read_to_end(256).await;
         Ok(sent)
-    });
+    }));
     let conn = client.connect(addr, ALPN).await.unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     write_frame(&mut send, &serde_json::json!({"kind": "pull", "token": token, "parallel": true, "integrity_v": 1, "pages_v": 1})).await.unwrap();
