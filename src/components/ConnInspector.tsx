@@ -13,13 +13,16 @@ export function ConnInfo({
   locality,
   label = 'Connection details',
   align = 'end',
+  moving = false,
 }: {
   detail?: ConnDetail | null
   locality?: Locality | null
   label?: string
   align?: 'start' | 'end' | 'center'
+  /** Bytes are actively moving — never show a stale "Connecting". */
+  moving?: boolean
 }) {
-  const kind = pathKind(detail, locality)
+  const kind = pathKind(detail, locality, moving)
   if (!kind) return null
   const Icon = ICONS[kind]
   return (

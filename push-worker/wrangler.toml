@@ -1,0 +1,31 @@
+name = "dropbeam-push"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+APNS_TOPIC = "com.ashtonmiller.dropbeam"
+
+# Rate limits (Workers Rate Limiting API: per Cloudflare location, period 10 or
+# 60 s). Keys are derived by the Worker (client IP, verified server key, hashed
+# APNs token) — see worker.js. No KV: per-request KV writes let anyone burn the
+# daily write quota and take push down for everyone. The old PUSH_RL namespace
+# (01482baf090e4b7c994c4010d5e251b7) is no longer used and can be deleted.
+[[ratelimits]]
+name = "RL_IP"
+namespace_id = "7101"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "RL_GLOBAL"
+namespace_id = "7102"
+simple = { limit = 600, period = 60 }
+
+[[ratelimits]]
+name = "RL_SERVER"
+namespace_id = "7103"
+simple = { limit = 60, period = 60 }
+
+[[ratelimits]]
+name = "RL_TOKEN"
+namespace_id = "7104"
+simple = { limit = 10, period = 60 }

@@ -1,4 +1,6 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { dateTime } from '../lib/dates'
+import { errorText } from '../lib/errors'
 import { ArrowDownToLine, ArrowUpFromLine, ChevronDown, ChevronLeft, ChevronRight, File, Folder, FolderPlus, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
 import { api, locationsApi, onLocationsChanged, onTransferUpdate, type LocationEntry, type LocationPage, type SharedLocation } from '../lib/api'
@@ -6,6 +8,8 @@ import { formatBytes } from '../lib/format'
 import { rememberLocationUpload, useStore } from '../store'
 import { Dialog } from './Dialog'
 import { IconButton, MenuPopover, Spinner } from './ui'
+import { TransferCard } from './TransferCard'
+import { outgoingForLocation, trackOutgoingLocationUpload } from '../lib/locationUploads'
 
 type Action = 'mkdir' | 'rename' | 'trash'
 const join = (parent: string, name: string) => parent ? `${parent}/${name}` : name
@@ -39,9 +43,10 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     try {
       const result = await request<LocationPage>('ls', { cursor: cursors.current[page], sort, query })
       if (token === generation.current) { cursors.current[page] = result.cursor; cursors.current[page + 1] = result.nextCursor; setData(result); setSelected(s => s.filter(name => result.entries.some(e => e.name === name))) }
-    } catch(e) { if (token === generation.current) { setError(String(e)); setData({ entries: [], page, hasMore: false }); setSelected([]) } }
+    } catch(e) { if (token === generation.current) { setError(errorText(e)); setData({ entries: [], page, hasMore: false }); setSelected([]) } }
     finally { if (token === generation.current) setLoading(false) }
   }, [page, request, sort, query])
+  // eslint-disable-next-line react-hooks/set-state-in-effect, react-hooks/exhaustive-deps -- fetch on input change; the bump invalidates the in-flight page
   useEffect(() => { void refresh(); return () => { ++generation.current } }, [refresh])
   useEffect(() => {
     let alive = true; const cleanup: (() => void)[] = []
@@ -60,8 +65,9 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     try {
       const u = await locationsApi.upload(friendId, location.id, path, paths)
       rememberLocationUpload(u.id, friendId, location.id, path, paths)
+      trackOutgoingLocationUpload(u.id, { friendId, locationId: location.id, relPath: path })
       if (!useStore.getState().transfers[u.id]) useStore.getState().upsertTransfer(u)
-      toast('success', 'Uploading · follow it in Send & Receive')
+      if (MOBILE_UI) toast('success', 'Uploading · follow it in Send & Receive')
     } catch(e) { toast('error', String(e)) }
     finally { actionBusy.current = false; setBusy(false) }
   }, [friendId, location.id, location.rights.upload, path, toast])
@@ -85,7 +91,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
           try {
             const result = await request<{ trashPath: string }>('trash', { rel_path: join(path, item.name) })
             results.push({ name: item.name, trashPath: result.trashPath })
-          } catch(e) { results.push({ name: item.name, error: String(e) }) }
+          } catch(e) { results.push({ name: item.name, error: errorText(e) }) }
           setTrashResults([...results])
         }
         const failed = results.filter(r => r.error)
@@ -100,7 +106,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       }
       toast('success', dialog === 'mkdir' ? 'Folder created' : 'Renamed')
       setDialog(null); setSelected([])
-    } catch(e) { setActionError(String(e)) }
+    } catch(e) { setActionError(errorText(e)) }
     finally { actionBusy.current = false; setBusy(false); restart() }
   }
   const pick = async (folder: boolean) => {
@@ -127,12 +133,12 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
   const trashTitle = trashCount === 1 ? `Move “${selectedEntries[0].name}” to Trash?` : `Move ${trashCount} items to Trash?`
   const failures = trashResults.filter(r => r.error)
   const actionSheet = dialog && <Dialog width={400} busy={busy} onClose={() => setDialog(null)} className="location-dialog"
-    title={dialog === 'trash' ? (trashCount ? trashTitle : 'Move to Trash') : dialog === 'rename' ? 'Rename' : 'New folder'}
+    title={dialog === 'trash' ? (trashCount ? trashTitle : 'Move to Trash') : dialog === 'rename' ? 'Rename' : 'New Folder'}
     footer={<>
       <button type="button" className="btn btn-secondary" disabled={busy} autoFocus={dialog === 'trash'} onClick={() => setDialog(null)}>{failures.length ? 'Close' : 'Cancel'}</button>
       <button type="submit" form="location-action-form" className={dialog === 'trash' ? 'btn btn-destructive' : 'btn btn-primary'}
         disabled={busy || (dialog !== 'trash' && !validName) || (dialog === 'trash' && !trashCount)}>
-        {busy ? 'Working…' : dialog === 'trash' ? (failures.length ? 'Try again' : 'Move to Trash') : dialog === 'mkdir' ? 'Create' : 'Rename'}</button>
+        {busy ? 'Working…' : dialog === 'trash' ? (failures.length ? 'Try Again' : 'Move to Trash') : dialog === 'mkdir' ? 'Create' : 'Rename'}</button>
     </>}>
     <form id="location-action-form" onSubmit={e => { e.preventDefault(); void run() }}>
       {dialog === 'trash'
@@ -171,7 +177,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
   const pageable = page > 0 || data.hasMore
   const here = parts.at(-1) ?? location.name
   return <section className="location-browser" aria-label={`${location.name} file browser`}>
-    <div className="page-header titlebar-drag location-browser-head">
+    <div className="page-header titlebar-drag location-browser-head" data-tauri-drag-region="deep">
       <div className="location-crumbs">
         <IconButton label="All locations" onClick={onBack} disabled={!onBack}><ChevronLeft /></IconButton>
         <nav aria-label="Folder path" className="location-breadcrumbs">
@@ -191,7 +197,7 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       </div>
       <div className="page-actions">
         <IconButton label="Refresh" disabled={loading || busy} onClick={restart}><RefreshCw /></IconButton>
-        {location.rights.manage && <IconButton label="New folder" disabled={!canAct} onClick={() => openDialog('mkdir')}><FolderPlus /></IconButton>}
+        {location.rights.manage && <IconButton label="New Folder" disabled={!canAct} onClick={() => openDialog('mkdir')}><FolderPlus /></IconButton>}
         {location.rights.upload && <UploadButton disabled={!canAct} onPick={folder => void pick(folder)} />}
       </div>
     </div>
@@ -217,6 +223,8 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
       </>}</div>
     </div>
 
+    <LocationUploads friendId={friendId} location={location} />
+
     <div className={`group location-table-group${hover && location.rights.upload ? ' location-drop' : ''}${loading && entries.length ? ' location-loading' : ''}`} aria-busy={loading}>
       <table className="location-table">
         <thead><tr>
@@ -238,13 +246,13 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
                 : <span className="location-filename"><File className="location-icon-file" aria-hidden /><span className="truncate-1" title={entry.name}>{entry.name}</span></span>}
             </td>
             <td className="location-col-size tnum">{entry.isDir ? '—' : formatBytes(entry.size)}</td>
-            <td className="location-col-date tnum">{entry.modified ? new Date(entry.modified).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—'}</td>
+            <td className="location-col-date tnum">{entry.modified ? dateTime(entry.modified) : '—'}</td>
           </tr>
         })}</tbody>
       </table>
       {error
         ? <div className="location-table-note" role="alert"><span className="truncate-1" title={error}>Couldn’t open this folder</span>
-          <button type="button" className="btn btn-plain btn-sm" disabled={busy || loading} onClick={restart}>Try again</button></div>
+          <button type="button" className="btn btn-plain btn-sm" disabled={busy || loading} onClick={restart}>Try Again</button></div>
         : loading && !entries.length
           ? <div className="location-table-note" role="status"><Spinner /> Loading…</div>
           : !entries.length && <div className="location-table-note">{query ? 'No matches' : location.rights.upload ? 'Empty folder · drop files here to upload' : 'Empty folder'}</div>}
@@ -266,6 +274,18 @@ export function FileBrowser({ friendId, location, online, host, onBack }: { frie
     </footer>
     {actionSheet}
   </section>
+}
+
+/** Uploads from this device into this Location, in place (GitHub #30) — the same
+ *  card as Send & Receive, so pause/cancel/retry work here too. Its own component
+ *  so progress ticks don't re-render the file table. */
+function LocationUploads({ friendId, location }: { friendId: string; location: SharedLocation }) {
+  const transfers = useStore(s => s.transfers)
+  const uploads = useMemo(() => outgoingForLocation(transfers, friendId, location.id), [transfers, friendId, location.id])
+  if (!uploads.length) return null
+  return <div className="location-uploads" aria-label={`Uploading to ${location.name}`}>
+    {uploads.map(t => <TransferCard key={t.id} t={t} />)}
+  </div>
 }
 
 /** "Upload" with a small menu: files, or a whole folder. */

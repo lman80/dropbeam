@@ -120,7 +120,7 @@ pub fn create(
     let _guard = LOCK.lock().unwrap();
     let mut pairs = load(config_dir);
     if pairs.iter().any(|p| same_path(&p.folder, &folder)) {
-        return Err("That folder is already a Shared Drop Folder.".into());
+        return Err("That folder is already shared. Choose a different folder.".into());
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -181,6 +181,32 @@ pub fn create(
 
 /// Accept an invite (this device is B).
 pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pair, String> {
+    accept_inner(config_dir, invite_str, folder, None)
+}
+
+/// Join a shared folder the way a person does it: they pick WHERE to keep it
+/// ("Documents", "Desktop"…), not an empty folder made for the purpose. If the
+/// chosen folder already holds other things, the shared files go into a new
+/// subfolder named after the shared folder instead of being mixed in with (and,
+/// in a two-way folder, sent along with) everything already there. `folder_name`
+/// is the shared folder's name when the invite came with one; otherwise the
+/// subfolder is named after the person who shared it.
+pub fn accept_joining(
+    config_dir: &Path,
+    invite_str: &str,
+    chosen: String,
+    folder_name: Option<String>,
+) -> Result<Pair, String> {
+    accept_inner(config_dir, invite_str, chosen, Some(folder_name.unwrap_or_default()))
+}
+
+fn accept_inner(
+    config_dir: &Path,
+    invite_str: &str,
+    folder: String,
+    // Some(name) = choose a safe spot inside `folder` (see accept_joining).
+    join_as: Option<String>,
+) -> Result<Pair, String> {
     validate_folder(&folder)?;
     let body = crate::codes::strip_prefix(invite_str, INVITE_PREFIX)
         .ok_or("That doesn't look like a DropBeam invite code.")?;
@@ -193,10 +219,27 @@ pub fn accept(config_dir: &Path, invite_str: &str, folder: String) -> Result<Pai
     let _guard = LOCK.lock().unwrap();
     let mut pairs = load(config_dir);
     if pairs.iter().any(|p| p.id == invite.id) {
-        return Err("You're already paired with this invite.".into());
+        return Err("You've already joined this shared folder.".into());
     }
+    let folder = match join_as {
+        None => folder,
+        Some(name) => {
+            let name = if name.trim().is_empty() {
+                let who = friends::sanitize_display_name(&invite.name, "");
+                if who.is_empty() { "Shared Folder".to_string() } else { format!("Shared by {who}") }
+            } else {
+                name
+            };
+            let target = join_target(Path::new(&folder), &name);
+            if !target.is_dir() {
+                fs::create_dir_all(&target)
+                    .map_err(|e| format!("Couldn't make a folder for the shared files there: {e}"))?;
+            }
+            target.to_string_lossy().into_owned()
+        }
+    };
     if pairs.iter().any(|p| same_path(&p.folder, &folder)) {
-        return Err("That folder is already a Shared Drop Folder.".into());
+        return Err("That folder is already a shared folder. Choose a different place.".into());
     }
 
     let pair = Pair {
@@ -366,6 +409,10 @@ pub fn key_unkeyed_group_link(config_dir: &Path, pair_id: &str, eid: &str) -> bo
     }
     if changed {
         let _ = save(config_dir, &pairs);
+        // Someone the owner deliberately (re-)invited is welcome again.
+        if let Some(g) = &gid {
+            unremove_member(config_dir, g, eid);
+        }
     }
     changed
 }
@@ -435,6 +482,15 @@ pub fn ensure_member(
     {
         return None; // already meshed with this member
     }
+    // D13: a member who was REMOVED from this folder stays removed — another
+    // member's roster gossip must not quietly re-create the link.
+    if load_removed(config_dir).get(group_id).is_some_and(|r| r.iter().any(|e| e == endpoint_id)) {
+        return None;
+    }
+    // A blocked person is never meshed with, whoever lists them.
+    if crate::block::is_blocked(config_dir, endpoint_id) {
+        return None;
+    }
     let new = Pair {
         // CRITICAL: both ends must derive the SAME id, because the folder-files /
         // folder-ctrl handlers authorize by matching the wire pair_id to a local
@@ -464,8 +520,10 @@ pub fn ensure_member(
     };
     pairs.push(new.clone());
     let _ = save(config_dir, &pairs);
-    // Folder partners are friends, so they show up by name + you can chat them.
-    friends::upsert_by_endpoint(config_dir, endpoint_id, &new.peer_name);
+    // A member another member listed is NOT made a friend (that would let any
+    // member hand out auto-accepting friendships): someone new is a friend
+    // request the user can accept.
+    friends::note_folder_member(config_dir, endpoint_id, &new.peer_name);
     Some(new)
 }
 
@@ -608,15 +666,142 @@ pub fn bind_friend_invite(
     }
     pairs[index].endpoint_id = Some(eid.to_string());
     pairs[index].peer_name = name.to_string();
-    save(config_dir, &pairs)
+    let gid = pairs[index].group_id.clone();
+    save(config_dir, &pairs)?;
+    if let Some(g) = gid {
+        unremove_member(config_dir, &g, eid);
+    }
+    Ok(())
 }
 
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap();
     let mut pairs = load(config_dir);
+    // D13: remember who was removed from a group folder FIRST, so a roster beacon
+    // arriving on another link in the meantime (e.g. while "Leave" removes the
+    // links one by one) can't re-create this one.
+    if let Some(p) = pairs.iter().find(|p| p.id == id) {
+        if let (Some(g), Some(e)) = (&p.group_id, &p.endpoint_id) {
+            let mut removed = load_removed(config_dir);
+            let list = removed.entry(g.clone()).or_default();
+            if !list.iter().any(|x| x == e) {
+                list.push(e.clone());
+            }
+            save_removed(config_dir, &removed);
+        }
+    }
+    let gid = pairs.iter().find(|p| p.id == id).and_then(|p| p.group_id.clone());
     pairs.retain(|p| p.id != id);
+    // Left the folder entirely (no link to it remains): forget its removal list,
+    // so re-joining it later meshes with everyone again.
+    if let Some(g) = gid {
+        if !pairs.iter().any(|p| p.group_id.as_deref() == Some(g.as_str())) {
+            let mut removed = load_removed(config_dir);
+            if removed.remove(&g).is_some() {
+                save_removed(config_dir, &removed);
+            }
+        }
+    }
     // Legitimately empties pairs.json when removing your last shared folder.
     save_inner(config_dir, &pairs, true)
+}
+
+// ── Removed group members (D13) ─────────────────────────────────────────────
+// group_id → endpoint ids removed from that folder. Separate file so the Pair
+// schema (and every place that builds one) is untouched.
+
+fn removed_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("folder-removed-members.json")
+}
+
+fn load_removed(config_dir: &Path) -> std::collections::HashMap<String, Vec<String>> {
+    fs::read_to_string(removed_path(config_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_removed(config_dir: &Path, map: &std::collections::HashMap<String, Vec<String>>) {
+    if let Ok(txt) = serde_json::to_string(map) {
+        let _ = crate::settings::write_atomic(&removed_path(config_dir), txt.as_bytes());
+    }
+}
+
+fn unremove_member(config_dir: &Path, group_id: &str, eid: &str) {
+    let mut removed = load_removed(config_dir);
+    if let Some(list) = removed.get_mut(group_id) {
+        let before = list.len();
+        list.retain(|e| e != eid);
+        if list.len() != before {
+            save_removed(config_dir, &removed);
+        }
+    }
+}
+
+/// Members removed from this group folder (rides the roster beacon).
+pub fn removed_members(config_dir: &Path, group_id: &str) -> Vec<String> {
+    load_removed(config_dir).remove(group_id).unwrap_or_default()
+}
+
+/// Apply the folder OWNER's removed-members list: it becomes our list for the
+/// group (so a re-invited member is welcome again), and every link we hold to a
+/// removed member is returned (id, eid) for the caller to unshare + drop. Ignored
+/// unless `sender_eid` is the group's recorded owner. Never removes ourselves.
+pub fn apply_owner_removals(
+    config_dir: &Path,
+    group_id: &str,
+    sender_eid: &str,
+    removed: &[String],
+    my_eid: &str,
+) -> Vec<(String, String)> {
+    let _guard = LOCK.lock().unwrap();
+    let pairs = load(config_dir);
+    let is_owner = pairs.iter().any(|p| {
+        p.group_id.as_deref() == Some(group_id) && p.owner_eid.as_deref() == Some(sender_eid)
+    });
+    if !is_owner {
+        return Vec::new();
+    }
+    let mut map = load_removed(config_dir);
+    let mut list: Vec<String> = removed
+        .iter()
+        .filter(|e| !e.is_empty() && e.as_str() != my_eid && e.as_str() != sender_eid)
+        .cloned()
+        .collect();
+    list.sort();
+    list.dedup();
+    let current = map.get(group_id).cloned().unwrap_or_default();
+    if current != list {
+        if list.is_empty() {
+            map.remove(group_id);
+        } else {
+            map.insert(group_id.to_string(), list.clone());
+        }
+        save_removed(config_dir, &map);
+    }
+    pairs
+        .iter()
+        .filter(|p| p.group_id.as_deref() == Some(group_id))
+        .filter_map(|p| {
+            let e = p.endpoint_id.as_ref()?;
+            list.contains(e).then(|| (p.id.clone(), e.clone()))
+        })
+        .collect()
+}
+
+/// Drop several links at once (an owner's removal). Never empties pairs.json by
+/// accident: only the named ids go.
+pub fn remove_links(config_dir: &Path, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let _guard = LOCK.lock().unwrap();
+    let mut pairs = load(config_dir);
+    let before = pairs.len();
+    pairs.retain(|p| !ids.contains(&p.id));
+    if pairs.len() != before {
+        let _ = save_inner(config_dir, &pairs, true);
+    }
 }
 
 /// The code phrase this side SENDS on.
@@ -725,7 +910,10 @@ pub fn set_pause(config_dir: &Path, pair_id: &str, paused: bool, epoch: u64) -> 
             None => p.id == pair_id,
         };
         // Only move FORWARD in epoch so a stale beacon can't un-pause us.
-        if in_scope && epoch >= p.pause_epoch {
+        // A poisoned far-future stored epoch (older builds accepted any value)
+        // must not freeze the switch forever.
+        let stored = if p.pause_epoch > now_ms().saturating_add(24 * 3600 * 1000) { 0 } else { p.pause_epoch };
+        if in_scope && epoch >= stored {
             p.paused = paused;
             p.pause_epoch = epoch;
             affected.push(p.id.clone());
@@ -968,6 +1156,45 @@ fn validate_folder(folder: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Files an OS drops into folders on its own — they don't make a folder "in use".
+fn os_clutter(name: &str) -> bool {
+    matches!(name, ".DS_Store" | ".localized" | "desktop.ini" | "Thumbs.db" | ".directory")
+}
+
+fn dir_is_empty(p: &Path) -> bool {
+    match fs::read_dir(p) {
+        Ok(mut it) => it.all(|e| e.map(|e| os_clutter(&e.file_name().to_string_lossy())).unwrap_or(false)),
+        Err(_) => false,
+    }
+}
+
+/// Where a joined shared folder should live, given the folder the person picked
+/// (see `accept_joining`): the picked folder itself when it's empty or already
+/// named after the share; otherwise a new subfolder `<name>` (or `<name> 2`, …
+/// when that name is taken by something non-empty). Never returns a folder that
+/// already holds unrelated files.
+pub(crate) fn join_target(chosen: &Path, name: &str) -> PathBuf {
+    let clean = crate::iroh_net::windows_safe_component(&friends::sanitize_display_name(name, "Shared Folder"));
+    if dir_is_empty(chosen) {
+        return chosen.to_path_buf();
+    }
+    let same_name = chosen
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase() == clean.to_lowercase())
+        .unwrap_or(false);
+    if same_name {
+        return chosen.to_path_buf();
+    }
+    let free = |p: &Path| !p.exists() || (p.is_dir() && dir_is_empty(p));
+    let mut candidate = chosen.join(&clean);
+    let mut n = 2;
+    while !free(&candidate) && n < 1000 {
+        candidate = chosen.join(format!("{clean} {n}"));
+        n += 1;
+    }
+    candidate
+}
+
 fn same_path(a: &str, b: &str) -> bool {
     let norm = |s: &str| s.trim_end_matches('/').to_string();
     norm(a) == norm(b)
@@ -1098,6 +1325,51 @@ mod tests {
         // One-way: A sends only, B listens only.
         assert!(runs_sender(&a) && !runs_listener(&a));
         assert!(!runs_sender(&b) && runs_listener(&b));
+    }
+
+    #[test]
+    fn joining_into_a_busy_folder_makes_a_subfolder() {
+        let dir = role_test_dir("join-target");
+        // Empty folder: used as-is (only OS clutter inside).
+        let empty = dir.join("Empty");
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(empty.join(".DS_Store"), b"x").unwrap();
+        assert_eq!(join_target(&empty, "Family Photos"), empty);
+        // A folder already named after the share: used as-is.
+        let named = dir.join("family photos");
+        fs::create_dir_all(&named).unwrap();
+        fs::write(named.join("a.jpg"), b"x").unwrap();
+        assert_eq!(join_target(&named, "Family Photos"), named);
+        // Documents with other things in it: a new "Family Photos" inside.
+        let docs = dir.join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("taxes.pdf"), b"x").unwrap();
+        assert_eq!(join_target(&docs, "Family Photos"), docs.join("Family Photos"));
+        // That name taken by something non-empty: "Family Photos 2".
+        fs::create_dir_all(docs.join("Family Photos")).unwrap();
+        fs::write(docs.join("Family Photos").join("old.jpg"), b"x").unwrap();
+        assert_eq!(join_target(&docs, "Family Photos"), docs.join("Family Photos 2"));
+        // Unsafe names can't escape the chosen folder.
+        let t = join_target(&docs, "../../etc");
+        assert_eq!(t.parent().unwrap(), docs.as_path());
+    }
+
+    #[test]
+    fn accept_joining_never_mixes_into_existing_files() {
+        let dir = role_test_dir("accept-joining");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let (_pair, code) = create(&dir, src.to_string_lossy().into(), "Alex".into(),
+            true, String::new(), false, Some("alex-eid".into())).unwrap();
+        // The joiner is a different device with its own config dir.
+        let other = dir.join("other-config");
+        fs::create_dir_all(&other).unwrap();
+        let docs = dir.join("Documents");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("letter.txt"), b"x").unwrap();
+        let pair = accept_joining(&other, &code, docs.to_string_lossy().into(), Some("Trip".into())).unwrap();
+        assert_eq!(Path::new(&pair.folder), docs.join("Trip").as_path());
+        assert!(docs.join("Trip").is_dir());
     }
 
     fn role_test_dir(tag: &str) -> PathBuf {
@@ -1262,5 +1534,53 @@ mod tests {
         .unwrap();
         std::fs::write(pairs_path(&dir), b"[{\"id\":\"a\"").unwrap(); // truncated
         assert_eq!(load(&dir).len(), 2, "both folders recovered from .bak");
+    }
+
+    /// D13: removing a member sticks — another member's roster gossip can't
+    /// quietly re-create the link — and only the OWNER's removal list spreads.
+    #[test]
+    fn removed_member_stays_removed_and_only_owner_lists_spread() {
+        let dir = role_test_dir("removed");
+        let to_b = group_pair("lb", "g1", Some("me"), Some("B"));
+        let to_c = group_pair("lc", "g1", Some("me"), Some("C"));
+        save(&dir, &[to_b.clone(), to_c.clone()]).unwrap();
+        remove(&dir, "lb").unwrap();
+        assert_eq!(removed_members(&dir, "g1"), vec!["B".to_string()]);
+        // C's beacon still lists B → must NOT re-create the link.
+        assert!(ensure_member(&dir, "g1", &to_c, "B", "Bob", "me").is_none());
+        assert_eq!(load(&dir).len(), 1);
+        // A newcomer is still meshed normally.
+        assert!(ensure_member(&dir, "g1", &to_c, "D", "Dee", "me").is_some());
+        // Leaving entirely clears the list (re-joining later meshes with everyone).
+        let ids: Vec<String> = load(&dir).iter().map(|p| p.id.clone()).collect();
+        for id in ids {
+            remove(&dir, &id).unwrap();
+        }
+        assert!(removed_members(&dir, "g1").is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn owner_removal_list_is_honored_only_from_the_owner() {
+        let dir = role_test_dir("owner-removed");
+        // I'm a member; the owner is "O". I hold links to O and to B.
+        let to_o = group_pair("lo", "g2", Some("O"), Some("O"));
+        let to_b = group_pair("lb", "g2", Some("O"), Some("B"));
+        save(&dir, &[to_o, to_b]).unwrap();
+        // A non-owner (B) claiming "remove O" is ignored.
+        assert!(apply_owner_removals(&dir, "g2", "B", &["O".into()], "me").is_empty());
+        assert!(removed_members(&dir, "g2").is_empty());
+        // The owner removing B: our link to B is returned for removal, and B is
+        // refused afterwards. The owner can't remove itself or us via the list.
+        let drop = apply_owner_removals(&dir, "g2", "O", &["B".into(), "O".into(), "me".into()], "me");
+        assert_eq!(drop, vec![("lb".to_string(), "B".to_string())]);
+        assert_eq!(removed_members(&dir, "g2"), vec!["B".to_string()]);
+        remove_links(&dir, &["lb".to_string()]);
+        let template = load(&dir)[0].clone();
+        assert!(ensure_member(&dir, "g2", &template, "B", "Bob", "me").is_none());
+        // The owner re-inviting B (an empty list) lets B back in.
+        assert!(apply_owner_removals(&dir, "g2", "O", &[], "me").is_empty());
+        assert!(ensure_member(&dir, "g2", &template, "B", "Bob", "me").is_some());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

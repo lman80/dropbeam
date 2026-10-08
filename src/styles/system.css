@@ -332,6 +332,7 @@ select option {
 .btn:focus-visible { box-shadow: var(--focus-ring); }
 
 /* Icon buttons: 28px hit target, 16px glyph, tooltip from <IconButton>. */
+.icon-btn-slot { display: inline-block; width: 28px; height: 28px; flex-shrink: 0; }
 .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -555,6 +556,10 @@ select.input {
   margin: 24px 0 8px 2px;
 }
 .section-row > .section-title { margin: 0; flex: 1; min-width: 0; }
+/* A header with an action is exactly as tall as one without: the button may
+   overhang, it never pushes the group below down. */
+.section-row { height: 18px; }
+.section-row > :not(.section-title) { margin-top: -6px; margin-bottom: -6px; }
 .section-row > .btn { margin: 0; }
 .page-header + .section-title,
 .page-header + .section-row { margin-top: 4px; }
@@ -675,7 +680,8 @@ button.row:hover,
   align-items: center;
   justify-content: center;
   text-align: center;
-  padding: 48px 24px;
+  /* Every page's empty state sits at the same height under its header. */
+  padding: 64px 24px 48px;
   color: var(--text-muted);
 }
 .empty-glyph { color: var(--text-faint); margin-bottom: 12px; }
@@ -1067,6 +1073,25 @@ html:not(.platform-mac) .sidebar-top { height: 12px; }
     background: var(--accent);
     box-shadow: 0 0 0 2px var(--sidebar);
   }
+  /* Unread keeps its number in the rail: a small pill on the icon's corner,
+     cut out from the icon by a ring in the sidebar colour. */
+  html:not(.mobile) .app-sidebar .nav-count.unread {
+    top: 1px;
+    right: 3px;
+    width: auto;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    box-sizing: border-box;
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 16px;
+    text-align: center;
+    color: #fff;
+  }
+  html:not(.mobile) .app-sidebar .nav-item.active .nav-count.unread { background: #fff; color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+  html:not(.mobile) .app-sidebar .nav-item.active .nav-count.active-dot { background: #fff; box-shadow: 0 0 0 2px var(--accent); }
   html:not(.mobile) .sidebar-foot { flex-direction: column-reverse; align-items: center; gap: 2px; }
   html:not(.mobile) .sidebar-me { flex: 0 0 auto; justify-content: center; padding: 0; width: 36px; }
 }
@@ -1083,6 +1108,10 @@ html:not(.mobile) .dialog-overlay {
   padding: 20px;
   background: var(--overlay);
 }
+/* A dialog closed without an exit animation leaves this snapshot to fade out. */
+.dialog-ghost { pointer-events: none; transition: opacity 0.16s ease; }
+.dialog-ghost.leaving { opacity: 0; }
+.dialog-ghost.leaving > .dialog-panel { transform: scale(0.99); transition: transform 0.16s ease; }
 html:not(.mobile) .dialog-panel {
   width: 440px;
   padding: 20px;
@@ -1147,6 +1176,7 @@ html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
   line-height: 1.4;
   margin-top: 6px;
 }
+.field-hint-warn { color: var(--amber); }
 .optional { color: var(--text-faint); font-weight: 400; }
 /* Toggleable chip (pick friends, filters). */
 .pick-chip {
@@ -1255,7 +1285,31 @@ html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
 .toast-icon.success { color: var(--green); }
 .toast-icon.error { color: var(--red); }
 .toast-icon.info { color: var(--accent-text); }
-.toast-msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.toast-group { display: contents; }
+.toast-body { flex: 1; min-width: 0; }
+.toast-msg { min-width: 0; overflow-wrap: anywhere; }
+.toast-details-btn {
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--text-12);
+  color: var(--accent-text);
+  cursor: default;
+}
+.toast-details-btn:hover { text-decoration: underline; }
+.toast-details {
+  margin: 6px 0 0;
+  max-height: 120px;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-size: var(--text-11);
+  line-height: 1.4;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .toast .icon-btn { margin: -3px 0 -3px 0; }
 
 /* Shared desktop/mobile dialog layout. Keep actions outside the scroll body. */
@@ -1314,3 +1368,8 @@ html:not(.mobile) .dialog-footer > .btn-block { flex: 1 1 100%; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin-top: 10px; }
 .kv dt { color: var(--text-muted); }
 .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.app-banner.info { background: color-mix(in srgb, var(--accent) 9%, var(--surface)); }
+.app-banner.info > svg { color: var(--accent-text); }
+.app-banner.info .icon-btn { color: var(--text-muted); }
+.toast-action { margin-top: 6px; margin-right: 8px; }
+.set-advanced-note { margin: 0 4px 4px; font-size: var(--text-13); color: var(--text-muted); }

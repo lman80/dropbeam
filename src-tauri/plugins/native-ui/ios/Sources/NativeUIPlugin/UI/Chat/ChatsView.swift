@@ -31,7 +31,7 @@ struct ChatsView: View {
                 ForEach(rows) { friend in
                     Button { open(friend) } label: {
                         ChatRow(friend: friend, overview: overview(friend), unread: (bridge.chatUnread[friend.id] ?? 0) > 0,
-                                fallback: bridge.threads[friend.id]?.last?.preview)
+                                fallback: bridge.threads[friend.id]?.last?.preview, online: bridge.presence[friend.id] == true)
                     }
                     .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 16))
                     .listRowSeparator(.hidden, edges: friend.id == rows.first?.id ? .top : [])
@@ -98,6 +98,9 @@ struct ChatRow: View {
     let overview: ChatOverview?
     let unread: Bool
     var fallback: String?
+    var online = false
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @ScaledMetric(relativeTo: .body) private var avatarSize: CGFloat = 52
     static func title(for friend: Friend) -> String { friend.displayName }
     static func subtitle(for friend: Friend, overview: ChatOverview?, fallback: String?) -> String {
         overview?.lastText ?? fallback ?? "No messages yet"
@@ -107,18 +110,29 @@ struct ChatRow: View {
         HStack(alignment: .center, spacing: 0) {
             Circle().fill(unread ? ChatPalette.sent : .clear).frame(width: 10, height: 10)
                 .frame(width: 22).accessibilityHidden(true)
-            Self.avatar(for: friend, size: 52).padding(.trailing, 12)
+            // Accessibility text sizes: a smaller avatar, the name gets the full width (it
+            // wraps instead of truncating) and the date moves under it.
+            Self.avatar(for: friend, size: typeSize.isAccessibilitySize ? 44 : min(avatarSize, 60)).overlay(alignment: .bottomTrailing) { if online { OnlineDot(size: 14) } }
+                .padding(.trailing, 12)
             VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(Self.title(for: friend)).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
-                    Spacer(minLength: 4)
+                if typeSize.isAccessibilitySize {
+                    Text(Self.title(for: friend)).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
                     if let ts = overview?.lastTs {
-                        Text(ChatDates.overview(ts)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                        Text(ChatDates.overview(ts)).font(.subheadline).foregroundStyle(.secondary)
                     }
-                    Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                } else {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(Self.title(for: friend)).font(.body.weight(.semibold)).foregroundStyle(.primary).lineLimit(1)
+                        Spacer(minLength: 4)
+                        if let ts = overview?.lastTs {
+                            Text(ChatDates.overview(ts)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                    }
                 }
                 Text(Self.subtitle(for: friend, overview: overview, fallback: fallback))
-                    .font(.subheadline).foregroundStyle(.secondary).lineLimit(2, reservesSpace: true)
+                    .font(.subheadline).foregroundStyle(.secondary).lineLimit(typeSize.isAccessibilitySize ? 3 : 2, reservesSpace: !typeSize.isAccessibilitySize)
                     .multilineTextAlignment(.leading)
             }
             .padding(.vertical, 11)
@@ -126,7 +140,17 @@ struct ChatRow: View {
         }
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(Self.title(for: friend)), \(unread ? "unread, " : "")\(Self.subtitle(for: friend, overview: overview, fallback: fallback))")
+        .accessibilityLabel("\(Self.title(for: friend)), \(online ? "online, " : "")\(unread ? "unread, " : "")\(Self.subtitle(for: friend, overview: overview, fallback: fallback))")
+    }
+}
+
+/// Small green "online now" dot on a contact's avatar, cut out from the background.
+struct OnlineDot: View {
+    var size: CGFloat
+    var body: some View {
+        Circle().fill(Color.green).frame(width: size, height: size)
+            .overlay(Circle().stroke(ChatPalette.background, lineWidth: size * 0.18))
+            .accessibilityHidden(true)
     }
 }
 
@@ -142,6 +166,7 @@ private struct PinnedGrid: View {
                 Button { open(friend) } label: {
                     VStack(spacing: 6) {
                         ChatRow.avatar(for: friend, size: 78)
+                            .overlay(alignment: .bottomTrailing) { if bridge.presence[friend.id] == true { OnlineDot(size: 18).offset(x: -3, y: -3) } }
                             .overlay(alignment: .topLeading) {
                                 if (bridge.chatUnread[friend.id] ?? 0) > 0 {
                                     Circle().fill(ChatPalette.sent).frame(width: 14, height: 14)

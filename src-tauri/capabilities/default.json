@@ -18,7 +18,6 @@
     "core:window:allow-minimize",
     "core:window:allow-set-theme",
     "core:window:allow-close",
-    "core:webview:allow-internal-toggle-devtools",
     "dialog:allow-open",
     "clipboard-manager:allow-read-image",
     "notification:default",

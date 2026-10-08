@@ -37,7 +37,7 @@ struct HistoryView: View {
         }
     }
     private var picker: some View {
-        Picker("Show", selection: $segment) { Text("Recents").tag(0); Text("Recoverable").tag(1) }
+        Picker("Show", selection: $segment) { Text("Recents").tag(0); Text("Recoverable Files").tag(1) }
             .pickerStyle(.segmented).clearRow(EdgeInsets(top: 0, leading: 20, bottom: 4, trailing: 20))
     }
     private var recents: some View {
@@ -94,7 +94,14 @@ struct HistoryView: View {
                     Spacer(minLength: 6)
                     Text(entry.date.formatted(date: .omitted, time: .shortened)).font(.subheadline).foregroundStyle(.secondary)
                 }
-                Text(subtitle(entry)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                if entry.direction != "send", let from = humanPeer(entry.peer) {
+                    HStack(spacing: 6) {
+                        FromChip(name: from).layoutPriority(1)
+                        if entry.bytesTotal > 0 { Text(Formatters.bytes(entry.bytesTotal)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1) }
+                    }
+                } else {
+                    Text(subtitle(entry)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                }
                 if entry.state == "failed" {
                     Text(entry.error.map { "\(entry.direction == "send" ? "Couldn’t send" : "Couldn’t receive") — \($0)" } ?? (entry.direction == "send" ? "Couldn’t send" : "Couldn’t receive"))
                         .font(.footnote).foregroundStyle(.red).lineLimit(2)
@@ -141,7 +148,9 @@ struct RecoverableView<Header: View>: View {
     private var budget: Double { (bridge.settings?.folderHistoryBudgetBytes ?? 2147483648) * Double(summaries.count) }
     var body: some View {
         List {
-            Section { header }
+            Section { header } footer: {
+                if !summaries.isEmpty { Text("Deleted or replaced a file in a shared folder by mistake? A copy waits here — tap ⋯ and choose Restore to bring it back.") }
+            }
             if !summaries.isEmpty {
                 Section {
                     VStack(alignment: .leading, spacing: 10) {
@@ -191,7 +200,7 @@ struct RecoverableView<Header: View>: View {
             if loading && summaries.isEmpty { ProgressView() }
             else if let error { BeamError(message: error) { Task { await load() } } }
             else if summaries.isEmpty {
-                ContentUnavailableView("Nothing to Recover", systemImage: "externaldrive.badge.checkmark", description: Text("When a file in a shared folder is deleted or replaced, a saved copy waits here."))
+                ContentUnavailableView("Nothing to Bring Back", systemImage: "externaldrive.badge.checkmark", description: Text("When a file in a shared folder is deleted or replaced, a copy waits here so you can bring it back."))
                     .allowsHitTesting(false)
             }
         }
@@ -201,13 +210,13 @@ struct RecoverableView<Header: View>: View {
         .onReceive(NotificationCenter.default.publisher(for: .init("DropBeam.folder-history://changed"))) { _ in Task { await load() } }
         .confirmationDialog("Empty \(emptyFolder?.folderName ?? "folder")?", isPresented: Binding(get: { emptyFolder != nil }, set: { if !$0 { emptyFolder = nil } }), titleVisibility: .visible) {
             if let folder = emptyFolder { Button("Empty Folder", role: .destructive) { mutate("recoverableEmpty", folder: folder.id) } }
-        } message: { Text("Its saved copies will be deleted permanently.") }
+        } message: { Text("Its saved copies will be deleted for good and can’t be brought back. Your current files aren’t touched.") }
         .confirmationDialog("Delete this saved copy forever?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
             if let deletion = deleting { Button("Delete Forever", role: .destructive) { mutate("recoverableForget", folder: deletion.folder, item: deletion.item.id) } }
         }
         .confirmationDialog("Permanently delete all saved copies?", isPresented: $emptyAll, titleVisibility: .visible) {
             Button("Empty All", role: .destructive) { mutate("recoverableEmptyAll", folder: "") }
-        }
+        } message: { Text("Deleted files can’t be brought back after this. Your current files aren’t touched.") }
     }
     private func load() async {
         loading = true; error = nil

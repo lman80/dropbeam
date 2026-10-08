@@ -19,6 +19,29 @@ export function changedSnapshots(previous: Map<string, string>, values: Record<s
   })
 }
 
+/** One snapshot: the store values it is built from + how to build it. */
+export type SnapshotSource = readonly [deps: readonly unknown[] | null, build: () => unknown]
+export type SnapshotMemo = Map<string, { deps: readonly unknown[] | null; json: string }>
+/**
+ * Like `changedSnapshots`, but a snapshot whose inputs are the SAME objects as last
+ * time (store slices are replaced, never mutated) is not rebuilt or re-serialized at
+ * all — a progress tick no longer stringifies every friend, chat and folder.
+ * `deps: null` = always rebuild (time-dependent views such as presence).
+ */
+export function memoSnapshots(previous: SnapshotMemo, sources: Record<string, SnapshotSource>) {
+  const out: { key: string; value: unknown }[] = []
+  for (const [key, [deps, build]] of Object.entries(sources)) {
+    const prev = previous.get(key)
+    if (deps && prev?.deps && prev.deps.length === deps.length && prev.deps.every((d, i) => Object.is(d, deps[i]))) continue
+    const value = build() ?? null
+    const json = JSON.stringify(value)
+    previous.set(key, { deps, json })
+    if (prev?.json === json) continue
+    out.push({ key, value: JSON.parse(json) as unknown })
+  }
+  return out
+}
+
 /** Re-push authoritative native state only after Swift receives the reply. */
 export async function deliverNativeReply<T>(reply: T, deliver: (reply: T) => Promise<unknown>, resnapshot: () => void) {
   await deliver(reply)

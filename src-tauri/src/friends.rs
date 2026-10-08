@@ -6,6 +6,7 @@
 //! both sides end up with a name without any extra handshake.
 
 use std::fs;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +52,7 @@ fn read_raw(config_dir: &Path) -> Vec<Friend> {
                 f.endpoint_id = None;
                 f.account_pub = None;
                 f.device_kind = None;
+                f.device_model = None;
             }
             f
         })
@@ -125,9 +127,11 @@ pub fn create(
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: None,
         account_pub: None,
         device_os: None,
+        device_model: None,
     };
     let invite = Invite {
         v: 1,
@@ -176,9 +180,11 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: None,
         account_pub: None,
         device_os: None,
+        device_model: None,
     };
     let detached = detached_threads(config_dir)?;
     friends.push(friend.clone());
@@ -227,9 +233,11 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: None,
         account_pub: None,
         device_os: None,
+        device_model: None,
     });
     let _ = save(config_dir, &friends);
 }
@@ -321,6 +329,7 @@ pub fn plan_reconcile(
         if survivor.endpoint_id.is_some() && survivor.endpoint_id == loser.endpoint_id {
             if survivor.account_pub.is_none() { survivor.account_pub = loser.account_pub.clone(); }
             if survivor.device_kind.is_none() { survivor.device_kind = loser.device_kind.clone(); }
+            if survivor.device_model.is_none() { survivor.device_model = loser.device_model.clone(); }
         }
         if survivor.avatar.is_none() {
             survivor.avatar = loser.avatar.clone();
@@ -405,6 +414,7 @@ pub fn set_endpoint_id(config_dir: &Path, id: &str, endpoint_id: String) -> bool
         if f.endpoint_id.as_deref() != Some(endpoint_id.as_str()) {
             f.account_pub = None;
             f.device_kind = None;
+            f.device_model = None;
             f.endpoint_id = Some(endpoint_id);
             changed = true;
         }
@@ -448,12 +458,46 @@ pub fn my_code(my_name: &str, my_endpoint_id: &str) -> String {
     format!("{USER_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
 }
 
+/// The base64url body of a personal code, however it was pasted: the canonical
+/// `dropbeam:…`, the code wrapped across lines by a chat app, a whole invite
+/// message ("Add me on DropBeam … dropbeam:eyJ…"), a `dropbeam://add?code=…`
+/// link, or the bare payload when someone deleted the "dropbeam:" part
+/// (people often do — they assume it's a label). The payload itself is never
+/// altered; only surrounding text/whitespace is dropped.
+fn user_code_body(code: &str) -> Option<String> {
+    if let Some(body) = crate::codes::strip_prefix(code, USER_PREFIX) {
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        if !compact.is_empty() && compact.bytes().all(is_b64url) {
+            return Some(compact);
+        }
+    }
+    let lower = code.to_ascii_lowercase();
+    // Embedded in text or a link (percent-encoded ':' included).
+    for needle in [USER_PREFIX, "dropbeam%3a"] {
+        let mut from = 0;
+        while let Some(at) = lower[from..].find(needle) {
+            let start = from + at + needle.len();
+            let body: String = code[start..].bytes().take_while(|b| is_b64url(*b)).map(char::from).collect();
+            if body.len() >= 8 && body.starts_with("eyJ") {
+                return Some(body);
+            }
+            from = start;
+        }
+    }
+    // The bare payload (prefix deleted): base64url JSON always starts "eyJ".
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    (compact.starts_with("eyJ") && compact.bytes().all(is_b64url)).then_some(compact)
+}
+
+fn is_b64url(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
 fn decode_user_code(code: &str) -> Result<UserCode, String> {
     if crate::link::is_device_code(code) {
         return Err(crate::link::DEVICE_CODE_AS_FRIEND.into());
     }
-    let body = crate::codes::strip_prefix(code, USER_PREFIX)
-        .ok_or("That doesn't look like a DropBeam code.")?;
+    let body = user_code_body(code).ok_or("That doesn't look like a DropBeam code.")?;
     let bytes = URL_SAFE_NO_PAD
         .decode(body.trim())
         .map_err(|_| "That DropBeam code is malformed.".to_string())?;
@@ -477,7 +521,8 @@ pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, o
     let created_at = fresh_created_at(config_dir, endpoint_id);
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
-    let name = name.trim();
+    let name = sanitize_display_name(name, "");
+    let name = name.as_str();
     if let Some(f) = friends
         .iter_mut()
         .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
@@ -507,9 +552,11 @@ pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, o
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: None,
         account_pub: None,
         device_os: None,
+        device_model: None,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -524,203 +571,327 @@ fn fresh_created_at(config_dir: &Path, endpoint_id: &str) -> u64 {
     crate::account::friend_removed_at(config_dir, endpoint_id).map_or(now, |t| now.max(t.saturating_add(1)))
 }
 
+pub const OWN_CODE: &str = "That's your own friend code. Send it to a friend so they can add you.";
+pub const OWN_DEVICE_CODE: &str = "That's the friend code of one of your own devices — it's already linked to you (Settings → Devices).";
+
+/// `add_by_code`, refusing this device's own code (`me` = our endpoint id).
+pub fn add_by_code_for(config_dir: &Path, code: &str, me: Option<&str>) -> Result<Friend, String> {
+    if me.is_some_and(|me| decode_user_code(code).is_ok_and(|uc| uc.eid == me)) {
+        return Err(OWN_CODE.into());
+    }
+    add_by_code(config_dir, code)
+}
+
 /// Add a friend from their permanent personal code (dedup by EndpointId).
 pub fn add_by_code(config_dir: &Path, code: &str) -> Result<Friend, String> {
     let uc = decode_user_code(code)?;
     if crate::block::is_blocked(config_dir, &uc.eid) {
         return Err("You blocked this person. Unblock them in Settings → Blocked to add them again.".into());
     }
-    Ok(upsert_by_endpoint(config_dir, &uc.eid, &uc.name))
+    if crate::account::is_own_device(config_dir, &uc.eid) {
+        return Err(OWN_DEVICE_CODE.into());
+    }
+    let f = upsert_by_endpoint(config_dir, &uc.eid, &uc.name);
+    remove_request(config_dir, &uc.eid);
+    Ok(f)
 }
 
-/// Self-heal the contact behind an incoming chat message so the conversation is
-/// always visible AND replyable, even if the friend record was lost across an
-/// update (GitHub #18/#19). Given the sender's cryptographic `endpoint_id`
-/// (`conn.remote_id()`), an optional display `name`, and the `claimed_id` the
-/// messages may already be keyed under, return a reachable [`Friend`] keyed to
-/// the right id — recreating it if missing.
-///
-/// Dedup invariants (mirror `reconcile`, so we NEVER duplicate a person):
-///   * a record with this **endpoint id** already exists → reuse it (refresh the
-///     name if we have a better one and the user hasn't locally renamed them),
-///     even if it's filed under a *different* record id than `claimed_id`;
-///   * else a record with `claimed_id` exists (an invite-friend whose endpoint
-///     wasn't keyed yet) → key it to this endpoint id so future dials work;
-///   * else create a minimal reachable record. We reuse `claimed_id` as the new
-///     record's id when present so it lines up with the thread the messages were
-///     already stored under (no orphaned conversation); otherwise a fresh uuid.
-/// The name falls back to "Unknown contact" so the row is never blank.
-pub fn self_heal_chat_sender(
-    config_dir: &Path,
-    endpoint_id: &str,
-    name: &str,
-    claimed_id: Option<&str>,
-) -> Option<Friend> {
-    if endpoint_id.trim().is_empty() || crate::block::is_blocked(config_dir, endpoint_id) {
-        return None;
-    }
-    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut friends = read_raw(config_dir);
-    let name = name.trim();
-
-    // 1) Already reachable under this endpoint id (anywhere in the list) → reuse.
-    if let Some(f) = friends
-        .iter_mut()
-        .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id))
-    {
-        if !name.is_empty() && !f.name_custom && f.name != name {
-            f.name = name.to_string();
-        }
-        let out = f.clone();
-        let _ = save(config_dir, &friends);
-        return Some(out);
-    }
-
-    // 2) An invite-friend filed under the claimed id but not yet keyed → key it.
-    if let Some(id) = claimed_id.filter(|id| !id.is_empty()) {
-        if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
-            f.account_pub = None;
-            f.device_kind = None;
-            f.endpoint_id = Some(endpoint_id.to_string());
-            if !name.is_empty() && !f.name_custom && f.name != name {
-                f.name = name.to_string();
-            }
-            let out = f.clone();
-            let _ = save(config_dir, &friends);
-            return Some(out);
-        }
-    }
-
-    // 2b) A real record for this person already exists but is endpoint-UNKEYED and
-    //     was filed under a DIFFERENT id than `claimed_id` (the classic phantom case:
-    //     a permanent-code / folder-pairing friend whose wire `friendId` is the
-    //     SENDER's foreign per-device uuid, so steps 1 & 2 both miss). Adopt it by
-    //     NAME and key it to this endpoint id instead of spawning a phantom. Mirrors
-    //     plan_reconcile's name-merge rule (the `either_unkeyed && !is_placeholder &&
-    //     name-match && !both_have_chat` invariant) and carries the SAME guards so two
-    //     distinct people can never be fused: a real non-placeholder name, the
-    //     candidate must be endpoint-UNKEYED (a record keyed to a different eid is a
-    //     provably different device — never touched), the UNIQUE name match only
-    //     (ambiguous → fall through to a fresh record), and refuse when BOTH the
-    //     candidate and the claimed-id thread already hold chat history.
-    if !name.is_empty() && !is_placeholder(name) {
-        let matches: Vec<usize> = friends
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.endpoint_id.is_none() && f.name.trim().eq_ignore_ascii_case(name))
-            .map(|(i, _)| i)
-            .collect();
-        if matches.len() == 1 {
-            let i = matches[0];
-            let cand_id = friends[i].id.clone();
-            let claimed_has_chat = claimed_id
-                .filter(|id| !id.is_empty())
-                .map(|id| !crate::chat::messages(config_dir, id).is_empty())
-                .unwrap_or(false);
-            let cand_has_chat = !crate::chat::messages(config_dir, &cand_id).is_empty();
-            if !(claimed_has_chat && cand_has_chat) {
-                // Key the existing record to the sender's cryptographic endpoint id so
-                // replies dial back AND future messages resolve by eid (step 1).
-                friends[i].account_pub = None;
-                friends[i].device_kind = None;
-                friends[i].endpoint_id = Some(endpoint_id.to_string());
-                if !friends[i].name_custom && friends[i].name != name {
-                    friends[i].name = name.to_string();
-                }
-                let out = friends[i].clone();
-                let _ = save(config_dir, &friends);
-                // Fold any messages a PRIOR buggy build already stored under the
-                // foreign claimed id onto this canonical record (idempotent union;
-                // no-op when the claimed thread is empty — the common live case,
-                // since resolution runs BEFORE chat::append).
-                if let Some(id) = claimed_id.filter(|id| !id.is_empty() && *id != out.id) {
-                    crate::chat::merge_threads(config_dir, id, &out.id);
-                }
-                return Some(out);
-            }
-        }
-    }
-
-    // 3) No record at all — recreate a minimal reachable one. Reuse the claimed id
-    //    when we have it so the new friend lines up with the already-stored thread.
-    let friend = Friend {
-        id: claimed_id
-            .filter(|id| !id.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        role: PairRole::B,
-        name: clean_name(name, "Unknown contact"),
-        secret: random_secret(),
-        created_at: now_ms(),
-        auto_accept: true,
-        endpoint_id: Some(endpoint_id.to_string()),
-        avatar: None,
-        name_custom: false,
-        name_at: 0,
-        progress_v: None,
-        device_kind: None,
-        account_pub: None,
-        device_os: None,
-    };
-    friends.push(friend.clone());
-    let _ = save(config_dir, &friends);
-    Some(friend)
+/// What an incoming friend-hello did.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum HelloOutcome {
+    /// Nothing (blocked, an own device, a removed friend, an empty id).
+    Ignored,
+    /// A friend we already had (or the invite they accepted) was updated.
+    Known,
+    /// A proven new device of someone who is already a friend was added.
+    AddedDevice,
+    /// Someone new: a pending friend request the user accepts or declines (S2).
+    Requested,
 }
 
-/// Apply an incoming friend-hello. If `friend_id` matches an existing record
-/// (classic invite flow), learn their EndpointId + name. Otherwise auto-add the
-/// sender by their EndpointId (the permanent-code reverse direction) so one code
-/// share makes the friendship two-way.
-pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: &str) {
+/// Apply an incoming friend-hello (no proof of account; see `apply_hello_from`).
+pub fn apply_hello(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: &str) -> HelloOutcome {
+    apply_hello_from(config_dir, friend_id, endpoint_id, name, &serde_json::Value::Null)
+}
+
+/// Apply an incoming friend-hello (`req` = the whole hello, for its account
+/// proof). If `friend_id` names one of OUR invites that nobody has used yet,
+/// the sender is the friend who accepted it: learn their EndpointId + name. A
+/// friend we already know updates their name. Anyone else becomes a PENDING
+/// friend request (S2) — never a friend, never auto-accepting files, until the
+/// user accepts — except a proven new device of an existing friend's account.
+pub fn apply_hello_from(config_dir: &Path, friend_id: &str, endpoint_id: &str, name: &str, req: &serde_json::Value) -> HelloOutcome {
+    let name = sanitize_display_name(name, "");
+    let name = name.as_str();
     // A blocked person's hello never adds (or re-keys) them.
     if endpoint_id.trim().is_empty() || crate::block::is_blocked(config_dir, endpoint_id) {
-        return;
+        return HelloOutcome::Ignored;
     }
     // One of the user's OWN devices: its record is kept by account sync (the
     // device's own roster entry names it), not by the person-name it greets
     // friends with — otherwise the two would overwrite each other forever.
     if crate::account::is_own_device(config_dir, endpoint_id) {
-        return;
+        return HelloOutcome::Ignored;
     }
-    if !friend_id.is_empty() {
-        let matched = {
-            let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut friends = read_raw(config_dir);
-            if let Some(f) = friends.iter_mut().find(|f| f.id == friend_id) {
-                let mut changed = false;
-                if f.endpoint_id.as_deref() != Some(endpoint_id) {
-                    f.account_pub = None;
-                    f.device_kind = None;
-                    f.endpoint_id = Some(endpoint_id.to_string());
-                    changed = true;
-                }
-                // Adopt the broadcast name unless the user has locally renamed this
-                // friend — so a friend changing their own name propagates to you.
-                if !name.trim().is_empty() && !f.name_custom && f.name != name.trim() {
-                    f.name = name.trim().to_string();
-                    changed = true;
-                }
-                if changed {
-                    let _ = save(config_dir, &friends);
-                }
-                true
-            } else {
-                false
+    {
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut friends = read_raw(config_dir);
+        // S5: a friend id only claims an invite record that is still UNKEYED
+        // (single use). The id rides in every `dropbeamf1:` invite, so it is
+        // no proof once someone has accepted it: re-pointing a keyed friend
+        // to whoever sent it would hand that conversation to a stranger.
+        let invite = (!friend_id.is_empty()).then(|| friends.iter().position(|f| f.id == friend_id
+            && f.endpoint_id.as_deref().is_none_or(|e| e == endpoint_id))).flatten();
+        let at = invite.or_else(|| friends.iter().position(|f| f.endpoint_id.as_deref() == Some(endpoint_id)));
+        if let Some(i) = at {
+            let f = &mut friends[i];
+            let mut changed = false;
+            if f.endpoint_id.as_deref() != Some(endpoint_id) {
+                f.account_pub = None;
+                f.device_kind = None;
+                f.device_model = None;
+                f.endpoint_id = Some(endpoint_id.to_string());
+                changed = true;
             }
-        };
-        if matched {
-            return;
+            // Adopt the broadcast name unless the user has locally renamed this
+            // friend — so a friend changing their own name propagates to you.
+            if !name.is_empty() && !f.name_custom && f.name != name {
+                f.name = name.to_string();
+                changed = true;
+            }
+            if changed {
+                let _ = save(config_dir, &friends);
+            }
+            drop(_guard);
+            remove_request(config_dir, endpoint_id);
+            return HelloOutcome::Known;
         }
     }
     // A friend the user removed (on any of their devices) isn't re-added just
     // because they said hello; adding them again by code still works.
     // Likewise a device removed from (or that left) the user's account doesn't
     // come back as a contact just by greeting us.
-    if (crate::account::friend_removed(config_dir, endpoint_id) || crate::account::device_was_removed(config_dir, endpoint_id))
-        && !read_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
-        return;
+    if crate::account::friend_removed(config_dir, endpoint_id) || crate::account::device_was_removed(config_dir, endpoint_id) {
+        return HelloOutcome::Ignored;
     }
-    let _ = upsert_by_endpoint(config_dir, endpoint_id, name);
+    // A new device that PROVES (signature over its endpoint id) it belongs to
+    // the account of someone who is already a friend is that person: add it
+    // with their auto-accept choice, so one person stays one person.
+    let proven = req["account_pub"].as_str().filter(|key| {
+        crate::link::verify_account(key, req["account_sig"].as_str().unwrap_or(""), endpoint_id)
+            && !is_revoked(config_dir, key, endpoint_id)
+    });
+    if let Some(account) = proven.filter(|a| crate::account::my_pub(config_dir).as_deref() != Some(*a)) {
+        let person = read_raw(config_dir).into_iter().find(|f| f.account_pub.as_deref() == Some(account) && f.endpoint_id.is_some());
+        if let Some(person) = person {
+            let added = upsert_by_endpoint(config_dir, endpoint_id, name);
+            let _ = set_auto_accept(config_dir, &added.id, person.auto_accept);
+            remove_request(config_dir, endpoint_id);
+            return HelloOutcome::AddedDevice;
+        }
+    }
+    add_request(config_dir, endpoint_id, name, proven);
+    HelloOutcome::Requested
+}
+
+// ── friends' removed devices (S4) ──────────────────────────────────────────
+
+/// Devices friends removed from THEIR accounts: account → device → when. A
+/// removed (e.g. stolen) device still holds that account's key, so without
+/// this it could keep posing as the person to every friend.
+fn revocations_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("account-revocations.json")
+}
+fn read_revocations(config_dir: &Path) -> HashMap<String, HashMap<String, u64>> {
+    fs::read(revocations_path(config_dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// A friend removed `eid` from their account `account`.
+pub(crate) fn is_revoked(config_dir: &Path, account: &str, eid: &str) -> bool {
+    read_revocations(config_dir).get(account).is_some_and(|m| m.contains_key(eid))
+}
+
+/// The signed removals a friend's device `who` lists in its hello (`revoked`):
+/// believed when signed by the removed device itself, by `who` (which proves
+/// the account in this very hello), or by another device we know as that
+/// person — and the signer isn't itself removed (first removal wins). The
+/// removed device stops counting as the person: its record goes (its thread
+/// folds into the person's). Returns true if anything changed.
+pub(crate) fn apply_revocations(config_dir: &Path, who: &str, req: &serde_json::Value) -> bool {
+    let Some(list) = req["revoked"].as_array() else { return false };
+    let Some(account) = req["account_pub"].as_str().filter(|key| {
+        crate::link::verify_account(key, req["account_sig"].as_str().unwrap_or(""), who)
+    }) else { return false };
+    if crate::account::my_pub(config_dir).as_deref() == Some(account) || is_revoked(config_dir, account, who) {
+        return false;
+    }
+    let known: Vec<String> = read_raw(config_dir).into_iter()
+        .filter(|f| f.account_pub.as_deref() == Some(account)).filter_map(|f| f.endpoint_id).collect();
+    let mut all = read_revocations(config_dir);
+    let mut newly = vec![];
+    for r in list.iter().take(64) {
+        let (Some(eid), Some(at), Some(by), Some(sig)) = (r["eid"].as_str(), r["at"].as_u64(), r["by"].as_str(), r["sig"].as_str()) else { continue };
+        if eid == who || all.get(account).is_some_and(|m| m.contains_key(eid)) { continue; }
+        let signer_known = by == eid || by == who || known.iter().any(|k| k == by);
+        let signer_removed = all.get(account).is_some_and(|m| m.contains_key(by));
+        let stamp = crate::account::Stamp::new(at, by, sig);
+        if !signer_known || signer_removed || !crate::account::removal_valid(account, eid, &stamp) { continue; }
+        let m = all.entry(account.to_owned()).or_default();
+        if m.len() >= 64 { continue; }
+        m.insert(eid.to_owned(), at);
+        newly.push(eid.to_owned());
+    }
+    if newly.is_empty() { return false; }
+    if all.len() > 256 {
+        let mut keys: Vec<String> = all.keys().cloned().collect();
+        keys.sort();
+        for k in keys.into_iter().take(all.len() - 256) { if k != account { all.remove(&k); } }
+    }
+    if let Ok(bytes) = serde_json::to_vec(&all) {
+        let _ = crate::settings::write_atomic(&revocations_path(config_dir), &bytes);
+    }
+    for eid in newly {
+        let records = read_raw(config_dir);
+        let Some(rec) = records.iter().find(|f| f.endpoint_id.as_deref() == Some(eid.as_str()) && f.account_pub.as_deref() == Some(account)).cloned() else { continue };
+        // Keep the conversation with the person: fold it into one of their
+        // remaining devices before the removed device's record goes.
+        if let Some(heir) = records.iter().filter(|f| f.id != rec.id && f.account_pub.as_deref() == Some(account) && f.endpoint_id.is_some())
+            .min_by_key(|f| f.endpoint_id.clone()) {
+            crate::chat::fold_thread(config_dir, &rec.id, &heir.id);
+        }
+        let _ = remove(config_dir, &rec.id);
+    }
+    fold_person_threads(config_dir);
+    true
+}
+
+// ── friend requests (S2) ───────────────────────────────────────────────────
+
+/// Someone who introduced themselves but isn't a friend yet. They can't chat
+/// with you and their files always ask first, until you accept.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendRequest {
+    pub endpoint_id: String,
+    pub name: String,
+    /// When they last said hello (ms).
+    pub at: u64,
+    /// Their account, when they proved one (groups a person's devices).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_pub: Option<String>,
+}
+
+/// Pending requests kept at most (oldest dropped), so strangers can't grow it.
+const MAX_REQUESTS: usize = 50;
+
+fn requests_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("friend-requests.json")
+}
+
+fn read_requests(config_dir: &Path) -> Vec<FriendRequest> {
+    fs::read(requests_path(config_dir)).ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn write_requests(config_dir: &Path, all: &[FriendRequest]) {
+    if let Ok(bytes) = serde_json::to_vec(all) {
+        if let Err(e) = crate::settings::write_atomic(&requests_path(config_dir), &bytes) {
+            log::warn!("friends: cannot save friend requests: {e}");
+        }
+    }
+}
+
+/// Record (or refresh) a pending request from `endpoint_id`. True if it's new.
+pub fn add_request(config_dir: &Path, endpoint_id: &str, name: &str, account_pub: Option<&str>) -> bool {
+    if endpoint_id.trim().is_empty() || crate::block::is_blocked(config_dir, endpoint_id)
+        || read_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        return false;
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut all = read_requests(config_dir);
+    let name = sanitize_display_name(name, "Someone");
+    if let Some(r) = all.iter_mut().find(|r| r.endpoint_id == endpoint_id) {
+        // A repeat: keep its place (first seen); only a real change is written.
+        if r.name == name && (r.account_pub.is_some() || account_pub.is_none()) {
+            return false;
+        }
+        r.name = name;
+        if account_pub.is_some() { r.account_pub = account_pub.map(str::to_owned); }
+        write_requests(config_dir, &all);
+        return false;
+    }
+    // Flood guard: the list keeps the OLDEST requests (a burst of new endpoint
+    // ids can't push out the real one waiting), and only so many new ones a
+    // minute are recorded at all.
+    if all.len() >= MAX_REQUESTS || !request_budget(config_dir) {
+        log::warn!("friends: dropped a friend request (list full or too many at once)");
+        return false;
+    }
+    all.push(FriendRequest { endpoint_id: endpoint_id.to_owned(), name, at: now_ms(), account_pub: account_pub.map(str::to_owned) });
+    write_requests(config_dir, &all);
+    true
+}
+
+/// New friend requests recorded per minute, across everyone (endpoint ids
+/// are free to mint, so a per-sender limit alone wouldn't hold).
+const REQUESTS_PER_MINUTE: usize = 20;
+fn request_budget(config_dir: &Path) -> bool {
+    use std::time::{Duration, Instant};
+    static RECENT: Mutex<Option<HashMap<PathBuf, Vec<Instant>>>> = Mutex::new(None);
+    let mut g = RECENT.lock().unwrap_or_else(|p| p.into_inner());
+    let recent = g.get_or_insert_with(HashMap::new).entry(config_dir.to_path_buf()).or_default();
+    recent.retain(|t| t.elapsed() < Duration::from_secs(60));
+    if recent.len() >= REQUESTS_PER_MINUTE { return false; }
+    recent.push(Instant::now());
+    true
+}
+
+/// Someone met through a shared folder's member roster (gossip from another
+/// member, not anyone the user chose): a friend we already have just gets
+/// their name refreshed; anyone else becomes a pending friend request — never
+/// an auto-accepting friend — and a blocked person is skipped (S2 / review #4).
+pub fn note_folder_member(config_dir: &Path, endpoint_id: &str, name: &str) -> bool {
+    if endpoint_id.trim().is_empty() || crate::block::is_blocked(config_dir, endpoint_id)
+        || crate::account::is_own_device(config_dir, endpoint_id) {
+        return false;
+    }
+    if read_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        upsert_by_endpoint(config_dir, endpoint_id, name);
+        return false;
+    }
+    add_request(config_dir, endpoint_id, name, None)
+}
+
+/// Pending requests, newest first (anyone who became a friend or was blocked
+/// meanwhile — e.g. on another of the user's devices — is left out).
+pub fn requests(config_dir: &Path) -> Vec<FriendRequest> {
+    let friends = read_raw(config_dir);
+    let mut all: Vec<FriendRequest> = read_requests(config_dir).into_iter()
+        .filter(|r| !friends.iter().any(|f| f.endpoint_id.as_deref() == Some(r.endpoint_id.as_str())))
+        .filter(|r| !crate::block::is_blocked(config_dir, &r.endpoint_id))
+        .collect();
+    all.sort_by_key(|r| std::cmp::Reverse(r.at));
+    all
+}
+
+/// Forget the request from `endpoint_id` (accepted, declined, or now a friend).
+pub fn remove_request(config_dir: &Path, endpoint_id: &str) -> Option<FriendRequest> {
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut all = read_requests(config_dir);
+    let at = all.iter().position(|r| r.endpoint_id == endpoint_id)?;
+    let out = all.remove(at);
+    write_requests(config_dir, &all);
+    Some(out)
+}
+
+/// The user accepted the request from `endpoint_id`: they're a friend now.
+pub fn accept_request(config_dir: &Path, endpoint_id: &str) -> Result<Friend, String> {
+    let r = remove_request(config_dir, endpoint_id).ok_or("That friend request is no longer there.")?;
+    if crate::block::is_blocked(config_dir, endpoint_id) {
+        return Err("You blocked this person. Unblock them in Settings → Blocked first.".into());
+    }
+    Ok(upsert_by_endpoint(config_dir, endpoint_id, &r.name))
 }
 
 /// Store the friend-at-`endpoint_id`'s profile picture path (received over the
@@ -746,7 +917,7 @@ pub fn rename(config_dir: &Path, id: &str, name: String) -> Result<(), String> {
     let mut friends = read_raw(config_dir);
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) {
         if !name.trim().is_empty() {
-            f.name = name.trim().to_string();
+            f.name = sanitize_display_name(&name, &f.name);
             // Mark as user-chosen so an incoming profile broadcast won't override it.
             f.name_custom = true;
             // Stamp it so the user's other devices adopt the newest rename.
@@ -763,6 +934,27 @@ pub fn set_auto_accept(config_dir: &Path, id: &str, auto_accept: bool) -> Result
         f.auto_accept = auto_accept;
     }
     save(config_dir, &friends)
+}
+
+/// Record whether the friend on `endpoint` has accepted us yet (their hello
+/// reply says). Own devices never wait. True when the stored value changed.
+pub fn set_awaiting_accept(config_dir: &Path, endpoint: &str, awaiting: bool) -> bool {
+    if awaiting && crate::account::is_own_device(config_dir, endpoint) {
+        return false;
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut friends = read_raw(config_dir);
+    let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(endpoint)) else { return false };
+    if f.awaiting_accept == awaiting {
+        return false;
+    }
+    f.awaiting_accept = awaiting;
+    save(config_dir, &friends).is_ok()
+}
+
+/// Whether a friend request from `endpoint_id` is already waiting here.
+pub fn has_request(config_dir: &Path, endpoint_id: &str) -> bool {
+    read_requests(config_dir).iter().any(|r| r.endpoint_id == endpoint_id)
 }
 
 pub fn set_progress_version(config_dir: &Path, endpoint: &str, version: u64) {
@@ -856,6 +1048,16 @@ pub fn person_endpoints(config_dir: &Path, owner_id: &str) -> Vec<String> {
     out
 }
 
+/// The OTHER records of the person behind friend `id`: their devices that
+/// prove the same (someone else's) account. Never the user's own devices.
+pub fn person_records(config_dir: &Path, id: &str) -> Vec<Friend> {
+    let all = read_raw(config_dir);
+    let Some(f) = all.iter().find(|f| f.id == id) else { return vec![] };
+    let mine = crate::account::my_pub(config_dir);
+    let Some(account) = f.account_pub.as_deref().filter(|a| Some(*a) != mine.as_deref()) else { return vec![] };
+    all.iter().filter(|o| o.id != id && o.account_pub.as_deref() == Some(account)).cloned().collect()
+}
+
 pub fn remove(config_dir: &Path, id: &str) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut friends = read_raw(config_dir);
@@ -912,12 +1114,60 @@ fn derive_friend_secret(pair_secret: &str) -> String {
 }
 
 fn clean_name(name: &str, fallback: &str) -> String {
-    let n = name.trim();
-    if n.is_empty() {
-        fallback.to_string()
-    } else {
-        n.to_string()
+    sanitize_display_name(name, fallback)
+}
+
+/// A profile picture someone else sent is only stored when it really is a
+/// small raster image (JPEG/PNG/GIF/WebP whose header decodes to sane
+/// dimensions): anything else — HTML, SVG, a script, a huge bomb — is dropped
+/// before it touches disk, since the UI loads these files directly.
+pub(crate) fn is_safe_avatar(bytes: &[u8]) -> bool {
+    use image::ImageFormat as F;
+    if bytes.is_empty() || bytes.len() > 2_000_000 {
+        return false;
     }
+    let Ok(format) = image::guess_format(bytes) else { return false };
+    if !matches!(format, F::Jpeg | F::Png | F::Gif | F::WebP) {
+        return false;
+    }
+    image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .is_ok_and(|(w, h)| w > 0 && h > 0 && w <= 8192 && h <= 8192)
+}
+
+/// Longest name a peer can give itself (characters).
+pub(crate) const MAX_NAME_CHARS: usize = 64;
+
+/// A name someone else chose, made safe to show (S12): no control characters,
+/// no bidirectional overrides/isolates (which can make "Alice<U+202E>fdp.exe" read as
+/// something else), no invisible zero-width characters (which make two
+/// different names look identical), runs of whitespace collapsed, and at most
+/// 64 characters. The zero-width JOINER is kept — emoji sequences (👨‍👩‍👧) need it.
+pub(crate) fn sanitize_display_name(name: &str, fallback: &str) -> String {
+    let invisible = |c: char| matches!(c,
+        '\u{200B}' | '\u{200C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{2069}' | '\u{206A}'..='\u{206F}' | '\u{061C}' | '\u{180E}' | '\u{FEFF}' | '\u{00AD}'
+        | '\u{034F}' | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}');
+    let mut out = String::new();
+    let mut space = false;
+    for c in name.chars() {
+        if c.is_whitespace() || c.is_control() {
+            space = !out.is_empty();
+            continue;
+        }
+        if invisible(c) {
+            continue;
+        }
+        if space {
+            out.push(' ');
+            space = false;
+        }
+        out.push(c);
+        if out.chars().count() >= MAX_NAME_CHARS {
+            break;
+        }
+    }
+    if out.is_empty() { fallback.to_string() } else { out }
 }
 
 fn random_secret() -> String {
@@ -951,9 +1201,11 @@ mod tests {
             name_custom: false,
             name_at: 0,
             progress_v: None,
+            awaiting_accept: false,
             device_kind: None,
             account_pub: None,
             device_os: None,
+            device_model: None,
         }
     }
 
@@ -980,9 +1232,11 @@ mod tests {
             name_custom: false,
             name_at: 0,
             progress_v: None,
+            awaiting_accept: false,
             device_kind: None,
             account_pub: None,
             device_os: None,
+            device_model: None,
         }
     }
 
@@ -1124,71 +1378,6 @@ mod tests {
         std::env::temp_dir().join(format!("db-friends-test-{tag}-{}", now_ms()))
     }
 
-    #[test]
-    fn self_heal_recreates_lost_contact_keyed_to_thread() {
-        // The "lost my friend's contact after update" case: friends.json is empty
-        // but a chat thread exists under the claimed id "thread1". A message lands
-        // → recreate a reachable friend filed under that same id so the stored
-        // conversation isn't orphaned, with the sender's endpoint id + name.
-        let dir = tmp("recreate");
-        let f = self_heal_chat_sender(&dir, "EIDX", "Mong", Some("thread1")).unwrap();
-        assert_eq!(f.id, "thread1"); // lines up with the existing thread
-        assert_eq!(f.name, "Mong");
-        assert_eq!(f.endpoint_id.as_deref(), Some("EIDX"));
-        assert_eq!(load(&dir).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_blank_name_falls_back() {
-        // No display name on the wire → a non-blank fallback so the chat row is
-        // never empty/invisible.
-        let dir = tmp("fallback");
-        let f = self_heal_chat_sender(&dir, "EIDY", "", None).unwrap();
-        assert_eq!(f.name, "Unknown contact");
-        assert_eq!(f.endpoint_id.as_deref(), Some("EIDY"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_dedups_by_endpoint_no_duplicate() {
-        // A record for this endpoint id already exists (under a DIFFERENT record id
-        // than the claimed one) → reuse it, never add a second. This preserves the
-        // reconcile invariant that endpoint id IS the identity.
-        let dir = tmp("dedup");
-        let _ = save(&dir, &[f("orig", "Mong", Some("EIDZ"), 5)]);
-        let healed = self_heal_chat_sender(&dir, "EIDZ", "Mong", Some("different-claim")).unwrap();
-        assert_eq!(healed.id, "orig"); // reused the existing record, not a new one
-        assert_eq!(load(&dir).len(), 1); // NO duplicate
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_keys_unkeyed_invite_friend() {
-        // An invite-friend exists under the claimed id but has no endpoint id yet
-        // (so replies couldn't dial back) → learn the endpoint id in place.
-        let dir = tmp("keyinvite");
-        let _ = save(&dir, &[f("invite1", "Mong", None, 5)]);
-        let healed = self_heal_chat_sender(&dir, "NEWEID", "Mong", Some("invite1")).unwrap();
-        assert_eq!(healed.id, "invite1");
-        assert_eq!(healed.endpoint_id.as_deref(), Some("NEWEID"));
-        assert_eq!(load(&dir).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_keeps_user_renamed_label() {
-        // The user locally renamed this friend (name_custom) → an incoming
-        // broadcast name must NOT overwrite their chosen label.
-        let dir = tmp("renamed");
-        let mut custom = f("c", "My Bestie", Some("EIDR"), 5);
-        custom.name_custom = true;
-        let _ = save(&dir, &[custom]);
-        let healed = self_heal_chat_sender(&dir, "EIDR", "RawDeviceName", None).unwrap();
-        assert_eq!(healed.name, "My Bestie");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     // Seed a received chat message under `peer` so the both-have-chat guard can be
     // exercised (a real conversation already exists under that record id).
     fn seed_msg(dir: &Path, peer: &str) {
@@ -1214,6 +1403,12 @@ mod tests {
                 deleted: false,
                 gif: None,
                 rev: 0,
+                held_on: None,
+                server_note: None,
+                via: None,
+                deliveries: vec![],
+                link_preview: None,
+                text_rev: 0, reaction_revs: vec![],
             },
         );
     }
@@ -1263,72 +1458,6 @@ mod tests {
         assert_eq!(crate::chat::overview(&dir).len(), 1);
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_dir_all(sender_dir);
-    }
-
-    #[test]
-    fn self_heal_adopts_unkeyed_name_match_no_phantom() {
-        // #19/#18: an inbound message from a permanent-code friend whose wire friendId
-        // is a FOREIGN per-device uuid must ADOPT the existing endpoint-unkeyed record
-        // (the one the open ChatView is subscribed to), NOT spawn a phantom.
-        let dir = tmp("adopt");
-        let _ = save(&dir, &[f("local-uuid", "Mong", None, 5)]);
-        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert_eq!(healed.id, "local-uuid"); // reused the existing record
-        assert_eq!(healed.endpoint_id.as_deref(), Some("EID")); // …now keyed
-        assert_eq!(load(&dir).len(), 1); // NO phantom
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_does_not_adopt_when_two_share_name() {
-        // Ambiguous: two endpoint-unkeyed records share the name → never guess; fall
-        // through to a fresh record rather than fuse the wrong one.
-        let dir = tmp("ambiguous");
-        let _ = save(&dir, &[f("u1", "Mong", None, 5), f("u2", "Mong", None, 6)]);
-        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert!(healed.id != "u1" && healed.id != "u2"); // a new record
-        assert_eq!(load(&dir).len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_does_not_adopt_record_keyed_to_other_eid() {
-        // A record already keyed to a DIFFERENT endpoint id is a provably different
-        // device — never adopt it by name.
-        let dir = tmp("otherkey");
-        let _ = save(&dir, &[f("x", "Mong", Some("OTHER_EID"), 5)]);
-        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert!(healed.id != "x"); // a new record, the OTHER_EID one untouched
-        assert_eq!(load(&dir).len(), 2);
-        let other = load(&dir).into_iter().find(|fr| fr.id == "x").unwrap();
-        assert_eq!(other.endpoint_id.as_deref(), Some("OTHER_EID"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_refuses_name_adopt_when_both_have_chat() {
-        // Two REAL conversations (one under the unkeyed candidate, one under the
-        // claimed id) must never be fused — mirrors reconcile_refuses_name_merge.
-        let dir = tmp("bothchat");
-        let _ = save(&dir, &[f("cand", "Mong", None, 5)]);
-        seed_msg(&dir, "cand");
-        seed_msg(&dir, "foreign-uuid");
-        let healed = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert!(healed.id != "cand"); // refused adoption → fresh record
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn self_heal_name_adopt_is_idempotent() {
-        // After the first adoption keys the record, a second inbound resolves by
-        // endpoint id (step 1) — same record, no new writes, no duplicate.
-        let dir = tmp("adopt-idem");
-        let _ = save(&dir, &[f("local-uuid", "Mong", None, 5)]);
-        let first = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        let second = self_heal_chat_sender(&dir, "EID", "Mong", Some("foreign-uuid")).unwrap();
-        assert_eq!(first.id, second.id);
-        assert_eq!(load(&dir).len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1413,6 +1542,27 @@ mod code_tests {
         assert!(decode_user_code("other:invalid").is_err());
         assert!(decode_user_code("Dropbeam:invalid").is_err());
     }
+
+    #[test]
+    fn personal_code_found_in_messages_links_and_without_prefix() {
+        let original = my_code("Alex", "e1d2c3b4a5");
+        let payload = original.strip_prefix("dropbeam:").unwrap();
+        let (a, b) = payload.split_at(20);
+        let pasted = [
+            payload.to_string(),                                     // "dropbeam:" deleted
+            format!("  {payload}\n"),
+            format!("dropbeam:{a}\n{b}"),                            // wrapped by a chat app
+            format!("Add me on DropBeam!\nOpen DropBeam → Add Friend.\n\n{original}\n"),
+            format!("dropbeam://add?code=dropbeam%3A{payload}"),
+            format!("https://example.invalid/add#{original}"),
+        ];
+        for code in pasted {
+            let decoded = decode_user_code(&code).unwrap_or_else(|e| panic!("{code:?}: {e}"));
+            assert_eq!((decoded.name.as_str(), decoded.eid.as_str()), ("Alex", "e1d2c3b4a5"));
+        }
+        assert!(decode_user_code("Add me on DropBeam").is_err());
+        assert!(decode_user_code("eyJub3QiOiJhIGZyaWVuZCJ9").is_err(), "JSON without an eid is not a friend code");
+    }
 }
 
 /// account_pub must already have been authenticated by the caller.
@@ -1430,9 +1580,21 @@ pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &ser
     let key = req["account_pub"].as_str().filter(|key| {
         crate::link::verify_account(key, req["account_sig"].as_str().unwrap_or(""), endpoint_id)
     });
+    // One of OUR account's devices that no remaining device vouched for (an
+    // older build linked it, or the device that did was removed): list it for
+    // approval instead of trusting the key alone (S4).
+    if let Some(k) = key {
+        if crate::account::my_pub(config_dir).as_deref() == Some(k) && crate::account::is_removed_device(config_dir, k, endpoint_id)
+            && !crate::account::device_was_removed(config_dir, endpoint_id) {
+            crate::account::note_pending_device(config_dir, endpoint_id, req["device_name"].as_str().unwrap_or(""),
+                req["device_kind"].as_str(), req["device_os"].as_str());
+        }
+    }
     // A device the user removed from their account stays a plain contact even
-    // though it still holds the key, until it is linked again.
-    let key = key.filter(|k| !crate::account::is_removed_device(config_dir, k, endpoint_id));
+    // though it still holds the key, until it is linked again — and a device a
+    // FRIEND removed from their account (signed revocation) no longer counts
+    // as that friend (S4).
+    let key = key.filter(|k| !crate::account::is_removed_device(config_dir, k, endpoint_id) && !is_revoked(config_dir, k, endpoint_id));
     set_device_info(config_dir, endpoint_id, req["device_kind"].as_str(), key);
     // A device that no longer proves an account (left it, or was removed) stops
     // counting as part of that person / as one of our devices. Only a hello from
@@ -1448,6 +1610,25 @@ pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &ser
     }
     if let Some(os) = req["device_os"].as_str().filter(|os| !os.is_empty() && os.len() <= 16) {
         set_device_os(config_dir, endpoint_id, os);
+    }
+    // Optional (older builds don't send it): "iPhone 15", "MacBook Air".
+    if let Some(model) = req["device_model"].as_str().and_then(crate::device_model::clean) {
+        set_device_model(config_dir, endpoint_id, &model);
+    }
+}
+
+pub(crate) fn set_device_model(config_dir: &Path, endpoint_id: &str, model: &str) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        if f.device_model.as_deref() != Some(model) {
+            f.device_model = Some(model.to_owned());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &friends);
     }
 }
 
@@ -1471,7 +1652,7 @@ pub(crate) fn set_device_os(config_dir: &Path, endpoint_id: &str, os: &str) {
 /// "removed" tombstone compares against when the device was linked, not when
 /// this copy happened to hear about it.
 pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str, kind: Option<&str>,
-    os: Option<&str>, account_pub: &str, created_at: u64, authoritative_name: bool) -> bool {
+    os: Option<&str>, model: Option<&str>, account_pub: &str, created_at: u64, authoritative_name: bool) -> bool {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);
     let name = clean_name(name, "My device");
@@ -1480,6 +1661,8 @@ pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str
         if f.account_pub.as_deref() != Some(account_pub) { f.account_pub = Some(account_pub.to_owned()); changed = true; }
         if kind.is_some() && f.device_kind.as_deref() != kind { f.device_kind = kind.map(str::to_owned); changed = true; }
         if os.is_some() && f.device_os.as_deref() != os { f.device_os = os.map(str::to_owned); changed = true; }
+        let model = model.and_then(crate::device_model::clean);
+        if model.is_some() && f.device_model != model { f.device_model = model; changed = true; }
         if authoritative_name && !f.name_custom && f.name != name { f.name = name; changed = true; }
         if changed { let _ = save(config_dir, &friends); }
         return changed;
@@ -1496,9 +1679,11 @@ pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str
         name_custom: false,
         name_at: 0,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: kind.map(str::to_owned),
         account_pub: Some(account_pub.to_owned()),
         device_os: os.map(str::to_owned),
+        device_model: model.and_then(crate::device_model::clean),
     });
     let _ = save(config_dir, &friends);
     true
@@ -1515,6 +1700,7 @@ pub(crate) struct SyncedFriend<'a> {
     pub auto_accept: bool,
     pub device_kind: Option<&'a str>,
     pub device_os: Option<&'a str>,
+    pub device_model: Option<&'a str>,
     pub account_pub: Option<&'a str>,
 }
 
@@ -1538,14 +1724,21 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
     if let Some(f) = friends.iter_mut().find(|f| f.endpoint_id.as_deref() == Some(r.endpoint_id)) {
         let mut changed = false;
         if rename_wins(f, r.name, r.name_custom, r.name_at) {
-            f.name = r.name.trim().to_owned();
+            f.name = sanitize_display_name(r.name, &f.name);
             f.name_custom = true;
             f.name_at = f.name_at.max(r.name_at);
             changed = true;
         }
         if f.device_kind.is_none() && r.device_kind.is_some() { f.device_kind = r.device_kind.map(str::to_owned); changed = true; }
         if f.device_os.is_none() && r.device_os.is_some() { f.device_os = r.device_os.map(str::to_owned); changed = true; }
+        if f.device_model.is_none() {
+            if let Some(m) = r.device_model.and_then(crate::device_model::clean) { f.device_model = Some(m); changed = true; }
+        }
         if f.account_pub.is_none() && r.account_pub.is_some() { f.account_pub = r.account_pub.map(str::to_owned); changed = true; }
+        // Lamport: remember the newest add any own device saw, so a removal made
+        // here later is stamped past it even if that device's clock ran ahead
+        // (otherwise the "newer" add would bring the friend back — D17).
+        if r.created_at > f.created_at { f.created_at = r.created_at; changed = true; }
         let out = f.clone();
         if changed { let _ = save(config_dir, &friends); }
         return (out, false);
@@ -1566,9 +1759,11 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
         name_custom: r.name_custom,
         name_at: r.name_at,
         progress_v: None,
+        awaiting_accept: false,
         device_kind: r.device_kind.map(str::to_owned),
         account_pub: r.account_pub.map(str::to_owned),
         device_os: r.device_os.map(str::to_owned),
+        device_model: r.device_model.and_then(crate::device_model::clean),
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -1576,27 +1771,197 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
 }
 
 pub(crate) fn clear_account_for_endpoint(config_dir: &Path, endpoint_id: &str) {
+    // Read before taking LOCK (the account lock is taken inside it elsewhere).
+    let mine = crate::account::my_pub(config_dir);
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);
-    let mut changed = false;
+    let before = friends.len();
+    // A former OWN device ("Your iPhone") is not a friend: it was never added
+    // as one, so it must not linger as an auto-accepting contact — drop it
+    // (relinking or adding its code brings it back).
+    friends.retain(|f| !(f.endpoint_id.as_deref() == Some(endpoint_id) && mine.is_some() && f.account_pub == mine));
+    let mut changed = friends.len() != before;
+    // A FRIEND's device that left their account just stops counting as them.
     for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id) && f.account_pub.is_some()) {
         f.account_pub = None;
         changed = true;
     }
-    if changed { let _ = save(config_dir, &friends); }
+    if changed { let _ = save_inner(config_dir, &friends, true); }
 }
 
-/// Clear the account claim on every record that carries `account_pub` (this
-/// device left that account): they become ordinary contacts again.
+/// This device left `account_pub`: the records of its former own devices go
+/// (they were never friends, and must not become auto-accepting contacts).
 pub(crate) fn clear_account(config_dir: &Path, account_pub: &str) {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);
-    let mut changed = false;
-    for f in friends.iter_mut().filter(|f| f.account_pub.as_deref() == Some(account_pub)) {
-        f.account_pub = None;
-        changed = true;
+    let before = friends.len();
+    friends.retain(|f| f.account_pub.as_deref() != Some(account_pub));
+    if friends.len() != before { let _ = save_inner(config_dir, &friends, true); }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    fn dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("db-req-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&d).unwrap();
+        d
     }
-    if changed { let _ = save(config_dir, &friends); }
+
+    #[test]
+    fn a_strangers_hello_is_a_request_not_a_friend() {
+        // S2: anyone who knows our endpoint id can say hello; that must not
+        // make them a friend (chat, notifications, auto-accepted files).
+        let d = dir();
+        assert_eq!(apply_hello(&d, "", "stranger", "Totally Your Bank"), HelloOutcome::Requested);
+        assert!(load(&d).is_empty(), "no friend record");
+        assert!(chat_sender(&d, "stranger").is_none(), "can't chat");
+        let r = requests(&d);
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].endpoint_id.as_str(), r[0].name.as_str()), ("stranger", "Totally Your Bank"));
+        // Accepting makes them a friend (and clears the request).
+        let f = accept_request(&d, "stranger").unwrap();
+        assert!(f.auto_accept && f.endpoint_id.as_deref() == Some("stranger"));
+        assert!(requests(&d).is_empty());
+        assert!(accept_request(&d, "stranger").is_err(), "one use");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn requests_are_bounded_deduped_and_skip_friends_and_blocked() {
+        let d = dir();
+        // A burst: only so many a minute, and the first ones are kept.
+        let added = (0..80).filter(|i| add_request(&d, &format!("e{i}"), "Spam", None)).count();
+        assert!(added <= REQUESTS_PER_MINUTE, "{added}");
+        assert!(requests(&d).iter().any(|r| r.endpoint_id == "e0"), "the oldest stays");
+        assert!(!add_request(&d, "e0", "Spam", None), "a repeat isn't new");
+        upsert_by_endpoint(&d, "friend", "Pal");
+        assert!(!add_request(&d, "friend", "Pal", None));
+        // Someone added by code meanwhile drops out of the list.
+        upsert_by_endpoint(&d, "e0", "Now a friend");
+        assert!(!requests(&d).iter().any(|r| r.endpoint_id == "e0"));
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn an_invite_id_only_claims_an_unused_invite() {
+        // S5: the friend id rides in every dropbeamf1: invite. Once the invite
+        // was used, a hello carrying it must not re-point that friend (and
+        // their conversation) to the sender.
+        let d = dir();
+        let (alice, _code) = create(&d, "Me".into(), "Alice".into(), Some("me".into())).unwrap();
+        assert_eq!(apply_hello(&d, &alice.id, "alice-eid", "Alice"), HelloOutcome::Known);
+        assert_eq!(get(&d, &alice.id).unwrap().endpoint_id.as_deref(), Some("alice-eid"));
+        // Mallory replays the invite id.
+        assert_eq!(apply_hello(&d, &alice.id, "mallory-eid", "Alice"), HelloOutcome::Requested);
+        assert_eq!(get(&d, &alice.id).unwrap().endpoint_id.as_deref(), Some("alice-eid"), "not hijacked");
+        assert!(chat_sender(&d, "mallory-eid").is_none());
+        // Alice herself saying hello again with the id is fine.
+        assert_eq!(apply_hello(&d, &alice.id, "alice-eid", "Alice B."), HelloOutcome::Known);
+        assert_eq!(get(&d, &alice.id).unwrap().name, "Alice B.");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_proven_new_device_of_a_friend_joins_them_but_a_bare_claim_does_not() {
+        let d = dir();
+        let key = iroh::SecretKey::generate();
+        let account = hex::encode(key.public().as_bytes());
+        let mac = upsert_by_endpoint(&d, "mac", "Mong");
+        set_auto_accept(&d, &mac.id, false).unwrap();
+        set_device_info(&d, "mac", None, Some(&account));
+        // A claim of their account without the signature: just a request.
+        let fake = serde_json::json!({"account_pub": account, "account_sig": "00"});
+        assert_eq!(apply_hello_from(&d, "", "phone", "Mong", &fake), HelloOutcome::Requested);
+        let proof = serde_json::json!({"account_pub": account, "account_sig": hex::encode(key.sign(b"phone").to_bytes())});
+        assert_eq!(apply_hello_from(&d, "", "phone", "Mong", &proof), HelloOutcome::AddedDevice);
+        let phone = load(&d).into_iter().find(|f| f.endpoint_id.as_deref() == Some("phone")).unwrap();
+        assert!(!phone.auto_accept, "inherits the person's choice");
+        assert!(requests(&d).is_empty());
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_persons_other_devices_are_found_but_never_own_devices() {
+        let d = dir();
+        let theirs = hex::encode(iroh::SecretKey::generate().public().as_bytes());
+        let mac = upsert_by_endpoint(&d, "mac", "Mong");
+        let phone = upsert_by_endpoint(&d, "phone", "Mong's iPhone");
+        let other = upsert_by_endpoint(&d, "other", "Someone else");
+        set_device_info(&d, "mac", None, Some(&theirs));
+        set_device_info(&d, "phone", None, Some(&theirs));
+        let ids: Vec<String> = person_records(&d, &mac.id).into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![phone.id.clone()]);
+        assert!(person_records(&d, &other.id).is_empty(), "no account → just that record");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn folder_roster_members_are_requests_not_friends() {
+        let d = dir();
+        assert!(note_folder_member(&d, "member", "Folder Member"));
+        assert!(load(&d).is_empty() && chat_sender(&d, "member").is_none());
+        assert_eq!(requests(&d).len(), 1);
+        crate::block::block_endpoint(&d, "blocked", "B", None).unwrap();
+        assert!(!note_folder_member(&d, "blocked", "B"));
+        assert!(!requests(&d).iter().any(|r| r.endpoint_id == "blocked"));
+        let f = upsert_by_endpoint(&d, "pal", "Pal");
+        assert!(!note_folder_member(&d, "pal", "Pal Renamed"));
+        assert_eq!(get(&d, &f.id).unwrap().name, "Pal Renamed");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn pasting_your_own_code_is_refused() {
+        let d = dir();
+        let code = my_code("Me", "my-eid");
+        assert_eq!(add_by_code_for(&d, &code, Some("my-eid")).unwrap_err(), OWN_CODE);
+        assert!(load(&d).is_empty());
+        assert!(add_by_code_for(&d, &my_code("Pal", "pal-eid"), Some("my-eid")).is_ok());
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    use super::*;
+    #[test]
+    fn only_real_small_images_pass_as_avatars() {
+        let mut png = Vec::new();
+        image::RgbImage::new(4, 4).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        assert!(is_safe_avatar(&png));
+        assert!(!is_safe_avatar(b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>"));
+        assert!(!is_safe_avatar(b"<html><script>alert(1)</script></html>"));
+        assert!(!is_safe_avatar(&[]));
+        // A real PNG signature with a lying header (0x0 / absurd size) is refused.
+        let mut bad = png.clone();
+        bad[16..24].copy_from_slice(&[0, 1, 0, 0, 0, 1, 0, 0]); // 65536 x 65536
+        assert!(!is_safe_avatar(&bad));
+        assert!(!is_safe_avatar(&vec![0xFF; 3_000_000]), "too big");
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    #[test]
+    fn names_from_peers_are_stripped_of_tricks_and_bounded() {
+        assert_eq!(sanitize_display_name("  Alice  ", "F"), "Alice");
+        // Right-to-left override: "Alice\u{202E}gpj.exe" would render reversed.
+        assert_eq!(sanitize_display_name("Alice\u{202E}gpj.exe", "F"), "Alicegpj.exe");
+        assert_eq!(sanitize_display_name("\u{2066}Bob\u{2069}", "F"), "Bob");
+        // Zero-width characters can't make two names look identical.
+        assert_eq!(sanitize_display_name("Ash\u{200B}ton\u{FEFF}", "F"), "Ashton");
+        assert_eq!(sanitize_display_name("a\n\tb\r\n  c", "F"), "a b c");
+        assert_eq!(sanitize_display_name("\u{200B}\u{202E} \n", "Friend"), "Friend");
+        assert_eq!(sanitize_display_name(&"x".repeat(500), "F").chars().count(), MAX_NAME_CHARS);
+        assert_eq!(sanitize_display_name("👨\u{200D}👩\u{200D}👧 Fam", "F"), "👨\u{200D}👩\u{200D}👧 Fam", "emoji joiners survive");
+        let dir = std::env::temp_dir().join(format!("db-names-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = upsert_by_endpoint(&dir, "e1", "Eve\u{202E}\u{200B}");
+        assert_eq!(f.name, "Eve");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
@@ -1627,6 +1992,26 @@ mod device_tests {
         assert!(crate::chat::messages(&dir, &mac.id).iter().any(|m| m.id == "p1"));
         assert!(crate::chat::messages(&dir, &phone.id).is_empty());
         assert_eq!(person_endpoints(&dir, &mac.id), vec!["mac-eid".to_string(), "phone-eid".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn hello_carries_an_optional_hardware_model() {
+        let dir = std::env::temp_dir().join(format!("db-model-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        upsert_by_endpoint(&dir, "endpoint", "Phone");
+        // An older build: no model, nothing breaks.
+        apply_device_hello(&dir, "endpoint", &serde_json::json!({"device_kind":"phone","device_os":"ios"}));
+        assert_eq!(load(&dir)[0].device_model, None);
+        apply_device_hello(&dir, "endpoint", &serde_json::json!({"device_kind":"phone","device_os":"ios","device_model":" iPhone 15 "}));
+        assert_eq!(load(&dir)[0].device_model.as_deref(), Some("iPhone 15"));
+        // A later hello without it (or with junk) keeps what we know.
+        apply_device_hello(&dir, "endpoint", &serde_json::json!({"device_kind":"phone","device_os":"ios","device_model":"x".repeat(200)}));
+        apply_device_hello(&dir, "endpoint", &serde_json::json!({"device_kind":"phone","device_os":"ios","device_model":null}));
+        assert_eq!(load(&dir)[0].device_model.as_deref(), Some("iPhone 15"));
+        // Stored records from older builds (no field) still load; and it round-trips.
+        let old: Friend = serde_json::from_value(serde_json::json!({"id":"x","role":"b","name":"Old","secret":"s","createdAt":1})).unwrap();
+        assert!(old.device_model.is_none());
+        assert!(!serde_json::to_string(&old).unwrap().contains("deviceModel"));
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
@@ -1698,7 +2083,7 @@ pub(crate) fn import_link_friend(config_dir: &Path, offered: &Friend) -> Friend 
         let mut friends = read_raw(config_dir);
         let Some(f) = friends.iter_mut().find(|f| f.id == friend.id) else { return friend };
         if rename_wins(f, &offered.name, offered.name_custom, offered.name_at) {
-            f.name = offered.name.trim().to_owned();
+            f.name = sanitize_display_name(&offered.name, &f.name);
             f.name_custom = true;
             f.name_at = f.name_at.max(offered.name_at);
         }
@@ -1733,3 +2118,149 @@ pub(crate) fn set_link_avatar(config_dir: &Path, id: &str, path: String) {
     if let Some(f) = friends.iter_mut().find(|f| f.id == id) { f.avatar = Some(path); }
     let _ = save(config_dir, &friends);
 }
+
+/// One contact in a "these might be the same person" group.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct LookAlike {
+    /// The contact's thread (person) id.
+    pub id: String,
+    pub name: String,
+}
+
+/// Names nobody chose (a device's default) say nothing about who someone is.
+fn telling_name(name: &str) -> Option<String> {
+    let n: String = name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    const GENERIC: &[&str] = &["", "friend", "a friend", "unknown", "dropbeam user", "my device", "iphone", "ipad", "mac", "pc",
+        "macbook", "macbook pro", "macbook air", "imac", "mac mini", "linux", "windows", "android", "phone", "computer"];
+    (!GENERIC.contains(&n.as_str()) && n.chars().count() >= 2).then_some(n)
+}
+
+/// Contacts that look like the same person on two devices that aren't linked
+/// (same name, or the same profile photo) but are different identities. Only a
+/// hint for the user — nothing is merged. Each group lists 2+ people.
+pub fn look_alike(config_dir: &Path) -> Vec<Vec<LookAlike>> {
+    let all = read_raw(config_dir);
+    let mine = crate::account::my_pub(config_dir);
+    // Person (thread owner) → name, and the photos of any of their devices.
+    let mut people: Vec<(LookAlike, Option<String>, Vec<String>)> = Vec::new();
+    for f in &all {
+        if f.endpoint_id.is_none() || (f.account_pub.is_some() && f.account_pub == mine) {
+            continue;
+        }
+        if f.endpoint_id.as_deref().is_some_and(|e| crate::block::is_blocked(config_dir, e)) {
+            continue;
+        }
+        let owner = owner_in(&all, f.clone(), mine.as_deref());
+        let photo = f.avatar.as_deref().and_then(|p| std::fs::read(p).ok()).filter(|b| b.len() > 64)
+            .map(|b| hex::encode(Sha256::digest(&b)));
+        match people.iter_mut().find(|(p, _, _)| p.id == owner.id) {
+            Some((_, _, photos)) => photos.extend(photo),
+            None => people.push((LookAlike { id: owner.id.clone(), name: owner.name.clone() }, telling_name(&owner.name), photo.into_iter().collect())),
+        }
+    }
+    // Union people who share a telling name or a photo.
+    let n = people.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(p: &mut [usize], i: usize) -> usize {
+        let mut i = i;
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            let same_name = people[i].1.is_some() && people[i].1 == people[j].1;
+            let same_photo = people[i].2.iter().any(|h| people[j].2.contains(h));
+            if same_name || same_photo {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+    }
+    let mut groups: HashMap<usize, Vec<LookAlike>> = HashMap::new();
+    for i in 0..n {
+        let r = root(&mut parent, i);
+        groups.entry(r).or_default().push(people[i].0.clone());
+    }
+    let mut out: Vec<Vec<LookAlike>> = groups.into_values().filter(|g| g.len() > 1).collect();
+    for g in &mut out {
+        g.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    out.sort_by(|a, b| a[0].id.cmp(&b[0].id));
+    out
+}
+
+#[cfg(test)]
+mod look_alike_tests {
+    use super::*;
+
+    #[test]
+    fn same_name_or_photo_different_people_are_flagged_but_linked_devices_are_not() {
+        let dir = std::env::temp_dir().join(format!("db-lookalike-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let eid = || iroh::SecretKey::generate().public().to_string();
+        let (m1, m2, a, b, c1, c2) = (eid(), eid(), eid(), eid(), eid(), eid());
+        upsert_by_endpoint(&dir, &m1, "Mong");
+        upsert_by_endpoint(&dir, &m2, " mong ");
+        upsert_by_endpoint(&dir, &a, "iPhone");
+        upsert_by_endpoint(&dir, &b, "iPhone");
+        // Same photo, different names.
+        let photo = dir.join("p.jpg");
+        std::fs::write(&photo, [7u8; 500]).unwrap();
+        upsert_by_endpoint(&dir, &c1, "Chen");
+        upsert_by_endpoint(&dir, &c2, "Wei");
+        set_avatar_by_endpoint(&dir, &c1, photo.to_string_lossy().to_string());
+        set_avatar_by_endpoint(&dir, &c2, photo.to_string_lossy().to_string());
+        let groups = look_alike(&dir);
+        let names: Vec<Vec<String>> = groups.iter().map(|g| { let mut n: Vec<String> = g.iter().map(|x| x.name.trim().to_lowercase()).collect(); n.sort(); n }).collect();
+        assert_eq!(groups.len(), 2, "{names:?}");
+        assert!(names.contains(&vec!["mong".to_string(), "mong".to_string()]));
+        assert!(names.contains(&vec!["chen".to_string(), "wei".to_string()]));
+        // Two devices of ONE person (same verified account) are one person, not a look-alike.
+        set_device_info(&dir, &m1, Some("laptop"), Some("acct-mong"));
+        set_device_info(&dir, &m2, Some("phone"), Some("acct-mong"));
+        assert_eq!(look_alike(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod awaiting_accept_tests {
+    use super::*;
+
+    fn dir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("db-awaiting-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn waiting_for_a_friend_to_accept_is_remembered_and_cleared() {
+        let d = dir();
+        let f = upsert_by_endpoint(&d, "alex-eid", "Alex");
+        assert!(!f.awaiting_accept);
+        assert!(set_awaiting_accept(&d, "alex-eid", true));
+        assert!(!set_awaiting_accept(&d, "alex-eid", true), "no change, no write");
+        assert!(get(&d, &f.id).unwrap().awaiting_accept);
+        assert!(!set_awaiting_accept(&d, "nobody", true), "only friends");
+        assert!(set_awaiting_accept(&d, "alex-eid", false));
+        assert!(!get(&d, &f.id).unwrap().awaiting_accept);
+        // An old friends.json without the field reads as not waiting.
+        let raw = serde_json::to_string(&load(&d)).unwrap().replace(",\"awaitingAccept\":false", "");
+        std::fs::write(d.join("friends.json"), raw).unwrap();
+        assert!(!load(&d)[0].awaiting_accept);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_new_request_is_told_apart_from_a_repeat() {
+        let d = dir();
+        assert!(!has_request(&d, "jo"));
+        assert_eq!(apply_hello(&d, "", "jo", "Jordan"), HelloOutcome::Requested);
+        assert!(has_request(&d, "jo"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+

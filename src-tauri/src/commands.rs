@@ -90,6 +90,14 @@ pub fn update_settings(
     // copy must not point it back at a replaced file.
     settings.avatar = state.settings.lock().unwrap().avatar.clone();
     settings.display_name = settings.display_name.trim().chars().take(64).collect();
+    // A window still holding the name from before another own device renamed
+    // the user must not rename them back by saving unrelated settings (D17).
+    {
+        let current = state.settings.lock().unwrap().display_name.clone();
+        if crate::account::stale_display_name(&settings.display_name, &current) {
+            settings.display_name = current;
+        }
+    }
 
     // Persist FIRST. If the disk write fails (e.g. Windows write contention), return
     // the error WITHOUT mutating in-memory state or applying any live side effect —
@@ -687,6 +695,41 @@ pub fn open_local_network_settings(app: AppHandle) -> Result<(), String> {
     }
 }
 
+/// Hold off idle sleep while files are moving (the UI turns it on/off as the
+/// number of active transfers crosses zero). See keep_awake.rs.
+#[tauri::command]
+pub fn set_keep_awake(on: bool) {
+    crate::keep_awake::set(on);
+}
+
+/// Open the system settings page that fixes a permission DropBeam was refused,
+/// so a "not allowed" message can carry a one-click fix. Only these known pages:
+/// `files` (macOS Files & Folders), `full-disk` (macOS Full Disk Access),
+/// `notifications` (macOS / Windows notification settings), `local-network`.
+#[tauri::command]
+pub fn open_privacy_settings(app: AppHandle, pane: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let url: Option<&str> = if cfg!(target_os = "macos") {
+        match pane.as_str() {
+            "files" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"),
+            "full-disk" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"),
+            "notifications" => Some("x-apple.systempreferences:com.apple.preference.notifications"),
+            "local-network" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork"),
+            _ => None,
+        }
+    } else if cfg!(target_os = "windows") {
+        match pane.as_str() {
+            "notifications" => Some("ms-settings:notifications"),
+            "files" => Some("ms-settings:privacy-broadfilesystemaccess"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let url = url.ok_or_else(|| "That settings page isn't available on this computer.".to_string())?;
+    app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
 /// On macOS, return a one-line warning if the app is running from a spot that
 /// makes the system forget folder permissions every launch — App Translocation
 /// (a quarantined app run from a randomized read-only path) or straight from the
@@ -795,6 +838,15 @@ pub(crate) fn apply_autostart(app: &AppHandle, enable: bool) {
     // registered does nothing and macOS stays silent. The plist is still (re)written
     // on a genuine first-enable or if something deleted it — so updates are covered.
     let current = manager.is_enabled().unwrap_or(false);
+    // A login item that points at an OLD location of the app (moved to another
+    // folder, AppImage replaced by a newer file) silently stops launching it.
+    // Rewrite it — rare, so the one-off macOS "Background items" notice is fine.
+    if enable && current && crate::desktop_shell::autostart_entry_stale(&app.package_info().name) {
+        log::info!("autostart: login item points at an old app location — refreshing it");
+        let _ = manager.disable();
+        let _ = manager.enable();
+        return;
+    }
     if enable == current {
         return;
     }
@@ -849,8 +901,11 @@ pub fn accept_pair(
     iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
     invite: String,
     folder: String,
+    folder_name: Option<String>,
 ) -> Result<Pair, String> {
-    let pair = pairing::accept(&state.config_dir, &invite, folder)?;
+    // `folder` is where the person chose to KEEP it; a busy folder gets a new
+    // subfolder for the shared files (pairing::accept_joining).
+    let pair = pairing::accept_joining(&state.config_dir, &invite, folder, folder_name)?;
     // Dial the creator back to hand them our iroh id (the invite gave us theirs),
     // so both directions of this folder can push directly over iroh.
     if let Some(inviter_eid) = pair.endpoint_id.clone() {
@@ -975,7 +1030,9 @@ pub fn stop_folder_transfer(sync: State<'_, Arc<SyncManager>>, pair_id: String) 
 /// newest toggle wins. While paused nothing syncs; Resume runs the normal reconcile.
 #[tauri::command]
 pub fn set_folder_paused(sync: State<'_, Arc<SyncManager>>, pair_id: String, paused: bool) {
-    sync.set_paused(&pair_id, paused, chat::now_ms());
+    // max(now, last epoch + 1): a toggle must beat the one it replaces even when
+    // this clock runs behind the device that set the last one (D16).
+    sync.set_paused_now(&pair_id, paused);
 }
 
 #[tauri::command]
@@ -1115,6 +1172,43 @@ pub fn list_friends(state: State<'_, Arc<AppState>>) -> Vec<Friend> {
     friends::load(&state.config_dir)
 }
 
+/// People who introduced themselves but aren't friends yet (S2).
+#[tauri::command]
+pub fn list_friend_requests(state: State<'_, Arc<AppState>>) -> Vec<friends::FriendRequest> {
+    friends::requests(&state.config_dir)
+}
+
+/// Accept a friend request: they become a friend (and hear back from us).
+#[tauri::command]
+pub fn accept_friend_request(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    sync: State<'_, Arc<SyncManager>>,
+    iroh: State<'_, Arc<crate::iroh_net::IrohState>>,
+    endpoint_id: String,
+) -> Result<Friend, String> {
+    let friend = friends::accept_request(&state.config_dir, &endpoint_id)?;
+    sync.reconcile_friends();
+    let my_name = state.settings.lock().unwrap().display_name.clone();
+    crate::iroh_net::say_hello_to_endpoint(iroh.inner().clone(), endpoint_id, my_name);
+    let _ = app.emit("friends://changed", ());
+    let _ = app.emit("friend-requests://changed", ());
+    Ok(friend)
+}
+
+/// Decline a friend request (optionally blocking them so they can't ask again).
+#[tauri::command]
+pub fn decline_friend_request(app: AppHandle, state: State<'_, Arc<AppState>>, endpoint_id: String, block: bool) -> Result<(), String> {
+    let request = friends::remove_request(&state.config_dir, &endpoint_id);
+    if block {
+        let (name, account) = request.map(|r| (r.name, r.account_pub)).unwrap_or_default();
+        crate::block::block_endpoint(&state.config_dir, &endpoint_id, &name, account)?;
+        let _ = app.emit("blocked://changed", ());
+    }
+    let _ = app.emit("friend-requests://changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn rename_friend(
     state: State<'_, Arc<AppState>>,
@@ -1140,11 +1234,20 @@ pub fn remove_friend(
         if let Some(eid) = f.endpoint_id.as_deref().filter(|e| crate::account::is_own_device(&state.config_dir, e)) {
             return crate::account::account_remove_device(app, state, eid.to_owned());
         }
+        // One person, all their devices: removing "Mong" must not leave Mong's
+        // iPhone behind as a friend (it would keep chatting and sending).
+        for other in friends::person_records(&state.config_dir, &id) {
+            crate::account::record_friend_removed(&state.config_dir, &other);
+            friends::remove(&state.config_dir, &other.id)?;
+        }
         crate::account::record_friend_removed(&state.config_dir, &f);
     }
     friends::remove(&state.config_dir, &id)?;
+    let _ = app.emit("friends://changed", ());
     // Soft-detach: friends::remove preserves the transcript and endpoint index.
     sync.reconcile_friends();
+    // A Transfer Server we share with our friends hears about it right away.
+    crate::mailbox::client::wake();
     Ok(())
 }
 
@@ -1160,6 +1263,7 @@ pub fn block_friend(
 ) -> Result<Vec<String>, String> {
     let blocked = crate::block::block_friend(&state.config_dir, &id)?;
     sync.reconcile_friends();
+    crate::mailbox::client::wake();
     let _ = app.emit("friends://changed", ());
     let _ = app.emit("blocked://changed", ());
     Ok(blocked)
@@ -1172,6 +1276,12 @@ pub fn unblock_person(app: AppHandle, state: State<'_, Arc<AppState>>, id: Strin
     crate::block::unblock(&state.config_dir, &id)?;
     let _ = app.emit("blocked://changed", ());
     Ok(())
+}
+
+/// Contacts that might be the same person on two unlinked devices (a hint only).
+#[tauri::command]
+pub fn friends_look_alike(state: State<'_, Arc<AppState>>) -> Vec<Vec<crate::friends::LookAlike>> {
+    friends::look_alike(&state.config_dir)
 }
 
 #[tauri::command]
@@ -1224,7 +1334,13 @@ pub async fn ping_friend(
     let Some(ep) = iroh.get().cloned() else {
         return Ok(false);
     };
-    Ok(crate::iroh_net::ping_endpoint(&ep, &eid).await)
+    let online = crate::iroh_net::ping_endpoint(&ep, &eid).await;
+    // A friend who answers is online NOW: flush anything queued for them at once
+    // (chat opens probe right away, so queued messages go out within seconds).
+    if online {
+        crate::iroh_net::wake_chat_outbox_for(&state.config_dir, &id);
+    }
+    Ok(online)
 }
 
 /// Probe how we're connected to a friend right now (connection inspector). Returns
@@ -1239,7 +1355,11 @@ pub async fn probe_connection(
     let (Some(ep), Some(eid)) = (iroh.get().cloned(), friend.endpoint_id) else {
         return Ok(None);
     };
-    Ok(crate::iroh_net::probe_conn(&ep, &eid).await)
+    let detail = crate::iroh_net::probe_conn(&ep, &eid).await;
+    if detail.is_some() {
+        crate::iroh_net::wake_chat_outbox_for(&state.config_dir, &friend_id);
+    }
+    Ok(detail)
 }
 
 /// "Send over relay anyway": break the wait-for-direct park for one transfer (by
@@ -1333,9 +1453,46 @@ pub async fn send_chat_message(
         deleted: false,
         gif: None,
         rev: 0,
+        held_on: None,
+        server_note: None,
+        via: None,
+        deliveries: vec![],
+        link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
+    // #47: a message with a link waits (≤ 8 s) for THIS device to fetch its
+    // preview, then goes out with it. The claim keeps the outbox from sending
+    // it bare meanwhile; the bubble shows at once, the card fills in after.
+    let wants_preview = state.settings.lock().unwrap().link_previews;
+    if let Some(url) = wants_preview.then(|| crate::link_preview::first_url(&msg.text)).flatten() {
+        if let Some(claim) = crate::iroh_net::claim_chat(&msg.id) {
+            let (state, iroh, app) = (state.inner().clone(), iroh.inner().clone(), app.clone());
+            let (friend, sent) = (friend.clone(), msg.clone());
+            tauri::async_runtime::spawn(async move {
+                let preview = tokio::time::timeout(crate::link_preview::BUDGET, crate::link_preview::fetch(&url))
+                    .await
+                    .ok()
+                    .flatten();
+                let dir = state.config_dir.clone();
+                if let Some(p) = preview {
+                    if let Some(u) = chat::set_link_preview(&dir, &sent.peer_id, &sent.id, p) {
+                        let _ = app.emit("chat://message", &u);
+                    }
+                } else {
+                    log::info!("chat: no link preview for a sent link");
+                }
+                drop(claim);
+                // Deliver what's stored now (it may have been edited meanwhile).
+                let current = chat::message(&dir, &sent.peer_id, &sent.id).unwrap_or(sent);
+                if current.status.as_deref() == Some("sending") {
+                    deliver_chat(&state, &iroh, &app, &friend, &current);
+                }
+            });
+            return Ok(msg);
+        }
+    }
     deliver_chat(&state, &iroh, &app, &friend, &msg);
     // No endpoint yet → leave it "sending"; the outbox retry flushes it once the
     // friend is reachable (self-healing learns their key on first contact).
@@ -1359,13 +1516,62 @@ fn deliver_chat(
         let my_name = state.settings.lock().unwrap().display_name.clone();
         let payload = crate::iroh_net::chat_payload(msg, &friend.id, &my_name);
         let config_dir = state.config_dir.clone();
-        let eids = friends::person_endpoints(&config_dir, &friend.id);
+        let mut eids = friends::person_endpoints(&config_dir, &friend.id);
+        // A file card reaches the devices its files go to ("Send to one device"
+        // must not leave a card for files that never come on the others).
+        let targets = msg.file_xfer_id.as_deref().and_then(crate::fanout::note_targets);
+        if let Some(t) = targets.filter(|t| !t.is_empty()) {
+            eids = t;
+        }
         let (pid, mid) = (friend.id.clone(), msg.id.clone());
         let app = app.clone();
         let iroh = iroh.clone();
+        // A file card goes to each of the person's devices (their files do too).
+        let to_all = msg.kind == "file";
         tauri::async_runtime::spawn(async move {
-            let status = match crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await {
-                Ok(_) => "delivered",
+            // The outbox loop (woken above) may be looking at the same message.
+            let Some(_claim) = crate::iroh_net::claim_chat(&mid) else { return };
+            // A Transfer Server can hold it: every device gets it (direct where
+            // they answer, a server copy — and a phone notification — for the
+            // rest), iMessage-style. File cards keep their own path (their files
+            // fan out to every device through the file send itself).
+            let me = ep.id().to_string();
+            if !to_all && crate::mailbox::client::can_hold_chat(&config_dir, &me, &pid) {
+                let mut skip = std::collections::HashSet::new();
+                let outcome = crate::iroh_net::deliver_chat_message(&iroh, &ep, &config_dir, &pid, &eids, &payload, &mid, true, &mut skip).await;
+                let updated = match outcome {
+                    crate::iroh_net::ChatOutcome::Delivered { reach, copies } => {
+                        log::info!("chat: delivered to {} of {} device(s){}", reach.delivered.len(), eids.len(),
+                            if copies.is_empty() { String::new() } else { format!(", {} waiting on a Transfer Server", copies.len()) });
+                        chat::set_status(&config_dir, &pid, &mid, "delivered")
+                    }
+                    crate::iroh_net::ChatOutcome::Held(h) => chat::set_held(&config_dir, &pid, &mid, &h.name),
+                    crate::iroh_net::ChatOutcome::Failed(e) => {
+                        if let Some(e) = &e {
+                            log::info!("chat: couldn't hold a message on a Transfer Server: {}", e.code());
+                            if let Some(u) = chat::set_server_note(&config_dir, &pid, &mid, crate::mailbox::client::note_for(e).as_deref()) {
+                                let _ = app.emit("chat://message", &u);
+                            }
+                        }
+                        chat::set_status(&config_dir, &pid, &mid, "failed")
+                    }
+                };
+                if let Some(u) = updated {
+                    let _ = app.emit("chat://message", &u);
+                }
+                return;
+            }
+            let sent = if to_all {
+                crate::iroh_net::send_chat_all(&iroh, &ep, &eids, payload).await
+            } else {
+                crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await
+            };
+            let status = match sent {
+                Ok(_) => {
+                    // If a Transfer Server was holding it meanwhile, drop that copy.
+                    crate::mailbox::client::delivered_directly(&iroh, &config_dir, &mid, &[]);
+                    "delivered"
+                }
                 Err(e) => {
                     log::debug!("chat send failed: {e:#}");
                     "failed"
@@ -1414,6 +1620,9 @@ pub(crate) fn post_file_note(
     file_xfer_id: Option<String>,
 ) -> Option<ChatMessage> {
     let friend = friends::get(&state.config_dir, friend_id)?;
+    // A send to several devices may already know where it got to.
+    let file_xfer_id_deliveries = file_xfer_id.as_deref()
+        .map(|x| crate::fanout::deliveries_for(&state.config_dir, x)).unwrap_or_default();
     let msg = ChatMessage {
         file_xfer_id,
         id: uuid::Uuid::new_v4().to_string(),
@@ -1435,6 +1644,12 @@ pub(crate) fn post_file_note(
         deleted: false,
         gif: None,
         rev: 0,
+        held_on: None,
+        server_note: None,
+        via: None,
+        deliveries: file_xfer_id_deliveries,
+        link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1556,13 +1771,35 @@ pub async fn send_typing(
             });
             // A person with several devices: whichever of them answers.
             let eids = friends::person_endpoints(&state.config_dir, &friend_id);
+            // The ~3 s "still typing" heartbeat must not dial a friend who is
+            // offline over and over: only devices heard from recently get it,
+            // plus at most one quick probe per friend every 30 s.
+            let Some(eids) = typing_targets(&friend_id, eids) else { return Ok(()) };
             let iroh = iroh.inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = crate::iroh_net::send_chat_any(&iroh, &ep, &eids, payload).await;
+                let _ = crate::iroh_net::send_chat_any_within(&iroh, &ep, &eids, payload, Some(std::time::Duration::from_secs(3))).await;
             });
         }
     }
     Ok(())
+}
+
+/// Which of a friend's devices a typing signal may go to (None = skip it).
+fn typing_targets(friend_id: &str, eids: Vec<String>) -> Option<Vec<String>> {
+    use std::{collections::HashMap, time::{Duration, Instant}};
+    static PROBED: std::sync::Mutex<Option<HashMap<String, Instant>>> = std::sync::Mutex::new(None);
+    let live: Vec<String> = eids.iter().filter(|e| crate::mailbox::seen_within(e, Duration::from_secs(120))).cloned().collect();
+    if !live.is_empty() {
+        return Some(live);
+    }
+    let mut g = PROBED.lock().unwrap_or_else(|p| p.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    if map.get(friend_id).is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+        return None;
+    }
+    map.insert(friend_id.to_owned(), Instant::now());
+    map.retain(|_, t| t.elapsed() < Duration::from_secs(600));
+    (!eids.is_empty()).then_some(eids)
 }
 
 /// Send a read receipt: tell a friend we've seen everything up to `up_to` (ms).
@@ -1594,6 +1831,15 @@ pub async fn send_read_receipt(
         }
     }
     Ok(())
+}
+
+/// The user has seen this conversation (it's open on screen): remember how far
+/// it's read, so the user's other devices clear their unread badge for it too.
+#[tauri::command]
+pub fn chat_mark_seen(state: State<'_, Arc<AppState>>, friend_id: String) {
+    if chat::mark_seen(&state.config_dir, &friend_id).is_some() {
+        crate::account::note_change();
+    }
 }
 
 /// Download a GIF's bytes (from Giphy's CDN) into a temp file so it can be sent
@@ -1668,6 +1914,12 @@ pub async fn send_chat_gif(
         deleted: false,
         gif: Some(gif),
         rev: 0,
+        held_on: None,
+        server_note: None,
+        via: None,
+        deliveries: vec![],
+        link_preview: None,
+        text_rev: 0, reaction_revs: vec![],
     };
     chat::append(&state.config_dir, &msg);
     let _ = app.emit("chat://message", &msg);
@@ -1728,7 +1980,9 @@ pub fn add_friend_by_code(
     app: AppHandle,
     code: String,
 ) -> Result<Friend, String> {
-    let friend = friends::add_by_code(&state.config_dir, &code)?;
+    let me = iroh.get().map(|e| e.id().to_string());
+    let friend = friends::add_by_code_for(&state.config_dir, &code, me.as_deref())?;
+    let _ = app.emit("friend-requests://changed", ());
     // Reverse direction: tell them who we are so they add us too.
     if let Some(eid) = friend.endpoint_id.clone() {
         let my_name = state.settings.lock().unwrap().display_name.clone();
@@ -1833,6 +2087,7 @@ fn folder_history_summary_blocking(state: &Arc<AppState>) -> Vec<crate::models::
             let items = folder_history::load(&folder);
             let bytes = folder_history::folder_size(&folder);
             let oldest_ms = items.iter().map(|i| i.timestamp_ms).min();
+            let overflow_trashed = folder_history::overflow_notice(&folder).map(|n| n.0).unwrap_or(0);
             crate::models::FolderHistorySummary {
                 pair_id,
                 folder_name: folder_display_name(&folder),
@@ -1840,9 +2095,10 @@ fn folder_history_summary_blocking(state: &Arc<AppState>) -> Vec<crate::models::
                 bytes,
                 item_count: items.len() as u64,
                 oldest_ms,
+                overflow_trashed,
             }
         })
-        .filter(|s| s.item_count > 0)
+        .filter(|s| s.item_count > 0 || s.overflow_trashed > 0)
         .collect()
 }
 
@@ -1907,6 +2163,7 @@ pub fn send_to_friend(
     paths: Vec<String>,
     chat_transfer_id: Option<String>,
     chat_attempt: Option<u64>,
+    device: Option<String>,
 ) -> Result<TransferUpdate, String> {
     let paths: Vec<String> = paths.into_iter().filter(|p| !p.trim().is_empty()).collect();
     if paths.is_empty() {
@@ -1917,17 +2174,13 @@ pub fn send_to_friend(
             return Err(format!("File not found: {p}"));
         }
     }
-    let friend = friends::get(&state.config_dir, &id).ok_or("Friend not found.")?;
-    // iroh-only: dial the friend's endpoint directly (discovery resolves their
-    // address). A friend added before Direct mode has no endpoint id and needs a
-    // quick re-pair to be reachable.
-    let eid = friend.endpoint_id.clone().ok_or(
-        "This friend was added on an old version — re-add them to send directly.",
-    )?;
     if iroh.get().is_none() {
         return Err("DropBeam is still connecting — try again in a moment.".into());
     }
-    crate::iroh_net::send_to_friend(app, iroh.inner().clone(), friend.name, eid, paths, chat_transfer_id, chat_attempt)
+    // iroh-only: dial the friend's devices directly (discovery resolves their
+    // addresses). Every one of the person's devices gets the files, unless the
+    // user picked one (`device` = its endpoint id).
+    crate::fanout::send(app, iroh.inner().clone(), &state.config_dir, &id, paths, chat_transfer_id, chat_attempt, device)
 }
 
 // ── iroh transport (Phase 1: foundation / diagnostics) ───────────────────────

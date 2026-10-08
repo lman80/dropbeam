@@ -15,6 +15,7 @@ function statusLine(t: TransferUpdate) {
   if (t.state === 'failed') return 'Failed · Retry'
   if (t.state === 'paused') return 'Paused · Resume'
   if (t.state === 'canceled') return 'Canceled'
+  if (t.state === 'held') return `On ${t.heldOn ?? 'your Transfer Server'} · reaches ${t.friendName ?? 'them'} when they’re online`
   if (t.state === 'transferring') return `${t.direction === 'send' ? `Sending${t.friendName ? ` to ${t.friendName}` : ''}` : 'Receiving'} · ${formatBytes(t.bytesDone)} of ${formatBytes(t.bytesTotal)} · ${formatSpeed(t.speedBps)}`
   return t.detail || ({ starting: 'Starting…', waitingForPeer: 'Waiting for a connection', connecting: 'Connecting…', waitingForAccept: 'Waiting for acceptance' }[t.state] ?? t.state)
 }

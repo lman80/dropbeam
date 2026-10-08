@@ -35,6 +35,9 @@ pub enum TransferState {
     /// receiver, landed files on a Location), so resuming replays the same send
     /// and skips what already arrived.
     Paused,
+    /// The friend was offline, so the (end-to-end sealed) files are waiting on a
+    /// Transfer Server; a later update turns this into Completed ("Delivered").
+    Held,
 }
 
 /// Which channel the active connection is using — so the UI can tell the user
@@ -128,6 +131,13 @@ pub struct TransferUpdate {
     /// connection". Drives the "wait for direct" parked card + "Send over relay anyway".
     #[serde(default)]
     pub detail: Option<String>,
+    /// The Transfer Server this send is uploading to / waiting on (its name),
+    /// when the friend was offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_on: Option<String>,
+    /// A send to a friend with several devices: where it is on each device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliveries: Option<Vec<crate::fanout::Delivery>>,
 }
 
 /// Chat-only batch coordinates; the transfer list keeps its per-push updates.
@@ -186,6 +196,8 @@ impl TransferUpdate {
             friend_name: None,
             conn_detail: None,
             detail: None,
+            held_on: None,
+            deliveries: None,
         }
     }
 }
@@ -227,7 +239,9 @@ pub struct Settings {
     pub launch_at_login: bool,
     /// Prefer direct peer-to-peer connections over the relay.
     pub prefer_direct_p2p: bool,
-    /// Custom relay address (host:port). Empty = use the public relay.
+    /// Extra relay server URL(s) — comma/space separated `https://…` — added in
+    /// front of the built-in relays (which stay as the fallback). Empty = the
+    /// built-in list. Applied at startup. See RELAY-SETUP.md.
     pub custom_relay: String,
     /// Custom relay password. Empty = default.
     pub custom_relay_pass: String,
@@ -270,6 +284,9 @@ pub struct Settings {
     /// a feature gate, so it never changes the wire format — the receiver follows.
     #[serde(default = "default_true")]
     pub parallel_streams: bool,
+    /// How long a Quick Send link stays valid, in hours (0 = the default, 24).
+    #[serde(default)]
+    pub quick_send_ttl_hours: u32,
     /// Absolute path to the user's chosen profile picture (copied into the app
     /// config dir). Empty = no picture (we render initials instead). Local-only.
     #[serde(default)]
@@ -282,6 +299,11 @@ pub struct Settings {
     /// iMessage/WhatsApp). On by default; turning it off stops you sending them.
     #[serde(default = "default_true")]
     pub send_read_receipts: bool,
+    /// Link previews in chat (#47): when you send a link, THIS device fetches a
+    /// small preview (title, image) and sends it with the message. Friends never
+    /// contact the site. On by default.
+    #[serde(default = "default_true")]
+    pub link_previews: bool,
     /// A free Giphy API key (developers.giphy.com) that powers GIF search in chat.
     /// Empty by default → the GIF picker shows a one-line setup prompt instead.
     /// Giphy sanctions client-side keys, so this rides in the client safely.
@@ -344,7 +366,7 @@ impl Default for Settings {
             minimize_to_tray: true,
             // Always ready: new installs auto-start (silently, in the menu bar) so
             // a friend's file can land without the app being open first.
-            launch_at_login: true,
+            launch_at_login: !cfg!(target_os = "linux"), // Linux: opt-in (see lib.rs setup)
             prefer_direct_p2p: true,
             custom_relay: String::new(),
             custom_relay_pass: String::new(),
@@ -356,9 +378,11 @@ impl Default for Settings {
             require_direct: false,
             wait_for_direct: false,
             parallel_streams: true,
+            quick_send_ttl_hours: 0,
             avatar: String::new(),
             notify_on_message: true,
             send_read_receipts: true,
+            link_previews: true,
             giphy_api_key: String::new(),
             verbose_logging: false,
             show_sync_popup: true,
@@ -501,6 +525,9 @@ pub struct FolderHistorySummary {
     pub item_count: u64,
     /// Timestamp (ms) of the oldest saved copy, if any.
     pub oldest_ms: Option<u64>,
+    /// Copies the disk-safety limit had to move to the OS Trash (since launch).
+    #[serde(default)]
+    pub overflow_trashed: u64,
 }
 
 /// A friend — a named peer you can send files to directly, no code needed.
@@ -517,6 +544,11 @@ pub struct Friend {
     /// an own device can read "Your Mac" / "Your iPhone" instead of a raw name.
     #[serde(default)]
     pub device_os: Option<String>,
+    /// The peer's hardware model in plain words ("iPhone 15", "MacBook Air"),
+    /// from its hello, so two own devices of the same kind can be told apart.
+    /// Absent from older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_model: Option<String>,
     pub id: String,
     pub role: PairRole,
     pub name: String,
@@ -548,6 +580,11 @@ pub struct Friend {
     /// None until hello/ready negotiation; zero denotes a legacy peer.
     #[serde(default)]
     pub progress_v: Option<u64>,
+    /// We added them, but their device says it doesn't accept us yet (a
+    /// friend request waiting on their side): our messages wait until they
+    /// do. Device-local; cleared as soon as they greet or message us.
+    #[serde(default)]
+    pub awaiting_accept: bool,
 }
 
 fn default_true() -> bool {
@@ -616,6 +653,13 @@ pub struct FolderStatus {
     /// Live connection detail for the active folder transfer (inspector data).
     #[serde(default)]
     pub conn_detail: Option<ConnDetail>,
+    /// The folder isn't on disk (unplugged drive, moved/renamed). Nothing syncs.
+    #[serde(default)]
+    pub folder_missing: bool,
+    /// Something worth telling the user that isn't an error — e.g. files the peer
+    /// can't hold under their names (Windows-illegal characters).
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// The honest answer to "are these two folders identical?", returned by the

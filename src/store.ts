@@ -1,5 +1,4 @@
 import { emit, listen } from '@tauri-apps/api/event'
-import { contentSummary, linkedTitle } from './lib/deviceLink'
 import { create } from 'zustand'
 import { listenForChatNotifications } from './lib/chatNotifications'
 import {
@@ -9,10 +8,15 @@ import {
   type ConnDetail,
   onChatMessage,
   onChatTyping,
+  onChatSeen,
+  onChatSyncedUnread,
+  FRIEND_REQUESTS_TARGET,
   onFolderComplete,
   onFolderStatus,
   onFolderSynced,
   onFriendsChanged,
+  onFriendRequestsChanged,
+  type FriendRequest,
   onBlockedChanged,
   onHistoryChanged,
   onOpenFileSend,
@@ -36,9 +40,11 @@ import { setSpeedUnit } from './lib/format'
 import { LandedEta, TransferRate, etaAt } from './lib/eta'
 import { chatTransferUpdate, loadChatTransfers, saveChatTransfers, pruneChatTransfers } from './lib/chatTransfer'
 import { normalizeChatMessage, normalizeTransfer } from './lib/normalize'
-import { parseCode, routeCode, wrongCodeMessage } from './lib/codes'
+import { DEVICE_CODE_ELSEWHERE, parseCode, routeCode, wrongCodeMessage } from './lib/codes'
 import { appVersion, checkUpdate, installUpdate as runInstall } from './lib/updater'
-import { MOBILE_UI } from './lib/platform'
+import { IS_MAC, IS_WINDOWS, MOBILE_UI } from './lib/platform'
+import { feedbackMoment } from './lib/feedback'
+import { PERMISSION_MESSAGE, humanError, humanErrorIn, rawErrorText } from './lib/errors'
 
 /** Used only if `get_settings` fails at startup, so the app still renders. */
 // Wire the periodic/online update re-check listeners exactly once.
@@ -62,6 +68,10 @@ export interface TransferRates {
   ageMs: number
   /** Below two samples the engine's own speedBps/etaSeconds stand in. */
   samples: number
+  /** True once the run has been measured for ~3 s of WALL time — flipped by a
+   *  timer too, so a card whose progress frames pause never sits on
+   *  "calculating…" forever. */
+  settled: boolean
 }
 
 // The two display toggles are GLOBAL (not per card) and outlive a restart.
@@ -103,6 +113,7 @@ const DEFAULT_SETTINGS: Settings = {
   avatar: '',
   notifyOnMessage: true,
   sendReadReceipts: true,
+  linkPreviews: true,
   giphyApiKey: '',
   verboseLogging: false,
   showSyncPopup: true,
@@ -130,6 +141,25 @@ import { playError, playIncoming, playOffer, playReceived, playSent } from './li
 
 /** Leading-edge throttle (per pair+direction) so a burst of synced files cues once. */
 const folderSoundThrottle = new Map<string, number>()
+
+/** Auto-dismiss timers per toast; cleared while the pointer rests on them. */
+const toastTimers = new Map<string, ReturnType<typeof setTimeout>>()
+let toastsHeld = false
+function scheduleToast(id: string, ms: number, dismiss: (id: string) => void): void {
+  if (toastsHeld) return
+  const prev = toastTimers.get(id)
+  if (prev) clearTimeout(prev)
+  toastTimers.set(id, setTimeout(() => dismiss(id), ms))
+}
+
+/** Transfers this window canceled itself — their end gets no error sound. */
+export const ownCancels = new Set<string>()
+
+/** True in the menu-bar popover, HUD and receive-card webviews. Checked lazily:
+ *  main.tsx adds the class after this module is evaluated. */
+function isOverlayWindow(): boolean {
+  return typeof document !== 'undefined' && document.documentElement.classList.contains('overlay-window')
+}
 
 /** When each transfer started moving bytes, to compute a final average speed. */
 const transferStart = new Map<string, number>()
@@ -193,6 +223,10 @@ export interface Toast {
   id: string
   kind: 'info' | 'success' | 'error'
   message: string
+  /** Raw technical text behind an error, shown under a "Details" disclosure. */
+  details?: string | null
+  /** A one-click fix shown as a button ("Open Settings"). */
+  action?: { label: string; run: () => void } | null
 }
 
 interface AppStore {
@@ -255,7 +289,8 @@ interface AppStore {
   clearHistoryFocus: () => void
   setDragHovering: (v: boolean) => void
   setPendingSend: (paths: string[] | null) => void
-  markFriendSeen: (name: string) => void
+  /** A friend id (preferred) or a display name. */
+  markFriendSeen: (who: string) => void
   applyTheme: (theme: Settings['theme']) => void
   saveSettings: (patch: Partial<Settings>) => Promise<void>
   pickAvatar: () => Promise<void>
@@ -272,6 +307,8 @@ interface AppStore {
   setPendingFolderInvite: (code: string | null) => void
   upsertTransfer: (u: TransferUpdate) => void
   removeTransfer: (id: string) => void
+  /** Cancel a transfer you started or accepted (no error sound when it ends). */
+  cancelTransfer: (id: string) => Promise<void>
   /** Re-run a failed friend/Quick Send with the same files + recipient (one tap).
    *  No-op if the original payload is no longer known or the card isn't failed. */
   retryTransfer: (id: string) => Promise<void>
@@ -283,9 +320,15 @@ interface AppStore {
   updatePair: (u: PairUpdate) => Promise<void>
   removePair: (id: string) => Promise<void>
   reloadFriends: () => Promise<void>
+  /** People asking to be friends (S2): they can't chat or send silently until accepted. */
+  friendRequests: FriendRequest[]
+  reloadFriendRequests: () => Promise<void>
+  acceptFriendRequest: (endpointId: string) => Promise<void>
+  declineFriendRequest: (endpointId: string, block: boolean) => Promise<void>
   /** Resolves true once a transfer actually started (false: nothing to send, a
    *  de-duped double-fire, or an error already toasted). */
-  sendToFriend: (id: string, paths: string[]) => Promise<boolean>
+  /** Files to a friend: every one of their devices, or just `device` (endpoint id). */
+  sendToFriend: (id: string, paths: string[], device?: string) => Promise<boolean>
   createFriend: (name: string) => Promise<string>
   acceptFriend: (invite: string) => Promise<void>
   addFriendByCode: (code: string) => Promise<void>
@@ -332,8 +375,19 @@ interface AppStore {
   unstageChatFile: (path: string) => void
   clearChatDraftFiles: () => void
   markChatRead: (friendId: string) => void
-  toast: (kind: Toast['kind'], message: string) => void
+  /** Error toasts accept anything thrown: it's mapped to a plain sentence, with
+   *  the raw text kept under "Details". */
+  toast: (kind: Toast['kind'], message: unknown) => void
+  /** An error toast with context: "Couldn’t save settings." + the cause. */
+  toastError: (context: string, e: unknown) => void
   dismissToast: (id: string) => void
+  /** Pause (hover) / resume auto-dismiss of every visible toast. */
+  holdToasts: (hold: boolean) => void
+  /** Settings came from the startup fallback (the engine didn't answer in time):
+   *  saving would write DEFAULTS over the real file, so saves are blocked until
+   *  a real load succeeds. */
+  settingsFallback: boolean
+  retryLoadSettings: () => Promise<boolean>
 }
 
 /** A short one-line preview of a message, for reply quotes + list rows. */
@@ -418,7 +472,7 @@ let lastFriendAt = 0
 // (NOT a per-webview Map) because a send can START in the menu-bar popover while its
 // failed card — and the Retry button — renders in the MAIN window; both windows must
 // read the same payload. Bounded so it can't grow unbounded across a session.
-type RetryPayload = { kind: 'friend'; id: string; paths: string[] } | { kind: 'quick'; paths: string[] } | { kind: 'location'; id: string; locationId: string; relPath: string; paths: string[] }
+type RetryPayload = { kind: 'friend'; id: string; paths: string[]; device?: string } | { kind: 'quick'; paths: string[] } | { kind: 'location'; id: string; locationId: string; relPath: string; paths: string[] }
 const RETRY_KEY = 'dropbeam-retry-payloads'
 function loadRetryPayloads(): Record<string, RetryPayload> {
   try {
@@ -440,6 +494,15 @@ function setRetryPayload(id: string, p: RetryPayload): void {
 }
 export function rememberLocationUpload(transferId: string, friendId: string, locationId: string, relPath: string, paths: string[]) {
   setRetryPayload(transferId, { kind: 'location', id: friendId, locationId, relPath, paths })
+}
+/** The friend a send went to (from its retry payload), if known. */
+export function retryFriendId(id: string): string | null {
+  const p = loadRetryPayloads()[id]
+  return p && p.kind !== 'quick' ? p.id : null
+}
+/** Can this stopped card be replayed with one tap? */
+export function hasRetryPayload(id: string): boolean {
+  return !!loadRetryPayloads()[id]
 }
 function deleteRetryPayload(id: string): void {
   try {
@@ -509,6 +572,9 @@ const typingTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 // the MAIN window via broadcast, and that window's upsertTransfer hook must read the
 // same link to flip the card. Bounded; cleared when the transfer succeeds.
 const CHATXFER_KEY = 'dropbeam-chat-file-xfer'
+/** Friend ids from the last load; null until the first (so launch isn't "added"). */
+let knownFriendIds: Set<string> | null = null
+
 function loadChatFileXfer(): Record<string, { peerId: string; msgId: string }> {
   try {
     return JSON.parse(localStorage.getItem(CHATXFER_KEY) || '{}') as Record<
@@ -543,6 +609,21 @@ function deleteChatFileXfer(id: string): void {
 }
 
 const restoredPaused = loadPausedTransfers()
+
+/** A refused file permission (macOS Files & Folders, Windows Controlled Folder
+ *  Access) is fixable in one place — say where, and offer to open it. */
+function permissionFix(message: string): { message: string; action: Toast['action'] } | null {
+  if (!message.includes(PERMISSION_MESSAGE) || MOBILE_UI) return null
+  if (IS_MAC) return {
+    message: `${message} In System Settings → Privacy & Security → Files & Folders, turn on DropBeam for that folder, then try again.`,
+    action: { label: 'Open Settings', run: () => { void api.openPrivacySettings('files').catch(() => {}) } },
+  }
+  if (IS_WINDOWS) return {
+    message: `${message} If Windows Security blocked it, open Windows Security → Virus & threat protection → Ransomware protection → Allow an app, and add DropBeam.`,
+    action: null,
+  }
+  return null
+}
 
 export const useStore = create<AppStore>((set, get) => ({
   ready: false,
@@ -613,14 +694,29 @@ export const useStore = create<AppStore>((set, get) => ({
     // we ALWAYS reach ready:true, so a slow or failing backend renders the app
     // (with defaults) rather than hanging on the loading screen forever. Any
     // failure is logged to the app log file (frontend_log) for diagnosis.
-    const [settings, history, pairs, friends, statuses, defaultDownloadDir] = await Promise.all([
-      guarded(api.getSettings(), DEFAULT_SETTINGS, 'getSettings'),
+    // Settings are special (D18): if the first read is slow, the app renders on
+    // DEFAULTS — and a save from that state would write those defaults over the
+    // real file. So remember it was a fallback (saves are blocked, a banner
+    // offers Retry) and adopt the real settings the moment the slow read lands.
+    const settingsRead = api.getSettings()
+    const [loadedSettings, history, pairs, friends, statuses, defaultDownloadDir] = await Promise.all([
+      guarded(settingsRead, null as Settings | null, 'getSettings'),
       guarded(api.getHistory(), [], 'getHistory'),
       guarded(api.listPairs(), [], 'listPairs'),
       guarded(api.listFriends(), [], 'listFriends'),
       guarded(api.getFolderStatuses(), [], 'getFolderStatuses'),
       guarded(api.getDefaultDownloadDir(), '', 'getDefaultDownloadDir'),
     ])
+    const settings = loadedSettings ?? DEFAULT_SETTINGS
+    const settingsFallback = !loadedSettings
+    if (settingsFallback) {
+      void settingsRead.then((real) => {
+        if (!get().settingsFallback) return
+        setSpeedUnit(real.showMegabits)
+        set({ settings: real, settingsFallback: false })
+        get().applyTheme(real.theme)
+      }, () => {})
+    }
     try {
       get().applyTheme(settings.theme)
     } catch {
@@ -634,8 +730,9 @@ export const useStore = create<AppStore>((set, get) => ({
     // push the OS badge once — otherwise a restored backlog showed in the sidebar
     // while the Dock stayed at 0 until the next message arrived (#27).
     const chatUnread = pruneChatUnread(get().chatUnread, new Set(friends.map((f) => f.id)))
-    set({ settings, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true, chatUnread })
-    void listenForChatNotifications((peerId) => get().openChat(peerId))
+    set({ settings, settingsFallback, history, pairs, friends, folderStatuses, defaultDownloadDir, ready: true, chatUnread })
+    // A friend-request banner opens Friends (Accept/Decline live there).
+    void listenForChatNotifications(async (peerId) => { if (peerId === FRIEND_REQUESTS_TARGET) get().setView('friends'); else await get().openChat(peerId) })
 
     // Probe independently of mounted views, including while iroh starts up.
     // Each webview has its own store; successful probes feed the same presence input.
@@ -665,15 +762,22 @@ export const useStore = create<AppStore>((set, get) => ({
         await listen<Settings>('settings://changed', ({ payload }) => {
           settingsEventReceived = true
           setSpeedUnit(payload.showMegabits)
-          set({ settings: payload })
+          set({ settings: payload, settingsFallback: false })
           get().applyTheme(payload.theme)
         }).catch(() => {})
         // Close the snapshot/listener gap for settings in newly opened HUDs.
         const latest = await guarded(api.getSettings(), null, 'getSettings refresh')
         if (latest && !settingsEventReceived) {
           setSpeedUnit(latest.showMegabits)
-          set({ settings: latest })
+          set({ settings: latest, settingsFallback: false })
         }
+        // A send started natively (menu-bar drag on macOS) never went through
+        // sendToFriend, so remember its payload here for one-tap Retry.
+        await listen<{ transferId: string; friendId: string; paths: string[] }>('dropbeam://send-started', ({ payload }) => {
+          if (payload?.transferId && payload.friendId && Array.isArray(payload.paths)) {
+            setRetryPayload(payload.transferId, { kind: 'friend', id: payload.friendId, paths: payload.paths })
+          }
+        }).catch(() => {})
       }
     }
 
@@ -808,19 +912,37 @@ export const useStore = create<AppStore>((set, get) => ({
         // uses the same gate, so the two never double up.
         const lookingHere =
           get().windowFocused && get().view === 'chat' && get().activeChatId === m.peerId
-        if (!m.fromMe && !lookingHere && (get().settings?.playSounds ?? true)) {
+        if (!m.fromMe && !m.alreadyRead && !lookingHere && (get().settings?.playSounds ?? true)) {
           playIncoming()
         }
         // If it landed in the open + focused chat, it's been seen → read receipt.
         if (!m.fromMe && lookingHere) get().markChatRead(m.peerId)
       })
+      // Read on another of your devices: clear what that device has seen here too.
+      void onChatSeen(({ peerId, upTo }) => {
+        const s = get()
+        const have = s.chatUnread[peerId] ?? 0
+        if (!have) return
+        const thread = s.chats[peerId]
+        const left = thread
+          ? thread.filter((m) => !m.fromMe && !m.deleted && m.ts > upTo).length
+          : (s.chatOverview.find((o) => o.peerId === peerId)?.lastTs ?? Infinity) <= upTo ? 0 : have
+        if (left < have) set({ chatUnread: saveChatUnread({ ...s.chatUnread, [peerId]: left }) })
+      }).catch(() => {})
+      // A friend's message that reached another of your devices first is still
+      // unread here (unless you're looking at that very chat).
+      void onChatSyncedUnread(({ peerId, count }) => {
+        const s = get()
+        if (count <= 0 || (s.windowFocused && s.view === 'chat' && s.activeChatId === peerId)) return
+        set({ chatUnread: saveChatUnread({ ...s.chatUnread, [peerId]: (s.chatUnread[peerId] ?? 0) + count }) })
+      }).catch(() => {})
       if (HAS_TAURI) void listen<{ peerId: string }>('friend://presence', ({ payload }) => {
         const friend = get().friends.find((f) => f.id === payload.peerId)
-        if (friend) get().markFriendSeen(friend.name)
+        if (friend) get().markFriendSeen(friend.id)
       })
       onChatTyping((t) => {
         const friend = get().friends.find((f) => f.id === t.peerId)
-        if (friend) get().markFriendSeen(friend.name)
+        if (friend) get().markFriendSeen(friend.id)
         set((s) => ({ chatTyping: { ...s.chatTyping, [t.peerId]: t.on } }))
         // Receiver-side safety net: the "stopped typing" signal is fire-once and can
         // be lost (peer goes offline / relay flap), which left "typing…" stuck on
@@ -848,6 +970,8 @@ export const useStore = create<AppStore>((set, get) => ({
     // so the folder shows who's in it (and clears the stale "waiting" state).
     onPairsChanged(() => get().reloadPairs())
     onFriendsChanged(() => get().reloadFriends())
+    void onFriendRequestsChanged(() => { void get().reloadFriendRequests() }).catch(() => {})
+    void get().reloadFriendRequests()
     onBlockedChanged(() => void get().reloadBlocked())
     void get().reloadBlocked()
 
@@ -923,7 +1047,7 @@ export const useStore = create<AppStore>((set, get) => ({
       })
       // The app relaunches inside runInstall on success.
     } catch (e) {
-      get().toast('error', `Update failed: ${e}`)
+      get().toastError('Couldn’t install the update.', e)
       const cur = get().update
       if (cur) set({ update: { ...cur, installing: false } })
     }
@@ -966,16 +1090,11 @@ export const useStore = create<AppStore>((set, get) => ({
           get().setView('folders')
           get().toast('info', 'That’s a shared-folder invite — choose where to keep the folder to join it.')
           return true
-        case 'linkDevice': {
-          // Either code works whichever device scans it: the engine picks the
-          // direction (the account that already has devices wins) and refuses
-          // two different accounts before touching anything.
-          const linked = /^dropbeamjoin1:/i.test(route.code) ? await api.linkDeviceJoin(route.code) : await api.linkDeviceSend(route.code)
-          const what = contentSummary(linked.friends, linked.messages)
-          get().toast('success', `${linkedTitle(linked)}${what ? ` — ${what} now on both` : ''}. Friends and chats stay in sync.`)
-          void get().reloadFriends()
-          return true
-        }
+        case 'linkDevice':
+          // S1: never linked from here (Add Friend, Have a code, the popover,
+          // a QR scan, a dropbeam:// link) — only from Settings → Devices.
+          get().toast('error', DEVICE_CODE_ELSEWHERE)
+          return false
         case 'invalid':
           get().toast('error', route.message)
           return false
@@ -986,8 +1105,17 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  markFriendSeen: (name) => {
-    const key = name.trim().toLowerCase()
+  markFriendSeen: (who) => {
+    // Presence is kept per friend id (#44). Callers that only know a display
+    // name (a transfer card, a folder beacon) resolve it to the ONE friend with
+    // that name; an ambiguous or unknown name keeps a name entry instead.
+    const friends = get().friends
+    let key = who.trim()
+    if (!friends.some(f => f.id === key)) {
+      const lower = key.toLowerCase()
+      const named = friends.filter(f => f.name.trim().toLowerCase() === lower)
+      key = named.length === 1 ? named[0].id : lower
+    }
     if (key) {
       const friendSeen = { ...get().friendSeen, [key]: Date.now() }
       try { localStorage.setItem('dropbeam-friend-seen', JSON.stringify(friendSeen)) } catch { /* storage unavailable */ }
@@ -1054,6 +1182,8 @@ export const useStore = create<AppStore>((set, get) => ({
   },
 
   applyTheme: (theme) => {
+    // Cache for index.html's pre-paint theme script (next launch, every window).
+    try { localStorage.setItem('dropbeam-theme', theme) } catch { /* storage unavailable */ }
     const root = document.documentElement
     const sysDark = window.matchMedia('(prefers-color-scheme: dark)').matches
     const dark = theme === 'dark' || (theme === 'system' && sysDark)
@@ -1070,6 +1200,12 @@ export const useStore = create<AppStore>((set, get) => ({
   saveSettings: async (patch) => {
     const current = get().settings
     if (!current) return
+    if (get().settingsFallback) {
+      // Never persist a change on top of startup DEFAULTS (D18) — it would
+      // overwrite every real setting with its default.
+      get().toast('error', 'Your settings haven’t finished loading, so this change wasn’t saved. Try again in a moment.')
+      return
+    }
     const next = { ...current, ...patch }
     set({ settings: next })
     if (patch.theme) get().applyTheme(patch.theme)
@@ -1086,7 +1222,7 @@ export const useStore = create<AppStore>((set, get) => ({
       set({ settings: current })
       if (patch.theme) get().applyTheme(current.theme)
       if (patch.showMegabits !== undefined) setSpeedUnit(current.showMegabits)
-      get().toast('error', `Couldn't save settings: ${e}`)
+      get().toastError('Couldn’t save settings.', e)
     }
   },
 
@@ -1095,7 +1231,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const saved = await api.setProfileAvatar()
       set({ settings: saved })
     } catch (e) {
-      get().toast('error', `Couldn't set picture: ${e}`)
+      get().toastError('Couldn’t set your picture.', e)
     }
   },
   clearAvatar: async () => {
@@ -1103,7 +1239,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const saved = await api.clearProfileAvatar()
       set({ settings: saved })
     } catch (e) {
-      get().toast('error', `Couldn't remove picture: ${e}`)
+      get().toastError('Couldn’t remove your picture.', e)
     }
   },
 
@@ -1122,7 +1258,17 @@ export const useStore = create<AppStore>((set, get) => ({
       // The card's own live/average rates. A run that just restarted (resumed
       // after Paused/Failed, or rewound) starts its clock again here.
       let rate = continuing ? rateTrackers.get(u.id) : undefined
-      rate ??= new TransferRate()
+      if (!rate) {
+        rate = new TransferRate()
+        const fresh = rate
+        const id = u.id
+        setTimeout(() => set((s) => {
+          const cur = s.transferRates[id]
+          return cur && !cur.settled && rateTrackers.get(id) === fresh
+            ? { transferRates: { ...s.transferRates, [id]: { ...cur, settled: true } } }
+            : s
+        }), 3000)
+      }
       rateTrackers.set(u.id, rate)
       rate.update(now, u.bytesDone)
       const liveBps = rate.live()
@@ -1134,6 +1280,7 @@ export const useStore = create<AppStore>((set, get) => ({
         avgEta: etaAt(u.bytesDone, u.bytesTotal, avgBps),
         ageMs: rate.startedAt == null ? 0 : now - rate.startedAt,
         samples: rate.count,
+        settled: (continuing && !!get().transferRates[u.id]?.settled) || (rate.startedAt != null && now - rate.startedAt >= 3000),
       }
     } else {
       etaSpeeds.delete(u.id)
@@ -1159,20 +1306,27 @@ export const useStore = create<AppStore>((set, get) => ({
       u.friendName &&
       (u.state === 'transferring' || u.state === 'completed' || !!u.connDetail)
     ) {
-      const key = u.friendName.trim().toLowerCase()
+      const named = get().friends.filter(f => f.name.trim().toLowerCase() === u.friendName!.trim().toLowerCase())
+      const key = named.length === 1 ? named[0].id : u.friendName.trim().toLowerCase()
       const last = get().friendSeen[key] ?? 0
       if (Date.now() - last > 5000) {
         get().markFriendSeen(u.friendName)
       }
     }
-    // Sounds fire on meaningful state changes only (not on every progress tick).
-    if ((get().settings?.playSounds ?? true) && (!prev || prev.state !== u.state)) {
+    // Sounds fire on meaningful state changes only (not on every progress tick),
+    // and only from the MAIN window: the popover, HUD and receive card run their
+    // own copy of this store and would otherwise chime two or three times.
+    const ownCancel = u.state === 'canceled' && ownCancels.delete(u.id)
+    if (!isOverlayWindow() && (get().settings?.playSounds ?? true) && (!prev || prev.state !== u.state)) {
       if (u.state === 'completed') {
         if (u.direction === 'send') playSent()
         else playReceived()
-      } else if (u.state === 'failed' || u.state === 'canceled') {
-        // A transfer errored out or was canceled — a soft descending "uh-oh".
+      } else if (u.state === 'failed' || (u.state === 'canceled' && !ownCancel)) {
+        // A transfer errored out, or the OTHER side stopped it — a soft "uh-oh".
+        // Your own Cancel is silent: you know you did it.
         playError()
+      } else if (u.state === 'held' && u.direction === 'send') {
+        playSent()
       } else if (u.state === 'waitingForAccept') {
         playOffer()
       } else if (u.direction === 'receive' && !prev) {
@@ -1180,6 +1334,12 @@ export const useStore = create<AppStore>((set, get) => ({
         // (failed/canceled are handled above, so this is a live arrival.)
         playIncoming()
       }
+    }
+    // SuperFeedback moment of value: a transfer finished while we watched it.
+    if (u.state === 'completed' && prev && prev.state !== 'completed') {
+      const chat = !!u.chatTransfer || !!loadChatFileXfer()[u.id]
+      if (chat) { if (u.direction === 'send') feedbackMoment('chat-file-delivered') }
+      else feedbackMoment(u.direction === 'send' ? 'files-sent' : 'files-received')
     }
     // Time the transfer so we can show a final summary (duration + avg speed).
     if (u.state === 'transferring' && (!prev || prev.state !== 'transferring')) {
@@ -1206,7 +1366,7 @@ export const useStore = create<AppStore>((set, get) => ({
       // on the card: flag "tap to resend" on failure, clear it on a successful resend.
       const link = loadChatFileXfer()[u.id]
       if (link) {
-        const card = (get().chats[link.peerId] ?? []).find((x) => x.id === link.msgId)
+        const card = (get().chats[link.peerId] ?? []).find((x) => x.id === link.msgId && x.fromMe)
         if (u.state === 'failed') {
           if (card) get().addChatMessage({ ...card, fileXferFailed: true })
         } else {
@@ -1232,6 +1392,16 @@ export const useStore = create<AppStore>((set, get) => ({
         transferRates,
       }
     })
+  },
+
+  cancelTransfer: async (id) => {
+    ownCancels.add(id)
+    try {
+      await api.cancelTransfer(id)
+    } catch (e) {
+      ownCancels.delete(id)
+      get().toastError('Couldn’t cancel.', e)
+    }
   },
 
   removeTransfer: (id) => {
@@ -1268,7 +1438,7 @@ export const useStore = create<AppStore>((set, get) => ({
     // Drop the failed card first so the retry starts a fresh transfer instead of
     // leaving a zombie alongside it (this also frees the old payload).
     get().removeTransfer(id)
-    if (payload.kind === 'friend') await get().sendToFriend(payload.id, payload.paths)
+    if (payload.kind === 'friend') await get().sendToFriend(payload.id, payload.paths, payload.device)
     else await get().sendPaths(payload.paths)
   },
 
@@ -1279,11 +1449,11 @@ export const useStore = create<AppStore>((set, get) => ({
       // Re-send the BYTES only — api.sendToFriend (the raw transfer), NOT the store
       // action that also posts a fresh chat note. That avoids a duplicate file card
       // on every resend; the recipient's engine dedup prevents a double-delivery.
-      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId)
+      const card = (get().chats[peerId] ?? []).find((x) => x.id === msgId && x.fromMe)
       const linkId = card?.fileXferId ?? xferId
       const current = get().chatTransfers[linkId]
       if (current && current.state !== 'failed') return
-      const t = await api.sendToFriend(payload.id, payload.paths, linkId, (current?.chatTransfer?.attempt ?? 0) + 1)
+      const t = await api.sendToFriend(payload.id, payload.paths, linkId, (current?.chatTransfer?.attempt ?? 0) + 1, payload.device)
       setRetryPayload(t.id, payload)
       setChatFileXfer(t.id, { peerId, msgId })
       // Keep the shared chat ID on retries so the receiver follows the same card.
@@ -1327,10 +1497,31 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
+  friendRequests: [],
+  reloadFriendRequests: async () => {
+    const friendRequests = await api.listFriendRequests().catch(() => null)
+    if (friendRequests) set({ friendRequests })
+  },
+  acceptFriendRequest: async (endpointId) => {
+    try {
+      const f = await api.acceptFriendRequest(endpointId)
+      get().toast('success', `${f.name} is now your friend.`)
+    } catch (e) {
+      get().toast('error', String(e))
+    }
+    await Promise.all([get().reloadFriends(), get().reloadFriendRequests()])
+  },
+  declineFriendRequest: async (endpointId, block) => {
+    try { await api.declineFriendRequest(endpointId, block) } catch (e) { get().toast('error', String(e)) }
+    await get().reloadFriendRequests()
+  },
   reloadFriends: async () => {
     await get().refreshMyDevice().catch(() => {})
     const friends = await api.listFriends()
     const ids = new Set(friends.map((f) => f.id))
+    // SuperFeedback moment of value: someone new (not the first load).
+    if (knownFriendIds && friends.some((f) => !knownFriendIds!.has(f.id))) feedbackMoment('friend-added')
+    knownFriendIds = ids
     const chatOverview = (await api.listChats()).filter((o) => ids.has(o.peerId))
     set((s) => ({
       friends, chatOverview,
@@ -1353,22 +1544,22 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  sendToFriend: async (id, paths) => {
+  sendToFriend: async (id, paths, device) => {
     paths = paths.filter(Boolean)
     if (!paths.length) return false
     // De-dupe a double-fired send of the same files to the same friend within
     // ~1.5s (a doubled OS drop event would otherwise transfer everything twice).
-    const sig = `${id}|${paths.join('|')}`
+    const sig = `${id}|${device ?? ''}|${paths.join('|')}`
     const now = Date.now()
     if (sig === lastFriendSig && now - lastFriendAt < 1500) return false
     lastFriendSig = sig
     lastFriendAt = now
     set({ view: 'send' })
     try {
-      const u = await api.sendToFriend(id, paths)
+      const u = await api.sendToFriend(id, paths, undefined, undefined, device)
       // Remember the recipient + paths so a failed send can offer one-tap Retry
       // (the TransferUpdate only keeps the friend's display name, not their id).
-      setRetryPayload(u.id, { kind: 'friend', id, paths })
+      setRetryPayload(u.id, { kind: 'friend', id, paths, device })
       if (!get().transfers[u.id]) get().upsertTransfer(u)
       // A direct send to a friend also lands in that friend's chat timeline, on
       // BOTH sides — so every interaction shows up in the conversation (GitHub
@@ -1428,8 +1619,10 @@ export const useStore = create<AppStore>((set, get) => ({
     // guard also required window focus, so opening a conversation while the webview
     // wasn't reporting focus (a focus event the OS swallowed, a detached/menu-bar
     // window, a restored session) left "17 new" stuck forever.
-    if (s.view === 'chat' && s.activeChatId === friendId && (s.chatUnread[friendId] ?? 0) > 0) {
-      set({ chatUnread: saveChatUnread({ ...s.chatUnread, [friendId]: 0 }) })
+    if (s.view === 'chat' && s.activeChatId === friendId) {
+      if ((s.chatUnread[friendId] ?? 0) > 0) set({ chatUnread: saveChatUnread({ ...s.chatUnread, [friendId]: 0 }) })
+      // Your other devices clear this chat's badge too (a no-op when nothing new).
+      void api.chatMarkSeen(friendId).catch(() => {})
     }
     // TELLING THE FRIEND "I read it" keeps the stricter gate: a read receipt must
     // mean the thread was genuinely on screen in a focused window.
@@ -1537,17 +1730,19 @@ export const useStore = create<AppStore>((set, get) => ({
     // An incoming message means that friend is reachable right now.
     if (!m.fromMe) {
       const f = get().friends.find((fr) => fr.id === m.peerId)
-      if (f) get().markFriendSeen(f.name)
+      if (f) get().markFriendSeen(f.id)
     }
     set((s) => {
       const thread = s.chats[m.peerId] ?? []
-      const idx = thread.findIndex((x) => x.id === m.id)
+      // Matched by id AND direction (an incoming id is chosen by the peer and
+      // must never replace — or be swallowed by — one of our own messages).
+      const idx = thread.findIndex((x) => x.id === m.id && x.fromMe === m.fromMe)
       // A repeat id is an UPDATE (a status change, edit, delete, reaction), not a
       // new message — replace it in place and don't re-bump unread/count.
       const isNew = idx < 0
       const nextThread = isNew
         ? [...thread, m].sort(byOrder)
-        : thread.map((x) => (x.id === m.id ? m : x))
+        : thread.map((x) => (x.id === m.id && x.fromMe === m.fromMe ? m : x))
       const prev = s.chatOverview.find((o) => o.peerId === m.peerId)
       const last = nextThread[nextThread.length - 1]
       const row: ChatOverview = {
@@ -1572,7 +1767,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const inOpenThread =
         s.windowFocused && s.view === 'chat' && s.activeChatId === m.peerId
       let chatUnread = s.chatUnread
-      if (isNew && !m.fromMe && !inOpenThread) {
+      if (isNew && !m.fromMe && !m.alreadyRead && !inOpenThread) {
         chatUnread = { ...s.chatUnread, [m.peerId]: (s.chatUnread[m.peerId] ?? 0) + 1 }
       } else if (inOpenThread && (s.chatUnread[m.peerId] ?? 0) > 0) {
         chatUnread = { ...s.chatUnread, [m.peerId]: 0 }
@@ -1597,7 +1792,7 @@ export const useStore = create<AppStore>((set, get) => ({
   addFriendByCode: async (code) => {
     const friend = await api.addFriendByCode(code)
     await get().reloadFriends()
-    get().toast('success', `Added ${friend.name}`)
+    get().toast('success', `Added ${friend.name}. If they haven’t added you yet, they get a friend request to accept.`)
   },
 
   renameFriend: async (id, name) => {
@@ -1665,7 +1860,7 @@ export const useStore = create<AppStore>((set, get) => ({
     if (pending) return pending
     const probe = api.probeConnection(id).then((detail) => {
       const friend = get().friends.find((f) => f.id === id)
-      if (detail && friend) get().markFriendSeen(friend.name)
+      if (detail && friend) get().markFriendSeen(friend.id)
       return detail
     }).finally(() => presenceProbes.delete(id))
     presenceProbes.set(id, probe)
@@ -1677,7 +1872,7 @@ export const useStore = create<AppStore>((set, get) => ({
       const online = await api.pingFriend(id)
       if (online) {
         const f = get().friends.find((x) => x.id === id)
-        if (f) get().markFriendSeen(f.name)
+        if (f) get().markFriendSeen(f.id)
       }
       return online
     } catch {
@@ -1688,6 +1883,7 @@ export const useStore = create<AppStore>((set, get) => ({
   respondToOffer: async (id, accept) => {
     // Reflect the choice immediately; the backend then drives the real states.
     const t = get().transfers[id]
+    if (!accept) ownCancels.add(id)
     if (t) {
       get().upsertTransfer({
         ...t,
@@ -1703,10 +1899,50 @@ export const useStore = create<AppStore>((set, get) => ({
 
   toast: (kind, message) => {
     const id = crypto.randomUUID()
-    set((s) => ({ toasts: [...s.toasts, { id, kind, message }] }))
-    setTimeout(() => get().dismissToast(id), kind === 'error' ? 6000 : 3500)
+    const h = kind === 'error' ? humanError(message) : { message: rawErrorText(message), details: null }
+    const fix = kind === 'error' ? permissionFix(h.message) : null
+    set((s) => ({ toasts: [...s.toasts, { id, kind, message: fix?.message ?? h.message, details: h.details, action: fix?.action }] }))
+    scheduleToast(id, fix ? 15000 : kind === 'error' ? 6000 : 3500, get().dismissToast)
+  },
+  toastError: (context, e) => {
+    const id = crypto.randomUUID()
+    const h = humanErrorIn(context, e)
+    const fix = permissionFix(h.message)
+    set((s) => ({ toasts: [...s.toasts, { id, kind: 'error', message: fix?.message ?? h.message, details: h.details, action: fix?.action }] }))
+    scheduleToast(id, fix ? 15000 : 6000, get().dismissToast)
   },
 
-  dismissToast: (id) =>
-    set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+  dismissToast: (id) => {
+    const t = toastTimers.get(id)
+    if (t) clearTimeout(t)
+    toastTimers.delete(id)
+    set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }))
+    // Dismissing the hovered toast removes it before any mouseleave can fire —
+    // release the hold so the rest still time out.
+    if (toastsHeld) get().holdToasts(false)
+  },
+  holdToasts: (hold) => {
+    toastsHeld = hold
+    if (hold) {
+      for (const t of toastTimers.values()) clearTimeout(t)
+      toastTimers.clear()
+    } else {
+      // Resume with a short grace so a toast you just read doesn't vanish instantly.
+      for (const t of get().toasts) scheduleToast(t.id, t.kind === 'error' ? 4000 : 2500, get().dismissToast)
+    }
+  },
+
+  settingsFallback: false,
+  retryLoadSettings: async () => {
+    try {
+      const settings = await api.getSettings()
+      setSpeedUnit(settings.showMegabits)
+      set({ settings, settingsFallback: false })
+      get().applyTheme(settings.theme)
+      return true
+    } catch (e) {
+      get().toastError('Still couldn’t load your settings.', e)
+      return false
+    }
+  },
 }))

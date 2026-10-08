@@ -1,9 +1,10 @@
 /* eslint-disable react-refresh/only-export-components -- peopleLabel/accessLabel are shared with the Locations page */
+import { errorText } from '../lib/errors'
 import { useEffect, useState } from 'react'
 import { Check, FolderOpen, HardDrive, Pencil, Server, Trash2 } from 'lucide-react'
 import { api, locationsApi, onLocationActivity, type LocationActivity, type HostedLocation, type LocationRights, type MountCandidate } from '../lib/api'
 import { formatBytes, formatRelativeTime } from '../lib/format'
-import { IS_MAC, IS_WINDOWS } from '../lib/platform'
+import { IS_WINDOWS, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { useStore } from '../store'
 import { Dialog } from './Dialog'
 import { MenuButton, SectionHeader } from './ui'
@@ -11,8 +12,8 @@ import { MenuButton, SectionHeader } from './ui'
 const DEFAULT_CAP = 500_000_000_000
 const empty = (): HostedLocation => ({ id: '', name: '', path: '', friendIds: [], rights: { upload: true, manage: false }, byteCap: DEFAULT_CAP })
 /** The folder's own name, so "where is it?" already answers "what's it called?". */
-const nameFromPath = (path: string): string => path.split('/').filter(Boolean).pop() || 'Shared folder'
-const baseName = (path: string): string => path.split('/').filter(Boolean).pop() || path
+const nameFromPath = (path: string): string => path.split(/[\\/]/).filter(Boolean).pop() || 'Shared folder'
+const baseName = (path: string): string => path.split(/[\\/]/).filter(Boolean).pop() || path
 /** What a friend may do, as plain-language choices instead of two checkboxes. */
 const ACCESS = [
   { id: 'read', label: 'View and download', hint: 'They can open it and copy things out.', rights: { upload: false, manage: false } },
@@ -83,7 +84,7 @@ function AddLocationWizard({ onCancel, onSaved }: { onCancel: () => void; onSave
   }
   const browse = async () => {
     try { const path = await api.pickDirectory(); if (path) choose(path) }
-    catch (e) { setError(String(e)) }
+    catch (e) { setError(errorText(e)) }
   }
   const save = async () => {
     if (busy) return
@@ -92,7 +93,7 @@ function AddLocationWizard({ onCancel, onSaved }: { onCancel: () => void; onSave
       const before = new Set((await locationsApi.listHosted()).map(l => l.id))
       const locations = await locationsApi.save({ ...draft, name: draft.name.trim() })
       onSaved(locations, locations.find(l => !before.has(l.id))?.id)
-    } catch (e) { setError(String(e)) }
+    } catch (e) { setError(errorText(e)) }
     finally { setBusy(false) }
   }
   const access = accessOf(draft.rights)
@@ -122,7 +123,7 @@ function AddLocationWizard({ onCancel, onSaved }: { onCancel: () => void; onSave
         </button>)}
         <button type="button" className="row location-pick" onClick={() => { void browse() }}>
           <span className="location-glyph" aria-hidden><FolderOpen /></span>
-          <span className="row-main"><span className="row-title">Choose another folder…</span></span>
+          <span className="row-main"><span className="row-title">Choose Another Folder…</span></span>
         </button>
       </div>}
 
@@ -174,7 +175,7 @@ function EditLocation({ draft: initial, onClose, onSaved }: { draft: HostedLocat
     if (busy) return
     setBusy(true); setError('')
     try { onSaved(await locationsApi.save(draft)) }
-    catch (e) { setError(String(e)) }
+    catch (e) { setError(errorText(e)) }
     finally { setBusy(false) }
   }
   const footer = <>
@@ -195,7 +196,7 @@ function EditLocation({ draft: initial, onClose, onSaved }: { draft: HostedLocat
         <span className="location-inline">
           <input className="input" required placeholder="/Volumes/NAS/Shared" value={draft.path} title={draft.path} onChange={e => setDraft({ ...draft, path: e.target.value })} />
           <button type="button" className="btn btn-secondary" onClick={async () => {
-            try { const path = await api.pickDirectory(); if (path) setDraft(d => ({ ...d, path, name: d.name || nameFromPath(path) })) } catch (e) { setError(String(e)) }
+            try { const path = await api.pickDirectory(); if (path) setDraft(d => ({ ...d, path, name: d.name || nameFromPath(path) })) } catch (e) { setError(errorText(e)) }
           }}>Choose…</button>
         </span>
       </label>
@@ -235,7 +236,7 @@ export function LocationSettings() {
   const [loaded, setLoaded] = useState(false)
   useEffect(() => {
     let alive = true
-    locationsApi.listHosted().then(v => { if (alive) { setLocations(v); setLoaded(true) } }).catch(e => { if (alive) setError(String(e)) })
+    locationsApi.listHosted().then(v => { if (alive) { setLocations(v); setLoaded(true) } }).catch(e => { if (alive) setError(errorText(e)) })
     return () => { alive = false }
   }, [])
   useEffect(() => {
@@ -248,13 +249,13 @@ export function LocationSettings() {
   const stopSharing = async (l: HostedLocation) => {
     setBusy(true); setError('')
     try { setLocations(await locationsApi.remove(l.id)); if (draft?.id === l.id) setDraft(null); setRemoving(null) }
-    catch (e) { setError(String(e)); setRemoving(null) } finally { setBusy(false) }
+    catch (e) { setError(errorText(e)); setRemoving(null) } finally { setBusy(false) }
   }
   const nameOf = (id: string) => friends.find(f => f.id === id)?.name
   const shownActivity = allActivity ? activity : activity.slice(0, ACTIVITY_CAP)
 
   return <section className="location-settings" aria-label="Locations">
-    <SectionHeader action={!IS_WINDOWS && <button className="btn btn-secondary btn-sm" disabled={!loaded || busy || adding} onClick={startAdding}>Share a folder…</button>}>
+    <SectionHeader action={!IS_WINDOWS && <button className="btn btn-secondary btn-sm" disabled={!loaded || busy || adding} onClick={startAdding}>Share a Folder…</button>}>
       Locations</SectionHeader>
     {error && <p className="form-error location-settings-error" role="alert">{error}</p>}
     <div className="group">
@@ -274,9 +275,9 @@ export function LocationSettings() {
           <div className="row-trailing">
             <MenuButton label={`More for ${l.name}`} items={[
               { label: 'Edit…', icon: <Pencil />, disabled: busy, onSelect: () => { setError(''); setAdding(false); setDraft({ ...l, friendIds: [...l.friendIds], rights: { ...l.rights } }) } },
-              { label: IS_MAC ? 'Open in Finder' : 'Open folder', icon: <FolderOpen />, onSelect: () => { void api.openPath(l.path).catch(e => setError(String(e))) } },
+              { label: OPEN_FOLDER_LABEL, icon: <FolderOpen />, onSelect: () => { void api.openPath(l.path).catch(e => setError(errorText(e))) } },
               { separator: true },
-              { label: 'Stop sharing…', icon: <Trash2 />, danger: true, disabled: busy, onSelect: () => setRemoving(l) },
+              { label: 'Stop Sharing…', icon: <Trash2 />, danger: true, disabled: busy, onSelect: () => setRemoving(l) },
             ]} />
           </div>
         </div>
@@ -302,7 +303,7 @@ export function LocationSettings() {
     {removing && <Dialog title={`Stop sharing “${removing.name}”?`} width={380} busy={busy} onClose={() => setRemoving(null)}
       footer={<>
         <button className="btn btn-secondary" disabled={busy} onClick={() => setRemoving(null)}>Cancel</button>
-        <button className="btn btn-destructive" disabled={busy} onClick={() => void stopSharing(removing)}>Stop sharing</button>
+        <button className="btn btn-destructive" disabled={busy} onClick={() => void stopSharing(removing)}>Stop Sharing</button>
       </>}>
       <p className="dialog-text">Friends lose access. Nothing in the folder is deleted.</p>
     </Dialog>}

@@ -1,7 +1,10 @@
-import { useEffect, useLayoutEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useState } from 'react'
+import { isEnterKey, isPrimaryMod } from './lib/keys'
+import { NAV_ORDER } from './components/Sidebar'
 import { JoinAccountModal } from './components/DevicesPanel'
 import { motion } from 'framer-motion'
-import { AlertTriangle, X } from 'lucide-react'
+import { AlertTriangle, Download, WifiOff, X } from 'lucide-react'
+import { InstallUpdateButton } from './components/UpdateInstall'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { api, HAS_TAURI, onFileDrop } from './lib/api'
 import { setTaskbarProgress } from './lib/taskbar'
@@ -9,6 +12,7 @@ import { useStore } from './store'
 import { parseCode } from './lib/codes'
 import { IS_MAC, MOBILE_UI } from './lib/platform'
 import { startNativeBridge } from './lib/nativeBridge'
+import { startDesktopDeepLinks } from './lib/deepLinks'
 import { nativeShellActive } from './lib/nativeShell'
 import { Sidebar } from './components/Sidebar'
 import { MobileTabBar } from './components/MobileTabBar'
@@ -23,14 +27,25 @@ import { IconButton, Spinner } from './components/ui'
 import { Dialog } from './components/Dialog'
 import { SendView } from './views/SendView'
 import { SendToChooser } from './components/SendToChooser'
-import { HistoryView } from './views/HistoryView'
-import { SettingsView } from './views/SettingsView'
-import { LocationsView } from './views/LocationsView'
-import { FoldersView } from './views/FoldersView'
-import { FriendsView } from './views/FriendsView'
-import { ChatView } from './views/ChatView'
-import { MobileApp } from './mobile/MobileApp'
-import { MobileOnboarding } from './mobile/Onboarding'
+// Route-level code splitting: Send & Receive (the landing page) ships in the main
+// chunk; every other page loads on first visit (and is prefetched once idle, so a
+// click never waits on the network-free-but-still-async import).
+const loadViews = {
+  history: () => import('./views/HistoryView').then((m) => ({ default: m.HistoryView })),
+  settings: () => import('./views/SettingsView').then((m) => ({ default: m.SettingsView })),
+  locations: () => import('./views/LocationsView').then((m) => ({ default: m.LocationsView })),
+  folders: () => import('./views/FoldersView').then((m) => ({ default: m.FoldersView })),
+  friends: () => import('./views/FriendsView').then((m) => ({ default: m.FriendsView })),
+  chat: () => import('./views/ChatView').then((m) => ({ default: m.ChatView })),
+}
+const HistoryView = lazy(loadViews.history)
+const SettingsView = lazy(loadViews.settings)
+const LocationsView = lazy(loadViews.locations)
+const FoldersView = lazy(loadViews.folders)
+const FriendsView = lazy(loadViews.friends)
+const ChatView = lazy(loadViews.chat)
+const MobileApp = lazy(() => import('./mobile/MobileApp').then((m) => ({ default: m.MobileApp })))
+const MobileOnboarding = lazy(() => import('./mobile/Onboarding').then((m) => ({ default: m.MobileOnboarding })))
 
 export default function App() {
   const [nativeShell, setNativeShell] = useState(false)
@@ -91,12 +106,54 @@ export default function App() {
     init()
   }, [init])
 
+  // `dropbeam:` links opened on macOS/Windows/Linux → the normal confirm flow.
+  useEffect(() => startDesktopDeepLinks(), [])
+  // Warm the other pages once the window is idle.
+  useEffect(() => {
+    if (MOBILE_UI) return
+    const warm = () => { for (const load of Object.values(loadViews)) void load().catch(() => {}) }
+    const ric = (window as unknown as { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback
+    const id = ric ? ric(warm) : window.setTimeout(warm, 1500)
+    return () => { if (!ric) window.clearTimeout(id) }
+  }, [])
+
+  // Keyboard shortcuts (main window, desktop): ⌘/Ctrl+, Settings · ⌘1–7 pages ·
+  // ⌘F find in Chat/History · ⌘N new message · ⌘O send files.
+  useEffect(() => {
+    if (MOBILE_UI) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.repeat || !isPrimaryMod(e) || e.shiftKey) return
+      // A modal owns the keyboard while it's open.
+      if (document.querySelector('[aria-modal="true"]')) return
+      const st = useStore.getState()
+      const key = e.key.toLowerCase()
+      const n = Number(e.key)
+      if (key === ',') {
+        e.preventDefault(); st.setView('settings')
+      } else if (Number.isInteger(n) && n >= 1 && n <= NAV_ORDER.length) {
+        e.preventDefault(); st.setView(NAV_ORDER[n - 1])
+      } else if (key === 'f' && (st.view === 'chat' || st.view === 'history')) {
+        e.preventDefault(); window.dispatchEvent(new CustomEvent('dropbeam:find'))
+      } else if (key === 'n') {
+        e.preventDefault()
+        if (st.view !== 'chat') st.setView('chat')
+        window.setTimeout(() => window.dispatchEvent(new CustomEvent('dropbeam:new-message')), 0)
+      } else if (key === 'o') {
+        e.preventDefault()
+        void api.pickFiles().then((paths) => { if (paths.length) st.setPendingSend(paths) }, (err) => st.toast('error', err))
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   // Drive the Windows/Linux taskbar progress from the most relevant active
   // transfer (macOS shows this on the Downloads stack instead — no-op there).
   // A plain store SUBSCRIPTION, not useStore selectors: transfers/order change on
   // EVERY progress event, and root-level selectors re-rendered the entire app tree
   // per tick. The taskbar is a side effect — it needs no React render at all.
   useEffect(() => {
+    let keepAwake = false
     const drive = (s: ReturnType<typeof useStore.getState>) => {
       const active = s.order
         .map((id) => s.transfers[id])
@@ -110,31 +167,50 @@ export default function App() {
         if (f) pct = f.percent
       }
       setTaskbarProgress(pct)
+      // Something is moving → don't let the computer idle to sleep mid-transfer.
+      const moving = pct != null || active.length > 0
+      if (moving !== keepAwake) {
+        keepAwake = moving
+        if (!MOBILE_UI) void api.setKeepAwake(moving).catch(() => {})
+      }
     }
     drive(useStore.getState())
-    return useStore.subscribe(drive)
+    const un = useStore.subscribe(drive)
+    return () => { un(); if (keepAwake && !MOBILE_UI) void api.setKeepAwake(false).catch(() => {}) }
   }, [])
 
   useEffect(() => {
     let un: UnlistenFn | undefined
     let active = true
+    // Files arriving from outside — dropped on the window, or pasted (#37).
+    const route = (paths: string[]) => {
+      // An open QR scanner takes the drop (a screenshot of a QR to decode).
+      if (routeDropToScanner(paths)) return
+      // On the Chat page with a conversation open, a dropped file/folder is
+      // STAGED in the composer (iMessage-style, GitHub #23) — it waits as a chip
+      // so you can add a message and send them together — instead of firing off
+      // immediately or routing to the global send chooser.
+      const st = useStore.getState()
+      if (st.view === 'locations') {
+        window.dispatchEvent(new CustomEvent('dropbeam:location-drop', { detail: paths }))
+      } else if (st.view === 'chat' && st.activeChatId) {
+        st.stageChatFiles(paths)
+      } else {
+        setPendingSend(paths)
+      }
+    }
+    // ⌘V / Ctrl+V outside a text field with files copied in Finder/Explorer (#37)
+    // works like dropping them. Text fields handle their own paste (the chat
+    // composer stages files itself); plain text on the clipboard is left alone.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== 'v' || !(IS_MAC ? e.metaKey : e.ctrlKey) || e.shiftKey || e.altKey) return
+      const t = e.target as HTMLElement | null
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+      void api.clipboardFilePaths().then((paths) => { if (active && paths.length) route(paths) }, () => {})
+    }
+    if (HAS_TAURI && !MOBILE_UI) window.addEventListener('keydown', onKey)
     onFileDrop(
-      (paths) => {
-        // An open QR scanner takes the drop (a screenshot of a QR to decode).
-        if (routeDropToScanner(paths)) return
-        // On the Chat page with a conversation open, a dropped file/folder is
-        // STAGED in the composer (iMessage-style, GitHub #23) — it waits as a chip
-        // so you can add a message and send them together — instead of firing off
-        // immediately or routing to the global send chooser.
-        const st = useStore.getState()
-        if (st.view === 'locations') {
-          window.dispatchEvent(new CustomEvent('dropbeam:location-drop', { detail: paths }))
-        } else if (st.view === 'chat' && st.activeChatId) {
-          st.stageChatFiles(paths)
-        } else {
-          setPendingSend(paths)
-        }
-      },
+      route,
       (h) => {
         setDragHovering(h)
         if (useStore.getState().view === 'locations') window.dispatchEvent(new CustomEvent('dropbeam:location-hover', { detail: h }))
@@ -145,6 +221,7 @@ export default function App() {
     })
     return () => {
       active = false
+      window.removeEventListener('keydown', onKey)
       un?.()
     }
   }, [setPendingSend, setDragHovering])
@@ -160,6 +237,7 @@ export default function App() {
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       {MOBILE_UI && <ErrorBoundary region="window controls">
+        <SettingsFallbackBanner />
         <InstallBanner />
         <LocalNetworkBanner />
       </ErrorBoundary>}
@@ -173,8 +251,11 @@ export default function App() {
         {/* Notices sit at the top of the content column (the sidebar runs to the
             top of the window under the macOS traffic lights). */}
         {!MOBILE_UI && <ErrorBoundary region="window controls">
+          <SettingsFallbackBanner />
           <InstallBanner />
+          <OfflineBanner />
           <LocalNetworkBanner />
+          <UpdateBanner />
         </ErrorBoundary>}
         <main
           className={MOBILE_UI ? `scroll-area mobile-main${view === 'chat' ? ' mobile-main-chat' : ''}` : "scroll-area"}
@@ -189,6 +270,7 @@ export default function App() {
           <ErrorBoundary region={`content:${view}`} key={view}>
             {/* Keyed remount plays a mount-fade on view change. No exit/mode="wait"
                 so it never deadlocks on a view that has its own AnimatePresence. */}
+            <Suspense fallback={null}>
             {MOBILE_UI ? <MobileApp bridgeOnly={nativeShell} /> : <motion.div
               initial={MOBILE_UI ? false : { opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -203,6 +285,7 @@ export default function App() {
               {view === 'history' && <HistoryView />}
               {view === 'settings' && <SettingsView />}
             </motion.div>}
+            </Suspense>
           </ErrorBoundary>
         </main>
         </div>
@@ -214,7 +297,7 @@ export default function App() {
       )}
       <ErrorBoundary region="overlays" fallbackStyle={{ position: 'fixed', bottom: 12, left: 12, zIndex: 201 }}>
         {!nativeShell && <SendToChooser />}
-        {MOBILE_UI ? (!nativeShell && <MobileOnboarding />) : <NameSetupModal />}
+        {MOBILE_UI ? (!nativeShell && <Suspense fallback={null}><MobileOnboarding /></Suspense>) : <NameSetupModal />}
         {!nativeShell && <FolderInviteModal />}
         {!nativeShell && <SafetyDialogHost />}
         {!MOBILE_UI && <PopoverCodeHandoff />}
@@ -280,13 +363,16 @@ function NameSetupModal() {
   const [show, setShow] = useState(false)
   const [name, setName] = useState('')
   const [joining, setJoining] = useState(false)
-
-  useEffect(() => {
-    if (settings && !localStorage.getItem('dropbeam.namedSelf')) {
+  // Decide ONCE, when settings first arrive. Re-running on every settings change
+  // (a synced name, a toggle in another window) overwrote what you were typing.
+  const [decided, setDecided] = useState(false)
+  if (settings && !decided) {
+    setDecided(true)
+    if (!localStorage.getItem('dropbeam.namedSelf')) {
       setName(suggestedName(settings.displayName || ''))
       setShow(true)
     }
-  }, [settings])
+  }
 
   if (!show || !settings) return null
   const finish = () => {
@@ -304,8 +390,8 @@ function NameSetupModal() {
         footer={
           <>
             {!MOBILE_UI && (
-              <button className="btn btn-plain" onClick={() => setJoining(true)} style={{ marginLeft: -8 }}>
-                Link an existing device…
+              <button className="btn btn-plain" onClick={() => setJoining(true)} style={{ marginLeft: -8 }} title="Already use DropBeam on another computer or phone? Link this one to it.">
+                I Already Use DropBeam…
               </button>
             )}
             <span className="spacer" />
@@ -319,16 +405,15 @@ function NameSetupModal() {
           <BeamLogo size={44} />
           <h2 className="onboard-title">Welcome to DropBeam</h2>
           <p className="onboard-text">
-            {MOBILE_UI
-              ? 'Choose the name friends see when you send them something.'
-              : 'Choose the name friends see when you send files or share a folder.'}
+            Send photos and files straight to family, friends and your other devices — nearby or far away, no account or cloud needed.
           </p>
+          <p className="onboard-text">What name should people see when you send them something?</p>
           <input
             autoFocus
             className="input onboard-input"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && name.trim() && finish()}
+            onKeyDown={(e) => isEnterKey(e) && name.trim() && finish()}
             placeholder="Your name"
             aria-label="Your name"
             maxLength={40}
@@ -368,8 +453,8 @@ function LocalNetworkBanner() {
       <AlertTriangle />
       <span style={{ flex: 1, minWidth: 0 }}>
         {IS_MAC
-          ? <>Transfers to devices nearby are slow. Allow DropBeam under <b>Local Network</b> on both devices.</>
-          : <>Transfers to devices nearby are slow. Allow DropBeam through the firewall on private networks, on both devices.</>}
+          ? <>Sending to computers on the same Wi-Fi is slow because DropBeam isn’t allowed on your local network. Click <b>Open Settings</b>, turn on <b>DropBeam</b>, then do the same on the other computer.</>
+          : <>Sending to computers on the same Wi-Fi is slow. When Windows asks, allow DropBeam on <b>private networks</b> — or add it in Windows Security → Firewall → Allow an app — on both computers.</>}
       </span>
       {IS_MAC && <button className="btn btn-secondary btn-sm" style={{ flexShrink: 0 }} onClick={() => api.openLocalNetworkSettings().catch(() => {})}>
         Open Settings
@@ -377,6 +462,30 @@ function LocalNetworkBanner() {
       <IconButton label="Dismiss" size="sm" onClick={() => setDismissed(true)}>
         <X />
       </IconButton>
+    </div>
+  )
+}
+
+/** Startup couldn't read settings in time (D18), so the app is running on
+ *  defaults and saving is blocked. Say so, and offer to try again. */
+function SettingsFallbackBanner() {
+  const fallback = useStore((s) => s.settingsFallback)
+  const retry = useStore((s) => s.retryLoadSettings)
+  const [busy, setBusy] = useState(false)
+  if (!fallback) return null
+  return (
+    <div className="app-banner warn" role="status">
+      <AlertTriangle />
+      <span style={{ flex: 1, minWidth: 0 }}>Your settings haven’t loaded yet. Changes won’t be saved until they do.</span>
+      <button
+        className="btn btn-secondary btn-sm"
+        style={{ flexShrink: 0 }}
+        disabled={busy}
+        onClick={() => { setBusy(true); void retry().finally(() => setBusy(false)) }}
+      >
+        {busy ? <Spinner size={12} /> : null}
+        Try Again
+      </button>
     </div>
   )
 }
@@ -392,6 +501,43 @@ function InstallBanner() {
       <AlertTriangle />
       <span style={{ flex: 1, minWidth: 0 }}>{hint}</span>
       <IconButton label="Dismiss" size="sm" onClick={() => setDismissed(true)}>
+        <X />
+      </IconButton>
+    </div>
+  )
+}
+
+/** The computer has no network at all. Said plainly, because otherwise every
+ *  friend just quietly turns "offline" and sends sit waiting. */
+function OfflineBanner() {
+  const [online, setOnline] = useState(() => typeof navigator === 'undefined' || navigator.onLine !== false)
+  useEffect(() => {
+    const on = () => setOnline(true)
+    const off = () => setOnline(false)
+    window.addEventListener('online', on)
+    window.addEventListener('offline', off)
+    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off) }
+  }, [])
+  if (online) return null
+  return (
+    <div className="app-banner warn" role="status">
+      <WifiOff />
+      <span style={{ flex: 1, minWidth: 0 }}>You’re not connected to the internet. Computers on the same Wi-Fi can still send to each other; everything else waits until you’re back online.</span>
+    </div>
+  )
+}
+
+/** A new version is ready: say so where it's seen, not only deep in Settings. */
+function UpdateBanner() {
+  const update = useStore((s) => s.update)
+  const [dismissed, setDismissed] = useState(false)
+  if (!update || update.installing || dismissed) return null
+  return (
+    <div className="app-banner info" role="status">
+      <Download />
+      <span style={{ flex: 1, minWidth: 0 }}>A new version of DropBeam ({update.version}) is ready.</span>
+      <InstallUpdateButton className="btn btn-secondary btn-sm" label="Restart to Update" />
+      <IconButton label="Later" size="sm" onClick={() => setDismissed(true)}>
         <X />
       </IconButton>
     </div>

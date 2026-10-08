@@ -3,6 +3,10 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::mem::ManuallyDrop;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set until the first panic of the process has written its backtrace.
+static FIRST_PANIC: AtomicBool = AtomicBool::new(true);
 
 struct Line {
     bytes: [u8; 4096],
@@ -25,7 +29,20 @@ impl std::fmt::Write for Line {
     }
 }
 
+/// The panic log only ever grew. At startup, once it passes `max` bytes keep
+/// just its newest `keep` bytes (from a line start).
+fn prune(path: &Path, max: u64, keep: u64) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.len() <= max { return; }
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let start = bytes.len().saturating_sub(keep as usize);
+    let start = bytes[start..].iter().position(|&b| b == b'\n').map_or(start, |i| start + i + 1);
+    let tmp = path.with_extension("log.tmp");
+    if std::fs::write(&tmp, &bytes[start..]).is_ok() { let _ = std::fs::rename(&tmp, path); }
+}
+
 pub(crate) fn install(log_dir: Option<&Path>) {
+    if let Some(dir) = log_dir { prune(&dir.join("DropBeam-panic.log"), 1 << 20, 256 << 10); }
     // Open once before installing the hook. A separate append-only file avoids
     // the rotating logger's locks; telemetry already scans DropBeam*.log.
     let log = log_dir.and_then(|dir| {
@@ -70,6 +87,28 @@ pub(crate) fn install(log_dir: Option<&Path>) {
             if let Some(file) = &log {
                 let _ = (&*file).write(bytes);
             }
+            // The FIRST panic is the one that matters: later ones are usually the
+            // cascade it caused (poisoned mutexes, panics in destructors, then an
+            // abort). Capture its backtrace once, like the default hook with
+            // RUST_BACKTRACE=1. This allocates and symbolizes (std's own backtrace
+            // lock only); it never touches the logger or application mutexes.
+            if FIRST_PANIC.swap(false, Ordering::SeqCst) {
+                let when = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let thread = std::thread::current();
+                let text = format!(
+                    "[ERROR][app_lib] first panic: unix_time={when} thread={} version={}\nbacktrace:\n{}\n",
+                    thread.name().unwrap_or("<unnamed>"),
+                    env!("CARGO_PKG_VERSION"),
+                    std::backtrace::Backtrace::force_capture(),
+                );
+                let _ = (&*stderr).write_all(text.as_bytes());
+                if let Some(file) = &log {
+                    let _ = (&*file).write_all(text.as_bytes());
+                }
+            }
         }));
         // catch_unwind is only a last guard: Rust may abort on a nested panic
         // inside a hook before unwinding. The body itself must remain non-panicking.
@@ -82,6 +121,20 @@ pub(crate) fn install(log_dir: Option<&Path>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panic_log_is_pruned_to_its_newest_lines() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-panic-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("DropBeam-panic.log");
+        let text: String = (0..1000).map(|i| format!("line {i:04}\n")).collect();
+        std::fs::write(&path, &text).unwrap();
+        super::prune(&path, 100_000, 1000);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "under the cap: untouched");
+        super::prune(&path, 5000, 1000);
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(kept.len() <= 1000 && kept.starts_with("line ") && kept.ends_with("line 0999\n"), "{kept}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn hook_survives_with_logger_and_stderr_locks_held() {
         const CHILD: &str = "DROPBEAM_PANIC_HOOK_TEST";
@@ -120,6 +173,13 @@ mod tests {
         assert!(text.contains("original worker panic"));
         assert!(text.contains("PoisonError"));
         assert!(text.contains("non-string panic payload"));
+        // Exactly one backtrace, attached to the first (root-cause) panic. Match
+        // the header LINE: symbolized frames ("std::backtrace_rs::backtrace::…",
+        // as Windows prints them) contain "backtrace:" too.
+        assert_eq!(text.matches("\nbacktrace:\n").count(), 1, "{text}");
+        let first_bt = text.find("\nbacktrace:\n").unwrap();
+        assert!(first_bt > text.find("original worker panic").unwrap());
+        assert!(first_bt < text.find("PoisonError").unwrap());
         assert!(disk.ends_with(b"\n"));
         std::fs::remove_dir_all(dir).unwrap();
     }

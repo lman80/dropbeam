@@ -75,6 +75,7 @@ function BlockDialog({ friend, onClose }: { friend: Friend; onClose: () => void 
 function ReportDialog({ friend, message, onClose }: { friend: Friend; message?: ChatMessage; onClose: () => void }) {
   const blockFriend = useStore((s) => s.blockFriend)
   const toast = useStore((s) => s.toast)
+  const toastError = useStore((s) => s.toastError)
   const [reason, setReason] = useState<ReportReason | ''>('')
   const [includeText, setIncludeText] = useState(true)
   const [notes, setNotes] = useState('')
@@ -107,7 +108,7 @@ function ReportDialog({ friend, message, onClose }: { friend: Friend; message?: 
       toast('success', 'Your email is ready — send it to finish the report. We respond within 24 hours.')
       onClose()
     } catch (e) {
-      toast('error', `Couldn’t open your mail app: ${String(e)}`)
+      toastError('Couldn’t open your mail app.', e)
     } finally {
       setBusy(false)
     }
@@ -194,10 +195,12 @@ export function SafetyMenu({ friend, before = [], after = [], size, blankIcon }:
 
 /** A small "are you sure?" dialog: one line of consequence, Cancel + the
  *  destructive action. */
-export function ConfirmDialog({ title, children, confirmLabel, onConfirm, onClose }: {
+export function ConfirmDialog({ title, children, confirmLabel, onConfirm, onClose, danger = true }: {
   title: string
   children?: ReactNode
   confirmLabel: string
+  /** A destructive red button (default); false for a plain "yes". */
+  danger?: boolean
   onConfirm: () => void | Promise<unknown>
   onClose: () => void
 }) {
@@ -216,7 +219,7 @@ export function ConfirmDialog({ title, children, confirmLabel, onConfirm, onClos
       footer={
         <>
           <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
-          <button className="btn btn-destructive" autoFocus onClick={() => void confirm()} disabled={busy}>
+          <button className={danger ? 'btn btn-destructive' : 'btn btn-primary'} autoFocus={danger} onClick={() => void confirm()} disabled={busy}>
             {busy && <Spinner size={13} />} {confirmLabel}
           </button>
         </>

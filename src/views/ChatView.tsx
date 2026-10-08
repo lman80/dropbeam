@@ -1,7 +1,9 @@
 import { MobileHeader } from '../components/MobileHeader'
+import { clockTime, dateTime, dayHeading, listDate, startOfDay } from '../lib/dates'
+import { isEnterKey, shortcutLabel } from '../lib/keys'
 import { TransferCard } from '../components/TransferCard'
 import { ChevronLeft } from 'lucide-react'
-import { MOBILE_UI } from '../lib/platform'
+import { MOBILE_UI, REVEAL_LABEL } from '../lib/platform'
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -26,10 +28,11 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { api, fileSrc, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend, type TransferUpdate } from '../lib/api'
+import { api, fileSrc, HAS_TAURI, type ChatMessage, type ConnDetail, type Friend, type LinkPreview, type TransferUpdate } from '../lib/api'
 import { useStore, byOrder, type FolderActivityEvent } from '../store'
 import { completedChatItems, restoredChatTransfer } from '../lib/chatTransfer'
 import { ChatTransferProgress } from '../components/ChatTransferProgress'
+import { DeliveryLine } from '../components/Deliveries'
 import { ConnInfo } from '../components/ConnInspector'
 import { GifPicker } from '../components/GifPicker'
 import { avatarGradient } from '../lib/avatar'
@@ -41,6 +44,9 @@ import { formatBytes } from '../lib/format'
 import { linkify } from '../lib/linkify'
 import { friendOnlineState, friendPresence, presenceLabel } from '../lib/presence'
 import { EmptyState, IconButton, MenuButton, MenuPopover, type MenuItem } from '../components/ui'
+import { statusExplanation, type MessageState } from '../lib/chatStatus'
+import { decideFile, isDeclined, onServersChanged, serverApi, serverNoteText, usePendingFile } from '../lib/transferServer'
+import { ServerOfferCard, useUsableServers } from '../components/TransferServerSettings'
 
 /** Stable empty array so the messages selector doesn't return a fresh ref each render. */
 const EMPTY_MSGS: ChatMessage[] = []
@@ -68,49 +74,18 @@ function fileKind(name: string | undefined): Kind {
   return 'file'
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000
 /** Within one day, a quiet time label appears after a pause this long. */
 const TIME_GAP_MS = 60 * 60 * 1000
 
 /** A short wall-clock label, e.g. "3:42 PM". */
-function clock(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-}
-const startOfDay = (ms: number) => {
-  const d = new Date(ms)
-  d.setHours(0, 0, 0, 0)
-  return d.getTime()
-}
+const clock = clockTime
 const sameDay = (a: number, b: number) => startOfDay(a) === startOfDay(b)
 /** A day label: Today / Yesterday / weekday (this week) / a date. */
-function dayLabel(ms: number): string {
-  const today = startOfDay(Date.now())
-  const day = startOfDay(ms)
-  if (day === today) return 'Today'
-  if (day === today - DAY_MS) return 'Yesterday'
-  if (today - day < 6 * DAY_MS) return new Date(ms).toLocaleDateString([], { weekday: 'long' })
-  const d = new Date(ms)
-  return d.toLocaleDateString([], {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
-  })
-}
-/** The time column of the conversation list: 3:42 PM / Yesterday / Tuesday / 9/18/26. */
-function listTime(ms: number | undefined): string {
-  if (!ms) return ''
-  const today = startOfDay(Date.now())
-  const day = startOfDay(ms)
-  if (day === today) return clock(ms)
-  if (day === today - DAY_MS) return 'Yesterday'
-  if (today - day < 6 * DAY_MS) return new Date(ms).toLocaleDateString([], { weekday: 'long' })
-  return new Date(ms).toLocaleDateString([], { month: 'numeric', day: 'numeric', year: '2-digit' })
-}
+const dayLabel = dayHeading
+/** The time column of the conversation list: 3:42 PM / Yesterday / Tuesday / Oct 2. */
+const listTime = listDate
 /** Full timestamp for a tooltip. */
-function fullTime(ms: number): string {
-  return `${dayLabel(ms)} ${clock(ms)}`
-}
+const fullTime = dateTime
 
 /** The engine's list preview carries emoji markers ("📎 Beach.jpg", "🎞️ GIF").
  *  Say it in words instead. */
@@ -212,6 +187,13 @@ export function ChatView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // ⌘N: open the "New message to…" menu.
+  useEffect(() => {
+    const open = () => document.querySelector<HTMLButtonElement>('.chat-list-head [aria-label="New message"]')?.click()
+    window.addEventListener('dropbeam:new-message', open)
+    return () => window.removeEventListener('dropbeam:new-message', open)
+  }, [])
+
   // A remembered selection is only being viewed while Chat is mounted.
   useEffect(() => {
     void api.setActiveChat(activeChatId)
@@ -219,7 +201,7 @@ export function ChatView() {
     return () => { void api.setActiveChat(null) }
   }, [activeChatId])
 
-  const online = (f: Friend) => friendOnlineState(f.name, friendSeen, folderStatuses) === true
+  const online = (f: Friend) => friendOnlineState(f, friendSeen, folderStatuses) === true
   const ownLabels = useOwnDeviceLabels()
 
   if (MOBILE_UI) return activeChatId ? <div className="mobile-page mobile-conversation"><Conversation key={activeChatId} friendId={activeChatId} /></div> : <div className="mobile-page mobile-chats"><MobileHeader title="Chats" /><div className="ios-list">{rows.map(({ friend, last }) => {
@@ -235,14 +217,14 @@ export function ChatView() {
   if (rows.length === 0 && !activeChatId) {
     return (
       <div className="page">
-        <div className="page-header titlebar-drag">
+        <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
           <h1 className="page-title">Chat</h1>
         </div>
         <EmptyState
+          icon={<MessageCircle />}
           title="No conversations yet"
           hint="Add a friend to start chatting."
-          action={<button className="btn btn-primary" onClick={() => setView('friends')}>Add a friend</button>}
-          style={{ paddingTop: 96 }}
+          action={<button className="btn btn-secondary" onClick={() => setView('friends')}>Add a Friend</button>}
         />
       </div>
     )
@@ -258,7 +240,7 @@ export function ChatView() {
   return (
     <div className={`chat-layout${activeChatId ? ' thread-open' : ''}`}>
       <div className="chat-list-pane">
-        <div className="chat-list-head titlebar-drag">
+        <div className="chat-list-head titlebar-drag" data-tauri-drag-region="deep">
           <h1 className="chat-list-title">Chat</h1>
           {conversations.length > 0 && startable.length > 0 && (
             <MenuButton
@@ -308,7 +290,7 @@ export function ChatView() {
           <Conversation key={activeChatId} friendId={activeChatId} />
         ) : (
           <>
-            <div className="titlebar-drag chat-header" />
+            <div className="titlebar-drag chat-header" data-tauri-drag-region="deep" />
             <EmptyState title="No conversation selected" style={{ flex: 1 }} />
           </>
         )}
@@ -351,19 +333,64 @@ function Conversation({ friendId }: { friendId: string }) {
   // record-level subscription re-rendered this entire (up to 2000-row) thread on
   // every tick. A boolean/string only re-renders when presence actually changes.
   const onlineNow = useStore((s) =>
-    friend ? friendOnlineState(friend.name, s.friendSeen, s.folderStatuses) === true : false,
+    friend ? friendOnlineState(friend, s.friendSeen, s.folderStatuses) === true : false,
   )
+  // An active check of this friend is in flight (thread just opened / refocused).
+  const [checking, setChecking] = useState(() => !onlineNow)
   const presenceText = useStore((s) => {
     if (!friend) return ''
-    const p = friendPresence(friend.name, s.friendSeen, s.folderStatuses)
-    return p.status === 'online' ? 'Online' : presenceLabel(p)
+    const p = friendPresence(friend, s.friendSeen, s.folderStatuses)
+    if (friend.awaitingAccept) return 'Hasn’t accepted your friend request yet'
+    return p.status === 'online' ? 'Online' : checking ? 'Connecting…' : presenceLabel(p)
   })
+  const windowFocused = useStore((s) => s.windowFocused)
+  const lastCheckRef = useRef({ id: '', at: 0 })
+  // Fast presence (#44): dial the friend the moment the thread opens or the window
+  // regains focus, instead of waiting on the background beacon's backoff; while
+  // they stay offline, re-check every 30 s. "Connecting…" is bounded at 8 s.
+  // A successful ping also makes the engine flush messages queued for them.
+  useEffect(() => {
+    if (!windowFocused) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset when the window loses focus
+      setChecking(false)
+      return
+    }
+    let cancelled = false
+    const check = (showConnecting: boolean) => {
+      lastCheckRef.current = { id: friendId, at: Date.now() }
+      if (showConnecting) setChecking(true)
+      const bound = window.setTimeout(() => { if (!cancelled) setChecking(false) }, 8000)
+      void useStore.getState().pingFriend(friendId).finally(() => {
+        window.clearTimeout(bound)
+        if (!cancelled) setChecking(false)
+      })
+    }
+    if (lastCheckRef.current.id !== friendId || Date.now() - lastCheckRef.current.at > 5000) check(!onlineNow)
+    const timer = window.setInterval(() => { if (!onlineNow) check(false) }, 30_000)
+    return () => { cancelled = true; window.clearInterval(timer); setChecking(false) }
+  }, [friendId, windowFocused, onlineNow])
   const typing = useStore((s) => !!s.chatTyping[friendId])
   const ownLabel = useOwnDeviceLabels()[friendId] as string | undefined
   const giphyKey = useStore((s) => s.settings?.giphyApiKey ?? '')
   const setView = useStore((s) => s.setView)
   const toast = useStore((s) => s.toast)
   const displayName = ownLabel ?? friend.name
+  // Where a message would wait if they're offline (a Transfer Server's name).
+  const [holdOn, setHoldOn] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    const load = () => { serverApi.holdRoute(friendId).then((r) => { if (alive) setHoldOn(r) }).catch(() => {}) }
+    load()
+    const un = onServersChanged(load)
+    return () => { alive = false; void un.then((f) => f()) }
+  }, [friendId])
+  // A Transfer Server this friend shared with us that we haven't answered yet.
+  const { servers } = useUsableServers()
+  // Also: a server this person owns and shares with their friends, or (on the
+  // owner's own device) the chat with their own server asking to share it.
+  const offer = servers?.find((sv) => !sv.revoked && !sv.own && (
+    (sv.offer === 'new' && (sv.eid === friend.endpointId || (!!sv.viaPeer && sv.viaPeer === friend.id)))
+    || (sv.offer === 'share' && sv.eid === friend.endpointId)))
 
   const [picking, setPicking] = useState(false)
   const [text, setText] = useState('')
@@ -378,6 +405,15 @@ function Conversation({ friendId }: { friendId: string }) {
   // client-side; ↑/↓ jump between matches, Esc closes. Reaches the same ~2000-message
   // window the thread itself keeps — no backend.
   const [searchOpen, setSearchOpen] = useState(false)
+  // ⌘F: open (or re-focus) this conversation's search.
+  useEffect(() => {
+    const find = () => {
+      setSearchOpen(true)
+      window.setTimeout(() => document.querySelector<HTMLInputElement>('.chat-search-field input')?.select(), 0)
+    }
+    window.addEventListener('dropbeam:find', find)
+    return () => window.removeEventListener('dropbeam:find', find)
+  }, [])
   const [searchQ, setSearchQ] = useState('')
   const [searchIdx, setSearchIdx] = useState(0)
 
@@ -394,6 +430,7 @@ function Conversation({ friendId }: { friendId: string }) {
   // Shown only on request (the ⓘ in the header).
   useEffect(() => {
     if (!onlineNow) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clear the stale path when they go offline
       setConn(null)
       return
     }
@@ -442,8 +479,8 @@ function Conversation({ friendId }: { friendId: string }) {
   // On open, jump to bottom.
   useLayoutEffect(() => {
     atBottomRef.current = true
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- jump to the newest message on open (clears the pill)
     scrollToBottom()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [friendId])
 
   // Stay anchored to the newest message while the thread settles: images, video
@@ -544,7 +581,7 @@ function Conversation({ friendId }: { friendId: string }) {
       const nm = next && next.kind === 'msg' ? next.m : undefined
       const firstOfRun = !pm || pm.fromMe !== row.m.fromMe || !!sep
       const lastOfRun = !nm || nm.fromMe !== row.m.fromMe || !!seps[i + 1]
-      const pendingStatus = row.m.status === 'sending' || row.m.status === 'failed' || row.m.status == null
+      const pendingStatus = row.m.status === 'sending' || row.m.status === 'failed' || row.m.status === 'held' || row.m.status == null
       const meta: MetaKind =
         !row.m.fromMe || row.m.deleted ? null
           : i === lastMine ? 'status'
@@ -578,6 +615,7 @@ function Conversation({ friendId }: { friendId: string }) {
   }
   // Start at the oldest match; down always moves toward newer messages.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- move the cursor for a new query
     if (searchMatches.length) jumpToMatch(0)
     else setSearchIdx(0)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -685,26 +723,8 @@ function Conversation({ friendId }: { friendId: string }) {
 
   // Cmd/Ctrl-V a screenshot straight into the chat: save the clipboard image to an
   // app-managed folder and stage it as a chip — the same proven flow a dropped file
-  // uses. Text pastes are untouched (we only intercept when an image is present).
-  const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = Array.from(e.clipboardData?.items ?? [])
-    const img = items.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
-    const blob = img?.getAsFile() ?? Array.from(e.clipboardData.files).find((f) => f.type.startsWith('image/'))
-    if (!blob) {
-      // Let normal text/file pastes proceed. WebKitGTK can expose an image-only
-      // clipboard as an entirely empty DataTransfer: ask the native clipboard.
-      if (items.some((i) => i.kind === 'file') || e.clipboardData.files.length ||
-          e.clipboardData.getData('text/plain') || e.clipboardData.getData('text/html')) return
-      e.preventDefault()
-      try {
-        if (!HAS_TAURI) throw new Error('No usable image is on the clipboard.')
-        stageChatFiles([await api.pasteClipboardImage()])
-      } catch (err) {
-        toast('error', String(err))
-      }
-      return
-    }
-    e.preventDefault()
+  // uses. Files copied in Finder/Explorer (#37) are staged the same way.
+  const pasteImage = async (blob: Blob) => {
     // Reject oversized pastes BEFORE any encoding work — otherwise a 40 MB clipboard
     // image would freeze the UI for seconds only to be refused on the Rust side.
     if (blob.size > 25 * 1024 * 1024) {
@@ -727,6 +747,64 @@ function Conversation({ friendId }: { friendId: string }) {
       toast('error', String(err))
     }
   }
+  const pasteNativeImage = async () => {
+    try {
+      if (!HAS_TAURI) throw new Error('No usable image is on the clipboard.')
+      stageChatFiles([await api.pasteClipboardImage()])
+    } catch (err) {
+      toast('error', String(err))
+    }
+  }
+  /** Type `value` at the caret as if it had been pasted (keeps native undo). */
+  const insertAtCaret = (value: string) => {
+    const ta = taRef.current
+    if (!ta) return
+    ta.focus({ preventScroll: true })
+    if (document.execCommand('insertText', false, value)) return
+    const { selectionStart: a, selectionEnd: b } = ta
+    const next = ta.value.slice(0, a) + value + ta.value.slice(b)
+    setText(next)
+    requestAnimationFrame(() => ta.setSelectionRange(a + value.length, a + value.length))
+  }
+  const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items ?? [])
+    const img = items.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
+    const blob = img?.getAsFile() ?? Array.from(e.clipboardData.files).find((f) => f.type.startsWith('image/'))
+    const plain = e.clipboardData.getData('text/plain')
+    const html = e.clipboardData.getData('text/html')
+    const hasFileItem = items.some((i) => i.kind === 'file') || e.clipboardData.files.length > 0
+    if (HAS_TAURI && !MOBILE_UI) {
+      // A file copied in Finder/Explorer reaches the webview only as its ICON (an
+      // image) and its NAME (text), so ask the OS clipboard for real file
+      // references first. That answer is async, so take the paste over now and
+      // replay it ourselves when there are no files.
+      e.preventDefault()
+      const paths = await api.clipboardFilePaths().catch(() => [] as string[])
+      if (paths.length) {
+        stageChatFiles(paths)
+        return
+      }
+      if (blob) return void pasteImage(blob)
+      if (plain) return insertAtCaret(plain)
+      if (html) {
+        const txt = new DOMParser().parseFromString(html, 'text/html').body.textContent ?? ''
+        if (txt) return insertAtCaret(txt)
+      }
+      // WebKitGTK can expose an image-only clipboard as an empty DataTransfer.
+      if (!hasFileItem) void pasteNativeImage()
+      return
+    }
+    if (!blob) {
+      // Let normal text/file pastes proceed. WebKitGTK can expose an image-only
+      // clipboard as an entirely empty DataTransfer: ask the native clipboard.
+      if (hasFileItem || plain || html) return
+      e.preventDefault()
+      void pasteNativeImage()
+      return
+    }
+    e.preventDefault()
+    void pasteImage(blob)
+  }
 
   const pickGif = (g: { id: string; sendUrl: string; pageUrl: string; w: number; h: number }) => {
     setShowGif(false)
@@ -746,7 +824,7 @@ function Conversation({ friendId }: { friendId: string }) {
   return (
     <>
       {MOBILE_UI ? <header className="mobile-header-compact visible mobile-conversation-header"><button className="ios-button mobile-back" aria-label="Back to chats" onClick={() => useStore.getState().closeChat()}><ChevronLeft />Chats</button><span className="mobile-chat-avatar compact"><FriendAvatar friend={friend} /></span><div className="mobile-grow"><h1 className="ios-headline mobile-ellipsis">{friend.name}</h1><p className="ios-footnote">{typing ? 'typing…' : presenceText}</p></div><button className="ios-icon" aria-label="Search conversation" onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}><Search size={20} /></button></header> : (
-        <div className="titlebar-drag chat-header">
+        <div className="titlebar-drag chat-header" data-tauri-drag-region="deep">
           <span className="chat-avatar sm" style={{ background: avatarGradient(friend.id) }}>
             <FriendAvatar friend={friend} />
           </span>
@@ -761,7 +839,7 @@ function Conversation({ friendId }: { friendId: string }) {
             {online && conn && <ConnInfo detail={conn} align="end" />}
             <IconButton
               label="Search this conversation"
-              tooltip="Search"
+              tooltip={`Search  ${shortcutLabel('f')}`}
               active={searchOpen}
               onClick={() => (searchOpen ? closeSearch() : setSearchOpen(true))}
             >
@@ -803,7 +881,7 @@ function Conversation({ friendId }: { friendId: string }) {
               onChange={(e) => setSearchQ(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Escape') closeSearch()
-                else if (e.key === 'Enter') jumpToMatch(searchIdx + (e.shiftKey ? -1 : 1))
+                else if (isEnterKey(e)) jumpToMatch(searchIdx + (e.shiftKey ? -1 : 1))
               }}
             />
           </label>
@@ -842,7 +920,7 @@ function Conversation({ friendId }: { friendId: string }) {
               </span>
               <div className="chat-thread-empty-name truncate-1">{displayName}</div>
               <div className="chat-thread-empty-hint">
-                {online ? 'No messages yet' : `Messages deliver when ${friend.name} is back online.`}
+                {online ? 'No messages yet' : holdOn ? `${friend.name} is offline — messages wait on ${holdOn}.` : `Messages deliver when ${friend.name} is back online.`}
               </div>
             </div>
           )) : (
@@ -852,7 +930,7 @@ function Conversation({ friendId }: { friendId: string }) {
                 const current = row.kind === 'msg' && searchMatches[searchIdx] === row.m.id
                 return (
                   <div
-                    key={row.kind === 'msg' ? row.m.id : row.ev.id}
+                    key={row.kind === 'msg' ? `${row.m.fromMe ? 'o' : 'i'}:${row.m.id}` : row.ev.id}
                     id={row.kind === 'msg' ? `msg-${row.m.id}` : undefined}
                     className={current ? 'chat-search-hit current' : hit ? 'chat-search-hit' : undefined}
                   >
@@ -875,6 +953,7 @@ function Conversation({ friendId }: { friendId: string }) {
                         firstOfRun={row.firstOfRun}
                         lastOfRun={row.lastOfRun}
                         meta={row.meta}
+                        waiting={!onlineNow && !checking}
                         allById={messages}
                         onReply={beginReply}
                         onEdit={beginEdit}
@@ -885,6 +964,7 @@ function Conversation({ friendId }: { friendId: string }) {
                   </div>
                 )
               })}
+              {offer && <ServerOfferCard server={offer} friendName={displayName} />}
               {typing && !MOBILE_UI && (
                 <div className="chat-line run-start run-end">
                   <div className="chat-line-body">
@@ -915,6 +995,17 @@ function Conversation({ friendId }: { friendId: string }) {
       </div>
 
       <div className={MOBILE_UI ? 'chat-composer mobile-composer' : 'chat-composer'}>
+        {friend.awaitingAccept ? (
+          <p className="chat-offline-note" role="status">
+            {`${displayName} hasn’t accepted your friend request yet. Your messages are saved and arrive as soon as they do.`}
+          </p>
+        ) : !onlineNow && !checking && (
+          <p className="chat-offline-note" role="status">
+            {holdOn
+              ? `${displayName} is offline. Messages wait on ${holdOn} and arrive when they’re back.`
+              : `${displayName} is offline. Messages will send when you’re both online with DropBeam open.`}
+          </p>
+        )}
         {reply && !editing && (
           <div className="composer-context">
             <CornerUpLeft size={14} aria-hidden />
@@ -964,7 +1055,7 @@ function Conversation({ friendId }: { friendId: string }) {
             onChange={(e) => onType(e.target.value)}
             onPaste={(e) => void onPaste(e)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              if (isEnterKey(e) && !e.shiftKey) {
                 e.preventDefault()
                 submit()
               } else if (e.key === 'Escape' && editing) {
@@ -1179,7 +1270,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
       const mv = ev.moves[0]
       const to = mv.to.split('\\').join('/')
       const from = mv.from.split('\\').join('/')
-      const item = <SyncLink title="Show in Finder" onOpen={reveal(to)}>{baseOf(to)}</SyncLink>
+      const item = <SyncLink title={REVEAL_LABEL} onOpen={reveal(to)}>{baseOf(to)}</SyncLink>
       line = dirOf(from) === dirOf(to)
         ? <>renamed {baseOf(from)} to {item}</>
         : <>moved {item} to {dirOf(to) ? baseOf(dirOf(to)) : folderName}</>
@@ -1190,7 +1281,7 @@ const FolderSyncRow = memo(function FolderSyncRow({
     const e = entries[0]
     line = e.kind === 'dir'
       ? <>added <SyncLink title={`Open ${e.name}`} onOpen={() => void api.openPath(full(e.name)).catch(() => {})}>{e.name}</SyncLink> ({e.count} item{e.count === 1 ? '' : 's'}) to {folderLink}</>
-      : <>added <SyncLink title="Show in Finder" onOpen={reveal(e.rel)}>{baseOf(e.rel)}</SyncLink> to {folderLink}</>
+      : <>added <SyncLink title={REVEAL_LABEL} onOpen={reveal(e.rel)}>{baseOf(e.rel)}</SyncLink> to {folderLink}</>
   } else {
     line = <>added {ev.files.length} items to {folderLink}</>
   }
@@ -1216,6 +1307,35 @@ const FolderSyncRow = memo(function FolderSyncRow({
  *  message can't inject markup. The anchor NEVER navigates this webview: we
  *  preventDefault and hand the URL to the OS browser (window.open is the
  *  `vite dev` fallback, where there is no Tauri to invoke). */
+/** The preview card under a message with a link (#47). Everything in it came
+ *  with the message — nothing is fetched here. */
+function LinkCard({ p }: { p: LinkPreview }) {
+  // The host shown is ALWAYS the card's real address, never the page's own
+  // claim (siteName), so a card can't pass itself off as another site (S6).
+  let host = ''
+  try { host = new URL(p.url).hostname.replace(/^www\./, '') } catch { /* keep blank */ }
+  const ratio = p.imageW && p.imageH ? Math.max(p.imageW / p.imageH, 1.2) : 1.91
+  return (
+    <a
+      href={p.url}
+      className="chat-linkcard"
+      rel="noopener noreferrer"
+      title={p.url}
+      onClick={(e) => {
+        e.preventDefault()
+        if (HAS_TAURI) api.openUrl(p.url).catch(() => {})
+        else window.open(p.url, '_blank', 'noopener,noreferrer')
+      }}
+    >
+      {p.image && <img className="chat-linkcard-img" src={p.image} alt="" draggable={false} style={{ aspectRatio: String(ratio) }} />}
+      <span className="chat-linkcard-text">
+        <span className="chat-linkcard-title">{p.title || p.siteName || host}</span>
+        {host && <span className="chat-linkcard-site truncate-1">{host}</span>}
+      </span>
+    </a>
+  )
+}
+
 function Linkified({ text }: { text: string }) {
   const parts = useMemo(() => linkify(text), [text])
   return (
@@ -1353,6 +1473,7 @@ const MessageRow = memo(function MessageRow({
   firstOfRun,
   lastOfRun,
   meta,
+  waiting,
   allById,
   onReply,
   onEdit,
@@ -1364,6 +1485,8 @@ const MessageRow = memo(function MessageRow({
   firstOfRun: boolean
   lastOfRun: boolean
   meta: MetaKind
+  /** The friend is offline: an undelivered message is queued, not failing. */
+  waiting: boolean
   allById: ChatMessage[]
   onReply: (m: ChatMessage) => void
   onEdit: (m: ChatMessage) => void
@@ -1423,14 +1546,15 @@ const MessageRow = memo(function MessageRow({
   const menuItems = (context: boolean): MenuItem[] => {
     const top: MenuItem[] = []
     if (context) top.push({ label: 'Reply', icon: <CornerUpLeft />, onSelect: () => onReply(m) })
-    if (copyable) top.push({ label: 'Copy', icon: <Copy />, onSelect: doCopy })
+    // Copy is one click on the hover bar (#68); the right-click menu keeps it too.
+    if (copyable && context) top.push({ label: 'Copy', icon: <Copy />, onSelect: doCopy })
     if (mine && m.kind === 'text' && !m.gif) top.push({ label: 'Edit', icon: <Pencil />, onSelect: () => onEdit(m) })
     const bottom: MenuItem[] = []
     if (mine) bottom.push({ label: 'Unsend', icon: <Trash2 />, danger: true, onSelect: () => void del(friend.id, m.id) })
     if (canReport) bottom.push({ label: 'Report…', icon: <Flag />, danger: true, onSelect: () => openSafety({ kind: 'report', friendId: friend.id, messageId: m.id }) })
     return [...top, ...(top.length && bottom.length ? [{ separator: true } as const] : []), ...bottom]
   }
-  const hasMenu = mine || copyable || canReport
+  const hasMenu = mine || canReport
 
   let content: ReactNode
   const jumbo = !m.deleted && !m.gif && m.kind === 'text' && !quote && isJumboEmoji(m.text)
@@ -1443,28 +1567,44 @@ const MessageRow = memo(function MessageRow({
   } else if (jumbo) {
     content = <div className="chat-jumbo" title={fullTime(m.ts)}>{m.text.trim()}</div>
   } else {
+    const lp = m.linkPreview
+    // A message that is ONLY the link shows just the card, like Messages.
+    const onlyLink = !!lp && !quote && /^https?:\/\/\S+$/i.test(m.text.trim())
     content = (
-      <div className={`chat-bubble${mine ? ' mine' : ''}`} title={fullTime(m.ts)}>
-        {quote && (
-          <div className="chat-quote">
-            <span className="chat-quote-text">{quote}</span>
+      <>
+        {!onlyLink && (
+          <div className={`chat-bubble${mine ? ' mine' : ''}`} title={fullTime(m.ts)}>
+            {quote && (
+              <div className="chat-quote">
+                <span className="chat-quote-text">{quote}</span>
+              </div>
+            )}
+            <span className="chat-text"><Linkified text={m.text} /></span>
           </div>
         )}
-        <span className="chat-text"><Linkified text={m.text} /></span>
-      </div>
+        {lp && <LinkCard p={lp} />}
+      </>
     )
   }
 
   const inFlight = !!xferState && xferState !== 'completed'
-  const metaText = (() => {
+  const first = friend.name.split(' ')[0]
+  // The status line under your message, and (click it) what it means.
+  const [metaText, metaState] = ((): [string, MessageState | null] => {
     const parts: string[] = []
+    let state: MessageState | null = null
     if (m.edited && !m.deleted) parts.push('Edited')
     if (meta && !(m.kind === 'file' && (inFlight || m.fileXferFailed))) {
       const s = m.status
-      if (meta === 'pending' || s === 'sending' || s === 'failed' || s == null) parts.push('Sending…')
-      else parts.push(s === 'read' ? 'Read' : 'Delivered')
+      const note = s === 'failed' ? serverNoteText(m.serverNote, first, m.heldOn) : null
+      const pending = meta === 'pending' || s === 'sending' || s === 'failed' || s == null
+      if (s === 'held') { state = 'held'; parts.push(`Waiting on ${m.heldOn ?? 'your Transfer Server'} — ${first} gets it when they’re back`) }
+      else if (note) { state = 'serverNote'; parts.push(note) }
+      else if (pending && friend.awaitingAccept) { state = 'notAccepted'; parts.push(`Waiting for ${first} to accept you`) }
+      else if (pending) { state = waiting ? 'waiting' : 'sending'; parts.push(waiting ? 'Waiting to send' : 'Sending…') }
+      else { state = s === 'read' ? 'read' : 'delivered'; parts.push(s === 'read' ? 'Read' : 'Delivered') }
     }
-    return parts.join(' · ')
+    return [parts.join(' · '), state]
   })()
 
   const pinned = !!tray || (!!menu && !menu.context)
@@ -1537,6 +1677,11 @@ const MessageRow = memo(function MessageRow({
               <IconButton size="sm" label="Reply" onClick={() => onReply(m)}>
                 <CornerUpLeft />
               </IconButton>
+              {copyable && (
+                <IconButton size="sm" label="Copy" onClick={doCopy}>
+                  <Copy />
+                </IconButton>
+              )}
               {hasMenu && (
                 <IconButton
                   size="sm"
@@ -1557,7 +1702,11 @@ const MessageRow = memo(function MessageRow({
           )}
         </motion.div>
 
-        {metaText && <div className="chat-meta">{metaText}</div>}
+        {metaText && (metaState
+          ? <button type="button" className="chat-meta chat-meta-explain" title="What does this mean?"
+              onClick={() => toast('info', statusExplanation(metaState, first, m.heldOn))}>{metaText}</button>
+          : <div className="chat-meta">{metaText}</div>)}
+        {!mine && m.via && lastOfRun && !(m.kind === 'file' && !m.path) && <div className="chat-via">via {m.via}</div>}
       </div>
       {tray && <ReactionTray anchor={tray.anchor} trigger={tray.trigger} mine={mine} onPick={doReact} onClose={closeTray} />}
       {menu && (
@@ -1709,6 +1858,7 @@ function FileMessage({
   onLightbox: (src: string) => void
 }) {
   const liveTransfer = useStore((s) => m.fileXferId ? s.chatTransfers[m.fileXferId] : undefined)
+  const friendName = useStore((s) => s.friends.find((f) => f.id === m.peerId)?.name ?? 'them')
   const history = useStore((s) => s.history)
   const transfer = liveTransfer ?? restoredChatTransfer(m, history)
   const name = m.files[0]
@@ -1724,6 +1874,7 @@ function FileMessage({
     !!t.outDir && t.fileNames.includes(name) &&
     `${t.outDir.replace(/\\/g, '/').replace(/\/$/, '')}/${name}` === path?.replace(/\\/g, '/')
   )?.id)
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- retry the preview when the file lands
   useEffect(() => setBroken(false), [path, landedTransfer, transfer?.state])
   const available = mine || !!landedPath || !!m.path && (!transfer || transfer.state === 'completed')
   const canPreview = !!path && (HAS_TAURI || path.startsWith('/mock-media/')) && !broken && available
@@ -1734,6 +1885,9 @@ function FileMessage({
   const openable = !!path && available
 
   const multi = m.files.length > 1
+  // A held send from a friend you asked to confirm first: Download / Decline.
+  const pending = usePendingFile(!mine && !transfer ? m.fileXferId : undefined)
+  const [deciding, setDeciding] = useState(false)
 
   if (MOBILE_UI) {
     const mobileTransfer = transfer ?? {
@@ -1833,7 +1987,17 @@ function FileMessage({
     <div className={`att${mine ? ' mine' : ''}`}>
       {body}
       {shownTransfer ? (
-        <ChatTransferProgress t={shownTransfer} onRetry={retry} />
+        <ChatTransferProgress t={shownTransfer} onRetry={retry} deliveries={mine ? m.deliveries : null} friendName={friendName} />
+      ) : mine && m.deliveries && m.deliveries.length > 1 ? (
+        <DeliveryLine friend={friendName} deliveries={m.deliveries} />
+      ) : pending ? (
+        <div className="xfer-line srv-ask">
+          <span className="truncate-1">Waiting on {pending.serverName}</span>
+          <button type="button" className="btn btn-plain btn-sm" disabled={deciding} onClick={() => { setDeciding(true); void decideFile(pending.linkId, false) }}>Decline</button>
+          <button type="button" className="btn btn-secondary btn-sm" disabled={deciding} onClick={() => { setDeciding(true); void decideFile(pending.linkId, true) }}>Download</button>
+        </div>
+      ) : !mine && m.via && !m.path ? (
+        <div className="xfer-line">{isDeclined(m.fileXferId) ? 'Declined' : deciding ? 'Downloading…' : `On its way from ${m.via}…`}</div>
       ) : m.fileXferId ? (
         <div className="xfer-line">Waiting…</div>
       ) : null}

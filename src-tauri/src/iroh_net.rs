@@ -15,6 +15,12 @@
 
 mod integrity;
 pub(crate) mod receive_stage;
+pub(crate) mod delivered;
+mod chat_manifest;
+mod quick;
+mod rate;
+mod partial_dirs;
+pub(crate) mod errors;
 #[cfg(test)]
 mod friendly_failure_tests {
     use super::*;
@@ -22,13 +28,18 @@ mod friendly_failure_tests {
     fn disk_full_reads_in_plain_words_for_either_side() {
         assert!(friendly_failure(Direction::Receive, "write: No space left on device (os error 28)").starts_with("This device's disk is full"));
         assert!(friendly_failure(Direction::Send, "peer: No space left on device (os error 28)").starts_with("The recipient's disk is full"));
-        assert_eq!(friendly_failure(Direction::Send, "their disk is full — once"), "their disk is full — once");
-        assert_eq!(friendly_failure(Direction::Send, "connection lost"), "connection lost");
+        // The receiver's own disk-full sentence reaches the sender card in the sender's words.
+        assert!(friendly_failure(Direction::Send, "receiver: their disk is full — once").starts_with("The recipient's disk is full"));
+        // Any other already-human sentence passes through untouched.
+        assert_eq!(friendly_failure(Direction::Send, "couldn't reach Mong"), "couldn't reach Mong");
+        assert!(friendly_failure(Direction::Send, "connection lost").contains("connection to the other device was lost"));
     }
 }
 
 #[cfg(test)]
 mod xfer_matrix;
+#[cfg(test)]
+mod engine_fix_tests;
 use receive_stage::{ReceiveStage, is_receive_stage};
 
 use std::collections::{HashMap, HashSet};
@@ -52,6 +63,14 @@ pub const ALPN: &[u8] = b"dropbeam/1";
 /// before giving up — lets a friend who's just opening their app still receive,
 /// mirroring croc's old parked-send window (without the hours-long hang).
 const FRIEND_SEND_RETRY_SECS: u64 = 90;
+/// Internal signal: the friend didn't answer and a Transfer Server can hold it.
+const GO_SERVER: &str = "dropbeam:go-server";
+
+/// How a friend send ended well: delivered directly, or held on a server.
+enum SendEnd {
+    Direct(crate::models::Locality),
+    Held(crate::mailbox::client::Held),
+}
 
 /// A Quick Send staged on this node, waiting for a receiver to pull it.
 #[derive(Clone)]
@@ -66,6 +85,13 @@ struct PendingSend {
     /// tell it is no longer the owner — it must not emit Failed, retire the
     /// token, or tear down the live attempt's cancel/conn registrations.
     gen: Arc<AtomicU64>,
+    /// The file list frozen when the link was made (T13).
+    items: Arc<Vec<SendItem>>,
+    dirs: Arc<Vec<String>>,
+    /// After this the link is gone (T13, default 24 h).
+    expires_at: Instant,
+    /// The device that pulled first owns the link (T13).
+    puller: Arc<Mutex<Option<String>>>,
 }
 
 /// Shared iroh state, managed by Tauri as `Arc<IrohState>`. The boot task fills
@@ -73,6 +99,9 @@ struct PendingSend {
 #[derive(Default)]
 pub struct IrohState {
     pub location_config: OnceCell<PathBuf>,
+    /// Tests: a windowless node lands pushed files here (like the app would).
+    #[cfg(test)]
+    pub test_inbox: OnceCell<PathBuf>,
     chat_batches: Mutex<HashMap<String, ChatBatch>>,
     chat_links: Mutex<HashMap<String, crate::models::ChatTransferLink>>,
     pub endpoint: OnceCell<Endpoint>,
@@ -86,6 +115,9 @@ pub struct IrohState {
     /// cancel. Marked before the flag flips, so the send loop that unwinds on the
     /// cancel can report Paused (and keep every partial) instead of Canceled.
     paused: Mutex<HashSet<String>>,
+    /// Transfers the USER canceled here (not a pause, not a dead back-channel):
+    /// only these may throw away their resumable partial.
+    user_canceled: Mutex<HashSet<String>>,
     /// Location uploads in flight, keyed by (peer, location, rel path, source
     /// paths) → transfer id, so the same folder is never uploaded twice at once
     /// (a Retry click and a scripted restart raced into two parallel sends).
@@ -117,12 +149,33 @@ struct CachedFriendConnection {
     conn: Connection,
     created_at: Instant,
     relay_with_direct_since: Option<Instant>,
+    /// Wire bytes (both ways) at the previous rotation check.
+    last_bytes: u64,
 }
 
 impl CachedFriendConnection {
     fn new(conn: Connection) -> Self {
-        Self { conn, created_at: Instant::now(), relay_with_direct_since: None }
+        let last_bytes = wire_bytes(&conn);
+        Self { conn, created_at: Instant::now(), relay_with_direct_since: None, last_bytes }
     }
+
+    /// Did real data (not just keep-alives) cross this connection since the last
+    /// check? A rotation then would kill whatever is streaming over it (a
+    /// Location download), so it waits for a quiet moment.
+    fn busy_since_last_check(&mut self) -> bool {
+        let now = wire_bytes(&self.conn);
+        let moved = now.saturating_sub(self.last_bytes);
+        self.last_bytes = now;
+        moved > ROTATION_BUSY_BYTES
+    }
+}
+
+/// More than this between two checks (≥ 45 s apart) is a transfer, not chatter.
+const ROTATION_BUSY_BYTES: u64 = 256 * 1024;
+
+fn wire_bytes(conn: &Connection) -> u64 {
+    let stats = conn.stats();
+    stats.udp_rx.bytes.saturating_add(stats.udp_tx.bytes)
 }
 
 /// Pure decision logic using continuous observed relay time.
@@ -221,7 +274,8 @@ impl IrohState {
             now.duration_since(cached.created_at), locality, has_direct_addrs,
             cached.relay_with_direct_since.map(|since| now.duration_since(since)),
         );
-        if let Some(reason) = reason {
+        let busy = cached.busy_since_last_check();
+        if let Some(reason) = reason.filter(|_| !busy) {
             log::info!("iroh: rotating friend connection {endpoint}: {reason}");
             cached.conn.close(0u32.into(), b"friend connection rotation");
             connections.remove(endpoint);
@@ -271,6 +325,16 @@ impl IrohState {
         }
     }
 
+    /// Ids of every transfer currently running (lab automation: cancel-all).
+    #[allow(dead_code)]
+    pub(crate) fn active_transfer_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.cancels.lock().unwrap().keys().cloned().collect();
+        for id in self.conns.lock().unwrap().keys() {
+            if !ids.contains(id) { ids.push(id.clone()); }
+        }
+        ids
+    }
+
     /// Signal cancellation for a transfer id. Drops a still-staged send so it
     /// can't be pulled, and flips the in-flight flag for a running transfer.
     pub fn cancel(&self, id: &str) -> CancelKind {
@@ -282,6 +346,10 @@ impl IrohState {
     /// the id so the unwinding send loop reports Paused, leaving the card's retry
     /// record intact for a one-tap Resume.
     pub fn cancel_with(&self, id: &str, reason: CancelReason) -> CancelKind {
+        // A send to all of a person's devices: stop every device's leg.
+        if crate::fanout::stop(self, id, reason) {
+            return CancelKind::Active;
+        }
         // Mark BEFORE anything flips the flag, or a fast loop could unwind and
         // read the reason before it was recorded.
         match reason {
@@ -291,6 +359,9 @@ impl IrohState {
             // A cancel after a pause request wins: never resurrect a stale mark.
             CancelReason::Cancel => {
                 self.paused.lock().unwrap().remove(id);
+                let mut c = self.user_canceled.lock().unwrap();
+                if c.len() > 512 { c.clear(); }
+                c.insert(id.to_owned());
             }
         }
         let was_staged = {
@@ -299,9 +370,11 @@ impl IrohState {
             // Flip the shared flag BEFORE dropping the entry — an in-flight pull
             // of this staged send holds a clone of the same Arc, so this is the
             // only way the cancel reliably reaches it.
-            p.retain(|_, ps| {
+            p.retain(|token, ps| {
                 if ps.transfer_id == id {
                     ps.cancel.store(true, Ordering::SeqCst);
+                    // A late puller is told "canceled", not "connection lost".
+                    quick::note_canceled(token);
                     false
                 } else {
                     true
@@ -320,7 +393,9 @@ impl IrohState {
         // Tear down the connection so a write stuck on QUIC flow-control aborts
         // immediately — this is what lets the SENDER cancel a stalled transfer.
         if let Some(conn) = self.conns.lock().unwrap().remove(id) {
-            conn.close(0u32.into(), b"canceled");
+            // The reason travels in CONNECTION_CLOSE: the far side reads it to
+            // show "Canceled by …" / "… paused" instead of a lost connection.
+            conn.close(0u32.into(), errors::close_reason_for(reason));
             active = true;
         }
         if was_staged {
@@ -414,7 +489,7 @@ fn speaks_progress_v1(frame: &serde_json::Value) -> bool {
 
 // Optional JSON metadata only: old peers ignore it, and absent metadata keeps
 // legacy cards static. Linked pushes reuse the existing hold/ready negotiation.
-fn incoming_chat_id(peer: &str, transfer: &str) -> String {
+pub(crate) fn incoming_chat_id(peer: &str, transfer: &str) -> String {
     format!("receive:{peer}:{transfer}")
 }
 
@@ -573,16 +648,101 @@ struct ChatBatch {
     landed: std::collections::BTreeMap<String, String>,
     touched: Instant,
     snapshot: TransferUpdate,
+    /// Set when this attempt stalled or its connection dropped mid-transfer: the
+    /// card reads "Reconnecting…" while the sender re-dials and resumes. Cleared
+    /// by the sender's next attempt; past BATCH_GIVE_UP the card fails.
+    reconnect_since: Option<Instant>,
 }
+
+/// A started batch with no data and no push finishing for this long is stalled:
+/// the receiver drops the connection so the sender re-dials and resumes.
+const BATCH_STALL: Duration = Duration::from_secs(20);
+/// How long a stalled/dropped batch waits for the sender to come back before the
+/// card says it failed. Covers the sender's own re-dial budget (90 s of dialing
+/// plus its back-off) with room to spare.
+const BATCH_GIVE_UP: Duration = Duration::from_secs(180);
+pub(crate) const RECONNECTING: &str = "Reconnecting…";
+
+/// What the batch watchdog should do next.
+enum BatchWatch {
+    Wait(Duration),
+    Reconnect(TransferUpdate),
+    /// The card's final state; true when bytes had moved (drop the connection).
+    Fail(TransferUpdate, bool),
+    Done,
+}
+
 impl ChatBatch {
+    fn new(link: crate::models::ChatTransferLink, snapshot: TransferUpdate) -> Self {
+        Self { link, landed: Default::default(), touched: Instant::now(), snapshot, reconnect_since: None }
+    }
+
     fn activity(&mut self, advancing: u64) {
         if advancing > 0 { self.touched = Instant::now(); }
+    }
+
+    fn started(&self) -> bool {
+        !self.landed.is_empty() || self.snapshot.bytes_done > 0
+    }
+
+    fn terminal(&self) -> bool {
+        matches!(self.link.batch_state, Some(TransferState::Completed | TransferState::Failed | TransferState::Canceled))
+    }
+
+    /// The card while the sender re-dials: honest, not a failure.
+    fn reconnecting_update(&mut self) -> TransferUpdate {
+        self.link.batch_state = Some(TransferState::Connecting);
+        let mut update = self.snapshot.clone();
+        update.state = TransferState::Connecting;
+        update.detail = Some(RECONNECTING.into());
+        update.speed_bps = 0.0;
+        update.eta_seconds = None;
+        let mut link = self.link.clone();
+        slim_for_ui(&mut link);
+        update.chat_transfer = Some(link);
+        update
+    }
+
+    /// This attempt's connection dropped mid-transfer: show "Reconnecting…" and
+    /// start the give-up clock (once). None when there's nothing to resume.
+    fn interrupted(&mut self, now: Instant) -> Option<TransferUpdate> {
+        if self.terminal() || !self.started() { return None; }
+        self.reconnect_since.get_or_insert(now);
+        Some(self.reconnecting_update())
+    }
+
+    /// One watchdog step. A batch that never moved a byte (e.g. waiting on the
+    /// accept dialog) keeps the old 60 s expiry; a started one is re-dialed after
+    /// BATCH_STALL of silence and only fails after BATCH_GIVE_UP without the
+    /// sender coming back.
+    fn watch(&mut self, now: Instant) -> BatchWatch {
+        if self.terminal() { return BatchWatch::Done; }
+        if let Some(since) = self.reconnect_since {
+            let waited = now.duration_since(since);
+            if waited < BATCH_GIVE_UP { return BatchWatch::Wait(BATCH_GIVE_UP - waited); }
+            return match self.expire_after(now, Duration::ZERO) {
+                Some(mut update) => {
+                    update.error = Some("The connection dropped and didn't come back — retry to pick up where it stopped".into());
+                    BatchWatch::Fail(update, true)
+                }
+                None => BatchWatch::Done,
+            };
+        }
+        let idle = now.duration_since(self.touched);
+        if !self.started() {
+            if idle < TRANSFER_STALL { return BatchWatch::Wait(TRANSFER_STALL - idle); }
+            return self.expire_after(now, TRANSFER_STALL).map_or(BatchWatch::Done, |u| BatchWatch::Fail(u, false));
+        }
+        if idle < BATCH_STALL { return BatchWatch::Wait(BATCH_STALL - idle); }
+        self.reconnect_since = Some(now);
+        BatchWatch::Reconnect(self.reconnecting_update())
     }
 
     fn observe(&mut self, link: &crate::models::ChatTransferLink, u: &TransferUpdate) -> Option<crate::models::ChatTransferLink> {
         if link.manifest != self.link.manifest || link.directories != self.link.directories || link.attempt < self.link.attempt { return None; }
         if link.attempt > self.link.attempt {
             self.link = link.clone();
+            self.reconnect_since = None;
             // Confirmed files belong to the immutable manifest, so reconnects
             // may resume at the next file without re-sending earlier parts.
         } else if matches!(self.link.batch_state, Some(TransferState::Completed | TransferState::Failed | TransferState::Canceled)) {
@@ -650,11 +810,16 @@ struct ChatLinkGuard<'a> {
 }
 impl Drop for ChatLinkGuard<'_> {
     fn drop(&mut self) {
-        self.state.chat_links.lock().unwrap().remove(&self.id);
+        // Poison-tolerant: a Drop that panics while unwinding aborts the whole app.
+        self.state.chat_links.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
     }
 }
 
 fn emit(app: &AppHandle, u: &TransferUpdate) {
+    // One device's leg of a multi-device send: its card is the send's card.
+    if crate::fanout::route(u) {
+        return;
+    }
     let mut u = u.clone();
     u.integrity = integrity::reports();
     if let Some(state) = app.try_state::<Arc<IrohState>>() {
@@ -667,6 +832,17 @@ fn emit(app: &AppHandle, u: &TransferUpdate) {
                         batch.landed.remove(&chat_item_key(row.index, &row.name));
                     }
                     u.chat_transfer = batch.observe(&link, &u);
+                    if let Some(done) = u.chat_transfer.as_ref().filter(|l| l.batch_state == Some(TransferState::Completed)) {
+                        // A Transfer Server copy of this send must not land twice.
+                        if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
+                            crate::mailbox::client::note_direct_landed(&st.config_dir, &link.id);
+                            if let Some(first) = done.completed_paths.values().next() {
+                                if let Some(m) = crate::chat::set_path_by_link(&st.config_dir, &link.id, first) {
+                                    let _ = app.emit("chat://message", &m);
+                                }
+                            }
+                        }
+                    }
                 }
                 if matches!(u.chat_transfer.as_ref().and_then(|l| l.batch_state), Some(TransferState::Completed | TransferState::Failed | TransferState::Canceled)) {
                     prune_chat_batches(&mut batches);
@@ -674,8 +850,24 @@ fn emit(app: &AppHandle, u: &TransferUpdate) {
             }
         }
     }
+    if let Some(link) = u.chat_transfer.as_mut() { slim_for_ui(link); }
     let _ = app.emit("transfer://update", &u);
 }
+
+/// Progress events carry counters, not the transfer's whole file list (T14):
+/// a 15k-file folder re-serialized its manifest into every 5-per-second UI
+/// event. Nothing in the UI reads the manifest; landed paths are kept for small
+/// batches (opened from the chat card while they arrive) and on the final event.
+fn slim_for_ui(link: &mut crate::models::ChatTransferLink) {
+    link.manifest = vec![];
+    link.directories = vec![];
+    link.completed_files = vec![];
+    let terminal = matches!(link.batch_state, Some(TransferState::Completed | TransferState::Failed | TransferState::Canceled));
+    if !terminal && link.completed_paths.len() > UI_PATHS_WHILE_ACTIVE {
+        link.completed_paths.clear();
+    }
+}
+const UI_PATHS_WHILE_ACTIVE: usize = 500;
 
 // One owner writes all progress frames; the receive future keeps its existing
 // disk writes, cancellation, coverage, and finalization semantics.
@@ -785,6 +977,11 @@ fn is_disk_full(error: &anyhow::Error) -> bool {
 /// A receive failure as the SENDER will read it (shown verbatim on their card):
 /// plain words for a full disk, the redacted technical chain otherwise.
 fn receiver_error_text(error: &anyhow::Error) -> String {
+    // The receiver's own Cancel: tell the sender in words its classifier reads
+    // as a deliberate stop by the other side ("Canceled by X"), not a failure.
+    if error.chain().any(|e| e.to_string() == "canceled") {
+        return errors::PEER_CANCELED.into();
+    }
     if is_disk_full(error) {
         return "their disk is full — once they free up space, retry and it picks up where it stopped".into();
     }
@@ -830,6 +1027,9 @@ fn remote_error_is_independent(remote: &anyhow::Error) -> bool {
         "connection lost",
         "unexpected end of stream",
         "aborted",
+        // A range stream that our side abandoned mid-segment (an aborted sibling
+        // of the failed one) reads as a short segment on the receiver.
+        "ended early",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -844,7 +1044,20 @@ async fn write_and_receipt<T>(
     tokio::pin!(write, receipt);
     tokio::select! {
         biased;
-        r = &mut receipt => { r?; write.await }
+        r = &mut receipt => match r {
+            Ok(()) => write.await,
+            // The receiver saw our stream die before our writer surfaced WHY
+            // (a range task's error reaches us via the worker drain). Prefer
+            // our own diagnosis — "changed while sending", "canceled" — when
+            // the remote error is only that echo.
+            Err(remote) if !remote_error_is_independent(&remote) => {
+                match tokio::time::timeout(Duration::from_secs(5), &mut write).await {
+                    Ok(Err(local)) => Err(local),
+                    _ => Err(remote),
+                }
+            }
+            Err(remote) => Err(remote),
+        },
         w = &mut write => {
             match w {
                 Ok(value) => { receipt.await?; Ok(value) }
@@ -1014,7 +1227,8 @@ fn progress_cb(
     conn: Connection,
     files: usize,
 ) -> impl Fn(u64, u64) {
-    let start = Instant::now();
+    // Speed from THIS attempt's recent bytes (T15), never the resume base.
+    let rate = Mutex::new(rate::RollingRate::default());
     // (when we last emitted, and what we emitted) — both halves matter.
     let last_emit = Mutex::new(None::<(Instant, u64, u64)>);
     move |done: u64, total: u64| {
@@ -1034,7 +1248,7 @@ fn progress_cb(
         }
         *previous = Some((Instant::now(), done, total));
         drop(previous);
-        let secs = start.elapsed().as_secs_f64().max(0.001);
+        let speed = rate.lock().map(|mut r| r.observe(Instant::now(), done)).unwrap_or(0.0);
         let mut u = TransferUpdate::new(id.clone(), dir, names.clone());
         u.file_count = files.max(u.file_count);
         u.state = TransferState::Transferring;
@@ -1045,12 +1259,23 @@ fn progress_cb(
         } else {
             0.0
         };
-        u.speed_bps = done as f64 / secs;
+        u.speed_bps = speed;
+        u.eta_seconds = (speed > 0.0).then(|| total.saturating_sub(done) as f64 / speed);
         u.locality = conn_locality(&conn); // live Direct/Relay badge
         u.conn_detail = Some(conn_detail(&conn)); // inspector: path, rtt, upgrading
         u.friend_name = friend.clone();
         emit(&app, &u);
     }
+}
+
+/// The exact files a receive just landed (after collision renames), so the iOS
+/// shell can offer to save photos/videos to the Photos library. Emitted once per
+/// landed batch — a folder that arrives as many pushes emits many small batches.
+fn emit_received_files(app: &AppHandle, id: &str, paths: &[PathBuf], chat: bool) {
+    let files: Vec<String> = paths.iter().filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned()).collect();
+    if files.is_empty() { return; }
+    let _ = app.emit("received://files", serde_json::json!({ "id": id, "paths": files, "chat": chat }));
 }
 
 fn completed_update(id: &str, dir: Direction, names: Vec<String>, total: u64) -> TransferUpdate {
@@ -1082,6 +1307,26 @@ fn emit_completed(
     u.friend_name = friend.clone();
     u.out_dir = out_dir.clone();
     emit(app, &u);
+    completed_side_effects(app, id, dir, names, total, locality, friend, out_dir);
+}
+
+/// The notification + History half of a completed transfer (shared with the
+/// Transfer Server paths, which emit their own chat-linked card).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn completed_side_effects(
+    app: &AppHandle,
+    id: &str,
+    dir: Direction,
+    names: Vec<String>,
+    total: u64,
+    locality: crate::models::Locality,
+    friend: Option<String>,
+    out_dir: Option<String>,
+) {
+    // A multi-device send writes ONE History row, for the whole send.
+    if crate::fanout::is_leg(id) {
+        return;
+    }
 
     // Pop a native OS notification for an INCOMING file — this is what makes
     // DropBeam feel "always ready in the background": the app runs in the menu
@@ -1103,15 +1348,24 @@ fn emit_completed(
                 } else {
                     format!("{} files", names.len())
                 };
+                // Say WHERE it went ("Saved in Downloads") — "where did it go?"
+                // is the first question after a file arrives.
+                let place = if cfg!(target_os = "ios") {
+                    None
+                } else {
+                    out_dir
+                        .as_deref()
+                        .and_then(|d| std::path::Path::new(d).file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .filter(|n| !n.is_empty())
+                };
+                let body = match place {
+                    Some(p) => format!("Saved in {p}. Click to open DropBeam."),
+                    None => "Saved. Tap to open DropBeam.".to_string(),
+                };
                 let (title, body) = match who {
-                    Some(name) => (
-                        format!("{name} sent you {what}"),
-                        "Saved — click to open DropBeam".to_string(),
-                    ),
-                    None => (
-                        format!("Received {what}"),
-                        "Saved — click to open DropBeam".to_string(),
-                    ),
+                    Some(name) => (format!("{name} sent you {what}"), body),
+                    None => (format!("Received {what}"), body),
                 };
                 // Audible (the silent-banner fix) — fires for every receive so a
                 // Quick Send can never slip by unnoticed.
@@ -1154,6 +1408,378 @@ fn emit_completed(
     }
 }
 
+/// Apply an incoming chat frame from friend endpoint `who` — a new message or an
+/// edit/unsend/reaction — whether it arrived directly or through a Transfer
+/// Server (`via` = that server's name). Returns whether it applied (false for a
+/// stranger, or an op whose target we don't have). Emits to the UI when running.
+pub(crate) fn apply_incoming_chat(state: &IrohState, config_dir: &Path, who: &str, req: &serde_json::Value, via: Option<&str>, _sent_ms: Option<u64>) -> Result<bool> {
+    let app = state.app.get().cloned();
+    let mut applied = true;
+    let msg_kind = req.get("msgKind").and_then(|k| k.as_str()).unwrap_or("text");
+    // Unsolicited frames cannot recreate a removed/unknown contact.
+    let friend = crate::friends::chat_sender(config_dir, &who);
+    if friend.is_none() {
+        applied = false;
+    }
+    if let Some(friend) = friend {
+        let peer_id = friend.id.clone();
+        // They message us, so they've accepted us: stop showing "waiting".
+        for eid in [Some(who), friend.endpoint_id.as_deref()].into_iter().flatten() {
+            if crate::friends::set_awaiting_accept(config_dir, eid, false) {
+                if let Some(app) = &app { let _ = app.emit("friends://changed", ()); }
+            }
+        }
+        match msg_kind {
+            "reaction" => {
+                if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                    let emoji = req.get("emoji").and_then(|e| e.as_str()).unwrap_or("");
+                    // S8: an emoji is a few code points; anything longer is
+                    // junk — acknowledge it (so it isn't retried) and drop it.
+                    if emoji.is_empty() || emoji.chars().count() > crate::chat::MAX_EMOJI_CHARS {
+                        return Ok(true);
+                    }
+                    let add = req.get("add").and_then(|a| a.as_bool()).unwrap_or(true);
+                    // None = we don't have the target message yet → tell the
+                    // sender (applied=false) so it KEEPS the op queued to
+                    // retry, rather than dropping it (apply_* is idempotent).
+                    match crate::chat::apply_reaction(
+                        config_dir, &peer_id, target, emoji, false, add,
+                    ) {
+                        Some(u) => {
+                            if let Some(app) = &app { let _ = app.emit("chat://message", &u); }
+                        }
+                        None => applied = false,
+                    }
+                }
+            }
+            "edit" => {
+                if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                    let new_text = crate::chat::cap_text(req.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                    let new_text = new_text.as_str();
+                    // author_is_me=false: a remote edit may only touch
+                    // the PEER's own message, never one we authored.
+                    match crate::chat::apply_edit(config_dir, &peer_id, target, new_text, false)
+                    {
+                        Some(u) => {
+                            if let Some(app) = &app { let _ = app.emit("chat://message", &u); }
+                        }
+                        None => applied = false,
+                    }
+                }
+            }
+            "delete" => {
+                if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
+                    match crate::chat::apply_delete(config_dir, &peer_id, target, false) {
+                        Some(u) => {
+                            if let Some(app) = &app { let _ = app.emit("chat://message", &u); }
+                        }
+                        None => applied = false,
+                    }
+                }
+            }
+            _ => {
+                // A new text / file / gif message.
+                // S8: bound every field a peer controls before it's stored.
+                let text = crate::chat::cap_text(req.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                let files: Vec<String> = req
+                    .get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(crate::chat::cap_file_name))
+                        .take(crate::chat::MAX_FILE_NAMES).collect())
+                    .unwrap_or_default();
+                let bytes = req.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
+                let id = req
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .filter(|i| !i.is_empty() && i.len() <= crate::chat::MAX_ID_LEN)
+                    .map(String::from)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let ts = crate::chat::cap_ts(req.get("ts").and_then(|t| t.as_u64()).unwrap_or_else(crate::chat::now_ms));
+                // Lamport merge: order this incoming message after
+                // everything we already have if its seq is stale/absent.
+                let recv_seq = req.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+                let seq = crate::chat::cap_seq(recv_seq, crate::chat::next_seq(config_dir, &peer_id));
+                let reply_to = req.get("replyTo").and_then(|r| r.as_str())
+                    .filter(|r| r.len() <= crate::chat::MAX_ID_LEN).map(String::from);
+                let reply_preview =
+                    req.get("replyPreview").and_then(|r| r.as_str()).map(crate::chat::cap_preview);
+                let gif: Option<crate::chat::GifMeta> =
+                    req.get("gif").and_then(|g| serde_json::from_value(g.clone()).ok())
+                        .filter(crate::chat::gif_within_limits);
+                let is_file = msg_kind == "file" || msg_kind == "gif";
+                // #47: a preview the sender fetched — re-checked, never re-fetched.
+                let link_preview = if is_file { None } else {
+                    req.get("linkPreview")
+                        .and_then(|v| serde_json::from_value::<crate::link_preview::LinkPreview>(v.clone()).ok())
+                        .and_then(crate::link_preview::sanitize)
+                        .and_then(|p| crate::link_preview::for_text(p, &text))
+                };
+                // Through a server the note can arrive before its bytes: the path
+                // is set when the file itself lands (land_server_files).
+                let path = if is_file && via.is_none() {
+                    // The receive-safe landing name: a peer-supplied
+                    // absolute/"../" name must never point this card
+                    // (which the UI previews + opens) outside Downloads.
+                    files.first().map(|name| receive_dir(state, config_dir).join(receive_rel(name)).to_string_lossy().to_string())
+                } else {
+                    None
+                };
+                let msg = crate::chat::ChatMessage {
+                    file_xfer_id: req.get("fileXferId").and_then(|v| v.as_str())
+                        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                        .map(|id| incoming_chat_id(&who, id)),
+                    id,
+                    peer_id: peer_id.clone(),
+                    from_me: false,
+                    kind: if is_file { "file".into() } else { "text".into() },
+                    text,
+                    files,
+                    bytes,
+                    path,
+                    status: None,
+                    ts,
+                    seq,
+                    reply_to,
+                    reply_preview,
+                    reactions: vec![],
+                    edited: false,
+                    deleted: false,
+                    gif,
+                    rev: 0,
+                    held_on: None,
+                    server_note: None,
+                    via: via.map(String::from),
+                    deliveries: vec![],
+                    link_preview,
+                    text_rev: 0, reaction_revs: vec![],
+                };
+                // D11: acknowledged only once it's on disk (Err → no ack, so the
+                // sender / Transfer Server keeps its copy and retries).
+                let stored = crate::chat::append_durable(config_dir, &msg)
+                    .map_err(|e| anyhow::anyhow!("could not save the message: {e}"))?;
+                if stored {
+                    // iPhone: the push banner may already have announced it.
+                    let announced = crate::mailbox::push::already_announced(config_dir, &msg.id);
+                    crate::mailbox::push::note_have(config_dir, &[msg.id.as_str()]);
+                    // Already read on another of your devices (a Transfer Server
+                    // copy landing late): store it, but no badge, chime or banner —
+                    // one message rings once, wherever you are.
+                    let already_read = crate::chat::read_markers(config_dir)
+                        .get(&msg.peer_id).is_some_and(|&t| t >= msg.ts);
+                    if let Some(app) = &app {
+                        match serde_json::to_value(&msg) {
+                            Ok(mut v) if already_read => {
+                                v["alreadyRead"] = serde_json::Value::Bool(true);
+                                let _ = app.emit("chat://message", v);
+                            }
+                            _ => { let _ = app.emit("chat://message", &msg); }
+                        }
+                        if already_read {
+                            log::info!("chat notification skipped: already read on another of your devices");
+                        } else if announced {
+                            log::info!("chat notification skipped: the push already showed it");
+                        } else {
+                            maybe_notify_chat(app, &friend.name, &msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(applied)
+}
+
+/// Where received files land: the configured download folder, else the OS
+/// Downloads (Documents on iOS), else (headless tests) `<config>/Downloads`.
+pub(crate) fn receive_dir(state: &IrohState, config_dir: &Path) -> PathBuf {
+    let configured = match state.app.get().and_then(|a| a.try_state::<Arc<crate::AppState>>()) {
+        Some(st) => st.settings.lock().unwrap().download_dir.clone(),
+        None => crate::settings::load(config_dir, "", "").download_dir,
+    };
+    if !configured.trim().is_empty() {
+        return PathBuf::from(configured);
+    }
+    match state.app.get() {
+        Some(app) => crate::commands::download_directory(app).unwrap_or_else(|_| std::env::temp_dir()),
+        // The background server lands things where the app would: ~/Downloads.
+        None if crate::mailbox::is_headless() => std::env::var_os("HOME").map(PathBuf::from)
+            .map(|h| h.join("Downloads")).unwrap_or_else(|| config_dir.join("Downloads")),
+        None => config_dir.join("Downloads"),
+    }
+}
+
+/// A friend's file send arrived through a Transfer Server and is now in
+/// `dest`: attach it to (or create) its chat card and surface a completed,
+/// chat-linked receive exactly like a direct one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn land_server_files(
+    state: &IrohState,
+    config: &Path,
+    from: &str,
+    xfer: &str,
+    note: &serde_json::Value,
+    top_names: &[String],
+    manifest: &[(String, u64)],
+    dirs: &[String],
+    landed: &[(String, PathBuf)],
+    dest: &Path,
+    server_name: &str,
+    created_ms: u64,
+) {
+    // The sender can resume/verify what reached us through its server too (S7).
+    for (key, path) in landed {
+        if let Some((_, name)) = key.strip_prefix("file:").and_then(|r| r.split_once(':')) {
+            delivered::record(config, from, name, path);
+        }
+    }
+    let Some(friend) = crate::friends::chat_sender(config, from) else { return };
+    let link_id = incoming_chat_id(from, xfer);
+    let total: u64 = manifest.iter().map(|(_, s)| *s).sum();
+    let first = landed.iter().find(|(k, _)| k.starts_with("file:")).or(landed.first())
+        .map(|(_, p)| p.to_string_lossy().into_owned());
+    let names: Vec<String> = if top_names.is_empty() { manifest.iter().map(|(n, _)| n.clone()).collect() } else { top_names.to_vec() };
+    let mut changed = first.as_deref().and_then(|p| crate::chat::set_received_path(config, &friend.id, &link_id, p, Some(server_name)));
+    if changed.is_none() && crate::chat::received_file(config, &friend.id, &link_id).is_none() {
+        let id = note["id"].as_str().filter(|i| uuid::Uuid::parse_str(i).is_ok()).map(String::from)
+            .unwrap_or_else(|| format!("mbx-{xfer}"));
+        let ts = note["ts"].as_u64().unwrap_or(created_ms);
+        let seq = note["seq"].as_u64().unwrap_or(0).max(crate::chat::next_seq(config, &friend.id));
+        let msg = crate::chat::ChatMessage {
+            file_xfer_id: Some(link_id.clone()),
+            id,
+            peer_id: friend.id.clone(),
+            from_me: false,
+            kind: "file".into(),
+            text: note["text"].as_str().unwrap_or("").chars().take(4000).collect(),
+            files: names.clone(),
+            bytes: total,
+            path: first.clone(),
+            status: None,
+            ts,
+            seq,
+            reply_to: None,
+            reply_preview: None,
+            reactions: vec![],
+            edited: false,
+            deleted: false,
+            gif: None,
+            rev: 0,
+            held_on: None,
+            server_note: None,
+            via: Some(server_name.to_owned()),
+            deliveries: vec![],
+            link_preview: None,
+            text_rev: 0, reaction_revs: vec![],
+        };
+        if crate::chat::append(config, &msg) {
+            changed = Some(msg);
+        }
+    }
+    let Some(app) = state.app.get() else { return };
+    if let Some(m) = &changed {
+        let _ = app.emit("chat://message", m);
+    }
+    let mut completed_paths = std::collections::BTreeMap::new();
+    for (k, p) in landed {
+        completed_paths.insert(k.clone(), p.to_string_lossy().into_owned());
+    }
+    let link = crate::models::ChatTransferLink {
+        id: link_id.clone(),
+        attempt: crate::chat::now_ms(),
+        manifest: manifest.iter().map(|(name, size)| crate::models::ChatFile { name: name.clone(), size: *size }).collect(),
+        directories: dirs.to_vec(),
+        batch_state: Some(TransferState::Completed),
+        bytes_done: total,
+        completed_files: completed_paths.keys().cloned().collect(),
+        completed_paths,
+        item_offset: 0,
+        offset: 0,
+        total,
+        last: true,
+    };
+    let card_id = format!("server-{xfer}");
+    let mut u = completed_update(&card_id, Direction::Receive, names.clone(), total);
+    u.friend_name = Some(friend.name.clone());
+    u.out_dir = Some(dest.to_string_lossy().into_owned());
+    u.detail = Some(format!("via {server_name}"));
+    u.chat_transfer = Some(link);
+    let _ = app.emit("transfer://update", &u);
+    completed_side_effects(app, &card_id, Direction::Receive, names, total, crate::models::Locality::Unknown,
+        Some(friend.name), Some(dest.to_string_lossy().into_owned()));
+}
+
+/// Final states of things we left on Transfer Servers → chat bubbles + cards.
+pub(crate) fn apply_receipts(state: &IrohState, config: &Path, receipts: &[crate::mailbox::client::Receipt]) {
+    let app = state.app.get();
+    for r in receipts {
+        let s = &r.sent;
+        match s.kind.as_str() {
+            "chat" => {
+                let Some(msg) = &s.msg_id else { continue };
+                // A per-device copy of a message that already reached them:
+                // whatever happens to it, the bubble stays "Delivered".
+                if s.copy {
+                    continue;
+                }
+                // Reached at least one of their devices (others may still fetch).
+                let reached = !r.delivered_to.is_empty() && matches!(r.state.as_str(), "held" | "expired");
+                let updated = match r.state.as_str() {
+                    _ if reached => crate::chat::set_status(config, &s.peer_id, msg, "delivered"),
+                    "delivered" => crate::chat::set_status(config, &s.peer_id, msg, "delivered"),
+                    "expired" => crate::chat::set_server_failed(config, &s.peer_id, msg, "expired"),
+                    "rejected" | "lost" => crate::chat::set_server_failed(config, &s.peer_id, msg, "lost"),
+                    _ => None,
+                };
+                if let (Some(app), Some(u)) = (app, updated) {
+                    let _ = app.emit("chat://message", &u);
+                }
+            }
+            "file" => {
+                // A send to several of a person's devices tracks each device.
+                if crate::fanout::on_receipt(state, config, r) {
+                    continue;
+                }
+                if r.state == "held" {
+                    continue;
+                }
+                let (Some(app), Some(xfer)) = (app, &s.xfer_id) else { continue };
+                let card_id = s.transfer_id.clone().unwrap_or_else(|| xfer.clone());
+                let friend = crate::friends::get(config, &s.peer_id).map(|f| f.name);
+                let mut u = TransferUpdate::new(card_id.clone(), Direction::Send, s.names.clone());
+                u.bytes_total = s.bytes;
+                u.friend_name = friend.clone();
+                u.held_on = Some(s.server_name.clone());
+                // Expired after reaching at least one of their devices = delivered.
+                let delivered = r.state == "delivered" || (r.state != "canceled" && !r.delivered_to.is_empty());
+                if delivered {
+                    u.state = TransferState::Completed;
+                    u.bytes_done = s.bytes;
+                    u.percent = 100.0;
+                } else if r.state == "canceled" {
+                    continue;
+                } else {
+                    u.state = TransferState::Failed;
+                    u.error = Some(if r.state == "expired" {
+                        format!("Expired on {} before it could be delivered", s.server_name)
+                    } else {
+                        format!("{} couldn't deliver it", s.server_name)
+                    });
+                }
+                u.chat_transfer = Some(crate::models::ChatTransferLink {
+                    id: xfer.clone(), attempt: crate::chat::now_ms(), manifest: vec![], directories: vec![],
+                    batch_state: Some(u.state), bytes_done: u.bytes_done, completed_files: vec![], completed_paths: Default::default(),
+                    item_offset: 0, offset: 0, total: s.bytes, last: true,
+                });
+                let _ = app.emit("transfer://update", &u);
+                if delivered {
+                    completed_side_effects(app, &card_id, Direction::Send, s.names.clone(), s.bytes, crate::models::Locality::Unknown, friend, None);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Prove we can write into `dir` WITHOUT risking an async worker. On macOS a
 /// file open inside a privacy-protected folder (Downloads, Desktop, Documents)
 /// BLOCKS until the user answers the "allow access" prompt. Field case
@@ -1193,16 +1819,32 @@ fn folder_name(dir: &Path) -> String {
 
 /// Plain words for the failures people can act on; everything else verbatim.
 fn friendly_failure(dir: Direction, err: &str) -> String {
-    let lower = err.to_ascii_lowercase();
-    let disk_full = lower.contains("no space left on device") || lower.contains("os error 28")
-        || lower.contains("not enough space on the disk") || lower.contains("os error 112");
-    if disk_full && !lower.contains("their disk is full") {
-        return match dir {
-            Direction::Receive => "This device's disk is full — free up space, then retry and it picks up where it stopped".into(),
-            _ => "The recipient's disk is full — once they free up space, retry and it picks up where it stopped".into(),
-        };
+    errors::friendly(dir, err)
+}
+
+/// A chat-linked receive whose connection dropped (or stalled) mid-transfer is
+/// not a failure yet: the sender re-dials and RESUMES it, so the card says
+/// "Reconnecting…" and the batch watchdog fails it only if they never come back.
+/// False (fail now, as before) for anything a retry can't fix or a batch that
+/// never moved a byte.
+fn receive_interrupted(app: &AppHandle, state: &IrohState, id: &str, err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    if is_disk_full(err) || text.contains(integrity::FAILED) || text.contains("declined") || text.contains("refused") {
+        return false;
     }
-    err.to_string()
+    let Some(link) = state.chat_links.lock().unwrap().get(id).cloned() else { return false };
+    let update = {
+        let mut batches = state.chat_batches.lock().unwrap();
+        let Some(batch) = batches.get_mut(&link.id) else { return false };
+        if batch.link.attempt != link.attempt { return false; }
+        match batch.interrupted(Instant::now()) {
+            Some(update) => update,
+            None => return false,
+        }
+    };
+    log::info!("friend-recv {id}: interrupted ({}) — waiting for the sender to reconnect and resume", crate::telemetry::redact_paths_only(&text));
+    let _ = app.emit("transfer://update", &update);
+    true
 }
 
 fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
@@ -1237,9 +1879,21 @@ fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
     emit(app, &u);
 }
 
+#[track_caller]
 fn emit_canceled(app: &AppHandle, id: &str, dir: Direction) {
+    log::info!("transfer {id}: canceled ({dir:?}, reported at line {})", std::panic::Location::caller().line());
     let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
     u.state = TransferState::Canceled;
+    emit(app, &u);
+}
+
+/// Canceled, saying who stopped it when it was the OTHER side (T6): "Canceled
+/// by Alex" instead of "Failed: connection lost".
+fn emit_canceled_by(app: &AppHandle, id: &str, dir: Direction, err: &str, who: Option<&str>) {
+    log::info!("transfer {id}: stopped by the other side ({dir:?}): {err}");
+    let mut u = TransferUpdate::new(id.to_string(), dir, Vec::new());
+    u.state = TransferState::Canceled;
+    u.detail = errors::peer_stop_detail(err, who);
     emit(app, &u);
 }
 
@@ -1266,6 +1920,7 @@ pub fn stopped_state(reason: CancelReason) -> TransferState {
 
 /// Report a user-stopped transfer. A pause carries its byte counts so the card
 /// can say how far it got (and the retry record stays put for Resume).
+#[track_caller]
 fn emit_stopped(
     app: &AppHandle,
     id: &str,
@@ -1448,8 +2103,16 @@ fn on_local_subnet(peer: std::net::IpAddr, subnets: &[netwatch::interfaces::IpNe
 fn addr_is_lan(dbg: &str) -> bool {
     let Some(addr) = dbg.strip_prefix("Ip(").and_then(|s| s.strip_suffix(')'))
         .and_then(|s| s.parse::<std::net::SocketAddr>().ok()) else { return false; };
+    #[cfg(test)]
+    if TEST_LOOPBACK_IS_LAN.load(Ordering::SeqCst) && addr.ip().is_loopback() { return true; }
     on_local_subnet(addr.ip(), &LOCAL_SUBNETS.read().unwrap_or_else(|p| p.into_inner()))
 }
+
+/// Test-only: make loopback paths classify as `Locality::Local`, so the LAN
+/// branches (one resumable stream, no pacing) are exercised over two in-process
+/// endpoints. Only set while holding `xfer_matrix::PACE_GATE` exclusively.
+#[cfg(test)]
+pub(crate) static TEST_LOOPBACK_IS_LAN: AtomicBool = AtomicBool::new(false);
 
 async fn refresh_local_subnets() {
     let state = netwatch::interfaces::State::new().await;
@@ -1551,7 +2214,16 @@ fn conn_locality(conn: &Connection) -> crate::models::Locality {
 pub fn conn_detail(conn: &Connection) -> crate::models::ConnDetail {
     use crate::models::ConnDetail;
     let paths = conn.paths();
-    let selected = paths.iter().find(|p| p.is_selected() && conn.close_reason().is_none());
+    let open = conn.close_reason().is_none();
+    // Iroh can briefly report NO selected path on a live connection (mid path
+    // switch / after a re-holepunch) and sometimes stays that way while bytes
+    // keep flowing. Don't call that "connecting" (GitHub #30): fall back the same
+    // way `conn_locality` does — an established IP path first, then the relay.
+    let selected = paths
+        .iter()
+        .find(|p| p.is_selected() && open)
+        .or_else(|| paths.iter().find(|p| open && path_is_validated_direct(p)))
+        .or_else(|| paths.iter().find(|p| open && p.is_relay()));
     // A direct upgrade is ready when an established IP path is present but
     // the relay is still selected. Probing paths are not exposed in iroh 1.2.
     let upgrading = selected.as_ref().map(|p| p.is_relay()).unwrap_or(false)
@@ -1772,10 +2444,51 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Prefer established direct paths, with relay as fallback regardless of RTT.
-/// Keep iroh's IPv6 bias and same-tier hysteresis to avoid path flapping.
-#[derive(Debug)]
-pub(crate) struct DirectPathSelector;
+/// Prefer established direct paths, with relay as fallback regardless of RTT —
+/// and, once a direct path carries the connection, STAY on it.
+///
+/// Field incident (2026-10-07): a friend across town advertised a public address
+/// and a 192.168.1.x LAN address; this Mac reached BOTH (the second through a
+/// Tailscale subnet route). iroh re-runs path selection on every new connection
+/// to the peer and every path established/abandoned (presence probes, chat,
+/// holepunch rounds every few seconds), and the old rule switched on a 5 ms
+/// smoothed-RTT gain. The path carrying a transfer always reads slower — its
+/// RTT includes the queue the transfer itself builds — while the idle alternative
+/// reads its bare RTT, so every re-selection flipped to the other path and back:
+/// 5–9 switches a minute, each abandoning the in-flight packets and restarting
+/// the congestion controller. 15.9 MB took 451 s, then the transfer died.
+///
+/// So within a class (relay last; a LAN path beats a public one, unchanged) we
+/// compare each path's MINIMUM observed RTT — what the path costs unloaded,
+/// immune to the queue a transfer builds — and only switch to a path that is at
+/// least twice as fast AND 20 ms faster, never sooner than 30 s after the last
+/// switch. Two healthy similar paths therefore never trade places; a genuinely
+/// much better one (a LAN appears) still wins, and a path that dies is dropped by
+/// iroh (absent from the candidates) and replaced at once. A path that only
+/// reaches the peer through an overlay subnet route (our Tailscale address to
+/// someone's private LAN address) carries a small RTT handicap, so the plain
+/// public path wins the first pick when the two are otherwise alike.
+#[derive(Debug, Default)]
+pub(crate) struct DirectPathSelector {
+    memo: Mutex<HashMap<iroh::endpoint::transports::FourTuple, PathMemo>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathMemo {
+    min_rtt: Duration,
+    last_seen: Instant,
+    /// When this path last became the selected one (as far as we know).
+    selected_at: Option<Instant>,
+}
+
+/// A same-class switch must halve the (min) RTT…
+const PATH_SWITCH_MIN_GAIN: Duration = Duration::from_millis(20);
+/// …and the current path must have been selected at least this long.
+const PATH_SWITCH_MIN_DWELL: Duration = Duration::from_secs(30);
+/// RTT handicap for a path routed through an overlay (VPN) subnet route.
+const OVERLAY_ROUTE_PENALTY: Duration = Duration::from_millis(15);
+/// Forget a path not seen for this long (it re-learns its min RTT if it returns).
+const PATH_MEMO_TTL: Duration = Duration::from_secs(120);
 
 /// BBRv3 with a larger initial congestion window. The QUIC default (~12 KB,
 /// 10 packets) needs ~9 doublings — ~2 s at a 220 ms intercontinental RTT —
@@ -1838,14 +2551,25 @@ pub(crate) fn congestion_factory() -> Arc<dyn noq_proto::congestion::ControllerF
 /// (hairpin NAT through 116.46.x) whenever it sampled a few ms faster; that
 /// router hairpins badly, so real sends timed out ("interrupted before the
 /// recipient confirmed receipt") while the LAN path was right there.
-/// Within a class the lower RTT wins, with a small IPv6 bias.
+/// Within a class the lower (minimum) RTT ranks first, with a small IPv6 bias
+/// and an overlay-route handicap.
 fn path_preference_key(is_relay: bool, is_lan: bool, is_ipv6: bool, rtt: Duration) -> (bool, bool, i128) {
     (is_relay, !is_lan, rtt.as_nanos() as i128 - if is_ipv6 { 3_000_000 } else { 0 })
 }
 
-fn should_switch_path(current: Option<(bool, bool, i128)>, best: (bool, bool, i128)) -> bool {
-    current.is_none_or(|current| (best.0, best.1) < (current.0, current.1)
-        || ((best.0, best.1) == (current.0, current.1) && best.2 + 5_000_000 <= current.2))
+/// Switch from `current` to `best`? A better class (relay → direct, public →
+/// LAN) or a vanished current path switches at once; within a class only a
+/// decisive, settled gain does (see `DirectPathSelector`). `dwell` = how long the
+/// current path has been selected.
+fn should_switch_path(current: Option<(bool, bool, i128)>, best: (bool, bool, i128), dwell: Duration) -> bool {
+    let Some(current) = current else { return true };
+    let (best_class, current_class) = ((best.0, best.1), (current.0, current.1));
+    if best_class != current_class {
+        return best_class < current_class;
+    }
+    dwell >= PATH_SWITCH_MIN_DWELL
+        && best.2.saturating_mul(2) <= current.2
+        && current.2 - best.2 >= PATH_SWITCH_MIN_GAIN.as_nanos() as i128
 }
 
 fn remote_is_lan(tuple: &iroh::endpoint::transports::FourTuple) -> bool {
@@ -1855,26 +2579,63 @@ fn remote_is_lan(tuple: &iroh::endpoint::transports::FourTuple) -> bool {
     }
 }
 
-impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
-    fn select(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>) -> iroh::endpoint::transports::PathSelection {
-        use iroh::endpoint::transports::{AddrKind, PathSelection};
-        let mut best = None;
+fn is_cgnat(ip: std::net::IpAddr) -> bool {
+    matches!(ip, std::net::IpAddr::V4(v4) if u32::from(v4) & 0xffc0_0000 == 0x6440_0000)
+}
+
+/// Our side of the path is an overlay (Tailscale/CGNAT) address but the peer's
+/// side is not: the packets reach a private/remote address through someone's
+/// subnet router or exit node — a detour, not the peer's own overlay address.
+fn is_overlay_routed(local: Option<std::net::IpAddr>, remote: std::net::IpAddr, remote_lan: bool) -> bool {
+    local.is_some_and(is_cgnat) && !is_cgnat(remote) && !remote_lan
+}
+
+impl DirectPathSelector {
+    fn decide(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>, now: Instant) -> Option<iroh::endpoint::transports::FourTuple> {
+        use iroh::endpoint::transports::{AddrKind, FourTuple};
+        let mut memo = self.memo.lock().unwrap_or_else(|p| p.into_inner());
+        let mut best: Option<(FourTuple, (bool, bool, i128))> = None;
         let mut current_key = None;
-        // Iroh supplies established paths only, and removes abandoned paths.
+        // Iroh supplies established paths only, and removes abandoned paths. The
+        // same address appears once per connection: min over them all.
         for path in ctx.paths() {
             let Some(stats) = path.stats() else { continue; };
             let tuple = path.network_path();
-            let key = path_preference_key(tuple.is_relay(), remote_is_lan(&tuple), tuple.addr_kind() == AddrKind::IpV6, stats.rtt);
+            let entry = memo.entry(tuple.clone()).or_insert(PathMemo { min_rtt: stats.rtt, last_seen: now, selected_at: None });
+            entry.min_rtt = entry.min_rtt.min(stats.rtt);
+            entry.last_seen = now;
+            let lan = remote_is_lan(tuple);
+            let mut rtt = entry.min_rtt;
+            if let FourTuple::Ip { remote, local } = tuple {
+                if is_overlay_routed(*local, remote.ip(), lan) { rtt += OVERLAY_ROUTE_PENALTY; }
+            }
+            let key = path_preference_key(tuple.is_relay(), lan, tuple.addr_kind() == AddrKind::IpV6, rtt);
             if Some(tuple) == ctx.current() && current_key.is_none_or(|current| key < current) {
                 current_key = Some(key);
             }
             if best.as_ref().is_none_or(|(_, best_key)| key < *best_key) {
-                best = Some((path, key));
+                best = Some((tuple.clone(), key));
             }
         }
-        let mut selection = PathSelection::none();
-        if let Some((path, key)) = best {
-            if should_switch_path(current_key, key) {
+        memo.retain(|_, m| now.duration_since(m.last_seen) < PATH_MEMO_TTL);
+        let dwell = ctx.current()
+            .and_then(|c| memo.get_mut(c))
+            .map(|m| now.duration_since(*m.selected_at.get_or_insert(now)))
+            .unwrap_or(Duration::MAX);
+        let (tuple, key) = best?;
+        if !should_switch_path(current_key, key, dwell) || Some(&tuple) == ctx.current() {
+            return None;
+        }
+        if let Some(m) = memo.get_mut(&tuple) { m.selected_at = Some(now); }
+        Some(tuple)
+    }
+}
+
+impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
+    fn select(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>) -> iroh::endpoint::transports::PathSelection {
+        let mut selection = iroh::endpoint::transports::PathSelection::none();
+        if let Some(chosen) = self.decide(ctx, Instant::now()) {
+            if let Some(path) = ctx.paths().find(|p| *p.network_path() == chosen) {
                 selection.set(&path);
             }
         }
@@ -1899,6 +2660,17 @@ pub async fn watch_local_subnets() {
 }
 
 pub async fn start(config_dir: &Path) -> Result<Endpoint> {
+    match start_with(config_dir, true).await {
+        Ok(ep) => Ok(ep),
+        // A fixed port that can't be used must never keep DropBeam offline.
+        Err(e) if format!("{e:#}").contains(FIXED_PORT_ERR) => start_with(config_dir, false).await,
+        Err(e) => Err(e),
+    }
+}
+
+const FIXED_PORT_ERR: &str = "fixed UDP port unusable";
+
+async fn start_with(config_dir: &Path, allow_fixed_port: bool) -> Result<Endpoint> {
     watch_local_subnets().await;
     let secret = load_or_create_secret(config_dir);
     // Seed the known-address cache so the FIRST dial after a relaunch already
@@ -1906,6 +2678,7 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     load_peer_addrs(config_dir);
     // Publish the tiny registry path before receives can record a destination.
     let _ = PARTIAL_DIRS_PATH.set(config_dir.join("partial-dirs.json"));
+    partial_dirs::init(config_dir);
     // Throughput tuning, balanced against NOT wrecking the user's whole connection.
     // BBR congestion control replaces quinn's CUBIC default (iroh benchmark
     // n0-computer/iroh#4286: up to ~30x single-stream throughput, no "fill the
@@ -1933,38 +2706,48 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     tcfg = tcfg.send_window(8 * 1024 * 1024);
 
     let mut builder = Endpoint::builder(presets::N0)
-        .path_selector(Arc::new(DirectPathSelector))
+        .path_selector(Arc::new(DirectPathSelector::default()))
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
         .transport_config(tcfg.build());
 
-    // OPT-IN custom relay (Settings → "Custom relay"). iroh's bundled public
-    // relays are number0's CANARY servers, which can be unstable for far-apart
-    // peers (constant resets show up as stalled internet transfers). Pointing both
-    // ends at your OWN iroh-relay (a free VM — see RELAY-SETUP.md) makes the
-    // internet fallback reliable. Empty = unchanged default (the public relays).
-    // Both peers must use the SAME relay URL. Only ever ADDITIVE: a blank or
-    // unparseable value leaves the default path exactly as it was.
-    let custom_relay = crate::settings::load(config_dir, "", "")
-        .custom_relay
-        .trim()
-        .to_string();
-    if !custom_relay.is_empty() {
-        match custom_relay.parse::<iroh::RelayUrl>() {
-            Ok(url) => {
-                log::warn!("iroh: using CUSTOM relay {url} (overrides the default public relays)");
-                builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
-            }
-            Err(e) => {
-                log::warn!("iroh: custom relay {custom_relay:?} is not a valid URL ({e}) — falling back to the default relays");
-            }
-        }
+    // Relays (T10): our own baked-in relay(s) plus any the user adds in
+    // Settings ("Custom relay": one or more https URLs), IN FRONT of n0's public
+    // relays — which stay in the map as the fallback, so a dead custom relay
+    // never strands a device. Each device publishes its home relay, so peers do
+    // NOT need the same list. See RELAY-SETUP.md. Unparseable entries are logged
+    // and skipped; with nothing extra configured this is exactly N0's default.
+    let custom_relay = crate::settings::load(config_dir, "", "").custom_relay;
+    let (extra, invalid) = relay_urls(&custom_relay);
+    for bad in invalid {
+        log::warn!("iroh: ignoring relay {bad:?} — not a valid https URL");
+    }
+    if !extra.is_empty() {
+        let map: iroh::RelayMap = extra.iter().cloned().collect();
+        map.extend(&iroh::defaults::prod::default_relay_map());
+        log::info!("iroh: relays = {} (+ public fallback)", extra.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", "));
+        builder = builder.relay_mode(iroh::RelayMode::Custom(map));
     }
 
-    let ep = builder
-        .bind()
-        .await
-        .context("bind iroh endpoint")?;
+    // Transfer Server option: a FIXED UDP port the owner can forward on their
+    // router, so friends reach this box directly instead of via a relay. Probed
+    // first; anything off falls back to the automatic port.
+    let port = if allow_fixed_port { crate::mailbox::server::load_config(config_dir).udp_port } else { 0 };
+    if port > 0 {
+        anyhow::ensure!(std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(), "{FIXED_PORT_ERR}: busy");
+        builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+            .map_err(|e| anyhow::anyhow!("{FIXED_PORT_ERR}: {e}"))?;
+        if std::net::UdpSocket::bind(("::", port)).is_ok() {
+            builder = builder.bind_addr(std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)))
+                .map_err(|e| anyhow::anyhow!("{FIXED_PORT_ERR}: {e}"))?;
+        }
+        log::info!("iroh: using the fixed UDP port set for the Transfer Server");
+    }
+    let ep = match builder.bind().await {
+        Ok(ep) => ep,
+        Err(e) if port > 0 => anyhow::bail!("{FIXED_PORT_ERR}: {e}"),
+        Err(e) => return Err(anyhow::Error::from(e).context("bind iroh endpoint")),
+    };
 
     // Local-network (mDNS) discovery: lets two machines on the same Wi-Fi/LAN
     // find each other's local addresses and connect DIRECTLY, instead of bouncing
@@ -2010,6 +2793,31 @@ pub async fn start(config_dir: &Path) -> Result<Endpoint> {
     Ok(ep)
 }
 
+/// Relay servers shipped with the app, tried before n0's public ones. Add our
+/// own relay here once it is deployed (RELAY-SETUP.md) — e.g.
+/// "https://relay.dropbeam.app". Empty = n0's public relays only.
+const BAKED_RELAYS: &[&str] = &[];
+
+/// Baked-in relays + the user's `custom_relay` list (comma/space separated),
+/// deduplicated, as (valid URLs, invalid entries).
+fn relay_urls(custom: &str) -> (Vec<iroh::RelayUrl>, Vec<String>) {
+    let mut ok: Vec<iroh::RelayUrl> = vec![];
+    let mut bad = vec![];
+    let entries = BAKED_RELAYS.iter().map(|s| s.to_string())
+        .chain(custom.split([',', ' ', '\n', '\t', ';']).map(str::trim).filter(|s| !s.is_empty()).map(String::from));
+    for entry in entries {
+        // A bare host (the old host:port field) gets https://.
+        let candidate = if entry.contains("://") { entry.clone() } else { format!("https://{entry}") };
+        match candidate.parse::<iroh::RelayUrl>() {
+            Ok(url) if candidate.starts_with("https://") || candidate.starts_with("http://") => {
+                if !ok.contains(&url) { ok.push(url); }
+            }
+            _ => bad.push(entry),
+        }
+    }
+    (ok, bad)
+}
+
 /// Accept incoming connections forever, dispatching each to the protocol handler.
 /// Runs for the life of the app. Errors on a single connection are logged, never
 /// fatal.
@@ -2034,6 +2842,7 @@ fn handle_conn(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
         let who = conn.remote_id();
+        note_live_conn(&conn);
         // #34: an ACCEPTED connection is proof of life right now — the remote id
         // is the authenticated transport identity, so a friend who reappears is
         // online the instant they dial us, not up to 45 s later when the first
@@ -2108,24 +2917,46 @@ fn refresh_presence(conn: &Connection, received: &mut u64, emit: impl FnOnce()) 
 
 /// Map only the authenticated endpoint to a local friend; never trust a wire name.
 fn emit_friend_presence(state: &IrohState, endpoint_id: &str) {
+    crate::mailbox::note_seen(endpoint_id);
     if let Some(app) = state.app.get() {
         if let Some(st) = app.try_state::<Arc<crate::AppState>>() {
             crate::account::device_seen(&st.config_dir, endpoint_id);
             if let Some(friend) = crate::friends::load(&st.config_dir).into_iter()
                 .find(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
                 let _ = app.emit("friend://presence", serde_json::json!({ "peerId": friend.id }));
+                // Messages a Transfer Server holds for them can go direct now.
+                if let Some(owner) = crate::friends::thread_owner(&st.config_dir, &friend.id) {
+                    wake_chat_outbox_for(&st.config_dir, &owner.id);
+                }
             }
         }
     }
 }
 
+/// Largest push someone who isn't a friend may offer (they're always asked
+/// about first; anything bigger is refused before a byte moves) — S2.
+const STRANGER_MAX_BYTES: u64 = 2 << 30;
+
 /// Stream kinds a blocked person is kept out of: introductions, chat, typing /
 /// read signals, file pushes (and their stat/verify), folder invites and
 /// Locations. Quick Send pulls (they hold a code the user gave them), pings and
 /// the user's own account traffic are unaffected.
+/// `DropBeam --server` refuses plain friend pushes (nobody to show them to) but
+/// still hosts Location uploads.
+fn headless_refuses(req: &serde_json::Value) -> bool {
+    headless_refuses_in(crate::mailbox::is_headless(), req)
+}
+fn headless_refuses_in(headless: bool, req: &serde_json::Value) -> bool {
+    headless && !(req["kind"] == "files" && req.get("location").is_some())
+}
+
 fn is_blockable_kind(kind: &str) -> bool {
-    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite")
+    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite" | "chat-manifest"
+        // S11: a blocked person can't push into, delete from or steer a shared
+        // folder either (they're refused exactly like an unknown folder).
+        | "folder-hello" | "folder-files" | "folder-ctrl" | "folder-reconcile")
         || kind.starts_with("locations.")
+        || kind.starts_with("mailbox.")
 }
 
 /// Answer a blocked peer exactly as a stranger is answered, so nothing tells
@@ -2149,6 +2980,10 @@ async fn serve_blocked(kind: &str, req: &serde_json::Value, send: &mut SendStrea
         k if k.starts_with("locations.") => {
             write_frame(send, &serde_json::json!({ "ok": false, "error": "Location access denied" })).await?;
         }
+        // Never acknowledged (an ack could read as "delivered" and let the
+        // sender clean up its copy): the stream just fails, as for a folder
+        // this device doesn't have.
+        "folder-files" | "folder-ctrl" | "folder-reconcile" | "folder-hello" => anyhow::bail!("folder access denied"),
         _ => write_frame(send, &serde_json::json!({ "kind": "ok" })).await?,
     }
     let _ = send.finish();
@@ -2188,6 +3023,10 @@ async fn serve_stream_inner(
         Some("ping") => {
             write_frame(send, &serde_json::json!({ "kind": "pong", "locations_v": crate::locations::VERSION })).await?;
             send.finish()?;
+        }
+        // Transfer Server (store-and-forward): hosting + the server's delivery poke.
+        Some(kind) if kind.starts_with("mailbox.") => {
+            crate::mailbox::serve(state, conn, send, recv, kind, &req).await?;
         }
         Some(kind) if kind.starts_with("locations.") => {
             let who = conn.remote_id().to_string();
@@ -2253,7 +3092,25 @@ async fn serve_stream_inner(
             // to RESUME after a dropped connection — a huge Quick Send must survive a
             // path blip. We remove the token only once delivery is confirmed.
             let pending = state.pending.lock().unwrap().get(token).cloned();
+            // Expired, canceled, used, or owned by another device: say so in a
+            // frame the puller stops on (T13/T6) instead of dropping the stream.
+            if let Err(refusal) = quick::admit(pending.as_ref(), token, &conn.remote_id().to_string(), Instant::now()) {
+                if pending.as_ref().is_some_and(|p| Instant::now() >= p.expires_at && p.puller.lock().unwrap_or_else(|e| e.into_inner()).is_none()) {
+                    state.pending.lock().unwrap().remove(token);
+                }
+                write_frame(send, &refusal).await?;
+                send.finish()?;
+                let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+                return Ok(());
+            }
             let p = pending.ok_or_else(|| anyhow::anyhow!("no pending send for token"))?;
+            if let Err(text) = quick::unchanged(&p.items) {
+                write_frame(send, &quick::refusal(&text, false)).await?;
+                send.finish()?;
+                let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+                return Ok(());
+            }
+            let pages_ok = req["pages_v"] == 1;
             // This attempt now OWNS the transfer: bump the generation so any
             // older serve task for the same token knows it has been superseded.
             let my_gen = p.gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2306,10 +3163,11 @@ async fn serve_stream_inner(
                             "No direct connection — and \"Only send over direct connections\" is on, so the slow relay wasn't used. Try the same Wi-Fi network, or turn that setting off in Settings."
                         ))
                     } else {
+                        let frozen = (&p.items[..], &p.dirs[..], p.total);
                         if integrity::enabled(&req) {
-                            serve_pull_verified(conn, send, recv, &p.paths, want_parallel, &p.cancel, cb).await
+                            serve_pull_verified_items(conn, send, recv, frozen, want_parallel, pages_ok, &p.cancel, cb).await
                         } else {
-                            serve_pull_negotiated(conn, send, recv, &p.paths, want_parallel, &p.cancel, cb).await
+                            serve_pull_negotiated_items(conn, send, recv, frozen, want_parallel, pages_ok, &p.cancel, cb).await
                         }
                     };
                     // Did this attempt end in CONFIRMED delivery? Only a real ack
@@ -2370,6 +3228,17 @@ async fn serve_stream_inner(
                                 );
                             }
                         }
+                        // The receiver canceled: end now, not after 150 s of
+                        // "Connecting" waiting for a resume that won't come (T6).
+                        // Before the generic arm — its error text says "canceled" too.
+                        Err(e) if !p.cancel.load(Ordering::SeqCst)
+                            && (errors::peer_stopped(conn).is_some() || errors::error_peer_stopped(&e).is_some()
+                                || e.to_string().contains(errors::PEER_CANCELED)) =>
+                        {
+                            state.pending.lock().unwrap().remove(token);
+                            let err = errors::peer_stop_error(CancelReason::Cancel).to_string();
+                            emit_canceled_by(&app, &p.transfer_id, Direction::Send, &err, None);
+                        }
                         Err(e)
                             if p.cancel.load(Ordering::SeqCst)
                                 || e.to_string().contains("canceled") =>
@@ -2382,6 +3251,13 @@ async fn serve_stream_inner(
                         Err(e) if e.to_string().contains(integrity::FAILED) => {
                             state.pending.lock().unwrap().remove(token);
                             emit_failed(&app, &p.transfer_id, Direction::Send, &e.to_string());
+                        }
+                        // The receiver canceled: end now, not after 150 s of
+                        // "Connecting" waiting for a resume that won't come (T6).
+                        Err(_) if errors::peer_stopped(conn).is_some() => {
+                            state.pending.lock().unwrap().remove(token);
+                            let err = errors::peer_stop_error(CancelReason::Cancel).to_string();
+                            emit_canceled_by(&app, &p.transfer_id, Direction::Send, &err, None);
                         }
                         Err(e) => unconfirmed_err = Some(e.to_string()),
                     }
@@ -2441,11 +3317,11 @@ async fn serve_stream_inner(
                 let who = conn.remote_id().to_string();
                 anyhow::ensure!(crate::friends::load(&config).iter()
                     .any(|f| f.endpoint_id.as_deref() == Some(who.as_str())), "Friend access denied");
-                let dest = if configured.trim().is_empty() {
-                    app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
-                } else { PathBuf::from(configured) };
+                let _ = configured;
+                // Only what THIS sender delivered, wherever it landed (S7, T5).
                 let request = req.clone();
-                tokio::task::spawn_blocking(move || friend_stat_reply(&dest, &request)).await?
+                tokio::task::spawn_blocking(move || friend_stat_reply_with(&request,
+                    |name| delivered::lookup(&config, &who, name))).await?
             }.await;
             let reply = result.unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}));
             write_frame(send, &reply).await?;
@@ -2455,7 +3331,7 @@ async fn serve_stream_inner(
             // "Verify copy": the friend who sent us these files wants a full
             // SHA-256 of what actually landed. Same known-friend gate and same
             // destination resolution as files.stat.
-            let prepared: Result<(PathBuf, serde_json::Value)> = async {
+            let prepared: Result<(PathBuf, String, serde_json::Value)> = async {
                 let app = state.app.get().context("Application is not ready")?;
                 let (config, configured) = app.try_state::<Arc<crate::AppState>>()
                     .map(|st| (st.config_dir.clone(), st.settings.lock().unwrap().download_dir.clone()))
@@ -2463,14 +3339,13 @@ async fn serve_stream_inner(
                 let who = conn.remote_id().to_string();
                 anyhow::ensure!(crate::friends::load(&config).iter()
                     .any(|f| f.endpoint_id.as_deref() == Some(who.as_str())), "Friend access denied");
-                let dest = if configured.trim().is_empty() {
-                    app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir())
-                } else { PathBuf::from(configured) };
-                Ok((dest, req.clone()))
+                let _ = configured;
+                Ok((config, who, req.clone()))
             }.await;
             let served = match prepared {
-                Ok((dest, request)) => serve_verify(send, move |cancel, hashed| {
-                    friend_verify_reply(&dest, &request, &cancel, &hashed)
+                // Only what THIS sender delivered, wherever it landed (S7, T5).
+                Ok((config, who, request)) => serve_verify(send, move |cancel, hashed| {
+                    friend_verify_reply_with(&request, &cancel, &hashed, |name| delivered::lookup(&config, &who, name))
                 }).await,
                 Err(e) => Err(e),
             };
@@ -2480,9 +3355,30 @@ async fn serve_stream_inner(
                 let _ = send.finish();
             }
         }
+        // `DropBeam --server` has no one to show files to: say so before a byte
+        // moves (the sender shows a clear error instead of re-uploading forever).
+        // A Location upload is the one push a headless host DOES serve: it lands in
+        // the hosted folder, not in front of a user. It must reach the "files" arm
+        // below (receive_location_headless) — this refusal used to shadow it.
+        // (files.stat / files.verify are answered above: with no app they reply
+        // "Application is not ready".)
+        Some("files") if headless_refuses(&req) => {
+            send_receiver_error(send, &anyhow::anyhow!("This computer is running in the background without the DropBeam app open. Try again when it's open.")).await;
+            let _ = send.finish();
+        }
+        Some("chat-manifest") => {
+            let who = conn.remote_id().to_string();
+            let friend = location_config(state).is_ok_and(|c| crate::friends::load(&c).iter().any(|f| f.endpoint_id.as_deref() == Some(who.as_str())));
+            // Windowless test nodes (test_inbox) have no friends list.
+            #[cfg(test)]
+            let friend = friend || state.test_inbox.get().is_some();
+            chat_manifest::serve(&who, friend, &req, send, recv).await?;
+        }
         Some("files") => {
             // A friend pushed files straight to us. Receive into the download
             // folder and surface it like any other receive.
+            // A compact chat link gets its once-sent manifest back (T1).
+            let req = chat_manifest::hydrate(&conn.remote_id().to_string(), req.clone());
             if req.get("location").is_some() && state.app.get().is_none() {
                 let config = location_config(state)?;
                 let peer = conn.remote_id().to_string(); let header = req.clone();
@@ -2496,6 +3392,11 @@ async fn serve_stream_inner(
                 return Ok(());
             }
             let Some(app) = state.app.get().cloned() else {
+                #[cfg(test)]
+                if let Some(dir) = state.test_inbox.get() {
+                    read_files_negotiated(conn, send, recv, &req, dir, &AtomicBool::new(false), &AtomicBool::new(false), |_, _| {}).await?;
+                    return Ok(());
+                }
                 let never = AtomicBool::new(false);
                 let _ = read_body(recv, &req, &std::env::temp_dir(), &never, |_, _| {}).await;
                 return Ok(());
@@ -2530,26 +3431,34 @@ async fn serve_stream_inner(
                     Err(e) => { send_receiver_error(send, &e).await; return Err(e); }
                 }
             } else { None };
+            // A FAT32 destination can't hold a ≥ 4 GiB file: refuse before a byte
+            // moves, not after 4 GB of it (T16).
+            if let Err(e) = errors::check_fits(&dest, &req) {
+                send_receiver_error(send, &e).await;
+                return Err(e);
+            }
             // Auto-add an unknown sender as a friend (issue #6) — receiving a file
             // from someone makes the relationship two-way without a separate pairing
             // step. Needs their name, which the sender now puts in the header.
             let from_name = req.get("fromName").and_then(|v| v.as_str()).unwrap_or("").trim();
             let (sender, auto_accept) = match &friend {
                 Some(f) => (Some(f.name.clone()), location_upload.is_some() || f.auto_accept),
-                None if !from_name.is_empty() && !who.is_empty() => {
-                    // Add them so the relationship is two-way — but DON'T grant silent
-                    // standing access. A stranger who has your link is now a named
-                    // friend whose FUTURE sends still prompt (auto_accept=false). The
-                    // current file still lands (true), matching the prior behavior for
-                    // an unknown sender.
-                    let f = crate::friends::upsert_by_endpoint(&config_dir, &who, from_name);
-                    let _ = crate::friends::set_auto_accept(&config_dir, &f.id, false);
-                    let _ = app.emit("friends://changed", ());
-                    (Some(f.name.clone()), true)
+                None => {
+                    // S2: someone who isn't a friend never sends silently — every
+                    // push asks first (a pending friend request is recorded so the
+                    // user can add them), and an oversized one is refused outright.
+                    let total = req["total"].as_u64().unwrap_or(0);
+                    if total > STRANGER_MAX_BYTES {
+                        let e = anyhow::anyhow!("Only friends can send files this large. Ask them to add you as a friend first.");
+                        send_receiver_error(send, &e).await;
+                        return Err(e);
+                    }
+                    if !who.is_empty() && crate::friends::add_request(&config_dir, &who, from_name, None) {
+                        let _ = app.emit("friend-requests://changed", ());
+                    }
+                    let name = crate::friends::sanitize_display_name(from_name, "Someone");
+                    (Some(format!("{name} (not a friend)")), false)
                 }
-                // A friend with manual-accept on must approve before we receive; an
-                // unknown sender with no name still defaults to auto-accept.
-                None => (None, true),
             };
             let total = req["total"].as_u64().unwrap_or(0);
             let names: Vec<String> = req["items"]
@@ -2601,12 +3510,14 @@ async fn serve_stream_inner(
                     if let Some(batch) = batches.get_mut(&link.id) {
                         anyhow::ensure!(batch.link.manifest == link.manifest && batch.link.directories == link.directories && link.attempt >= batch.link.attempt, "stale or changed chat batch");
                         anyhow::ensure!(link.attempt > batch.link.attempt || !matches!(batch.link.batch_state, Some(TransferState::Failed | TransferState::Canceled)), "chat attempt already ended");
-                        if link.attempt > batch.link.attempt { batch.link = link.clone(); }
+                        if link.attempt > batch.link.attempt {
+                            batch.link = link.clone();
+                            batch.reconnect_since = None;
+                            batch.touched = Instant::now();
+                        }
                     }
-                    batches.entry(link.id.clone()).or_insert_with(|| ChatBatch {
-                        link: link.clone(), landed: Default::default(), touched: Instant::now(),
-                        snapshot: TransferUpdate::new(id.clone(), Direction::Receive, names.clone()),
-                    });
+                    batches.entry(link.id.clone()).or_insert_with(|| ChatBatch::new(
+                        link.clone(), TransferUpdate::new(id.clone(), Direction::Receive, names.clone())));
                 }
                 state.chat_links.lock().unwrap().insert(id.clone(), link.clone());
                 let activity_state = app.state::<Arc<IrohState>>().inner().clone();
@@ -2619,26 +3530,41 @@ async fn serve_stream_inner(
                 }));
                 let watch_state = app.state::<Arc<IrohState>>().inner().clone();
                 let watch_app = app.clone();
+                let watch_conn = conn.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
-                        let delay = {
-                            let batches = watch_state.chat_batches.lock().unwrap();
-                            let Some(batch) = batches.get(&link.id) else { break; };
+                        let step = {
+                            let mut batches = watch_state.chat_batches.lock().unwrap();
+                            let Some(batch) = batches.get_mut(&link.id) else { break; };
                             if batch.link.attempt != link.attempt { break; }
-                            TRANSFER_STALL.saturating_sub(batch.touched.elapsed())
+                            batch.watch(Instant::now())
                         };
-                        tokio::time::sleep(delay).await;
-                        let mut batches = watch_state.chat_batches.lock().unwrap();
-                        let Some(batch) = batches.get_mut(&link.id) else { break; };
-                        if batch.link.attempt != link.attempt { break; }
-                        if batch.touched.elapsed() < TRANSFER_STALL { continue; }
-                        if let Some(update) = batch.expire(Instant::now()) {
-                            let _ = watch_app.emit("transfer://update", &update);
+                        match step {
+                            BatchWatch::Wait(delay) => tokio::time::sleep(delay.max(Duration::from_millis(200))).await,
+                            BatchWatch::Reconnect(update) => {
+                                // A started transfer went quiet: don't fail it. Drop
+                                // this attempt's connection so the sender's wedged
+                                // writes error out at once — it re-dials and RESUMES
+                                // (stat probes skip landed files, partials keep their
+                                // bytes) — and tell the user what's happening.
+                                log::info!("friend-recv: {} stalled for {}s — dropping the connection so the sender reconnects and resumes", &link.id, BATCH_STALL.as_secs());
+                                let _ = watch_app.emit("transfer://update", &update);
+                                watch_conn.close(1u32.into(), b"stalled");
+                            }
+                            BatchWatch::Fail(update, started) => {
+                                log::warn!("TRANSFER-FAIL[Receive] id={}: {}", &link.id, update.error.as_deref().unwrap_or("interrupted"));
+                                let _ = watch_app.emit("transfer://update", &update);
+                                // End this attempt for real so no bytes keep landing
+                                // behind a Failed card (not one waiting on the
+                                // user's accept dialog).
+                                if started { watch_conn.close(1u32.into(), b"stalled"); }
+                                // Retain bounded terminal tombstones so a late same-attempt
+                                // push cannot revive an interrupted batch.
+                                prune_chat_batches(&mut watch_state.chat_batches.lock().unwrap());
+                                break;
+                            }
+                            BatchWatch::Done => break,
                         }
-                        // Retain bounded terminal tombstones so a late same-attempt
-                        // push cannot revive an interrupted batch.
-                        prune_chat_batches(&mut batches);
-                        break;
                     }
                 });
             }
@@ -2936,7 +3862,7 @@ async fn serve_stream_inner(
                                         let r = landed_receive!(
                                             send, recv; progress_mode, total, &cancel, cb,
                                             finish_location_receive(location_upload.clone(), req.clone(), cancel.clone(), &cb, read_body_with_landed(recv, &req, item_offset, &id, &dest, &cancel, |d, t| cb(location_receive_progress(&req, d), t),
-                            |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); } }))
+                            |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); delivered::record(&config_dir, &who, name, path); } }))
                                         );
                                         // The file arrived classically — a kept
                                         // partial would only make a LATER send of
@@ -2960,6 +3886,16 @@ async fn serve_stream_inner(
                     }
                     Err(e) => Err(e),
                 };
+                // The RECEIVER canceled (not paused, not a stalled back-channel):
+                // the partial will never be resumed — don't leave a hidden
+                // multi-GB file sitting in Downloads for 7 days.
+                // (A dead progress back-channel also sets `cancel`, and a
+                // reconnecting sender re-registers this card id — neither is a
+                // user cancel, and both must keep the partial for the resume.)
+                if res.is_err() && resumable && cancel.load(Ordering::SeqCst)
+                    && state.user_canceled.lock().unwrap().remove(&id) {
+                    discard_partial_owned(&dest, &fp);
+                }
                 drop(owner);
                 res
             } else {
@@ -2972,7 +3908,7 @@ async fn serve_stream_inner(
                     landed_receive!(
                         send, recv; progress_mode, total, &cancel, cb,
                         finish_location_receive(location_upload.clone(), req.clone(), cancel.clone(), &cb, read_body_with_landed(recv, &req, item_offset, &id, &dest, &cancel, |d, t| cb(location_receive_progress(&req, d), t),
-                            |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); } }))
+                            |index, name, path| { if location_upload.is_none() { chat_file_landed(state, &id, Some(index), name, path); delivered::record(&config_dir, &who, name, path); } }))
                     )
                 }
                 .await
@@ -2993,6 +3929,16 @@ async fn serve_stream_inner(
                     }
                     for (index, (name, path)) in names.iter().zip(&paths).enumerate() {
                         chat_file_landed(state, &id, Some(received_item_index(item_offset, index)), name, path);
+                        if location_upload.is_none() { delivered::record(&config_dir, &who, name, path); }
+                    }
+                    // Location uploads are hosted payloads, not "files sent to me".
+                    if location_upload.is_none() {
+                        emit_received_files(&app, &id, &paths, req.get("chatTransfer").is_some());
+                        // Provenance travels with the file (GitHub #12): stamp who
+                        // sent it, as shared-folder receives already do.
+                        if let Some(from) = sender.as_deref() {
+                            for p in &paths { crate::provenance::set_sender(p, from); }
+                        }
                     }
                     let landed_in = location_upload.as_ref().map(|u| &u.destination).unwrap_or(&dest)
                         .to_string_lossy().to_string();
@@ -3036,9 +3982,22 @@ async fn serve_stream_inner(
                     // Bounded so a truly-dead peer can't hang us — the data is on disk.
                     let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
                 }
+                // The sender canceled/paused: say so, not "connection lost" (T6).
+                // Checked BEFORE the generic "canceled" arm: the close reason
+                // text ("canceled") can appear in the read error itself.
+                // No local-flag guard: a dead progress back-channel sets `cancel`
+                // too, and a PEER close reason can only come from the sender (our
+                // own cancel closes the connection locally).
+                Err(e) if errors::peer_stopped(conn).is_some() || errors::error_peer_stopped(&e).is_some() => {
+                    let reason = errors::peer_stopped(conn).or_else(|| errors::error_peer_stopped(&e)).unwrap_or(CancelReason::Cancel);
+                    let err = errors::peer_stop_error(reason).to_string();
+                    emit_canceled_by(&app, &id, Direction::Receive, &err, sender.as_deref());
+                }
                 Err(e) if e.to_string().contains("canceled") => {
+                    log::info!("friend-recv {id}: canceled: {e:#} (local flag {})", cancel.load(Ordering::SeqCst));
                     emit_canceled(&app, &id, Direction::Receive)
                 }
+                Err(e) if receive_interrupted(&app, state, &id, &e) => {}
                 Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
             }
             {
@@ -3057,8 +4016,14 @@ async fn serve_stream_inner(
         Some("link-join") => {
             crate::link::serve_join(state, &conn.remote_id().to_string(), &req, send, recv).await?;
         }
+        Some("link-safety") => {
+            crate::link::serve_safety(state, &conn.remote_id().to_string(), &req, send, recv).await?;
+        }
         Some("account-sync") => {
             crate::account::serve(state, &conn.remote_id().to_string(), &req, send, recv).await?;
+        }
+        Some("account-activity") => {
+            crate::device_activity::serve(state, &conn.remote_id().to_string(), &req, send).await?;
         }
         Some("link-ok" | "link-error") => {}
         Some("friend-hello") => {
@@ -3078,34 +4043,58 @@ async fn serve_stream_inner(
                     if let Some(left) = req.get("left_accounts") {
                         crate::account::apply_left_notice(&st.config_dir, &who, left);
                     }
-                    crate::friends::apply_hello(&st.config_dir, friend_id, &who, name);
+                    let was_pending = crate::friends::has_request(&st.config_dir, &who);
+                    let outcome = crate::friends::apply_hello_from(&st.config_dir, friend_id, &who, name, &req);
                     crate::friends::apply_device_hello(&st.config_dir, &who, &req);
+                    // A friend's devices they removed from their account (S4).
+                    crate::friends::apply_revocations(&st.config_dir, &who, &req);
+                    // S2: someone new is a request the user accepts or declines.
+                    if outcome == crate::friends::HelloOutcome::Requested {
+                        let _ = app.emit("friend-requests://changed", ());
+                        if !was_pending && crate::friends::has_request(&st.config_dir, &who) {
+                            notify_friend_request(app, &crate::friends::sanitize_display_name(name, "Someone"));
+                        }
+                    }
+                    // A friend greeting us has us as a friend: anything we were
+                    // waiting on them to accept can go now.
+                    if outcome == crate::friends::HelloOutcome::Known
+                        && crate::friends::set_awaiting_accept(&st.config_dir, &who, false) {
+                        wake_chat_outbox();
+                    }
                     // Cache their profile picture (if they sent one) and point the
                     // friend record at it.
                     if let Some(b64) = avatar_b64 {
-                        use base64::Engine;
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                            if !bytes.is_empty() && bytes.len() <= 2_000_000 {
-                                let path = st.config_dir.join(format!("friend-avatar-{who}.jpg"));
-                                if std::fs::write(&path, &bytes).is_ok() {
-                                    crate::friends::set_avatar_by_endpoint(
-                                        &st.config_dir,
-                                        &who,
-                                        path.to_string_lossy().to_string(),
-                                    );
-                                }
-                            }
-                        }
+                        store_friend_avatar(&st.config_dir, &who, b64);
                     }
                     let _ = app.emit("pairs://changed", ());
                     let _ = app.emit("friends://changed", ());
                 }
             }
             state.learn_progress(&who, u64::from(speaks_progress_v1(&req)));
+            if let Ok(config) = location_config(state) {
+                crate::mailbox::on_hello(state, &config, &who, &req);
+            }
             if req["locations_v"].as_u64() == Some(crate::locations::VERSION) {
                 if let Some(app) = state.app.get() { let _ = app.emit("locations://changed", &who); }
             }
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION })).await?;
+            // Answer with OUR picture too, so one hello exchanges both: a friend
+            // whose device was offline when we last broadcast still gets it the
+            // next time they say hello (older peers ignore the extra field).
+            let blocked = state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>())
+                .is_some_and(|st| crate::block::is_blocked(&st.config_dir, &who));
+            let my_avatar = if blocked { None } else { state.app.get().and_then(my_avatar_thumb_b64) };
+            let mailbox = match (location_config(state), state.get()) {
+                (Ok(config), Some(ep)) if !blocked => Some(crate::mailbox::hello_fields(&config, ep.secret_key(), &who)),
+                _ => None,
+            };
+            // Whether we take their messages (a friend, not a pending request),
+            // so someone who added us can show "waiting for you to accept".
+            // A blocked person gets no answer here, so a block isn't revealed.
+            let accepts_chat = match state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>()) {
+                Some(st) if !blocked => Some(crate::friends::chat_sender(&st.config_dir, &who).is_some()),
+                _ => None,
+            };
+            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat })).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -3149,21 +4138,23 @@ async fn serve_stream_inner(
                     // Only surface invites from a KNOWN FRIEND — this feature is
                     // friend-to-friend, and gating here stops a stranger who learned
                     // our endpoint id from popping invite prompts at us.
-                    let is_friend = app
+                    let friend = app
                         .try_state::<Arc<crate::AppState>>()
-                        .map(|st| {
+                        .and_then(|st| {
                             crate::friends::load(&st.config_dir)
-                                .iter()
-                                .any(|f| f.endpoint_id.as_deref() == Some(from_id.as_str()))
-                        })
-                        .unwrap_or(false);
-                    if is_friend {
+                                .into_iter()
+                                .find(|f| f.endpoint_id.as_deref() == Some(from_id.as_str()))
+                        });
+                    if let Some(friend) = friend {
+                        // Name them as THIS user knows them (their label for the
+                        // friend), not whatever name the sender put in the frame.
+                        let _ = from;
                         let _ = app.emit(
                             "folder-invite://incoming",
                             serde_json::json!({
                                 "code": code,
-                                "folderName": folder_name,
-                                "fromName": from,
+                                "folderName": crate::friends::sanitize_display_name(&folder_name, "Shared folder"),
+                                "fromName": friend.name,
                                 "fromId": from_id,
                             }),
                         );
@@ -3180,15 +4171,17 @@ async fn serve_stream_inner(
             // staging dir, then hand them to the SyncManager to land in the shared
             // folder with the exact same loop-protection / mirror / history rules
             // the croc receive path uses.
+            // Receipt protocol v1 sender: it understands per-item answers (and
+            // refusals); older senders get the legacy contract — see
+            // `refuse_folder_push` for how they're kept from misreading a refusal.
+            let strict = req.get("receipt").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
             let pair_id = req
                 .get("pair_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             let Some(app) = state.app.get().cloned() else {
-                let never = AtomicBool::new(false);
-                let _ = read_folder_body(recv, &req, &std::env::temp_dir(), &never, |_, _| {}).await;
-                return Ok(());
+                return refuse_folder_push(send, recv, "not-ready", strict).await;
             };
             let sm = app
                 .try_state::<Arc<crate::sync::SyncManager>>()
@@ -3198,17 +4191,22 @@ async fn serve_stream_inner(
                 .map(|st| st.config_dir.clone())
                 .unwrap_or_else(std::env::temp_dir);
             let Some(sm) = sm else {
-                anyhow::bail!("sync manager not ready");
+                return refuse_folder_push(send, recv, "not-ready", strict).await;
             };
-            if !sm.has_pair(&pair_id) {
-                anyhow::bail!("push for unknown folder pair {pair_id}");
-            }
-            // ROLE ENFORCEMENT (receive side): a read-only VIEWER must never push
-            // files into our folder. The viewer's own sender is suppressed, but
-            // that can be stale during role propagation — so reject here too, where
-            // it's authoritative, rather than trust the sender to behave.
-            if sm.peer_is_viewer(&pair_id) {
-                anyhow::bail!("ignoring folder push from a read-only viewer ({pair_id})");
+            // Who may push into this folder, decided BEFORE a byte of body is read:
+            // only this link's own peer (S3 — bound to the connection's key, keying a
+            // still-unkeyed invite link first), never a read-only viewer, never while
+            // paused, and never into a folder whose drive isn't there (that would
+            // recreate the path on the boot disk). A refusal is explicit, so the
+            // sender can neither mistake it for delivery nor re-dial in a loop.
+            let refusal = {
+                let sm = sm.clone();
+                let pid = pair_id.clone();
+                let who = conn.remote_id().to_string();
+                tokio::task::spawn_blocking(move || sm.folder_push_refusal(&pid, &who)).await?
+            };
+            if let Some(reason) = refusal {
+                return refuse_folder_push(send, recv, reason, strict).await;
             }
             // Each receive gets its OWN staging dir. A shared per-pair dir was a
             // data-loss race: two handlers for the same pair overlap routinely (a
@@ -3224,34 +4222,53 @@ async fn serve_stream_inner(
             // so the recipient sees a file is on the way (esp. a multi-minute big
             // transfer), then remove them once the real files land. The suffix is
             // skipped by the watcher, so they never sync or trigger a mirror-delete.
-            let placeholders: Vec<PathBuf> = sm
-                .folder_path(&pair_id)
-                .map(|folder| {
-                    req["items"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|it| {
-                                    let raw = it.get("name").and_then(|n| n.as_str())?;
-                                    // Same mapping as the landing path (keeps colons /
-                                    // hidden names; never a control path).
-                                    let rel = folder_receive_rel(raw)?;
-                                    let ph = Path::new(&folder)
-                                        .join(format!("{}.dropbeam-incoming", rel.to_string_lossy()));
-                                    if let Some(parent) = ph.parent() {
-                                        let _ = std::fs::create_dir_all(parent);
+            // Directories created ONLY to hold a placeholder are remembered so a
+            // failed receive doesn't leave (and then sync) empty folders.
+            let mut placeholder_dirs: Vec<PathBuf> = Vec::new();
+            let placeholders: Vec<PathBuf> = match sm.folder_path(&pair_id) {
+                Some(folder) => req["items"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|it| {
+                                let raw = it.get("name").and_then(|n| n.as_str())?;
+                                // Same mapping as the landing path (keeps colons /
+                                // hidden names; never a control path).
+                                let rel = folder_item_rel(raw, strict).ok()?;
+                                let ph = Path::new(&folder)
+                                    .join(format!("{}.dropbeam-incoming", rel.to_string_lossy()));
+                                if let Some(parent) = ph.parent() {
+                                    let mut missing = Vec::new();
+                                    let mut d = parent.to_path_buf();
+                                    while !d.exists() && d.starts_with(&folder) && d != Path::new(&folder) {
+                                        missing.push(d.clone());
+                                        match d.parent() { Some(up) => d = up.to_path_buf(), None => break }
                                     }
-                                    let _ = std::fs::File::create(&ph);
-                                    Some(ph)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-            let clear_placeholders = || {
+                                    let _ = std::fs::create_dir_all(parent);
+                                    placeholder_dirs.extend(missing);
+                                }
+                                let _ = std::fs::File::create(&ph);
+                                crate::sync::placeholder_active(&ph, true);
+                                Some(ph)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let clear_placeholders = |landed: bool| {
                 for ph in &placeholders {
                     let _ = std::fs::remove_file(ph);
+                    crate::sync::placeholder_active(ph, false);
+                }
+                // Deepest first; remove_dir only succeeds on an EMPTY dir, so a dir
+                // that received a real file (or the user put something in) stays.
+                if !landed {
+                    let mut dirs = placeholder_dirs.clone();
+                    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+                    for d in dirs {
+                        let _ = std::fs::remove_dir(&d);
+                    }
                 }
             };
             let total = req["total"].as_u64().unwrap_or(0);
@@ -3279,11 +4296,29 @@ async fn serve_stream_inner(
                 let item0 = &req["items"][0];
                 let raw = item0["name"].as_str().unwrap_or("file");
                 // Mirror sync must land the EXACT name, like the classic body path
-                // (read_folder_body → folder_receive_rel). sanitize_rel dropped any
+                // (read_folder_body → folder_item_rel). sanitize_rel dropped any
                 // component with ':' — a ≥16 MB "Meeting 9:23.mov" landed as "file",
                 // so reconcile saw it missing and re-sent it forever.
-                let Some(rel) = folder_receive_rel(raw) else {
-                    anyhow::bail!("folder receive: refusing control/degenerate path {raw:?}");
+                let rel = match folder_item_rel(raw, strict) {
+                    Ok(rel) => rel,
+                    Err(reason) => {
+                        clear_placeholders(false);
+                        sm.note_folder_receive_ended(&pair_id);
+                        if strict {
+                            // Answer instead of "ready": this item won't land, by design.
+                            let receipt = serde_json::json!({
+                                "kind": "receipt", "v": 1, "n": 1, "landed": [], "failed": [],
+                                "kept": [0], "reasons": { "0": reason },
+                            });
+                            let _ = write_frame(send, &receipt).await;
+                            let _ = send.finish();
+                            let _ = recv.stop(0u32.into());
+                            let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+                            return Ok(());
+                        }
+                        stall_legacy_sender().await;
+                        anyhow::bail!("folder receive: refusing control/degenerate path {raw:?}");
+                    }
                 };
                 let mtime = item0["mtime"].as_u64().unwrap_or(0);
                 let who = conn.remote_id().to_string();
@@ -3375,27 +4410,46 @@ async fn serve_stream_inner(
                     let ingest_sm = sm.clone();
                     let ingest_pair = pair_id.clone();
                     let ingest_staging = staging.clone();
-                    tokio::task::spawn_blocking(move || {
-                        ingest_sm.ingest_iroh_folder_files(&ingest_pair, &ingest_staging)
+                    let ingest_items = req["items"].clone();
+                    let report = tokio::task::spawn_blocking(move || {
+                        ingest_sm.ingest_iroh_folder_files(&ingest_pair, &ingest_staging, &ingest_items)
                     }).await?;
                     let _ = std::fs::remove_dir_all(&staging);
-                    clear_placeholders();
-                    let _ = send.write_all(b"ok").await;
+                    clear_placeholders(!report.moved.is_empty());
+                    // The per-item answer. Only items that are really IN our folder
+                    // now are "landed"; a sender may auto-delete exactly those.
+                    let receipt = folder_receipt(&req, &report.outcomes, strict);
+                    if strict {
+                        let _ = send.write_all(&serde_json::to_vec(&receipt).unwrap_or_default()).await;
+                    } else if receipt["failed"].as_array().is_some_and(|a| a.is_empty()) {
+                        // Older sender: keep its contract ("ok" = it arrived), but
+                        // only when NOTHING failed to land — never a blanket ok.
+                        let _ = send.write_all(b"ok").await;
+                    } else {
+                        // Older senders treat ANY non-"ok" answer after a full body
+                        // as delivered (and may auto-delete). Answer nothing: their
+                        // stall watchdog fails the send instead, so it's retried.
+                        stall_legacy_sender().await;
+                        return Ok(());
+                    }
                     let _ = send.finish();
-                    // Wait until the SENDER has actually consumed the "ok" before we
+                    // Wait until the SENDER has actually consumed the answer before we
                     // return (which can let the connection tear down). Without this
-                    // the ack races the teardown, the sender reads an empty reply,
-                    // marks a fully-delivered file as "did not confirm receipt", and
-                    // re-sends it forever. Mirrors recv_files. Bounded by a timeout so
-                    // a wedged sender can't pin this receive task open (the data is
-                    // already safely ingested above — timing out costs nothing).
+                    // the ack races the teardown and the sender reads an empty reply.
+                    // Bounded by a timeout so a wedged sender can't pin this receive
+                    // task open (the data is already safely ingested above).
                     let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
                 }
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&staging);
-                    clear_placeholders();
+                    clear_placeholders(false);
                     // Don't leave the folder frozen on "Receiving N%".
                     sm.note_folder_receive_ended(&pair_id);
+                    // An older sender would read our dropped stream as "delivered,
+                    // ack lost" — make its own watchdog fail the send instead.
+                    if !strict {
+                        stall_legacy_sender().await;
+                    }
                     anyhow::bail!("folder receive failed: {e}");
                 }
             }
@@ -3416,7 +4470,7 @@ async fn serve_stream_inner(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let deletes: Vec<(String, u64)> = req
+            let deletes: Vec<(String, u64, Option<(u64, u64)>)> = req
                 .get("deletes")
                 .and_then(|d| d.as_array())
                 .map(|arr| {
@@ -3424,7 +4478,13 @@ async fn serve_stream_inner(
                         .filter_map(|d| {
                             let rel = d.get("rel").and_then(|r| r.as_str())?.to_string();
                             let ts = d.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
-                            Some((rel, ts))
+                            // The exact version the deleter last had (newer peers):
+                            // a delete only removes THAT version, never a newer edit.
+                            let known = match (d.get("size").and_then(|v| v.as_u64()), d.get("mtime").and_then(|v| v.as_u64())) {
+                                (Some(sz), Some(mt)) => Some((sz, mt)),
+                                _ => None,
+                            };
+                            Some((rel, ts, known))
                         })
                         .collect()
                 })
@@ -3477,6 +4537,13 @@ async fn serve_stream_inner(
             // Role authority: who claims to own role assignments + which version.
             let owner = req.get("owner").and_then(|v| v.as_str()).map(String::from);
             let role_epoch = req.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+            let deletes_versioned = req.get("deletes_v").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
+            // Absent (an older owner build) ≠ "nobody is removed": only a present
+            // list may replace ours.
+            let removed: Option<Vec<String>> = req
+                .get("removed")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
             if !pair_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
@@ -3487,10 +4554,16 @@ async fn serve_stream_inner(
                         let sender_eid = conn.remote_id().to_string();
                         // reconcile rides its own message (folder-reconcile) now.
                         tokio::task::spawn_blocking(move || {
+                            // S3: only this link's own peer may speak for it — its
+                            // deletes, pause switch, roster and "unshared" signal.
+                            if !sm.authorize_folder_peer(&pair_id, &sender_eid) {
+                                log::warn!("ignoring folder-ctrl for {pair_id} from a non-member ({sender_eid})");
+                                return;
+                            }
                             sm.apply_remote_control(
                                 &pair_id, &name, &deletes, &moves, &group_id, &members,
                                 owner.as_deref(), role_epoch, peer_paused, peer_pause_epoch,
-                                None, unshared, Some(&sender_eid),
+                                None, unshared, Some(&sender_eid), removed.as_deref(), deletes_versioned,
                             );
                         }).await?;
                     }
@@ -3531,19 +4604,42 @@ async fn serve_stream_inner(
                 .and_then(|d| d.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            let reconcile = crate::sync::Reconcile { files, tombstones, empty_dirs };
+            // Present (even empty) = the peer tracks which version each tombstone
+            // deleted; absent = a legacy peer.
+            let tomb_versions = payload.get("tombVersions").and_then(|t| t.as_object()).map(|t| {
+                t.iter()
+                    .filter_map(|(rel, v)| {
+                        let a = v.as_array()?;
+                        Some((rel.clone(), (a.first()?.as_u64()?, a.get(1)?.as_u64()?)))
+                    })
+                    .collect()
+            });
+            let reconcile = crate::sync::Reconcile { files, tombstones, empty_dirs, tomb_versions };
             if !pair_id.is_empty() {
                 if let Some(app) = state.app.get() {
                     if let Some(sm) = app.try_state::<Arc<crate::sync::SyncManager>>() {
                         let sm = sm.inner().clone();
                         let control_sm = sm.clone();
                         let control_pair = pair_id.clone();
-                        tokio::task::spawn_blocking(move || {
+                        let sender_eid = conn.remote_id().to_string();
+                        let authorized = tokio::task::spawn_blocking(move || {
+                            // S3: a snapshot's tombstones delete files — only the
+                            // link's own peer may deliver one.
+                            if !control_sm.authorize_folder_peer(&control_pair, &sender_eid) {
+                                log::warn!("ignoring folder-reconcile for {control_pair} from a non-member ({sender_eid})");
+                                return false;
+                            }
                             control_sm.apply_remote_control(
                                 &control_pair, "", &[], &[], "", &[], None, 0, false, 0,
-                                Some(&reconcile), false, None,
+                                Some(&reconcile), false, Some(&sender_eid), None, false,
                             );
+                            true
                         }).await?;
+                        if !authorized {
+                            write_frame(send, &serde_json::json!({ "kind": "refused" })).await?;
+                            send.finish()?;
+                            return Ok(());
+                        }
                         if payload.get("requestReply").and_then(|v| v.as_bool()) == Some(true) {
                             sm.request_folder_snapshot(&pair_id, &conn.remote_id().to_string());
                         }
@@ -3555,143 +4651,14 @@ async fn serve_stream_inner(
         }
         Some("chat") => {
             // A friend sent us a chat message OR an update to one (reaction, edit,
-            // delete). Identify them by endpoint id, apply it, surface it live.
-            // `applied` rides the ack so the sender's durable op-outbox knows whether
-            // an edit/unsend/reaction actually landed (its target was stored) — only
-            // then does it drop the op. Stays true for plain messages.
-            let mut applied = true;
-            if let Some(app) = state.app.get().cloned() {
-                let config_dir = app
-                    .try_state::<Arc<crate::AppState>>()
-                    .map(|st| st.config_dir.clone())
-                    .unwrap_or_else(std::env::temp_dir);
-                let who = conn.remote_id().to_string();
-                let msg_kind = req.get("msgKind").and_then(|k| k.as_str()).unwrap_or("text");
-                // Unsolicited frames cannot recreate a removed/unknown contact.
-                let friend = crate::friends::chat_sender(&config_dir, &who);
-                if friend.is_none() {
-                    applied = false;
-                }
-                if let Some(friend) = friend {
-                    let peer_id = friend.id.clone();
-                    match msg_kind {
-                        "reaction" => {
-                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
-                                let emoji = req.get("emoji").and_then(|e| e.as_str()).unwrap_or("");
-                                let add = req.get("add").and_then(|a| a.as_bool()).unwrap_or(true);
-                                // None = we don't have the target message yet → tell the
-                                // sender (applied=false) so it KEEPS the op queued to
-                                // retry, rather than dropping it (apply_* is idempotent).
-                                match crate::chat::apply_reaction(
-                                    &config_dir, &peer_id, target, emoji, false, add,
-                                ) {
-                                    Some(u) => {
-                                        let _ = app.emit("chat://message", &u);
-                                    }
-                                    None => applied = false,
-                                }
-                            }
-                        }
-                        "edit" => {
-                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
-                                let new_text = req.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                                // author_is_me=false: a remote edit may only touch
-                                // the PEER's own message, never one we authored.
-                                match crate::chat::apply_edit(&config_dir, &peer_id, target, new_text, false)
-                                {
-                                    Some(u) => {
-                                        let _ = app.emit("chat://message", &u);
-                                    }
-                                    None => applied = false,
-                                }
-                            }
-                        }
-                        "delete" => {
-                            if let Some(target) = req.get("targetId").and_then(|t| t.as_str()) {
-                                match crate::chat::apply_delete(&config_dir, &peer_id, target, false) {
-                                    Some(u) => {
-                                        let _ = app.emit("chat://message", &u);
-                                    }
-                                    None => applied = false,
-                                }
-                            }
-                        }
-                        _ => {
-                            // A new text / file / gif message.
-                            let text =
-                                req.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                            let files: Vec<String> = req
-                                .get("files")
-                                .and_then(|f| f.as_array())
-                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                                .unwrap_or_default();
-                            let bytes = req.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
-                            let id = req
-                                .get("id")
-                                .and_then(|i| i.as_str())
-                                .map(String::from)
-                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                            let ts = req.get("ts").and_then(|t| t.as_u64()).unwrap_or_else(crate::chat::now_ms);
-                            // Lamport merge: order this incoming message after
-                            // everything we already have if its seq is stale/absent.
-                            let recv_seq = req.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
-                            let seq = recv_seq.max(crate::chat::next_seq(&config_dir, &peer_id));
-                            let reply_to = req.get("replyTo").and_then(|r| r.as_str()).map(String::from);
-                            let reply_preview =
-                                req.get("replyPreview").and_then(|r| r.as_str()).map(String::from);
-                            let gif: Option<crate::chat::GifMeta> =
-                                req.get("gif").and_then(|g| serde_json::from_value(g.clone()).ok());
-                            let is_file = msg_kind == "file" || msg_kind == "gif";
-                            let path = if is_file {
-                                files.first().map(|name| {
-                                    let configured = app
-                                        .try_state::<Arc<crate::AppState>>()
-                                        .map(|st| st.settings.lock().unwrap().download_dir.clone())
-                                        .unwrap_or_default();
-                                    let dir = if configured.trim().is_empty() {
-                                        crate::commands::download_directory(&app).unwrap_or_else(|_| std::env::temp_dir())
-                                    } else {
-                                        PathBuf::from(configured)
-                                    };
-                                    // The receive-safe landing name: a peer-supplied
-                                    // absolute/"../" name must never point this card
-                                    // (which the UI previews + opens) outside Downloads.
-                                    dir.join(receive_rel(name)).to_string_lossy().to_string()
-                                })
-                            } else {
-                                None
-                            };
-                            let msg = crate::chat::ChatMessage {
-                                file_xfer_id: req.get("fileXferId").and_then(|v| v.as_str())
-                                    .filter(|id| uuid::Uuid::parse_str(id).is_ok())
-                                    .map(|id| incoming_chat_id(&who, id)),
-                                id,
-                                peer_id: peer_id.clone(),
-                                from_me: false,
-                                kind: if is_file { "file".into() } else { "text".into() },
-                                text,
-                                files,
-                                bytes,
-                                path,
-                                status: None,
-                                ts,
-                                seq,
-                                reply_to,
-                                reply_preview,
-                                reactions: vec![],
-                                edited: false,
-                                deleted: false,
-                                gif,
-                                rev: 0,
-                            };
-                            if crate::chat::append(&config_dir, &msg) {
-                                let _ = app.emit("chat://message", &msg);
-                                maybe_notify_chat(&app, &friend.name, &msg);
-                            }
-                        }
-                    }
-                }
-            }
+            // delete). `applied` rides the ack so the sender's durable op-outbox knows
+            // whether an edit/unsend/reaction actually landed (its target was stored)
+            // — only then does it drop the op. Stays true for plain messages.
+            let who = conn.remote_id().to_string();
+            let applied = match location_config(state) {
+                Ok(config_dir) => apply_incoming_chat(state, &config_dir, &who, &req, None, None)?,
+                Err(_) => true,
+            };
             // Any inbound chat frame is proof the sender is ONLINE — kick the outbox
             // so messages queued while they slept flush NOW instead of waiting out the
             // per-peer backoff (up to 300s) mid-conversation. Mirrors the folder-side
@@ -3815,6 +4782,14 @@ pub fn spawn(config_dir: std::path::PathBuf, state: Arc<IrohState>, app: AppHand
                 // Clean up any duplicate folder-member links from the pre-fix
                 // hello/beacon race (a person added twice to a shared folder).
                 crate::pairing::dedup_group_links(&config_dir);
+                // Transfer Server: host-side delivery pokes + expiry, and the
+                // user-side fetch/receipt loop.
+                crate::mailbox::server::spawn_delivery(config_dir.clone(), state.clone());
+                crate::mailbox::client::spawn(state.clone());
+                // Sends to all of a friend's devices: finish what's still owed.
+                if let Some(app) = state.app.get() {
+                    crate::fanout::init(app.clone(), state.clone(), config_dir.clone());
+                }
                 accept_loop(ep, state).await;
             }
             Err(e) => log::warn!("iroh endpoint failed to start: {e:#}"),
@@ -3835,7 +4810,11 @@ pub fn start_send(
         .cloned()
         .ok_or("DropBeam is still connecting — try again in a moment.")?;
     let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let (names, total) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
+    let (names, _) = send_summary(&pathbufs).map_err(|e| e.to_string())?;
+    // Freeze exactly what is being shared (T13): a puller gets this list, not
+    // whatever the folder holds when they finally open the link.
+    let (items, dirs, total) = gather_items(&pathbufs).map_err(|e| e.to_string())?;
+    let ttl = quick::ttl(app.try_state::<Arc<crate::AppState>>().map(|st| st.config_dir.clone()).as_deref());
     let id = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
     let ticket = make_ticket(&ep, &token).map_err(|e| e.to_string())?;
@@ -3846,7 +4825,7 @@ pub fn start_send(
         .unwrap()
         .insert(id.clone(), cancel.clone());
     state.pending.lock().unwrap().insert(
-        token,
+        token.clone(),
         PendingSend {
             transfer_id: id.clone(),
             paths: pathbufs,
@@ -3854,8 +4833,26 @@ pub fn start_send(
             total,
             cancel,
             gen: Arc::new(AtomicU64::new(0)),
+            items: Arc::new(items),
+            dirs: Arc::new(dirs),
+            expires_at: Instant::now() + ttl,
+            puller: Arc::default(),
         },
     );
+    // Retire the link when its time is up, unless it was used or canceled.
+    {
+        let (state, app, id, token) = (state.clone(), app.clone(), id.clone(), token.clone());
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            let expired = state.pending.lock().unwrap().get(&token)
+                .is_some_and(|p| p.transfer_id == id && p.gen.load(Ordering::SeqCst) == 0);
+            if expired {
+                state.pending.lock().unwrap().remove(&token);
+                state.cancels.lock().unwrap().remove(&id);
+                emit_failed(&app, &id, Direction::Send, "This link expired — nobody opened it in time. Send again to make a new one.");
+            }
+        });
+    }
     let mut update = TransferUpdate::new(id, Direction::Send, names);
     update.state = TransferState::WaitingForPeer;
     update.code = Some(ticket);
@@ -3934,11 +4931,18 @@ pub fn start_receive(
                     // resume; an older sender just ignores it.
                     write_frame(
                         &mut send,
-                        &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1 }),
+                        &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1, "pages_v": 1 }),
                     )
                     .await?;
                     let __t0 = std::time::Instant::now();
-                    let header = read_frame(&mut recv).await?;
+                    let first = read_frame(&mut recv).await?;
+                    // A refusal (canceled / expired / in use) is final; a huge
+                    // header arrives in pages (T1, T13).
+                    let header = quick::read_header(&mut recv, first).await?;
+                    if let Err(e) = errors::check_fits(&dest, &header) {
+                        let _ = send.reset(1u32.into());
+                        return Err(e);
+                    }
                     // Native macOS Dock download-progress for a single incoming file.
                     let items = header.get("items").and_then(|i| i.as_array());
                     let dl = match items {
@@ -3977,7 +4981,19 @@ pub fn start_receive(
                         &engaged_ever,
                         cb,
                     )
-                    .await?;
+                    .await
+                    // The sender canceled: a terminal "canceled", never a retry (T6).
+                    .map_err(|e| errors::peer_stopped(&conn).map(errors::peer_stop_error).unwrap_or(e));
+                    if paths.is_err() && cancel.load(Ordering::SeqCst) && cleanup.user_canceled.lock().unwrap().remove(&id) {
+                        // WE canceled: drop the resumable partial of this pull now.
+                        let item0 = &header["items"][0];
+                        if header["items"].as_array().map(|a| a.len()) == Some(1) {
+                            let fp = transfer_fingerprint(&conn.remote_id().to_string(), item0["name"].as_str().unwrap_or("file"),
+                                header["total"].as_u64().unwrap_or(0), item0["mtime"].as_u64().unwrap_or(0));
+                            if let Some(_owner) = claim_partial(&fp, Duration::from_secs(5)).await { discard_partial_owned(&dest, &fp); }
+                        }
+                    }
+                    let paths = paths?;
                     let loc = conn_locality(&conn);
                     let bytes: u64 = paths
                         .iter()
@@ -3990,7 +5006,11 @@ pub fn start_receive(
                 match one {
                     Ok(r) => break Ok(r),
                     Err(e) => {
-                        if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") || e.to_string().contains(integrity::FAILED) {
+                        if let Some(reason) = errors::error_peer_stopped(&e).filter(|_| !cancel.load(Ordering::SeqCst)) {
+                            break Err(errors::peer_stop_error(reason));
+                        }
+                        if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") || e.to_string().contains(integrity::FAILED)
+                            || e.to_string().contains(quick::REFUSED) {
                             break Err(e);
                         }
                         // Never auto-retry a pull that hasn't gone resumable: the
@@ -4039,7 +5059,11 @@ pub fn start_receive(
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
                     .sum();
+                emit_received_files(&app, &id, &paths, false);
                 emit_completed(&app, &id, Direction::Receive, names, total, loc, None, Some(out_dir), 0);
+            }
+            Err(e) if !cancel.load(Ordering::SeqCst) && errors::peer_stop_detail(&e.to_string(), None).is_some() => {
+                emit_canceled_by(&app, &id, Direction::Receive, &e.to_string(), None)
             }
             Err(e) if e.to_string().contains("canceled") => {
                 emit_canceled(&app, &id, Direction::Receive)
@@ -4067,7 +5091,44 @@ pub fn send_to_friend(
     chat_transfer_id: Option<String>,
     chat_attempt: Option<u64>,
 ) -> Result<TransferUpdate, String> {
-    send_friend_inner(app, state, friend_name, endpoint_id, paths, chat_transfer_id, chat_attempt, None)
+    send_friend_inner(app, state, friend_name, endpoint_id, paths, chat_transfer_id, chat_attempt, None, None, None)
+}
+
+/// `send_to_friend` with the multi-device options: `child` makes this one
+/// device's leg of a send to all of a person's devices (see `fanout`), and
+/// `hold_devices` limits a Transfer Server copy to just these devices.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_to_friend_opts(
+    app: AppHandle,
+    state: Arc<IrohState>,
+    friend_name: String,
+    endpoint_id: String,
+    paths: Vec<String>,
+    chat_transfer_id: Option<String>,
+    chat_attempt: Option<u64>,
+    child: Option<crate::fanout::ChildCtx>,
+    hold_devices: Option<Vec<String>>,
+) -> Result<TransferUpdate, String> {
+    send_friend_inner(app, state, friend_name, endpoint_id, paths, chat_transfer_id, chat_attempt, None, child, hold_devices)
+}
+
+/// What a send card shows before any bytes move: its names and total size.
+pub(crate) fn card_summary(paths: &[String]) -> Result<(Vec<String>, u64), String> {
+    let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let (items, directories, total) = gather_items_with(&pathbufs, false).map_err(|e| e.to_string())?;
+    let names = if items.is_empty() { directories } else { items.into_iter().map(|i| i.1).collect() };
+    Ok((names, total))
+}
+
+/// The files (and empty folders) a Transfer Server copy of a send carries.
+pub(crate) fn deposit_inputs(paths: &[String]) -> Result<(Vec<crate::mailbox::client::DepositFile>, Vec<String>, Vec<String>), String> {
+    let pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let (items, directories, _) = gather_items_with(&pathbufs, false).map_err(|e| e.to_string())?;
+    let files = items.into_iter()
+        .map(|(path, name, size, mtime)| crate::mailbox::client::DepositFile { path, name, size, mtime })
+        .collect();
+    let top = pathbufs.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+    Ok((files, directories, top))
 }
 
 type SendItem = (PathBuf, String, u64, u64);
@@ -4088,7 +5149,7 @@ struct LocationPush {
 tokio::task_local! { static LOCATION_PUSH: LocationPush; }
 
 async fn location_stat(conn: &Connection, target: &crate::locations::Target, paths: &[String])
-    -> Result<std::collections::HashMap<String, (bool, u64)>> {
+    -> Result<std::collections::HashMap<String, (bool, u64, Option<u64>)>> {
     let mut entries = std::collections::HashMap::new();
     for (i, paths) in paths.chunks(1000).enumerate() {
         if i > 0 { tokio::time::sleep(Duration::from_millis(120)).await; }
@@ -4103,7 +5164,8 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
         anyhow::ensure!(reply["ok"] == true, "{}", reply["error"].as_str().unwrap_or("Location stat failed"));
         for entry in reply["data"]["entries"].as_array().context("Invalid stat response")? {
             entries.insert(entry["rel_path"].as_str().context("Invalid stat path")?.to_string(),
-                (entry["is_dir"].as_bool().context("Invalid stat type")?, entry["size"].as_u64().context("Invalid stat size")?));
+                (entry["is_dir"].as_bool().context("Invalid stat type")?, entry["size"].as_u64().context("Invalid stat size")?,
+                 entry["mtime"].as_u64()));
         }
     }
     Ok(entries)
@@ -4111,10 +5173,23 @@ async fn location_stat(conn: &Connection, target: &crate::locations::Target, pat
 
 /// Only exact regular-file matches are safe to skip; preserve normal landing
 /// (including collision naming) for every other destination.
+#[cfg(test)]
 fn friend_file_landed(dest: &Path, name: &str, size: u64, mtime: u64) -> bool {
-    occupied_siblings(&dest.join(receive_rel(name))).any(|(_, meta)|
-        meta.file_type().is_file() && meta.len() == size
-            && (mtime == 0 || mtime_secs(&meta) == mtime))
+    landed_match(&dest_candidates(dest, name), size, mtime)
+}
+
+/// Same size AND same (known) modified time on a regular file. An unknown
+/// mtime (0) is NOT a wildcard: "any same-size file" would skip a file that was
+/// never delivered. (The re-send is cheap: `identical_landed` reuses the copy.)
+fn landed_match(candidates: &[PathBuf], size: u64, mtime: u64) -> bool {
+    mtime != 0 && candidates.iter().any(|p| std::fs::symlink_metadata(p).is_ok_and(|meta|
+        meta.file_type().is_file() && meta.len() == size && mtime_secs(&meta) == mtime))
+}
+
+/// Lab/test resolution: the natural name under `dest` and its occupied
+/// collision siblings. Production answers from the per-sender ledger instead.
+fn dest_candidates(dest: &Path, name: &str) -> Vec<PathBuf> {
+    occupied_siblings(&dest.join(receive_rel(name))).map(|(p, _)| p).collect()
 }
 
 /// `natural` and its "name (n)" siblings, in landing order, for as long as they
@@ -4129,7 +5204,7 @@ fn occupied_siblings(natural: &Path) -> impl Iterator<Item = (PathBuf, std::fs::
 /// An already-landed regular file byte-identical to `part` at `natural` or one
 /// of its occupied siblings: a re-send reuses it instead of minting another
 /// "name (n)" copy. Bytes are compared only on an exact size match.
-fn identical_landed(part: &Path, natural: &Path) -> Option<PathBuf> {
+pub(crate) fn identical_landed(part: &Path, natural: &Path) -> Option<PathBuf> {
     let len = std::fs::metadata(part).ok()?.len();
     occupied_siblings(natural)
         .find(|(c, m)| m.is_file() && m.len() == len && files_identical(part, c).unwrap_or(false))
@@ -4137,6 +5212,12 @@ fn identical_landed(part: &Path, natural: &Path) -> Option<PathBuf> {
 }
 
 fn friend_stat_reply(dest: &Path, req: &serde_json::Value) -> Result<serde_json::Value> {
+    friend_stat_reply_with(req, |name| dest_candidates(dest, name))
+}
+
+/// `files.stat` answered only from `candidates(name)` — in the app, the paths
+/// the asking sender itself delivered under that name (S7).
+fn friend_stat_reply_with(req: &serde_json::Value, candidates: impl Fn(&str) -> Vec<PathBuf>) -> Result<serde_json::Value> {
     anyhow::ensure!(req["files_v"] == 1, "Unsupported files stat version");
     let items = req["items"].as_array().context("Invalid stat items")?;
     anyhow::ensure!(items.len() <= 1000, "Too many stat items");
@@ -4145,7 +5226,7 @@ fn friend_stat_reply(dest: &Path, req: &serde_json::Value) -> Result<serde_json:
         let name = item["name"].as_str().context("Invalid stat name")?;
         let size = item["size"].as_u64().context("Invalid stat size")?;
         let mtime = item["mtime"].as_u64().context("Invalid stat mtime")?;
-        if friend_file_landed(dest, name, size, mtime) { landed.push(index); }
+        if landed_match(&candidates(name), size, mtime) { landed.push(index); }
     }
     Ok(serde_json::json!({"ok":true,"landed":landed}))
 }
@@ -4186,23 +5267,45 @@ where
 /// folder, in request order. `None` = absent, not a regular file (a symlink is
 /// never followed, and never hashed), or unreadable — one bad file reports as a
 /// missing copy instead of failing the whole run.
+#[cfg(test)]
 fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool,
     hashed: &AtomicU64) -> Result<Vec<Option<String>>> {
+    friend_verify_reply_with(req, cancel, hashed, |name| dest_candidates(dest, name))
+}
+
+/// `files.verify` over `candidates(name)` (newest delivery first). Each distinct
+/// path is hashed at most once per request, however often it is named — a
+/// request repeating one big name thousands of times costs one read.
+fn friend_verify_reply_with(req: &serde_json::Value, cancel: &AtomicBool,
+    hashed: &AtomicU64, candidates: impl Fn(&str) -> Vec<PathBuf>) -> Result<Vec<Option<String>>> {
     anyhow::ensure!(req["files_v"] == 1, "Unsupported files verify version");
     let items = req["items"].as_array().context("Invalid verify items")?;
     anyhow::ensure!(items.len() <= crate::verify::MAX_ITEMS, "Too many verify items");
     let mut digests = Vec::with_capacity(items.len());
+    let mut done: HashMap<PathBuf, Option<String>> = HashMap::new();
     let mut base = 0u64;
     for item in items {
         anyhow::ensure!(!cancel.load(Ordering::SeqCst), "canceled");
         let name = item["name"].as_str().context("Invalid verify name")?;
         let size = item["size"].as_u64().unwrap_or(0);
-        // Where recv_files landed it: the natural name, or — if that was taken
-        // by an unrelated file — the first collision sibling of the right size.
-        let natural = dest.join(receive_rel(name));
-        let sibling = occupied_siblings(&natural)
-            .find(|(_, m)| m.is_file() && m.len() == size).map(|(p, _)| p);
-        let path = sibling.unwrap_or(natural);
+        // Where it landed: the first candidate of the right size (a "name (n)"
+        // collision sibling, an older delivery), else the newest candidate (a
+        // changed copy then reports as differing, not missing).
+        let found = candidates(name);
+        let sized = found.iter().find(|p| std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() == size)).cloned();
+        let Some(path) = sized.or_else(|| found.into_iter().next()) else {
+            base += size;
+            hashed.fetch_max(base, Ordering::Relaxed);
+            digests.push(None);
+            continue;
+        };
+        if let Some(digest) = done.get(&path) {
+            base += size;
+            hashed.fetch_max(base, Ordering::Relaxed);
+            digests.push(digest.clone());
+            continue;
+        }
         let mut digest = None;
         if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
             if let Ok(file) = std::fs::File::open(&path) {
@@ -4218,6 +5321,7 @@ fn friend_verify_reply(dest: &Path, req: &serde_json::Value, cancel: &AtomicBool
         // requester's bar still reaches the end on a partly missing copy.
         base += size;
         hashed.fetch_max(base, Ordering::Relaxed);
+        done.insert(path, digest.clone());
         digests.push(digest);
     }
     Ok(digests)
@@ -4345,7 +5449,9 @@ impl LocationBatch {
         require_locations(conn).await?;
         let stat_paths: Vec<_> = self.items.iter().map(|i| i.1.clone()).chain(self.dirs.iter().cloned()).collect();
         let existing = location_stat(conn, location.target.as_ref().context("Missing upload target")?, &stat_paths).await?;
-        let landed: Vec<_> = self.items.iter().map(|item| existing.get(&item.1) == Some(&(false, item.2))).collect();
+        let landed: Vec<_> = self.items.iter()
+            .map(|item| location_item_current(existing.get(&item.1).copied(), item.2, item.3, location.replace_existing))
+            .collect();
         skipped(landed.iter().filter(|&&v| v).count());
         let total: u64 = self.items.iter().map(|i| i.2).sum();
         let folder = folder_label(self.items.iter().map(|i| i.1.as_str())).unwrap_or_default();
@@ -4397,6 +5503,38 @@ impl LocationBatch {
     }
 }
 
+/// Whether an upload item already has a current copy on the host (skip it).
+/// An ordinary upload keeps the original rule: same size = already landed (its
+/// resume semantics). A continuously SYNCED folder (`newest_wins`) compares the
+/// modified time too (D9): a same-size EDIT must upload, and a host copy that is
+/// NEWER than ours must never be overwritten by our older one. Mtimes within 2 s
+/// count as equal (FAT/exFAT store 2-second steps). An older host that doesn't
+/// report mtime falls back to the size rule.
+pub(crate) fn location_item_current(remote: Option<(bool, u64, Option<u64>)>, size: u64, mtime: u64, newest_wins: bool) -> bool {
+    let Some((is_dir, rsize, rmtime)) = remote else { return false };
+    if is_dir {
+        return false;
+    }
+    if !newest_wins {
+        return rsize == size;
+    }
+    match rmtime {
+        None => rsize == size,
+        Some(rm) => {
+            let same_time = rm.abs_diff(mtime) <= 2;
+            if same_time {
+                if rsize != size {
+                    log::warn!("synced folder: host copy differs but has the same modified time — keeping the host's copy");
+                }
+                true
+            } else {
+                // Host newer → keep it (skip). Ours newer → upload (replace).
+                rm > mtime
+            }
+        }
+    }
+}
+
 pub struct LocationSend {
     pub target: Option<crate::locations::Target>,
     pub transfer_id: String,
@@ -4409,13 +5547,14 @@ pub struct LocationSend {
 }
 pub fn send_location_to_friend(app: AppHandle, state: Arc<IrohState>, friend_name: String,
     endpoint_id: String, paths: Vec<String>, location: LocationSend) -> Result<TransferUpdate, String> {
-    send_friend_inner(app, state, friend_name, endpoint_id, paths, None, None, Some(location))
+    send_friend_inner(app, state, friend_name, endpoint_id, paths, None, None, Some(location), None, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_friend_inner(
     app: AppHandle, state: Arc<IrohState>, friend_name: String, endpoint_id: String,
     paths: Vec<String>, chat_transfer_id: Option<String>, chat_attempt: Option<u64>,
-    location: Option<LocationSend>,
+    location: Option<LocationSend>, child: Option<crate::fanout::ChildCtx>, hold_devices: Option<Vec<String>>,
 ) -> Result<TransferUpdate, String> {
     let ep = state
         .get()
@@ -4429,7 +5568,10 @@ fn send_friend_inner(
         (snapshot.source.items.clone(), snapshot.source.dirs.clone(), snapshot.source.items.iter().map(|i| i.2).sum())
     } else { gather_items_with(&pathbufs, location.as_ref().is_some_and(|l| l.target.is_some())).map_err(|e| e.to_string())? };
     let names = if items.is_empty() { directories.clone() } else { items.iter().map(|i| i.1.clone()).collect() };
-    let id = uuid::Uuid::new_v4().to_string();
+    // One device's leg of a send to all of a person's devices reports to that
+    // send's card (fanout), under the id it was given.
+    let id = child.as_ref().map_or_else(|| uuid::Uuid::new_v4().to_string(), |c| c.id.clone());
+    let first_dial = child.as_ref().map(|c| c.first_dial);
     if let Some(target) = location.as_ref().and_then(|l| l.target.as_ref()) {
         let mut sorted = paths.clone(); sorted.sort();
         let key = format!("{endpoint_id}|{}|{}|{}", target.location_id, target.rel_path, sorted.join("\n"));
@@ -4485,13 +5627,36 @@ fn send_friend_inner(
         .try_state::<Arc<crate::AppState>>()
         .map(|st| st.settings.lock().unwrap().display_name.clone())
         .unwrap_or_default();
+    // Transfer Server: when this friend is offline and a server can hold the
+    // files for them, a short direct attempt is followed by a sealed upload to
+    // the server instead of 90s of re-dialing and a failure.
+    let hold_config = app.try_state::<Arc<crate::AppState>>().map(|st| st.config_dir.clone());
+    // A fan-out leg never deposits on its own: the fanout decides what goes
+    // to a server (once, sealed for every offline device together).
+    let hold_peer: Option<String> = match (&location, &hold_config) {
+        (None, Some(config)) if first_dial.is_none() => crate::friends::chat_sender(config, &endpoint_id).map(|f| f.id),
+        _ => None,
+    };
+    let top_names: Vec<String> = pathbufs.iter()
+        .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        .collect();
     tauri::async_runtime::spawn(integrity::scope(async move {
         let _chat_guard = ChatLinkGuard { state: &state, id: id.clone() };
+        let _leg_guard = first_dial.map(|_| crate::fanout::LegGuard(id.clone()));
+        // Only the FIRST reach-out may divert to the server: once any connection
+        // formed, a later drop resumes the direct send (never restarts it on the
+        // server from byte zero).
+        let use_server = AtomicBool::new(first_dial.is_some() || match (&hold_peer, &hold_config) {
+            (Some(peer), Some(config)) => crate::mailbox::client::can_hold(config, &ep.id().to_string(), peer),
+            _ => false,
+        });
+        let mut server_note: Option<String> = None;
         // High-water mark of confirmed bytes across ALL attempts. Declared out here
         // (the retry loop below borrows it) so a PAUSE can report how far the send
         // actually got.
         let progress_high = std::sync::Arc::new(AtomicU64::new(0));
-        let outcome: Result<crate::models::Locality> = async {
+        let outcome: Result<SendEnd> = loop {
+        let direct: Result<crate::models::Locality> = async {
             // A parallel transfer that was UNDERWAY and died is almost always a
             // network blip / sleep — so we auto-reconnect up to 2 extra times, and
             // the resume handshake picks up from the receiver's partial instead of
@@ -4522,7 +5687,7 @@ fn send_friend_inner(
             // index of the first file NOT yet confirmed delivered. Survives across
             // retry attempts so a reconnect never re-sends finished files.
             let mut next_file: usize = 0;
-            let mut upload_batch = LocationBatch { items: upload_items, dirs: upload_dirs, next_file: 0, dirs_pending: true };
+            let mut upload_batch = LocationBatch { items: upload_items.clone(), dirs: upload_dirs.clone(), next_file: 0, dirs_pending: true };
             let linked = location.is_none() && friend_split(&upload_batch.items);
             let split = location.is_some() && location.as_ref().is_none_or(|l| l.snapshot.is_none()) && pathbufs.len() > 1
                 && pathbufs.iter().any(|p| {
@@ -4540,6 +5705,11 @@ fn send_friend_inner(
                     let mut transition = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
                     transition.state = TransferState::Connecting;
                     transition.bytes_total = total;
+                    if progress_high.load(Ordering::SeqCst) > 0 {
+                        // Bytes already moved: this is a resume, not a first try.
+                        transition.detail = Some(RECONNECTING.into());
+                        transition.bytes_done = progress_high.load(Ordering::SeqCst).min(total);
+                    }
                     emit(&app, &transition);
                 }
                 // Bounded so an offline/unreachable friend FAILS clearly instead of
@@ -4558,12 +5728,13 @@ fn send_friend_inner(
                             anyhow::bail!("canceled");
                         }
                         match tokio::time::timeout(
-                            Duration::from_secs(20),
+                            if use_server.load(Ordering::SeqCst) { first_dial.unwrap_or(Duration::from_secs(6)) } else { Duration::from_secs(20) },
                             ep.connect(dial_addr(parsed), ALPN),
                         )
                         .await
                         {
                             Ok(Ok(c)) => {
+                                use_server.store(false, Ordering::SeqCst);
                                 let known_direct = peer_addrs().lock().ok()
                                     .and_then(|a| a.get(&parsed.to_string()).map(|a| a.iter().any(|x| x.observed_working)))
                                     .unwrap_or(false);
@@ -4578,9 +5749,13 @@ fn send_friend_inner(
                                 }
                                 log::info!("friend-send: dialed {} → {:?} paths=[{}] known_direct={known_direct}",
                                     &endpoint_id[..10.min(endpoint_id.len())], conn_locality(&c), describe_paths(&c));
+                                note_live_conn(&c);
                                 break c;
                             }
                             _ => {
+                                if use_server.load(Ordering::SeqCst) {
+                                    anyhow::bail!(GO_SERVER);
+                                }
                                 if started.elapsed() > Duration::from_secs(FRIEND_SEND_RETRY_SECS) {
                                     anyhow::bail!("Couldn't reach this friend — make sure their DropBeam is running and online.");
                                 }
@@ -4874,6 +6049,12 @@ fn send_friend_inner(
                         return Ok(conn_locality(&conn));
                     }
                     Err(e) => {
+                        // The receiver canceled/paused on purpose: never auto-
+                        // resume into a transfer they just stopped (T6).
+                        if let Some(reason) = errors::peer_stopped(&conn).filter(|_| !cancel.load(Ordering::SeqCst)) {
+                            log::info!("friend-send: the receiver stopped the transfer ({reason:?})");
+                            return Err(errors::peer_stop_error(reason));
+                        }
                         let canceled = cancel.load(Ordering::SeqCst)
                             || e.to_string().contains("canceled")
                             || e.to_string().contains("declined")
@@ -4913,6 +6094,8 @@ fn send_friend_inner(
                             ru.friend_name = Some(friend_name.clone());
                             ru.state = TransferState::Connecting;
                             ru.bytes_total = total;
+                            ru.bytes_done = high.min(total);
+                            ru.detail = Some(RECONNECTING.into());
                             emit(&app, &ru);
                             tokio::time::sleep(Duration::from_secs(1 + attempt.min(8) as u64)).await;
                             continue;
@@ -4923,8 +6106,108 @@ fn send_friend_inner(
             }
         }
         .await;
+        match direct {
+            Err(e) if e.to_string() == GO_SERVER => {
+                if first_dial.is_some() {
+                    // Offline right now: the fanout holds or queues it for this device.
+                    break Err(anyhow::anyhow!(crate::fanout::DEVICE_OFFLINE));
+                }
+                let (Some(peer), Some(config)) = (hold_peer.as_ref(), hold_config.as_ref()) else {
+                    use_server.store(false, Ordering::SeqCst);
+                    continue;
+                };
+                let files: Vec<crate::mailbox::client::DepositFile> = upload_items.iter()
+                    .map(|(path, name, size, mtime)| crate::mailbox::client::DepositFile { path: path.clone(), name: name.clone(), size: *size, mtime: *mtime })
+                    .collect();
+                let label = Arc::new(Mutex::new(String::new()));
+                let last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
+                let upload_started = Instant::now();
+                let (app2, id2, names2, fname2, label2) = (app.clone(), id.clone(), names.clone(), friend_name.clone(), label.clone());
+                let progress = move |done: u64, all: u64| {
+                    let mut last = last_emit.lock().unwrap();
+                    if done < all && last.elapsed() < Duration::from_millis(250) {
+                        return;
+                    }
+                    *last = Instant::now();
+                    let mut u = TransferUpdate::new(id2.clone(), Direction::Send, names2.clone());
+                    u.state = TransferState::Transferring;
+                    u.friend_name = Some(fname2.clone());
+                    u.bytes_total = all;
+                    u.bytes_done = done;
+                    u.percent = if all > 0 { done as f64 * 100.0 / all as f64 } else { 100.0 };
+                    let secs = upload_started.elapsed().as_secs_f64();
+                    u.speed_bps = if secs > 0.5 { done as f64 / secs } else { 0.0 };
+                    u.eta_seconds = (u.speed_bps > 0.0).then(|| (all.saturating_sub(done)) as f64 / u.speed_bps);
+                    let server = label2.lock().unwrap().clone();
+                    u.detail = Some(format!("Uploading to {server} — locked so only {fname2} can open it"));
+                    u.held_on = Some(server);
+                    emit(&app2, &u);
+                };
+                let (app3, id3, names3, fname3) = (app.clone(), id.clone(), names.clone(), friend_name.clone());
+                let on_start = move |server: &str| {
+                    *label.lock().unwrap() = server.to_owned();
+                    let mut u = TransferUpdate::new(id3.clone(), Direction::Send, names3.clone());
+                    u.state = TransferState::Connecting;
+                    u.friend_name = Some(fname3.clone());
+                    u.bytes_total = total;
+                    u.detail = Some(format!("{fname3} is offline — sending to {server}"));
+                    u.held_on = Some(server.to_owned());
+                    emit(&app3, &u);
+                };
+                // A server that's briefly unreachable/busy gets two more tries
+                // (the upload resumes where it stopped) before going direct.
+                let mut tries = 0u64;
+                let deposited = loop {
+                    let r = crate::mailbox::client::deposit_files(&state, config, peer, &chat_id, &id, &files, &upload_dirs, &top_names, &progress, &on_start, &cancel, hold_devices.as_deref()).await;
+                    if matches!(r, Err(crate::mailbox::client::DepositError::Unreachable)) && tries < 2 && !cancel.load(Ordering::SeqCst) {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_secs(5 * tries)).await;
+                        continue;
+                    }
+                    break r;
+                };
+                match deposited {
+                    Ok(held) => break Ok(SendEnd::Held(held)),
+                    Err(crate::mailbox::client::DepositError::GoDirect) => {
+                        log::info!("friend-send: the friend came online mid-upload — sending directly instead");
+                        use_server.store(false, Ordering::SeqCst);
+                        let mut u = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                        u.state = TransferState::Connecting;
+                        u.friend_name = Some(friend_name.clone());
+                        u.bytes_total = total;
+                        u.detail = Some(format!("{friend_name} came online — sending directly"));
+                        emit(&app, &u);
+                        continue;
+                    }
+                    Err(crate::mailbox::client::DepositError::Canceled) => break Err(anyhow::anyhow!("canceled")),
+                    Err(e) => {
+                        log::info!("friend-send: Transfer Server couldn't take it ({}) — retrying directly", e.code());
+                        if !matches!(e, crate::mailbox::client::DepositError::NoRoute) {
+                            server_note = Some(e.to_string());
+                        }
+                        use_server.store(false, Ordering::SeqCst);
+                        continue;
+                    }
+                }
+            }
+            other => break other.map(SendEnd::Direct),
+        }
+        };
         match outcome {
-            Ok(loc) => {
+            Ok(SendEnd::Held(held)) => {
+                log::info!("friend-send: held on a Transfer Server until the friend is online");
+                let mut u = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
+                u.state = TransferState::Held;
+                u.friend_name = Some(friend_name.clone());
+                u.bytes_total = total;
+                u.bytes_done = total;
+                u.percent = 100.0;
+                u.detail = Some(format!("Waiting on {} — {} gets it when they're back", held.name, friend_name));
+                u.held_on = Some(held.name.clone());
+                emit(&app, &u);
+                crate::mailbox::client::wake();
+            }
+            Ok(SendEnd::Direct(loc)) => {
                 // Snapshot the finished card so a later "Verify copy" report is
                 // emitted on THIS card — locality badge, integrity rows and all
                 // (the verify task runs outside the integrity scope).
@@ -4950,17 +6233,39 @@ fn send_friend_inner(
             // so trust the flag too. Whether that stop was a cancel or a PAUSE is
             // whatever the command recorded; either way the partials stay on disk,
             // so a paused send resumes from where it stopped.
+            Err(e) if !cancel.load(Ordering::SeqCst) && errors::peer_stop_detail(&e.to_string(), None).is_some() => {
+                emit_canceled_by(&app, &id, Direction::Send, &e.to_string(), Some(&friend_name));
+            }
             Err(e) if cancel.load(Ordering::SeqCst) || e.to_string().contains("canceled") => {
+                let reason = cleanup.take_reason(&id);
+                if matches!(reason, CancelReason::Cancel) && first_dial.is_none() {
+                    if let Some(config) = &hold_config {
+                        crate::mailbox::client::abandon(&cleanup, config, &chat_id);
+                    }
+                }
                 emit_stopped(
                     &app,
                     &id,
                     Direction::Send,
-                    cleanup.take_reason(&id),
+                    reason,
                     progress_high.load(Ordering::SeqCst),
                     total,
                 )
             }
-            Err(e) => emit_failed(&app, &id, Direction::Send, &e.to_string()),
+            Err(e) if e.to_string() == crate::fanout::DEVICE_OFFLINE => {
+                // Not a failure: this device just isn't reachable yet.
+                let mut u = TransferUpdate::new(id.clone(), Direction::Send, vec![]);
+                u.state = TransferState::Failed;
+                u.error = Some(crate::fanout::DEVICE_OFFLINE.into());
+                emit(&app, &u);
+            }
+            Err(e) => {
+                let text = match &server_note {
+                    Some(note) => format!("{e} ({note})"),
+                    None => e.to_string(),
+                };
+                emit_failed(&app, &id, Direction::Send, &text)
+            }
         }
         // A finished transfer can't be paused any more (a pause raced in after the
         // send ended would otherwise linger and mislabel a later stop).
@@ -4978,6 +6283,35 @@ fn send_friend_inner(
 /// After accepting a friend invite, dial the inviter (whose EndpointId is in the
 /// invite) and tell them our id for the shared friend record — so the reverse
 /// direction (them → us) also works. Best-effort, fire-and-forget.
+/// Save a friend's profile picture (base64 JPEG from a hello or its reply) and
+/// point every record for that device at it. Only updates existing friends.
+fn store_friend_avatar(config_dir: &std::path::Path, who: &str, b64: &str) {
+    use base64::Engine;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else { return };
+    if !crate::friends::is_safe_avatar(&bytes) || !crate::friends::load_raw(config_dir).iter().any(|f| f.endpoint_id.as_deref() == Some(who)) {
+        return;
+    }
+    let path = config_dir.join(format!("friend-avatar-{who}.jpg"));
+    // Unchanged picture: skip the write (keeps its mtime, so no UI reload).
+    if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+        crate::friends::set_avatar_by_endpoint(config_dir, who, path.to_string_lossy().to_string());
+        return;
+    }
+    if std::fs::write(&path, &bytes).is_ok() {
+        crate::friends::set_avatar_by_endpoint(config_dir, who, path.to_string_lossy().to_string());
+    }
+}
+
+/// A newer peer answers our hello with its own picture: store it.
+fn apply_hello_reply_avatar(state: &Arc<IrohState>, who: &str, reply: &serde_json::Value) {
+    let Some(b64) = reply.get("avatar").and_then(|v| v.as_str()) else { return };
+    let Some(app) = state.app.get() else { return };
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else { return };
+    if crate::block::is_blocked(&st.config_dir, who) { return; }
+    store_friend_avatar(&st.config_dir, who, b64);
+    let _ = app.emit("friends://changed", ());
+}
+
 /// Cache the encoded avatar thumbnail by (path, mtime) so a profile broadcast to
 /// N friends decodes the image at most once.
 static AVATAR_THUMB_CACHE: std::sync::Mutex<Option<(String, u64, Option<String>)>> =
@@ -5060,6 +6394,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
         return;
     };
     let my_id = ep.id().to_string();
+    let peer_eid = inviter_endpoint_id.clone();
     let addr = dial_addr(parsed);
     let avatar = state.app.get().and_then(my_avatar_thumb_b64);
     tauri::async_runtime::spawn(async move {
@@ -5068,6 +6403,10 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
             "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_changed": true,
         });
         hello.as_object_mut().unwrap().extend(crate::link::profile(&state, &my_id).as_object().unwrap().clone());
+        let config = location_config(&state).ok();
+        if let Some(config) = &config {
+            hello["mailbox"] = crate::mailbox::hello_fields(config, ep.secret_key(), &peer_eid);
+        }
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
         {
@@ -5076,6 +6415,17 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                 let _ = send.finish();
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
+                    apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    // Older builds don't say; a null answer changes nothing.
+                    if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
+                        if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
+                            if let Some(app) = state.app.get() { let _ = app.emit("friends://changed", ()); }
+                            if accepts { wake_chat_outbox(); }
+                        }
+                    }
+                    if let Some(config) = &config {
+                        crate::mailbox::on_hello(&state, config, &conn.remote_id().to_string(), &reply);
+                    }
                 }
             }
         }
@@ -5094,6 +6444,7 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
         return;
     };
     let my_id = ep.id().to_string();
+    let peer_eid = endpoint_id.clone();
     let addr = dial_addr(parsed);
     let avatar = state.app.get().and_then(my_avatar_thumb_b64);
     tauri::async_runtime::spawn(async move {
@@ -5102,6 +6453,10 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
             "avatar": avatar, "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "locations_changed": true,
         });
         hello.as_object_mut().unwrap().extend(crate::link::profile(&state, &my_id).as_object().unwrap().clone());
+        let config = location_config(&state).ok();
+        if let Some(config) = &config {
+            hello["mailbox"] = crate::mailbox::hello_fields(config, ep.secret_key(), &peer_eid);
+        }
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
         {
@@ -5110,6 +6465,17 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
                 let _ = send.finish();
                 if let Ok(reply) = read_frame(&mut recv).await {
                     state.learn_progress(&conn.remote_id().to_string(), u64::from(speaks_progress_v1(&reply)));
+                    apply_hello_reply_avatar(&state, &conn.remote_id().to_string(), &reply);
+                    // Older builds don't say; a null answer changes nothing.
+                    if let (Some(accepts), Some(config)) = (reply["accepts_chat"].as_bool(), &config) {
+                        if crate::friends::set_awaiting_accept(config, &conn.remote_id().to_string(), !accepts) {
+                            if let Some(app) = state.app.get() { let _ = app.emit("friends://changed", ()); }
+                            if accepts { wake_chat_outbox(); }
+                        }
+                    }
+                    if let Some(config) = &config {
+                        crate::mailbox::on_hello(&state, config, &conn.remote_id().to_string(), &reply);
+                    }
                 }
             }
         }
@@ -5202,7 +6568,8 @@ pub async fn send_folder_ctrl(
     endpoint_id: &str,
     pair_id: &str,
     name: &str,
-    deletes: &[(String, u64)],
+    // (rel, deleted-at ms, the version (size, mtime) the deleter last had).
+    deletes: &[(String, u64, Option<(u64, u64)>)],
     // Intra-folder renames (from, to, size, mtime) — applied BEFORE deletes so a
     // moved file relocates in place instead of being re-downloaded. Older peers
     // ignore the unknown `moves` key and just apply the delete (re-send fallback).
@@ -5216,12 +6583,18 @@ pub async fn send_folder_ctrl(
     paused: bool,
     pause_epoch: u64,
     unshared: bool,
+    // Group members the sender removed. Receivers honor it only from the folder
+    // OWNER (D13). Older peers ignore the unknown key.
+    removed: &[String],
 ) -> Result<()> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
     let addr = dial_addr(parsed);
     let dels: Vec<serde_json::Value> = deletes
         .iter()
-        .map(|(rel, ts)| serde_json::json!({ "rel": rel, "ts": ts }))
+        .map(|(rel, ts, known)| match known {
+            Some((size, mtime)) => serde_json::json!({ "rel": rel, "ts": ts, "size": size, "mtime": mtime }),
+            None => serde_json::json!({ "rel": rel, "ts": ts }),
+        })
         .collect();
     let mvs: Vec<serde_json::Value> = moves
         .iter()
@@ -5245,6 +6618,10 @@ pub async fn send_folder_ctrl(
         "owner": owner, "epoch": role_epoch,
         "paused": paused, "pauseEpoch": pause_epoch,
         "unshared": unshared,
+        "removed": removed,
+        // Versioned deletes: every FILE entry above names the version deleted;
+        // an entry without one may only remove an empty directory.
+        "deletes_v": 1,
     });
     // Bounded dial so a perpetually-offline peer fails fast and the caller can
     // back off, exactly like the old croc control timeout.
@@ -5291,6 +6668,34 @@ pub async fn send_folder_reconcile(
     // (bounded) for that ack.
     let _ = tokio::time::timeout(Duration::from_secs(60), recv.read_to_end(64)).await;
     Ok(())
+}
+
+/// Conversation id a friend-request notification carries: a click opens
+/// Friends (where Accept/Decline are) instead of a chat.
+pub const FRIEND_REQUESTS_TARGET: &str = "friend-requests";
+
+/// "Jordan wants to be your friend" — a request is easy to miss on a page
+/// nobody opens, so it gets a banner like a message does (same setting).
+pub(crate) fn notify_friend_request(app: &AppHandle, name: &str) {
+    let Some(st) = app.try_state::<Arc<crate::AppState>>() else { return };
+    if !st.settings.lock().unwrap().notify_on_message {
+        return;
+    }
+    let title = "Friend request";
+    let body = format!("{name} wants to be your friend. Open DropBeam to accept or decline.");
+    #[cfg(desktop)]
+    if crate::chat_notify::show(app, title, &body, FRIEND_REQUESTS_TARGET) {
+        return;
+    }
+    use tauri_plugin_notification::NotificationExt;
+    let notification = app.notification().builder().title(title).body(body);
+    #[cfg(not(target_os = "linux"))]
+    let notification = notification.sound("default");
+    #[cfg(target_os = "ios")]
+    let notification = notification.extra("chatPeerId", FRIEND_REQUESTS_TARGET);
+    if let Err(err) = notification.show() {
+        log::warn!("friend request notification failed: {err}");
+    }
 }
 
 /// Pop a native OS notification for an inbound chat message — the iMessage rule:
@@ -5341,6 +6746,13 @@ fn maybe_notify_chat(app: &AppHandle, sender: &str, msg: &crate::chat::ChatMessa
             t.to_string()
         }
     };
+    // Desktop: a banner whose click opens this conversation (#67). Falls back to
+    // the plugin's plain banner where that isn't available (e.g. `tauri dev`).
+    #[cfg(desktop)]
+    if crate::chat_notify::show(app, who, &body, &msg.peer_id) {
+        log::info!("chat notification queued for {} (clickable)", msg.peer_id);
+        return;
+    }
     use tauri_plugin_notification::NotificationExt;
     // Keep the same content on every platform. Linux uses the desktop sound
     // theme's message event; "default" is the macOS notification sound name.
@@ -5366,6 +6778,18 @@ pub async fn send_chat(
     endpoint_id: &str,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value> {
+    send_chat_within(state, ep, endpoint_id, payload, Duration::from_secs(12)).await
+}
+
+/// `send_chat` with a caller-chosen dial budget (a short one when a Transfer
+/// Server can hold the message instead of us waiting out a sleeping peer).
+pub async fn send_chat_within(
+    state: &IrohState,
+    ep: &Endpoint,
+    endpoint_id: &str,
+    payload: serde_json::Value,
+    dial_budget: Duration,
+) -> Result<serde_json::Value> {
     let parsed: iroh::EndpointId = endpoint_id.parse().context("parse peer endpoint id")?;
     let addr = dial_addr(parsed);
     // Only reuse outgoing connections: older peers may not accept streams on
@@ -5374,7 +6798,7 @@ pub async fn send_chat(
     let conn = if let Some(conn) = cached {
         conn
     } else {
-        let conn = tokio::time::timeout(Duration::from_secs(12), ep.connect(addr, ALPN))
+        let conn = tokio::time::timeout(dial_budget, ep.connect(addr, ALPN))
             .await.map_err(|_| anyhow::anyhow!("chat dial timed out"))?
             .context("dial friend for chat")?;
         if let Some(st) = state.app.get().and_then(|app| app.try_state::<Arc<IrohState>>()) {
@@ -5401,7 +6825,10 @@ pub async fn send_chat(
     // Fail instead so the outbox retries (the receiver dedups by id), and forget
     // that connection so the retry dials fresh.
     match tokio::time::timeout(Duration::from_secs(10), read_frame_cap(&mut recv, 4096)).await {
-        Ok(Ok(ack)) => Ok(ack),
+        Ok(Ok(ack)) => {
+            crate::mailbox::note_seen(endpoint_id);
+            Ok(ack)
+        }
         outcome => {
             if let Ok(mut conns) = state.friend_conns.lock() {
                 if conns.get(endpoint_id).is_some_and(|c| c.conn.stable_id() == conn.stable_id()) {
@@ -5421,9 +6848,46 @@ pub async fn send_chat(
 /// protocol (seq for ordering; optional reply/gif metadata old peers ignore).
 /// Deliver to the first of a person's devices that accepts (they sync the rest).
 pub async fn send_chat_any(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value) -> Result<serde_json::Value> {
+    send_chat_any_within(state, ep, eids, payload, None).await
+}
+
+/// Deliver to EVERY one of a person's devices that answers (concurrently): a
+/// file note must reach each device its files are going to, so the linked
+/// transfer finds its card there. Ok if at least one device took it.
+pub async fn send_chat_all(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value) -> Result<serde_json::Value> {
+    if eids.len() <= 1 {
+        return send_chat_any(state, ep, eids, payload).await;
+    }
+    let tries = eids.iter().map(|eid| send_chat_any(state, ep, std::slice::from_ref(eid), payload.clone()));
+    let results = n0_future::join_all(tries).await;
     let mut last = Err(anyhow::anyhow!("no reachable device"));
+    for r in results {
+        if r.is_ok() {
+            return r;
+        }
+        last = r;
+    }
+    last
+}
+
+/// `send_chat_any` with a quick "is anyone there?" budget per device: used when
+/// a Transfer Server can hold the message, so an offline friend costs ~4s, not
+/// 12s per device. In that mode an iPhone unseen for 2 minutes is skipped
+/// outright (iOS suspends apps in the background; the dial can't succeed).
+pub async fn send_chat_any_within(state: &IrohState, ep: &Endpoint, eids: &[String], payload: serde_json::Value, quick: Option<Duration>) -> Result<serde_json::Value> {
+    let mut last = Err(anyhow::anyhow!("no reachable device"));
+    let ios: HashSet<String> = match (quick, location_config(state)) {
+        (Some(_), Ok(config)) => crate::friends::load(&config).into_iter()
+            .filter(|f| f.device_os.as_deref() == Some("ios"))
+            .filter_map(|f| f.endpoint_id).collect(),
+        _ => HashSet::new(),
+    };
     for eid in eids {
-        last = match send_chat(state, ep, eid, payload.clone()).await {
+        if quick.is_some() && ios.contains(eid) && !crate::mailbox::seen_within(eid, Duration::from_secs(120)) {
+            continue;
+        }
+        let budget = quick.unwrap_or(Duration::from_secs(12));
+        last = match send_chat_within(state, ep, eid, payload.clone(), budget).await {
             // A device that doesn't know us yet drops the message but still
             // acks it — that is not delivery; try the person's next device.
             // (A new message, not an edit/reaction on something it lacks:
@@ -5441,6 +6905,138 @@ pub async fn send_chat_any(state: &IrohState, ep: &Endpoint, eids: &[String], pa
         }
     }
     last
+}
+
+/// Where one chat frame got to across a person's devices.
+#[derive(Debug, Default, Clone)]
+pub struct ChatReach {
+    /// Devices that took it (and stored/applied it).
+    pub delivered: Vec<String>,
+    /// Devices that didn't answer (or didn't know us yet).
+    pub missed: Vec<String>,
+}
+
+/// Deliver `payload` to EACH of a person's devices at once — like iMessage,
+/// every device gets the message, not just the first that answers. Used when a
+/// Transfer Server can hold it for the devices that don't answer: a device not
+/// seen in the last 20 s gets a quick 4 s dial, and an iPhone unseen for 2 min
+/// is skipped outright (iOS suspends apps in the background; the dial can't
+/// land). Devices in `skip` (didn't answer earlier this round) count as missed.
+pub async fn send_chat_each(state: &IrohState, ep: &Endpoint, eids: &[String], payload: &serde_json::Value, skip: &HashSet<String>) -> ChatReach {
+    let ios: HashSet<String> = match location_config(state) {
+        Ok(config) => crate::friends::load(&config).into_iter()
+            .filter(|f| f.device_os.as_deref() == Some("ios"))
+            .filter_map(|f| f.endpoint_id).collect(),
+        _ => HashSet::new(),
+    };
+    let new_message = payload.get("msgKind").and_then(|k| k.as_str()).is_none_or(|k| !matches!(k, "reaction" | "edit" | "delete"));
+    let tries = eids.iter().map(|eid| {
+        let skipped = skip.contains(eid) || (ios.contains(eid) && !crate::mailbox::seen_within(eid, Duration::from_secs(120)));
+        let budget = if crate::mailbox::seen_within(eid, Duration::from_secs(20)) { Duration::from_secs(12) } else { Duration::from_secs(4) };
+        async move {
+            if skipped {
+                return (eid.clone(), false);
+            }
+            let ok = match send_chat_within(state, ep, eid, payload.clone(), budget).await {
+                Ok(ack) if ack["applied"] == false => {
+                    if new_message {
+                        introduce_once(state, eid);
+                    }
+                    false
+                }
+                Ok(_) => true,
+                Err(_) => false,
+            };
+            (eid.clone(), ok)
+        }
+    });
+    let mut out = ChatReach::default();
+    for (eid, ok) in n0_future::join_all(tries).await {
+        if ok { out.delivered.push(eid) } else { out.missed.push(eid) }
+    }
+    out
+}
+
+static CHAT_INFLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// While held, no one else delivers this message (the send command and the
+/// outbox loop can both pick up a fresh message).
+pub struct ChatClaim(String);
+impl Drop for ChatClaim {
+    fn drop(&mut self) {
+        if let Some(s) = CHAT_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            s.remove(&self.0);
+        }
+    }
+}
+
+pub fn claim_chat(msg_id: &str) -> Option<ChatClaim> {
+    let mut g = CHAT_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(HashSet::new).insert(msg_id.to_owned()).then(|| ChatClaim(msg_id.to_owned()))
+}
+
+/// How one queued message fared (`deliver_chat_message`).
+#[derive(Debug)]
+pub enum ChatOutcome {
+    /// At least one device has it; `copies` = devices it waits for on a server.
+    Delivered { reach: ChatReach, copies: Vec<String> },
+    /// No device answered; a Transfer Server holds it for them.
+    Held(crate::mailbox::client::Held),
+    /// Nowhere yet (the outbox retries); the server's refusal, if any.
+    Failed(Option<crate::mailbox::client::DepositError>),
+}
+
+/// Deliver one of our messages to a person who has a Transfer Server route:
+/// directly to every device that answers, and a per-device server copy for
+/// each one that doesn't — so an iPhone asleep in a pocket still gets it (and
+/// a notification) even though the Mac already did. `skip` carries the
+/// devices that didn't answer earlier this round (and gains this round's).
+pub async fn deliver_chat_message(state: &IrohState, ep: &Endpoint, config: &Path, peer_id: &str, eids: &[String],
+    payload: &serde_json::Value, msg_id: &str, use_server: bool, skip: &mut HashSet<String>) -> ChatOutcome {
+    let reach = send_chat_each(state, ep, eids, payload, skip).await;
+    skip.extend(reach.missed.iter().cloned());
+    let me = ep.id().to_string();
+    if !reach.delivered.is_empty() {
+        let mut copies = crate::mailbox::client::chat_holdable_devices(config, &me, &reach.missed);
+        if !copies.is_empty() && use_server {
+            match crate::mailbox::client::deposit_chat_for(state, config, peer_id, "chat", payload, Some(msg_id), None, Some(&copies), true).await {
+                Ok(_) => crate::mailbox::client::wake(),
+                Err(e) => {
+                    log::info!("chat: couldn't leave a copy for their other device(s): {}", e.code());
+                    copies.clear();
+                }
+            }
+        } else {
+            copies.clear();
+        }
+        return ChatOutcome::Delivered { reach, copies };
+    }
+    if !use_server {
+        return ChatOutcome::Failed(None);
+    }
+    match crate::mailbox::client::deposit_chat(state, config, peer_id, "chat", payload, Some(msg_id)).await {
+        Ok(h) => {
+            crate::mailbox::client::wake();
+            ChatOutcome::Held(h)
+        }
+        Err(e) => ChatOutcome::Failed(Some(e)),
+    }
+}
+
+/// An edit/unsend/reaction reached them directly: it also follows every
+/// server copy of its message that some device hasn't fetched or got through
+/// a server (sealed for those devices, on the same server, which hands items
+/// over in order). An unsend first just takes back a copy nobody fetched yet.
+pub async fn op_follows_copies(state: &IrohState, config: &Path, thread: &str, op_kind: &str, target_id: &str, payload: &serde_json::Value) {
+    for c in crate::mailbox::client::chat_copies(config, target_id) {
+        if op_kind == "delete" && c.state == "held" && c.delivered_to.is_empty()
+            && crate::mailbox::client::cancel_copy(state, config, &c).await == crate::mailbox::client::Unsend::Removed {
+            continue;
+        }
+        if let Err(e) = crate::mailbox::client::deposit_chat_for(state, config, thread, "op", payload, None, Some(&c.server), Some(&c.to), true).await {
+            log::info!("chat: an edit/reaction couldn't follow its message's server copy: {}", e.code());
+        }
+    }
 }
 
 /// Say hello to a device that turned our message away as a stranger (e.g. a
@@ -5485,6 +7081,10 @@ pub fn chat_payload(m: &crate::chat::ChatMessage, peer_id: &str, my_name: &str) 
     } else {
         o.insert("msgKind".into(), serde_json::json!("text"));
         o.insert("text".into(), serde_json::json!(m.text));
+        // #47: an extra key older builds simply never read.
+        if let Some(lp) = m.link_preview.as_ref().and_then(|p| serde_json::to_value(p).ok()) {
+            o.insert("linkPreview".into(), lp);
+        }
     }
     if let Some(rt) = &m.reply_to {
         o.insert("replyTo".into(), serde_json::json!(rt));
@@ -5509,6 +7109,19 @@ fn chat_outbox_wake_cell() -> &'static tokio::sync::Notify {
 /// the next 12s tick.
 pub fn wake_chat_outbox() {
     chat_outbox_wake_cell().notify_one();
+}
+
+/// A friend just answered a ping/probe: if messages to that person are still
+/// queued, flush them now rather than waiting out the per-peer backoff (up to
+/// 300s). Only wakes when something is actually queued for them, so the periodic
+/// presence probes of online friends never churn the outbox loop.
+pub fn wake_chat_outbox_for(config_dir: &std::path::Path, friend_id: &str) -> bool {
+    let owner = crate::friends::thread_owner(config_dir, friend_id).map_or_else(|| friend_id.to_string(), |o| o.id);
+    let queued = crate::chat::has_outbox_for(config_dir, &[friend_id, owner.as_str()]);
+    if queued {
+        wake_chat_outbox();
+    }
+    queued
 }
 
 pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
@@ -5554,7 +7167,8 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
             }
             let pending = crate::chat::outbox(&config_dir);
             let ops = crate::chat::pending_ops(&config_dir);
-            if pending.is_empty() && ops.is_empty() {
+            let held = crate::chat::held(&config_dir);
+            if pending.is_empty() && ops.is_empty() && held.is_empty() {
                 idle_since = Some(mtimes);
                 continue;
             }
@@ -5564,6 +7178,7 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 backoff.get(peer).is_some_and(|(_, until)| now < *until)
             };
             let friends = crate::friends::load(&config_dir);
+            let me = ep.id().to_string();
 
             // --- Messages first, so an original lands before any op that targets it.
             // Track which of OUR messages we delivered THIS round.
@@ -5583,9 +7198,65 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                         continue;
                     }
                     let eids = crate::friends::person_endpoints(&config_dir, &peer_id);
+                    // A Transfer Server can hold messages for this person: then an
+                    // offline friend costs a quick ~4s probe, not a long dial, and
+                    // the message is sealed + left on the server instead of waiting.
+                    let holdable = crate::mailbox::client::can_hold_chat(&config_dir, &me, &peer_id);
+                    if holdable {
+                        // Every device gets it: direct where they answer, a
+                        // server copy for the rest (see deliver_chat_message).
+                        let mut skip: HashSet<String> = HashSet::new();
+                        for m in msgs {
+                            // Being sent right now by the send command: stop here (order).
+                            let Some(_claim) = claim_chat(&m.id) else { break };
+                            let payload = chat_payload(&m, &peer_id, &my_name);
+                            // Don't re-deposit what a server already gave up on.
+                            let retry_server = !matches!(m.server_note.as_deref(), Some("expired" | "lost"));
+                            match deliver_chat_message(&state, &ep, &config_dir, &peer_id, &eids, &payload, &m.id, retry_server, &mut skip).await {
+                                ChatOutcome::Delivered { reach, copies } => {
+                                    backoff.remove(&peer_id);
+                                    just_delivered.insert(m.id.clone());
+                                    log::info!("chat: delivered to {} of {} device(s){}", reach.delivered.len(), eids.len(),
+                                        if copies.is_empty() { String::new() } else { format!(", {} waiting on a Transfer Server", copies.len()) });
+                                    if let Some(u) = crate::chat::set_status(&config_dir, &peer_id, &m.id, "delivered") {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                }
+                                ChatOutcome::Held(h) => {
+                                    if let Some(u) = crate::chat::set_held(&config_dir, &peer_id, &m.id, &h.name) {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                }
+                                ChatOutcome::Failed(e) => {
+                                    if let Some(e) = &e {
+                                        log::info!("chat: couldn't hold a message on a Transfer Server: {}", e.code());
+                                        if let Some(u) = crate::chat::set_server_note(&config_dir, &peer_id, &m.id, crate::mailbox::client::note_for(e).as_deref()) {
+                                            let _ = app.emit("chat://message", &u);
+                                        }
+                                    }
+                                    if let Some(u) = crate::chat::set_status(&config_dir, &peer_id, &m.id, "failed") {
+                                        let _ = app.emit("chat://message", &u);
+                                    }
+                                    let fails = backoff.get(&peer_id).map(|(f, _)| *f).unwrap_or(0) + 1;
+                                    let delay = match fails {
+                                        1 => Duration::from_secs(12),
+                                        2 => Duration::from_secs(60),
+                                        _ => Duration::from_secs(300),
+                                    };
+                                    backoff.insert(peer_id.clone(), (fails, now + delay));
+                                    break; // preserve order — stop this peer until next round
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     for m in msgs {
+                        let Some(_claim) = claim_chat(&m.id) else { break };
                         let payload = chat_payload(&m, &peer_id, &my_name);
-                        match send_chat_any(&state, &ep, &eids, payload).await {
+                        // No Transfer Server for this person: the first device
+                        // that answers gets it (their devices sync the rest).
+                        let direct = send_chat_any_within(&state, &ep, &eids, payload.clone(), None).await;
+                        match direct {
                             Ok(_) => {
                                 backoff.remove(&peer_id);
                                 just_delivered.insert(m.id.clone());
@@ -5622,6 +7293,27 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 }
             }
 
+            // --- Held messages: a Transfer Server has them, but if the friend shows
+            // up here first, hand them over directly (they dedupe by id) and remove
+            // the server copy. Only when they're visibly online — never a blind dial.
+            for m in held {
+                let eids = crate::friends::person_endpoints(&config_dir, &m.peer_id);
+                if !crate::mailbox::client::any_live(&eids) || deferred(&m.peer_id, &backoff) {
+                    continue;
+                }
+                let payload = chat_payload(&m, &m.peer_id, &my_name);
+                // Only the devices showing life; the rest keep their server copy.
+                let live: Vec<String> = eids.iter().filter(|e| crate::mailbox::client::any_live(std::slice::from_ref(*e))).cloned().collect();
+                let reach = send_chat_each(&state, &ep, &live, &payload, &HashSet::new()).await;
+                if !reach.delivered.is_empty() {
+                    just_delivered.insert(m.id.clone());
+                    if let Some(u) = crate::chat::set_status(&config_dir, &m.peer_id, &m.id, "delivered") {
+                        let _ = app.emit("chat://message", &u);
+                    }
+                    crate::mailbox::client::delivered_directly(&state, &config_dir, &m.id, &reach.delivered);
+                }
+            }
+
             // --- Edit/unsend/reaction ops, AFTER messages. Each is gated on its target
             // being delivered/read so the receiver (which drops an op whose target it
             // hasn't stored) never loses it. An op whose target we delivered in THIS
@@ -5643,14 +7335,18 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 if just_delivered.contains(&op.target_id) {
                     continue;
                 }
-                let target_ready =
-                    match crate::chat::message_status(&config_dir, &thread, &op.target_id) {
-                        Some(s) => matches!(s.as_str(), "delivered" | "read"),
-                        // None = the target is the PEER's own message (they authored it,
-                        // so they have it) or it aged out of our store — send anyway.
-                        None => true,
-                    };
-                if !target_ready {
+                let target_status = crate::chat::message_status(&config_dir, &thread, &op.target_id);
+                let target_ready = match target_status.as_deref() {
+                    Some(s) => matches!(s, "delivered" | "read"),
+                    // None = the target is the PEER's own message (they authored it,
+                    // so they have it) or it aged out of our store — send anyway.
+                    None => true,
+                };
+                // The target is waiting on a Transfer Server: the op follows it
+                // there (servers hand items over in order), unless the friend is
+                // online right now — then the held message goes direct first.
+                let target_held = target_status.as_deref() == Some("held") && !crate::mailbox::client::any_live(&eids);
+                if !target_ready && !target_held {
                     continue;
                 }
                 let payload = match op.kind.as_str() {
@@ -5676,7 +7372,32 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
                 // receiver's apply_* are idempotent, so at-least-once is safe.
                 // send_chat_any moves on to the person's next device when one
                 // answers applied:false, so Ok here means some device applied it.
-                if send_chat_any(&state, &ep, &eids, payload).await.is_ok() {
+                if target_held {
+                    // Unsending a message the server still holds: just take it back.
+                    if op.kind == "delete" {
+                        match crate::mailbox::client::unsend_held(&state, &config_dir, &op.target_id).await {
+                            crate::mailbox::client::Unsend::Removed => {
+                                crate::chat::ack_op(&config_dir, &op.id);
+                                continue;
+                            }
+                            crate::mailbox::client::Unsend::Delivered => {
+                                // It reached them already; the unsend travels next round.
+                                if let Some(u) = crate::chat::set_status(&config_dir, &thread, &op.target_id, "delivered") {
+                                    let _ = app.emit("chat://message", &u);
+                                }
+                                continue;
+                            }
+                            crate::mailbox::client::Unsend::Unknown => {}
+                        }
+                    }
+                    let Some(server) = crate::mailbox::client::held_server_of(&config_dir, &op.target_id) else { continue };
+                    if crate::mailbox::client::deposit_chat_on(&state, &config_dir, &thread, "op", &payload, None, Some(&server)).await.is_ok() {
+                        crate::chat::ack_op(&config_dir, &op.id);
+                    }
+                    continue;
+                }
+                if send_chat_any(&state, &ep, &eids, payload.clone()).await.is_ok() {
+                    op_follows_copies(&state, &config_dir, &thread, &op.kind, &op.target_id, &payload).await;
                     crate::chat::ack_op(&config_dir, &op.id);
                 }
             }
@@ -5684,10 +7405,50 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
     });
 }
 
+// ── Live-connection registry ──────────────────────────────────────────────
+// Every connection to a peer joins ONE shared path-selection state inside iroh:
+// a new connection re-runs path selection and holepunching for ALL of them, and
+// opens/closes paths on the connection carrying a transfer. Presence probes used
+// to dial a fresh connection to every friend every 30 s (once per open window),
+// which on 2026-10-07 re-shuffled a friend's transfer path every few seconds.
+// So: while ANY live connection to a peer exists, presence and the connection
+// inspector read it instead of dialing. Weak handles: the registry never keeps a
+// connection open.
+static LIVE_CONNS: std::sync::OnceLock<Mutex<HashMap<String, Vec<iroh::endpoint::WeakConnectionHandle>>>> =
+    std::sync::OnceLock::new();
+
+fn live_conns() -> &'static Mutex<HashMap<String, Vec<iroh::endpoint::WeakConnectionHandle>>> {
+    LIVE_CONNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remember a connection (incoming or dialed) for `live_conn_to`.
+pub(crate) fn note_live_conn(conn: &Connection) {
+    let peer = conn.remote_id().to_string();
+    let mut map = live_conns().lock().unwrap_or_else(|p| p.into_inner());
+    let list = map.entry(peer).or_default();
+    list.retain(|w| w.upgrade().is_some_and(|c| c.close_reason().is_none() && c.stable_id() != conn.stable_id()));
+    list.push(conn.weak_handle());
+    map.retain(|_, l| !l.is_empty());
+}
+
+/// An open connection to this peer, if one exists — newest first.
+pub(crate) fn live_conn_to(endpoint_id: &str) -> Option<Connection> {
+    let mut map = live_conns().lock().unwrap_or_else(|p| p.into_inner());
+    let list = map.get_mut(endpoint_id)?;
+    list.retain(|w| w.upgrade().is_some_and(|c| c.close_reason().is_none()));
+    let conn = list.iter().rev().find_map(|w| w.upgrade());
+    if list.is_empty() { map.remove(endpoint_id); }
+    conn
+}
+
 /// Liveness check: dial a friend/peer's endpoint and round-trip a ping. Returns
 /// true only if they answered with a pong (their app is running and reachable) —
-/// the iroh replacement for the croc "ping_send" online check.
+/// the iroh replacement for the croc "ping_send" online check. A connection that
+/// is open right now (and still receiving) already proves that, without a dial.
 pub async fn ping_endpoint(ep: &Endpoint, endpoint_id: &str) -> bool {
+    if live_conn_to(endpoint_id).is_some_and(|c| conn_recently_heard(&c)) {
+        return true;
+    }
     let Ok(parsed) = endpoint_id.parse::<iroh::EndpointId>() else {
         return false;
     };
@@ -5712,6 +7473,54 @@ pub async fn ping_endpoint(ep: &Endpoint, endpoint_id: &str) -> bool {
 /// no transfer is active): dial them, let a direct path try to form briefly, read
 /// the live path detail, then close. None if they're unreachable.
 pub async fn probe_conn(ep: &Endpoint, endpoint_id: &str) -> Option<crate::models::ConnDetail> {
+    // Reuse a live connection (a transfer, chat, or their own dial to us): its
+    // path detail is the real one, and a probe dial would disturb its paths.
+    if let Some(conn) = live_conn_to(endpoint_id).filter(conn_recently_heard) {
+        return Some(conn_detail(&conn));
+    }
+    // One probe per peer at a time, and a fresh answer is shared: every open
+    // window (main, menu-bar popover…) probes every friend every 30 s.
+    let gate = {
+        let mut gates = PROBE_GATES.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+        gates.retain(|_, g| Arc::strong_count(g) > 1 || g.try_lock().is_ok_and(|v| v.0.elapsed() < PROBE_REUSE));
+        gates.entry(endpoint_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((Instant::now() - PROBE_REUSE, None))))
+            .clone()
+    };
+    let mut slot = gate.lock().await;
+    if slot.0.elapsed() < PROBE_REUSE {
+        return slot.1.clone();
+    }
+    let detail = probe_conn_dial(ep, endpoint_id).await;
+    *slot = (Instant::now(), detail.clone());
+    detail
+}
+
+/// How long a probe answer is reused for other callers.
+const PROBE_REUSE: Duration = Duration::from_secs(20);
+type ProbeGate = Arc<tokio::sync::Mutex<(Instant, Option<crate::models::ConnDetail>)>>;
+static PROBE_GATES: std::sync::OnceLock<Mutex<HashMap<String, ProbeGate>>> = std::sync::OnceLock::new();
+
+/// A live connection is only proof of life while datagrams keep arriving (keep-
+/// alives every few seconds): a peer whose app vanished leaves an open handle
+/// until the idle timeout. Sample twice, a moment apart, if nothing is recorded.
+fn conn_recently_heard(conn: &Connection) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<HashMap<usize, (u64, Instant)>>> = std::sync::OnceLock::new();
+    let rx = conn.stats().udp_rx.datagrams;
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    seen.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(120));
+    let now = Instant::now();
+    let fresh = match seen.get(&conn.stable_id()) {
+        // Unknown handle: trust a connection only if it already moved traffic.
+        None => rx > 0,
+        Some((last_rx, at)) => rx > *last_rx || at.elapsed() < Duration::from_secs(10),
+    };
+    let entry = seen.entry(conn.stable_id()).or_insert((rx, now));
+    if rx > entry.0 { *entry = (rx, now); }
+    fresh && conn.close_reason().is_none()
+}
+
+async fn probe_conn_dial(ep: &Endpoint, endpoint_id: &str) -> Option<crate::models::ConnDetail> {
     let parsed = endpoint_id.parse::<iroh::EndpointId>().ok()?;
     let addr = dial_addr(parsed);
     let conn = tokio::time::timeout(Duration::from_secs(8), ep.connect(addr, ALPN))
@@ -5739,7 +7548,7 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
     cancel: &AtomicBool,
     on_progress: F,
     on_transport_activity: impl Fn(),
-) -> Result<crate::models::Locality> {
+) -> Result<FolderSendReport> {
     let parsed: iroh::EndpointId = endpoint_id
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid folder peer endpoint id"))?;
@@ -5749,108 +7558,7 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
         .map_err(|_| anyhow::anyhow!("folder peer unreachable over iroh"))?
         .context("dial folder peer")?;
     let mut last_frames = transport_stream_frames(&conn);
-    let transfer = async {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        // Prefer a direct path for folder sync too (shorter wait since this runs in the
-        // background and LAN peers get a direct path via mDNS almost immediately). With
-        // "Wait for a direct connection" on, give the hole-punch MUCH longer before
-        // settling for the slow relay — unless the user hit "Send over relay anyway" for
-        // this folder. (Folders never park forever: after the window they proceed, so the
-        // background sync can't wedge; the long wait just strongly favors direct.)
-        let direct_window = if wait_for_direct_mode() && !is_force_relay(pair_id) {
-            30
-        } else {
-            5
-        };
-        let _ = wait_for_direct_path(&conn, Duration::from_secs(direct_window)).await;
-        let __t0 = std::time::Instant::now();
-        // Internet folder sync respects the upload cap; LAN sync stays full speed.
-        let pace = !matches!(conn_locality(&conn), crate::models::Locality::Local);
-
-        let mut items = Vec::new();
-        for p in paths {
-            // PRE-FILTER: drop any file moved/deleted since the folder scan built this
-            // batch, BEFORE the header is written — so the advertised manifest matches
-            // the body byte-for-byte. A single vanished file used to fail the WHOLE
-            // folder send (surfacing as "No such file or directory (os error 2)" and a
-            // stalled-then-requeued folder; the body open now also retries briefly and
-            // bails cleanly — see open_for_send). The deletion still reaches the peer via
-            // the normal delete path. (NB: the asset-protocol "File does not exist at
-            // path" log line is a SEPARATE, benign convertFileSrc 404 — not this race.)
-            let meta = match std::fs::metadata(p) {
-                Ok(m) => m,
-                Err(e) => {
-                    log::warn!("folder send: skipping {} — {e}", p.display());
-                    continue;
-                }
-            };
-            let Some(rel) = folder_rel(p, root) else {
-                // Not provably under the folder root — skip rather than risk sending it
-                // at the wrong (root) level. The reconcile re-sends it correctly later.
-                log::warn!("folder send: skipping {} — not under folder root {root}", p.display());
-                continue;
-            };
-            items.push((p.clone(), rel, meta.len(), mtime_secs(&meta)));
-        }
-        // After pre-filter, an empty batch is a clean NO-OP, not an error: every item
-        // was deleted/moved (or un-rootable), and each deletion propagates on its own.
-        // Returning Ok here means a vanished-file folder send never error-spams.
-        if items.is_empty() {
-            log::info!("folder send: nothing to send (all items vanished or un-rootable) — no-op");
-            return Ok(conn_locality(&conn));
-        }
-        let total = checked_byte_total(items.iter().map(|i| i.2))?;
-        // Big single folder files fan across parallel streams exactly like friend
-        // sends (same negotiation, same resume). Folder sync was the LAST big-file
-        // path still single-stream — which is where iroh's per-stream stalls hurt.
-        let n = parallel_streams_for(&conn, items.len(), total);
-        let header = serde_json::json!({
-            "kind": "folder-files",
-            "pair_id": pair_id,
-            // `mtime` (seconds) travels with each file so EVERY member writes it with
-            // the same modified-time → the same file signature group-wide (loop-guard
-            // works across a mesh, identical re-receives are no-ops).
-            "items": items
-                .iter()
-                .map(|(_, n, s, mt)| serde_json::json!({ "name": n, "size": s, "mtime": mt }))
-                .collect::<Vec<_>>(),
-            "total": total,
-            "parallel": n,
-        });
-        write_frame(&mut send, &header).await?;
-
-        if n > 0 {
-            let reply = match tokio::time::timeout(Duration::from_secs(6), read_frame(&mut recv)).await
-            {
-                Ok(Ok(v)) => Some(v),
-                _ => None, // older receiver: no reply → classic body below
-            };
-            let ready = reply
-                .as_ref()
-                .and_then(|v| v.get("ready"))
-                .and_then(|r| r.as_bool())
-                .unwrap_or(false);
-            if ready {
-                let (base, plan) = parse_resume_reply(reply.as_ref(), total, n);
-                send_ranges_parallel(&conn, &items.first().context("parallel transfer has no file")?.0, total, base, &plan, cancel, pace, on_progress)
-                    .await?;
-                send.finish()?;
-                let ack = recv.read_to_end(4096).await.unwrap_or_default();
-                anyhow::ensure!(ack.ends_with(b"ok"), "folder peer did not confirm receipt");
-                log_transfer_perf(&conn, "folder-send", "send", total, __t0.elapsed());
-                return Ok(conn_locality(&conn));
-            }
-        }
-
-        write_folder_body(&mut send, &items, total, cancel, pace, &on_progress).await?;
-        send.finish()?;
-        // Require the receiver's "ok" so "delivered" means the bytes actually landed
-        // in their folder (not just that we finished writing to the socket).
-        let ack = recv.read_to_end(4096).await.unwrap_or_default();
-        anyhow::ensure!(ack.ends_with(b"ok"), "folder peer did not confirm receipt");
-        log_transfer_perf(&conn, "folder-send", "send", total, __t0.elapsed());
-        Ok(conn_locality(&conn))
-    };
+    let transfer = send_folder_on_conn(&conn, pair_id, root, paths, cancel, on_progress);
     tokio::pin!(transfer);
     loop {
         tokio::select! {
@@ -5864,6 +7572,304 @@ pub async fn send_folder_file<F: Fn(u64, u64)>(
             }
         }
     }
+}
+
+/// What the receiver did with ONE pushed folder item (receipt protocol v1). Only
+/// `Landed` means "the peer now has these exact bytes in its folder" — the ONLY
+/// outcome that may ever trip "delete after delivery".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FolderItemOutcome {
+    /// In the peer's folder now (newly written, or it already had identical bytes).
+    Landed,
+    /// Deliberately NOT landed and must not be retried as-is: the peer keeps a
+    /// newer version, the name can't exist on its disk, it was deleted there… The
+    /// reason travels for the status line. Never counts as delivered.
+    Kept(String),
+    /// Didn't land (disk error, blocked path, truncated body…) — retry later.
+    Failed,
+}
+
+/// Per-item result of one folder push. `legacy` = the peer is an older build that
+/// only answers a bare "ok": we can trust that something arrived but NOT per-item,
+/// so nothing in a legacy report is ever treated as safe to auto-delete.
+#[derive(Debug, Clone)]
+pub(crate) struct FolderSendReport {
+    pub locality: crate::models::Locality,
+    pub items: Vec<(PathBuf, FolderItemOutcome)>,
+    pub legacy: bool,
+}
+
+/// The receiver turned the whole push away before reading it (unknown/unshared
+/// folder, we're a viewer there, their folder is paused or its drive is
+/// unplugged). Typed so the sender can show WHY and back off instead of
+/// re-dialing; never "delivered".
+#[derive(Debug, Clone)]
+pub(crate) struct FolderRefused(pub String);
+impl std::fmt::Display for FolderRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "folder peer refused the push: {}", self.0)
+    }
+}
+impl std::error::Error for FolderRefused {}
+
+/// The receiver's final answer, decoded. New receivers send a JSON receipt (plain
+/// or framed); a refusal is a framed `{"kind":"refused"}`; older receivers send
+/// the two bytes "ok". Anything else — an EMPTY reply included — proves nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FolderAck {
+    Receipt(serde_json::Value),
+    Refused(String),
+    LegacyOk,
+    Nothing,
+}
+
+pub(crate) fn parse_folder_ack(bytes: &[u8]) -> FolderAck {
+    let json = if bytes.len() > 4
+        && u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize == bytes.len() - 4
+    {
+        &bytes[4..]
+    } else {
+        bytes
+    };
+    if json.first() == Some(&b'{') {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(json) {
+            return match v.get("kind").and_then(|k| k.as_str()) {
+                Some("receipt") => FolderAck::Receipt(v),
+                Some("refused") => FolderAck::Refused(
+                    v.get("reason").and_then(|r| r.as_str()).unwrap_or("refused").to_string(),
+                ),
+                _ => FolderAck::Nothing,
+            };
+        }
+        return FolderAck::Nothing;
+    }
+    if bytes == b"ok" {
+        FolderAck::LegacyOk
+    } else {
+        FolderAck::Nothing
+    }
+}
+
+/// Map a receipt onto the pushed items, by header index. An index the receipt
+/// doesn't account for is Failed (retry), never Landed.
+pub(crate) fn folder_report_from_receipt(
+    receipt: &serde_json::Value,
+    items: &[PathBuf],
+) -> Vec<(PathBuf, FolderItemOutcome)> {
+    let n = receipt.get("n").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+    let idx = |key: &str| -> std::collections::HashSet<u64> {
+        receipt
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+            .unwrap_or_default()
+    };
+    let failed = idx("failed");
+    let kept = idx("kept");
+    let landed = idx("landed");
+    let reasons = receipt.get("reasons").cloned().unwrap_or_default();
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let i = i as u64;
+            let outcome = if n != items.len() as u64 || failed.contains(&i) {
+                FolderItemOutcome::Failed
+            } else if kept.contains(&i) {
+                let why = reasons
+                    .get(i.to_string())
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("kept")
+                    .to_string();
+                FolderItemOutcome::Kept(why)
+            } else if landed.contains(&i) {
+                FolderItemOutcome::Landed
+            } else {
+                FolderItemOutcome::Failed
+            };
+            (p.clone(), outcome)
+        })
+        .collect()
+}
+
+/// Read the receiver's final answer after the body went out and turn it into a
+/// per-item report. A refusal is an error; a missing/garbled answer is ALSO an
+/// error (it used to be waved through as "delivered", which let auto-delete wipe
+/// files the peer never kept).
+async fn folder_finish_report(
+    recv: &mut RecvStream,
+    conn: &Connection,
+    sent: &[PathBuf],
+) -> Result<FolderSendReport> {
+    let ack = recv.read_to_end(256 * 1024).await.unwrap_or_default();
+    let locality = conn_locality(conn);
+    match parse_folder_ack(&ack) {
+        FolderAck::Receipt(r) => Ok(FolderSendReport {
+            locality,
+            items: folder_report_from_receipt(&r, sent),
+            legacy: false,
+        }),
+        FolderAck::LegacyOk => Ok(FolderSendReport {
+            locality,
+            items: sent.iter().map(|p| (p.clone(), FolderItemOutcome::Landed)).collect(),
+            legacy: true,
+        }),
+        FolderAck::Refused(reason) => Err(anyhow::Error::new(FolderRefused(reason))),
+        FolderAck::Nothing => anyhow::bail!("folder peer did not confirm receipt"),
+    }
+}
+
+/// After a body write failed, the receiver may have turned the push away before
+/// reading it (it stops the stream and leaves a framed reason). Surface that
+/// reason instead of the bare "stopped by peer".
+async fn folder_refusal_after(recv: &mut RecvStream, err: anyhow::Error) -> anyhow::Error {
+    match tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(64 * 1024)).await {
+        Ok(Ok(bytes)) => match parse_folder_ack(&bytes) {
+            FolderAck::Refused(reason) => anyhow::Error::new(FolderRefused(reason)),
+            _ => err,
+        },
+        _ => err,
+    }
+}
+
+/// The folder push itself, on an already-open connection (split out of
+/// `send_folder_file` so the loopback tests drive the real wire protocol).
+pub(crate) async fn send_folder_on_conn<F: Fn(u64, u64)>(
+    conn: &Connection,
+    pair_id: &str,
+    root: &str,
+    paths: &[PathBuf],
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<FolderSendReport> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    // Prefer a direct path for folder sync too (shorter wait since this runs in the
+    // background and LAN peers get a direct path via mDNS almost immediately). With
+    // "Wait for a direct connection" on, give the hole-punch MUCH longer before
+    // settling for the slow relay — unless the user hit "Send over relay anyway" for
+    // this folder. (Folders never park forever: after the window they proceed, so the
+    // background sync can't wedge; the long wait just strongly favors direct.)
+    let direct_window = if wait_for_direct_mode() && !is_force_relay(pair_id) {
+        30
+    } else {
+        5
+    };
+    let _ = wait_for_direct_path(conn, Duration::from_secs(direct_window)).await;
+    let __t0 = std::time::Instant::now();
+    // Internet folder sync respects the upload cap; LAN sync stays full speed.
+    let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
+
+    let mut items = Vec::new();
+    for p in paths {
+        // PRE-FILTER: drop any file moved/deleted since the folder scan built this
+        // batch, BEFORE the header is written — so the advertised manifest matches
+        // the body byte-for-byte. A single vanished file used to fail the WHOLE
+        // folder send (surfacing as "No such file or directory (os error 2)" and a
+        // stalled-then-requeued folder; the body open now also retries briefly and
+        // bails cleanly — see open_for_send). The deletion still reaches the peer via
+        // the normal delete path. (NB: the asset-protocol "File does not exist at
+        // path" log line is a SEPARATE, benign convertFileSrc 404 — not this race.)
+        let meta = match std::fs::metadata(p) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("folder send: skipping {} — {e}", p.display());
+                continue;
+            }
+        };
+        let Some(rel) = folder_rel(p, root) else {
+            // Not provably under the folder root — skip rather than risk sending it
+            // at the wrong (root) level. The reconcile re-sends it correctly later.
+            log::warn!("folder send: skipping {} — not under folder root {root}", p.display());
+            continue;
+        };
+        let ver = crate::sync::path_version_ms(p, &meta);
+        items.push((p.clone(), rel, meta.len(), mtime_secs(&meta), ver));
+    }
+    // After pre-filter, an empty batch is a clean NO-OP, not an error: every item
+    // was deleted/moved (or un-rootable), and each deletion propagates on its own.
+    // The report lists nothing, so nothing is marked delivered or auto-deleted.
+    if items.is_empty() {
+        log::info!("folder send: nothing to send (all items vanished or un-rootable) — no-op");
+        return Ok(FolderSendReport { locality: conn_locality(conn), items: Vec::new(), legacy: false });
+    }
+    let sent: Vec<PathBuf> = items.iter().map(|i| i.0.clone()).collect();
+    let total = checked_byte_total(items.iter().map(|i| i.2))?;
+    // Big single folder files fan across parallel streams exactly like friend
+    // sends (same negotiation, same resume). Folder sync was the LAST big-file
+    // path still single-stream — which is where iroh's per-stream stalls hurt.
+    let n = parallel_streams_for(conn, items.len(), total);
+    let header = serde_json::json!({
+        "kind": "folder-files",
+        "pair_id": pair_id,
+        // `mtime` (seconds) travels with each file so EVERY member writes it with
+        // the same modified-time → the same file signature group-wide (loop-guard
+        // works across a mesh, identical re-receives are no-ops). `ver` (ms) is the
+        // file's placement version, so a receiver can tell a copy that PREDATES its
+        // own deletion of that file (a long-offline device) from a fresh re-add.
+        "items": items
+            .iter()
+            .map(|(_, n, s, mt, ver)| serde_json::json!({ "name": n, "size": s, "mtime": mt, "ver": ver }))
+            .collect::<Vec<_>>(),
+        "total": total,
+        "parallel": n,
+        // Receipt protocol v1: answer with a per-item receipt (never a bare "ok"),
+        // and refuse names this receiver's filesystem can't hold instead of
+        // mangling them into a different name.
+        "receipt": 1,
+    });
+    write_frame(&mut send, &header).await?;
+
+    if n > 0 {
+        let reply = match tokio::time::timeout(Duration::from_secs(6), read_frame(&mut recv)).await
+        {
+            Ok(Ok(v)) => Some(v),
+            _ => None, // older receiver: no reply → classic body below
+        };
+        // Turned away up front (unshared, viewer, paused, drive missing) — or the
+        // receiver already knows it won't land this item (receipt instead of ready).
+        if let Some(v) = &reply {
+            match v.get("kind").and_then(|k| k.as_str()) {
+                Some("refused") => {
+                    let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("refused");
+                    return Err(anyhow::Error::new(FolderRefused(reason.to_string())));
+                }
+                Some("receipt") => {
+                    return Ok(FolderSendReport {
+                        locality: conn_locality(conn),
+                        items: folder_report_from_receipt(v, &sent),
+                        legacy: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let ready = reply
+            .as_ref()
+            .and_then(|v| v.get("ready"))
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
+        if ready {
+            let (base, plan) = parse_resume_reply(reply.as_ref(), total, n);
+            send_ranges_parallel(conn, &items.first().context("parallel transfer has no file")?.0, total, base, &plan, cancel, pace, on_progress)
+                .await?;
+            send.finish()?;
+            let report = folder_finish_report(&mut recv, conn, &sent).await?;
+            log_transfer_perf(conn, "folder-send", "send", total, __t0.elapsed());
+            return Ok(report);
+        }
+    }
+
+    let body: Vec<(PathBuf, String, u64, u64)> =
+        items.iter().map(|(p, r, s, m, _)| (p.clone(), r.clone(), *s, *m)).collect();
+    if let Err(e) = write_folder_body(&mut send, &body, total, cancel, pace, &on_progress).await {
+        return Err(folder_refusal_after(&mut recv, e).await);
+    }
+    send.finish()?;
+    // Require the receiver's per-item receipt so "delivered" means the bytes
+    // actually landed in their folder (not just that we finished writing).
+    let report = folder_finish_report(&mut recv, conn, &sent).await?;
+    log_transfer_perf(conn, "folder-send", "send", total, __t0.elapsed());
+    Ok(report)
 }
 
 /// Parse the receiver's `{ready, resume:{have}}` reply into (already-have bytes,
@@ -5912,7 +7918,7 @@ fn parse_resume_reply(
 /// sends each file's path RELATIVE to the folder root (so `sub/a.txt` lands in
 /// `sub/a.txt`, not the folder root).
 /// A file's modified-time as whole seconds since the epoch (0 if unavailable).
-fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -6043,16 +8049,23 @@ async fn read_folder_body<F: Fn(u64, u64)>(
     anyhow::ensure!(total == manifest_total, "file manifest byte total mismatch");
     std::fs::create_dir_all(dest_dir)?;
 
+    let strict = header.get("receipt").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
+    // Two items naming the SAME file here (case / NFC-NFD twins on APFS/NTFS) would
+    // be staged into one file with the second one's bytes under the first one's
+    // name — never land either twin; the receipt reports them kept.
+    let dups = folder_dup_items(&items);
     let mut got = 0u64;
     let mut out = Vec::new();
     let mut buf = vec![0u8; CHUNK];
-    for item in &items {
+    for (index, item) in items.iter().enumerate() {
         let raw = item["name"].as_str().unwrap_or("file");
         let size = item["size"].as_u64().unwrap_or(0);
         // Folder-safe rel: preserves the exact hidden/colon name, but REFUSES
-        // DropBeam's own control paths (`.dropbeam-history` etc.). A refused item
-        // must still have its bytes drained so the next item stays framed.
-        let Some(rel) = folder_receive_rel(raw) else {
+        // DropBeam's own control paths (`.dropbeam-history` etc.) — and, for a
+        // receipt-speaking sender, names this filesystem can't hold. A refused
+        // item must still have its bytes drained so the next item stays framed;
+        // the receipt reports it as kept (never landed).
+        let Some(rel) = folder_item_rel(raw, strict).ok().filter(|_| !dups.contains(&index)) else {
             log::debug!("folder receive: skipping control/degenerate rel {raw:?}");
             let mut remaining = size;
             while remaining > 0 {
@@ -6114,8 +8127,11 @@ async fn read_folder_body<F: Fn(u64, u64)>(
         // Buffer disk writes: QUIC delivers data in small pieces, and one blocking
         // write syscall per piece throttles big receives. A 1 MiB buffer batches
         // them into far fewer, larger writes. Flushed before the file is finalized.
-        let mut f =
-            tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&dest).await?);
+        // create_new: a staged name must never be shared by two items.
+        let mut f = tokio::io::BufWriter::with_capacity(
+            1 << 20,
+            tokio::fs::OpenOptions::new().write(true).create_new(true).open(&dest).await?,
+        );
         let mut remaining = size;
         let mut failed: Option<anyhow::Error> = None;
         while remaining > 0 {
@@ -6223,11 +8239,15 @@ pub(crate) fn windows_safe_component(comp: &str) -> String {
     }
     // "CON", "con.txt", "COM1.tar.gz" are all reserved — the check is on the
     // portion before the first dot, case-insensitive.
+    // Includes the superscript-digit ports (COM¹…LPT³), COM0/LPT0 and the
+    // console devices — all refused by Windows like the classic names.
     const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}", "CONIN$", "CONOUT$",
     ];
-    let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+    // Windows ignores trailing spaces before the extension too ("CON .txt").
+    let stem = s.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
     if RESERVED.contains(&stem.as_str()) {
         s.insert(0, '_');
     }
@@ -6320,9 +8340,136 @@ fn fit_name(name: &str, suffix: &str) -> String {
 /// visible it self-synced), plus any `.dropbeam-*` staging/incoming placeholder.
 /// Match is on ANY path component so a nested `sub/.dropbeam-history/x` is caught.
 pub(crate) fn is_control_rel(rel: &str) -> bool {
-    rel.split('/').any(|c| {
+    // `\` too: a Windows-built rel (`PathBuf::to_string_lossy`) joins with it,
+    // and "sub\.dropbeam-incoming" must still be recognised as ours.
+    rel.split(['/', '\\']).any(|c| {
         c.starts_with(".dropbeam") || c == "dropbeam-history"
     })
+}
+
+/// Turn a folder push away BEFORE reading its body: a framed reason the sender
+/// decodes (never mistaken for delivery), then stop the stream so a classic body
+/// write fails fast instead of streaming gigabytes into the void.
+async fn refuse_folder_push(send: &mut SendStream, recv: &mut RecvStream, reason: &str, strict: bool) -> Result<()> {
+    log::info!("folder push refused before body: {reason}");
+    if !strict {
+        // An OLDER sender (no receipt protocol) reads any answer that isn't "ok" —
+        // even an empty one, even a reset — as "delivered, ack lost", and with
+        // "delete after delivery" on it then deletes its only copy. The one outcome
+        // it treats as a failure is its own no-progress watchdog (45 s). So: read
+        // nothing, answer nothing, let that watchdog fire; it retries later. Costs
+        // one parked stream per retry, never a file.
+        let _ = recv;
+        let _ = send;
+        stall_legacy_sender().await;
+        return Ok(());
+    }
+    let _ = write_frame(send, &serde_json::json!({ "kind": "refused", "reason": reason })).await;
+    let _ = send.finish();
+    let _ = recv.stop(0u32.into());
+    let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+    Ok(())
+}
+
+/// Hold an older sender's push without answering until its no-progress watchdog
+/// (45 s) gives up — the only "not delivered" signal it understands.
+async fn stall_legacy_sender() {
+    tokio::time::sleep(Duration::from_secs(if cfg!(test) { 1 } else { 60 })).await;
+}
+
+/// Build the per-item receipt for a folder push from the ingest outcomes (keyed by
+/// the NFC landing rel). Every header item is accounted for exactly once; an item
+/// the ingest never saw is FAILED (retry), never landed.
+pub(crate) fn folder_receipt(
+    header: &serde_json::Value,
+    outcomes: &std::collections::HashMap<String, FolderItemOutcome>,
+    strict: bool,
+) -> serde_json::Value {
+    let items = header["items"].as_array().cloned().unwrap_or_default();
+    let (mut landed, mut kept, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+    let mut reasons = serde_json::Map::new();
+    let dups = folder_dup_items(&items);
+    for (i, item) in items.iter().enumerate() {
+        let raw = item["name"].as_str().unwrap_or("");
+        if dups.contains(&i) {
+            kept.push(i);
+            reasons.insert(i.to_string(), serde_json::json!("case"));
+            continue;
+        }
+        match folder_item_rel(raw, strict) {
+            Err(reason) => {
+                kept.push(i);
+                reasons.insert(i.to_string(), serde_json::json!(reason));
+            }
+            Ok(rel) => {
+                let key = crate::sync::norm_rel(&rel.to_string_lossy());
+                match outcomes.get(&key) {
+                    Some(FolderItemOutcome::Landed) => landed.push(i),
+                    Some(FolderItemOutcome::Kept(why)) => {
+                        kept.push(i);
+                        reasons.insert(i.to_string(), serde_json::json!(why));
+                    }
+                    Some(FolderItemOutcome::Failed) | None => failed.push(i),
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "kind": "receipt", "v": 1, "n": items.len(),
+        "landed": landed, "kept": kept, "failed": failed, "reasons": reasons,
+    })
+}
+
+/// Header items that name the SAME file on this disk as another item in the batch:
+/// NFC/NFD twins everywhere, and case-only twins on case-insensitive platforms.
+/// ALL members of such a group are returned — staging them would overwrite one
+/// with the other, so none of them may be reported as landed.
+pub(crate) fn folder_dup_items(items: &[serde_json::Value]) -> std::collections::HashSet<usize> {
+    use unicode_normalization::UnicodeNormalization;
+    let fold_case = cfg!(any(target_os = "macos", target_os = "ios", windows));
+    let mut groups: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (i, item) in items.iter().enumerate() {
+        let raw = item["name"].as_str().unwrap_or("");
+        let Some(rel) = folder_receive_rel(raw) else { continue };
+        let mut key: String = rel.to_string_lossy().nfc().collect();
+        if fold_case {
+            key = key.to_lowercase();
+        }
+        groups.entry(key).or_default().push(i);
+    }
+    groups.into_values().filter(|v| v.len() > 1).flatten().collect()
+}
+
+/// True if this '/'-separated wire rel names something a WINDOWS filesystem can't
+/// hold under that exact name (`a:b`, `CON`, trailing dot/space, a `\` inside a
+/// name). Pure, so it's tested on every host.
+pub(crate) fn name_unrepresentable_on_windows(raw: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    raw.split('/')
+        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+        .any(|c| {
+            let c: String = c.nfc().collect();
+            c.contains('\\') || windows_safe_component(&c) != c
+        })
+}
+
+/// The receive decision for one folder item. `strict` = the sender speaks the
+/// receipt protocol, so instead of silently MANGLING a name we can't hold (which
+/// lands it under a different name → the two sides never agree → endless re-send +
+/// a duplicate syncing back), we refuse it and say why. Hidden/dot paths are never
+/// synced by DropBeam, so they're refused too (they used to be staged and then
+/// silently dropped by the ingest, which a sender would see as "failed" forever).
+pub(crate) fn folder_item_rel(raw: &str, strict: bool) -> Result<PathBuf, &'static str> {
+    let rel = folder_receive_rel(raw).ok_or("control")?;
+    if strict {
+        if rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
+            return Err("hidden");
+        }
+        if cfg!(windows) && name_unrepresentable_on_windows(raw) {
+            return Err("name");
+        }
+    }
+    Ok(rel)
 }
 
 /// Receive-side rel for FOLDER SYNC (mirror). Unlike `sanitize_rel` (quick-send),
@@ -6443,7 +8590,9 @@ fn receive_candidates(natural: &Path, limit: usize) -> impl Iterator<Item = Path
 /// Split a receive name into (parent dir under `dir`, leaf name) using the
 /// same sanitising as every other landing path; never escapes `dir`.
 fn unique_in_parts(dir: &Path, name: &str) -> (PathBuf, String) {
-    // `name` is already receive_rel'd by the caller; receive_rel is idempotent.
+    // `name` is already receive_rel_wire'd by the caller (`/`-joined — a
+    // `\`-joined Windows PathBuf string would be ONE mangled name here);
+    // the mapping is idempotent on it.
     // (sanitize_rel here dropped any component containing ':' — a big parallel
     // "Meeting 9:23.mov" landed as a bare "file".)
     let rel = receive_rel(name);
@@ -6463,14 +8612,16 @@ fn unique_path(dir: &Path, name: &str) -> Result<PathBuf> {
     }
     anyhow::bail!("receive destination name space exhausted ({RECEIVE_NAME_LIMIT} candidates)")
 }
-fn publish_unique(part: &Path, natural: &Path) -> Result<PathBuf> {
+pub(crate) fn publish_unique(part: &Path, natural: &Path) -> Result<PathBuf> {
     publish_unique_limit(part, natural, RECEIVE_NAME_LIMIT)
 }
 fn publish_unique_limit(part: &Path, natural: &Path, limit: usize) -> Result<PathBuf> {
     publish_unique_owned(part, natural, limit, None)
 }
 fn publish_unique_owned(part: &Path, natural: &Path, limit: usize, identity: Option<receive_stage::Identity>) -> Result<PathBuf> {
-    if let Some(dir) = natural.parent() { note_partial_dir(dir); }
+    // A stage's own directory is tracked while it is live (receive_stage.rs);
+    // only an untracked part (a finalized resumable partial) registers here.
+    if identity.is_none() { if let Some(dir) = natural.parent() { note_partial_dir(dir); } }
     // One atomic attempt per candidate. Case-insensitive aliases are reported
     // by the filesystem as the same occupied candidate; never restart the scan.
     for destination in receive_candidates(natural, limit) {
@@ -6516,7 +8667,7 @@ fn blocking_fs<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-fn ensure_parent_or_flat(dest_dir: &Path, rel: &Path) -> PathBuf {
+pub(crate) fn ensure_parent_or_flat(dest_dir: &Path, rel: &Path) -> PathBuf {
     if let Some(parent) = rel.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(dest_dir.join(parent)) {
@@ -6689,23 +8840,31 @@ async fn pace_bytes(n: u64) {
     loop {
         let wait = {
             let mut g = bucket.lock().unwrap();
-            let now = Instant::now();
-            let elapsed = now.duration_since(g.1).as_secs_f64();
-            // Refill, capping banked burst at ~0.5s of rate so a paused transfer
-            // can't resume with a giant spike. CRITICAL: never below one CHUNK, or a
-            // full-chunk request at a low limit could NEVER be granted (the bucket
-            // would top out under `n` and the loop would spin forever).
-            let cap = (rate as f64 * 0.5).max(CHUNK as f64);
-            g.0 = (g.0 + elapsed * rate as f64).min(cap);
-            g.1 = now;
-            if g.0 >= n as f64 {
-                g.0 -= n as f64;
-                return;
+            match bucket_take(&mut g, Instant::now(), rate, n) {
+                None => return,
+                Some(wait) => wait,
             }
-            Duration::from_secs_f64((n as f64 - g.0) / rate as f64)
         };
         tokio::time::sleep(wait).await;
     }
+}
+
+/// The token bucket behind the upload cap, as a pure step: refill for the time
+/// since the last call, then grant `n` bytes (None) or say how long to wait.
+fn bucket_take(g: &mut (f64, Instant), now: Instant, rate: u64, n: u64) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(g.1).as_secs_f64();
+    // Refill, capping banked burst at ~0.5s of rate so a paused transfer
+    // can't resume with a giant spike. CRITICAL: never below one CHUNK, or a
+    // full-chunk request at a low limit could NEVER be granted (the bucket
+    // would top out under `n` and the loop would spin forever).
+    let cap = (rate as f64 * 0.5).max(CHUNK as f64);
+    g.0 = (g.0 + elapsed * rate as f64).min(cap);
+    g.1 = now;
+    if g.0 >= n as f64 {
+        g.0 -= n as f64;
+        return None;
+    }
+    Some(Duration::from_secs_f64((n as f64 - g.0) / rate as f64))
 }
 
 /// Parallel transfer tuning. A single QUIC stream tops out around ~40% of link
@@ -6742,20 +8901,28 @@ pub fn set_parallel_streams(on: bool) {
     PARALLEL_ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// How many streams to fan a transfer across: only a SINGLE file at least
-/// PARALLEL_MIN big, and never so many that a stream would carry under ~4 MiB.
-/// Returns 0 = "send the classic single-stream way".
 /// Streams for a send on `conn`: parallel only helps over the internet. Measured
 /// 2026-09-25 (256 MiB, 4 alternating pairs each): same-Wi-Fi Mac→Mac single stream
 /// 4.9 MB/s vs 3.3 MB/s parallel; Korea←US internet parallel 7.8 vs 6.6 MB/s. So a
-/// LAN path sends one stream (still resumable), everything else fans out.
+/// LAN path uses ONE range stream, everything else fans out.
+///
+/// The LAN answer must be 1, never 0: 0 means the classic body, which has no
+/// coverage sidecar and so CANNOT resume — a 40 GB copy over Wi-Fi restarted from
+/// zero after any blip (regression 540a837). One range stream is the same wire
+/// speed as the classic body and keeps the resumable/integrity path.
 fn parallel_streams_for(conn: &Connection, item_count: usize, total: u64) -> u64 {
-    if matches!(conn_locality(conn), crate::models::Locality::Local) {
-        return 0;
-    }
-    parallel_stream_count(item_count, total)
+    local_stream_cap(matches!(conn_locality(conn), crate::models::Locality::Local), parallel_stream_count(item_count, total))
 }
 
+/// LAN caps the fan-out at one stream but never turns a resumable send (n ≥ 1)
+/// into the classic, non-resumable body (n = 0).
+fn local_stream_cap(local: bool, n: u64) -> u64 {
+    if local { n.min(1) } else { n }
+}
+
+/// How many streams to fan a transfer across: only a SINGLE file at least
+/// PARALLEL_MIN big, and never so many that a stream would carry under ~4 MiB.
+/// Returns 0 = "send the classic single-stream way".
 fn parallel_stream_count(item_count: usize, total: u64) -> u64 {
     // Kill-switch first: off → 0 → every path sends the classic single stream, and
     // the receiver (which only forks parallel on an advertised `parallel > 0`)
@@ -6944,6 +9111,14 @@ async fn claim_partial(fp: &str, budget: Duration) -> Option<PartialOwner> {
     None
 }
 
+/// Delete a fingerprint's partial + sidecar. Caller must own `fp` (or have
+/// just claimed it): a receiver cancel ends that resume for good.
+fn discard_partial_owned(dir: &Path, fp: &str) {
+    let (part, side) = partial_paths(dir, fp);
+    let _ = std::fs::remove_file(&side);
+    let _ = std::fs::remove_file(&part);
+}
+
 fn partial_paths(dir: &Path, fp: &str) -> (PathBuf, PathBuf) {
     (
         dir.join(format!(".dropbeam-partial-{fp}.part")),
@@ -7048,33 +9223,12 @@ fn gc_stale_partials_at(dir: &Path, config: &Path) {
 static PARTIAL_DIRS_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn load_partial_dirs() -> Vec<PathBuf> {
-    let Some(path) = PARTIAL_DIRS_PATH.get() else {
-        return Vec::new();
-    };
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    // In memory, bounded and aged (T14) — see partial_dirs.rs.
+    partial_dirs::all()
 }
 
 fn note_partial_dir(dir: &Path) {
-    let Some(path) = PARTIAL_DIRS_PATH.get() else {
-        return;
-    };
-    static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
-    let _lock = REGISTRY_LOCK.lock().unwrap();
-    let mut dirs = load_partial_dirs();
-    if dirs.first().map(|d| d.as_path()) == Some(dir) {
-        return;
-    }
-    dirs.retain(|d| d != dir);
-    dirs.insert(0, dir.to_path_buf());
-    // Nested destinations remain registered for crash recovery.
-
-    if let Ok(json) = serde_json::to_vec(&dirs) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() { let _ = std::fs::rename(tmp, path); }
-    }
+    partial_dirs::note_root(dir);
 }
 
 // A process-unique prefix lets the background sweep distinguish crash litter
@@ -7285,10 +9439,21 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
     leaves: Option<integrity::Leaves>,
 ) -> Result<()> {
     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(base));
+    // The receiver finalizes the moment every byte is covered, so a file written
+    // to mid-send (same inode) must be caught BEFORE the last byte of any range
+    // leaves — else a mix of two versions lands (and passes integrity, which
+    // hashes what was read). One stamp for the whole plan; each range holds back
+    // its final chunk until its own handle still matches it.
+    let stamp = if plan.iter().any(|&(_, len)| len > 0) {
+        let m = open_for_send(path).await?.metadata().await?;
+        Some((m.modified().ok(), m.len()))
+    } else { None };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
     for &(start, len) in plan {
         let conn = conn.clone();
         let path = path.to_path_buf();
+        let name = name.clone();
         let progress = progress.clone();
         let leaves = leaves.clone();
         let source = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten();
@@ -7296,34 +9461,49 @@ async fn send_ranges_hashed<F: Fn(u64, u64)>(
             let mut hash = leaves.map(|l| integrity::Blocks::new(start, l)).transpose()?;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut uni = conn.open_uni().await?;
-            // The explicit length lets the receiver write EXACTLY its region and
-            // reject an over- or under-sending peer, instead of trusting EOF.
-            uni.write_all(&start.to_be_bytes()).await?;
-            uni.write_all(&len.to_be_bytes()).await?;
-            if len > 0 {
-                let mut f = open_for_send(&path).await?;
-                f.seek(std::io::SeekFrom::Start(start)).await?;
-                let mut remaining = len;
-                let mut buf = vec![0u8; CHUNK];
-                while remaining > 0 {
-                    let want = remaining.min(CHUNK as u64) as usize;
-                    let k = f.read(&mut buf[..want]).await?;
-                    if k == 0 {
-                        anyhow::bail!("file ended early while sending segment");
+            let body: Result<()> = async {
+                // The explicit length lets the receiver write EXACTLY its region and
+                // reject an over- or under-sending peer, instead of trusting EOF.
+                uni.write_all(&start.to_be_bytes()).await?;
+                uni.write_all(&len.to_be_bytes()).await?;
+                if len > 0 {
+                    let mut f = open_for_send(&path).await?;
+                    f.seek(std::io::SeekFrom::Start(start)).await?;
+                    let mut remaining = len;
+                    let mut buf = vec![0u8; CHUNK];
+                    while remaining > 0 {
+                        let want = remaining.min(CHUNK as u64) as usize;
+                        let k = f.read(&mut buf[..want]).await?;
+                        if k == 0 {
+                            anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
+                        }
+                        if k as u64 == remaining {
+                            let now = f.metadata().await?;
+                            anyhow::ensure!(stamp == Some((now.modified().ok(), now.len())),
+                                "\"{name}\" changed while sending — try again");
+                        }
+                        if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
+                        if pace {
+                            pace_bytes(k as u64).await;
+                        }
+                        write_payload(&mut uni, &buf[..k], |n| {
+                            progress.fetch_add(n, Ordering::Relaxed);
+                        })
+                        .await?;
+                        remaining -= k as u64;
                     }
-                    if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
-                    if pace {
-                        pace_bytes(k as u64).await;
-                    }
-                    write_payload(&mut uni, &buf[..k], |n| {
-                        progress.fetch_add(n, Ordering::Relaxed);
-                    })
-                    .await?;
-                    remaining -= k as u64;
                 }
+                if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(&path)?; }
+                if let Some(hash) = hash { hash.finish(); }
+                Ok(())
+            }.await;
+            if body.is_err() {
+                // Dropping an unfinished stream FINISHES it gracefully: the
+                // receiver would read a short segment ("ended early") instead
+                // of the reset that marks it as our own failure's echo.
+                let _ = uni.reset(1u32.into());
             }
-            if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(&path)?; }
-            if let Some(hash) = hash { hash.finish(); }
+            body?;
             uni.finish()?;
             // Keep the stream alive until the peer has acked the segment, so the
             // last bytes aren't dropped by an early reset when the task ends.
@@ -7396,7 +9576,7 @@ fn spawn_range_reader(
             match uni.read(&mut buf[..want]).await? {
                 Some(k) if k > 0 => {
                     #[cfg(test)]
-                    xfer_matrix::throttle(&part).await;
+                    xfer_matrix::throttle(&part, k).await;
                     f.write_all(&buf[..k]).await?;
                     if let Some(hash) = &mut hash { hash.update(&buf[..k]); }
                     done += k as u64;
@@ -7508,6 +9688,22 @@ async fn recv_file_resumable_hashed<F: Fn(u64, u64)>(
     let mut last_growth = Instant::now();
     let mut last_persist = Instant::now();
     let mut persist_n: u32 = 0;
+    // A resumable receive gives up on a silent link fast: the sender re-dials and
+    // resumes from the partial, which beats sitting at a frozen % for a minute
+    // (2026-10-07: a friend's transfer crawled and froze for minutes). Without a
+    // partial to resume from, a stall costs the whole file, so keep the patience.
+    let stall_budget = if resume.is_some() { RESUMABLE_RECV_STALL } else { TRANSFER_STALL };
+    // The end-game (joining the writers, the final fsync + rename of a big file)
+    // moves no wire bytes; keep the transfer's watchdog informed it's still busy.
+    let _busy = integrity::activity_hook().map(|hook| {
+        let cov = cov.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if cov.lock().map(|c| c.covered() >= total).unwrap_or(false) { hook(1); }
+            }
+        }))
+    });
     loop {
         // Stall detection watches RAW wire bytes (per-chunk), not coverage —
         // coverage now advances in FLUSH_SPAN steps, and a slow-but-alive link
@@ -7546,8 +9742,8 @@ async fn recv_file_resumable_hashed<F: Fn(u64, u64)>(
                     display_base.saturating_add(wire.min(total.saturating_sub(display_base))),
                 );
                 on_progress(shown, total);
-                if last_growth.elapsed() > TRANSFER_STALL {
-                    err = Some(anyhow::anyhow!("transfer stalled — no data for 60s"));
+                if last_growth.elapsed() > stall_budget {
+                    err = Some(anyhow::anyhow!("transfer stalled — no data for {}s", stall_budget.as_secs()));
                     break;
                 }
                 // Persist coverage every couple of seconds so even a hard kill
@@ -7621,6 +9817,16 @@ async fn recv_file_resumable_hashed<F: Fn(u64, u64)>(
         }
         Err(e)
     }
+}
+
+/// A resumable receive with no wire bytes for this long ends the attempt (the
+/// sender re-dials and resumes from the partial).
+const RESUMABLE_RECV_STALL: Duration = Duration::from_secs(20);
+
+/// Aborts a helper task when the work it accompanies ends, however it ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 fn finalize_received(finalize: FinalizeDest, part: PathBuf, resume: Option<&ResumeCtx>) -> Result<PathBuf> {
@@ -7960,6 +10166,22 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             if n == 0 {
                 anyhow::bail!("\"{name}\" changed while sending (file shrank) — try again");
             }
+            // Written to WHILE we read it (same inode, new mtime or length): what
+            // we read mixes two versions, and would still pass the integrity check
+            // (it hashes what was READ). The receiver publishes an item the moment
+            // its LAST advertised byte arrives, so the check must happen BEFORE
+            // that byte leaves: hold the final chunk back until the source is
+            // proven unchanged since we opened it, else fail (the reset below
+            // makes the receiver drop its stage — nothing mixed ever lands; the
+            // retry re-reads it whole). An atomic save (new inode) keeps our
+            // handle on the old, consistent version; an edit before we opened it
+            // simply sends the newer bytes.
+            if n as u64 == remaining {
+                if let (Some(before), Ok(after)) = (opened, f.metadata().await) {
+                    anyhow::ensure!(before == (after.modified().ok(), after.len()),
+                        "\"{name}\" changed while sending — try again");
+                }
+            }
             if let Some(hash) = &mut hash { hash.update(&buf[..n]); }
             if let Some(plain) = &mut plain { plain.update(&buf[..n]); }
             if pace {
@@ -7971,15 +10193,6 @@ async fn write_files_body_inner<F: Fn(u64, u64)>(
             })
             .await?;
             remaining -= n as u64;
-        }
-        // Written to WHILE we read it (same inode, new mtime or length): what
-        // went out mixes two versions, and would still pass the integrity check
-        // (it hashes what was READ). Fail loudly — the retry re-reads it whole.
-        // An atomic save (new inode) keeps our handle on the old, consistent
-        // version; an edit before we opened it simply sends the newer bytes.
-        if let (Some(before), Ok(after)) = (opened, f.metadata().await) {
-            anyhow::ensure!(before == (after.modified().ok(), after.len()),
-                "\"{name}\" changed while sending — try again");
         }
         if let Some(source) = LOCATION_SOURCE.try_with(Clone::clone).ok().flatten() { source.open(path)?; }
         if let Some(hash) = hash {
@@ -8093,7 +10306,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             match read {
                 Ok(Some(n)) if n > 0 => {
                     #[cfg(test)]
-                    xfer_matrix::throttle(&dest).await;
+                    xfer_matrix::throttle(&dest, n).await;
                     if let Err(e) = f.write_all(&buf[..n]).await {
                         failed = Some(e.into());
                         break;
@@ -8145,7 +10358,7 @@ async fn read_body_with_landed<F: Fn(u64, u64), L: Fn(u64, &str, &Path)>(
             stage.remove()?;
             return Err(e);
         }
-        let landed = if let Some(existing) = identical_landed(&dest, &natural) {
+        let landed = if let Some(existing) = stage.identical_landed(&natural) {
             stage.remove()?;
             existing
         } else {
@@ -8237,8 +10450,10 @@ async fn send_files_linked<F: Fn(u64, u64)>(
     location: Option<&LocationSend>,
 ) -> Result<u64> {
     let source = location.and_then(|l| l.snapshot.as_ref()).map(|s| s.source.clone());
-    let result = LOCATION_SOURCE.scope(source, integrity::ensure_scope(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
-        parallel_engaged, activity, friend_state, chat_link, location))).await;
+    // Boxed: this state machine is large in debug builds, and callers nest it
+    // inside their own (a test body on a 2 MiB thread overflowed its stack).
+    let result = LOCATION_SOURCE.scope(source, integrity::ensure_scope(Box::pin(send_files_linked_inner(conn, paths, cancel, on_progress, my_name,
+        parallel_engaged, activity, friend_state, chat_link, location)))).await;
     if result.as_ref().is_err_and(|e| e.to_string().contains("inactivity timeout")) {
         conn.close(1u32.into(), b"receiver stalled");
     }
@@ -8280,7 +10495,12 @@ async fn send_files_linked_inner<F: Fn(u64, u64)>(
     let mut header = files_header(&items, &dirs, total, n, my_name, true);
     header["integrity_v"] = serde_json::json!(1);
     if let Some(link) = chat_link {
-        header["chatTransfer"] = serde_json::to_value(link)?;
+        // Big manifests travel once, out of band (T1); `None` = an older
+        // receiver that can't take one: push without the chat link.
+        match Box::pin(chat_manifest::header_value(conn, link)).await? {
+            Some(v) => header["chatTransfer"] = v,
+            None => header["location_item_offset"] = serde_json::json!(link.item_offset),
+        }
     }
     if let Some(location) = location {
         header["locations_v"] = serde_json::json!(crate::locations::VERSION);
@@ -8801,8 +11021,9 @@ pub async fn pull_files<F: Fn(u64, u64)>(
     let (addr, token) = parse_ticket(ticket)?;
     let conn = client.connect(addr, ALPN).await.context("dial ticket")?;
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1 })).await?;
-    let header = read_frame(&mut recv).await?;
+    write_frame(&mut send, &serde_json::json!({ "kind": "pull", "token": token, "parallel": true, "integrity_v": 1, "pages_v": 1 })).await?;
+    let first = read_frame(&mut recv).await?;
+    let header = quick::read_header(&mut recv, first).await?;
     read_pull_files_negotiated(&conn, &mut send, &mut recv, &header, dest_dir,
         cancel, &AtomicBool::new(false), on_progress).await
 }
@@ -9044,13 +11265,22 @@ async fn read_files_negotiated_inner<F: Fn(u64, u64)>(
 
 /// Only used after the pull REQUEST advertised integrity. Legacy pull traffic
 /// retains its original header, body and raw trailing receipt.
+#[cfg(test)]
 async fn serve_pull_verified<F: Fn(u64, u64)>(conn: &Connection, send: &mut SendStream,
     recv: &mut RecvStream, paths: &[PathBuf], parallel: bool, cancel: &AtomicBool, progress: F) -> Result<u64> {
     let (items, dirs, total) = gather_items(paths)?;
+    serve_pull_verified_items(conn, send, recv, (&items, &dirs, total), parallel, true, cancel, progress).await
+}
+
+/// Serve a pull of a frozen item list (T13), paging a huge header (T1).
+#[allow(clippy::too_many_arguments)]
+async fn serve_pull_verified_items<F: Fn(u64, u64)>(conn: &Connection, send: &mut SendStream,
+    recv: &mut RecvStream, frozen: (&[SendItem], &[String], u64), parallel: bool, pages_ok: bool, cancel: &AtomicBool, progress: F) -> Result<u64> {
+    let (items, dirs, total) = frozen;
     let n = if parallel { parallel_streams_for(conn, items.len(), total) } else { 0 };
-    let mut header = files_header(&items, &dirs, total, n, "", false);
+    let mut header = files_header(items, dirs, total, n, "", false);
     header["integrity_v"] = serde_json::json!(1);
-    write_frame(send, &header).await?;
+    Box::pin(quick::write_header(send, &header, pages_ok)).await?;
     let reply = read_frame(recv).await?;
     anyhow::ensure!(reply["ready"] == true && integrity::enabled(&reply), "missing integrity ready");
     let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
@@ -9083,6 +11313,7 @@ async fn serve_pull_verified<F: Fn(u64, u64)>(conn: &Connection, send: &mut Send
 /// only when the puller said it understands it), then negotiate exactly like a
 /// friend send — parallel + resume when the receiver replies ready, classic
 /// single-stream otherwise.
+#[cfg(test)]
 async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     conn: &Connection,
     send: &mut SendStream,
@@ -9093,6 +11324,21 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     on_progress: F,
 ) -> Result<u64> {
     let (items, dirs, total) = gather_items(paths)?;
+    serve_pull_negotiated_items(conn, send, recv, (&items, &dirs, total), allow_parallel, true, cancel, on_progress).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_pull_negotiated_items<F: Fn(u64, u64)>(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    frozen: (&[SendItem], &[String], u64),
+    allow_parallel: bool,
+    pages_ok: bool,
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<u64> {
+    let (items, dirs, total) = frozen;
     let n = if allow_parallel {
         parallel_streams_for(conn, items.len(), total)
     } else {
@@ -9100,7 +11346,7 @@ async fn serve_pull_negotiated<F: Fn(u64, u64)>(
     };
     // Internet Quick Send respects the upload cap; LAN stays full speed.
     let pace = !matches!(conn_locality(conn), crate::models::Locality::Local);
-    write_frame(send, &files_header(&items, &dirs, total, n, "", false)).await?;
+    Box::pin(quick::write_header(send, &files_header(items, dirs, total, n, "", false), pages_ok)).await?;
     if n > 0 {
         let reply = match tokio::time::timeout(Duration::from_secs(6), read_frame(recv)).await {
             Ok(Ok(v)) => Some(v),
@@ -9136,7 +11382,7 @@ pub async fn serve_pull<F: Fn(u64, u64)>(
     Ok(sent)
 }
 
-fn location_config(state: &IrohState) -> Result<PathBuf> {
+pub(crate) fn location_config(state: &IrohState) -> Result<PathBuf> {
     state.app.get().and_then(|app| app.try_state::<Arc<crate::AppState>>())
         .map(|st| st.config_dir.clone()).or_else(|| state.location_config.get().cloned())
         .context("Locations are not ready")
@@ -9656,7 +11902,7 @@ mod tests {
         assert!(friend_file_landed(&dir, "file", 3, 1_700_000_000));
         assert!(!friend_file_landed(&dir, "file", 4, 1_700_000_000));
         assert!(!friend_file_landed(&dir, "file", 3, 1_700_000_001));
-        assert!(friend_file_landed(&dir, "file", 3, 0));
+        assert!(!friend_file_landed(&dir, "file", 3, 0), "an unknown mtime is not a wildcard");
         assert!(!friend_file_landed(&dir, "missing", 0, 0));
         std::fs::create_dir(dir.join("folder")).unwrap();
         let size = std::fs::metadata(dir.join("folder")).unwrap().len();
@@ -9955,14 +12201,16 @@ mod tests {
     fn unique_in_parts_keeps_colon_names_and_subfolders() {
         use std::path::Path;
         let dir = Path::new("/dl");
-        #[cfg(not(windows))]
+        // (Windows can't hold the colon: it lands mangled, never as "file".)
         assert_eq!(
-            unique_in_parts(dir, &receive_rel("Meeting 9:23.mov").to_string_lossy()),
-            (dir.to_path_buf(), "Meeting 9:23.mov".to_string()),
+            unique_in_parts(dir, &receive_rel_wire("Meeting 9:23.mov")),
+            (dir.to_path_buf(), if cfg!(windows) { "Meeting 9-23.mov" } else { "Meeting 9:23.mov" }.to_string()),
             "a big (parallel) colon file must not land as a bare 'file'"
         );
+        // Callers hand it the `/`-joined wire form (a Windows `\\`-joined
+        // receive_rel would read as one name containing backslashes).
         assert_eq!(
-            unique_in_parts(dir, &receive_rel("Project/clips/a.mp4").to_string_lossy()),
+            unique_in_parts(dir, &receive_rel_wire("Project/clips/a.mp4")),
             (dir.join("Project/clips"), "a.mp4".to_string())
         );
         // Idempotent on already-mapped names; traversal still can't escape.
@@ -9987,6 +12235,111 @@ mod tests {
         assert_eq!(receive_rel("..."), Path::new("file"));
     }
 
+    /// D1: the final answer of a folder push is decoded strictly — only a real
+    /// receipt or a legacy "ok" is an answer; empty/garbage is NOT delivery.
+    #[test]
+    fn folder_ack_parsing_never_treats_silence_as_delivery() {
+        assert_eq!(parse_folder_ack(b""), FolderAck::Nothing);
+        assert_eq!(parse_folder_ack(b"partial"), FolderAck::Nothing);
+        assert_eq!(parse_folder_ack(b"nok"), FolderAck::Nothing);
+        assert_eq!(parse_folder_ack(b"ok"), FolderAck::LegacyOk);
+        let r = br#"{"kind":"receipt","v":1,"n":1,"landed":[0],"kept":[],"failed":[]}"#;
+        assert!(matches!(parse_folder_ack(r), FolderAck::Receipt(_)));
+        // A framed refusal (length-prefixed), as refuse_folder_push writes it.
+        let body = br#"{"kind":"refused","reason":"paused"}"#;
+        let mut framed = (body.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(body);
+        assert_eq!(parse_folder_ack(&framed), FolderAck::Refused("paused".into()));
+    }
+
+    #[test]
+    fn receipt_maps_every_item_and_defaults_to_failed() {
+        let items = vec![PathBuf::from("/f/a"), PathBuf::from("/f/b"), PathBuf::from("/f/c"), PathBuf::from("/f/d")];
+        let r = serde_json::json!({"kind":"receipt","v":1,"n":4,"landed":[0],"kept":[1],"failed":[2],"reasons":{"1":"name"}});
+        let out = folder_report_from_receipt(&r, &items);
+        assert_eq!(out[0].1, FolderItemOutcome::Landed);
+        assert_eq!(out[1].1, FolderItemOutcome::Kept("name".into()));
+        assert_eq!(out[2].1, FolderItemOutcome::Failed);
+        assert_eq!(out[3].1, FolderItemOutcome::Failed, "unaccounted = failed, never landed");
+        // A receipt for a different batch size is not trusted at all.
+        let wrong = serde_json::json!({"kind":"receipt","v":1,"n":3,"landed":[0,1,2,3]});
+        assert!(folder_report_from_receipt(&wrong, &items).iter().all(|(_, o)| *o == FolderItemOutcome::Failed));
+    }
+
+    #[test]
+    fn receiver_receipt_reports_exactly_what_landed() {
+        let header = serde_json::json!({"kind":"folder-files","items":[
+            {"name":"a.txt","size":1},{"name":"sub/b.txt","size":1},{"name":".dropbeam-history/x","size":1},
+            {"name":"c.txt","size":1},{"name":".secret","size":1}]});
+        let mut outcomes = std::collections::HashMap::new();
+        outcomes.insert("a.txt".to_string(), FolderItemOutcome::Landed);
+        outcomes.insert("sub/b.txt".to_string(), FolderItemOutcome::Kept("conflict".into()));
+        let r = folder_receipt(&header, &outcomes, true);
+        assert_eq!(r["n"], 5);
+        assert_eq!(r["landed"], serde_json::json!([0]));
+        assert_eq!(r["kept"], serde_json::json!([1, 2, 4]));
+        assert_eq!(r["failed"], serde_json::json!([3]), "never ingested = failed");
+        assert_eq!(r["reasons"]["2"], "control");
+        assert_eq!(r["reasons"]["4"], "hidden");
+    }
+
+    /// P1-b: case/NFC twins in one batch are never staged into one file and never
+    /// reported landed (the sender would delete bytes that exist nowhere).
+    #[test]
+    fn twin_names_in_one_batch_are_kept_not_landed() {
+        let header = serde_json::json!({"kind":"folder-files","items":[
+            {"name":"caf\u{e9}.txt","size":1},{"name":"cafe\u{301}.txt","size":1},
+            {"name":"a.txt","size":1},{"name":"A.txt","size":1},{"name":"b.txt","size":1}]});
+        let items = header["items"].as_array().unwrap().clone();
+        let dups = folder_dup_items(&items);
+        assert!(dups.contains(&0) && dups.contains(&1), "NFC/NFD twins everywhere");
+        assert_eq!(dups.contains(&2) && dups.contains(&3), cfg!(any(target_os = "macos", target_os = "ios", windows)));
+        assert!(!dups.contains(&4));
+        let mut outcomes = std::collections::HashMap::new();
+        for k in ["café.txt", "a.txt", "A.txt", "b.txt"] {
+            outcomes.insert(k.to_string(), FolderItemOutcome::Landed);
+        }
+        let r = folder_receipt(&header, &outcomes, true);
+        let landed: Vec<u64> = r["landed"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        assert!(!landed.contains(&0) && !landed.contains(&1));
+        assert!(landed.contains(&4));
+    }
+
+    /// D8: names Windows can't hold are recognised (so a Windows receiver refuses
+    /// them instead of landing a mangled copy that loops + duplicates).
+    #[test]
+    fn windows_unrepresentable_names_are_detected() {
+        for n in ["a:b.txt", "sub/CON", "trailing.", "space ", "q?.txt", "back\\slash.txt", "dir:x/a.txt"] {
+            assert!(name_unrepresentable_on_windows(n), "{n}");
+        }
+        for n in ["a.txt", "sub/Résumé.pdf", "con-tract.txt", ".hidden", "CONSOLE.log"] {
+            assert!(!name_unrepresentable_on_windows(n), "{n}");
+        }
+        // Non-strict (older sender) keeps the legacy behaviour; strict refuses
+        // hidden/control paths with a reason.
+        assert!(folder_item_rel(".secret", false).is_ok());
+        assert_eq!(folder_item_rel(".secret", true), Err("hidden"));
+        assert_eq!(folder_item_rel(".dropbeam-history/x", true), Err("control"));
+    }
+
+    /// D9: a synced folder uploads same-size EDITS and never overwrites a NEWER
+    /// host copy; an ordinary upload keeps the size-only rule.
+    #[test]
+    fn synced_folder_compares_mtime_not_just_size() {
+        // Ordinary upload: same size = already landed.
+        assert!(location_item_current(Some((false, 10, Some(1))), 10, 999, false));
+        // Synced folder: same size, ours newer → upload (an edit).
+        assert!(!location_item_current(Some((false, 10, Some(100))), 10, 200, true));
+        // Host copy newer → keep it, never overwrite with our older one.
+        assert!(location_item_current(Some((false, 99, Some(300))), 10, 200, true));
+        // Same file (FAT 2-second rounding) → current.
+        assert!(location_item_current(Some((false, 10, Some(201))), 10, 200, true));
+        // Older host without mtime → size rule.
+        assert!(location_item_current(Some((false, 10, None)), 10, 200, true));
+        assert!(!location_item_current(None, 10, 200, true));
+        assert!(!location_item_current(Some((true, 0, Some(0))), 10, 200, true));
+    }
+
     #[test]
     fn folder_receive_rel_preserves_names_but_refuses_control_paths() {
         use std::path::Path;
@@ -9994,11 +12347,10 @@ mod tests {
         // leading dot (stays hidden) and a colon (kept on macOS).
         assert_eq!(folder_receive_rel("sub/a.txt").as_deref(), Some(Path::new("sub/a.txt")));
         assert_eq!(folder_receive_rel(".hidden.bin").as_deref(), Some(Path::new(".hidden.bin")));
-        #[cfg(not(windows))]
         assert_eq!(
             folder_receive_rel("report 7:3.pdf").as_deref(),
-            Some(Path::new("report 7:3.pdf")),
-            "colon preserved on macOS — no corruption to 'file'"
+            Some(Path::new(if cfg!(windows) { "report 7-3.pdf" } else { "report 7:3.pdf" })),
+            "colon preserved on macOS (mangled to a real name on Windows) — no corruption to 'file'"
         );
         // Traversal still blocked.
         assert_eq!(folder_receive_rel("../../etc/passwd").as_deref(), Some(Path::new("etc/passwd")));
@@ -10014,6 +12366,8 @@ mod tests {
         assert!(is_control_rel(".dropbeam-history/data/abc"));
         assert!(is_control_rel("dropbeam-history/index.json")); // dotless leaked form
         assert!(is_control_rel("a/.dropbeam-incoming"));
+        assert!(is_control_rel("dropbeam-history\\index.json")); // a Windows-joined rel
+        assert!(is_control_rel("a\\.dropbeam-incoming"));
         assert!(!is_control_rel("normal/file.txt"));
         assert!(!is_control_rel("my-history/notes.txt")); // similar name, not ours
     }
@@ -10122,20 +12476,27 @@ mod tests {
 
     #[tokio::test]
     async fn upload_limiter_throttles_and_never_stalls() {
+        // Deterministic (simulated clock): the real bucket is process-global and
+        // other tests' sends drew from it, which made the wall-clock version flaky.
         // 16 Mbps = 2 MB/s. A 1 MB chunk must be grantable (cap >= CHUNK), and
-        // pushing several chunks must take roughly bytes/rate — proving the cap
-        // both throttles AND can never deadlock a full-chunk request at a low rate.
-        let _exclusive = super::xfer_matrix::PACE_GATE.write().await;
-        set_upload_limit_mbps(16);
-        let t0 = Instant::now();
+        // pushing 4 chunks must take roughly bytes/rate — proving the cap both
+        // throttles AND can never deadlock a full-chunk request at a low rate.
+        let rate = 16 * 1_000_000 / 8;
+        let start = Instant::now();
+        let mut bucket = (0.0, start);
+        let mut now = start + Duration::from_secs(10); // a long idle banks only the cap
+        let t0 = now;
         for _ in 0..4 {
-            pace_bytes(CHUNK as u64).await; // 4 × 1 MB = 4 MB
+            let mut spins = 0;
+            while let Some(wait) = bucket_take(&mut bucket, now, rate, CHUNK as u64) {
+                now += wait;
+                spins += 1;
+                assert!(spins < 3, "a full chunk must be granted after one wait");
+            }
         }
-        let secs = t0.elapsed().as_secs_f64();
-        set_upload_limit_mbps(0); // reset so other tests are unaffected
-        // 4 MB at 2 MB/s ≈ 2s, minus the initial ~1 MB burst → expect ~1.5s+.
-        assert!(secs >= 1.3, "limiter should throttle 4 MB @ 2 MB/s, took {secs:.2}s");
-        assert!(secs < 4.0, "but not stall: {secs:.2}s");
+        let secs = now.duration_since(t0).as_secs_f64();
+        // 4 MB at 2 MB/s minus the ~1 MB banked burst ≈ 1.5 s.
+        assert!((1.3..2.0).contains(&secs), "limiter should throttle 4 MB @ 2 MB/s, took {secs:.2}s");
         // And unlimited (0) must be an instant no-op.
         let t1 = Instant::now();
         pace_bytes(CHUNK as u64).await;
@@ -10579,6 +12940,10 @@ mod tests {
                 total: data.len() as u64,
                 cancel: Arc::new(AtomicBool::new(false)),
                 gen: Arc::new(AtomicU64::new(0)),
+                items: Arc::new(gather_items(std::slice::from_ref(&src)).unwrap().0),
+                dirs: Arc::default(),
+                expires_at: Instant::now() + Duration::from_secs(3600),
+                puller: Arc::default(),
             },
         );
         let ticket = make_ticket(&server, &token).unwrap();
@@ -10746,43 +13111,76 @@ mod locality_evidence_tests {
 
 #[cfg(test)]
 mod path_preference_tests {
-    use super::{path_preference_key, should_switch_path};
+    use super::{is_overlay_routed, path_preference_key, should_switch_path, PATH_SWITCH_MIN_DWELL};
     use std::time::Duration;
+
+    const SETTLED: Duration = Duration::from_secs(3600);
+    fn ms(n: u64) -> Duration { Duration::from_millis(n) }
 
     #[test]
     fn direct_beats_faster_relay_and_relay_recovers_when_direct_disappears() {
         let direct = path_preference_key(false, false, false, Duration::from_secs(1));
-        let relay = path_preference_key(true, false, false, Duration::from_millis(1));
+        let relay = path_preference_key(true, false, false, ms(1));
         assert!(direct < relay);
-        assert!(should_switch_path(Some(relay), direct));
+        // A better class switches at once, even right after the last switch.
+        assert!(should_switch_path(Some(relay), direct, Duration::ZERO));
         // When the direct path is abandoned it is absent from ctx.paths(),
         // so the current key is None and the remaining relay must be selected.
-        assert!(should_switch_path(None, relay));
+        assert!(should_switch_path(None, relay, Duration::ZERO));
     }
 
     #[test]
-    fn direct_paths_keep_ipv6_bias_and_five_ms_hysteresis() {
-        let v4 = path_preference_key(false, false, false, Duration::from_millis(20));
-        let v6 = path_preference_key(false, false, true, Duration::from_millis(22));
-        assert!(v6 < v4);
-        assert!(!should_switch_path(Some(v4), v6));
-        assert!(!should_switch_path(Some(v4), path_preference_key(false, false, false, Duration::from_millis(16))));
-        assert!(should_switch_path(Some(v4), path_preference_key(false, false, false, Duration::from_millis(15))));
+    fn two_healthy_direct_paths_never_trade_places() {
+        // The 2026-10-07 flap: public ~45 ms vs a Tailscale-routed LAN address
+        // ~42 ms. Neither may displace the other, however long it has been.
+        let public = path_preference_key(false, false, false, ms(45));
+        let routed = path_preference_key(false, false, false, ms(42));
+        assert!(!should_switch_path(Some(public), routed, SETTLED));
+        assert!(!should_switch_path(Some(routed), public, SETTLED));
+        // The old 5 ms rule's switch case no longer switches.
+        let v4 = path_preference_key(false, false, false, ms(20));
+        assert!(!should_switch_path(Some(v4), path_preference_key(false, false, false, ms(15)), SETTLED));
+        // IPv6 keeps its small ranking bias.
+        assert!(path_preference_key(false, false, true, ms(22)) < v4);
     }
+
+    #[test]
+    fn a_decisively_faster_path_wins_only_after_the_dwell() {
+        let slow = path_preference_key(false, false, false, ms(120));
+        let fast = path_preference_key(false, false, false, ms(30));
+        assert!(!should_switch_path(Some(slow), fast, PATH_SWITCH_MIN_DWELL - ms(1)));
+        assert!(should_switch_path(Some(slow), fast, PATH_SWITCH_MIN_DWELL));
+        // Twice as fast but under 20 ms of gain: not worth a restart.
+        let a = path_preference_key(false, false, false, ms(30));
+        let b = path_preference_key(false, false, false, ms(14));
+        assert!(!should_switch_path(Some(a), b, SETTLED));
+    }
+
     #[test]
     fn a_lan_path_beats_a_faster_public_path_and_relay_stays_last() {
-        let lan = path_preference_key(false, true, false, Duration::from_millis(60));
-        let public = path_preference_key(false, false, false, Duration::from_millis(15));
-        let relay = path_preference_key(true, true, false, Duration::from_millis(1));
+        let lan = path_preference_key(false, true, false, ms(60));
+        let public = path_preference_key(false, false, false, ms(15));
+        let relay = path_preference_key(true, true, false, ms(1));
         assert!(lan < public, "a local-network path wins even when the hairpin samples faster");
         assert!(public < relay);
-        assert!(should_switch_path(Some(public), lan));
-        assert!(!should_switch_path(Some(lan), public));
-        // Same class: only a clear (>5 ms) RTT gain switches.
-        let lan2 = path_preference_key(false, true, false, Duration::from_millis(57));
-        assert!(!should_switch_path(Some(lan), lan2));
+        assert!(should_switch_path(Some(public), lan, Duration::ZERO));
+        assert!(!should_switch_path(Some(lan), public, SETTLED));
+        let lan2 = path_preference_key(false, true, false, ms(57));
+        assert!(!should_switch_path(Some(lan), lan2, SETTLED));
     }
 
+    #[test]
+    fn overlay_routed_paths_are_recognised() {
+        let ts: std::net::IpAddr = "100.85.220.95".parse().unwrap();
+        let lan_far: std::net::IpAddr = "192.168.1.102".parse().unwrap();
+        let ts_peer: std::net::IpAddr = "100.107.127.115".parse().unwrap();
+        let home: std::net::IpAddr = "192.168.0.119".parse().unwrap();
+        assert!(is_overlay_routed(Some(ts), lan_far, false), "our Tailscale address → someone's LAN = subnet route");
+        assert!(!is_overlay_routed(Some(ts), ts_peer, false), "Tailscale peer to Tailscale peer is a real direct path");
+        assert!(!is_overlay_routed(Some(home), lan_far, false));
+        assert!(!is_overlay_routed(None, lan_far, false));
+        assert!(!is_overlay_routed(Some(ts), lan_far, true));
+    }
 }
 
 #[cfg(test)]
@@ -11316,6 +13714,86 @@ mod loopback_tests {
         client.close().await; server.close().await; std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// D1 / D6 end-to-end over a real loopback connection: a refusal, a missing
+    /// answer, a legacy "ok" and a per-item receipt are each decoded correctly by
+    /// the REAL folder sender — and only a receipt's `landed` items are delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn folder_push_answers_over_loopback() {
+        let dir = scratch("folder-answers");
+        let root = dir.join("Shared");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"bravo").unwrap();
+        let paths = vec![root.join("a.txt"), root.join("sub/b.txt")];
+        let root_s = root.to_string_lossy().to_string();
+        for scenario in ["refuse", "empty", "legacy", "receipt"] {
+            let server = loopback_endpoint(true).await;
+            let client = loopback_endpoint(false).await;
+            let srv = server.clone();
+            let stage = dir.join(format!("stage-{scenario}"));
+            let receiver = tokio::spawn(async move {
+                let conn = srv.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let header = read_frame(&mut recv).await.unwrap();
+                assert_eq!(header["receipt"], 1, "new senders ask for a receipt");
+                assert!(header["items"][0]["ver"].as_u64().is_some(), "items carry their placement version");
+                match scenario {
+                    "refuse" => {
+                        refuse_folder_push(&mut send, &mut recv, "paused", true).await.unwrap();
+                    }
+                    other => {
+                        let staged = read_folder_body(&mut recv, &header, &stage, &AtomicBool::new(false), |_, _| {}).await.unwrap();
+                        assert_eq!(staged.len(), 2);
+                        match other {
+                            "empty" => {}
+                            "legacy" => send.write_all(b"ok").await.unwrap(),
+                            _ => {
+                                let mut outcomes = std::collections::HashMap::new();
+                                outcomes.insert("a.txt".to_string(), FolderItemOutcome::Landed);
+                                outcomes.insert("sub/b.txt".to_string(), FolderItemOutcome::Kept("conflict".into()));
+                                let receipt = folder_receipt(&header, &outcomes, true);
+                                send.write_all(&serde_json::to_vec(&receipt).unwrap()).await.unwrap();
+                            }
+                        }
+                        send.finish().unwrap();
+                        let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+                    }
+                }
+                conn
+            });
+            let conn = client.connect(server.addr(), ALPN).await.unwrap();
+            let res = tokio::time::timeout(Duration::from_secs(30),
+                send_folder_on_conn(&conn, "pair-x", &root_s, &paths, &AtomicBool::new(false), |_, _| {})).await.unwrap();
+            let _keep = receiver.await.unwrap();
+            match scenario {
+                "refuse" => {
+                    let e = res.unwrap_err();
+                    let r = e.downcast_ref::<FolderRefused>().unwrap_or_else(|| panic!("expected a refusal, got {e:#}"));
+                    assert_eq!(r.0, "paused");
+                }
+                "empty" => {
+                    let e = res.unwrap_err();
+                    assert!(e.downcast_ref::<FolderRefused>().is_none());
+                    assert!(format!("{e:#}").contains("did not confirm"), "{e:#}");
+                }
+                "legacy" => {
+                    let r = res.unwrap();
+                    assert!(r.legacy, "bare ok = legacy (never trusted for auto-delete)");
+                    assert!(r.items.iter().all(|(_, o)| *o == FolderItemOutcome::Landed));
+                }
+                _ => {
+                    let r = res.unwrap();
+                    assert!(!r.legacy);
+                    assert_eq!(r.items[0], (paths[0].clone(), FolderItemOutcome::Landed));
+                    assert_eq!(r.items[1], (paths[1].clone(), FolderItemOutcome::Kept("conflict".into())));
+                }
+            }
+            client.close().await;
+            server.close().await;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A unique scratch dir under the OS temp dir, namespaced by pid + a label so
     /// parallel test binaries never collide. Removed by the caller at the end.
     fn scratch(label: &str) -> PathBuf {
@@ -11349,7 +13827,7 @@ mod loopback_tests {
     /// any `address_lookup`, so nothing is ever published or resolved off-box.
     async fn loopback_endpoint(accept: bool) -> Endpoint {
         let mut b = Endpoint::builder(presets::Minimal)
-            .path_selector(Arc::new(super::DirectPathSelector))
+            .path_selector(Arc::new(super::DirectPathSelector::default()))
             .relay_mode(RelayMode::Disabled)
             .bind_addr("127.0.0.1:0")
             .expect("127.0.0.1:0 is a valid bind address");
@@ -12229,6 +14707,20 @@ mod loopback_tests {
         }
     }
 
+    /// A receiver's own Cancel reaches the sender as a deliberate stop by the
+    /// other side ("Canceled by Mong"), not a bare "Canceled" (live QA 0.53.0).
+    #[test]
+    fn receiver_cancel_reads_as_peer_stop_on_the_sender() {
+        let text = receiver_error_text(&anyhow::anyhow!("canceled"));
+        assert_eq!(text, errors::PEER_CANCELED);
+        let sender_side = format!("receiver: {text}");
+        assert_eq!(errors::peer_stop_detail(&sender_side, Some("Mong")).as_deref(), Some("Canceled by Mong"));
+        let wrapped = anyhow::anyhow!("canceled").context("landing");
+        assert_eq!(receiver_error_text(&wrapped), errors::PEER_CANCELED);
+        // Other receiver errors pass through untouched.
+        assert!(!receiver_error_text(&anyhow::anyhow!("boom")).contains("canceled"));
+    }
+
     #[tokio::test]
     async fn loopback_receiver_setup_error_reaches_sender() {
         let server = loopback_endpoint(true).await;
@@ -12342,7 +14834,10 @@ mod loopback_tests {
                             let written = std::fs::metadata(&disk_path).map(|m| m.len()).unwrap_or_else(|_| {
                                 std::fs::read_dir(disk_path.parent().unwrap()).unwrap().flatten()
                                     .filter(|e| e.file_name().to_string_lossy().starts_with(".dropbeam-recv-"))
-                                    .map(|e| e.metadata().unwrap().len()).sum()
+                                    // A fresh stat, not the dir entry's: Windows
+                                    // directory listings report a file's size as of
+                                    // its last close, not the bytes written so far.
+                                    .map(|e| std::fs::metadata(e.path()).unwrap().len()).sum()
                             });
                             assert!(written >= done, "classic progress includes unflushed buffer bytes");
                         }
@@ -13265,7 +15760,7 @@ mod chat_transfer_link_tests {
         }})
     }
     fn batch(link: &crate::models::ChatTransferLink) -> ChatBatch {
-        ChatBatch { link: link.clone(), landed: Default::default(), touched: Instant::now(),
+        ChatBatch { reconnect_since: None, link: link.clone(), landed: Default::default(), touched: Instant::now(),
             snapshot: TransferUpdate::new("push".into(), Direction::Receive, vec![]) }
     }
     #[test]
@@ -13326,6 +15821,56 @@ mod chat_transfer_link_tests {
         assert!(b.observe(&link, &u).is_none());
         let mut retry = link.clone(); retry.attempt += 1;
         assert!(b.observe(&retry, &u).is_some());
+    }
+
+    #[test]
+    fn a_stalled_started_batch_reconnects_and_fails_only_after_the_give_up() {
+        let link = incoming_chat_link(&header(), "alice").unwrap();
+        let mut b = batch(&link);
+        b.landed.insert(chat_item_key(0, "a"), "/saved/a".into());
+        let u = completed_update("push", Direction::Receive, vec!["a".into()], 40);
+        b.observe(&link, &u).unwrap();
+        let t0 = b.touched;
+        assert!(matches!(b.watch(t0 + BATCH_STALL - Duration::from_millis(1)), BatchWatch::Wait(_)));
+        let BatchWatch::Reconnect(update) = b.watch(t0 + BATCH_STALL) else { panic!("a quiet started batch must reconnect, not fail") };
+        assert_eq!(update.state, TransferState::Connecting);
+        assert_eq!(update.detail.as_deref(), Some(RECONNECTING));
+        assert_eq!(update.chat_transfer.unwrap().batch_state, Some(TransferState::Connecting));
+        // While waiting for the sender to come back: no second reconnect, no failure.
+        let since = t0 + BATCH_STALL;
+        assert!(matches!(b.watch(since + BATCH_GIVE_UP - Duration::from_millis(1)), BatchWatch::Wait(_)));
+        // The sender's next attempt clears the reconnect state and revives the card.
+        let mut retry = link.clone(); retry.attempt += 1;
+        let mut moving = u.clone(); moving.state = TransferState::Transferring;
+        assert_eq!(b.observe(&retry, &moving).unwrap().batch_state, Some(TransferState::Transferring));
+        assert!(b.reconnect_since.is_none());
+        // If the sender never returns, the card fails — keeping what landed.
+        let t1 = b.touched;
+        assert!(matches!(b.watch(t1 + BATCH_STALL), BatchWatch::Reconnect(_)));
+        let BatchWatch::Fail(failed, started) = b.watch(t1 + BATCH_STALL + BATCH_GIVE_UP) else { panic!("must give up eventually") };
+        assert!(started);
+        assert_eq!(failed.state, TransferState::Failed);
+        assert_eq!(failed.chat_transfer.unwrap().completed_paths[&chat_item_key(0, "a")], "/saved/a");
+        assert!(matches!(b.watch(t1 + BATCH_GIVE_UP * 3), BatchWatch::Done));
+    }
+
+    #[test]
+    fn an_unstarted_batch_keeps_the_old_expiry_and_a_drop_mid_transfer_reads_reconnecting() {
+        let link = incoming_chat_link(&header(), "alice").unwrap();
+        let mut b = batch(&link);
+        let t0 = b.touched;
+        assert!(b.interrupted(t0).is_none(), "nothing moved yet: a failure is a failure");
+        assert!(matches!(b.watch(t0 + BATCH_STALL), BatchWatch::Wait(_)), "waiting on the accept dialog is not a stall");
+        let BatchWatch::Fail(_, started) = b.watch(t0 + TRANSFER_STALL) else { panic!("unstarted batches still expire") };
+        assert!(!started);
+
+        let mut b = batch(&link);
+        b.snapshot.bytes_done = 5;
+        let update = b.interrupted(Instant::now()).expect("a started batch resumes");
+        assert_eq!(update.detail.as_deref(), Some(RECONNECTING));
+        assert!(b.reconnect_since.is_some());
+        b.link.batch_state = Some(TransferState::Completed);
+        assert!(b.interrupted(Instant::now()).is_none());
     }
 
     #[test]
@@ -13413,6 +15958,14 @@ mod chat_transfer_link_tests {
 #[cfg(test)]
 mod block_loopback_tests {
     use super::*;
+
+    #[test]
+    fn folder_streams_are_blockable() {
+        for k in ["folder-files", "folder-ctrl", "folder-reconcile", "folder-hello", "folder-invite", "chat", "files"] {
+            assert!(is_blockable_kind(k), "{k}");
+        }
+        assert!(!is_blockable_kind("pull") && !is_blockable_kind("account-sync"));
+    }
 
     async fn ep() -> Endpoint {
         Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
@@ -13969,7 +16522,7 @@ mod integrity_round2_tests {
             "itemOffset":0,"offset":0,"total":size*2,"last":true})).unwrap()
     }
     fn batch(link: &crate::models::ChatTransferLink) -> ChatBatch {
-        ChatBatch { link: link.clone(), landed: Default::default(), touched: Instant::now(),
+        ChatBatch { reconnect_since: None, link: link.clone(), landed: Default::default(), touched: Instant::now(),
             snapshot: TransferUpdate::new("push".into(), Direction::Receive, vec![]) }
     }
 

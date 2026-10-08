@@ -1,45 +1,83 @@
 name: build-check
 
-# Compile-checks the Rust backend (incl. the new iroh transport) on macOS AND
-# Windows for every push to main — so cross-platform build breaks (e.g. a
-# Windows-only dependency issue) surface immediately, without cutting a release.
+# Every push to main/ios and every PR: the frontend type-checks, builds and is
+# linted, and the Rust backend is compiled, unit-tested and clippy'd on macOS,
+# Windows AND Linux — so a platform-only break surfaces before a release.
 on:
   push:
-    branches: [main]
+    branches: [main, ios]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: build-check-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
+  frontend:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # `npm run build` = `tsc -b && vite build` (type-check + production bundle).
+      - name: Type-check + build
+        run: npm run build
+
+      - name: ESLint
+        run: npx eslint .
+
+  rust:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest, windows-latest]
+        # macos-15, not macos-latest — see release.yml (macOS 26 image hdiutil bug).
+        platform: [macos-15, windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+          cache: npm
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      # Same version as rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
 
-      - name: Cache Rust
-        uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
 
-      - name: Install frontend dependencies
-        run: npm install
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+
+      - run: npm ci
 
       # generate_context! embeds the built frontend, so dist must exist.
       - name: Build frontend
         run: npm run build
 
-      - name: Cargo check (lib + tests)
-        run: cargo check --manifest-path src-tauri/Cargo.toml --lib --tests
+      # Single-threaded: several engine tests bind real sockets / share globals.
+      - name: Unit tests
+        working-directory: src-tauri
+        run: cargo test --lib -- --test-threads=1
+
+      # Warnings are listed, errors fail the job.
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets

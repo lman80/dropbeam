@@ -1,0 +1,95 @@
+// Transfer Server data as the native iOS shell sees it. Pure (no Tauri import) so
+// the normalization is testable in node; nativeBridge.ts does the I/O.
+import type { PendingFile, UsableServer } from './transferServer'
+import type { BridgeArgs } from './nativeBridgeProtocol'
+
+const OFFERS = new Set(['new', 'share', 'seen', 'dismissed', ''])
+const obj = (v: unknown): Record<string, unknown> | null => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null
+const str = (v: unknown, fallback = '') => typeof v === 'string' ? v : fallback
+const num = (v: unknown) => typeof v === 'number' && Number.isFinite(v) ? v : 0
+
+/** Servers this device may use: malformed rows dropped, flags coerced to booleans. */
+export function nativeServerList(list: unknown): UsableServer[] {
+  if (!Array.isArray(list)) return []
+  const seen = new Set<string>()
+  return list.flatMap((raw) => {
+    const s = obj(raw)
+    const eid = s && str(s.eid).trim()
+    if (!s || !eid || seen.has(eid)) return []
+    seen.add(eid)
+    const offer = str(s.offer)
+    return [{
+      eid,
+      name: str(s.name).trim() || 'Transfer Server',
+      own: s.own === true,
+      member: s.member === true,
+      through: s.through === true,
+      useIt: s.useIt === true,
+      holdForMe: s.useIt === true && s.holdForMe === true,
+      offer: OFFERS.has(offer) ? offer : '',
+      revoked: s.revoked === true,
+      paused: s.paused === true,
+      learnedMs: num(s.learnedMs),
+      owner: s.owner === true,
+      shareFriends: s.owner === true && s.shareFriends === true,
+      access: str(s.access),
+      via: Array.isArray(s.via) ? s.via.filter((v): v is string => typeof v === 'string').slice(0, 8) : [],
+      ...(str(s.viaPeer) ? { viaPeer: str(s.viaPeer) } : {}),
+      ...(str(s.viaName).trim() ? { viaName: str(s.viaName).trim().slice(0, 64) } : {}),
+    }]
+  })
+}
+
+/** Held files waiting for the user's OK; only rows with a link id are actionable. */
+export function nativePendingFiles(list: unknown): PendingFile[] {
+  if (!Array.isArray(list)) return []
+  return list.flatMap((raw) => {
+    const p = obj(raw)
+    const linkId = p && str(p.linkId)
+    if (!p || !linkId) return []
+    return [{
+      linkId,
+      peerId: str(p.peerId),
+      server: str(p.server),
+      serverName: str(p.serverName).trim() || 'the Transfer Server',
+      itemId: str(p.itemId),
+      bytes: num(p.bytes),
+      names: Array.isArray(p.names) ? p.names.filter((n): n is string => typeof n === 'string') : [],
+      at: num(p.at),
+    }]
+  })
+}
+
+export interface ServerPrefs { useIt?: boolean; holdForMe?: boolean; offer?: string; shareFriends?: boolean }
+
+/** Validate a native `serverPrefs` call. Turning a server off also stops holding. */
+export function serverPrefsArgs(a: BridgeArgs): { eid: string; prefs: ServerPrefs } {
+  const eid = typeof a.eid === 'string' ? a.eid.trim() : ''
+  if (!eid) throw new Error('Missing eid')
+  const prefs: ServerPrefs = {}
+  for (const key of ['useIt', 'holdForMe', 'shareFriends'] as const) {
+    if (a[key] == null) continue
+    if (typeof a[key] !== 'boolean') throw new Error(`Invalid ${key}`)
+    prefs[key] = a[key] as boolean
+  }
+  if (a.offer != null) {
+    if (typeof a.offer !== 'string' || !OFFERS.has(a.offer) || a.offer === 'new' || a.offer === 'share') throw new Error('Invalid offer')
+    prefs.offer = a.offer
+  }
+  if (prefs.useIt === false) prefs.holdForMe = false
+  if (prefs.offer == null && (prefs.useIt != null || prefs.holdForMe != null || prefs.shareFriends != null)) prefs.offer = 'seen'
+  if (!Object.keys(prefs).length) throw new Error('Nothing to change')
+  return { eid, prefs }
+}
+
+/** Server push state for this iPhone (push_status). Anything odd reads as "not set up yet". */
+export interface NativePushStatus { enabled: boolean; previews: boolean; servers: number }
+export function nativePushStatus(raw: unknown): NativePushStatus {
+  const p = obj(raw)
+  return {
+    enabled: p?.enabled === true,
+    // The engine defaults previews on; only an explicit false turns them off.
+    previews: p?.previews !== false,
+    servers: Math.max(0, Math.floor(num(p?.servers))),
+  }
+}

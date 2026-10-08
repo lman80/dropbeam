@@ -15,14 +15,16 @@ actor ThumbnailProvider {
     // cached image on their very first frame instead of flashing a placeholder.
     nonisolated(unsafe) private let cache = NSCache<NSString, Preview>()
     init() { cache.totalCostLimit = 48 * 1024 * 1024; cache.countLimit = 160 }
-    private static func key(_ path: String, _ points: CGFloat) -> NSString {
-        "\(path)|\(max(1, Int(ceil(points * 2))))" as NSString
+    /// `tag` versions a file that is rewritten in place (a friend's profile picture
+    /// keeps its path when they change it): a new tag misses the old entry.
+    private static func key(_ path: String, _ points: CGFloat, _ tag: String? = nil) -> NSString {
+        "\(path)|\(max(1, Int(ceil(points * 2))))|\(tag ?? "")" as NSString
     }
-    nonisolated func cached(path: String, points: CGFloat) -> Preview? { cache.object(forKey: Self.key(path, points)) }
+    nonisolated func cached(path: String, points: CGFloat, tag: String? = nil) -> Preview? { cache.object(forKey: Self.key(path, points, tag)) }
 
-    func image(path: String, points: CGFloat, fullSize: Bool = false) async -> Preview? {
+    func image(path: String, points: CGFloat, fullSize: Bool = false, tag: String? = nil) async -> Preview? {
         let pixels = max(1, Int(ceil(points * 2)))
-        let key = fullSize ? "\(path)|full" as NSString : Self.key(path, points)
+        let key = fullSize ? "\(path)|full" as NSString : Self.key(path, points, tag)
         if let cached = cache.object(forKey: key) { return cached }
         let url = ChatAttachment.fileURL(path)
         let preview: Preview?
@@ -53,7 +55,8 @@ actor ThumbnailProvider {
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
                 kCGImageSourceShouldCacheImmediately: true,
-                kCGImageSourceThumbnailMaxPixelSize: fullSize ? original : pixels
+                // "Full size" is capped so a 48 MP photo can't take ~200 MB to view.
+                kCGImageSourceThumbnailMaxPixelSize: fullSize ? min(original, 4096) : pixels
             ] as CFDictionary) else { return nil }
             preview = Preview(UIImage(cgImage: cg))
         }

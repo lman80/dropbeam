@@ -209,6 +209,13 @@ impl<'a> TransmitBuf<'a> {
         self.buf.len()
     }
 
+    /// DropBeam patch: drops bytes written after `len` (used to undo a frame that overflowed
+    /// its packet). Never truncates into an earlier datagram.
+    pub(super) fn truncate(&mut self, len: usize) {
+        debug_assert!(len >= self.datagram_start, "truncating into a previous datagram");
+        self.buf.truncate(len.max(self.datagram_start));
+    }
+
     /// Returns the already written bytes in the buffer
     pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
         self.buf.as_mut_slice()

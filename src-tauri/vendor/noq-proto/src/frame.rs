@@ -1216,6 +1216,60 @@ impl<'a> Encodable for AckEncoder<'a> {
     }
 }
 
+/// DropBeam patch: encoded size of a varint, saturating at 8 for out-of-range values (which
+/// `write_var` itself would reject).
+fn var_size(x: u64) -> usize {
+    VarInt::from_u64(x).map_or(8, VarInt::size)
+}
+
+/// DropBeam patch: the largest number of ranges `k` (highest ranges first, as the encoders
+/// emit them) such that an ACK frame (`path_id == None`) or PATH_ACK frame carrying only those
+/// `k` ranges encodes into at most `limit` bytes, together with that encoded size. `None` if
+/// not even a single-range frame fits (or `ranges` is empty).
+///
+/// noq writes the (PATH_)ACKs of every path into one packet without checking the space, so
+/// several paths with fragmented ranges overflowed the packet and the bounded frame buffer
+/// panicked (n0-computer/noq#367). Callers use this to truncate the ranges to what fits;
+/// dropping the lowest ranges only acknowledges fewer packets, which is always valid.
+pub(crate) fn ack_ranges_that_fit(
+    path_id: Option<PathId>,
+    delay: u64,
+    ranges: &ArrayRangeSet,
+    ecn: Option<&EcnCounts>,
+    limit: usize,
+) -> Option<(usize, usize)> {
+    let mut rest = ranges.iter().rev();
+    let first = rest.next()?;
+    let kind = match (path_id.is_some(), ecn.is_some()) {
+        (true, true) => FrameType::PathAckEcn,
+        (true, false) => FrameType::PathAck,
+        (false, true) => FrameType::AckEcn,
+        (false, false) => FrameType::Ack,
+    };
+    let fixed = kind.size()
+        + path_id.map_or(0, |p| var_size(p.as_u32().into()))
+        + var_size(first.end - 1)
+        + var_size(delay)
+        + var_size(first.end - first.start - 1)
+        + ecn.map_or(0, |e| var_size(e.ect0) + var_size(e.ect1) + var_size(e.ce));
+    let mut blocks = 0usize;
+    let mut best = None;
+    let mut k = 1usize;
+    let mut prev = first.start;
+    loop {
+        let size = fixed + var_size(k as u64 - 1) + blocks;
+        if size > limit {
+            break;
+        }
+        best = Some((k, size));
+        let Some(block) = rest.next() else { break };
+        blocks += var_size(prev - block.end - 1) + var_size(block.end - block.start - 1);
+        prev = block.start;
+        k += 1;
+    }
+    best
+}
+
 #[cfg_attr(test, derive(Arbitrary))]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct EcnCounts {
@@ -2082,6 +2136,9 @@ pub(crate) struct AckFrequency {
 }
 
 impl AckFrequency {
+    /// DropBeam patch: upper bound of the encoded size (frame type plus four varints).
+    pub(crate) const SIZE_BOUND: usize = FrameType::AckFrequency.size() + 4 * 8;
+
     const fn get_type(&self) -> FrameType {
         FrameType::AckFrequency
     }
@@ -2573,6 +2630,63 @@ mod test {
             }
             ref x => panic!("incorrect frame {x:?}"),
         }
+    }
+
+    /// DropBeam patch: `ack_ranges_that_fit` predicts the exact encoded size of the truncated
+    /// frame, never exceeds the limit, and keeps the highest ranges.
+    #[test]
+    fn ack_ranges_that_fit_matches_encoding() {
+        let mut ranges = ArrayRangeSet::new();
+        // Mixed gap/size magnitudes so varints of 1, 2, 4 and 8 bytes all occur.
+        let mut pn = 3u64;
+        for i in 0..64u64 {
+            let len = 1 + (i % 5) * 70;
+            ranges.insert(pn..pn + len);
+            pn += len + [1, 100, 20_000, 1 << 33][(i % 4) as usize];
+        }
+        const ECN: EcnCounts = EcnCounts {
+            ect0: 1 << 20,
+            ect1: 0,
+            ce: 70,
+        };
+        for path_id in [None, Some(PathId(0)), Some(PathId::MAX)] {
+            for ecn in [None, Some(&ECN)] {
+                for limit in (0..1400).step_by(7) {
+                    let Some((k, size)) =
+                        ack_ranges_that_fit(path_id, 12_345, &ranges, ecn, limit)
+                    else {
+                        continue;
+                    };
+                    assert!(size <= limit && k >= 1 && k <= 64);
+                    let mut r = ranges.clone();
+                    while r.range_count() > k {
+                        r.pop_min();
+                    }
+                    let mut buf = Vec::new();
+                    match path_id {
+                        Some(p) => PathAck::encoder(p, 12_345, &r, ecn).encode(&mut buf),
+                        None => Ack::encoder(12_345, &r, ecn).encode(&mut buf),
+                    }
+                    assert_eq!(buf.len(), size, "k={k} limit={limit}");
+                    // One more range must not have fit.
+                    if k < 64 {
+                        let mut r2 = ranges.clone();
+                        while r2.range_count() > k + 1 {
+                            r2.pop_min();
+                        }
+                        let mut buf2 = Vec::new();
+                        match path_id {
+                            Some(p) => PathAck::encoder(p, 12_345, &r2, ecn).encode(&mut buf2),
+                            None => Ack::encoder(12_345, &r2, ecn).encode(&mut buf2),
+                        }
+                        assert!(buf2.len() > limit);
+                    }
+                    assert_eq!(frames(buf).len(), 1);
+                }
+            }
+        }
+        assert_eq!(ack_ranges_that_fit(None, 0, &ArrayRangeSet::new(), None, 1000), None);
+        assert_eq!(ack_ranges_that_fit(None, 0, &ranges, None, 3), None);
     }
 
     #[test]

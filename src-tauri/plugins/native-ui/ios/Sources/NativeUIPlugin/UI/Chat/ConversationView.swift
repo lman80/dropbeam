@@ -21,6 +21,24 @@ struct ConversationView: View {
     @State private var reporting: ReportTarget?
     /// Report chosen in the Tapback menu: shown once the cover has closed.
     @State private var pendingReport: ReportTarget?
+    /// Points the composer covers from the screen bottom (feedback button keeps clear).
+    @State private var composerHeight: CGFloat = 0
+    /// An active check of the friend is in flight (header reads "Connecting…").
+    @State private var probing = true
+    /// The latest active check got no answer, overriding a still-fresh presence stamp.
+    @State private var probedOffline = false
+    @State private var lastProbe = Date.distantPast
+    /// Bumped to restart the check loop (thread opened again / app foregrounded).
+    @State private var probeRun = 0
+    /// "What does Delivered mean?" — a tapped status's one-line explanation.
+    @State private var statusHelp: String?
+    /// They haven't accepted our friend request yet: messages wait until they do.
+    private var notAccepted: Bool { friend.awaitingAccept == true }
+    /// Reachable right now, as far as the latest evidence says.
+    private var online: Bool { bridge.presence[friendID] == true && !probedOffline }
+    /// Offline, and the check that says so has finished.
+    private var knownOffline: Bool { !online && !probing }
+    private var hasQueued: Bool { messages.contains { $0.fromMe && $0.deleted != true && ["sending", "failed"].contains($0.status ?? "") } }
     /// A friend (not one of the user's own devices): Report / Block are offered.
     private var reportable: Bool {
         guard let f = bridge.friends.first(where: { $0.id == friendID }), !f.ownDevice else { return false }
@@ -28,6 +46,22 @@ struct ConversationView: View {
         return f.accountPub != account
     }
     private var messages: [ChatMessage] { bridge.threads[friendID] ?? [] }
+    /// Where a message to them would wait while they're offline (a Transfer Server's name).
+    private var holdOn: String? { bridge.holdRoutes[friendID] }
+    private var firstName: String { ServerCopy.firstName(friend.displayName) }
+    /// A Transfer Server this person shared that hasn't been answered yet: their
+    /// server shares with us (it's their friend), a server of theirs they share
+    /// with their friends, or — in the chat with our own server — whether to
+    /// share it with ours.
+    private var offer: UsableServer? {
+        let endpoints = Set(bridge.friends.filter { $0.id == friendID || $0.groupedUnder == friendID }.compactMap(\.endpointId))
+        return bridge.servers.first { s in
+            guard !s.revoked, !s.own else { return false }
+            if s.offer == "share" { return endpoints.contains(s.eid) }
+            guard s.offer == "new" else { return false }
+            return endpoints.contains(s.eid) || s.viaPeer == friendID || !endpoints.isDisjoint(with: s.via)
+        }
+    }
     private var friend: Friend { bridge.friends.first { $0.id == friendID } ?? Friend(id: friendID, name: "Friend") }
     private var matches: [String] {
         guard !query.isEmpty else { return [] }
@@ -45,6 +79,11 @@ struct ConversationView: View {
                     ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
                         messageRow(message, index: index)
                             .id(message.id)
+                    }
+                    if let offer {
+                        ServerOfferCard(server: offer, friendName: ServerCopy.firstName(friend.displayName))
+                            .padding(.top, 16).padding(.horizontal, 4)
+                            .transition(.opacity)
                     }
                     if bridge.chatTyping[friendID] == true {
                         HStack(alignment: .bottom, spacing: 6) { ContactAvatar(friend: friend, size: 28); TypingBubble(); Spacer() }
@@ -75,18 +114,44 @@ struct ConversationView: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
+            .modifier(HeaderBar { if !searching { nameCapsule } })
             .modifier(ComposerBar {
                 VStack(spacing: 0) {
                     if searching { searchFooter(proxy) }
+                    if (knownOffline || notAccepted) && !searching { offlineNote.transition(.opacity) }
                     ChatComposer(friendID: friendID, reply: $reply, editing: $editing, text: $draft) { scrollDown(proxy) }
                 }
+                // The feedback button stays available here, parked above the composer
+                // (it grows with replies, drafts and attachments) — never over Send.
+                .animation(.easeInOut(duration: 0.2), value: knownOffline)
+                .background { GeometryReader { geo in
+                    Color.clear.preference(key: ComposerTopKey.self, value: geo.frame(in: .global).minY)
+                } }
             })
+            .onPreferenceChange(ComposerTopKey.self) { top in
+                let screen = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds.height ?? 0
+                if top.isFinite, screen > 0 { composerHeight = max(0, screen - top); SuperFeedback.setBottomObstruction(composerHeight) }
+            }
+            .onAppear { if composerHeight > 0 { SuperFeedback.setBottomObstruction(composerHeight) } }
             .onChange(of: messages.map(\.id)) { old, new in
                 if !loaded || old.isEmpty || nearBottom || messages.last?.fromMe == true {
                     scrollDown(proxy, animated: loaded); loaded = !new.isEmpty
                 } else if new.count > old.count { withAnimation { unseen = true } }
             }
-            .onChange(of: bridge.chatTyping[friendID]) { _, _ in if nearBottom { scrollDown(proxy) } }
+            // The typing bubble follows like a new message (#36): scroll once it has
+            // been laid out (the change fires in the insert's own transaction, so an
+            // immediate scrollTo lands short) and again as the spring settles; the
+            // same when it goes away. `nearBottom` is read NOW — the insert itself
+            // pushes the bottom marker out of view and would flip it.
+            .onChange(of: bridge.chatTyping[friendID] == true) { _, _ in
+                guard nearBottom else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    scrollDown(proxy)
+                    try? await Task.sleep(for: .milliseconds(360))
+                    scrollDown(proxy)
+                }
+            }
             .onChange(of: viewport.height) { _, _ in if nearBottom { scrollDown(proxy, animated: false) } }
             .onChange(of: matches) { _, _ in matchIndex = 0; scrollToMatch(proxy) }
             .task {
@@ -101,6 +166,35 @@ struct ConversationView: View {
                     loaded = true
                 } catch is CancellationError {} catch { bridge.errorMessage = error.localizedDescription }
             }
+        }
+        // Presence: check the friend the moment the thread opens (and again on
+        // return to the foreground) instead of waiting on the background beacon.
+        .task(id: probeRun) { await presenceLoop() }
+        .task(id: probeRun) { await bridge.refreshHoldRoute(friendId: friendID) }
+        // QA (-qaTyping): the friend starts typing after 3 s and stops 4 s later.
+        .task {
+            guard CommandLine.arguments.contains("-qaTyping") else { return }
+            try? await Task.sleep(for: .seconds(3)); bridge.chatTyping[friendID] = true
+            try? await Task.sleep(for: .seconds(4)); bridge.chatTyping[friendID] = false
+        }
+        .onChange(of: bridge.servers) { _, _ in Task { await bridge.refreshHoldRoute(friendId: friendID) } }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("DropBeam.mailbox://servers"))) { _ in
+            Task { await bridge.refreshHoldRoute(friendId: friendID) }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active, Date().timeIntervalSince(lastProbe) > 5 { probeRun += 1 }
+        }
+        .onChange(of: bridge.presence[friendID] == true) { _, isOnline in
+            guard isOnline else { return }
+            probedOffline = false; probing = false
+            // Seen through another channel (a folder beacon, an incoming connection):
+            // one quick check makes the engine flush what was waiting for them.
+            if hasQueued { Task { _ = try? await bridge.checkPresence(id: friendID) } }
+        }
+        .onChange(of: bridge.chatTyping[friendID] == true) { _, typing in if typing { probedOffline = false; probing = false } }
+        .onChange(of: messages.last?.id) { _, _ in
+            // Their new message is proof they're reachable right now.
+            if let last = messages.last, !last.fromMe, Date().timeIntervalSince(last.date) < 60 { probedOffline = false; probing = false }
         }
         .background(ChatPalette.background.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
@@ -142,6 +236,7 @@ struct ConversationView: View {
                 .presentationBackground(.clear)
         }
         .safetyPrompts(block: $blocking, report: $reporting)
+        .modifier(StatusHelpAlert(text: $statusHelp))
         .sheet(isPresented: $showDetail) {
             NavigationStack {
                 FriendDetailView(friendID: friendID, initial: friend)
@@ -149,6 +244,7 @@ struct ConversationView: View {
             }.environmentObject(bridge).tint(.beam)
         }
         .onDisappear {
+            SuperFeedback.setBottomObstruction(0)
             // Sheets retain this destination; only a pop/switch closes the store.
             if !bridge.chatPath.contains(friendID) || bridge.selectedTab != "chat" {
                 Task { try? await bridge.setTyping(friendId: friendID, on: false); try? await bridge.closeChat(friendId: friendID) }
@@ -156,25 +252,98 @@ struct ConversationView: View {
         }
     }
 
-    /// Avatar over the name capsule, centered in the glass navigation bar.
+    /// Messages-style header (#46): a big avatar centred in the navigation bar,
+    /// with the name + presence capsule just under the bar (see `nameCapsule`).
+    /// Split in two because the bar's principal slot is only bar-high — a stacked
+    /// avatar + name overflowed upward into the Dynamic Island and forced both small.
     private var header: some View {
         Button { Haptics.tap(); showDetail = true } label: {
-            VStack(spacing: -4) {
-                ContactAvatar(friend: friend, size: 36).zIndex(1)
-                // iOS 26 Messages: the name rides a glass capsule so it stays legible
-                // over bubbles scrolling beneath the bar.
-                HStack(spacing: 3) {
-                    Text(friend.displayName).font(.caption.weight(.semibold)).lineLimit(1)
-                    Image(systemName: "chevron.right").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
+            ContactAvatar(friend: friend, size: 50)
+        }.buttonStyle(.plain)
+            .accessibilityLabel("\(friend.displayName), \(presenceText)").accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
+    }
+
+    /// Name (with the "more info" chevron) over Online / Last seen, on a glass
+    /// capsule so it stays legible over bubbles scrolling beneath it.
+    private var nameCapsule: some View {
+        Button { Haptics.tap(); showDetail = true } label: {
+            VStack(spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(friend.displayName).font(.subheadline.weight(.semibold)).lineLimit(1)
+                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
                 }
                 .foregroundStyle(Color.primary)
-                .padding(.horizontal, 10).padding(.vertical, 4)
-                .glassSurface(Capsule())
-                .frame(maxWidth: 220)
+                TimelineView(.periodic(from: .now, by: 60)) { _ in
+                    Text(presenceText).font(.caption).foregroundStyle(online ? Color.green : Color.secondary)
+                        .lineLimit(1).contentTransition(.opacity)
+                }
             }
+            .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+            .padding(.horizontal, 16).padding(.vertical, 6)
+            .glassSurface(Capsule(), interactive: true)
+            .frame(maxWidth: 260)
+            .animation(.easeInOut(duration: 0.2), value: presenceText)
         }.buttonStyle(.plain)
+            .padding(.top, 4).padding(.bottom, 6)
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(friend.displayName).accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
+            .accessibilityLabel("\(friend.displayName), \(presenceText)").accessibilityHint("Shows contact details").accessibilityAddTraits(.isButton)
+            .accessibilityIdentifier("chat.header")
+    }
+
+    /// "Online", "Connecting…", "Last seen 5 min ago" or "Offline" under the name.
+    private var presenceText: String {
+        if notAccepted { return "Hasn’t accepted your request yet" }
+        if online { return "Online" }
+        if probing { return "Connecting…" }
+        guard let seen = bridge.presenceSeen[friendID] else { return "Offline" }
+        return Self.lastSeen(Date(timeIntervalSince1970: seen / 1000))
+    }
+    static func lastSeen(_ date: Date, now: Date = Date()) -> String {
+        let minutes = Int(now.timeIntervalSince(date) / 60)
+        if minutes < 1 { return "Last seen just now" }
+        if minutes < 60 { return "Last seen \(minutes) min ago" }
+        if minutes < 24 * 60 { return "Last seen \(minutes / 60) hr ago" }
+        if Calendar.current.isDateInYesterday(date) { return "Last seen yesterday" }
+        return "Last seen \(date.formatted(.dateTime.month(.abbreviated).day()))"
+    }
+
+    /// Calm inline note over the composer while the friend can't be reached.
+    private var offlineNote: some View {
+        Text(notAccepted ? "\(friend.displayName) hasn’t accepted your friend request yet. Your messages are saved and arrive as soon as they do."
+             : holdOn.map { "\(friend.displayName) is offline. Messages wait on \($0) and arrive when they’re back." }
+             ?? "\(friend.displayName) is offline. Messages will send when you’re both online with DropBeam open.")
+            .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity).padding(.horizontal, 28).padding(.top, 6).padding(.bottom, 8)
+            .accessibilityIdentifier("chat.offlineNote")
+    }
+
+    /// Check now; while they stay offline, check again every 30 s (never faster).
+    private func presenceLoop() async {
+        var first = true
+        while !Task.isCancelled {
+            // Always on open (a fresh-looking stamp may be stale); after that only
+            // while they read as offline — online friends are refreshed by the engine.
+            if first || !online { await probe() }
+            first = false
+            try? await Task.sleep(for: .seconds(30))
+        }
+    }
+    /// One active check. The header gives up waiting after 8 s (Offline) while the
+    /// dial itself may still land and flip it to Online.
+    private func probe() async {
+        lastProbe = Date()
+        if bridge.presence[friendID] != true { probing = true }
+        let check = Task { @MainActor in (try? await bridge.checkPresence(id: friendID)) ?? false }
+        let deadline = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled, probing else { return }
+            probing = false; probedOffline = true
+        }
+        let reached = await check.value
+        deadline.cancel()
+        probedOffline = !reached
+        probing = false
     }
 
     @ViewBuilder private func messageRow(_ message: ChatMessage, index: Int) -> some View {
@@ -210,13 +379,26 @@ struct ConversationView: View {
                 }
                 .padding(.top, newRun && !newCluster ? 10 : newCluster ? 0 : 2)
                 .padding(.top, message.reactions?.isEmpty == false ? 24 : 0)
-                if message.edited == true || (lastMine && delivery(message) != nil) {
+                let via = !message.fromMe && lastInRun && !(message.kind == "file" && message.path == nil) ? message.via : nil
+                if message.edited == true || via != nil || (lastMine && delivery(message) != nil) {
                     VStack(alignment: message.fromMe ? .trailing : .leading, spacing: 1) {
                         if message.edited == true {
                             Text("Edited").font(.caption2.weight(.medium)).foregroundStyle(message.fromMe ? ChatPalette.sent : Color.secondary)
                         }
+                        if let via {
+                            Text("via \(via)").font(.caption2).foregroundStyle(.secondary)
+                        }
                         if lastMine, let status = delivery(message) {
-                            Text(status).font(.caption2.weight(.medium)).foregroundStyle(status == "Not Delivered" ? Color.red : Color.secondary)
+                            Button { statusHelp = explanation(message) } label: {
+                                Group {
+                                    if message.status == "held" { Text("\(Image(systemName: "server.rack")) \(status)") } else { Text(status) }
+                                }
+                                .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                                .multilineTextAlignment(.trailing).fixedSize(horizontal: false, vertical: true)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Explains what this means")
+                            .padding(.leading, 40)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: message.fromMe ? .trailing : .leading)
@@ -232,9 +414,28 @@ struct ConversationView: View {
         switch message.status {
         case "read": return "Read"
         case "delivered", "sent": return "Delivered"
-        case "sending": return "Sending…"
-        case "failed": return "Not Delivered"
+        case "held": return ServerCopy.held(server: message.heldOn, friend: firstName)
+        case "failed" where ServerCopy.note(message.serverNote, friend: firstName, server: message.heldOn) != nil:
+            return ServerCopy.note(message.serverNote, friend: firstName, server: message.heldOn)
+        // The engine keeps every undelivered message queued and retries it until it
+        // lands, so neither state is a failure; offline it is simply waiting.
+        case "sending", "failed" where notAccepted: return "Waiting for \(firstName) to accept you"
+        case "sending", "failed": return knownOffline ? "Waiting to send" : "Sending…"
         default: return nil
+        }
+    }
+    /// One plain sentence for a tapped status (mirrors src/lib/chatStatus.ts).
+    private func explanation(_ message: ChatMessage) -> String {
+        let name = firstName
+        switch message.status {
+        case "read": return "\(name) has opened the chat and seen your message."
+        case "delivered", "sent": return "It’s on \(name)’s device. You’ll see “Read” once they open the chat (unless they’ve turned that off)."
+        case "held": return "\(name) isn’t online, so \(message.heldOn ?? "your Transfer Server") is keeping your message safe. \(name) gets it the moment they’re back."
+        default:
+            if notAccepted { return "\(name) hasn’t accepted your friend request yet. Your message is saved and arrives as soon as they do." }
+            if message.status == "failed" && message.serverNote != nil { return "Your message is saved on this iPhone and DropBeam keeps trying. You don’t need to do anything." }
+            return knownOffline ? "\(name) isn’t online right now. Your message is saved and goes out by itself as soon as you’re both online with DropBeam open."
+                : "Sending now. It usually takes a second or two."
         }
     }
     /// Presents/dismisses the Tapback cover without the modal slide.
@@ -270,6 +471,20 @@ private struct ComposerBar<Bar: View>: ViewModifier {
     }
 }
 
+/// The name capsule under the navigation bar: floats in a scroll-edge bar on
+/// iOS 26 (the thread blurs beneath it, like Messages), a plain inset before.
+private struct HeaderBar<Bar: View>: ViewModifier {
+    @ViewBuilder var bar: Bar
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) { content.safeAreaBar(edge: .top, spacing: 0) { bar.frame(maxWidth: .infinity) } }
+        else { content.safeAreaInset(edge: .top, spacing: 0) { bar.frame(maxWidth: .infinity) } }
+    }
+}
+
+private struct ComposerTopKey: PreferenceKey {
+    static let defaultValue: CGFloat = .infinity
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = min(value, nextValue()) }
+}
 private struct ChatBottomKey: PreferenceKey {
     static let defaultValue: CGFloat = .greatestFiniteMagnitude
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
@@ -310,3 +525,12 @@ struct TypingBubble: View {
     }
 }
 
+/// "What this means" for a tapped message status (kept out of the long body chain).
+private struct StatusHelpAlert: ViewModifier {
+    @Binding var text: String?
+    func body(content: Content) -> some View {
+        content.alert("What this means", isPresented: Binding(get: { text != nil }, set: { if !$0 { text = nil } })) {
+            Button("OK", role: .cancel) { text = nil }
+        } message: { Text(text ?? "") }
+    }
+}

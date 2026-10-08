@@ -239,13 +239,20 @@ pub async fn pick_photos(app: AppHandle) -> Result<Vec<String>, String> {
 #[tauri::command]
 pub async fn share_files(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
     if paths.is_empty() { return Err("No files to share.".into()); }
-    // Received files, imported picks and sent-chat media all live in our sandbox.
-    // Canonicalize both sides so a symlink cannot share a file outside it.
+    // Received files, imported picks and sent-chat media all live in our sandbox —
+    // or in the folder the user chose under Settings → Save Files To (its
+    // security scope is held by the native shell while the app runs).
+    // Canonicalize both sides so a symlink cannot share a file outside them.
     let documents = app.path().document_dir().map_err(|e| e.to_string())?;
     let sandbox = documents.parent().ok_or("No app sandbox")?.canonicalize().map_err(|e| e.to_string())?;
+    let chosen = app.try_state::<std::sync::Arc<crate::AppState>>()
+        .map(|st| st.settings.lock().unwrap().download_dir.clone())
+        .filter(|d| !d.trim().is_empty())
+        .and_then(|d| std::path::PathBuf::from(d).canonicalize().ok());
     let paths: Vec<_> = paths.into_iter().map(|path| {
         let path = std::path::PathBuf::from(path).canonicalize().map_err(|e| e.to_string())?;
-        if !path.starts_with(&sandbox) || !path.is_file() { return Err("This received file is unavailable for sharing.".to_string()); }
+        let allowed = path.starts_with(&sandbox) || chosen.as_ref().is_some_and(|root| path.starts_with(root));
+        if !allowed || !path.is_file() { return Err("This received file is unavailable for sharing.".to_string()); }
         Ok(path)
     }).collect::<Result<_, String>>()?;
     let (tx, rx) = oneshot::channel();

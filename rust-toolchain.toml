@@ -1,0 +1,10 @@
+# One Rust for every build (local, CI, release). Bump deliberately: change the
+# version here and the matching `dtolnay/rust-toolchain@<version>` lines in
+# .github/workflows/*.yml, run the tests, commit together.
+# rustup installs this toolchain + targets on first use (one-time download).
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+# macOS universal build + the iOS app (device + simulator).
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-apple-ios", "aarch64-apple-ios-sim"]

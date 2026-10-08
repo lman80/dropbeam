@@ -31,6 +31,7 @@ export function GifPicker({
   // Debounced search; trending when the box is empty. Cancels in-flight fetches.
   useEffect(() => {
     if (!hasKey) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- no key: nothing to load
       setLoading(false)
       return
     }

@@ -5,6 +5,7 @@
 import type {
   ChatMessage,
   ChatOverview,
+  Delivery,
   GifMeta,
   FolderStatus,
   Friend,
@@ -57,6 +58,7 @@ let settings: Settings = {
   avatar: '',
   notifyOnMessage: true,
   sendReadReceipts: true,
+  linkPreviews: true,
   giphyApiKey: '',
   verboseLogging: false,
   showSyncPopup: true,
@@ -109,7 +111,12 @@ function seedChats() {
   mockChats.f1 = [
     msg('f1', 2 * DAY, false, 'Hey! Did the footage come through?'),
     msg('f1', 2 * DAY - MIN, true, 'Half of it — the relay was crawling. Trying again on the same Wi-Fi now'),
-    msg('f1', 3 * HOUR, false, 'Perfect. Here’s the link to the brief: https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', { reactions: [{ emoji: '👍', fromMe: true }] }),
+    msg('f1', 3 * HOUR, false, 'Perfect. Here’s the link to the brief: https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', { reactions: [{ emoji: '👍', fromMe: true }], linkPreview: {
+      url: 'https://example.com/brief/a-very-long-path-that-should-wrap-nicely-in-the-bubble', title: 'Spring campaign brief — goals, audience and the three hero shots', siteName: 'example.com',
+      description: 'Everything the shoot needs in one page.', imageW: 480, imageH: 252,
+      image: 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="480" height="252"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c6cf0"/><stop offset="1" stop-color="#e59ab8"/></linearGradient></defs><rect width="480" height="252" fill="url(#g)"/></svg>'),
+    } }),
+    msg('f1', 3 * HOUR - 1, true, 'https://github.com/lman80/dropbeam', { linkPreview: { url: 'https://github.com/lman80/dropbeam', title: 'lman80/dropbeam: Send files to friends, direct and private', siteName: 'GitHub' } }),
     msg('f1', 3 * HOUR - MIN, true, 'Got it', { replyTo: 'seed-f1-3', replyPreview: 'Here’s the link to the brief…', edited: true }),
     file('f1', 2 * HOUR, false, ['Beach.jpg'], 3_400_000, '/mock-media/beach.jpg', { reactions: [{ emoji: '❤️', fromMe: true }, { emoji: '❤️', fromMe: false }] }),
     file('f1', 2 * HOUR - MIN, false, ['Portrait.jpg'], 2_100_000, '/mock-media/portrait.jpg'),
@@ -120,6 +127,17 @@ function seedChats() {
     file('f1', 40 * MIN, true, ['Presentation.key'], 312_000_000, '/Users/you/Desktop/Presentation.key', { status: 'delivered', fileXferId: 'cx-failed', fileXferFailed: true }),
     msg('f1', 30 * MIN, false, 'مرحبا — سلام — こんにちは — Ünïcödé names work too'),
     file('f1', 6 * MIN, true, ['raw-footage-day2.mov'], 4_800_000_000, '/Users/you/Movies/raw-footage-day2.mov', { status: 'sending', fileXferId: 'cx-live' }),
+    // Sent to both of Alex's devices: one has it, the other is waiting on the box.
+    file('f1', 5 * MIN + 30_000, true, ['Beach trip.zip'], 212_000_000, '/Users/you/Desktop/Beach trip.zip', { status: 'delivered', fileXferId: 'cx-fan-held',
+      deliveries: [
+        { eid: 'mock-endpoint-alex', label: 'Mac', kind: 'laptop', os: 'macos', state: 'delivered' },
+        { eid: 'mock-endpoint-alex-phone', label: 'iPhone', kind: 'phone', os: 'ios', state: 'held', via: 'Linux Box' },
+      ] }),
+    file('f1', 5 * MIN + 10_000, true, ['Itinerary.pdf'], 640_000, '/Users/you/Desktop/Itinerary.pdf', { status: 'read', fileXferId: 'cx-fan-both',
+      deliveries: [
+        { eid: 'mock-endpoint-alex', label: 'Mac', kind: 'laptop', os: 'macos', state: 'delivered' },
+        { eid: 'mock-endpoint-alex-phone', label: 'iPhone', kind: 'phone', os: 'ios', state: 'delivered' },
+      ] }),
     msg('f1', 5 * MIN, true, 'Sending the rest tonight.', { status: 'delivered' }),
   ]
   mockChats.f3 = [
@@ -130,6 +148,23 @@ function seedChats() {
   ]
   mockChats.f6 = [file('f6', 3 * DAY, false, ['Mountains.jpg'], 1_900_000, '/mock-media/mountains.jpg')]
   mockChats.f4 = [msg('f4', 9 * DAY, true, 'Welcome aboard!', { status: 'delivered' })]
+  // Transfer Server states: Priya's iPhone is offline, so things wait on the box.
+  mockChats.f5 = [
+    msg('f5', 26 * HOUR, false, 'Landing at 9 tomorrow'),
+    msg('f5', 25 * HOUR, true, 'I’ll grab you from arrivals', { status: 'read' }),
+    msg('f5', 40 * MIN, true, 'Running 10 min late — the car’s in the short-term lot', { status: 'held', heldOn: 'Linux Box' }),
+    file('f5', 38 * MIN, true, ['Parking map.pdf'], 2_400_000, '/Users/you/Desktop/Parking map.pdf', { status: 'held', heldOn: 'Linux Box', fileXferId: 'cx-held' }),
+  ]
+  // Things that came in through the server, and one waiting for your OK.
+  mockChats.f6 = [
+    file('f6', 3 * DAY, false, ['Mountains.jpg'], 1_900_000, '/mock-media/mountains.jpg'),
+    msg('f6', 9 * HOUR, false, 'Sent the site photos while you were out', { via: 'Linux Box' }),
+    file('f6', 9 * HOUR - MIN, false, ['Site photos.zip'], 48_200_000, null, { via: 'Linux Box', fileXferId: 'receive:mock-chen:held-1' }),
+  ]
+  mockChats.f8 = [
+    msg('f8', 2 * DAY, false, 'Call me when you land'),
+    msg('f8', 20 * MIN, true, 'Landed safe', { status: 'failed', serverNote: 'full', heldOn: 'Linux Box' }),
+  ]
 }
 seedChats()
 // Chat preview extras (ui-chat): an emoji-only reply (renders large, no bubble)
@@ -188,11 +223,13 @@ const folderHistory: Record<string, HistoryItem[]> = EMPTY ? {} : {
 }
 
 let friends: Friend[] = EMPTY ? [] : [
-  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: T0 - 5 * DAY, autoAccept: true, endpointId: 'mock-endpoint-alex', avatar: null, deviceKind: 'laptop', deviceOs: 'macos' },
+  { id: 'f1', role: 'a', name: 'Alex', secret: 'mock', createdAt: T0 - 5 * DAY, autoAccept: true, endpointId: 'mock-endpoint-alex', avatar: null, deviceKind: 'laptop', deviceOs: 'macos', accountPub: 'alex-account' },
+  // Alex's iPhone: the same person (verified account), so sends reach both.
+  { id: 'f1-phone', role: 'a', name: 'Alex', secret: 'mock', createdAt: T0 - 4 * DAY, autoAccept: true, endpointId: 'mock-endpoint-alex-phone', avatar: null, deviceKind: 'phone', deviceOs: 'ios', accountPub: 'alex-account' },
   { id: 'f2', role: 'b', name: 'Sam', secret: 'mock', createdAt: T0 - 2 * DAY, autoAccept: false, endpointId: null, avatar: null, deviceKind: 'desktop', deviceOs: 'windows' },
   { id: 'f3', role: 'a', name: 'Jordan Kim', secret: 'mock', createdAt: T0 - 9 * DAY, autoAccept: true, endpointId: 'mock-jordan', avatar: null, deviceKind: 'laptop', deviceOs: 'linux' },
   { id: 'f4', role: 'b', name: 'Maximilian Alexander von Hohenzollern-Sigmaringen', secret: 'mock', createdAt: T0 - 1 * DAY, autoAccept: true, endpointId: null, avatar: null },
-  { id: 'f5', role: 'a', name: 'Priya Raman', secret: 'mock', createdAt: T0 - 60 * DAY, autoAccept: true, endpointId: 'mock-priya', avatar: null, deviceKind: 'phone', deviceOs: 'ios' },
+  { id: 'f5', role: 'a', name: 'Priya Raman', secret: 'mock', createdAt: T0 - 60 * DAY, autoAccept: true, endpointId: 'mock-priya', avatar: null, deviceKind: 'phone', deviceOs: 'ios', awaitingAccept: true },
   { id: 'f6', role: 'a', name: 'Chen Wei', secret: 'mock', createdAt: T0 - 90 * DAY, autoAccept: true, endpointId: 'mock-chen', avatar: null, deviceKind: 'desktop', deviceOs: 'linux' },
   { id: 'f7', role: 'a', name: 'Lab Peer', secret: 'mock', createdAt: T0 - 4 * HOUR, autoAccept: true, endpointId: 'mock-lab', avatar: null, deviceKind: 'laptop', deviceOs: 'macos' },
   { id: 'f8', role: 'b', name: 'Mom', secret: 'mock', createdAt: T0 - 200 * DAY, autoAccept: false, endpointId: 'mock-mom', avatar: null, deviceKind: 'phone', deviceOs: 'ios' },
@@ -340,6 +377,17 @@ if (typeof window !== 'undefined' && !EMPTY) {
   setTimeout(() => {
     emit('transfer://update', { ...base('cx-live', 'send', ['raw-footage-day2.mov']), state: 'transferring', friendName: 'Alex', bytesTotal: 4_800_000_000, bytesDone: 1_920_000_000, percent: 40, speedBps: 88_000_000, etaSeconds: 33, locality: 'local', peer: '192.168.1.40:5', connDetail: { path: 'local', rttMs: 3, upgrading: false, relay: null }, chatTransfer: { id: 'cx-live', offset: 0, total: 4_800_000_000, last: true } })
     emit('transfer://update', { ...base('cx-failed', 'send', ['Presentation.key']), state: 'failed', friendName: 'Alex', bytesTotal: 312_000_000, bytesDone: 71_000_000, percent: 23, error: 'Alex went offline before the file finished.', chatTransfer: { id: 'cx-failed', offset: 0, total: 312_000_000, last: true } })
+    const fanHeld = [
+      { eid: 'mock-endpoint-alex', label: 'Mac', kind: 'laptop', os: 'macos', state: 'delivered' as const },
+      { eid: 'mock-endpoint-alex-phone', label: 'iPhone', kind: 'phone', os: 'ios', state: 'held' as const, via: 'Linux Box' },
+    ]
+    emit('transfer://update', { ...base('cx-fan-held', 'send', ['Beach trip.zip']), state: 'completed', friendName: 'Alex', bytesTotal: 212_000_000, bytesDone: 212_000_000, percent: 100, heldOn: 'Linux Box', deliveries: fanHeld, chatTransfer: { id: 'cx-fan-held', attempt: 2, offset: 0, total: 212_000_000, last: true } })
+    emit('transfer://update', { ...base('cx-fan-live', 'send', ['Drone footage.mov']), state: 'transferring', friendName: 'Alex', bytesTotal: 1_400_000_000, bytesDone: 530_000_000, percent: 38, speedBps: 61_000_000, etaSeconds: 14, locality: 'local', connDetail: { path: 'local', rttMs: 3, upgrading: false, relay: null },
+      deliveries: [
+        { eid: 'mock-endpoint-alex', label: 'Mac', kind: 'laptop', os: 'macos', state: 'sending' as const },
+        { eid: 'mock-endpoint-alex-phone', label: 'iPhone', kind: 'phone', os: 'ios', state: 'uploading' as const, via: 'Linux Box' },
+      ] })
+    emit('transfer://update', { ...base('cx-held', 'send', ['Parking map.pdf']), state: 'held', friendName: 'Priya Raman', heldOn: 'Linux Box', bytesTotal: 2_400_000, bytesDone: 2_400_000, percent: 100, detail: 'Waiting on Linux Box — Priya Raman gets it when they’re back', chatTransfer: { id: 'cx-held', attempt: 1, offset: 0, total: 2_400_000, last: true } })
   }, 600)
 }
 if (typeof window !== 'undefined') {
@@ -616,6 +664,8 @@ export const mockApi = {
   restartApp: async (): Promise<void> => {},
   lanNetworkBlocked: async (): Promise<boolean> => typeof location !== 'undefined' && new URLSearchParams(location.search).has('lan'),
   openLocalNetworkSettings: async (): Promise<void> => {},
+  openPrivacySettings: async (_pane: string): Promise<void> => {},
+  setKeepAwake: async (_on: boolean): Promise<void> => {},
   openUrl: async (_url: string): Promise<void> => {},
   getDefaultDownloadDir: async (): Promise<string> => '/Users/you/Downloads',
 
@@ -655,7 +705,8 @@ export const mockApi = {
     }
     return { pair, invite: `dropbeam1:MOCK${id}invitecodewouldgohere0000` }
   },
-  acceptPair: async (_invite: string, folder: string): Promise<Pair> => {
+  acceptPair: async (_invite: string, chosen: string, folderName?: string | null): Promise<Pair> => {
+    const folder = folderName ? `${chosen}/${folderName}` : chosen
     const id = `p${++pairCounter}`
     const pair: Pair = {
       id,
@@ -840,9 +891,30 @@ export const mockApi = {
     return f
   },
   macosInstallHint: async (): Promise<string | null> => null,
-  sendToFriend: async (id: string, paths: string[]): Promise<TransferUpdate> => {
+  sendToFriend: async (id: string, paths: string[], _chatTransferId?: string, _chatAttempt?: number, device?: string): Promise<TransferUpdate> => {
     const friend = friends.find((f) => f.id === id)
     const tid = `m${++counter}`
+    // A friend with two devices (Alex): both get it; the phone is "offline".
+    const devices = friend?.accountPub && !device ? friends.filter(f => f.accountPub === friend.accountPub && f.endpointId) : []
+    if (devices.length > 1) {
+      const names = paths.map((p) => p.split('/').pop() || p)
+      const ds = devices.map(f => ({ eid: f.endpointId!, label: f.deviceOs === 'ios' ? 'iPhone' : 'Mac', kind: f.deviceKind, os: f.deviceOs, state: 'sending' as Delivery['state'], via: null as string | null }))
+      const t = { ...base(tid, 'send', names), friendName: friend!.name, bytesTotal: 88_000_000, state: 'connecting' as TransferUpdate['state'], deliveries: ds }
+      let pct = 0
+      const iv = setInterval(() => {
+        pct = Math.min(100, pct + 9)
+        const phone = ds.find(d => d.label === 'iPhone')!
+        if (pct > 20 && phone.state === 'sending') { phone.state = 'uploading'; phone.via = 'Linux Box' }
+        if (pct >= 100) {
+          clearInterval(iv)
+          ds.forEach(d => { d.state = d.label === 'iPhone' ? 'held' : 'delivered' })
+          emit('transfer://update', { ...t, state: 'completed', percent: 100, bytesDone: t.bytesTotal, heldOn: 'Linux Box', deliveries: ds.map(d => ({ ...d })) })
+          return
+        }
+        emit('transfer://update', { ...t, state: 'transferring', percent: pct, bytesDone: t.bytesTotal * pct / 100, speedBps: 40_000_000, etaSeconds: (100 - pct) / 9, deliveries: ds.map(d => ({ ...d })) })
+      }, 500)
+      return { ...t }
+    }
     const names = paths.map((p) => p.split('/').pop() || p)
     const t = base(tid, 'send', names)
     t.friendName = friend?.name ?? 'Friend'
@@ -934,6 +1006,7 @@ export const mockApi = {
     return m
   },
   pasteClipboardImage: async (): Promise<string> => { throw new Error('No usable image is on the clipboard.') },
+  clipboardFilePaths: async (): Promise<string[]> => [],
   savePastedImage: async (_b64: string, ext: string): Promise<string> =>
     `/tmp/mock-pasted.${ext}`,
   reactToMessage: async (friendId: string, messageId: string, emoji: string, add: boolean) => {
@@ -965,6 +1038,7 @@ export const mockApi = {
   },
   sendTyping: async () => {},
   sendReadReceipt: async () => {},
+  chatMarkSeen: async () => {},
   downloadGif: async (url: string) => url,
   sendChatGif: async (
     friendId: string,
@@ -1017,4 +1091,38 @@ export function mockLocationRequest(request: Record<string, unknown>): Promise<u
   const q = String(request.query ?? '').toLowerCase()
   if (q) entries = entries.filter((e) => e.name.toLowerCase().includes(q))
   return new Promise((r) => setTimeout(() => r({ entries, page: 0, hasMore: false, total: entries.length }), 250))
+}
+
+// ── "On your other devices" (#31) ───────────────────────────────────────────
+// ?others=0 hides it (nothing happening elsewhere). Otherwise the iPhone is
+// sending a video to Alex (ticking, then "Sent" and gone) and the Mac mini is
+// receiving from Jordan. ?others=still freezes the progress for screenshots.
+export function mockOtherDevices(): import('./otherDevices').DeviceActivity[] {
+  const q = typeof location === 'undefined' ? new URLSearchParams() : new URLSearchParams(location.search)
+  if (q.get('others') === '0') return []
+  const now = Date.now()
+  const phone: import('./otherDevices').DeviceActivity = {
+    endpointId: 'preview-phone', name: 'iPhone', kind: 'phone', os: 'ios', updatedMs: now,
+    items: [{ id: 'od1', direction: 'send', state: 'transferring', names: ['IMG_2041.MOV', 'IMG_2042.HEIC', 'IMG_2043.HEIC'], fileCount: 3,
+      bytesDone: 412_000_000, bytesTotal: 980_000_000, percent: 42, speedBps: 38_000_000, peer: 'Alex' }],
+  }
+  const mini: import('./otherDevices').DeviceActivity = {
+    endpointId: 'preview-mini', name: 'Mac mini', kind: 'desktop', os: 'macos', updatedMs: now,
+    items: [{ id: 'od2', direction: 'receive', state: 'transferring', names: ['Wedding edit v3.mov'], fileCount: 1,
+      bytesDone: 1_900_000_000, bytesTotal: 6_200_000_000, percent: 30.6, speedBps: 94_000_000, peer: 'Jordan Kim' }],
+  }
+  const devices = [phone, mini]
+  if (q.get('others') !== 'still') {
+    const timer = setInterval(() => {
+      const it = phone.items[0]
+      if (it.state === 'completed') { clearInterval(timer); setTimeout(() => emit('account://activity', [mini]), 8000); return }
+      it.bytesDone = Math.min(it.bytesTotal, it.bytesDone + it.speedBps)
+      it.percent = (it.bytesDone / it.bytesTotal) * 100
+      if (it.bytesDone >= it.bytesTotal) { it.state = 'completed'; it.speedBps = 0 }
+      const m = mini.items[0]
+      m.bytesDone = Math.min(m.bytesTotal, m.bytesDone + m.speedBps); m.percent = (m.bytesDone / m.bytesTotal) * 100
+      emit('account://activity', devices.map(d => ({ ...d, items: d.items.map(i => ({ ...i })) })))
+    }, 1000)
+  }
+  return devices
 }

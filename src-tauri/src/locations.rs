@@ -192,7 +192,7 @@ fn canonical_missing(path: &Path) -> Result<PathBuf> {
     let name = path.file_name().context("Cannot resolve paired mirror folder")?;
     Ok(canonical_missing(parent)?.join(name))
 }
-fn validate_root(config: &Path, root: &Path) -> Result<()> {
+pub(crate) fn validate_root(config: &Path, root: &Path) -> Result<()> {
     let canonical_root = fs::canonicalize(root)?;
     let root = canonical_root.as_path();
     let config = fs::canonicalize(config)?;
@@ -368,14 +368,41 @@ pub(crate) fn publish_noreplace_owned(source: &Path, destination: &Path, expecte
             &to, destination.file_name().context("destination name missing")?, expected)
     }
     #[cfg(not(unix))] {
-        // A new hard link is atomic and never replaces an existing directory entry.
         let file = fs::File::open(source)?;
         let identity = crate::iroh_net::receive_stage::Identity::of(&file)?;
+        drop(file);
         ensure!(expected.is_none_or(|id| id == identity), "Receive stage identity changed before publication");
+        // A rename WITHOUT MOVEFILE_REPLACE_EXISTING is atomic and fails on an
+        // occupied name — and unlike a hard link it works on FAT32/exFAT drives,
+        // where every receive used to fail (T3).
+        #[cfg(windows)]
+        match windows_move_noreplace(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+            Err(e) => log::debug!("no-replace rename failed ({e}); publishing with a hard link"),
+        }
+        // A new hard link is atomic and never replaces an existing directory entry.
         fs::hard_link(source, destination)?;
         if let Err(e) = identity.remove(source) { log::warn!("Published hard link; stage cleanup deferred: {e:#}"); }
         Ok(())
     }
+}
+
+/// `MoveFileExW` with no flags: never replaces an existing destination.
+#[cfg(windows)]
+fn windows_move_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (from, to) = (wide(source), wide(destination));
+    unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVE_FILE_FLAGS(0)) }.map_err(|e| {
+        // HRESULT_FROM_WIN32(code) → the Win32 code, so ERROR_ALREADY_EXISTS /
+        // ERROR_FILE_EXISTS read as io::ErrorKind::AlreadyExists.
+        let hr = e.code().0 as u32;
+        let raw = if hr & 0xFFFF_0000 == 0x8007_0000 { (hr & 0xFFFF) as i32 } else { hr as i32 };
+        std::io::Error::from_raw_os_error(raw)
+    })
 }
 
 /// Only call for registered ordinary receive directories, never NAS roots.
@@ -700,13 +727,15 @@ mod unix {
         /// A 17,000-file upload used to stat every path from the root, six
         /// network round trips each on a mounted NAS, and outran the sender's
         /// patience. A missing or unreadable parent means every leaf is absent.
-        pub fn stat_many(&self, raw_parent: &str, leaves: &[String]) -> Result<Vec<Option<(bool, u64)>>> {
+        /// (is_dir, size, mtime secs) per leaf. The mtime lets a continuously
+        /// synced folder tell a same-size EDIT from an unchanged file (D9).
+        pub fn stat_many(&self, raw_parent: &str, leaves: &[String]) -> Result<Vec<Option<(bool, u64, u64)>>> {
             let rel = relative(raw_parent)?;
             let Ok(dir) = self.open_rel(&rel, true) else { return Ok(vec![None; leaves.len()]); };
             Ok(leaves.iter().map(|leaf| {
                 let file = child(&dir, std::ffi::OsStr::new(leaf), false).ok()?;
                 let meta = file.metadata().ok()?;
-                Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 }))
+                Some((meta.is_dir(), if meta.is_file() { meta.len() } else { 0 }, crate::iroh_net::mtime_secs(&meta)))
             }).collect())
         }
         /// SHA-256 of one entry, opened descriptor-relative with O_NOFOLLOW at
@@ -1054,7 +1083,7 @@ mod unix {
 #[cfg(not(unix))]
 impl Root {
     pub fn stat_entry(&self, _: &str) -> Result<Option<(bool, u64)>> { bail!("Hosting unavailable") }
-    pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64)>>> { bail!("Hosting unavailable") }
+    pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64, u64)>>> { bail!("Hosting unavailable") }
     pub fn hash_entry(&self, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64)) -> Result<Option<String>> { bail!("Hosting unavailable") }
     pub fn listing(&self, _: &str) -> Result<Vec<Entry>> { bail!("Hosting unavailable") }
     pub fn new_folder(&self, _: &str) -> Result<()> { bail!("Hosting unavailable") }
@@ -1144,8 +1173,8 @@ fn dispatch_at(config: &Path, endpoint: &str, request: &Value, now: Instant) -> 
             for (parent, items) in &groups {
                 let leaves: Vec<String> = items.iter().map(|(_, leaf)| leaf.clone()).collect();
                 for ((rel, _), found) in items.iter().zip(root.stat_many(parent, &leaves)?) {
-                    if let Some((is_dir, size)) = found {
-                        entries.push(json!({"rel_path":rel,"size":size,"is_dir":is_dir}));
+                    if let Some((is_dir, size, mtime)) = found {
+                        entries.push(json!({"rel_path":rel,"size":size,"is_dir":is_dir,"mtime":mtime}));
                     }
                 }
             }
@@ -1251,7 +1280,8 @@ pub fn hosted_status(config: &Path, id: &str) -> Result<HostedStatus> {
 }
 fn free_bytes(path: &Path) -> u64 { volume_bytes(path).map_or(0, |(free, total)| if plausible_volume(total) { free } else { 0 }) }
 /// (free, total) bytes on the volume `path` lives on; `None` when the mount is
-/// gone (or on a platform without statvfs).
+/// gone. Windows asks GetDiskFreeSpaceExW (a Windows Transfer Server used to
+/// get `None` here and never enforce its keep-free floor).
 pub(crate) fn volume_bytes(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)] {
         use std::{os::unix::ffi::OsStrExt, ffi::CString};
@@ -1262,7 +1292,16 @@ pub(crate) fn volume_bytes(path: &Path) -> Option<(u64, u64)> {
         let frsize = stat.f_frsize as u64;
         Some(((stat.f_bavail as u64).saturating_mul(frsize), (stat.f_blocks as u64).saturating_mul(frsize)))
     }
-    #[cfg(not(unix))] { let _ = path; None }
+    #[cfg(windows)] {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{core::PCWSTR, Win32::Storage::FileSystem::GetDiskFreeSpaceExW};
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let (mut free, mut total) = (0u64, 0u64);
+        // `free` = available to THIS user (honours quotas), like statvfs f_bavail.
+        unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free as *mut u64), Some(&mut total as *mut u64), None) }.ok()?;
+        Some((free, total))
+    }
+    #[cfg(not(any(unix, windows)))] { let _ = path; None }
 }
 
 pub struct Budget { remaining: u64, entries: usize }
@@ -1914,7 +1953,11 @@ mod tests {
         request["paths"] = json!(["folder/file", "folder/empty", "absent", "escape/friends.json"]);
         let now = Instant::now();
         error_message(dispatch_at(&f.config, "stranger", &request, now), "Location access denied");
-        let reply = dispatch_at(&f.config, "owner-device", &request, now).unwrap();
+        let mut reply = dispatch_at(&f.config, "owner-device", &request, now).unwrap();
+        // Each entry also carries its mtime (synced folders compare it — D9).
+        for e in reply["entries"].as_array_mut().unwrap() {
+            assert!(e.as_object_mut().unwrap().remove("mtime").and_then(|m| m.as_u64()).is_some());
+        }
         assert_eq!(reply["entries"], json!([
             {"rel_path":"folder/file","is_dir":false,"size":4},
             {"rel_path":"folder/empty","is_dir":true,"size":0}]));

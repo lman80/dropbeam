@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct ChatComposer: View {
     @EnvironmentObject private var bridge: Bridge
@@ -42,8 +43,10 @@ struct ChatComposer: View {
                     Menu {
                         Button { pick("photos") } label: { Label("Photos", systemImage: "photo.on.rectangle.angled") }
                         Button { pick("files") } label: { Label("Files", systemImage: "folder") }
+                        // PasteButton: tapping it IS the consent, so iOS never shows the
+                        // "Allow Paste" prompt (hasImages only peeks at the types — no prompt).
                         if UIPasteboard.general.hasImages {
-                            Button { pasteImage() } label: { Label("Paste Image", systemImage: "doc.on.clipboard") }
+                            PasteButton(supportedContentTypes: [.image]) { providers in pasteImages(providers) }
                         }
                         if bridge.settings?.giphyApiKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
                             Button { focused = false; gifPicker = true } label: { Label("GIFs", systemImage: "magnifyingglass") }
@@ -62,6 +65,15 @@ struct ChatComposer: View {
             .sheet(isPresented: $gifPicker) { ChatGifPicker(friendID: friendID).environmentObject(bridge) }
             .onChange(of: editing?.id) { _, _ in if let editing { text = editing.text ?? ""; focused = true } }
             .onChange(of: reply?.id) { _, _ in if reply != nil { focused = true } }
+            #if targetEnvironment(simulator)
+            // QA: `-focusComposer` shows then hides the keyboard (reproduces the state
+            // that made feedback screenshots black).
+            .task {
+                guard CommandLine.arguments.contains("-focusComposer") else { return }
+                try? await Task.sleep(for: .seconds(1.5)); focused = true
+                try? await Task.sleep(for: .seconds(2.5)); focused = false
+            }
+            #endif
             .onChange(of: scenePhase) { _, phase in if phase != .active { stopTyping() } }
             .onDisappear { stopTyping() }
     }
@@ -118,7 +130,7 @@ struct ChatComposer: View {
         focused = false; picking = true; reply = nil
         bridge.perform {
             let paths: [String]
-            do { paths = try await bridge.pickFiles(source: source) }
+            do { paths = try await bridge.pickFiles(source: source, purpose: .chat) }
             catch { picking = false; throw error }
             // Unlock + immediately on the picker reply, before any staging reply.
             picking = false
@@ -127,14 +139,14 @@ struct ChatComposer: View {
         }
     }
     /// Stage the clipboard's image(s) like picked photos (screenshots are the #1 paste).
-    private func pasteImage() {
-        focused = false; reply = nil
-        bridge.perform {
-            let images = UIPasteboard.general.images ?? []
-            guard !images.isEmpty else { return }
-            let paths = try await Task.detached(priority: .userInitiated) { try PastedImages.save(images) }.value
-            guard !paths.isEmpty, bridge.chatPath.last == friendID else { return }
-            try await bridge.action("stageChatFiles", ["friendId": friendID, "paths": paths])
+    private func pasteImages(_ providers: [NSItemProvider]) {
+        Task { @MainActor in
+            focused = false; reply = nil
+            bridge.perform {
+                let paths = try await PastedImages.save(providers)
+                guard !paths.isEmpty, bridge.chatPath.last == friendID else { return }
+                try await bridge.action("stageChatFiles", ["friendId": friendID, "paths": paths])
+            }
         }
     }
     private func send() {
@@ -211,21 +223,26 @@ private struct ChatGifPicker: View {
 }
 
 /// Pasted images are written as files so they ride the normal staged-attachment path.
+/// They live in a PickedMedia session (not Caches): a paste sent to a friend who is
+/// offline must still exist when the send finally goes out.
 enum PastedImages {
-    static func save(_ images: [UIImage]) throws -> [String] {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Pasted", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        // Keep the folder small: drop pastes older than a day.
-        let old = Date().addingTimeInterval(-86_400)
-        for url in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
-            if let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, date < old { try? FileManager.default.removeItem(at: url) }
-        }
+    static func save(_ providers: [NSItemProvider]) async throws -> [String] {
+        guard !providers.isEmpty else { return [] }
+        let dir = try PickedMedia.session(.chat)
         let stamp = Date().formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false).timeSeparator(.omitted).dateSeparator(.dash)).replacingOccurrences(of: ":", with: "")
-        return try images.enumerated().compactMap { index, image in
-            guard let data = image.pngData() else { return nil }
-            let url = dir.appendingPathComponent("Pasted \(stamp)\(images.count > 1 ? "-\(index + 1)" : "").png")
+        var paths: [String] = []
+        for (index, provider) in providers.enumerated() {
+            let type = provider.registeredTypeIdentifiers.first { UTType($0)?.conforms(to: .image) == true } ?? UTType.png.identifier
+            let data: Data? = await withCheckedContinuation { continuation in
+                _ = provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in continuation.resume(returning: data) }
+            }
+            guard let data, !data.isEmpty else { continue }
+            let ext = UTType(type)?.preferredFilenameExtension ?? "png"
+            let url = PickedMedia.unique("Pasted \(stamp)\(providers.count > 1 ? "-\(index + 1)" : "").\(ext)", in: dir)
             try data.write(to: url, options: .atomic)
-            return url.path
+            paths.append(url.path)
         }
+        if paths.isEmpty { try? FileManager.default.removeItem(at: dir) }
+        return paths
     }
 }

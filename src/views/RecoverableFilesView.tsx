@@ -19,7 +19,7 @@ type Confirm =
   | { kind: 'all' }
   | { kind: 'folder'; pairId: string; name: string; bytes: number }
 
-/** The "Recoverable files" tab: every shared folder's saved copies of deleted /
+/** The "Recoverable Files" tab: every shared folder's saved copies of deleted /
  *  replaced files, with a storage summary and ways to free space. */
 export function RecoverableFilesView() {
   const toast = useStore((s) => s.toast)
@@ -45,6 +45,7 @@ export function RecoverableFilesView() {
   }, [])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch; state is set when it resolves
     void load()
     const un = onFolderHistoryChanged(() => void load())
     return () => {
@@ -56,6 +57,7 @@ export function RecoverableFilesView() {
   useEffect(() => {
     if (focusPair && summaries) {
       if (summaries.some((s) => s.pairId === focusPair)) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot deep link consumed from the store
         setOpen(focusPair)
         setFocused(focusPair)
       }
@@ -142,7 +144,7 @@ export function RecoverableFilesView() {
       <EmptyState
         icon={<HardDrive />}
         title="Nothing to recover"
-        hint="Files deleted from shared folders show up here."
+        hint="When a file in a shared folder is deleted or replaced, a copy is kept here for a while so you can bring it back."
       />
     )
   }
@@ -151,6 +153,7 @@ export function RecoverableFilesView() {
 
   return (
     <div className="rf">
+      <p className="rf-intro">Deleted or replaced a file in a shared folder by mistake? Find it below and choose <b>Restore</b> to put it back.</p>
       <SectionHeader>Storage</SectionHeader>
       <div className="group rf-storage">
         <div className="row">
@@ -158,7 +161,7 @@ export function RecoverableFilesView() {
           <div className="row-main">
             <div className="row-title tnum">{formatBytes(total)} used</div>
             <div className="row-sub">
-              {budget > 0 ? `Up to ${formatBytes(budget)} per folder · old copies are removed automatically` : 'No storage limit'}
+              {budget > 0 ? `Up to ${formatBytes(budget)} per folder · copies from the last 30 days are always kept` : 'No storage limit'}
             </div>
             {limit > 0 && <ProgressBar percent={(total / Math.max(total, limit, 1)) * 100} label="Storage used by saved copies" />}
           </div>
@@ -167,11 +170,28 @@ export function RecoverableFilesView() {
               <SettingsIcon />
             </IconButton>
             <button className="btn btn-danger btn-sm" onClick={() => setConfirm({ kind: 'all' })} disabled={total === 0}>
-              Free up space…
+              Free Up Space…
             </button>
           </div>
         </div>
       </div>
+
+      {(() => {
+        const trashed = summaries.reduce((n, f) => n + (f.overflowTrashed ?? 0), 0)
+        return trashed > 0 ? (
+          <div className="group">
+            <div className="row">
+              <div className="row-main">
+                <div className="row-title">Some older copies were moved to the Trash</div>
+                <div className="row-sub">
+                  Your disk was nearly full, so {trashed} older saved cop{trashed === 1 ? 'y was' : 'ies were'} moved to the
+                  Trash to make room. {trashed === 1 ? 'It' : 'They'} can still be restored from there until you empty it.
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null
+      })()}
 
       {summaries.map((f) => (
         <FolderSection
@@ -199,7 +219,7 @@ export function RecoverableFilesView() {
                   onClick={() => (confirm.kind === 'all' ? freeAll() : emptyFolder(confirm.pairId))}
                 >
                   {busy ? <Spinner size={13} /> : null}
-                  {confirm.kind === 'all' ? 'Free up space' : 'Empty'}
+                  {confirm.kind === 'all' ? 'Free Up Space' : 'Empty'}
                 </button>
               </>
             }
@@ -297,7 +317,7 @@ function FolderSection({
           <MenuButton
             size="sm"
             label={`${summary.folderName} options`}
-            items={[{ label: 'Empty saved copies…', icon: <Trash2 />, danger: true, onSelect: onAskEmpty }]}
+            items={[{ label: 'Empty Saved Copies…', icon: <Trash2 />, danger: true, onSelect: onAskEmpty }]}
           />
         }
       >
@@ -340,7 +360,7 @@ function FolderSection({
                     <MenuButton
                       size="sm"
                       label={`More for ${name}`}
-                      items={[{ label: 'Delete forever…', icon: <Trash2 />, danger: true, onSelect: () => setForgetting(item) }]}
+                      items={[{ label: 'Delete Forever…', icon: <Trash2 />, danger: true, onSelect: () => setForgetting(item) }]}
                     />
                   </div>
                 </div>

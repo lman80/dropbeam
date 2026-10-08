@@ -1,0 +1,9 @@
+[  7.0s] B introduced itself and went offline
+[  9.5s] A sees server "Linux Box" member=true through=false
+[ 15.1s] chat held on "Linux Box"
+[218.6s] file held on "Linux Box" (upload 195.9s)
+[234.3s] B received 2 item(s)
+sha256 match: ed303bf4cf52ece1b27dab51135d81a09e92cbf12706fa0080a40193ffa33706
+receipts: [("chat", "delivered"), ("file", "delivered")]
+LIVE OK in 239.8s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 440 filtered out; finished in 239.82s

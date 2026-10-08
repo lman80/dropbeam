@@ -84,6 +84,7 @@ export function Hud() {
   const [shown, setShown] = useState<Pill | null>(null)
   useEffect(() => {
     if (pill) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- hold-last-pill grace period needs the timer below
       setShown(pill)
       return
     }

@@ -9,6 +9,7 @@ export function chatTransferLabel(t?: TransferUpdate): string {
     : t.state === 'completed' ? (t.direction === 'send' ? 'Delivered' : 'Saved')
     : t.state === 'failed' ? 'Not delivered' : t.state === 'canceled' ? 'Canceled'
     : t.state === 'paused' ? 'Paused'
+    : t.state === 'held' ? `On ${t.heldOn ?? 'your Transfer Server'}`
     : t.state === 'waitingForAccept' ? 'Waiting for acceptance'
     : t.state === 'transferring' ? (t.direction === 'send' ? 'Sending' : 'Receiving') : 'Connecting…'
 }
@@ -90,11 +91,12 @@ export function loadChatTransfers(): Record<string, ChatTransfer> {
       if (!record(v) || typeof v.id !== 'string' || !['send', 'receive'].includes(String(v.direction))) continue
       const l = v.chatTransfer
       if (!record(l) || l.id !== id || !Number.isSafeInteger(l.attempt) || !number(l.attempt) || !number(l.total)) continue
-      if (!['starting', 'waitingForPeer', 'connecting', 'waitingForAccept', 'transferring', 'completed', 'failed', 'canceled', 'paused'].includes(String(v.state))) continue
+      if (!['starting', 'waitingForPeer', 'connecting', 'waitingForAccept', 'transferring', 'completed', 'failed', 'canceled', 'paused', 'held'].includes(String(v.state))) continue
       // Old caches cannot prove completion. In-flight attempts restore as interrupted,
       // retaining their own generation instead of resurrecting a previous failure.
       let state = v.state as TransferUpdate['state']
-      const unconfirmed = v.unconfirmed === true || !terminal(state) || (state === 'completed' && (v.bytesDone !== l.total || (v.direction === 'receive' && l.batchState !== 'completed')))
+      // "held" is durable: a Transfer Server has it, and its receipt arrives later.
+      const unconfirmed = v.unconfirmed === true || (!terminal(state) && state !== 'held') || (state === 'completed' && (v.bytesDone !== l.total || (v.direction === 'receive' && l.batchState !== 'completed')))
       if (unconfirmed) state = 'failed'
       const bytesDone = number(v.bytesDone) ? Math.min(v.bytesDone as number, l.total as number) : 0
       out[id] = {
@@ -107,6 +109,7 @@ export function loadChatTransfers(): Record<string, ChatTransfer> {
         },
         bytesDone, bytesTotal: l.total as number, percent: state === 'completed' ? 100 : 0,
         fileNames: strings(v.fileNames) ? v.fileNames : [], fileCount: strings(v.fileNames) ? v.fileNames.length : 0,
+        heldOn: typeof v.heldOn === 'string' ? v.heldOn : null,
         speedBps: 0, etaSeconds: null,
         locality: ['local', 'direct', 'internet'].includes(String(v.locality)) ? v.locality as TransferUpdate['locality'] : 'unknown', connDetail: null,
         code: null, peer: null, friendName: typeof v.friendName === 'string' ? v.friendName : null,

@@ -4,10 +4,10 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { api, HAS_TAURI, isActive, type Settings, type Friend, type LinkResult, locationsApi, type SharedLocation, type LocationPage } from './api'
 import { useStore, rememberLocationUpload, type View } from '../store'
 import { MOBILE_UI } from './platform'
-import { friendOnlineState } from './presence'
+import { friendOnlineState, friendPresence } from './presence'
 import { transferSharePaths } from './mobilePick'
 import { setNativeShellActive } from './nativeShell'
-import { changedSnapshots, dispatchNativeCall, deliverNativeReply, pickNativeMedia, nativeAvatarPath, type BridgeArgs, type BridgeHandlers } from './nativeBridgeProtocol'
+import { memoSnapshots, type SnapshotMemo, type SnapshotSource, dispatchNativeCall, deliverNativeReply, pickNativeMedia, nativeAvatarPath, type BridgeArgs, type BridgeHandlers } from './nativeBridgeProtocol'
 import { nativeReply, nativeChatSource, nativeTransfers, nativeThread } from './nativeChatBridge'
 import { withMobileFileSource } from '../components/MobileFileSheet'
 import { restoredChatTransfer } from './chatTransfer'
@@ -15,16 +15,24 @@ import { nativeBrowserPage, nativeHistoryPaths, locationChild, requireLocationRi
 import { appVersion } from './updater'
 import { searchGifs, type GifResult } from './gif'
 import { ownDeviceLabels, personGroups } from './deviceIcons'
-import { routeCode } from './codes'
+import { routeCode, parseCode, friendCodeName, DEVICE_CODE_ELSEWHERE } from './codes'
 import { nativeFolders, folderLinks } from './nativeFolders'
 import { linkedDetail, linkedTitle } from './deviceLink'
+import { startOtherDevices, useOtherDevices } from './otherDevices'
 import { linkWithCode } from '../components/LinkDeviceModal'
 import { nativeReportMail, REPORT_REASONS, contactMailto, REPORT_EMAIL } from './report'
+import { serverApi, decideFile, type UsableServer, type PendingFile } from './transferServer'
+import { nativeServerList, nativePendingFiles, nativePushStatus, serverPrefsArgs } from './nativeServers'
+import { lookAlikeGroups, lookAlikesOf, refreshLookAlikes } from './lookAlike'
 
 declare global {
   interface Window { __dbBridge?: { call(id: number, name: string, args: BridgeArgs): Promise<void> } }
 }
 const st = () => useStore.getState()
+/** Device-link confirm tokens from linkDevicePrepare, by code (S1 / #10). */
+const confirmTokens = new Map<string, string>()
+const takeConfirm = (code: string) => { const t = confirmTokens.get(code.trim()) ?? ''; confirmTokens.delete(code.trim()); return t }
+const retryPayloads = () => { try { return localStorage.getItem('dropbeam-retry-payloads') } catch { return null } }
 const string = (a: BridgeArgs, key: string) => {
   if (typeof a[key] !== 'string') throw new Error(`Missing ${key}`)
   return a[key] as string
@@ -38,7 +46,8 @@ const handlers: BridgeHandlers = {
     const source = nativeChatSource(a)
     return pickNativeMedia(source, invoke)
   },
-  sendToFriend: async a => { await storeAction(() => st().sendToFriend(string(a, 'friendId'), paths(a))); st().setPendingSend(null) },
+  // `device` (an endpoint id) = "Send to one device"; without it every device gets it.
+  sendToFriend: async a => { await storeAction(() => st().sendToFriend(string(a, 'friendId'), paths(a), typeof a.device === 'string' && a.device ? a.device : undefined)); st().setPendingSend(null) },
   quickSend: async a => { await storeAction(() => st().sendPaths(paths(a))); st().setPendingSend(null) },
   dismissSend: () => st().setPendingSend(null),
   refreshRecipients: async () => {
@@ -65,15 +74,20 @@ const handlers: BridgeHandlers = {
     const route = routeCode(string(a, 'code'))
     switch (route.action) {
       case 'receive': await handlers.receiveWithCode({ code: route.code }); return { kind: 'receive' }
-      case 'addFriend': await handlers.addFriendByCode({ code: route.code }); return { kind: 'friend' }
-      case 'acceptFriendInvite': await handlers.acceptFriend({ code: route.code }); return { kind: 'friend' }
+      // The new friend's id rides back so Swift can show "Waiting for Alex…" → "Connected".
+      case 'addFriend': { const f = await api.addFriendByCode(route.code); await st().reloadFriends(); return { kind: 'friend', friendId: f.id, name: f.name, code: route.code } }
+      case 'acceptFriendInvite': { const f = await api.acceptFriend(route.code); await st().reloadFriends(); return { kind: 'friend', friendId: f.id, name: f.name } }
       case 'acceptFolderInvite': return { kind: 'folderInvite', code: route.code }
-      case 'linkDevice': {
-        const r = /^dropbeamjoin1:/i.test(route.code) ? await handlers.linkDeviceJoin({ code: route.code }) : await handlers.linkDeviceSend({ code: route.code })
-        return { kind: 'linked', name: (r as { name?: string } | undefined)?.name ?? null }
-      }
+      // S1: a device code is never acted on here — only from Settings → Devices.
+      case 'linkDevice': throw new Error(DEVICE_CODE_ELSEWHERE)
       case 'invalid': throw new Error(route.message)
     }
+  },
+  /** What a pasted/scanned/linked text holds, without acting on it: the canonical
+   *  code, its kind and (for a friend code) the name inside — for "Add Alex?". */
+  describeCode: a => {
+    const parsed = parseCode(string(a, 'code'))
+    return parsed ? { kind: parsed.kind, code: parsed.code, name: friendCodeName(parsed.code) } : null
   },
   retryTransfer: a => {
     const t = st().transfers[string(a, 'id')]
@@ -171,6 +185,22 @@ const handlers: BridgeHandlers = {
     const detail = online ? await st().probeFriend(id).catch(() => null) : null
     return { online, path: detail?.path ?? null, rttMs: detail?.rttMs ?? null }
   },
+  // Chat threads ask as they open / return to the foreground: dial every device of
+  // the person at once and answer as soon as ANY of them does. A success feeds the
+  // presence snapshot and (engine side) flushes messages queued for them.
+  checkPresence: async a => {
+    const ids = personDevices(string(a, 'id'))
+    if (!ids.length) return { online: false }
+    // Always answers: a ping that throws counts as "no", and the whole check gives up
+    // after 12 s (Swift's bridge call would otherwise wait out its 30 s timeout).
+    const online = await new Promise<boolean>(resolve => {
+      let left = ids.length
+      const timer = setTimeout(() => resolve(false), 12_000)
+      const done = (ok: boolean) => { if (ok) { clearTimeout(timer); resolve(true) } else if (--left === 0) { clearTimeout(timer); resolve(false) } }
+      for (const id of ids) st().pingFriend(id).then(ok => done(!!ok), () => done(false))
+    })
+    return { online }
+  },
   removeFriend: a => st().removeFriend(string(a, 'id')),
   blockFriend: async a => { if (!await st().blockFriend(string(a, 'id'))) throw new Error(st().toasts.at(-1)?.message || 'Could not block') },
   unblockPerson: a => st().unblockPerson(string(a, 'id')),
@@ -197,16 +227,36 @@ const handlers: BridgeHandlers = {
   },
   myInviteCode: () => api.myInviteCode(),
   addFriendByCode: a => storeAction(() => st().addFriendByCode(string(a, 'code'))),
+  // S2: people asking to be friends → [{ endpointId, name, at }]; accept/decline
+  // (decline with bool:true also blocks them). Swift re-asks on 'friend-requests://changed'.
+  listFriendRequests: () => api.listFriendRequests(),
+  acceptFriendRequest: a => storeAction(() => st().acceptFriendRequest(string(a, 'endpointId'))),
+  declineFriendRequest: a => storeAction(() => st().declineFriendRequest(string(a, 'endpointId'), a.bool === true)),
   acceptFriend: a => storeAction(() => st().acceptFriend(string(a, 'code'))),
   shareFiles: a => api.shareFiles(paths(a)),
   linkDeviceBegin: () => api.linkDeviceBegin(),
   linkDeviceCancel: () => api.linkDeviceCancel(),
-  linkDeviceSend: async a => linked(await linkWithCode(string(a, 'code'))),
+  // S1: step 1 with a scanned code → { name, safety, direction, peerShowsCode };
+  // Swift shows the safety code and calls linkDeviceSend only once confirmed.
+  linkDevicePrepare: async a => {
+    const info = await api.linkDevicePrepare(string(a, 'code'))
+    // The confirm step's token stays here; linkDeviceSend hands it back (#10).
+    confirmTokens.set(string(a, 'code').trim(), info.confirmToken)
+    return info
+  },
+  // The answer to a 'link://confirm' prompt (the other device scanned ours).
+  linkConfirm: a => {
+    if (typeof a.bool !== 'boolean') throw new Error('Invalid confirmation')
+    return api.linkConfirm(string(a, 'endpointId'), a.bool)
+  },
+  linkDeviceSend: async a => linked(await linkWithCode(string(a, 'code'), takeConfirm(string(a, 'code')))),
   linkHostBegin: () => api.linkHostBegin(),
   linkHostCancel: () => api.linkHostCancel(),
-  linkDeviceJoin: async a => linked(await linkWithCode(string(a, 'code'))),
+  linkDeviceJoin: async a => linked(await linkWithCode(string(a, 'code'), takeConfirm(string(a, 'code')))),
   accountSyncNow: async () => { await api.accountSyncNow(); await st().refreshMyDevice() },
   accountRemoveDevice: async a => { await api.accountRemoveDevice(string(a, 'endpointId')); await st().reloadFriends() },
+  // S4: a device in Settings → Devices marked needs_approval (myDevice.devices[].needs_approval).
+  accountApproveDevice: async a => { await api.accountApproveDevice(string(a, 'endpointId')); await st().reloadFriends() },
   accountLeave: async () => { await api.accountLeave(); await st().reloadFriends() },
   updateSettings: a => {
     if (!a.patch || typeof a.patch !== 'object' || Array.isArray(a.patch)) throw new Error('Invalid settings patch')
@@ -239,7 +289,7 @@ const handlers: BridgeHandlers = {
     checkLocation(a, 'upload')
     const source = string(a, 'source')
     let picked: string[]
-    if (source === 'folder') { const folder = await pickNativeFolder(); picked = folder ? [folder] : [] }
+    if (source === 'folder') { const folder = await pickNativeFolder('upload'); picked = folder ? [folder] : [] }
     else { nativeChatSource(a); picked = paths(a) }
     if (!picked.length) return null
     checkLocation(a, 'upload')
@@ -284,7 +334,7 @@ const handlers: BridgeHandlers = {
   acceptFolderInvite: async a => {
     const folder = await pickNativeFolder()
     if (!folder) return false
-    await api.acceptPair(string(a, 'code'), folder)
+    await api.acceptPair(string(a, 'code'), folder, typeof a.folderName === 'string' ? a.folderName : null)
     await st().reloadPairs()
     return true
   },
@@ -297,11 +347,11 @@ const handlers: BridgeHandlers = {
   },
   folderSetPaused: async a => {
     if (typeof a.bool !== 'boolean') throw new Error('Invalid pause value')
-    await api.setFolderPaused(folderLinks(st().pairs, string(a, 'folderId'))[0].id, a.bool)
+    await api.setFolderPaused(folderLink(a).id, a.bool)
     await st().reloadPairs()
   },
   folderStop: async a => { for (const link of folderLinks(st().pairs, string(a, 'folderId'))) await api.stopFolderTransfer(link.id).catch(() => {}) },
-  folderVerify: a => api.verifyFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id),
+  folderVerify: a => api.verifyFolder(folderLink(a).id),
   folderLeave: async a => {
     for (const link of folderLinks(st().pairs, string(a, 'folderId'))) await storeAction(() => st().removePair(link.id))
   },
@@ -317,16 +367,82 @@ const handlers: BridgeHandlers = {
   folderShowInvite: a => api.pairInvite(folderMember(a).id),
   /** A fresh invite code for one more person (desktop "Add person"). */
   folderAddPerson: async a => {
-    const code = await api.folderAddPerson(folderLinks(st().pairs, string(a, 'folderId'))[0].id)
+    const code = await api.folderAddPerson(folderLink(a).id)
     await st().reloadPairs()
     return code
   },
+  // Transfer Servers (servers this device may use; iOS never hosts one).
+  serversList: async () => { await refreshServers(); return usableServers },
+  serverPrefs: async a => {
+    const { eid, prefs } = serverPrefsArgs(a)
+    usableServers = nativeServerList(await serverApi.serverPrefs(eid, prefs))
+    resnapshot?.()
+    return usableServers
+  },
+  serverForget: async a => {
+    usableServers = nativeServerList(await serverApi.forgetServer(string(a, 'eid')))
+    resnapshot?.()
+    return usableServers
+  },
+  /** Pull anything a server holds for us (Swift calls this on every foreground). */
+  mailboxFetchNow: async () => { await serverApi.fetchNow(); void refreshPending() },
+  /** The server a message to this friend would wait on while they're offline. */
+  serverHoldRoute: a => serverApi.holdRoute(string(a, 'friendId')),
+  decidePendingFile: async a => {
+    if (typeof a.accept !== 'boolean') throw new Error('Invalid accept value')
+    const linkId = string(a, 'linkId')
+    await decideFile(linkId, a.accept)
+    pendingFiles = pendingFiles.filter(p => p.linkId !== linkId)
+    resnapshot?.()
+  },
+  /** Can servers wake this iPhone (APNs token registered), and do pushes show text? */
+  pushStatus: async () => nativePushStatus(await invoke<unknown>('push_status').catch(() => null)),
+  pushSetPreviews: async a => {
+    if (typeof a.on !== 'boolean') throw new Error('Invalid on value')
+    await invoke('push_set_previews', { on: a.on })
+    return nativePushStatus(await invoke<unknown>('push_status').catch(() => null))
+  },
+  /** Foreground / Wi-Fi ↔ cellular: let iroh re-probe its addresses now. */
+  networkChanged: () => invoke('network_changed'),
+  /** iOS Bonjour (no multicast entitlement needed): our id + LAN addresses to advertise… */
+  lanSelfInfo: () => invoke('lan_self_info'),
+  /** …and a nearby device the shell found, for the next direct dial. */
+  lanPeerFound: a => {
+    if (!Array.isArray(a.addrs) || !a.addrs.every(x => typeof x === 'string')) throw new Error('Invalid addresses')
+    return invoke('lan_peer_found', { endpointId: string(a, 'endpointId'), addrs: a.addrs })
+  },
+  /** Settings → Erase All Data, step 1 (Swift then wipes the files and quits):
+   *  withdraw the push token from Transfer Servers and leave the account, so the
+   *  user's other devices drop this iPhone. Both best effort, bounded. */
+  eraseAllData: async () => {
+    const bounded = (p: Promise<unknown>, ms: number) => Promise.race([p.catch(() => {}), new Promise(r => setTimeout(r, ms))])
+    await bounded(invoke('push_unregister_all'), 15_000)
+    if (st().myDevice?.account_pub) await bounded(api.accountLeave(), 25_000)
+    await bounded(invoke('network_shutdown'), 4_000)
+    return true
+  },
   folderInviteFriend: async a => {
-    await api.inviteFriendToFolder(folderLinks(st().pairs, string(a, 'folderId'))[0].id, string(a, 'friendId'))
+    await api.inviteFriendToFolder(folderLink(a).id, string(a, 'friendId'))
     await st().reloadPairs()
   },
 }
+let usableServers: UsableServer[] = []
+let pendingFiles: PendingFile[] = []
+async function refreshServers() {
+  usableServers = nativeServerList(await serverApi.servers().catch(() => usableServers))
+  resnapshot?.()
+}
+async function refreshPending() {
+  pendingFiles = nativePendingFiles(await invoke<unknown>('mailbox_pending_files').catch(() => pendingFiles))
+  resnapshot?.()
+}
 const folderSnapshot = () => { const s = st(); return nativeFolders(s.pairs, s.folderStatuses, s.folderSummaries, s.folderLastSynced, s.myEid, s.friends) }
+/** The folder's first link — a folder left on another screen has none any more. */
+function folderLink(a: BridgeArgs) {
+  const link = folderLinks(st().pairs, string(a, 'folderId'))[0]
+  if (!link) throw new Error('This shared folder no longer exists.')
+  return link
+}
 /** A member link, checked to belong to the named folder (never act on a stale id). */
 function folderMember(a: BridgeArgs) {
   const link = folderLinks(st().pairs, string(a, 'folderId')).find(p => p.id === string(a, 'pairId'))
@@ -361,23 +477,46 @@ const linked = async (r: LinkResult) => {
 const deviceSnapshot = () => {
   const d = st().myDevice
   return d ? { name: d.name, displayName: d.display_name ?? st().settings?.displayName ?? null, endpointId: d.endpoint_id, deviceKind: d.device_kind, deviceOs: d.device_os ?? null, accountPub: d.account_pub, linkedDevices: d.linked_devices,
-    devices: (d.devices ?? []).map(x => ({ friendId: x.friend_id, endpointId: x.endpoint_id, name: x.name, deviceKind: x.device_kind, deviceOs: x.device_os, lastSyncMs: x.last_sync_ms, thisDevice: x.this_device })) } : null
+    devices: (d.devices ?? []).map(x => ({ friendId: x.friend_id, endpointId: x.endpoint_id, name: x.name, deviceKind: x.device_kind, deviceOs: x.device_os, deviceModel: x.device_model ?? null, lastSyncMs: x.last_sync_ms, thisDevice: x.this_device, needsApproval: x.needs_approval === true })) } : null
 }
 /** Friends as Swift sees them: own devices flagged and labelled "Your Mac" etc. */
 const friendSnapshot = (friends: Friend[], accountPub?: string | null) => {
   const own = friends.filter(f => accountPub && f.accountPub === accountPub)
   const labels = ownDeviceLabels(own)
   const groups = personGroups(friends, accountPub)
-  return friends.map(({ secret: _secret, ...friend }) => ({ ...friend, ownDevice: friend.id in labels, ownLabel: labels[friend.id] ?? null, groupedUnder: groups[friend.id] ?? null }))
+  const alike = lookAlikeGroups()
+  return friends.map(({ secret: _secret, ...friend }) => ({ ...friend, ownDevice: friend.id in labels, ownLabel: labels[friend.id] ?? null, groupedUnder: groups[friend.id] ?? null,
+    // Other contacts this one might be (same name/photo, not linked): a hint only.
+    lookAlikeWith: lookAlikesOf(alike, friend.id).map(x => x.name) }))
 }
 /** Presence per friend; a person reads online when ANY of their devices is. */
 const presenceSnapshot = (s: ReturnType<typeof st>) => {
-  const out: Record<string, boolean> = Object.fromEntries(s.friends.map(f => [f.id, friendOnlineState(f.name, s.friendSeen, s.folderStatuses) === true]))
+  const out: Record<string, boolean> = Object.fromEntries(s.friends.map(f => [f.id, friendOnlineState(f, s.friendSeen, s.folderStatuses) === true]))
   for (const [member, owner] of Object.entries(personGroups(s.friends, s.myDevice?.account_pub))) if (out[member]) out[owner] = true
   return out
 }
-const presenceOf = (name: string) => friendOnlineState(name, st().friendSeen, st().folderStatuses) === true
-const locationSnapshot = () => nativeLocationRows(st().friends, { presence: f => presenceOf(f.name), results: locationResults, shared, checking: locationChecking, now: Date.now() })
+/** Last contact (ms) for people NOT online right now, so a thread can say
+ * "Last seen 5 min ago". Online people are left out on purpose: their stamp moves
+ * on every probe, and re-pushing it every 30 s would be pure churn. */
+const presenceSeenSnapshot = (s: ReturnType<typeof st>, online: Record<string, boolean>) => {
+  const out: Record<string, number> = {}
+  const groups = personGroups(s.friends, s.myDevice?.account_pub)
+  for (const f of s.friends) {
+    const owner = groups[f.id] ?? f.id
+    if (online[owner]) continue
+    const seen = friendPresence(f, s.friendSeen, s.folderStatuses).lastSeen
+    if (seen != null && seen > (out[owner] ?? 0)) out[owner] = seen
+  }
+  return out
+}
+/** Every friend record that speaks for this person: the thread owner + their grouped devices. */
+const personDevices = (id: string) => {
+  const s = st()
+  const groups = personGroups(s.friends, s.myDevice?.account_pub)
+  return s.friends.filter(f => f.id === id || groups[f.id] === id).map(f => f.id)
+}
+const presenceOf = (f: { id: string; name: string }) => friendOnlineState(f, st().friendSeen, st().folderStatuses) === true
+const locationSnapshot = () => nativeLocationRows(st().friends, { presence: f => presenceOf(f), results: locationResults, shared, checking: locationChecking, now: Date.now() })
 // Tauri command errors arrive as plain strings; the engine already words them
 // for people ("Couldn’t reach this device…"), and Swift shows them under the
 // friend's own heading, so no name prefix.
@@ -392,7 +531,7 @@ function refreshLocations(force = false) {
       pushLocations?.()
       await loadLocations({
         friends,
-        online: f => presenceOf(f.name),
+        online: f => presenceOf(f),
         probe: id => st().pingFriend(id),
         list: locationsApi.list,
         cached: shared,
@@ -423,8 +562,10 @@ function locationRequest<T>(a: BridgeArgs, kind: string, extra: Record<string, u
   checkLocation(a, 'read')
   return locationsApi.request<T>(string(a, 'friendId'), { kind: `locations.${kind}`, id: string(a, 'locationId'), rel_path: string(a, 'path'), ...extra })
 }
-async function pickNativeFolder(): Promise<string | null> {
-  const result = await invoke<{ path: string | null }>('plugin:native-ui|pick_folder')
+/** `upload`: a folder to send (private copy, swept once sent); otherwise a Shared
+ *  Folder's local copy (Documents/Shared Folders, visible in Files). */
+async function pickNativeFolder(purpose?: 'upload'): Promise<string | null> {
+  const result = await invoke<{ path: string | null }>('plugin:native-ui|pick_folder', { purpose: purpose ?? null })
   return result.path
 }
 function recoveryItem(a: BridgeArgs) {
@@ -453,7 +594,7 @@ async function start() {
   const stops: UnlistenFn[] = []
   let running = true
   let queue = Promise.resolve()
-  const previous = new Map<string, string>()
+  const previous: SnapshotMemo = new Map()
   const send = (command: 'state' | 'event', payload: Record<string, unknown>) => {
     queue = queue.then(async () => {
       if (running) await invoke(`plugin:native-ui|${command}`, payload)
@@ -485,30 +626,45 @@ async function start() {
       useStore.setState({ windowFocused: nativeFocused })
       return
     }
-    const snapshots = {
-      friends: friendSnapshot(s.friends, s.myDevice?.account_pub),
-      transfers: nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
+    const chatId = s.activeChatId
+    const activeThread = chatId ? s.chats[chatId] : undefined
+    const others = useOtherDevices.getState().devices
+    let presence: Record<string, boolean> | undefined
+    const presenceNow = () => (presence ??= presenceSnapshot(s))
+    // Each snapshot lists the store slices it is built from; unchanged inputs = no work.
+    const snapshots: Record<string, SnapshotSource> = {
+      friends: [[s.friends, s.myDevice?.account_pub, lookAlikeGroups()], () => friendSnapshot(s.friends, s.myDevice?.account_pub)],
+      // sharePaths also come from the retry payloads saved in localStorage (string compare).
+      transfers: [[s.order, s.transfers, chatId, activeThread, s.history, s.chatTransfers, retryPayloads()], () => nativeTransfers(s.order.map(id => s.transfers[id]).filter(Boolean).reverse()
         .filter(t => !(t.state === 'canceled' && !t.fileNames.length)),
-        Object.assign({}, ...(s.activeChatId ? s.chats[s.activeChatId] ?? [] : []).map(m => {
+        Object.assign({}, ...(activeThread ?? []).map(m => {
           const restored = restoredChatTransfer(m, s.history)
           return restored && m.fileXferId ? { [m.fileXferId]: restored } : {}
-        }), s.chatTransfers)).map(t => ({ ...t, sharePaths: t.direction === 'send' || t.state === 'completed' ? transferSharePaths(t) : [] })),
-      settings: s.settings,
-      history: s.history,
-      locations: locationSnapshot(),
-      needsName: needsName(),
-      pendingSend: s.pendingSend ?? [],
-      chatOverview: s.chatOverview.map(o => ({ ...o, unread: s.chatUnread[o.peerId] ?? 0 })),
-      chatUnread: s.chatUnread,
-      chatTyping: s.chatTyping,
-      thread: nativeThread(s.activeChatId, s.chats),
-      chatDraftFiles: s.chatDraftFiles,
-      presence: presenceSnapshot(s),
-      myDevice: deviceSnapshot(),
-      folders: folderSnapshot(),
-      blocked: s.blocked,
+        }), s.chatTransfers)).map(t => ({ ...t, sharePaths: t.direction === 'send' || t.state === 'completed' ? transferSharePaths(t) : [] }))],
+      settings: [[s.settings], () => s.settings],
+      history: [[s.history], () => s.history],
+      // Built from module state (results, cache, checking set) and the clock: always.
+      locations: [null, () => locationSnapshot()],
+      // null until settings load: "no name needed" must not be guessed (it let iOS ask for
+      // notifications over the Welcome screen of a brand-new install).
+      needsName: [null, () => st().settings ? needsName() : null],
+      pendingSend: [[s.pendingSend], () => s.pendingSend ?? []],
+      chatOverview: [[s.chatOverview, s.chatUnread], () => s.chatOverview.map(o => ({ ...o, unread: s.chatUnread[o.peerId] ?? 0 }))],
+      chatUnread: [[s.chatUnread], () => s.chatUnread],
+      chatTyping: [[s.chatTyping], () => s.chatTyping],
+      thread: [[chatId, activeThread], () => nativeThread(chatId, s.chats)],
+      chatDraftFiles: [[s.chatDraftFiles], () => s.chatDraftFiles],
+      // Presence expires with time (the 15 s timer re-runs this): always rebuilt.
+      presence: [null, presenceNow],
+      presenceSeen: [null, () => presenceSeenSnapshot(s, presenceNow())],
+      myDevice: [[s.myDevice, s.settings?.displayName], () => deviceSnapshot()],
+      folders: [[s.pairs, s.folderStatuses, s.folderSummaries, s.folderLastSynced, s.myEid, s.friends], () => folderSnapshot()],
+      blocked: [[s.blocked], () => s.blocked],
+      transferServers: [[usableServers], () => usableServers],
+      pendingFiles: [[pendingFiles], () => pendingFiles],
+      otherDevices: [[others], () => others],
     }
-    for (const change of changedSnapshots(previous, snapshots)) send('state', change)
+    for (const change of memoSnapshots(previous, snapshots)) send('state', change)
     if (s.activeChatId !== activeChat) {
       activeChat = s.activeChatId
       if (!markingRead || (activeChat && activeChat !== markingRead)) send('event', { name: 'chatOpen', payload: { friendId: activeChat } })
@@ -524,24 +680,44 @@ async function start() {
   resnapshot = sync
   // Store staging is path-only. Coalesce synchronous store notifications into
   // the next turn so serialization cannot hold the picker/staging reply hostage.
+  // Progress ticks arrive several times a second per transfer: at most ~8 syncs/s.
   let syncTimer: ReturnType<typeof setTimeout> | undefined
-  stops.push(useStore.subscribe(() => {
-    syncTimer ??= setTimeout(() => { syncTimer = undefined; if (running) sync() }, 0)
-  }))
+  let lastSync = 0
+  const schedule = () => {
+    syncTimer ??= setTimeout(() => { syncTimer = undefined; lastSync = Date.now(); if (running) sync() }, Math.max(0, 120 - (Date.now() - lastSync)))
+  }
+  stops.push(useStore.subscribe(schedule))
+  // "On your other devices" (#31) lives in its own small store.
+  startOtherDevices()
+  stops.push(useOtherDevices.subscribe(schedule))
   sync() // Full initial snapshot, even when init is still in progress.
   void st().refreshMyDevice().catch(() => {})
   const timer = window.setInterval(sync, 15_000) // Presence must expire without a store mutation.
   cleanup = () => { resnapshot = undefined; pushLocations = undefined; running = false; stops.forEach(stop => stop()); clearInterval(timer); clearTimeout(syncTimer) }
-  for (const name of ['chat://message', 'friend://presence', 'folder-history://changed', 'folder-invite://incoming', 'locations://changed']) {
+  for (const name of ['chat://message', 'friend://presence', 'folder-history://changed', 'folder-invite://incoming', 'locations://changed', 'received://files']) {
     try { stops.push(await listen(name, ({ payload }) => {
       send('event', { name, payload })
       if (name === 'locations://changed') void refreshLocations(true)
     })) } catch { /* optional event */ }
   }
-  for (const name of ['friends://changed', 'account://synced', 'link://linked']) {
-    try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}) })) } catch { /* store also refreshes */ }
+  // `dropbeam:` links the app was opened with (invite links, Camera-scanned QRs):
+  // queued by the engine until taken, so a cold launch loses none.
+  const takeOpenUrls = async () => {
+    const urls = await invoke<string[]>('take_open_urls').catch(() => [] as string[])
+    for (const url of urls) send('event', { name: 'openURL', payload: { url } })
   }
-  for (const name of ['link://linked', 'account://left', 'link://failed', 'link://progress']) {
+  try { stops.push(await listen('open-url://incoming', () => { void takeOpenUrls() })) } catch { /* optional event */ }
+  void takeOpenUrls()
+  // Transfer Servers: the list and held files re-push on their events; Swift also
+  // hears mailbox://servers to re-ask a thread's hold route.
+  void refreshServers(); void refreshPending()
+  try { stops.push(await listen('mailbox://servers', ({ payload }) => { void refreshServers(); send('event', { name: 'mailbox://servers', payload: payload ?? null }) })) } catch { /* optional event */ }
+  try { stops.push(await listen('mailbox://pending', () => { void refreshPending() })) } catch { /* optional event */ }
+  for (const name of ['friends://changed', 'account://synced', 'link://linked']) {
+    try { stops.push(await listen(name, () => { void st().refreshMyDevice().catch(() => {}); void refreshLookAlikes().then(() => resnapshot?.()) })) } catch { /* store also refreshes */ }
+  }
+  void refreshLookAlikes().then(() => resnapshot?.())
+  for (const name of ['link://linked', 'account://left', 'link://failed', 'link://progress', 'link://confirm', 'friend-requests://changed']) {
     try { stops.push(await listen(name, ({ payload }) => send('event', { name, payload }))) } catch { /* optional event */ }
   }
 }

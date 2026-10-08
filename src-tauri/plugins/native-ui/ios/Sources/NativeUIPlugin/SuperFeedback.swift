@@ -1,4 +1,5 @@
-// SuperFeedback 2.1.0 — copy this file into an iOS 16+ target.
+// SuperFeedback 3.3.1 + lman80/SuperFeedback branch dropbeam-ios-fixes (56928f7) — iOS 17+.
+// Only local addition: the simulator-only QA dump in SFSceneState.present (search "DropBeam QA").
 import Foundation
 import SwiftUI
 import UIKit
@@ -7,10 +8,31 @@ import ImageIO
 import Darwin
 import OSLog
 import Network
+import Security
+import StoreKit
 
 @MainActor
 public enum SuperFeedback {
-    public nonisolated static let version = "2.1.0"
+    public nonisolated static let version = "3.3.1"
+
+    public enum Tab: String, Sendable { case feedback, ideas, support }
+    /// `.off` hides Support even when the backend has a `fund.supportUrl` — for App Store /
+    /// TestFlight builds that have no In-App Purchase products (an external payment link
+    /// there would break App Store guideline 3.1.1).
+    public enum Support: Sendable { case products([String]); case url(URL); case off }
+    public struct SupportNudge: Sendable {
+        public var enabled: Bool
+        public var cooldownDays: Int
+        public var minLaunches: Int
+        public var minMoments: Int
+        public var afterTipDays: Int
+        public var thankYou: Bool
+        public init(enabled: Bool = true, cooldownDays: Int = 30, minLaunches: Int = 3,
+                    minMoments: Int = 3, afterTipDays: Int = 180, thankYou: Bool = true) {
+            self.enabled = enabled; self.cooldownDays = cooldownDays; self.minLaunches = minLaunches
+            self.minMoments = minMoments; self.afterTipDays = afterTipDays; self.thankYou = thankYou
+        }
+    }
 
     public enum Trigger: Sendable { case draggable, floating, none }
     public enum Position: Sendable {
@@ -29,27 +51,51 @@ public enum SuperFeedback {
         public var maxImages = 5
         public var captureLogs = true
         public var captureCrashes = true
+        public var community = true
+        public var supportPurpose: String? = nil
+        public var support: Support? = nil
+        public var supportNudge: SupportNudge = .init()
+        public var keychainGroup: String? = nil
+        /// Repo for the "Feedback on SuperFeedback" link; nil or a value without "/" hides it.
+        public var widgetFeedback: String? = "lman80/SuperFeedback"
+        /// Daily anonymous version/config check-in (PROTOCOL.md "POST /checkin"); false disables.
+        public var checkin = true
         public var meta: [String: String] = [:]
         /// Whether the floating button shows before the user has chosen in Settings.
         public var defaultEnabled = true
-        /// Extra room the trigger keeps clear of (e.g. a tab bar), on top of the safe area.
+        /// Extra room the trigger keeps clear of, on top of the safe area. The bottom value is
+        /// only a fallback: a visible UITabBar in the host's windows is measured directly.
         public var reservedInsets: UIEdgeInsets = .zero
-        /// Rest the trigger half-tucked into the screen edge so it never sits over
-        /// row controls (chevrons, switches); it slides fully out while touched.
-        public var dockedToEdge = false
 
         public init(backendURL: URL, repo: String, app: String, appKey: String = "",
                     trigger: Trigger = .draggable, position: Position? = nil,
                     accent: Color? = nil, attachScreenshot: Bool = true, maxImages: Int = 5,
                     captureLogs: Bool = true, captureCrashes: Bool = true,
-                    meta: [String: String] = [:]) {
+                    meta: [String: String] = [:], community: Bool = true, support: Support? = nil,
+                    supportNudge: SupportNudge = .init(), keychainGroup: String? = nil,
+                    supportPurpose: String? = nil, widgetFeedback: String? = "lman80/SuperFeedback",
+                    checkin: Bool = true) {
+            self.widgetFeedback = widgetFeedback; self.checkin = checkin
+            self.community = community; self.support = support; self.supportPurpose = supportPurpose
+            self.supportNudge = supportNudge; self.keychainGroup = keychainGroup
             self.backendURL = backendURL; self.repo = repo; self.app = app; self.appKey = appKey
             self.trigger = trigger; self.position = position; self.accent = accent
             self.attachScreenshot = attachScreenshot; self.maxImages = maxImages
             self.captureLogs = captureLogs; self.captureCrashes = captureCrashes; self.meta = meta
         }
+
+        fileprivate var widgetFeedbackRepo: String? {
+            widgetFeedback.flatMap { $0.contains("/") ? $0.trimmingCharacters(in: .whitespaces) : nil }
+        }
     }
 
+    public static var voterId: String { SFIdentity.value(group: config?.keychainGroup) }
+    fileprivate static var hasSupport: Bool { SFCommunity.shared.effectiveSupport(config: config) != nil }
+    fileprivate static var isOffline: Bool { network == "offline" }
+    fileprivate static var isOnline: Bool { ["wifi", "cellular", "online"].contains(network) }
+    fileprivate static func noticeScene() -> SFSceneState? {
+        activeScene().flatMap { scenes[ObjectIdentifier($0)] }
+    }
     private static var config: Config?
     private static var scenes: [ObjectIdentifier: SFSceneState] = [:]
     private static var observers: [NSObjectProtocol] = []
@@ -57,6 +103,7 @@ public enum SuperFeedback {
     private static var context: [String: String] = [:]
     private static var logs: [SFLogLine] = []
     private static var logsWriteTask: Task<Void, Never>?
+    private static var lastMomentEvaluation: TimeInterval?
     private static var initializedAt = ProcessInfo.processInfo.systemUptime
     private static let sessionId = UUID().uuidString
     private static let networkMonitor = NWPathMonitor()
@@ -66,7 +113,9 @@ public enum SuperFeedback {
 
     public static func configure(_ config: Config) {
         if self.config == nil { initializedAt = ProcessInfo.processInfo.systemUptime }
+        dismissNudges()
         self.config = config
+        SFCommunity.shared.configure(config)
         for state in scenes.values { state.config = config }
         SFCrashCapture.setEnabled(config.captureCrashes)
         if !config.captureLogs {
@@ -79,12 +128,17 @@ public enum SuperFeedback {
     public static func start() {
         guard let config, !started else { return }
         started = true
+        UserDefaults.standard.set(UserDefaults.standard.integer(forKey: "superfeedback.launches") + 1,
+                                  forKey: "superfeedback.launches")
+        Task { await SFCommunity.shared.drainTips(config: config) }
         // Consume the previous session's ring before this session can write or crash.
         let previousLogs = config.captureLogs ? SFStorage.readLogs() : []
         if let url = SFStorage.directory()?.appendingPathComponent("diagnostics.log") {
             try? FileManager.default.removeItem(at: url)
         }
         if !logs.isEmpty { scheduleLogsWrite() }
+        SFCheckin.send(config: config, platform: "ios",
+                       os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)", enabled: isEnabled)
         networkMonitor.pathUpdateHandler = { path in
             let status = path.status != .satisfied ? "offline"
                 : path.usesInterfaceType(.wifi) ? "wifi"
@@ -102,7 +156,9 @@ public enum SuperFeedback {
                     if notificationName == UIScene.didDisconnectNotification {
                         let state = scenes.removeValue(forKey: ObjectIdentifier(scene))
                         state?.tearDown()
-                    } else { install(in: scene) }
+                    } else {
+                        install(in: scene)
+                    }
                 }
             })
         }
@@ -120,24 +176,24 @@ public enum SuperFeedback {
             let resources = await Task.detached(priority: .utility) { SFDiagnostics.resourceMetadata() }.value
             readyMeta.merge(resources) { _, new in new }
             await delivery.start(config: config, crashMeta: readyMeta, previousLogs: previousLogs)
+            try? await Task.sleep(for: .seconds(3))
+            if isOnline { await SFCommunity.shared.fetch(config: config) }
         }
     }
 
-    public static func present() {
-        guard config != nil else { return }
-        start()
-        guard let scene = activeScene() else { return }
-        install(in: scene)
-        scenes[ObjectIdentifier(scene)]?.present()
-    }
+    public static func present() { present(tab: .feedback) }
+
+    public static func present(tab: Tab) { present(tab: tab, in: nil) }
 
     /// Presents in the caller's window scene; nil uses the active-scene fallback.
-    public static func present(in scene: UIWindowScene?) {
-        guard let scene else { present(); return }
+    public static func present(in scene: UIWindowScene?) { present(tab: .feedback, in: scene) }
+
+    fileprivate static func present(tab: Tab, in scene: UIWindowScene?) {
         guard config != nil else { return }
         start()
+        guard let scene = scene ?? activeScene() else { return }
         install(in: scene)
-        scenes[ObjectIdentifier(scene)]?.present()
+        scenes[ObjectIdentifier(scene)]?.present(tab: tab)
     }
 
     public static func dismiss() {
@@ -157,36 +213,74 @@ public enum SuperFeedback {
 
     public static func setContext(_ values: [String: String]) {
         context.merge(values) { _, new in new }
+        if context["busy"] == "true" { dismissNudges() }
+        // A screen change can show or hide the host's tab bar: re-measure it.
+        DispatchQueue.main.async { for state in scenes.values { state.refreshObstructions() } }
+    }
+
+    /// Report a completed, successful user outcome after its success state is visible.
+    public static func moment(_ name: String) {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let defaults = UserDefaults.standard
+        defaults.set(min(999, max(0, defaults.integer(forKey: "superfeedback.moments"))) + 1,
+                     forKey: "superfeedback.moments")
+        defaults.set(name, forKey: "superfeedback.lastMoment")
+        SFCheckin.remember(moment: name)
+        let now = ProcessInfo.processInfo.systemUptime
+        guard lastMomentEvaluation.map({ now - $0 >= 2 }) ?? true else { return }
+        lastMomentEvaluation = now
+        if let state = noticeScene() { SFCommunity.shared.offerNudge(in: state) }
+    }
+
+    fileprivate static var allowsNudge: Bool {
+        isEnabled && context["busy"] != "true"
+            && ProcessInfo.processInfo.systemUptime - initializedAt >= 10
+            && !scenes.values.contains { $0.isPresented || $0.sheetClosing }
+    }
+
+    fileprivate static func dismissNudges() {
+        for state in scenes.values { state.dismissNudge() }
     }
 
     public static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: "superfeedback.enabled") as? Bool ?? (config?.defaultEnabled ?? true)
     }
 
-    /// Temporarily hide the trigger (e.g. on a screen whose edge holds fixed controls).
-    public static func setSuppressed(_ suppressed: Bool) {
-        for state in scenes.values where state.suppressed != suppressed {
-            state.suppressed = suppressed
-            if suppressed { state.buttonFrame = .zero }
-        }
-        suppressedByApp = suppressed
-    }
-    private static var suppressedByApp = false
-
-    /// Turn automatic crash reports on or off at runtime (follows the app's diagnostics opt-out).
-    public static func setCrashReportingEnabled(_ on: Bool) {
-        guard var current = config, current.captureCrashes != on else { return }
-        current.captureCrashes = on
-        configure(current)
-    }
-
     public static func setEnabled(_ on: Bool) {
         UserDefaults.standard.set(on, forKey: "superfeedback.enabled")
         for state in scenes.values {
             state.enabled = on
-            if !on { state.buttonFrame = .zero }
+            if !on { state.buttonFrame = .zero; state.dismissNudge() }
         }
         NotificationCenter.default.post(name: enabledChanged, object: nil)
+    }
+
+    /// Keep the trigger clear of bottom-edge controls the host draws itself (a chat composer,
+    /// a floating toolbar), in points from the bottom of the screen; 0 clears it.
+    public static func setBottomObstruction(_ height: CGFloat) {
+        bottomObstruction = max(0, height)
+        for state in scenes.values where abs(state.bottomObstruction - bottomObstruction) > 0.5 {
+            state.bottomObstruction = bottomObstruction
+        }
+    }
+    private static var bottomObstruction: CGFloat = 0
+
+    /// Temporarily hide the trigger (onboarding, a full-screen player…) without touching the
+    /// user's Settings choice. Settings rows and `present()` keep working.
+    public static func setSuppressed(_ suppressed: Bool) {
+        suppressedByApp = suppressed
+        for state in scenes.values where state.suppressed != suppressed {
+            state.suppressed = suppressed
+            if suppressed { state.buttonFrame = .zero; state.dismissNudge() }
+        }
+    }
+    private static var suppressedByApp = false
+
+    /// Turn crash capture on or off at runtime (e.g. following the app's own diagnostics opt-out).
+    public static func setCrashReportingEnabled(_ on: Bool) {
+        guard var current = config, current.captureCrashes != on else { return }
+        current.captureCrashes = on
+        configure(current)
     }
 
     private static func install(in scene: UIWindowScene) {
@@ -194,6 +288,7 @@ public enum SuperFeedback {
         guard scenes[id] == nil, let config else { return }
         let state = SFSceneState(scene: scene, config: config)
         state.suppressed = suppressedByApp
+        state.bottomObstruction = bottomObstruction
         scenes[id] = state
         let window = SFOverlayWindow(windowScene: scene)
         window.state = state
@@ -246,16 +341,21 @@ public enum SuperFeedback {
             : !state.attachScreenshot ? "declined"
             : state.annotatedScreenshot != nil
                 ? "attached (annotated, \(state.markupShapes.count) shape\(state.markupShapes.count == 1 ? "" : "s"))" : "attached"
-        let report = SFReport(type: state.type, message: message,
+        var report = SFReport(type: state.type, message: message,
                               screenshot: state.attachScreenshot ? state.screenshotURL : nil,
                               images: state.attachments.map(\.dataURL),
                               logs: nil,
                               meta: metadata(in: state.scene, config: config, screenshot: screenshotStatus))
+        // Widget-feedback mode: the same report, filed to the SuperFeedback repo instead of the app's.
+        if state.widgetMode, let repo = config.widgetFeedbackRepo {
+            report.repo = repo; report.app = "SuperFeedback"
+            report.meta["hostApp"] = config.app; report.meta["hostRepo"] = config.repo
+        }
         state.dismiss()
         Task { [weak state] in
             // Give a backgrounded app time to persist and finish its request.
             let background = SFBackgroundLease()
-            let ready = await Task.detached(priority: .utility) {
+            let ready = await Task.detached(priority: .utility) { [report] in
                 var ready = report
                 ready.meta.merge(SFDiagnostics.resourceMetadata()) { _, new in new }
                 if config.captureLogs {
@@ -265,7 +365,9 @@ public enum SuperFeedback {
             }.value
             let result = await delivery.submit(ready, config: config)
             background.end()
-            state?.showToast(result.ok ? "Thanks! Feedback sent ✓" : "Couldn't send — will retry next launch")
+            if result.ok, let idea = result.idea {
+                state?.showToast("Matched with “\(idea.title)” — \(idea.votes) people support it. You have been added.", seconds: 8)
+            } else { state?.showToast(result.ok ? "Thanks! Feedback sent ✓" : "Couldn't send — will retry next launch") }
         }
     }
 
@@ -287,6 +389,9 @@ public enum SuperFeedback {
         values.merge(context) { _, new in new }
         if let route = context["route"] { values["url"] = route }
         values.removeValue(forKey: "route")
+        if let lastMoment = UserDefaults.standard.string(forKey: "superfeedback.lastMoment") {
+            values["lastMoment"] = lastMoment
+        }
         let process = ProcessInfo.processInfo
         let screen = scene?.screen
         let screenSize = screen?.bounds.size ?? size
@@ -312,7 +417,7 @@ public enum SuperFeedback {
             "uptime": String(max(0, process.systemUptime - initializedAt)),
             "timezone": TimeZone.current.identifier,
             "colorScheme": traits.userInterfaceStyle == .dark ? "dark" : "light",
-            "screenSize": "\(Int(screenSize.width))x\(Int(screenSize.height)) @\(scale.formatted())x",
+            "screen": "\(Int(screenSize.width))x\(Int(screenSize.height)) @\(scale.formatted())x",
             "network": network, "lowPowerMode": String(process.isLowPowerModeEnabled),
             "thermalState": thermal, "orientation": orientation,
             "reduceMotion": String(UIAccessibility.isReduceMotionEnabled),
@@ -412,13 +517,17 @@ fileprivate final class SFSceneState: ObservableObject {
     weak var previousKeyWindow: UIWindow?
     @Published var config: SuperFeedback.Config
     @Published var enabled = SuperFeedback.isEnabled
-    @Published var suppressed = false
-    @Published var keyboardVisible = false
-    private var keyboardObservers: [NSObjectProtocol] = []
     @Published var isPresented = false
+    @Published var tab: SuperFeedback.Tab = .feedback
+    @Published var supportNudge = false
+    var nudgeText = ""
+    private var nudgeTask: Task<Void, Never>?
+    var thankYouTask: Task<Void, Never>?
+    var nudgeFrame: CGRect = .zero
     @Published var toast: String?
     @Published var message = ""
     @Published var type = "bug"
+    @Published var widgetMode = false
     @Published var attachScreenshot = true
     @Published var attachments: [SFAttachment] = []
     @Published var safeAreaInsets: UIEdgeInsets = .zero
@@ -435,15 +544,37 @@ fileprivate final class SFSceneState: ObservableObject {
     var toastFrame: CGRect = .zero
     var draftID = UUID()
     var toastTask: Task<Void, Never>?
+    private var toastQueue: [(String, Double, (@MainActor () -> Void)?)] = []
     @Published var sheetClosing = false
     private var dismissalFallback: DispatchWorkItem?
+    /// Hidden by the host (`SuperFeedback.setSuppressed`).
+    @Published var suppressed = false
+    /// The keyboard brings a text field and send button to the screen edge: step aside.
+    @Published var keyboardVisible = false
+    /// Bottom room to keep clear while the host presents a full-height sheet or cover (its
+    /// primary buttons usually sit at the bottom). Menus, popovers and alerts need none.
+    @Published var presentationInset: CGFloat = 0
+    private var presentationTimer: Timer?
+    /// Height from the bottom of the screen covered by the host's visible tab bar (0 when
+    /// none), measured from the real UITabBar so the trigger never rests over it.
+    @Published var tabBarInset: CGFloat = 0
+    /// Host-reported bottom controls (`SuperFeedback.setBottomObstruction`).
+    @Published var bottomObstruction: CGFloat = 0
+    private var keyboardObservers: [NSObjectProtocol] = []
 
     init(scene: UIWindowScene, config: SuperFeedback.Config) {
         self.scene = scene; self.config = config
-        // The keyboard usually brings a text field + send button to the screen edge.
-        for (name, visible) in [(UIResponder.keyboardWillShowNotification, true), (UIResponder.keyboardWillHideNotification, false)] {
+        // Presentations don't announce themselves app-wide, so look a few times a second.
+        let timer = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshHostPresentation() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        presentationTimer = timer
+        for (name, visible) in [(UIResponder.keyboardWillShowNotification, true),
+                                (UIResponder.keyboardWillHideNotification, false)] {
             keyboardObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
+                    // The panel's own text field raises the keyboard too; that one doesn't count.
                     guard let self, !self.isPresented else { return }
                     self.keyboardVisible = visible
                     if visible { self.buttonFrame = .zero }
@@ -452,16 +583,78 @@ fileprivate final class SFSceneState: ObservableObject {
         }
     }
 
+    /// The trigger stays over everything the host presents (it must never vanish), but over a
+    /// full-height sheet or cover it rests above that presentation's bottom buttons.
+    func refreshHostPresentation() {
+        guard let scene, let overlay = window else { return }
+        var inset: CGFloat = 0
+        for host in scene.windows where !(host is SFOverlayWindow) && !host.isHidden {
+            var presented = host.rootViewController?.presentedViewController
+            while let controller = presented {
+                defer { presented = controller.presentedViewController }
+                guard !(controller is UIAlertController), controller.modalPresentationStyle != .popover,
+                      !controller.isBeingDismissed, let view = controller.viewIfLoaded, view.window != nil else { continue }
+                let frame = overlay.convert(view.convert(view.bounds, to: nil), from: view.window)
+                // Sheets and covers reach the bottom edge and take most of the screen; context menus
+                // and small custom presentations don't.
+                guard frame.maxY >= overlay.bounds.maxY - 2, frame.height >= overlay.bounds.height * 0.5 else { continue }
+                inset = max(inset, view.safeAreaInsets.bottom + 64)
+            }
+        }
+        if abs(presentationInset - inset) > 0.5 { presentationInset = inset }
+    }
+
     var accent: Color { config.accent ?? Color(red: 109 / 255, green: 94 / 255, blue: 252 / 255) }
+    // The trigger stays over the host's sheets, menus and alerts; only the keyboard, the user's
+    // setting or the host's suppression hide it.
     var showsButton: Bool { enabled && !suppressed && !keyboardVisible && config.trigger != .none && !isPresented && !sheetClosing }
 
-    func present() {
+    var showsNudge: Bool { enabled && !suppressed && !keyboardVisible && supportNudge && !isPresented && !sheetClosing }
+
+    /// Measure the host's tab bar (in another window) in overlay coordinates.
+    func refreshObstructions() {
+        guard let scene, let overlay = window else { return }
+        var inset: CGFloat = 0
+        for host in scene.windows where !(host is SFOverlayWindow) && !host.isHidden {
+            guard let bar = Self.tabBar(in: host), !bar.isHidden, bar.alpha > 0.01, bar.window === host else { continue }
+            let frame = overlay.convert(bar.convert(bar.bounds, to: host), from: host)
+            guard frame.height > 0, frame.maxY >= overlay.bounds.maxY - 60 else { continue } // bottom bars only
+            inset = max(inset, overlay.bounds.maxY - frame.minY)
+        }
+        if abs(tabBarInset - inset) > 0.5 { tabBarInset = inset }
+    }
+
+    private static func tabBar(in root: UIView) -> UITabBar? {
+        var queue: [UIView] = [root]
+        var index = 0
+        while index < queue.count {
+            let view = queue[index]; index += 1
+            if let bar = view as? UITabBar { return bar }
+            queue.append(contentsOf: view.subviews)
+        }
+        return nil
+    }
+
+    func present(tab: SuperFeedback.Tab = .feedback) {
+        self.tab = tab == .support && SFCommunity.shared.effectiveSupport(config: config) == nil ? .feedback
+            : tab == .ideas && (!config.community || SFCommunity.shared.unavailable) ? .feedback : tab
+        SuperFeedback.dismissNudges()
+        Task { await SFCommunity.shared.fetch(config: config) }
+        Task { await SFCommunity.shared.loadProducts(config: config) }
         guard !isPresented, !sheetClosing, let scene else { return }
         clearDraft()
         switch SFImages.capture(scene: scene) {
         case .success(let capture):
             screenshot = capture.image
             screenshotURL = capture.url; screenshotCleanURL = capture.url
+            // DropBeam QA (simulator only): the capture + window list, for the -feedbackCapture hook.
+            #if targetEnvironment(simulator)
+            if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                try? capture.image.pngData()?.write(to: docs.appendingPathComponent("qa-feedback.png"))
+                let windows = scene.windows.map { "\(NSStringFromClass(Swift.type(of: $0))) level=\($0.windowLevel.rawValue) hidden=\($0.isHidden)" }
+                try? windows.joined(separator: "\n").write(to: docs.appendingPathComponent("qa-windows.txt"), atomically: true, encoding: .utf8)
+            }
+            #endif
         case .failure(let failure): screenshotFailure = failure.rawValue
         }
         attachScreenshot = config.attachScreenshot
@@ -474,21 +667,22 @@ fileprivate final class SFSceneState: ObservableObject {
     func dismiss() {
         guard isPresented else { return }
         isPresented = false
+        window?.endEditing(true)
         beginDismissal()
     }
 
+    /// Also runs when the sheet is swiped down. onDismiss normally completes cleanup; the
+    /// fallback covers interrupted UIKit transitions / backgrounding so `sheetClosing` can
+    /// never latch and hide the trigger for the rest of the session.
     func beginDismissal() {
         guard !isPresented else { return }
         sheetClosing = true
-        window?.endEditing(true)
         dismissalFallback?.cancel()
         let fallback = DispatchWorkItem { [weak self] in
-            guard let self, !self.isPresented else { return }
+            guard let self, !self.isPresented, self.sheetClosing else { return }
             self.didDismiss()
         }
         dismissalFallback = fallback
-        // onDismiss normally completes cleanup. The timer covers interrupted
-        // UIKit transitions/backgrounding so sheetClosing can never latch shut.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: fallback)
     }
 
@@ -503,7 +697,7 @@ fileprivate final class SFSceneState: ObservableObject {
     }
 
     private func clearDraft() {
-        draftID = UUID(); message = ""; type = "bug"; attachments = []
+        draftID = UUID(); message = ""; type = "bug"; attachments = []; widgetMode = false
         screenshot = nil; screenshotURL = nil; screenshotCleanURL = nil; screenshotFailure = nil
         markupShapes = []; annotatedScreenshot = nil
     }
@@ -523,22 +717,50 @@ fileprivate final class SFSceneState: ObservableObject {
         screenshotURL = encoded.url
     }
 
-    func showToast(_ text: String) {
-        toastTask?.cancel()
-        toast = text
-        UIAccessibility.post(notification: .announcement, argument: text)
+    func showToast(_ text: String, seconds: Double = 2.6, onShown: (@MainActor () -> Void)? = nil) {
+        toastQueue.append((text, seconds, onShown))
+        guard toastTask == nil else { return }
         toastTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 2_600_000_000)
-            guard !Task.isCancelled else { return }
-            self?.toast = nil
-            self?.toastFrame = .zero
+            guard let self else { return }
+            defer { toastTask = nil }
+            while !toastQueue.isEmpty && !Task.isCancelled {
+                let (text, duration, onShown) = toastQueue.removeFirst()
+                toast = text
+                onShown?()
+                UIAccessibility.post(notification: .announcement, argument: text)
+                try? await Task.sleep(for: .seconds(duration))
+                toast = nil; toastFrame = .zero
+            }
         }
     }
 
+    func showNudge(_ text: String) {
+        nudgeText = text
+        supportNudge = true
+        nudgeTask?.cancel()
+        nudgeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(14))
+            guard !Task.isCancelled else { return }
+            self?.dismissNudge()
+        }
+    }
+
+    func dismissNudge(optOut: Bool = false) {
+        if optOut { UserDefaults.standard.set(true, forKey: "superfeedback.supportNudge.optOut") }
+        if supportNudge {
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "superfeedback.lastNudge")
+        }
+        nudgeTask?.cancel(); nudgeTask = nil
+        supportNudge = false; nudgeFrame = .zero
+    }
+
     func tearDown() {
+        dismissNudge(); thankYouTask?.cancel()
         toastTask?.cancel()
+        presentationTimer?.invalidate(); presentationTimer = nil
         keyboardObservers.forEach(NotificationCenter.default.removeObserver)
         keyboardObservers = []
+        dismissalFallback?.cancel(); dismissalFallback = nil
         window?.isHidden = true
         window?.rootViewController = nil
         window = nil
@@ -553,26 +775,30 @@ fileprivate final class SFOverlayWindow: UIWindow {
         let insets = safeAreaInsets
         // Publishing from inside UIKit's layout pass can invalidate SwiftUI mid-update.
         DispatchQueue.main.async { [weak self] in
-            guard let state = self?.state, state.safeAreaInsets != insets else { return }
-            state.safeAreaInsets = insets
+            guard let state = self?.state else { return }
+            if state.safeAreaInsets != insets { state.safeAreaInsets = insets }
+            state.refreshObstructions()
         }
     }
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard let state else { return nil }
         // The toast never owns a touch, even if it overlaps a button or a sheet.
         if state.toast != nil && state.toastFrame.contains(point) { return nil }
-        // Guarantee: transparent window space NEVER owns touches, including
-        // dismissal. Only the visible panel (or measured trigger) can hit-test.
-        // A stale presented controller/sheetClosing flag cannot cover friend rows.
+        // Guarantee: transparent overlay space never owns touches, not even while the panel is
+        // closing. Only the visible panel (or the measured trigger / nudge) hit-tests, so a stale
+        // presented controller or `sheetClosing` flag can't freeze the app underneath.
         if state.isPresented, var panel = rootViewController?.presentedViewController {
             while let next = panel.presentedViewController { panel = next }
             guard !panel.isBeingDismissed, let view = panel.viewIfLoaded, !view.isHidden else { return nil }
             let frame = view.convert(view.bounds, to: self)
             guard frame.contains(point) else { return nil }
-            // iOS 26 can route sheets through a separate floating container;
-            // UIWindow's hit is then not a descendant of the hosting view.
-            // Hit-test the actual panel locally, still bounded by its frame.
+            // iOS 26 can route sheets through a separate floating container, so UIWindow's hit
+            // isn't a descendant of the hosting view: hit-test the panel itself, within its frame.
             return view.hitTest(view.convert(point, from: self), with: event)
+        }
+        if state.isPresented || state.sheetClosing { return nil }
+        if state.showsNudge && state.nudgeFrame.contains(point) {
+            return super.hitTest(point, with: event)
         }
         let frame = state.buttonFrame
         // AshTranslate's fail-open guard: a full-screen measurement must never freeze the app.
@@ -580,6 +806,11 @@ fileprivate final class SFOverlayWindow: UIWindow {
               frame.width <= 120, frame.height <= 120, frame.contains(point) else { return nil }
         return super.hitTest(point, with: event)
     }
+}
+
+private struct SFNudgeFrameKey: PreferenceKey {
+    static let defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
 }
 
 private struct SFFrameKey: PreferenceKey {
@@ -601,12 +832,14 @@ private extension View {
 @MainActor
 private struct SFOverlayView: View {
     @ObservedObject var state: SFSceneState
+    @ObservedObject private var community = SFCommunity.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.displayScale) private var displayScale
     @State private var resting: SFButtonPosition?
     @State private var dragOrigin: CGPoint?
     @State private var draggedCenter: CGPoint?
     @State private var dragging = false
+    @State private var nudgeHeight: CGFloat = 110
     @GestureState private var pressed = false
     private let space = "superfeedback.overlay"
 
@@ -614,7 +847,7 @@ private struct SFOverlayView: View {
         GeometryReader { geometry in
             ZStack(alignment: .top) {
                 Color.clear
-                if state.showsButton {
+                if state.showsButton || state.showsNudge {
                     trigger(geometry)
                 }
                 if let toast = state.toast {
@@ -633,13 +866,17 @@ private struct SFOverlayView: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .coordinateSpace(name: space)
-            .onAppear { resting = SFButtonPosition.restore() }
-            .sfOnChange(of: geometry.size) { _ in resetDrag() }
+            .onAppear { resting = SFButtonPosition.restore(); state.refreshObstructions() }
+            .sfOnChange(of: geometry.size) { _ in resetDrag(); state.refreshObstructions() }
+            .sfOnChange(of: state.showsButton) { shown in if shown { state.refreshObstructions() } }
+            .onChange(of: community.isSupporter) { _, supporter in
+                if supporter { state.dismissNudge() }
+            }
         }
         .ignoresSafeArea(.container)
         .tint(state.accent)
         .sfOnChange(of: state.isPresented) { presented in
-            if !presented { state.beginDismissal() }
+            if !presented { state.beginDismissal() } // swipe-down closes too
         }
         .sheet(isPresented: $state.isPresented, onDismiss: { state.didDismiss() }) {
             SFPanel(state: state)
@@ -652,16 +889,36 @@ private struct SFOverlayView: View {
     private func trigger(_ geometry: GeometryProxy) -> some View {
         let bounds = movementBounds(geometry)
         let configuredPosition = state.config.position
-            ?? (state.config.trigger == .floating ? .bottomRight : .rightCenter)
+            ?? (state.config.trigger != .draggable ? .bottomRight : .rightCenter)
         let position = state.config.trigger == .draggable
             ? (resting ?? SFButtonPosition(position: configuredPosition))
             : SFButtonPosition(position: configuredPosition)
-        var center = draggedCenter.map { clamp($0, to: bounds) } ?? position.center(in: bounds)
-        if state.config.dockedToEdge && draggedCenter == nil && !pressed {
-            // Tuck about half the button past the edge while resting.
-            center.x += (position.side == "left" ? -1 : 1) * 30
-        }
-        return Image(systemName: "bubble.left.and.bubble.right.fill")
+        let center = draggedCenter.map { clamp($0, to: bounds) } ?? position.center(in: bounds)
+        let nudgeWidth = min(300, max(0, bounds.width))
+        let halfHeight = min(nudgeHeight / 2, bounds.height / 2)
+        let nudgeY = center.y > bounds.midY ? center.y - halfHeight - 28 : center.y + halfHeight + 28
+        return ZStack {
+            if state.showsNudge {
+                VStack(spacing: 8) {
+                    Text(state.nudgeText).font(.caption)
+                    Button("Support") { state.present(tab: .support) }.font(.caption.bold())
+                    HStack(spacing: 6) {
+                        Button("Not now") { state.dismissNudge() }.font(.caption)
+                        Text("·").font(.caption)
+                        Button("Don't ask again") { state.dismissNudge(optOut: true) }.font(.caption2)
+                    }.buttonStyle(.plain).foregroundStyle(.secondary)
+                }
+                .padding(16).frame(width: nudgeWidth)
+                .background(.regularMaterial, in: Capsule())
+                .background(GeometryReader { proxy in
+                    Color.clear.preference(key: SFNudgeFrameKey.self, value: proxy.frame(in: .named(space)))
+                })
+                .onPreferenceChange(SFNudgeFrameKey.self) { state.nudgeFrame = $0; nudgeHeight = $0.height }
+                .position(x: min(max(center.x, bounds.minX + nudgeWidth / 2), bounds.maxX - nudgeWidth / 2),
+                          y: min(max(nudgeY, bounds.minY + halfHeight), bounds.maxY - halfHeight))
+            }
+            if state.showsButton {
+            Image(systemName: "bubble.left.and.bubble.right.fill")
             .font(.system(size: 17, weight: .semibold)).foregroundStyle(Color.primary.opacity(0.8))
             .frame(width: 40, height: 40)
             .background(.ultraThinMaterial, in: Circle())
@@ -670,6 +927,7 @@ private struct SFOverlayView: View {
             .contentShape(Circle())
             .opacity(pressed ? 1 : 0.62)
             .scaleEffect(dragging && state.config.trigger == .draggable ? 1.1 : 1)
+            .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: pressed)
             // Measure before .position(), whose layout frame is the entire overlay.
             .background(GeometryReader { proxy in
                 Color.clear.preference(key: SFFrameKey.self, value: proxy.frame(in: .named(space)))
@@ -703,7 +961,6 @@ private struct SFOverlayView: View {
                     }
                 })
             .position(center)
-            .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: pressed)
             .sfOnChange(of: pressed) { value in
                 if !value {
                     // Let onEnded use the latched movement threshold before clearing a cancelled gesture.
@@ -711,21 +968,33 @@ private struct SFOverlayView: View {
                 }
             }
             .accessibilityLabel("Send feedback")
-            .accessibilityHint(state.config.trigger == .draggable ? "Captures the app and opens a feedback form. Drag to move the button." : "Captures the app and opens a feedback form.")
+            .accessibilityHint(state.config.trigger == .draggable
+                ? "Screenshots the app and opens a feedback form. Drag to move the button."
+                : "Screenshots the app and opens a feedback form.")
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { state.present() }
+            }
+        }
     }
 
     private func resetDrag() { dragOrigin = nil; draggedCenter = nil; dragging = false }
+    /// Where the trigger's centre may go: fully on screen inside the safe area (notch / Dynamic
+    /// Island, home indicator, landscape sensor housing), clear of the host's tab bar and any
+    /// reported bottom controls, with a 12pt gap between the 40pt button and every edge.
     private func movementBounds(_ geometry: GeometryProxy) -> CGRect {
         let safe = state.safeAreaInsets, extra = state.config.reservedInsets
-        let insets = UIEdgeInsets(top: safe.top + extra.top, left: safe.left + extra.left, bottom: safe.bottom + extra.bottom, right: safe.right + extra.right)
-        // 20pt radius plus the existing 12pt edge gap.
-        let left = min(geometry.size.width / 2, insets.left + 32)
-        let top = min(geometry.size.height / 2, insets.top + 32)
+        // A measured tab bar beats the configured guess (it may float, grow or be hidden).
+        let bottom = max(state.tabBarInset > 0 ? max(safe.bottom, state.tabBarInset) : safe.bottom + extra.bottom,
+                         state.bottomObstruction > 0 ? state.bottomObstruction + 8 : 0,
+                         state.presentationInset)
+        let insets = UIEdgeInsets(top: safe.top + extra.top, left: safe.left + extra.left,
+                                  bottom: bottom, right: safe.right + extra.right)
+        let reach: CGFloat = 20 + 12 // radius + edge gap
+        let left = min(geometry.size.width / 2, insets.left + reach)
+        let top = min(geometry.size.height / 2, insets.top + reach)
         return CGRect(x: left, y: top,
-                      width: max(0, geometry.size.width - insets.right - 32 - left),
-                      height: max(0, geometry.size.height - insets.bottom - 32 - top))
+                      width: max(0, geometry.size.width - insets.right - reach - left),
+                      height: max(0, geometry.size.height - insets.bottom - reach - top))
     }
     private func clamp(_ point: CGPoint, to rect: CGRect) -> CGPoint {
         CGPoint(x: min(max(point.x, rect.minX), rect.maxX), y: min(max(point.y, rect.minY), rect.maxY))
@@ -771,18 +1040,65 @@ private struct SFAttachment: Identifiable {
 @MainActor
 private struct SFPanel: View {
     @ObservedObject var state: SFSceneState
+    @ObservedObject private var community = SFCommunity.shared
     @State private var selection: [PhotosPickerItem] = []
     @State private var loading = false
     @State private var photoTask: Task<Void, Never>?
     @State private var markingUp = false
 
     private var markupTitle: String { state.markupShapes.isEmpty ? "Mark up" : "Edit markup" }
+    private var widgetMode: Bool { state.widgetMode && state.config.widgetFeedbackRepo != nil }
 
     var body: some View {
         NavigationStack {
+            VStack(spacing: 0) {
+                if (state.config.community && !community.unavailable) || community.effectiveSupport(config: state.config) != nil {
+                    Picker("Tab", selection: $state.tab) {
+                        Text("Feedback").tag(SuperFeedback.Tab.feedback)
+                        if state.config.community && !community.unavailable { Text("Ideas").tag(SuperFeedback.Tab.ideas) }
+                        if community.effectiveSupport(config: state.config) != nil { Text("Support").tag(SuperFeedback.Tab.support) }
+                    }.pickerStyle(.segmented).padding()
+                }
+                if state.tab == .ideas { SFIdeasView(state: state) }
+                else if state.tab == .support { SFSupportView(state: state) }
+                else { feedbackForm }
+            }
+            .navigationTitle(state.tab == .feedback ? (widgetMode ? "Feedback on SuperFeedback" : "Send feedback") : state.tab == .ideas ? "Ideas & roadmap" : "Support development")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { state.dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    if state.tab == .feedback {
+                        Button("Send") { SuperFeedback.submit(from: state) }
+                            .disabled(state.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || loading)
+                    }
+                }
+            }
+            .onChange(of: community.unavailable) { _, unavailable in
+                if unavailable && state.tab == .ideas { state.tab = .feedback }
+            }
+            .overlay(alignment: .top) {
+                if let toast = state.toast {
+                    Text(toast).font(.subheadline).padding().background(.regularMaterial, in: Capsule())
+                        .padding().allowsHitTesting(false)
+                }
+            }
+            .sfOnChange(of: selection) { items in load(items) }
+            .onDisappear { photoTask?.cancel() }
+        }
+        .fullScreenCover(isPresented: $markingUp) {
+            if let screenshot = state.screenshot {
+                SFMarkupEditor(image: screenshot, shapes: state.markupShapes,
+                               cancel: { markingUp = false },
+                               commit: { shapes in state.applyMarkup(shapes); markingUp = false })
+            }
+        }
+    }
+
+    private var feedbackForm: some View {
             Form {
                 Section {
-                    Text(state.config.app).font(.subheadline).foregroundStyle(.secondary)
+                    if !widgetMode { Text(state.config.app).font(.subheadline).foregroundStyle(.secondary) }
                     Picker("Type", selection: $state.type) {
                         Text("🐞 Bug").tag("bug")
                         Text("✨ Idea").tag("feature")
@@ -792,7 +1108,8 @@ private struct SFPanel: View {
                         TextEditor(text: $state.message).frame(minHeight: 110)
                             .accessibilityLabel("Feedback message")
                         if state.message.isEmpty {
-                            Text("What went wrong, or what would you like?")
+                            Text(widgetMode ? "What about this feedback card could be better?"
+                                 : "What went wrong, or what would you like?")
                                 .foregroundStyle(.secondary).padding(.top, 8).padding(.leading, 5)
                                 .allowsHitTesting(false)
                         }
@@ -848,25 +1165,15 @@ private struct SFPanel: View {
                         }
                     }
                 }
-            }
-            .navigationTitle("Send feedback").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { state.dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Send") { SuperFeedback.submit(from: state) }
-                        .disabled(state.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || loading)
+                if state.config.widgetFeedbackRepo != nil {
+                    Section {
+                        Button(widgetMode ? "← Back to feedback" + (state.config.app.isEmpty ? "" : " for \(state.config.app)")
+                               : "Feedback on SuperFeedback") { state.widgetMode.toggle() }
+                            .font(.footnote).foregroundStyle(.secondary).buttonStyle(.borderless)
+                            .frame(maxWidth: .infinity)
+                    }.listRowBackground(Color.clear)
                 }
             }
-            .sfOnChange(of: selection) { items in load(items) }
-            .onDisappear { photoTask?.cancel() }
-        }
-        .fullScreenCover(isPresented: $markingUp) {
-            if let screenshot = state.screenshot {
-                SFMarkupEditor(image: screenshot, shapes: state.markupShapes,
-                               cancel: { markingUp = false },
-                               commit: { shapes in state.applyMarkup(shapes); markingUp = false })
-            }
-        }
     }
 
     private func load(_ items: [PhotosPickerItem]) {
@@ -897,28 +1204,40 @@ private enum SFImages {
         case tooLarge = "PNG exceeds 2 MB after downscaling"
     }
     static func capture(scene: UIWindowScene) -> Result<(image: UIImage, url: String), CaptureFailure> {
-        let windows = scene.windows.filter { !($0 is SFOverlayWindow) && !$0.isHidden && $0.alpha > 0 }
+        // Only the app's own windows: once the keyboard has appeared UIKit keeps system windows
+        // (UIRemoteKeyboardWindow, UITextEffectsWindow) whose content lives in another process,
+        // so they can only ever draw as blank or black. The app's sheets and alerts render in its
+        // own windows.
+        let windows = scene.windows.filter { !($0 is SFOverlayWindow) && !$0.isHidden && $0.alpha > 0 && !isSystemWindow($0) }
             .sorted { $0.windowLevel.rawValue < $1.windowLevel.rawValue }
         let bounds = scene.coordinateSpace.bounds
         guard !windows.isEmpty else { return .failure(.noWindows) }
         guard bounds.width > 0, bounds.height > 0 else { return .failure(.invalidBounds) }
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1; format.opaque = true
+        let layerFormat = UIGraphicsImageRendererFormat()
+        layerFormat.scale = 1; layerFormat.opaque = false
         let image = UIGraphicsImageRenderer(size: bounds.size, format: format).image { context in
             UIColor.systemBackground.setFill(); context.fill(CGRect(origin: .zero, size: bounds.size))
             for window in windows {
-                let rect = window.convert(window.bounds, to: scene.coordinateSpace)
-                context.cgContext.saveGState()
-                context.cgContext.translateBy(x: rect.minX - bounds.minX, y: rect.minY - bounds.minY)
-                context.cgContext.scaleBy(x: rect.width / max(1, window.bounds.width),
-                                         y: rect.height / max(1, window.bounds.height))
-                if !window.drawHierarchy(in: window.bounds, afterScreenUpdates: false) {
-                    window.layer.render(in: context.cgContext)
+                // drawHierarchy copies pixels instead of blending, so a transparent window drawn straight into
+                // the canvas wipes it to black. Once the keyboard has appeared, every scene keeps a clear
+                // UITextEffectsWindow above the app — render each window alone, then composite it.
+                let layer = UIGraphicsImageRenderer(size: window.bounds.size, format: layerFormat).image { layer in
+                    if !window.drawHierarchy(in: window.bounds, afterScreenUpdates: false) {
+                        window.layer.render(in: layer.cgContext)
+                    }
                 }
-                context.cgContext.restoreGState()
+                let rect = window.convert(window.bounds, to: scene.coordinateSpace)
+                layer.draw(in: rect.offsetBy(dx: -bounds.minX, dy: -bounds.minY))
             }
         }
         return encodePNG(image)
+    }
+
+    private static func isSystemWindow(_ window: UIWindow) -> Bool {
+        let name = NSStringFromClass(type(of: window))
+        return name.contains("Keyboard") || name.contains("TextEffects") || name.hasPrefix("_UI")
     }
 
     /// Initial encode plus at most five 0.75 downscales. Never emit an oversized PNG.
@@ -1370,6 +1689,8 @@ private enum SFDiagnostics {
     nonisolated static func resourceMetadata() -> [String: String] {
         var values: [String: String] = [:]
         if let memory = memoryMB() { values["memoryMB"] = String(memory) }
+        // No free-disk figure on iOS: disk space is an App Store "required reason" API, and none of
+        // its approved reasons allow sending the value off the device in a report nobody sees.
         return values
     }
 }
@@ -1387,6 +1708,9 @@ struct SFReport: Codable, Sendable, Equatable {
     var images: [String]?
     var logs: [String]?
     var meta: [String: String]
+    // Absent in older outbox entries; nil sends to config.repo/app.
+    var repo: String? = nil
+    var app: String? = nil
 }
 
 enum SFOutbox {
@@ -1427,6 +1751,78 @@ enum SFOutbox {
     }
 }
 
+/// Fleet check-in (PROTOCOL.md "POST /checkin"): once per UTC day per repo, or right away when the
+/// widget or app version changed. Fire-and-forget off the main thread: no retry, no outbox, silent.
+private enum SFCheckin {
+    nonisolated static let momentsKey = "superfeedback.momentNames"
+
+    nonisolated static func remember(moment name: String) {
+        let trimmed = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
+        guard !trimmed.isEmpty else { return }
+        let names = UserDefaults.standard.stringArray(forKey: momentsKey) ?? []
+        guard !names.contains(trimmed) else { return }
+        UserDefaults.standard.set(Array((names + [trimmed]).suffix(20)), forKey: momentsKey)
+    }
+
+    @MainActor static func send(config: SuperFeedback.Config, platform: String, os: String, enabled: Bool) {
+        guard config.checkin else { return }
+        let info = Bundle.main.infoDictionary ?? [:]
+        let appVersion = info["CFBundleShortVersionString"] as? String ?? ""
+        let build = info["CFBundleVersion"] as? String ?? ""
+        let widget = "\(platform)/\(SuperFeedback.version)"
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate]
+        let stamp = ["day": formatter.string(from: Date()), "widget": widget, "appVersion": appVersion, "build": build]
+        let key = "superfeedback.checkin." + config.repo
+        guard UserDefaults.standard.dictionary(forKey: key) as? [String: String] != stamp else { return }
+        let position: SuperFeedback.Position = config.position ?? (config.trigger == .floating ? .bottomRight : .rightCenter)
+        let support: String
+        switch config.support {
+        case .url?: support = "url"
+        case .products?: support = "products"
+        case .off?: support = "off"
+        case nil: support = config.community ? "backend" : "off"
+        }
+        let trigger: String
+        switch config.trigger {
+        case .draggable: trigger = "draggable"
+        case .floating: trigger = "floating"
+        case .none: trigger = "none"
+        }
+        let place: String
+        switch position {
+        case .rightCenter: place = "right-center"
+        case .leftCenter: place = "left-center"
+        case .bottomRight: place = "bottom-right"
+        case .bottomLeft: place = "bottom-left"
+        case .topRight: place = "top-right"
+        case .topLeft: place = "top-left"
+        }
+        let settings: [String: Any] = [
+            "trigger": trigger, "position": place,
+            "community": config.community, "captureLogs": config.captureLogs, "captureCrashes": config.captureCrashes,
+            "attachScreenshot": config.attachScreenshot, "maxImages": config.maxImages,
+            "widgetFeedback": config.widgetFeedbackRepo ?? false, "supportNudge": config.supportNudge.enabled,
+            "support": support, "appKey": !config.appKey.isEmpty,
+            "keychainGroup": !(config.keychainGroup ?? "").isEmpty, "enabled": enabled,
+            "moments": UserDefaults.standard.stringArray(forKey: momentsKey) ?? [],
+        ]
+        let body: [String: Any] = ["repo": config.repo, "app": config.app, "widget": widget, "appVersion": appVersion,
+                                   "build": build, "platform": platform, "os": os, "config": settings]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        var request = URLRequest(url: config.backendURL.appendingPathComponent("checkin"))
+        request.httpMethod = "POST"; request.timeoutInterval = 30; request.httpBody = data
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        Task.detached(priority: .utility) { [request] in
+            try? await Task.sleep(for: .seconds(2))
+            // Any HTTP answer (including an old backend's 405) counts for today; offline tries next launch.
+            guard let (_, response) = try? await URLSession.shared.data(for: request),
+                  response is HTTPURLResponse else { return }
+            UserDefaults.standard.set(stamp, forKey: key)
+        }
+    }
+}
+
 private enum SFStorage {
     nonisolated static func directory(_ child: String? = nil) -> URL? {
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
@@ -1448,6 +1844,7 @@ private struct SFResponse: Decodable, Sendable {
     var ok: Bool?
     var url: String?
     var error: String?
+    var idea: SFMatchedIdea?
 }
 
 private struct SFSendResult: Sendable {
@@ -1455,13 +1852,15 @@ private struct SFSendResult: Sendable {
     var status: Int?
     var url: String?
     var error: String?
+    var idea: SFMatchedIdea?
 }
 
 private enum SFNetwork {
     nonisolated static func send(_ report: SFReport, config: SuperFeedback.Config) async -> SFSendResult {
         do {
-            var body: [String: Any] = ["repo": config.repo, "app": config.app, "type": report.type,
+            var body: [String: Any] = ["repo": report.repo ?? config.repo, "app": report.app ?? config.app, "type": report.type,
                                        "message": report.message, "meta": report.meta]
+            body["voter"] = await SuperFeedback.voterId
             if let screenshot = report.screenshot { body["screenshot"] = screenshot }
             if let images = report.images, !images.isEmpty { body["images"] = images }
             if let logs = report.logs, !logs.isEmpty { body["logs"] = logs }
@@ -1474,7 +1873,7 @@ private enum SFNetwork {
             let status = (response as? HTTPURLResponse)?.statusCode
             let decoded = try? JSONDecoder().decode(SFResponse.self, from: data)
             return SFSendResult(ok: status.map { (200..<300).contains($0) } == true && decoded?.ok == true,
-                                status: status, url: decoded?.url, error: decoded?.error)
+                                status: status, url: decoded?.url, error: decoded?.error, idea: decoded?.idea)
         } catch { return SFSendResult(ok: false, error: error.localizedDescription) }
     }
 }
@@ -1659,4 +2058,503 @@ private func sfSignalHandler(_ number: Int32) {
     }
     signal(number, SIG_DFL)
     raise(number)
+}
+
+// MARK: - Community and support
+
+@MainActor
+public struct SuperFeedbackIdeasRow: View {
+    @State private var scene: UIWindowScene?
+    public init() {}
+    public var body: some View {
+        Button("Ideas & roadmap…") { SuperFeedback.present(tab: .ideas, in: scene) }
+            .background(SFSceneReader(scene: $scene).allowsHitTesting(false))
+    }
+}
+
+/// Hidden until support is available (local config or backend `fund.supportUrl`). Pass a custom
+/// label to match the host's Settings rows: `SuperFeedbackSupportRow { MyRowLabel(…) }`.
+@MainActor
+public struct SuperFeedbackSupportRow<Label: View>: View {
+    @ObservedObject private var community = SFCommunity.shared
+    @State private var scene: UIWindowScene?
+    private let label: Label
+    public init(@ViewBuilder label: () -> Label) { self.label = label() }
+    public var body: some View {
+        if SuperFeedback.hasSupport {
+            Button { SuperFeedback.present(tab: .support, in: scene) } label: { label }
+                .background(SFSceneReader(scene: $scene).allowsHitTesting(false))
+        }
+    }
+}
+
+extension SuperFeedbackSupportRow where Label == Text {
+    public init() { self.init { Text("Support development…") } }
+}
+
+private struct CommunityPayload: Codable, Sendable {
+    var ok: Bool
+    var app: CommunityApp
+    var ideas: [CommunityIdea]
+    var shipped: [CommunityIdea]
+    var notices: [CommunityNotice]
+    var you: CommunityYou
+    var fund: CommunityFund
+}
+private struct CommunityApp: Codable, Sendable { var repo: String; var syncedAt: Double }
+private struct CommunityIdea: Codable, Sendable, Identifiable {
+    var id: Int
+    var number: Int
+    var title: String
+    var summary: String
+    var status: String
+    var votes: Int
+    var voted: Bool
+    var createdAt: Double?
+    var version: String?
+    var shippedAt: Double?
+}
+private struct CommunityNotice: Codable, Sendable, Identifiable {
+    var id: Int; var title: String; var version: String; var shippedAt: Double
+}
+private struct CommunityYou: Codable, Sendable {
+    var votes: Int; var submitted: Int; var shipped: Int; var supporter: Bool
+}
+private struct CommunityFund: Codable, Sendable {
+    var currency: String; var monthCents: Int; var goalCents: Int
+    var supporters: Int; var allTimeCents: Int; var shippedThisMonth: Int
+    var supportUrl: String?
+}
+private struct SFMatchedIdea: Decodable, Sendable { var id: Int; var number: Int; var title: String; var votes: Int }
+private struct SFCommunityCache: Codable, Sendable { var payload: CommunityPayload; var timestamp: Date }
+private struct SFVote: Codable, Sendable { var repo: String; var ideaId: Int; var voter: String; var on: Bool }
+private struct SFVoteResponse: Decodable, Sendable { var ok: Bool; var votes: Int; var voted: Bool }
+private struct SFTip: Codable, Sendable { var repo: String; var voter: String; var provider = "apple"; var jws: String }
+private struct SFTipResponse: Decodable, Sendable {
+    var ok: Bool; var recorded: Bool; var amountCents: Int; var currency: String
+}
+private struct SFCommunityError: Error { var legacy: Bool = false }
+
+private enum SFCommunityHelpers {
+    nonisolated static func status(_ idea: CommunityIdea) -> String {
+        let label = idea.status.capitalized
+        return idea.status == "shipped" ? idea.version.map { "\(label) · \($0)" } ?? label : label
+    }
+    nonisolated static func currency(_ cents: Int, code: String) -> String {
+        (Decimal(cents) / 100).formatted(.currency(code: code))
+    }
+    nonisolated static func unseen(_ notices: [CommunityNotice], seen: Set<Int>) -> [CommunityNotice] {
+        var ids = seen
+        return notices.filter { ids.insert($0.id).inserted }
+    }
+    nonisolated static func url(_ base: URL, items: [URLQueryItem]) -> URL? {
+        guard var parts = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
+        let names = Set(items.map(\.name))
+        parts.queryItems = (parts.queryItems ?? []).filter { !names.contains($0.name) } + items
+        return parts.url
+    }
+    nonisolated static func request<Response: Decodable & Sendable>(
+        _ url: URL, body: Data? = nil, as: Response.Type
+    ) async throws -> Response {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 30
+        if let body {
+            request.httpMethod = "POST"; request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let envelope = try? JSONDecoder().decode(SFResponse.self, from: data)
+        guard (200..<300).contains(status), envelope?.ok == true else {
+            throw SFCommunityError(legacy: status == 503 && envelope?.error == "community not configured")
+        }
+        return try JSONDecoder().decode(Response.self, from: data)
+    }
+}
+
+@MainActor
+private enum SFIdentity {
+    private static var cached: String?
+    static func value(group: String?) -> String {
+        if let cached { return cached }
+        let candidate = UUID().uuidString
+        let shared = group.flatMap { group in prefix().flatMap { readOrCreate(candidate, group: $0 + "." + group) } }
+        let value = shared ?? readOrCreate(candidate, group: nil) ?? candidate
+        cached = value
+        return value
+    }
+    private static func prefix() -> String? {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "superfeedback", kSecAttrAccount as String: "probe." + UUID().uuidString,
+            kSecValueData as String: Data(), kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock]
+        guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else { return nil }
+        var lookup = query
+        lookup.removeValue(forKey: kSecValueData as String)
+        lookup[kSecReturnAttributes as String] = true
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+        var deletion = lookup
+        deletion.removeValue(forKey: kSecReturnAttributes as String)
+        let deleted = SecItemDelete(deletion as CFDictionary)
+        guard status == errSecSuccess, deleted == errSecSuccess,
+              let attributes = result as? [String: Any],
+              let group = attributes[kSecAttrAccessGroup as String] as? String else { return nil }
+        return group.split(separator: ".").first.map(String.init)
+    }
+    private static func readOrCreate(_ candidate: String, group: String?) -> String? {
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "superfeedback", kSecAttrAccount as String: "voter",
+            kSecAttrSynchronizable as String: kCFBooleanTrue as Any]
+        if let group { query[kSecAttrAccessGroup as String] = group }
+        var lookup = query
+        lookup[kSecReturnData as String] = true
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+        if status == errSecSuccess {
+            guard let data = result as? Data, let value = String(data: data, encoding: .utf8),
+                  UUID(uuidString: value) != nil else { return nil }
+            return value
+        }
+        guard status == errSecItemNotFound else { return nil }
+        query[kSecValueData as String] = Data(candidate.utf8)
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else { return nil }
+        return candidate
+    }
+}
+
+@MainActor
+private final class SFCommunity: ObservableObject {
+    static let shared = SFCommunity()
+    @Published var payload: CommunityPayload?
+    @Published var timestamp: Date?
+    @Published var unavailable = false
+    @Published var stale = true
+    @Published var products: [Product] = []
+    @Published var loadingProducts = false
+    @Published var purchasing = false
+    @Published var voting: Set<Int> = []
+    var nudged = false
+    @Published private var tipped = false
+    var isSupporter: Bool { tipped || payload?.you.supporter == true }
+    private var voteRevision = 0
+    private var repo = ""
+    private var legacy = false
+    private var fetchTask: Task<Void, Never>?
+    private var loadedProducts = false
+    private var noticeTask: Task<Void, Never>?
+    private var pendingNotices: [CommunityNotice] = []
+    private var tipIDs: Set<UInt64> = []
+
+    func effectiveSupport(config: SuperFeedback.Config?) -> SuperFeedback.Support? {
+        guard let config else { return nil }
+        if case .off? = config.support { return nil }
+        if let support = config.support { return support }
+        guard let value = payload?.fund.supportUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty, let url = URL(string: value) else { return nil }
+        return .url(url)
+    }
+
+    func offerNudge(in state: SFSceneState, thankYouID: Int? = nil) {
+        let options = state.config.supportNudge
+        let defaults = UserDefaults.standard
+        let now = Date().timeIntervalSince1970
+        guard SuperFeedback.allowsNudge, state.enabled, state.scene?.activationState == .foregroundActive,
+              effectiveSupport(config: state.config) != nil, options.enabled, !nudged, !isSupporter,
+              !defaults.bool(forKey: "superfeedback.supportNudge.optOut"),
+              now - defaults.double(forKey: "superfeedback.lastNudge") >= Double(max(0, options.cooldownDays)) * 86400,
+              now - defaults.double(forKey: "superfeedback.lastTip") >= Double(max(0, options.afterTipDays)) * 86400 else { return }
+        let text: String
+        if let thankYouID {
+            let key = "superfeedback.thankYouShown." + state.config.repo
+            var shown = Set(defaults.array(forKey: key) as? [Int] ?? [])
+            guard options.thankYou, shown.insert(thankYouID).inserted else { return }
+            defaults.set(Array(shown), forKey: key)
+            text = "You helped build this. Want to help fund the next one? 💜"
+        } else {
+            guard defaults.integer(forKey: "superfeedback.launches") >= options.minLaunches,
+                  defaults.integer(forKey: "superfeedback.moments") >= options.minMoments else { return }
+            let purpose = String((state.config.supportPurpose ?? "the AI tools and servers").prefix(60))
+            let supporters = payload?.fund.supporters ?? 0
+            text = "This app is free. If it's useful, you can help fund \(purpose) that keep it improving 💜"
+                + (supporters >= 5 ? " \(supporters) people supported this month." : "")
+        }
+        nudged = true
+        defaults.set(now, forKey: "superfeedback.lastNudge")
+        state.showNudge(text)
+    }
+
+    func configure(_ config: SuperFeedback.Config) {
+        guard repo != config.repo else { return }
+        fetchTask?.cancel(); fetchTask = nil
+        noticeTask?.cancel(); noticeTask = nil; pendingNotices = []
+        repo = config.repo; payload = nil; timestamp = nil; unavailable = false; stale = true
+        if let data = UserDefaults.standard.data(forKey: "superfeedback.community." + repo),
+           let cache = try? JSONDecoder().decode(SFCommunityCache.self, from: data) {
+            payload = cache.payload; timestamp = cache.timestamp
+        }
+    }
+    func fetch(config: SuperFeedback.Config) async {
+        guard config.community, !legacy else { return }
+        if let fetchTask { await fetchTask.value; return }
+        guard !SuperFeedback.isOffline else { stale = true; return }
+        let task = Task { await refresh(config: config) }
+        fetchTask = task
+        await task.value
+        fetchTask = nil
+    }
+    private func refresh(config: SuperFeedback.Config) async {
+        guard let url = SFCommunityHelpers.url(config.backendURL.appendingPathComponent("community"), items: [
+            .init(name: "repo", value: config.repo), .init(name: "voter", value: SuperFeedback.voterId)
+        ]) else { unavailable = true; return }
+        let revision = voteRevision
+        do {
+            let result = try await SFCommunityHelpers.request(url, as: CommunityPayload.self)
+            guard !Task.isCancelled, repo == config.repo else { return }
+            // A response started before a vote must not overwrite its result.
+            if revision != voteRevision || !voting.isEmpty {
+                while !voting.isEmpty && !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
+                guard !Task.isCancelled else { return }
+                await refresh(config: config)
+                return
+            }
+            if result.you.supporter && payload?.you.supporter != true {
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "superfeedback.lastTip")
+                SuperFeedback.dismissNudges()
+            }
+            payload = result; timestamp = Date(); unavailable = false; stale = false
+            if tipped { payload?.you.supporter = true }
+            persist()
+            enqueueNotices(result.notices)
+        } catch {
+            guard !Task.isCancelled else { return }
+            stale = true
+            if error is SFCommunityError || error is DecodingError { unavailable = true }
+            if (error as? SFCommunityError)?.legacy == true { legacy = true }
+        }
+    }
+    private func persist() {
+        guard voting.isEmpty, let payload, let timestamp,
+              let data = try? JSONEncoder().encode(SFCommunityCache(payload: payload, timestamp: timestamp)) else { return }
+        UserDefaults.standard.set(data, forKey: "superfeedback.community." + repo)
+    }
+    private func enqueueNotices(_ notices: [CommunityNotice]) {
+        let key = "superfeedback.seenNotices." + repo
+        let seen = Set(UserDefaults.standard.array(forKey: key) as? [Int] ?? [])
+        pendingNotices += SFCommunityHelpers.unseen(notices, seen: seen.union(pendingNotices.map(\.id)))
+        guard noticeTask == nil else { return }
+        noticeTask = Task {
+            defer { noticeTask = nil }
+            while !pendingNotices.isEmpty && !Task.isCancelled {
+                guard let state = SuperFeedback.noticeScene(), state.toast == nil else {
+                    try? await Task.sleep(for: .seconds(0.3)); continue
+                }
+                let notice = pendingNotices.removeFirst()
+                let noticeRepo = repo
+                state.showToast("🎉 Your suggestion shipped in \(notice.version): \(notice.title)", seconds: 6) { [weak state] in
+                    var seen = Set(UserDefaults.standard.array(forKey: key) as? [Int] ?? [])
+                    seen.insert(notice.id)
+                    UserDefaults.standard.set(Array(seen), forKey: key)
+                    state?.thankYouTask?.cancel()
+                    state?.thankYouTask = Task { [weak state] in
+                        try? await Task.sleep(for: .seconds(5))
+                        guard !Task.isCancelled, let state, self.repo == noticeRepo,
+                              state.config.repo == noticeRepo else { return }
+                        self.offerNudge(in: state, thankYouID: notice.id)
+                    }
+                }
+                try? await Task.sleep(for: .seconds(6))
+            }
+        }
+    }
+    func vote(_ idea: CommunityIdea, state: SFSceneState) async {
+        guard voting.insert(idea.id).inserted else { return }
+        voteRevision += 1
+        defer { voting.remove(idea.id); voteRevision += 1; persist() }
+        let on = !idea.voted
+        updateVote(id: idea.id, votes: max(0, idea.votes + (on ? 1 : -1)), voted: on)
+        do {
+            let body = SFVote(repo: state.config.repo, ideaId: idea.id, voter: SuperFeedback.voterId, on: on)
+            let result = try await SFCommunityHelpers.request(state.config.backendURL.appendingPathComponent("vote"),
+                body: JSONEncoder().encode(body), as: SFVoteResponse.self)
+            updateVote(id: idea.id, votes: result.votes, voted: result.voted)
+            persist()
+        } catch {
+            updateVote(id: idea.id, votes: idea.votes, voted: idea.voted)
+            persist()
+            state.showToast("Couldn't update vote. Please try again.")
+        }
+    }
+    private func updateVote(id: Int, votes: Int, voted: Bool) {
+        guard var next = payload else { return }
+        if let i = next.ideas.firstIndex(where: { $0.id == id }) {
+            next.you.votes += (voted ? 1 : 0) - (next.ideas[i].voted ? 1 : 0)
+            next.ideas[i].votes = votes; next.ideas[i].voted = voted
+        } else if let i = next.shipped.firstIndex(where: { $0.id == id }) {
+            next.you.votes += (voted ? 1 : 0) - (next.shipped[i].voted ? 1 : 0)
+            next.shipped[i].votes = votes; next.shipped[i].voted = voted
+        }
+        payload = next
+    }
+    func loadProducts(config: SuperFeedback.Config) async {
+        guard case .products(let ids) = config.support, !loadedProducts else { return }
+        loadedProducts = true; loadingProducts = true
+        defer { loadingProducts = false }
+        do { products = try await Product.products(for: ids).sorted { $0.price < $1.price } }
+        catch { products = [] }
+    }
+    func purchase(_ product: Product, state: SFSceneState) async {
+        guard !purchasing else { return }
+        purchasing = true
+        defer { purchasing = false }
+        do {
+            switch try await product.purchase() {
+            case .success(let verification):
+                switch verification {
+                case .verified(let transaction):
+                    if await record(transaction, jws: verification.jwsRepresentation, config: state.config) {
+                        state.showToast("Thank you for supporting development 💜")
+                        Task { await fetch(config: state.config) }
+                    } else { state.showToast("Couldn't record purchase — will retry next launch") }
+                case .unverified: state.showToast("Purchase could not be verified")
+                }
+            case .userCancelled: break
+            case .pending: state.showToast("Purchase pending")
+            @unknown default: break
+            }
+        } catch { state.showToast("Couldn't complete purchase. Please try again.") }
+    }
+    func drainTips(config: SuperFeedback.Config) async {
+        for await verification in StoreKit.Transaction.unfinished {
+            guard case .verified(let transaction) = verification, transaction.productType == .consumable else { continue }
+            _ = await record(transaction, jws: verification.jwsRepresentation, config: config)
+        }
+    }
+    private func record(_ transaction: StoreKit.Transaction, jws: String, config: SuperFeedback.Config) async -> Bool {
+        guard tipIDs.insert(transaction.id).inserted else { return false }
+        defer { tipIDs.remove(transaction.id) }
+        do {
+            let body = SFTip(repo: config.repo, voter: SuperFeedback.voterId, jws: jws)
+            _ = try await SFCommunityHelpers.request(config.backendURL.appendingPathComponent("tip"),
+                body: JSONEncoder().encode(body), as: SFTipResponse.self)
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "superfeedback.lastTip")
+            SuperFeedback.dismissNudges()
+            await transaction.finish()
+            tipped = true
+            payload?.you.supporter = true
+            persist()
+            return true
+        } catch { return false }
+    }
+}
+
+@MainActor
+private struct SFIdeasView: View {
+    @ObservedObject var state: SFSceneState
+    @ObservedObject private var community = SFCommunity.shared
+    @State private var filter = "Top"
+    private var ideas: [CommunityIdea] {
+        if filter == "Shipped" { return (community.payload?.shipped ?? []).sorted { ($0.shippedAt ?? 0) > ($1.shippedAt ?? 0) } }
+        return (community.payload?.ideas ?? []).sorted {
+            filter == "New" ? ($0.createdAt ?? 0) > ($1.createdAt ?? 0)
+                : ($0.votes, $0.createdAt ?? 0) > ($1.votes, $1.createdAt ?? 0)
+        }
+    }
+    var body: some View {
+        Form {
+            Section {
+                Button("+ Suggest an idea") { state.type = "feature"; state.tab = .feedback }
+                HStack {
+                    ForEach(["Top", "New", "Shipped"], id: \.self) { value in
+                        Button(value) { filter = value }.buttonStyle(.bordered)
+                            .buttonBorderShape(.capsule).tint(filter == value ? state.accent : .secondary)
+                            .accessibilityAddTraits(filter == value ? .isSelected : [])
+                    }
+                }
+            }
+            Section {
+                if ideas.isEmpty { Text("No public ideas yet. Be the first.").foregroundStyle(.secondary) }
+                ForEach(ideas) { idea in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(idea.title).font(.headline)
+                            Text(idea.summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                            Text(SFCommunityHelpers.status(idea)).font(.caption)
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                .background(state.accent.opacity(0.12), in: Capsule())
+                        }
+                        Spacer()
+                        Button { Task { await community.vote(idea, state: state) } } label: {
+                            Label("\(idea.votes)", systemImage: "chevron.up")
+                                .padding(10).foregroundStyle(idea.voted ? Color.white : state.accent)
+                                .background(idea.voted ? state.accent : state.accent.opacity(0.1), in: Capsule())
+                        }.buttonStyle(.borderless).disabled(community.voting.contains(idea.id))
+                            .accessibilityLabel(idea.voted ? "Remove vote" : "Vote for \(idea.title), \(idea.votes) \(idea.votes == 1 ? "vote" : "votes")")
+                    }
+                }
+            } footer: {
+                VStack(alignment: .leading) {
+                    if let you = community.payload?.you {
+                        Text("You: \(you.votes) votes · \(you.submitted) ideas · \(you.shipped) shipped")
+                    }
+                    if community.stale, let date = community.timestamp {
+                        Text("Last updated \(date.formatted(date: .abbreviated, time: .shortened))")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@MainActor
+private struct SFSupportView: View {
+    @ObservedObject var state: SFSceneState
+    @ObservedObject private var community = SFCommunity.shared
+    var body: some View {
+        Form {
+            Section {
+                HStack {
+                    Text("This app is free.").font(.headline)
+                    if community.isSupporter {
+                        Text("Supporter").font(.caption).padding(6).background(state.accent.opacity(0.12), in: Capsule())
+                    }
+                }
+                Text("If it's useful to you, optional contributions help pay for the AI tools, infrastructure and development that keep improving it. Supporting doesn't unlock anything — every improvement ships to everyone.")
+            }
+            if let fund = community.payload?.fund {
+                Section {
+                    Text("Community development fund · \(Date().formatted(.dateTime.month(.wide).year()))").font(.caption)
+                    ProgressView(value: fund.goalCents > 0 ? min(1, max(0, Double(fund.monthCents) / Double(fund.goalCents))) : 0)
+                    Text("\(SFCommunityHelpers.currency(fund.monthCents, code: fund.currency)) / \(SFCommunityHelpers.currency(fund.goalCents, code: fund.currency))")
+                        .font(.caption)
+                    Text("\(fund.supporters) supporters this month · \(fund.shippedThisMonth) improvements shipped")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Section {
+                if case .url(let base) = community.effectiveSupport(config: state.config),
+                   let url = SFCommunityHelpers.url(base, items: [.init(name: "client_reference_id", value: SuperFeedback.voterId)]) {
+                    Button("Support development") { UIApplication.shared.open(url) }
+                } else if case .products = community.effectiveSupport(config: state.config) {
+                    if community.loadingProducts { ProgressView() }
+                    else if community.products.isEmpty { Text("Contributions are currently unavailable.").foregroundStyle(.secondary) }
+                    ViewThatFits(in: .horizontal) {
+                        HStack { tips }
+                        VStack(alignment: .leading) { tips }
+                    }
+                    Text("Tips are optional and unlock nothing.").font(.caption).foregroundStyle(.secondary)
+                }
+                if community.isSupporter { Text("Thank you for supporting development 💜") }
+            }
+        }
+    }
+    private var tips: some View {
+        ForEach(Array(community.products.enumerated()), id: \.element.id) { index, product in
+            VStack(spacing: 4) {
+                Button(product.displayPrice) { Task { await community.purchase(product, state: state) } }
+                    .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).disabled(community.purchasing)
+                if index == 1 { Text("Most common").font(.caption2).foregroundStyle(.secondary) }
+            }
+        }
+    }
 }

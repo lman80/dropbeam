@@ -1,3 +1,4 @@
+import { createElement } from 'react'
 import { fileSrc, HAS_TAURI, type Friend } from '../lib/api'
 import { initials } from '../lib/avatar'
 import { deviceIcon } from '../lib/deviceIcons'
@@ -8,8 +9,8 @@ import { useStore } from '../store'
 export function FriendAvatar({ friend }: { friend: Pick<Friend, 'name' | 'avatar'> & Partial<Pick<Friend, 'accountPub' | 'deviceKind' | 'deviceOs'>> }) {
   const account = useStore(s => s.myDevice?.account_pub)
   if (account && friend.accountPub === account) {
-    const Icon = deviceIcon(friend.deviceOs === 'macos' && friend.deviceKind !== 'desktop' ? 'laptop' : friend.deviceKind ?? undefined)
-    return <Icon className="avatar-device" size={18} strokeWidth={1.8} aria-hidden />
+    const icon = deviceIcon(friend.deviceOs === 'macos' && friend.deviceKind !== 'desktop' ? 'laptop' : friend.deviceKind ?? undefined)
+    return createElement(icon, { className: 'avatar-device', size: 18, strokeWidth: 1.8, 'aria-hidden': true })
   }
   const avatar = typeof friend.avatar === 'string' ? friend.avatar : ''
   const src = avatar.startsWith('data:')

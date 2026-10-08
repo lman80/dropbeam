@@ -2293,3 +2293,76 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+/// DropBeam patch regression: (PATH_)ACK frames for every path are written into one packet,
+/// and with several paths whose ACK ranges are fragmented they used to overflow the packet's
+/// frame space. `Limit<TransmitBuf>` then panicked in `bytes` ("advance out of bounds: the len
+/// is 0 but advancing by 4") while noq held the connection mutex, poisoning it and aborting the
+/// process (the Linux Transfer Server crash). Building the packet must not panic and must
+/// stay within the datagram.
+fn fragmented_acks_on_three_paths() -> Result<ConnPair, Box<dyn std::error::Error>> {
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let base_client = pair.routes.as_basic().client_addr;
+    let base_server = pair.routes.as_basic().server_addr;
+    let mut clients = vec![base_client];
+    let mut servers = vec![base_server];
+    for i in 1..3u16 {
+        let mut c = base_client;
+        let mut s = base_server;
+        c.set_port(c.port() + i);
+        s.set_port(s.port() + i);
+        clients.push(c);
+        servers.push(s);
+    }
+    pair.routes = ManyToManyRouting::simple_symmetric(clients.clone(), servers.clone()).into();
+    let mut paths = vec![PathId::ZERO];
+    for i in 1..3 {
+        let fourtuple = FourTuple {
+            local_ip: Some(clients[i].ip()),
+            remote: servers[i],
+        };
+        paths.push(pair.open_path(Client, fourtuple, PathStatus::Available)?);
+        pair.drive();
+    }
+    assert_eq!(pair.paths(Server).len(), 3, "server should know all three paths");
+    let now = pair.time;
+    for path_id in paths {
+        // 64 ranges (MAX_ACK_BLOCKS) separated by 2^40-sized gaps: every gap is an 8-byte
+        // varint, so each PATH_ACK is ~600 bytes and three of them cannot share one packet.
+        pair.conn_mut(Server)
+            .inject_pending_acks(path_id, (1..=64u64).map(|i| i << 40), now);
+    }
+    Ok(pair)
+}
+
+fn drain_transmits(pair: &mut ConnPair, side: crate::Side) -> usize {
+    let mut n = 0;
+    let mut buf = Vec::new();
+    while let Some(t) = pair.poll_transmit(side, std::num::NonZeroUsize::MIN, &mut buf) {
+        assert!(t.size <= 1500, "datagram of {} bytes", t.size);
+        assert!(buf.len() <= 1500, "buffer of {} bytes", buf.len());
+        n += 1;
+        assert!(n < 100, "poll_transmit never went idle");
+    }
+    n
+}
+
+#[test]
+fn many_paths_fragmented_acks_do_not_overflow_packet() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = fragmented_acks_on_three_paths()?;
+    // ~1800 bytes of PATH_ACKs: the ranges that do not fit are truncated (lowest first).
+    let n = drain_transmits(&mut pair, Server);
+    assert!(n >= 1, "the ACKs must still be sent");
+    Ok(())
+}
+
+#[test]
+fn many_paths_fragmented_acks_do_not_overflow_close_packet() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = fragmented_acks_on_three_paths()?;
+    pair.close(Server, 42, b"bye");
+    let n = drain_transmits(&mut pair, Server);
+    assert!(n >= 1, "a close packet must still go out");
+    Ok(())
+}

@@ -8,6 +8,7 @@ export function DropZone({
   onPick,
   onPickPhotos,
   compact = false,
+  short = false,
 }: {
   hovering: boolean
   picking?: boolean
@@ -15,6 +16,8 @@ export function DropZone({
   onPickPhotos?: () => void
   /** Transfers are listed below: no big target, just the drag overlay. */
   compact?: boolean
+  /** Still the drop target, just shorter (another device's transfer is listed below). */
+  short?: boolean
 }) {
   if (MOBILE_UI) return (
     <section className="mobile-send-hero" data-testid="dropzone" aria-busy={picking}>
@@ -35,13 +38,13 @@ export function DropZone({
           disabled={picking}
           aria-busy={picking}
           data-testid="dropzone"
-          className={`dropzone${hovering ? ' hovering' : ''}`}
+          className={`dropzone${hovering ? ' hovering' : ''}${short ? ' short' : ''}`}
           aria-label="Choose files to send"
         >
           <FileUp className="dropzone-glyph" strokeWidth={1.5} />
-          <span className="dropzone-title">Drop files here to send</span>
+          <span className="dropzone-title">Drop files here, or click to choose</span>
           <span className="dropzone-hint">
-            Send to a friend by name, or to anyone with a code. Files sent to you appear here.
+            Next, pick who gets them — a friend, your other devices, or anyone with a code. Files people send you show up here too.
           </span>
         </button>
       )}

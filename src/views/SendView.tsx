@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { shortcutLabel } from '../lib/keys'
 import { AnimatePresence } from 'framer-motion'
 import { ArrowDownToLine, FolderUp, Inbox, Send as SendIcon } from 'lucide-react'
 import { api, isActive } from '../lib/api'
@@ -7,6 +8,8 @@ import { IS_MAC, MOBILE_UI } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { DropZone } from '../components/DropZone'
 import { TransferCard } from '../components/TransferCard'
+import { OtherDevices } from '../components/OtherDevices'
+import { useOtherDevices } from '../lib/otherDevices'
 import { ScanCodeButton } from '../components/CodeQr'
 import { Dialog } from '../components/Dialog'
 import { SectionHeader } from '../components/ui'
@@ -19,6 +22,7 @@ export function SendView() {
   const receiveCode = useStore((s) => s.receiveCode)
   const openCode = useStore((s) => s.openCode)
   const [picking, setPicking] = useState(false)
+  const othersBusy = useOtherDevices((s) => s.devices.length > 0)
   const [code, setCode] = useState('')
   const [showReceive, setShowReceive] = useState(false)
 
@@ -97,7 +101,7 @@ export function SendView() {
 
   return (
     <div className="page send-page">
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Send &amp; Receive</h1>
         <div className="page-actions">
           <button className="btn btn-secondary" onClick={() => setShowReceive(true)}>
@@ -108,14 +112,19 @@ export function SendView() {
               <FolderUp /> Send Folder…
             </button>
           )}
-          <button className="btn btn-primary" disabled={picking} onClick={() => void onPick()}>
+          <button className="btn btn-primary" disabled={picking} onClick={() => void onPick()} title={`Send files  ${shortcutLabel('o')}`}>
             <SendIcon /> Send Files…
           </button>
         </div>
       </div>
 
       {list.length === 0 ? (
-        <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} />
+        <>
+          {/* Shorter while another device's transfer is showing, so both are in view —
+              but always a visible drop target. */}
+          <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} short={othersBusy} />
+          <OtherDevices />
+        </>
       ) : (
         <>
           <DropZone hovering={dragHovering} onPick={() => void onPick()} picking={picking} compact />
@@ -131,6 +140,7 @@ export function SendView() {
               ))}
             </AnimatePresence>
           </div>
+          <OtherDevices />
         </>
       )}
 
@@ -160,7 +170,7 @@ export function SendView() {
                 onChange={(e) => setCode(e.target.value)}
               />
               <ScanCodeButton
-                label="Scan…"
+                label="Scan QR Code…"
                 hint="Hold the sender’s QR code up to your camera."
                 title="Scan to receive"
                 accept={['receive']}

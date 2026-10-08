@@ -4,10 +4,11 @@ import { FriendAvatar as MobileAvatar } from '../mobile/shared'
 import { presenceText } from '../mobile/helpers'
 import { friendPresence } from '../lib/presence'
 import { Fragment } from 'react'
-import { groupDevices } from '../lib/deviceIcons'
+import { sendTargets } from '../lib/deviceIcons'
+import { serverApi } from '../lib/transferServer'
 import { useOwnDeviceLabels } from '../lib/ownDevices'
 import { MOBILE_UI } from '../lib/platform'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { AnimatePresence } from 'framer-motion'
 import { QrCode, UserPlus } from 'lucide-react'
 import { Dialog } from './Dialog'
@@ -24,7 +25,8 @@ export function SendToChooser() {
   const files = useStore((s) => s.pendingSend)
   const friends = useStore((s) => s.friends)
   const myDevice = useStore(s => s.myDevice)
-  const { myDevices, others } = groupDevices(friends, myDevice?.account_pub)
+  // One entry per person (a friend's extra devices fold into one row).
+  const { myDevices, others } = sendTargets(friends, myDevice?.account_pub)
   const friendSeen = useStore((s) => s.friendSeen)
   const folderStatuses = useStore((s) => s.folderStatuses)
   const sendToFriend = useStore((s) => s.sendToFriend)
@@ -35,6 +37,20 @@ export function SendToChooser() {
 
   const open = !!files && files.length > 0
   const close = () => setPendingSend(null)
+  // Who a Transfer Server would hold a send for while they're offline
+  // (friend id → server name). Without one, an offline send retries ~2 min.
+  const [holds, setHolds] = useState<Record<string, string>>({})
+  useEffect(() => {
+    if (!open) return
+    let alive = true
+    const ids = useStore.getState().friends.map((f) => f.id)
+    void Promise.all(ids.map((id) => serverApi.holdRoute(id).then((name) => [id, name] as const, () => [id, null] as const)))
+      .then((pairs) => {
+        if (!alive) return
+        setHolds(Object.fromEntries(pairs.filter((p): p is readonly [string, string] => !!p[1])))
+      })
+    return () => { alive = false }
+  }, [open])
 
   // #34: the sheet is where a stale "offline" hurts most — it's the moment you
   // pick who to send to. Opening it actively re-checks everyone who doesn't
@@ -61,12 +77,15 @@ export function SendToChooser() {
   }
 
   if (MOBILE_UI) return open ? <Sheet title="Send to" onClose={close}>
-    {[{ title: 'My Devices', items: myDevices }, { title: 'Friends', items: others }].map(group => <Section key={group.title} title={group.title} footer={!group.items.length ? (group.title === 'My Devices' ? 'Your linked devices appear here.' : 'Add a friend to send by name.') : undefined}>{group.items.map(friend => <Row key={friend.id} avatar={<MobileAvatar friend={friend} />} title={friend.name} subtitle={presenceText(friendPresence(friend.name, friendSeen, folderStatuses))} onPress={() => toFriend(friend.id)} />)}</Section>)}
+    {[{ title: 'My Devices', items: myDevices }, { title: 'Friends', items: others }].map(group => <Section key={group.title} title={group.title} footer={!group.items.length ? (group.title === 'My Devices' ? 'Your linked devices appear here.' : 'Add a friend to send by name.') : undefined}>{group.items.map(friend => <Row key={friend.id} avatar={<MobileAvatar friend={friend} />} title={friend.name} subtitle={presenceText(friendPresence(friend, friendSeen, folderStatuses))} onPress={() => toFriend(friend.id)} />)}</Section>)}
     <Section title="Or"><Row icon={<IconSquare><QrCode /></IconSquare>} title="Quick Send (code)" accessory="chevron" onPress={withCode} /></Section>
   </Sheet> : null
 
   const people = [{ title: 'My devices', items: myDevices }, { title: 'Friends', items: others }].filter((g) => g.items.length)
-  const anyOffline = friends.some((f) => friendPresence(f.name, friendSeen, folderStatuses).status !== 'online')
+  const targets = [...myDevices, ...others]
+  const isOffline = (f: (typeof targets)[number]) => friendPresence(f, friendSeen, folderStatuses).status !== 'online'
+  // The "keeps trying" note only matters for someone offline with no server to hold it.
+  const anyUnheldOffline = targets.some((f) => isOffline(f) && !holds[f.id])
 
   return (
     <AnimatePresence>
@@ -82,7 +101,7 @@ export function SendToChooser() {
               <span className="chooser-avatar chooser-glyph" aria-hidden><QrCode size={16} /></span>
               <span className="chooser-text">
                 <span className="chooser-name">Share with a code or QR code</span>
-                <span className="chooser-sub">For anyone, even without DropBeam friends</span>
+                <span className="chooser-sub">For anyone — they enter the code in their DropBeam</span>
               </span>
             </button>
           }
@@ -97,7 +116,7 @@ export function SendToChooser() {
             >
               <span className="chooser-avatar chooser-glyph" aria-hidden><UserPlus size={16} /></span>
               <span className="chooser-text">
-                <span className="chooser-name">Add a friend</span>
+                <span className="chooser-name">Add a Friend</span>
                 <span className="chooser-sub">Then send to them by name</span>
               </span>
             </button>
@@ -107,7 +126,7 @@ export function SendToChooser() {
                 <Fragment key={group.title}>
                   <h3 className="chooser-section">{group.title}</h3>
                   {group.items.map((f) => {
-                    const presence = friendPresence(f.name, friendSeen, folderStatuses)
+                    const presence = friendPresence(f, friendSeen, folderStatuses)
                     const online = presence.status === 'online'
                     const name = ownLabels[f.id] ?? f.name
                     const own = !!ownLabels[f.id]
@@ -119,7 +138,9 @@ export function SendToChooser() {
                         </span>
                         <span className="chooser-text">
                           <span className="chooser-name truncate-1">{name}</span>
-                          <span className="chooser-sub truncate-1">{online ? 'Online' : presenceLabel(presence)}</span>
+                          <span className="chooser-sub truncate-1">
+                            {online ? 'Online' : holds[f.id] ? `${presenceLabel(presence)} · ${holds[f.id]} will hold it` : presenceLabel(presence)}
+                          </span>
                         </span>
                         <span className="chooser-go" aria-hidden>Send</span>
                       </button>
@@ -129,7 +150,7 @@ export function SendToChooser() {
               ))}
               {/* Honest, said once: friend file sends retry ~90s then fail — there is
                   no store-and-forward for files (chat messages DO queue). */}
-              {anyOffline && <p className="chooser-note">If someone’s offline, DropBeam keeps trying for about 2 minutes.</p>}
+              {anyUnheldOffline && <p className="chooser-note">Someone offline? DropBeam keeps trying for about 2 minutes, then stops — send again when they’re online.</p>}
             </>
           )}
         </Dialog>

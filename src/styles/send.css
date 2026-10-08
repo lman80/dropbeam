@@ -21,6 +21,7 @@
   cursor: default;
   transition: background var(--dur-fast), box-shadow var(--dur-fast);
 }
+.dropzone.short { min-height: 220px; }
 .dropzone:hover { background: color-mix(in srgb, var(--text) 2.5%, transparent); }
 .dropzone:focus-visible { box-shadow: var(--focus-ring); }
 .dropzone-glyph { width: 34px; height: 34px; color: var(--text-faint); margin-bottom: 8px; }
@@ -60,3 +61,9 @@
 .receive-code-row { display: flex; gap: 8px; }
 .receive-code-row .input { flex: 1; min-width: 0; }
 .input.mono { font-family: var(--font-mono); font-size: var(--text-12); }
+
+/* "On your other devices" (#31): read-only rows mirrored from the user's other
+   linked devices — same rhythm as the transfer list, no controls. */
+.other-devices .xfer-icon { color: var(--text-muted); }
+.other-device-name { color: var(--text); font-weight: 500; }
+.other-device-pct { font-size: var(--text-12); color: var(--text-muted); flex-shrink: 0; padding-left: 8px; }

@@ -1,6 +1,6 @@
 import { FileIcon } from './FileIcon'
 import { integrityLabel } from '../lib/integrity'
-import { MOBILE_UI } from '../lib/platform'
+import { DOWNLOAD_URL, MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { memo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { QRCodeSVG } from 'qrcode.react'
@@ -13,6 +13,7 @@ import {
   Play,
   RotateCw,
   ShieldCheck,
+  Server,
   X,
 } from 'lucide-react'
 import { api, isActive, type TransferUpdate } from '../lib/api'
@@ -22,6 +23,10 @@ import { folderLabel } from '../lib/humanize'
 import { IntegrityDetails } from './IntegrityDetails'
 import { ConnInfo } from './ConnInspector'
 import { useStore } from '../store'
+import { deliverySummary, multiDevice } from '../lib/deliveries'
+import { DeliveryRows } from './Deliveries'
+import { useTransferMeter } from '../lib/useTransferMeter'
+import { errorText } from '../lib/errors'
 
 function title(t: TransferUpdate): string {
   if (t.fileNames.length === 1) return t.fileNames[0]
@@ -42,12 +47,15 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   const respondToOffer = useStore((s) => s.respondToOffer)
   const toast = useStore((s) => s.toast)
   const summary = useStore((s) => s.transferSummaries[t.id])
-  const rates = useStore((s) => s.transferRates[t.id])
-  const speedMode = useStore((s) => s.speedMode)
-  const etaMode = useStore((s) => s.etaMode)
+  const meter = useTransferMeter(t)
+  const { speedMode, etaMode } = meter
+  const cancelTransfer = useStore((s) => s.cancelTransfer)
   const toggleSpeedMode = useStore((s) => s.toggleSpeedMode)
   const toggleEtaMode = useStore((s) => s.toggleEtaMode)
   const [copied, setCopied] = useState(false)
+  // Sent to a friend with several devices: say where it is on each one.
+  const devices = t.direction === 'send' && multiDevice(t.deliveries) ? t.deliveries : null
+  const reach = devices ? deliverySummary(t.friendName ?? 'them', devices) : null
 
   const active = isActive(t.state)
   const isOffer = t.state === 'waitingForAccept'
@@ -79,17 +87,13 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   // By default the SPEED is live (what the link is doing right now) and the TIME
   // LEFT is based on the whole-transfer average (which doesn't swing with every
   // hiccup). Clicking either swaps its basis; both choices are global and stick.
-  const engineBps = t.speedBps > 0 ? t.speedBps : null
-  const shownBps =
-    (speedMode === 'live' ? rates?.liveBps ?? rates?.avgBps : rates?.avgBps ?? rates?.liveBps) ??
-    engineBps
-  const shownEta =
-    (etaMode === 'avg' ? rates?.avgEta ?? rates?.liveEta : rates?.liveEta ?? rates?.avgEta) ??
-    t.etaSeconds
   // Neither figure blinks between frames: the live rate holds its last reading
   // across a frame it can't measure, and a stall is named rather than shown as a
-  // dash. Only the first few seconds say "calculating…".
-  const settling = (rates?.ageMs ?? 0) < 3000
+  // dash. Only the first few seconds (by the clock) say "calculating…", and time
+  // left is always derived from the speed on screen.
+  const shownBps = meter.speedBps
+  const shownEta = meter.etaSeconds
+  const settling = meter.settling
   const speedText =
     shownBps == null
       ? settling
@@ -119,11 +123,11 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
           else if (show) void api.shareFiles(t.fileNames.map(n => `${t.outDir}/${n}`)).catch(e => toast('error', String(e)))
           else if (retry) { if (onRetry) onRetry(); else void retryTransfer(t.id) }
           else if (isOffer) void respondToOffer(t.id, false)
-          else if (active) void api.cancelTransfer(t.id)
+          else if (active) void cancelTransfer(t.id)
           else removeTransfer(t.id)
         }}>{show ? <FolderOpen size={21} /> : retry ? <RotateCw size={21} /> : <X size={21} />}</button>}
       </div>
-      {t.state === 'completed' ? <p className="ios-footnote">{t.direction === 'send' ? 'Delivered' : 'Saved'}{route && ` · ${route}`} · {verified}</p> : <>
+      {reach && !active ? <p className="ios-footnote">{reach.text}</p> : t.state === 'completed' ? <p className="ios-footnote">{t.direction === 'send' ? 'Delivered' : 'Saved'}{route && ` · ${route}`} · {verified}</p> : <>
         <div className="mobile-progress" role="progressbar" aria-label="Transfer progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(t.percent)}><span style={{ width: `${Math.max(0, Math.min(100, t.percent))}%` }} /></div>
         <div className="mobile-transfer-stats ios-footnote"><button className="xfer-meter" onClick={toggleSpeedMode}>{formatBytesLive(t.bytesDone)} of {formatBytesLive(t.bytesTotal)} · {speedText}</button><button className="xfer-meter" onClick={toggleEtaMode}>{etaText}</button></div>
         <div className="mobile-transfer-badges">{route && <span className="ios-caption">{route}</span>}{verified === 'Verified' && <span className="ios-caption">Verified</span>}</div>
@@ -139,6 +143,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   const paused = t.state === 'paused'
   const completed = t.state === 'completed'
   const canceled = t.state === 'canceled'
+  const held = t.state === 'held'
   const transferring = t.state === 'transferring'
   const connecting = !isOffer && !isSendWaiting && (t.state === 'starting' || t.state === 'waitingForPeer' || t.state === 'connecting')
   const who = t.friendName
@@ -194,7 +199,10 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   } else if (paused) {
     meta = <>Paused{who ? ` · to ${who}` : ''}{t.bytesTotal > 0 ? <> · <span className="tnum">{formatBytes(t.bytesDone)} of {formatBytes(t.bytesTotal)}</span></> : ''}</>
   } else if (failed) {
-    meta = <span className="xfer-error" title={t.error ?? undefined}>{t.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}{t.error ? ` — ${t.error}` : ''}</span>
+    meta = <span className="xfer-error" title={t.error ?? undefined}>{t.direction === 'send' ? 'Couldn’t send' : 'Couldn’t receive'}{t.error ? ` — ${errorText(t.error, 'Something went wrong.')}` : ''}</span>
+  } else if (reach && (completed || held)) {
+    // "Delivered to Alex’s Mac · iPhone: waiting (Linux Box is holding it)"
+    meta = <span title={reach.text}>{reach.text}{t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}</span>
   } else if (completed) {
     const saved = t.direction === 'receive' && t.outDir ? `Saved to ${folderLabel(t.outDir)}` : null
     meta = (
@@ -205,8 +213,11 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
         {locationNotes.length > 0 && <span title={locationTip}> · {locationNotes.join(' · ')}</span>}
       </span>
     )
+  } else if (held) {
+    meta = <span><Server className="srv-glyph" aria-hidden />{statusLabel(t)}{t.bytesTotal > 0 ? ` · ${formatBytes(t.bytesTotal)}` : ''}</span>
   } else if (canceled) {
-    meta = statusLabel(t)
+    // "Canceled by Alex" when the OTHER side stopped it (engine sets detail).
+    meta = t.detail ?? statusLabel(t)
   } else {
     meta = statusLabel(t)
   }
@@ -253,11 +264,13 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
                   <Play /> Resume
                 </button>
               )}
-              {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} />}
+              {(transferring || connecting) && <ConnInfo detail={t.connDetail} locality={t.locality} moving={transferring} />}
+              {/* "Where did it go?" is the first question after a file arrives —
+                  a labelled button, not an icon to discover. */}
               {completed && t.direction === 'receive' && t.outDir && (
-                <IconButton label={t.fileCount === 1 && t.fileNames.length === 1 ? 'Show in Finder' : 'Open Folder'} onClick={showInFolder}>
-                  <FolderOpen />
-                </IconButton>
+                <button className="btn btn-secondary btn-sm" onClick={showInFolder}>
+                  <FolderOpen /> {t.fileCount === 1 && t.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL}
+                </button>
               )}
               {completed && t.direction === 'send' && verify?.state !== 'running' && (
                 <MenuButton
@@ -273,7 +286,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
               )}
               <IconButton
                 label={active ? 'Cancel' : 'Remove from list'}
-                onClick={() => (active ? api.cancelTransfer(t.id) : removeTransfer(t.id))}
+                onClick={() => (active ? void cancelTransfer(t.id) : removeTransfer(t.id))}
               >
                 <X />
               </IconButton>
@@ -288,6 +301,8 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
         </div>
       )}
 
+      {devices && !canceled && <DeliveryRows deliveries={devices} />}
+
       {isSendWaiting && (
         <div className="xfer-code">
           <ShareCode
@@ -295,8 +310,16 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
             size={132}
             hint={null}
             copyVariant="secondary"
-            instructions="On the other device, open DropBeam, choose Receive, and scan this code — or paste it."
-            footer={<span className="xfer-connecting"><Spinner size={11} />Waiting for the other device…</span>}
+            instructions="On the other device, open DropBeam, choose Receive…, and scan this code — or paste it. Keep DropBeam open here until it’s done."
+            footer={<>
+              <span className="xfer-connecting"><Spinner size={11} />Waiting for the other device…</span>
+              <span className="xfer-getapp">
+                They don’t have DropBeam? It’s free:{' '}
+                <button className="btn btn-plain btn-sm" onClick={() => navigator.clipboard.writeText(DOWNLOAD_URL).then(() => toast('success', 'Download link copied — send it to them'), () => toast('error', DOWNLOAD_URL))}>
+                  Copy Download Link
+                </button>
+              </span>
+            </>}
           />
         </div>
       )}
@@ -354,5 +377,7 @@ function statusLabel(t: TransferUpdate): string {
       return !send && fn ? 'Declined' : 'Canceled'
     case 'paused':
       return 'Paused'
+    case 'held':
+      return `Waiting on ${t.heldOn ?? 'your Transfer Server'} — ${fn ?? 'they'} gets it when they’re back`
   }
 }

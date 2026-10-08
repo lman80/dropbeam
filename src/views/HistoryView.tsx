@@ -1,8 +1,10 @@
 import { MobileHeader } from '../components/MobileHeader'
+import { clockTime, shortDate } from '../lib/dates'
+import { shortcutLabel } from '../lib/keys'
 import { integrityLabel } from '../lib/integrity'
 import { ChevronRight } from 'lucide-react'
-import { MOBILE_UI } from '../lib/platform'
-import { useMemo, useState } from 'react'
+import { MOBILE_UI, REVEAL_LABEL, OPEN_FOLDER_LABEL } from '../lib/platform'
+import { useEffect, useMemo, useState } from 'react'
 import { AnimatePresence } from 'framer-motion'
 import { FolderOpen, History as HistoryIcon, Search, Trash2, X } from 'lucide-react'
 import { api, type HistoryEntry } from '../lib/api'
@@ -12,6 +14,7 @@ import { Dialog } from '../components/Dialog'
 import { peerLabel } from '../lib/humanize'
 import { IntegrityDetails } from '../components/IntegrityDetails'
 import { FileIcon } from '../components/FileIcon'
+import { FromChip } from '../components/FromChip'
 import { RecoverableFilesView } from './RecoverableFilesView'
 import { formatBytes } from '../lib/format'
 
@@ -23,20 +26,11 @@ function entryTitle(e: HistoryEntry): string {
   return e.direction === 'receive' ? 'Received files' : 'Files'
 }
 
-function timeOfDay(ms: number): string {
-  return new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
-}
-
 /** Time for today/yesterday (the section says which day), a short date before that. */
 function whenLabel(ms: number): string {
   const group = dayGroup(ms)
-  if (group === 'Today' || group === 'Yesterday') return timeOfDay(ms)
-  const d = new Date(ms)
-  return d.toLocaleDateString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
-  })
+  if (group === 'Today' || group === 'Yesterday') return clockTime(ms)
+  return shortDate(ms)
 }
 
 /** Files-app style date buckets: Today / Yesterday / Last 7 days / month. */
@@ -55,6 +49,12 @@ function dayGroup(ms: number): string {
 }
 
 export function HistoryView() {
+  // ⌘F focuses the search field.
+  useEffect(() => {
+    const find = () => document.querySelector<HTMLInputElement>('.history-search input')?.select()
+    window.addEventListener('dropbeam:find', find)
+    return () => window.removeEventListener('dropbeam:find', find)
+  }, [])
   const history = useStore((s) => s.history)
   const reload = useStore((s) => s.reloadHistory)
   const focusPair = useStore((s) => s.historyFocusPair)
@@ -75,13 +75,13 @@ export function HistoryView() {
 
   return (
     <div className="page">
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">History</h1>
         {tab === 'recents' && history.length > 0 && (
           <div className="page-actions">
             <MenuButton
               label="More"
-              items={[{ label: 'Clear list…', icon: <Trash2 />, onSelect: () => setConfirmClear(true) }]}
+              items={[{ label: 'Clear List…', icon: <Trash2 />, onSelect: () => setConfirmClear(true) }]}
             />
           </div>
         )}
@@ -91,15 +91,16 @@ export function HistoryView() {
         <Segmented
           role="tablist"
           label="History"
+          idBase="history"
           value={tab}
           onChange={setTab}
           options={[
             { value: 'recents', label: 'Recents' },
-            { value: 'recoverable', label: 'Recoverable files' },
+            { value: 'recoverable', label: 'Recoverable Files' },
           ]}
         />
         {tab === 'recents' && history.length > 0 && (
-          <label className="search-field history-search">
+          <label className="search-field history-search" title={`Search  ${shortcutLabel('f')}`}>
             <Search />
             <input
               className="input"
@@ -114,11 +115,13 @@ export function HistoryView() {
         )}
       </div>
 
-      {tab === 'recents' ? (
-        <Recents history={history} query={query} setQuery={setQuery} />
-      ) : (
-        <RecoverableFilesView />
-      )}
+      <div role="tabpanel" id="history-panel" aria-labelledby={`history-tab-${tab}`}>
+        {tab === 'recents' ? (
+          <Recents history={history} query={query} setQuery={setQuery} />
+        ) : (
+          <RecoverableFilesView />
+        )}
+      </div>
 
       <AnimatePresence>
         {confirmClear && (
@@ -129,7 +132,7 @@ export function HistoryView() {
             footer={
               <>
                 <button className="btn btn-secondary" onClick={() => setConfirmClear(false)}>Cancel</button>
-                <button className="btn btn-destructive" onClick={() => { setConfirmClear(false); void clearAll() }}>Clear list</button>
+                <button className="btn btn-destructive" onClick={() => { setConfirmClear(false); void clearAll() }}>Clear List</button>
               </>
             }
           >
@@ -177,7 +180,8 @@ function Recents({
   </>
 
   if (history.length === 0) {
-    return <EmptyState icon={<HistoryIcon />} title="No transfers yet" hint="Files you send and receive show up here." />
+    return <EmptyState icon={<HistoryIcon />} title="No transfers yet" hint="Files you send and receive show up here."
+      action={<button className="btn btn-secondary" onClick={() => void api.pickFiles().then((p) => { if (p.length) useStore.getState().setPendingSend(p) }, (e) => useStore.getState().toast('error', e))}>Send Files…</button>} />
   }
 
   if (groups.length === 0) {
@@ -204,12 +208,15 @@ function RecentRow({ e }: { e: HistoryEntry }) {
   const ok = e.state === 'completed'
   const failed = e.state === 'failed'
 
-  if (MOBILE_UI) return <div className="ios-row"><span className="mobile-tinted-icon"><FileIcon name={e.fileNames[0] ?? ''} size={22} /></span><div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{entryTitle(e)}</h3><p className="ios-footnote">{e.peer ?? 'Peer'} · {formatBytes(e.bytesTotal)}{e.locality !== 'unknown' && ` · ${e.locality === 'internet' ? 'Relay' : 'Direct'}`} · {ok ? integrityLabel(e.integrity ?? [], e.bytesTotal, true) : e.state}</p></div>{ok && e.outDir && <button className="ios-button" aria-label={`Show ${entryTitle(e)}`} onClick={() => void api.shareFiles(e.fileNames.map(n => `${e.outDir}/${n}`)).catch(error => useStore.getState().toast('error', String(error)))}>Show<ChevronRight size={16} /></button>}</div>
+  if (MOBILE_UI) return <div className="ios-row"><span className="mobile-tinted-icon"><FileIcon name={e.fileNames[0] ?? ''} size={22} /></span><div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{entryTitle(e)}</h3><p className="ios-footnote">{e.direction === 'receive' && peerLabel(e.peer) ? <FromChip name={peerLabel(e.peer)!} /> : (peerLabel(e.peer) ?? 'Peer')} · {formatBytes(e.bytesTotal)}{e.locality !== 'unknown' && ` · ${e.locality === 'internet' ? 'Relay' : 'Direct'}`} · {ok ? integrityLabel(e.integrity ?? [], e.bytesTotal, true) : e.state}</p></div>{ok && e.outDir && <button className="ios-button" aria-label={`Show ${entryTitle(e)}`} onClick={() => void api.shareFiles(e.fileNames.map(n => `${e.outDir}/${n}`)).catch(error => useStore.getState().toast('error', String(error)))}>Show<ChevronRight size={16} /></button>}</div>
 
   const who = peerLabel(e.peer)
   const verb = e.direction === 'send' ? 'Sent' : 'Received'
+  // A received item leads with a "from Alex" chip (its provenance); the text
+  // then only needs the size and time.
+  const from = e.direction === 'receive' && who ? who : null
   const meta = [
-    who ? `${verb} ${e.direction === 'send' ? 'to' : 'from'} ${who}` : verb,
+    from ? null : who ? `${verb} to ${who}` : verb,
     e.bytesTotal > 0 ? formatBytes(e.bytesTotal) : null,
     whenLabel(e.timestampMs),
   ].filter(Boolean).join(' · ')
@@ -226,7 +233,10 @@ function RecentRow({ e }: { e: HistoryEntry }) {
       <span className="history-icon" aria-hidden><FileIcon name={e.fileNames[0] ?? ''} size={20} /></span>
       <div className="row-main">
         <div className="row-title truncate-1" title={e.fileNames.join('\n')}>{entryTitle(e)}</div>
-        <div className="row-sub truncate-1 tnum" title={meta}>{meta}</div>
+        <div className="row-sub history-sub tnum" title={from ? `Received from ${from} · ${meta}` : meta}>
+          {from && <FromChip name={from} />}
+          <span className="truncate-1">{meta}</span>
+        </div>
         <IntegrityDetails rows={e.integrity} total={e.bytesTotal} completed={ok} />
       </div>
       <div className="row-trailing history-trailing">
@@ -247,7 +257,7 @@ function RecentRow({ e }: { e: HistoryEntry }) {
         {e.state === 'canceled' && <span className="history-state">Canceled</span>}
         {canReveal && (
           <IconButton
-            label={e.fileNames.length === 1 ? 'Show in Finder' : 'Open folder'}
+            label={e.fileNames.length === 1 ? REVEAL_LABEL : OPEN_FOLDER_LABEL}
             onClick={() => {
               const sep = e.outDir!.includes('\\') ? '\\' : '/'
               if (e.fileNames.length === 1) {

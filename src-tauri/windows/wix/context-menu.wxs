@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- DropBeam MSI: "Send with DropBeam" in the Explorer right-click menu for files
+     AND folders (the NSIS installer adds the same entries per-user in hooks.nsh).
+     The MSI installs per-machine, so these go under HKLM\Software\Classes and are
+     removed with the product. Referenced from tauri.conf.json →
+     bundle.windows.wix.fragmentPaths / componentRefs. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="DropBeamContextMenu" Guid="294787F1-1C3B-4CBF-A947-FAD9C48F3078" Win64="$(var.Win64)">
+        <RegistryKey Root="HKLM" Key="Software\Classes\*\shell\DropBeam">
+          <RegistryValue Type="string" Value="Send with DropBeam" KeyPath="yes" />
+          <RegistryValue Name="Icon" Type="string" Value="&quot;[!Path]&quot;,0" />
+          <RegistryKey Key="command">
+            <RegistryValue Type="string" Value="&quot;[!Path]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\Directory\shell\DropBeam">
+          <RegistryValue Type="string" Value="Send with DropBeam" />
+          <RegistryValue Name="Icon" Type="string" Value="&quot;[!Path]&quot;,0" />
+          <RegistryKey Key="command">
+            <RegistryValue Type="string" Value="&quot;[!Path]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

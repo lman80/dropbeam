@@ -83,6 +83,8 @@ pub(super) struct ReceiveStage {
     _file: File,
     registry: Option<(File, Identity)>,
     armed: bool,
+    /// Registered in the partial-dirs registry (left exactly once, in Drop).
+    entered: bool,
 }
 impl ReceiveStage {
     pub(super) fn create(path: PathBuf, size: u64, transfer_id: &str) -> Result<(Self, File)> {
@@ -92,7 +94,7 @@ impl ReceiveStage {
         // No guard exists until exclusive creation succeeds.
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
         let identity = Identity::of(&file)?;
-        let mut stage = Self { path, identity, _file: file.try_clone()?, registry: None, armed: true };
+        let mut stage = Self { path, identity, _file: file.try_clone()?, registry: None, armed: true, entered: false };
         file.try_lock()?;
         let record = Ownership { path: stage.path.clone(), identity, size, created: SystemTime::now(), transfer_id: transfer_id.into() };
         let mut registry = OpenOptions::new().read(true).write(true).create_new(true).open(sidecar(&stage.path))?;
@@ -107,7 +109,9 @@ impl ReceiveStage {
         if flush { flush_to_disk(&registry)?; }
         if let Some(dir) = stage.path.parent() {
             #[cfg(unix)] if flush { flush_to_disk(&File::open(dir)?)?; }
-            note_partial_dir(dir);
+            // Listed only while live (T14); Drop takes it off again.
+            super::partial_dirs::stage_enter(dir);
+            stage.entered = true;
         }
         Ok((stage, file))
     }
@@ -119,6 +123,16 @@ impl ReceiveStage {
         }
         Ok(())
     }
+    /// An already-landed copy byte-identical to this stage (T7). Reads the
+    /// stage through its OWN handle: on Windows the stage is under a mandatory
+    /// LockFileEx lock, so re-opening it by path failed and every re-send
+    /// minted a "name (1)" duplicate instead of reusing the identical copy.
+    pub(super) fn identical_landed(&self, natural: &Path) -> Option<PathBuf> {
+        let len = self._file.metadata().ok()?.len();
+        occupied_siblings(natural)
+            .find(|(c, m)| m.is_file() && m.len() == len && same_bytes(&self._file, len, c).unwrap_or(false))
+            .map(|(c, _)| c)
+    }
     pub(super) fn publish(&mut self, natural: &Path) -> Result<PathBuf> {
         let landed = publish_unique_owned(&self.path, natural, RECEIVE_NAME_LIMIT, Some(self.identity))?;
         self.published();
@@ -129,6 +143,12 @@ impl ReceiveStage {
         // If its unlink failed, retain the record for later recovery, never retry
         // that unlink from Drop.
         self.armed = false;
+        // The lock only marks a LIVE stage for recovery; the bytes now sit under
+        // their real name. On Windows the lock is mandatory: holding it past
+        // publication left the landed file unreadable ("another process has
+        // locked a portion of the file") to the user and to our own same-name
+        // checks until this guard dropped.
+        let _ = self._file.unlock();
         if !self.identity.matches(&self.path) { self.forget_registry(); }
     }
     fn forget_registry(&mut self) {
@@ -143,7 +163,38 @@ impl Drop for ReceiveStage {
         if self.armed {
             if let Err(e) = self.remove() { log::warn!("Stage cleanup deferred: {e:#}"); }
         }
+        if self.entered {
+            if let Some(dir) = self.path.parent() {
+                // Still on disk (cleanup deferred / record kept): keep its dir
+                // listed so the startup sweep can recover it.
+                super::partial_dirs::stage_leave(dir, self.identity.matches(&self.path));
+            }
+        }
     }
+}
+/// Compare `len` bytes of `ours` (positional reads — no reopen) with `other`.
+fn same_bytes(ours: &File, len: u64, other: &Path) -> std::io::Result<bool> {
+    let mut theirs = std::io::BufReader::new(open_regular_nofollow(other)?);
+    let mut a = vec![0u8; 1 << 16];
+    let mut b = vec![0u8; 1 << 16];
+    let mut offset = 0u64;
+    while offset < len {
+        let want = ((len - offset) as usize).min(a.len());
+        let n = read_at(ours, &mut a[..want], offset)?;
+        if n == 0 { return Ok(false); }
+        theirs.read_exact(&mut b[..n])?;
+        if a[..n] != b[..n] { return Ok(false); }
+        offset += n as u64;
+    }
+    Ok(true)
+}
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(f, buf, offset)
+}
+#[cfg(windows)]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(f, buf, offset)
 }
 /// Return freed bytes. Unknown, changed, young, or locked stages are untouched.
 pub(super) fn recover(path: &Path, now: SystemTime) -> u64 {
@@ -189,6 +240,21 @@ mod tests {
         (dir, path)
     }
     fn aged() -> SystemTime { SystemTime::now() + TRANSFER_STALL + Duration::from_secs(1) }
+    #[test]
+    fn t7_identical_copy_is_found_through_the_locked_stage_handle() {
+        let (dir, path) = fixture();
+        fs::write(dir.join("photo.jpg"), b"same bytes").unwrap();
+        fs::write(dir.join("photo (1).jpg"), b"other byte").unwrap();
+        let (stage, mut file) = ReceiveStage::create(path.clone(), 10, "owner").unwrap();
+        file.write_all(b"same bytes").unwrap();
+        file.flush().unwrap();
+        drop(file);
+        assert_eq!(stage.identical_landed(&dir.join("photo.jpg")), Some(dir.join("photo.jpg")));
+        assert_eq!(stage.identical_landed(&dir.join("nothing.jpg")), None);
+        drop(stage);
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn recovery_requires_persisted_identity_age_and_inactive_owner() {
         let (dir, path) = fixture();

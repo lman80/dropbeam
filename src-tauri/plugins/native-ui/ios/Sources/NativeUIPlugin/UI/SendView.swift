@@ -2,71 +2,87 @@ import SwiftUI
 import CoreImage.CIFilterBuiltins
 import UIKit
 
+/// Home: what to send (one strong tile + two smaller ones), who to send it to
+/// (friends and your devices, online first), a code/QR to receive, then the
+/// transfers — moving ones first, finished ones under Recent.
 struct SendView: View {
     @EnvironmentObject private var bridge: Bridge
     @State private var code = ""
     @State private var picking = false
     @State private var receiving = false
     @State private var scanning = false
+    @State private var adding = false
     @FocusState private var codeFocused: Bool
+    @ObservedObject private var lan = LanDiscovery.shared
+    private var active: [Transfer] { bridge.sendTransfers.filter(\.active) }
     private var finished: [Transfer] { bridge.sendTransfers.filter { !$0.active } }
     var body: some View {
         NavigationStack {
             List {
-                Section { hero }.clearRow(EdgeInsets(top: 4, leading: 20, bottom: 4, trailing: 20))
+                if lan.localNetworkDenied { LocalNetworkNotice() }
+                Section { SendSourceGrid(picking: $picking, pick: pick) }
+                    .clearRow(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 Section {
-                    receiveRow
-                } header: { Text("Receive") } footer: {
-                    Text("Paste or scan a code from DropBeam — files, a friend, a shared folder or one of your devices.")
-                }
-                Section {
-                    if bridge.sendTransfers.isEmpty { emptyState.clearRow() }
-                    ForEach(bridge.sendTransfers) { transfer in TransferRow(transfer: transfer) }
+                    RecipientStrip(adding: $adding, pick: pick)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Color.clear)
                 } header: {
                     HStack {
-                        Text("Transfers")
+                        Text("Send To")
                         Spacer()
-                        if !finished.isEmpty {
-                            Button("Clear") { clearFinished() }.font(.body).textCase(nil).accessibilityLabel("Clear finished transfers")
+                        if !bridge.friends.isEmpty {
+                            Button("See All") { bridge.selectedTab = "friends"; Haptics.tap() }
+                                .font(.body).textCase(nil)
+                        }
+                    }
+                }.headerProminence(.increased)
+                if !active.isEmpty {
+                    Section {
+                        ForEach(active) { transfer in TransferRow(transfer: transfer) }
+                    } header: { Text("In Progress") }.headerProminence(.increased)
+                }
+                OtherDevicesSection()
+                Section {
+                    receiveRow
+                    Button { scanning = true; Haptics.tap() } label: {
+                        Label("Scan a QR Code", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity, minHeight: 32, alignment: .leading).contentShape(Rectangle())
+                    }
+                } header: { Text("Receive") } footer: {
+                    Text("Someone sent you a code? Paste it here, or scan their QR code, to get their files.")
+                }.headerProminence(.increased)
+                Section {
+                    if bridge.sendTransfers.isEmpty { emptyState }
+                    ForEach(finished) { transfer in TransferRow(transfer: transfer) }
+                } header: {
+                    if !finished.isEmpty || bridge.sendTransfers.isEmpty {
+                        HStack {
+                            Text("Recent")
+                            Spacer()
+                            if !finished.isEmpty {
+                                Button("Clear") { clearFinished() }.font(.body).textCase(nil).accessibilityLabel("Clear finished transfers")
+                            }
                         }
                     }
                 }.headerProminence(.increased)
             }
             .beamList()
             .navigationTitle("Send")
-            .animation(.smooth, value: bridge.sendTransfers.map(\.id))
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { scanning = true; Haptics.tap() } label: { Image(systemName: "qrcode.viewfinder") }
-                        .accessibilityLabel("Scan a code")
-                }
-            }
+            .animation(.smooth, value: bridge.sendTransfers.map { "\($0.id)|\($0.active)" })
         }
         .sheet(isPresented: $scanning) {
             QRScannerSheet(title: "Scan a Code", autoSubmit: true, hint: "Scan any DropBeam QR code — files to receive, a friend, a shared folder or one of your devices.") { value in
                 try await bridge.openAnyCode(value.trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
+        .sheet(isPresented: $adding) { AddFriendSheet().environmentObject(bridge) }
     }
-    private var hero: some View {
-        ActionTileRow {
-            pickButton("Photos", symbol: "photo.on.rectangle", source: "photos")
-            pickButton("Files", symbol: "doc", source: "files")
-            SendFolderButton()
-        }
-    }
-    private func pickButton(_ title: String, symbol: String, source: String) -> some View {
-        ActionTile(title: title, symbol: symbol, large: true) {
-            picking = true
-            bridge.perform { defer { picking = false }; try await bridge.pickAndSend(source: source) }
-        }
-        .disabled(picking)
-        .accessibilityLabel("Send \(title)")
+    private func pick(_ source: String, _ friendId: String? = nil) {
+        picking = true
+        bridge.perform { defer { picking = false }; try await bridge.pickAndSend(source: source, friendId: friendId) }
     }
     private var trimmed: String { code.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var receiveRow: some View {
         HStack(spacing: 12) {
-            Image(systemName: "arrow.down.circle.fill").font(.title2).foregroundStyle(.tint).accessibilityHidden(true)
             TextField("Paste a code", text: $code)
                 .font(code.isEmpty ? .body : .body.monospaced()).textInputAutocapitalization(.never)
                 .autocorrectionDisabled().submitLabel(.go).onSubmit(receive).focused($codeFocused)
@@ -77,8 +93,8 @@ struct SendView: View {
                     Task { @MainActor in code = strings.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
                 }.labelStyle(.iconOnly).buttonBorderShape(.circle).tint(.beam)
             } else {
-                Button(receiving ? "Opening…" : "Go", action: receive)
-                    .beamButton().controlSize(.small).disabled(receiving)
+                Button(receiving ? "Opening…" : "Receive", action: receive)
+                    .beamButton(prominent: true).controlSize(.small).disabled(receiving)
             }
         }.frame(minHeight: 44)
     }
@@ -94,9 +110,144 @@ struct SendView: View {
         Task { for id in ids { try? await bridge.action("dismissTransfer", ["id": id]) } }
     }
     private var emptyState: some View {
-        Text("Files you send and receive show up here.")
-            .font(.subheadline).foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity).padding(.vertical, 20)
+        HStack(spacing: 14) {
+            Image(systemName: "arrow.up.arrow.down").font(.title3.weight(.medium)).foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("No Transfers Yet").font(.body.weight(.semibold))
+                Text("Sent and received files appear here.").font(.subheadline).foregroundStyle(.secondary)
+            }
+        }.padding(.vertical, 4).accessibilityElement(children: .combine)
+    }
+}
+
+/// The three send sources. Photos leads as one tall filled tile; Files and Folder
+/// stack beside it. At accessibility text sizes the three stack full-width.
+private struct SendSourceGrid: View {
+    @Binding var picking: Bool
+    let pick: (String, String?) -> Void
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @ScaledMetric(relativeTo: .body) private var rowHeight: CGFloat = 62
+    var body: some View {
+        Group {
+            if typeSize.isAccessibilitySize {
+                VStack(spacing: 10) { photos(height: rowHeight); files; folder }
+            } else {
+                HStack(spacing: 10) {
+                    photos(height: rowHeight * 2 + 10)
+                    VStack(spacing: 10) { files; folder }
+                }
+            }
+        }
+        .disabled(picking)
+    }
+    private func photos(height: CGFloat) -> some View {
+        Button { pick("photos", nil) } label: {
+            VStack(alignment: .leading, spacing: 0) {
+                Image(systemName: "photo.on.rectangle.angled").font(.title.weight(.medium))
+                Spacer(minLength: 8)
+                Text("Photos & Videos").font(.headline).multilineTextAlignment(.leading).fixedSize(horizontal: false, vertical: true)
+            }
+            .foregroundStyle(.white)
+            .padding(16)
+            .frame(maxWidth: .infinity, minHeight: height, alignment: .leading)
+            .background(Color.beam, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        }
+        .buttonStyle(SourcePressStyle())
+        .accessibilityLabel("Send Photos and Videos")
+    }
+    private var files: some View { small("Files", symbol: "doc.fill", source: "files", label: "Send Files") }
+    private var folder: some View { small("Folder", symbol: "folder.fill", source: "folder", label: "Send a Folder") }
+    private func small(_ title: String, symbol: String, source: String, label: String) -> some View {
+        Button { pick(source, nil) } label: {
+            HStack(spacing: 12) {
+                Image(systemName: symbol).font(.title3).foregroundStyle(.tint).frame(width: 26)
+                Text(title).font(.body.weight(.semibold)).foregroundStyle(.primary)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, minHeight: rowHeight, alignment: .leading)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        }
+        .buttonStyle(SourcePressStyle())
+        .accessibilityLabel(label)
+    }
+}
+private struct SourcePressStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .opacity(!enabled ? 0.45 : configuration.isPressed ? 0.85 : 1)
+            .animation(.snappy(duration: 0.18), value: configuration.isPressed)
+    }
+}
+
+/// Friends and your own devices as a row of avatars (online first), plus Add.
+/// Tapping one picks what to send straight to them.
+private struct RecipientStrip: View {
+    @EnvironmentObject private var bridge: Bridge
+    @Binding var adding: Bool
+    let pick: (String, String?) -> Void
+    @ScaledMetric(relativeTo: .caption) private var avatar: CGFloat = 58
+    private var people: [Friend] {
+        let all = bridge.friends.filter { $0.groupedUnder == nil }
+        let online = all.filter { bridge.presence[$0.id] == true }
+        return online + all.filter { bridge.presence[$0.id] != true }
+    }
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 14) {
+                ForEach(people) { friend in person(friend) }
+                addButton
+            }
+            .padding(.horizontal, 16).padding(.vertical, 6)
+        }
+        .scrollClipDisabled()
+    }
+    private func person(_ friend: Friend) -> some View {
+        let online = bridge.presence[friend.id] == true
+        // A tap opens the send menu anchored to this person (not a screen-wide dialog).
+        return Menu {
+            Section("Send to \(friend.displayName)") {
+                Button("Photos & Videos", systemImage: "photo.on.rectangle") { pick("photos", friend.id) }
+                Button("Files", systemImage: "doc") { pick("files", friend.id) }
+                Button("Folder", systemImage: "folder") { pick("folder", friend.id) }
+            }
+            if !friend.ownDevice { Button("Message", systemImage: "bubble.left") { bridge.perform { try await bridge.openChat(friendId: friend.id) } } }
+        } label: {
+            VStack(spacing: 6) {
+                ContactAvatar(friend: friend, size: avatar)
+                    .overlay(alignment: .bottomTrailing) {
+                        if online {
+                            Circle().fill(Color.green).frame(width: avatar * 0.24, height: avatar * 0.24)
+                                .overlay(Circle().stroke(Color(uiColor: .systemGroupedBackground), lineWidth: 3))
+                                .offset(x: -1, y: -1)
+                        }
+                    }
+                Text(friend.displayName).font(.caption.weight(.medium)).foregroundStyle(.primary)
+                    .multilineTextAlignment(.center).lineLimit(2).frame(width: avatar + 16)
+            }
+        }
+        .menuStyle(.button)
+        .buttonStyle(SourcePressStyle())
+        .accessibilityLabel("Send to \(friend.displayName), \(online ? "online" : "offline")")
+    }
+    private var addButton: some View {
+        Button { adding = true; Haptics.tap() } label: {
+            VStack(spacing: 6) {
+                Image(systemName: "plus").font(.system(size: avatar * 0.36, weight: .medium)).foregroundStyle(.tint)
+                    .frame(width: avatar, height: avatar)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: Circle())
+                Text("Add").font(.caption.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .buttonStyle(SourcePressStyle())
+        .accessibilityLabel("Add a friend")
     }
 }
 
@@ -107,6 +258,7 @@ struct TransferRow: View {
     @EnvironmentObject private var bridge: Bridge
     let transfer: Transfer
     @State private var copied = false
+    @State private var viewing: LocalMedia?
     private var failed: Bool { transfer.state == "failed" }
     private var canRetry: Bool { (failed || transfer.state == "paused") && (transfer.direction == "send" || transfer.code?.isEmpty == false) }
     private var canShare: Bool { transfer.state == "completed" && transfer.sharePaths?.isEmpty == false }
@@ -137,12 +289,22 @@ struct TransferRow: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) { ProgressView().controlSize(.small); Text(detail).font(.footnote).foregroundStyle(.secondary) }
                     if transfer.state == "waitingForPeer" {
-                        Button("Send Through a Relay Now") { bridge.perform { try await bridge.action("forceRelay", ["id": transfer.id]) } }
+                        Button("Send Now Through a Relay (slower, still encrypted)") { bridge.perform { try await bridge.action("forceRelay", ["id": transfer.id]) } }
                             .font(.footnote.weight(.semibold)).buttonStyle(.borderless)
                     }
                 }
             }
+            if let devices = DeliveryCopy.multi(transfer.deliveries), transfer.direction == "send", transfer.state != "canceled" {
+                DeliveryRows(deliveries: devices)
+            }
             if transfer.state == "completed" { completedDetails }
+            if canShare && transfer.direction == "receive" { receivedPlace }
+            // Sending to a friend who isn't around: say it will go by itself.
+            if transfer.direction == "send", transfer.code == nil, ["waitingForPeer", "connecting"].contains(transfer.state ?? ""),
+               (transfer.detail ?? "").isEmpty, let name = transfer.friendName, !name.isEmpty {
+                Text("It sends by itself as soon as \(name) opens DropBeam. Keep DropBeam open on this iPhone until then.")
+                    .font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             if failed || transfer.state == "paused", let error = transfer.error {
                 Text(error).font(.footnote).foregroundStyle(.secondary)
             }
@@ -174,7 +336,8 @@ struct TransferRow: View {
             if canShare { Button("Share", systemImage: "square.and.arrow.up", action: share) }
             if canRetry { Button(transfer.state == "paused" ? "Resume" : "Retry", systemImage: "arrow.clockwise", action: retry) }
             if canPause { Button("Pause", systemImage: "pause", action: pause) }
-            if canVerify { Button("Verify Copy", systemImage: "checkmark.shield", action: verify) }
+            if canShare && transfer.direction == "receive" { Button("Show in Files", systemImage: "folder", action: showInFiles) }
+            if canVerify { Button("Check the Copy", systemImage: "checkmark.shield", action: verify) }
             if let code = transfer.code, transfer.state == "waitingForPeer" { Button("Copy Code", systemImage: "doc.on.doc") { UIPasteboard.general.string = code; Haptics.tap() } }
             if transfer.active { Button("Cancel Transfer", systemImage: "xmark", role: .destructive, action: cancel) }
             else { Button("Remove", systemImage: "trash", role: .destructive, action: dismiss) }
@@ -185,9 +348,15 @@ struct TransferRow: View {
         let who = name.map { (transfer.direction == "receive" ? "From " : "To ") + $0 }
         let status: String
         switch transfer.state {
-        case "waitingForPeer" where transfer.direction == "send" && transfer.code != nil: status = "Waiting for a receiver"
+        case "waitingForPeer" where transfer.direction == "send" && transfer.code != nil: status = "Waiting for someone to use the code"
+        case "waitingForAccept" where transfer.direction == "receive": status = "Wants to send you this"
+        case "waitingForAccept": status = "Waiting for them to accept"
         case "failed": status = transfer.direction == "send" ? "Couldn’t send" : "Couldn’t receive"
         default: status = transfer.status
+        }
+        // Sent to a friend's several devices: one line says where it is on each.
+        if let devices = DeliveryCopy.multi(transfer.deliveries), transfer.direction == "send", ["completed", "held"].contains(transfer.state ?? "") {
+            return DeliveryCopy.summary(friend: name ?? "them", devices)
         }
         // A finished row's badge already says Sent/Received; the line says who and how much.
         if transfer.state == "completed" {
@@ -201,7 +370,7 @@ struct TransferRow: View {
         if (transfer.speedBps ?? 0) > 0 { parts.append(Formatters.speed(transfer.speedBps, megabits: bridge.settings?.showMegabits == true)) }
         if let eta = Formatters.eta(transfer.etaSeconds) { parts.append(eta) }
         // The route only matters to people when it explains a slow transfer.
-        if transfer.routeLabel?.hasPrefix("Relay") == true { parts.append("via relay") }
+        if transfer.routeLabel?.hasPrefix("Relay") == true { parts.append("via relay (slower)") }
         return parts.joined(separator: " · ")
     }
     private var icon: some View {
@@ -246,6 +415,8 @@ struct TransferRow: View {
     }
     private func codeBlock(_ code: String) -> some View {
         VStack(spacing: 12) {
+            Text("Ask them to open DropBeam and scan this code (Send → Scan a QR Code), or send them the code to paste. Keep DropBeam open until it’s done.")
+                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             QRCodeView(code: code, side: 168)
             CodeLine(code: code).padding(.horizontal, 8)
             HStack(spacing: 12) {
@@ -254,6 +425,15 @@ struct TransferRow: View {
                 }.beamButton()
                 ShareLink(item: code) { Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity) }.beamButton()
             }
+            // The code only works inside DropBeam: say so, and hand over the way to get it.
+            VStack(spacing: 6) {
+                Text("They don’t have DropBeam? It’s free — send them the download link first.")
+                    .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                ShareLink(item: URL(string: "https://github.com/lman80/dropbeam/releases/latest")!,
+                          message: Text("Get DropBeam (free) so I can send you files")) {
+                    Label("Send Download Link", systemImage: "arrow.down.circle")
+                }.font(.footnote.weight(.semibold)).buttonStyle(.borderless)
+            }.padding(.top, 4)
         }.frame(maxWidth: .infinity).padding(.top, 4)
     }
     /// A finished transfer stays quiet unless something needs attention: files the
@@ -278,7 +458,7 @@ struct TransferRow: View {
             let report = transfer.verify!
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("Verifying… \(report.checked) of \(report.total) files").font(.footnote).foregroundStyle(.secondary).monospacedDigit()
+                    Text("Checking… \(report.checked) of \(report.total) files").font(.footnote).foregroundStyle(.secondary).monospacedDigit()
                     Spacer()
                     Button("Cancel") { bridge.perform { try await bridge.action("cancelVerify", ["id": transfer.id]) } }.font(.footnote).buttonStyle(.borderless)
                 }
@@ -292,15 +472,38 @@ struct TransferRow: View {
                 ForEach(report.mismatched, id: \.self) { Text("Different: \($0)").font(.caption) }
                 ForEach(report.missing, id: \.self) { Text("Missing: \($0)").font(.caption) }
             } label: { Label("\(report.mismatched.count + report.missing.count) of \(report.total) files don’t match", systemImage: "xmark.shield.fill").font(.footnote.weight(.semibold)).foregroundStyle(.red) }
-            Button("Verify Again", action: verify).font(.footnote.weight(.semibold)).buttonStyle(.borderless)
+            Button("Check Again", action: verify).font(.footnote.weight(.semibold)).buttonStyle(.borderless)
         default:
             HStack {
-                Text(transfer.verify?.error ?? "Couldn’t verify the copy.").font(.footnote).foregroundStyle(.red)
+                Text(transfer.verify?.error ?? "Couldn’t check the copy.").font(.footnote).foregroundStyle(.red)
                 Spacer(minLength: 8)
                 Button("Try Again", action: verify).font(.footnote.weight(.semibold)).buttonStyle(.borderless)
             }
         }
     }
+    /// Right after something arrives: where it is, and the three things people do next.
+    private var receivedPaths: [String] { (transfer.sharePaths ?? []).map(LocalPaths.resolve) }
+    private var receivedMedia: [URL] { receivedPaths.map { URL(fileURLWithPath: $0) }.filter { ReceivedMediaSaver.kind(of: $0) != nil } }
+    @ViewBuilder private var receivedPlace: some View {
+        let folder = SaveFolder.shared
+        VStack(alignment: .leading, spacing: 8) {
+            Label("In the Files app: \(folder.place) › \(folder.displayName)" + (!receivedMedia.isEmpty && ReceivedMediaSaver.shared.choice == .on ? ", and in Photos" : ""), systemImage: "folder")
+                .font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                if receivedPaths.count == 1, let item = receivedPaths.first.flatMap(LocalMedia.init(path:)) {
+                    Button("Open") { viewing = item }.beamButton(prominent: true)
+                } else {
+                    Button("Open", action: share).beamButton(prominent: true)
+                }
+                Button("Show in Files", action: showInFiles).beamButton()
+                if !receivedMedia.isEmpty && ReceivedMediaSaver.shared.choice != .on {
+                    Button("Save to Photos") { Task { _ = await ReceivedMediaSaver.shared.save(receivedMedia) } }.beamButton()
+                }
+            }.controlSize(.small).font(.footnote.weight(.semibold))
+        }
+        .fullScreenCover(item: $viewing) { item in MediaViewer(path: item.path, name: item.name, video: item.video) }
+    }
+    private func showInFiles() { Haptics.tap(); SaveFolder.shared.showInFiles() }
     private func pause() { bridge.perform { try await bridge.action("pauseTransfer", ["id": transfer.id]) } }
     private func verify() { bridge.perform { try await bridge.action("verifyTransfer", ["id": transfer.id]) } }
     private func cancel() { bridge.perform { try await bridge.cancelTransfer(id: transfer.id) } }
@@ -338,5 +541,20 @@ struct RouteBadge: View {
         Label(label, systemImage: symbol).font(.caption2.weight(.semibold)).foregroundStyle(color)
             .padding(.horizontal, 8).padding(.vertical, 3).background(color.opacity(0.14), in: Capsule())
             .lineLimit(1).accessibilityLabel("Route: \(label)")
+    }
+}
+
+/// Shown on the Send tab while Local Network access is off for DropBeam.
+private struct LocalNetworkNotice: View {
+    var body: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Nearby devices can’t connect directly", systemImage: "wifi.exclamationmark")
+                    .font(.headline).foregroundStyle(.orange)
+                Text("Files still send, but slower. To send at full speed on the same Wi-Fi, turn on Local Network for DropBeam in Settings.")
+                    .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button("Open Settings") { SystemSettings.open() }.beamButton(prominent: true).controlSize(.small)
+            }.padding(.vertical, 4)
+        }
     }
 }

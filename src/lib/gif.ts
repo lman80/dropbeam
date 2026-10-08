@@ -18,10 +18,13 @@ export interface GifResult {
   h: number
 }
 
-function normalize(data: any[]): GifResult[] {
+type GiphyRendition = { url?: string; width?: string | number; height?: string | number }
+type GiphyItem = { id?: unknown; title?: unknown; url?: unknown; images?: Record<string, GiphyRendition | undefined> }
+
+function normalize(data: GiphyItem[]): GifResult[] {
   return (data || [])
     .map((g) => {
-      const img = g?.images ?? {}
+      const img: Record<string, GiphyRendition | undefined> = g?.images ?? {}
       const thumb = img.fixed_width_small ?? img.preview_gif ?? img.fixed_width
       const send = img.downsized ?? img.fixed_width ?? img.original
       if (!thumb?.url || !send?.url) return null

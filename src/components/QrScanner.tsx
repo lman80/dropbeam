@@ -5,7 +5,7 @@ import jsQR from 'jsqr'
 import { fileSrc } from '../lib/api'
 import { CameraOff, ImageUp, X } from 'lucide-react'
 import { IS_MAC, MOBILE_UI } from '../lib/platform'
-import { useEscape } from './Dialog'
+import { useEscape, useModalFocus } from './Dialog'
 import { IconButton } from './ui'
 import { decodeQrFromImage, imageFromTransfer, setScannerDrop } from '../lib/qrImage'
 
@@ -173,12 +173,12 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
         {notice && <p className="qrs-notice" role="alert">{notice}</p>}
         {paste ? <form className="qrs-paste" onSubmit={e => { e.preventDefault(); e.stopPropagation(); rejected.current = ''; finish(code) }}>
           <input className="input" aria-label="Paste a code" placeholder="Paste the code" autoFocus autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={code} onChange={e => { setCode(e.target.value); setNotice('') }} />
-          <button className="btn btn-primary" disabled={!code.trim()}>Use code</button>
+          <button className="btn btn-primary" disabled={!code.trim()}>Use Code</button>
         </form> : null}
       </div>
       <div className="dialog-actions dialog-footer qrs-actions">
-        <button className="btn btn-plain" type="button" disabled={reading} onClick={() => fileInput.current?.click()}>Choose image…</button>
-        {!paste && <button className="btn btn-plain" type="button" onClick={() => setPaste(true)}>Paste code</button>}
+        <button className="btn btn-plain" type="button" disabled={reading} onClick={() => fileInput.current?.click()}>Choose Image…</button>
+        {!paste && <button className="btn btn-plain" type="button" onClick={() => setPaste(true)}>Paste Code</button>}
         <span className="spacer" />
         <button className="btn btn-secondary" type="button" onClick={close}>Cancel</button>
         <input ref={fileInput} type="file" accept="image/*" hidden onChange={e => { const f = e.target.files?.[0] ?? null; e.target.value = ''; void readImage(f) }} />
@@ -191,5 +191,7 @@ export function QrScanner({ onResult, onClose, hint, title = 'Scan QR code', val
  *  above any dialog that opened it, so Esc only closes the scanner). */
 function ScannerFrame({ close, children }: { close: () => void; children: React.ReactNode }) {
   useEscape(close)
-  return <div className="dialog-overlay qr-overlay" onMouseDown={e => { if (e.target === e.currentTarget) close() }}>{children}</div>
+  const ref = useRef<HTMLDivElement>(null)
+  useModalFocus(ref)
+  return <div ref={ref} className="dialog-overlay qr-overlay" onMouseDown={e => { if (e.target === e.currentTarget) close() }}>{children}</div>
 }

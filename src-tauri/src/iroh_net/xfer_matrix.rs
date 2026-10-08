@@ -27,14 +27,29 @@ use sha2::{Digest, Sha256};
 /// receive loops call `throttle(<file being written>)` per chunk, so ONE test
 /// can slow its own receiver (to break a transfer provably mid-stream) without
 /// touching any other test running in the same process.
-static THROTTLED: std::sync::LazyLock<Mutex<HashMap<PathBuf, Duration>>> = std::sync::LazyLock::new(Default::default);
-pub(super) async fn throttle(writing: &Path) {
-    let delay = {
+static THROTTLED: std::sync::LazyLock<Mutex<HashMap<PathBuf, (Duration, Option<Arc<Hold>>)>>> = std::sync::LazyLock::new(Default::default);
+pub(super) async fn throttle(writing: &Path, n: usize) {
+    let rule = {
         let map = THROTTLED.lock().unwrap();
         if map.is_empty() { return; }
-        writing.ancestors().find_map(|a| map.get(a).copied())
+        writing.ancestors().find_map(|a| map.get(a).cloned())
     };
-    if let Some(d) = delay { tokio::time::sleep(d).await; }
+    let Some((delay, hold)) = rule else { return };
+    if let Some(hold) = hold {
+        if hold.released.load(Ordering::SeqCst) { return; }
+        let into = {
+            let mut seen = hold.seen.lock().unwrap();
+            let e = seen.entry(writing.to_path_buf()).or_default();
+            *e += n as u64;
+            *e
+        };
+        if into > hold.after {
+            hold.reached.store(true, Ordering::SeqCst);
+            while !hold.released.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(5)).await; }
+            return;
+        }
+    }
+    if !delay.is_zero() { tokio::time::sleep(delay).await; }
 }
 /// The upload limiter is process-global and loopback counts as "not LAN", so
 /// a test that dials the limit down (`upload_limiter_throttles_and_never_stalls`)
@@ -42,14 +57,37 @@ pub(super) async fn throttle(writing: &Path) {
 /// transfers share this gate; that test takes it exclusively.
 pub(crate) static PACE_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
-pub(super) struct Throttle(PathBuf);
+/// A deterministic mid-transfer pause: the receiver STOPS (inside its write
+/// loop) once any one file under the destination has taken `after` bytes, until
+/// the test releases it. While it is stopped the sender can only run ahead by
+/// the flow-control windows, so a test can act on the SOURCE while the sender is
+/// provably still reading it — no polling race against a fast or slow runner.
+#[derive(Default)]
+pub(super) struct Hold { after: u64, seen: Mutex<HashMap<PathBuf, u64>>, reached: AtomicBool, released: AtomicBool }
+impl Hold {
+    pub(super) async fn reached(&self) { while !self.reached.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(5)).await; } }
+    pub(super) fn release(&self) { self.released.store(true, Ordering::SeqCst); }
+}
+
+pub(super) struct Throttle(PathBuf, Option<Arc<Hold>>);
 impl Throttle {
     pub(super) fn new(dest: &Path, per_chunk: Duration) -> Self {
-        THROTTLED.lock().unwrap().insert(dest.to_path_buf(), per_chunk);
-        Throttle(dest.to_path_buf())
+        THROTTLED.lock().unwrap().insert(dest.to_path_buf(), (per_chunk, None));
+        Throttle(dest.to_path_buf(), None)
+    }
+    /// Stop the receiver once one file under `dest` has `after` bytes (see `Hold`).
+    pub(super) fn hold_after(dest: &Path, after: u64) -> (Self, Arc<Hold>) {
+        let hold = Arc::new(Hold { after, ..Default::default() });
+        THROTTLED.lock().unwrap().insert(dest.to_path_buf(), (Duration::ZERO, Some(hold.clone())));
+        (Throttle(dest.to_path_buf(), Some(hold.clone())), hold)
     }
 }
-impl Drop for Throttle { fn drop(&mut self) { THROTTLED.lock().unwrap().remove(&self.0); } }
+impl Drop for Throttle {
+    fn drop(&mut self) {
+        if let Some(hold) = &self.1 { hold.release(); }
+        THROTTLED.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0);
+    }
+}
 
 pub(super) struct Scratch(pub PathBuf);
 impl Drop for Scratch {
@@ -83,7 +121,7 @@ pub(super) async fn endpoint(accept: bool) -> Endpoint {
 pub(super) async fn endpoint_with(accept: bool, key: SecretKey) -> Endpoint {
     let mut b = Endpoint::builder(presets::Minimal)
         .secret_key(key)
-        .path_selector(Arc::new(super::DirectPathSelector))
+        .path_selector(Arc::new(super::DirectPathSelector::default()))
         .relay_mode(iroh::RelayMode::Disabled)
         .bind_addr("127.0.0.1:0")
         .unwrap();
@@ -157,7 +195,13 @@ pub(super) fn tree(root: &Path) -> Vec<PathBuf> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Via { Push, Friend, Quick, Location }
+/// Every path this platform can serve. Hosting a Location is intentionally
+/// unix-only in Phase 1 (`HostedLocation::open` refuses on Windows — a Windows
+/// device can still UPLOAD to one), so Windows crosses the other three.
+#[cfg(unix)]
 pub(super) const ALL: [Via; 4] = [Via::Push, Via::Friend, Via::Quick, Via::Location];
+#[cfg(not(unix))]
+pub(super) const ALL: [Via; 3] = [Via::Push, Via::Friend, Via::Quick];
 
 /// What a Location host names a landed upload: the sender's rel verbatim
 /// (hidden files included — it is a backup). Every other path runs `receive_rel`.
@@ -448,6 +492,9 @@ async fn matrix_unicode_and_odd_names() {
         "a:colon.txt", "star*.txt", "q?.txt", "quote\".txt", "lt<gt>.txt", "pipe|.txt", "back\\slash.txt",
         "CON", "NUL.txt", "COM1.tar.gz", "aux", "trailing dot.", "percent %20 & $HOME ~.txt", "#hash;semi'apos.txt",
     ];
+    // A Windows SOURCE can't even hold the NTFS-forbidden names; how a Windows
+    // RECEIVER maps them is pinned by the `receive_parts(_, windows = true)` tests.
+    let names: Vec<&str> = names.into_iter().filter(|n| !cfg!(windows) || windows_safe_component(n) == *n).collect();
     let paths: Vec<_> = names.iter().enumerate().map(|(i, n)| put(&src.0, n, 100 + i, 50 + i as u64)).collect();
     over_all("odd-names", &paths, QUICK).await;
     // The same names inside a sent FOLDER (rel paths with parents).
@@ -769,26 +816,35 @@ enum Break { NetworkDrop, ReceiverRestart, SenderRestart, Cancel }
 /// then sent again: the second attempt must RESUME (send well under the full
 /// size), land one byte-identical file with the sender's mtime, and leave no
 /// partial, sidecar or duplicate behind.
-async fn interrupted_big_send_resumes(how: Break) {
+async fn interrupted_big_send_resumes(how: Break) { interrupted_big_send_resumes_paced(how, Duration::from_millis(1)).await }
+async fn interrupted_big_send_resumes_paced(how: Break, per_chunk: Duration) {
     let src = scratch("resume");
     let rx = scratch("resume-rx");
     let dest = rx.0.join("dest");
-    let total = 4 * PARALLEL_MIN as usize + 12345;
+    // 4 lanes of ~32 MiB. A lane can only finish once its reader is within
+    // one 8 MiB stream window of its end (≥ 24 MiB read), while coverage is
+    // only recorded per flushed 8 MiB span of a lane. With 16 MiB lanes both
+    // thresholds were the same 8 MiB, so no break point was both "can't have
+    // finished" and "has something to resume" (60% flaked as a completed
+    // file on Windows; 40% flaked as a from-zero retry).
+    let total = 8 * PARALLEL_MIN as usize + 12345;
     let file = put(&src.0, "movie.mov", total, 7);
     std::fs::create_dir_all(&dest).unwrap();
-    let slow = Throttle::new(&dest, Duration::from_millis(1));
+    let slow = Throttle::new(&dest, per_chunk);
     let (server_key, client_key) = (SecretKey::generate(), SecretKey::generate());
     let server = endpoint_with(true, server_key.clone()).await;
     let client = endpoint_with(false, client_key.clone()).await;
     let cancel = Arc::new(AtomicBool::new(false));
     let fired = Arc::new(AtomicBool::new(false));
     let live: Arc<std::sync::OnceLock<Connection>> = Arc::default();
-    // The break is triggered by the RECEIVER once a third has landed, and the
+    // The break is triggered by the RECEIVER once half has landed, and the
     // receiver is throttled, so the sender is provably still mid-stream.
     let hook: Hook = {
         let (srv, cli, live, cancel, fired) = (server.clone(), client.clone(), live.clone(), cancel.clone(), fired.clone());
         Arc::new(move |done, _| {
-            if done > total as u64 * 6 / 10 && !fired.swap(true, Ordering::SeqCst) {
+            // Break at half: finishing every lane needs ≥ 75% read, and by
+            // half at least 32 MiB is in flushed spans (≤ 4 × 8 MiB unflushed).
+            if done > total as u64 / 2 && !fired.swap(true, Ordering::SeqCst) {
                 match how {
                     Break::NetworkDrop => live.get().unwrap().close(9u32.into(), b"wifi gone"),
                     Break::Cancel => cancel.store(true, Ordering::SeqCst),
@@ -803,7 +859,7 @@ async fn interrupted_big_send_resumes(how: Break) {
     live.set(conn.clone()).unwrap();
     let first = tokio::time::timeout(QUICK, friend_send(&conn, &server.id().to_string(), &[file.clone()], &cancel))
         .await.expect("the interrupted send must end, not hang");
-    assert!(fired.load(Ordering::SeqCst), "{how:?}: the break never fired");
+    assert!(fired.load(Ordering::SeqCst), "{how:?}: the break never fired: {first:?}");
     assert!(first.is_err(), "{how:?}: the interrupted attempt reports failure");
     conn.close(0u32.into(), b"retry");
     let _ = tokio::time::timeout(Duration::from_secs(20), receiver).await.expect("receiver must notice the break");
@@ -834,7 +890,26 @@ async fn matrix_resume_after_receiver_restart() { let _gate = PACE_GATE.read().a
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_resume_after_sender_restart() { let _gate = PACE_GATE.read().await; interrupted_big_send_resumes(Break::SenderRestart).await; }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_resume_after_cancel_or_pause() { let _gate = PACE_GATE.read().await; interrupted_big_send_resumes(Break::Cancel).await; }
+async fn matrix_resume_after_cancel_or_pause() {
+    let _gate = PACE_GATE.read().await;
+    interrupted_big_send_resumes_paced(Break::Cancel, Duration::from_millis(1)).await;
+}
+
+/// T2 regression (540a837): on a LAN path the big file used to go out as the
+/// classic, sidecar-less body, so a Wi-Fi blip restarted it from zero. The LAN
+/// path must stay ONE stream but resumable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_resume_on_lan_path_after_network_drop() {
+    let _gate = PACE_GATE.write().await;
+    struct Lan;
+    impl Drop for Lan { fn drop(&mut self) { TEST_LOOPBACK_IS_LAN.store(false, Ordering::SeqCst); } }
+    TEST_LOOPBACK_IS_LAN.store(true, Ordering::SeqCst);
+    let _lan = Lan;
+    assert_eq!(local_stream_cap(true, parallel_stream_count(1, 4 * PARALLEL_MIN)), 1);
+    assert_eq!(local_stream_cap(true, parallel_stream_count(3, 4 * PARALLEL_MIN)), 0, "multi-file stays classic");
+    assert_eq!(local_stream_cap(false, parallel_stream_count(1, 4 * PARALLEL_MIN)), PARALLEL_STREAMS);
+    interrupted_big_send_resumes_paced(Break::NetworkDrop, Duration::from_millis(15)).await;
+}
 
 /// A folder of small files canceled (or paused) part-way, then re-sent: every
 /// file that already landed is recognised (`files.stat`: size + mtime) and
@@ -1009,7 +1084,9 @@ async fn matrix_source_grows_mid_send_sends_the_advertised_bytes() {
 
 /// A file written to WHILE its bytes are being read (same inode): the send
 /// must fail rather than deliver a silent mix of two versions, and a retry
-/// then lands the file exactly as it is on disk now.
+/// then lands the file exactly as it is on disk now. Push sends it as part of
+/// a two-file classic body; Friend splits it into its own resumable (range)
+/// push — both sender paths must catch the edit before the last byte leaves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_source_edited_during_read_never_lands_a_mix() {
     let _gate = PACE_GATE.read().await;
@@ -1019,26 +1096,25 @@ async fn matrix_source_edited_during_read_never_lands_a_mix() {
         let dest = rx.0.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         let head = put(&src.0, "a-head.bin", 1 << 20, 1);
-        // Under the parallel threshold and > the small limit: a classic body.
-        let doc = put(&src.0, "b-doc.bin", 12 << 20, 2);
-        let slow = Throttle::new(&dest, Duration::from_millis(2));
+        // Far bigger than the flow-control windows: with the receiver stopped
+        // 2 MiB into it, the sender cannot have finished reading it.
+        const DOC: usize = 64 << 20;
+        let doc = put(&src.0, "b-doc.bin", DOC, 2);
+        let (slow, hold) = Throttle::hold_after(&dest, 2 << 20);
         let edited = Arc::new(AtomicBool::new(false));
-        let watcher = tokio::spawn({ let (dest, doc, edited) = (dest.clone(), doc.clone(), edited.clone()); async move {
-            // Once the doc's bytes are landing, rewrite its tail in place.
-            loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                let busy = std::fs::read_dir(&dest).into_iter().flatten().flatten().chain(std::fs::read_dir(dest.join("x")).into_iter().flatten().flatten())
-                    .any(|e| e.file_name().to_string_lossy().starts_with(".dropbeam-recv-") && e.metadata().map(|m| m.len() > 1 << 20).unwrap_or(false));
-                if busy {
-                    use std::io::{Seek, Write};
-                    let mut f = std::fs::OpenOptions::new().write(true).open(&doc).unwrap();
-                    f.seek(std::io::SeekFrom::Start(11 << 20)).unwrap();
-                    f.write_all(&[9u8; 4096]).unwrap();
-                    f.sync_all().unwrap();
-                    edited.store(true, Ordering::SeqCst);
-                    break;
-                }
-            }
+        let watcher = tokio::spawn({ let (doc, edited, hold) = (doc.clone(), edited.clone(), hold.clone()); async move {
+            // Once the doc's bytes are landing (receiver now stopped), rewrite its tail in place.
+            hold.reached().await;
+            use std::io::{Seek, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&doc).unwrap();
+            f.seek(std::io::SeekFrom::Start(DOC as u64 - (1 << 20))).unwrap();
+            f.write_all(&[9u8; 4096]).unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            // Coarse-mtime filesystems: make the edit visible as a new stamp.
+            set_mtime_secs(&doc, stamp(2) + 1);
+            edited.store(true, Ordering::SeqCst);
+            hold.release();
         }});
         let r = transfer(via, &[head.clone(), doc.clone()], &dest, QUICK).await;
         watcher.abort();
@@ -1107,17 +1183,17 @@ async fn matrix_big_source_shrinks_mid_send_fails_promptly_then_retry_lands() {
         let dest = rx.0.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         let big = put(&src.0, "clip.mov", 4 * PARALLEL_MIN as usize, 5);
-        let slow = Throttle::new(&dest, Duration::from_millis(1));
+        // Stop the receiver 2 MiB in: the sender is then provably still reading
+        // the 64 MiB source (it can only run ahead by the flow-control windows).
+        let (slow, hold) = Throttle::hold_after(&dest, 2 << 20);
         let victim = big.clone();
         let fired = Arc::new(AtomicBool::new(false));
         let f2 = fired.clone();
-        // Shrink from a side task once the first bytes are landing.
-        let watcher = tokio::spawn({ let dest = dest.clone(); async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                let busy = tree(&dest).iter().any(|p| p.to_string_lossy().contains(".dropbeam-"));
-                if busy { std::fs::OpenOptions::new().write(true).open(&victim).unwrap().set_len(PARALLEL_MIN).unwrap(); f2.store(true, Ordering::SeqCst); break; }
-            }
+        let watcher = tokio::spawn({ let hold = hold.clone(); async move {
+            hold.reached().await;
+            std::fs::OpenOptions::new().write(true).open(&victim).unwrap().set_len(PARALLEL_MIN).unwrap();
+            f2.store(true, Ordering::SeqCst);
+            hold.release();
         }});
         let started = Instant::now();
         let r = transfer(via, &[big.clone()], &dest, QUICK).await;
@@ -1152,6 +1228,8 @@ fn bench_receive_stage_create() {
 /// pushes it from the pinned root to the requester (the app's
 /// `send_location_to_friend` with a snapshot). Everything selected must land
 /// byte-identical with the requester's naming rule and the host's mtimes.
+/// Unix-only: hosting a Location is intentionally unsupported on Windows (Phase 1).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_location_download_lands_every_selected_file() {
     let _gate = PACE_GATE.read().await;
@@ -1225,7 +1303,9 @@ async fn matrix_resend_after_collision_does_not_pile_up_copies() {
                 transfer(via, &paths, &dest, QUICK).await.unwrap_or_else(|e| panic!("{via:?} round {round}: {e:#}"));
             }
         }
-        let mut names: Vec<String> = tree(&dest).iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        // `/`-joined on every platform (Windows paths print with `\`).
+        let mut names: Vec<String> = tree(&dest).iter()
+            .map(|p| p.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")).collect();
         names.sort();
         assert_eq!(names, ["Trip/a (1).jpg", "Trip/a.jpg", "Trip/b.jpg", "movie (1).mov", "movie.mov", "notes (1).txt", "notes.txt"], "{via:?}");
         assert_eq!(sha(&dest.join("notes (1).txt")), sha(&small));

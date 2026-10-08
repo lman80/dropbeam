@@ -62,10 +62,39 @@ export function parseCode(raw: string | null | undefined): ParsedCode | null {
     try { text = decodeURIComponent(text) } catch { /* keep as-is */ }
   }
   const m = EMBEDDED.exec(text)
-  if (!m) return null
+  if (!m) return bareFriendCode(text)
   const prefix = (m[1] ?? m[3]).toLowerCase()
   const payload = m[2] ?? m[4]
   return { kind: PREFIXES.find(([p]) => p === prefix)![1], code: prefix + payload }
+}
+
+/** Decode a base64url JSON payload (codes carry no padding). */
+function payloadJson(payload: string): Record<string, unknown> | null {
+  try {
+    const b64 = payload.replace(/-/g, '+').replace(/_/g, '/')
+    const bin = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4))
+    const json = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))))
+    return json && typeof json === 'object' && !Array.isArray(json) ? json as Record<string, unknown> : null
+  } catch { return null }
+}
+
+// People often delete the "dropbeam:" part of a friend code, thinking it's a
+// label. The bare payload is still unambiguous: a personal code's JSON has an
+// `eid` and no `secret` (invites carry a secret; tickets aren't JSON objects).
+function bareFriendCode(text: string): ParsedCode | null {
+  const compact = text.replace(/\s+/g, '')
+  if (!/^eyJ[A-Za-z0-9_-]{8,}$/.test(compact)) return null
+  const json = payloadJson(compact)
+  if (!json || typeof json.eid !== 'string' || !json.eid || 'secret' in json) return null
+  return { kind: 'friend', code: 'dropbeam:' + compact }
+}
+
+/** The name inside a friend code ("Alex"), for "Add Alex?" — null if none. */
+export function friendCodeName(raw: string): string | null {
+  const parsed = parseCode(raw)
+  if (parsed?.kind !== 'friend') return null
+  const name = payloadJson(parsed.code.slice('dropbeam:'.length))?.name
+  return typeof name === 'string' && name.trim() ? name.trim() : null
 }
 
 /** The code string to hand the engine: canonical when recognized, else the
@@ -124,6 +153,11 @@ export function routeCode(raw: string): CodeRoute {
     case 'deviceLink': return { action: 'linkDevice', code: parsed.code }
   }
 }
+
+/** A device-link code anywhere but Settings → Devices (S1): it is never acted
+ *  on there — linking hands over the whole account, so it only happens from
+ *  the screen made for it, after both devices show the same safety code. */
+export const DEVICE_CODE_ELSEWHERE = 'This is a device-link code — open Settings → Devices to link your own device.'
 
 /** QR sizing: long codes (Quick Send tickets carry the sender's addresses and
  *  run to several hundred chars) get lower error correction and more pixels so

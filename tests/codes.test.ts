@@ -65,3 +65,24 @@ test('long codes get a bigger, lower-ECC QR', () => {
   assert.equal(qrSpec('x'.repeat(500)).level, 'L')
   assert.ok(qrSpec('x'.repeat(900)).size > qrSpec('x'.repeat(500)).size)
 })
+
+test('a friend code still works when the "dropbeam:" part was deleted, or inside a whole invite message', () => {
+  assert.deepEqual(parseCode(J), { kind: 'friend', code: `dropbeam:${J}` })
+  assert.deepEqual(parseCode(`  ${J.slice(0, 30)}\n${J.slice(30)} `), { kind: 'friend', code: `dropbeam:${J}` })
+  const message = `Add me on DropBeam — Test\nCopy this whole message, then open DropBeam → Add Friend.\n\ndropbeam:${J}\n`
+  assert.deepEqual(parseCode(message), { kind: 'friend', code: `dropbeam:${J}` })
+  assert.equal(routeCode(J).action, 'addFriend')
+  // A bare payload that isn't a personal code (an invite has a secret) is not guessed at.
+  const invite = Buffer.from(JSON.stringify({ v: 1, id: 'x', secret: 's', name: 'N', eid: 'e' })).toString('base64url')
+  assert.equal(parseCode(invite), null)
+  assert.equal(parseCode(Buffer.from('{"v":1}').toString('base64url')), null)
+})
+
+test('friendCodeName reads the name for "Add …?"', async () => {
+  const { friendCodeName } = await import('../src/lib/codes.ts')
+  assert.equal(friendCodeName(`dropbeam:${J}`), 'Test')
+  assert.equal(friendCodeName(J), 'Test')
+  const unicode = Buffer.from(JSON.stringify({ v: 1, eid: 'abc', name: 'Zoë 李' })).toString('base64url')
+  assert.equal(friendCodeName(`dropbeam:${unicode}`), 'Zoë 李')
+  assert.equal(friendCodeName(`direct${J}`), null)
+})

@@ -1,4 +1,5 @@
 import { loadLocations } from '../lib/locationsLoad'
+import { errorText } from '../lib/errors'
 import { MobileHeader } from '../components/MobileHeader'
 import { IS_WINDOWS, MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -6,6 +7,7 @@ import { ChevronLeft, ChevronRight, HardDrive, Info, RefreshCw } from 'lucide-re
 import { locationsApi, onLocationsChanged, type HostedLocation, type HostedLocationStatus, type SharedLocation } from '../lib/api'
 import { formatBytes, formatRelativeTime } from '../lib/format'
 import { incomingByLocation, trackLocationTransfers } from '../lib/hostedLocations'
+import { outgoingForLocation, pruneOutgoingLocationUploads } from '../lib/locationUploads'
 import { claimPresenceChecks, friendPresence, presenceLabel } from '../lib/presence'
 import { useStore } from '../store'
 import { FileBrowser } from '../components/FileBrowser'
@@ -47,7 +49,7 @@ function SharedFromThisDevice() {
       if (!mounted.current) return
       setHosted(list); setLoaded(true); setError('')
       return list
-    } catch (e) { if (mounted.current) { setError(String(e)); setLoaded(true) } }
+    } catch (e) { if (mounted.current) { setError(errorText(e)); setLoaded(true) } }
   }, [])
   // Status is cheap (one open + marker read + statvfs), so it can follow the
   // view: once on open, then every 30 s while it stays open.
@@ -57,7 +59,7 @@ function SharedFromThisDevice() {
         const status = await locationsApi.hostedStatus(l.id)
         if (mounted.current) setStatuses(prev => ({ ...prev, [l.id]: status }))
       } catch (e) {
-        if (mounted.current) setStatuses(prev => ({ ...prev, [l.id]: { id: l.id, reachable: false, freeBytes: 0, markerOk: false, error: String(e), lastActivity: prev[l.id]?.lastActivity ?? null } }))
+        if (mounted.current) setStatuses(prev => ({ ...prev, [l.id]: { id: l.id, reachable: false, freeBytes: 0, markerOk: false, error: errorText(e), lastActivity: prev[l.id]?.lastActivity ?? null } }))
       }
     }))
   }, [])
@@ -88,7 +90,7 @@ function SharedFromThisDevice() {
       const reach = !status ? null
         : ok ? <span className="location-reach" title={status.freeBytes > 0 ? `${formatBytes(status.freeBytes)} free` : undefined}><Dot tone="ok" /><span className="truncate-1">Available{status.freeBytes > 0 ? ` · ${formatBytes(status.freeBytes)} free` : ''}</span></span>
           : <span className="location-reach warn" title={status.error || (status.reachable ? 'The drive at this path isn’t the one you shared.' : undefined)}>
-            <Dot tone="warn" /><span className="truncate-1">{status.reachable ? 'Drive changed' : 'Not reachable'}</span></span>
+            <Dot tone="warn" /><span className="truncate-1">{status.reachable ? 'Drive changed' : 'Drive not connected'}</span></span>
       return <div className="row location-row" key={l.id}>
         <span className="location-glyph" aria-hidden><HardDrive /></span>
         <div className="row-main">
@@ -110,6 +112,8 @@ export function LocationsView() {
   const seen = useStore(s => s.friendSeen)
   const statuses = useStore(s => s.folderStatuses)
   const setView = useStore(s => s.setView)
+  const transfers = useStore(s => s.transfers)
+  useEffect(() => pruneOutgoingLocationUploads(useStore.getState().transfers), [])
   const [shared, setShared] = useState<SharedByFriend>(cached)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
@@ -118,16 +122,16 @@ export function LocationsView() {
   const inFlight = useRef(false)
   const queued = useRef(false)
   const friendKey = friends.map(f => `${f.id}:${f.endpointId}`).join('|')
-  const presenceKey = friends.map(f => `${f.id}:${friendPresence(f.name, seen, statuses).status}`).join('|')
+  const presenceKey = friends.map(f => `${f.id}:${friendPresence(f, seen, statuses).status}`).join('|')
   const refresh = useCallback(async function reload() {
     if (inFlight.current) { queued.current = true; return }
     inFlight.current = true; setBusy(true)
     const state = useStore.getState()
     await loadLocations({
-      friends: state.friends.filter(f => friendPresence(f.name, state.friendSeen, state.folderStatuses).status === 'online'),
+      friends: state.friends.filter(f => friendPresence(f, state.friendSeen, state.folderStatuses).status === 'online'),
       online: () => true,
       list: locationsApi.list,
-      errorText: (_friend, error) => String(error),
+      errorText: (_friend, error) => errorText(error),
       onResult: result => {
         if (!mounted.current) return
         if (result.error) setErrors(prev => ({ ...prev, [result.friendId]: result.error! }))
@@ -171,15 +175,15 @@ export function LocationsView() {
   const location = active && shared[active.friend]?.find(l => l.id === active.location)
   const count = friends.reduce((sum,f) => sum + (shared[f.id]?.length || 0), 0)
   if (MOBILE_UI) return <div className="mobile-page mobile-locations">
-    {active && friend && location ? <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} online={presenceLabel(friendPresence(friend.name, seen, statuses))} onBack={() => setActive(null)} /> : <>
+    {active && friend && location ? <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} online={presenceLabel(friendPresence(friend, seen, statuses))} onBack={() => setActive(null)} /> : <>
       <MobileHeader title="Locations" actions={<button className="ios-icon" aria-label="Refresh locations" disabled={busy} onClick={() => void refresh()}><RefreshCw size={20} /></button>} />
-      <div className="ios-list">{friends.flatMap(f => (shared[f.id] || []).map(l => <button className="ios-row" key={`${f.id}:${l.id}`} onClick={() => setActive({ friend: f.id, location: l.id })}><span className="mobile-tinted-icon"><HardDrive size={24} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{l.name}</span><span className="ios-footnote mobile-presence"><i className={friendPresence(f.name, seen, statuses).status === 'online' ? 'online' : ''} />{f.name} · {presenceLabel(friendPresence(f.name, seen, statuses))}</span></span><ChevronRight size={18} /></button>))}</div>
+      <div className="ios-list">{friends.flatMap(f => (shared[f.id] || []).map(l => <button className="ios-row" key={`${f.id}:${l.id}`} onClick={() => setActive({ friend: f.id, location: l.id })}><span className="mobile-tinted-icon"><HardDrive size={24} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{l.name}</span><span className="ios-footnote mobile-presence"><i className={friendPresence(f, seen, statuses).status === 'online' ? 'online' : ''} />{f.name} · {presenceLabel(friendPresence(f, seen, statuses))}</span></span><ChevronRight size={18} /></button>))}</div>
       {!count && <div className="mobile-empty"><HardDrive /><h2 className="ios-title2">A place for everything</h2><p className="ios-footnote">Folders shared by friends appear here.</p><button className="ios-button ios-primary" onClick={() => setView('friends')}>Find a friend</button></div>}
       {!!Object.keys(errors).length && <p className="ios-footnote mobile-inset">Some devices are unavailable. Open a location to retry.</p>}
     </>}
   </div>
-  const presenceWords = (f: { name: string }) => {
-    const p = friendPresence(f.name, seen, statuses)
+  const presenceWords = (f: { id: string; name: string }) => {
+    const p = friendPresence(f, seen, statuses)
     return { online: p.status === 'online', words: p.status === 'online' ? 'Online' : presenceLabel(p) }
   }
   if (active) return <div className="locations-view page">
@@ -187,7 +191,7 @@ export function LocationsView() {
       ? <FileBrowser key={`${friend.id}:${location.id}`} friendId={friend.id} location={location} host={friend.name}
         online={presenceWords(friend).words} onBack={() => setActive(null)} />
       : <>
-        <div className="page-header titlebar-drag"><div className="location-crumbs">
+        <div className="page-header titlebar-drag" data-tauri-drag-region="deep"><div className="location-crumbs">
           <IconButton label="All locations" onClick={() => setActive(null)}><ChevronLeft /></IconButton>
           <h1 className="page-title">Locations</h1></div></div>
         <EmptyState icon={<HardDrive />} title="This location isn’t shared with you anymore" />
@@ -195,9 +199,9 @@ export function LocationsView() {
   </div>
   const unavailable = friends.filter(f => errors[f.id])
   return <div className="locations-view page">
-    <div className="page-header titlebar-drag"><h1 className="page-title">Locations</h1><div className="page-actions">
-      {!IS_WINDOWS && <button className="btn btn-secondary" onClick={() => setView('settings')}>Share a folder…</button>}
-      {count > 0 && <button className="btn btn-primary" onClick={openSyncFolderSheet}>Sync a folder…</button>}
+    <div className="page-header titlebar-drag" data-tauri-drag-region="deep"><h1 className="page-title">Locations</h1><div className="page-actions">
+      {!IS_WINDOWS && <button className="btn btn-secondary" onClick={() => setView('settings')}>Share a Folder…</button>}
+      <button className="btn btn-primary" onClick={openSyncFolderSheet}>Sync a Folder…</button>
     </div></div>
 
     {count > 0
@@ -205,8 +209,11 @@ export function LocationsView() {
         <SectionHeader>Shared with you</SectionHeader>
         <div className="group">{friends.flatMap(f => (shared[f.id] || []).map(l => {
           const p = presenceWords(f)
-          const room = l.reachable === false
-            ? <span className="location-reach warn"><Dot tone="warn" />Not reachable</span>
+          // The friend is reachable but the folder's drive isn't (unplugged NAS,
+          // ejected disk): say THAT, instead of "Online" next to "Not reachable".
+          const driveGone = l.reachable === false
+          const room = driveGone
+            ? <span className="location-reach warn"><Dot tone="warn" />Drive not connected</span>
             : l.reachable && l.freeBytes != null && l.totalBytes
               ? <span className="location-reach" title={`${formatBytes(l.freeBytes)} free of ${formatBytes(l.totalBytes)}`}>{formatBytes(l.freeBytes)} free</span>
               : null
@@ -214,14 +221,24 @@ export function LocationsView() {
             <span className="location-glyph" aria-hidden><HardDrive /></span>
             <span className="row-main">
               <span className="row-title truncate-1" title={l.name}>{l.name}</span>
-              <span className="row-sub location-presence truncate-1"><Dot tone={p.online ? 'online' : 'off'} />{f.name} · {p.words}</span>
+              {(() => {
+                // This device's uploads into it (#30): say so right on the tile.
+                const up = outgoingForLocation(transfers, f.id, l.id)
+                if (!up.length) return <span className="row-sub location-presence truncate-1">{driveGone ? <>{f.name}</> : <><Dot tone={p.online ? 'online' : 'off'} />{f.name} · {p.words}</>}</span>
+                const done = up.reduce((n, t) => n + (t.bytesDone || 0), 0)
+                const total = up.reduce((n, t) => n + (t.bytesTotal || 0), 0)
+                const paused = up.every(t => t.state === 'paused')
+                return <span className="row-sub location-activity live truncate-1" role="status">
+                  {paused ? null : <Spinner size={10} />} {f.name} · {paused ? 'Upload paused' : 'Uploading'}{total > 0 ? ` · ${Math.floor((done / total) * 100)}% of ${formatBytes(total)}` : '…'}
+                </span>
+              })()}
             </span>
             <span className="row-trailing">{room}<ChevronRight className="location-chevron" aria-hidden /></span>
           </button>
         }))}</div>
       </section>
       : <EmptyState icon={<HardDrive />} title={busy ? 'Looking for locations…' : 'No locations yet'}
-        hint="Folders friends share with you appear here." style={{ padding: '40px 24px 32px' }} />}
+        hint={busy ? undefined : <>A location is a folder on an always-on computer or network drive (NAS) that a friend lets you open from here — to look through, download from, or add to. When someone shares one with you, it appears here.<br /><br />This is optional; most people never need it. To send files, use Send &amp; Receive.</>} />}
     {unavailable.length > 0 && <div className="location-note">
       <span className="truncate-1">{unavailable.length === 1 ? `Couldn’t load ${unavailable[0].name}’s locations` : `Couldn’t load locations from ${unavailable.length} friends`}</span>
       <InfoButton label="Details" icon={<Info />} width={280}>

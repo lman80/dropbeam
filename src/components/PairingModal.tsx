@@ -1,6 +1,5 @@
 import { ScanCodeButton, ShareCode } from './CodeQr'
 import { parseCode, wrongCodeMessage } from '../lib/codes'
-import { useState } from 'react'
 import { Check, FolderOpen } from 'lucide-react'
 import { Dialog } from './Dialog'
 import { folderName as baseName } from '../lib/syncedFolders'
@@ -8,6 +7,9 @@ import { api } from '../lib/api'
 import { useStore } from '../store'
 import { friendOnlineState } from '../lib/presence'
 import { Spinner } from './bits'
+import { sendTargets } from '../lib/deviceIcons'
+import { FOLDER_MODES, inviteMode, inviteModeForJoiner, isBroadFolder } from '../lib/folderWords'
+import { useEffect, useState } from 'react'
 
 export function PairingModal({
   mode,
@@ -23,6 +25,9 @@ export function PairingModal({
   const reloadFriends = useStore((s) => s.reloadFriends)
   const toast = useStore((s) => s.toast)
   const friends = useStore((s) => s.friends)
+  const myAccount = useStore((s) => s.myDevice?.account_pub)
+  // One chip per PERSON, and never your own devices (they aren't invitees).
+  const invitable = sendTargets(friends, myAccount).others
   const [folder, setFolder] = useState('')
   const [syncMode, setSyncMode] = useState<'mirror' | 'twoway' | 'oneway'>('twoway')
   const [peerName, setPeerName] = useState('')
@@ -31,6 +36,14 @@ export function PairingModal({
   const [inviteInput, setInviteInput] = useState(initialInvite)
   const [createdInvite, setCreatedInvite] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+
+  // Home folder, for warning before sharing all of Documents/Desktop/home.
+  const [home, setHome] = useState<string | null>(null)
+  useEffect(() => {
+    void api.getDefaultDownloadDir().then((d) => setHome(d.replace(/[\\/][^\\/]+[\\/]?$/, '')), () => {})
+  }, [])
+  const broad = mode === 'create' && !!folder && isBroadFolder(folder, home)
+  const joinMode = mode === 'accept' ? inviteMode(inviteInput) : null
 
   const pickFolder = async () => {
     const d = await api.pickDirectory()
@@ -78,7 +91,7 @@ export function PairingModal({
         const offline = invitees
           .map((fid) => friends.find((f) => f.id === fid))
           .filter((f) => f && invitedNames.includes(f.name))
-          .filter((f) => friendOnlineState(f!.name, friendSeen, folderStatuses) !== true)
+          .filter((f) => friendOnlineState(f!, friendSeen, folderStatuses) !== true)
           .map((f) => f!.name)
         const online = invitedNames.filter((n) => !offline.includes(n))
         if (online.length) toast('success', `Invited ${online.join(', ')} to “${folderName}”.`)
@@ -112,9 +125,10 @@ export function PairingModal({
     }
     setBusy(true)
     try {
-      await api.acceptPair(parsed.code, folder)
+      const pair = await api.acceptPair(parsed.code, folder)
       await reloadPairs()
-      toast('success', 'Joined the folder. Files will sync automatically.')
+      const where = pair.folder.split(/[/\\]/).filter(Boolean).slice(-2).join(' › ')
+      toast('success', `Joined. The shared files go in ${where}.`)
       onClose()
     } catch (e) {
       toast('error', String(e))
@@ -133,15 +147,15 @@ export function PairingModal({
         onClose={onClose}
         footer={<button className="btn btn-secondary" onClick={onClose}>Done</button>}
       >
-        <p className="dialog-text">In DropBeam, they choose Accept invite and scan or paste this.</p>
-        <ShareCode code={createdInvite} layout="stack" copyLabel="Copy invite" />
+        <p className="dialog-text">Send this to them. In DropBeam they choose Shared Folders → Join a Folder… and scan or paste it.</p>
+        <ShareCode code={createdInvite} layout="stack" copyLabel="Copy Invite" />
       </Dialog>
     )
   }
 
   return (
     <Dialog
-      title={mode === 'create' ? 'New shared folder' : 'Accept a folder invite'}
+      title={mode === 'create' ? 'New Shared Folder' : 'Join a Shared Folder'}
       width={460}
       className="folder-dialog"
       onClose={onClose}
@@ -157,9 +171,9 @@ export function PairingModal({
             {busy ? <Spinner size={13} /> : null}
             {mode === 'create'
               ? invitees.length > 0
-                ? `Create & invite ${invitees.length}`
+                ? `Create & Invite ${invitees.length}`
                 : 'Create'
-              : 'Accept'}
+              : 'Join'}
           </button>
         </>
       }
@@ -167,7 +181,7 @@ export function PairingModal({
       {mode === 'accept' && (
         <div className="folder-field">
           <div className="folder-field-head">
-            <label htmlFor="folder-invite-code" className="field-label">Invite</label>
+            <label htmlFor="folder-invite-code" className="field-label">Invite code from the other person</label>
             <ScanCodeButton
               small
               className="btn btn-plain btn-sm"
@@ -185,50 +199,38 @@ export function PairingModal({
             value={inviteInput}
             onChange={(e) => setInviteInput(e.target.value)}
           />
+          {joinMode && <div className="field-hint">{inviteModeForJoiner(joinMode)}</div>}
         </div>
       )}
 
       <div className="folder-field">
-        <label className="field-label">{mode === 'create' ? 'Folder to share' : 'Save into'}</label>
-        <button className="btn btn-secondary folder-picker" onClick={pickFolder} title={folder || undefined}>
+        <label className="field-label">{mode === 'create' ? 'Folder to share' : 'Where to keep it'}</label>
+        <button className="btn btn-secondary folder-picker" data-autofocus onClick={pickFolder} title={folder || undefined}>
           <FolderOpen />
-          <span className={folder ? undefined : 'placeholder'}>{folder ? folderName : 'Choose a folder…'}</span>
+          <span className={folder ? undefined : 'placeholder'}>{folder ? folderName : 'Choose a Folder…'}</span>
         </button>
+        {mode === 'accept' && <div className="field-hint">For example Documents. If it already has things in it, DropBeam makes a new folder inside for the shared files.</div>}
+        {broad && <div className="field-hint field-hint-warn" role="alert">This shares everything in “{folderName}”. To share only some files, make a new folder inside it and choose that.</div>}
       </div>
 
       {mode === 'create' && (
         <div className="folder-field">
-          <label className="field-label" id="folder-mode-label">Access</label>
+          <label className="field-label" id="folder-mode-label">What others can do</label>
           <div className="group folder-mode-group" role="radiogroup" aria-labelledby="folder-mode-label">
-            <ModeOption
-              active={syncMode === 'mirror'}
-              onClick={() => setSyncMode('mirror')}
-              title="Total sync"
-              desc="Everyone adds, edits and deletes. Both folders stay identical."
-            />
-            <ModeOption
-              active={syncMode === 'twoway'}
-              onClick={() => setSyncMode('twoway')}
-              title="Two-way"
-              desc="Everyone adds and edits. Deletes stay on each side."
-            />
-            <ModeOption
-              active={syncMode === 'oneway'}
-              onClick={() => setSyncMode('oneway')}
-              title="View only"
-              desc="Only you make changes. Others get a read-only copy."
-            />
+            {(['twoway', 'mirror', 'oneway'] as const).map((m) => (
+              <ModeOption key={m} active={syncMode === m} onClick={() => setSyncMode(m)} title={FOLDER_MODES[m].title} desc={FOLDER_MODES[m].desc} />
+            ))}
           </div>
         </div>
       )}
 
-      {mode === 'create' && friends.length > 0 && (
+      {mode === 'create' && invitable.length > 0 && (
         <div className="folder-field">
           <label className="field-label">
             Invite friends <span className="optional">(optional)</span>
           </label>
           <div className="folder-chips">
-            {friends.map((f) => {
+            {invitable.map((f) => {
               const on = invitees.includes(f.id)
               return (
                 <button
@@ -256,7 +258,7 @@ export function PairingModal({
       {mode === 'create' && (
         <div className="folder-field">
           <label className="field-label" htmlFor="folder-peer-name">
-            {friends.length > 0 ? 'Or someone new' : 'Their name'} <span className="optional">(optional)</span>
+            {invitable.length > 0 ? 'Or someone new' : 'Their name'} <span className="optional">(optional)</span>
           </label>
           <input
             id="folder-peer-name"

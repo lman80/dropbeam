@@ -12,8 +12,6 @@
        iroh/rustls) is standard crypto that is NOT provided by Apple's OS, so it
        is not the "exempt" kind. App Store Connect then asks the export-compliance
        questions per build (answer: standard algorithms; see docs/APPSTORE.md). -->
-  <key>ITSAppUsesNonExemptEncryption</key>
-  <true/>
 
   <!-- Camera: QR scanning for friend, device and shared-folder codes. -->
   <key>NSCameraUsageDescription</key>
@@ -26,7 +24,7 @@
   <!-- iroh's mDNS peer discovery (N0_SERVICE_NAME). Without BOTH of these the OS
        silently drops multicast and LAN peers never appear (macOS 15+ and iOS). -->
   <key>NSBonjourServices</key>
-  <array><string>_irohv1._udp</string></array>
+  <array><string>_irohv1._udp</string><string>_dropbeam._udp</string></array>
   <key>NSLocalNetworkUsageDescription</key>
   <string>DropBeam looks for your devices and friends on this network so files go straight between them at full speed, without the internet.</string>
 </dict>

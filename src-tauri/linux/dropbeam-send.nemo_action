@@ -1,0 +1,9 @@
+# Cinnamon Nemo: right-click → "Send with DropBeam" for one file or folder.
+# Installed to /usr/share/nemo/actions/ by the .deb/.rpm.
+[Nemo Action]
+Name=Send with DropBeam
+Comment=Send the selected item with DropBeam
+Exec=DropBeam %F
+Icon-Name=DropBeam
+Selection=s
+Extensions=any;dir;

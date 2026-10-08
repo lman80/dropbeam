@@ -1,0 +1,304 @@
+/* Transfer Server: the explainer animation, the settings pane, the setup
+   wizard and the small status touches in chat. Same tokens as everything else:
+   neutral wells, one accent, no gradients or glows. */
+
+/* ── Explainer ───────────────────────────────────────────────────────────── */
+.sx {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sx-stage {
+  position: relative;
+  height: 104px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.sx-compact .sx-stage { height: 92px; }
+.sx-station {
+  position: absolute;
+  top: 20px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 120px;
+}
+.sx-you { left: 15%; }
+.sx-box { left: 50%; }
+.sx-them { left: 85%; }
+.sx-disc {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--text-muted);
+}
+.sx-disc svg { width: 20px; height: 20px; }
+.sx-box .sx-disc { color: var(--text); }
+.sx-label {
+  font-size: var(--text-11);
+  color: var(--text-muted);
+  max-width: 100%;
+  text-align: center;
+}
+.sx-track {
+  position: absolute;
+  left: 15%;
+  right: 15%;
+  top: 40px;
+  border-top: 1px solid var(--border);
+  z-index: 0;
+}
+.sx-station { z-index: 1; }
+.sx-plane {
+  position: absolute;
+  top: 40px;
+  left: 15%;
+  z-index: 2;
+  width: 22px;
+  height: 22px;
+  margin: -11px 0 0 -11px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  opacity: 0;
+}
+.sx-plane svg { width: 12px; height: 12px; margin-left: -1px; }
+.sx-lock, .sx-check {
+  position: absolute;
+  top: -6px;
+  right: 16px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  transform: scale(0.6);
+}
+.sx-lock { background: var(--text); color: var(--surface); }
+.sx-check { background: var(--green-dot); color: #fff; }
+.sx-lock svg, .sx-check svg { width: 10px; height: 10px; }
+.sx-zzz {
+  position: absolute;
+  top: -4px;
+  right: 18px;
+  font-size: var(--text-12);
+  font-weight: 600;
+  color: var(--text-faint);
+  font-style: italic;
+  opacity: 0;
+}
+.sx-gauge {
+  position: absolute;
+  bottom: -8px;
+  width: 44px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.sx-gauge > span { display: block; height: 100%; width: 20%; background: var(--accent); }
+
+.sx-captions {
+  position: relative;
+  height: 2.6em;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+  text-align: center;
+}
+.sx-cap {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  text-wrap: balance;
+}
+
+/* One 9s loop; each station/element has its own track over the same clock. */
+.sx:not(.sx-still) .sx-offline .sx-plane { animation: sx-plane 9s var(--ease-out) infinite; }
+.sx:not(.sx-still) .sx-offline .sx-them { animation: sx-them 9s ease infinite; }
+.sx:not(.sx-still) .sx-offline .sx-you { animation: sx-you 9s ease infinite; }
+.sx:not(.sx-still) .sx-offline .sx-zzz { animation: sx-zzz 9s ease infinite; }
+.sx:not(.sx-still) .sx-lock { animation: sx-lock 9s var(--ease-out) infinite; }
+.sx:not(.sx-still) .sx-check { animation: sx-check 9s var(--ease-out) infinite; }
+.sx:not(.sx-still) .sx-cap-1 { animation: sx-cap1 9s ease infinite; }
+.sx:not(.sx-still) .sx-cap-2 { animation: sx-cap2 9s ease infinite; }
+.sx:not(.sx-still) .sx-cap-3 { animation: sx-cap3 9s ease infinite; }
+
+@keyframes sx-plane {
+  0%   { left: 15%; opacity: 0; }
+  4%   { left: 15%; opacity: 1; }
+  18%  { left: 71%; opacity: 1; }
+  24%  { left: 62%; opacity: 1; }
+  33%  { left: 62%; opacity: 1; }
+  42%  { left: 50%; opacity: 1; }
+  46%  { left: 50%; opacity: 0.35; }
+  68%  { left: 50%; opacity: 0.35; }
+  71%  { left: 50%; opacity: 1; }
+  82%  { left: 85%; opacity: 1; }
+  86%  { left: 85%; opacity: 0; }
+  100% { left: 85%; opacity: 0; }
+}
+@keyframes sx-them {
+  0%, 66% { opacity: 0.45; }
+  70%, 100% { opacity: 1; }
+}
+@keyframes sx-you {
+  0%, 48% { opacity: 1; }
+  54%, 80% { opacity: 0.45; }
+  84%, 100% { opacity: 1; }
+}
+@keyframes sx-zzz {
+  0% { opacity: 0; transform: translateY(2px); }
+  6%, 60% { opacity: 1; transform: translateY(-3px); }
+  66%, 100% { opacity: 0; transform: translateY(-6px); }
+}
+@keyframes sx-lock {
+  0%, 42% { opacity: 0; transform: scale(0.6); }
+  46% { opacity: 1; transform: scale(1.12); }
+  49%, 84% { opacity: 1; transform: scale(1); }
+  88%, 100% { opacity: 0; transform: scale(0.6); }
+}
+@keyframes sx-check {
+  0%, 82% { opacity: 0; transform: scale(0.6); }
+  86% { opacity: 1; transform: scale(1.12); }
+  89%, 97% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1); }
+}
+@keyframes sx-cap1 { 0%, 30% { opacity: 1; } 33%, 100% { opacity: 0; } }
+@keyframes sx-cap2 { 0%, 33% { opacity: 0; } 36%, 63% { opacity: 1; } 66%, 100% { opacity: 0; } }
+@keyframes sx-cap3 { 0%, 66% { opacity: 0; } 69%, 97% { opacity: 1; } 100% { opacity: 0; } }
+
+/* "Friends can use it too": three sends converge on the box, the gauge fills. */
+.sx:not(.sx-still) .sx-share .sx-plane { animation: sx-in 9s var(--ease-out) infinite; }
+.sx:not(.sx-still) .sx-share .sx-plane-2 { animation-delay: 0.5s; top: 30px; }
+.sx:not(.sx-still) .sx-share .sx-plane-3 { animation-delay: 1s; top: 50px; }
+.sx:not(.sx-still) .sx-share .sx-gauge > span { animation: sx-gauge 9s ease infinite; }
+.sx-share .sx-them { opacity: 0.8; }
+@keyframes sx-in {
+  0% { left: 15%; opacity: 0; }
+  5% { left: 15%; opacity: 1; }
+  20% { left: 40%; opacity: 1; }
+  24%, 100% { left: 44%; opacity: 0; }
+}
+.sx .sx-share .sx-lock { animation: none; opacity: 1; transform: none; }
+@keyframes sx-gauge {
+  0%, 12% { width: 18%; }
+  34%, 90% { width: 58%; }
+  100% { width: 18%; }
+}
+
+/* Reduce Motion: the three beats as a still, numbered strip. */
+.sx-still .sx-plane { opacity: 1; left: 50%; }
+.sx-still .sx-share .sx-plane-2, .sx-still .sx-share .sx-plane-3 { display: none; }
+.sx-still .sx-lock { opacity: 1; transform: none; }
+.sx-still .sx-them { opacity: 0.45; }
+.sx-still .sx-zzz { opacity: 1; }
+.sx-steps {
+  margin: 0;
+  padding-left: 18px;
+  font-size: var(--text-12);
+  color: var(--text-muted);
+  display: grid;
+  gap: 2px;
+}
+
+/* ── Settings pane ──────────────────────────────────────────────────────── */
+.srv-intro {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+  padding: 16px;
+}
+.srv-intro-copy h3 { font-size: var(--text-15); margin-bottom: 4px; }
+.srv-intro-copy p { margin: 0; color: var(--text-muted); max-width: 60ch; text-wrap: pretty; }
+.srv-intro-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.srv-fit { display: inline-flex; align-items: center; gap: 6px; font-size: var(--text-12); color: var(--text-muted); }
+.srv-fit.warn { color: var(--amber); }
+
+.srv-status { display: inline-flex; align-items: center; gap: 6px; font-size: var(--text-12); color: var(--text-muted); font-weight: 400; margin-left: 8px; }
+.srv-usage { display: grid; gap: 6px; min-width: 220px; }
+.srv-usage-line { font-size: var(--text-12); color: var(--text-muted); text-align: right; }
+.srv-meter { height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
+.srv-meter > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.srv-meter.warn > span { background: var(--amber-dot); }
+.srv-person .row-title { display: flex; align-items: center; gap: 8px; }
+.srv-tag { font-size: var(--text-11); color: var(--text-muted); font-weight: 400; }
+.srv-danger { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 12px; }
+.srv-error { color: var(--red); }
+
+/* ── Setup wizard ───────────────────────────────────────────────────────── */
+.srv-wizard { display: grid; gap: 14px; }
+.srv-steps { display: flex; gap: 6px; }
+.srv-steps > span { height: 3px; flex: 1; border-radius: 2px; background: var(--surface-3); }
+.srv-steps > span.on { background: var(--accent); }
+.srv-field { display: grid; gap: 6px; }
+.srv-field > .seg { justify-self: start; }
+.srv-field > label, .srv-field-title { font-weight: 600; font-size: var(--text-13); }
+.srv-hint { font-size: var(--text-12); color: var(--text-muted); margin: 0; text-wrap: pretty; }
+.srv-slider { display: grid; gap: 4px; }
+.srv-slider input[type='range'] { width: 100%; }
+.srv-slider-line { display: flex; justify-content: space-between; font-size: var(--text-12); color: var(--text-muted); }
+.srv-slider-line b { color: var(--text); font-weight: 600; }
+.srv-choice {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 2px 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.srv-choice:hover { background: var(--surface-hover); }
+.srv-choice input { margin: 2px 0 0; }
+.srv-choice-title { font-weight: 500; }
+.srv-choice-hint { grid-column: 2; font-size: var(--text-12); color: var(--text-muted); }
+.srv-choice-extra { grid-column: 2; margin-top: 6px; }
+.srv-check { display: flex; gap: 8px; align-items: flex-start; font-size: var(--text-13); padding: 4px 12px; }
+.srv-check input { margin-top: 2px; }
+.srv-done { display: grid; gap: 12px; justify-items: center; text-align: center; padding: 4px 0 8px; }
+.srv-done-mark {
+  width: 44px; height: 44px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--green-soft); color: var(--green);
+}
+.srv-done h3 { font-size: var(--text-15); }
+.srv-done p { margin: 0; color: var(--text-muted); max-width: 44ch; }
+
+/* ── "Servers you can use" + offers ─────────────────────────────────────── */
+.srv-offer {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  max-width: 440px;
+  margin: 8px auto;
+}
+.srv-offer h4 { font-size: var(--text-13); font-weight: 600; margin: 0 0 4px; }
+.srv-offer p { margin: 0; font-size: var(--text-12); color: var(--text-muted); text-wrap: pretty; }
+.srv-offer-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; }
+.srv-offer-actions label { margin-right: auto; display: inline-flex; gap: 6px; align-items: center; font-size: var(--text-12); color: var(--text-muted); }
+
+/* ── Chat touches ───────────────────────────────────────────────────────── */
+.chat-meta .srv-glyph, .xfer-line .srv-glyph { width: 11px; height: 11px; vertical-align: -1px; margin-right: 3px; }
+.chat-via { font-size: var(--text-11); color: var(--text-faint); margin: 2px 0 0 2px; }
+.chat-meta-link { background: none; border: 0; padding: 0; color: var(--accent-text); font: inherit; cursor: pointer; }
+.chat-meta-link:hover { text-decoration: underline; }
+.srv-pop { display: grid; gap: 10px; }
+.srv-pop p { margin: 0; font-size: var(--text-12); color: var(--text-muted); }
+.srv-ask { display: flex; align-items: center; gap: 6px; }
+.srv-ask > span { flex: 1; min-width: 0; }
+.xfer-line.srv-held { display: flex; align-items: flex-start; gap: 4px; white-space: normal; text-align: inherit; }
+.xfer-line.srv-held .srv-glyph { flex: none; margin: 2px 0 0; }
+.att.mine .xfer-line.srv-held { justify-content: flex-end; text-align: right; }

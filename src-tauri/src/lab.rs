@@ -14,10 +14,39 @@
 //! authentication — a random peer can never drive Lab Mode even if they somehow
 //! learn the frame format. Off + no-operator (the defaults) accept nothing.
 
+// Lab Mode is compiled into debug builds and `--features lab` builds only;
+// a shipping release refuses every lab stream without the dispatcher (S10).
+#![cfg_attr(not(any(debug_assertions, feature = "lab")), allow(dead_code, unused_imports))]
+
 use anyhow::{bail, Result};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 use crate::iroh_net::{read_frame_cap, write_frame, IrohState};
+
+/// Whether this build carries Lab Mode at all.
+pub(crate) const COMPILED_IN: bool = cfg!(any(debug_assertions, feature = "lab"));
+
+/// A lab-supplied relative path inside `root`, or an error. Only plain
+/// components; never absolute, `..`, a drive prefix, or a path that resolves
+/// (through a symlinked ancestor) outside `root` (S10).
+pub(crate) fn lab_path(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf> {
+    use std::path::Component;
+    let rel_path = std::path::Path::new(rel);
+    if rel.is_empty() || rel.contains('\\') || rel_path.components().any(|c| !matches!(c, Component::Normal(_))) {
+        bail!("lab: path must be relative and stay inside the folder");
+    }
+    let target = root.join(rel_path);
+    let root = std::fs::canonicalize(root)?;
+    // The deepest existing ancestor must still be inside the root.
+    let existing = target.ancestors().find(|a| a.exists()).map(std::fs::canonicalize).transpose()?;
+    if !existing.is_some_and(|e| e.starts_with(&root)) {
+        bail!("lab: path escapes the folder");
+    }
+    if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("lab: refusing to operate on a symlink");
+    }
+    Ok(target)
+}
 
 /// THE security gate, as a pure function so it can be exhaustively tested. A
 /// peer may drive Lab Mode iff the feature is enabled AND a non-empty operator
@@ -51,7 +80,7 @@ pub(crate) async fn handle_lab(
     req: &serde_json::Value,
     state: &IrohState,
 ) -> Result<()> {
-    if !authorized(conn, state) {
+    if !COMPILED_IN || !authorized(conn, state) {
         // Deliberately terse — don't leak whether lab mode is on or who the
         // operator is to an unauthorized caller.
         write_frame(send, &serde_json::json!({ "ok": false, "error": "unauthorized" })).await?;
@@ -59,7 +88,10 @@ pub(crate) async fn handle_lab(
         bail!("lab: unauthorized peer {}", conn.remote_id());
     }
     let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
+    #[cfg(any(debug_assertions, feature = "lab"))]
     let reply = dispatch(cmd, req, recv, state).await;
+    #[cfg(not(any(debug_assertions, feature = "lab")))]
+    let reply: Result<serde_json::Value> = { let _ = (cmd, recv); Err(anyhow::anyhow!("unavailable")) };
     let frame = match reply {
         Ok(v) => {
             let mut v = v;
@@ -143,8 +175,19 @@ fn folder_manifest(root: &std::path::Path) -> Vec<serde_json::Value> {
     out
 }
 
+/// Run blocking work (file IO, hashing, a full `SyncManager::reconcile`) off the
+/// async workers. Lab ops hash/write files of hundreds of MB; doing that inline
+/// on a tokio worker starves the iroh endpoint sharing the runtime (relay pings,
+/// handshakes, the mDNS subscriber) — on a 4-core box that is enough to make the
+/// device look unreachable to the operator.
+#[cfg(any(debug_assertions, feature = "lab"))]
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f).await?
+}
+
 /// Run one authorized lab command. Returns the JSON payload to reply with (the
 /// caller stamps `ok`). New commands slot in here.
+#[cfg(any(debug_assertions, feature = "lab"))]
 async fn dispatch(
     cmd: &str,
     req: &serde_json::Value,
@@ -199,6 +242,12 @@ async fn dispatch(
                 deleted: false,
                 gif: None,
                 rev: 0,
+                held_on: None,
+                server_note: None,
+                via: None,
+                deliveries: vec![],
+                link_preview: None,
+                text_rev: 0, reaction_revs: vec![],
             };
             crate::chat::append(&cfg, &msg);
             let ep = state.get().cloned().ok_or_else(|| anyhow::anyhow!("iroh not ready"))?;
@@ -235,10 +284,11 @@ async fn dispatch(
             let dir = str_field(req, "dir")?;
             std::fs::create_dir_all(dir)?;
             let mirror = req.get("mirror").and_then(|v| v.as_bool()).unwrap_or(true);
+            let two_way = req.get("twoWay").and_then(|v| v.as_bool()).unwrap_or(true);
             let name = my_display_name(state);
             let my_id = state.get().map(|ep| ep.id().to_string());
             let (pair, invite) = crate::pairing::create(
-                &cfg, dir.to_string(), name, true, "Lab Peer".into(), mirror, my_id,
+                &cfg, dir.to_string(), name, two_way, "Lab Peer".into(), mirror, my_id,
             )
             .map_err(|e| anyhow::anyhow!(e))?;
             let sm = sync_manager(state)?;
@@ -264,6 +314,79 @@ async fn dispatch(
             Ok(serde_json::json!({ "pairId": pair.id }))
         }
 
+        // Change a folder's options (one-way / auto-delete / mirror).
+        "pair-update" => {
+            let cfg = config_dir(state)?;
+            let id = str_field(req, "pairId")?;
+            let b = |k: &str| req.get(k).and_then(|v| v.as_bool());
+            let pair = crate::pairing::update(&cfg, id, b("twoWay"), b("autoDelete"), None, None, b("mirror"))
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let sm = sync_manager(state)?;
+            blocking(move || Ok(sm.reconcile())).await?;
+            Ok(serde_json::to_value(&pair)?)
+        }
+        // Pause / resume a folder (the shared switch).
+        "pair-pause" => {
+            let id = str_field(req, "pairId")?.to_owned();
+            let paused = req.get("paused").and_then(|v| v.as_bool()).unwrap_or(true);
+            sync_manager(state)?.set_paused_now(&id, paused);
+            Ok(serde_json::json!({ "paused": paused }))
+        }
+        // Stop sharing (announce + forget the link), like the UI's Unshare.
+        "pair-remove" => {
+            let cfg = config_dir(state)?;
+            let id = str_field(req, "pairId")?;
+            let sm = sync_manager(state)?;
+            sm.announce_unshare(id);
+            crate::pairing::remove(&cfg, id).map_err(|e| anyhow::anyhow!(e))?;
+            blocking(move || Ok(sm.reconcile())).await?;
+            Ok(serde_json::json!({ "removed": id }))
+        }
+        // Invite one more person into an existing folder (group of 3+).
+        "pair-add-person" => {
+            let cfg = config_dir(state)?;
+            let id = str_field(req, "pairId")?;
+            let my_id = state.get().map(|ep| ep.id().to_string());
+            let invite = crate::pairing::group_invite(&cfg, id, my_display_name(state), my_id)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let sm = sync_manager(state)?;
+            blocking(move || Ok(sm.reconcile())).await?;
+            Ok(serde_json::json!({ "invite": invite }))
+        }
+        // Owner: make the member on this link a viewer (or an editor again).
+        "pair-role" => {
+            let cfg = config_dir(state)?;
+            let id = str_field(req, "pairId")?;
+            let viewer = req.get("viewer").and_then(|v| v.as_bool()).unwrap_or(true);
+            let my_id = state.get().map(|ep| ep.id().to_string());
+            let ok = crate::pairing::set_peer_viewer(&cfg, id, viewer, my_id.as_deref());
+            let sm = sync_manager(state)?;
+            blocking(move || Ok(sm.reconcile())).await?;
+            Ok(serde_json::json!({ "ok_role": ok }))
+        }
+        // Full pair records + live folder statuses.
+        "pair-dump" => {
+            let cfg = config_dir(state)?;
+            let sm = sync_manager(state)?;
+            blocking(move || Ok(serde_json::json!({ "pairs": crate::pairing::load(&cfg), "statuses": sm.statuses() }))).await
+        }
+        // A folder's History (deleted/overwritten copies) and restoring one.
+        "history-list" => {
+            let cfg = config_dir(state)?;
+            let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
+            blocking(move || Ok(serde_json::json!({ "items": crate::folder_history::load(&root.to_string_lossy()) }))).await
+        }
+        "history-restore" => {
+            let cfg = config_dir(state)?;
+            let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
+            let item = str_field(req, "itemId")?.to_owned();
+            blocking(move || {
+                let to = crate::folder_history::restore(&root.to_string_lossy(), &item).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(serde_json::json!({ "restored": to }))
+            })
+            .await
+        }
+
         // List shared folders on this device.
         "pair-list" => {
             let cfg = config_dir(state)?;
@@ -280,13 +403,17 @@ async fn dispatch(
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
             let rel = str_field(req, "rel")?;
-            let size = req.get("size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+            let size = req.get("size").and_then(|v| v.as_u64()).unwrap_or(4096).min(1 << 30) as usize;
             let seed = req.get("seed").and_then(|v| v.as_u64()).unwrap_or(1);
-            let p = root.join(rel);
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&p, crate::labkit::payload(size, seed))?;
+            let p = lab_path(&root, rel)?;
+            blocking(move || {
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&p, crate::labkit::payload(size, seed))?;
+                Ok(())
+            })
+            .await?;
             Ok(serde_json::json!({ "wrote": rel, "bytes": size }))
         }
 
@@ -294,8 +421,12 @@ async fn dispatch(
         "fs-delete" => {
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
-            let p = root.join(str_field(req, "rel")?);
-            if p.is_dir() { std::fs::remove_dir_all(&p)?; } else { let _ = std::fs::remove_file(&p); }
+            let p = lab_path(&root, str_field(req, "rel")?)?;
+            blocking(move || {
+                if p.is_dir() { std::fs::remove_dir_all(&p)?; } else { let _ = std::fs::remove_file(&p); }
+                Ok(())
+            })
+            .await?;
             Ok(serde_json::json!({ "deleted": str_field(req, "rel")? }))
         }
 
@@ -303,12 +434,15 @@ async fn dispatch(
         "fs-move" => {
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
-            let from = root.join(str_field(req, "from")?);
-            let to = root.join(str_field(req, "to")?);
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(&from, &to)?;
+            let from = lab_path(&root, str_field(req, "from")?)?;
+            let to = lab_path(&root, str_field(req, "to")?)?;
+            blocking(move || {
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Ok(std::fs::rename(&from, &to)?)
+            })
+            .await?;
             Ok(serde_json::json!({ "moved": [str_field(req, "from")?, str_field(req, "to")?] }))
         }
 
@@ -316,7 +450,7 @@ async fn dispatch(
         "fs-manifest" => {
             let cfg = config_dir(state)?;
             let root = pair_folder(&cfg, str_field(req, "pairId")?)?;
-            let files = folder_manifest(&root);
+            let files = blocking(move || Ok(folder_manifest(&root))).await?;
             Ok(serde_json::json!({ "count": files.len(), "files": files }))
         }
 
@@ -372,6 +506,24 @@ fn my_display_name(state: &IrohState) -> String {
 #[cfg(test)]
 mod tests {
     use super::gate;
+
+    #[test]
+    fn s10_lab_paths_stay_inside_the_folder() {
+        let dir = std::env::temp_dir().join(format!("dropbeam-lab-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("share");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        assert!(super::lab_path(&root, "sub/a.txt").is_ok());
+        assert!(super::lab_path(&root, "new/dir/b.txt").is_ok());
+        for bad in ["", "../escape", "sub/../../escape", "/etc/passwd", "./x", "a\\..\\b"] {
+            assert!(super::lab_path(&root, bad).is_err(), "{bad:?}");
+        }
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(&dir, root.join("link")).unwrap();
+            assert!(super::lab_path(&root, "link/outside.txt").is_err(), "symlinked ancestor escapes");
+            assert!(super::lab_path(&root, "link").is_err());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     const OP: &str = "825e889fce001f39630c1ddf37a24de39c658ef9f0c466a33d650b1360030b70";
 

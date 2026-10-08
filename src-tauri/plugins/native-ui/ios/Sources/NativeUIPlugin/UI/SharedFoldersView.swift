@@ -13,6 +13,10 @@ struct SharedFoldersView: View {
         List {
             if !bridge.folders.isEmpty {
                 Section {
+                    Text("A shared folder stays the same on everyone’s devices: when someone adds or changes a file, everyone gets it.")
+                        .font(.subheadline).foregroundStyle(.secondary).listRowBackground(Color.clear)
+                }
+                Section {
                     ForEach(bridge.folders) { folder in
                         NavigationLink { SharedFolderDetailView(folderID: folder.id, initial: folder) } label: { FolderRow(folder: folder) }
                     }
@@ -27,16 +31,16 @@ struct SharedFoldersView: View {
                     ContentUnavailableView {
                         Label("No Shared Folders Yet", systemImage: "folder.badge.person.crop")
                     } description: {
-                        Text("When a friend shares a folder with you from DropBeam on their computer, accept the invite here — or scan their invite code.")
+                        Text("A shared folder stays the same on everyone’s devices: when someone adds or changes a file, everyone gets it. When a friend shares one with you, it shows up here — or join with the code they sent you.")
                     } actions: {
-                        Button { joining = true; Haptics.tap() } label: { Label("Join with a Code", systemImage: "qrcode.viewfinder") }.beamButton(prominent: true)
+                        Button { joining = true; Haptics.tap() } label: { Label("Join a Shared Folder", systemImage: "qrcode.viewfinder") }.beamButton(prominent: true)
                     }
                 }
             }
         }
         .navigationTitle("Shared Folders").navigationBarTitleDisplayMode(.large)
         .toolbar { ToolbarItem(placement: .topBarTrailing) {
-            Button { joining = true; Haptics.tap() } label: { Image(systemName: "plus") }.accessibilityLabel("Join a shared folder")
+            Button { joining = true; Haptics.tap() } label: { Image(systemName: "plus") }.accessibilityLabel("Join a Shared Folder")
         } }
         .task { loading = bridge.folders.isEmpty; defer { loading = false }; await refresh() }
         .refreshable { await refresh() }
@@ -49,10 +53,10 @@ struct SharedFoldersView: View {
 struct JoinFolderSheet: View {
     @EnvironmentObject private var bridge: Bridge
     var body: some View {
-        QRScannerSheet(title: "Join Shared Folder") { code in
+        QRScannerSheet(title: "Join a Shared Folder", hint: "Scan or paste the shared-folder code your friend sent. Then choose where to keep the folder — DropBeam makes a folder for it there.") { code in
             let accepted: Bool = try await bridge.call("acceptFolderInvite", ["code": code])
             if !accepted { throw NSError(domain: "DropBeam", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose a folder to join, or cancel."]) }
-            bridge.showToast("Joined shared folder")
+            bridge.showToast("Joined the shared folder")
         }
     }
 }
@@ -60,7 +64,7 @@ struct JoinFolderSheet: View {
 /// What iOS allows, said once, plainly.
 private struct FolderIOSNote: View {
     var body: some View {
-        Text("Each shared folder is a copy in Files → On My iPhone → DropBeam. Syncing runs while DropBeam is open; iOS pauses it in the background, and changes catch up the next time you open the app. Create new shared folders in DropBeam on a computer.")
+        Text("You’ll find each folder in the Files app → On My iPhone → DropBeam. Changes go back and forth while DropBeam is open; anything missed catches up the next time you open it. To start a new shared folder, use DropBeam on a computer.")
     }
 }
 
@@ -75,11 +79,11 @@ private func toneColor(_ tone: String) -> Color {
 }
 private func statusText(_ folder: SharedFolder) -> String {
     guard folder.tone == "ok", let ms = folder.lastSyncedMs else { return folder.label }
-    return "\(folder.label) · synced \(Date(timeIntervalSince1970: ms / 1000).formatted(.relative(presentation: .named)))"
+    return "\(folder.label) · updated \(Date(timeIntervalSince1970: ms / 1000).formatted(.relative(presentation: .named)))"
 }
 private func peopleLine(_ folder: SharedFolder) -> String {
     let names = folder.members.filter { !$0.pending }.map(\.name)
-    if names.isEmpty { return folder.members.isEmpty ? folder.modeLabel : "Waiting for someone to join" }
+    if names.isEmpty { return folder.members.isEmpty ? FolderModeCopy.title(folder.mode) : "Waiting for someone to join" }
     return "With " + ListFormatter.localizedString(byJoining: names)
 }
 
@@ -129,7 +133,17 @@ struct SharedFolderDetailView: View {
         List {
             Section { header }.clearRow()
             Section { actions }.clearRow(EdgeInsets(top: 0, leading: 20, bottom: 8, trailing: 20))
-            Section("Status") { statusCard }
+            Section("Status") {
+                statusCard
+                if folder.mirror {
+                    Button {
+                        verify = nil
+                        run("verify") { verify = try await bridge.call("folderVerify", ["folderId": folderID]) }
+                    } label: {
+                        HStack { Label(busy == "verify" ? "Checking…" : "Check Everything Matches", systemImage: "checkmark.shield"); Spacer(); if busy == "verify" { ProgressView() } }
+                    }.disabled(busy != nil)
+                }
+            }
             if let verify { Section { verifyCard(verify) } }
             members
             if folder.mirror {
@@ -138,20 +152,20 @@ struct SharedFolderDetailView: View {
                 }
             }
             Section {
-                Button("Leave Folder", role: .destructive) { leaving = true; Haptics.warning() }.frame(maxWidth: .infinity)
-            } footer: { Text("Leaving stops syncing on this iPhone and tells the others. Your copy stays in Files.") }
+                Button("Leave Folder…", role: .destructive) { leaving = true; Haptics.warning() }.frame(maxWidth: .infinity)
+            } footer: { Text("If you leave, you stop getting changes and your changes aren’t shared. The files already on this iPhone stay in the Files app, and nobody else loses anything.") }
         }
         .beamList()
         .navigationTitle(folder.name).navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("Leave \(folder.name)?", isPresented: $leaving, titleVisibility: .visible) {
             Button("Leave Folder", role: .destructive) { run("leave") { try await bridge.action("folderLeave", ["folderId": folderID]); bridge.showToast("Left \(folder.name)"); dismiss() } }
-        } message: { Text("It stops syncing with everyone. Files already on this iPhone stay in Files.") }
+        } message: { Text("You’ll stop getting changes from the others, and your changes won’t be shared. The files already on this iPhone stay in the Files app. Nothing is deleted for anyone.") }
         .onChange(of: bridge.folders.map(\.id)) { _, ids in if !ids.contains(folderID) { dismiss() } }
         .confirmationDialog(removing.map { $0.pending ? "Cancel this invite?" : "Remove \($0.name)?" } ?? "", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible) {
             if let member = removing {
                 Button(member.pending ? "Cancel Invite" : "Remove from Folder", role: .destructive) { run("member") { try await bridge.action("folderRemoveMember", ["folderId": folderID, "pairId": member.pairId]) } }
             }
-        } message: { Text(removing?.pending == true ? "Anyone you already sent this invite to won’t be able to join with it." : "They’ll stop syncing this folder with you.") }
+        } message: { Text(removing?.pending == true ? "Anyone you already sent this invite to won’t be able to join with it." : "They’ll stop getting changes to this folder. The files they already have stay with them.") }
         .sheet(isPresented: $inviting) { InviteFriendsSheet(folder: folder) }
         .sheet(item: $code) { InviteCodeSheet(invite: $0) }
     }
@@ -159,8 +173,10 @@ struct SharedFolderDetailView: View {
         VStack(spacing: 12) {
             Image(systemName: "folder.fill").font(.system(size: 64)).foregroundStyle(.blue).accessibilityHidden(true)
             Text(folder.name).font(.title2.bold()).multilineTextAlignment(.center).lineLimit(3)
-            Text(([folder.modeLabel] + (folder.paused ? ["Paused"] : []) + (folder.autoDelete ? ["Removes files after sending"] : [])).joined(separator: " · "))
-                .font(.subheadline).foregroundStyle(folder.paused ? Color.orange : .secondary).multilineTextAlignment(.center)
+            Text(([FolderModeCopy.title(folder.mode)] + (folder.paused ? ["Paused"] : []) + (folder.autoDelete ? ["Removes files after sending"] : [])).joined(separator: " · "))
+                .font(.subheadline.weight(.semibold)).foregroundStyle(folder.paused ? Color.orange : .secondary).multilineTextAlignment(.center)
+            Text(folder.paused ? "Paused — nothing is sent or received until you tap Resume." : FolderModeCopy.detail(folder.mode))
+                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
         }.frame(maxWidth: .infinity).padding(.vertical, 4)
     }
     private var statusCard: some View {
@@ -168,15 +184,15 @@ struct SharedFolderDetailView: View {
             VStack(alignment: .leading, spacing: 12) {
                 FolderStatusRow(folder: folder)
                 if folder.peerUnshared {
-                    Label("The others no longer share this folder. Your files are still here — you can leave it now.", systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red)
+                    Label("The others stopped sharing this folder. Your files are still here — you can leave it now.", systemImage: "exclamationmark.triangle.fill").font(.footnote).foregroundStyle(.red)
                 }
                 if folder.iAmViewer {
-                    Label("View only: changes you make here are not sent.", systemImage: "eye").font(.footnote).foregroundStyle(.orange)
+                    Label("You’re a Viewer: you can open and copy files, but changes you make here aren’t shared.", systemImage: "eye").font(.footnote).foregroundStyle(.orange)
                 }
                 if folder.busy {
                     HStack(alignment: .firstTextBaseline) {
                         Text("\(Int(folder.percent))%").font(.title3.weight(.bold)).foregroundStyle(.tint)
-                        if folder.locality == "internet" { Text("via relay").font(.footnote).foregroundStyle(.secondary) }
+                        if folder.locality == "internet" { Text("via relay (slower, still encrypted)").font(.footnote).foregroundStyle(.secondary) }
                         Spacer()
                         if folder.state == "sending" {
                             Button { run("stop") { try await bridge.action("folderStop", ["folderId": folderID]) } } label: { Label("Stop", systemImage: "xmark") }.font(.footnote).beamButton().controlSize(.small)
@@ -192,7 +208,7 @@ struct SharedFolderDetailView: View {
                     if folder.queuedFiles.count > 5 { Text("and \(folder.queuedFiles.count - 5) more queued").font(.footnote).foregroundStyle(.secondary) }
                 }
                 if folder.inSync {
-                    Label(folder.peerFiles.map { "In sync — both sides have \($0) file\($0 == 1 ? "" : "s")" } ?? "In sync", systemImage: "checkmark.circle.fill").font(.footnote).foregroundStyle(.green)
+                    Label(folder.peerFiles.map { "Up to date — everyone has the same \($0) file\($0 == 1 ? "" : "s")" } ?? "Up to date", systemImage: "checkmark.circle.fill").font(.footnote).foregroundStyle(.green)
                 }
                 if let s = folder.summary {
                     Text("\(s.direction == "send" ? "Sent" : "Received") \(s.files) file\(s.files == 1 ? "" : "s") · \(Formatters.bytes(s.bytes)) · \(Formatters.speed(s.avgBps, megabits: megabits)) avg")
@@ -209,22 +225,16 @@ struct SharedFolderDetailView: View {
                 }.disabled(busy != nil)
             }
             ActionTile(title: "Open in Files", symbol: "folder") { openInFiles() }.disabled(busy != nil)
-            if folder.mirror {
-                ActionTile(title: busy == "verify" ? "Checking…" : "Verify", symbol: "checkmark.shield") {
-                    verify = nil
-                    run("verify") { verify = try await bridge.call("folderVerify", ["folderId": folderID]) }
-                }.disabled(busy != nil)
-            }
         }
     }
     private func verifyCard(_ r: FolderVerify) -> some View {
         Group {
             if !r.peerOnline || !r.compared {
-                Label("Couldn’t compare right now — the others need to be online. Try again when they are.", systemImage: "wifi.exclamationmark").font(.subheadline)
+                Label("Couldn’t check right now — the others need DropBeam open. Try again when they do.", systemImage: "wifi.exclamationmark").font(.subheadline)
             } else if r.identical {
-                Label("Identical — \(r.matched) file\(r.matched == 1 ? "" : "s") match on both sides.", systemImage: "checkmark.seal.fill").font(.subheadline).foregroundStyle(.green)
+                Label("Everything matches — all \(r.matched) file\(r.matched == 1 ? "" : "s") are the same for everyone.", systemImage: "checkmark.seal.fill").font(.subheadline).foregroundStyle(.green)
             } else {
-                Label("\(r.differences) difference\(r.differences == 1 ? "" : "s") found — syncing now to fix \(r.differences == 1 ? "it" : "them").", systemImage: "arrow.triangle.2.circlepath").font(.subheadline).foregroundStyle(.orange)
+                Label("\(r.differences) file\(r.differences == 1 ? " is" : "s are") different — DropBeam is fixing \(r.differences == 1 ? "it" : "them") now.", systemImage: "arrow.triangle.2.circlepath").font(.subheadline).foregroundStyle(.orange)
             }
         }
     }
@@ -240,8 +250,11 @@ struct SharedFolderDetailView: View {
             }.padding(.vertical, 2)
             ForEach(folder.members) { member in memberRow(member) }
         } header: { Text("People") } footer: {
-            if !folder.members.contains(where: \.canSetRole) && folder.members.contains(where: { !$0.pending }) {
-                Text("Only the person who created this folder can change who can edit.")
+            VStack(alignment: .leading, spacing: 4) {
+                Text("**Editor** — \(RoleCopy.editor).\n**Viewer** — \(RoleCopy.viewer).")
+                if !folder.members.contains(where: \.canSetRole) && folder.members.contains(where: { !$0.pending }) {
+                    Text("Only the person who created this folder can change who is an Editor.")
+                }
             }
         }
         if !folder.iAmViewer {
@@ -272,7 +285,7 @@ struct SharedFolderDetailView: View {
             }
             VStack(alignment: .leading, spacing: 3) {
                 Text(friend?.displayName ?? member.name).font(.body.weight(.semibold)).foregroundStyle(member.pending ? .secondary : .primary).lineLimit(1).alignmentGuide(.listRowSeparatorLeading) { $0[.leading] }
-                if member.pending { Text("Hasn’t accepted yet").font(.footnote).foregroundStyle(.secondary) }
+                if member.pending { Text("Hasn’t joined yet").font(.footnote).foregroundStyle(.secondary) }
                 else if member.canSetRole {
                     Picker("Role", selection: Binding(get: { member.viewer }, set: { viewer in
                         run("role") { try await bridge.action("folderSetRole", ["folderId": folderID, "pairId": member.pairId, "bool": viewer]) }
@@ -369,7 +382,7 @@ struct InviteFriendsSheet: View {
                             }.contentShape(Rectangle())
                         }.buttonStyle(.plain).disabled(sending != nil || sent.contains(friend.id))
                     }
-                } footer: { Text("They’ll get a prompt to join \(folder.name) and choose where to keep it.") }
+                } footer: { Text("They’ll be asked to join \(folder.name) and choose where to keep it.") }
             }
             .beamList()
             .overlay { if candidates.isEmpty { ContentUnavailableView("Everyone’s Already Here", systemImage: "person.2", description: Text("Add more friends from the Friends tab, or share an invite code instead.")) } }
@@ -424,7 +437,7 @@ struct FolderRecoverableView: View {
         .overlay {
             if let error, items.isEmpty { BeamError(message: error) { Task { await load() } } }
             else if loading && items.isEmpty { ProgressView() }
-            else if items.isEmpty { ContentUnavailableView("Nothing to Recover", systemImage: "clock.arrow.circlepath", description: Text("When a file in \(name) is deleted or replaced, a copy waits here so you can bring it back.")) }
+            else if items.isEmpty { ContentUnavailableView("Nothing to Bring Back", systemImage: "clock.arrow.circlepath", description: Text("When a file in \(name) is deleted or replaced, a copy waits here so you can bring it back.")) }
         }
         .navigationTitle("Recoverable Files").navigationBarTitleDisplayMode(.inline)
         .task { await load() }

@@ -1,21 +1,36 @@
 mod account;
+mod device_activity;
+mod device_model;
 mod automation;
 mod block;
 mod codes;
 mod link;
+mod link_preview;
 mod location_sync;
 mod locations;
+mod mailbox;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+mod headless;
 mod chat;
+#[cfg(desktop)]
+mod chat_notify;
+mod clipboard_files;
 mod commands;
 #[cfg(target_os = "ios")]
 mod ios_media;
 mod download_progress;
+// Per-OS tray/popover placement, Linux tray detection, login-item refresh, deep links.
+// (macOS keeps its own popover placement, so the placement helpers are unused there.)
+#[cfg_attr(any(mobile, target_os = "macos"), allow(dead_code))]
+mod desktop_shell;
+mod fanout;
 mod file_protocol;
 mod folder_history;
 mod friends;
 mod fs_walk;
 mod history;
 mod iroh_net;
+mod keep_awake;
 // Gated remote test-and-update surface (Settings → Lab Mode). Off by default;
 // only a named operator device can drive it. See lab.rs for the trust model.
 mod lab;
@@ -28,6 +43,7 @@ mod mac_service;
 mod models;
 // What is mounted right now (NAS shares, external disks), for the Add-a-location wizard.
 mod mounts;
+mod native_shell;
 mod pairing;
 mod panic_log;
 #[cfg(any(target_os = "ios", test))]
@@ -56,6 +72,14 @@ static LAST_POPOVER_HIDE: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mu
 /// A file the app was launched to send (Windows "Send with DropBeam" right-click,
 /// or a second launch forwarded by single-instance). The UI drains it on load.
 static LAUNCH_FILE: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Whether a tray/menu-bar host is showing our icon (see
+/// desktop_shell::tray_host_available). Decided once at setup; true until then.
+static TRAY_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+fn tray_available() -> bool {
+    TRAY_AVAILABLE.load(Ordering::Relaxed)
+}
 #[cfg(desktop)]
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
@@ -145,11 +169,37 @@ fn spawn_upload_queue_consumer(app: tauri::AppHandle, config_dir: PathBuf) {
     });
 }
 
+/// The file or folder the app was launched to send: an absolute path, or a
+/// `file://` URI (Linux "Open with" passes `%U`). Flags and `dropbeam:` links are
+/// not paths and are skipped (links go through the deep-link plugin).
 fn file_from_args(argv: &[String]) -> Option<String> {
-    argv.iter()
-        .skip(1)
-        .find(|a| std::path::Path::new(a.as_str()).is_file())
-        .cloned()
+    argv.iter().skip(1).find_map(|a| desktop_shell::local_path_from_arg(a))
+}
+
+/// Queue `dropbeam:` links for the main window and tell it to take them. The UI
+/// treats them exactly like a pasted/scanned code (describe + confirm), so a link
+/// can never act on its own. Cold-start links wait in the queue until it asks.
+#[cfg(desktop)]
+fn deliver_open_urls(app: &AppHandle, urls: Vec<String>) {
+    let links = desktop_shell::dropbeam_links(urls.iter().map(String::as_str));
+    if links.is_empty() {
+        return;
+    }
+    log::info!("deep link: {} dropbeam: link(s) received", links.len());
+    OPEN_URLS.lock().unwrap().extend(links);
+    show_main_window(app);
+    let _ = tauri::Emitter::emit_to(app, "main", "open-url://incoming", ());
+}
+
+/// `dropbeam:` links the app was opened with (iOS: tapping an invite link or
+/// scanning a friend's QR with the Camera app). Kept until the UI takes them, so
+/// a cold launch — before the web view listens — loses nothing.
+static OPEN_URLS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Returns (and clears) the links the app was opened with.
+#[tauri::command]
+fn take_open_urls() -> Vec<String> {
+    std::mem::take(&mut *OPEN_URLS.lock().unwrap())
 }
 
 /// The UI calls this on launch to pick up a file the app was opened to send
@@ -236,8 +286,25 @@ impl AppState {
     }
 }
 
+/// `DropBeam --server`: the Transfer Server without a window (see headless.rs).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn run_headless(args: &[String]) {
+    headless::run(args)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK's DMA-BUF renderer shows a blank/white window (or crashes) on
+    // NVIDIA's proprietary driver and in some VMs. Turn it off there, before GTK
+    // starts, unless the user already chose a value.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+        && (std::path::Path::new("/proc/driver/nvidia/version").exists()
+            || std::env::var_os("DROPBEAM_SOFTWARE_RENDER").is_some())
+    {
+        // SAFETY (edition 2021): no other threads exist yet at the top of run().
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
     // BUG-23: a launcher shell's closed pipe must return EPIPE, not terminate
     // the app (including when the emergency panic hook writes to stderr).
     #[cfg(unix)]
@@ -270,12 +337,10 @@ pub fn run() {
     // opening a duplicate. (macOS already single-instances .app bundles and has
     // the menu-bar drag-to-send, so it's skipped there.)
     #[cfg(all(desktop, not(target_os = "macos")))]
+    // With its `deep-link` feature it also hands a `dropbeam:` URL in the second
+    // launch's argv to the deep-link plugin (→ deliver_open_urls).
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.show();
-            let _ = window.unminimize();
-            let _ = window.set_focus();
-        }
+        show_main_window(app);
         if let Some(req) = location_upload_from_args(&argv) {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -314,12 +379,18 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        // `dropbeam:` links on macOS/Windows/Linux (scheme registered by the
+        // bundle from plugins.deep-link in tauri.conf.json).
+        .plugin(tauri_plugin_deep_link::init());
     // macOS: panel plugin so the popover can float over full-screen apps.
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .setup(|app| {
+            // #67: install the chat-notification click handler before launch finishes.
+            #[cfg(desktop)]
+            chat_notify::init(app.handle());
             // Always-on logging to a FILE so we can diagnose issues on machines we
             // can't access (e.g. a tester's Windows box — the log lands in
             // %APPDATA%\com.dropbeam.app\logs\DropBeam.log, or ~/Library/Logs/
@@ -484,7 +555,12 @@ pub fn run() {
                     log::error!("could not persist device kind at startup: {e}");
                 }
             }
-            // Sandbox container paths can change across iOS installs.
+            // Sandbox container paths can change across iOS installs, and a folder
+            // the user chose (Settings → Save Files To, iCloud Drive etc.) is only
+            // reachable through a security-scoped bookmark that the native shell
+            // resolves and starts accessing at launch. So the engine always boots
+            // on the app's Documents folder ("On My iPhone → DropBeam" in Files)
+            // and the shell re-applies the chosen folder once its scope is active.
             #[cfg(target_os = "ios")]
             if loaded.download_dir != default_download {
                 loaded.download_dir = default_download.clone();
@@ -499,7 +575,12 @@ pub fn run() {
             // can't be reset by the frontend's full-object settings save, and so we
             // never override a later manual choice to turn it off.
             let bg_marker = config_dir.join(".bg-ready-migrated");
-            if !bg_marker.exists() {
+            // Linux is opt-in (Settings → Launch at login): autostart entries there
+            // are less expected, and with no tray host a hidden login launch is an
+            // invisible app. macOS/Windows keep it on, shown in Settings.
+            if !bg_marker.exists() && cfg!(target_os = "linux") {
+                let _ = std::fs::write(&bg_marker, b"1");
+            } else if !bg_marker.exists() {
                 loaded.launch_at_login = true;
                 // Only record the migration as done if the setting actually persisted.
                 // Writing the marker after a FAILED save (e.g. Windows write
@@ -583,7 +664,9 @@ pub fn run() {
                 // `application:didFinishLaunching:`, so the run loop isn't pumping
                 // yet: calling them here deadlocks the app forever (webview never
                 // paints — a black screen). Do it off-thread once the loop is up.
-                #[cfg(mobile)]
+                // (iOS asks from the native onboarding instead — at the moment
+                // it's explained, never stacked on the Local Network prompt.)
+                #[cfg(all(mobile, not(target_os = "ios")))]
                 {
                     let h = app.handle().clone();
                     std::thread::spawn(move || {
@@ -615,6 +698,18 @@ pub fn run() {
             // toggled the old "Direct mode" off must still get a working app.
             let iroh_state = Arc::new(iroh_net::IrohState::default());
             locations::spawn_gc(config_dir.clone());
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            {
+                // One engine per identity: take it over from a background
+                // `DropBeam --server` service if one is running (headless.rs).
+                let (dir, st, handle) = (config_dir.clone(), iroh_state.clone(), app.handle().clone());
+                std::thread::spawn(move || {
+                    let lock = headless::lock_for_app(&dir);
+                    std::mem::forget(lock);
+                    iroh_net::spawn(dir, st, handle);
+                });
+            }
+            #[cfg(any(target_os = "ios", target_os = "android"))]
             iroh_net::spawn(config_dir.clone(), iroh_state.clone(), app.handle().clone());
             // Synced folders: a local folder this device keeps copied into a
             // friend's Location. Starts its own reconcile a few seconds in, once
@@ -624,6 +719,8 @@ pub fn run() {
             iroh_net::spawn_chat_outbox_retry(app.handle().clone(), iroh_state.clone());
             // Keep the user's own devices (same account) in step: friends, chats, devices.
             account::spawn(app.handle().clone(), iroh_state.clone());
+            // Tell the user's other devices what this one is sending/receiving (#31).
+            device_activity::spawn(app.handle().clone(), iroh_state.clone());
             // Background diagnostics: periodically upload a REDACTED error/perf digest
             // so background problems surface without users reporting them. Uploads ONLY
             // to the operator-configured `settings.diagnostics_url` (empty by default →
@@ -664,7 +761,27 @@ pub fn run() {
             #[cfg(desktop)]
             {
                 build_tray(app.handle())?;
-                log::info!("setup: tray built");
+                let tray_ok = desktop_shell::tray_host_available();
+                TRAY_AVAILABLE.store(tray_ok, Ordering::Relaxed);
+                log::info!("setup: tray built (tray host available: {tray_ok})");
+
+                // Deep links: one that cold-started the app, then any later ones.
+                use tauri_plugin_deep_link::DeepLinkExt;
+                #[cfg(target_os = "linux")]
+                if app.env().appimage.is_some() {
+                    // .deb/.rpm register the scheme in their .desktop file; an
+                    // AppImage has to do it itself.
+                    if let Err(e) = app.deep_link().register_all() {
+                        log::warn!("deep link: could not register dropbeam: scheme: {e}");
+                    }
+                }
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    deliver_open_urls(app.handle(), urls.iter().map(|u| u.to_string()).collect());
+                }
+                let h = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    deliver_open_urls(&h, event.urls().iter().map(|u| u.to_string()).collect());
+                });
             }
 
             // Register (or clear) the login item so DropBeam is ready to receive
@@ -685,7 +802,18 @@ pub fn run() {
             // front), then show it. On an autostart launch (`--minimized` from the
             // login item) stay quietly in the menu bar, ready to receive.
             let autostart_launch = std::env::args().any(|a| a == "--minimized");
-            if autostart_launch {
+            if autostart_launch && !tray_available() {
+                // No tray to live in (e.g. GNOME without the AppIndicator
+                // extension): start minimized to the taskbar/dock instead of
+                // invisible, so the user can still find the running app.
+                log::info!("setup: launched at login with no tray host — minimized window");
+                #[cfg(desktop)]
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    #[cfg(desktop)]
+                    let _ = w.minimize();
+                }
+            } else if autostart_launch {
                 log::info!("setup: launched at login — staying in the menu bar");
             } else {
                 set_dock_icon_visible(app.handle(), true);
@@ -739,7 +867,13 @@ pub fn run() {
                     .try_state::<Arc<AppState>>()
                     .map(|s| s.settings.lock().unwrap().minimize_to_tray)
                     .unwrap_or(true);
-                if !force && minimize {
+                if !force && minimize && !tray_available() {
+                    // No tray host: hiding would leave no way back in. Keep it
+                    // running (still receiving) as a minimized window instead.
+                    #[cfg(desktop)]
+                    let _ = window.minimize();
+                    api.prevent_close();
+                } else if !force && minimize {
                     let _ = window.hide();
                     api.prevent_close();
                     // Back to a menu-bar-only app (no Dock icon) while the window
@@ -782,18 +916,26 @@ pub fn run() {
             ios_media::pick_photos,
             #[cfg(target_os = "ios")]
             ios_media::share_files,
+            native_shell::network_changed,
+            native_shell::lan_self_info,
+            native_shell::lan_peer_found,
+            native_shell::push_unregister_all,
+            native_shell::network_shutdown,
             commands::pick_directory,
             commands::set_profile_avatar,
             commands::clear_profile_avatar,
             commands::reveal_path,
             commands::save_pasted_image,
             commands::paste_clipboard_image,
+            clipboard_files::clipboard_file_paths,
             commands::open_path,
             commands::export_diagnostics,
             commands::diagnostics_test,
             commands::restart_app,
             commands::lan_network_blocked,
             commands::open_local_network_settings,
+            commands::open_privacy_settings,
+            commands::set_keep_awake,
             commands::open_url,
             commands::open_mailto,
             commands::open_main_window,
@@ -811,10 +953,14 @@ pub fn run() {
             link::link_host_cancel,
             link::link_device_join,
             account::account_sync_now,
+            device_activity::other_device_activity,
             account::account_remove_device,
             account::account_leave,
             link::link_device_cancel,
             link::link_device_send,
+            link::link_device_prepare,
+            link::link_confirm,
+            crate::account::account_approve_device,
             link::my_device_info,
             commands::verify_folders,
             commands::verify_folder,
@@ -836,11 +982,15 @@ pub fn run() {
             commands::create_friend,
             commands::accept_friend,
             commands::list_friends,
+            commands::list_friend_requests,
+            commands::accept_friend_request,
+            commands::decline_friend_request,
             commands::rename_friend,
             commands::remove_friend,
             commands::block_friend,
             commands::unblock_person,
             commands::list_blocked,
+            commands::friends_look_alike,
             commands::set_friend_auto_accept,
             commands::respond_to_offer,
             commands::ping_friend,
@@ -855,6 +1005,25 @@ pub fn run() {
             commands::location_request,
             commands::upload_to_location,
             mounts::list_mount_candidates,
+            mailbox::cmds::server_check_device,
+            mailbox::cmds::server_folder_space,
+            mailbox::cmds::server_status,
+            mailbox::cmds::server_configure,
+            mailbox::cmds::server_remove_person,
+            mailbox::cmds::server_restore_person,
+            mailbox::cmds::server_wipe,
+            mailbox::cmds::server_disable,
+            mailbox::cmds::server_set_owner,
+            mailbox::cmds::mailbox_servers,
+            mailbox::cmds::mailbox_server_prefs,
+            mailbox::cmds::mailbox_forget_server,
+            mailbox::cmds::mailbox_fetch_now,
+            mailbox::cmds::mailbox_hold_route,
+            mailbox::cmds::mailbox_pending_files,
+            mailbox::cmds::mailbox_decide_file,
+            mailbox::cmds::push_set_device,
+            mailbox::cmds::push_set_previews,
+            mailbox::cmds::push_status,
             location_sync::list_synced_folders,
             location_sync::synced_folder_statuses,
             location_sync::add_synced_folder,
@@ -876,6 +1045,7 @@ pub fn run() {
             commands::delete_chat_message,
             commands::send_typing,
             commands::send_read_receipt,
+            commands::chat_mark_seen,
             commands::download_gif,
             commands::send_chat_gif,
             commands::set_active_chat,
@@ -886,11 +1056,23 @@ pub fn run() {
             traydrag_debug,
             frontend_log,
             take_launch_file,
+            take_open_urls,
             set_popover_rows,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DropBeam")
         .run(|_app, _event| {
+            // A `dropbeam:` link (invite link, Camera-scanned friend QR): queue it
+            // for the UI and tell a running one right away.
+            #[cfg(target_os = "ios")]
+            if let tauri::RunEvent::Opened { urls } = &_event {
+                let links: Vec<String> = urls.iter().map(|u| u.to_string())
+                    .filter(|u| u.to_ascii_lowercase().starts_with("dropbeam")).collect();
+                if !links.is_empty() {
+                    OPEN_URLS.lock().unwrap().extend(links);
+                    let _ = tauri::Emitter::emit(_app, "open-url://incoming", ());
+                }
+            }
             // macOS: clicking the Dock icon (or otherwise re-opening the app) when
             // the main window is hidden/minimized should bring it back. Without
             // this the window "disappears" after it's been hidden to the tray.
@@ -988,15 +1170,22 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         });
 
-    // A dedicated monochrome beam glyph (template) for the menu bar — templating
-    // the full app icon just yields a solid square silhouette.
-    match tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png")) {
+    // macOS: a dedicated monochrome beam glyph (template) — the menu bar tints it
+    // for light/dark. Windows/Linux don't tint tray icons, and a black glyph
+    // vanishes on a dark taskbar/panel, so they get the brand-coloured glyph that
+    // reads on both light and dark.
+    #[cfg(target_os = "macos")]
+    let tray_png: &[u8] = include_bytes!("../icons/tray.png");
+    #[cfg(not(target_os = "macos"))]
+    let tray_png: &[u8] = include_bytes!("../icons/tray-color.png");
+    let template = cfg!(target_os = "macos");
+    match tauri::image::Image::from_bytes(tray_png) {
         Ok(icon) => {
-            builder = builder.icon(icon).icon_as_template(true);
+            builder = builder.icon(icon).icon_as_template(template);
         }
         Err(_) => {
             if let Some(icon) = app.default_window_icon() {
-                builder = builder.icon(icon.clone()).icon_as_template(true);
+                builder = builder.icon(icon.clone()).icon_as_template(template);
             }
         }
     }
@@ -1056,18 +1245,46 @@ fn toggle_popover(app: &AppHandle, cursor: tauri::PhysicalPosition<f64>) {
     if just_hid {
         return;
     }
-    // Cursor is physical; convert to logical so layout math matches window size.
-    let scale = w.scale_factor().unwrap_or(1.0);
-    let cx = cursor.x / scale;
-    let cy = cursor.y / scale;
-    let pop_w = 300.0;
-    let x = (cx - pop_w / 2.0).max(8.0);
-    let y = cy + 8.0; // just under the menu bar
-    let _ = w.set_position(tauri::LogicalPosition::new(x, y));
     #[cfg(target_os = "macos")]
-    tray_drag::show_popover_key(app);
+    {
+        // Cursor is physical; convert to logical so layout math matches window size.
+        let scale = w.scale_factor().unwrap_or(1.0);
+        let cx = cursor.x / scale;
+        let cy = cursor.y / scale;
+        let pop_w = 300.0;
+        let x = (cx - pop_w / 2.0).max(8.0);
+        let y = cy + 8.0; // just under the menu bar
+        let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+        tray_drag::show_popover_key(app);
+    }
     #[cfg(not(target_os = "macos"))]
     {
+        // Windows/Linux: the tray usually sits in a BOTTOM taskbar, so open above
+        // the icon and keep the whole popover inside the work area of the monitor
+        // that was clicked (multi-monitor, scaled displays, side taskbars). All
+        // in physical pixels of that monitor. (Wayland ignores set_position — the
+        // compositor places the window; nothing more we can do there.)
+        let monitor = app
+            .monitor_from_point(cursor.x, cursor.y)
+            .ok()
+            .flatten()
+            .or_else(|| w.current_monitor().ok().flatten())
+            .or_else(|| app.primary_monitor().ok().flatten());
+        let (x, y) = match monitor {
+            Some(m) => {
+                let s = m.scale_factor();
+                let wa = m.work_area();
+                let rect = desktop_shell::Rect {
+                    x: wa.position.x as f64,
+                    y: wa.position.y as f64,
+                    w: wa.size.width as f64,
+                    h: wa.size.height as f64,
+                };
+                desktop_shell::popover_origin(cursor.x, cursor.y, 300.0 * s, 390.0 * s, 8.0 * s, rect)
+            }
+            None => (cursor.x - 150.0, cursor.y - 398.0),
+        };
+        let _ = w.set_position(tauri::PhysicalPosition::new(x.round() as i32, y.round() as i32));
         let _ = w.show();
         let _ = w.set_focus();
     }

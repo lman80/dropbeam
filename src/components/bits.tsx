@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Cloud, Loader2, Wifi, Zap } from 'lucide-react'
+import { ArrowLeftRight, Cloud, Folder, Laptop, Loader2, Monitor, Wifi, Zap } from 'lucide-react'
 import type { Locality } from '../lib/api'
 
 /** The app mark: a flat accent tile with the beam glyph (no gradient). */
@@ -86,4 +86,16 @@ export { ProgressBar, Spinner, EmptyState } from './ui'
 
 export function SectionTitle({ children }: { children: ReactNode }) {
   return <h2 className="section-title">{children}</h2>
+}
+
+/** Two computers holding the same folder, with arrows between them — the
+ *  one-glance picture of "a shared folder is the same folder everywhere". */
+export function SameFolderArt() {
+  return (
+    <div className="same-folder-art" aria-hidden>
+      <span className="sfa-device"><Laptop strokeWidth={1.5} /><Folder className="sfa-folder" strokeWidth={1.75} /></span>
+      <span className="sfa-arrows"><ArrowLeftRight strokeWidth={1.75} /></span>
+      <span className="sfa-device"><Monitor strokeWidth={1.5} /><Folder className="sfa-folder" strokeWidth={1.75} /></span>
+    </div>
+  )
 }

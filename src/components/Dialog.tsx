@@ -3,7 +3,7 @@
 // surface panel with a title row (title + optional subtitle + close ×), a
 // scrolling body and an optional footer of actions. Escape closes the TOPMOST
 // dialog only; a click on the backdrop closes it too (unless busy).
-import { useEffect, useId, useRef, type CSSProperties, type ReactNode } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
 import { motion } from 'framer-motion'
 import { X } from 'lucide-react'
 import { MOBILE_UI } from '../lib/platform'
@@ -45,6 +45,124 @@ export function useEscape(onClose: (() => void) | undefined) {
   }, [enabled])
 }
 
+// ── Modal focus: trap, inert background, initial focus, restore ──────────────
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
+const modalStack: HTMLElement[] = []
+/** Was the last input a pointer? Then a restored focus shouldn't draw a ring. */
+let lastInputPointer = false
+if (typeof window !== 'undefined') {
+  window.addEventListener('pointerdown', () => { lastInputPointer = true }, true)
+  window.addEventListener('keydown', () => { lastInputPointer = false }, true)
+}
+/** How many open modals made each background element inert (nested dialogs). */
+const inertCount = new WeakMap<Element, number>()
+
+function focusables(root: HTMLElement): HTMLElement[] {
+  return [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.getClientRects().length > 0 && !el.closest('[inert]'))
+}
+
+/** Everything outside `el` (siblings of it and of each ancestor up to <body>),
+ *  except live surfaces that must stay usable: toasts, tooltips, menus. */
+function backgroundOf(el: HTMLElement): Element[] {
+  const out: Element[] = []
+  let node: HTMLElement | null = el
+  while (node && node.parentElement && node !== document.body) {
+    for (const sib of node.parentElement.children) {
+      if (sib === node || sib.tagName === 'SCRIPT' || sib.tagName === 'STYLE') continue
+      if (sib.matches('.app-toasts, .tooltip, .menu, .popover-panel-ui')) continue
+      out.push(sib)
+    }
+    node = node.parentElement
+  }
+  return out
+}
+
+/**
+ * The modal contract every dialog-shaped surface shares: on open, remember what
+ * had focus, make the rest of the window inert (no Tab, click or screen-reader
+ * escape), and move focus inside (an autofocus field, else the first field, else
+ * the default button, else the panel); Tab cycles within; on close, the
+ * background comes back and focus returns where it was.
+ */
+export function useModalFocus(panelRef: RefObject<HTMLElement | null>, overlayRef?: RefObject<HTMLElement | null>) {
+  // Captured during the first render — before an autoFocus child steals focus.
+  const [opener] = useState(() => (typeof document === 'undefined' ? null : document.activeElement as HTMLElement | null))
+  useLayoutEffect(() => {
+    const panel = panelRef.current
+    if (!panel || MOBILE_UI) return
+    const root = overlayRef?.current ?? panel
+    const previous = opener
+    modalStack.push(panel)
+    const bg = backgroundOf(root)
+    for (const el of bg) {
+      const n = inertCount.get(el) ?? 0
+      inertCount.set(el, n + 1)
+      if (n === 0) el.setAttribute('inert', '')
+    }
+    // Initial focus (an element that autofocused itself already won).
+    if (!panel.contains(document.activeElement)) {
+      const target =
+        panel.querySelector<HTMLElement>('[autofocus], [data-autofocus]') ??
+        panel.querySelector<HTMLElement>('.dialog-body :is(input, textarea, select):not([disabled])') ??
+        panel.querySelector<HTMLElement>('.dialog-footer .btn-primary:not([disabled])') ??
+        focusables(panel).find((el) => !el.closest('.dialog-head')) ??
+        panel
+      if (target === panel && !panel.hasAttribute('tabindex')) panel.setAttribute('tabindex', '-1')
+      target.focus({ preventScroll: true })
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab' || modalStack[modalStack.length - 1] !== panel) return
+      const list = focusables(panel)
+      if (!list.length) { e.preventDefault(); panel.focus(); return }
+      const first = list[0]
+      const last = list[list.length - 1]
+      const active = document.activeElement as HTMLElement | null
+      if (e.shiftKey && (active === first || !panel.contains(active))) { e.preventDefault(); last.focus() }
+      else if (!e.shiftKey && (active === last || !panel.contains(active))) { e.preventDefault(); first.focus() }
+    }
+    document.addEventListener('keydown', onKey, true)
+    return () => {
+      document.removeEventListener('keydown', onKey, true)
+      const i = modalStack.indexOf(panel)
+      if (i >= 0) modalStack.splice(i, 1)
+      for (const el of bg) {
+        const n = (inertCount.get(el) ?? 1) - 1
+        if (n <= 0) { inertCount.delete(el); el.removeAttribute('inert') }
+        else inertCount.set(el, n)
+      }
+      if (previous && previous.isConnected && typeof previous.focus === 'function') {
+        // focusVisible is honoured by Chromium/WebView2; WebKit ignores it harmlessly.
+        previous.focus({ preventScroll: true, focusVisible: !lastInputPointer } as FocusOptions)
+      }
+    }
+    // Mount/unmount only: the trap follows the panel element itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+}
+
+/** Dialogs that a parent unmounts without an AnimatePresence still fade out:
+ *  on unmount a non-interactive snapshot of the overlay fades away in its place. */
+function useFadeOutGhost(ref: RefObject<HTMLElement | null>) {
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el || MOBILE_UI) return
+    return () => {
+      if (!el.isConnected || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+      // Already faded by a parent AnimatePresence: nothing left to show.
+      if (Number(getComputedStyle(el).opacity) < 0.05) return
+      const ghost = el.cloneNode(true) as HTMLElement
+      ghost.removeAttribute('id')
+      ghost.setAttribute('aria-hidden', 'true')
+      ghost.setAttribute('inert', '')
+      ghost.classList.add('dialog-ghost')
+      document.body.appendChild(ghost)
+      requestAnimationFrame(() => ghost.classList.add('leaving'))
+      window.setTimeout(() => ghost.remove(), 220)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+}
+
 export function Dialog({
   title,
   subtitle,
@@ -76,8 +194,13 @@ export function Dialog({
   const titleId = useId()
   const close = onClose && !busy ? onClose : undefined
   useEscape(close)
+  const overlayRef = useRef<HTMLDivElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  useModalFocus(panelRef, overlayRef)
+  useFadeOutGhost(overlayRef)
   return (
     <motion.div
+      ref={overlayRef}
       className="dialog-overlay"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
@@ -88,6 +211,7 @@ export function Dialog({
       onMouseDown={(e) => { if (e.target === e.currentTarget) close?.() }}
     >
       <motion.div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={title ? titleId : undefined}

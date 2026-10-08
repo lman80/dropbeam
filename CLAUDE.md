@@ -1,3 +1,5 @@
+# DropBeam — agent instructions
+
 <!-- superfeedback:handling v2 -->
 ## User feedback (SuperFeedback) — keep the Issues up to date
 

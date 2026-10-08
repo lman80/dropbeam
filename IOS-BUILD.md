@@ -461,3 +461,10 @@ Compatibility with older iOS versions remains unverified.
 No simulator installation or launch was performed. The operator still needs to
 check portrait/landscape safe areas, status-bar contrast in light/dark appearance,
 and the first-run display name. Existing saved names are preserved.
+
+
+## Transfer Server additions (2026-09-26)
+
+- `DropBeamNotify` Notification Service Extension target (gen/apple/DropBeamNotify, project.yml). After editing project.yml run `cd src-tauri/gen/apple && xcodegen generate --spec project.yml` and commit the regenerated app.xcodeproj.
+- App Group `group.com.ashtonmiller.dropbeam` on the app + NSE (same group the share extension uses — when merging share-ext, keep ONE `application-groups` line per target in project.yml and regenerate with xcodegen instead of hand-merging project.pbxproj).
+- Push is off until `scripts/enable-push.sh` (adds `aps-environment`) — see docs/PUSH-SETUP.md.

@@ -1,0 +1,18 @@
+# Simulator XCUITest harness for the iOS app (real taps/swipes). xcodegen generate; then
+# xcodebuild test -project DBUITest.xcodeproj -scheme UITests -destination id=<sim udid>
+# Screenshots land in /tmp/shots/ui-*.png. Tests assume the QA sim data (friend ids, 3-photo chat).
+name: DBUITest
+options: { bundleIdPrefix: qa.dbuitest, deploymentTarget: { iOS: "17.0" } }
+targets:
+  Runner:
+    type: application
+    platform: iOS
+    sources: [Runner]
+    info: { path: Runner/Info.plist, properties: { UILaunchScreen: {} } }
+    settings: { base: { CODE_SIGNING_ALLOWED: NO, GENERATE_INFOPLIST_FILE: YES } }
+  UITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies: [{ target: Runner }]
+    settings: { base: { TEST_TARGET_NAME: Runner, CODE_SIGNING_ALLOWED: NO, GENERATE_INFOPLIST_FILE: YES } }

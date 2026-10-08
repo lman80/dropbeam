@@ -15,6 +15,10 @@ struct Friend: Decodable, Identifiable {
     /// Set on a friend's extra device (same account as an older record): it is
     /// shown and chatted with as part of that person, never as its own row.
     var groupedUnder: String?
+    /// Other contacts this one might be (same name or photo, not linked): a hint only.
+    var lookAlikeWith: [String] = []
+    /// We added them but they haven't accepted us yet: messages wait until they do.
+    var awaitingAccept: Bool?
     /// The name to show: "Your iPhone" for an own device, else the friend's name.
     var displayName: String { ownDevice ? (ownLabel ?? name) : name }
 }
@@ -27,6 +31,8 @@ struct MyDevice: Decodable {
     var linkedDevices: Int?
     var devices: [AccountDevice] = []
     var inAccount: Bool { !(accountPub ?? "").isEmpty }
+    /// The account's devices minus any still waiting for approval.
+    var linked: [AccountDevice] { devices.filter { !$0.needsApproval } }
 }
 /// A device in this account (the first one is this device).
 struct AccountDevice: Decodable, Identifiable {
@@ -36,8 +42,38 @@ struct AccountDevice: Decodable, Identifiable {
     var name: String
     var deviceKind: String?
     var deviceOs: String?
+    /// "iPhone 15", "MacBook Air" — absent from older builds.
+    var deviceModel: String?
     var lastSyncMs: Double?
     var thisDevice: Bool
+    /// Proves the account key but no remaining device vouched for it (linked by an
+    /// older build, or by a device since removed): the user must approve it (S4).
+    var needsApproval: Bool = false
+}
+/// Labels for the user's OWN devices: "Your iPhone", "Your Mac". When two would
+/// read the same, each says its model ("Your iPhone 15" / "Your iPhone 12");
+/// still alike → device names if they tell them apart, else "Your iPhone" /
+/// "Your iPhone (2)" in a stable order. Mirrors ownDeviceLabels in
+/// src/lib/deviceIcons.ts.
+func ownDeviceLabels(_ devices: [(id: String, name: String, noun: String, model: String?)]) -> [String: String] {
+    let first = devices.map { d -> String in
+        if devices.filter({ $0.noun == d.noun }).count == 1 { return "Your \(d.noun)" }
+        let model = (d.model ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return "Your \(model.isEmpty ? d.noun : model)"
+    }
+    var out: [String: String] = [:]
+    for (i, d) in devices.enumerated() {
+        let same = devices.indices.filter { first[$0] == first[i] }
+        if same.count == 1 { out[d.id] = first[i]; continue }
+        let names = same.map { devices[$0].name.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let taken = Set(first.filter { $0 != first[i] })
+        if Set(names).count == names.count, !names.contains(where: { $0.isEmpty || $0 == d.noun || taken.contains($0) }) {
+            out[d.id] = d.name.trimmingCharacters(in: .whitespacesAndNewlines); continue
+        }
+        let n = (same.map { devices[$0].id }.sorted().firstIndex(of: d.id) ?? 0) + 1
+        out[d.id] = n == 1 ? first[i] : "\(first[i]) (\(n))"
+    }
+    return out
 }
 struct Transfer: Decodable, Identifiable {
     let id: String
@@ -63,6 +99,10 @@ struct Transfer: Decodable, Identifiable {
     var connDetail: ConnDetail?
     var verify: VerifyReport?
     var integrity: [FileIntegrity]?
+    /// Transfer Server name: uploading to it ("transferring") or held there ("held").
+    var heldOn: String?
+    /// A send to a friend with several devices: where it is on each one.
+    var deliveries: [Delivery]?
     var active: Bool { ["starting", "waitingForPeer", "connecting", "waitingForAccept", "transferring"].contains(state ?? "") }
     var title: String { (fileCount ?? 0) > 1 ? "\(fileCount ?? 0) files" : fileNames?.first ?? "Files" }
     var status: String {
@@ -76,6 +116,7 @@ struct Transfer: Decodable, Identifiable {
         case "failed": return "Transfer failed"
         case "paused": return "Paused"
         case "canceled": return "Canceled"
+        case "held": return "Waiting on \(heldOn ?? "a Transfer Server")"
         default: return "Preparing"
         }
     }
@@ -105,12 +146,32 @@ struct ChatMessage: Decodable, Identifiable, Equatable {
     var gif: ChatGif?
     var fileXferId: String?
     var fileXferFailed: Bool?
+    /// Sender side: the Transfer Server holding this message (status "held").
+    var heldOn: String?
+    /// Why a server couldn't deliver: expired | lost | refused | full | paused | unreachable | needs_update.
+    var serverNote: String?
+    /// Receiver side: arrived through this Transfer Server.
+    var via: String?
+    /// Sender side: a file sent to a friend's several devices — where it is on each.
+    var deliveries: [Delivery]?
+    /// A link preview the sender's device fetched (#47); nothing is fetched here.
+    var linkPreview: ChatLinkPreview?
     var date: Date { Date(timeIntervalSince1970: ts / 1000) }
     var preview: String { deleted == true ? "Message deleted" : text?.isEmpty == false ? (text ?? "") : files?.joined(separator: ", ") ?? "Attachment" }
 }
 struct ChatReaction: Decodable, Equatable {
     var emoji: String?
     var fromMe: Bool?
+}
+/// #47: title / site / a small JPEG (data: URL) that came with the message.
+struct ChatLinkPreview: Decodable, Equatable {
+    var url: String
+    var title: String?
+    var description: String?
+    var siteName: String?
+    var image: String?
+    var imageW: Double?
+    var imageH: Double?
 }
 struct ChatGif: Decodable, Equatable {
     var url: String?
@@ -136,6 +197,7 @@ struct Settings: Decodable {
     var notifyOnComplete: Bool?
     var notifyOnMessage: Bool?
     var sendReadReceipts: Bool?
+    var linkPreviews: Bool?
     var directMode: Bool?
     var preferDirectP2p: Bool?
     var requireDirect: Bool?
@@ -189,6 +251,40 @@ struct LinkResult: Decodable {
     var name: String?
     var deviceKind: String?
     var deviceOs: String?
+}
+/// `linkDevicePrepare`: whose device-link code was scanned, and the safety code
+/// both devices show before anything is linked (S1).
+struct LinkPreviewInfo: Decodable {
+    var name: String
+    var safety: String
+    /// "give": that device gets this account; "take": this device joins theirs.
+    var direction: String
+    /// False when the other device is too old to show the safety code.
+    var peerShowsCode: Bool
+}
+/// `link://confirm`: another device scanned this one's code and waits for a yes.
+struct LinkConfirmRequest: Equatable {
+    var endpointId: String
+    var name: String
+    var safety: String
+    var joining: Bool
+    init?(_ payload: Any?) {
+        guard let p = payload as? [String: Any], let eid = p["endpointId"] as? String, !eid.isEmpty,
+              let safety = p["safety"] as? String, !safety.isEmpty else { return nil }
+        endpointId = eid
+        let n = (p["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        name = n.isEmpty ? "Your other device" : n
+        self.safety = safety
+        joining = p["joining"] as? Bool ?? false
+    }
+}
+/// Someone new who introduced themselves: a request, not yet a friend (S2).
+struct FriendRequest: Decodable, Identifiable, Equatable {
+    var endpointId: String
+    var name: String
+    /// When they asked (ms since 1970).
+    var at: Double?
+    var id: String { endpointId }
 }
 // Accept any JSON result for actions whose return value the UI doesn't need.
 struct IgnoredResult: Decodable { init(from decoder: Decoder) throws {} }
@@ -320,7 +416,7 @@ extension Friend {
         self.id = try c.decode(String.self, forKey: BridgeKey("id"))
         self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Unknown"
         self.endpointId = (try? c.decode(String.self, forKey: BridgeKey("endpointId")))
-        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar")))
+        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar"))).flatMap { $0.isEmpty ? nil : $0 }
         self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
         self.accountPub = (try? c.decode(String.self, forKey: BridgeKey("accountPub")))
         self.autoAccept = (try? c.decode(Bool.self, forKey: BridgeKey("autoAccept")))
@@ -328,6 +424,8 @@ extension Friend {
         self.ownDevice = (try? c.decode(Bool.self, forKey: BridgeKey("ownDevice"))) ?? false
         self.ownLabel = (try? c.decode(String.self, forKey: BridgeKey("ownLabel")))
         self.groupedUnder = (try? c.decode(String.self, forKey: BridgeKey("groupedUnder")))
+        self.lookAlikeWith = (try? c.decode([String].self, forKey: BridgeKey("lookAlikeWith"))) ?? []
+        self.awaitingAccept = (try? c.decode(Bool.self, forKey: BridgeKey("awaitingAccept")))
     }
 }
 extension BlockedPerson {
@@ -347,8 +445,11 @@ extension AccountDevice {
         self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Device"
         self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
         self.deviceOs = (try? c.decode(String.self, forKey: BridgeKey("deviceOs")))
+        self.deviceModel = (try? c.decode(String.self, forKey: BridgeKey("deviceModel")))
         self.lastSyncMs = (try? c.decode(Double.self, forKey: BridgeKey("lastSyncMs")))
         self.thisDevice = (try? c.decode(Bool.self, forKey: BridgeKey("thisDevice"))) ?? false
+        self.needsApproval = (try? c.decode(Bool.self, forKey: BridgeKey("needsApproval")))
+            ?? (try? c.decode(Bool.self, forKey: BridgeKey("needs_approval"))) ?? false
     }
 }
 
@@ -391,6 +492,8 @@ extension Transfer {
         self.connDetail = (try? c.decode(ConnDetail.self, forKey: BridgeKey("connDetail")))
         self.verify = (try? c.decode(VerifyReport.self, forKey: BridgeKey("verify")))
         self.integrity = (try? c.decode(LossyArray<FileIntegrity>.self, forKey: BridgeKey("integrity")))?.values
+        self.heldOn = (try? c.decode(String.self, forKey: BridgeKey("heldOn"))).flatMap { $0.isEmpty ? nil : $0 }
+        self.deliveries = (try? c.decode(LossyArray<Delivery>.self, forKey: BridgeKey("deliveries")))?.values
     }
 }
 
@@ -424,6 +527,11 @@ extension ChatMessage {
         self.gif = (try? c.decode(ChatGif.self, forKey: BridgeKey("gif")))
         self.fileXferId = (try? c.decode(String.self, forKey: BridgeKey("fileXferId")))
         self.fileXferFailed = (try? c.decode(Bool.self, forKey: BridgeKey("fileXferFailed")))
+        self.heldOn = (try? c.decode(String.self, forKey: BridgeKey("heldOn"))).flatMap { $0.isEmpty ? nil : $0 }
+        self.serverNote = (try? c.decode(String.self, forKey: BridgeKey("serverNote"))).flatMap { $0.isEmpty ? nil : $0 }
+        self.via = (try? c.decode(String.self, forKey: BridgeKey("via"))).flatMap { $0.isEmpty ? nil : $0 }
+        self.deliveries = (try? c.decode(LossyArray<Delivery>.self, forKey: BridgeKey("deliveries")))?.values
+        self.linkPreview = (try? c.decode(ChatLinkPreview.self, forKey: BridgeKey("linkPreview")))
     }
 }
 
@@ -467,12 +575,13 @@ extension Settings {
         self.downloadDir = (try? c.decode(String.self, forKey: BridgeKey("downloadDir")))
         self.displayName = (try? c.decode(String.self, forKey: BridgeKey("displayName")))
         self.theme = (try? c.decode(String.self, forKey: BridgeKey("theme")))
-        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar")))
+        self.avatar = (try? c.decode(String.self, forKey: BridgeKey("avatar"))).flatMap { $0.isEmpty ? nil : $0 }
         self.showMegabits = (try? c.decode(Bool.self, forKey: BridgeKey("showMegabits")))
         self.playSounds = (try? c.decode(Bool.self, forKey: BridgeKey("playSounds")))
         self.notifyOnComplete = (try? c.decode(Bool.self, forKey: BridgeKey("notifyOnComplete")))
         self.notifyOnMessage = (try? c.decode(Bool.self, forKey: BridgeKey("notifyOnMessage")))
         self.sendReadReceipts = (try? c.decode(Bool.self, forKey: BridgeKey("sendReadReceipts")))
+        self.linkPreviews = (try? c.decode(Bool.self, forKey: BridgeKey("linkPreviews")))
         self.directMode = (try? c.decode(Bool.self, forKey: BridgeKey("directMode")))
         self.preferDirectP2p = (try? c.decode(Bool.self, forKey: BridgeKey("preferDirectP2p")))
         self.requireDirect = (try? c.decode(Bool.self, forKey: BridgeKey("requireDirect")))
@@ -513,6 +622,16 @@ extension ConnectionCheck {
         self.online = (try? c.decode(Bool.self, forKey: BridgeKey("online")))
         self.path = (try? c.decode(String.self, forKey: BridgeKey("path")))
         self.rttMs = (try? c.decode(Double.self, forKey: BridgeKey("rttMs"))).flatMap { $0.isFinite && abs($0) < 9_000_000_000_000_000 ? $0 : nil }
+    }
+}
+
+extension FriendRequest {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.endpointId = try c.decode(String.self, forKey: BridgeKey("endpointId"))
+        let name = ((try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        self.name = name.isEmpty ? "Someone" : name
+        self.at = (try? c.decode(Double.self, forKey: BridgeKey("at"))).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
     }
 }
 
@@ -672,6 +791,14 @@ struct FileIntegrity: Decodable, Identifiable, Equatable {
 struct OpenCodeResult: Decodable {
     var kind: String
     var code: String?
+    var name: String?
+    /// Set when a friend was added: drives "Waiting for Alex…" → "Connected".
+    var friendId: String?
+}
+/// `describeCode`: what a pasted/scanned/linked text holds (nothing is done yet).
+struct CodeDescription: Decodable {
+    var kind: String
+    var code: String
     var name: String?
 }
 extension ConnDetail {
@@ -858,5 +985,119 @@ extension FolderVerify {
         let int = { (key: String) in (try? c.decode(Int.self, forKey: BridgeKey(key))) ?? 0 }
         self.peerOnline = bool("peerOnline"); self.compared = bool("compared"); self.identical = bool("identical")
         self.matched = int("matched"); self.differences = int("differences"); self.localFiles = int("localFiles"); self.peerFiles = int("peerFiles")
+    }
+}
+
+/// A Transfer Server this device may use (a friend's always-on computer, or the user's own).
+struct UsableServer: Decodable, Identifiable, Equatable {
+    var id: String { eid }
+    let eid: String
+    var name: String
+    var own: Bool
+    var member: Bool
+    var through: Bool
+    var useIt: Bool
+    var holdForMe: Bool
+    /// "new" → show the one-time offer card; "seen" | "dismissed" | "".
+    var offer: String
+    var revoked: Bool
+    var paused: Bool
+    var learnedMs: Double
+    /// The server says it's ours (this device is one of its owner's devices).
+    var owner: Bool = false
+    /// We let our friends use it.
+    var shareFriends: Bool = false
+    var access: String = ""
+    /// Friends' devices that told us about it (it's their own server).
+    var via: [String] = []
+    var viaPeer: String?
+    var viaName: String?
+    /// The short line under the server's name (same wording as desktop).
+    var status: String {
+        if revoked { return "No longer available" }
+        if paused { return "Paused by its owner" }
+        if own { return "Yours · holds your messages and sends for you" }
+        if owner && shareFriends { return "Yours · shared with your friends" }
+        if owner && !useIt { return "Set up as yours · not in use yet" }
+        if let viaName, !useIt, !holdForMe { return "\(viaName)’s · not in use" }
+        if useIt && holdForMe { return "Holds your messages and sends for you" }
+        if useIt { return "Sends for you when friends are offline" }
+        return "Not in use"
+    }
+}
+extension UsableServer {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.eid = try c.decode(String.self, forKey: BridgeKey("eid"))
+        self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))).flatMap { $0.isEmpty ? nil : $0 } ?? "Transfer Server"
+        self.own = (try? c.decode(Bool.self, forKey: BridgeKey("own"))) ?? false
+        self.member = (try? c.decode(Bool.self, forKey: BridgeKey("member"))) ?? false
+        self.through = (try? c.decode(Bool.self, forKey: BridgeKey("through"))) ?? false
+        self.useIt = (try? c.decode(Bool.self, forKey: BridgeKey("useIt"))) ?? false
+        self.holdForMe = (try? c.decode(Bool.self, forKey: BridgeKey("holdForMe"))) ?? false
+        self.offer = (try? c.decode(String.self, forKey: BridgeKey("offer"))) ?? ""
+        self.revoked = (try? c.decode(Bool.self, forKey: BridgeKey("revoked"))) ?? false
+        self.paused = (try? c.decode(Bool.self, forKey: BridgeKey("paused"))) ?? false
+        self.learnedMs = (try? c.decode(Double.self, forKey: BridgeKey("learnedMs"))) ?? 0
+        self.owner = (try? c.decode(Bool.self, forKey: BridgeKey("owner"))) ?? false
+        self.shareFriends = (try? c.decode(Bool.self, forKey: BridgeKey("shareFriends"))) ?? false
+        self.access = (try? c.decode(String.self, forKey: BridgeKey("access"))) ?? ""
+        self.via = (try? c.decode([String].self, forKey: BridgeKey("via"))) ?? []
+        self.viaPeer = try? c.decode(String.self, forKey: BridgeKey("viaPeer"))
+        self.viaName = (try? c.decode(String.self, forKey: BridgeKey("viaName"))).flatMap { $0.isEmpty ? nil : $0 }
+    }
+}
+/// A file a friend sent through a Transfer Server that waits for your OK.
+struct PendingFile: Decodable, Identifiable, Equatable {
+    var id: String { linkId }
+    let linkId: String
+    var peerId: String
+    var serverName: String
+    var bytes: Double
+    var names: [String]
+}
+extension PendingFile {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.linkId = try c.decode(String.self, forKey: BridgeKey("linkId"))
+        self.peerId = (try? c.decode(String.self, forKey: BridgeKey("peerId"))) ?? ""
+        self.serverName = (try? c.decode(String.self, forKey: BridgeKey("serverName"))).flatMap { $0.isEmpty ? nil : $0 } ?? "the Transfer Server"
+        self.bytes = (try? c.decode(Double.self, forKey: BridgeKey("bytes"))).flatMap { $0.isFinite ? $0 : nil } ?? 0
+        self.names = (try? c.decode(LossyArray<String>.self, forKey: BridgeKey("names")))?.values ?? []
+    }
+}
+/// Transfer Server copy shared by chat and settings (mirrors src/lib/transferServer.ts).
+enum ServerCopy {
+    /// The short line under an undelivered message for a server note.
+    static func note(_ note: String?, friend: String, server: String?) -> String? {
+        let box = server?.isEmpty == false ? server! : "the Transfer Server"
+        let cap = box.prefix(1).uppercased() + box.dropFirst()
+        switch note {
+        case "expired": return "\(cap) couldn’t deliver it in time · will send when \(friend) is online"
+        case "lost", "refused": return "\(cap) couldn’t deliver it · will send when \(friend) is online"
+        case "full": return "\(cap) is full · will send when \(friend) is online"
+        case "paused": return "\(cap) is paused · will send when \(friend) is online"
+        case "unreachable": return "Couldn’t reach \(box) · will keep trying"
+        case "needs_update": return "\(friend) needs to update DropBeam to get messages while offline"
+        default: return nil
+        }
+    }
+    static func held(server: String?, friend: String) -> String {
+        "Waiting on \(server ?? "your Transfer Server") — \(friend) gets it when they’re back"
+    }
+    static func firstName(_ name: String) -> String { name.split(separator: " ").first.map(String.init) ?? name }
+}
+/// Whether Transfer Servers can wake this iPhone (push_status).
+struct PushStatus: Decodable, Equatable {
+    var enabled = false
+    var previews = true
+    var servers = 0
+}
+extension PushStatus {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: BridgeKey.self)
+        self.enabled = (try? c.decode(Bool.self, forKey: BridgeKey("enabled"))) ?? false
+        self.previews = (try? c.decode(Bool.self, forKey: BridgeKey("previews"))) ?? true
+        self.servers = (try? c.decode(Int.self, forKey: BridgeKey("servers"))) ?? 0
     }
 }

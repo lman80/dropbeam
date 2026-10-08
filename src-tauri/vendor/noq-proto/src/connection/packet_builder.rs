@@ -239,7 +239,20 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         msg: Option<&'static str>,
     ) {
         let frame = frame.into();
-        frame.encode(&mut self.frame_space_mut());
+        // DropBeam patch: encode into the unbounded datagram buffer and check the frame space
+        // afterwards instead of encoding through `Limit`, whose overflow is a `bytes` panic.
+        // That panic happened while noq held the connection mutex, poisoning it and aborting
+        // the whole process. Callers check the space before writing; an overflow here is a
+        // bug, so drop the frame (it is not tracked as sent) and log it instead of crashing.
+        let start = self.buf.len();
+        let space = self.frame_space_remaining();
+        frame.encode(&mut *self.buf);
+        let written = self.buf.len() - start;
+        if written > space {
+            self.buf.truncate(start);
+            tracing::error!(%frame, written, space, "frame does not fit in the packet, dropped");
+            return;
+        }
         self.ack_eliciting |= frame.is_ack_eliciting();
         stats.record(frame.get_type());
         self.qlog.record(&frame);
@@ -248,15 +261,6 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             None => trace!(%frame),
         }
         self.sent_frames.record_sent_frame(frame);
-    }
-
-    /// Returns a writable buffer limited to the remaining frame space
-    ///
-    /// The [`BufMut::remaining_mut`] call on the returned buffer indicates the amount of
-    /// space available to write QUIC frames into.
-    // In rust 1.82 we can use `-> impl BufMut + use<'_, 'a, 'b>`
-    fn frame_space_mut(&mut self) -> bytes::buf::Limit<&mut TransmitBuf<'b>> {
-        self.buf.limit(self.frame_space_remaining())
     }
 
     pub(super) fn sent_frames(&self) -> &SentFrames {

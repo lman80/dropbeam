@@ -1,4 +1,6 @@
 import { deviceKindLabel } from '../lib/deviceIcons'
+import { shortDate } from '../lib/dates'
+import { isEnterKey } from '../lib/keys'
 import { LinkDeviceModal, LinkNewDeviceModal } from '../components/LinkDeviceModal'
 import { DevicesPanel } from '../components/DevicesPanel'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
@@ -13,7 +15,10 @@ import { useStore, type View } from '../store'
 import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
+import { TransferServerPane } from '../components/TransferServerSettings'
+import { InstallUpdateButton } from '../components/UpdateInstall'
 import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spinner, Toggle } from '../components/ui'
+import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbackButton } from '../lib/feedback'
 
 // ── Tabs ─────────────────────────────────────────────────────────────────────
 // Settings is split into panes (like a Mac preferences window) instead of one
@@ -21,13 +26,16 @@ import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spi
 // location" on Locations opens the Locations pane, the GIF setup link in Chat
 // opens General, "Settings" under History's recoverable files opens Transfers —
 // otherwise it's the pane you last had open.
-type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'privacy' | 'advanced'
+type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'advanced'
+const DEV_KEY = 'dropbeam.developer'
+// Everyday tabs first; the optional/advanced features after Privacy.
 const TABS: { value: Tab; label: string }[] = [
   { value: 'general', label: 'General' },
-  { value: 'devices', label: 'Devices' },
-  { value: 'locations', label: 'Locations' },
   { value: 'transfers', label: 'Transfers' },
+  { value: 'devices', label: 'Devices' },
   { value: 'privacy', label: 'Privacy' },
+  { value: 'locations', label: 'Locations' },
+  { value: 'server', label: 'Transfer Server' },
   { value: 'advanced', label: 'Advanced' },
 ]
 let lastTab: Tab = 'general'
@@ -151,6 +159,27 @@ export function SettingsView() {
   const deviceDescription = myDevice ? `This device: ${settings.displayName || myDevice.name} · ${deviceKindLabel(myDevice.device_kind)}` : 'Loading this device…'
   const linkedDescription = myDevice ? `${myDevice.linked_devices} linked device${myDevice.linked_devices === 1 ? '' : 's'}` : ''
   const toast = useStore((s) => s.toast)
+  const toastError = useStore((s) => s.toastError)
+  // Developer options (Giphy key, Lab Mode) stay out of normal Settings. They
+  // show when already in use, or after tapping the version number 7 times.
+  const [devMode, setDevModeState] = useState(() => {
+    try { return localStorage.getItem(DEV_KEY) === '1' || new URLSearchParams(location.search).get('dev') === '1' } catch { return false }
+  })
+  const setDevMode = (on: boolean) => {
+    setDevModeState(on)
+    try { if (on) localStorage.setItem(DEV_KEY, '1'); else localStorage.removeItem(DEV_KEY) } catch { /* storage unavailable */ }
+  }
+  const versionTaps = useRef<number[]>([])
+  const tapVersion = () => {
+    const now = Date.now()
+    versionTaps.current = [...versionTaps.current.filter((t) => now - t < 3000), now]
+    if (versionTaps.current.length >= 7 && !devMode) {
+      versionTaps.current = []
+      setDevMode(true)
+      setTab('advanced')
+      toast('info', 'Developer options are now in Advanced.')
+    }
+  }
   const [clearing, setClearing] = useState(false)
   const clearCache = async () => {
     setClearing(true)
@@ -240,7 +269,7 @@ export function SettingsView() {
         {toggle('waitForDirect', 'Wait for direct connection', settings.requireDirect ? 'Unavailable while direct connections are required.' : 'Wait for a fast direct path before sending. You can choose the relay on each transfer.', settings.requireDirect)}
         {toggle('parallelStreams', 'Parallel streams', 'Send files over 16 MB using several connections. Turn off if transfers stall.')}
         <MobileSetting title="Upload limit" desc="Mbps; 0 means unlimited. Local transfers run at full speed. Start at 100 Mbps and adjust if your Wi-Fi stutters."><input className="input" aria-label="Upload limit in Mbps" type="number" min={0} max={100000} value={settings.uploadLimitMbps || 0} onChange={e => save({ uploadLimitMbps: Math.max(0, Math.floor(Number(e.target.value) || 0)) })} /></MobileSetting>
-        {toggle('showMegabits', 'Speeds in megabits', 'Use Mbps instead of kB/s or MB/s on this device.')}
+        {toggle('showMegabits', 'Speeds in megabits', 'Use Mbps instead of KB/s or MB/s on this device.')}
       </MobileSection>
       <MobileSection title="How transfers connect">
         <MobileSetting title="Local" desc="Same Wi-Fi or network. Files travel directly across your network, without the internet." />
@@ -348,6 +377,13 @@ export function SettingsView() {
           on={settings.notifyOnComplete}
           onChange={(v) => save({ notifyOnComplete: v })}
         />
+        {(IS_MAC || IS_WINDOWS) && (
+          <Row title="Not seeing notifications?" sub={IS_MAC ? 'Make sure DropBeam is allowed in System Settings → Notifications.' : 'Make sure DropBeam is turned on in Windows Settings → Notifications.'}>
+            <button className="btn btn-secondary" onClick={() => api.openPrivacySettings('notifications').catch(() => {})}>
+              Open Settings…
+            </button>
+          </Row>
+        )}
         <ToggleRow
           title="When a message arrives"
           sub="Only while you’re not looking at DropBeam."
@@ -364,26 +400,17 @@ export function SettingsView() {
           on={settings.sendReadReceipts}
           onChange={(v) => save({ sendReadReceipts: v })}
         />
-        <Row title="GIFs" sub="Add a free key from developers.giphy.com to turn on GIFs.">
-          <input
-            className="input set-field"
-            type="text"
-            aria-label="Giphy API key"
-            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-            placeholder="Giphy API key"
-            defaultValue={settings.giphyApiKey}
-            onBlur={(e) => {
-              const v = e.target.value.trim()
-              if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
-            }}
-            onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
-          />
-        </Row>
+        <ToggleRow
+          title="Link previews"
+          sub="When you send a link, this device fetches a small preview and sends it along. Friends never contact the site."
+          on={settings.linkPreviews}
+          onChange={(v) => save({ linkPreviews: v })}
+        />
       </div>
 
       <SectionHeader>Updates</SectionHeader>
       <div className="group">
-        <UpdateRow />
+        <UpdateRow onVersionTap={tapVersion} />
       </div>
     </>
   )
@@ -392,13 +419,13 @@ export function SettingsView() {
     <>
       <SectionHeader>Downloads</SectionHeader>
       <div className="group">
-        <Row title="Save files to">
+        <Row title="Save files to" sub="Files from friends save here automatically. To be asked first, turn off “Accept automatically” for that friend under Friends.">
           <button className="btn btn-secondary set-dir" onClick={changeDir} title={settings.downloadDir}>
             <FolderOpen />
             <span className="truncate-1">{folderLabel(settings.downloadDir)}</span>
           </button>
         </Row>
-        <Row title="Transfer leftovers" sub="Lets interrupted transfers resume. Cleared after a week.">
+        <Row title="Unfinished transfers" sub="Parts of files that didn’t finish arriving, kept so they can pick up where they stopped. Removed after a week.">
           <button className="btn btn-secondary" onClick={clearCache} disabled={clearing}>
             {clearing && <Spinner size={12} />}
             Clear Now
@@ -438,29 +465,6 @@ export function SettingsView() {
             </InfoTip>
           </Row>
         )}
-        <ToggleRow
-          title="Only send over direct connections"
-          sub="If there’s no direct path, the send stops instead of using a relay."
-          on={settings.requireDirect}
-          onChange={(v) => save({ requireDirect: v })}
-        />
-        <ToggleRow
-          title="Wait for a direct connection"
-          sub={
-            settings.requireDirect
-              ? 'Not needed while only direct connections are allowed.'
-              : 'Hold sends until a direct path forms, instead of using a relay.'
-          }
-          on={settings.requireDirect ? false : settings.waitForDirect}
-          disabled={settings.requireDirect}
-          onChange={(v) => save({ waitForDirect: v })}
-        />
-        <ToggleRow
-          title="Parallel streams"
-          sub="Faster sends for files over 16 MB. Turn off if transfers stall."
-          on={settings.parallelStreams}
-          onChange={(v) => save({ parallelStreams: v })}
-        />
       </div>
 
       <SectionHeader>Speed</SectionHeader>
@@ -545,9 +549,94 @@ export function SettingsView() {
           on={settings.shareDiagnostics}
           onChange={(v) => save({ shareDiagnostics: v })}
         />
+      </div>
+
+      <FeedbackSection />
+
+      <SectionHeader>
+        Support
+          <InfoTip label="Reporting a person">
+            <p>To report a person or a message, use Report… on their friend card, in their chat, or on the message. We reply within 24 hours.</p>
+          </InfoTip>
+      </SectionHeader>
+      <div className="group">
+        <Row title="Report a problem" sub="Opens an email to the DropBeam team.">
+          <button
+            className="btn btn-secondary"
+            onClick={() =>
+              api
+                .openMailto(contactMailto(appVer || null, platformLabel(navigator.userAgent)))
+                .catch((e) => toastError('Couldn’t open your mail app.', e))
+            }
+          >
+            Email Us…
+          </button>
+        </Row>
+      </div>
+    </>
+  )
+
+  const advanced = (
+    <>
+      <p className="set-advanced-note">You don’t need anything on this page for everyday use. These are for fixing connection problems.</p>
+      <SectionHeader>Connection</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="Only send over direct connections"
+          sub="If there’s no direct path, the send stops instead of using a relay."
+          on={settings.requireDirect}
+          onChange={(v) => save({ requireDirect: v })}
+        />
+        <ToggleRow
+          title="Wait for a direct connection"
+          sub={
+            settings.requireDirect
+              ? 'Not needed while only direct connections are allowed.'
+              : 'Hold sends until a direct path forms, instead of using a relay.'
+          }
+          on={settings.requireDirect ? false : settings.waitForDirect}
+          disabled={settings.requireDirect}
+          onChange={(v) => save({ waitForDirect: v })}
+        />
+        <ToggleRow
+          title="Parallel streams"
+          sub="Faster sends for files over 16 MB. Turn off if transfers stall."
+          on={settings.parallelStreams}
+          onChange={(v) => save({ parallelStreams: v })}
+        />
+      </div>
+
+      <SectionHeader>
+        Relay
+          <InfoTip label="About relays">
+            <p>When two devices can’t connect directly, data goes through a relay. Point both devices at your own relay for a faster, steadier fallback.</p>
+            <button className="btn btn-plain btn-sm set-info-link" onClick={() => api.openUrl(RELAY_GUIDE).catch(() => {})}>
+              Relay Setup Guide
+            </button>
+          </InfoTip>
+      </SectionHeader>
+      <div className="group">
+        <Row
+          title="Custom relay"
+          sub={relayChanged ? 'Restart DropBeam to use this relay.' : 'Use the same relay on both devices. Leave empty for public relays.'}
+        >
+          {relayChanged && restartButton}
+          <input
+            className="input set-field set-field-wide"
+            aria-label="Relay server URL"
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+            placeholder="https://relay.example.com"
+            value={settings.customRelay}
+            onChange={(e) => save({ customRelay: e.target.value })}
+          />
+        </Row>
+      </div>
+
+      <SectionHeader>Logs</SectionHeader>
+      <div className="group">
         {settings.shareDiagnostics && (
           <Row
-            title="Custom collector"
+            title="Diagnostics collector"
             sub={diagUrlInvalid ? <span className="set-status-error">Use an https:// address.</span> : 'Leave empty to use the built-in one.'}
           >
             <input
@@ -577,61 +666,7 @@ export function SettingsView() {
             </button>
           </Row>
         )}
-      </div>
 
-      <SectionHeader>
-        Support
-          <InfoTip label="Reporting a person">
-            <p>To report a person or a message, use Report… on their friend card, in their chat, or on the message. We reply within 24 hours.</p>
-          </InfoTip>
-      </SectionHeader>
-      <div className="group">
-        <Row title="Report a problem" sub="Opens an email to the DropBeam team.">
-          <button
-            className="btn btn-secondary"
-            onClick={() =>
-              api
-                .openMailto(contactMailto(appVer || null, platformLabel(navigator.userAgent)))
-                .catch((e) => toast('error', `Couldn’t open your mail app: ${String(e)}`))
-            }
-          >
-            Email Us…
-          </button>
-        </Row>
-      </div>
-    </>
-  )
-
-  const advanced = (
-    <>
-      <SectionHeader>
-        Relay
-          <InfoTip label="About relays">
-            <p>When two devices can’t connect directly, data goes through a relay. Point both devices at your own relay for a faster, steadier fallback.</p>
-            <button className="btn btn-plain btn-sm set-info-link" onClick={() => api.openUrl(RELAY_GUIDE).catch(() => {})}>
-              Relay setup guide
-            </button>
-          </InfoTip>
-      </SectionHeader>
-      <div className="group">
-        <Row
-          title="Custom relay"
-          sub={relayChanged ? 'Restart DropBeam to use this relay.' : 'Use the same relay on both devices. Leave empty for public relays.'}
-        >
-          {relayChanged && restartButton}
-          <input
-            className="input set-field set-field-wide"
-            aria-label="Relay server URL"
-            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
-            placeholder="https://relay.example.com"
-            value={settings.customRelay}
-            onChange={(e) => save({ customRelay: e.target.value })}
-          />
-        </Row>
-      </div>
-
-      <SectionHeader>Logs</SectionHeader>
-      <div className="group">
         <ToggleRow
           title="Detailed logging"
           sub={verboseChanged ? 'Restart DropBeam to apply.' : 'Adds network internals while you reproduce a connection problem.'}
@@ -647,8 +682,24 @@ export function SettingsView() {
         </Row>
       </div>
 
-      <SectionHeader>Lab Mode</SectionHeader>
+      {(devMode || settings.labModeEnabled) && <>
+      <SectionHeader action={<button className="btn btn-plain btn-sm" onClick={() => setDevMode(false)}>Hide</button>}>Developer</SectionHeader>
       <div className="group">
+        <Row title="GIFs" sub="A free key from developers.giphy.com turns on the GIF picker.">
+          <input
+            className="input set-field"
+            type="text"
+            aria-label="Giphy API key"
+            autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off"
+            placeholder="Giphy API key"
+            defaultValue={settings.giphyApiKey}
+            onBlur={(e) => {
+              const v = e.target.value.trim()
+              if (v !== settings.giphyApiKey) save({ giphyApiKey: v })
+            }}
+            onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }}
+          />
+        </Row>
         <ToggleRow
           title="Allow Lab Mode"
           sub="Lets one trusted developer device run tests on this app. Turn on only if asked."
@@ -705,6 +756,7 @@ export function SettingsView() {
           </>
         )}
       </div>
+      </>}
       {scanOperator && (
         <QrScanner
           title="Scan operator ID"
@@ -717,22 +769,23 @@ export function SettingsView() {
     </>
   )
 
-  const visibleTabs = TABS.filter((t) => t.value !== 'locations' || !MOBILE_UI)
+  const visibleTabs = TABS.filter((t) => (t.value !== 'locations' && t.value !== 'server') || !MOBILE_UI)
 
   return (
     <div className="page settings-page" ref={rootRef}>
-      <div className="page-header titlebar-drag">
+      <div className="page-header titlebar-drag" data-tauri-drag-region="deep">
         <h1 className="page-title">Settings</h1>
         <div className="page-actions">
-          <Segmented role="tablist" label="Settings sections" value={tab} onChange={setTab} options={visibleTabs} className="settings-tabs" />
+          <Segmented role="tablist" label="Settings sections" value={tab} onChange={setTab} options={visibleTabs} className="settings-tabs" idBase="settings" />
         </div>
       </div>
       {deviceModals}
-      <div role="tabpanel" aria-label={TABS.find((t) => t.value === tab)?.label} className={`settings-pane settings-pane-${tab}`}>
+      <div role="tabpanel" id="settings-panel" aria-labelledby={`settings-tab-${tab}`} className={`settings-pane settings-pane-${tab}`}>
         {tab === 'general' && general}
         {tab === 'devices' && <DevicesPanel />}
         {tab === 'locations' && <LocationSettings />}
         {tab === 'transfers' && transfers}
+        {tab === 'server' && <TransferServerPane />}
         {tab === 'privacy' && privacy}
         {tab === 'advanced' && advanced}
       </div>
@@ -740,14 +793,52 @@ export function SettingsView() {
   )
 }
 
+/** SuperFeedback: the sidebar button toggle, Send / Ideas, and Support once the
+ *  backend has a support link (re-checked each time Settings opens). */
+function FeedbackSection() {
+  const [showButton, setShowButton] = useFeedbackButton()
+  const [supportAvailable, setSupportAvailable] = useState(false)
+  useEffect(() => {
+    let live = true
+    void fetchSupportAvailable().then((v) => { if (live && v !== null) setSupportAvailable(v) })
+    return () => { live = false }
+  }, [])
+  return (
+    <>
+      <SectionHeader>Feedback</SectionHeader>
+      <div className="group">
+        <ToggleRow
+          title="Show feedback button"
+          sub="The Feedback button at the bottom of the sidebar."
+          on={showButton}
+          onChange={setShowButton}
+        />
+        <Row
+          title="Send feedback"
+          sub="Goes straight to the developer. Good suggestions often ship in an update within days."
+        >
+          <button className="btn btn-secondary" onClick={openFeedback}>Send Feedback…</button>
+        </Row>
+        <Row title="Ideas & roadmap" sub="Vote on what gets built next.">
+          <button className="btn btn-secondary" onClick={openIdeas}>Open…</button>
+        </Row>
+        {supportAvailable && (
+          <Row title="Support development" sub="Optional. Supporting unlocks nothing.">
+            <button className="btn btn-secondary" onClick={openSupport}>Support…</button>
+          </Row>
+        )}
+      </div>
+    </>
+  )
+}
+
 /** Version + update check + install progress, as one row. */
-function UpdateRow() {
+function UpdateRow({ onVersionTap }: { onVersionTap?: () => void }) {
   const appVer = useStore((s) => s.appVer)
   const update = useStore((s) => s.update)
   const checkingUpdate = useStore((s) => s.checkingUpdate)
   const updateError = useStore((s) => s.updateError)
   const checkForUpdates = useStore((s) => s.checkForUpdates)
-  const installUpdate = useStore((s) => s.installUpdate)
 
   let sub: ReactNode
   let control: ReactNode
@@ -757,9 +848,7 @@ function UpdateRow() {
   } else if (update) {
     sub = `Version ${update.version} is available.`
     control = (
-      <button className="btn btn-primary" onClick={() => installUpdate()}>
-        Install and Restart
-      </button>
+      <InstallUpdateButton />
     )
   } else if (updateError) {
     sub = 'Couldn’t reach the update server.'
@@ -783,7 +872,7 @@ function UpdateRow() {
       </button>
     )
   }
-  return <Row title={<span className="tnum">DropBeam {appVer || '…'}</span>} sub={sub}>{control}</Row>
+  return <Row title={<span className="tnum" onClick={onVersionTap}>DropBeam {appVer || '…'}</span>} sub={sub}>{control}</Row>
 }
 
 /** Upload cap: presets as a segmented control, plus a custom value. 0 = off. */
@@ -861,7 +950,7 @@ function DisplayNameInput({ value, onSave }: { value: string; onSave: (name: str
       onFocus={() => setDraft(value)}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}
-      onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+      onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }}
     />
   )
 }
@@ -889,7 +978,7 @@ function SafetySection() {
             <Row
               key={p.id}
               title={<span className="truncate-1 set-block-name" title={p.name}>{p.name}</span>}
-              sub={`${p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}Blocked ${new Date(p.at).toLocaleDateString()}`}
+              sub={`${p.endpointIds.length > 1 ? `${p.endpointIds.length} devices · ` : ''}Blocked ${shortDate(p.at)}`}
             >
               <button
                 className="btn btn-secondary"

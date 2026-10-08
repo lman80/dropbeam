@@ -123,3 +123,23 @@
 .integrity-bad { color: var(--red); font-weight: 400; }
 .integrity-row code { display: block; font-family: var(--font-mono); font-size: var(--text-11); color: var(--text-muted); overflow-wrap: anywhere; }
 .conn-info-btn { color: var(--text-faint); }
+
+/* A send to a friend's several devices: one row per device, under the card. */
+.delivery-rows { list-style: none; margin: 8px 0 0 40px; padding: 0; display: grid; gap: 3px; }
+.delivery-row {
+  display: grid;
+  grid-template-columns: 14px auto 1fr auto;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--text-12);
+  line-height: 1.35;
+  color: var(--text-muted);
+  min-width: 0;
+}
+.delivery-icon { width: 13px; height: 13px; color: var(--text-faint); }
+.delivery-label { color: var(--text); font-weight: 500; }
+.delivery-status { min-width: 0; }
+.delivery-check { width: 12px; height: 12px; color: var(--green); }
+.delivery-row.is-failed .delivery-status, .delivery-row.is-declined .delivery-status { color: var(--red); }
+.xfer-meta .srv-glyph { width: 12px; height: 12px; vertical-align: -2px; margin-right: 4px; display: inline-block; }
+.xfer-getapp { display: block; margin-top: 6px; font-size: var(--text-12); color: var(--text-muted); }

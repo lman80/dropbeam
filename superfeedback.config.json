@@ -3,7 +3,40 @@
   "repo": "lman80/dropbeam",
   "app": "DropBeam",
   "appKey": "",
-  "version": "1.1.0",
+  "version": "3.3.1",
+  "platforms": [
+    "web",
+    "ios"
+  ],
+  "theme": "auto",
   "type": "bug",
-  "trigger": "none"
+  "trigger": "draggable",
+  "position": "right-center",
+  "triggerByPlatform": {
+    "web": "none (sidebar Feedback item, hidden by the Settings toggle)",
+    "ios": "draggable, right-center"
+  },
+  "nudge": false,
+  "captureLogs": false,
+  "captureCrashes": true,
+  "settingsToggle": true,
+  "settingsRows": [
+    "feedback",
+    "ideas",
+    "support"
+  ],
+  "moments": [
+    "files-sent",
+    "files-received",
+    "chat-file-delivered",
+    "friend-added"
+  ],
+  "community": true,
+  "support": "backend",
+  "supportByPlatform": {
+    "web": "backend",
+    "ios": "off"
+  },
+  "keychainGroup": "superfeedback.shared",
+  "widgetPatches": "iOS widget = 3.3.1 + lman80/SuperFeedback branch dropbeam-ios-fixes"
 }

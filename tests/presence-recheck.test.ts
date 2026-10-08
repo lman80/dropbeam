@@ -49,3 +49,15 @@ test('a removed friend does not keep a cooldown slot forever', () => {
   claimPresenceChecks(without, {}, noFolders, NOW + 1)
   assert.deepEqual(claimPresenceChecks(friends, {}, noFolders, NOW + 2), ['sam'])
 })
+
+test('presence is kept per friend id, not per display name (#44)', () => {
+  const a = { id: 'alex-1', name: 'Alex' }
+  const b = { id: 'alex-2', name: 'Alex' }
+  const seen = { 'alex-1': Date.now() }
+  assert.equal(friendPresence(a, seen, noFolders).status, 'online')
+  assert.equal(friendPresence(b, seen, noFolders).status, 'unknown', 'a namesake is not online just because the other Alex is')
+  // A friend who renames keeps their presence.
+  assert.equal(friendPresence({ id: 'alex-1', name: 'Alexander' }, seen, noFolders).status, 'online')
+  // A pre-#44 name entry still counts for a friend with that name.
+  assert.equal(friendPresence({ id: 'x', name: 'Sam' }, { sam: Date.now() - 600_000 }, noFolders).status, 'offline')
+})

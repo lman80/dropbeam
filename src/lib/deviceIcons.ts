@@ -37,19 +37,33 @@ export function deviceNoun(kind?: string | null, os?: string | null): string {
 
 /**
  * Labels for the user's OWN devices, Blip-style: "Your Mac", "Your iPhone".
- * When two devices would read the same ("Your Mac" twice), they fall back to
- * their device names — or, when those don't tell them apart either (iPhones
- * all report "iPhone"), to "Your iPhone 1" / "Your iPhone 2" in a stable order.
+ * When two devices would read the same ("Your iPhone" twice), each says its
+ * model instead ("Your iPhone 15" / "Your iPhone 12", "Your MacBook Air" /
+ * "Your Mac mini"). Devices still alike (same model, or an older build that
+ * doesn't say) use their device names when those tell them apart, else
+ * "Your iPhone" / "Your iPhone (2)" in a stable order.
+ * Mirrored in DevicesView.swift (ownDeviceLabels).
  */
-export function ownDeviceLabels<T extends { id: string; name: string; deviceKind?: string | null; deviceOs?: string | null }>(devices: readonly T[]): Record<string, string> {
+export function ownDeviceLabels<T extends { id: string; name: string; deviceKind?: string | null; deviceOs?: string | null; deviceModel?: string | null }>(devices: readonly T[]): Record<string, string> {
   const nouns = devices.map(d => deviceNoun(d.deviceKind, d.deviceOs))
+  // Step 1: the plain noun, or — when that's shared — the model, if known.
+  const first = devices.map((d, i) => {
+    if (nouns.filter(n => n === nouns[i]).length === 1) return `Your ${nouns[i]}`
+    const model = d.deviceModel?.trim()
+    return `Your ${model || nouns[i]}`
+  })
   const out: Record<string, string> = {}
   devices.forEach((d, i) => {
-    const same = devices.filter((_, j) => nouns[j] === nouns[i])
-    if (same.length === 1) { out[d.id] = `Your ${nouns[i]}`; return }
+    const same = devices.filter((_, j) => first[j] === first[i])
+    if (same.length === 1) { out[d.id] = first[i]; return }
+    // Step 2: device names, when they tell these apart (iPhones all say "iPhone").
     const names = same.map(x => x.name.trim())
-    const tellable = new Set(names).size === names.length && names.every(n => n && n !== nouns[i])
-    out[d.id] = tellable ? d.name : `Your ${nouns[i]} ${[...same].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0).indexOf(d) + 1}`
+    const taken = new Set(first.filter((_, j) => first[j] !== first[i]))
+    const tellable = new Set(names).size === names.length && names.every(n => n && n !== nouns[i] && !taken.has(n))
+    if (tellable) { out[d.id] = d.name.trim(); return }
+    // Step 3: number them, Finder-style.
+    const n = [...same].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0).indexOf(d) + 1
+    out[d.id] = n === 1 ? first[i] : `${first[i]} (${n})`
   })
   return out
 }
@@ -74,4 +88,21 @@ export function personGroups<T extends { id: string; createdAt: number; accountP
     if (owner && owner.id !== f.id) out[f.id] = owner.id
   }
   return out
+}
+
+/**
+ * Who you can send to, one entry per PERSON: your own devices (each its own
+ * entry — "Your iPhone", "Your Mac") and every friend once, however many
+ * devices they have (their extra devices fold into the record that owns the
+ * conversation, and a send to it reaches all of them).
+ */
+export function sendTargets<T extends { id: string; createdAt: number; accountPub?: string | null; endpointId?: string | null }>(friends: readonly T[], myAccount?: string | null): { myDevices: T[]; others: T[] } {
+  const grouped = personGroups(friends, myAccount)
+  return groupDevices(friends.filter((f) => !grouped[f.id]), myAccount)
+}
+
+/** The stable id a person's avatar colour is keyed by: the record that owns
+ *  their conversation (so every device of one friend shares one colour). */
+export function personKey<T extends { id: string; createdAt: number; accountPub?: string | null; endpointId?: string | null }>(friends: readonly T[], id: string, myAccount?: string | null): string {
+  return personGroups(friends, myAccount)[id] ?? id
 }

@@ -30,6 +30,8 @@ export type TransferState =
   | 'canceled'
   /** Stopped by the user, everything already transferred kept — Resume replays it. */
   | 'paused'
+  /** The friend was offline: the (sealed) files wait on a Transfer Server. */
+  | 'held'
 export type Locality = 'unknown' | 'local' | 'direct' | 'internet'
 
 /** Live detail of how two peers are connected — the connection inspector data. */
@@ -68,6 +70,19 @@ export interface VerifyReport {
   mismatched: string[]
   missing: string[]
   error: string | null
+}
+
+/** Where a send to a friend is on ONE of their devices (their Mac, their iPhone…). */
+export interface Delivery {
+  eid: string
+  /** What the device is: "Mac", "iPhone", "Mac 2". */
+  label: string
+  kind?: string | null
+  os?: string | null
+  state: 'sending' | 'uploading' | 'offline' | 'delivered' | 'held' | 'waiting' | 'failed' | 'declined' | 'canceled' | 'paused'
+  /** The Transfer Server holding it for this device. */
+  via?: string | null
+  note?: string | null
 }
 
 export interface TransferUpdate {
@@ -115,6 +130,10 @@ export interface TransferUpdate {
   connDetail?: ConnDetail | null
   /** A short reason for a PARKED/waiting state (e.g. "Waiting for a direct connection"). */
   detail?: string | null
+  /** The Transfer Server this send is uploading to / waiting on. */
+  heldOn?: string | null
+  /** A send to a friend with several devices: where it is on each device. */
+  deliveries?: Delivery[] | null
 }
 
 export interface HistoryEntry {
@@ -164,6 +183,8 @@ export interface Settings {
   notifyOnMessage: boolean
   /** Send read receipts so friends see when you've read their message. */
   sendReadReceipts: boolean
+  /** Fetch + send a preview when you send a link (#47). */
+  linkPreviews: boolean
   /** Free Giphy API key (developers.giphy.com) powering GIF search. '' = off. */
   giphyApiKey: string
   /** Detailed diagnostics logging (app + iroh internals). Applied on restart. */
@@ -199,6 +220,8 @@ export interface FolderHistorySummary {
   bytes: number
   itemCount: number
   oldestMs: number | null
+  /** Older copies moved to the OS Trash because the disk was nearly full. */
+  overflowTrashed?: number
 }
 
 export type PairRole = 'a' | 'b'
@@ -239,7 +262,16 @@ export interface HistoryItem {
 }
 
 /** A successfully linked device; command and link wire fields use snake_case. */
+/** What the scanner shows before linking (S1): who, which way, and the
+ *  safety code both screens must show before an account key moves. */
+export interface LinkPreviewInfo { name: string; safety: string; direction: 'give' | 'take'; peerShowsCode: boolean
+  /** Proof that the user went through the confirm step: hand it to linkDeviceSend. */
+  confirmToken: string }
+/** The other device presented this device's code: confirm its safety code. */
+export interface LinkConfirmRequest { endpointId: string; name: string; safety: string; joining: boolean }
 export interface LinkResult { endpoint_id: string; name: string; device_kind: string; device_os?: string
+  /** "iPhone 15", "MacBook Air" — absent from older builds. */
+  device_model?: string | null
   /** What the link brought over (friends and chat messages), when known. */
   friends?: number; messages?: number }
 /** One device in this account (this one first). */
@@ -249,8 +281,13 @@ export interface AccountDevice {
   name: string
   device_kind: string | null
   device_os: string | null
+  /** "iPhone 15", "MacBook Air" — absent from older builds. */
+  device_model?: string | null
   last_sync_ms: number | null
   this_device: boolean
+  /** Proves the account key but no remaining device vouched for it (linked by
+   *  an older build, or by a device since removed): approve or remove it. */
+  needs_approval?: boolean
 }
 export interface MyDeviceInfo extends LinkResult { account_pub: string; linked_devices: number; device_os?: string; devices?: AccountDevice[]
   /** The person's name — the same on every device in the account. `name` is this device's own name. */
@@ -262,6 +299,8 @@ export interface Friend {
   accountPub?: string | null
   /** "macos" | "ios" | "windows" | "linux" — from the device's hello. */
   deviceOs?: string | null
+  /** "iPhone 15", "MacBook Air" — from the device's hello; absent from older builds. */
+  deviceModel?: string | null
   id: string
   role: PairRole
   name: string
@@ -274,6 +313,20 @@ export interface Friend {
   avatar: string | null
   /** True once you've renamed this friend locally (their broadcasts won't override). */
   nameCustom?: boolean
+  /** You added them, but they haven't accepted you yet: messages wait until they do. */
+  awaitingAccept?: boolean
+}
+
+/** A link preview the SENDER's device fetched (#47) — it travels with the
+ *  message, so the receiver never contacts the site. `image` is a data: URL. */
+export interface LinkPreview {
+  url: string
+  title?: string | null
+  description?: string | null
+  siteName?: string | null
+  image?: string | null
+  imageW?: number
+  imageH?: number
 }
 
 /** A GIF attachment on a chat message (Giphy). */
@@ -298,6 +351,8 @@ export interface ChatMessage {
   /** The friend id this conversation belongs to. */
   peerId: string
   fromMe: boolean
+  /** Live event only: you already read this on another of your devices (no badge/chime). */
+  alreadyRead?: boolean
   /** "text" or "file". */
   kind: 'text' | 'file'
   text: string
@@ -309,7 +364,15 @@ export interface ChatMessage {
    * sender's source or receiver's saved copy. Enables preview + open. */
   path: string | null
   /** Delivery state for messages WE sent. 'sent' is tolerated from older builds. */
-  status: 'sending' | 'delivered' | 'read' | 'failed' | 'sent' | null
+  status: 'sending' | 'delivered' | 'read' | 'failed' | 'sent' | 'held' | null
+  /** Sender: the Transfer Server holding it while the friend is offline. */
+  heldOn?: string | null
+  /** Sender: why a server couldn't take/deliver it ("expired", "full", "unreachable", "needs_update", "lost", "refused"). */
+  serverNote?: string | null
+  /** Receiver: the Transfer Server it arrived through. */
+  via?: string | null
+  /** Sender side: a file sent to a friend with several devices — where it is on each. */
+  deliveries?: Delivery[] | null
   ts: number
   /** Logical ordering clock — sort by this (then ts, then id), not wall-clock. */
   seq: number
@@ -324,6 +387,8 @@ export interface ChatMessage {
   deleted: boolean
   /** A GIF attachment — render a GIF bubble when present. */
   gif?: GifMeta | null
+  /** A link preview (#47); older builds never send one. */
+  linkPreview?: LinkPreview | null
   /** UI-only (never persisted, never on the wire): set on the SENDER's file card when
    *  the byte transfer it describes ultimately failed, so the card can offer "tap to
    *  resend" instead of implying the file arrived. Carries the failed transfer id so
@@ -374,6 +439,10 @@ export interface FolderStatus {
   paused?: boolean
   /** Live connection detail for the active folder transfer. */
   connDetail?: ConnDetail | null
+  /** The folder isn't on disk (unplugged drive / moved). Nothing syncs. */
+  folderMissing?: boolean
+  /** A non-error heads-up, e.g. files the peer can't hold under their names. */
+  warning?: string | null
 }
 
 /** The honest answer to "are these two folders identical?" from `verifyFolder`.
@@ -456,14 +525,22 @@ const realApi = {
   lanNetworkBlocked: () => invoke<boolean>('lan_network_blocked'),
   /** Open System Settings → Privacy & Security → Local Network. */
   openLocalNetworkSettings: () => invoke<void>('open_local_network_settings'),
+  /** Keep the computer from idle-sleeping while files are moving. */
+  setKeepAwake: (on: boolean) => invoke<void>('set_keep_awake', { on }),
+  /** Open the OS settings page that fixes a refused permission. */
+  openPrivacySettings: (pane: 'files' | 'full-disk' | 'notifications' | 'local-network') =>
+    invoke<void>('open_privacy_settings', { pane }),
   openUrl: (url: string) => invoke<void>('open_url', { url }),
   getDefaultDownloadDir: () => invoke<string>('get_default_download_dir'),
   // Shared Drop Folders. Tauri v2 maps camelCase JS keys → snake_case Rust params,
   // so the keys here MUST be camelCase (e.g. twoWay, not two_way).
   createPair: (folder: string, twoWay: boolean, peerName?: string, mirror?: boolean) =>
     invoke<{ pair: Pair; invite: string }>('create_pair', { folder, twoWay, peerName, mirror }),
-  acceptPair: (invite: string, folder: string) =>
-    invoke<Pair>('accept_pair', { invite, folder }),
+  /** Join a shared folder. `folder` is where the person chose to keep it: if it
+   *  already holds other things, the engine makes a subfolder named `folderName`
+   *  (or after the sharer) inside it. The returned pair has the real folder. */
+  acceptPair: (invite: string, folder: string, folderName?: string | null) =>
+    invoke<Pair>('accept_pair', { invite, folder, folderName: folderName || null }),
   listPairs: () => invoke<Pair[]>('list_pairs'),
   updatePair: (u: PairUpdate) =>
     invoke<Pair>('update_pair', {
@@ -517,14 +594,22 @@ const realApi = {
   clearAllFolderHistory: () => invoke<number>('clear_all_folder_history'),
   linkDeviceBegin: () => invoke<string>('link_device_begin'),
   linkDeviceCancel: () => invoke<void>('link_device_cancel'),
-  linkDeviceSend: (code: string) => invoke<LinkResult>('link_device_send', { code }),
+  listFriendRequests: () => invoke<FriendRequest[]>('list_friend_requests'),
+  acceptFriendRequest: (endpointId: string) => invoke<Friend>('accept_friend_request', { endpointId }),
+  declineFriendRequest: (endpointId: string, block: boolean) => invoke<void>('decline_friend_request', { endpointId, block }),
+  /** Step 1 with a scanned code: the other device shows the safety code; nothing moves yet. */
+  linkDevicePrepare: (code: string) => invoke<LinkPreviewInfo>('link_device_prepare', { code }),
+  /** This device's answer to a "Link <name>? Safety code …" prompt. */
+  linkConfirm: (endpointId: string, accept: boolean) => invoke<void>('link_confirm', { endpointId, accept }),
+  linkDeviceSend: (code: string, confirm: string) => invoke<LinkResult>('link_device_send', { code, confirm }),
   /** Show a code a NEW device scans to join this device's account. */
   linkHostBegin: () => invoke<string>('link_host_begin'),
   linkHostCancel: () => invoke<void>('link_host_cancel'),
   /** This (new) device joins the account whose `dropbeamjoin1:` code was scanned. */
-  linkDeviceJoin: (code: string) => invoke<LinkResult>('link_device_join', { code }),
+  linkDeviceJoin: (code: string, confirm: string) => invoke<LinkResult>('link_device_join', { code, confirm }),
   accountSyncNow: () => invoke<void>('account_sync_now'),
   accountRemoveDevice: (endpointId: string) => invoke<void>('account_remove_device', { endpointId }),
+  accountApproveDevice: (endpointId: string) => invoke<void>('account_approve_device', { endpointId }),
   accountLeave: () => invoke<void>('account_leave'),
   myDeviceInfo: () => invoke<MyDeviceInfo>('my_device_info'),
   // Friends — named peers you send to directly.
@@ -552,8 +637,9 @@ const realApi = {
   respondToOffer: (id: string, accept: boolean, dest?: string) =>
     invoke<void>('respond_to_offer', { id, accept, dest: dest ?? null }),
   friendInvite: (id: string) => invoke<string>('friend_invite', { id }),
-  sendToFriend: (id: string, paths: string[], chatTransferId?: string, chatAttempt?: number) =>
-    invoke<TransferUpdate>('send_to_friend', { id, paths, chatTransferId, chatAttempt }),
+  /** Files to a friend — to every one of their devices, or just `device` (an endpoint id). */
+  sendToFriend: (id: string, paths: string[], chatTransferId?: string, chatAttempt?: number, device?: string) =>
+    invoke<TransferUpdate>('send_to_friend', { id, paths, chatTransferId, chatAttempt, device: device ?? null }),
   /** Your permanent, reusable DropBeam code (stable device key + name). */
   myInviteCode: () => invoke<string>('my_invite_code'),
   /** Add a friend from their permanent code; auto-fills their name, two-way. */
@@ -585,6 +671,9 @@ const realApi = {
   savePastedImage: (b64: string, ext: string) =>
     invoke<string>('save_pasted_image', { b64, ext }),
   pasteClipboardImage: () => invoke<string>('paste_clipboard_image'),
+  /** Files/folders copied in Finder / Explorer / a Linux file manager (#37), as
+   *  absolute paths — empty when the clipboard holds none. */
+  clipboardFilePaths: () => invoke<string[]>('clipboard_file_paths'),
   /** Add/remove an emoji reaction on a message (ours or theirs). */
   reactToMessage: (friendId: string, messageId: string, emoji: string, add: boolean) =>
     invoke<void>('react_to_message', { friendId, messageId, emoji, add }),
@@ -599,6 +688,8 @@ const realApi = {
   /** Send a read receipt: seen everything up to `upTo` (ms). Honors the toggle. */
   sendReadReceipt: (friendId: string, upTo: number) =>
     invoke<void>('send_read_receipt', { friendId, upTo }),
+  /** This conversation is on screen: your other devices clear its unread badge too. */
+  chatMarkSeen: (friendId: string) => invoke<void>('chat_mark_seen', { friendId }),
   /** Download a GIF's bytes (Giphy CDN) to a temp file; returns the local path. */
   downloadGif: (url: string, id: string) => invoke<string>('download_gif', { url, id }),
   /** Drop a GIF card in the thread (bytes already sent via the file transfer). */
@@ -620,7 +711,7 @@ const realApi = {
 // containing "fail" shows the error screen, anything else the progress + success.
 const previewParam = (k: string) => typeof location === 'undefined' ? null : new URLSearchParams(location.search).get(k)
 const previewLink = async (code: string): Promise<LinkResult> => {
-  if (/fail/i.test(code)) { await new Promise(r => setTimeout(r, 900)); throw 'Both devices already belong to different accounts, so they can’t be linked. On the device you want to move, open Settings → Devices → Remove This Device from Account, then try again.' }
+  if (/fail/i.test(code)) { await new Promise(r => setTimeout(r, 900)); throw 'Each of these devices is already linked to other devices, so they can’t be linked to each other. On the one you want to move, open Settings → Devices and choose Remove This Device from My Devices, then try again.' }
   mockEmit('link://progress', { stage: 'waiting', friends: 0, messages: 0 })
   await new Promise(r => setTimeout(r, 900))
   mockEmit('link://progress', { stage: 'importing', friends: 7, messages: 309 })
@@ -632,11 +723,21 @@ const backend: typeof realApi = HAS_TAURI ? realApi : ({
   linkDeviceBegin: async () => 'dropbeamlink1:eyJ2IjoxLCJlaWQiOiJwcmV2aWV3IiwibmFtZSI6IlByZXZpZXciLCJ0b2tlbiI6IjAwIn0',
   linkDeviceCancel: async () => {},
   linkDeviceSend: previewLink,
+  linkDevicePrepare: async (code: string) => {
+    await new Promise(r => setTimeout(r, 500))
+    if (/fail/i.test(code)) throw 'Couldn’t reach your other device. Make sure DropBeam is open on it and both devices are online, then try again.'
+    return { name: 'iPhone', safety: '482 913', direction: /^dropbeamjoin1:/i.test(code) ? 'take' : 'give', peerShowsCode: true, confirmToken: 'preview' } satisfies LinkPreviewInfo
+  },
+  linkConfirm: async () => {},
+  listFriendRequests: async () => previewParam('requests') === '1' ? [{ endpointId: 'preview-req', name: 'Jordan', at: Date.now() - 60_000 }] : [],
+  acceptFriendRequest: async () => { throw 'Not available in preview' },
+  declineFriendRequest: async () => {},
   linkHostBegin: async () => 'dropbeamjoin1:eyJ2IjoxLCJlaWQiOiJwcmV2aWV3IiwibmFtZSI6IlByZXZpZXciLCJ0b2tlbiI6IjAwIn0',
   linkHostCancel: async () => {},
   linkDeviceJoin: previewLink,
   accountSyncNow: async () => {},
   accountRemoveDevice: async () => {},
+  accountApproveDevice: async () => {},
   accountLeave: async () => {},
   myDeviceInfo: async () => previewParam('devices') === '0' ? ({
     endpoint_id: 'preview', name: "Ashton's MacBook Pro", device_kind: 'laptop', account_pub: '', linked_devices: 0, device_os: 'macos', devices: [], display_name: 'Ashton',
@@ -730,6 +831,22 @@ export function onChatMessage(cb: (m: ChatMessage) => void): Promise<UnlistenFn>
   return listen<ChatMessage>('chat://message', (e) => cb(e.payload))
 }
 
+/** Another of your devices read this conversation up to `upTo` (ms). */
+export interface ChatSeen { peerId: string; upTo: number }
+export function onChatSeen(cb: (s: ChatSeen) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('chat://seen', (p) => cb(p as ChatSeen))
+  return listen<ChatSeen>('chat://seen', (e) => cb(e.payload))
+}
+/** Messages from a friend that reached another of your devices first. */
+export interface ChatSyncedUnread { peerId: string; count: number }
+export function onChatSyncedUnread(cb: (s: ChatSyncedUnread) => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('chat://synced-unread', (p) => cb(p as ChatSyncedUnread))
+  return listen<ChatSyncedUnread>('chat://synced-unread', (e) => cb(e.payload))
+}
+
+/** The conversation id a friend-request notification carries (opens Friends). */
+export const FRIEND_REQUESTS_TARGET = 'friend-requests'
+
 /** A friend started/stopped typing to us (ephemeral). */
 export interface ChatTyping {
   peerId: string
@@ -751,6 +868,14 @@ export type BlockedPerson = { id: string; name: string; at: number; endpointIds:
 export function onBlockedChanged(cb: () => void): Promise<UnlistenFn> {
   if (!HAS_TAURI) return mockListen('blocked://changed', () => cb())
   return listen('blocked://changed', () => cb())
+}
+
+/** Someone who introduced themselves but isn't a friend yet (S2). */
+export type FriendRequest = { endpointId: string; name: string; at: number; accountPub?: string }
+
+export function onFriendRequestsChanged(cb: () => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('friend-requests://changed', () => cb())
+  return listen('friend-requests://changed', () => cb())
 }
 
 export function onFriendsChanged(cb: () => void): Promise<UnlistenFn> {

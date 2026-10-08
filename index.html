@@ -5,6 +5,24 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>DropBeam</title>
+    <!-- Apply the last-used theme before the first paint (no light flash on a
+         dark-mode launch). Overlay windows (popover, HUD, receive card) are
+         transparent, so only the main window gets the background colour. -->
+    <script>
+      try {
+        var t = localStorage.getItem('dropbeam-theme') || 'system'
+        var dark = t === 'dark' || (t === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)
+        var q = new URLSearchParams(location.search).get('window')
+        var meta = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.metadata
+        var label = q || (meta && meta.currentWindow && meta.currentWindow.label) || 'main'
+        if (dark) document.documentElement.classList.add('dark')
+        if (label === 'main') document.documentElement.classList.add('main-window')
+      } catch (e) {}
+    </script>
+    <style>
+      html.main-window { background: #f7f7f8; }
+      html.main-window.dark { background: #1d1d1f; color-scheme: dark; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
