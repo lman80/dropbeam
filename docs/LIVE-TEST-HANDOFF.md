@@ -41,11 +41,11 @@ Next steps on 449ddd9:
 - Test-script fixes (nightly, not in repo): `chat2.py` uses `pkill … ; true`; `fold2.py` uses `wc -c` instead of `stat -f` (Linux).
 
 ## Open / suspected (not fixed)
-- `hist` "delete of settled file" failed once on 449ddd9 (204 s). It could be a regression from 449ddd9's `delete_allowed` change or a link stall. Check this first.
+- `hist` "delete of settled file" failed once on 449ddd9 (204 s). It could be a regression from 449ddd9's `delete_allowed` change or a link stall. Check this first. Code review (2026-10-07): 449ddd9 is unlikely to be the cause. The reconcile `plan.delete` only lists rels whose peer tombstone is newer than the file, so `version_mismatch_survivors` keeps none of them, and the new same-size branch only makes `delete_allowed` more permissive. Rerun live to tell a link stall from something else.
 - Once, Linux's lab endpoint stopped answering ("dial device app endpoint: timed out") while the GUI was still active. A restart fixed it; the cause is unknown.
 - The idle rescan (`seed_existing`, sync.rs ~1216) is starved while the peer is online, because `wake_sender` on every control success restarts its 45–180 s sleep. 2b13030 only moved the placeholder sweep. Other rescan duties may also be starved.
 - Stale partial on Linux: `~/.config/com.dropbeam.app/folder-partials/.dropbeam-partial-ac541896e83a3a9e.*` (200 MB, from the morning). Check that partials are GC'd.
-- Flaky test `iroh_net::xfer_matrix::matrix_resume_after_cancel_or_pause`: it fails under full-suite load and passes alone.
+- ~~Flaky `xfer_matrix::matrix_resume_*`~~ fixed in bd98f38 (2026-10-07): with 16 MiB lanes the "interrupted" send could finish from buffered flow-control windows (Windows CI: a complete, verified `movie.mov` at its real name, not a truncated one). The test now uses 32 MiB lanes and breaks at half. Not an engine bug.
 - m1 logs at "full (app+iroh)" verbosity: 4 MB rotation about every 20 min, so app_lib lines get lost. Use app-level verbosity for tests.
 
 ## Rebuild + deploy
