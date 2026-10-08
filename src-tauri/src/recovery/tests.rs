@@ -239,7 +239,7 @@ fn a_friend_sends_back_the_conversation_flipped_with_old_devices_and_folders() {
     assert_eq!(thread.len(), 10);
     for m in &thread {
         let n: u64 = m.id[1..].parse().unwrap();
-        assert_eq!(m.from_me, n % 3 != 0, "who sent what flips to this side");
+        assert_eq!(m.from_me, !n.is_multiple_of(3), "who sent what flips to this side");
         assert_eq!(m.reactions[0].from_me, !m.from_me);
         assert_eq!(m.status.as_deref(), m.from_me.then_some("delivered"));
     }

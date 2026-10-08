@@ -421,7 +421,7 @@ private struct RecoveryStep: View {
             Image(systemName: "key.horizontal").font(.system(size: 60, weight: .light)).foregroundStyle(.tint).padding(.top, 24).accessibilityHidden(true)
             PageTitle(title: saved ? "Your code is saved" : "Save a recovery code",
                       detail: saved ? "Keep the paper somewhere safe, like with your important papers."
-                                    : "12 words on paper. If you ever lose all your phones and computers, they bring back your friends and chats.")
+                                    : "A few words on paper. If you ever lose all your phones and computers, they bring back your friends and chats.")
         } actions: {
             if saved { PrimaryButton(title: "Continue", action: next) }
             else {

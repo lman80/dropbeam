@@ -80,7 +80,7 @@ export function SaveRecoveryModal({ onClose, offer = false }: { onClose: () => v
     <div className="recovery-intro">
       <KeyRound size={28} strokeWidth={1.6} aria-hidden />
       <p>{RECOVERY_WHY}</p>
-      <p>Your code is 12 words. Have a pen and paper ready — it takes about two minutes.</p>
+      <p>Your code is a list of words. Have a pen and paper ready — it takes about two minutes.</p>
       {error && <p className="recovery-error" role="alert">{error}</p>}
     </div>
   </Dialog>

@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { isRecoveryQr, listNames, makeQuiz, oldDeviceName, ordinal, restoreSummary, sheetLines, shouldRemind, splitWords } from '../src/lib/recovery.ts'
+import { isRecoveryQr, listNames, makeQuiz, oldDeviceName, ordinal, restoreSummary, sheetLines, splitWords } from '../src/lib/recovery.ts'
 
 const WORDS = 'legal winner thank year wave sausage worth useful legal winner thank yellow'.split(' ')
 
@@ -31,15 +31,6 @@ test('pasted or scanned words are split however they were written', () => {
   assert.deepEqual(splitWords('1. Legal\n2. winner, 3) thank'), ['legal', 'winner', 'thank'])
   assert.deepEqual(splitWords('dropbeamrecover1:legal winner'), ['legal', 'winner'])
   assert.ok(isRecoveryQr(' DropBeamRecover1:abc') && !isRecoveryQr('dropbeam:abc'))
-})
-
-test('the reminder waits two weeks after "later" and stops once saved', () => {
-  const now = 100 * 24 * 3600 * 1000
-  assert.equal(shouldRemind(null, now), false)
-  assert.equal(shouldRemind({ saved: true, hasAccount: true, laterAt: 0 }, now), false)
-  assert.equal(shouldRemind({ saved: false, hasAccount: false, laterAt: 0 }, now), true)
-  assert.equal(shouldRemind({ saved: false, hasAccount: true, laterAt: now - 3 * 24 * 3600 * 1000 }, now), false)
-  assert.equal(shouldRemind({ saved: false, hasAccount: true, laterAt: now - 15 * 24 * 3600 * 1000 }, now), true)
 })
 
 test('old devices and the restore summary use plain words', () => {

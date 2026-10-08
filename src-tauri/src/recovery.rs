@@ -512,7 +512,7 @@ pub(crate) async fn request_restore(dir: &Path, me: &str, send: &mut iroh::endpo
     let sig = crate::link::sign_endpoint(dir, me).ok_or_else(|| anyhow::anyhow!("no account"))?;
     iroh_net::write_frame(send, &json!({"kind": "restore-sync", "v": 1, "account_pub": account, "account_sig": sig})).await?;
     send.finish()?;
-    Ok(tokio::time::timeout(Duration::from_secs(90), iroh_net::read_frame_cap(recv, SYNC_FRAME_CAP)).await??)
+    tokio::time::timeout(Duration::from_secs(90), iroh_net::read_frame_cap(recv, SYNC_FRAME_CAP)).await?
 }
 
 /// iroh_net's dispatcher: a `restore-sync` stream.

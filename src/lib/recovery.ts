@@ -77,12 +77,6 @@ export function isRecoveryQr(text: string): boolean {
   return /^dropbeamrecover1:/i.test(text.trim())
 }
 
-/** Whether to remind the person to save their code (not every launch). */
-export function shouldRemind(status: RecoveryStatus | null | undefined, now: number): boolean {
-  if (!status || status.saved) return false
-  return now - (status.laterAt || 0) > 14 * 24 * 3600 * 1000
-}
-
 /** "Your Mac", "Your iPhone 12" for a device from before the restore. */
 export function oldDeviceName(d: Pick<RecoveryOldDevice, 'kind' | 'os' | 'model'>): string {
   if (d.model) return `Your ${d.model}`

@@ -183,7 +183,7 @@ struct SaveRecoverySheet: View {
             Image(systemName: "key.horizontal").font(.system(size: 52, weight: .light)).foregroundStyle(.tint).frame(maxWidth: .infinity).padding(.top, 12).accessibilityHidden(true)
             Text("Save Your Recovery Code").font(.title.bold()).frame(maxWidth: .infinity)
             Text(RecoveryText.why).font(.body)
-            Text("Your code is 12 words. Have a pen and paper ready — it takes about two minutes.").font(.body).foregroundStyle(.secondary)
+            Text("Your code is a list of words. Have a pen and paper ready — it takes about two minutes.").font(.body).foregroundStyle(.secondary)
         case .words:
             Text("Write each word on paper, in order, exactly as shown.").font(.body)
             WordColumns(words: words)
@@ -413,50 +413,57 @@ struct RecoverySection: View {
     @State private var saving = false
     @State private var removing: [String]?
     var body: some View {
+        // Modifiers sit on the first Section only: on a Group inside a List they
+        // would be copied onto every section (two sheets, two refreshes).
         Group {
-            if let status {
-                Section {
-                    Button { saving = true; Haptics.tap() } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Label(status.saved ? "Show Recovery Code" : "Save Your Recovery Code", systemImage: "key.horizontal")
-                            Text(status.saved ? "Saved. Keep the paper somewhere safe." : "Not saved yet. If you lose all your devices, it’s the only way to get your friends and chats back.")
-                                .font(.footnote).foregroundStyle(status.saved ? Color.secondary : Color.orange)
-                        }
+            codeSection
+                .task { await refresh() }
+                .onChange(of: bridge.friends.count) { _, _ in Task { await refresh() } }
+                .sheet(isPresented: $saving, onDismiss: { Task { await refresh() } }) { SaveRecoverySheet().environmentObject(bridge) }
+                .confirmationDialog((removing?.count ?? 0) > 1 ? "Remove your old devices?" : "Remove this old device?",
+                                    isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { ids in
+                    Button("Remove", role: .destructive) {
+                        bridge.perform { try await bridge.recoveryRemoveOldDevices(ids); bridge.showToast(ids.count == 1 ? "The old device was removed" : "The old devices were removed"); await refresh() }
                     }
-                } header: { Text("Recovery Code") }
-                if let r = status.restore {
-                    Section {
-                        Text(r.summary).font(.subheadline)
-                        ForEach(r.oldDevices) { d in
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(d.title).font(.body.weight(.semibold))
-                                Text("\(d.via) still knew it. Lost or stolen? Remove it so nobody can use it as you.").font(.subheadline).foregroundStyle(.secondary)
-                                HStack(spacing: 10) {
-                                    Button("Remove", role: .destructive) { removing = [d.endpointId] }.buttonStyle(.borderedProminent).tint(.red)
-                                    Button("I Still Have It") { keep(d.endpointId) }.buttonStyle(.bordered)
-                                }.controlSize(.small)
-                            }.padding(.vertical, 2)
-                        }
-                        if r.oldDevices.count > 1 {
-                            Button("Remove All Old Devices", role: .destructive) { removing = r.oldDevices.map(\.endpointId) }
-                        }
-                    } header: { Text("Since You Restored") } footer: {
-                        if !r.folders.isEmpty {
-                            Text("Shared folders you were in: \(r.folders.map { "\($0.name) (with \($0.with))" }.joined(separator: ", ")). Their files are still with your friends — ask them to invite you again.")
-                        }
+                } message: { _ in Text("Your friends will stop treating it as you, and it gets no new messages. If you find it later, you can link it again.") }
+            if let r = status?.restore { restoreSection(r) }
+        }
+    }
+    private var codeSection: some View {
+        let saved = status?.saved == true
+        return Section {
+            Button { saving = true; Haptics.tap() } label: {
+                VStack(alignment: .leading, spacing: 3) {
+                    Label(saved ? "Show Recovery Code" : "Save Your Recovery Code", systemImage: "key.horizontal")
+                    if let status {
+                        Text(status.saved ? "Saved. Keep the paper somewhere safe." : "Not saved yet. If you lose all your devices, it’s the only way to get your friends and chats back.")
+                            .font(.footnote).foregroundStyle(status.saved ? Color.secondary : Color.orange)
                     }
                 }
             }
-        }
-        .task { await refresh() }
-        .onChange(of: bridge.friends.count) { _, _ in Task { await refresh() } }
-        .sheet(isPresented: $saving, onDismiss: { Task { await refresh() } }) { SaveRecoverySheet().environmentObject(bridge) }
-        .confirmationDialog((removing?.count ?? 0) > 1 ? "Remove your old devices?" : "Remove this old device?",
-                            isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { ids in
-            Button("Remove", role: .destructive) {
-                bridge.perform { try await bridge.recoveryRemoveOldDevices(ids); bridge.showToast(ids.count == 1 ? "The old device was removed" : "The old devices were removed"); await refresh() }
+        } header: { Text("Recovery Code") }
+    }
+    @ViewBuilder private func restoreSection(_ r: RecoveryRestoreView) -> some View {
+        Section {
+            Text(r.summary).font(.subheadline)
+            ForEach(r.oldDevices) { d in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(d.title).font(.body.weight(.semibold))
+                    Text("\(d.via) still knew it. Lost or stolen? Remove it so nobody can use it as you.").font(.subheadline).foregroundStyle(.secondary)
+                    HStack(spacing: 10) {
+                        Button("Remove", role: .destructive) { removing = [d.endpointId] }.buttonStyle(.borderedProminent).tint(.red)
+                        Button("I Still Have It") { keep(d.endpointId) }.buttonStyle(.bordered)
+                    }.controlSize(.small)
+                }.padding(.vertical, 2)
             }
-        } message: { _ in Text("Your friends will stop treating it as you, and it gets no new messages. If you find it later, you can link it again.") }
+            if r.oldDevices.count > 1 {
+                Button("Remove All Old Devices", role: .destructive) { removing = r.oldDevices.map(\.endpointId) }
+            }
+        } header: { Text("Since You Restored") } footer: {
+            if !r.folders.isEmpty {
+                Text("Shared folders you were in: \(r.folders.map { "\($0.name) (with \($0.with))" }.joined(separator: ", ")). Their files are still with your friends — ask them to invite you again.")
+            }
+        }
     }
     private func refresh() async { if let s = try? await bridge.recoveryStatus() { status = s } }
     private func keep(_ id: String) { Task { try? await bridge.recoveryKeepOldDevice(id); await refresh() } }

@@ -451,7 +451,9 @@ pub(crate) fn forget_key(dir: &Path) {
 // while it still derives the key on disk, so a stale seed can never show words
 // for a different account.
 
-fn read_seed(dir: &Path) -> Option<zeroize::Zeroizing<[u8; 16]>> {
+/// The 16 bytes behind a 12-word recovery code, wiped from memory on drop.
+pub(crate) type Seed = zeroize::Zeroizing<[u8; 16]>;
+fn read_seed(dir: &Path) -> Option<Seed> {
     let bytes = zeroize::Zeroizing::new(std::fs::read(dir.join("account.seed")).ok()?);
     let seed: [u8; 16] = bytes.as_slice().try_into().ok()?;
     Some(zeroize::Zeroizing::new(seed))
@@ -463,12 +465,12 @@ fn remove_seed(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("account.seed"));
 }
 /// The 16-byte seed behind `key`, if this device has it and it still matches.
-fn matching_seed(dir: &Path, key: &iroh::SecretKey) -> Option<zeroize::Zeroizing<[u8; 16]>> {
+fn matching_seed(dir: &Path, key: &iroh::SecretKey) -> Option<Seed> {
     read_seed(dir).filter(|s| crate::recovery::key_from_seed(s).to_bytes() == key.to_bytes())
 }
 /// The account key for the recovery code, minting a new (word-derived)
 /// account if this device has none yet, plus its 12-word seed when known.
-pub(crate) fn account_for_recovery(dir: &Path) -> Result<(iroh::SecretKey, Option<zeroize::Zeroizing<[u8; 16]>>), String> {
+pub(crate) fn account_for_recovery(dir: &Path) -> Result<(iroh::SecretKey, Option<Seed>), String> {
     let key = account(dir)?;
     let _guard = ACCOUNT_LOCK.lock().unwrap();
     let seed = matching_seed(dir, &key);
