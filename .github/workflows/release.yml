@@ -136,7 +136,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf binutils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf binutils xdg-utils
 
       # macOS only: Spotlight auto-mounts + indexes the DMG while tauri's
       # bundle_dmg.sh is still attaching it, which intermittently fails the bundle
@@ -228,11 +228,13 @@ jobs:
       # split off by scripts/split-linux-debug.sh.
       - name: Collect debug symbols
         if: always()
+        # Symbols are a nice-to-have: never let this step fail a release.
+        continue-on-error: true
         shell: bash
         run: |
           mkdir -p debug-symbols
-          shopt -s nullglob globstar
-          for f in src-tauri/target/**/release/DropBeam.dSYM src-tauri/target/**/release/DropBeam.pdb src-tauri/target/debug-symbols/*.debug; do
+          # find, not globstar: macOS runners ship bash 3.2, which has no globstar.
+          find src-tauri/target \( -path '*/release/DropBeam.dSYM' -o -path '*/release/DropBeam.pdb' -o -path 'src-tauri/target/debug-symbols/*.debug' \) -prune -print | while IFS= read -r f; do
             # Prefix with the target dir (e.g. aarch64-apple-darwin) so the two
             # halves of the universal build don't overwrite each other.
             triple=$(basename "$(dirname "$(dirname "$f")")")
