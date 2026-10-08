@@ -86,6 +86,12 @@ noq-proto = { version = "1.3", default-features = false }
 # StreamExt to drain the mDNS discovery-event stream into the log.
 n0-future = "0.3"
 anyhow = "1"
+# Recovery code (recovery.rs): wipe the words/seed from memory after use. Already in
+# the tree via the crypto crates, so nothing new is downloaded.
+zeroize = "1"
+# Recovery rendezvous (recovery.rs): a signed pkarr record so friends can find a
+# restored account's new device. The same crate iroh already uses to publish addresses.
+iroh-dns = "1.3"
 # Diagnostics digest upload (telemetry.rs). rustls reuses iroh's TLS stack; no
 # OpenSSL. Only used to POST a small JSON to the operator-configured endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

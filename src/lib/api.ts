@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { mockApi, mockListen, mockLocationRequest, mockSharedLocations, mockSyncedFolders, mockLocations, emit as mockEmit } from './mock'
 import { normalizeSharedLocations } from './normalize'
+import type { RecoveryCheck, RecoveryReveal, RecoveryStatus } from './recovery'
 import { MOBILE_UI } from './platform'
 import { pickMobileFiles } from '../components/MobileFileSheet'
 
@@ -612,6 +613,18 @@ const realApi = {
   accountApproveDevice: (endpointId: string) => invoke<void>('account_approve_device', { endpointId }),
   accountLeave: () => invoke<void>('account_leave'),
   myDeviceInfo: () => invoke<MyDeviceInfo>('my_device_info'),
+  // Recovery code (docs/RECOVERY-CODE.md). The words only ever go to the screen.
+  recoveryStatus: () => invoke<RecoveryStatus>('recovery_status'),
+  /** The words to write down (creates the account if this device has none yet). */
+  recoveryReveal: () => invoke<RecoveryReveal>('recovery_reveal'),
+  recoveryConfirmSaved: (answers: { index: number; word: string }[]) => invoke<void>('recovery_confirm_saved', { answers }),
+  recoveryLater: () => invoke<void>('recovery_later'),
+  recoveryCheck: (text: string) => invoke<RecoveryCheck>('recovery_check', { text }),
+  recoveryRestore: (text: string) => invoke<void>('recovery_restore', { text }),
+  recoveryRemoveOldDevices: (endpointIds: string[]) => invoke<void>('recovery_remove_old_devices', { endpointIds }),
+  recoveryKeepOldDevice: (endpointId: string) => invoke<void>('recovery_keep_old_device', { endpointId }),
+  /** Open the system print dialog for this window (the recovery sheet). */
+  recoveryPrint: () => invoke<void>('recovery_print'),
   // Friends — named peers you send to directly.
   createFriend: (friendName: string) =>
     invoke<{ friend: Friend; invite: string }>('create_friend', { friendName }),
@@ -709,6 +722,7 @@ const realApi = {
 // Keep browser-only link placeholders in this bridge, within the backend slice.
 // Preview knobs: ?devices=0 shows a device not linked yet; a pasted device code
 // containing "fail" shows the error screen, anything else the progress + success.
+const PREVIEW_WORDS = 'legal winner thank year wave sausage worth useful legal winner thank yellow'.split(' ')
 const previewParam = (k: string) => typeof location === 'undefined' ? null : new URLSearchParams(location.search).get(k)
 const previewLink = async (code: string): Promise<LinkResult> => {
   if (/fail/i.test(code)) { await new Promise(r => setTimeout(r, 900)); throw 'Each of these devices is already linked to other devices, so they can’t be linked to each other. On the one you want to move, open Settings → Devices and choose Remove This Device from My Devices, then try again.' }
@@ -739,6 +753,24 @@ const backend: typeof realApi = HAS_TAURI ? realApi : ({
   accountRemoveDevice: async () => {},
   accountApproveDevice: async () => {},
   accountLeave: async () => {},
+  recoveryStatus: async () => ({ saved: previewParam('recovery') === 'saved', hasAccount: true, laterAt: 0,
+    restore: previewParam('restored') === '1' ? { restoredAt: Date.now() - 3_600_000, friendsSynced: 2, returned: ['Fran', 'Jordan'],
+      oldDevices: [{ endpointId: 'old-phone', os: 'ios', kind: 'phone', model: 'iPhone 12', via: 'Fran' }], folders: [{ name: 'Vacation', with: 'Fran' }] } : null }),
+  recoveryReveal: async () => ({ words: PREVIEW_WORDS, qr: `dropbeamrecover1:${PREVIEW_WORDS.join(' ')}` }),
+  recoveryConfirmSaved: async (answers: { index: number; word: string }[]) => {
+    if (answers.some(a => PREVIEW_WORDS[a.index] !== a.word)) throw 'That’s not the right word. Look at your paper again.'
+  },
+  recoveryLater: async () => {},
+  recoveryCheck: async (text: string) => {
+    const w = text.trim().toLowerCase().split(/[^a-z]+/).filter(Boolean)
+    const unknown = w.map((x, i) => (x.length < 3 ? i : -1)).filter(i => i >= 0)
+    const complete = (w.length === 12 || w.length === 24) && !unknown.length
+    return { count: w.length, unknown, complete, valid: complete && !w.includes('wrong'), problem: unknown.length ? `Word ${unknown[0] + 1} isn’t one of the recovery words. Check its spelling.` : null }
+  },
+  recoveryRestore: async (text: string) => { await new Promise(r => setTimeout(r, 700)); if (/wrong/.test(text)) throw 'Those words don’t add up — one of them is probably mistyped. Check each word against your paper.' },
+  recoveryRemoveOldDevices: async () => {},
+  recoveryKeepOldDevice: async () => {},
+  recoveryPrint: async () => { window.print() },
   myDeviceInfo: async () => previewParam('devices') === '0' ? ({
     endpoint_id: 'preview', name: "Ashton's MacBook Pro", device_kind: 'laptop', account_pub: '', linked_devices: 0, device_os: 'macos', devices: [], display_name: 'Ashton',
   }) : ({
@@ -1022,4 +1054,10 @@ export function onLocationActivity(cb: (activity: LocationActivity) => void): Pr
 }
 export function onLocationsChanged(cb: () => void): Promise<UnlistenFn> {
   return HAS_TAURI ? listen('locations://changed', cb) : Promise.resolve(() => {})
+}
+
+/** After a restore: a friend came back or sent back their copy of the chats. */
+export function onRecoveryChanged(cb: () => void): Promise<UnlistenFn> {
+  if (!HAS_TAURI) return mockListen('recovery://changed', () => cb())
+  return listen('recovery://changed', () => cb())
 }

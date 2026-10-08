@@ -9,6 +9,7 @@ import { useStore } from '../store'
 import { LinkFlow } from './LinkDeviceModal'
 import { ConfirmDialog } from './SafetyDialogs'
 import { MenuButton } from './ui'
+import { RecoverySection } from './RecoveryCode'
 
 // eslint-disable-next-line react-refresh/only-export-components -- re-exported helpers for existing importers
 export { linkWithCode, isDeviceCode } from './LinkDeviceModal'
@@ -116,6 +117,7 @@ export function DevicesPanel() {
     <p className="account-devices-note">{inAccount
       ? 'Lost a phone or computer? Remove it here so it gets no new messages. Messages already on it stay there, so also lock or erase it (on an iPhone, with Find My).'
       : 'Your friends and chats are only on your devices — there’s no online backup. Link a second device so losing one doesn’t lose them.'}</p>
+    <RecoverySection />
     {mode && <LinkFlow start={mode} title="Link a Device" onClose={() => { setMode(null); void useStore.getState().refreshMyDevice().catch(() => {}) }} />}
     <AnimatePresence>
       {confirm?.kind === 'remove' && <ConfirmDialog key="remove"

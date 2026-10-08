@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useLayoutEffect, useState } from 'react'
 import { isEnterKey, isPrimaryMod } from './lib/keys'
 import { NAV_ORDER } from './components/Sidebar'
 import { JoinAccountModal } from './components/DevicesPanel'
+import { RestoreRecoveryModal, SaveRecoveryModal } from './components/RecoveryCode'
 import { motion } from 'framer-motion'
 import { AlertTriangle, Download, WifiOff, X } from 'lucide-react'
 import { InstallUpdateButton } from './components/UpdateInstall'
@@ -363,6 +364,8 @@ function NameSetupModal() {
   const [show, setShow] = useState(false)
   const [name, setName] = useState('')
   const [joining, setJoining] = useState(false)
+  const [restoring, setRestoring] = useState(false)
+  const [offerCode, setOfferCode] = useState(false)
   // Decide ONCE, when settings first arrive. Re-running on every settings change
   // (a synced name, a toggle in another window) overwrote what you were typing.
   const [decided, setDecided] = useState(false)
@@ -374,12 +377,16 @@ function NameSetupModal() {
     }
   }
 
+  if (offerCode) return <SaveRecoveryModal offer onClose={() => setOfferCode(false)} />
   if (!show || !settings) return null
   const finish = () => {
     const trimmed = name.trim()
     if (trimmed && trimmed !== settings.displayName) save({ displayName: trimmed })
     localStorage.setItem('dropbeam.namedSelf', '1')
     setShow(false)
+    // Offered once, right after setup (always in Settings → Devices later) —
+    // unless this device already has a saved code (a restore, a linked device).
+    void api.recoveryStatus().then(s => { if (!s.saved) setOfferCode(true) }).catch(() => {})
   }
   return (
     <>
@@ -418,9 +425,13 @@ function NameSetupModal() {
             aria-label="Your name"
             maxLength={40}
           />
+          {!MOBILE_UI && <button className="btn btn-plain onboard-restore" onClick={() => setRestoring(true)}>
+            Lost your old phone or computer? Restore with your recovery code…
+          </button>}
         </div>
       </Dialog>
       {joining && <JoinAccountModal onClose={() => setJoining(false)} onShowCode={() => setJoining(false)} />}
+      {restoring && <RestoreRecoveryModal onClose={() => setRestoring(false)} onRestored={() => void useStore.getState().refreshMyDevice().catch(() => {})} />}
     </>
   )
 }

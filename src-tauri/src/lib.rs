@@ -49,6 +49,7 @@ mod panic_log;
 #[cfg(any(target_os = "ios", test))]
 mod ios_log_policy;
 mod provenance;
+mod recovery;
 mod settings;
 mod sync;
 mod telemetry;
@@ -721,6 +722,8 @@ pub fn run() {
             account::spawn(app.handle().clone(), iroh_state.clone());
             // Tell the user's other devices what this one is sending/receiving (#31).
             device_activity::spawn(app.handle().clone(), iroh_state.clone());
+            // Recovery code: friends find a restored account; it gets its history back.
+            recovery::spawn(app.handle().clone(), iroh_state.clone());
             // Background diagnostics: periodically upload a REDACTED error/perf digest
             // so background problems surface without users reporting them. Uploads ONLY
             // to the operator-configured `settings.diagnostics_url` (empty by default →
@@ -962,6 +965,15 @@ pub fn run() {
             link::link_confirm,
             crate::account::account_approve_device,
             link::my_device_info,
+            recovery::recovery_status,
+            recovery::recovery_reveal,
+            recovery::recovery_confirm_saved,
+            recovery::recovery_later,
+            recovery::recovery_check,
+            recovery::recovery_restore,
+            recovery::recovery_remove_old_devices,
+            recovery::recovery_keep_old_device,
+            recovery::recovery_print,
             commands::verify_folders,
             commands::verify_folder,
             commands::stop_folder_transfer,

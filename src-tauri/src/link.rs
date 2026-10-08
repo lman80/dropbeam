@@ -427,10 +427,71 @@ pub(crate) fn sign_endpoint(dir: &Path, endpoint: &str) -> Option<String> {
     let _guard = ACCOUNT_LOCK.lock().unwrap();
     read_key(dir).ok().flatten().map(|k| hex::encode(k.sign(endpoint.as_bytes()).to_bytes()))
 }
+/// This device's account key, if it has one (never mints).
+pub(crate) fn account_key(dir: &Path) -> Option<iroh::SecretKey> {
+    let _guard = ACCOUNT_LOCK.lock().unwrap();
+    read_key(dir).ok().flatten()
+}
+/// The account's signature over any message (hex), when this device has the key.
+/// Callers domain-separate their messages ("dropbeam-…/1|…").
+pub(crate) fn sign_with_account(dir: &Path, message: &str) -> Option<String> {
+    let _guard = ACCOUNT_LOCK.lock().unwrap();
+    read_key(dir).ok().flatten().map(|k| hex::encode(k.sign(message.as_bytes()).to_bytes()))
+}
 /// Leave the account: this device forgets the key (it can be linked again).
 pub(crate) fn forget_key(dir: &Path) {
     let _guard = ACCOUNT_LOCK.lock().unwrap();
     let _ = std::fs::remove_file(dir.join("account.key"));
+    remove_seed(dir);
+}
+
+// ── recovery words (recovery.rs) ──────────────────────────────────────────
+// An account minted on this build comes from 16 random bytes (the 12 recovery
+// words); `account.seed` keeps them next to the key. It is only ever trusted
+// while it still derives the key on disk, so a stale seed can never show words
+// for a different account.
+
+fn read_seed(dir: &Path) -> Option<zeroize::Zeroizing<[u8; 16]>> {
+    let bytes = zeroize::Zeroizing::new(std::fs::read(dir.join("account.seed")).ok()?);
+    let seed: [u8; 16] = bytes.as_slice().try_into().ok()?;
+    Some(zeroize::Zeroizing::new(seed))
+}
+fn write_seed(dir: &Path, seed: &[u8; 16]) -> Result<(), String> {
+    write_private(dir, "account.seed", seed).map_err(|_| "cannot save account key".to_owned())
+}
+fn remove_seed(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("account.seed"));
+}
+/// The 16-byte seed behind `key`, if this device has it and it still matches.
+fn matching_seed(dir: &Path, key: &iroh::SecretKey) -> Option<zeroize::Zeroizing<[u8; 16]>> {
+    read_seed(dir).filter(|s| crate::recovery::key_from_seed(s).to_bytes() == key.to_bytes())
+}
+/// The account key for the recovery code, minting a new (word-derived)
+/// account if this device has none yet, plus its 12-word seed when known.
+pub(crate) fn account_for_recovery(dir: &Path) -> Result<(iroh::SecretKey, Option<zeroize::Zeroizing<[u8; 16]>>), String> {
+    let key = account(dir)?;
+    let _guard = ACCOUNT_LOCK.lock().unwrap();
+    let seed = matching_seed(dir, &key);
+    Ok((key, seed))
+}
+/// Make this device hold the recovered account `key` (and its seed, for 12
+/// words). Refused when the device already shares a DIFFERENT account with
+/// other devices (it must be removed from them first), and when it already
+/// holds this very account. `others` = its other own devices, read by the
+/// caller before taking the lock (like `adopt_offer`).
+pub(crate) fn install_recovered(dir: &Path, key: &iroh::SecretKey, seed: Option<&[u8; 16]>, others: &[crate::models::Friend]) -> Result<(), String> {
+    let _guard = ACCOUNT_LOCK.lock().unwrap();
+    if let Some(old) = read_key(dir)? {
+        if old.to_bytes() == key.to_bytes() { return Err(crate::recovery::ALREADY_THIS.into()); }
+        let old_pub = hex::encode(old.public().as_bytes());
+        if others.iter().any(|f| f.account_pub.as_deref() == Some(&old_pub)) { return Err(crate::recovery::LINKED_ELSEWHERE.into()); }
+    }
+    write_key(dir, key)?;
+    match seed {
+        Some(s) => write_seed(dir, s)?,
+        None => remove_seed(dir),
+    }
+    Ok(())
 }
 #[cfg(test)]
 pub(crate) fn adopt_key_for_tests(dir: &Path, key: &iroh::SecretKey) { write_key(dir, key).unwrap(); }
@@ -442,6 +503,11 @@ fn read_key(dir: &Path) -> Result<Option<iroh::SecretKey>, String> {
     }
 }
 fn write_key(dir: &Path, key: &iroh::SecretKey) -> Result<(), String> {
+    let bytes = zeroize::Zeroizing::new(key.to_bytes());
+    write_private(dir, "account.key", bytes.as_slice()).map_err(|_| "cannot save account key".into())
+}
+/// Write a secret file atomically, readable only by this user.
+fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let path = dir.join(format!(".account-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -449,17 +515,23 @@ fn write_key(dir: &Path, key: &iroh::SecretKey) -> Result<(), String> {
         options.write(true).create_new(true);
         #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
         let mut file = options.open(&path)?;
-        file.write_all(&key.to_bytes())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&path, dir.join("account.key"))
+        std::fs::rename(&path, dir.join(name))
     })();
     let _ = std::fs::remove_file(path);
-    result.map_err(|_: std::io::Error| "cannot save account key".into())
+    result
 }
+/// This device's account key, minting one if it has none. A new account is
+/// made from 16 random bytes, so it can be written down as 12 recovery words.
 fn account(dir: &Path) -> Result<iroh::SecretKey, String> {
     let _guard = ACCOUNT_LOCK.lock().unwrap();
     if let Some(key) = read_key(dir)? { return Ok(key); }
-    let key = iroh::SecretKey::generate();
+    let seed = zeroize::Zeroizing::new(rand::random::<[u8; 16]>());
+    let key = crate::recovery::key_from_seed(&seed);
+    // Seed first: a crash between the two leaves a seed without a key (ignored
+    // and replaced next time), never a key whose words were lost.
+    write_seed(dir, &seed)?;
     write_key(dir, &key)?;
     Ok(key)
 }
@@ -574,8 +646,12 @@ fn offer(st: &AppState, net: &IrohState, code: &LinkCode, key: &iroh::SecretKey)
         value
     }).collect();
     let sender = device(st, net)?;
+    // The 12-word seed travels with the key it derives (older builds ignore it),
+    // so every device of the account shows the same recovery words.
+    let words = { let _guard = ACCOUNT_LOCK.lock().unwrap(); matching_seed(&st.config_dir, key).map(|s| hex::encode(*s)) };
     Ok(json!({"kind":"link-offer", "v":1, "token":code.token,
         "account_seed_hex":hex::encode(key.to_bytes()), "account_pub":hex::encode(key.public().as_bytes()),
+        "account_words_hex": words,
         "account_sig":hex::encode(key.sign(sender.endpoint_id.as_bytes()).to_bytes()),
         "sender":sender, "friends":records, "chats":chats}))
 }
@@ -877,6 +953,15 @@ fn adopt_offer(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<
         }
     }
     write_key(&st.config_dir, &key)?;
+    // Keep the recovery seed only if it really derives this key; anything else
+    // (an older sender, a different account) means this device shows 24 words.
+    let words = req["account_words_hex"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|v| <[u8; 16]>::try_from(v).ok())
+        .map(zeroize::Zeroizing::new)
+        .filter(|s| crate::recovery::key_from_seed(s).to_bytes() == seed);
+    match words {
+        Some(s) => write_seed(&st.config_dir, &s)?,
+        None => remove_seed(&st.config_dir),
+    }
     drop(_guard);
     crate::account::forget_left(&st.config_dir, &public);
     crate::account::mark_linked(&st.config_dir, &me.endpoint_id);

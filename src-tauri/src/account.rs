@@ -592,6 +592,19 @@ pub(crate) fn is_removed_device(dir: &Path, account_pub: &str, eid: &str) -> boo
     !read_book(dir, account_pub).is_member(eid)
 }
 
+/// This device just restored `account` from its recovery words: a fresh book
+/// in which it is the only member (on link proofs from the start), so devices
+/// from before have to be approved again (S4) and none of their old link
+/// times, removals or friend removals linger from an earlier account here.
+pub(crate) fn start_restored_book(dir: &Path, account: &str, me: &str) {
+    let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut b = Book { account: account.to_owned(), me: me.to_owned(), proofs_v: 1, ..Default::default() };
+    b.linked.insert(me.to_owned(), chat::now_ms());
+    write_book(dir, &b);
+    drop(_g);
+    note_change();
+}
+
 /// A device joined the account now (either end of a link): record it and clear
 /// any older removal so the relink sticks everywhere.
 pub(crate) fn mark_linked(dir: &Path, eid: &str) {

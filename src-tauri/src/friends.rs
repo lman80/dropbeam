@@ -607,6 +607,10 @@ pub enum HelloOutcome {
     AddedDevice,
     /// Someone new: a pending friend request the user accepts or declines (S2).
     Requested,
+    /// A friend from before this account was restored from its recovery words:
+    /// their device presented this account's own signed word that it was a
+    /// friend (recovery.rs vouch), so they're a friend again without a request.
+    Returned,
 }
 
 /// Apply an incoming friend-hello (no proof of account; see `apply_hello_from`).
@@ -689,6 +693,11 @@ pub fn apply_hello_from(config_dir: &Path, friend_id: &str, endpoint_id: &str, n
             remove_request(config_dir, endpoint_id);
             return HelloOutcome::AddedDevice;
         }
+    }
+    if crate::recovery::vouched_by_me(config_dir, endpoint_id, req) {
+        upsert_by_endpoint(config_dir, endpoint_id, name);
+        remove_request(config_dir, endpoint_id);
+        return HelloOutcome::Returned;
     }
     add_request(config_dir, endpoint_id, name, proven);
     HelloOutcome::Requested

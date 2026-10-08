@@ -2951,7 +2951,7 @@ fn headless_refuses_in(headless: bool, req: &serde_json::Value) -> bool {
 }
 
 fn is_blockable_kind(kind: &str) -> bool {
-    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite" | "chat-manifest"
+    matches!(kind, "friend-hello" | "chat" | "chat-signal" | "files" | "files.stat" | "files.verify" | "folder-invite" | "chat-manifest" | "restore-sync"
         // S11: a blocked person can't push into, delete from or steer a shared
         // folder either (they're refused exactly like an unknown folder).
         | "folder-hello" | "folder-files" | "folder-ctrl" | "folder-reconcile")
@@ -2984,6 +2984,7 @@ async fn serve_blocked(kind: &str, req: &serde_json::Value, send: &mut SendStrea
         // sender clean up its copy): the stream just fails, as for a folder
         // this device doesn't have.
         "folder-files" | "folder-ctrl" | "folder-reconcile" | "folder-hello" => anyhow::bail!("folder access denied"),
+        "restore-sync" => write_frame(send, &serde_json::json!({ "kind": "restore-sync-no" })).await?,
         _ => write_frame(send, &serde_json::json!({ "kind": "ok" })).await?,
     }
     let _ = send.finish();
@@ -4022,6 +4023,9 @@ async fn serve_stream_inner(
         Some("account-sync") => {
             crate::account::serve(state, &conn.remote_id().to_string(), &req, send, recv).await?;
         }
+        Some("restore-sync") => {
+            crate::recovery::serve(state, &conn.remote_id().to_string(), &req, send).await?;
+        }
         Some("account-activity") => {
             crate::device_activity::serve(state, &conn.remote_id().to_string(), &req, send).await?;
         }
@@ -4045,6 +4049,21 @@ async fn serve_stream_inner(
                     }
                     let was_pending = crate::friends::has_request(&st.config_dir, &who);
                     let outcome = crate::friends::apply_hello_from(&st.config_dir, friend_id, &who, name, &req);
+                    // Recovery: keep the vouch their account gives us; a former
+                    // friend who came back to a restored account gets its history.
+                    if let Some(me) = state.get().map(|e| e.id().to_string()) {
+                        crate::recovery::store_vouch(&st.config_dir, &me, &req);
+                    }
+                    if outcome == crate::friends::HelloOutcome::Returned {
+                        crate::recovery::note_returned(&st.config_dir, name);
+                        let _ = app.emit("recovery://changed", ());
+                        // Greet them back, so their side learns this device is
+                        // the person they knew (and sends their messages here).
+                        if let Some(net) = app.try_state::<Arc<IrohState>>() {
+                            let my_name = st.settings.lock().unwrap().display_name.clone();
+                            say_hello_to_endpoint(net.inner().clone(), who.clone(), my_name);
+                        }
+                    }
                     crate::friends::apply_device_hello(&st.config_dir, &who, &req);
                     // A friend's devices they removed from their account (S4).
                     crate::friends::apply_revocations(&st.config_dir, &who, &req);
@@ -4094,7 +4113,11 @@ async fn serve_stream_inner(
                 Some(st) if !blocked => Some(crate::friends::chat_sender(&st.config_dir, &who).is_some()),
                 _ => None,
             };
-            write_frame(send, &serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat })).await?;
+            let mut reply = serde_json::json!({ "kind": "ok", "progress_v": PROGRESS_V, "locations_v": crate::locations::VERSION, "avatar": my_avatar, "mailbox": mailbox, "accepts_chat": accepts_chat });
+            if let (Ok(config), false) = (location_config(state), blocked) {
+                reply.as_object_mut().unwrap().extend(crate::recovery::hello_fields(&config, &who, None));
+            }
+            write_frame(send, &reply).await?;
             send.finish()?;
         }
         Some("folder-hello") => {
@@ -6406,6 +6429,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
         let config = location_config(&state).ok();
         if let Some(config) = &config {
             hello["mailbox"] = crate::mailbox::hello_fields(config, ep.secret_key(), &peer_eid);
+            hello.as_object_mut().unwrap().extend(crate::recovery::hello_fields(config, &peer_eid, None));
         }
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
@@ -6425,6 +6449,7 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
                     }
                     if let Some(config) = &config {
                         crate::mailbox::on_hello(&state, config, &conn.remote_id().to_string(), &reply);
+                        crate::recovery::store_vouch(config, &my_id, &reply);
                     }
                 }
             }
@@ -6437,6 +6462,12 @@ pub fn say_hello(state: Arc<IrohState>, friend_id: String, inviter_endpoint_id: 
 /// which they auto-add (the reverse of `add_by_code`). Best-effort; if they're
 /// offline now, the first message/file we send carries our name too.
 pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name: String) {
+    say_hello_to_endpoint_with(state, endpoint_id, my_name, serde_json::Value::Null);
+}
+
+/// `say_hello_to_endpoint` with extra hello fields (recovery.rs greets a
+/// friend's restored device with the vouch it holds for that account).
+pub fn say_hello_to_endpoint_with(state: Arc<IrohState>, endpoint_id: String, my_name: String, extra: serde_json::Value) {
     let Some(ep) = state.get().cloned() else {
         return;
     };
@@ -6456,6 +6487,10 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
         let config = location_config(&state).ok();
         if let Some(config) = &config {
             hello["mailbox"] = crate::mailbox::hello_fields(config, ep.secret_key(), &peer_eid);
+            hello.as_object_mut().unwrap().extend(crate::recovery::hello_fields(config, &peer_eid, None));
+        }
+        if let Some(extra) = extra.as_object() {
+            hello.as_object_mut().unwrap().extend(extra.clone());
         }
         if let Ok(Ok(conn)) =
             tokio::time::timeout(Duration::from_secs(20), ep.connect(addr, ALPN)).await
@@ -6475,6 +6510,7 @@ pub fn say_hello_to_endpoint(state: Arc<IrohState>, endpoint_id: String, my_name
                     }
                     if let Some(config) = &config {
                         crate::mailbox::on_hello(&state, config, &conn.remote_id().to_string(), &reply);
+                        crate::recovery::store_vouch(config, &my_id, &reply);
                     }
                 }
             }
