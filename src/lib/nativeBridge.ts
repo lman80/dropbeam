@@ -258,6 +258,22 @@ const handlers: BridgeHandlers = {
   // S4: a device in Settings → Devices marked needs_approval (myDevice.devices[].needs_approval).
   accountApproveDevice: async a => { await api.accountApproveDevice(string(a, 'endpointId')); await st().reloadFriends() },
   accountLeave: async () => { await api.accountLeave(); await st().reloadFriends() },
+  // Recovery code (docs/RECOVERY-CODE.md). The words only go to the screen.
+  recoveryStatus: () => api.recoveryStatus(),
+  recoveryReveal: async () => { const r = await api.recoveryReveal(); void st().refreshMyDevice().catch(() => {}); return r },
+  recoveryConfirmSaved: a => {
+    const answers = Array.isArray(a.answers) ? a.answers : []
+    if (!answers.every(x => x && typeof x === 'object' && typeof (x as { index?: unknown }).index === 'number' && typeof (x as { word?: unknown }).word === 'string')) throw new Error('Invalid answers')
+    return api.recoveryConfirmSaved(answers as { index: number; word: string }[])
+  },
+  recoveryLater: () => api.recoveryLater(),
+  recoveryCheck: a => api.recoveryCheck(string(a, 'text')),
+  recoveryRestore: async a => { await api.recoveryRestore(string(a, 'text')); await st().reloadFriends(); await st().refreshMyDevice().catch(() => {}) },
+  recoveryRemoveOldDevices: async a => {
+    const ids = Array.isArray(a.endpointIds) ? a.endpointIds.filter((x): x is string => typeof x === 'string') : []
+    await api.recoveryRemoveOldDevices(ids); await st().reloadFriends()
+  },
+  recoveryKeepOldDevice: a => api.recoveryKeepOldDevice(string(a, 'endpointId')),
   updateSettings: a => {
     if (!a.patch || typeof a.patch !== 'object' || Array.isArray(a.patch)) throw new Error('Invalid settings patch')
     return storeAction(() => st().saveSettings(a.patch as Partial<Settings>))

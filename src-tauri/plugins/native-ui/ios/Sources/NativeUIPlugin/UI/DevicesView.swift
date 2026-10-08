@@ -35,6 +35,7 @@ struct DevicesView: View {
                         HStack { Label("Sync Now", systemImage: "arrow.triangle.2.circlepath"); Spacer(); if syncing { ProgressView() } }
                     }.disabled(syncing)
                 }
+                RecoverySection()
                 Section {
                     Button("Remove This \(myNoun) from My Devices", role: .destructive) { leaving = true }
                 } footer: { Text("Lost a phone or computer? Remove it above (swipe or tap ⋯) so it gets no new messages. Messages already on it stay there, so also lock or erase it with Find My.\n\nFriends, chats, your name and photo sync directly between your devices, end-to-end encrypted.") }
@@ -45,6 +46,7 @@ struct DevicesView: View {
                 } header: { Text("Use DropBeam on Another Device") } footer: {
                     Text("Link your Mac, PC or another phone to share your friends and chats. They stay in sync directly between your devices, end-to-end encrypted.\n\nYour friends and chats are only on your devices — there’s no online backup. Link a second device so losing one doesn’t lose them.")
                 }
+                RecoverySection()
             }
         }
         .beamList()

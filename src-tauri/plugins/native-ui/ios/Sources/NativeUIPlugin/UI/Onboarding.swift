@@ -10,10 +10,11 @@ import UserNotifications
 struct OnboardingFlow: View {
     @EnvironmentObject private var bridge: Bridge
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    enum Step: Int, CaseIterable { case welcome, name, photo, devices, friend, notifications }
+    enum Step: Int, CaseIterable { case welcome, name, photo, devices, recovery, friend, notifications }
     @State private var step: Step = .welcome
     @State private var forward = true
     @State private var joining = false
+    @State private var restoring = false
     @State private var notificationsAsked = false
     var body: some View {
         VStack(spacing: 0) {
@@ -31,6 +32,10 @@ struct OnboardingFlow: View {
             // Linked into an account: name and photo came with it.
             if !bridge.needsName, (bridge.myDevice?.linked.count ?? 0) > 1 { go(.friend) }
         }) { JoinAccountSheet().environmentObject(bridge) }
+        .sheet(isPresented: $restoring) {
+            // Restored: the account is back; the person still picks their name.
+            RestoreRecoverySheet { go(.name) }.environmentObject(bridge)
+        }
         .task {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             notificationsAsked = settings.authorizationStatus != .notDetermined
@@ -65,10 +70,11 @@ struct OnboardingFlow: View {
     }
     @ViewBuilder private func page(_ step: Step) -> some View {
         switch step {
-        case .welcome: WelcomeStep(next: { go(.name) }, join: { joining = true })
+        case .welcome: WelcomeStep(next: { go(.name) }, join: { joining = true }, restore: { restoring = true })
         case .name: NameStep(next: { go(.photo) })
         case .photo: PhotoStep(next: { go(.devices) })
-        case .devices: DevicesStep(next: { go(.friend) })
+        case .devices: DevicesStep(next: { go(.recovery) })
+        case .recovery: RecoveryStep(next: { go(.friend) })
         case .friend: FriendStep(next: { notificationsAsked ? finish() : go(.notifications) })
         case .notifications: NotificationsStep(next: finish)
         }
@@ -168,6 +174,7 @@ private struct FeatureRow: View {
 private struct WelcomeStep: View {
     let next: () -> Void
     let join: () -> Void
+    let restore: () -> Void
     var body: some View {
         OnboardingPage {
             PeerToPeerDemo().padding(.top, 8)
@@ -182,6 +189,8 @@ private struct WelcomeStep: View {
         } actions: {
             PrimaryButton(title: "Get Started", action: next)
             SecondaryButton(title: "I Already Use DropBeam", action: join)
+            Button("Lost your old phone? Restore with Recovery Code", action: restore)
+                .font(.footnote).frame(maxWidth: .infinity, minHeight: 44)
         }
     }
 }
@@ -394,6 +403,36 @@ private struct DevicesStep: View {
             }
         }
         .sheet(isPresented: $linking) { LinkDeviceSheet(start: .show, title: "Link a Device").environmentObject(bridge) }
+    }
+}
+
+// MARK: - 4b. Recovery code
+
+/// Offered once, right after setup: write down the 12 words. Skippable; always
+/// in Settings → Devices later. Skipped on its own when the code is already
+/// saved (a restore, or a device that joined an account whose code was saved here).
+private struct RecoveryStep: View {
+    @EnvironmentObject private var bridge: Bridge
+    let next: () -> Void
+    @State private var saving = false
+    @State private var saved = false
+    var body: some View {
+        OnboardingPage {
+            Image(systemName: "key.horizontal").font(.system(size: 60, weight: .light)).foregroundStyle(.tint).padding(.top, 24).accessibilityHidden(true)
+            PageTitle(title: saved ? "Your code is saved" : "Save a recovery code",
+                      detail: saved ? "Keep the paper somewhere safe, like with your important papers."
+                                    : "12 words on paper. If you ever lose all your phones and computers, they bring back your friends and chats.")
+        } actions: {
+            if saved { PrimaryButton(title: "Continue", action: next) }
+            else {
+                PrimaryButton(title: "Save My Code") { saving = true }
+                SecondaryButton(title: "Later") { Task { try? await bridge.recoveryLater() }; next() }
+            }
+        }
+        .task { if (try? await bridge.recoveryStatus())?.saved == true { saved = true } }
+        .sheet(isPresented: $saving, onDismiss: { Task { if (try? await bridge.recoveryStatus())?.saved == true { saved = true } } }) {
+            SaveRecoverySheet().environmentObject(bridge)
+        }
     }
 }
 
