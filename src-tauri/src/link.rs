@@ -478,6 +478,7 @@ pub(crate) fn profile(state: &IrohState, endpoint: &str) -> Value {
     let key = read_key(&st.config_dir).ok().flatten();
     let kind = st.settings.lock().unwrap().device_kind.clone();
     let mut out = json!({"device_kind": kind, "device_os": std::env::consts::OS,
+        "device_model": crate::device_model::this_model(),
         "device_name": crate::account::device_name(&kind),
         "account_pub": key.as_ref().map(|k| hex::encode(k.public().as_bytes())),
         "account_sig": key.map(|k| hex::encode(k.sign(endpoint.as_bytes()).to_bytes()))});
@@ -493,6 +494,8 @@ pub(crate) fn profile(state: &IrohState, endpoint: &str) -> Value {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct LinkResult { endpoint_id: String, name: String, device_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")] device_os: Option<String>,
+    /// "iPhone 15", "MacBook Air" (absent from older builds).
+    #[serde(default, skip_serializing_if = "Option::is_none")] device_model: Option<String>,
     /// What came over (or went over) in the link, for the success screen.
     #[serde(default, skip_serializing_if = "Option::is_none")] friends: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")] messages: Option<usize> }
@@ -505,7 +508,7 @@ fn device(st: &AppState, net: &IrohState) -> Result<LinkResult, String> {
     let endpoint_id = net.get().ok_or(NOT_READY)?.id().to_string();
     let s = st.settings.lock().unwrap();
     Ok(LinkResult { endpoint_id, name: crate::account::device_name(&s.device_kind), device_kind: s.device_kind.clone(),
-        device_os: Some(std::env::consts::OS.into()), friends: None, messages: None })
+        device_os: Some(std::env::consts::OS.into()), device_model: crate::device_model::this_model(), friends: None, messages: None })
 }
 /// This device's account and how many OTHER devices share it right now.
 fn account_state(dir: &Path) -> (Option<String>, u32) {
@@ -678,7 +681,7 @@ fn record_new_device_data(st: &AppState, iroh: &IrohState, key: &iroh::SecretKey
     // A former plain contact (the user once added their own device as a friend)
     // becomes one of their devices; its name comes from the device itself.
     friends::upsert_own_device(&st.config_dir, &result.endpoint_id, &result.name, Some(&result.device_kind),
-        result.device_os.as_deref(), &account, crate::chat::now_ms(), true);
+        result.device_os.as_deref(), result.device_model.as_deref(), &account, crate::chat::now_ms(), true);
 }
 
 // ── Reverse flow: the device that HAS the account shows a code, the new one scans it.
@@ -879,6 +882,7 @@ fn adopt_offer(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<
     crate::account::mark_linked(&st.config_dir, &me.endpoint_id);
     crate::account::mark_linked(&st.config_dir, who);
     friends::upsert_own_device(&st.config_dir, who, &sender.name, Some(&sender.device_kind), sender.device_os.as_deref(),
+        sender.device_model.as_deref(),
         &public, crate::chat::now_ms(), true);
     for (f, avatar) in validated {
         let eid = f.endpoint_id.as_deref();
@@ -886,7 +890,7 @@ fn adopt_offer(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<
         // The account's other devices: the sender holds the key, so it speaks
         // for them (exactly as its roster will on the first sync).
         if let (Some(eid), Some(true)) = (eid, f.account_pub.as_deref().map(|a| a == public)) {
-            friends::upsert_own_device(&st.config_dir, eid, &f.name, f.device_kind.as_deref(), f.device_os.as_deref(), &public, f.created_at, true);
+            friends::upsert_own_device(&st.config_dir, eid, &f.name, f.device_kind.as_deref(), f.device_os.as_deref(), f.device_model.as_deref(), &public, f.created_at, true);
             continue;
         }
         let local = friends::import_link_friend(&st.config_dir, &f);
@@ -904,7 +908,7 @@ fn adopt_offer(st: &AppState, me: LinkResult, who: &str, req: &Value) -> Result<
         }
     }
     friends::fold_person_threads(&st.config_dir);
-    Ok(json!({"kind":"link-ok", "endpoint_id":me.endpoint_id, "name":me.name, "device_kind":me.device_kind, "device_os":me.device_os,
+    Ok(json!({"kind":"link-ok", "endpoint_id":me.endpoint_id, "name":me.name, "device_kind":me.device_kind, "device_os":me.device_os, "device_model":me.device_model,
         "account_sig":hex::encode(key.sign(me.endpoint_id.as_bytes()).to_bytes())}))
 }
 pub(crate) async fn serve(net: &IrohState, who: &str, req: &Value, send: &mut iroh::endpoint::SendStream) -> anyhow::Result<()> {
@@ -1014,7 +1018,7 @@ mod receive_tests {
             transfers: Mutex::new(HashMap::new()), offers: Mutex::new(HashMap::new()),
             force_quit: AtomicBool::new(false), main_focused: AtomicBool::new(false), active_chat: Mutex::new(None) }
     }
-    fn me() -> LinkResult { LinkResult { endpoint_id: iroh::SecretKey::generate().public().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: Some("ios".into()), friends: None, messages: None } }
+    fn me() -> LinkResult { LinkResult { endpoint_id: iroh::SecretKey::generate().public().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: Some("ios".into()), device_model: None, friends: None, messages: None } }
     fn offer(key: &iroh::SecretKey, who: &str) -> Value {
         json!({"kind":"link-offer", "v":1, "token":hex::encode([7;16]),
             "account_seed_hex":hex::encode(key.to_bytes()), "account_pub":hex::encode(key.public().as_bytes()),
@@ -1116,7 +1120,7 @@ mod receive_tests {
                 });
                 let conn = new_ep.connect(addr, iroh_net::ALPN).await.unwrap();
                 let (mut send, mut recv) = conn.open_bi().await.unwrap();
-                let me = LinkResult { endpoint_id: new_ep.id().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: Some("ios".into()), friends: None, messages: None };
+                let me = LinkResult { endpoint_id: new_ep.id().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: Some("ios".into()), device_model: None, friends: None, messages: None };
                 let code = LinkCode { v: 1, eid: host_id, name: "Mac".into(), token: hex::encode(shown), acct: None, devices: None };
                 let joined = join_over(&n, None, me, &code, &mut send, &mut recv).await;
                 (joined, server.await.unwrap())
@@ -1159,7 +1163,7 @@ mod receive_tests {
         let n = AppState::for_tests(state().config_dir);
         let conn = new_ep.connect(host_ep.addr(), iroh_net::ALPN).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        let me = LinkResult { endpoint_id: new_ep.id().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: None, friends: None, messages: None };
+        let me = LinkResult { endpoint_id: new_ep.id().to_string(), name: "Phone".into(), device_kind: "phone".into(), device_os: None, device_model: None, friends: None, messages: None };
         let code = LinkCode { v: 1, eid: host_ep.id().to_string(), name: "Mac".into(), token: hex::encode([3u8; 16]), acct: None, devices: None };
         let r = join_over(&n, None, me, &code, &mut send, &mut recv).await;
         server.await.unwrap();
@@ -1185,13 +1189,13 @@ mod edge_tests {
         n
     }
     fn me(d: &Dev) -> LinkResult {
-        LinkResult { endpoint_id: d.eid(), name: d.label.clone(), device_kind: "phone".into(), device_os: Some("ios".into()), friends: None, messages: None }
+        LinkResult { endpoint_id: d.eid(), name: d.label.clone(), device_kind: "phone".into(), device_os: Some("ios".into()), device_model: None, friends: None, messages: None }
     }
     /// Put `d` in an account with one other (made-up) device.
     fn shared(d: &Dev, key: &iroh::SecretKey) -> String {
         adopt_key_for_tests(&d.dir, key);
         let account = hex::encode(key.public().as_bytes());
-        friends::upsert_own_device(&d.dir, &eid(), "Other device", Some("laptop"), Some("macos"), &account, 1, true);
+        friends::upsert_own_device(&d.dir, &eid(), "Other device", Some("laptop"), Some("macos"), None, &account, 1, true);
         account
     }
 

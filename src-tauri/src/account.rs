@@ -799,6 +799,9 @@ struct DeviceRec {
     kind: Option<String>,
     #[serde(default)]
     os: Option<String>,
+    /// "iPhone 15", "MacBook Air" (absent from older builds, which ignore it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -891,7 +894,7 @@ fn mtime_ms(path: &str) -> u64 {
 fn this_device(st: &AppState, me: &str) -> DeviceRec {
     let s = st.settings.lock().unwrap();
     DeviceRec { eid: me.to_owned(), name: device_name(&s.device_kind), kind: Some(s.device_kind.clone()),
-        os: Some(std::env::consts::OS.to_owned()) }
+        os: Some(std::env::consts::OS.to_owned()), model: crate::device_model::this_model() }
 }
 
 fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
@@ -908,7 +911,7 @@ fn gather(dir: &Path, account: &str, me: &str, device: &DeviceRec) -> Local {
         }
         if f.account_pub.as_deref() == Some(account) {
             if book.is_member(&eid) {
-                devices.push(DeviceRec { eid, name: f.name, kind: f.device_kind, os: f.device_os });
+                devices.push(DeviceRec { eid, name: f.name, kind: f.device_kind, os: f.device_os, model: f.device_model });
             }
             continue;
         }
@@ -1034,7 +1037,7 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
         // A device's name comes only from the device itself (its own roster
         // entry); third-hand names would ping-pong between devices forever.
         let own_entry = d.eid == from;
-        out.changed |= friends::upsert_own_device(dir, &d.eid, &d.name, d.kind.as_deref(), d.os.as_deref(), account, linked, own_entry);
+        out.changed |= friends::upsert_own_device(dir, &d.eid, &d.name, d.kind.as_deref(), d.os.as_deref(), d.model.as_deref(), account, linked, own_entry);
         if !known.contains(&d.eid) {
             out.new_devices.push(d.clone());
         }
@@ -1068,7 +1071,7 @@ fn apply_meta(dir: &Path, local: &Local, from: &str, meta: &Meta) -> Applied {
         }
         let (friend, added) = friends::import_synced_friend(dir, &friends::SyncedFriend {
             endpoint_id: &r.eid, name: &r.name, name_custom: r.name_custom, name_at: r.name_at, created_at: r.created_at,
-            auto_accept: r.auto_accept, device_kind: r.kind.as_deref(), device_os: r.os.as_deref(),
+            auto_accept: r.auto_accept, device_kind: r.kind.as_deref(), device_os: r.os.as_deref(), device_model: None,
             account_pub: r.account.as_deref(),
         });
         out.changed |= added;
@@ -1629,6 +1632,9 @@ pub struct DeviceView {
     name: String,
     device_kind: Option<String>,
     device_os: Option<String>,
+    /// "iPhone 15", "MacBook Air" — tells two devices of one kind apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_model: Option<String>,
     last_sync_ms: Option<u64>,
     this_device: bool,
     /// Proves the account key but no remaining device vouched for it: the user
@@ -1640,18 +1646,18 @@ pub(crate) fn device_views(st: &AppState, me: &str) -> Vec<DeviceView> {
     let s = st.settings.lock().unwrap();
     let mut out = vec![DeviceView { friend_id: None, endpoint_id: me.to_owned(), name: device_name(&s.device_kind),
         device_kind: Some(s.device_kind.clone()), device_os: Some(std::env::consts::OS.to_owned()),
-        last_sync_ms: None, this_device: true, needs_approval: false }];
+        device_model: crate::device_model::this_model(), last_sync_ms: None, this_device: true, needs_approval: false }];
     drop(s);
     for f in own_devices(&st.config_dir) {
         let eid = f.endpoint_id.clone().unwrap_or_default();
         out.push(DeviceView { friend_id: Some(f.id), last_sync_ms: last_sync(&eid), endpoint_id: eid, name: f.name,
-            device_kind: f.device_kind, device_os: f.device_os, this_device: false, needs_approval: false });
+            device_kind: f.device_kind, device_os: f.device_os, device_model: f.device_model, this_device: false, needs_approval: false });
     }
     if let Some(account) = my_pub(&st.config_dir) {
         let b = { let _g = BOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner()); read_book(&st.config_dir, &account) };
         for (eid, p) in b.pending_devices.iter().filter(|(e, _)| !b.is_member(e) && !b.is_removed(e)) {
             out.push(DeviceView { friend_id: None, endpoint_id: eid.clone(), name: p.name.clone(), device_kind: p.kind.clone(),
-                device_os: p.os.clone(), last_sync_ms: None, this_device: false, needs_approval: true });
+                device_os: p.os.clone(), device_model: None, last_sync_ms: None, this_device: false, needs_approval: true });
         }
     }
     out
@@ -1713,7 +1719,7 @@ pub(crate) fn approve_device(dir: &Path, eid: &str, signer: &iroh::SecretKey) ->
         if p.is_some() { b.add_voucher(eid, sign_stamp(signer, &account, eid, at)); }
         p
     }).ok_or("That device isn't waiting for approval.")?;
-    friends::upsert_own_device(dir, eid, &pending.name, pending.kind.as_deref(), pending.os.as_deref(), &account, chat::now_ms(), true);
+    friends::upsert_own_device(dir, eid, &pending.name, pending.kind.as_deref(), pending.os.as_deref(), None, &account, chat::now_ms(), true);
     note_change();
     Ok(())
 }
@@ -1797,7 +1803,7 @@ mod tests {
         iroh::SecretKey::generate().public().to_string()
     }
     fn local(dir: &Path, account: &str, me: &str) -> Local {
-        gather(dir, account, me, &DeviceRec { eid: me.to_owned(), name: "Test".into(), kind: Some("laptop".into()), os: Some("macos".into()) })
+        gather(dir, account, me, &DeviceRec { eid: me.to_owned(), name: "Test".into(), kind: Some("laptop".into()), os: Some("macos".into()), model: None })
     }
     fn text(id: &str, peer: &str, from_me: bool, ts: u64) -> chat::ChatMessage {
         serde_json::from_value(json!({"id": id, "peerId": peer, "fromMe": from_me, "kind": "text",
@@ -2025,8 +2031,8 @@ mod tests {
         let (me_a, me_b, f1, phone) = (eid(), eid(), eid(), eid());
         let fa = friends::upsert_by_endpoint(&a, &f1, "Mong");
         friends::upsert_by_endpoint(&b, &f1, "Mong");
-        friends::upsert_own_device(&a, &phone, "Phone", Some("phone"), Some("ios"), &account, 1, true);
-        friends::upsert_own_device(&b, &phone, "Phone", Some("phone"), Some("ios"), &account, 1, true);
+        friends::upsert_own_device(&a, &phone, "Phone", Some("phone"), Some("ios"), None, &account, 1, true);
+        friends::upsert_own_device(&b, &phone, "Phone", Some("phone"), Some("ios"), None, &account, 1, true);
         // A removes the friend and the phone.
         std::thread::sleep(Duration::from_millis(5));
         record_friend_removed(&a, &fa);
@@ -2063,7 +2069,8 @@ mod tests {
         for i in 0..30 { chat::append(&a, &text(&format!("a{i}"), &fa.id, i % 2 == 0, i)); }
         let fb = friends::upsert_by_endpoint(&b, &f2, "Ethan");
         chat::append(&b, &text("b1", &fb.id, false, 3));
-        let dev = |me: &str, name: &str| DeviceRec { eid: me.to_owned(), name: name.into(), kind: Some("laptop".into()), os: Some("macos".into()) };
+        let dev = |me: &str, name: &str| DeviceRec { eid: me.to_owned(), name: name.into(), kind: Some("laptop".into()), os: Some("macos".into()),
+            model: (name == "Mac").then(|| "MacBook Air".to_owned()) };
         let ctx_a = Ctx { dir: a.clone(), me: me_a.clone(), device: dev(&me_a, "Mac"), st: None, signer: None };
         let ctx_b = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone"), st: None, signer: None };
         let addr = server.addr();
@@ -2090,6 +2097,7 @@ mod tests {
         let mac_on_b = friends::load(&b).into_iter().find(|f| f.endpoint_id.as_deref() == Some(me_a.as_str())).unwrap();
         assert_eq!(mac_on_b.account_pub.as_deref(), Some(account.as_str()));
         assert_eq!(mac_on_b.device_os.as_deref(), Some("macos"));
+        assert_eq!(mac_on_b.device_model.as_deref(), Some("MacBook Air"), "the roster carries the hardware model");
         // A second exchange has nothing left to move.
         let srv = server.clone();
         let ctx_b2 = Ctx { dir: b.clone(), me: me_b.clone(), device: dev(&me_b, "iPhone"), st: None, signer: None };
@@ -2167,7 +2175,7 @@ pub(crate) mod testkit {
         pub(crate) fn ctx(&self) -> Ctx {
             let kind = self.st.settings.lock().unwrap().device_kind.clone();
             Ctx { dir: self.dir.clone(), me: self.eid(), st: Some(self.st.clone()), signer: Some(self.ep.secret_key().clone()),
-                device: DeviceRec { eid: self.eid(), name: self.label.clone(), kind: Some(kind), os: Some("macos".into()) } }
+                device: DeviceRec { eid: self.eid(), name: self.label.clone(), kind: Some(kind), os: Some("macos".into()), model: None } }
         }
         pub(crate) fn friend(&self, eid: &str) -> Option<Friend> {
             friends::load(&self.dir).into_iter().find(|f| f.endpoint_id.as_deref() == Some(eid))

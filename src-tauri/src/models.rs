@@ -544,6 +544,11 @@ pub struct Friend {
     /// an own device can read "Your Mac" / "Your iPhone" instead of a raw name.
     #[serde(default)]
     pub device_os: Option<String>,
+    /// The peer's hardware model in plain words ("iPhone 15", "MacBook Air"),
+    /// from its hello, so two own devices of the same kind can be told apart.
+    /// Absent from older builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_model: Option<String>,
     pub id: String,
     pub role: PairRole,
     pub name: String,
