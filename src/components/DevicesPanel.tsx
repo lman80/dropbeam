@@ -40,9 +40,9 @@ export function DevicesPanel() {
   const inAccount = !!myDevice?.account_pub && devices.length > 1
   const me = devices.find(d => d.this_device)
   const myNoun = deviceNoun(me?.device_kind ?? myDevice?.device_kind, me?.device_os ?? myDevice?.device_os)
-  // "Your iPhone" — or "Your iPhone 2" when two would read the same.
+  // "Your iPhone" — or "Your iPhone 15" / "Your iPhone 12" when two would read the same.
   const labels = useMemo(() => ownDeviceLabels(devices.filter(d => !d.this_device)
-    .map(d => ({ id: d.endpoint_id, name: d.name, deviceKind: d.device_kind, deviceOs: d.device_os }))), [devices])
+    .map(d => ({ id: d.endpoint_id, name: d.name, deviceKind: d.device_kind, deviceOs: d.device_os, deviceModel: d.device_model }))), [devices])
   useEffect(() => { void useStore.getState().refreshMyDevice().catch(() => {}) }, [])
   const online = (d: AccountDevice) => { const f = friends.find(x => x.id === d.friend_id); return f ? friendOnlineState(f, friendSeen, folderStatuses) === true : false }
   const syncNow = async () => {

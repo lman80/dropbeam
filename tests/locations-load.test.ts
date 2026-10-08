@@ -44,8 +44,8 @@ test('probe errors are isolated and empty friend lists complete', async () => {
 })
 test('native rows: pending, checking, no address, offline keeps last known list, fresh list counts as online', async () => {
   const now = 1_000_000
-  const rows = (results: Record<string, Pick<CheckedLoad, 'status' | 'error' | 'at'>>, checking: string[] = [], presence = () => false) =>
-    nativeLocationRows(friends, { presence, results: results as Record<string, CheckedLoad>, shared: { linux: [folder] }, checking: new Set(checking), now })
+  const rows = (results: Record<string, CheckedLoad>, checking: string[] = [], presence = () => false) =>
+    nativeLocationRows(friends, { presence, results, shared: { linux: [folder] }, checking: new Set(checking), now })
   const first = rows({}, ['linux', 'legacy'])
   assert.deepEqual(first.map(r => [r.status, r.checking]), [['pending', true], ['pending', false], ['unavailable', false]])
   assert.match(first[2].error!, /hasn’t connected/)

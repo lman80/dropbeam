@@ -121,7 +121,7 @@ pub(super) async fn endpoint(accept: bool) -> Endpoint {
 pub(super) async fn endpoint_with(accept: bool, key: SecretKey) -> Endpoint {
     let mut b = Endpoint::builder(presets::Minimal)
         .secret_key(key)
-        .path_selector(Arc::new(super::DirectPathSelector))
+        .path_selector(Arc::new(super::DirectPathSelector::default()))
         .relay_mode(iroh::RelayMode::Disabled)
         .bind_addr("127.0.0.1:0")
         .unwrap();
@@ -821,7 +821,13 @@ async fn interrupted_big_send_resumes_paced(how: Break, per_chunk: Duration) {
     let src = scratch("resume");
     let rx = scratch("resume-rx");
     let dest = rx.0.join("dest");
-    let total = 4 * PARALLEL_MIN as usize + 12345;
+    // 4 lanes of ~32 MiB. A lane can only finish once its reader is within
+    // one 8 MiB stream window of its end (≥ 24 MiB read), while coverage is
+    // only recorded per flushed 8 MiB span of a lane. With 16 MiB lanes both
+    // thresholds were the same 8 MiB, so no break point was both "can't have
+    // finished" and "has something to resume" (60% flaked as a completed
+    // file on Windows; 40% flaked as a from-zero retry).
+    let total = 8 * PARALLEL_MIN as usize + 12345;
     let file = put(&src.0, "movie.mov", total, 7);
     std::fs::create_dir_all(&dest).unwrap();
     let slow = Throttle::new(&dest, per_chunk);
@@ -831,17 +837,14 @@ async fn interrupted_big_send_resumes_paced(how: Break, per_chunk: Duration) {
     let cancel = Arc::new(AtomicBool::new(false));
     let fired = Arc::new(AtomicBool::new(false));
     let live: Arc<std::sync::OnceLock<Connection>> = Arc::default();
-    // The break is triggered by the RECEIVER once a third has landed, and the
+    // The break is triggered by the RECEIVER once half has landed, and the
     // receiver is throttled, so the sender is provably still mid-stream.
     let hook: Hook = {
         let (srv, cli, live, cancel, fired) = (server.clone(), client.clone(), live.clone(), cancel.clone(), fired.clone());
         Arc::new(move |done, _| {
-            // A cancel is only seen between writes: break it while the rest of
-            // the file can't already sit in the 4 × 8 MB flow-control windows
-            // (at 60% the whole remainder often fit, and the "interrupted"
-            // send simply finished — a pre-existing timing flake).
-            let at = if matches!(how, Break::Cancel) { 4 } else { 6 };
-            if done > total as u64 * at / 10 && !fired.swap(true, Ordering::SeqCst) {
+            // Break at half: finishing every lane needs ≥ 75% read, and by
+            // half at least 32 MiB is in flushed spans (≤ 4 × 8 MiB unflushed).
+            if done > total as u64 / 2 && !fired.swap(true, Ordering::SeqCst) {
                 match how {
                     Break::NetworkDrop => live.get().unwrap().close(9u32.into(), b"wifi gone"),
                     Break::Cancel => cancel.store(true, Ordering::SeqCst),

@@ -69,7 +69,7 @@ export function ChatTransferProgress({ t, onRetry, deliveries, friendName }: { t
     ? `${t.heldOn ? `To ${t.heldOn} · ` : ''}${ofBytes(t.bytesDone, t.bytesTotal)}${meter.etaSeconds != null && meter.etaSeconds > 0 ? ` · ${formatEta(meter.etaSeconds)} left` : ''}`
     : paused ? `Paused · ${ofBytes(t.bytesDone, t.bytesTotal)}`
       : t.state === 'waitingForAccept' ? (send ? `Waiting for ${t.friendName ?? 'them'} to accept` : 'Waiting to accept')
-        : t.state === 'connecting' ? 'Connecting…'
+        : t.state === 'connecting' ? (t.detail || 'Connecting…')
           : t.detail || (send ? 'Waiting to send…' : 'Waiting…')
   const speed = moving && meter.speedBps ? formatSpeed(meter.speedBps, megabits) : undefined
 

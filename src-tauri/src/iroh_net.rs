@@ -149,12 +149,33 @@ struct CachedFriendConnection {
     conn: Connection,
     created_at: Instant,
     relay_with_direct_since: Option<Instant>,
+    /// Wire bytes (both ways) at the previous rotation check.
+    last_bytes: u64,
 }
 
 impl CachedFriendConnection {
     fn new(conn: Connection) -> Self {
-        Self { conn, created_at: Instant::now(), relay_with_direct_since: None }
+        let last_bytes = wire_bytes(&conn);
+        Self { conn, created_at: Instant::now(), relay_with_direct_since: None, last_bytes }
     }
+
+    /// Did real data (not just keep-alives) cross this connection since the last
+    /// check? A rotation then would kill whatever is streaming over it (a
+    /// Location download), so it waits for a quiet moment.
+    fn busy_since_last_check(&mut self) -> bool {
+        let now = wire_bytes(&self.conn);
+        let moved = now.saturating_sub(self.last_bytes);
+        self.last_bytes = now;
+        moved > ROTATION_BUSY_BYTES
+    }
+}
+
+/// More than this between two checks (≥ 45 s apart) is a transfer, not chatter.
+const ROTATION_BUSY_BYTES: u64 = 256 * 1024;
+
+fn wire_bytes(conn: &Connection) -> u64 {
+    let stats = conn.stats();
+    stats.udp_rx.bytes.saturating_add(stats.udp_tx.bytes)
 }
 
 /// Pure decision logic using continuous observed relay time.
@@ -253,7 +274,8 @@ impl IrohState {
             now.duration_since(cached.created_at), locality, has_direct_addrs,
             cached.relay_with_direct_since.map(|since| now.duration_since(since)),
         );
-        if let Some(reason) = reason {
+        let busy = cached.busy_since_last_check();
+        if let Some(reason) = reason.filter(|_| !busy) {
             log::info!("iroh: rotating friend connection {endpoint}: {reason}");
             cached.conn.close(0u32.into(), b"friend connection rotation");
             connections.remove(endpoint);
@@ -626,16 +648,101 @@ struct ChatBatch {
     landed: std::collections::BTreeMap<String, String>,
     touched: Instant,
     snapshot: TransferUpdate,
+    /// Set when this attempt stalled or its connection dropped mid-transfer: the
+    /// card reads "Reconnecting…" while the sender re-dials and resumes. Cleared
+    /// by the sender's next attempt; past BATCH_GIVE_UP the card fails.
+    reconnect_since: Option<Instant>,
 }
+
+/// A started batch with no data and no push finishing for this long is stalled:
+/// the receiver drops the connection so the sender re-dials and resumes.
+const BATCH_STALL: Duration = Duration::from_secs(20);
+/// How long a stalled/dropped batch waits for the sender to come back before the
+/// card says it failed. Covers the sender's own re-dial budget (90 s of dialing
+/// plus its back-off) with room to spare.
+const BATCH_GIVE_UP: Duration = Duration::from_secs(180);
+pub(crate) const RECONNECTING: &str = "Reconnecting…";
+
+/// What the batch watchdog should do next.
+enum BatchWatch {
+    Wait(Duration),
+    Reconnect(TransferUpdate),
+    /// The card's final state; true when bytes had moved (drop the connection).
+    Fail(TransferUpdate, bool),
+    Done,
+}
+
 impl ChatBatch {
+    fn new(link: crate::models::ChatTransferLink, snapshot: TransferUpdate) -> Self {
+        Self { link, landed: Default::default(), touched: Instant::now(), snapshot, reconnect_since: None }
+    }
+
     fn activity(&mut self, advancing: u64) {
         if advancing > 0 { self.touched = Instant::now(); }
+    }
+
+    fn started(&self) -> bool {
+        !self.landed.is_empty() || self.snapshot.bytes_done > 0
+    }
+
+    fn terminal(&self) -> bool {
+        matches!(self.link.batch_state, Some(TransferState::Completed | TransferState::Failed | TransferState::Canceled))
+    }
+
+    /// The card while the sender re-dials: honest, not a failure.
+    fn reconnecting_update(&mut self) -> TransferUpdate {
+        self.link.batch_state = Some(TransferState::Connecting);
+        let mut update = self.snapshot.clone();
+        update.state = TransferState::Connecting;
+        update.detail = Some(RECONNECTING.into());
+        update.speed_bps = 0.0;
+        update.eta_seconds = None;
+        let mut link = self.link.clone();
+        slim_for_ui(&mut link);
+        update.chat_transfer = Some(link);
+        update
+    }
+
+    /// This attempt's connection dropped mid-transfer: show "Reconnecting…" and
+    /// start the give-up clock (once). None when there's nothing to resume.
+    fn interrupted(&mut self, now: Instant) -> Option<TransferUpdate> {
+        if self.terminal() || !self.started() { return None; }
+        self.reconnect_since.get_or_insert(now);
+        Some(self.reconnecting_update())
+    }
+
+    /// One watchdog step. A batch that never moved a byte (e.g. waiting on the
+    /// accept dialog) keeps the old 60 s expiry; a started one is re-dialed after
+    /// BATCH_STALL of silence and only fails after BATCH_GIVE_UP without the
+    /// sender coming back.
+    fn watch(&mut self, now: Instant) -> BatchWatch {
+        if self.terminal() { return BatchWatch::Done; }
+        if let Some(since) = self.reconnect_since {
+            let waited = now.duration_since(since);
+            if waited < BATCH_GIVE_UP { return BatchWatch::Wait(BATCH_GIVE_UP - waited); }
+            return match self.expire_after(now, Duration::ZERO) {
+                Some(mut update) => {
+                    update.error = Some("The connection dropped and didn't come back — retry to pick up where it stopped".into());
+                    BatchWatch::Fail(update, true)
+                }
+                None => BatchWatch::Done,
+            };
+        }
+        let idle = now.duration_since(self.touched);
+        if !self.started() {
+            if idle < TRANSFER_STALL { return BatchWatch::Wait(TRANSFER_STALL - idle); }
+            return self.expire_after(now, TRANSFER_STALL).map_or(BatchWatch::Done, |u| BatchWatch::Fail(u, false));
+        }
+        if idle < BATCH_STALL { return BatchWatch::Wait(BATCH_STALL - idle); }
+        self.reconnect_since = Some(now);
+        BatchWatch::Reconnect(self.reconnecting_update())
     }
 
     fn observe(&mut self, link: &crate::models::ChatTransferLink, u: &TransferUpdate) -> Option<crate::models::ChatTransferLink> {
         if link.manifest != self.link.manifest || link.directories != self.link.directories || link.attempt < self.link.attempt { return None; }
         if link.attempt > self.link.attempt {
             self.link = link.clone();
+            self.reconnect_since = None;
             // Confirmed files belong to the immutable manifest, so reconnects
             // may resume at the next file without re-sending earlier parts.
         } else if matches!(self.link.batch_state, Some(TransferState::Completed | TransferState::Failed | TransferState::Canceled)) {
@@ -1715,6 +1822,31 @@ fn friendly_failure(dir: Direction, err: &str) -> String {
     errors::friendly(dir, err)
 }
 
+/// A chat-linked receive whose connection dropped (or stalled) mid-transfer is
+/// not a failure yet: the sender re-dials and RESUMES it, so the card says
+/// "Reconnecting…" and the batch watchdog fails it only if they never come back.
+/// False (fail now, as before) for anything a retry can't fix or a batch that
+/// never moved a byte.
+fn receive_interrupted(app: &AppHandle, state: &IrohState, id: &str, err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    if is_disk_full(err) || text.contains(integrity::FAILED) || text.contains("declined") || text.contains("refused") {
+        return false;
+    }
+    let Some(link) = state.chat_links.lock().unwrap().get(id).cloned() else { return false };
+    let update = {
+        let mut batches = state.chat_batches.lock().unwrap();
+        let Some(batch) = batches.get_mut(&link.id) else { return false };
+        if batch.link.attempt != link.attempt { return false; }
+        match batch.interrupted(Instant::now()) {
+            Some(update) => update,
+            None => return false,
+        }
+    };
+    log::info!("friend-recv {id}: interrupted ({}) — waiting for the sender to reconnect and resume", crate::telemetry::redact_paths_only(&text));
+    let _ = app.emit("transfer://update", &update);
+    true
+}
+
 fn emit_failed(app: &AppHandle, id: &str, dir: Direction, err: &str) {
     // Log every failure so a transfer that "kept failing" on a machine we can't
     // reach leaves a trace in DropBeam.log (was invisible — failures only emitted
@@ -2312,10 +2444,51 @@ fn write_private(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Prefer established direct paths, with relay as fallback regardless of RTT.
-/// Keep iroh's IPv6 bias and same-tier hysteresis to avoid path flapping.
-#[derive(Debug)]
-pub(crate) struct DirectPathSelector;
+/// Prefer established direct paths, with relay as fallback regardless of RTT —
+/// and, once a direct path carries the connection, STAY on it.
+///
+/// Field incident (2026-10-07): a friend across town advertised a public address
+/// and a 192.168.1.x LAN address; this Mac reached BOTH (the second through a
+/// Tailscale subnet route). iroh re-runs path selection on every new connection
+/// to the peer and every path established/abandoned (presence probes, chat,
+/// holepunch rounds every few seconds), and the old rule switched on a 5 ms
+/// smoothed-RTT gain. The path carrying a transfer always reads slower — its
+/// RTT includes the queue the transfer itself builds — while the idle alternative
+/// reads its bare RTT, so every re-selection flipped to the other path and back:
+/// 5–9 switches a minute, each abandoning the in-flight packets and restarting
+/// the congestion controller. 15.9 MB took 451 s, then the transfer died.
+///
+/// So within a class (relay last; a LAN path beats a public one, unchanged) we
+/// compare each path's MINIMUM observed RTT — what the path costs unloaded,
+/// immune to the queue a transfer builds — and only switch to a path that is at
+/// least twice as fast AND 20 ms faster, never sooner than 30 s after the last
+/// switch. Two healthy similar paths therefore never trade places; a genuinely
+/// much better one (a LAN appears) still wins, and a path that dies is dropped by
+/// iroh (absent from the candidates) and replaced at once. A path that only
+/// reaches the peer through an overlay subnet route (our Tailscale address to
+/// someone's private LAN address) carries a small RTT handicap, so the plain
+/// public path wins the first pick when the two are otherwise alike.
+#[derive(Debug, Default)]
+pub(crate) struct DirectPathSelector {
+    memo: Mutex<HashMap<iroh::endpoint::transports::FourTuple, PathMemo>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathMemo {
+    min_rtt: Duration,
+    last_seen: Instant,
+    /// When this path last became the selected one (as far as we know).
+    selected_at: Option<Instant>,
+}
+
+/// A same-class switch must halve the (min) RTT…
+const PATH_SWITCH_MIN_GAIN: Duration = Duration::from_millis(20);
+/// …and the current path must have been selected at least this long.
+const PATH_SWITCH_MIN_DWELL: Duration = Duration::from_secs(30);
+/// RTT handicap for a path routed through an overlay (VPN) subnet route.
+const OVERLAY_ROUTE_PENALTY: Duration = Duration::from_millis(15);
+/// Forget a path not seen for this long (it re-learns its min RTT if it returns).
+const PATH_MEMO_TTL: Duration = Duration::from_secs(120);
 
 /// BBRv3 with a larger initial congestion window. The QUIC default (~12 KB,
 /// 10 packets) needs ~9 doublings — ~2 s at a 220 ms intercontinental RTT —
@@ -2378,14 +2551,25 @@ pub(crate) fn congestion_factory() -> Arc<dyn noq_proto::congestion::ControllerF
 /// (hairpin NAT through 116.46.x) whenever it sampled a few ms faster; that
 /// router hairpins badly, so real sends timed out ("interrupted before the
 /// recipient confirmed receipt") while the LAN path was right there.
-/// Within a class the lower RTT wins, with a small IPv6 bias.
+/// Within a class the lower (minimum) RTT ranks first, with a small IPv6 bias
+/// and an overlay-route handicap.
 fn path_preference_key(is_relay: bool, is_lan: bool, is_ipv6: bool, rtt: Duration) -> (bool, bool, i128) {
     (is_relay, !is_lan, rtt.as_nanos() as i128 - if is_ipv6 { 3_000_000 } else { 0 })
 }
 
-fn should_switch_path(current: Option<(bool, bool, i128)>, best: (bool, bool, i128)) -> bool {
-    current.is_none_or(|current| (best.0, best.1) < (current.0, current.1)
-        || ((best.0, best.1) == (current.0, current.1) && best.2 + 5_000_000 <= current.2))
+/// Switch from `current` to `best`? A better class (relay → direct, public →
+/// LAN) or a vanished current path switches at once; within a class only a
+/// decisive, settled gain does (see `DirectPathSelector`). `dwell` = how long the
+/// current path has been selected.
+fn should_switch_path(current: Option<(bool, bool, i128)>, best: (bool, bool, i128), dwell: Duration) -> bool {
+    let Some(current) = current else { return true };
+    let (best_class, current_class) = ((best.0, best.1), (current.0, current.1));
+    if best_class != current_class {
+        return best_class < current_class;
+    }
+    dwell >= PATH_SWITCH_MIN_DWELL
+        && best.2.saturating_mul(2) <= current.2
+        && current.2 - best.2 >= PATH_SWITCH_MIN_GAIN.as_nanos() as i128
 }
 
 fn remote_is_lan(tuple: &iroh::endpoint::transports::FourTuple) -> bool {
@@ -2395,26 +2579,63 @@ fn remote_is_lan(tuple: &iroh::endpoint::transports::FourTuple) -> bool {
     }
 }
 
-impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
-    fn select(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>) -> iroh::endpoint::transports::PathSelection {
-        use iroh::endpoint::transports::{AddrKind, PathSelection};
-        let mut best = None;
+fn is_cgnat(ip: std::net::IpAddr) -> bool {
+    matches!(ip, std::net::IpAddr::V4(v4) if u32::from(v4) & 0xffc0_0000 == 0x6440_0000)
+}
+
+/// Our side of the path is an overlay (Tailscale/CGNAT) address but the peer's
+/// side is not: the packets reach a private/remote address through someone's
+/// subnet router or exit node — a detour, not the peer's own overlay address.
+fn is_overlay_routed(local: Option<std::net::IpAddr>, remote: std::net::IpAddr, remote_lan: bool) -> bool {
+    local.is_some_and(is_cgnat) && !is_cgnat(remote) && !remote_lan
+}
+
+impl DirectPathSelector {
+    fn decide(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>, now: Instant) -> Option<iroh::endpoint::transports::FourTuple> {
+        use iroh::endpoint::transports::{AddrKind, FourTuple};
+        let mut memo = self.memo.lock().unwrap_or_else(|p| p.into_inner());
+        let mut best: Option<(FourTuple, (bool, bool, i128))> = None;
         let mut current_key = None;
-        // Iroh supplies established paths only, and removes abandoned paths.
+        // Iroh supplies established paths only, and removes abandoned paths. The
+        // same address appears once per connection: min over them all.
         for path in ctx.paths() {
             let Some(stats) = path.stats() else { continue; };
             let tuple = path.network_path();
-            let key = path_preference_key(tuple.is_relay(), remote_is_lan(&tuple), tuple.addr_kind() == AddrKind::IpV6, stats.rtt);
+            let entry = memo.entry(tuple.clone()).or_insert(PathMemo { min_rtt: stats.rtt, last_seen: now, selected_at: None });
+            entry.min_rtt = entry.min_rtt.min(stats.rtt);
+            entry.last_seen = now;
+            let lan = remote_is_lan(tuple);
+            let mut rtt = entry.min_rtt;
+            if let FourTuple::Ip { remote, local } = tuple {
+                if is_overlay_routed(*local, remote.ip(), lan) { rtt += OVERLAY_ROUTE_PENALTY; }
+            }
+            let key = path_preference_key(tuple.is_relay(), lan, tuple.addr_kind() == AddrKind::IpV6, rtt);
             if Some(tuple) == ctx.current() && current_key.is_none_or(|current| key < current) {
                 current_key = Some(key);
             }
             if best.as_ref().is_none_or(|(_, best_key)| key < *best_key) {
-                best = Some((path, key));
+                best = Some((tuple.clone(), key));
             }
         }
-        let mut selection = PathSelection::none();
-        if let Some((path, key)) = best {
-            if should_switch_path(current_key, key) {
+        memo.retain(|_, m| now.duration_since(m.last_seen) < PATH_MEMO_TTL);
+        let dwell = ctx.current()
+            .and_then(|c| memo.get_mut(c))
+            .map(|m| now.duration_since(*m.selected_at.get_or_insert(now)))
+            .unwrap_or(Duration::MAX);
+        let (tuple, key) = best?;
+        if !should_switch_path(current_key, key, dwell) || Some(&tuple) == ctx.current() {
+            return None;
+        }
+        if let Some(m) = memo.get_mut(&tuple) { m.selected_at = Some(now); }
+        Some(tuple)
+    }
+}
+
+impl iroh::endpoint::transports::PathSelector for DirectPathSelector {
+    fn select(&self, ctx: &iroh::endpoint::transports::PathSelectionContext<'_>) -> iroh::endpoint::transports::PathSelection {
+        let mut selection = iroh::endpoint::transports::PathSelection::none();
+        if let Some(chosen) = self.decide(ctx, Instant::now()) {
+            if let Some(path) = ctx.paths().find(|p| *p.network_path() == chosen) {
                 selection.set(&path);
             }
         }
@@ -2485,7 +2706,7 @@ async fn start_with(config_dir: &Path, allow_fixed_port: bool) -> Result<Endpoin
     tcfg = tcfg.send_window(8 * 1024 * 1024);
 
     let mut builder = Endpoint::builder(presets::N0)
-        .path_selector(Arc::new(DirectPathSelector))
+        .path_selector(Arc::new(DirectPathSelector::default()))
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
         .transport_config(tcfg.build());
@@ -2621,6 +2842,7 @@ fn handle_conn(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
         let who = conn.remote_id();
+        note_live_conn(&conn);
         // #34: an ACCEPTED connection is proof of life right now — the remote id
         // is the authenticated transport identity, so a friend who reappears is
         // online the instant they dial us, not up to 45 s later when the first
@@ -3288,12 +3510,14 @@ async fn serve_stream_inner(
                     if let Some(batch) = batches.get_mut(&link.id) {
                         anyhow::ensure!(batch.link.manifest == link.manifest && batch.link.directories == link.directories && link.attempt >= batch.link.attempt, "stale or changed chat batch");
                         anyhow::ensure!(link.attempt > batch.link.attempt || !matches!(batch.link.batch_state, Some(TransferState::Failed | TransferState::Canceled)), "chat attempt already ended");
-                        if link.attempt > batch.link.attempt { batch.link = link.clone(); }
+                        if link.attempt > batch.link.attempt {
+                            batch.link = link.clone();
+                            batch.reconnect_since = None;
+                            batch.touched = Instant::now();
+                        }
                     }
-                    batches.entry(link.id.clone()).or_insert_with(|| ChatBatch {
-                        link: link.clone(), landed: Default::default(), touched: Instant::now(),
-                        snapshot: TransferUpdate::new(id.clone(), Direction::Receive, names.clone()),
-                    });
+                    batches.entry(link.id.clone()).or_insert_with(|| ChatBatch::new(
+                        link.clone(), TransferUpdate::new(id.clone(), Direction::Receive, names.clone())));
                 }
                 state.chat_links.lock().unwrap().insert(id.clone(), link.clone());
                 let activity_state = app.state::<Arc<IrohState>>().inner().clone();
@@ -3309,31 +3533,38 @@ async fn serve_stream_inner(
                 let watch_conn = conn.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
-                        let delay = {
-                            let batches = watch_state.chat_batches.lock().unwrap();
-                            let Some(batch) = batches.get(&link.id) else { break; };
+                        let step = {
+                            let mut batches = watch_state.chat_batches.lock().unwrap();
+                            let Some(batch) = batches.get_mut(&link.id) else { break; };
                             if batch.link.attempt != link.attempt { break; }
-                            TRANSFER_STALL.saturating_sub(batch.touched.elapsed())
+                            batch.watch(Instant::now())
                         };
-                        tokio::time::sleep(delay).await;
-                        let mut batches = watch_state.chat_batches.lock().unwrap();
-                        let Some(batch) = batches.get_mut(&link.id) else { break; };
-                        if batch.link.attempt != link.attempt { break; }
-                        if batch.touched.elapsed() < TRANSFER_STALL { continue; }
-                        // Only a batch that had started moving bytes is a stalled
-                        // transfer (not one waiting on the user's accept dialog).
-                        let started = !batch.landed.is_empty() || batch.snapshot.bytes_done > 0;
-                        if let Some(update) = batch.expire(Instant::now()) {
-                            let _ = watch_app.emit("transfer://update", &update);
-                            // The card now says Failed: end this attempt for real
-                            // so no bytes keep landing behind it (the sender
-                            // reconnects and resumes instead).
-                            if started { watch_conn.close(1u32.into(), b"stalled"); }
+                        match step {
+                            BatchWatch::Wait(delay) => tokio::time::sleep(delay.max(Duration::from_millis(200))).await,
+                            BatchWatch::Reconnect(update) => {
+                                // A started transfer went quiet: don't fail it. Drop
+                                // this attempt's connection so the sender's wedged
+                                // writes error out at once — it re-dials and RESUMES
+                                // (stat probes skip landed files, partials keep their
+                                // bytes) — and tell the user what's happening.
+                                log::info!("friend-recv: {} stalled for {}s — dropping the connection so the sender reconnects and resumes", &link.id, BATCH_STALL.as_secs());
+                                let _ = watch_app.emit("transfer://update", &update);
+                                watch_conn.close(1u32.into(), b"stalled");
+                            }
+                            BatchWatch::Fail(update, started) => {
+                                log::warn!("TRANSFER-FAIL[Receive] id={}: {}", &link.id, update.error.as_deref().unwrap_or("interrupted"));
+                                let _ = watch_app.emit("transfer://update", &update);
+                                // End this attempt for real so no bytes keep landing
+                                // behind a Failed card (not one waiting on the
+                                // user's accept dialog).
+                                if started { watch_conn.close(1u32.into(), b"stalled"); }
+                                // Retain bounded terminal tombstones so a late same-attempt
+                                // push cannot revive an interrupted batch.
+                                prune_chat_batches(&mut watch_state.chat_batches.lock().unwrap());
+                                break;
+                            }
+                            BatchWatch::Done => break,
                         }
-                        // Retain bounded terminal tombstones so a late same-attempt
-                        // push cannot revive an interrupted batch.
-                        prune_chat_batches(&mut batches);
-                        break;
                     }
                 });
             }
@@ -3766,6 +3997,7 @@ async fn serve_stream_inner(
                     log::info!("friend-recv {id}: canceled: {e:#} (local flag {})", cancel.load(Ordering::SeqCst));
                     emit_canceled(&app, &id, Direction::Receive)
                 }
+                Err(e) if receive_interrupted(&app, state, &id, &e) => {}
                 Err(e) => emit_failed(&app, &id, Direction::Receive, &e.to_string()),
             }
             {
@@ -5473,6 +5705,11 @@ fn send_friend_inner(
                     let mut transition = TransferUpdate::new(id.clone(), Direction::Send, names.clone());
                     transition.state = TransferState::Connecting;
                     transition.bytes_total = total;
+                    if progress_high.load(Ordering::SeqCst) > 0 {
+                        // Bytes already moved: this is a resume, not a first try.
+                        transition.detail = Some(RECONNECTING.into());
+                        transition.bytes_done = progress_high.load(Ordering::SeqCst).min(total);
+                    }
                     emit(&app, &transition);
                 }
                 // Bounded so an offline/unreachable friend FAILS clearly instead of
@@ -5512,6 +5749,7 @@ fn send_friend_inner(
                                 }
                                 log::info!("friend-send: dialed {} → {:?} paths=[{}] known_direct={known_direct}",
                                     &endpoint_id[..10.min(endpoint_id.len())], conn_locality(&c), describe_paths(&c));
+                                note_live_conn(&c);
                                 break c;
                             }
                             _ => {
@@ -5856,6 +6094,8 @@ fn send_friend_inner(
                             ru.friend_name = Some(friend_name.clone());
                             ru.state = TransferState::Connecting;
                             ru.bytes_total = total;
+                            ru.bytes_done = high.min(total);
+                            ru.detail = Some(RECONNECTING.into());
                             emit(&app, &ru);
                             tokio::time::sleep(Duration::from_secs(1 + attempt.min(8) as u64)).await;
                             continue;
@@ -7165,10 +7405,50 @@ pub fn spawn_chat_outbox_retry(app: AppHandle, state: Arc<IrohState>) {
     });
 }
 
+// ── Live-connection registry ──────────────────────────────────────────────
+// Every connection to a peer joins ONE shared path-selection state inside iroh:
+// a new connection re-runs path selection and holepunching for ALL of them, and
+// opens/closes paths on the connection carrying a transfer. Presence probes used
+// to dial a fresh connection to every friend every 30 s (once per open window),
+// which on 2026-10-07 re-shuffled a friend's transfer path every few seconds.
+// So: while ANY live connection to a peer exists, presence and the connection
+// inspector read it instead of dialing. Weak handles: the registry never keeps a
+// connection open.
+static LIVE_CONNS: std::sync::OnceLock<Mutex<HashMap<String, Vec<iroh::endpoint::WeakConnectionHandle>>>> =
+    std::sync::OnceLock::new();
+
+fn live_conns() -> &'static Mutex<HashMap<String, Vec<iroh::endpoint::WeakConnectionHandle>>> {
+    LIVE_CONNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remember a connection (incoming or dialed) for `live_conn_to`.
+pub(crate) fn note_live_conn(conn: &Connection) {
+    let peer = conn.remote_id().to_string();
+    let mut map = live_conns().lock().unwrap_or_else(|p| p.into_inner());
+    let list = map.entry(peer).or_default();
+    list.retain(|w| w.upgrade().is_some_and(|c| c.close_reason().is_none() && c.stable_id() != conn.stable_id()));
+    list.push(conn.weak_handle());
+    map.retain(|_, l| !l.is_empty());
+}
+
+/// An open connection to this peer, if one exists — newest first.
+pub(crate) fn live_conn_to(endpoint_id: &str) -> Option<Connection> {
+    let mut map = live_conns().lock().unwrap_or_else(|p| p.into_inner());
+    let list = map.get_mut(endpoint_id)?;
+    list.retain(|w| w.upgrade().is_some_and(|c| c.close_reason().is_none()));
+    let conn = list.iter().rev().find_map(|w| w.upgrade());
+    if list.is_empty() { map.remove(endpoint_id); }
+    conn
+}
+
 /// Liveness check: dial a friend/peer's endpoint and round-trip a ping. Returns
 /// true only if they answered with a pong (their app is running and reachable) —
-/// the iroh replacement for the croc "ping_send" online check.
+/// the iroh replacement for the croc "ping_send" online check. A connection that
+/// is open right now (and still receiving) already proves that, without a dial.
 pub async fn ping_endpoint(ep: &Endpoint, endpoint_id: &str) -> bool {
+    if live_conn_to(endpoint_id).is_some_and(|c| conn_recently_heard(&c)) {
+        return true;
+    }
     let Ok(parsed) = endpoint_id.parse::<iroh::EndpointId>() else {
         return false;
     };
@@ -7193,6 +7473,54 @@ pub async fn ping_endpoint(ep: &Endpoint, endpoint_id: &str) -> bool {
 /// no transfer is active): dial them, let a direct path try to form briefly, read
 /// the live path detail, then close. None if they're unreachable.
 pub async fn probe_conn(ep: &Endpoint, endpoint_id: &str) -> Option<crate::models::ConnDetail> {
+    // Reuse a live connection (a transfer, chat, or their own dial to us): its
+    // path detail is the real one, and a probe dial would disturb its paths.
+    if let Some(conn) = live_conn_to(endpoint_id).filter(conn_recently_heard) {
+        return Some(conn_detail(&conn));
+    }
+    // One probe per peer at a time, and a fresh answer is shared: every open
+    // window (main, menu-bar popover…) probes every friend every 30 s.
+    let gate = {
+        let mut gates = PROBE_GATES.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+        gates.retain(|_, g| Arc::strong_count(g) > 1 || g.try_lock().is_ok_and(|v| v.0.elapsed() < PROBE_REUSE));
+        gates.entry(endpoint_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((Instant::now() - PROBE_REUSE, None))))
+            .clone()
+    };
+    let mut slot = gate.lock().await;
+    if slot.0.elapsed() < PROBE_REUSE {
+        return slot.1.clone();
+    }
+    let detail = probe_conn_dial(ep, endpoint_id).await;
+    *slot = (Instant::now(), detail.clone());
+    detail
+}
+
+/// How long a probe answer is reused for other callers.
+const PROBE_REUSE: Duration = Duration::from_secs(20);
+type ProbeGate = Arc<tokio::sync::Mutex<(Instant, Option<crate::models::ConnDetail>)>>;
+static PROBE_GATES: std::sync::OnceLock<Mutex<HashMap<String, ProbeGate>>> = std::sync::OnceLock::new();
+
+/// A live connection is only proof of life while datagrams keep arriving (keep-
+/// alives every few seconds): a peer whose app vanished leaves an open handle
+/// until the idle timeout. Sample twice, a moment apart, if nothing is recorded.
+fn conn_recently_heard(conn: &Connection) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<HashMap<usize, (u64, Instant)>>> = std::sync::OnceLock::new();
+    let rx = conn.stats().udp_rx.datagrams;
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    seen.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(120));
+    let now = Instant::now();
+    let fresh = match seen.get(&conn.stable_id()) {
+        // Unknown handle: trust a connection only if it already moved traffic.
+        None => rx > 0,
+        Some((last_rx, at)) => rx > *last_rx || at.elapsed() < Duration::from_secs(10),
+    };
+    let entry = seen.entry(conn.stable_id()).or_insert((rx, now));
+    if rx > entry.0 { *entry = (rx, now); }
+    fresh && conn.close_reason().is_none()
+}
+
+async fn probe_conn_dial(ep: &Endpoint, endpoint_id: &str) -> Option<crate::models::ConnDetail> {
     let parsed = endpoint_id.parse::<iroh::EndpointId>().ok()?;
     let addr = dial_addr(parsed);
     let conn = tokio::time::timeout(Duration::from_secs(8), ep.connect(addr, ALPN))
@@ -9360,6 +9688,22 @@ async fn recv_file_resumable_hashed<F: Fn(u64, u64)>(
     let mut last_growth = Instant::now();
     let mut last_persist = Instant::now();
     let mut persist_n: u32 = 0;
+    // A resumable receive gives up on a silent link fast: the sender re-dials and
+    // resumes from the partial, which beats sitting at a frozen % for a minute
+    // (2026-10-07: a friend's transfer crawled and froze for minutes). Without a
+    // partial to resume from, a stall costs the whole file, so keep the patience.
+    let stall_budget = if resume.is_some() { RESUMABLE_RECV_STALL } else { TRANSFER_STALL };
+    // The end-game (joining the writers, the final fsync + rename of a big file)
+    // moves no wire bytes; keep the transfer's watchdog informed it's still busy.
+    let _busy = integrity::activity_hook().map(|hook| {
+        let cov = cov.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if cov.lock().map(|c| c.covered() >= total).unwrap_or(false) { hook(1); }
+            }
+        }))
+    });
     loop {
         // Stall detection watches RAW wire bytes (per-chunk), not coverage —
         // coverage now advances in FLUSH_SPAN steps, and a slow-but-alive link
@@ -9398,8 +9742,8 @@ async fn recv_file_resumable_hashed<F: Fn(u64, u64)>(
                     display_base.saturating_add(wire.min(total.saturating_sub(display_base))),
                 );
                 on_progress(shown, total);
-                if last_growth.elapsed() > TRANSFER_STALL {
-                    err = Some(anyhow::anyhow!("transfer stalled — no data for 60s"));
+                if last_growth.elapsed() > stall_budget {
+                    err = Some(anyhow::anyhow!("transfer stalled — no data for {}s", stall_budget.as_secs()));
                     break;
                 }
                 // Persist coverage every couple of seconds so even a hard kill
@@ -9473,6 +9817,16 @@ async fn recv_file_resumable_hashed<F: Fn(u64, u64)>(
         }
         Err(e)
     }
+}
+
+/// A resumable receive with no wire bytes for this long ends the attempt (the
+/// sender re-dials and resumes from the partial).
+const RESUMABLE_RECV_STALL: Duration = Duration::from_secs(20);
+
+/// Aborts a helper task when the work it accompanies ends, however it ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 fn finalize_received(finalize: FinalizeDest, part: PathBuf, resume: Option<&ResumeCtx>) -> Result<PathBuf> {
@@ -12757,43 +13111,76 @@ mod locality_evidence_tests {
 
 #[cfg(test)]
 mod path_preference_tests {
-    use super::{path_preference_key, should_switch_path};
+    use super::{is_overlay_routed, path_preference_key, should_switch_path, PATH_SWITCH_MIN_DWELL};
     use std::time::Duration;
+
+    const SETTLED: Duration = Duration::from_secs(3600);
+    fn ms(n: u64) -> Duration { Duration::from_millis(n) }
 
     #[test]
     fn direct_beats_faster_relay_and_relay_recovers_when_direct_disappears() {
         let direct = path_preference_key(false, false, false, Duration::from_secs(1));
-        let relay = path_preference_key(true, false, false, Duration::from_millis(1));
+        let relay = path_preference_key(true, false, false, ms(1));
         assert!(direct < relay);
-        assert!(should_switch_path(Some(relay), direct));
+        // A better class switches at once, even right after the last switch.
+        assert!(should_switch_path(Some(relay), direct, Duration::ZERO));
         // When the direct path is abandoned it is absent from ctx.paths(),
         // so the current key is None and the remaining relay must be selected.
-        assert!(should_switch_path(None, relay));
+        assert!(should_switch_path(None, relay, Duration::ZERO));
     }
 
     #[test]
-    fn direct_paths_keep_ipv6_bias_and_five_ms_hysteresis() {
-        let v4 = path_preference_key(false, false, false, Duration::from_millis(20));
-        let v6 = path_preference_key(false, false, true, Duration::from_millis(22));
-        assert!(v6 < v4);
-        assert!(!should_switch_path(Some(v4), v6));
-        assert!(!should_switch_path(Some(v4), path_preference_key(false, false, false, Duration::from_millis(16))));
-        assert!(should_switch_path(Some(v4), path_preference_key(false, false, false, Duration::from_millis(15))));
+    fn two_healthy_direct_paths_never_trade_places() {
+        // The 2026-10-07 flap: public ~45 ms vs a Tailscale-routed LAN address
+        // ~42 ms. Neither may displace the other, however long it has been.
+        let public = path_preference_key(false, false, false, ms(45));
+        let routed = path_preference_key(false, false, false, ms(42));
+        assert!(!should_switch_path(Some(public), routed, SETTLED));
+        assert!(!should_switch_path(Some(routed), public, SETTLED));
+        // The old 5 ms rule's switch case no longer switches.
+        let v4 = path_preference_key(false, false, false, ms(20));
+        assert!(!should_switch_path(Some(v4), path_preference_key(false, false, false, ms(15)), SETTLED));
+        // IPv6 keeps its small ranking bias.
+        assert!(path_preference_key(false, false, true, ms(22)) < v4);
     }
+
+    #[test]
+    fn a_decisively_faster_path_wins_only_after_the_dwell() {
+        let slow = path_preference_key(false, false, false, ms(120));
+        let fast = path_preference_key(false, false, false, ms(30));
+        assert!(!should_switch_path(Some(slow), fast, PATH_SWITCH_MIN_DWELL - ms(1)));
+        assert!(should_switch_path(Some(slow), fast, PATH_SWITCH_MIN_DWELL));
+        // Twice as fast but under 20 ms of gain: not worth a restart.
+        let a = path_preference_key(false, false, false, ms(30));
+        let b = path_preference_key(false, false, false, ms(14));
+        assert!(!should_switch_path(Some(a), b, SETTLED));
+    }
+
     #[test]
     fn a_lan_path_beats_a_faster_public_path_and_relay_stays_last() {
-        let lan = path_preference_key(false, true, false, Duration::from_millis(60));
-        let public = path_preference_key(false, false, false, Duration::from_millis(15));
-        let relay = path_preference_key(true, true, false, Duration::from_millis(1));
+        let lan = path_preference_key(false, true, false, ms(60));
+        let public = path_preference_key(false, false, false, ms(15));
+        let relay = path_preference_key(true, true, false, ms(1));
         assert!(lan < public, "a local-network path wins even when the hairpin samples faster");
         assert!(public < relay);
-        assert!(should_switch_path(Some(public), lan));
-        assert!(!should_switch_path(Some(lan), public));
-        // Same class: only a clear (>5 ms) RTT gain switches.
-        let lan2 = path_preference_key(false, true, false, Duration::from_millis(57));
-        assert!(!should_switch_path(Some(lan), lan2));
+        assert!(should_switch_path(Some(public), lan, Duration::ZERO));
+        assert!(!should_switch_path(Some(lan), public, SETTLED));
+        let lan2 = path_preference_key(false, true, false, ms(57));
+        assert!(!should_switch_path(Some(lan), lan2, SETTLED));
     }
 
+    #[test]
+    fn overlay_routed_paths_are_recognised() {
+        let ts: std::net::IpAddr = "100.85.220.95".parse().unwrap();
+        let lan_far: std::net::IpAddr = "192.168.1.102".parse().unwrap();
+        let ts_peer: std::net::IpAddr = "100.107.127.115".parse().unwrap();
+        let home: std::net::IpAddr = "192.168.0.119".parse().unwrap();
+        assert!(is_overlay_routed(Some(ts), lan_far, false), "our Tailscale address → someone's LAN = subnet route");
+        assert!(!is_overlay_routed(Some(ts), ts_peer, false), "Tailscale peer to Tailscale peer is a real direct path");
+        assert!(!is_overlay_routed(Some(home), lan_far, false));
+        assert!(!is_overlay_routed(None, lan_far, false));
+        assert!(!is_overlay_routed(Some(ts), lan_far, true));
+    }
 }
 
 #[cfg(test)]
@@ -13440,7 +13827,7 @@ mod loopback_tests {
     /// any `address_lookup`, so nothing is ever published or resolved off-box.
     async fn loopback_endpoint(accept: bool) -> Endpoint {
         let mut b = Endpoint::builder(presets::Minimal)
-            .path_selector(Arc::new(super::DirectPathSelector))
+            .path_selector(Arc::new(super::DirectPathSelector::default()))
             .relay_mode(RelayMode::Disabled)
             .bind_addr("127.0.0.1:0")
             .expect("127.0.0.1:0 is a valid bind address");
@@ -15373,7 +15760,7 @@ mod chat_transfer_link_tests {
         }})
     }
     fn batch(link: &crate::models::ChatTransferLink) -> ChatBatch {
-        ChatBatch { link: link.clone(), landed: Default::default(), touched: Instant::now(),
+        ChatBatch { reconnect_since: None, link: link.clone(), landed: Default::default(), touched: Instant::now(),
             snapshot: TransferUpdate::new("push".into(), Direction::Receive, vec![]) }
     }
     #[test]
@@ -15434,6 +15821,56 @@ mod chat_transfer_link_tests {
         assert!(b.observe(&link, &u).is_none());
         let mut retry = link.clone(); retry.attempt += 1;
         assert!(b.observe(&retry, &u).is_some());
+    }
+
+    #[test]
+    fn a_stalled_started_batch_reconnects_and_fails_only_after_the_give_up() {
+        let link = incoming_chat_link(&header(), "alice").unwrap();
+        let mut b = batch(&link);
+        b.landed.insert(chat_item_key(0, "a"), "/saved/a".into());
+        let u = completed_update("push", Direction::Receive, vec!["a".into()], 40);
+        b.observe(&link, &u).unwrap();
+        let t0 = b.touched;
+        assert!(matches!(b.watch(t0 + BATCH_STALL - Duration::from_millis(1)), BatchWatch::Wait(_)));
+        let BatchWatch::Reconnect(update) = b.watch(t0 + BATCH_STALL) else { panic!("a quiet started batch must reconnect, not fail") };
+        assert_eq!(update.state, TransferState::Connecting);
+        assert_eq!(update.detail.as_deref(), Some(RECONNECTING));
+        assert_eq!(update.chat_transfer.unwrap().batch_state, Some(TransferState::Connecting));
+        // While waiting for the sender to come back: no second reconnect, no failure.
+        let since = t0 + BATCH_STALL;
+        assert!(matches!(b.watch(since + BATCH_GIVE_UP - Duration::from_millis(1)), BatchWatch::Wait(_)));
+        // The sender's next attempt clears the reconnect state and revives the card.
+        let mut retry = link.clone(); retry.attempt += 1;
+        let mut moving = u.clone(); moving.state = TransferState::Transferring;
+        assert_eq!(b.observe(&retry, &moving).unwrap().batch_state, Some(TransferState::Transferring));
+        assert!(b.reconnect_since.is_none());
+        // If the sender never returns, the card fails — keeping what landed.
+        let t1 = b.touched;
+        assert!(matches!(b.watch(t1 + BATCH_STALL), BatchWatch::Reconnect(_)));
+        let BatchWatch::Fail(failed, started) = b.watch(t1 + BATCH_STALL + BATCH_GIVE_UP) else { panic!("must give up eventually") };
+        assert!(started);
+        assert_eq!(failed.state, TransferState::Failed);
+        assert_eq!(failed.chat_transfer.unwrap().completed_paths[&chat_item_key(0, "a")], "/saved/a");
+        assert!(matches!(b.watch(t1 + BATCH_GIVE_UP * 3), BatchWatch::Done));
+    }
+
+    #[test]
+    fn an_unstarted_batch_keeps_the_old_expiry_and_a_drop_mid_transfer_reads_reconnecting() {
+        let link = incoming_chat_link(&header(), "alice").unwrap();
+        let mut b = batch(&link);
+        let t0 = b.touched;
+        assert!(b.interrupted(t0).is_none(), "nothing moved yet: a failure is a failure");
+        assert!(matches!(b.watch(t0 + BATCH_STALL), BatchWatch::Wait(_)), "waiting on the accept dialog is not a stall");
+        let BatchWatch::Fail(_, started) = b.watch(t0 + TRANSFER_STALL) else { panic!("unstarted batches still expire") };
+        assert!(!started);
+
+        let mut b = batch(&link);
+        b.snapshot.bytes_done = 5;
+        let update = b.interrupted(Instant::now()).expect("a started batch resumes");
+        assert_eq!(update.detail.as_deref(), Some(RECONNECTING));
+        assert!(b.reconnect_since.is_some());
+        b.link.batch_state = Some(TransferState::Completed);
+        assert!(b.interrupted(Instant::now()).is_none());
     }
 
     #[test]
@@ -16085,7 +16522,7 @@ mod integrity_round2_tests {
             "itemOffset":0,"offset":0,"total":size*2,"last":true})).unwrap()
     }
     fn batch(link: &crate::models::ChatTransferLink) -> ChatBatch {
-        ChatBatch { link: link.clone(), landed: Default::default(), touched: Instant::now(),
+        ChatBatch { reconnect_since: None, link: link.clone(), landed: Default::default(), touched: Instant::now(),
             snapshot: TransferUpdate::new("push".into(), Direction::Receive, vec![]) }
     }
 

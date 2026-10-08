@@ -42,11 +42,38 @@ struct AccountDevice: Decodable, Identifiable {
     var name: String
     var deviceKind: String?
     var deviceOs: String?
+    /// "iPhone 15", "MacBook Air" — absent from older builds.
+    var deviceModel: String?
     var lastSyncMs: Double?
     var thisDevice: Bool
     /// Proves the account key but no remaining device vouched for it (linked by an
     /// older build, or by a device since removed): the user must approve it (S4).
     var needsApproval: Bool = false
+}
+/// Labels for the user's OWN devices: "Your iPhone", "Your Mac". When two would
+/// read the same, each says its model ("Your iPhone 15" / "Your iPhone 12");
+/// still alike → device names if they tell them apart, else "Your iPhone" /
+/// "Your iPhone (2)" in a stable order. Mirrors ownDeviceLabels in
+/// src/lib/deviceIcons.ts.
+func ownDeviceLabels(_ devices: [(id: String, name: String, noun: String, model: String?)]) -> [String: String] {
+    let first = devices.map { d -> String in
+        if devices.filter({ $0.noun == d.noun }).count == 1 { return "Your \(d.noun)" }
+        let model = (d.model ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return "Your \(model.isEmpty ? d.noun : model)"
+    }
+    var out: [String: String] = [:]
+    for (i, d) in devices.enumerated() {
+        let same = devices.indices.filter { first[$0] == first[i] }
+        if same.count == 1 { out[d.id] = first[i]; continue }
+        let names = same.map { devices[$0].name.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let taken = Set(first.filter { $0 != first[i] })
+        if Set(names).count == names.count, !names.contains(where: { $0.isEmpty || $0 == d.noun || taken.contains($0) }) {
+            out[d.id] = d.name.trimmingCharacters(in: .whitespacesAndNewlines); continue
+        }
+        let n = (same.map { devices[$0].id }.sorted().firstIndex(of: d.id) ?? 0) + 1
+        out[d.id] = n == 1 ? first[i] : "\(first[i]) (\(n))"
+    }
+    return out
 }
 struct Transfer: Decodable, Identifiable {
     let id: String
@@ -418,6 +445,7 @@ extension AccountDevice {
         self.name = (try? c.decode(String.self, forKey: BridgeKey("name"))) ?? "Device"
         self.deviceKind = (try? c.decode(String.self, forKey: BridgeKey("deviceKind")))
         self.deviceOs = (try? c.decode(String.self, forKey: BridgeKey("deviceOs")))
+        self.deviceModel = (try? c.decode(String.self, forKey: BridgeKey("deviceModel")))
         self.lastSyncMs = (try? c.decode(Double.self, forKey: BridgeKey("lastSyncMs")))
         self.thisDevice = (try? c.decode(Bool.self, forKey: BridgeKey("thisDevice"))) ?? false
         self.needsApproval = (try? c.decode(Bool.self, forKey: BridgeKey("needsApproval")))

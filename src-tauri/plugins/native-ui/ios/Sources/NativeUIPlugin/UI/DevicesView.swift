@@ -72,18 +72,15 @@ struct DevicesView: View {
             if linkedDevices.isEmpty { DeviceAvatar(kind: "phone", os: "ios", size: 64) }
         }.frame(maxWidth: .infinity)
     }
-    /// "Your iPhone" — or "Your iPhone 2" when two of your devices would read the
-    /// same (mirrors ownDeviceLabels in src/lib/deviceIcons.ts).
+    /// "Your iPhone" — or "Your iPhone 15" / "Your iPhone 12" when two of your
+    /// devices would read the same (ownDeviceLabels in Models.swift).
     private func label(_ device: AccountDevice) -> String {
         let noun = deviceNoun(device.deviceKind, os: device.deviceOs)
         if device.thisDevice { return "This \(noun)" }
         if device.needsApproval { return device.name }
-        let same = linkedDevices.filter { !$0.thisDevice && deviceNoun($0.deviceKind, os: $0.deviceOs) == noun }
-        guard same.count > 1 else { return "Your \(noun)" }
-        let names = same.map { $0.name.trimmingCharacters(in: .whitespaces) }
-        if Set(names).count == names.count, !names.contains(noun), !names.contains("") { return device.name }
-        let index = (same.map(\.endpointId).sorted().firstIndex(of: device.endpointId) ?? 0) + 1
-        return "Your \(noun) \(index)"
+        let others = linkedDevices.filter { !$0.thisDevice }
+            .map { (id: $0.endpointId, name: $0.name, noun: deviceNoun($0.deviceKind, os: $0.deviceOs), model: $0.deviceModel) }
+        return ownDeviceLabels(others)[device.endpointId] ?? "Your \(noun)"
     }
     @ViewBuilder private func row(_ device: AccountDevice) -> some View {
         HStack(spacing: 14) {
