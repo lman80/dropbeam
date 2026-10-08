@@ -270,6 +270,8 @@ export interface LinkPreviewInfo { name: string; safety: string; direction: 'giv
 /** The other device presented this device's code: confirm its safety code. */
 export interface LinkConfirmRequest { endpointId: string; name: string; safety: string; joining: boolean }
 export interface LinkResult { endpoint_id: string; name: string; device_kind: string; device_os?: string
+  /** "iPhone 15", "MacBook Air" — absent from older builds. */
+  device_model?: string | null
   /** What the link brought over (friends and chat messages), when known. */
   friends?: number; messages?: number }
 /** One device in this account (this one first). */
@@ -279,6 +281,8 @@ export interface AccountDevice {
   name: string
   device_kind: string | null
   device_os: string | null
+  /** "iPhone 15", "MacBook Air" — absent from older builds. */
+  device_model?: string | null
   last_sync_ms: number | null
   this_device: boolean
   /** Proves the account key but no remaining device vouched for it (linked by
@@ -295,6 +299,8 @@ export interface Friend {
   accountPub?: string | null
   /** "macos" | "ios" | "windows" | "linux" — from the device's hello. */
   deviceOs?: string | null
+  /** "iPhone 15", "MacBook Air" — from the device's hello; absent from older builds. */
+  deviceModel?: string | null
   id: string
   role: PairRole
   name: string

@@ -1,5 +1,6 @@
 mod account;
 mod device_activity;
+mod device_model;
 mod automation;
 mod block;
 mod codes;

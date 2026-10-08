@@ -42,9 +42,12 @@ test('progress and success read like a person wrote them', () => {
 })
 
 test('own devices that would read the same get told apart', () => {
-  // Two iPhones both report "iPhone": numbered, in a stable order.
+  // Two iPhones both report "iPhone" and no model (older builds): numbered, in a stable order.
   assert.deepEqual(ownDeviceLabels([{ id: 'b', name: 'iPhone', deviceKind: 'phone', deviceOs: 'ios' }, { id: 'a', name: 'iPhone', deviceKind: 'phone', deviceOs: 'ios' }, { id: 'm', name: 'Mac', deviceOs: 'macos' }]),
-    { a: 'Your iPhone 1', b: 'Your iPhone 2', m: 'Your Mac' })
+    { a: 'Your iPhone', b: 'Your iPhone (2)', m: 'Your Mac' })
+  // With models, the models.
+  assert.deepEqual(ownDeviceLabels([{ id: 'b', name: 'iPhone', deviceKind: 'phone', deviceOs: 'ios', deviceModel: 'iPhone 12' }, { id: 'a', name: 'iPhone', deviceKind: 'phone', deviceOs: 'ios', deviceModel: 'iPhone 15' }]),
+    { a: 'Your iPhone 15', b: 'Your iPhone 12' })
   // Distinct device names are used when they exist.
   assert.deepEqual(ownDeviceLabels([{ id: 'a', name: 'Work Mac', deviceOs: 'macos' }, { id: 'b', name: 'Home Mac', deviceOs: 'macos' }]), { a: 'Work Mac', b: 'Home Mac' })
 })

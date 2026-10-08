@@ -52,6 +52,7 @@ fn read_raw(config_dir: &Path) -> Vec<Friend> {
                 f.endpoint_id = None;
                 f.account_pub = None;
                 f.device_kind = None;
+                f.device_model = None;
             }
             f
         })
@@ -130,6 +131,7 @@ pub fn create(
         device_kind: None,
         account_pub: None,
         device_os: None,
+        device_model: None,
     };
     let invite = Invite {
         v: 1,
@@ -182,6 +184,7 @@ pub fn accept(config_dir: &Path, invite_str: &str) -> Result<Friend, String> {
         device_kind: None,
         account_pub: None,
         device_os: None,
+        device_model: None,
     };
     let detached = detached_threads(config_dir)?;
     friends.push(friend.clone());
@@ -234,6 +237,7 @@ pub fn upsert_from_pairing(config_dir: &Path, name: &str, pair_secret: &str, rol
         device_kind: None,
         account_pub: None,
         device_os: None,
+        device_model: None,
     });
     let _ = save(config_dir, &friends);
 }
@@ -325,6 +329,7 @@ pub fn plan_reconcile(
         if survivor.endpoint_id.is_some() && survivor.endpoint_id == loser.endpoint_id {
             if survivor.account_pub.is_none() { survivor.account_pub = loser.account_pub.clone(); }
             if survivor.device_kind.is_none() { survivor.device_kind = loser.device_kind.clone(); }
+            if survivor.device_model.is_none() { survivor.device_model = loser.device_model.clone(); }
         }
         if survivor.avatar.is_none() {
             survivor.avatar = loser.avatar.clone();
@@ -409,6 +414,7 @@ pub fn set_endpoint_id(config_dir: &Path, id: &str, endpoint_id: String) -> bool
         if f.endpoint_id.as_deref() != Some(endpoint_id.as_str()) {
             f.account_pub = None;
             f.device_kind = None;
+            f.device_model = None;
             f.endpoint_id = Some(endpoint_id);
             changed = true;
         }
@@ -550,6 +556,7 @@ pub(crate) fn upsert_with_id(config_dir: &Path, endpoint_id: &str, name: &str, o
         device_kind: None,
         account_pub: None,
         device_os: None,
+        device_model: None,
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -642,6 +649,7 @@ pub fn apply_hello_from(config_dir: &Path, friend_id: &str, endpoint_id: &str, n
             if f.endpoint_id.as_deref() != Some(endpoint_id) {
                 f.account_pub = None;
                 f.device_kind = None;
+                f.device_model = None;
                 f.endpoint_id = Some(endpoint_id.to_string());
                 changed = true;
             }
@@ -1197,6 +1205,7 @@ mod tests {
             device_kind: None,
             account_pub: None,
             device_os: None,
+            device_model: None,
         }
     }
 
@@ -1227,6 +1236,7 @@ mod tests {
             device_kind: None,
             account_pub: None,
             device_os: None,
+            device_model: None,
         }
     }
 
@@ -1601,6 +1611,25 @@ pub(crate) fn apply_device_hello(config_dir: &Path, endpoint_id: &str, req: &ser
     if let Some(os) = req["device_os"].as_str().filter(|os| !os.is_empty() && os.len() <= 16) {
         set_device_os(config_dir, endpoint_id, os);
     }
+    // Optional (older builds don't send it): "iPhone 15", "MacBook Air".
+    if let Some(model) = req["device_model"].as_str().and_then(crate::device_model::clean) {
+        set_device_model(config_dir, endpoint_id, &model);
+    }
+}
+
+pub(crate) fn set_device_model(config_dir: &Path, endpoint_id: &str, model: &str) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut friends = read_raw(config_dir);
+    let mut changed = false;
+    for f in friends.iter_mut().filter(|f| f.endpoint_id.as_deref() == Some(endpoint_id)) {
+        if f.device_model.as_deref() != Some(model) {
+            f.device_model = Some(model.to_owned());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = save(config_dir, &friends);
+    }
 }
 
 pub(crate) fn set_device_os(config_dir: &Path, endpoint_id: &str, os: &str) {
@@ -1623,7 +1652,7 @@ pub(crate) fn set_device_os(config_dir: &Path, endpoint_id: &str, os: &str) {
 /// "removed" tombstone compares against when the device was linked, not when
 /// this copy happened to hear about it.
 pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str, kind: Option<&str>,
-    os: Option<&str>, account_pub: &str, created_at: u64, authoritative_name: bool) -> bool {
+    os: Option<&str>, model: Option<&str>, account_pub: &str, created_at: u64, authoritative_name: bool) -> bool {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut friends = read_raw(config_dir);
     let name = clean_name(name, "My device");
@@ -1632,6 +1661,8 @@ pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str
         if f.account_pub.as_deref() != Some(account_pub) { f.account_pub = Some(account_pub.to_owned()); changed = true; }
         if kind.is_some() && f.device_kind.as_deref() != kind { f.device_kind = kind.map(str::to_owned); changed = true; }
         if os.is_some() && f.device_os.as_deref() != os { f.device_os = os.map(str::to_owned); changed = true; }
+        let model = model.and_then(crate::device_model::clean);
+        if model.is_some() && f.device_model != model { f.device_model = model; changed = true; }
         if authoritative_name && !f.name_custom && f.name != name { f.name = name; changed = true; }
         if changed { let _ = save(config_dir, &friends); }
         return changed;
@@ -1652,6 +1683,7 @@ pub(crate) fn upsert_own_device(config_dir: &Path, endpoint_id: &str, name: &str
         device_kind: kind.map(str::to_owned),
         account_pub: Some(account_pub.to_owned()),
         device_os: os.map(str::to_owned),
+        device_model: model.and_then(crate::device_model::clean),
     });
     let _ = save(config_dir, &friends);
     true
@@ -1668,6 +1700,7 @@ pub(crate) struct SyncedFriend<'a> {
     pub auto_accept: bool,
     pub device_kind: Option<&'a str>,
     pub device_os: Option<&'a str>,
+    pub device_model: Option<&'a str>,
     pub account_pub: Option<&'a str>,
 }
 
@@ -1698,6 +1731,9 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
         }
         if f.device_kind.is_none() && r.device_kind.is_some() { f.device_kind = r.device_kind.map(str::to_owned); changed = true; }
         if f.device_os.is_none() && r.device_os.is_some() { f.device_os = r.device_os.map(str::to_owned); changed = true; }
+        if f.device_model.is_none() {
+            if let Some(m) = r.device_model.and_then(crate::device_model::clean) { f.device_model = Some(m); changed = true; }
+        }
         if f.account_pub.is_none() && r.account_pub.is_some() { f.account_pub = r.account_pub.map(str::to_owned); changed = true; }
         // Lamport: remember the newest add any own device saw, so a removal made
         // here later is stamped past it even if that device's clock ran ahead
@@ -1727,6 +1763,7 @@ pub(crate) fn import_synced_friend(config_dir: &Path, r: &SyncedFriend) -> (Frie
         device_kind: r.device_kind.map(str::to_owned),
         account_pub: r.account_pub.map(str::to_owned),
         device_os: r.device_os.map(str::to_owned),
+        device_model: r.device_model.and_then(crate::device_model::clean),
     };
     friends.push(friend.clone());
     let _ = save(config_dir, &friends);
@@ -1955,6 +1992,26 @@ mod device_tests {
         assert!(crate::chat::messages(&dir, &mac.id).iter().any(|m| m.id == "p1"));
         assert!(crate::chat::messages(&dir, &phone.id).is_empty());
         assert_eq!(person_endpoints(&dir, &mac.id), vec!["mac-eid".to_string(), "phone-eid".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn hello_carries_an_optional_hardware_model() {
+        let dir = std::env::temp_dir().join(format!("db-model-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        upsert_by_endpoint(&dir, "endpoint", "Phone");
+        // An older build: no model, nothing breaks.
+        apply_device_hello(&dir, "endpoint", &serde_json::json!({"device_kind":"phone","device_os":"ios"}));
+        assert_eq!(load(&dir)[0].device_model, None);
+        apply_device_hello(&dir, "endpoint", &serde_json::json!({"device_kind":"phone","device_os":"ios","device_model":" iPhone 15 "}));
+        assert_eq!(load(&dir)[0].device_model.as_deref(), Some("iPhone 15"));
+        // A later hello without it (or with junk) keeps what we know.
+        apply_device_hello(&dir, "endpoint", &serde_json::json!({"device_kind":"phone","device_os":"ios","device_model":"x".repeat(200)}));
+        apply_device_hello(&dir, "endpoint", &serde_json::json!({"device_kind":"phone","device_os":"ios","device_model":null}));
+        assert_eq!(load(&dir)[0].device_model.as_deref(), Some("iPhone 15"));
+        // Stored records from older builds (no field) still load; and it round-trips.
+        let old: Friend = serde_json::from_value(serde_json::json!({"id":"x","role":"b","name":"Old","secret":"s","createdAt":1})).unwrap();
+        assert!(old.device_model.is_none());
+        assert!(!serde_json::to_string(&old).unwrap().contains("deviceModel"));
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]

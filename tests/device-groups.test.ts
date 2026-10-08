@@ -25,6 +25,27 @@ test('own devices read "Your Mac"/"Your iPhone" and fall back to names when two 
     { a: 'Work Mac', b: 'Home Mac', c: 'Your iPhone' })
 })
 
+test('two own devices of one kind read as their models, then names, then numbers', async () => {
+  const { ownDeviceLabels } = await import('../src/lib/deviceIcons.ts')
+  const phone = (id: string, deviceModel?: string | null, name = 'iPhone') => ({ id, name, deviceKind: 'phone', deviceOs: 'ios', deviceModel })
+  const mac = (id: string, deviceModel?: string | null, name = 'Mac') => ({ id, name, deviceKind: 'laptop', deviceOs: 'macos', deviceModel })
+  // Different models: the model tells them apart.
+  assert.deepEqual(ownDeviceLabels([phone('a', 'iPhone 15'), phone('b', 'iPhone 12')]), { a: 'Your iPhone 15', b: 'Your iPhone 12' })
+  assert.deepEqual(ownDeviceLabels([mac('a', 'MacBook Air', "Ashton's MacBook Air"), mac('b', 'Mac mini', 'Studio')]), { a: 'Your MacBook Air', b: 'Your Mac mini' })
+  // Only one of a kind: just the noun, even when the model is known.
+  assert.deepEqual(ownDeviceLabels([phone('a', 'iPhone 15'), mac('b', 'MacBook Air')]), { a: 'Your iPhone', b: 'Your Mac' })
+  // Same model (or an older build that doesn't say): numbered, Finder-style, in a stable order.
+  assert.deepEqual(ownDeviceLabels([phone('b', 'iPhone 15'), phone('a', 'iPhone 15')]), { a: 'Your iPhone 15', b: 'Your iPhone 15 (2)' })
+  assert.deepEqual(ownDeviceLabels([phone('b'), phone('a', null)]), { a: 'Your iPhone', b: 'Your iPhone (2)' })
+  // One knows its model, the other is an older build: still distinct.
+  assert.deepEqual(ownDeviceLabels([phone('a', 'iPhone 15'), phone('b')]), { a: 'Your iPhone 15', b: 'Your iPhone' })
+  // Same model but telling device names: the names.
+  assert.deepEqual(ownDeviceLabels([mac('a', 'MacBook Pro', 'Work Mac'), mac('b', 'MacBook Pro', 'Home Mac')]), { a: 'Work Mac', b: 'Home Mac' })
+  // Three iPhones, two the same model.
+  assert.deepEqual(ownDeviceLabels([phone('a', 'iPhone 15'), phone('b', 'iPhone 15'), phone('c', 'iPhone 12')]),
+    { a: 'Your iPhone 15', b: 'Your iPhone 15 (2)', c: 'Your iPhone 12' })
+})
+
 test("a friend's extra devices fold under one deterministic record; own devices never do", async () => {
   const { personGroups } = await import('../src/lib/deviceIcons.ts')
   const f = [
