@@ -753,14 +753,6 @@ mod unix {
             self.resolve(&parent.to_string_lossy())?;
             Ok((self.open_rel(parent, true)?, name))
         }
-        /// Open one entry for open-in-place (stat / range read): descriptor-
-        /// relative and O_NOFOLLOW at every component, regular file or folder
-        /// only, same device as the root. Positioned reads need no cursor.
-        pub fn open_entry(&self, raw: &str) -> Result<fs::File> {
-            let rel = relative(raw)?;
-            if rel.as_os_str().is_empty() { return Ok(self.dir.try_clone()?); }
-            self.open_rel(&rel, false).context("Not found in this location")
-        }
         pub fn stat_entry(&self, raw: &str) -> Result<Option<(bool, u64)>> {
             let rel = relative(raw)?;
             // Descriptor-relative, O_NOFOLLOW at every component, just like ls.
@@ -1128,12 +1120,23 @@ mod unix {
     }
 }
 
+impl Root {
+    /// Open one entry for open-in-place (stat / range read) through the same
+    /// pinned walk as everything else: descriptor/handle-relative, no
+    /// symlinks, junctions or reparse points, regular file or folder only,
+    /// same volume as the root. Positioned reads need no shared cursor.
+    #[cfg(any(unix, windows))]
+    pub fn open_entry(&self, raw: &str) -> Result<fs::File> {
+        let rel = relative(raw)?;
+        if rel.as_os_str().is_empty() { return Ok(self.dir.try_clone()?); }
+        self.open_rel(&rel, false).context("Not found in this location")
+    }
+    #[cfg(not(any(unix, windows)))]
+    pub fn open_entry(&self, _: &str) -> Result<fs::File> { bail!("Hosting unavailable") }
+}
 // Fail closed on platforms without descriptor-relative filesystem protection.
 #[cfg(not(any(unix, windows)))]
 impl Root {
-    // TODO(windows Root port): open one entry handle-relative (no reparse
-    // points) for open-in-place stat/read. Shape matches the unix method.
-    pub fn open_entry(&self, _: &str) -> Result<fs::File> { bail!("Hosting unavailable") }
     pub fn stat_entry(&self, _: &str) -> Result<Option<(bool, u64)>> { bail!("Hosting unavailable") }
     pub fn stat_many(&self, _: &str, _: &[String]) -> Result<Vec<Option<(bool, u64, u64)>>> { bail!("Hosting unavailable") }
     pub fn hash_entry(&self, _: &str, _: &std::sync::atomic::AtomicBool, _: impl Fn(u64)) -> Result<Option<String>> { bail!("Hosting unavailable") }
@@ -1207,7 +1210,7 @@ pub const MAX_READ: u64 = 16 << 20;
 pub fn etag_of(meta: &fs::Metadata) -> String {
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
     #[cfg(unix)] let ino = { use std::os::unix::fs::MetadataExt; meta.ino() };
-    #[cfg(not(unix))] let ino = 0u64;
+    #[cfg(not(unix))] let ino = 0u64; // Windows: size + 100 ns mtime
     format!("{:x}-{:x}-{:x}", meta.len(), mtime, ino)
 }
 fn modified_ms(meta: &fs::Metadata) -> u64 {
@@ -2187,7 +2190,7 @@ mod tests {
     fn open_in_place_reads_are_gated_clamped_and_detect_changes() {
         let mut f = Fixture::new();
         fs::write(f.root.join("movie.mp4"), vec![7u8; 5000]).unwrap();
-        std::os::unix::fs::symlink(f.config.join("friends.json"), f.root.join("escape")).unwrap();
+        link_file(&f.config.join("friends.json"), &f.root.join("escape"));
         let v2 = |kind: &str, rel: &str| json!({"kind": format!("locations.{kind}"), "locations_v": STREAM_VERSION, "id": "nas", "rel_path": rel});
         let now = Instant::now();
         let stat = dispatch_at(&f.config, "owner-device", &v2("stat", "movie.mp4"), now).unwrap();

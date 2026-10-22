@@ -758,7 +758,7 @@ fn file_ref(config: &Path, friend_id: &str, location_id: &str, rel_path: &str) -
     let endpoint = crate::friends::get(config, friend_id).and_then(|f| f.endpoint_id).ok_or("Friend not found")?;
     let rel = crate::locations::relative(rel_path).map_err(|e| e.to_string())?;
     if rel.as_os_str().is_empty() { return Err("Choose a file".into()); }
-    Ok(FileRef { endpoint, location_id: location_id.into(), rel_path: rel.to_string_lossy().replace('\\', "/") })
+    Ok(FileRef { endpoint, location_id: location_id.into(), rel_path: crate::locations::slash(&rel) })
 }
 fn text(e: anyhow::Error) -> String { format!("{e:#}") }
 
