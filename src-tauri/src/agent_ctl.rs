@@ -838,7 +838,7 @@ mod tests {
     fn socket_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         // A long config folder falls back to a short per-user path.
-        assert!(socket_path(&PathBuf::from(format!("/{}", "x".repeat(120)))).starts_with("/tmp/dropbeam-"));
+        assert!(socket_path(&PathBuf::from(format!("/{}", "x".repeat(120)))).to_string_lossy().starts_with("/tmp/dropbeam-"));
         let d = PathBuf::from(format!("/tmp/dbt-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]));
         std::fs::create_dir_all(&d).unwrap();
         assert_eq!(socket_dir(&d), d.join("agent"));
