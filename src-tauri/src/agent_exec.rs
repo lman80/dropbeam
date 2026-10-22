@@ -18,6 +18,7 @@
 //! - "Let my other devices run commands here" is on (default off; "for 1 hour"
 //!   or "until I turn it off") — a desktop-only switch only the window can set;
 //! - not iOS / not the windowless `--server` mode.
+//!
 //! Each command shows a notification on the target and lands in its agent log.
 
 use std::sync::Arc;

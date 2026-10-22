@@ -411,9 +411,10 @@ async fn command(a: &Args) -> Result<i32, String> {
             }
             let (who, loc) = target.ok_or("nothing to get")?;
             let r = data(&mut c, "locations.download", json!({"who": who, "location": loc, "paths": paths})).await?;
-            match r["transferId"].as_str() {
-                Some(id) => { let id = id.to_owned(); return finish_transfer(&mut c, a, json!({"id": id}), "Downloaded").await; }
-                None => { if json_out { show(&r) } else { println!("Nothing to download."); } }
+            match (r["receiveId"].as_str(), r["transferId"].as_str()) {
+                (Some(id), _) => { let id = id.to_owned(); return finish_transfer(&mut c, a, json!({"id": id}), "Downloaded").await; }
+                (None, Some(_)) => { if json_out { show(&r) } else { println!("Started; see dropbeam transfers."); } }
+                (None, None) => { if json_out { show(&r) } else { println!("Nothing to download."); } }
             }
         }
         "put" => {

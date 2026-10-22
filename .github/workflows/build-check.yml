@@ -87,13 +87,13 @@ jobs:
           cargo build --bin DropBeam
           bin=target/debug/DropBeam
           $bin cli version
-          $bin cli ops --json | head -c 300; echo
-          $bin cli mcp --no-start <<< '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q '"chat_wait"'
+          $bin cli ops --json > ops.json && grep -q "\"chat.send\"" ops.json
+          $bin cli mcp --no-start <<< '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' > tools.json && grep -q '"chat_wait"' tools.json
           set +e; $bin cli status --no-start; code=$?; set -e
           test "$code" = 1
           if [ "$RUNNER_OS" = "Windows" ]; then
             printf '@echo off\r\n"%%~dp0DropBeam.exe" cli %%*\r\nexit /b %%ERRORLEVEL%%\r\n' > target/debug/dropbeam.cmd
-            cmd //c 'target\debug\dropbeam.cmd version' | grep -q dropbeam
+            cmd //c 'target\debug\dropbeam.cmd version' > version.txt && grep -q dropbeam version.txt
             set +e; cmd //c 'target\debug\dropbeam.cmd status --no-start'; code=$?; set -e
             test "$code" = 1
           fi

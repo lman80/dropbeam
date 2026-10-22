@@ -6,6 +6,7 @@
 //! - Windows: a named pipe whose random name is kept in `<config>\agent\pipe`
 //!   (only the user can read it) and whose security descriptor grants access to
 //!   the current user's SID alone; remote clients are refused.
+//!
 //! No TCP anywhere.
 //!
 //! Protocol: one JSON object per line.
@@ -136,7 +137,12 @@ static HUB: LazyLock<broadcast::Sender<Value>> = LazyLock::new(|| broadcast::cha
 /// Latest update of each transfer since launch, newest first (bounded).
 static TRANSFERS: LazyLock<Mutex<VecDeque<Value>>> = LazyLock::new(Default::default);
 /// Sends an agent started, so transfers.retry can replay them: id → (op, input).
-static RETRY: LazyLock<Mutex<VecDeque<(String, &'static str, Value)>>> = LazyLock::new(Default::default);
+/// (transfer id, op, input) of a send an agent started.
+type RetryEntry = (String, &'static str, Value);
+static RETRY: LazyLock<Mutex<VecDeque<RetryEntry>>> = LazyLock::new(Default::default);
+
+/// Live events (the same stream events.subscribe gives).
+pub fn events() -> broadcast::Receiver<Value> { HUB.subscribe() }
 
 pub fn remember_retry(id: &str, op: &'static str, input: &Value) {
     let mut r = RETRY.lock().unwrap();
@@ -169,20 +175,22 @@ fn note_transfer(u: &Value) {
 
 pub async fn transfer_wait(id: &str, timeout_secs: u64) -> R {
     let mut rx = HUB.subscribe();
-    if let Some(u) = transfer(id).filter(|u| terminal(u["state"].as_str().unwrap_or(""))) { return Ok(u); }
-    if transfer(id).is_none() && retry_payload(id).is_none() {
-        // Might be one that started before we were listening: still wait.
-        log::debug!("agent: waiting on a transfer not seen yet");
-    }
+    let done = |u: &Value| terminal(u["state"].as_str().unwrap_or(""));
+    if let Some(u) = transfer(id).filter(done) { return Ok(u); }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs.clamp(1, 86_400));
+    // An id nobody has reported within a minute is a mistake, not a slow start.
+    let unknown_by = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
+        let known = transfer(id).is_some() || retry_payload(id).is_some();
+        let until = if known { deadline } else { deadline.min(unknown_by) };
+        match tokio::time::timeout_at(until, rx.recv()).await {
+            Err(_) if !known && transfer(id).is_none() && until < deadline => return Err(OpError::new("not_found", "no transfer with that id (see transfers.list)")),
             Err(_) => return Ok(json!({"timedOut": true, "transfer": transfer(id)})),
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                if let Some(u) = transfer(id).filter(|u| terminal(u["state"].as_str().unwrap_or(""))) { return Ok(u); }
+                if let Some(u) = transfer(id).filter(done) { return Ok(u); }
             }
             Ok(Err(_)) => return Err(OpError::new("failed", "DropBeam is shutting down")),
-            Ok(Ok(ev)) if ev["type"] == "transfer" && ev["data"]["id"] == id && terminal(ev["data"]["state"].as_str().unwrap_or("")) => return Ok(ev["data"].clone()),
+            Ok(Ok(ev)) if ev["type"] == "transfer" && ev["data"]["id"] == id && done(&ev["data"]) => return Ok(ev["data"].clone()),
             Ok(Ok(_)) => {}
         }
     }
@@ -212,10 +220,14 @@ pub async fn chat_wait(app: &AppHandle, i: &Value) -> R {
         None => crate::friends::load(&dir).into_iter().map(|f| owner_of(&f.id)).collect::<std::collections::BTreeSet<_>>().into_iter().collect(),
     };
     let mut found: Vec<Value> = vec![];
+    // Every message already here: a later event about one of them (an edit, a
+    // reaction, a status change) is not a new message. A NEW one counts even if
+    // the sender's clock is behind ours.
     let mut seen = std::collections::HashSet::new();
     for t in &threads {
-        for m in crate::chat::messages(&dir, t).iter().filter(|m| !m.from_me && m.ts > since && !m.deleted) {
-            if seen.insert(m.id.clone()) { found.push(shape(m)); }
+        for m in crate::chat::messages(&dir, t) {
+            if !m.from_me && m.ts > since && !m.deleted { found.push(shape(&m)); }
+            seen.insert(m.id);
         }
     }
     if !found.is_empty() { return Ok(json!({"messages": found, "timedOut": false})); }
@@ -228,7 +240,7 @@ pub async fn chat_wait(app: &AppHandle, i: &Value) -> R {
             Ok(Err(_)) => return Err(OpError::new("failed", "DropBeam is shutting down")),
             Ok(Ok(ev)) if ev["type"] == "chat" => {
                 let Ok(m) = serde_json::from_value::<crate::chat::ChatMessage>(ev["data"].clone()) else { continue };
-                if m.from_me || m.ts <= since || m.deleted || m.kind == "reaction" { continue; }
+                if m.from_me || m.deleted { continue; }
                 if want.as_ref().is_some_and(|w| *w != owner_of(&m.peer_id)) { continue; }
                 if seen.insert(m.id.clone()) { found.push(shape(&m)); }
             }
@@ -296,6 +308,7 @@ fn admit(dir: &Path, op: &str, input: &Value) -> Result<(&'static agent_ops::OpS
     Ok((spec, dry))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record(app: &AppHandle, dir: &Path, who: &Caller, op: &str, input: &Value, risk: Option<Risk>, result: &Result<Value, OpError>, started: Instant) {
     if quiet(op) { return; }
     let mut e = json!({"agent": who.agent, "reason": who.reason, "op": op, "risk": risk, "summary": agent_ops::summarize(op, input),
@@ -367,7 +380,10 @@ async fn serve_conn<S: AsyncRead + AsyncWrite + Send + 'static>(app: AppHandle, 
             continue;
         }
         let (app, tx, controls) = (app.clone(), tx.clone(), controls.clone());
-        tasks.push(tauri::async_runtime::spawn(async move {
+        // Waits and streams end with the connection; a change already asked for
+        // (a send, a message) is allowed to finish.
+        let waits = matches!(req["op"].as_str(), Some("chat.wait" | "transfers.wait" | "events.subscribe" | "exec.run"));
+        let task = tauri::async_runtime::spawn(async move {
             let id = req["id"].clone();
             let op = req["op"].as_str().unwrap_or("").to_owned();
             let input = if req["input"].is_null() { json!({}) } else { req["input"].clone() };
@@ -385,7 +401,8 @@ async fn serve_conn<S: AsyncRead + AsyncWrite + Send + 'static>(app: AppHandle, 
                 _ => call(&app, &op, input, &who).await,
             };
             let _ = tx.send(reply(&id, out)).await;
-        }));
+        });
+        if waits { tasks.push(task); }
     }
     // The client went away: stop what it was waiting on (streams, long polls).
     for t in tasks { t.abort(); }
@@ -744,7 +761,7 @@ mod tests {
         save_settings(&d, &AgentSettings { access: true, exec_until: soon }).unwrap();
         assert_eq!(exec_allowed_now(&d), (true, Some(soon)));
         save_settings(&d, &AgentSettings { access: true, exec_until: crate::chat::now_ms() - 1 }).unwrap();
-        assert_eq!(exec_allowed_now(&d).0, false, "an expired hour is off");
+        assert!(!exec_allowed_now(&d).0, "an expired hour is off");
         let _ = std::fs::remove_dir_all(d);
     }
 

@@ -266,7 +266,7 @@ fn catalog() -> Vec<OpSpec> {
             .req("who", S, WHO).req("location", S, "Location name or id.").opt("path", S, "Folder inside it ('' = top).").opt("cursor", S, "nextCursor from the previous page.").opt("query", S, "Only names containing this.")
             .out("{entries:[{name,isDir,size,modified}], hasMore, nextCursor, total}").build(),
         op("locations.download", Write, "Download files or folders from a friend's Location into your download folder.")
-            .req("who", S, WHO).req("location", S, "Location name or id.").req("paths", Strs, "Paths inside the Location.").out("{transferId}").build(),
+            .req("who", S, WHO).req("location", S, "Location name or id.").req("paths", Strs, "Paths inside the Location.").out("{transferId, receiveId} — follow receiveId (the incoming transfer here) with transfers.wait").build(),
         op("locations.upload", Write, "Upload files into a friend's Location (if they gave you upload rights). Never overwrites: a same-named file lands beside it.")
             .req("who", S, WHO).req("location", S, "Location name or id.").req("paths", Strs, PATHS).opt("path", S, "Folder inside it ('' = top).").dry()
             .out("the transfer").cmds(&["upload_to_location"]).build(),
@@ -788,7 +788,28 @@ pub async fn run(app: &AppHandle, name: &str, i: &Value, ctx: &Ctx) -> R {
                 "locations.rename" => req["to"] = json!(s(i, "to")?.trim_matches('/')),
                 _ => {}
             }
-            ok(commands::location_request(app.state(), app.state(), host.id, req).await.map_err(failed)?)
+            if name != "locations.download" {
+                return ok(commands::location_request(app.state(), app.state(), host.id, req).await.map_err(failed)?);
+            }
+            // The host pushes the files back as a new incoming transfer with its
+            // own id here: find it, so the caller can follow it (transfers.wait).
+            let wanted: Vec<String> = strs(i, "paths").iter().filter_map(|p| p.trim_matches('/').rsplit('/').next().map(str::to_owned)).collect();
+            let mut events = crate::agent_ctl::events();
+            let before: Vec<Value> = crate::agent_ctl::transfers(false).as_array().cloned().unwrap_or_default();
+            let mut r = commands::location_request(app.state(), app.state(), host.id, req).await.map_err(failed)?;
+            if r["transferId"].is_string() {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, events.recv()).await {
+                    let t = &ev["data"];
+                    let names: Vec<&str> = t["fileNames"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                    let ours = t["peer"] == host.name.as_str() || wanted.iter().any(|w| names.contains(&w.as_str()));
+                    if ev["type"] == "transfer" && t["direction"] == "receive" && ours && !before.iter().any(|b| b["id"] == t["id"]) {
+                        r["receiveId"] = t["id"].clone();
+                        break;
+                    }
+                }
+            }
+            Ok(r)
         }
         "locations.upload" => {
             let paths = abs_paths(i, "paths")?;
