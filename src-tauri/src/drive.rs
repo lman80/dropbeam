@@ -815,27 +815,9 @@ impl Drive {
 
     #[cfg(target_os = "macos")]
     async fn mount_inner(&self) -> Result<Mounted> {
-        use nfsserve::tcp::{NFSTcp, NFSTcpListener};
         let path = mount_point()?;
         tokio::task::spawn_blocking(recover_stale).await?;
-        std::fs::create_dir_all(&path)?;
-        let leftovers: Vec<_> = std::fs::read_dir(&path)?.flatten().filter(|e| e.file_name() != ".DS_Store").collect();
-        anyhow::ensure!(leftovers.is_empty(), "The folder {} isn't empty, so the drive can't appear there. Move its contents and try again.", path.display());
-        let listener = NFSTcpListener::bind("127.0.0.1:0", nfs::Nfs::new(self.tree.clone())).await?;
-        let port = listener.get_listen_port();
-        let server = tokio::spawn(async move { if let Err(e) = listener.handle_forever().await { log::warn!("drive: NFS server stopped: {e}"); } });
-        // Options as hf-mount / xet use them, plus a soft mount that fails fast
-        // (and is dropped after `deadtimeout`) if DropBeam stops answering.
-        let options = format!("locallocks,vers=3,tcp,port={port},mountport={port},soft,intr,timeo=300,retrans=2,deadtimeout=60,rsize=1048576,wsize=1048576,actimeo=5");
-        let target = path.clone();
-        let out = tokio::time::timeout(Duration::from_secs(40), tokio::task::spawn_blocking(move || {
-            std::process::Command::new("/sbin/mount_nfs").args(["-o", &options, "127.0.0.1:/"]).arg(&target).output()
-        })).await;
-        let out = match out { Ok(Ok(Ok(o))) => o, other => { server.abort(); anyhow::bail!("Couldn’t mount the drive ({other:?})"); } };
-        if !out.status.success() {
-            server.abort();
-            anyhow::bail!("Couldn’t mount the drive: {}", String::from_utf8_lossy(&out.stderr).trim());
-        }
+        let server = mount_nfs_at(self.tree.clone(), &path).await?;
         Ok(Mounted { path, server })
     }
     #[cfg(target_os = "linux")]
@@ -872,8 +854,46 @@ impl Drive {
     async fn mount_inner(&self) -> Result<Mounted> { anyhow::bail!("Showing Locations as a drive isn't available on this device") }
 }
 
+/// `~/DropBeam Drives` (`DROPBEAM_DRIVE_DIR` overrides it, for testing).
 #[cfg(target_os = "macos")]
-fn mount_point() -> Result<PathBuf> { Ok(PathBuf::from(std::env::var_os("HOME").context("No home folder")?).join(MOUNT_NAME)) }
+fn mount_point() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("DROPBEAM_DRIVE_DIR") { return Ok(PathBuf::from(dir)); }
+    Ok(PathBuf::from(std::env::var_os("HOME").context("No home folder")?).join(MOUNT_NAME))
+}
+/// Serve `tree` over NFSv3 on 127.0.0.1 and mount it at `path` with the
+/// built-in client, as the signed-in user (no administrator rights).
+#[cfg(target_os = "macos")]
+pub(crate) async fn mount_nfs_at(tree: Arc<Tree>, path: &Path) -> Result<tokio::task::JoinHandle<()>> {
+    use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+    std::fs::create_dir_all(path)?;
+    let leftovers: Vec<_> = std::fs::read_dir(path)?.flatten().filter(|e| e.file_name() != ".DS_Store").collect();
+    anyhow::ensure!(leftovers.is_empty(), "The folder {} isn't empty, so the drive can't appear there. Move its contents and try again.", path.display());
+    let listener = NFSTcpListener::bind("127.0.0.1:0", nfs::Nfs::new(tree)).await?;
+    let port = listener.get_listen_port();
+    let server = tokio::spawn(async move { if let Err(e) = listener.handle_forever().await { log::warn!("drive: NFS server stopped: {e}"); } });
+    // Options as hf-mount / xet use them (locallocks: flock works, no NLM), plus
+    // a soft mount that fails fast — and is dropped after `deadtimeout` — if
+    // DropBeam stops answering, so a crash never wedges Finder.
+    let options = format!("locallocks,vers=3,tcp,port={port},mountport={port},soft,intr,timeo=300,retrans=2,deadtimeout=60,rsize=1048576,wsize=1048576,actimeo=5");
+    let target = path.to_path_buf();
+    let out = tokio::time::timeout(Duration::from_secs(40), tokio::task::spawn_blocking(move || {
+        std::process::Command::new("/sbin/mount_nfs").args(["-o", &options, "127.0.0.1:/"]).arg(&target).output()
+    })).await;
+    let out = match out { Ok(Ok(Ok(o))) => o, other => { server.abort(); anyhow::bail!("Couldn’t mount the drive ({other:?})"); } };
+    if !out.status.success() {
+        server.abort();
+        anyhow::bail!("Couldn’t mount the drive: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(server)
+}
+/// `umount`, then `diskutil unmount force` if something still holds it.
+#[cfg(target_os = "macos")]
+pub(crate) fn unmount_nfs_at(path: &Path) -> Result<()> {
+    if std::process::Command::new("/sbin/umount").arg(path).status().is_ok_and(|s| s.success()) { return Ok(()); }
+    let out = std::process::Command::new("/usr/sbin/diskutil").args(["unmount", "force"]).arg(path).output()?;
+    anyhow::ensure!(out.status.success(), "The drive is in use. Close files opened from it and try again.");
+    Ok(())
+}
 
 /// A mount left behind by a crash (the server it pointed at is gone).
 fn recover_stale() {
@@ -918,12 +938,7 @@ fn windows_unc(port: u16, token: &str) -> String { format!("\\\\127.0.0.1@{port}
 async fn unmount_os(m: &Mounted) -> Result<()> {
     #[cfg(target_os = "macos")] {
         let path = m.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            if std::process::Command::new("/sbin/umount").arg(&path).status().is_ok_and(|s| s.success()) { return Ok(()); }
-            let out = std::process::Command::new("/usr/sbin/diskutil").args(["unmount", "force"]).arg(&path).output()?;
-            anyhow::ensure!(out.status.success(), "The drive is in use. Close files opened from it and try again.");
-            Ok(())
-        }).await?
+        tokio::task::spawn_blocking(move || unmount_nfs_at(&path)).await?
     }
     #[cfg(target_os = "linux")] {
         let uri = m.uri.clone();

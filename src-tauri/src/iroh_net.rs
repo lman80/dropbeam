@@ -16469,6 +16469,81 @@ mod location_loopback_tests {
         conn.close(0u32.into(), b"done"); listener.abort(); client.close().await; host.close().await;
     }
 
+    /// Manual end-to-end check on a Mac (not run in CI): a host engine shares a
+    /// folder (DROPBEAM_E2E_NAS), a second engine with its own config mounts
+    /// the drive over NFS at DROPBEAM_DRIVE_DIR, then waits for a `stop` file
+    /// in DROPBEAM_E2E_DIR while the shell exercises the mount (dd, ffprobe, cp).
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn drive_e2e_on_this_mac() {
+        use iroh::RelayMode;
+        let base = PathBuf::from(std::env::var("DROPBEAM_E2E_DIR").expect("DROPBEAM_E2E_DIR"));
+        let nas = PathBuf::from(std::env::var("DROPBEAM_E2E_NAS").expect("DROPBEAM_E2E_NAS"));
+        let mount = PathBuf::from(std::env::var("DROPBEAM_DRIVE_DIR").expect("DROPBEAM_DRIVE_DIR"));
+        let (host_config, client_config) = (base.join("host-config"), base.join("client-config"));
+        std::fs::create_dir_all(&host_config).unwrap(); std::fs::create_dir_all(&client_config).unwrap();
+        let host = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let client = Endpoint::builder(presets::Minimal).secret_key(SecretKey::generate())
+            .relay_mode(RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap().bind().await.unwrap();
+        let friend = crate::friends::upsert_by_endpoint(&host_config, &client.id().to_string(), "Mac");
+        crate::friends::upsert_by_endpoint(&client_config, &host.id().to_string(), "OptiPlex");
+        crate::locations::save(&host_config, Some(crate::locations::Location { id: "d".into(), name: "Storage (D:)".into(), path: nas.to_string_lossy().into_owned(),
+            friend_ids: vec![friend.id], rights: crate::locations::Rights { upload: true, manage: true }, byte_cap: crate::locations::default_byte_cap(), device: None, marker: None, safe_publish: None }), None).unwrap();
+        let state = Arc::new(IrohState::default()); state.location_config.set(host_config.clone()).unwrap();
+        let listener = tokio::spawn(accept_loop(host.clone(), state));
+        let conn = client.connect(host.addr(), ALPN).await.unwrap();
+        struct E2e(Connection, String);
+        #[async_trait::async_trait]
+        impl crate::stream::Remote for E2e {
+            async fn stat(&self, f: &crate::stream::FileRef) -> Result<crate::stream::Stat> {
+                Ok(serde_json::from_value(location_rpc_on(&self.0, &serde_json::json!({"kind":"locations.stat","locations_v":2,"id":f.location_id,"rel_path":f.rel_path}), Duration::from_secs(30)).await?)?)
+            }
+            async fn read(&self, f: &crate::stream::FileRef, offset: u64, len: u64, etag: &str) -> Result<tokio::sync::mpsc::Receiver<Result<bytes::Bytes>>> {
+                let (header, recv) = location_read_on(&self.0, &serde_json::json!({"kind":"locations.read","locations_v":2,"id":f.location_id,"rel_path":f.rel_path,"offset":offset,"len":len,"etag":etag})).await?;
+                crate::stream::chunked(&header, recv, len)
+            }
+            async fn rpc(&self, _: &str, request: serde_json::Value) -> Result<serde_json::Value> { location_rpc_on(&self.0, &request, Duration::from_secs(30)).await }
+            fn devices(&self) -> Vec<(String, String, String)> { vec![("host".into(), self.1.clone(), "OptiPlex".into())] }
+            async fn upload(&self, _: &str, location_id: &str, rel_dir: &str, file: &std::path::Path, replace: bool) -> Result<String> {
+                // The same verified Locations upload the app uses (send_location_to_friend → send_files_linked).
+                let (conn, file) = (self.0.clone(), file.to_path_buf());
+                let options = LocationSend { target: Some(crate::locations::Target { location_id: location_id.into(), rel_path: rel_dir.into() }),
+                    transfer_id: uuid::Uuid::new_v4().to_string(), snapshot: None, replace_existing: replace };
+                tokio::spawn(async move {
+                    let t = Instant::now();
+                    match send_files_linked(&conn, &[file.clone()], &AtomicBool::new(false), |_, _| {}, "Mac", &AtomicBool::new(false), &AtomicU64::new(0), None, None, Some(&options)).await {
+                        Ok(n) => eprintln!("E2E UPLOADED {} bytes in {:?}", n, t.elapsed()),
+                        Err(e) => eprintln!("E2E UPLOAD FAILED {e:#}"),
+                    }
+                });
+                Ok("e2e".into())
+            }
+            fn path(&self, _: &str) -> Option<(String, Option<u64>)> { let d = conn_detail(&self.0); Some((d.path, d.rtt_ms)) }
+        }
+        let host_id = host.id().to_string();
+        let remote = Arc::new(E2e(conn.clone(), host_id.clone()));
+        let engine = crate::stream::Engine::new(remote, base.join("client-cache"), 10_000_000_000);
+        let tree = crate::drive::Tree::new(engine.clone(), &client_config, base.join("client-staging"));
+        tree.refresh_hosts().await;
+        let server = crate::drive::mount_nfs_at(tree.clone(), &mount).await.expect("mount");
+        let ticker = { let tree = tree.clone(); tokio::spawn(async move { loop { tokio::time::sleep(Duration::from_secs(1)).await; tree.tick().await; } }) };
+        eprintln!("E2E READY {}", mount.display());
+        let stop = base.join("stop");
+        let started = Instant::now();
+        let mut last = 0u64;
+        while !stop.exists() && started.elapsed() < Duration::from_secs(3600) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let s = engine.status(&host_id);
+            if s.received != last { eprintln!("E2E STATUS path={} rtt={:?} rate={}B/s received={} cached={}", s.path, s.rtt_ms, s.bytes_per_sec, s.received, s.cached_bytes); last = s.received; }
+        }
+        let unmounted = tokio::task::spawn_blocking(move || crate::drive::unmount_nfs_at(&mount)).await.unwrap();
+        eprintln!("E2E UNMOUNT {unmounted:?}");
+        ticker.abort(); server.abort();
+        conn.close(0u32.into(), b"done"); listener.abort(); client.close().await; host.close().await;
+    }
+
     #[tokio::test]
     async fn loopback_locations_list_upload_hash_and_permission_denial() {
         use iroh::RelayMode;
