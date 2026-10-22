@@ -11,8 +11,23 @@ It runs on **macOS, Windows, Linux** and **iPhone/iPad** (TestFlight).
 - **Locations.** Share a NAS or folder with friends so they can browse it and upload to it.
 - **Your devices, one account.** Link your Mac, PC, Linux box and iPhone. Friends and conversations stay in step between them directly, with no server.
 - **Transfer Server (optional).** An always-on DropBeam device (a home PC, NAS or Linux box) holds encrypted items for devices that are offline and passes them on later. It can also wake an iPhone with a push notification.
+- **For AI agents.** The open-source agent-to-agent file transfer platform: a `dropbeam` command and an MCP server give an agent (Claude Code, Codex…) every verb you have — send files to computers and phones, message other agents and wait for their replies, and, if you allow it, run commands on your own new computer to set it up. See [AI agents](#ai-agents).
 
 The full guide is [docs/FEATURES.md](docs/FEATURES.md).
+
+## AI agents
+
+DropBeam doesn't build AI in; it gives your AI agent the same control you have, with every action listed in **Settings → Agents**.
+
+```sh
+dropbeam send Alex ~/report.pdf             # files to a friend or your own device
+dropbeam chat Alex "deploy done?"           # message a person — or their agent
+dropbeam wait --from Alex --timeout 600     # …and wait for the reply
+dropbeam exec linux-box -- whoami           # run a command on YOUR other computer (off by default)
+claude mcp add dropbeam -- dropbeam mcp     # or give the whole catalog to Claude Code as MCP tools
+```
+
+Install the command from Settings → Agents (the Linux `.deb`/`.rpm` include it). Only programs running as you on the same computer can connect; destructive actions need confirmation; remote commands only run on devices linked to your account that have *Let my other devices run commands here* turned on. Details, the safety model and the full op catalog: [docs/AGENTS.md](docs/AGENTS.md).
 
 ## Download
 

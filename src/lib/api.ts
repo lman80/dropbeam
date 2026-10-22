@@ -371,6 +371,8 @@ export interface ChatMessage {
   serverNote?: string | null
   /** Receiver: the Transfer Server it arrived through. */
   via?: string | null
+  /** Sent through an AI agent ("via Claude"), on either side. */
+  fromAgent?: { name: string } | null
   /** Sender side: a file sent to a friend with several devices — where it is on each. */
   deliveries?: Delivery[] | null
   ts: number

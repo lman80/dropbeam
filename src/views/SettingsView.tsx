@@ -16,6 +16,7 @@ import { IS_MAC, IS_WINDOWS, MOBILE_UI, TRAY_NAME } from '../lib/platform'
 import { MobileHeader } from '../components/MobileHeader'
 import { LocationSettings } from '../components/LocationSettings'
 import { TransferServerPane } from '../components/TransferServerSettings'
+import { AgentsPane } from '../components/AgentsSettings'
 import { InstallUpdateButton } from '../components/UpdateInstall'
 import { Dot, IconButton, InfoButton, ProgressBar, SectionHeader, Segmented, Spinner, Toggle } from '../components/ui'
 import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbackButton } from '../lib/feedback'
@@ -26,7 +27,7 @@ import { fetchSupportAvailable, openFeedback, openIdeas, openSupport, useFeedbac
 // location" on Locations opens the Locations pane, the GIF setup link in Chat
 // opens General, "Settings" under History's recoverable files opens Transfers —
 // otherwise it's the pane you last had open.
-type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'advanced'
+type Tab = 'general' | 'devices' | 'locations' | 'transfers' | 'server' | 'privacy' | 'agents' | 'advanced'
 const DEV_KEY = 'dropbeam.developer'
 // Everyday tabs first; the optional/advanced features after Privacy.
 const TABS: { value: Tab; label: string }[] = [
@@ -36,6 +37,7 @@ const TABS: { value: Tab; label: string }[] = [
   { value: 'privacy', label: 'Privacy' },
   { value: 'locations', label: 'Locations' },
   { value: 'server', label: 'Transfer Server' },
+  { value: 'agents', label: 'Agents' },
   { value: 'advanced', label: 'Advanced' },
 ]
 let lastTab: Tab = 'general'
@@ -769,7 +771,7 @@ export function SettingsView() {
     </>
   )
 
-  const visibleTabs = TABS.filter((t) => (t.value !== 'locations' && t.value !== 'server') || !MOBILE_UI)
+  const visibleTabs = TABS.filter((t) => (t.value !== 'locations' && t.value !== 'server' && t.value !== 'agents') || !MOBILE_UI)
 
   return (
     <div className="page settings-page" ref={rootRef}>
@@ -786,6 +788,7 @@ export function SettingsView() {
         {tab === 'locations' && <LocationSettings />}
         {tab === 'transfers' && transfers}
         {tab === 'server' && <TransferServerPane />}
+        {tab === 'agents' && <AgentsPane />}
         {tab === 'privacy' && privacy}
         {tab === 'advanced' && advanced}
       </div>

@@ -134,3 +134,9 @@ and recorded (an agent that acts without a trace is a bug).
 
 ## Deviations / results
 (filled in as work lands)
+- **Phase 5 (agents, branch `agent-ctl`):** built as planned (docs/AGENTS.md). Deviations:
+  no separate token file — the socket lives in an owner-only folder (0700/0600 plus a peer-uid
+  check) and the Windows pipe's random name is in a user-only file with a user-SID-only ACL;
+  `dropbeam wait-for message` is `dropbeam wait`; sending to a person with several devices
+  follows the window (every device, online ones first) instead of "the online one" — `--device`
+  picks one; drive/stream ops (`drives.*`, `locations.stat/read`) are added at integration.

@@ -59,3 +59,17 @@
   .set-row { flex-wrap: wrap; row-gap: 6px; }
   .set-row .row-trailing { max-width: 100%; margin-left: auto; }
 }
+
+/* Settings → Agents: copyable setup lines, the "run commands" warning, the log. */
+.agent-snippets { padding: 6px 0 10px; }
+.agent-snippet { padding: 6px 14px; }
+.agent-snippet-line { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.agent-snippet-line code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font-size: var(--text-12);
+  padding: 6px 8px; border-radius: 6px; background: var(--surface-2); }
+.agent-note { padding: 6px 14px 10px; line-height: 1.45; }
+.agent-note code { font-size: var(--text-11); }
+.agent-warning { margin: 4px 14px 8px; padding: 8px 10px; border-radius: 8px; font-size: var(--text-12); line-height: 1.45;
+  color: var(--text); background: var(--red-soft); }
+.agent-log-row .row-title { font-weight: 400; overflow-wrap: anywhere; }
+.agent-ok { color: var(--green, #2e9d5b); }
+.agent-failed { color: var(--red); }

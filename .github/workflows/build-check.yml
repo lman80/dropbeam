@@ -77,6 +77,27 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib -- --test-threads=1
 
+      # The `dropbeam` command line lives in the app binary (cli.rs): it must run
+      # without starting any window, and on Windows the dropbeam.cmd shim the
+      # app installs must wait for it and hand back its exit code.
+      - name: CLI smoke test
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          cargo build --bin DropBeam
+          bin=target/debug/DropBeam
+          $bin cli version
+          $bin cli ops --json | head -c 300; echo
+          $bin cli mcp --no-start <<< '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q '"chat_wait"'
+          set +e; $bin cli status --no-start; code=$?; set -e
+          test "$code" = 1
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            printf '@echo off\r\n"%%~dp0DropBeam.exe" cli %%*\r\nexit /b %%ERRORLEVEL%%\r\n' > target/debug/dropbeam.cmd
+            cmd //c 'target\debug\dropbeam.cmd version' | grep -q dropbeam
+            set +e; cmd //c 'target\debug\dropbeam.cmd status --no-start'; code=$?; set -e
+            test "$code" = 1
+          fi
+
       # Warnings are listed, errors fail the job.
       - name: Clippy
         working-directory: src-tauri

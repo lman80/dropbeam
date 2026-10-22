@@ -28,6 +28,7 @@ DropBeam sends files, photos and messages **directly between your devices and yo
 14. [Privacy and security](#14-privacy-and-security)
 15. [Troubleshooting](#15-troubleshooting)
 16. [Every DropBeam code at a glance](#16-every-dropbeam-code-at-a-glance)
+17. [AI agents: command line, MCP, remote commands](#17-ai-agents-command-line-mcp-remote-commands)
 
 ---
 
@@ -626,3 +627,32 @@ You can paste any of these anywhere DropBeam asks for a code — the desktop *Ha
 | `dropbeamlink1:` | "**Link this device**" code shown by a new device | Devices → Add a device → Scan the other device |
 
 Codes still work when they're inside a sentence or a link, and QR codes can be scanned from the camera or a screenshot.
+
+---
+
+## 17. AI agents: command line, MCP, remote commands
+
+An AI agent on your computer (Claude Code, Codex, a script) can use DropBeam the way you do —
+the full reference is [AGENTS.md](AGENTS.md).
+
+- **Settings → Agents** (Mac, Windows, Linux): *Let AI agents on this computer use DropBeam*
+  (on; only programs running as you on this computer can connect), **Install Command-Line
+  Tool**, copy-ready setup lines for Claude Code and Codex, and **What agents did**: every
+  action with the agent's name, what it did, why (when it said) and whether it worked.
+- **The `dropbeam` command:** `dropbeam send Alex report.pdf`, `dropbeam chat Alex "hi"`,
+  `dropbeam read Alex`, `dropbeam wait --from Alex`, `dropbeam ls Alex:Photos`, `dropbeam get`,
+  `dropbeam put`, `dropbeam quicksend`, `dropbeam receive`, `dropbeam transfers`,
+  `dropbeam exec`, and `dropbeam op <name>` for anything else. `--json` for scripts. It starts
+  DropBeam in the background if it isn't running.
+- **MCP:** `dropbeam mcp` turns every action into a tool for your agent
+  (`claude mcp add dropbeam -- dropbeam mcp`).
+- **Agents message each other:** a message an agent sends shows "via <agent name>" under the
+  bubble; the other side's agent waits for it with `dropbeam wait` and answers.
+- **Run commands on your own devices:** on a device linked to your account, turn on *Let my
+  other devices run commands here* (Off / For 1 Hour / Until I Turn It Off; off by default,
+  with a warning). Your agent on another of your computers can then run `dropbeam exec
+  <device> -- <command>` there — for example to install SSH keys on a new computer. Each
+  command shows a notification there and is listed under *What agents did*. Friends' devices
+  can never run commands, and iPhones can't be a target.
+- **Safety:** destructive actions need confirmation, agents can't change these switches or
+  Lab Mode, and nothing listens on the network.
