@@ -1,3 +1,4 @@
+import { RecoverableScreen, RecoverableFolder } from '../mobile/screens/RecoverableScreen'
 import { MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -19,7 +20,7 @@ const BAR_COLORS = ['#5b9bf0', '#34c2a8', '#e0719a', '#d99b3f', '#b08cf0', '#3fa
 
 /** The "Recoverable files" tab: every shared folder's saved copies of deleted /
  *  replaced files, with a global storage gauge and one-tap ways to free space. */
-export function RecoverableFilesView() {
+export function RecoverableFilesView({ query = '' }: { query?: string } = {}) {
   const toast = useStore((s) => s.toast)
   const budget = useStore((s) => s.settings?.folderHistoryBudgetBytes ?? 2 * 1024 * 1024 * 1024)
   const setView = useStore((s) => s.setView)
@@ -92,7 +93,7 @@ export function RecoverableFilesView() {
     )
   }
 
-  if (MOBILE_UI && summaries.length === 0) return <div className="mobile-empty"><HardDrive /><h2 className="ios-title2">Nothing to recover</h2><p className="ios-footnote">Saved copies of replaced files appear here.</p><button className="ios-button ios-primary" onClick={() => setView('locations')}>Browse locations</button></div>
+  if (MOBILE_UI) return <RecoverableScreen summaries={summaries} total={total} budget={budget}>{summaries.filter(f => f.itemCount > 0).map(f => <FolderRow key={f.pairId} summary={f} isOpen onToggle={() => {}} confirming={confirming === f.pairId} onAskEmpty={() => { if (!busy) setConfirming(confirming === f.pairId ? null : f.pairId) }} onEmpty={() => void emptyFolder(f.pairId)} busy={busy} onChanged={load} query={query} focused={open === f.pairId} />)}</RecoverableScreen>
 
   if (summaries.length === 0) {
     return (
@@ -203,8 +204,12 @@ function FolderRow({
   onEmpty,
   busy,
   onChanged,
+  query = '',
+  focused = false,
 }: {
   summary: FolderHistorySummary
+  query?: string
+  focused?: boolean
   isOpen: boolean
   onToggle: () => void
   confirming: boolean
@@ -224,13 +229,13 @@ function FolderRow({
     if (!isOpen) return
     // Reload whenever opened or the underlying summary count changes.
     const key = `${summary.pairId}:${summary.itemCount}`
-    if (loadedFor.current === key) return
+    if (!MOBILE_UI && loadedFor.current === key) return
     loadedFor.current = key
     void api
       .listFolderHistory(summary.pairId)
       .then(setItems)
       .catch(() => setItems([]))
-  }, [isOpen, summary.pairId, summary.itemCount])
+  }, [isOpen, summary.pairId, summary.itemCount, MOBILE_UI ? summary : null])
 
   const restore = async (item: HistoryItem) => {
     setItemBusy(item.id)
@@ -250,7 +255,7 @@ function FolderRow({
     // This deletes the ONLY saved copy of a recovered file — it must never be one
     // accidental click. Two-tap confirm: first click arms the button, second click
     // (within 4s) deletes; anything else disarms.
-    if (confirmForget !== item.id) {
+    if (!MOBILE_UI && confirmForget !== item.id) {
       setConfirmForget(item.id)
       window.setTimeout(() => setConfirmForget((v) => (v === item.id ? null : v)), 4000)
       return
@@ -261,18 +266,15 @@ function FolderRow({
       await api.forgetFolderItem(summary.pairId, item.id)
       await onChanged()
       setItems(await api.listFolderHistory(summary.pairId))
+    } catch (e) {
+      if (MOBILE_UI) toast('error', String(e))
+      else throw e
     } finally {
       setItemBusy(null)
     }
   }
 
-  if (MOBILE_UI) return <section className="ios-list">
-    <div className="ios-row"><button className="mobile-entry" aria-expanded={isOpen} onClick={onToggle}><span className="mobile-tinted-icon"><HardDrive size={22} /></span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{summary.folderName}</span><span className="ios-footnote">{formatBytes(summary.bytes)} · {summary.itemCount} items</span></span><ChevronRight size={18} /></button><button className="ios-icon ios-destructive" aria-label="Empty saved copies" disabled={busy} onClick={onAskEmpty}><Trash2 size={18} /></button></div>
-    {confirming && <div className="mobile-inset mobile-stack"><p className="ios-footnote">Delete this folder’s saved copies?</p><button className="ios-button ios-destructive" disabled={busy} onClick={onEmpty}>Empty saved copies</button><button className="ios-button" disabled={busy} onClick={onAskEmpty}>Cancel</button></div>}
-    {isOpen && <div aria-busy={items === null}>
-      {items === null ? <p className="mobile-inset ios-footnote">Loading saved copies…</p> : !items.length ? <p className="mobile-inset ios-footnote">Nothing saved here.</p> : items.map(item => <div className="ios-row" key={item.id}><span className="mobile-tinted-icon"><FileIcon name={item.relPath} size={22} /></span><div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{item.relPath.split('/').pop()}</h3><p className="ios-footnote">{formatBytes(item.size)} · {formatRelativeTime(item.timestampMs)}</p><div className="mobile-recovery-actions"><button className="ios-button" disabled={itemBusy === item.id} onClick={() => void restore(item)}>Restore</button><button className="ios-button ios-destructive" disabled={itemBusy === item.id} onClick={() => void forget(item)}>{confirmForget === item.id ? 'Delete forever?' : 'Forget'}</button></div></div></div>)}
-    </div>}
-  </section>
+  if (MOBILE_UI) return <RecoverableFolder summary={summary} items={items} busy={busy} itemBusy={itemBusy} confirming={confirming} askEmpty={onAskEmpty} empty={onEmpty} restore={restore} forget={forget} query={query} focused={focused} />
 
   return (
     <div className="card" style={{ padding: 0, overflow: 'hidden' }}>

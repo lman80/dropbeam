@@ -1,0 +1,40 @@
+/* This slice never changes desktop selectors or reserves a second tab-bar inset. */
+html.mobile .files-screen { height: 100%; min-height: 0; position: relative; }
+html.mobile :is(.files-screen,.files-transfer,.files-recovery) .mk-row-subtitle { font-size: var(--mk-foot); line-height: calc(18px * var(--ui-font-scale, 1)); }
+html.mobile .files-segments { margin: 0 16px 12px; }
+html.mobile .files-tile { width: 29px; height: 29px; flex: 0 0 29px; border-radius: 6px; display: inline-grid; place-items: center; color: var(--mk-blue); }
+html.mobile .files-tile-folder { background: color-mix(in srgb, var(--mk-blue) 13%, transparent); }
+html.mobile .files-menu-glyph { min-width: 44px; min-height: 44px; display: grid; place-items: center; color: var(--accent); }
+html.mobile .files-recent:not(:last-child) { position: relative; }
+html.mobile .files-recent:not(:last-child)::after { content: ''; position: absolute; left: 57px; right: 0; bottom: 0; height: .5px; background: var(--mk-separator); pointer-events: none; }
+html.mobile .files-storage { height: 4px; background: var(--mk-fill); border-radius: 2px; overflow: hidden; margin: 0 16px 16px; }
+html.mobile .files-storage i { display: block; height: 100%; background: var(--accent); }
+html.mobile .files-folder-section { position: relative; }
+html.mobile .files-folder-section .mk-section-title { padding-right: 60px; min-height: 26px; display: flex; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+html.mobile .files-empty-folder { position: absolute; right: 24px; top: -9px; font-size: var(--mk-foot); }
+html.mobile .files-presence { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--mk-gray); margin: 0 4px 1px 0; }
+html.mobile .files-presence.online { background: var(--mk-green); }
+html.mobile .files-presence.recent { background: var(--mk-orange); }
+html.mobile .files-loading { padding: 32px; display: grid; place-items: center; color: var(--mk-secondary); }
+html.mobile .files-browser-selecting .mk-scroll { padding-bottom: 76px; }
+html.mobile .files-toolbar { position: absolute; bottom: 0; inset-inline: 0; z-index: 3; display: flex; gap: 12px; padding: 4px 16px; min-height: 52px; border-top: .5px solid var(--mk-separator); background: color-mix(in srgb, var(--mk-bg) 85%, transparent); backdrop-filter: blur(20px) saturate(1.8); -webkit-backdrop-filter: blur(20px) saturate(1.8); }
+html.mobile .files-toolbar .mk-destructive { margin-left: auto; }
+html.mobile .files-check { width: 22px; height: 22px; flex: 0 0 22px; border: 1.5px solid var(--mk-tertiary); border-radius: 50%; display: inline-grid; place-items: center; margin-right: 12px; }
+html.mobile .files-check.is-selected { background: var(--accent); border-color: var(--accent); color: white; }
+html.mobile .files-transfer { overflow: hidden; background: var(--mk-cell); color: var(--mk-label); }
+html.mobile .files-transfer .mk-row-main { min-height: 62px; }
+html.mobile .files-transfer + .files-transfer { border-top: .5px solid var(--mk-separator); }
+html.mobile .files-transfer .mk-row-trailing { display: flex; }
+html.mobile .files-transfer .mk-row-value { max-width: 30%; font-variant-numeric: tabular-nums; }
+html.mobile .files-qr { background: #fff; padding: 16px; border-radius: 10px; width: fit-content; max-width: 100%; margin: 16px auto; }
+html.mobile .files-qr svg { display: block; max-width: 100%; height: auto; }
+html.mobile .files-screen .mk-bar-trailing { min-width: max-content; }
+@media (prefers-reduced-transparency: reduce) { html.mobile .files-toolbar { background: var(--mk-bg); backdrop-filter: none; -webkit-backdrop-filter: none; } }
+html.mobile .files-browser-row { display: flex; position: relative; }
+html.mobile .files-browser-row > .mk-row { flex: 1; min-width: 0; }
+html.mobile .files-browser-row:not(:last-child)::after { content: ''; position: absolute; left: 57px; right: 0; bottom: 0; height: .5px; background: var(--mk-separator); pointer-events: none; }
+html.mobile .files-browser-row > .mk-row::after { display: none; }
+html.mobile .files-select-target { align-self: stretch; flex: 0 0 44px; padding: 0 0 0 12px; }
+html.mobile .files-select-target .files-check { margin: 0; }
+html.mobile .files-select-target + .mk-row .mk-row-main { padding-left: 8px; }
+html.mobile .files-browser-row:has(.files-select-target)::after { left: 93px; }

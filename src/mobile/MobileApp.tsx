@@ -21,7 +21,7 @@ export function MobileApp() {
     {view === 'friends' && (top?.kind === 'friend' ? <FriendDetail key={top.id} id={top.id} back={back} /> : <FriendsScreen push={id => push({ kind: 'friend', id })} />)}
     {view === 'settings' && <SettingsScreen key={top?.kind === 'settings' ? top.page : 'settings'} page={top?.kind === 'settings' ? top.page : 'settings'} push={page => push({ kind: 'settings', page })} back={back} />}
     {view === 'chat' && <div className="mk-legacy mk-legacy-chat"><ChatView /></div>}
-    {view === 'history' && <div className="mk-legacy"><HistoryView /></div>}
-    {(view === 'locations' || view === 'folders') && <div className="mk-legacy"><LocationsView /></div>}
+    {view === 'history' && <HistoryView />}
+    {(view === 'locations' || view === 'folders') && <LocationsView />}
   </div>
 }

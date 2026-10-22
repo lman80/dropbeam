@@ -1,3 +1,5 @@
+import { Button, Row, Section, Sheet, TextField } from '../mobile/kit'
+import '../mobile/files.css'
 import { QrScanner } from './QrScanner'
 import { MOBILE_UI } from '../lib/platform'
 import { useState } from 'react'
@@ -139,6 +141,20 @@ export function PairingModal({
     if (!/^dropbeam1:/i.test(text.trim())) { toast('error', 'This is not a shared folder invite.'); return }
     setInviteInput(text.trim())
   }} />
+
+  if (MOBILE_UI) return <Sheet title={createdInvite ? 'Folder Invite' : mode === 'create' ? 'Share Folder' : 'Join Folder'} size="large" onClose={() => { if (!busy) onClose() }} primary={<Button disabled={busy || (!createdInvite && (!folder || (mode === 'accept' && !inviteInput.trim())))} onClick={() => createdInvite ? onClose() : void (mode === 'create' ? doCreate() : doAccept())}>Done</Button>}>
+    {createdInvite ? <Section footer="Share this invite with someone to sync this folder."><Row title={folderName} subtitle="Shared folder" /><div className="files-qr"><QRCodeSVG value={createdInvite} size={200} level="M" fgColor="#000" bgColor="#fff" /></div><Row title={copied ? 'Copied' : 'Copy'} value={createdInvite} tint onPress={() => void copyInvite()} /></Section> : <>
+      <Section title="Folder"><Row title={folderName || 'Choose Folder'} subtitle={folder || undefined} accessory="chevron" disabled={busy} onPress={() => { void pickFolder().catch(e => toast('error', String(e))) }} /></Section>
+      {mode === 'accept' ? <Section title="Invite"><TextField label="Invite code" placeholder="Paste invite code" value={inviteInput} disabled={busy} onChange={e => setInviteInput(e.target.value)} /><Row title="Scan QR Code" tint accessory="chevron" disabled={busy} onPress={() => setScanning(true)} /></Section> : <>
+        <Section title="Name" footer="Add a name to link as friends automatically."><TextField label="Their name (optional)" placeholder="Their name (optional)" value={peerName} disabled={busy} onChange={e => setPeerName(e.target.value)} /></Section>
+        <Section title="Access" footer={syncMode === 'mirror' ? 'Everyone can add, edit, and delete. Deleted files are kept in History.' : syncMode === 'twoway' ? 'Both sides can add and change files. Deletes stay local.' : 'Your files flow to invitees. Their changes stay on their device.'}>
+          {([{ value: 'mirror', label: 'Full Access · Total Sync' }, { value: 'twoway', label: 'Full Access · No Deletes' }, { value: 'oneway', label: 'View Only' }] as const).map(option => <Row key={option.value} title={option.label} accessory="checkmark" checked={syncMode === option.value} disabled={busy} onPress={() => setSyncMode(option.value)} />)}
+        </Section>
+        {!!friends.length && <Section title="Invite Friends" footer="Choose friends to invite directly, or leave this empty to get a code.">{friends.map(friend => <Row key={friend.id} title={friend.name} accessory="checkmark" checked={invitees.includes(friend.id)} disabled={busy} onPress={() => setInvitees(previous => previous.includes(friend.id) ? previous.filter(id => id !== friend.id) : [...previous, friend.id])} />)}</Section>}
+      </>}
+    </>}
+    {busy && <Section footer={<span role="status">Working…</span>} />}
+  </Sheet>
 
   return (
     <AnimatePresence>

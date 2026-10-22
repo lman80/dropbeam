@@ -1,4 +1,4 @@
-import { MobileHeader } from '../components/MobileHeader'
+import { HistoryScreen } from '../mobile/screens/HistoryScreen'
 import { integrityLabel } from '../lib/integrity'
 import { ChevronRight } from 'lucide-react'
 import { ShareFilesButton } from '../components/ShareFilesButton'
@@ -63,10 +63,7 @@ export function HistoryView() {
     reload()
   }
 
-  if (MOBILE_UI) return <div className="mobile-page mobile-history"><MobileHeader title="History" actions={tab === 'recents' && history.length > 0 ? <button className="ios-icon ios-destructive" aria-label="Clear history list" onClick={clearAll}><Trash2 size={20} /></button> : undefined} />
-    <div className="mobile-inset mobile-segmented">{(['recents', 'recoverable'] as const).map(value => <button key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>{value === 'recents' ? 'Recents' : 'Recoverable'}</button>)}</div>
-    {tab === 'recents' ? <Recents history={history} query={query} setQuery={setQuery} /> : <div className="mobile-inset"><RecoverableFilesView /></div>}
-  </div>
+  if (MOBILE_UI) return <HistoryScreen history={history} tab={tab} setTab={setTab} query={query} setQuery={setQuery} clearAll={clearAll} recoverable={<RecoverableFilesView query={query} />} />
 
   return (
     <div style={{ maxWidth: 680, margin: '0 auto', padding: '8px 28px 36px' }}>

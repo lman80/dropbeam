@@ -1,5 +1,5 @@
-import { FileIcon } from './FileIcon'
-import { integrityLabel } from '../lib/integrity'
+import { Button, ProgressRow, Row, Section, Sheet } from '../mobile/kit'
+import { FileTile } from '../mobile/screens/BrowserControls'
 import { ShareFilesButton } from './ShareFilesButton'
 import { MOBILE_UI } from '../lib/platform'
 import { memo, useState } from 'react'
@@ -52,6 +52,7 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
   const toggleSpeedMode = useStore((s) => s.toggleSpeedMode)
   const toggleEtaMode = useStore((s) => s.toggleEtaMode)
   const [copied, setCopied] = useState(false)
+  const [mobileDetails, setMobileDetails] = useState(false)
 
   const active = isActive(t.state)
   const isOffer = t.state === 'waitingForAccept'
@@ -118,32 +119,39 @@ function TransferCardImpl({ t, onRetry, onShow, showAction = true }: { t: Transf
 
   if (MOBILE_UI) {
     const route = t.connDetail?.path === 'relay' || t.locality === 'internet' ? 'Relay' : t.connDetail?.path === 'direct' || t.connDetail?.path === 'local' || t.locality === 'direct' || t.locality === 'local' ? 'Direct' : ''
-    const verified = integrityLabel(t.integrity ?? [], t.bytesTotal, t.state === 'completed')
-    const show = t.state === 'completed' && (!!t.outDir || !!onShow)
-    const retry = t.state === 'failed' && t.direction === 'send'
-    const action = show ? 'Show' : retry ? 'Retry' : active ? 'Cancel' : 'Dismiss'
-    return <article className="mobile-transfer">
-      <div className="mobile-transfer-heading"><span className="mobile-tinted-icon"><FileIcon name={t.fileNames[0] ?? ''} size={22} /></span>
-        <div className="mobile-grow"><h3 className="ios-headline mobile-ellipsis">{title(t)}</h3><p className="ios-footnote mobile-ellipsis">{formatBytes(t.bytesTotal)} · {t.friendName ?? t.peer ?? 'Peer'}</p></div>
-        {showAction && <button className="ios-icon" aria-label={action} onClick={() => {
-          if (show && onShow) onShow()
-          else if (show) void api.shareFiles(t.fileNames.map(n => `${t.outDir}/${n}`)).catch(e => toast('error', String(e)))
-          else if (retry) { if (onRetry) onRetry(); else void retryTransfer(t.id) }
-          else if (isOffer) void respondToOffer(t.id, false)
-          else if (active) void api.cancelTransfer(t.id)
-          else removeTransfer(t.id)
-        }}>{show ? <FolderOpen size={21} /> : retry ? <RotateCw size={21} /> : <X size={21} />}</button>}
-      </div>
-      {t.state === 'completed' ? <p className="ios-footnote">{t.direction === 'send' ? 'Delivered' : 'Saved'}{route && ` · ${route}`} · {verified}</p> : <>
-        <div className="mobile-progress" role="progressbar" aria-label="Transfer progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(t.percent)}><span style={{ width: `${Math.max(0, Math.min(100, t.percent))}%` }} /></div>
-        <div className="mobile-transfer-stats ios-footnote"><button className="xfer-meter" onClick={toggleSpeedMode}>{formatBytesLive(t.bytesDone)} of {formatBytesLive(t.bytesTotal)} · {speedText}</button><button className="xfer-meter" onClick={toggleEtaMode}>{etaText}</button></div>
-        <div className="mobile-transfer-badges">{route && <span className="ios-caption">{route}</span>}{verified === 'Verified' && <span className="ios-caption">Verified</span>}</div>
-        {t.state !== 'transferring' && <p className="ios-footnote">{t.error ?? t.detail ?? statusLabel(t)}</p>}
-      </>}
-      {isOffer && <button className="ios-button ios-primary" onClick={() => respondToOffer(t.id, true)}>Accept files</button>}
-      {isSendWaiting && <div className="mobile-stack"><code className="mobile-transfer-code">{t.code}</code><button className="ios-button" onClick={copyCode}>{copied ? 'Copied' : 'Copy code'}</button><div className="mobile-qr"><QRCodeSVG value={t.code!} size={116} /></div></div>}
-      {t.detail && t.state === 'waitingForPeer' && <button className="ios-button" onClick={() => void api.forceRelay(t.id)}>Send over relay anyway</button>}
-    </article>
+    const done = t.state === 'completed'
+    const retry = (t.state === 'failed' || t.state === 'paused') && t.direction === 'send'
+    const name = t.fileNames.length === 1 ? t.fileNames[0] : `${t.fileCount || t.fileNames.length} files`
+    const person = t.friendName || t.peer || 'the other device'
+    const subtitle = isOffer ? `${person} wants to send you ${t.fileCount || t.fileNames.length} files`
+      : done ? `${t.direction === 'send' ? 'Sent' : 'Received'} · ${formatBytes(t.bytesTotal)}${route ? ` · ${route}` : ''}`
+      : t.state === 'failed' ? `Failed${retry ? ' · Tap to retry' : ' · Ask the sender to retry'}`
+      : t.state === 'paused' ? `Paused${retry ? ' · Tap to resume' : ''}`
+      : t.state === 'canceled' ? 'Canceled'
+      : t.state === 'transferring' ? `${t.direction === 'send' ? 'Sending to' : 'Receiving from'} ${person} · ${formatBytesLive(t.bytesDone)} of ${formatBytesLive(t.bytesTotal)}${shownBps != null ? ` · ${formatSpeed(shownBps)}` : ''}${shownEta != null ? ` · ${formatEta(shownEta)} left` : ''}`
+      : `Waiting for ${person} …`
+    const open = () => {
+      if (done && onShow) onShow()
+      else if (done && t.outDir) void api.shareFiles(t.fileNames.length ? t.fileNames.map(n => `${t.outDir}/${n}`) : [t.outDir]).catch(e => toast('error', String(e)))
+      else if (retry) { if (onRetry) onRetry(); else void retryTransfer(t.id) }
+      else setMobileDetails(true)
+    }
+    return <div className="files-transfer">
+      <ProgressRow title={name} emphasized icon={<FileTile name={t.fileNames[0] || ''} />} subtitle={<span className={t.state === 'failed' ? 'mk-destructive' : undefined}>{subtitle}</span>}
+        progress={active && !isOffer ? t.percent : null} value={isSendWaiting ? t.code : undefined} onPress={showAction && !isOffer ? open : undefined}
+        accessory={showAction && (done || isSendWaiting) ? 'chevron' : 'none'} trailing={showAction ? isOffer ? <><Button onClick={() => void respondToOffer(t.id, true)}>Accept</Button><Button onClick={() => void respondToOffer(t.id, false)}>Decline</Button></>
+          : retry ? <Button aria-label={t.state === 'paused' ? 'Resume' : 'Retry'} onClick={open}><RotateCw size={20} /></Button>
+          : active ? <Button aria-label="Cancel transfer" onClick={() => void api.cancelTransfer(t.id).catch(e => toast('error', String(e)))}><X size={20} /></Button>
+          : !done ? <Button aria-label="Dismiss transfer" onClick={() => removeTransfer(t.id)}><X size={20} /></Button> : undefined : undefined} />
+      {mobileDetails && <Sheet title={isSendWaiting ? 'Quick Send' : name} onClose={() => setMobileDetails(false)} primary={<Button onClick={() => setMobileDetails(false)}>Done</Button>}>
+        <Section footer={t.error || t.detail || undefined}><Row title={name} subtitle={subtitle} icon={<FileTile name={t.fileNames[0] || ''} />} />
+          {isSendWaiting && <><div className="files-qr"><QRCodeSVG value={t.code!} size={200} level="M" fgColor="#000" bgColor="#fff" /></div><Row title={copied ? 'Copied' : 'Copy'} value={t.code} tint onPress={() => void copyCode()} /></>}
+          {t.state === 'waitingForPeer' && <Row title="Send over relay anyway" tint onPress={() => { void api.forceRelay(t.id).then(() => setMobileDetails(false)).catch(e => toast('error', String(e))) }} />}
+          {canPause && <Row title="Pause Transfer" onPress={() => { void api.pauseTransfer(t.id).then(() => setMobileDetails(false)).catch(e => toast('error', String(e))) }} />}
+          {done && <Row title="Dismiss" onPress={() => removeTransfer(t.id)} />}
+        </Section>
+      </Sheet>}
+    </div>
   }
 
   return (

@@ -1,4 +1,4 @@
-import { ChevronLeft, Plus } from 'lucide-react'
+import { BrowserScreen } from '../mobile/screens/BrowserScreen'
 import { MOBILE_UI } from '../lib/platform'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowDownToLine, ArrowUpFromLine, ChevronRight, File, Folder, FolderPlus, Home, Pencil, RefreshCw, Search, Trash2, X } from 'lucide-react'
@@ -12,7 +12,6 @@ const join = (parent: string, name: string) => parent ? `${parent}/${name}` : na
 export function FileBrowser({ friendId, location, online, onBack }: { friendId: string; location: SharedLocation; online: string; onBack?: () => void }) {
   const toast = useStore(s => s.toast)
   const [selecting, setSelecting] = useState(false)
-  const [actionsOpen, setActionsOpen] = useState(false)
   const [path, setPath] = useState('')
   const [page, setPage] = useState(0)
   const cursors = useRef<(string | undefined)[]>([undefined])
@@ -28,6 +27,7 @@ export function FileBrowser({ friendId, location, online, onBack }: { friendId: 
   const [trashResults, setTrashResults] = useState<{ name: string; error?: string; trashPath?: string }[]>([])
   const [busy, setBusy] = useState(false)
   const [hover, setHover] = useState(false)
+  const mobilePages = useRef<LocationPage[]>([])
   const generation = useRef(0)
   const actionBusy = useRef(false)
   const request = useCallback(<T,>(kind: string, args: Record<string, unknown> = {}) =>
@@ -37,7 +37,13 @@ export function FileBrowser({ friendId, location, online, onBack }: { friendId: 
     setLoading(true); setError('')
     try {
       const result = await request<LocationPage>('ls', { cursor: cursors.current[page], sort, query })
-      if (token === generation.current) { cursors.current[page] = result.cursor; cursors.current[page + 1] = result.nextCursor; setData(result); setSelected(s => s.filter(name => result.entries.some(e => e.name === name))) }
+      if (token === generation.current) { cursors.current[page] = result.cursor; cursors.current[page + 1] = result.nextCursor; if (MOBILE_UI) {
+        if (page === 0) mobilePages.current = []
+        mobilePages.current[page] = result
+        const entries = mobilePages.current.slice(0, page + 1).flatMap(p => p.entries)
+        const unique = [...new Map(entries.map(entry => [entry.name, entry])).values()]
+        setData({ ...result, entries: unique }); setSelected(s => s.filter(name => unique.some(e => e.name === name)))
+      } else { setData(result); setSelected(s => s.filter(name => result.entries.some(e => e.name === name))) } }
     } catch(e) { if (token === generation.current) { setError(String(e)); setData({ entries: [], page, hasMore: false }); setSelected([]) } }
     finally { if (token === generation.current) setLoading(false) }
   }, [page, request, sort, query])
@@ -133,18 +139,11 @@ export function FileBrowser({ friendId, location, online, onBack }: { friendId: 
       {!!trashResults.length && <ul className="location-trash-items" aria-live="polite">{trashResults.map(r => <li key={r.name}><strong>{r.name}:</strong> {r.error ? `Failed — ${r.error}` : `Moved to ${r.trashPath}`}</li>)}</ul>}
       <div className="dialog-actions location-toolbar"><button type="button" autoFocus={dialog === 'trash'} className="btn btn-ghost" disabled={busy} onClick={() => setDialog(null)}>Cancel</button><button className="btn btn-primary" disabled={busy || (dialog !== 'trash' && !validName) || (dialog === 'trash' && !selectedEntries.length)}>{busy ? 'Working…' : dialog === 'trash' ? 'Move to trash' : dialog === 'mkdir' ? 'Create folder' : 'Rename'}</button></div>
     </form></div>
-  if (MOBILE_UI) return <section className="mobile-browser" aria-label={`${location.name} file browser`}>
-    <header className="mobile-header-compact visible mobile-browser-header"><button className="ios-button mobile-back" aria-label="Back" disabled={busy} onClick={() => path ? navigate(parts.slice(0, -1).join('/')) : onBack?.()}><ChevronLeft />Back</button><h1 className="ios-headline mobile-grow mobile-ellipsis">{parts.at(-1) ?? location.name}</h1><button className="ios-button" onClick={() => { setSelecting(!selecting); setSelected([]) }}>{selecting ? 'Done' : 'Select'}</button><button className="ios-icon" aria-label="Folder actions" aria-expanded={actionsOpen} onClick={() => setActionsOpen(!actionsOpen)}><Plus /></button></header>
-    <div className="mobile-inset"><input className="mobile-search" aria-label="Search folder" placeholder="Search folder" value={query} onChange={e => { cursors.current = [undefined]; setPage(0); setQuery(e.target.value) }} /></div>
-    {error && <div className="mobile-inset ios-footnote" role="alert">{error}<button className="ios-button" onClick={restart}>Try again</button></div>}
-    {busy && <p className="mobile-inset ios-footnote" role="status">Preparing…</p>}
-    <div className="ios-list" aria-busy={loading}>{entries.map(entry => <div className="ios-row" key={entry.name}><button className="mobile-entry" disabled={busy || loading} onClick={() => selecting || !entry.isDir ? (setSelecting(true), toggle(entry)) : navigate(join(path, entry.name))}><span className="mobile-tinted-icon">{entry.isDir ? <Folder /> : <File />}</span><span className="mobile-grow"><span className="ios-headline mobile-ellipsis">{entry.name}</span><span className="ios-footnote">{entry.isDir ? 'Folder' : formatBytes(entry.size)} · {entry.modified ? new Date(entry.modified).toLocaleDateString() : '—'}</span></span></button>{selecting ? <input type="checkbox" aria-label={`Select ${entry.name}`} disabled={busy || loading} checked={selected.includes(entry.name)} onChange={() => toggle(entry)} /> : entry.isDir && <ChevronRight size={18} />}</div>)}</div>
-    {loading && <p className="mobile-inset ios-footnote" role="status">Loading folder…</p>}
-    {!loading && !error && !entries.length && <div className="mobile-empty"><Folder /><h2 className="ios-title2">{query ? 'No matching items' : 'This folder is empty'}</h2><p className="ios-footnote">{query ? 'Try another file name.' : 'Files shared here appear in this folder.'}</p><button className="ios-button ios-primary" onClick={() => query ? setQuery('') : setActionsOpen(true)}>{query ? 'Clear search' : 'Folder actions'}</button></div>}
-    <footer className="mobile-inset mobile-browser-footer"><p className="ios-footnote">{online} · {data.total ?? entries.length} items · Page {page + 1}</p><div className="ios-row"><button className="ios-button" disabled={!page || loading || busy} onClick={() => { setPage(p => p - 1); setSelected([]) }}>Previous</button><button className="ios-button" disabled={!data.hasMore || loading || busy} onClick={() => { setPage(p => p + 1); setSelected([]) }}>Next</button></div></footer>
-    {(selected.length > 0 || actionsOpen) && <div className="mobile-browser-actions"><button className="ios-button" disabled={!selected.length || busy || loading || !!error} onClick={() => void download()}><ArrowDownToLine size={18} />Download</button>{location.rights.upload && <><button className="ios-button" disabled={busy || loading || !!error} onClick={() => void pick(false)}>Upload files</button><button className="ios-button" disabled={busy || loading || !!error} onClick={() => void pick(true)}>Upload folder</button></>}{location.rights.manage && <><button className="ios-button" disabled={busy || loading || !!error} onClick={() => openDialog('mkdir')}>New folder</button><button className="ios-button" disabled={selected.length !== 1 || busy || loading} onClick={() => openDialog('rename')}>Rename</button><button className="ios-button ios-destructive" disabled={!selected.length || busy || loading} onClick={() => openDialog('trash')}>Trash</button></>}<button className="ios-button" disabled={busy} onClick={() => { setActionsOpen(false); setSelected([]); setSelecting(false) }}>Done</button></div>}
-    {actionSheet}
-  </section>
+  if (MOBILE_UI) return <BrowserScreen location={location} path={path} entries={entries} selected={selected} selecting={selecting} query={query} loading={loading} busy={busy} error={error} hasMore={data.hasMore} dialog={dialog} name={name} validName={!!validName} actionError={actionError} trashResults={trashResults}
+    back={() => { setSelecting(false); setTrashResults([]); setActionError(''); if (path) navigate(parts.slice(0, -1).join('/')); else onBack?.() }} navigate={name => { setSelecting(false); setTrashResults([]); setActionError(''); navigate(join(path, name)) }} toggle={toggle} selectFile={name => setSelected([name])}
+    setSelecting={() => { setSelecting(!selecting); setSelected([]) }} search={value => { cursors.current = [undefined]; setPage(0); setSelected([]); setQuery(value) }} sort={value => { cursors.current = [undefined]; setPage(0); setSelected([]); setSort(value) }}
+    showMore={() => setPage(p => p + 1)} refresh={restart} download={download} pick={pick} openDialog={openDialog} closeDialog={() => setDialog(null)} setName={setName} run={run} />
+
   return <section className={`card file-browser${hover && location.rights.upload ? ' location-drag' : ''}`} aria-label={`${location.name} file browser`}>
     <nav className="location-breadcrumbs" aria-label="Folder path"><button disabled={busy} onClick={() => navigate('')}><Home size={15} />{location.name}</button>{parts.map((part, i) => <span key={i}><ChevronRight size={14} /><button disabled={busy} onClick={() => navigate(parts.slice(0,i+1).join('/'))}>{part}</button></span>)}</nav>
     <div className="location-toolbar location-actions">

@@ -1,3 +1,7 @@
+import { QRCodeSVG } from 'qrcode.react'
+import { QrScanner } from './QrScanner'
+import { Button, Row, Section, Sheet } from '../mobile/kit'
+import '../mobile/files.css'
 import { MOBILE_UI } from '../lib/platform'
 import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -14,6 +18,7 @@ export function FolderInviteModal() {
   const toast = useStore((s) => s.toast)
   const [queue, setQueue] = useState<FolderInvite[]>([])
   const [busy, setBusy] = useState(false)
+  const [scanning, setScanning] = useState(false)
   const invite = queue[0]
 
   useEffect(() => {
@@ -44,6 +49,18 @@ export function FolderInviteModal() {
       setBusy(false)
     }
   }
+
+  if (MOBILE_UI && scanning && invite) return <QrScanner hint="Scan this shared folder’s invite." onClose={() => setScanning(false)} onResult={code => {
+    setScanning(false)
+    if (code.trim() !== invite.code) { toast('error', 'This code belongs to a different folder invite.'); return }
+    void accept().catch(e => toast('error', String(e)))
+  }} />
+
+  if (MOBILE_UI) return invite ? <Sheet title="Shared Folder Invite" onClose={() => { if (!busy) dismiss() }} primary={<Button disabled={busy} onClick={() => { void accept().catch(e => toast('error', String(e))) }}>Done</Button>}>
+    <Section footer="Choose a folder to keep in sync. Files added by either of you will appear for both."><Row title={invite.folderName || 'Shared Folder'} subtitle={`${invite.fromName || 'A friend'} wants to share this folder with you.`} /><Row title={busy ? 'Joining…' : 'Accept & Choose Folder'} tint accessory="chevron" disabled={busy} onPress={() => { void accept().catch(e => toast('error', String(e))) }} /></Section>
+    <Section title="Invite Code"><div className="files-qr"><QRCodeSVG value={invite.code} size={200} level="M" fgColor="#000" bgColor="#fff" /></div><Row title="Copy" tint onPress={() => { void navigator.clipboard.writeText(invite.code).then(() => toast('success', 'Invite copied')).catch(e => toast('error', String(e))) }} /><Row title="Scan QR Code" accessory="chevron" tint disabled={busy} onPress={() => setScanning(true)} /></Section>
+    <Section><Row title="Decline" destructive disabled={busy} onPress={dismiss} /></Section>
+  </Sheet> : null
 
   return (
     <AnimatePresence>
