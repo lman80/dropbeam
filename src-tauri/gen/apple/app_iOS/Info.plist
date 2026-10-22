@@ -48,6 +48,11 @@
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>DropBeam uses the camera only to scan QR codes for adding friends, linking your devices and joining shared folders.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>DropBeam looks for your devices and friends on this network so files go straight between them at full speed, without the internet.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

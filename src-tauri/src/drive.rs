@@ -20,6 +20,8 @@
 //! the drive shows the local copy. New folders, renames and deletes are
 //! `locations.mkdir/rename/trash` and need the "rename & delete" right; without
 //! the upload right a location is read-only.
+// iOS has no system-wide mount in this pass (needs a File Provider extension).
+#![cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
 use crate::stream::{Engine, Entry, FileRef};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -749,10 +751,11 @@ pub fn init(config: &Path, cache: &Path) {
     let drive = Arc::new(Drive { tree: tree.clone(), config: config.to_path_buf(), mounted: Default::default(), state: Mutex::new((false, None)) });
     if DRIVE.set(drive.clone()).is_err() { return; }
     // The WebDAV view is always there (127.0.0.1 + token); Linux and Windows mount it.
-    let dav_tree = tree.clone();
-    tauri::async_runtime::spawn(async move {
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    { let dav_tree = tree.clone(); tauri::async_runtime::spawn(async move {
         if let Ok(server) = crate::stream::server().await { server.set_dav(Some(dav::handler(dav_tree, &server.token))); }
-    });
+    }); }
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut since_hosts = 0u32;

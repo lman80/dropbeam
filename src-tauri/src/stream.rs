@@ -9,6 +9,8 @@
 //! read-ahead window; misses become several range requests at once, each on
 //! its own QUIC stream of the friend's existing connection. Which path that
 //! connection uses (Local / Direct / Relay) is iroh's selector, unchanged.
+// The drive (and its uploads/listing) is desktop-only in this pass.
+#![cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use serde::Serialize;

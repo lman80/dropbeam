@@ -286,3 +286,18 @@ button.location-filename:hover > span { text-decoration: underline; text-decorat
 .location-added { display: flex !important; align-items: center; gap: 4px; color: var(--green); }
 .location-activity-row { min-height: 36px; font-size: var(--text-13); }
 .location-activity-row .row-trailing { font-size: var(--text-12); }
+
+/* Open in place (FilePreview.tsx) */
+.location-thumb { display: inline-flex; width: 20px; height: 20px; align-items: center; justify-content: center; flex-shrink: 0; }
+.location-thumb > img { width: 20px; height: 20px; object-fit: cover; border-radius: 3px; }
+.location-thumb > svg { width: 16px; height: 16px; stroke-width: 1.75; }
+.stream-body { display: flex; align-items: center; justify-content: center; min-height: 120px; }
+.stream-media { max-width: 100%; max-height: 62vh; border-radius: 6px; background: #000; }
+.stream-audio { width: 100%; }
+.stream-pdf { width: 100%; height: 62vh; border: 0; border-radius: 6px; background: #fff; }
+.stream-text { width: 100%; max-height: 62vh; overflow: auto; margin: 0; padding: 12px; font-size: 12px; white-space: pre-wrap; word-break: break-word; background: var(--bg-sunken, rgba(127,127,127,.08)); border-radius: 6px; }
+.stream-loading { display: flex; gap: 8px; align-items: center; color: var(--text-faint); }
+.stream-sub { display: inline-flex; gap: 8px; align-items: center; }
+.stream-badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: rgba(127,127,127,.14); color: var(--text-muted, inherit); font-variant-numeric: tabular-nums; }
+.stream-local, .stream-direct { background: rgba(52,199,89,.16); }
+.stream-relay { background: rgba(255,159,10,.18); }
