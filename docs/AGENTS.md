@@ -340,6 +340,8 @@ Bold arguments are required. 141 ops.
 | `server.wipe` | destructive (confirm) |  | Delete everything this Transfer Server holds. |
 | `server.disable` | destructive (confirm) | deleteItems | Turn this device's Transfer Server off. |
 | `server.setOwner` | write | **account** | Set which account owns this Transfer Server. |
+| `background.status` | read |  | Whether DropBeam keeps running when no one is signed in (Windows: a switch; Linux: the command to run; macOS: not available). |
+| `background.set` | write | **enabled** | Turn "Keep running when no one is signed in" on or off (Windows). Windows shows a permission (UAC) prompt on this computer's screen, so a person must approve it. |
 | `servers.list` | read |  | Transfer Servers your friends offer you. |
 | `servers.prefs` | write | **eid**, holdForMe, offer, shareFriends, useIt | Choose whether and how to use a friend's Transfer Server. |
 | `servers.forget` | write | **eid** | Stop using a friend's Transfer Server. |

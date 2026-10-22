@@ -6,6 +6,7 @@ import { api, locationsApi, onLocationActivity, type LocationActivity, type Host
 import { formatBytes, formatRelativeTime } from '../lib/format'
 import { IS_WINDOWS, OPEN_FOLDER_LABEL } from '../lib/platform'
 import { useStore } from '../store'
+import { BackgroundHostRow } from './BackgroundHostRow'
 import { Dialog } from './Dialog'
 import { MenuButton, SectionHeader } from './ui'
 
@@ -284,6 +285,7 @@ export function LocationSettings() {
           </div>
         </div>
       })}
+      {loaded && locations.length > 0 && <BackgroundHostRow className="row" />}
     </div>
 
     {activity.length > 0 && <>

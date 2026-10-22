@@ -56,6 +56,8 @@ After that, **updates install themselves** from inside the app.
 
 **Headless Transfer Server (Linux):** the `.deb` installs a systemd unit. Enable it with `sudo systemctl enable --now dropbeam-server@$USER` to run `DropBeam --server` without a window.
 
+**Keep running when no one is signed in (Windows):** Settings → Transfer Server → Advanced (or under your hosted Locations) → *Keep running when no one is signed in*. After one Windows permission prompt it registers a Scheduled Task, *DropBeam Background*, that starts `DropBeam.exe --server --config <your settings folder>` at boot as you (S4U — no password stored), so Locations and the Transfer Server stay reachable before anyone signs in. The app takes over while it's open and hands back when it closes. Log: `%APPDATA%\com.dropbeam.app\background-server.log`.
+
 ## Privacy
 
 Your files and messages go device to device and are never stored on our servers. Some things do leave your device. Diagnostics are **on by default** (a redacted error/performance summary; turn them off in Settings → Privacy). Feedback you send becomes a **public** GitHub issue. Relay and discovery servers see your IP address and device id. Read **[PRIVACY.md](PRIVACY.md)** for the full list.

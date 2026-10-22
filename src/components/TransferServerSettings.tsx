@@ -10,12 +10,13 @@ import { api, locationsApi, type MountCandidate } from '../lib/api'
 import { formatBytes } from '../lib/format'
 import { personGroups } from '../lib/deviceIcons'
 import { folderLabel } from '../lib/humanize'
-import { IS_LINUX, IS_MAC, IS_WINDOWS } from '../lib/platform'
+import { IS_MAC, IS_WINDOWS } from '../lib/platform'
 import {
   ACCESS_LABEL, expiresIn, heldFor, onServerChanged, onServersChanged, serverApi,
   type DeviceCheck, type ServerAccess, type ServerConfig, type ServerStatus, type UsableServer,
 } from '../lib/transferServer'
 import { useStore } from '../store'
+import { BackgroundHostRow } from './BackgroundHostRow'
 import { Dialog } from './Dialog'
 import { ServerExplainer } from './ServerExplainer'
 import { Dot, MenuButton, SectionHeader, Segmented, Spinner, Toggle } from './ui'
@@ -411,15 +412,7 @@ function ServerManager({ status, check, setStatus }: { status: ServerStatus; che
             }}
             onKeyDown={(e) => { if (isEnterKey(e)) e.currentTarget.blur() }} />
         </Row>
-        {IS_LINUX && (
-          <Row title="Keep running when no one is logged in" sub="Runs the server in the background after a restart. The app takes over whenever it’s open.">
-            <button className="btn btn-secondary btn-sm" onClick={() => {
-              void navigator.clipboard.writeText('sudo systemctl enable --now dropbeam-server@$USER')
-                .then(() => toast('success', 'Copied — paste it into Terminal'))
-                .catch(() => toast('error', 'Couldn’t copy'))
-            }}>Copy Command</button>
-          </Row>
-        )}
+        <BackgroundHostRow />
       </div>
 
       <SectionHeader count={members.length + theirs.length + 1}>People</SectionHeader>
