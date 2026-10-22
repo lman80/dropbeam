@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::{collections::{BTreeMap, HashMap, VecDeque}, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
+use std::{collections::{BTreeMap, HashMap, VecDeque}, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock, LazyLock, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
 use tokio::sync::{mpsc, watch, Semaphore};
 
 pub const BLOCK: u64 = 1 << 20;
@@ -568,7 +568,7 @@ pub async fn server() -> Result<&'static Server> {
 }
 
 pub type Resolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
-type Body = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub type Dav = Arc<dyn Fn(hyper::Request<hyper::body::Incoming>) -> std::pin::Pin<Box<dyn std::future::Future<Output = hyper::Response<Body>> + Send>> + Send + Sync>;
 
@@ -618,7 +618,7 @@ struct Ctx {
 fn full(status: u16, text: &str) -> hyper::Response<Body> {
     use http_body_util::BodyExt;
     hyper::Response::builder().status(status).header("Content-Type", "text/plain; charset=utf-8").header("Cache-Control", "no-store")
-        .body(http_body_util::Full::new(Bytes::from(text.to_string())).map_err(|e| match e {}).boxed()).unwrap()
+        .body(http_body_util::Full::new(Bytes::from(text.to_string())).map_err(|e| match e {}).boxed_unsync()).unwrap()
 }
 impl Ctx {
     async fn handle(&self, req: hyper::Request<hyper::body::Incoming>) -> hyper::Response<Body> {
@@ -652,7 +652,7 @@ impl Ctx {
         };
         if req.method() == hyper::Method::OPTIONS {
             return with_cors(hyper::Response::builder().status(204)).header("Access-Control-Allow-Methods", "GET, HEAD")
-                .header("Access-Control-Allow-Headers", "Range").body(http_body_util::Empty::new().map_err(|e| match e {}).boxed()).unwrap();
+                .header("Access-Control-Allow-Headers", "Range").body(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap();
         }
         if req.method() != hyper::Method::GET && req.method() != hyper::Method::HEAD { return full(405, "Method not allowed"); }
         let decode = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8().map(|c| c.into_owned()).ok();
@@ -680,11 +680,11 @@ impl Ctx {
             None | Some(Range::Ignore) => (0, len),
             Some(Range::Bytes(s, e)) => { b = b.status(206).header("Content-Range", format!("bytes {s}-{}/{len}", e - 1)); (s, e) }
             Some(Range::Unsatisfiable) => return with_cors(hyper::Response::builder()).status(416).header("Content-Range", format!("bytes */{len}"))
-                .body(http_body_util::Empty::new().map_err(|e| match e {}).boxed()).unwrap(),
+                .body(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap(),
         };
         b = b.header("Content-Length", end - start);
         if req.method() == hyper::Method::HEAD || start == end {
-            return b.body(http_body_util::Empty::new().map_err(|e| match e {}).boxed()).unwrap();
+            return b.body(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap();
         }
         let (tx, rx) = mpsc::channel::<Result<hyper::body::Frame<Bytes>, std::io::Error>>(2);
         let engine = self.engine.clone();
@@ -700,7 +700,7 @@ impl Ctx {
             }
         });
         let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
-        b.body(http_body_util::StreamBody::new(stream).boxed()).unwrap()
+        b.body(http_body_util::StreamBody::new(stream).boxed_unsync()).unwrap()
     }
 }
 fn constant_eq(a: &[u8], b: &[u8]) -> bool { a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0 }
@@ -749,6 +749,130 @@ pub fn preview_kind(name: &str) -> &'static str {
     if m.starts_with("image/") && !matches!(m, "image/heic" | "image/heif" | "image/tiff") { "image" }
     else if m.starts_with("video/") { "video" } else if m.starts_with("audio/") { "audio" }
     else if m == "application/pdf" { "pdf" } else if m.starts_with("text/") { "text" } else { "other" }
+}
+
+// ── Commands (UI, iOS bridge and the agent layer call these) ────────────────
+
+type Shared<'a> = tauri::State<'a, Arc<crate::AppState>>;
+fn file_ref(config: &Path, friend_id: &str, location_id: &str, rel_path: &str) -> Result<FileRef, String> {
+    let endpoint = crate::friends::get(config, friend_id).and_then(|f| f.endpoint_id).ok_or("Friend not found")?;
+    let rel = crate::locations::relative(rel_path).map_err(|e| e.to_string())?;
+    if rel.as_os_str().is_empty() { return Err("Choose a file".into()); }
+    Ok(FileRef { endpoint, location_id: location_id.into(), rel_path: rel.to_string_lossy().replace('\\', "/") })
+}
+fn text(e: anyhow::Error) -> String { format!("{e:#}") }
+
+/// Size, date and version (etag) of one file in a friend's Location.
+#[tauri::command]
+pub async fn location_stat(state: Shared<'_>, friend_id: String, location_id: String, rel_path: String) -> Result<Stat, String> {
+    let f = file_ref(&state.config_dir, &friend_id, &location_id, &rel_path)?;
+    engine().map_err(text)?.stat(&f).await.map_err(text)
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadUrl { pub url: String, pub kind: &'static str, pub mime: &'static str, pub size: u64, pub etag: String }
+/// A 127.0.0.1 URL that streams the file with Range support (previews,
+/// <video>, AVPlayer). Checks the file first, so problems show up now.
+#[tauri::command]
+pub async fn location_read_url(state: Shared<'_>, friend_id: String, location_id: String, rel_path: String) -> Result<ReadUrl, String> {
+    let f = file_ref(&state.config_dir, &friend_id, &location_id, &rel_path)?;
+    let stat = engine().map_err(text)?.stat(&f).await.map_err(text)?;
+    if stat.is_dir { return Err("This is a folder".into()); }
+    let server = server().await.map_err(text)?;
+    Ok(ReadUrl { url: server.file_url(&friend_id, &location_id, &f.rel_path), kind: preview_kind(&f.rel_path), mime: mime(&f.rel_path), size: stat.size, etag: stat.etag })
+}
+
+static NO_THUMB: LazyLock<Mutex<std::collections::HashSet<String>>> = LazyLock::new(Default::default);
+/// A small JPEG preview (data URL) of a picture, made by the host and cached
+/// here by name, size and date. `None` when the host can't make one.
+#[tauri::command]
+pub async fn location_thumb(app: tauri::AppHandle, state: Shared<'_>, friend_id: String, location_id: String, rel_path: String,
+    size: u64, modified: u64, max: Option<u32>) -> Result<Option<String>, String> {
+    use base64::Engine as _;
+    use tauri::Manager;
+    if preview_kind(&rel_path) != "image" { return Ok(None); }
+    let f = file_ref(&state.config_dir, &friend_id, &location_id, &rel_path)?;
+    let max = max.unwrap_or(256).clamp(32, 512);
+    let key = { use sha2::Digest; hex::encode(sha2::Sha256::digest(format!("{}\0{}\0{}\0{size}\0{modified}\0{max}", f.endpoint, f.location_id, f.rel_path)))[..40].to_string() };
+    if lock(&NO_THUMB).contains(&key) { return Ok(None); }
+    let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("stream-thumbs");
+    let cached = dir.join(format!("{key}.jpg"));
+    let data_url = |b: &[u8]| format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(b));
+    if let Ok(b) = tokio::fs::read(&cached).await { return Ok(Some(data_url(&b))); }
+    let engine = engine().map_err(text)?;
+    let request = json!({"kind": "locations.thumb", "locations_v": crate::locations::STREAM_VERSION, "id": f.location_id, "rel_path": f.rel_path, "max": max});
+    match rpc_retrying(&**engine.remote(), &f.endpoint, request).await {
+        Ok(reply) => {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(reply["data"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+            let _ = tokio::fs::create_dir_all(&dir).await;
+            let _ = tokio::fs::write(&cached, &bytes).await;
+            Ok(Some(data_url(&bytes)))
+        }
+        Err(e) => {
+            log::debug!("open in place: no thumbnail: {e:#}");
+            let mut none = lock(&NO_THUMB);
+            if none.len() > 20_000 { none.clear(); }
+            none.insert(key);
+            Ok(None)
+        }
+    }
+}
+
+/// The whole file in this app's cache (for Quick Look and "Open with"). Kept
+/// a day; reopening an unchanged file reuses it.
+#[tauri::command]
+pub async fn location_cache_file(app: tauri::AppHandle, state: Shared<'_>, friend_id: String, location_id: String, rel_path: String) -> Result<String, String> {
+    use tauri::Manager;
+    let f = file_ref(&state.config_dir, &friend_id, &location_id, &rel_path)?;
+    let engine = engine().map_err(text)?;
+    let stat = engine.stat(&f).await.map_err(text)?;
+    let root = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("opened");
+    let key = { use sha2::Digest; hex::encode(sha2::Sha256::digest(format!("{}\0{}\0{}\0{}", f.endpoint, f.location_id, f.rel_path, stat.etag)))[..32].to_string() };
+    let name = Path::new(&f.rel_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let dest = root.join(&key).join(&name);
+    if tokio::fs::metadata(&dest).await.is_ok_and(|m| m.len() == stat.size) { return Ok(dest.to_string_lossy().into_owned()); }
+    // Forget copies older than a day.
+    for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        if e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(86_400)) { let _ = std::fs::remove_dir_all(e.path()); }
+    }
+    engine.fetch_to_file(&f, &dest).await.map_err(text)?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+/// "Open with the default app": through the drive when it is mounted (the app
+/// then reads only what it needs), otherwise a cached copy.
+#[tauri::command]
+pub async fn location_open(app: tauri::AppHandle, state: Shared<'_>, friend_id: String, location_id: String, rel_path: String) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    if let Ok(drive) = crate::drive::drive() {
+        if let (Some(mount), Some(rel)) = (drive.mount_path().await, drive.tree().virtual_path(&friend_id, &location_id, &rel_path)) {
+            let path = rel.split('/').fold(mount, |p, part| p.join(part));
+            if tokio::fs::metadata(&path).await.is_ok() {
+                app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())?;
+                return Ok(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let path = location_cache_file(app.clone(), state, friend_id, location_id, rel_path).await?;
+    app.opener().open_path(&path, None::<&str>).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Settings → Drives → "Clear": drop every cached block now.
+#[tauri::command]
+pub fn stream_clear_cache() -> Result<u64, String> {
+    let engine = engine().map_err(text)?;
+    engine.clear();
+    Ok(engine.cached_bytes())
+}
+
+/// Path badge (Local / Direct / Relay), round trip and live speed for a friend.
+#[tauri::command]
+pub fn stream_status(state: Shared<'_>, friend_id: String) -> Result<StreamStatus, String> {
+    let endpoint = crate::friends::get(&state.config_dir, &friend_id).and_then(|f| f.endpoint_id).ok_or("Friend not found")?;
+    Ok(engine().map_err(text)?.status(&endpoint))
 }
 
 #[cfg(test)]

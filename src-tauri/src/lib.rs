@@ -9,6 +9,7 @@ mod link_preview;
 mod location_sync;
 mod locations;
 mod stream;
+mod drive;
 mod mailbox;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod headless;
@@ -746,6 +747,14 @@ pub fn run() {
                     iroh_net::broadcast_profile(app2, iroh2);
                 });
             }
+            // Open in place: the block cache + 127.0.0.1 range server; on
+            // desktops also "Show Locations as a drive" (docs/locations-v2.md).
+            {
+                let cache = app.path().app_cache_dir().unwrap_or_else(|_| config_dir.join("cache"));
+                stream::init(&config_dir, &cache, iroh_state.clone(), app.handle().clone());
+                #[cfg(desktop)]
+                drive::init(&config_dir, &cache);
+            }
             app.manage(iroh_state);
             log::info!("setup: iroh spawned + state managed");
 
@@ -1005,6 +1014,20 @@ pub fn run() {
             commands::save_location,
             commands::location_request,
             commands::upload_to_location,
+            stream::location_stat,
+            stream::location_read_url,
+            stream::location_thumb,
+            stream::location_cache_file,
+            stream::location_open,
+            stream::stream_status,
+            stream::stream_clear_cache,
+            drive::drive_status,
+            drive::drive_mount,
+            drive::drive_unmount,
+            drive::drive_refresh,
+            drive::drive_settings_set,
+            drive::drive_open,
+            drive::drive_fix_windows,
             mounts::list_mount_candidates,
             mailbox::cmds::server_check_device,
             mailbox::cmds::server_folder_space,
@@ -1063,6 +1086,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building DropBeam")
         .run(|_app, _event| {
+            // Take the drive away cleanly on quit (a crash is cleaned up at launch).
+            #[cfg(desktop)]
+            if let tauri::RunEvent::Exit = &_event { drive::shutdown_blocking(); }
             // A `dropbeam:` link (invite link, Camera-scanned friend QR): queue it
             // for the UI and tell a running one right away.
             #[cfg(target_os = "ios")]
